@@ -42,6 +42,23 @@ type AuthTransitionOwner = {
   ext: number;
 };
 /**
+ * c-reconnfu gate 43 — TRI-STATE bootstrap / connection install outcome.
+ *  - "installed":   a current-identity connection machine exists (newly built
+ *                   or adopted) and the authenticated/degraded UI is settled;
+ *                   callers are fulfilled.
+ *  - "obsolete":    the external epoch moved OR a same-epoch credential
+ *                   transition superseded this run's generation. This run NEVER
+ *                   fulfils a caller itself: while extEpoch is still current
+ *                   callers are handed to the CURRENT generation's install
+ *                   (join its in-flight run or start one); after an external
+ *                   change they settle silently as retired.
+ *  - "unavailable": the CURRENT generation's durable storage genuinely failed
+ *                   to open/read: publish the settled degraded/offline
+ *                   cached-session state (ready: true, authed per session)
+ *                   with polling/recovery and fulfil — never a loading screen.
+ */
+type BootstrapOutcome = "installed" | "obsolete" | "unavailable";
+/**
  * Outcome of a serialized credential transition run. `obsolete` (c-reconnfu
  * gate 40 item 1) means an EXTERNAL identity change retired the transition
  * WHILE IT WAS QUEUED (after it issued but before it acquired the chain): it
@@ -1186,21 +1203,7 @@ class HubStore {
    * installed instead of constructing a second one.
    */
   private connectionInstallEpoch: number | null = null;
-  /**
-   * c-reconnfu gate 41 S1 / gate 42 — SINGLE-FLIGHT BOOTSTRAP. At most one
-   * bootstrap RUN per (external epoch, credential generation). A second call
-   * with the SAME epoch AND same authGen (React StrictMode effect replay; two
-   * identical reloads) returns the in-flight promise. A call in a NEWER
-   * credential generation — a successful login's transition acquires the chain
-   * and applyAuthIdentityChange bumps authGen while the external epoch is
-   * unchanged — must NOT join: the older run's outbox initialization was
-   * invalidated by that gen bump, so satisfying the newer caller with its
-   * promise would resolve the login with no machine/bubble restore. The newer
-   * caller runs its own fresh pass; the older run retires via the gen/epoch
-   * checks and never reports completion when its install went obsolete.
-   * A call in a newer EXTERNAL epoch (logout/401/peer) likewise runs fresh.
-   */
-  private bootstrapInFlight: { ext: number; gen: number; promise: Promise<boolean> } | null = null;
+  private bootstrapInFlight: { ext: number; gen: number; promise: Promise<BootstrapOutcome> } | null = null;
   private outbox: Outbox | null = null;
   private outboxUnsubscribe: (() => void) | null = null;
   private outboxDegraded = false;
@@ -1605,7 +1608,14 @@ class HubStore {
         // successor's generation): bind the obligation to the generation that
         // is current NOW. Only through this VERIFIED succession — and never
         // after an external change, which nulls the obligation instead.
-        if (extLive()) this.authBootstrapOwed = { gen: this.authGen };
+        if (!extLive()) return;
+        this.authBootstrapOwed = { gen: this.authGen };
+        // Gate 43 item 1: do NOT resolve this login while the installation is
+        // still parked. Await the current generation's bootstrap (single-flight
+        // joins the successor's run, or the tri-state runner starts one if the
+        // successor later fails): this caller is fulfilled only once a machine
+        // or settled degraded state exists for the current identity.
+        await this.bootstrap().catch(() => undefined);
         return;
       }
       this.authBootstrapOwed = null;
@@ -2998,15 +3008,27 @@ class HubStore {
    * state and the outbox still restores/flushes on recovery.
    */
   /**
-   * @returns true when the caller's identity has a live current-epoch machine
-   * after this call (newly installed, or an existing one adopted); false when
-   * NO machine was installed — the caller's epoch retired, or its outbox
-   * initialization became obsolete (gate 42: a same-epoch credential
-   * transition bumped authGen while this was awaiting storage). A false result
-   * must never be treated as a completed bootstrap: the current generation is
-   * installed by a newer bootstrap run.
+   * Gate 43 (c): publish the SETTLED cached-session state after a successful
+   * REST bootstrap whose durable storage is unavailable (or whose catch branch
+   * keeps the cached session offline). ready is always true so AuthGate never
+   * sticks on the loading screen; authed follows the cached device session.
    */
-  private async initConnection(offline: boolean, ext: number): Promise<boolean> {
+  private publishCachedSessionSettled(err: unknown): void {
+    this.emit({
+      ready: true,
+      authed: true,
+      session: readSession(),
+      error: err ? (err instanceof Error ? err.message : String(err)) : null,
+    });
+  }
+
+  /**
+   * @returns installed when a current-epoch machine exists after this call;
+   * obsolete when the caller's epoch/generation retired (never install for a
+   * newer identity); unavailable when the CURRENT generation's storage failed
+   * (the caller settles degraded without a machine — gate 43 item 2).
+   */
+  private async initConnection(offline: boolean, ext: number): Promise<BootstrapOutcome> {
     // Gate 39/40 R-b: the CALLER's external epoch (captured at its public
     // entry before its first await) is REQUIRED; this installer never reads a
     // fresh epoch for the caller.
@@ -3021,7 +3043,15 @@ class HubStore {
     // an open transition) stops this install entirely — never adopt the box the
     // NEW identity created.
     const status = await this.ensureOutbox(epoch);
-    if (status !== "ok" || !live() || !this.outbox) return false;
+    // Gate 43: epoch moved (external logout) retires regardless of status.
+    if (!live()) return "obsolete";
+    // Gate 43: the caller's generation was superseded by a same-epoch
+    // credential transition while storage opened — never build a machine from
+    // the stale run; fulfilBootstrap hands the caller to the current gen.
+    if (status === "obsolete") return "obsolete";
+    // Gate 43 (c): storage genuinely unavailable for the CURRENT generation.
+    // No machine this pass; the caller publishes the settled degraded state.
+    if (status === "unavailable" || !this.outbox) return "unavailable";
     // Gate 41 S1: a connection machine installed for THIS epoch is already
     // owned — either by a replacement login's reused machine or by a
     // concurrent same-epoch bootstrap that won the single-flight/reload race.
@@ -3029,14 +3059,14 @@ class HubStore {
     // machine (the second assignment would orphan the first, whose timers and
     // callbacks keep running).
     if (this.connection && this.connectionInstallEpoch === epoch) {
-      return true;
+      return "installed";
     }
     const box = this.outbox;
 
     // Reload: restore unsent rows as bubbles, keyed to their stored instances.
     // Gate 39 R-b: identity-publishing/resource work — revalidate synchronously
     // before the restore emit and machine creation.
-    if (!live()) return false;
+    if (!live()) return "obsolete";
     const restored = box.unresolved();
     if (restored.length) {
       // Offline reload never ran the instance list. Restore the LAST KNOWN
@@ -3072,7 +3102,7 @@ class HubStore {
     // stops the machine from being built or published.
     if (!live()) {
       box.dispose();
-      return false;
+      return "obsolete";
     }
     const machine = new ConnectionMachine({
       resume: () => this.resumeConnection(),
@@ -3114,7 +3144,7 @@ class HubStore {
       machine.dispose();
       this.connection = null;
       this.connectionInstallEpoch = null;
-      return false;
+      return "obsolete";
     }
     // A successful REST bootstrap proves reachability, but on the list/new
     // pages there is no follow socket to watchdog yet: start live WITHOUT a
@@ -3137,7 +3167,7 @@ class HubStore {
 
     // Send anything already due (e.g. rows left inflight when the tab closed).
     void this.flushAllOutbox();
-    return true;
+    return "installed";
   }
 
   private onConnOnline = () => this.connection?.dispatch({ type: "online" });
@@ -4450,40 +4480,68 @@ class HubStore {
   }
 
   async bootstrap(): Promise<void> {
-    // Gate 41 S1 / gate 42 — SINGLE-FLIGHT keyed on (extEpoch, authGen).
+    // Gate 41 S1 / gate 42-43 — SINGLE-FLIGHT keyed on (extEpoch, authGen),
+    // with TRI-STATE fulfilment (see BootstrapOutcome).
     this.registerPeerAuthWatch();
-    const extAtBoot = this.extEpoch;
-    const genAtBoot = this.authGen;
-    const inFlight = this.bootstrapInFlight;
-    if (inFlight && inFlight.ext === extAtBoot && inFlight.gen === genAtBoot) {
-      // Identical identity (StrictMode replay / duplicate reload): join the
-      // run already in flight instead of running health/lists/install twice.
-      await inFlight.promise;
-      return;
-    }
-    // First call, a NEW external epoch, OR a NEWER credential generation (a
-    // login that bumped authGen while a reload run was parked): run a FRESH
-    // pass for this identity. We do NOT await the older run — it may be parked
-    // on a dead request and retires itself via its captured gen/epoch checks.
-    const promise = this.runBootstrap(extAtBoot, genAtBoot);
-    this.bootstrapInFlight = { ext: extAtBoot, gen: genAtBoot, promise };
-    try {
-      await promise;
-    } finally {
-      // Only the latest run clears the slot (a newer run may already have
-      // replaced it; joined same-identity callers never reach here).
-      if (this.bootstrapInFlight?.promise === promise) this.bootstrapInFlight = null;
-    }
+    await this.fulfilBootstrap(this.launchBootstrapRun(this.extEpoch, this.authGen), this.extEpoch);
   }
 
   /**
-   * @returns true when this run reached a fully installed/settled state for
-   * its identity; false when it retired mid-install (external epoch moved, or
-   * a same-epoch credential transition superseded its generation) — in which
-   * case it reports NO completion: the current identity is owned by a newer
-   * bootstrap run (gate 42).
+   * Launch a bootstrap run for an exact identity, coalescing an identical
+   * in-flight one (StrictMode replay / duplicate reload). A newer identity
+   * always starts a fresh run (it replaces the slot; the older run clears the
+   * slot only when it still owns it).
    */
-  private async runBootstrap(extAtBoot: number, _genAtBoot: number): Promise<boolean> {
+  private launchBootstrapRun(ext: number, gen: number): Promise<BootstrapOutcome> {
+    const existing = this.bootstrapInFlight;
+    if (existing && existing.ext === ext && existing.gen === gen) return existing.promise;
+    const slot: { ext: number; gen: number; promise: Promise<BootstrapOutcome> } = {
+      ext,
+      gen,
+      promise: undefined as unknown as Promise<BootstrapOutcome>,
+    };
+    const promise = this.runBootstrap(ext, gen);
+    slot.promise = promise;
+    this.bootstrapInFlight = slot;
+    void promise.finally(() => {
+      if (this.bootstrapInFlight === slot) this.bootstrapInFlight = null;
+    });
+    return promise;
+  }
+
+  /**
+   * Fulfil one bootstrap caller from a run's tri-state outcome.
+   *  - installed / unavailable: the UI is settled for this identity — done.
+   *  - obsolete while the external epoch is STILL current: a same-epoch
+   *    credential transition superseded this run. Follow the CURRENT
+   *    generation's installation — join its in-flight run or start one — until
+   *    it reports installed/unavailable (gate 43 item 1: the login's own
+   *    callers, and a predecessor parked across a later FAILED successor, are
+   *    fulfilled only once a current-gen machine or degraded state exists).
+   *  - obsolete after the epoch moved: the identity logged out externally;
+   *    settle silently (R-c already published the logged-out state).
+   */
+  private async fulfilBootstrap(first: Promise<BootstrapOutcome>, callerExt: number): Promise<void> {
+    let result = await first;
+    while (result === "obsolete" && this.extEpoch === callerExt) {
+      const current = this.bootstrapInFlight;
+      if (
+        current &&
+        current.promise !== first &&
+        current.ext === this.extEpoch &&
+        current.gen === this.authGen
+      ) {
+        result = await current.promise;
+      } else {
+        // No current-generation run (the successor failed without bootstrapping
+        // or its run already drained): install for the current generation now.
+        result = await this.launchBootstrapRun(this.extEpoch, this.authGen);
+      }
+    }
+  }
+
+  private async runBootstrap(extAtBoot: number, _genAtBoot: number): Promise<BootstrapOutcome> {
+
     // Gate 38 item 2: capture the external epoch at bootstrap start and
     // revalidate SYNCHRONOUSLY after every await below, before installing a
     // resource or publishing state. A peer logout / local logout / 401 while a
@@ -4499,27 +4557,38 @@ class HubStore {
     ++this.bootGen;
     if (api.mock && readLoggedOut() && !readSession()) {
       this.emit({ ready: true, authed: false, session: null, devices: [], passkeys: [], connection: "offline" });
-      return true;
+      return "installed";
     }
     if (api.mock && !readSession()) {
       const session = await api.login(MOCK_BOOTSTRAP_TOKEN, readDeviceSettings().deviceName);
       // Gate 40: epoch is the only retirement gate (not bootGen — see the catch
       // block); an external change while this step was parked retires the run.
-      if (!extLive()) return false;
+      if (!extLive()) return "obsolete";
       // First identity establishment: route through the same helper so the
       // initial Outbox initializer starts under a defined, current generation.
       this.applyAuthIdentityChange();
       writeSession(session, { mock: api.mock });
       this.emit({ session: readSession() });
     }
+    // Gate 43 item 1: if this run was launched by a SUPERSEDED predecessor's
+    // settlement while the successor credential transition is still holding the
+    // chain, wait for that transition instead of racing health/lists/install.
+    // On success the successor's own settlement joins THIS single-flight run
+    // (one install for both callers); if the successor fails without moving the
+    // external epoch this run performs the current-generation recovery; if an
+    // external change arrives meanwhile, retire silently (never hello).
+    while (this.authTransition !== null && this.extEpoch === extAtBoot) {
+      await this.authTransition;
+    }
+    if (!extLive()) return "obsolete";
     try {
       await api.hello();
       // Gate 40: epoch is the only retirement gate (not bootGen — see the catch
       // block); an external change while this step was parked retires the run.
-      if (!extLive()) return false;
+      if (!extLive()) return "obsolete";
       if (!api.mock && !api.hasDeviceSession()) {
         this.emit({ ready: true, authed: false, error: null, connection: "live" });
-        return true;
+        return "installed";
       }
       const [instances, hosts, interactions, devices, passkeys] = await Promise.all([
         api.instanceList(),
@@ -4530,7 +4599,7 @@ class HubStore {
       ]);
       // Gate 40: epoch is the only retirement gate (not bootGen — see the catch
       // block); an external change while this step was parked retires the run.
-      if (!extLive()) return false;
+      if (!extLive()) return "obsolete";
       const registeredHosts = mergeHostWorkspaces(hosts.items, this.state.hosts);
       this.emit({
         ready: true,
@@ -4582,17 +4651,21 @@ class HubStore {
       // it the outbox): an external change landing during this synchronous
       // setup must not be followed by a stale machine/install, and again after
       // the install settles before starting polls.
-      if (!extLive()) return false;
-      // Gate 42: a false install means a same-epoch credential transition
-      // superseded this run's generation while it parked; do not start polls or
-      // report completion — the newer generation's own bootstrap owns the
-      // machine, restoration and completion of any joined caller.
-      const installed = await this.initConnection(false, extAtBoot);
-      if (!extLive()) return false;
-      if (!installed) return false;
+      if (!extLive()) return "obsolete";
+      // Gate 42/43: tri-state install. "installed" starts polls/dev handle.
+      // "obsolete" is handed to the current generation by fulfilBootstrap (no
+      // polls here). "unavailable" falls through to the settled degraded state.
+      const install = await this.initConnection(false, extAtBoot);
+      if (!extLive()) return "obsolete";
+      if (install === "installed") {
+        this.startPoll();
+        this.installDevHandle();
+        return "installed";
+      }
+      if (install === "obsolete") return "obsolete";
+      this.publishCachedSessionSettled(null);
       this.startPoll();
-      this.installDevHandle();
-      return true;
+      return "unavailable";
     } catch (err) {
       // Gate 41 item 1: RETIREMENT FIRST. If an external change (logout/401/
       // peer) advanced the epoch while the health/list request was parked —
@@ -4603,7 +4676,7 @@ class HubStore {
       // external change already published the logged-out state and tore the
       // old resources down. A CURRENT-epoch bootstrap's OWN 401 still passes
       // this check (the epoch has not moved yet) and performs the logout below.
-      if (!extLive()) return false;
+      if (!extLive()) return "obsolete";
       const unauth = isUnauthorized(err);
       if (unauth) {
         // c-reconnfu gate 33 item 1: a 401 means the current session is gone;
@@ -4620,19 +4693,16 @@ class HubStore {
       // and let the connection machine reconnect. Only a real 401 logs out.
       const hasSession = api.hasDeviceSession();
       if (!unauth && hasSession) {
-        const installedOffline = await this.initConnection(true, extAtBoot);
-        if (!extLive()) return false;
-        // Gate 42: obsolete install (newer credential generation) — do not
-        // republish authed or poll from the retired run.
-        if (!installedOffline) return false;
-        this.emit({
-          ready: true,
-          authed: true,
-          session: readSession(),
-          error: null,
-        });
+        const installOffline = await this.initConnection(true, extAtBoot);
+        if (!extLive()) return "obsolete";
+        // Gate 43 (b): gen-superseded while the epoch is current — never fulfil
+        // here; fulfilBootstrap joins/starts the current generation's install.
+        if (installOffline === "obsolete") return "obsolete";
+        // installed OR unavailable (gate 43 (c)): either way settle the cached
+        // authenticated session, start polling/recovery, and fulfil.
+        this.publishCachedSessionSettled(err);
         this.startPoll();
-        return true;
+        return installOffline; // "installed" | "unavailable"
       }
       this.emit({
         ready: true,
@@ -4641,7 +4711,7 @@ class HubStore {
         error: err instanceof Error ? err.message : "bootstrap failed",
         connection: "offline",
       });
-      return true;
+      return "installed";
     }
   }
 

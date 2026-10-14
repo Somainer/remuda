@@ -10207,7 +10207,7 @@ mod partial_usage_poll_boundary_tests {
                 ObservationPayload::Usage(usage) => Some(usage),
                 _ => None,
             })
-            .last()
+            .next_back()
             .expect("the group published at least one usage observation")
     }
 

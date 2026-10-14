@@ -528,7 +528,7 @@ pub fn run_fake_herdr() -> Result<i32, FakeHerdrError> {
             rt.block_on(async move {
                 // Exit requests arrive through `parent_watch` (parent death /
                 // stdin EOF) or the scripted shutdown window in `serve`.
-                let serve = serve(options);
+                let serve = serve(*options);
                 match parent_watch {
                     Some(parent_watch) => {
                         tokio::select! {
@@ -557,7 +557,9 @@ pub fn run_fake_herdr() -> Result<i32, FakeHerdrError> {
 }
 
 enum Cli {
-    Serve(FakeHerdrOptions),
+    // Boxed: the options struct (many PathBuf seams) must not inflate every
+    // other variant on the stack (clippy::large_enum_variant).
+    Serve(Box<FakeHerdrOptions>),
     Observe {
         frames: PathBuf,
         cols: u16,
@@ -731,7 +733,7 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
         positional.first().map(String::as_str),
         Some("serve") | Some("server") | None
     ) {
-        return Ok(Cli::Serve(FakeHerdrOptions {
+        return Ok(Cli::Serve(Box::new(FakeHerdrOptions {
             socket,
             script,
             frames,
@@ -749,7 +751,7 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
             subscribe_never_acks,
             refuse_shell_exit_send_text,
             refuse_close_subscribes_marker: refuse_close_subscribes_marker.clone(),
-        }));
+        })));
     }
     Err(FakeHerdrError::Args(format!(
         "unknown command {}",

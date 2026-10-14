@@ -7939,3 +7939,123 @@ it("GATE38 item 2: a peer logout while bootstrap's health request is parked inva
     sessionStorage.removeItem("remuda-outbox-owner");
   }
 });
+
+it("GATE39 item 1: passkeyLogin captures the external epoch at ENTRY — a peer logout while the challenge or the WebAuthn assertion is parked skips the finish request, writes no session, authed false", async () => {
+  for (const phase of ["challenge", "assertion"] as const) {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_310_000 + (phase === "assertion" ? 1 : 0));
+    const I = `ins_g39_1_${phase}`;
+    const originalNavigator = globalThis.navigator;
+    let getCalled = 0;
+    let releaseAssertion: (() => void) | null = null;
+    Object.defineProperty(globalThis, "navigator", {
+      configurable: true,
+      writable: true,
+      value: {
+        locks: fifoWebLocks().locks,
+        credentials: {
+          get: () => {
+            getCalled += 1;
+            return new Promise((resolve) => {
+              releaseAssertion = () =>
+                resolve({
+                  id: `cred_g39_1_${phase}`,
+                  type: "public-key",
+                  rawId: new ArrayBuffer(1),
+                  response: {
+                    authenticatorData: new ArrayBuffer(1),
+                    clientDataJSON: new ArrayBuffer(1),
+                    signature: new ArrayBuffer(1),
+                    userHandle: new ArrayBuffer(1),
+                  },
+                });
+            });
+          },
+        },
+      },
+    });
+    localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+    const pump = async (n = 4_000) => {
+      for (let i = 0; i < n; i += 1) await Promise.resolve();
+    };
+    const sessionKey = `remuda-outbox-owner-g39-1-${phase}`;
+    try {
+      sessionStorage.setItem(sessionKey, "owner");
+      localStorage.removeItem("runtime.device-session");
+      localStorage.setItem("runtime.logged-out", "1");
+      vi.stubGlobal("PublicKeyCredential", class { static isUserVerifyingPlatformAuthenticatorAvailable() { return Promise.resolve(true); } });
+      const { api, hubStore } = await fresh();
+      vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+      vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+      vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+      vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+      vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+      vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+      vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+      vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+      vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+      vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+      vi.spyOn(api, "instanceList").mockResolvedValue({ items: [], nextCursor: null } as never);
+      vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+      vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+      const finish = vi.spyOn(api, "passkeyLoginFinish").mockResolvedValue({ deviceId: "devStale", token: "t", name: "stale" });
+      const h = hubStore as unknown as {
+        passkeyLogin: (m: "required", d?: string) => Promise<unknown>;
+        state: { authed: boolean };
+      };
+
+      let releaseChallenge: () => void = () => undefined;
+      vi.spyOn(api, "passkeyLoginStart").mockImplementation(
+        () => new Promise((resolve) => {
+          releaseChallenge = () =>
+            resolve({
+              challengeId: `chal_g39_1_${phase}`,
+              options: { publicKey: { challenge: "Y2hhbA", allowCredentials: [] } } as never,
+            });
+        }),
+      );
+
+      const p = h.passkeyLogin("required", "dev");
+      if (phase === "challenge") {
+        await pump(300); // challenge parked; ceremony not yet started
+      } else {
+        // Release the challenge so the ceremony begins, then wait until the
+        // WebAuthn assertion (credentials.get) is parked.
+        releaseChallenge();
+        for (let i = 0; i < 4_000 && getCalled < 1; i += 1) await Promise.resolve();
+        expect(getCalled).toBe(1);
+      }
+
+      // PEER logout while the preliminary phase is parked.
+      localStorage.removeItem("runtime.device-session");
+      window.dispatchEvent(
+        new StorageEvent("storage", { key: "runtime.device-session", oldValue: "{}", newValue: null }),
+      );
+      await pump(200);
+
+      releaseChallenge();
+      if (phase === "challenge") {
+        await pump(1_000);
+        // Retired BEFORE the ceremony: the old code entered credentials.get and
+        // parked there; release it so the (stale) finish can settle and the
+        // assertions below name the defect instead of timing out.
+        if (getCalled > 0) releaseAssertion!();
+        await p;
+        await pump(1_000);
+        expect(getCalled).toBe(0);
+      } else {
+        releaseAssertion!();
+        await p;
+        await pump(1_000);
+      }
+      expect(finish).not.toHaveBeenCalled();
+      expect(h.state.authed).toBe(false);
+      expect(localStorage.getItem("runtime.device-session")).toBeNull();
+    } finally {
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+      sessionStorage.removeItem(sessionKey);
+    }
+  }
+});

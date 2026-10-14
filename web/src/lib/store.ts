@@ -1364,6 +1364,13 @@ class HubStore {
    */
   private async runAuthTransition<T>(
     issue: () => Promise<T>,
+    // Gate 39 R-a: the EXTERNAL epoch captured by the PUBLIC entry point
+    // BEFORE its first await (login/passkeyLogin entry), passed in here — the
+    // helper never captures a fresh epoch on the caller's behalf. A logout/401/
+    // peer change between the entry capture and settlement retires the whole
+    // transition even when the interruption happened during a PRELIMINARY
+    // await (passkey challenge/ceremony) before this wrapper was entered.
+    extAtEntry: number,
   ): Promise<
     | { superseded: boolean; ok: true; result: T; acquired: AuthTransitionOwner }
     | { superseded: boolean; ok: false; error: unknown; acquired: AuthTransitionOwner }
@@ -1379,10 +1386,9 @@ class HubStore {
     // credential body can park — a peer logout during it must invalidate the
     // continuation even though startOutboxInit has not run.
     this.registerPeerAuthWatch();
-    // Gate 38: capture the EXTERNAL epoch at issue time. A logout/401/peer
-    // change before this transition settles moves it; the continuation and
-    // finalizer then suppress every externally visible effect.
-    const myExt = this.extEpoch;
+    // Gate 38/39: the caller's entry-time external epoch governs this whole
+    // transition; it is never refreshed inside the helper.
+    const myExt = extAtEntry;
     // Chain acquisition order equals issuance order (the chain serializes in
     // call order), so the issued id is also this transition's ownership seq.
     // Link onto the chain and publish the tail BEFORE awaiting so the next
@@ -4398,14 +4404,19 @@ class HubStore {
   }
 
   async login(kind: "bootstrap" | "pair", secret: string, deviceName: string) {
+    // Gate 39 R-a: capture the EXTERNAL epoch at ENTRY, before the first await,
+    // and carry that original value through the transition and settlement.
+    const extAtEntry = this.extEpoch;
     // Fence A: dispose + block init BEFORE the credential request (the new
     // cookie lands in response headers); write the session only after the body
     // resolves. A body failure still releases the blocker and the chain's
     // final owner settles any pending bootstrap obligation (gate 36 item 4).
-    const outcome = await this.runAuthTransition(() =>
-      kind === "pair"
-        ? api.pairRedeem(secret, deviceName)
-        : api.login(secret, deviceName),
+    const outcome = await this.runAuthTransition(
+      () =>
+        kind === "pair"
+          ? api.pairRedeem(secret, deviceName)
+          : api.login(secret, deviceName),
+      extAtEntry,
     );
     if (!outcome.ok) {
       // A failed superseded caller transfers the obligation and settles on the
@@ -4453,11 +4464,25 @@ class HubStore {
     deviceName?: string,
     signal?: AbortSignal,
   ): Promise<{ assertion: PasskeyAssertionBody; challengeId: string } | void> {
+    // Gate 39 R-a: capture the EXTERNAL epoch at ENTRY (before the challenge
+    // request, the ceremony, and the finish transition) and revalidate after
+    // every preliminary await. A peer/local logout while the challenge or the
+    // WebAuthn assertion is parked must stop the flow BEFORE the finish
+    // request is issued — no session, no bootstrap, and the promise settles
+    // (resolves void), never hangs. The peer watch is registered here because
+    // the credential transition (which otherwise registers it) has not started
+    // when the challenge/ceremony await is parked.
+    this.registerPeerAuthWatch();
+    const extAtEntry = this.extEpoch;
+    const retired = () => this.extEpoch !== extAtEntry;
     const envelope = await api.passkeyLoginStart(mediation === "conditional" ? "conditional" : undefined);
+    if (retired()) return;
     const options = envelope.options as ServerRequestOptions;
     const assertion = await getPasskey(options, mediation, signal);
-    const outcome = await this.runAuthTransition(() =>
-      api.passkeyLoginFinish(envelope.challengeId, assertion, deviceName),
+    if (retired()) return;
+    const outcome = await this.runAuthTransition(
+      () => api.passkeyLoginFinish(envelope.challengeId, assertion, deviceName),
+      extAtEntry,
     );
     if (!outcome.ok) {
       // A failed superseded caller transfers the obligation and settles on the

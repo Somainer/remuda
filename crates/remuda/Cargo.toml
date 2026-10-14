@@ -34,6 +34,8 @@ toml = "0.8"
 tracing.workspace = true
 tracing-subscriber.workspace = true
 nix = { version = "0.28", features = ["process", "fs"] }
+# r20 items 4+5 / R8(b)/(c): portable non-reaping waitid shared with the Node.
+remuda-unix.workspace = true
 
 [target.'cfg(target_env = "musl")'.dependencies]
 # Static Node artifacts (just linux-musl / deploy/m1) vendor OpenSSL so

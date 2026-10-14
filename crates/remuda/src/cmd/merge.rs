@@ -1196,10 +1196,18 @@ const RECOVERY_GIT_CAP: std::time::Duration = std::time::Duration::from_secs(10)
 /// Hub's 30 s RPC timeout and bounds standalone CLI execution.
 const LAND_RECOVERY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(25);
 
-/// What an owned subprocess did relative to its deadline (R6 single owner).
+/// What an owned subprocess did relative to its deadline (R6 single owner,
+/// r20 R8(b) normal-completion ownership).
 #[derive(Debug)]
 enum OwnedRun {
+    /// The leader exited before the soft cap AND the owner finished the whole
+    /// cleanup sequence (survivor kill, leader reap, pipe drains) before the
+    /// ABSOLUTE deadline. The leader was reaped exactly once.
     Completed(std::process::Output),
+    /// The leader was still running at the soft cap, or the cleanup sequence
+    /// (reap/pipe drain) could not finish by the ABSOLUTE deadline. The owner
+    /// SIGKILLed the whole group while the leader was unreaped; callers treat
+    /// this as Unknown.
     TimedOut(std::process::Output),
 }
 impl OwnedRun {
@@ -1215,9 +1223,9 @@ impl OwnedRun {
 
 const OWNED_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 const OWNED_KILL_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
-/// Bound on joining a pipe reader after exit/group-kill before abandoning it
-/// (R7 — an inherited transport pipe is never joined unboundedly).
-const OWNED_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+/// SIGTERM settle for surviving same-group members before the unconditional
+/// KILL (clamped to the absolute deadline).
+const OWNED_TERM_GRACE: std::time::Duration = std::time::Duration::from_millis(750);
 
 /// Drain one child pipe to EOF on a reader thread that never reaps the leader
 /// (R6 — the owner is the sole reaper).
@@ -1233,34 +1241,129 @@ fn drain_pipe<R: std::io::Read + Send + 'static>(
     })
 }
 
-/// Bound a draining reader's join: its bytes once EOF arrives, else ABANDON the
-/// thread (dropping the `JoinHandle` detaches it) after `grace`. R7 — a
-/// surviving ssh grandchild that inherited a pipe must never pin recovery
-/// forever; the owner killed the child's group, so the last fd closes on its
-/// own and the abandoned thread then finishes.
-fn join_drained(handle: std::thread::JoinHandle<Vec<u8>>, grace: std::time::Duration) -> Vec<u8> {
-    let deadline = std::time::Instant::now() + grace;
+/// Join a draining reader ONLY while the ABSOLUTE deadline has time left: its
+/// bytes once EOF arrives, else `None` and the thread is ABANDONED (dropping
+/// the handle detaches it). R8(b) — a surviving ssh grandchild that inherited
+/// a pipe can never pin the recovery response past the deadline; the abandoned
+/// thread reaches EOF on its own once the owner-killed group's last fd closes.
+fn join_drained_until(
+    handle: std::thread::JoinHandle<Vec<u8>>,
+    deadline: Instant,
+) -> Option<Vec<u8>> {
     loop {
         if handle.is_finished() {
-            return handle.join().unwrap_or_default();
+            return Some(handle.join().unwrap_or_default());
         }
         if std::time::Instant::now() >= deadline {
             drop(handle);
-            return Vec::new();
+            return None;
         }
-        std::thread::sleep(OWNED_POLL_INTERVAL);
+        std::thread::sleep(OWNED_POLL_INTERVAL.min(remaining(deadline)));
     }
 }
 
-/// R6/R7 single-owner runner (identical ownership rules to the Node's helper):
-/// the calling thread polls try_wait (no second reaper), reader threads drain
-/// pipes without reaping, the child runs in its OWN group (read-only recovery
-/// probes — the granted land's actual push stays in the Node-tracked land
-/// group), and on deadline the owner SIGKILLs the whole group WHILE THE LEADER
-/// IS UNREAPED, reaps once, and bounds the reader joins.
+/// Linux: whether a non-zombie member OTHER than the unreaped leader is still
+/// in `pgid` (`/proc`, timing only). Other platforms cannot enumerate, so they
+/// answer "no other members": TERM is sent regardless and the unconditional
+/// KILL still reaches every group member.
+#[cfg(target_os = "linux")]
+fn other_members_alive(leader_pgid: i32) -> bool {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<i32>() else {
+            continue;
+        };
+        if pid == leader_pgid {
+            continue;
+        }
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        let Some(after_comm) = stat.rsplit_once(')').map(|(_, rest)| rest) else {
+            continue;
+        };
+        let fields: Vec<&str> = after_comm.split_whitespace().collect();
+        let state = fields.first().copied().unwrap_or("");
+        let pgrp = fields.get(2).and_then(|v| v.parse::<i32>().ok());
+        if pgrp == Some(leader_pgid) && state != "Z" {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(not(target_os = "linux"))]
+fn other_members_alive(_leader_pgid: i32) -> bool {
+    false
+}
+
+/// R8(b) normal-completion cleanup while the leader is an UNREAPED zombie:
+/// TERM the whole group, boundedly wait for OTHER members to disappear, then
+/// SIGKILL unconditionally. Both waits are clamped to the absolute deadline.
+fn clean_surviving_group_until(leader_pgid: i32, deadline: Instant) {
+    use nix::sys::signal::{Signal, killpg};
+    use nix::unistd::Pid;
+    let clamp = |grace: std::time::Duration| std::cmp::min(Instant::now() + grace, deadline);
+    let _ = killpg(Pid::from_raw(leader_pgid), Some(Signal::SIGTERM));
+    let term_until = clamp(OWNED_TERM_GRACE);
+    while std::time::Instant::now() < term_until && other_members_alive(leader_pgid) {
+        std::thread::sleep(OWNED_POLL_INTERVAL.min(remaining(term_until)));
+    }
+    // Unconditional KILL: never leave a SIGTERM-ignoring transport descendant
+    // free to keep a pipe (or a connection) open.
+    let _ = killpg(Pid::from_raw(leader_pgid), Some(Signal::SIGKILL));
+    let kill_until = clamp(OWNED_KILL_GRACE);
+    while std::time::Instant::now() < kill_until && other_members_alive(leader_pgid) {
+        std::thread::sleep(OWNED_POLL_INTERVAL.min(remaining(kill_until)));
+    }
+}
+
+/// Reap the leader by polling, never blocking, never past the absolute
+/// deadline.
+fn reap_bounded(
+    child: &mut std::process::Child,
+    deadline: Instant,
+) -> Option<std::process::ExitStatus> {
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(OWNED_POLL_INTERVAL.min(remaining(deadline)));
+    }
+}
+
+/// Hand an unreaped child to a DETACHED owner thread: the eventual reap stays
+/// inside this owner process and never blocks the response (R8(b)).
+fn detach_reaper(mut child: std::process::Child) {
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+}
+
+/// R6/R7/R8(b) single-owner runner (identical ownership rules to the Node's
+/// helper): the calling thread observes the leader's exit WITHOUT reaping,
+/// reader threads drain pipes without reaping, the child runs in its OWN
+/// group, and:
+/// 1. a still-running leader at the soft `cap` is SIGKILLed whole-group while
+///    unreaped; a NORMALLY exited leader gets its surviving group members
+///    killed WHILE the unreaped leader still pins the pgid;
+/// 2. the leader is reaped exactly once, bounded by the ABSOLUTE `deadline`;
+/// 3. the pipe joins are bounded by that same deadline — a blocked reader is
+///    ABANDONED at it and the run returns TimedOut (caller → PushUncertain);
+/// 4. a leader that cannot be reaped by the deadline moves to a detached
+///    owner-side reaper and the run returns an error (Unknown).
 fn run_owned_process(
     mut command: std::process::Command,
-    deadline: std::time::Duration,
+    cap: std::time::Duration,
+    deadline: Instant,
 ) -> std::io::Result<OwnedRun> {
     use std::os::unix::process::CommandExt;
     command.process_group(0);
@@ -1272,82 +1375,82 @@ fn run_owned_process(
     let leader_pid = child.id() as i32;
     let out_handle = drain_pipe(child.stdout.take());
     let err_handle = drain_pipe(child.stderr.take());
-    let started = std::time::Instant::now();
+    let group_deadline = std::cmp::min(Instant::now() + cap, deadline);
+
+    // Phase 1: non-reaping exit observation (remuda-unix, portable on Linux
+    // and macOS). Observation errors are NOT exits — keep polling.
+    let mut leader_exited = false;
     loop {
-        match child.try_wait()? {
-            Some(status) => {
-                return Ok(OwnedRun::Completed(std::process::Output {
-                    status,
-                    stdout: join_drained(out_handle, OWNED_DRAIN_GRACE),
-                    stderr: join_drained(err_handle, OWNED_DRAIN_GRACE),
-                }));
-            }
-            None if started.elapsed() >= deadline => {
-                use nix::sys::signal::{Signal, killpg};
-                use nix::unistd::Pid;
-                let _ = killpg(Pid::from_raw(leader_pid), Some(Signal::SIGKILL));
-                let kill_at = std::time::Instant::now();
-                let mut status = None;
-                loop {
-                    if let Some(exit) = child.try_wait()? {
-                        status = Some(exit);
-                        if !group_exists(leader_pid) {
-                            break;
-                        }
-                    }
-                    if kill_at.elapsed() >= OWNED_KILL_GRACE {
-                        if status.is_none()
-                            && let Ok(exit) = child.wait()
-                        {
-                            status = Some(exit);
-                        }
-                        break;
-                    }
-                    std::thread::sleep(OWNED_POLL_INTERVAL);
-                }
-                let Some(status) = status else {
-                    return Err(std::io::Error::other(
-                        "owned process killed at deadline but could not be reaped",
-                    ));
-                };
-                return Ok(OwnedRun::TimedOut(std::process::Output {
-                    status,
-                    stdout: join_drained(out_handle, OWNED_DRAIN_GRACE),
-                    stderr: join_drained(err_handle, OWNED_DRAIN_GRACE),
-                }));
-            }
-            None => std::thread::sleep(OWNED_POLL_INTERVAL),
+        if matches!(
+            remuda_unix::observe_exit_without_reaping(leader_pid as u32),
+            Ok(remuda_unix::ObservedChildExit::Exited)
+        ) {
+            leader_exited = true;
+            break;
         }
+        if Instant::now() >= group_deadline {
+            break;
+        }
+        std::thread::sleep(OWNED_POLL_INTERVAL.min(remaining(group_deadline)));
+    }
+
+    if leader_exited {
+        // R8(b): clean surviving members while the unreaped leader pins the
+        // pgid, then reap the leader.
+        clean_surviving_group_until(leader_pid, deadline);
+    } else {
+        use nix::sys::signal::{Signal, killpg};
+        use nix::unistd::Pid;
+        let _ = killpg(Pid::from_raw(leader_pid), Some(Signal::SIGKILL));
+    }
+
+    let Some(status) = reap_bounded(&mut child, deadline) else {
+        detach_reaper(child);
+        drop(out_handle);
+        drop(err_handle);
+        return Err(std::io::Error::other(
+            "owned process group did not finish (reap/pipe) before the absolute deadline; outcome \
+             unknown",
+        ));
+    };
+    let stdout = join_drained_until(out_handle, deadline);
+    let stderr = join_drained_until(err_handle, deadline);
+    let drains_done = stdout.is_some() && stderr.is_some();
+    let output = std::process::Output {
+        status,
+        stdout: stdout.unwrap_or_default(),
+        stderr: stderr.unwrap_or_default(),
+    };
+    if leader_exited && drains_done {
+        Ok(OwnedRun::Completed(output))
+    } else {
+        Ok(OwnedRun::TimedOut(output))
     }
 }
 
-/// `killpg(pgid,0)` == ESRCH (group gone), the kernel's authoritative answer.
-fn group_exists(pgid: i32) -> bool {
-    use nix::sys::signal::killpg;
-    use nix::unistd::Pid;
-    killpg(Pid::from_raw(pgid), None).is_ok()
-}
-
 /// Remaining time until an absolute deadline (saturates at zero).
-fn remaining(deadline: std::time::Instant) -> std::time::Duration {
+fn remaining(deadline: Instant) -> std::time::Duration {
     deadline
-        .checked_duration_since(std::time::Instant::now())
+        .checked_duration_since(Instant::now())
         .unwrap_or(std::time::Duration::ZERO)
 }
 
-/// Run a git command through the R6/R7 owner (own group, whole-group kill,
-/// bounded drains). The caller treats TimedOut as Unknown.
+/// Run a git command through the R6/R7/R8(b) owner (own group, non-reaping
+/// exit observation, survivor cleanup while the leader is unreaped, one
+/// absolute deadline over the reap and the drains). The caller treats TimedOut
+/// as Unknown.
 fn owned_git(
     repo: &Path,
     args: &[&str],
-    deadline: std::time::Duration,
+    cap: std::time::Duration,
+    deadline: Instant,
 ) -> std::io::Result<OwnedRun> {
     let mut command = std::process::Command::new("git");
     command
         .current_dir(repo)
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0");
-    run_owned_process(command, deadline)
+    run_owned_process(command, cap, deadline)
 }
 
 /// Whether the repository has a shallow boundary that could hide an ancestry
@@ -1424,23 +1527,24 @@ fn recovery_git(
     require_success: bool,
     deadline: Instant,
 ) -> Result<std::process::Output> {
-    let budget = RECOVERY_GIT_CAP.min(remaining(deadline));
-    if budget.is_zero() {
+    if remaining(deadline).is_zero() {
         return Err(MergeStop::PushUncertain(format!(
             "the {LAND_RECOVERY_DEADLINE:?} post-push recovery deadline elapsed before {what}; \
              the remote may already contain the merge"
         ))
         .into());
     }
-    let run = owned_git(repo, args, budget).map_err(|error| {
+    // R8(b): the per-command soft cap decides when a still-running git is
+    // KILLed; the ABSOLUTE deadline bounds the reap and every pipe drain.
+    let run = owned_git(repo, args, RECOVERY_GIT_CAP, deadline).map_err(|error| {
         MergeStop::PushUncertain(format!(
             "{what} could not run ({error}); push outcome unknown"
         ))
     })?;
     if run.timed_out() {
         return Err(MergeStop::PushUncertain(format!(
-            "{what} exceeded the {budget:?} recovery bound and its group was killed; push \
-             outcome unknown"
+            "{what} exceeded the {RECOVERY_GIT_CAP:?} recovery bound and its group was killed; \
+             push outcome unknown"
         ))
         .into());
     }
@@ -2126,7 +2230,8 @@ mod tests {
             .current_dir(keep.path())
             .args(["fetch", "-q", "origin"]);
         let start = std::time::Instant::now();
-        let run = run_owned_process(command, std::time::Duration::from_millis(300))
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let run = run_owned_process(command, std::time::Duration::from_millis(300), deadline)
             .expect("an owned run returns a verdict");
         use std::os::unix::process::ExitStatusExt;
         let output = match run {
@@ -2143,6 +2248,94 @@ mod tests {
             start.elapsed() < std::time::Duration::from_secs(5),
             "the bound must apply promptly"
         );
+    }
+
+    /// r20 item 5 / R8(b): the git leader EXITS UNSUCCESSFULLY FIRST (the ssh
+    /// wrapper backgrounds its transport and exits) while a same-group
+    /// grandchild keeps a pipe open. The owner observes the exit without
+    /// reaping, kills the survivor while the unreaped leader pins the pgid,
+    /// reaps the leader and returns its exit code; no `sleep` lingers. The old
+    /// owner reaped the leader with try_wait on the normal arm and never
+    /// signalled, so the descendant and the blocked reader survived.
+    #[test]
+    fn an_owned_git_whose_leader_exits_first_kills_its_surviving_transport() {
+        let keep = tempfile::tempdir().unwrap();
+        let git = keep.path().join("git-transport");
+        // Backgrounded transport in the SAME group: stdout detached to
+        // /dev/null, stderr INHERITED (holds the captured pipe); leader exits.
+        std::fs::write(&git, "#!/bin/sh\n(sleep 47.66 >/dev/null) &\nexit 42\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let command = std::process::Command::new(git.to_str().unwrap());
+        let start = std::time::Instant::now();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let run = run_owned_process(command, std::time::Duration::from_secs(2), deadline)
+            .expect("an owned run returns a verdict");
+        let output = match run {
+            OwnedRun::Completed(output) => output,
+            other => panic!("expected Completed after survivor cleanup, got {other:?}"),
+        };
+        assert_eq!(
+            output.status.code(),
+            Some(42),
+            "the git leader's own exit status drives the result"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(4),
+            "cleanup is bounded, not the grandchild's sleep: {:?}",
+            start.elapsed()
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let left = live_marker_processes("sleep 47.66");
+            if left == 0 || std::time::Instant::now() >= deadline {
+                assert_eq!(
+                    left, 0,
+                    "the surviving transport grandchild outlived the owner"
+                );
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// r20 item 4 / R8(b): a TERM-ignoring survivor keeps stderr open past the
+    /// tight ABSOLUTE deadline. The owner KILLs it there, ABANDONS the blocked
+    /// reader and returns TimedOut (→ PushUncertain); nothing survives.
+    #[test]
+    fn an_owned_git_blocked_pipe_is_abandoned_at_the_absolute_deadline() {
+        let keep = tempfile::tempdir().unwrap();
+        let git = keep.path().join("git-blocked");
+        std::fs::write(
+            &git,
+            "#!/bin/sh\n(trap '' TERM; exec sleep 47.67) &\nexit 0\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let command = std::process::Command::new(git.to_str().unwrap());
+        let start = std::time::Instant::now();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
+        let run = run_owned_process(command, std::time::Duration::from_secs(10), deadline)
+            .expect("an owned run returns a verdict");
+        assert!(
+            matches!(run, OwnedRun::TimedOut(_)),
+            "a blocked pipe at the absolute deadline is TimedOut/Unknown, got {run:?}"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(3),
+            "the absolute deadline bounds the cleanup and the drains: {:?}",
+            start.elapsed()
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let left = live_marker_processes("sleep 47.67");
+            if left == 0 || std::time::Instant::now() >= deadline {
+                assert_eq!(left, 0, "the TERM-ignoring pipe holder survived the KILL");
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
     /// r19 item 2 / R7: a depth-1 clone grafts both tips as roots, so

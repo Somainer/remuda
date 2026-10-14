@@ -41,29 +41,6 @@ type AuthTransitionOwner = {
   seq: number;
   ext: number;
 };
-/**
- * Outcome of a serialized credential transition run. `obsolete` (c-reconnfu
- * gate 40 item 1) means an EXTERNAL identity change retired the transition
- * WHILE IT WAS QUEUED (after it issued but before it acquired the chain): it
- * never sent its credential request, never changed ownership, and the public
- * caller settles silently (resolves, never throws — nothing was attempted).
- */
-type AuthTransitionOutcome<T> =
-  | { obsolete: true }
-  | {
-      obsolete: false;
-      superseded: boolean;
-      ok: true;
-      result: T;
-      acquired: AuthTransitionOwner;
-    }
-  | {
-      obsolete: false;
-      superseded: boolean;
-      ok: false;
-      error: unknown;
-      acquired: AuthTransitionOwner;
-    };
 import { mapWorkspace, mergeHostWorkspaces } from "../features/workspaces/registry";
 import {
   api,
@@ -1369,21 +1346,12 @@ class HubStore {
       // in-memory session in THIS tab so readSession()/hasDeviceSession()
       // cannot resurrect the old identity.
       clearCachedSession();
-      // Gate 40 item 2: dispose the OLD identity's connection machine
-      // coherently (socket/timers/follow bookkeeping). Retaining it while
-      // publishing "offline" would strand a false-offline field — its live
-      // frames suppress redundant publication and a healthy re-login's reuse
-      // branch would then never resync; a fresh login builds a new machine
-      // that publishes its own state. The logout/401 callers also dispose via
-      // their own teardown, so this is idempotent for them.
-      this.disposeConnectionForAuthChange();
       // Gate 39 R-c: leave the UI in a SETTLED state synchronously. A peer
       // logout observed while no entry point is running (or while one is
       // parked) must not strand protected pages on the loading screen waiting
       // on a bootstrap that will now return silently; the logout/401 callers
       // emit their own identical state right after this, so this is an
-      // idempotent publish. With the machine just disposed, "offline" is the
-      // truthful machine-less state.
+      // idempotent publish.
       this.emit({
         ready: true,
         authed: false,
@@ -1430,7 +1398,10 @@ class HubStore {
     // transition even when the interruption happened during a PRELIMINARY
     // await (passkey challenge/ceremony) before this wrapper was entered.
     extAtEntry: number,
-  ): Promise<AuthTransitionOutcome<T>> {
+  ): Promise<
+    | { superseded: boolean; ok: true; result: T; acquired: AuthTransitionOwner }
+    | { superseded: boolean; ok: false; error: unknown; acquired: AuthTransitionOwner }
+  > {
     // Monotonic ISSUANCE order, assigned synchronously at call time: two
     // transitions issued back-to-back before either acquires still get
     // distinct ids, so the earlier one can tell at settle time that a newer
@@ -1451,21 +1422,11 @@ class HubStore {
     // caller queues behind this run.
     const run = async (
       prev: Promise<void>,
-    ): Promise<AuthTransitionOutcome<T>> => {
+    ): Promise<
+      | { superseded: boolean; ok: true; result: T; acquired: AuthTransitionOwner }
+      | { superseded: boolean; ok: false; error: unknown; acquired: AuthTransitionOwner }
+    > => {
       await prev;
-      // Gate 40 item 1: the FIRST thing after the chain opened is the epoch
-      // check. A transition QUEUED behind its predecessor may have been
-      // retired by an EXTERNAL logout/401/peer change while waiting. It must
-      // return obsolete BEFORE acquiring ownership (no seq/generation change,
-      // no disposal, no blocker) and, crucially, BEFORE invoking issue() — the
-      // credential request must never reach the Hub (a passkey finish / pair
-      // redeem would otherwise create a device session and Set-Cookie
-      // server-side after this identity logged out). The predecessor already
-      // released the blocker and nulled the obligation; the chain tail simply
-      // resolves so a later fresh transition can acquire.
-      if (this.extEpoch !== myExt) {
-        return { obsolete: true };
-      }
       this.transitionSeq = myIssuedSeq;
       // Gate 37 item 1: this transition's OWN acquisition routes through
       // applyAuthIdentityChange (which invalidates any obligation as an
@@ -1515,8 +1476,8 @@ class HubStore {
       // bootstrap — the final owner's continuation owns the chain's bootstrap
       // obligation (gate 36 item 4).
       const superseded = this.transitionIssuedSeq !== myIssuedSeq;
-      if (failed) return { obsolete: false, ok: false, error, superseded, acquired };
-      return { obsolete: false, ok: true, result: result!, superseded, acquired };
+      if (failed) return { ok: false, error, superseded, acquired };
+      return { ok: true, result: result!, superseded, acquired };
     };
     // Snapshot the previous chain SYNCHRONOUSLY and publish the new tail
     // before run's body microtask executes — so run awaits the PREVIOUS chain,
@@ -1568,11 +1529,9 @@ class HubStore {
    * supply the old identity.
    */
   private async settleAuthBootstrap(outcome:
-    | AuthTransitionOutcome<DeviceSession>,
+    | { ok: true; result: DeviceSession; superseded: boolean; acquired: AuthTransitionOwner }
+    | { ok: false; error: unknown; superseded: boolean; acquired: AuthTransitionOwner },
   ): Promise<void> {
-    // Gate 40 item 1: a transition retired while QUEUED sent no request and
-    // never acquired — the external change already nulled any obligation.
-    if (outcome.obsolete) return;
     const extLive = () => this.extEpoch === outcome.acquired.ext;
     const ownsNow = () =>
       this.authGen === outcome.acquired.gen && this.transitionSeq === outcome.acquired.seq;
@@ -1620,27 +1579,6 @@ class HubStore {
   }
 
   /**
-   * Tear down the connection machine and its follow bookkeeping for an auth
-   * change (c-reconnfu gate 40 item 2). Disposing the machine coherently —
-   * rather than retaining a live machine while publishing "offline" — is what
-   * makes the R-c logged-out publication truthful: a subsequent healthy
-   * login's bootstrap builds a FRESH machine whose onState publishes
-   * recovering/live, so the banner can never stick on a stale false offline.
-   * Idempotent.
-   */
-  private disposeConnectionForAuthChange() {
-    this.connection?.dispose();
-    this.connection = null;
-    this.connectionBoundTo = null;
-    this.connectionBoundJournal = null;
-    this.connectionBindGen = 0;
-    this.reconcileOwed.clear();
-    this.owedReconcileRunning.clear();
-    this.followReadyState.clear();
-    this.followFrameAt.clear();
-  }
-
-  /**
    * Peer-tab auth-identity watcher (c-reconnfu gate 32 item 1b). localStorage
    * 'storage' events fire only in OTHER documents, so this observes a login/
    * logout/session replacement in another tab and disposes THIS tab's Outbox
@@ -1681,12 +1619,12 @@ class HubStore {
    *    the legacy direct POST may run, but ALWAYS carrying the client command
    *    id as its dedupe id.
    */
-  private async ensureOutbox(ext: number): Promise<"ok" | "obsolete" | "unavailable"> {
-    // Gate 39/40 R-b: `ext` is REQUIRED — the epoch the CALLER captured at ITS
-    // public entry before its first await. This helper never adopts a fresh
-    // epoch on a caller's behalf (no default). The current-identity test seam
-    // is {@link ensureOutboxForTest}.
-    const epoch = ext;
+  private async ensureOutbox(ext?: number): Promise<"ok" | "obsolete" | "unavailable"> {
+    // Gate 39 R-b: `ext` is the epoch the CALLER captured at ITS public entry.
+    // Production callers always pass it; the helper never adopts a fresh epoch
+    // on their behalf. The parameter is optional ONLY for the private test
+    // seam.
+    const epoch = ext ?? this.extEpoch;
     // c-reconnfu gate 35 item 2: LOOP while any credential transition is open.
     // Overlapping logins are serialized: each release can be followed by a
     // queued transition acquiring, so re-await until the chain fully settles.
@@ -2971,11 +2909,10 @@ class HubStore {
    * at offline instead of an optimistic live, so cached UI shows an honest
    * state and the outbox still restores/flushes on recovery.
    */
-  private async initConnection(offline: boolean, ext: number) {
-    // Gate 39/40 R-b: the CALLER's external epoch (captured at its public
-    // entry before its first await) is REQUIRED; this installer never reads a
-    // fresh epoch for the caller.
-    const epoch = ext;
+  private async initConnection(offline = false, ext?: number) {
+    // Gate 39 R-b: the CALLER's external epoch (captured at its public entry)
+    // gates every install here. Optional ONLY for the private test seam.
+    const epoch = ext ?? this.extEpoch;
     const live = () => this.extEpoch === epoch;
     // c-reconnfu gate 34 item 4: a REPLACEMENT login keeps this.connection but
     // the old box was disposed by runAuthIdentityChange. Ensure a current-
@@ -3257,24 +3194,12 @@ class HubStore {
   get authGenForTest(): number {
     return this.authGen;
   }
-  /** Test seam: current external-identity epoch (gate 40 item 3). */
-  get extEpochForTest(): number {
-    return this.extEpoch;
-  }
   applyAuthIdentityChangeForTest(): void {
     this.applyAuthIdentityChange(true);
   }
   /** Test seam: true while a Fence-A credential transition is open. */
   get authTransitionOpenForTest(): boolean {
     return this.authTransition !== null;
-  }
-  /**
-   * Test seam (gate 40 item 3): ensure the outbox for the CURRENT identity.
-   * Production callers must call {@link ensureOutbox} with the epoch they
-   * captured before their first await; tests act as the current identity.
-   */
-  ensureOutboxForTest(): Promise<"ok" | "obsolete" | "unavailable"> {
-    return this.ensureOutbox(this.extEpoch);
   }
 
   private outboxOpenGateForTest: ((resolve: () => void) => void) | null = null;
@@ -4559,9 +4484,6 @@ class HubStore {
           : api.login(secret, deviceName),
       extAtEntry,
     );
-    // Gate 40 item 1: retired while QUEUED — the credential request was never
-    // sent; settle silently (resolve, never throw).
-    if (outcome.obsolete) return;
     if (!outcome.ok) {
       // A failed superseded caller transfers the obligation and settles on the
       // rejection WITHOUT awaiting its successor; the final owner owns it.
@@ -4628,9 +4550,6 @@ class HubStore {
       () => api.passkeyLoginFinish(envelope.challengeId, assertion, deviceName),
       extAtEntry,
     );
-    // Gate 40 item 1: retired while QUEUED — the finish request was never
-    // sent; settle silently (resolve void, never throw).
-    if (outcome.obsolete) return;
     if (!outcome.ok) {
       // A failed superseded caller transfers the obligation and settles on the
       // rejection WITHOUT awaiting its successor; the final owner owns it.
@@ -4750,9 +4669,17 @@ class HubStore {
     ++this.bootGen;
     this.pinnedCreates.clear();
     this.polledEffort.clear();
-    // Tear down the connection machine and its follow bookkeeping (init
+    // Tear down the connection machine and its browser listeners (init
     // recreates them at the next bootstrap); the durable outbox itself stays.
-    this.disposeConnectionForAuthChange();
+    this.connection?.dispose();
+    this.connection = null;
+    this.connectionBoundTo = null;
+    this.connectionBoundJournal = null;
+    this.connectionBindGen = 0;
+    this.reconcileOwed.clear();
+    this.owedReconcileRunning.clear();
+    this.followReadyState.clear();
+    this.followFrameAt.clear();
     for (const [, t] of this.outboxRetryTimer) clearTimeout(t);
     this.outboxRetryTimer.clear();
     this.outboxRetryAttempt.clear();

@@ -8157,24 +8157,68 @@ it("GATE39 item 2: bootstrap parked INSIDE connection initialization across a pe
     );
     await pump(300);
 
+    // Pending durable work seeded WHILE A is parked and B is about to release:
+    // if A's resumed continuation wrongly installed a post-logout box, that
+    // box would load and flush this row before the replacement even starts.
+    const posted: Array<{ id?: string; lifetime?: string }> = [];
+    const send = vi.spyOn(api, "instanceSend").mockImplementation(
+      (async (_i: string, _p: string, _x?: unknown, _m?: unknown, commandId?: string) => {
+        const row = JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as Array<{ commandId: string; issuerLifetime?: string }>;
+        posted.push({ id: commandId, lifetime: row.find((r) => r.commandId === commandId)?.issuerLifetime });
+        return {
+          relatedCommandIds: [],
+          command: { commandId, id: commandId, state: "accepted", revision: "1", dispatch: "native-acknowledged", resolution: "clear" },
+        };
+      }) as unknown as Api["instanceSend"],
+    );
+    const seed = new (await import("./outbox")).LocalStorageOutboxStorage();
+    await seed.put({
+      commandId: "cmd_g39_2_seed",
+      clientRequestId: "local_g39_2_seed",
+      instanceId: I,
+      prompt: "g39 2 replacement delivery",
+      createdAt: 1,
+      attempts: 0,
+      state: "pending",
+    });
+
     // B (issued BEFORE the peer logout) settles successfully but is itself
     // retired; it releases A's wait without installing anything.
     releaseB();
     await loginB;
-    await bootA;
-    await pump(5_000);
+    await pump(2_000);
     expect(h.state.authed).toBe(false);
     expect(h.outbox).toBeNull();
     expect(h.connection).toBeNull();
+    // Nothing delivered while no current-identity box exists.
+    expect(posted).toEqual([]);
 
-    // A FRESH post-logout login (new external epoch) is fully serviced.
+    // Gate 40 item 4: the SUCCESSFUL replacement starts AFTER the logout and
+    // is issued WITHOUT awaiting A's parked completion (bootA is still settling
+    // in the background). The replacement's OWN fresh outbox/connection install
+    // and deliver the seeded row; A installs nothing.
     vi.mocked(api.login).mockImplementationOnce(() => Promise.resolve({ deviceId: "devC_g39_2", token: "tokC", name: "C" }));
     const loginC = h.login("bootstrap", "c", "devC");
+    // Do NOT await bootA here: the replacement starts while A is still alive.
     await loginC;
-    await pump(5_000);
+    await pump(8_000);
     expect(h.state.authed).toBe(true);
     expect(h.outbox).not.toBeNull();
     expect(h.connection).not.toBeNull();
+    // The replacement's OWN fresh box delivered the seeded row exactly once —
+    // not a rogue box the retired A installed when its wait resumed (on the
+    // buggy code A captured the post-logout epoch inside ensureOutbox and its
+    // box flushed the row before/under C).
+    const lifeC = h.outbox?.lifetime;
+    expect(posted).toEqual([{ id: "cmd_g39_2_seed", lifetime: lifeC }]);
+    expect(send).toHaveBeenCalledTimes(1);
+
+    // The retired A now settles too — still having installed nothing and no
+    // second delivery.
+    await bootA;
+    await pump(1_000);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(h.state.authed).toBe(true);
   } finally {
     vi.useRealTimers();
     Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });

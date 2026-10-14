@@ -885,17 +885,12 @@ pub(super) fn spawn(
     // observations via try_send before its sender drops. The variable is read
     // only by its Drop impl.
 
-    // c-usagefu r18 item 5: the guard OWNS the live hydrator for the whole
-    // poll loop; the task below only borrows it (`hydrator_slot`). When the
-    // task is aborted mid-loop (close's finalise deadline on a wedged pump),
-    // the guard's Drop therefore runs finish_sync() on the LIVE mapper and its
-    // buffered usage instead of on an empty slot. Normal completion marks the
-    // guard done after its async finalise, so Drop never publishes twice.
-    let mut finalise_guard = FinaliseGuard {
-        hydrator: None,
-        events: events.clone(),
-        done: false,
-    };
+    // c-usagefu r18 item 5 + r19 item 2: the guard OWNS the live hydrator for
+    // the whole poll loop and the mapped-but-unpublished finalize queue; the
+    // task below only borrows the hydrator (`hydrator_slot`). When the task is
+    // aborted — mid-loop on a wedged pump, or INSIDE finalization on close's
+    // deadline — the guard's Drop delivers whatever remains.
+    let mut finalise_guard = FinaliseGuard::new(events.clone());
     tokio::spawn(async move {
         let mut promote = PromoteState::default();
         // Borrowed ownership of the live hydrator — created, replaced and
@@ -1529,10 +1524,14 @@ pub(super) fn spawn(
         // is deterministically parked and its abort-after-deadline path (which
         // must run the guard's finish_sync on the live mapper) is drivable.
         test_park_before_final_finalise().await;
-        finalize_hydrator(hydrator, &events, &seq, &ctx).await;
-        // The async finalise above already drained and published the live
-        // hydrator's group; mark the guard done so its Drop (which still OWNS
-        // the hydrator) does not finish_sync it a second time.
+        // c-usagefu r19 item 2: `finalize` publishes straight into the guard's
+        // pending queue, removing each observation only once sent — the guard
+        // keeps BOTH the hydrator and every mapped-but-unpublished observation
+        // across every awaited send, so cancellation inside finalization
+        // (close's abort after its deadline) can no longer lose usage.
+        finalise_guard.finalize(&events, &seq, &ctx).await;
+        // Finalization completed: the queue is empty and the hydrator is fully
+        // drained; mark done so Drop does nothing.
         finalise_guard.mark_done();
         let _ = finalised.send(());
     })
@@ -1541,23 +1540,57 @@ pub(super) fn spawn(
 /// Best-effort abort-path safety net for [`spawn`].
 ///
 /// c-usagefu r18 item 5: the guard holds the LIVE hydrator for the whole poll
-/// loop (the task borrows `self.hydrator` mutably). A task aborted while the
-/// poller is wedged drops the guard with the live mapper still buffered; Drop
-/// runs its synchronous `finish()` and tries to hand the observations to the
-/// still-held channel via `try_send`. Delivery is best effort, but the final
-/// usage mapping is never silently skipped.
+/// loop. c-usagefu r19 item 2: it additionally owns the queue of observations
+/// `finalize` mapped but had not published when the task was cancelled. The
+/// hydrator is taken out of the guard ONLY when finalization starts, and each
+/// queued observation leaves the queue only after its send — so an abort
+/// during finalization leaves Drop with the hydrator's synchronous finish
+/// group PLUS whatever was queued, all delivered non-blockingly.
 struct FinaliseGuard {
     hydrator: Option<Hydrator>,
+    /// Mapped-but-unpublished observations finalize handed over.
+    pending: std::sync::Mutex<Vec<Observation>>,
     events: mpsc::Sender<Observation>,
+    /// Set once finalization completed (or never started because the loop did
+    /// not break): false on abort means Drop must publish.
+    finalized: bool,
+    /// Normal-cooperative-completion suppression: true only after finalize
+    /// finished and the queue drained empty.
     done: bool,
 }
 
 impl FinaliseGuard {
-    /// Normal completion: the async finalise already drained and published the
-    /// hydrator; suppress the Drop finalise so its group is never emitted
-    /// twice. The (drained) hydrator keeps living in the guard until the task
-    /// ends — it owns no unpublished observations after `finish()`.
+    fn new(events: mpsc::Sender<Observation>) -> Self {
+        Self {
+            hydrator: None,
+            pending: std::sync::Mutex::new(Vec::new()),
+            events,
+            finalized: false,
+            done: false,
+        }
+    }
+
+    /// Run [`Hydrator::finalize`] against the guard-owned pending queue. The
+    /// hydrator moves into the call (it is consumed by finish()) but
+    /// unpublished observations remain in the guard.
+    async fn finalize(
+        &mut self,
+        events: &mpsc::Sender<Observation>,
+        seq: &AtomicU64,
+        ctx: &PromoteCtx,
+    ) {
+        self.finalized = true;
+        if let Some(hydrator) = self.hydrator.take() {
+            hydrator.finalize(events, seq, ctx, &self.pending).await;
+        }
+    }
+
+    /// Normal completion: finalize finished and every observation published.
     fn mark_done(&mut self) {
+        debug_assert!(
+            self.pending.lock().expect("finalise pending").is_empty(),
+            "mark_done with unpublished finalize observations"
+        );
         self.done = true;
     }
 }
@@ -1567,19 +1600,64 @@ impl Drop for FinaliseGuard {
         if self.done {
             return;
         }
-        // Abort path (c-usagefu r18 item 5): finish the LIVE hydrator the
-        // poller was holding when it was cancelled.
-        if let Some(hydrator) = self.hydrator.as_mut()
+        // Abort path.
+        // 1. Anything finalize mapped but never published: best-effort
+        // non-blocking send, in order.
+        let pending = std::mem::take(&mut *self.pending.lock().expect("finalise pending"));
+        for observation in pending {
+            if self.events.try_send(observation).is_err() {
+                break;
+            }
+        }
+        // 2. If the task was cancelled BEFORE finalize consumed the hydrator,
+        // finish the live mapper synchronously and deliver it too.
+        if !self.finalized
+            && let Some(hydrator) = self.hydrator.as_mut()
             && let Ok(observations) = hydrator.finish_sync()
         {
             for observation in observations {
-                // Best effort: a full/gone channel drops the observation.
                 if self.events.try_send(observation).is_err() {
                     break;
                 }
             }
         }
     }
+}
+
+/// c-usagefu r19 item 2 deterministic test gate. A test ACQUIRES the permit;
+/// the poller's finalize parks AFTER mapper.finish() populated the guard's
+/// pending queue and BEFORE the queue is flushed — i.e. inside finalization
+/// with observations mapped but not yet published. close() aborts the poller
+/// there; the guard's Drop must deliver the usage.
+#[cfg(test)]
+static TEST_FINALISE_SEND_PARK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// Whether the poller has reached the finalize finish() stage — set by the
+/// gate so the test does not observe an earlier holder of the same mutex.
+#[cfg(test)]
+static TEST_FINALISE_SEND_STAGE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+async fn test_park_during_finalise_send(_pending: &std::sync::Mutex<Vec<Observation>>) {
+    if !TEST_FINALISE_SEND_STAGE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        let _parked = TEST_FINALISE_SEND_PARK.lock().await;
+    }
+}
+
+#[cfg(not(test))]
+async fn test_park_during_finalise_send(_pending: &std::sync::Mutex<Vec<Observation>>) {}
+
+#[cfg(test)]
+pub(crate) async fn test_acquire_finalise_send_park() -> tokio::sync::MutexGuard<'static, ()> {
+    TEST_FINALISE_SEND_PARK.lock().await
+}
+
+#[cfg(test)]
+pub(crate) fn test_finalise_send_park_held() -> bool {
+    TEST_FINALISE_SEND_STAGE.load(std::sync::atomic::Ordering::SeqCst)
+        && TEST_FINALISE_SEND_PARK.try_lock().is_err()
 }
 
 /// c-usagefu r18 items 1/5 deterministic test gate. A test ACQUIRES the permit
@@ -2792,37 +2870,74 @@ impl Hydrator {
     ///
     /// Best-effort by contract: when the event channel is already gone the
     /// observations are dropped rather than failing the shutdown.
+    ///
+    /// c-usagefu r19 item 2: every mapped observation is handed to the
+    /// FINALISE GUARD (`pending`) immediately after production and REMOVED
+    /// from it only once published, so a cancellation (close's abort after
+    /// its deadline) landing between two awaited sends loses nothing — the
+    /// guard's Drop publishes whatever remains, best effort and non-blocking.
     async fn finalize(
         mut self,
         events: &mpsc::Sender<Observation>,
         seq: &AtomicU64,
         ctx: &PromoteCtx,
+        pending: &std::sync::Mutex<Vec<Observation>>,
     ) {
-        let mut batches: Vec<_> = match self.tail.poll() {
-            Ok(read) => read
-                .lines
-                .iter()
-                .zip(read.positions.iter().copied())
-                .map(|(line, position)| self.mapper.map_line_at(line, Some(position)))
-                .collect(),
-            // The final read failed (vanished/unreadable transcript): nothing
-            // new to map, but finish() below still runs.
-            Err(_) => Vec::new(),
-        };
-        batches.push(self.mapper.finish());
-        for batch in batches {
-            let Ok(mapped) = batch else {
-                continue;
-            };
-            for observation in mapped {
-                if emit_mapped(events, seq, ctx, SourceChannel::Transcript, observation)
+        // Flush the guard-owned queue. Each observation leaves the queue only
+        // AFTER a successful send: it is removed immediately before the
+        // awaited send (after the channel has accepted it), so a cancellation
+        // during the await leaves the remaining queued observations for the
+        // guard's Drop to publish.
+        async fn flush(
+            events: &mpsc::Sender<Observation>,
+            seq: &AtomicU64,
+            ctx: &PromoteCtx,
+            pending: &std::sync::Mutex<Vec<Observation>>,
+        ) -> bool {
+            loop {
+                let next = {
+                    let mut guard = pending.lock().expect("finalise pending");
+                    if guard.is_empty() {
+                        return true;
+                    }
+                    guard.remove(0)
+                };
+                if emit_mapped(events, seq, ctx, SourceChannel::Transcript, next)
                     .await
                     .is_err()
                 {
-                    return;
+                    // Channel gone: finalisation cannot deliver anything. The
+                    // just-removed observation is unrecoverable, but nothing
+                    // else was mapped-and-unpublished in this flush because
+                    // each item is removed one at a time immediately before
+                    // its own send.
+                    return false;
                 }
             }
         }
+        // 1. Final tail lines. Each mapped batch enters the guard-owned queue
+        // and is flushed BEFORE the next batch — nothing sits in a local Vec
+        // across an awaited send.
+        if let Ok(read) = self.tail.poll() {
+            for (line, position) in read.lines.iter().zip(read.positions.iter().copied()) {
+                if let Ok(mapped) = self.mapper.map_line_at(line, Some(position)) {
+                    pending.lock().expect("finalise pending").extend(mapped);
+                    if !flush(events, seq, ctx, pending).await {
+                        return;
+                    }
+                }
+            }
+        }
+        // 2. mapper.finish() — the open turn's held usage group — enters the
+        // guard-owned queue; publishing happens below.
+        if let Ok(finished) = self.mapper.finish() {
+            pending.lock().expect("finalise pending").extend(finished);
+        }
+        // 3. Publish the finish() group. If the task is aborted during this
+        // await, the group stays queued and the FinaliseGuard's Drop delivers
+        // it non-blockingly.
+        test_park_during_finalise_send(pending).await;
+        let _ = flush(events, seq, ctx, pending).await;
     }
 
     /// Synchronous finalise for the task-abort safety net (no async emit is
@@ -2842,6 +2957,10 @@ impl Hydrator {
 
 /// Finalise and discard the current hydrator, if any, preserving the last
 /// turn's observations across an epoch boundary (c-ctxusage r4 item 2).
+///
+/// Unlike the task-shutdown finalise this hydrator is not guard-owned: it is
+/// being replaced by a fresh one and the observations publish straight through
+/// a local queue shared only with this call.
 async fn finalize_hydrator(
     hydrator: &mut Option<Hydrator>,
     events: &mpsc::Sender<Observation>,
@@ -2849,7 +2968,17 @@ async fn finalize_hydrator(
     ctx: &PromoteCtx,
 ) {
     if let Some(active) = hydrator.take() {
-        active.finalize(events, seq, ctx).await;
+        let pending = std::sync::Mutex::new(Vec::new());
+        active.finalize(events, seq, ctx, &pending).await;
+        // A cancellation here is possible; unlike shutdown there is no guard
+        // to own the leftovers (the epoch is being torn down) — the
+        // replacement hydrator is independent. Flush what is still queued
+        // best-effort and non-blocking.
+        for observation in std::mem::take(&mut *pending.lock().expect("finalise pending")) {
+            if events.try_send(observation).is_err() {
+                break;
+            }
+        }
     }
 }
 
@@ -4117,7 +4246,12 @@ mod tests {
 
         // Close/exit/demotion all route through Hydrator::finalize now.
         hydrator
-            .finalize(&tx, &std::sync::atomic::AtomicU64::new(0), &ctx)
+            .finalize(
+                &tx,
+                &std::sync::atomic::AtomicU64::new(0),
+                &ctx,
+                &std::sync::Mutex::new(Vec::new()),
+            )
             .await;
         drop(tx);
 
@@ -4225,7 +4359,12 @@ mod tests {
         );
 
         hydrator
-            .finalize(&tx, &std::sync::atomic::AtomicU64::new(0), &ctx)
+            .finalize(
+                &tx,
+                &std::sync::atomic::AtomicU64::new(0),
+                &ctx,
+                &std::sync::Mutex::new(Vec::new()),
+            )
             .await;
         drop(tx);
 

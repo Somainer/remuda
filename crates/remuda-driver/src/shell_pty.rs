@@ -6870,6 +6870,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_abort_inside_finalization_delivers_finished_usage_exactly_once() {
+        // c-usagefu r19 item 2: the poller breaks normally and enters finalize;
+        // mapper.finish() maps the open turn into the GUARD-OWNED pending
+        // queue; the flush parks on the test gate (standing in for a
+        // cancellation landing on the awaited send). Aborting there used to
+        // find the guard hydrator None and the mapped observations in a local
+        // Vec — all lost. The guard now owns both and Drop delivers them.
+        let dir = tempfile::tempdir().unwrap();
+        let (driver, mut events, _cwd, _session) = driver_with_buffered_open_turn(dir.path()).await;
+
+        // Break the loop (same as close's cooperative shutdown).
+        driver
+            .state()
+            .await
+            .unwrap()
+            .closed
+            .store(true, Ordering::SeqCst);
+        if let Some(shutdown) = driver.poller_shutdown.lock().await.take() {
+            let _ = shutdown.send(true);
+        }
+        // The in-finalize gate: the finish() group is queued behind it.
+        let park = promotion::test_acquire_finalise_send_park().await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !promotion::test_finalise_send_park_held() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the poller parks inside finalization"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Drain anything published before the gate.
+        let _ = drain_observations(&mut events, |body| Some(body.clone())).len();
+
+        // Abort exactly as close's deadline does when a finalize send never
+        // returns: the task is cancelled INSIDE finalization.
+        let poller = driver
+            .poller
+            .lock()
+            .await
+            .take()
+            .expect("the real poller handle");
+        poller.abort();
+        let _ = poller.await;
+        drop(park);
+
+        // The guard's Drop found the finish() group in its pending queue and
+        // delivered it (the hydrator was consumed, so no finish_sync rerun).
+        let payloads = buffered_usage_payloads(&mut events);
+        assert_eq!(
+            payloads.len(),
+            1,
+            "the finish() group survives cancellation inside finalization once"
+        );
+        assert_eq!(
+            payloads[0].output_tokens,
+            remuda_protocol::Knowledge::Known { value: U64(13) }
+        );
+
+        Driver::close(&driver).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            buffered_usage_payloads(&mut events).is_empty(),
+            "no second publication"
+        );
+        crate::adapters::codex_discovery::shutdown_unconfirmed_guards(None);
+    }
+
+    #[tokio::test]
     async fn a_normal_close_with_guard_owned_hydrator_publishes_buffered_usage_once() {
         // c-usagefu r18 item 5 normal-path half: with the guard owning the
         // hydrator, the cooperative close finalises it and marks the guard

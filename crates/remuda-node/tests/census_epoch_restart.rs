@@ -238,9 +238,15 @@ fn shadow_home(root: &Path, id: &remuda_protocol::InstanceId) -> PathBuf {
         .join("codex-home")
 }
 
+/// Record the matching prompt under `prompt_owner` (the prompt half, kept
+/// separate from file writing so a probe can construct its discoverer and open
+/// its census lifetime FIRST, then record the prompt, then write the rollout).
+fn record_matching_prompt(cwd: &Path, prompt_owner: &str) {
+    remuda_driver::adapters::codex_discovery::record_input(cwd, prompt_owner, PROMPT);
+}
+
 /// Write an otherwise-eligible rollout (matching session/cwd/prompt) into a
-/// shadow codex home under `session`, timestamped at `created_at`. Records
-/// the matching prompt under `prompt_owner`.
+/// shadow codex home under `session`, timestamped at `created_at`.
 ///
 /// c-usagefu r21 items 1/2: callers create the owner's census lifetime and
 /// sample its launch floor BEFORE calling this, and pass `created_at >=
@@ -252,7 +258,18 @@ fn write_rollout_into(
     session: &str,
     created_at: time::OffsetDateTime,
 ) {
-    remuda_driver::adapters::codex_discovery::record_input(cwd, prompt_owner, PROMPT);
+    record_matching_prompt(cwd, prompt_owner);
+    write_rollout_file(shadow_home, cwd, session, created_at);
+}
+
+/// File-only half of [`write_rollout_into`]: write the session_meta + matching
+/// user-message rollout and backdate its mtime to `created_at`.
+fn write_rollout_file(
+    shadow_home: &Path,
+    cwd: &Path,
+    session: &str,
+    created_at: time::OffsetDateTime,
+) {
     let month_dir = shadow_home.join("sessions").join(format!(
         "{:04}/{:02}/{:02}",
         created_at.year(),
@@ -289,10 +306,17 @@ fn write_rollout_into(
 /// registered interval). The rollout is written AT `floor` (which is after
 /// B's launch), so the strict floor, prompt-fingerprint and stale-claim
 /// tiers all pass; only the census overlap can refuse.
+///
+/// c-usagefu r22 item 2 ordering: the pending discoverer is constructed and
+/// its census lifetime opened (with_instance_key) FIRST; the owner's matching
+/// prompt is recorded only THEN; the unique unclaimed rollout at/after the
+/// floor is written last. Constructing in any other order lets the proof pass
+/// on tiers other than the census overlap it targets.
 fn prompt_only_binds_with_owner(shadow_home: &Path, cwd: &Path, owner: &str) -> bool {
     let floor = time::OffsetDateTime::now_utc();
     let session = format!("{SESSION}-probe-{}", std::process::id());
-    write_rollout_into(shadow_home, cwd, owner, &session, floor);
+    // 1. Pending discoverer FIRST — this also opens its own census interval at
+    //    the floor, so the owner exists in the census with no launch slack.
     let mut adapter = remuda_driver::adapters::codex_adapter::CodexAdapter::new(AdapterHome {
         home: shadow_home.to_path_buf(),
         cwd: cwd.to_path_buf(),
@@ -301,6 +325,10 @@ fn prompt_only_binds_with_owner(shadow_home: &Path, cwd: &Path, owner: &str) -> 
         resume_session_id: None,
     })
     .with_instance_key(Some(owner.to_owned()));
+    // 2. Record the owner's matching prompt after the lifetime is open.
+    record_matching_prompt(cwd, owner);
+    // 3. Write the unique, unclaimed rollout at/after the floor last.
+    write_rollout_file(shadow_home, cwd, &session, floor);
     let _ = adapter.poll();
     adapter.binding().is_some()
 }

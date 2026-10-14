@@ -2533,6 +2533,90 @@ async fn a_failed_log_insert_keeps_the_previous_object_served() {
     );
 }
 
+/// r21 item 4: a PASSED verify verdict that SUPPLIES a run log whose insert
+/// fails must stand down exactly like the Failed case — the job stays Running
+/// and keeps the prior reference; Passed must never commit with missing
+/// evidence or under another result's old bytes (successful Node runs supply
+/// such logs with keepLogs). Once storage recovers, the retried identical
+/// verdict persists its OWN object and settles Passed bound to it.
+#[tokio::test]
+async fn a_failed_log_insert_makes_a_passed_verification_stand_down() {
+    let (ctx, _node) = Ctx::boot().await.unwrap();
+    let (job_id, legacy_id, _old_bytes) = running_job_with_legacy_log(&ctx).await;
+
+    let passed_result = json!({
+        "jobId": job_id,
+        "generation": 1,
+        "status": "passed",
+        "runLog": {
+            "step": "*",
+            "kind": "kept",
+            "attempts": 1,
+            "headline": "green but never stored",
+            "summary": ["cargo test ... ok"],
+            "tail": [],
+            "capturedLines": 1,
+            "truncated": false
+        }
+    });
+
+    // First arrival: the immutable insert fails (one-shot fault).
+    ctx.store().test_arm_gate_log_insert_fault();
+    ctx.hub
+        .test_apply_gate_result(&job_id, passed_result.clone())
+        .await
+        .unwrap();
+
+    // Passed DEFERS: still Running, legacy reference untouched, no Passed row.
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(
+        doc["state"],
+        json!("running"),
+        "a passed verdict whose evidence did not persist must stand down: {doc}"
+    );
+    assert_eq!(
+        doc["logObjectId"],
+        json!(legacy_id),
+        "the failed persist must not rebind the reference: {doc}"
+    );
+
+    // The fault was one-shot: the identical retry persists its own object and
+    // the Passed settlement commits bound to it.
+    ctx.hub
+        .test_apply_gate_result(&job_id, passed_result)
+        .await
+        .unwrap();
+    let settled = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(
+        settled["state"],
+        json!("passed"),
+        "the retry settles Passed: {settled}"
+    );
+    let new_id = settled["logObjectId"]
+        .as_str()
+        .expect("the Passed job binds its persisted object")
+        .to_owned();
+    assert_ne!(
+        new_id, legacy_id,
+        "the settled evidence is not the legacy log"
+    );
+    let (status, served) = ctx
+        .send(
+            "GET",
+            &format!("/v1/gate/logs/{new_id}"),
+            &ctx.human,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{served}");
+    assert_eq!(
+        served["log"]["headline"],
+        json!("green but never stored"),
+        "the Passed settlement binds the retried result's own bytes: {served}"
+    );
+}
+
 /// The Node delivers a FAILED verdict with runLog through BOTH real Hub
 /// entry points — the `gate.event` finished NOTIFICATION and the gate.run
 /// RPC REPLY — not a shared in-process helper. The event lands while the

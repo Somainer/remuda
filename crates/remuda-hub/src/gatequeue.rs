@@ -2271,6 +2271,14 @@ pub(crate) async fn apply_result(
                 return Some(());
             }
             if result.status == "passed" && row.mode == GateMode::Verify {
+                // r21 item 4: Passed is a DEFINITIVE settlement too (a Node
+                // green run supplies its kept log with keepLogs). Require this
+                // verdict's OWN persisted digest before the Passed transition;
+                // a failed/absent insert defers (Running) for the retry rather
+                // than settling green with missing or another result's bytes.
+                if !evidence_is_own(log_object_id.as_ref(), row.log_object_id.as_deref()) {
+                    return None;
+                }
                 row.state = GateJobState::Passed;
                 row.finished_at = Some(now_ts());
             } else if result.status == "landed" {

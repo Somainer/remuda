@@ -16,74 +16,52 @@ import type { Workspace, WorkspaceSnapshot } from "../types/workspace";
 import type { AttachmentRef } from "./attachments";
 
 /**
- * c-reconnfu gate 35 DELIVERY TOKEN: identity captured once at the start of a
- * send / lock turn / fallback and validated synchronously before any POST.
+ * c-reconnfu gate 47 RULING S3 — ONE AUTH OPERATION AT A TIME.
+ *
+ * bootstrap(), login()/pair login, passkeyLogin()'s finish (and any other
+ * credential-establishing operation) run through ONE serialized queue
+ * ({@link enqueueAuthOp}):
+ *  - a credential operation never STARTS while a bootstrap is in flight — it
+ *    queues behind the bootstrap's gate and begins only after the bootstrap
+ *    settles (bootstrap requests are bounded by the existing REST timeouts);
+ *  - a bootstrap never starts while a credential operation is open — a
+ *    successful credential op runs its install INLINE as the tail of its own
+ *    queued turn, so same-tab credential succession can never overlap a
+ *    bootstrap. That is why every await in runBootstrap only needs to re-check
+ *    extEpoch: a same-epoch authGen bump while this run is parked is
+ *    impossible (a credential successor waits for the gate), and every
+ *    external bump moves extEpoch too.
+ *
+ * Retirement. An EXTERNAL identity change — local logout (HubStore.logout) or
+ * a peer-tab storage event — calls externalIdentityRetire(): extEpoch bumps
+ * (R-a/R-b/R-c below stay in force), the running credential request is
+ * aborted best-effort (AbortSignal -> the REST write timeout still bounds it),
+ * and EVERY queued waiter settles RETIRED immediately — each waiter races its
+ * turn against the cancellation broadcast, and a retired waiter never sends
+ * credentials and settles silently (the queue gate still opens, so a fresh
+ * post-logout op is not blocked behind the retired body).
+ *
+ * Bootstrap 401 is deliberately different: it bumps extEpoch and publishes the
+ * settled logged-out state (R-c), but does NOT cancel a queued credential op.
+ * A login/passkey finish queued behind that bootstrap is the user's fresh
+ * auth intent — when it reaches its turn it re-anchors to the CURRENT epoch
+ * and proceeds; an explicit logout/peer change is the only thing that cancels
+ * queued credentials (a queued request must never create a device session
+ * after an explicit logout).
+ *
+ * Deleted by S3 (the overlap it serialized is now impossible): the
+ * same-epoch credential-generation handoff — obsolete-follows-current run
+ * loops, issuedSeq/settledSeq settlement waits, the bootstrap obligation
+ * transfer between overlapping transitions, superseded-transition outcomes,
+ * and generation coordinates on bootstrap/connection installs (extEpoch
+ * alone guards them; authGen still guards the outbox layer, where SENDS can
+ * overlap a credential op, and the delivery token).
  */
 type DeliveryToken = {
   box: Outbox;
   authGen: number;
   transitionSeq: number;
 };
-/**
- * c-reconnfu gate 37 item 1: the auth generation + transition sequence a
- * credential transition captured when it ACQUIRED the chain. Carried in the
- * transition outcome so the PUBLIC continuation can re-validate synchronous
- * current ownership before bootstrapping (a peer logout bumps the generation
- * without touching the sequence).
- *
- * Gate 38 adds `ext`: the external-identity epoch captured when the
- * transition was ISSUED. A logout/401/peer change while the credential
- * request (or a queued successor) is suspended moves it; every externally
- * visible effect of the continuation is then suppressed silently.
- */
-type AuthTransitionOwner = {
-  gen: number;
-  seq: number;
-  ext: number;
-};
-/**
- * c-reconnfu gate 43 — TRI-STATE bootstrap / connection install outcome.
- *  - "installed":   a current-identity connection machine exists (newly built
- *                   or adopted) and the authenticated/degraded UI is settled;
- *                   callers are fulfilled.
- *  - "obsolete":    the external epoch moved OR a same-epoch credential
- *                   transition superseded this run's generation. This run NEVER
- *                   fulfils a caller itself: while extEpoch is still current
- *                   callers are handed to the CURRENT generation's install
- *                   (join its in-flight run or start one); after an external
- *                   change they settle silently as retired.
- *  - "unavailable": the CURRENT generation's durable storage genuinely failed
- *                   to open/read: publish the settled degraded/offline
- *                   cached-session state (ready: true, authed per session)
- *                   with polling/recovery and fulfil — never a loading screen.
- */
-type BootstrapOutcome =
-  | { kind: "installed"; gen: number }
-  | { kind: "unavailable"; gen: number }
-  | { kind: "obsolete"; gen: number };
-/**
- * Outcome of a serialized credential transition run. `obsolete` (c-reconnfu
- * gate 40 item 1) means an EXTERNAL identity change retired the transition
- * WHILE IT WAS QUEUED (after it issued but before it acquired the chain): it
- * never sent its credential request, never changed ownership, and the public
- * caller settles silently (resolves, never throws — nothing was attempted).
- */
-type AuthTransitionOutcome<T> =
-  | { obsolete: true; issuedSeq: number }
-  | {
-      obsolete: false;
-      superseded: boolean;
-      ok: true;
-      result: T;
-      acquired: AuthTransitionOwner;
-    }
-  | {
-      obsolete: false;
-      superseded: boolean;
-      ok: false;
-      error: unknown;
-      acquired: AuthTransitionOwner;
-    };
 import { mapWorkspace, mergeHostWorkspaces } from "../features/workspaces/registry";
 import {
   api,
@@ -1206,7 +1184,14 @@ class HubStore {
    * installed instead of constructing a second one.
    */
   private connectionInstallEpoch: number | null = null;
-  private bootstrapInFlight: { ext: number; gen: number; promise: Promise<BootstrapOutcome> } | null = null;
+  /**
+   * S3 bootstrap single-flight slot. Reserved SYNCHRONOUSLY by bootstrap(), so
+   * same-tick duplicate callers (React StrictMode, a double reload) join the
+   * SAME queued op instead of enqueuing two. Cleared when the op settles: a
+   * later bootstrap for the still-current identity (manual retry, a 401-test
+   * re-run) must execute a fresh pass, never join a stale resolved run.
+   */
+  private bootstrapCallSlot: { ext: number; gen: number; promise: Promise<void> } | null = null;
   private outbox: Outbox | null = null;
   private outboxUnsubscribe: (() => void) | null = null;
   private outboxDegraded = false;
@@ -1242,29 +1227,31 @@ class HubStore {
   private owedReconcileRunning = new Set<Id>();
   private outboxInit: Promise<"ok" | "obsolete" | "unavailable"> | null = null;
   /**
-   * Auth-identity generation (c-reconnfu gate 33 item 2). Bumped by EVERY
-   * session mutation via applyAuthIdentityChange (login, passkey login,
-   * logout, bootstrap-401 clear, peer-tab session change). An Outbox
-   * initializer captures the generation when it starts; if the generation has
-   * moved by the time it would install its box, the initialization is
-   * obsolete — it disposes what it built and installs/flushes NOTHING, so a
-   * cross-identity initializer can never publish an outbox (or run its
-   * post-load flush) belonging to the previous identity.
+   * Auth-identity generation (c-reconnfu gate 33 item 2; kept under S3).
+   * Bumped by EVERY session mutation via applyAuthIdentityChange: the
+   * serialized credential op (login/pair/passkey finish acquisition), logout,
+   * bootstrap-401 clear, peer-tab session change, and bootstrap's own mock
+   * first-login. Under S3 a same-epoch gen bump can no longer land while a
+   * bootstrap/connection install is parked (credential ops wait for the auth
+   * queue gate), so bootstrap code checks extEpoch only. The generation still
+   * guards the OUTBOX layer — SENDS are not auth ops and can overlap a
+   * credential op — and the delivery token.
    */
   private authGen = 0;
   /**
-   * EXTERNAL-identity epoch (c-reconnfu gate 38/39, the ONE mechanism for auth
-   * work suspended across an external change). Incremented ONLY by an identity
-   * change originating OUTSIDE this tab's serialized credential chain — local
-   * logout, bootstrap's 401 session clear, and a peer-tab login/logout
-   * observed via storage. Ordinary credential succession (login B after login
-   * A in this tab) does NOT bump it.
+   * EXTERNAL-identity epoch (c-reconnfu gate 38/39; the retirement coordinate
+   * of the S3 auth queue). Bumped by an identity change originating OUTSIDE
+   * the current tab's queued credential intent — local logout, bootstrap's
+   * 401 session clear, and a peer-tab login/logout observed via storage.
+   * Ordinary credential succession (login B after login A in this tab) does
+   * NOT bump it.
    *
    * The complete rule:
    *  R-a: every PUBLIC auth entry point (login, pair, passkeyLogin, bootstrap,
    *       any other that leads to session/resources) captures extEpoch at
    *       ENTRY, BEFORE its first await, and carries that original value
-   *       through transitions and settlement.
+   *       through to settlement (a queued credential op re-anchors once when
+   *       its turn starts — see S3).
    *  R-b: every internal helper that installs resources or publishes identity
    *       (initConnection, ensureOutbox, startOutboxInit, connection-machine
    *       creation, row restore, session write/publish, authed publication)
@@ -1277,49 +1264,17 @@ class HubStore {
    *       session:null synchronously; retired continuations then stay silent.
    *
    * A mismatch anywhere means the identity is gone — stop silently,
-   * publish/install nothing more, settle the caller's promise as
-   * superseded/failed, never hang.
+   * publish/install nothing more, settle the caller's promise silently (a
+   * retired login resolves, never throws), never hang.
    */
   private extEpoch = 0;
   /**
-   * Monotonic id of the current/most-recent credential transition
-   * (c-reconnfu gate 35). Incremented when a transition ACQUIRES ownership
-   * (inside the serialized chain). A delivery token captures the seq at turn
-   * start; tokenLive fails once a newer transition exists.
+   * Monotonic id of the most recent credential acquisition (c-reconnfu gate
+   * 35). Incremented inside the serialized credential op when it acquires the
+   * auth-operation queue. A delivery token captures the seq at turn start;
+   * tokenLive fails once a newer acquisition exists.
    */
   private transitionSeq = 0;
-  /**
-   * Monotonic id assigned SYNCHRONOUSLY when a credential transition is issued
-   * (before chain acquisition), so two transitions issued back-to-back before
-   * either acquires still get distinct ids (c-reconnfu gate 36 item 4). Chain
-   * acquisition order equals issuance order; the id doubles as
-   * {@link transitionSeq} at acquisition.
-   */
-  private transitionIssuedSeq = 0;
-  /**
-   * c-reconnfu gate 45 item 1: sequence of transitions whose post-issue
-   * settlement (settleAuthBootstrap) has RUN. Allows an obsolete bootstrap
-   * continuation to distinguish "blocker released, issue still settling" from
-   * "no successor pending" without reading the already-null authTransition.
-   */
-  private transitionSettledSeq = 0;
-  /**
-   * Pending-bootstrap obligation on the serialized transition chain
-   * (c-reconnfu gate 36 item 4). A successful login whose own bootstrap is
-   * skipped because a newer transition was issued sets this; the FINAL owner
-   * of the chain discharges it when it settles — including on FAILURE, when an
-   * earlier transition's valid session is on disk and would otherwise never
-   * reach the authenticated UI/connection (a failed queued login exits before
-   * bootstrap).
-   *
-   * Gate 37 item 1: the obligation is bound to the auth GENERATION that owns
-   * it (re-bound on every credential-transition acquisition = explicit
-   * transfer along the chain) and is invalidated by applyAuthIdentityChange,
-   * so an EXTERNAL identity change (logout, bootstrap 401, peer-tab logout)
-   * between acquisition and settlement makes a stale continuation discharge
-   * nothing — even though readSession() may still return a cached session.
-   */
-  private authBootstrapOwed: { gen: number } | null = null;
   /**
    * DELIVERY TOKEN (c-reconnfu gate 35). Captured ONCE at the start of every
    * send / lock turn / fallback and never re-read inside a delivery. The
@@ -1350,24 +1305,44 @@ class HubStore {
     return gen === this.authGen && seq === this.transitionSeq && !wasOpen && this.authTransition === null;
   }
   /**
-   * Auth-transition blocker (c-reconnfu gate 34 Fence A). While a credential
-   * request is in flight (its response sets the new cookie in HEADERS before
-   * the body parses), outbox initialization/delivery must be held so the old
-   * box cannot retry with the new cookie. runAuthTransition wraps every
-   * login/passkey call: it disposes BEFORE the request, blocks ensureOutbox
-   * until the body settles (success or failure), and then releases so a
-   * current-generation box initializes.
+   * Fence A blocker (c-reconnfu gate 34/35; kept under S3). While a credential
+   * REQUEST is in flight (its response sets the new cookie in HEADERS before
+   * the body parses), outbox initialization/delivery by a SEND must be held so
+   * the old box cannot retry with the new cookie. The serialized credential op
+   * opens the blocker after the dispose/bump and releases it once the body
+   * settles (success or failure). The blocker is OWNER-KEYED: a retired op's
+   * late body settlement must never release a successor op's blocker.
    */
   private authTransition: Promise<void> | null = null;
-  private resolveAuthTransition: (() => void) | null = null;
+  private authTransitionRelease: (() => void) | null = null;
+  private authTransitionOwnerExt = -1;
+  private openCredentialBlocker(ext: number): void {
+    this.authTransitionOwnerExt = ext;
+    this.authTransition = new Promise<void>((resolve) => {
+      this.authTransitionRelease = resolve;
+    });
+  }
+  private releaseCredentialBlocker(ext: number): void {
+    // Guarded: an external retirement force-released THIS blocker and a
+    // successor (a fresh post-logout login) may already own a new one.
+    if (this.authTransitionOwnerExt !== ext) return;
+    this.authTransitionOwnerExt = -1;
+    const release = this.authTransitionRelease;
+    this.authTransitionRelease = null;
+    this.authTransition = null;
+    release?.();
+  }
+  private forceReleaseCredentialBlocker(): void {
+    if (this.authTransitionRelease === null) return;
+    this.authTransitionOwnerExt = -1;
+    const release = this.authTransitionRelease;
+    this.authTransitionRelease = null;
+    this.authTransition = null;
+    release();
+  }
 
   /**
-   * Lazily open the durable outbox (also used outside bootstrap, e.g. a
-   * send that races first mount or unit-test callers). Resolves false when no
-   * storage backend is writable — send then uses the legacy direct path.
-   */
-  /**
-   * The ONE helper through which every auth-identity mutation must pass
+   * The ONE helper through which every auth-identity mutation passes
    * (c-reconnfu gate 33 item 1): login, passkey login, logout, bootstrap's
    * 401 session clear, and the peer-tab storage event. It disposes the
    * current Outbox (and invalidates any in-flight initialization) BEFORE the
@@ -1386,18 +1361,12 @@ class HubStore {
    * leaves the external epoch alone.
    */
   private applyAuthIdentityChange(external = false) {
-    // Bump the auth generation and dispose the current outbox. A credential
-    // transition ALSO bumps transitionSeq (in runAuthTransition); non-request
-    // changes (logout/401/peer) bump the generation here so their generation
-    // invalidates in-flight initializers even though no credential transition
-    // blocker is open.
+    // Bump the auth generation and dispose the current outbox. Credential ops
+    // acquire THROUGH this helper after they enter the S3 queue; non-request
+    // changes (logout/401/peer) bump the generation here so a SEND's in-flight
+    // outbox initializer (sends are not auth ops and can overlap) is
+    // invalidated even though no credential blocker is open.
     this.authGen += 1;
-    // Gate 37 item 1: an EXTERNAL identity change invalidates any pending
-    // bootstrap obligation. A credential transition's own acquisition routes
-    // through here too but RE-TRANSFERS a predecessor obligation explicitly
-    // afterwards (see runAuthTransition), so this only kills obligations whose
-    // identity is gone.
-    this.authBootstrapOwed = null;
     if (external) {
       this.extEpoch += 1;
       // The peer tab removed persisted storage itself; also forget the cached
@@ -1412,28 +1381,17 @@ class HubStore {
       // that publishes its own state. The logout/401 callers also dispose via
       // their own teardown, so this is idempotent for them.
       this.disposeConnectionForAuthChange();
-      // Gate 46 item 3: an external identity change retires EVERY settlement
-      // waiter — no waiter may outlive its epoch. They wake, re-read extEpoch
-      // at the fulfilment-loop top and return silently.
-      this.notifyBootstrapSettledWaiters();
-      // Release any OPEN credential transition blocker so queued/running
-      // transitions waiting on the chain (a parked predecessor's fulfilment,
-      // and B/C runAuthTransition calls parked at `await prev`) wake and
-      // observe the new epoch -> obsolete, instead of hanging behind a held
-      // successor body that never resolves.
-      if (this.resolveAuthTransition) {
-        const resolve = this.resolveAuthTransition;
-        this.resolveAuthTransition = null;
-        this.authTransition = null;
-        resolve();
-      }
+      // Release any OPEN Fence-A blocker so a SEND parked in ensureOutbox
+      // wakes (it then re-reads the epoch and goes obsolete), instead of
+      // hanging behind a held credential body.
+      this.forceReleaseCredentialBlocker();
       // Gate 39 R-c: leave the UI in a SETTLED state synchronously. A peer
       // logout observed while no entry point is running (or while one is
       // parked) must not strand protected pages on the loading screen waiting
-      // on a bootstrap that will now return silently; the logout/401 callers
-      // emit their own identical state right after this, so this is an
-      // idempotent publish. With the machine just disposed, "offline" is the
-      // truthful machine-less state.
+      // on a bootstrap that will now return silently; the logout caller emits
+      // its own identical state right after this, so this is an idempotent
+      // publish. With the machine just disposed, "offline" is the truthful
+      // machine-less state.
       this.emit({
         ready: true,
         authed: false,
@@ -1445,234 +1403,121 @@ class HubStore {
   }
 
   /**
-   * Serialized transition chain tail (c-reconnfu gate 35 item 2). Overlapping
-   * credential requests cannot bypass Fence A.
+   * Full external retirement for an EXPLICIT external identity change — local
+   * logout and the peer-tab storage event (S3). Beyond applyAuthIdentityChange
+   * (epoch bump, dispose, R-c publish) this CANCELS the S3 auth queue: the
+   * running credential request is aborted best-effort and every queued waiter
+   * settles retired immediately, never sending credentials. Bootstrap's own
+   * 401 deliberately calls applyAuthIdentityChange(true) WITHOUT this: a
+   * credential op queued behind that bootstrap is fresh auth intent and runs
+   * at the new epoch once its turn comes (see the S3 comment at the top).
    */
-  private authTransitionChain: Promise<void> = Promise.resolve();
-  /** Monotonic sequence shared by all transition acquisitions (c-reconnfu gate 35). */
-  /**
-   * FENCE A (c-reconnfu gate 34/35): wrap a credential-establishing request.
-   * Serialized — a second login queues behind the first and only disposes/bumps
-   * (its own seq) once it acquires the chain after the first settles. While a
-   * transition is open, outbox initialization and delivery are blocked by the
-   * delivery token + ensureOutbox. The blocker releases in finally on success,
-   * rejection or body error; gate-35 item 1 then runs current-generation
-   * initialization in that finalizer (when this transition still owns it).
-   */
-  /**
-   * Run a serialized credential transition. Always RESOLVES (never throws)
-   * with a discriminated outcome so the PUBLIC caller can settle the chain's
-   * bootstrap obligation on BOTH success and failure (c-reconnfu gate 36
-   * item 4):
-   *  - `{ ok: true, result, superseded }` — the credential request succeeded.
-   *  - `{ ok: false, error, superseded }` — it rejected; the caller rethrows
-   *    `error` after dealing with any obligation.
-   * `superseded` is true when a NEWER transition was issued before this one
-   * finished: this caller must defer to the final owner of the chain rather
-   * than run its own post-login bootstrap.
-   */
-  private async runAuthTransition<T>(
-    issue: () => Promise<T>,
-    // Gate 39 R-a: the EXTERNAL epoch captured by the PUBLIC entry point
-    // BEFORE its first await (login/passkeyLogin entry), passed in here — the
-    // helper never captures a fresh epoch on the caller's behalf. A logout/401/
-    // peer change between the entry capture and settlement retires the whole
-    // transition even when the interruption happened during a PRELIMINARY
-    // await (passkey challenge/ceremony) before this wrapper was entered.
-    extAtEntry: number,
-  ): Promise<AuthTransitionOutcome<T>> {
-    // Monotonic ISSUANCE order, assigned synchronously at call time: two
-    // transitions issued back-to-back before either acquires still get
-    // distinct ids, so the earlier one can tell at settle time that a newer
-    // transition was issued and hand the chain's obligations to it
-    // (c-reconnfu gate 36 item 4).
-    const myIssuedSeq = ++this.transitionIssuedSeq;
-    // Gate 38: a login can be in flight while the store is still logged out
-    // (no outbox initialized yet), so ensure the peer watch is live BEFORE the
-    // credential body can park — a peer logout during it must invalidate the
-    // continuation even though startOutboxInit has not run.
-    this.registerPeerAuthWatch();
-    // Gate 38/39: the caller's entry-time external epoch governs this whole
-    // transition; it is never refreshed inside the helper.
-    const myExt = extAtEntry;
-    // Chain acquisition order equals issuance order (the chain serializes in
-    // call order), so the issued id is also this transition's ownership seq.
-    // Link onto the chain and publish the tail BEFORE awaiting so the next
-    // caller queues behind this run.
-    const run = async (
-      prev: Promise<void>,
-    ): Promise<AuthTransitionOutcome<T>> => {
-      await prev;
-      // Gate 40 item 1: the FIRST thing after the chain opened is the epoch
-      // check. A transition QUEUED behind its predecessor may have been
-      // retired by an EXTERNAL logout/401/peer change while waiting. It must
-      // return obsolete BEFORE acquiring ownership (no seq/generation change,
-      // no disposal, no blocker) and, crucially, BEFORE invoking issue() — the
-      // credential request must never reach the Hub (a passkey finish / pair
-      // redeem would otherwise create a device session and Set-Cookie
-      // server-side after this identity logged out). The predecessor already
-      // released the blocker and nulled the obligation; the chain tail simply
-      // resolves so a later fresh transition can acquire.
-      if (this.extEpoch !== myExt) {
-        // Gate 46 item 3: carry the issued sequence so the public login
-        // continuation settles THAT sequence (settleAuthBootstrap bumps
-        // transitionSettledSeq), preventing an obsolete queued C from stalling
-        // later settlement waiters forever.
-        return { obsolete: true, issuedSeq: myIssuedSeq };
-      }
-      this.transitionSeq = myIssuedSeq;
-      // Gate 37 item 1: this transition's OWN acquisition routes through
-      // applyAuthIdentityChange (which invalidates any obligation as an
-      // external change would). A predecessor's obligation is explicitly
-      // TRANSFERRED to this chain owner and re-bound to the new generation —
-      // the only way an obligation survives an identity bump. Gate 38: the
-      // transfer itself survives only while no EXTERNAL change happened before
-      // this successor acquired.
-      const carriedObligation = this.authBootstrapOwed;
-      this.applyAuthIdentityChange();
-      // Gate 36 item 3: capture the auth generation THIS transition owns at
-      // ACQUISITION. A non-transition identity change (logout, bootstrap 401,
-      // peer-tab session removal) bumps the generation while a queued/in-flight
-      // credential request is still open, WITHOUT advancing transitionSeq;
-      // that generation must invalidate this transition's recovery finalizer.
-      const myGen = this.authGen;
-      const acquired: AuthTransitionOwner = { gen: myGen, seq: myIssuedSeq, ext: myExt };
-      if (carriedObligation && this.extEpoch === myExt) this.authBootstrapOwed = { gen: myGen };
-      this.authTransition = new Promise<void>((resolve) => {
-        this.resolveAuthTransition = resolve;
-      });
-      let result: T;
-      let error: unknown;
-      let failed = false;
-      try {
-        result = await issue();
-      } catch (err) {
-        failed = true;
-        error = err;
-      } finally {
-        // Release the blocker. Run current-generation initialization in the
-        // finalizer (gate 35 item 1) only while this transition still owns
-        // BOTH the sequence and the generation it acquired — a queued newer
-        // transition OR a logout/401/peer change invalidates it. Gate 38 adds
-        // the external epoch: a transition issued before an external logout
-        // never installs an outbox after it.
-        const resolve = this.resolveAuthTransition;
-        this.resolveAuthTransition = null;
-        this.authTransition = null;
-        resolve?.();
-        const stillOwns =
-          this.transitionSeq === myIssuedSeq && this.authGen === myGen && this.extEpoch === myExt;
-        if (stillOwns) void this.ensureOutbox(myExt).catch(() => undefined);
-      }
-      // A NEWER transition was issued before this one settled (whether or not
-      // it has acquired yet): this caller must not run the post-login
-      // bootstrap — the final owner's continuation owns the chain's bootstrap
-      // obligation (gate 36 item 4).
-      const superseded = this.transitionIssuedSeq !== myIssuedSeq;
-      if (failed) return { obsolete: false, ok: false, error, superseded, acquired };
-      return { obsolete: false, ok: true, result: result!, superseded, acquired };
-    };
-    // Snapshot the previous chain SYNCHRONOUSLY and publish the new tail
-    // before run's body microtask executes — so run awaits the PREVIOUS chain,
-    // never itself, and the next caller queues onto this run.
-    const prev = this.authTransitionChain;
-    const resultPromise = run(prev);
-    this.authTransitionChain = resultPromise.then(
-      () => undefined,
-      () => undefined,
-    );
-    return resultPromise;
+  private externalIdentityRetire(): void {
+    this.applyAuthIdentityChange(true);
+    this.cancelAuthOps();
   }
 
+  /**
+   * S3 serialized auth-operation queue tail. The gate opens when an op
+   * settles OR is retired — retirement opens it immediately, without waiting
+   * for the retired body's parked HTTP request (the REST write timeout bounds
+   * the dead body; a fresh post-logout op must not queue behind it).
+   */
+  private authOpGate: Promise<void> = Promise.resolve();
+  /** Subscriptions fired by {@link cancelAuthOps}: one per queued/running op. */
+  private readonly authOpCancelSubs = new Set<() => void>();
 
   /**
-   * Settle the serialized chain's bootstrap obligation from a credential
-   * transition's PUBLIC continuation (c-reconnfu gate 36 item 4) — the only
-   * place a successful transition's session has just been written.
-   *  - successful FINAL owner: discharge any pending obligation and bootstrap
-   *    now;
-   *  - successful SUPERSEDED transition: transfer the obligation to the
-   *    chain's final owner instead of bootstrapping under it;
-   *  - FAILED final owner: when a predecessor's valid session is on disk and
-   *    still unbootstrapped, bootstrap THAT session (a queued login failing
-   *    after an earlier one succeeded must not leave the app logged out);
-   *  - failed superseded transition: nothing — the newer owner is responsible.
-   *
-   * Gate 37 item 1: every discharge SYNCHRONOUSLY re-validates that this
-   * continuation still owns the auth generation AND transition sequence it
-   * captured at acquisition, and that the obligation itself is bound to the
-   * current generation. An EXTERNAL change between acquisition and settlement
-   * (logout, bootstrap 401, a peer-tab logout that bumps authGen without
-   * touching transitionSeq) nulls the obligation and moves the generation, so
-   * a stale continuation never bootstraps — readSession()'s cached in-memory
-   * session is consulted only AFTER those checks and cannot outlive the peer
-   * logout for this decision.
-   *
-   * Gate 37 item 2: returns the bootstrap promise so the PUBLIC login
-   * continuations can await it; a final owner's login resolves only once the
-   * authenticated UI is published (AuthGate no longer bounces a too-early
-   * navigation back to /login), while a superseded caller transfers the
-   * obligation and returns immediately without waiting on its successor.
-   *
-   * Gate 38: the captured external epoch gates EVERY effect here. An external
-   * logout/401/peer change after the transition was issued (or after the
-   * successor acquired) makes the continuation return silently — no
-   * obligation (re)created, no bootstrap — so a stale result is never re-bound
-   * to the current generation and readSession() (its cache cleared) cannot
-   * supply the old identity.
+   * Run `body` as one serialized auth operation. Resolves with
+   * `{ retired: true }` when the op was cancelled BEFORE/DURING its turn by an
+   * explicit external retirement (its body may or may not have run; it never
+   * sends credentials when retired before acquisition). Otherwise the body's
+   * own result/throw comes through. The tail gate is published SYNCHRONOUSLY,
+   * before the first await, so two calls issued back-to-back queue in order.
    */
-  private async settleAuthBootstrap(outcome:
-    | AuthTransitionOutcome<DeviceSession>,
-  ): Promise<void> {
-    // Gate 45 item 1 / gate 46 item 3: a queued-obsolete transition settles with
-    // no install but MUST settle its OWN issued sequence so later settlement
-    // waiters never stall behind it.
-    if (outcome.obsolete) {
-      this.transitionSettledSeq = Math.max(this.transitionSettledSeq, outcome.issuedSeq);
-      this.notifyBootstrapSettledWaiters();
-      return;
-    }
-    const extLive = () => this.extEpoch === outcome.acquired.ext;
-    const ownsNow = () =>
-      this.authGen === outcome.acquired.gen && this.transitionSeq === outcome.acquired.seq;
-    // Gate 45: notify obsolete callers only once this settlement has decided
-    // whether a bootstrap runs — i.e. right before every return, after the
-    // bootstrap() call has been kicked (the slot then exists).
-    const settled = () => {
-        this.transitionSettledSeq = Math.max(this.transitionSettledSeq, outcome.acquired.seq);
-      this.notifyBootstrapSettledWaiters();
+  private enqueueAuthOp<T>(
+    body: (ctx: { signal: AbortSignal | null }) => Promise<T>,
+    kind: "bootstrap" | "credential",
+  ): Promise<{ retired: true } | { retired: false; value: T }> {
+    const predecessorGate = this.authOpGate;
+    // Credential requests get an abort signal so an explicit logout while the
+    // body is parked cancels the fetch (best effort; mock ignores it and the
+    // epoch gate after the await drops any late result anyway).
+    const controller = kind === "credential" ? new AbortController() : null;
+    let openGate: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      openGate = resolve;
+    });
+    this.authOpGate = gate;
+    let fireCancelled: () => void = () => {};
+    const cancelled = new Promise<void>((resolve) => {
+      fireCancelled = resolve;
+    });
+    let finished = false;
+    // Set SYNCHRONOUSLY by an explicit-retirement broadcast, before the gate
+    // opens. Decisive at acquisition: when the predecessor gate and the
+    // cancel broadcast resolve in the same synchronous pass, the microtask
+    // race can settle either way, so the body is admitted ONLY when this flag
+    // is still false. A bootstrap-401 bump (no cancel) never sets it — a
+    // queued credential op then re-anchors and runs at the new epoch.
+    let cancelledFlag = false;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      this.authOpCancelSubs.delete(onCancel);
+      // Best-effort abort when the op ends WITHOUT an explicit cancel: covers
+      // a retire reaching the body through extEpoch while the fetch is parked
+      // (bootstrap 401), so a successor does not share a live credential
+      // request. No-op once the fetch settled.
+      controller?.abort();
+      openGate();
     };
-    if (outcome.ok) {
-      if (outcome.superseded) {
-        if (!extLive()) {
-          settled();
-          return;
-        }
-        this.authBootstrapOwed = { gen: this.authGen };
-        await this.bootstrap().catch(() => undefined);
-        settled();
-        return;
+    const onCancel = () => {
+      cancelledFlag = true;
+      fireCancelled();
+      finish();
+    };
+    this.authOpCancelSubs.add(onCancel);
+    return (async (): Promise<{ retired: true } | { retired: false; value: T }> => {
+      // Each QUEUED waiter races its turn against the cancellation broadcast.
+      await Promise.race([
+        predecessorGate.then(() => "turn" as const),
+        cancelled.then(() => "cancelled" as const),
+      ]);
+      if (cancelledFlag) return { retired: true };
+      // The predecessor's gate opens one microtask INSIDE its op envelope,
+      // i.e. BEFORE the predecessor's PUBLIC promise (and the .then callbacks
+      // attached to it, such as a store subscriber scheduling this very call)
+      // settles. Yield TWO extra microtasks so a successor's body starts only
+      // AFTER the predecessor's public settlement — this is what makes
+      // "bootstrap A's public promise settles before queued login B sends"
+      // observable even when B was scheduled from A's own publication.
+      await Promise.resolve();
+      await Promise.resolve();
+      if (cancelledFlag) return { retired: true };
+      // The turn is ours. A bootstrap-401 epoch bump (no explicit cancel) is
+      // NOT retirement for a queued credential op: the body reads the CURRENT
+      // epoch at acquisition and proceeds as fresh auth intent.
+      try {
+        const value = await body({ signal: controller?.signal ?? null });
+        return { retired: false, value };
+      } finally {
+        finish();
       }
-      this.authBootstrapOwed = null;
-      if (!extLive() || !ownsNow()) {
-        settled();
-        return;
-      }
-      await this.bootstrap().catch(() => undefined);
-      settled();
-      return;
-    }
-    if (
-      !outcome.superseded &&
-      extLive() &&
-      ownsNow() &&
-      this.authBootstrapOwed?.gen === this.authGen &&
-      readSession()
-    ) {
-      this.authBootstrapOwed = null;
-      await this.bootstrap().catch(() => undefined);
-    }
-    settled();
+    })();
+  }
+
+  /**
+   * Cancel the running op and every queued waiter (S3 explicit retirement).
+   * Each op's subscription aborts its credential fetch, opens the queue gate
+   * and releases its acquisition wait — queued callers settle retired on the
+   * next microtask, and a fresh post-logout op enqueued afterwards acquires
+   * immediately (it does not wait for the retired body).
+   */
+  private cancelAuthOps(): void {
+    const subs = [...this.authOpCancelSubs];
+    this.authOpCancelSubs.clear();
+    for (const fire of subs) fire();
   }
 
   /**
@@ -1728,11 +1573,12 @@ class HubStore {
   ]);
   private onPeerAuthChange = (event: StorageEvent) => {
     if (!event.key || !HubStore.SESSION_STORAGE_KEYS.has(event.key)) return;
-    // A peer logged in/out or replaced the session: an EXTERNAL change — rotate
-    // the auth generation AND external epoch (clearing this tab's cached
-    // session), dispose the outbox, and invalidate suspended auth work
-    // (gate 38). No reconnect here — the UI/next action decides re-auth.
-    this.applyAuthIdentityChange(true);
+    // A peer logged in/out or replaced the session: an EXPLICIT external
+    // change — rotate the epoch/generation (clearing this tab's cached
+    // session), dispose outbox/machine, publish the settled logged-out state
+    // AND cancel the S3 auth queue (a queued credential must never reach the
+    // Hub after the peer logout). No reconnect here — the next action decides.
+    this.externalIdentityRetire();
   };
   private peerAuthWatchRegistered = false;
   private registerPeerAuthWatch() {
@@ -1760,11 +1606,12 @@ class HubStore {
     // epoch on a caller's behalf (no default). The current-identity test seam
     // is {@link ensureOutboxForTest}.
     const epoch = ext;
-    // c-reconnfu gate 35 item 2: LOOP while any credential transition is open.
-    // Overlapping logins are serialized: each release can be followed by a
-    // queued transition acquiring, so re-await until the chain fully settles.
+    // c-reconnfu gate 35 item 2 (kept under S3): a SEND parks while a
+    // credential REQUEST holds the Fence-A blocker. Auth operations themselves
+    // never hit this wait (a bootstrap runs only after the login turn released
+    // the blocker), but send() can overlap a credential op at any time.
     // Gate 39 R-b: revalidate the caller's epoch at EVERY pass, including
-    // immediately after the open-transition wait — a continuation parked here
+    // immediately after the blocker wait — a continuation parked here
     // across an external logout resumes "obsolete" and never starts an
     // initializer under the new identity.
     // eslint-disable-next-line no-constant-condition
@@ -1852,14 +1699,6 @@ class HubStore {
           this.toast("待发队列连续读取或投递失败，已暂停自动重试；恢复后将在下次发送时继续");
         };
         this.emit({ outboxPending: box.pendingCount() });
-        // Test gate (c-reconnfu gate 44 item 1): fires AFTER the box is installed
-        // but before the initializer reports "ok", letting a regression
-        // interleave a credential-generation supersession (which disposes the
-        // just-installed box) exactly between the two — the window in which a
-        // parked initConnection used to read "ok" with this.outbox null.
-        if (this.outboxInstalledGateForTest) {
-          await new Promise<void>((resolve) => this.outboxInstalledGateForTest?.(resolve));
-        }
         if (opened.degraded) this.toast("本机无法可靠保存待发消息（存储不可用）");
         // Rows left inflight by a closed tab are due immediately — but never
         // from an initializer whose identity is already obsolete (it may have
@@ -3068,48 +2907,41 @@ class HubStore {
   }
 
   /**
-   * @returns installed when a current-epoch machine exists after this call;
-   * obsolete when the caller's epoch/generation retired (never install for a
-   * newer identity); unavailable when the CURRENT generation's storage failed
-   * (the caller settles degraded without a machine — gate 43 item 2).
+   * @returns "installed" when a current-epoch machine exists after this call;
+   * "obsolete" when the caller's epoch retired (never install for a newer
+   * identity); "unavailable" when the CURRENT identity's storage failed (the
+   * caller settles degraded with a machine but without a box — ruling U).
+   *
+   * S3: the external epoch is the ONLY identity coordinate checked here. This
+   * installer runs inside an auth operation (bootstrap turn, or the inline
+   * tail of a credential turn), so a same-epoch credential op cannot bump
+   * authGen while it is parked; the outbox initializer's own gen guards remain
+   * for SEND-driven initializers, which can overlap a credential op.
    */
-  private async initConnection(offline: boolean, ext: number): Promise<BootstrapOutcome> {
+  private async initConnection(offline: boolean, ext: number): Promise<"installed" | "unavailable" | "obsolete"> {
     // Gate 39/40 R-b: the CALLER's external epoch (captured at its public
     // entry before its first await) is REQUIRED; this installer never reads a
     // fresh epoch for the caller.
     const epoch = ext;
-    // Gate 44 item 1: capture the CREDENTIAL generation this installation is
-    // for BEFORE awaiting the outbox. A subscriber-triggered login can acquire
-    // the transition WHILE this call is parked in ensureOutbox: it bumps authGen
-    // and disposes the outbox, so on resume storage may report "ok" while
-    // this.outbox is null (the newer transition owns it). Treating that as
-    // "unavailable" wrongly fulfilled this caller instead of the successor's
-    // install. A generation mismatch is "obsolete" — checked immediately after
-    // the await, BEFORE any storage-availability classification.
-    const installGen = this.authGen;
-    const sameIdentity = () => this.extEpoch === epoch && this.authGen === installGen;
-    // c-reconnfu gate 34 item 4: a REPLACEMENT login keeps this.connection but
-    // the old box was disposed by runAuthIdentityChange. Ensure a current-
-    // generation outbox on EVERY init path even when the connection machine is
-    // reused, otherwise pending durable rows sit unserviced until another send
-    // or a reload. (When the connection is brand new this also runs, as before.)
-    // Gate 39: an "obsolete" result (the caller's epoch moved while waiting on
-    // an open transition) stops this install entirely — never adopt the box the
-    // NEW identity created.
+    const extLive = () => this.extEpoch === epoch;
+    // gate 34 item 4: a REPLACEMENT login keeps this.connection but the old
+    // box was disposed at acquisition. Ensure a current outbox on EVERY init
+    // path even when the connection machine is reused, otherwise pending
+    // durable rows sit unserviced until another send or a reload. An
+    // "obsolete" result (the caller's epoch moved while the box opened) stops
+    // this install entirely — never adopt the box the NEW identity created.
     await this.ensureOutbox(epoch);
-    // Gate 44 item 1: revalidate BOTH identity coordinates immediately after
-    // the storage await, before classifying availability (see installGen).
-    if (!sameIdentity()) return { kind: "obsolete", gen: installGen };
+    if (!extLive()) return "obsolete";
     // Gate 41 S1: a connection machine installed for THIS epoch is already
     // owned — either by a replacement login's reused machine or by a
-    // concurrent same-epoch bootstrap that won the single-flight/reload race.
-    // Adopt it and return: never restore bubbles twice or construct a second
+    // same-identity bootstrap that won the single-flight/reload race. Adopt
+    // it and return: never restore bubbles twice or construct a second
     // machine (the second assignment would orphan the first, whose timers and
     // callbacks keep running).
     if (this.connection && this.connectionInstallEpoch === epoch) {
-      return { kind: "installed", gen: installGen };
+      return "installed";
     }
-    // Gate 44 ruling U: storage UNAVAILABLE for the CURRENT generation still
+    // Gate 44 ruling U: storage UNAVAILABLE for the CURRENT identity still
     // installs the connection machine (and listeners) WITHOUT an outbox, so the
     // published connection state always comes from a live machine and the UI is
     // never stuck on the initial "recovering". Sends use the keyed direct
@@ -3118,8 +2950,8 @@ class HubStore {
     const box = this.outbox;
 
     // Durable bubble restoration exists only when the box opened. Recheck
-    // identity synchronously before the restore emit and machine creation.
-    if (box && !sameIdentity()) return { kind: "obsolete", gen: installGen };
+    // the epoch synchronously before the restore emit and machine creation.
+    if (box && !extLive()) return "obsolete";
     if (box) {
       const restored = box.unresolved();
       if (restored.length) {
@@ -3152,25 +2984,12 @@ class HubStore {
       }
     }
 
-    // Gate 39/44 R-b: revalidate synchronously immediately before constructing
-    // the connection machine; a retirement between the outbox install and here
+    // R-b: revalidate synchronously immediately before constructing the
+    // connection machine; a retirement between the outbox install and here
     // stops the machine from being built or published.
-    if (!sameIdentity()) {
+    if (!extLive()) {
       box?.dispose();
-      return { kind: "obsolete", gen: installGen };
-    }
-    // c-reconnfu gate 45 item 1 TEST SEAM: suspend right before machine
-    // construction (ensureOutbox returned, identity just revalidated) so a
-    // regression can start a REAL login whose acquisition bumps authGen DURING
-    // this await — the production subscriber/publication window. Re-validate
-    // immediately after: a gen that moved makes the install obsolete before
-    // any machine is built.
-    if (this.machineConstructGateForTest) {
-      await new Promise<void>((resolve) => this.machineConstructGateForTest?.(resolve));
-      if (!sameIdentity()) {
-        box?.dispose();
-        return { kind: "obsolete", gen: installGen };
-      }
+      return "obsolete";
     }
     const machine = new ConnectionMachine({
       resume: () => this.resumeConnection(),
@@ -3206,13 +3025,13 @@ class HubStore {
     // Gate 41 S1: stamp the installing epoch so a concurrent same-epoch
     // initConnection adopts this machine instead of building another.
     this.connectionInstallEpoch = epoch;
-    // Gate 39/44 R-b: do not start/attach a machine if the identity retired
-    // during construction.
-    if (!sameIdentity()) {
+    // R-b: do not start/attach a machine if the identity retired during
+    // construction.
+    if (!extLive()) {
       machine.dispose();
       this.connection = null;
       this.connectionInstallEpoch = null;
-      return { kind: "obsolete", gen: installGen };
+      return "obsolete";
     }
     // A successful REST bootstrap proves reachability, but on the list/new
     // pages there is no follow socket to watchdog yet: start live WITHOUT a
@@ -3245,10 +3064,10 @@ class HubStore {
     // Send anything already due (e.g. rows left inflight when the tab closed).
     // No-op without an outbox (ruling U).
     if (box) void this.flushAllOutbox();
-    // Ruling U: a machine installed with no outbox reports "unavailable" — —
+    // Ruling U: a machine installed with no outbox reports "unavailable" —
     // callers are fulfilled (machine + listeners own connection state), sends
     // use the keyed direct fallback and durable rows restore on next reload.
-    return { kind: box ? "installed" : "unavailable", gen: installGen };
+    return box ? "installed" : "unavailable";
   }
 
   private onConnOnline = () => this.connection?.dispatch({ type: "online" });
@@ -3420,8 +3239,12 @@ class HubStore {
   get extEpochForTest(): number {
     return this.extEpoch;
   }
+  /**
+   * Test seam: simulate an EXPLICIT external identity change (a peer/local
+   * logout) — epoch bump, disposal, R-c publish AND S3 queue cancellation.
+   */
   applyAuthIdentityChangeForTest(): void {
-    this.applyAuthIdentityChange(true);
+    this.externalIdentityRetire();
   }
   /** Test seam: true while a Fence-A credential transition is open. */
   get authTransitionOpenForTest(): boolean {
@@ -3439,27 +3262,6 @@ class HubStore {
   private outboxOpenGateForTest: ((resolve: () => void) => void) | null = null;
   setOutboxOpenGateForTest(gate: ((resolve: () => void) => void) | null): void {
     this.outboxOpenGateForTest = gate;
-  }
-  /** Gate after the box is installed but before the initializer returns (gate 44). */
-  private outboxInstalledGateForTest: ((resolve: () => void) => void) | null = null;
-  setOutboxInstalledGateForTest(gate: ((resolve: () => void) => void) | null): void {
-    this.outboxInstalledGateForTest = gate;
-  }
-  /** Gate inside initConnection right before machine construction (gate 45). */
-  private machineConstructGateForTest: ((release: () => void) => void) | null = null;
-  setMachineConstructGateForTest(gate: ((release: () => void) => void) | null): void {
-    this.machineConstructGateForTest = gate;
-  }
-  /**
-   * Test seam (c-reconnfu gate 44 item 1): simulate a credential-generation
-   * supersession WITHOUT an external-identity change — bumps authGen and
-   * disposes the current outbox exactly like the credential part of an
-   * interleaved login acquisition, leaving extEpoch current.
-   */
-  credentialGenerationSupersedeForTest(): void {
-    this.authGen += 1;
-    this.authBootstrapOwed = null;
-    this.disposeOutboxForAuthChange();
   }
   /** Gate the Outbox.load step (second suspension point) for gate-34 item 5. */
   private outboxLoadGateForTest: ((resolve: () => void) => void) | null = null;
@@ -4582,165 +4384,79 @@ class HubStore {
   }
 
   async bootstrap(): Promise<void> {
-    // Gate 41 S1 / gate 42-43 — SINGLE-FLIGHT keyed on (extEpoch, authGen),
-    // with TRI-STATE fulfilment (see BootstrapOutcome).
     this.registerPeerAuthWatch();
-    await this.fulfilBootstrap(this.launchBootstrapRun(this.extEpoch, this.authGen), this.extEpoch);
-  }
-
-  /**
-   * Launch a bootstrap run for an exact identity, coalescing an identical
-   * in-flight one (StrictMode replay / duplicate reload). A newer identity
-   * always starts a fresh run (it replaces the slot; the older run clears the
-   * slot only when it still owns it).
-   */
-  private launchBootstrapRun(ext: number, gen: number): Promise<BootstrapOutcome> {
-    const existing = this.bootstrapInFlight;
+    const ext = this.extEpoch;
+    const gen = this.authGen;
+    // S3 single-flight: a same-tick duplicate (StrictMode double invoke, a
+    // double reload) joins the SAME queued op. The slot is reserved
+    // synchronously and cleared on settlement, so a later re-bootstrap for the
+    // same identity runs a fresh pass rather than joining a stale run.
+    const existing = this.bootstrapCallSlot;
     if (existing && existing.ext === ext && existing.gen === gen) return existing.promise;
-    const slot: { ext: number; gen: number; promise: Promise<BootstrapOutcome> } = {
+    const slot: { ext: number; gen: number; promise: Promise<void> } = {
       ext,
       gen,
-      promise: undefined as unknown as Promise<BootstrapOutcome>,
+      promise: undefined as unknown as Promise<void>,
     };
-    const promise = this.runBootstrap(ext, gen);
-    slot.promise = promise;
-    this.bootstrapInFlight = slot;
-    void promise.finally(() => {
-      if (this.bootstrapInFlight === slot) this.bootstrapInFlight = null;
+    slot.promise = (async () => {
+      const outcome = await this.enqueueAuthOp(
+        // Re-anchor at acquisition: like a credential op, a bootstrap queued
+        // behind a predecessor that ended on a 401 runs at the new epoch.
+        () => this.runBootstrap(this.extEpoch),
+        "bootstrap",
+      );
+      // The public wrapper never fulfils an installation after retirement:
+      // runBootstrap installs/publishes nothing after an epoch move, and this
+      // tail also covers an external change dispatched by a publication
+      // subscriber in the microtask gap before this continuation.
+      if (outcome.retired || outcome.value === "retired" || this.extEpoch !== ext) return;
+    })();
+    this.bootstrapCallSlot = slot;
+    void slot.promise.finally(() => {
+      if (this.bootstrapCallSlot === slot) this.bootstrapCallSlot = null;
     });
-    return promise;
+    return slot.promise;
   }
 
-  /**
-   * Fulfil one bootstrap caller from a run's tri-state outcome.
-   *  - installed / unavailable: the UI is settled for this identity — done.
-   *  - obsolete while the external epoch is STILL current: a same-epoch
-   *    credential transition superseded this run. Follow the CURRENT
-   *    generation's installation — join its in-flight run or start one — until
-   *    it reports installed/unavailable (gate 43 item 1: the login's own
-   *    callers, and a predecessor parked across a later FAILED successor, are
-   *    fulfilled only once a current-gen machine or degraded state exists).
-   *  - obsolete after the epoch moved: the identity logged out externally;
-   *    settle silently (R-c already published the logged-out state).
-   */
-  /**
-   * c-reconnfu gate 46 — ONE RULE for bootstrap completion: every await in
-   * runBootstrap / fulfilBootstrap / initConnection / settleAuthBootstrap is
-   * followed by a synchronous check of BOTH the caller's external epoch and
-   * credential generation BEFORE any publication, polling, installation or
-   * caller fulfilment.
-   *  - external epoch changed -> retire silently (never wait, never publish);
-   *  - credential generation changed within the same epoch -> obsolete ->
-   *    follow the CURRENT-generation run.
-   * Every settlement/transition waiter is also woken and retired by an
-   * external identity change — no waiter outlives its epoch.
-   */
-  private bootstrapSettledWaiters: Array<() => void> = [];
-  private notifyBootstrapSettledWaiters(): void {
-    const waiters = this.bootstrapSettledWaiters;
-    this.bootstrapSettledWaiters = [];
-    for (const w of waiters) w();
-  }
-
-  private async fulfilBootstrap(first: Promise<BootstrapOutcome>, callerExt: number): Promise<void> {
-    let result = await first;
-    // Gate 46 item 2: revalidate after the FIRST await. External epoch moved ->
-    // retire silently (R-c published the logged-out state). Same-epoch gen move
-    // falls into the obsolete handoff below.
-    // eslint-disable-next-line no-constant-condition
-    while (true) {
-      if (result.kind !== "obsolete") {
-        if (this.extEpoch !== callerExt) return; // retired externally
-        if (result.gen !== this.authGen) {
-          // Settled outcome whose generation was superseded in the SAME epoch:
-          // treat as obsolete and follow the current generation (don't return
-          // success for a stale install).
-          result = { kind: "obsolete", gen: result.gen };
-          continue;
-        }
-        return;
-      }
-      if (this.extEpoch !== callerExt) return; // retired externally, never wait
-      // Gate 45/46: an OPEN successor transition owns the chain. Await its
-      // blocker but re-check the caller epoch IMMEDIATELY after (a logout
-      // interleaved with the blocker release must strand no waiter).
-      if (this.authTransition) {
-        await this.authTransition;
-        if (this.extEpoch !== callerExt) return;
-      }
-      // Wait for the successor's post-issue settlement; an external change
-      // wakes this waiter via notifyBootstrapSettledWaiters and the epoch
-      // re-check at the loop top retires it.
-      for (let guard = 0; guard < 1_000; guard += 1) {
-        if (this.transitionIssuedSeq <= this.transitionSettledSeq) break;
-        if (this.bootstrapInFlight && this.bootstrapInFlight.gen === this.authGen) break;
-        if (this.extEpoch !== callerExt) return;
-        await new Promise<void>((resolve) => {
-          this.bootstrapSettledWaiters.push(resolve);
-        });
-      }
-      if (this.extEpoch !== callerExt) return;
-      const awaited = this.bootstrapInFlight;
-      if (awaited) {
-        result = await awaited.promise;
-        continue; // re-evaluate identity at the top
-      }
-      // No in-flight run (successor failed without bootstrapping): install for
-      // the current generation now.
-      result = await this.launchBootstrapRun(this.extEpoch, this.authGen);
-    }
-  }
-
-  private async runBootstrap(extAtBoot: number, genAtBoot: number): Promise<BootstrapOutcome> {
-    const obsoleteOutcome = (): BootstrapOutcome => ({ kind: "obsolete", gen: genAtBoot });
-
-    // Gate 38 item 2: capture the external epoch at bootstrap start and
-    // revalidate SYNCHRONOUSLY after every await below, before installing a
-    // resource or publishing state. A peer logout / local logout / 401 while a
-    // health or list request is in flight makes this bootstrap stop silently —
-    // the external change already published logged-out and disposed the
-    // outbox; this stale run must not recreate a connection/outbox or
-    // republish authed from a cached session.
+  private async runBootstrap(extAtBoot: number): Promise<"settled" | "retired"> {
+    // S3: after EVERY await below only extEpoch is re-checked. A same-epoch
+    // authGen supersession is impossible — a credential operation waits for
+    // this op's queue gate and can neither acquire nor bump the generation
+    // while this run is parked; the mock first-login bump below is this run's
+    // OWN synchronous step. Every external bump moves extEpoch, so it is the
+    // sole retirement coordinate here (authGen still guards the outbox layer,
+    // where SENDS can overlap a credential op).
     const extLive = () => this.extEpoch === extAtBoot;
     // bootGen is still bumped so a list poll issued by an older bootstrap is
-    // dropped when a newer one starts (refresh captures it), but it does NOT
-    // retire bootstrap runs — single-flight + the external epoch own that
-    // (gate 41 S1).
+    // dropped when a newer one starts (refresh captures it); it does NOT
+    // retire bootstrap runs — the S3 queue + extEpoch own that.
     ++this.bootGen;
     if (api.mock && readLoggedOut() && !readSession()) {
       this.emit({ ready: true, authed: false, session: null, devices: [], passkeys: [], connection: "offline" });
-      return { kind: "installed", gen: genAtBoot };
+      return "settled";
     }
     if (api.mock && !readSession()) {
       const session = await api.login(MOCK_BOOTSTRAP_TOKEN, readDeviceSettings().deviceName);
-      // Gate 40: epoch is the only retirement gate (not bootGen — see the catch
-      // block); an external change while this step was parked retires the run.
-      if (!extLive()) return obsoleteOutcome();
-      // First identity establishment: route through the same helper so the
-      // initial Outbox initializer starts under a defined, current generation.
+      // An external change while this cold-start request was parked retires
+      // the run. It is the bootstrap op's OWN first identity establishment:
+      // no other auth op can be open (the queue gate), so this api.login
+      // needs no Fence-A blocker (there is no prior outbox to dispose).
+      if (!extLive()) return "retired";
+      // Define the generation under which the initial Outbox initializer
+      // starts, THEN persist/publish the session.
       this.applyAuthIdentityChange();
       writeSession(session, { mock: api.mock });
       this.emit({ session: readSession() });
     }
-    // Gate 43 item 1: if this run was launched by a SUPERSEDED predecessor's
-    // settlement while the successor credential transition is still holding the
-    // chain, wait for that transition instead of racing health/lists/install.
-    // On success the successor's own settlement joins THIS single-flight run
-    // (one install for both callers); if the successor fails without moving the
-    // external epoch this run performs the current-generation recovery; if an
-    // external change arrives meanwhile, retire silently (never hello).
-    while (this.authTransition !== null && this.extEpoch === extAtBoot) {
-      await this.authTransition;
-    }
-    if (!extLive()) return obsoleteOutcome();
+    // No open-credential-transition wait here: under S3 a credential op can
+    // never be open while a bootstrap turn runs (a login releases its blocker
+    // BEFORE its inline bootstrap; a public bootstrap acquires the same gate).
     try {
       await api.hello();
-      // Gate 40: epoch is the only retirement gate (not bootGen — see the catch
-      // block); an external change while this step was parked retires the run.
-      if (!extLive()) return obsoleteOutcome();
+      if (!extLive()) return "retired";
       if (!api.mock && !api.hasDeviceSession()) {
         this.emit({ ready: true, authed: false, error: null, connection: "live" });
-        return { kind: "installed", gen: genAtBoot };
+        return "settled";
       }
       const [instances, hosts, interactions, devices, passkeys] = await Promise.all([
         api.instanceList(),
@@ -4749,9 +4465,7 @@ class HubStore {
         api.deviceList().catch(() => ({ items: [] as PairedDevice[] })),
         api.passkeyList().catch(() => ({ items: [] as PasskeyView[] })),
       ]);
-      // Gate 40: epoch is the only retirement gate (not bootGen — see the catch
-      // block); an external change while this step was parked retires the run.
-      if (!extLive()) return obsoleteOutcome();
+      if (!extLive()) return "retired";
       const registeredHosts = mergeHostWorkspaces(hosts.items, this.state.hosts);
       this.emit({
         ready: true,
@@ -4800,43 +4514,41 @@ class HubStore {
         }, 300);
       });
       // Re-validate immediately before installing the connection (and through
-      // it the outbox): an external change landing during this synchronous
-      // setup must not be followed by a stale machine/install, and again after
-      // the install settles before starting polls.
-      if (!extLive()) return obsoleteOutcome();
-      // Gate 42/43: tri-state install. "installed" starts polls/dev handle.
-      // "obsolete" is handed to the current generation by fulfilBootstrap (no
-      // polls here). "unavailable" falls through to the settled degraded state.
+      // it the outbox), and again after the install settles before polling.
+      if (!extLive()) return "retired";
+      // Ruling U: install may be "installed" (machine + box) or "unavailable"
+      // (machine WITHOUT a box); both settle this identity. "obsolete" means
+      // the caller's epoch retired during the install.
       const install = await this.initConnection(false, extAtBoot);
-      // Gate 45 item 1: revalidate BOTH coordinates after the install await and
-      // before accepting the outcome/publishing/polling. A subscriber-triggered
-      // login acquiring during this install return bumps authGen; accepting a
-      // settled outcome whose gen no longer matches would publish/poll from the
-      // retired run — become obsolete and follow the current-generation run.
-      if (!extLive()) return obsoleteOutcome();
-      if (install.gen !== this.authGen) return obsoleteOutcome();
-      if (install.kind === "obsolete") return obsoleteOutcome();
+      if (!extLive()) return "retired";
+      if (install === "obsolete") return "retired";
       this.startPoll();
       this.installDevHandle();
-      return install;
+      // S3: settle the install's initial delivery BEFORE this turn opens the
+      // queue gate. A queued successor (login B) acquires immediately after
+      // this turn and its Fence-A bump disposes this box; a fire-and-forget
+      // inflight POST could then leave its durable row stuck in "inflight".
+      // Draining here means successor failure/success never strands rows that
+      // this identity's install had already claimed.
+      if (this.outbox) await this.flushAllOutbox().catch(() => undefined);
+      if (!extLive()) return "retired";
+      return "settled";
     } catch (err) {
-      // Gate 41 item 1: RETIREMENT FIRST. If an external change (logout/401/
-      // peer) advanced the epoch while the health/list request was parked —
-      // possibly AFTER a replacement login had already completed its own
-      // bootstrap — this stale run must not even classify the error: its late
-      // 401 would otherwise applyAuthIdentityChange(true) + clearSession/drop
-      // the cookie and destroy the replacement's session/outbox/connection. The
-      // external change already published the logged-out state and tore the
-      // old resources down. A CURRENT-epoch bootstrap's OWN 401 still passes
-      // this check (the epoch has not moved yet) and performs the logout below.
-      if (!extLive()) return obsoleteOutcome();
+      // RETIREMENT FIRST. If an external change advanced the epoch while the
+      // health/list request was parked — possibly AFTER a queued credential op
+      // was issued — this stale run must not even classify the error: its late
+      // 401 would otherwise clearSession/dropCookie. A CURRENT-epoch
+      // bootstrap's OWN 401 passes this check (the epoch has not moved yet)
+      // and performs the logout below; per S3 it does NOT cancel a queued
+      // credential op, whose fresh request runs only AFTER this settles.
+      if (!extLive()) return "retired";
       const unauth = isUnauthorized(err);
       if (unauth) {
-        // c-reconnfu gate 33 item 1: a 401 means the current session is gone;
-        // dispose the outbox (and invalidate its initializer) before clearing
-        // the session, so no delivery runs under the revoked identity. Gate 38:
-        // this is an EXTERNAL change — bump extEpoch and drop the cached
-        // session so any other suspended auth continuation stops silently.
+        // A 401 means the current session is gone: dispose the outbox (and
+        // invalidate its initializer) before clearing the session, so no
+        // delivery runs under the revoked identity. This bumps extEpoch and
+        // publishes the settled logged-out state (R-c), but deliberately does
+        // NOT cancel queued credential ops — see externalIdentityRetire.
         this.applyAuthIdentityChange(true);
         clearSession();
         dropDeviceCookie();
@@ -4847,18 +4559,13 @@ class HubStore {
       const hasSession = api.hasDeviceSession();
       if (!unauth && hasSession) {
         const installOffline = await this.initConnection(true, extAtBoot);
-        // Gate 46 item 1: BOTH coordinates after the offline install await,
-        // BEFORE publishing/polling. The offline branch must publish only for
-        // the generation that owned the install — a gen moved here goes
-        // obsolete and follows the current run (same as the healthy branch).
-        if (!extLive()) return obsoleteOutcome();
-        if (installOffline.gen !== this.authGen) return obsoleteOutcome();
-        if (installOffline.kind === "obsolete") return obsoleteOutcome();
-        // installed OR unavailable (gate 43 (c)): either way settle the cached
+        if (!extLive()) return "retired";
+        if (installOffline === "obsolete") return "retired";
+        // installed OR unavailable (ruling U): either way settle the cached
         // authenticated session, start polling/recovery, and fulfil.
         this.publishCachedSessionSettled(err);
         this.startPoll();
-        return installOffline; // "installed" | "unavailable"
+        return "settled";
       }
       this.emit({
         ready: true,
@@ -4867,49 +4574,74 @@ class HubStore {
         error: err instanceof Error ? err.message : "bootstrap failed",
         connection: "offline",
       });
-      return { kind: "installed", gen: genAtBoot };
+      return "settled";
     }
   }
 
   async login(kind: "bootstrap" | "pair", secret: string, deviceName: string) {
-    // Gate 39 R-a: capture the EXTERNAL epoch at ENTRY, before the first await,
-    // and carry that original value through the transition and settlement.
-    const extAtEntry = this.extEpoch;
-    // Fence A: dispose + block init BEFORE the credential request (the new
-    // cookie lands in response headers); write the session only after the body
-    // resolves. A body failure still releases the blocker and the chain's
-    // final owner settles any pending bootstrap obligation (gate 36 item 4).
-    const outcome = await this.runAuthTransition(
-      () =>
-        kind === "pair"
-          ? api.pairRedeem(secret, deviceName)
-          : api.login(secret, deviceName),
-      extAtEntry,
+    // Peer watch must be live BEFORE the credential body can park (a peer
+    // logout during it retires the queued/running op).
+    this.registerPeerAuthWatch();
+    // S3: the whole credential operation (request + session write + install)
+    // is ONE serialized auth turn. Retired while queued/running — resolve
+    // silently, never throw (nothing was attempted/written); a request
+    // rejection after acquisition propagates to the caller.
+    const outcome = await this.enqueueAuthOp(
+      ({ signal }) =>
+        this.performCredentialTurn(
+          (abortSignal) =>
+            kind === "pair"
+              ? api.pairRedeem(secret, deviceName, abortSignal)
+              : api.login(secret, deviceName, abortSignal),
+          signal,
+        ),
+      "credential",
     );
-    // Gate 40 item 1: retired while QUEUED — the credential request was never
-    // sent; settle silently (resolve, never throw).
-    if (outcome.obsolete) return;
-    if (!outcome.ok) {
-      // A failed superseded caller transfers the obligation and settles on the
-      // rejection WITHOUT awaiting its successor; the final owner owns it.
-      await this.settleAuthBootstrap(outcome);
-      throw outcome.error;
+    if (outcome.retired || outcome.value === "retired") return;
+  }
+
+  /**
+   * The body of one serialized credential turn (S3). Runs only after the turn
+   * is acquired: Fence A dispose/bump + blocker, the credential request, then
+   * the session write and the install INLINE (a separate bootstrap op cannot
+   * interleave — it waits for this turn's gate). Re-anchors extEpoch AT
+   * ACQUISITION so a login queued behind a bootstrap that ended on 401 runs at
+   * the new epoch; an explicit logout/peer change cancels the op before this
+   * body runs.
+   */
+  private async performCredentialTurn(
+    issue: (signal: AbortSignal | undefined) => Promise<DeviceSession>,
+    queueSignal: AbortSignal | null,
+  ): Promise<"settled" | "retired"> {
+    const ext = this.extEpoch;
+    // Fence A: dispose/bump BEFORE the credential request (the new cookie
+    // lands in response HEADERS before the body parses); the blocker holds
+    // SEND-driven outbox init/delivery until the body settles.
+    this.applyAuthIdentityChange();
+    this.transitionSeq += 1;
+    this.openCredentialBlocker(ext);
+    let session: DeviceSession;
+    try {
+      session = await issue(queueSignal ?? undefined);
+    } catch (err) {
+      this.releaseCredentialBlocker(ext);
+      // External change while the body was parked (logout aborted the fetch,
+      // or a bootstrap-401/peer epoch bump): write nothing, settle silently.
+      if (this.extEpoch !== ext) return "retired";
+      // Failed request under a live epoch. The predecessor identity (if any)
+      // stays on disk and its own turn already installed UI/machine (S3 — no
+      // obligation transfer); just restore ITS outbox so pending durable work
+      // resumes, then propagate the rejection to the caller.
+      void this.ensureOutbox(ext).catch(() => undefined);
+      throw err as Error;
     }
-    // Gate 38: an EXTERNAL logout/401/peer change while the credential body was
-    // suspended retires this result — write/publish NOTHING (the promise still
-    // resolves; the caller navigates nowhere because no session appeared).
-    if (this.extEpoch !== outcome.acquired.ext) {
-      await this.settleAuthBootstrap(outcome);
-      return;
-    }
-    writeSession(outcome.result, { mock: api.mock });
-    // bootstrap marks the session authenticated after cookie-backed reads finish.
+    this.releaseCredentialBlocker(ext);
+    if (this.extEpoch !== ext) return "retired";
+    writeSession(session, { mock: api.mock });
     this.emit({ session: readSession(), error: null });
-    // Gate 37 item 2: AWAIT the final-owner bootstrap so the login promise
-    // resolves only after the authenticated UI is published — LoginPage
-    // navigates in this promise's .then(), and resolving earlier made
-    // AuthGate bounce back to /login (remount, passkey mediation restart).
-    await this.settleAuthBootstrap(outcome);
+    const result = await this.runBootstrap(ext);
+    if (result === "retired" || this.extEpoch !== ext) return "retired";
+    return "settled";
   }
 
   /** Whether the browser exposes WebAuthn on this origin. */
@@ -4935,14 +4667,13 @@ class HubStore {
     deviceName?: string,
     signal?: AbortSignal,
   ): Promise<{ assertion: PasskeyAssertionBody; challengeId: string } | void> {
-    // Gate 39 R-a: capture the EXTERNAL epoch at ENTRY (before the challenge
-    // request, the ceremony, and the finish transition) and revalidate after
-    // every preliminary await. A peer/local logout while the challenge or the
-    // WebAuthn assertion is parked must stop the flow BEFORE the finish
-    // request is issued — no session, no bootstrap, and the promise settles
-    // (resolves void), never hangs. The peer watch is registered here because
-    // the credential transition (which otherwise registers it) has not started
-    // when the challenge/ceremony await is parked.
+    // The challenge/ceremony awaits are OUTSIDE the S3 queue (a conditional
+    // mediation can stay pending forever and must not block a cold bootstrap):
+    // capture the external epoch at ENTRY and revalidate after every
+    // preliminary await, so a peer/local logout while the challenge or the
+    // WebAuthn assertion is parked stops the flow BEFORE the finish request is
+    // issued (no session, no bootstrap; the promise resolves void). Only the
+    // finish goes through the serialized credential queue.
     this.registerPeerAuthWatch();
     const extAtEntry = this.extEpoch;
     const retired = () => this.extEpoch !== extAtEntry;
@@ -4951,29 +4682,15 @@ class HubStore {
     const options = envelope.options as ServerRequestOptions;
     const assertion = await getPasskey(options, mediation, signal);
     if (retired()) return;
-    const outcome = await this.runAuthTransition(
-      () => api.passkeyLoginFinish(envelope.challengeId, assertion, deviceName),
-      extAtEntry,
+    const outcome = await this.enqueueAuthOp(
+      ({ signal: finishSignal }) =>
+        this.performCredentialTurn(
+          (abortSignal) => api.passkeyLoginFinish(envelope.challengeId, assertion, deviceName, abortSignal),
+          finishSignal,
+        ),
+      "credential",
     );
-    // Gate 40 item 1: retired while QUEUED — the finish request was never
-    // sent; settle silently (resolve void, never throw).
-    if (outcome.obsolete) return;
-    if (!outcome.ok) {
-      // A failed superseded caller transfers the obligation and settles on the
-      // rejection WITHOUT awaiting its successor; the final owner owns it.
-      await this.settleAuthBootstrap(outcome);
-      throw outcome.error;
-    }
-    // Gate 38: suppress every effect of a result retired by an external change.
-    if (this.extEpoch !== outcome.acquired.ext) {
-      await this.settleAuthBootstrap(outcome);
-      return;
-    }
-    writeSession(outcome.result, { mock: api.mock });
-    this.emit({ session: readSession(), error: null });
-    // Gate 37 item 2: await the final-owner bootstrap for the same reason as
-    // password/pair login — no /login bounce after passkey navigation.
-    await this.settleAuthBootstrap(outcome);
+    if (outcome.retired || outcome.value === "retired") return;
     return { assertion, challengeId: envelope.challengeId };
   }
 
@@ -5088,14 +4805,12 @@ class HubStore {
     this.heldRetryAttempt.clear();
     for (const [, slot] of this.effortReconcileTimers) clearTimeout(slot.timer);
     this.effortReconcileTimers.clear();
-    // c-reconnfu gate 33 item 1: logout goes through the single
-    // identity-change helper — bumps authGen and disposes the outbox (and any
-    // in-flight initializer) BEFORE the logged-out identity can be used; the
-    // next bootstrap loads a fresh Outbox with a new lifetime. The helper also
-    // nulls the pending bootstrap obligation (gate 37 item 1). Gate 38:
-    // EXTERNAL — bump extEpoch and clear the cached session so suspended login
-    // continuations and an in-flight bootstrap publish nothing afterwards.
-    this.applyAuthIdentityChange(true);
+    // S3: logout is an EXPLICIT external retirement — epoch bump, outbox and
+    // machine disposal BEFORE the logged-out identity can be used, R-c settled
+    // logged-out publication, AND cancellation of the auth queue: the running
+    // credential fetch is aborted and every queued waiter retires immediately
+    // without sending credentials.
+    this.externalIdentityRetire();
     if (this.unloadClearTimer) {
       clearTimeout(this.unloadClearTimer);
       this.unloadClearTimer = null;

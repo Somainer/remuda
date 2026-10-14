@@ -650,15 +650,15 @@ export type PasskeyAssertionBody = {
 
 export type HubApi = {
   mock: boolean;
-  login(bootstrapToken: string, deviceName: string): Promise<DeviceSession>;
-  pairRedeem(code: string, deviceName: string): Promise<DeviceSession>;
+  login(bootstrapToken: string, deviceName: string, signal?: AbortSignal): Promise<DeviceSession>;
+  pairRedeem(code: string, deviceName: string, signal?: AbortSignal): Promise<DeviceSession>;
   pairCode(): Promise<PairCode>;
   deviceList(): Promise<{ items: PairedDevice[] }>;
   deviceRevoke(deviceId: string): Promise<{ ok: boolean }>;
   passkeyRegisterStart(name: string): Promise<PasskeyEnvelope>;
   passkeyRegisterFinish(challengeId: string, attestation: PasskeyAttestationBody): Promise<PasskeyView>;
   passkeyLoginStart(mediation?: "conditional"): Promise<PasskeyEnvelope>;
-  passkeyLoginFinish(challengeId: string, assertion: PasskeyAssertionBody, deviceName?: string): Promise<DeviceSession>;
+  passkeyLoginFinish(challengeId: string, assertion: PasskeyAssertionBody, deviceName?: string, signal?: AbortSignal): Promise<DeviceSession>;
   passkeyList(): Promise<{ items: PasskeyView[] }>;
   passkeyRename(passkeyId: string, name: string): Promise<PasskeyView>;
   passkeyDelete(passkeyId: string): Promise<{ ok: boolean }>;
@@ -973,10 +973,12 @@ function createMockApi(): HubApi {
   const subs = new Map<Id, (batch: EventsBatch["params"]) => void>();
   return {
     mock: true,
-    async login(bootstrapToken, deviceName) {
+    async login(bootstrapToken, deviceName, signal) {
+      void signal;
       return mockLogin(bootstrapToken, deviceName);
     },
-    async pairRedeem(code, deviceName) {
+    async pairRedeem(code, deviceName, signal) {
+      void signal;
       return mockPairRedeem(code, deviceName);
     },
     async pairCode() {
@@ -1000,9 +1002,10 @@ function createMockApi(): HubApi {
     async passkeyLoginStart(mediation) {
       return mockPasskeyLoginStart(mediation);
     },
-    async passkeyLoginFinish(challengeId, assertion, deviceName) {
+    async passkeyLoginFinish(challengeId, assertion, deviceName, signal) {
       void challengeId;
       void assertion;
+      void signal;
       return mockPasskeyLoginFinish(deviceName);
     },
     async passkeyList() {
@@ -1464,17 +1467,19 @@ function createLiveApi(): HubApi {
 
   return {
     mock: false,
-    async login(bootstrapToken, deviceName) {
+    async login(bootstrapToken, deviceName, signal) {
       const body = await rest<HubJson<"/v1/login", "post">>("/v1/login", {
         method: "POST",
         body: JSON.stringify({ bootstrapToken, deviceName }),
+        signal,
       });
       return body;
     },
-    async pairRedeem(code, deviceName) {
+    async pairRedeem(code, deviceName, signal) {
       const body = await rest<HubJson<"/v1/devices/pair", "post">>("/v1/devices/pair", {
         method: "POST",
         body: JSON.stringify({ code, deviceName }),
+        signal,
       });
       return body;
     },
@@ -1509,10 +1514,10 @@ function createLiveApi(): HubApi {
         { method: "POST", body },
       ) as Promise<PasskeyEnvelope>;
     },
-    async passkeyLoginFinish(challengeId, assertion, deviceName) {
+    async passkeyLoginFinish(challengeId, assertion, deviceName, signal) {
       return rest<HubJson<"/v1/auth/passkeys/login/finish", "post">>(
         "/v1/auth/passkeys/login/finish",
-        { method: "POST", body: JSON.stringify({ challengeId, assertion, deviceName }) },
+        { method: "POST", body: JSON.stringify({ challengeId, assertion, deviceName }), signal },
       );
     },
     async passkeyList() {

@@ -6819,20 +6819,32 @@ it("GATE36 item 6(a) (replaces GATE35 item 3): C1's CLAIM parked before it resol
     expect(send).not.toHaveBeenCalled(); // parked BEFORE the POST boundary
 
     // Complete the replacement login (and therefore L2 initialization) while
-    // L1's claim is still parked. L2's flush can only queue on the instance
-    // lock L1 still holds.
+    // L1's claim is still parked. Under S3 the login TURN awaits its install
+    // flush, which is queued on the instance lock L1 still holds — so loginP
+    // stays pending until the claim is released (L2's box itself is installed
+    // before the flush parks).
     vi.spyOn(api, "login").mockResolvedValue({ deviceId: "dev_g35_3", token: "tok", name: "g35_3" });
     const loginP = hubStore.login("bootstrap", "secret", "dev");
-    await loginP;
-    await pump(3_000);
+    for (let i = 0; i < 3_000; i += 1) {
+      const lifeNow = (hubStore as unknown as { outbox: { lifetime: string } | null }).outbox?.lifetime;
+      await Promise.resolve();
+      if (lifeNow && lifeNow !== life1) break;
+    }
+    await pump(1_000);
     const life2 = (hubStore as unknown as { outbox: { lifetime: string } | null }).outbox?.lifetime;
     expect(life2).toBeTruthy();
     expect(life2).not.toBe(life1);
     expect(send).not.toHaveBeenCalled(); // L1 parked; L2 waiting on the held lock
+    let loginSettled = false;
+    void loginP.then(() => { loginSettled = true; });
+    await pump(500);
+    expect(loginSettled).toBe(false); // parked behind L1's held instance lock
 
     // Resume C1's claim: L1's fence is stale — it restores C1 and ends its
-    // turn with ZERO POSTs; L2's queued lock turn then drains C1, C2 in order.
+    // turn with ZERO POSTs; L2's queued lock turn (awaited by the login turn)
+    // then drains C1, C2 in order.
     releaseClaim();
+    await loginP;
     await pump(8_000);
     expect(posted).toEqual([
       { id: "cmd_g35_3_c1", lifetime: life2 },
@@ -7008,7 +7020,7 @@ it("GATE35 item 5: a send whose token captured an OPEN credential transition nev
   }
 });;;
 
-it("GATE35 item 2: overlapping credential requests are serialized — while login A's body is open a send waits; queued login B disposes only after A settles, and no outbox is installed/POSTing until B settles", async () => {
+it("GATE35 item 2 (S3): credential requests are serialized with bootstraps through one queue — while login A's body is open a send waits; queued login B's request never starts until A's WHOLE turn settles", async () => {
   vi.useFakeTimers();
   vi.setSystemTime(1_210_000);
   const I = "ins_g35_2";
@@ -7076,27 +7088,23 @@ it("GATE35 item 2: overlapping credential requests are serialized — while logi
     await pump(200);
     expect(bStarted).toBe(false); // B has not acquired the chain while A is open
 
-    // Release A: B acquires (disposes A's box), its body parks. Gate 43: A's
-    // superseded continuation now AWAITS the current generation's bootstrap,
-    // which is itself blocked on B's open transition — so loginA does not settle
-    // yet, but still no outbox/POST happens (the waiting bootstrap can't pass
-    // ensureOutbox while B holds the chain).
+    // Release A: under S3 A's WHOLE turn settles first (request + install),
+    // and only THEN does B's turn begin: its dispose/bump, held body, blocker.
     releaseA();
-    await pump(500);
+    for (let i = 0; i < 2_000 && !bStarted; i += 1) await Promise.resolve();
     expect(bStarted).toBe(true);
+    let aSettled = false;
+    void loginA.then(() => { aSettled = true; });
+    await pump(500);
+    expect(aSettled).toBe(true); // A settled BEFORE B's request started
     expect(h.authTransitionOpenForTest).toBe(true);
-    // Gate 36 item 6(b): the outbox stays ABSENT for the whole window B is
-    // open — A's finalizer initialization must be killed by B's acquisition
-    // and B's own finalizer has not run yet.
+    // B's Fence-A acquisition disposed A's box for the whole window B is open.
     expect(h.outbox).toBeNull();
-    // Still no box installed / no POST while B is open (the finalizer hasn't run).
-    expect(send).not.toHaveBeenCalled();
 
-    // Release B: its finalizer initializes a current box; the waiting send, A's
-    // pending bootstrap and flush deliver P.
+    // Release B: its turn installs a current box and the waiting send is
+    // delivered (through B's box) exactly once.
     releaseB();
     await loginB;
-    await loginA;
     const sent = await sendP;
     expect(sent).toBe(true);
     await pump(3_000);
@@ -7237,17 +7245,19 @@ it("GATE36 item 3: a failed login finalizer is invalidated by logout — no box 
     await pump(300);
     expect(h.authTransitionOpenForTest).toBe(true);
 
-    // Logout completes WHILE A's credential request is in flight. It bumps the
-    // auth generation but leaves the transition seq alone.
+    // Logout completes WHILE A's credential request is in flight. S3: this is
+    // an EXPLICIT external retirement — the queued/running op is cancelled,
+    // the blocker released and the outbox disposed immediately.
     h.logout();
     await pump(200);
     expect(h.outbox).toBeNull();
 
-    // A's request then rejects. Its stale finalizer must NOT create a box or
-    // deliver anything under the new logged-out generation.
+    // A's request then rejects. Under S3 the op was already RETIRED by the
+    // logout: the public login promise settles silently (never rejects with
+    // the 503), and the stale body creates no box and delivers nothing.
     const { HubHttpError: HE } = await import("./httpError");
     rejectA!(new HE(503, "busy", "host busy"));
-    await expect(loginP).rejects.toThrow(/busy/);
+    await loginP;
     await pump(4_000);
 
     expect(h.outbox).toBeNull();
@@ -7617,7 +7627,7 @@ it("GATE36 item 6(e): bootstrap 401 disposes the box; a later public login with 
   }
 });
 
-it("GATE37 item 1: a PEER logout between login A's success and queued login B's rejection invalidates B's bootstrap obligation — no bootstrap, no box, authed stays false (plain and transient-health-failure variants)", async () => {
+it("GATE37 item 1 (S3): login A's WHOLE turn (with its bootstrap) completes before queued B starts; a PEER logout while B's body is held retires B silently and tears down A's install — no box, authed false (plain and transient-health-failure variants)", async () => {
   for (const variant of ["plain", "transient-health-failure"] as const) {
     vi.useFakeTimers();
     vi.setSystemTime(1_270_000 + (variant === "transient-health-failure" ? 1 : 0));
@@ -7683,44 +7693,46 @@ it("GATE37 item 1: a PEER logout between login A's success and queued login B's 
         .mockImplementationOnce(() => new Promise((_resolve, reject) => {
           releaseB = () => reject(new HE(503, "busy", "host busy"));
         }));
-      const loginA = h.login("bootstrap", "a", "devA");
-      const loginB = h.login("bootstrap", "b", "devB");
-      await pump(400); // A settles, B acquires and parks
-      // Gate 43: A's superseded continuation now awaits the current-gen
-      // install, which is itself blocked behind B's open transition — so loginA
-      // is still pending (no box; no health call yet).
+      // Capture A's outbox synchronously at ITS settlement (attached before
+      // any pumping): B's acquisition immediately afterwards disposes it.
       let aSettled = false;
-      void loginA.then(() => { aSettled = true; });
-      await pump(200);
-      expect(aSettled).toBe(false);
-      expect(h.outbox).toBeNull(); // B's transition is open; no box yet
-      expect(hello).not.toHaveBeenCalled();
+      let aBoxAtSettle: unknown = null;
+      const loginA = h.login("bootstrap", "a", "devA");
+      void loginA.then(() => { aSettled = true; aBoxAtSettle = h.outbox; });
+      const loginB = h.login("bootstrap", "b", "devB");
+      await pump(400); // A's whole turn settles; B acquires and parks
+      expect(aSettled).toBe(true);
+      expect(aBoxAtSettle).not.toBeNull();
+      expect(h.state.authed).toBe(true);
+      expect(h.outbox).toBeNull(); // B acquired and disposed A's box
+      expect(hello).toHaveBeenCalledTimes(1);
 
-      // ANOTHER TAB logs out: the peer storage event bumps this tab's auth
-      // generation. Simulate the peer's storage removal too — readSession()
-      // still returns the cached in-memory A session, exactly the trap.
+      // ANOTHER TAB logs out while B's body is held: explicit external retire —
+      // B is cancelled (no successor request effect), A's box/machine are torn
+      // down and the UI settles logged-out. Simulate the peer's storage
+      // removal too — readSession() still returns the cached in-memory A
+      // session, exactly the trap.
       localStorage.removeItem("runtime.device-session");
       window.dispatchEvent(
         new StorageEvent("storage", { key: "runtime.device-session", oldValue: "{}", newValue: null }),
       );
       await pump(200);
+      expect(h.state.authed).toBe(false);
+      expect(h.outbox).toBeNull();
 
-      // B's credential request rejects. Its stale continuation must NOT
-      // bootstrap A's cached session under the post-peer-logout generation.
+      // B's credential request rejects after the retire: the stale body settles
+      // the public promise SILENTLY (S3 — retired never throws) and bootstraps
+      // nothing.
       releaseB();
-      await expect(loginB).rejects.toThrow(/busy/);
-      // A's waiting continuation observes the moved external epoch and retires
-      // silently (no install); it still settles its promise.
-      await loginA;
+      await loginB;
       await pump(4_000);
 
       expect(aSettled).toBe(true);
       expect(h.state.authed).toBe(false);
       expect(h.outbox).toBeNull();
       expect(send).not.toHaveBeenCalled();
-      // No bootstrap health request was ever issued (A skipped bootstrap as
-      // superseded; stale B must not run one either).
-      expect(hello).not.toHaveBeenCalled();
+      // Only A's single health run ever happened; B never bootstrapped.
+      expect(hello).toHaveBeenCalledTimes(1);
     } finally {
       vi.useRealTimers();
       Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
@@ -7942,7 +7954,6 @@ it("GATE38 item 2: a peer logout while bootstrap's health request is parked inva
     await pump(4_000);
     await vi.advanceTimersByTimeAsync(120_000);
     await pump(1_000);
-
     expect(h.state.authed).toBe(false);
     // The peer handler intentionally emits no new page state (the UI/next
     // action decides re-auth); what matters is that the stale bootstrap never
@@ -8823,8 +8834,9 @@ it("GATE42 item 1: a login that bumps authGen while a reload bootstrap is parked
         state: "pending",
       });
 
-      // Park A's storage step: the FIRST initializer parks; any later
-      // initializer (the login's current-generation one) proceeds at once.
+      // Park A's storage step: the FIRST initializer parks; the queued login
+      // B reaches its own (second) initializer only after A is released and
+      // settles — S3 serialization, so that later initializer proceeds at once.
       let releaseA: (() => void) | null = null;
       let parkArmed = false;
       const internals = hubStore as unknown as Record<string, unknown>;
@@ -8869,17 +8881,17 @@ it("GATE42 item 1: a login that bumps authGen while a reload bootstrap is parked
       expect(releaseA).not.toBeNull();
       expect(h.connection).toBeNull();
 
-      // A REAL login B in the SAME external epoch: its transition bumps authGen
-      // and clears A's initializer; its settlement bootstrap must not join A's
-      // obsolete run but perform the current-generation install itself.
+      // S3: the login B is QUEUED behind A's bootstrap op — it can neither
+      // acquire nor open an initializer while A is parked at its storage gate.
       const loginB = h.login("bootstrap", "secret", "devB");
       await pump(1_200);
-      // A is still parked at its storage gate; B's fresh initializer passed
-      // the gate (2nd call auto-resolves) and B has installed its own machine.
+      // A is still parked; B has not started (its own initializer gate never
+      // armed while it waits for A's queue gate).
       expect(releaseA).not.toBeNull();
 
-      // Release A: it resumes obsolete and installs nothing of its own. Login
-      // resolves only once B's machine is installed and bubbles restored.
+      // Release A: A's bootstrap completes first; only then does B's turn
+      // acquire, dispose A's box and install its own. Both public promises
+      // settle on the one surviving machine with the bubble restored once.
       releaseA!();
       await Promise.all([bootA, loginB]);
       await pump(6_000);
@@ -8900,223 +8912,6 @@ it("GATE42 item 1: a login that bumps authGen while a reload bootstrap is parked
     }
   }
 });
-
-it("GATE43 item 1 (i): obsolete reload bootstrap and its joined caller wait for the replacement login's parked installation, then resolve with one machine", async () => {
-  vi.useFakeTimers();
-  vi.setSystemTime(1_400_000);
-  const I = "ins_g43_1i";
-  const originalNavigator = globalThis.navigator;
-  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
-  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
-  const pump = async (n = 5_000) => {
-    for (let i = 0; i < n; i += 1) await Promise.resolve();
-  };
-  try {
-    sessionStorage.setItem("remuda-outbox-owner", "owner_g43_1i");
-    localStorage.setItem("runtime.device-session", JSON.stringify({ deviceId: "devA_g43_1i", name: "A" }));
-    const { api, hubStore } = await fresh();
-    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
-    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
-    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
-    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
-    vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
-    vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
-    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
-    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
-    vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
-    vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
-    vi.spyOn(api, "instanceList").mockResolvedValue({
-      items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
-      nextCursor: null,
-    } as never);
-    vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
-    vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
-    vi.spyOn(api, "login").mockResolvedValue({ deviceId: "devB_g43_1i", token: "tokB", name: "B" });
-
-    // One durable row the replacement machine restores exactly once.
-    const seed = new (await import("./outbox")).LocalStorageOutboxStorage();
-    await seed.put({
-      commandId: "cmd_g43_1i", clientRequestId: "local_g43_1i", instanceId: I,
-      prompt: "g43 1i", createdAt: 1, attempts: 0, state: "pending",
-    });
-
-    // Park the FIRST (A) and SECOND (B replacement) storage initializers
-    // independently; later initializers auto-resolve.
-    const releases: Array<() => void> = [];
-    const internals = hubStore as unknown as Record<string, unknown>;
-    (internals.setOutboxOpenGateForTest as (g: ((r: () => void) => void) | null) => void)((resolve) => {
-      releases.push(resolve);
-    });
-
-    const addSpy = vi.spyOn(window, "addEventListener");
-    const h = hubStore as unknown as {
-      bootstrap: () => Promise<void>;
-      login: (k: "bootstrap", s: string, d: string) => Promise<void>;
-      connection: unknown;
-      state: { bubbles: Array<{ clientRequestId: string }> };
-    };
-    // Reload A and its StrictMode duplicate A2 (same gen) join one run.
-    const bootA = h.bootstrap();
-    const bootA2 = h.bootstrap();
-    await pump(300);
-    expect(releases).toHaveLength(1);
-
-    // Replacement login B (healthy) acquires, bumps gen, then parks its own
-    // installation.
-    const loginB = h.login("bootstrap", "secret", "devB");
-    await pump(800);
-    expect(releases).toHaveLength(2);
-    expect(h.connection).toBeNull();
-
-    // Readiness is observed AT each caller's fulfilment (inside .then).
-    const settled: string[] = [];
-    void bootA.then(() => { settled.push("A"); expect(h.connection).not.toBeNull(); });
-    void bootA2.then(() => { settled.push("A2"); expect(h.connection).not.toBeNull(); });
-    void loginB.then(() => { settled.push("B"); expect(h.connection).not.toBeNull(); });
-
-    // Release obsolete A: its run must NOT fulfil (B's install still parked).
-    releases[0]!();
-    await pump(500);
-    expect(h.connection).toBeNull();
-    expect(settled).toEqual([]);
-
-    // Release B: the current-generation install completes; all three fulfil.
-    releases[1]!();
-    await Promise.all([bootA, bootA2, loginB]);
-    await pump(6_000);
-    expect(settled.sort()).toEqual(["A", "A2", "B"]);
-    expect(addSpy.mock.calls.filter((c) => c[0] === "online")).toHaveLength(1);
-    expect(h.state.bubbles.filter((b) => b.clientRequestId === "local_g43_1i")).toHaveLength(1);
-  } finally {
-    vi.useRealTimers();
-    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
-    sessionStorage.removeItem("remuda-outbox-owner");
-  }
-});
-
-it("GATE45 item 3: failed successor with obsolete A parked isolates A's completion until the current-gen install releases", async () => {
-  vi.useFakeTimers();
-  vi.setSystemTime(1_460_000);
-  const I = "ins_g45_3";
-  const originalNavigator = globalThis.navigator;
-  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
-  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
-  const pump = async (n = 5_000) => {
-    for (let i = 0; i < n; i += 1) await Promise.resolve();
-  };
-  let seams: Record<string, unknown> | null = null;
-  try {
-    sessionStorage.setItem("remeda-outbox-owner", "owner_g45_3");
-    localStorage.setItem("runtime.logged-out", "1");
-    const { api, hubStore } = await fresh();
-    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
-    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
-    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
-    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
-    vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
-    vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
-    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
-    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
-    vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
-    vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
-    vi.spyOn(api, "instanceList").mockResolvedValue({
-      items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
-      nextCursor: null,
-    } as never);
-    vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
-    vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
-
-    let releaseA: () => void = () => undefined;
-    const { HubHttpError } = await import("./httpError");
-    vi.spyOn(api, "login").mockImplementationOnce(
-      () => new Promise((resolve) => { releaseA = () => resolve({ deviceId: "devA_g45_3", token: "tokA", name: "A" }); }),
-    ).mockImplementationOnce(
-      () => Promise.reject(new HubHttpError(503, "busy", "host busy")),
-    );
-
-    // Gate EVERY storage initializer: gate #0 is A's own, gate #1 is the
-    // current-gen recovery install driven after B fails.
-    const storageReleases: Array<() => void> = [];
-    const internals = hubStore as unknown as Record<string, unknown>;
-    seams = internals;
-    (internals.setOutboxOpenGateForTest as (g: ((r: () => void) => void) | null) => void)((resolve) => {
-      storageReleases.push(resolve);
-    });
-
-    const addSpy = vi.spyOn(window, "addEventListener");
-    const h = hubStore as unknown as {
-      login: (k: "bootstrap", s: string, d: string) => Promise<void>;
-      connection: unknown;
-      state: { ready: boolean; authed: boolean; bubbles: Array<{ clientRequestId: string }> };
-    };
-
-    // 1) Complete A's credentials and wait until A's OWN bootstrap install is
-    // PARKED (obligation already cleared by A's successful continuation).
-    const loginAP = h.login("bootstrap", "a", "devA");
-    await pump(200);
-    releaseA!();
-    await pump(800);
-    expect(storageReleases.length).toBeGreaterThanOrEqual(1);
-    let aFulfilled = false;
-    const aFulfilPromise = loginAP.then(() => { aFulfilled = true; });
-    await pump(200);
-    expect(aFulfilled).toBe(false);
-    expect(h.connection).toBeNull();
-
-    // 2) Successor B starts and FAILS; its acquisition invalidates A and the
-    // surviving obligation parks a current-gen recovery install.
-    const loginBP = h.login("bootstrap", "b", "devB");
-    await expect(loginBP).rejects.toThrow(/busy/);
-    await pump(600);
-    expect(storageReleases.length).toBeGreaterThanOrEqual(2);
-    expect(h.connection).toBeNull();
-
-    // 3) Release ONLY A's obsolete initializer and drain its continuation:
-    // A must STILL be pending with no machine — the replacement gate (#1)
-    // stays closed and owns A's fulfilment.
-    storageReleases[0]!();
-    await pump(800);
-    expect(aFulfilled).toBe(false);
-    expect(h.connection).toBeNull();
-    // No machine listener from A's drained-but-obsolete continuation.
-    expect(addSpy.mock.calls.filter((c: unknown[]) => c[0] === "online")).toHaveLength(0);
-
-    // 4) Seed a durable row while the replacement install is parked.
-    const seed = new (await import("./outbox")).LocalStorageOutboxStorage();
-    await seed.put({
-      commandId: "cmd_g45_3", clientRequestId: "local_g45_3", instanceId: I,
-      prompt: "g45 3", createdAt: 1, attempts: 0, state: "pending",
-    });
-
-    // 5) Release the CURRENT-GEN replacement gate (#1); A fulfils on that
-    // install. Assert readiness, machine, restored row and listener set INSIDE
-    // the awaited fulfilment callback (no detached promise).
-    let assertedInFulfilment = false;
-    const asserted = aFulfilPromise.then(() => {
-      expect(h.state.ready).toBe(true);
-      expect(h.state.authed).toBe(true);
-      expect(h.connection).not.toBeNull();
-      expect(h.state.bubbles.filter((b) => b.clientRequestId === "local_g45_3")).toHaveLength(1);
-      expect(addSpy.mock.calls.filter((c: unknown[]) => c[0] === "online")).toHaveLength(1);
-      assertedInFulfilment = true;
-    });
-    storageReleases[1]!();
-    await asserted;
-    await loginAP;
-    await pump(4_000);
-    expect(aFulfilled).toBe(true);
-    expect(assertedInFulfilment).toBe(true);
-    expect(addSpy.mock.calls.filter((c: unknown[]) => c[0] === "online")).toHaveLength(1);
-  } finally {
-    if (seams) {
-      (seams.setOutboxOpenGateForTest as (g: ((r: () => void) => void) | null) => void)(null);
-    }
-    vi.useRealTimers();
-    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
-    sessionStorage.removeItem("remeda-outbox-owner");
-  }
-});
-;
 
 it("GATE44 item 2 (ruling U): unavailable outbox storage installs the connection machine; a degraded send uses the keyed fallback (unbound page)", async () => {
   vi.useFakeTimers();
@@ -9315,340 +9110,4 @@ it("GATE44 item 2 (ruling U): unavailable outbox storage installs the connection
     Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
     sessionStorage.removeItem("remuda-outbox-owner");
   }
-});;
-
-it("GATE44 item 1: a credential generation superseding a parked storage install is classified obsolete — status ok with the outbox disposed never fulfils as unavailable", async () => {
-  vi.useFakeTimers();
-  vi.setSystemTime(1_430_000);
-  const I = "ins_g44_1";
-  const originalNavigator = globalThis.navigator;
-  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
-  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
-  const pump = async (n = 5_000) => {
-    for (let i = 0; i < n; i += 1) await Promise.resolve();
-  };
-  let seams: Record<string, unknown> | null = null;
-  try {
-    sessionStorage.setItem("remuda-outbox-owner", "owner_g44_1");
-    localStorage.setItem("runtime.device-session", JSON.stringify({ deviceId: "devA_g44_1", name: "A" }));
-    const { api, hubStore } = await fresh();
-    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
-    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
-    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
-    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
-    vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
-    vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
-    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
-    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
-    vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
-    vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
-    vi.spyOn(api, "instanceList").mockResolvedValue({
-      items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
-      nextCursor: null,
-    } as never);
-    vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
-    const hello = vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
-
-    // One durable row: restored exactly once, by the CURRENT generation.
-    const seed = new (await import("./outbox")).LocalStorageOutboxStorage();
-    await seed.put({
-      commandId: "cmd_g44_1", clientRequestId: "local_g44_1", instanceId: I,
-      prompt: "g44 1", createdAt: 1, attempts: 0, state: "pending",
-    });
-
-    const internals = hubStore as unknown as Record<string, unknown>;
-    seams = internals;
-    // The FIRST initializer parks AFTER installing its box; the interleave
-    // supersedes its generation and disposes the box while the continuation is
-    // parked. Later initializers (the current-generation recovery) run normally.
-    let firstInstallGate = false;
-    let releaseInstall: (() => void) | null = null;
-    (internals.setOutboxInstalledGateForTest as (g: ((r: () => void) => void) | null) => void)((resolve) => {
-      if (!firstInstallGate) {
-        firstInstallGate = true;
-        releaseInstall = resolve;
-      } else {
-        resolve();
-      }
-    });
-
-    const addSpy = vi.spyOn(window, "addEventListener");
-    const h = hubStore as unknown as {
-      bootstrap: () => Promise<void>;
-      connection: unknown;
-      state: { ready: boolean; authed: boolean; bubbles: Array<{ clientRequestId: string }> };
-    };
-    // Reload A (+ StrictMode duplicate A2) enters bootstrap; the initializer
-    // installs its box and parks at the interleave gate.
-    const bootA = h.bootstrap();
-    const bootA2 = h.bootstrap();
-    await pump(400);
-    expect(releaseInstall).not.toBeNull();
-    expect(hello).toHaveBeenCalledTimes(1);
-
-    // Interleave the credential supersession: generation advances and the
-    // just-installed box is disposed (external epoch unchanged).
-    let aFulfilled = false;
-    let a2Fulfilled = false;
-    void bootA.then(() => {
-      aFulfilled = true;
-      // Readiness at fulfilment: the CURRENT generation installed exactly one
-      // machine; A never fulfilled from its stale "ok"/null result.
-      expect(h.connection).not.toBeNull();
-      expect(addSpy.mock.calls.filter((c) => c[0] === "online")).toHaveLength(1);
-    });
-    void bootA2.then(() => { a2Fulfilled = true; });
-
-    (internals.credentialGenerationSupersedeForTest as () => void)();
-    releaseInstall!();
-    // A's stale continuation resumes with status "ok" but the box gone. The
-    // fix classifies it obsolete and hands the callers to a CURRENT-generation
-    // run, which performs its OWN bootstrap pass: A/A2 fulfil only once that
-    // pass completes (second health call), with exactly one machine.
-    await Promise.all([bootA, bootA2]);
-    await pump(8_000);
-    expect(aFulfilled).toBe(true);
-    expect(a2Fulfilled).toBe(true);
-    // A stale direct fulfilment would have resolved after the ORIGINAL single
-    // health pass; the mandatory current-generation handoff adds a second.
-    expect(hello.mock.calls.length).toBeGreaterThanOrEqual(2);
-    expect(addSpy.mock.calls.filter((c) => c[0] === "online")).toHaveLength(1);
-    expect(h.state.ready).toBe(true);
-    expect(h.state.authed).toBe(true);
-    expect(h.state.bubbles.filter((b) => b.clientRequestId === "local_g44_1")).toHaveLength(1);
-  } finally {
-    if (seams) {
-      (seams.setOutboxInstalledGateForTest as (g: ((r: () => void) => void) | null) => void)(null);
-    }
-    vi.useRealTimers();
-    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
-    sessionStorage.removeItem("remuda-outbox-owner");
-  }
-});;
-
-it("GATE46 item 1/4: a one-shot store subscriber starts a held login B at A's machine-state publication; A fulfils only on B's machine (healthy and offline-install paths differ)", async () => {
-  for (const variant of ["healthy", "offline-install"] as const) {
-    vi.useFakeTimers();
-    vi.setSystemTime(1_470_000 + (variant === "offline-install" ? 1 : 0));
-    const I = `ins_g46_1_${variant}`;
-    const originalNavigator = globalThis.navigator;
-    Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
-    localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
-    const pump = async (n = 5_000) => {
-      for (let i = 0; i < n; i += 1) await Promise.resolve();
-    };
-    try {
-      sessionStorage.setItem(`remeda-outbox-owner-g46-1-${variant}`, "owner");
-      localStorage.setItem("runtime.device-session", JSON.stringify({ deviceId: "devA_g46_1", name: "A" }));
-      const { api, hubStore } = await fresh();
-      vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
-      vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
-      vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
-      vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
-      vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
-      vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
-      vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
-      vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
-      vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
-      const startPollSpy = vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
-      vi.spyOn(api, "instanceList").mockResolvedValue({
-        items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
-        nextCursor: null,
-      } as never);
-      vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
-      // healthy: health succeeds, machine starts live. offline-install: the
-      // health request fails transiently once, so A's bootstrap takes the
-      // catch -> initConnection(offline) path (genuinely different branch).
-      const { RestNetworkError } = await import("./api");
-      let helloFailOnce = variant === "offline-install";
-      vi.spyOn(api, "hello").mockImplementation(() => {
-        if (helloFailOnce) {
-          helloFailOnce = false;
-          return Promise.reject(new RestNetworkError("offline once"));
-        }
-        return Promise.resolve({} as Awaited<ReturnType<Api["hello"]>>);
-      });
-
-      // The FIRST actual login request is held (B). A is the cold reload
-      // (bootstrap, cached session) — no login call is made for it.
-      let releaseB: () => void = () => undefined;
-      let bBodyPending = false;
-      vi.spyOn(api, "login").mockImplementationOnce(() => {
-        bBodyPending = true;
-        return new Promise((resolve) => {
-          releaseB = () => {
-            bBodyPending = false;
-            resolve({ deviceId: "devB_g46_1", token: "tokB", name: "B" });
-          };
-        });
-      });
-
-      const h = hubStore as unknown as {
-        bootstrap: () => Promise<void>;
-        subscribe: (cb: () => void) => () => void;
-        login: (k: "bootstrap", s: string, d: string) => Promise<void>;
-        outbox: unknown;
-        connection: unknown;
-        state: { authed: boolean; connection: string };
-      };
-      // ONE-SHOT REAL store subscriber: fires on the next machine-state
-      // publication (A's machine publishing its initial state) and starts the
-      // held login B synchronously — the exact production subscriber window.
-      // ONE-SHOT subscriber that fires only on a CONNECTION state change (the
-      // machine's publication), not on the earlier session/authed emits.
-      let prevConn = (hubStore as unknown as { state: { connection: string } }).state.connection;
-      let unsub = (): void => {};
-      unsub = h.subscribe(() => {
-        const store3 = hubStore as unknown as { state: { connection: string }; connection: unknown };
-        const conn = store3.state.connection;
-        if (conn === prevConn || !store3.connection) return;
-        prevConn = conn;
-        unsub();
-        void h.login("bootstrap", "secret", "devB");
-      });
-
-      // Assertions live in SAVED awaited callbacks for A and A2.
-      const assertReady = async (label: string) => {
-        expect(h.state.authed).toBe(true);
-        expect(h.connection).not.toBeNull();
-        void label;
-      };
-      // A (+ StrictMode duplicate A2) bootstrap; A's machine publishes and the
-      // subscriber starts B, which acquires and parks on its held body.
-      const bootA = h.bootstrap();
-      const bootA2 = h.bootstrap();
-      // Wait for B's held request to be in flight.
-      for (let i = 0; i < 100 && !bBodyPending; i += 1) await pump(50);
-      expect(bBodyPending).toBe(true);
-      // A is not fulfilled while B's body is held (its settled gen is stale).
-      let aFulfilled = false;
-      let a2Fulfilled = false;
-      const aReady = bootA.then(() => { aFulfilled = true; return assertReady("A"); });
-      const a2Ready = bootA2.then(() => { a2Fulfilled = true; return assertReady("A2"); });
-      await pump(400);
-      expect(aFulfilled).toBe(false);
-      expect(a2Fulfilled).toBe(false);
-      // A's stale-gen continuation never starts a poll while B holds the gen.
-      expect(startPollSpy).not.toHaveBeenCalled();
-
-      // Release B: its bootstrap installs the current-generation machine; A/A2
-      // are handed to that gen and fulfil on it.
-      releaseB!();
-      await aReady;
-      await a2Ready;
-      await pump(4_000);
-      expect(aFulfilled).toBe(true);
-      expect(a2Fulfilled).toBe(true);
-      expect(h.state.authed).toBe(true);
-      expect(h.connection).not.toBeNull();
-      expect(bBodyPending).toBe(false);
-    } finally {
-      vi.useRealTimers();
-      Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
-      sessionStorage.removeItem(`remeda-outbox-owner-g46-1-${variant}`);
-    }
-  }
-});;
-;
-
-it("GATE46 item 3: logout with a queued successor C retires every settlement waiter without stranding", async () => {
-  vi.useFakeTimers();
-  vi.setSystemTime(1_480_000);
-  const I = "ins_g46_3";
-  const originalNavigator = globalThis.navigator;
-  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
-  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
-  const pump = async (n = 5_000) => {
-    for (let i = 0; i < n; i += 1) await Promise.resolve();
-  };
-  try {
-    sessionStorage.setItem("remeda-outbox-owner", "owner_g46_3");
-    localStorage.setItem("runtime.logged-out", "1");
-    const { api, hubStore } = await fresh();
-    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
-    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
-    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
-    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
-    vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
-    vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
-    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
-    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
-    vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
-    vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
-    vi.spyOn(api, "instanceList").mockResolvedValue({
-      items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
-      nextCursor: null,
-    } as never);
-    vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
-    vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
-
-    let releaseA: () => void = () => {};
-    let resolveQueued: (() => void) | null = null;
-    const queuedSession = { deviceId: "devX_g46_3", token: "tokX", name: "X" };
-    vi.spyOn(api, "login")
-      .mockImplementationOnce(() => new Promise((resolve) => { releaseA = () => resolve({ deviceId: "devA_g46_3", token: "tokA", name: "A" }); }))
-      .mockImplementation(() => new Promise((resolve) => {
-        resolveQueued = () => resolve(queuedSession);
-      }));
-
-    const h = hubStore as unknown as {
-      login: (k: "bootstrap", s: string, d: string) => Promise<void>;
-      logout: () => void;
-      bootstrap: () => Promise<void>;
-      connection: unknown;
-      outbox: unknown;
-      state: { ready: boolean; authed: boolean };
-    };
-    // A held, B queued, C queued behind B.
-    const pA = h.login("bootstrap", "a", "devA");
-    const pB = h.login("bootstrap", "b", "devB");
-    const pC = h.login("bootstrap", "c", "devC");
-    await pump(300);
-    expect(releaseA).not.toBe(undefined);
-
-    // A's bootstrap parks in its storage initializer (gate).
-    const gates: Array<() => void> = [];
-    const internals = hubStore as unknown as Record<string, unknown>;
-    (internals.setOutboxOpenGateForTest as (g: ((r: () => void) => void) | null) => void)((r) => gates.push(r));
-
-    // Release A: it succeeds, superseded by B; A's continuation awaits B's
-    // current-gen install (which parks behind B's held body). B is superseded
-    // by C.
-    releaseA();
-    await pump(800);
-    expect(gates.length).toBeGreaterThanOrEqual(1);
-    // A must not have settled yet (B's body never resolves).
-    let aSettled = false;
-    void pA.then(() => { aSettled = true; });
-    await pump(200);
-    expect(aSettled).toBe(false);
-
-    // EXTERNAL logout while A/B/C are all pending on the queued chain. It must
-    // wake and RETIRE every settlement waiter; all three login promises settle
-    // (A already did via its own continuation, B/C obsolete-queued) and no
-    // bootstrap/box is installed.
-    h.logout();
-    // The queued login requests respond after logout (late server replies).
-    const rq = resolveQueued as (() => void) | null;
-    rq?.();
-    // Resolve every parked initializer so their awaits can observe the epoch.
-    for (const g of gates) g();
-    await pump(2_000);
-    expect(aSettled).toBe(true);
-    // B and C were queued-obsolete; their promises must settle (not hang) even
-    // though their held bodies never resolve.
-    // B and C were queued-obsolete: their public promises settle even though
-    // the held bodies never resolve. Microtask race (no real timer needed).
-    let settledCount = 0;
-    void Promise.all([pB, pC]).then(() => { settledCount = 2; });
-    await pump(500);
-    expect(settledCount).toBe(2);
-    expect(h.state.authed).toBe(false);
-    expect(h.connection).toBeNull();
-    expect(h.outbox).toBeNull();
-  } finally {
-    vi.useRealTimers();
-    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
-    sessionStorage.removeItem("remeda-outbox-owner");
-  }
-});
+})

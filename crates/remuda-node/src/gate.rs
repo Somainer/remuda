@@ -7736,52 +7736,19 @@ head -c 1 >/dev/null || exit 4
         }
     }
 
-    /// r20 item 4 / R8(b); r21 item 3 latched: a surviving grandchild IGNORES
-    /// SIGTERM and keeps the stderr pipe open past the tight ABSOLUTE deadline.
-    /// The owner never returns Completed — on Linux cleanup reaches the
-    /// deadline so the reap moves to the detached owner (Err), and where the
-    /// group cannot be enumerated the blocked drain yields TimedOut; both are
-    /// Unknown. r21 item 7 replaces this /proc-timing test with the
-    /// platform-independent seam test in remuda-unix.
-    #[test]
-    fn run_owned_blocked_pipe_is_abandoned_at_the_absolute_deadline_and_group_is_killed() {
-        let keep = tempfile::TempDir::new().unwrap();
-        let wrapper = keep.path().join("wrapper-blocked");
-        // SIG_IGN for TERM survives the exec into sleep; stderr stays the
-        // captured pipe so the reader blocks until the KILL.
-        std::fs::write(
-            &wrapper,
-            "#!/bin/sh\n(trap '' TERM; exec sleep 47.56) &\nexit 0\n",
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let started = std::time::Instant::now();
-        let command = std::process::Command::new(wrapper.to_str().unwrap());
-        // Soft cap is generous (the leader exits on its own), but the ABSOLUTE
-        // deadline is tight: cleanup + drains must all fit inside it.
-        let deadline = std::time::Instant::now() + Duration::from_millis(400);
-        let run = remuda_unix::run_owned_process(command, Duration::from_secs(10), deadline);
-        assert!(
-            !matches!(run, Ok(remuda_unix::OwnedRun::Completed(_))),
-            "a pipe blocked at the deadline is Unknown, got {run:?}"
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "the absolute deadline bounds the cleanup/drains: {:?}",
-            started.elapsed()
-        );
-        // The SIGKILL at the deadline still reaches the TERM-ignoring holder.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            let left = live_marker_processes("sleep 47.56");
-            if left == 0 || std::time::Instant::now() >= deadline {
-                assert_eq!(left, 0, "the TERM-ignoring pipe holder survived the KILL");
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
+    // r21 item 7: the blocked-pipe/deadline regression no longer lives here.
+    // The old test assumed Linux /proc enumeration makes a TERM-ignoring
+    // descendant consume the tight deadline; without /proc (macOS) the owner
+    // signals, KILLs and reaps before the deadline and correctly returns
+    // Completed, so the mandatory Unknown assertion failed under ordinary
+    // scheduling. Platform-independent coverage now runs against the shared
+    // owner itself in remuda-unix:
+    // `owner::tests::completion_after_the_deadline_is_latched_unknown` uses
+    // the injected post-exit-observation seam to hold the whole
+    // cleanup/reap/drain sequence beyond the absolute deadline and asserts
+    // the latched Unknown on every platform. This module keeps the portable
+    // owner-sequence tests above (soft-cap kill, normal-exit survivor
+    // cleanup) and the Node-specific async land-path tests.
 
     /// Helper for the shallow-history resolve tests: `git clone` through the
     /// smart file:// transport (plain local paths ignore --depth).

@@ -7,8 +7,8 @@
 #![cfg(unix)]
 
 use remuda_driver::{
-    BinarySource, ClaudePtyDriver, ClaudePtyOptions, Delegation, Driver, DriverKind, LaunchOrigin,
-    ProviderHealth, ProviderKind, ProviderProfile, pin_binary,
+    BinarySource, ClaudePtyDriver, ClaudePtyOptions, Delegation, Driver, DriverKind, FileLifetime,
+    LaunchOrigin, ProviderHealth, ProviderKind, ProviderProfile, pin_binary,
 };
 use remuda_protocol::{InstanceSpec, LifecyclePayload, ObservationPayload};
 use remuda_testing::{
@@ -68,10 +68,6 @@ async fn a_failed_first_carrier_close_is_completed_once_by_a_retry() {
     // Marker that arms the fake's close-subscribe refusal while present.
     let refuse_marker = tmp.path().join("refuse-closes");
     fs::write(&refuse_marker, "1").unwrap();
-    // report_launch_cleanup writes a marker next to the recipe; assert it ran
-    // exactly once by the time the successful close returns.
-    let cleanup_marker = launch.join("cleanup-done");
-    assert!(!cleanup_marker.exists());
 
     // The fake refuses the FIRST close-phase events.subscribe with a
     // transient server_unavailable; the retry connection's snapshot succeeds.
@@ -104,6 +100,19 @@ async fn a_failed_first_carrier_close_is_completed_once_by_a_retry() {
     }));
 
     let handle = driver.start(spec(&cwd)).await.expect("start");
+    // c-ctxusage r26 item 4: the ACTUAL launch-lifetime recipe paths
+    // (report_launch_cleanup shreds these on a successful close).
+    let launch_files: Vec<std::path::PathBuf> = handle
+        .recipe()
+        .materialized_files
+        .iter()
+        .filter(|file| file.lifetime == FileLifetime::Launch)
+        .map(|file| std::path::PathBuf::from(&file.path))
+        .collect();
+    assert!(
+        !launch_files.is_empty(),
+        "the launch materializes at least one launch-lifetime file"
+    );
     let mut events_rx = handle.into_events();
     let closed_count = Arc::new(AtomicU32::new(0));
     let counter = Arc::clone(&closed_count);
@@ -164,6 +173,20 @@ async fn a_failed_first_carrier_close_is_completed_once_by_a_retry() {
         0,
         "no carrier_closed on the failed first close"
     );
+    // r26 item 4: a FAILED close never runs launch cleanup and never retires
+    // the live state — the overlays survive for the retry.
+    for path in &launch_files {
+        assert!(
+            path.exists(),
+            "{} must survive the failed first close",
+            path.display()
+        );
+    }
+    assert!(
+        driver.native_ref().await.is_some(),
+        "the failed close does not retire the live state"
+    );
+    assert_eq!(driver.retirement_count(), 0);
 
     // Retry: succeeds and completes the terminal phases once. Wait for the
     // single carrier_closed frame bounded, rather than a fixed sleep.
@@ -183,6 +206,25 @@ async fn a_failed_first_carrier_close_is_completed_once_by_a_retry() {
         terminal_after_retry, 1,
         "exactly one carrier_closed after the successful retry"
     );
+    // r26 item 4: the successful retry really ran launch cleanup (every
+    // launch-lifetime overlay is gone) and retired the captured live state
+    // exactly once.
+    for path in &launch_files {
+        assert!(
+            !path.exists(),
+            "{} removed by report_launch_cleanup on the successful close",
+            path.display()
+        );
+    }
+    assert!(
+        driver.native_ref().await.is_none(),
+        "the successful close retires the live state"
+    );
+    assert_eq!(
+        driver.retirement_count(),
+        1,
+        "the successful retry retires the live state once"
+    );
 
     // A third close is a clean no-op (no second terminal observation).
     tokio::time::timeout(Duration::from_secs(30), driver.close())
@@ -194,6 +236,11 @@ async fn a_failed_first_carrier_close_is_completed_once_by_a_retry() {
         closed_count.load(Ordering::SeqCst),
         1,
         "the no-op close does not emit a second carrier_closed"
+    );
+    assert_eq!(
+        driver.retirement_count(),
+        1,
+        "the no-op close never retires again"
     );
 
     drainer.abort();

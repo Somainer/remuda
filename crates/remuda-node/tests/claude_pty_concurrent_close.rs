@@ -6,8 +6,8 @@
 #![cfg(unix)]
 
 use remuda_driver::{
-    BinarySource, ClaudePtyDriver, ClaudePtyOptions, Delegation, Driver, DriverKind, LaunchOrigin,
-    ProviderHealth, ProviderKind, ProviderProfile, pin_binary,
+    BinarySource, ClaudePtyDriver, ClaudePtyOptions, Delegation, Driver, DriverKind, FileLifetime,
+    LaunchOrigin, ProviderHealth, ProviderKind, ProviderProfile, pin_binary,
 };
 use remuda_protocol::{InstanceSpec, LifecyclePayload, ObservationPayload};
 use remuda_testing::{
@@ -91,6 +91,19 @@ async fn two_concurrent_closes_emit_one_terminal_observation_and_retire_once() {
     }));
 
     let handle = driver.start(spec(&cwd)).await.expect("start");
+    // c-ctxusage r26 item 4: real launch-lifetime recipe paths, all of which
+    // the single completion phase must remove exactly once.
+    let launch_files: Vec<std::path::PathBuf> = handle
+        .recipe()
+        .materialized_files
+        .iter()
+        .filter(|file| file.lifetime == FileLifetime::Launch)
+        .map(|file| std::path::PathBuf::from(&file.path))
+        .collect();
+    assert!(!launch_files.is_empty());
+    for path in &launch_files {
+        assert!(path.exists(), "{} exists before close", path.display());
+    }
     let mut events_rx = handle.into_events();
     let closed_count = Arc::new(AtomicU32::new(0));
     let counter = Arc::clone(&closed_count);
@@ -129,6 +142,24 @@ async fn two_concurrent_closes_emit_one_terminal_observation_and_retire_once() {
         closed_count.load(Ordering::SeqCst),
         1,
         "exactly one carrier_closed across two concurrent closes"
+    );
+    // r26 item 4: the launch cleanup and live-state retirement also happen
+    // exactly once, witnessed independently of the terminal frame.
+    for path in &launch_files {
+        assert!(
+            !path.exists(),
+            "{} removed by the one completion phase",
+            path.display()
+        );
+    }
+    assert!(
+        driver.native_ref().await.is_none(),
+        "the live state is retired after the concurrent closes"
+    );
+    assert_eq!(
+        driver.retirement_count(),
+        1,
+        "two concurrent closes retire the captured live state exactly once"
     );
     drainer.abort();
 }

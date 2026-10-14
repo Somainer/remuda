@@ -35,6 +35,8 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(any(test, feature = "test-stub"))]
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
@@ -231,9 +233,20 @@ pub struct ClaudePtyDriver {
     /// completion (a no-op) instead of duplicating the terminal work.
     close_lock: Mutex<()>,
     seq: Arc<AtomicU64>,
+    /// c-ctxusage r26 item 4 test witness: number of times a completed close
+    /// retired the captured live state. Concurrent closes must retire once.
+    /// Gated like shell_pty's `fail_after_spawn` seam (cfg test / test-stub).
+    #[cfg(any(test, feature = "test-stub"))]
+    retirements: AtomicU32,
 }
 
 impl ClaudePtyDriver {
+    /// Number of times close completed live-state retirement (test witness for
+    /// exactly-once retirement under concurrent closes).
+    #[cfg(any(test, feature = "test-stub"))]
+    pub fn retirement_count(&self) -> u32 {
+        self.retirements.load(Ordering::SeqCst)
+    }
     /// Build a driver from explicit options.
     pub fn new(options: ClaudePtyOptions) -> Self {
         Self {
@@ -245,6 +258,8 @@ impl ClaudePtyDriver {
             closed: AtomicBool::new(false),
             close_lock: Mutex::new(()),
             seq: Arc::new(AtomicU64::new(0)),
+            #[cfg(any(test, feature = "test-stub"))]
+            retirements: AtomicU32::new(0),
         }
     }
 
@@ -1290,7 +1305,12 @@ impl Driver for ClaudePtyDriver {
             live.close_complete = true;
         }
         drop(inner);
-        self.inner.lock().await.take();
+        #[cfg_attr(not(any(test, feature = "test-stub")), allow(unused_variables))]
+        let retired = self.inner.lock().await.take().is_some();
+        #[cfg(any(test, feature = "test-stub"))]
+        if retired {
+            self.retirements.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(DriverAck::not_dispatched())
     }
 

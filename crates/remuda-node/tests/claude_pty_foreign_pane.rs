@@ -80,10 +80,15 @@ async fn a_forced_close_after_a_server_restart_refuses_the_reused_foreign_pane()
     fs::write(&transcript, "").unwrap();
 
     // The fake restarts on the first ctrl+c and reuses the agent pane id for
-    // a FOREIGN workspace with its own live agent.
-    let _fake =
-        FakeHerdrServer::spawn(FakeHerdrOptions::new(&socket).restart_reuses_ids_on_ctrlc())
-            .unwrap();
+    // a FOREIGN workspace with its own live agent. It records every control
+    // dispatch it serves, so the test can prove ZERO reached the reused pane.
+    let dispatch_record = tmp.path().join("control-dispatches.jsonl");
+    let _fake = FakeHerdrServer::spawn(
+        FakeHerdrOptions::new(&socket)
+            .restart_reuses_ids_on_ctrlc()
+            .control_dispatches_record_to(&dispatch_record),
+    )
+    .unwrap();
 
     // The polite exit returns "foreign" the moment the restart lands; the
     // shortened grace only bounds how long the close call runs.
@@ -218,6 +223,19 @@ async fn a_forced_close_after_a_server_restart_refuses_the_reused_foreign_pane()
         matches!(attach_err, Err(DriverError::ControlUnavailable)),
         "attach after a failed close is refused, got {attach_err:?}"
     );
+    // r26 item 4: the TTY bridge gate too — no bridge can be handed out for
+    // the pane a foreign boot now owns.
+    assert!(
+        driver.tty_bridge().await.is_none(),
+        "tty_bridge after a failed close must be None"
+    );
+    // None of the refused controls, nor anything else, dispatched to the
+    // reused foreign pane: the fake recorded no control RPC at all.
+    let dispatched = fs::read_to_string(&dispatch_record).unwrap_or_default();
+    assert!(
+        dispatched.is_empty(),
+        "zero control dispatches after the failed close, got: {dispatched}"
+    );
 
     // Positive proof the foreign pane, workspace and live agent survived the
     // refused close, on a server whose boot generation bumped.
@@ -283,6 +301,12 @@ async fn a_forced_close_after_a_server_restart_refuses_the_reused_foreign_pane()
             .iter()
             .any(|agent| agent.pane_id == foreign_pane),
         "the foreign agent must still survive the retried close"
+    );
+    // The retried no-op close dispatched no control either.
+    let dispatched = fs::read_to_string(&dispatch_record).unwrap_or_default();
+    assert!(
+        dispatched.is_empty(),
+        "zero control dispatches after the retried close, got: {dispatched}"
     );
 
     drainer.abort();

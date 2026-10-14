@@ -141,6 +141,11 @@ pub struct FakeHerdrOptions {
     /// File whose contents are appended to `force_close_transcript` when a
     /// still-live agent pane is force-closed.
     pub force_close_record_file: Option<PathBuf>,
+    /// c-ctxusage r26 item 4: every control dispatch (`agent.prompt`,
+    /// `agent.send_keys`) the fake serves appends one JSON line
+    /// (`{"method":…,"target":…}`) to this file. A close-gate regression arms
+    /// it and asserts ZERO lines reached a pane after a failed close.
+    pub control_dispatch_record_file: Option<PathBuf>,
     /// Server-restart / ID-reuse model (c-ctxusage r14 item 1): the FIRST
     /// live-agent ctrl+c makes the fake act like Herdr restarted — the boot
     /// generation bumps and the deterministic ids (`w1`, `w1:t1`, `w1:p1`)
@@ -202,6 +207,7 @@ impl FakeHerdrOptions {
             interrupt_record_file: None,
             force_close_transcript: None,
             force_close_record_file: None,
+            control_dispatch_record_file: None,
             restart_reuses_ids_on_ctrlc: false,
             restart_barrier_on_close: false,
             restart_barrier_close_ordinal: 1,
@@ -259,6 +265,15 @@ impl FakeHerdrOptions {
     ) -> Self {
         self.force_close_transcript = Some(transcript.into());
         self.force_close_record_file = Some(record_file.into());
+        self
+    }
+
+    /// Append one JSON line per served control dispatch
+    /// (`agent.prompt`/`agent.send_keys`) to `record_file` (c-ctxusage r26
+    /// item 4): the zero-foreign-dispatch witness.
+    #[must_use]
+    pub fn control_dispatches_record_to(mut self, record_file: impl Into<PathBuf>) -> Self {
+        self.control_dispatch_record_file = Some(record_file.into());
         self
     }
 
@@ -402,6 +417,9 @@ impl FakeHerdrServer {
         }
         if let Some(record_file) = &options.force_close_record_file {
             command.env("FAKE_HERDR_FORCE_CLOSE_RECORD", record_file);
+        }
+        if let Some(record_file) = &options.control_dispatch_record_file {
+            command.env("FAKE_HERDR_CONTROL_DISPATCH_RECORD", record_file);
         }
         if options.restart_reuses_ids_on_ctrlc {
             command.env("FAKE_HERDR_RESTART_REUSES_IDS", "1");
@@ -598,6 +616,10 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
         .ok()
         .filter(|value| !value.is_empty())
         .map(PathBuf::from);
+    let control_dispatch_record_file = std::env::var("FAKE_HERDR_CONTROL_DISPATCH_RECORD")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
     let mut restart_reuses_ids_on_ctrlc = std::env::var("FAKE_HERDR_RESTART_REUSES_IDS")
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true"));
     let mut restart_barrier_on_close = std::env::var("FAKE_HERDR_RESTART_BARRIER_ON_CLOSE")
@@ -720,6 +742,7 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
             interrupt_record_file,
             force_close_transcript,
             force_close_record_file,
+            control_dispatch_record_file,
             restart_reuses_ids_on_ctrlc,
             restart_barrier_on_close,
             restart_barrier_close_ordinal,
@@ -836,6 +859,7 @@ async fn serve(options: FakeHerdrOptions) -> Result<(), FakeHerdrError> {
         options.interrupt_record_file,
         options.force_close_transcript,
         options.force_close_record_file,
+        options.control_dispatch_record_file,
         options.restart_reuses_ids_on_ctrlc,
         options.restart_barrier_on_close,
         options.restart_barrier_close_ordinal,
@@ -919,6 +943,8 @@ struct State {
     /// c-ctxusage r25 item 3: marker file; refuse closes-subscribes while it
     /// exists.
     refuse_close_subscribes_marker: Option<PathBuf>,
+    /// c-ctxusage r26 item 4: one JSON line per served control dispatch.
+    control_dispatch_record_file: Option<PathBuf>,
     /// Bumped by the simulated restart; surfaced in `ping` capabilities.
     server_generation: u32,
 }
@@ -934,6 +960,7 @@ impl State {
         interrupt_record_file: Option<PathBuf>,
         force_close_transcript: Option<PathBuf>,
         force_close_record_file: Option<PathBuf>,
+        control_dispatch_record_file: Option<PathBuf>,
         restart_on_ctrlc: bool,
         restart_barrier_on_close: bool,
         close_barrier_ordinal: u32,
@@ -963,6 +990,7 @@ impl State {
             interrupt_record_file,
             force_close_transcript,
             force_close_record_file,
+            control_dispatch_record_file,
             restart_on_ctrlc,
             restart_done: false,
             restart_barrier_on_close,
@@ -1971,11 +1999,36 @@ fn crash_screen(args: &[String]) -> String {
     "error: unexpected argument '--name' found\nUsage: grok [OPTIONS] [PROMPT]\n%\n".into()
 }
 
+/// Append one line per control dispatch the fake actually served
+/// (c-ctxusage r26 item 4). Best-effort: the witness file is test
+/// infrastructure, a write failure must never change the RPC result.
+fn record_control_dispatch(st: &State, method: &str, target: &str) {
+    let Some(path) = &st.control_dispatch_record_file else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(
+            file,
+            "{}",
+            serde_json::json!({ "method": method, "target": target })
+        );
+    }
+}
+
 fn agent_prompt(st: &mut State, params: &Value) -> Result<Value, (&'static str, String)> {
     let target = params
         .get("target")
         .and_then(Value::as_str)
         .ok_or(("invalid_request", "missing target".into()))?;
+    record_control_dispatch(st, "agent.prompt", target);
     let text = params.get("text").and_then(Value::as_str).unwrap_or("");
     let name = resolve_agent(st, target)?;
     if st.dead_agents.contains(&name) {
@@ -2075,6 +2128,7 @@ fn agent_send_keys(st: &mut State, params: &Value) -> Result<Value, (&'static st
         .get("target")
         .and_then(Value::as_str)
         .ok_or(("invalid_request", "missing target".into()))?;
+    record_control_dispatch(st, "agent.send_keys", target);
     let name = resolve_agent(st, target)?;
     let keys: Vec<String> = params
         .get("keys")

@@ -2158,8 +2158,8 @@ async fn a_duplicate_failed_verdict_keeps_the_referenced_gate_log_object() {
         }
     });
 
-    // First arrival: persists the log under the stable per-job object id and
-    // commits Failed with logObjectId set.
+    // First arrival: persists the log under its content-addressed object id
+    // and commits Failed with logObjectId set.
     ctx.hub
         .test_apply_gate_result(&job_id, failed_result.clone())
         .await
@@ -2354,14 +2354,14 @@ fn failed_gate_result(job_id: &str, _branch: &str) -> Value {
     })
 }
 
-/// A pre-upgrade job references a LEGACY random object id A. A later runLog
-/// result must reuse that id (not derive a new deterministic B and delete
-/// A), including when a competing terminal write (the duplicate's first
-/// arrival / grace finisher) makes THIS writer stop at the guard after
-/// persisting. The job's stored logObjectId resolves by object id and by
-/// job id.
+/// r19 item 4: a pre-upgrade job references a LEGACY object id holding OLD
+/// bytes. A later runLog gets its OWN immutable content-addressed object and
+/// can never mutate the legacy row. Here a competing terminal write (the
+/// duplicate's first arrival) makes THIS writer stop at the guard after it
+/// persisted, so the job keeps the legacy reference, which keeps serving the
+/// OLD bytes by object id and by job id.
 #[tokio::test]
-async fn a_late_runlog_reuses_the_jobs_legacy_log_object_id_through_a_terminal_interleave() {
+async fn a_late_runlog_never_overwrites_the_jobs_legacy_log_object() {
     use remuda_hub::store_test_support::TestGateFinishBeforeWrite;
 
     let (ctx, _node) = Ctx::boot().await.unwrap();
@@ -2369,7 +2369,8 @@ async fn a_late_runlog_reuses_the_jobs_legacy_log_object_id_through_a_terminal_i
 
     // The second handler's perspective: its pre-read saw Running and the
     // first duplicate arrival's Failed write lands inside its writer after
-    // the persist. The persist must replace bytes UNDER THE LEGACY ID.
+    // the persist. Its OWN object is inserted immutably, and the writer then
+    // stands down without rebinding, so the legacy reference is untouched.
     ctx.store().test_arm_finish_before_gate_mutate(
         job_id.clone(),
         TestGateFinishBeforeWrite::DuplicateFailed,
@@ -2379,13 +2380,14 @@ async fn a_late_runlog_reuses_the_jobs_legacy_log_object_id_through_a_terminal_i
         .await
         .unwrap();
 
-    // The job still references the legacy id, which now holds the new bytes.
+    // The seam's terminal write preserved the legacy reference; the late
+    // writer did not rebind it.
     let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
     assert_eq!(doc["state"], json!("failed"), "{doc}");
     assert_eq!(
         doc["logObjectId"],
         json!(legacy_id),
-        "the legacy reference must be reused, not orphaned: {doc}"
+        "the legacy reference stays bound through the interleave: {doc}"
     );
 
     let (status, by_object) = ctx
@@ -2401,8 +2403,8 @@ async fn a_late_runlog_reuses_the_jobs_legacy_log_object_id_through_a_terminal_i
     assert_eq!(by_object["objectId"], json!(legacy_id), "{by_object}");
     assert_eq!(
         by_object["log"]["headline"],
-        json!("the NEW evidence"),
-        "the reused object should carry the new bytes: {by_object}"
+        json!("the OLD evidence"),
+        "the immutable legacy object must keep the OLD bytes: {by_object}"
     );
     let (status, by_job) = ctx
         .send(
@@ -2419,11 +2421,16 @@ async fn a_late_runlog_reuses_the_jobs_legacy_log_object_id_through_a_terminal_i
         json!(legacy_id),
         "by-job lookup resolves elsewhere: {by_job}"
     );
+    assert_eq!(
+        by_job["log"]["headline"],
+        json!("the OLD evidence"),
+        "by-job lookup still serves the immutable OLD evidence: {by_job}"
+    );
 }
 
-/// A failed INSERT inside the log writer must roll the prior DELETE back:
-/// the previously referenced object stays served. The select/delete/insert
-/// are one immediate transaction.
+/// A failed INSERT in the immutable log writer must leave the previously
+/// referenced object served (nothing is deleted) and the job keeps its prior
+/// reference because no new object is bound.
 #[tokio::test]
 async fn a_failed_log_insert_keeps_the_previous_object_served() {
     let (ctx, _node) = Ctx::boot().await.unwrap();
@@ -4167,12 +4174,14 @@ async fn the_max_positive_i64_session_grants_but_a_2_31_epoch_is_refused() {
 }
 
 /// r18 item 7: a winning landed verdict must reference ITS OWN evidence. The
-/// evidence persist and the settlement are separate transactions; a concurrent
-/// same-grant result that replaces the log object between them must not make
-/// this verdict settle pointing at the other evidence. The gate-apply barrier
-/// parks AFTER persist and BEFORE the settlement writer, so we deterministically
-/// interleave: persist A, replace the object with B, release — A refuses and the
-/// row stays Landing. An identical dual delivery (same digest) settles.
+/// r19 item 4: each verdict gets an immutable content-addressed object, so a
+/// concurrent same-grant result persisting different bytes can never overwrite
+/// this verdict's evidence. The gate-apply barrier parks AFTER persist and
+/// BEFORE the settlement writer, so we deterministically interleave: A
+/// persists its object, B persists different bytes, release — A settles
+/// landed serving its OWN bytes; B's object is stored but unbound and B's
+/// later arrival stands down. An identical dual delivery (same digest)
+/// resolves to the same object id.
 #[tokio::test]
 async fn a_landed_verdict_cannot_reference_another_results_evidence() {
     let (ctx, _node) = Ctx::boot().await.unwrap();
@@ -4198,7 +4207,10 @@ async fn a_landed_verdict_cannot_reference_another_results_evidence() {
         })
     };
 
-    // Park A's apply AFTER it persisted evidence A but BEFORE settlement.
+    // r19 item 4: evidence objects are IMMUTABLE and per result. Park A after
+    // it persisted its own object; a concurrent same-grant result B persists
+    // DIFFERENT bytes. They resolve to distinct content-addressed objects, so
+    // A settles landed bound to ITS OWN evidence even with B interleaved.
     let barrier = ctx.store().gate_after_persist_barrier();
     barrier.arm();
     let job_a = job.clone();
@@ -4218,14 +4230,15 @@ async fn a_landed_verdict_cannot_reference_another_results_evidence() {
     });
     barrier.wait_parked(1).await;
 
-    // A's evidence is persisted; now a concurrent same-grant result B replaces
-    // the per-job object with different bytes while A is parked.
-    let replaced = ctx
+    // A concurrent same-grant handler persists DIFFERENT evidence while A is
+    // parked. Under the old per-job object this deleted-and-replaced A's row;
+    // now it is a separate immutable object.
+    let b_id = ctx
         .hub
         .test_insert_gate_log(
             &ctx.project,
             &job,
-            br#"{"headline":"EVIDENCE-B"}"#.to_vec(),
+            serde_json::to_vec(&run_log("EVIDENCE-B")).unwrap(),
             "digest-b".into(),
             "dev",
             1,
@@ -4235,37 +4248,243 @@ async fn a_landed_verdict_cannot_reference_another_results_evidence() {
         )
         .await
         .unwrap()
-        .expect("B replaces the Landing object while A is parked");
-    assert!(
-        replaced.starts_with("obj_"),
-        "B writes under the same deterministic per-job object: {replaced}"
-    );
+        .expect("B persists its own object while A is parked");
+    assert!(b_id.starts_with("obj_"), "{b_id}");
 
-    // Release A: its settlement reads the linked digest (B) ≠ A's run_log and
-    // must stand down, leaving the Landing.
+    // Release A: it settles landed and binds ITS OWN object, not B's.
     barrier.release();
     apply_a.await.unwrap();
     let doc = ctx.hub.test_get_gate_job(&job).await.unwrap().unwrap();
-    assert_eq!(
-        doc["state"],
-        json!("landing"),
-        "A must not settle while its linked evidence was replaced by B: {doc}"
-    );
+    assert_eq!(doc["state"], json!("landed"), "{doc}");
+    let a_id = doc["logObjectId"]
+        .as_str()
+        .expect("the landed job references A's object")
+        .to_owned();
+    assert_ne!(a_id, b_id, "A and B own distinct per-result objects: {doc}");
 
-    // Control: with no concurrent replacement, A's own identical delivery
-    // settles (its persist and writer see the same digest).
+    let (status, served) = ctx
+        .send(
+            "GET",
+            &format!("/v1/gate/logs/{a_id}"),
+            &ctx.human,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{served}");
+    assert_eq!(
+        served["log"]["headline"],
+        json!("EVIDENCE-A"),
+        "the settled landed verdict serves A's own bytes: {served}"
+    );
+    // B's object remains stored (immutable history) but is not the job's
+    // reference.
+    let (status_b, served_b) = ctx
+        .send(
+            "GET",
+            &format!("/v1/gate/logs/{b_id}"),
+            &ctx.human,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status_b, 200, "{served_b}");
+    assert_eq!(served_b["objectId"], json!(b_id), "{served_b}");
+
+    // B's real handler then arrives and stands down at the terminal guard;
+    // the bound evidence never changes.
     ctx.hub
         .test_apply_gate_result(
             &job,
             json!({
                 "jobId": job, "generation": 1, "status": "landed",
-                "mergeSha": merge, "runLog": run_log("EVIDENCE-A"),
+                "mergeSha": merge, "runLog": run_log("EVIDENCE-B"),
             }),
         )
         .await
         .unwrap();
     let settled = ctx.hub.test_get_gate_job(&job).await.unwrap().unwrap();
     assert_eq!(settled["state"], json!("landed"), "{settled}");
+    assert_eq!(settled["logObjectId"], json!(a_id), "{settled}");
+}
+
+/// r19 item 4: the ATTEMPT-CAP base-moved Failed settlement binds ITS OWN
+/// result's evidence. Two REAL same-grant attempt-3 base-moved results A and B
+/// carry different logs. A's handler persists first and parks; B's handler
+/// persists its own object while A is parked; A reaches the settlement first
+/// and must Fail the job bound to A's object (never B's bytes); B's later
+/// arrival stands down at the terminal guard.
+#[tokio::test]
+async fn an_attempt_cap_base_moved_failure_binds_its_own_results_evidence() {
+    let (ctx, _node) = Ctx::boot().await.unwrap();
+    ctx.configure_gate_lane().await;
+    let job = queued_land_job(&ctx).await;
+    let merge = "7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c";
+    let moved_base = "0123456789abcdef0123456789abcdef01234567";
+
+    let run_log = |headline: &'static str| {
+        json!({
+            "step": "*", "kind": "failed", "headline": headline,
+            "summary": [], "tail": [], "capturedLines": 1,
+            "truncated": false, "attempts": 3,
+        })
+    };
+
+    // Attempt 1: claim, then a real base-moved requeue through the running
+    // path; the scheduler claims attempt 2.
+    ctx.hub
+        .test_claim_gate_job(&job, "lane1", &ctx.host)
+        .await
+        .unwrap()
+        .expect("claimed attempt 1");
+    ctx.hub
+        .test_apply_gate_result(
+            &job,
+            json!({
+                "jobId": job, "generation": 1, "status": "base-moved",
+                "mergeSha": merge, "currentMainSha": moved_base,
+            }),
+        )
+        .await
+        .unwrap();
+    ctx.hub
+        .test_claim_gate_job(&job, "lane1", &ctx.host)
+        .await
+        .unwrap()
+        .expect("scheduler claims attempt 2");
+    let session = ctx.hub.test_node_session(&ctx.host).await.unwrap();
+    // Attempt 2 is granted (Landing); its base-moved verdict requeues.
+    ctx.hub
+        .test_gate_land_grant(&job, &ctx.host, merge, session)
+        .await
+        .unwrap();
+    ctx.hub
+        .test_apply_gate_result(
+            &job,
+            json!({
+                "jobId": job, "generation": 2, "status": "base-moved",
+                "mergeSha": merge, "currentMainSha": moved_base,
+            }),
+        )
+        .await
+        .unwrap();
+    // Attempt 3: claimed and granted — the row is Landing at the cap.
+    ctx.hub
+        .test_claim_gate_job(&job, "lane1", &ctx.host)
+        .await
+        .unwrap()
+        .expect("scheduler claims attempt 3");
+    ctx.hub
+        .test_gate_land_grant(&job, &ctx.host, merge, session)
+        .await
+        .unwrap();
+    let pre = ctx.hub.test_get_gate_job(&job).await.unwrap().unwrap();
+    assert_eq!(pre["attempts"], json!(3), "{pre}");
+    assert_eq!(pre["state"], json!("landing"), "{pre}");
+
+    // Handler A persists ITS evidence, then parks before the settlement.
+    let barrier = ctx.store().gate_after_persist_barrier();
+    barrier.arm();
+    let job_a = job.clone();
+    let apply_a = tokio::spawn({
+        let state = ctx.hub.test_state().clone();
+        async move {
+            remuda_hub::RunningHub::test_apply_gate_result_static(
+                &state,
+                &job_a,
+                json!({
+                    "jobId": job_a, "generation": 3, "status": "base-moved",
+                    "mergeSha": merge, "currentMainSha": moved_base,
+                    "runLog": run_log("EVIDENCE-A"),
+                }),
+            )
+            .await
+        }
+    });
+    barrier.wait_parked(1).await;
+
+    // Handler B's interleave: it persists its OWN evidence (different bytes)
+    // before A settles.
+    let b_id = ctx
+        .hub
+        .test_insert_gate_log(
+            &ctx.project,
+            &job,
+            serde_json::to_vec(&run_log("EVIDENCE-B")).unwrap(),
+            "digest-b".into(),
+            "dev",
+            3,
+            Some(session),
+            Some(&ctx.host),
+            Some(merge),
+        )
+        .await
+        .unwrap()
+        .expect("B persists its own attempt-3 object");
+
+    // A settles first: the job reaches Failed AT THE CAP bound to A's own
+    // object — never B's bytes.
+    barrier.release();
+    apply_a.await.unwrap();
+    let doc = ctx.hub.test_get_gate_job(&job).await.unwrap().unwrap();
+    assert_eq!(doc["state"], json!("failed"), "{doc}");
+    let a_id = doc["logObjectId"]
+        .as_str()
+        .expect("the Failed job references A's object")
+        .to_owned();
+    assert_ne!(
+        a_id, b_id,
+        "the cap failure binds A's object, not B's: {doc}"
+    );
+    let (status, served) = ctx
+        .send(
+            "GET",
+            &format!("/v1/gate/logs/{a_id}"),
+            &ctx.human,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{served}");
+    assert_eq!(
+        served["log"]["headline"],
+        json!("EVIDENCE-A"),
+        "the immutable Failed evidence is A's own bytes: {served}"
+    );
+
+    // B's own object is stored independently (and not bound to the job).
+    let (status_b, served_b) = ctx
+        .send(
+            "GET",
+            &format!("/v1/gate/logs/{b_id}"),
+            &ctx.human,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status_b, 200, "{served_b}");
+    assert_eq!(served_b["objectId"], json!(b_id), "{served_b}");
+
+    // B's REAL handler then arrives and stands down at the terminal guard;
+    // the Failed evidence stays A.
+    ctx.hub
+        .test_apply_gate_result(
+            &job,
+            json!({
+                "jobId": job, "generation": 3, "status": "base-moved",
+                "mergeSha": merge, "currentMainSha": moved_base,
+                "runLog": run_log("EVIDENCE-B"),
+            }),
+        )
+        .await
+        .unwrap();
+    let final_doc = ctx.hub.test_get_gate_job(&job).await.unwrap().unwrap();
+    assert_eq!(final_doc["state"], json!("failed"), "{final_doc}");
+    assert_eq!(
+        final_doc["logObjectId"],
+        json!(a_id),
+        "B's later arrival must never rebind the settled evidence: {final_doc}"
+    );
 }
 
 /// r16 item 6: when a NEW carrier B takes over while the older socket A is

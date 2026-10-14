@@ -1932,6 +1932,45 @@ pub(crate) async fn apply_result(
                 );
                 return None;
             }
+            // r19 item 4: bind EVERY definitive settlement to THIS result's
+            // OWN evidence. The object id is content-addressed and immutable;
+            // when this arrival persisted a run_log (new_object_id is Some),
+            // the linked row must hold exactly that log's digest — read inside
+            // this write transaction, so a same-grant result whose object was
+            // attached by an interleaved writer is observed and the verdict
+            // stands down. No run_log, or a persist that produced no object
+            // (nothing is rebound), leaves the check vacuous.
+            let evidence_is_own = |new_object_id: Option<&String>| -> bool {
+                let Some(run_log) = result.run_log.as_ref() else {
+                    return true;
+                };
+                let Some(new_object_id) = new_object_id else {
+                    return true;
+                };
+                let own_digest =
+                    crate::config::sha256_hex(&serde_json::to_vec(run_log).unwrap_or_default());
+                let linked: Option<String> = conn
+                    .query_row(
+                        "SELECT digest FROM gate_log_objects WHERE id = ?1",
+                        params![new_object_id],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .unwrap_or(None)
+                    .flatten();
+                if linked.as_deref() != Some(own_digest.as_str()) {
+                    tracing::info!(
+                        new_object_id,
+                        own_digest,
+                        ?linked,
+                        "dropping definitive gate settlement: linked evidence is another result's \
+                         log"
+                    );
+                    false
+                } else {
+                    true
+                }
+            };
             // Landing: settle the GRANTED attempt's land verdict. Cancel is not
             // grantable once Landing (the grant writer only takes Running), so
             // there is no Canceling sub-case here. Idempotent on the dual
@@ -2040,41 +2079,11 @@ pub(crate) async fn apply_result(
                 row.finished_at = Some(now_ts());
                 match result.status.as_str() {
                     "landed" => {
-                        // r18 item 7: bind the winning landed verdict to ITS OWN
-                        // evidence, checked INSIDE this write transaction (so a
-                        // concurrent same-grant result that replaced the object
-                        // after this result persisted is observed). When this
-                        // verdict carries a run_log, the linked log object must
-                        // still hold that log's digest; otherwise the row stays
-                        // Landing. An identical dual delivery shares the digest.
-                        if let Some(object_id) = row
-                            .log_object_id
-                            .as_deref()
-                            .filter(|_| result.run_log.is_some())
-                        {
-                            let own_digest = crate::config::sha256_hex(
-                                &serde_json::to_vec(result.run_log.as_ref().expect("checked"))
-                                    .unwrap_or_default(),
-                            );
-                            let linked: Option<String> = conn
-                                .query_row(
-                                    "SELECT digest FROM gate_log_objects WHERE id = ?1",
-                                    params![object_id],
-                                    |r| r.get(0),
-                                )
-                                .optional()
-                                .unwrap_or(None)
-                                .flatten();
-                            if linked.as_deref() != Some(own_digest.as_str()) {
-                                tracing::info!(
-                                    object_id,
-                                    own_digest,
-                                    ?linked,
-                                    "dropping landed verdict: linked evidence is another result's \
-                                     log"
-                                );
-                                return None;
-                            }
+                        // r18 item 7 / r19 item 4: the winning landed verdict
+                        // is bound to ITS OWN evidence object (digest checked in
+                        // this transaction); a mismatch keeps the row Landing.
+                        if !evidence_is_own(log_object_id.as_ref()) {
+                            return None;
                         }
                         row.state = GateJobState::Landed;
                         row.error = None;
@@ -2096,6 +2105,14 @@ pub(crate) async fn apply_result(
                         row.log_object_id = None;
                     }
                     other => {
+                        // r19 item 4: the attempt-cap Failed settlement is a
+                        // DEFINITIVE settlement too — bind it to this result's
+                        // own evidence, so a same-grant base-moved result can
+                        // never pin another arrival's log (r18 only checked the
+                        // landed arm).
+                        if !evidence_is_own(log_object_id.as_ref()) {
+                            return None;
+                        }
                         row.state = GateJobState::Failed;
                         let error = result
                             .error
@@ -2144,7 +2161,11 @@ pub(crate) async fn apply_result(
                 row.finished_at = Some(now_ts());
                 if result.status == "landed" {
                     // The lane already pushed before the cancel reached it;
-                    // main moved. Keep the truth rather than claim a cancel.
+                    // main moved. Keep the truth rather than claim a cancel —
+                    // bound to this result's own evidence (r19 item 4).
+                    if !evidence_is_own(log_object_id.as_ref()) {
+                        return None;
+                    }
                     row.state = GateJobState::Landed;
                     row.error = None;
                     row.reason = Some("cancel arrived after the lane had pushed main".into());
@@ -2213,6 +2234,11 @@ pub(crate) async fn apply_result(
                 row.state = GateJobState::Passed;
                 row.finished_at = Some(now_ts());
             } else if result.status == "landed" {
+                // r19 item 4: a definitive landed settlement binds its own
+                // evidence digest.
+                if !evidence_is_own(log_object_id.as_ref()) {
+                    return None;
+                }
                 row.state = GateJobState::Landed;
                 row.finished_at = Some(now_ts());
                 row.error = None;
@@ -2229,6 +2255,12 @@ pub(crate) async fn apply_result(
                 row.reason = None;
                 row.log_object_id = None;
             } else {
+                // r19 item 4: a definitive failure (incl. an attempt-cap
+                // base-moved Failed reached through this arm) binds its own
+                // evidence digest.
+                if !evidence_is_own(log_object_id.as_ref()) {
+                    return None;
+                }
                 row.state = GateJobState::Failed;
                 row.finished_at = Some(now_ts());
                 row.error = result
@@ -2311,8 +2343,11 @@ pub(crate) async fn apply_result(
     barrier.note_completed();
 }
 
-/// Serialize and store the bounded run log as an `obj_…` gate log object.
-/// One log per job: a later attempt replaces the previous row.
+/// Serialize and store the bounded run log as an immutable,
+/// content-addressed `obj_…` gate log object (r19 item 4): one object per
+/// verdict, keyed by the job and the evidence sha256, so same-job arrivals
+/// never overwrite one another and a settlement binds only the object its own
+/// result persisted.
 /// What a bounded run log object is persisted for: the attempt generation and
 /// the authenticated carrier session the verdict rode (r13 item 4). Evidence
 /// for a Landing may only be written by the granted session.
@@ -3896,29 +3931,25 @@ pub(crate) struct GateLogObject {
 }
 
 impl Store {
-    /// Deterministic log-object id for a gate job. The Node delivers one
-    /// verdict TWICE (a `finished` event and the `gate.run` reply through
-    /// independent queues); a fresh random id per persist let the second
-    /// arrival delete the row the first writer had just referenced. A
-    /// per-job stable id makes the duplicate an in-place replacement: the
-    /// object id the job stores never dangles. A later re-verify attempt
-    /// replaces the bytes under the same id (still "one log per job").
-    pub(crate) fn gate_log_object_id(job_id: &str) -> String {
+    /// Deterministic, CONTENT-ADDRESSED log-object id for one verdict's
+    /// evidence (r19 item 4): `obj_<job>_<sha256>`. Every result gets its own
+    /// immutable object, so two same-grant arrivals with different logs never
+    /// overwrite one another and a settlement can only bind the object its own
+    /// result persisted. The Node's duplicate delivery (a `finished` event and
+    /// the `gate.run` reply) carries identical bytes, so both arrivals resolve
+    /// to the same id and the second persist is an idempotent no-op.
+    pub(crate) fn gate_log_object_id(job_id: &str, digest: &str) -> String {
         let suffix = job_id.strip_prefix("gjb_").unwrap_or(job_id);
-        format!("obj_{suffix}")
+        format!("obj_{suffix}_{digest}")
     }
 
-    /// Replace and persist the log object for one job run; returns the
-    /// object id the JOB references — its existing `logObjectId` when it
-    /// already has one (legacy pre-upgrade random id or the stable per-job
-    /// id), or the deterministic per-job id when none exists. Reusing the
-    /// referenced id means even a writer that persists and then stops at the
-    /// terminal guard never leaves the job pointing at a deleted object.
-    ///
-    /// The lookup, delete and insert run in ONE immediate transaction, so a
-    /// concurrent GET can never observe the post-delete/pre-insert gap and a
-    /// failed insert rolls the delete back (the previous object stays
-    /// served).
+    /// Persist one verdict's evidence as an IMMUTABLE, CONTENT-ADDRESSED log
+    /// object (r19 item 4), returning its object id. Different results of one
+    /// job get different rows and never overwrite one another; the settlement
+    /// transaction binds the job to the id this call returned and verifies its
+    /// digest. An identical dual delivery (finished event + RPC reply) resolves
+    /// to the same id and is a no-op. A failed insert rolls back, creates no
+    /// object, and leaves every earlier object served.
     pub(crate) async fn insert_gate_log(
         &self,
         project_id: &str,
@@ -3966,28 +3997,21 @@ impl Store {
                 tx.commit()?;
                 return Ok(None);
             }
-            // r17 item 3: read the row's current state, grant tuple and the
-            // accepted log digest INSIDE this transaction, so the validation
-            // and the (no-op or replace) write are atomic against the verdict
-            // settlement. A late evidence frame after terminal settlement is
-            // checked below, not skipped.
-            let (current_state, row_merge, current_digest): (
-                Option<String>,
-                Option<String>,
-                Option<String>,
-            ) = tx
+            // r19 item 4: read the row's current state and grant tuple INSIDE
+            // this transaction, so the authority validation and the immutable
+            // insert are atomic against the verdict settlement. Objects are
+            // content-addressed, so no accepted-digest comparison is needed
+            // here — a settlement binds its own object by digest.
+            let (current_state, row_merge): (Option<String>, Option<String>) = tx
                 .query_row(
                     "SELECT json_extract(doc_json, '$.state'),
-                            json_extract(doc_json, '$.mergeSha'),
-                            lo.digest
-                       FROM gate_jobs j
-                       LEFT JOIN gate_log_objects lo ON lo.id = json_extract(j.doc_json, '$.logObjectId')
-                      WHERE j.id = ?1",
+                            json_extract(doc_json, '$.mergeSha')
+                       FROM gate_jobs WHERE id = ?1",
                     params![job_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?
-                .unwrap_or((None, None, None));
+                .unwrap_or((None, None));
             // The exact-grant tuple is required while the row is a LANDING
             // (session + host + merge) and, r17 item 3, on a settled
             // landed/failed land row too. A terminal settlement NULLS
@@ -4039,47 +4063,17 @@ impl Store {
                     return Ok(None);
                 }
             }
-            // r17 item 3: once the job has reached a terminal state with an
-            // ACCEPTED log object, the evidence is IMMUTABLE. A different digest
-            // (even from the exact grant session) is rejected; only an
-            // identical duplicate (the Node's finished-event + RPC-reply pair)
-            // is accepted, touching nothing. running/landing/queued rows still
-            // settle their evidence and keep the prior replace semantics.
-            let row_is_terminal = !matches!(
-                current_state.as_deref(),
-                None | Some("running" | "landing" | "queued")
-            );
-            if row_is_terminal
-                && let Some(accepted_digest) = current_digest.as_deref()
-                && accepted_digest != digest
-            {
-                tracing::info!(
-                    job_id,
-                    current_state = current_state.as_deref().unwrap_or(""),
-                    "rejecting mismatched evidence after terminal settlement (immutable accepted \
-                     log)"
-                );
-                tx.commit()?;
-                return Ok(None);
-            }
-            // The id this job already references, read under the same
-            // transaction before any delete. Covers legacy random ids; only
-            // a row with no reference at all gets the deterministic id.
-            let referenced: Option<String> = tx
-                .query_row(
-                    "SELECT json_extract(doc_json, '$.logObjectId')
-                       FROM gate_jobs WHERE id = ?1",
-                    params![job_id],
-                    |row| row.get::<_, Option<String>>(0),
-                )
-                .optional()?
-                .flatten();
-            let object_id = referenced
-                .filter(|id| id.starts_with("obj_"))
-                .unwrap_or_else(|| Self::gate_log_object_id(&job_id));
-            // The Node delivers one verdict twice (finished event + RPC
-            // reply), and both handlers persist the same bytes. If the
-            // referenced row already stores that exact digest, touch nothing.
+            // r19 item 4: evidence objects are IMMUTABLE and
+            // CONTENT-ADDRESSED. A later result (even on a terminal row) gets
+            // its OWN object row and never mutates this one; the job's binding
+            // is only changed by a settlement transaction that verifies the
+            // linked digest, so here we never delete or overwrite and never
+            // reject on a different digest — the host/merge guards above remain
+            // the authority for WHOSE evidence may be stored.
+            let object_id = Self::gate_log_object_id(&job_id, &digest);
+            // The Node delivers one verdict twice (finished event + RPC reply)
+            // with identical bytes; both resolve to the same id, so the second
+            // write is an idempotent no-op.
             let same: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM gate_log_objects
                   WHERE id = ?1 AND digest = ?2",
@@ -4087,13 +4081,10 @@ impl Store {
                 |row| row.get(0),
             )?;
             if same == 0 {
-                tx.execute(
-                    "DELETE FROM gate_log_objects WHERE job_id = ?1",
-                    params![job_id],
-                )?;
-                // Test-only fault: fail the write AFTER the delete, inside
-                // the transaction. Must roll the delete back so the prior
-                // object is still served.
+                // Test-only fault: make the immutable insert fail inside the
+                // transaction. There is no delete to roll back any more, so no
+                // prior object can be lost; the settlement then simply has no
+                // object to bind and stands down.
                 #[cfg(any(test, feature = "test-faults"))]
                 if insert_fault {
                     // Missing the NOT NULL job_id/project_id columns: a
@@ -4531,13 +4522,38 @@ impl Store {
                 )
                 .optional()?
             } else {
-                conn.query_row(
-                    "SELECT id, job_id, project_id, bytes, expires_at
-                     FROM gate_log_objects WHERE job_id = ?1 ORDER BY rowid DESC LIMIT 1",
-                    params![id],
-                    mapper,
-                )
-                .optional()?
+                // A job id resolves to the object the job CURRENTLY binds
+                // (r19 item 4: objects are immutable and a job accumulates one
+                // per verdict, so "newest row" would serve another result's
+                // evidence). Pre-upgrade jobs without an obj_ reference fall
+                // back to the latest row.
+                let referenced: Option<String> = conn
+                    .query_row(
+                        "SELECT json_extract(doc_json, '$.logObjectId')
+                           FROM gate_jobs WHERE id = ?1",
+                        params![id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .optional()?
+                    .flatten();
+                if let Some(object_id) = referenced.filter(|oid| oid.starts_with("obj_")) {
+                    conn.query_row(
+                        "SELECT id, job_id, project_id, bytes, expires_at
+                         FROM gate_log_objects WHERE id = ?1",
+                        params![object_id],
+                        mapper,
+                    )
+                    .optional()?
+                } else {
+                    conn.query_row(
+                        "SELECT id, job_id, project_id, bytes, expires_at
+                         FROM gate_log_objects
+                         WHERE job_id = ?1 ORDER BY rowid DESC LIMIT 1",
+                        params![id],
+                        mapper,
+                    )
+                    .optional()?
+                }
             };
             Ok(row)
         })

@@ -7074,10 +7074,13 @@ it("GATE35 item 2: overlapping credential requests are serialized — while logi
     await pump(200);
     expect(bStarted).toBe(false); // B has not acquired the chain while A is open
 
-    // Release A: B acquires (disposes A's box), its body parks.
+    // Release A: B acquires (disposes A's box), its body parks. Gate 43: A's
+    // superseded continuation now AWAITS the current generation's bootstrap,
+    // which is itself blocked on B's open transition — so loginA does not settle
+    // yet, but still no outbox/POST happens (the waiting bootstrap can't pass
+    // ensureOutbox while B holds the chain).
     releaseA();
-    await loginA;
-    await pump(300);
+    await pump(500);
     expect(bStarted).toBe(true);
     expect(h.authTransitionOpenForTest).toBe(true);
     // Gate 36 item 6(b): the outbox stays ABSENT for the whole window B is
@@ -7087,10 +7090,11 @@ it("GATE35 item 2: overlapping credential requests are serialized — while logi
     // Still no box installed / no POST while B is open (the finalizer hasn't run).
     expect(send).not.toHaveBeenCalled();
 
-    // Release B: its finalizer initializes a current box; the waiting send and
-    // flush deliver P.
+    // Release B: its finalizer initializes a current box; the waiting send, A's
+    // pending bootstrap and flush deliver P.
     releaseB();
     await loginB;
+    await loginA;
     const sent = await sendP;
     expect(sent).toBe(true);
     await pump(3_000);
@@ -7679,8 +7683,15 @@ it("GATE37 item 1: a PEER logout between login A's success and queued login B's 
       const loginA = h.login("bootstrap", "a", "devA");
       const loginB = h.login("bootstrap", "b", "devB");
       await pump(400); // A settles, B acquires and parks
-      await loginA;
+      // Gate 43: A's superseded continuation now awaits the current-gen
+      // install, which is itself blocked behind B's open transition — so loginA
+      // is still pending (no box; no health call yet).
+      let aSettled = false;
+      void loginA.then(() => { aSettled = true; });
+      await pump(200);
+      expect(aSettled).toBe(false);
       expect(h.outbox).toBeNull(); // B's transition is open; no box yet
+      expect(hello).not.toHaveBeenCalled();
 
       // ANOTHER TAB logs out: the peer storage event bumps this tab's auth
       // generation. Simulate the peer's storage removal too — readSession()
@@ -7695,8 +7706,12 @@ it("GATE37 item 1: a PEER logout between login A's success and queued login B's 
       // bootstrap A's cached session under the post-peer-logout generation.
       releaseB();
       await expect(loginB).rejects.toThrow(/busy/);
+      // A's waiting continuation observes the moved external epoch and retires
+      // silently (no install); it still settles its promise.
+      await loginA;
       await pump(4_000);
 
+      expect(aSettled).toBe(true);
       expect(h.state.authed).toBe(false);
       expect(h.outbox).toBeNull();
       expect(send).not.toHaveBeenCalled();
@@ -8881,5 +8896,253 @@ it("GATE42 item 1: a login that bumps authGen while a reload bootstrap is parked
       vi.useRealTimers();
       Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
     }
+  }
+});
+
+it("GATE43 item 1 (i): obsolete reload bootstrap and its joined caller wait for the replacement login's parked installation, then resolve with one machine", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_400_000);
+  const I = "ins_g43_1i";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 5_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g43_1i");
+    localStorage.setItem("runtime.device-session", JSON.stringify({ deviceId: "devA_g43_1i", name: "A" }));
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+    vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+    vi.spyOn(api, "instanceList").mockResolvedValue({
+      items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
+      nextCursor: null,
+    } as never);
+    vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+    vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+    vi.spyOn(api, "login").mockResolvedValue({ deviceId: "devB_g43_1i", token: "tokB", name: "B" });
+
+    // One durable row the replacement machine restores exactly once.
+    const seed = new (await import("./outbox")).LocalStorageOutboxStorage();
+    await seed.put({
+      commandId: "cmd_g43_1i", clientRequestId: "local_g43_1i", instanceId: I,
+      prompt: "g43 1i", createdAt: 1, attempts: 0, state: "pending",
+    });
+
+    // Park the FIRST (A) and SECOND (B replacement) storage initializers
+    // independently; later initializers auto-resolve.
+    const releases: Array<() => void> = [];
+    const internals = hubStore as unknown as Record<string, unknown>;
+    (internals.setOutboxOpenGateForTest as (g: ((r: () => void) => void) | null) => void)((resolve) => {
+      releases.push(resolve);
+    });
+
+    const addSpy = vi.spyOn(window, "addEventListener");
+    const h = hubStore as unknown as {
+      bootstrap: () => Promise<void>;
+      login: (k: "bootstrap", s: string, d: string) => Promise<void>;
+      connection: unknown;
+      state: { bubbles: Array<{ clientRequestId: string }> };
+    };
+    // Reload A and its StrictMode duplicate A2 (same gen) join one run.
+    const bootA = h.bootstrap();
+    const bootA2 = h.bootstrap();
+    await pump(300);
+    expect(releases).toHaveLength(1);
+
+    // Replacement login B (healthy) acquires, bumps gen, then parks its own
+    // installation.
+    const loginB = h.login("bootstrap", "secret", "devB");
+    await pump(800);
+    expect(releases).toHaveLength(2);
+    expect(h.connection).toBeNull();
+
+    // Readiness is observed AT each caller's fulfilment (inside .then).
+    const settled: string[] = [];
+    void bootA.then(() => { settled.push("A"); expect(h.connection).not.toBeNull(); });
+    void bootA2.then(() => { settled.push("A2"); expect(h.connection).not.toBeNull(); });
+    void loginB.then(() => { settled.push("B"); expect(h.connection).not.toBeNull(); });
+
+    // Release obsolete A: its run must NOT fulfil (B's install still parked).
+    releases[0]!();
+    await pump(500);
+    expect(h.connection).toBeNull();
+    expect(settled).toEqual([]);
+
+    // Release B: the current-generation install completes; all three fulfil.
+    releases[1]!();
+    await Promise.all([bootA, bootA2, loginB]);
+    await pump(6_000);
+    expect(settled.sort()).toEqual(["A", "A2", "B"]);
+    expect(addSpy.mock.calls.filter((c) => c[0] === "online")).toHaveLength(1);
+    expect(h.state.bubbles.filter((b) => b.clientRequestId === "local_g43_1i")).toHaveLength(1);
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});
+
+it("GATE43 item 1 (ii): successful login A parked, login B invalidates it and then fails — A resolves only after a current-gen install", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_410_000);
+  const I = "ins_g43_1ii";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 5_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g43_1ii");
+    localStorage.setItem("runtime.logged-out", "1");
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+    vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+    vi.spyOn(api, "instanceList").mockResolvedValue({
+      items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
+      nextCursor: null,
+    } as never);
+    vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+    vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+
+    // Login A succeeds; login B's credential request rejects.
+    let releaseA: () => void = () => undefined;
+    const { HubHttpError } = await import("./httpError");
+    vi.spyOn(api, "login").mockImplementationOnce(
+      () => new Promise((resolve) => { releaseA = () => resolve({ deviceId: "devA_g43_1ii", token: "tokA", name: "A" }); }),
+    ).mockImplementationOnce(
+      () => Promise.reject(new HubHttpError(503, "busy", "host busy")),
+    );
+
+    // Every storage initializer parks (A's own, B's finalizer init, and the
+    // current-gen recovery install) with its own release, so the recovery
+    // install is genuinely parked when A's obsolete run hands over to it.
+    const storageReleases: Array<() => void> = [];
+    const internals = hubStore as unknown as Record<string, unknown>;
+    (internals.setOutboxOpenGateForTest as (g: ((r: () => void) => void) | null) => void)((resolve) => {
+      storageReleases.push(resolve);
+    });
+
+    const addSpy = vi.spyOn(window, "addEventListener");
+    const h = hubStore as unknown as {
+      login: (k: "bootstrap", s: string, d: string) => Promise<void>;
+      connection: unknown;
+      state: { authed: boolean; bubbles: Array<{ clientRequestId: string }> };
+    };
+    const loginAP = h.login("bootstrap", "a", "devA");
+    await pump(800);
+
+    // B queues behind parked A.
+    const loginBP = h.login("bootstrap", "b", "devB");
+    await pump(300);
+
+    // A releases (success, parked install); B acquires, fails (503): the
+    // obligation transferred from superseded A to B's generation, so B's
+    // failed settlement starts a current-gen recovery install.
+    let aFulfilled = false;
+    void loginAP.then(() => { aFulfilled = true; });
+    releaseA!();
+    await pump(600);
+    // A's obsolete initializer and the current-gen recovery install (B's
+    // failed settlement AWAITS the surviving obligation's bootstrap) are both
+    // parked; nothing installed and A is still unfulfilled.
+    expect(storageReleases.length).toBeGreaterThanOrEqual(2);
+    expect(aFulfilled).toBe(false);
+    expect(h.connection).toBeNull();
+
+    // Release every parked initializer: the current-generation recovery
+    // install completes; A fulfils and B's login rejects (its settlement
+    // awaited that same install before rethrowing).
+    for (const r of storageReleases) r!();
+    await expect(loginBP).rejects.toThrow(/busy/);
+    await loginAP;
+    await pump(6_000);
+    expect(aFulfilled).toBe(true);
+    expect(h.connection).not.toBeNull();
+    expect(h.state.authed).toBe(true);
+    // Exactly one machine from the recovery install.
+    expect(addSpy.mock.calls.filter((c) => c[0] === "online")).toHaveLength(1);
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});
+
+it("GATE43 item 2: cold reload with cached session, Hub unreachable and a failing initial outbox read settles the cached-session state", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_420_000);
+  const I = "ins_g43_2";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 5_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g43_2");
+    localStorage.setItem("runtime.device-session", JSON.stringify({ deviceId: "dev_g43_2", name: "X" }));
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+    vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+    vi.spyOn(api, "instanceList").mockResolvedValue({
+      items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
+      nextCursor: null,
+    } as never);
+    vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+    // Hub unreachable: the health request fails transiently (offline reload).
+    const { RestNetworkError } = await import("./api");
+    vi.spyOn(api, "hello").mockRejectedValue(new RestNetworkError("offline"));
+    // IndexedDB opens and the write probe succeeds, but the initial getAll read
+    // rejects (gate 43 item 2 seam).
+    const outboxMod = await import("./outbox");
+    outboxMod.__setOutboxLoadAllFailsForTest(true);
+
+    const h = hubStore as unknown as {
+      bootstrap: () => Promise<void>;
+      connection: unknown;
+      state: { ready: boolean; authed: boolean; connection: string };
+    };
+    await h.bootstrap();
+    await pump(4_000);
+
+    // Settled cached-session state: NOT stuck on the loading screen.
+    expect(h.state.ready).toBe(true);
+    expect(h.state.authed).toBe(true);
+    // No machine (storage unavailable), but polling/recovery was started.
+    expect(h.connection).toBeNull();
+    expect((hubStore as unknown as { startPoll: ReturnType<typeof vi.fn> }).startPoll).toHaveBeenCalled();
+  } finally {
+    const outboxMod = await import("./outbox");
+    outboxMod.__setOutboxLoadAllFailsForTest(false);
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
   }
 });

@@ -126,6 +126,17 @@ const HEX = "0123456789abcdef";
  */
 let lastIdTs = -1;
 let lastIdTail = 0n;
+
+/**
+ * Test seam (c-reconnfu gate 43 item 2): when set, Outbox.load's initial
+ * `storage.all()` read rejects even though IndexedDB opened and the write
+ * probe succeeded — a real read-after-open quota/IO failure. A cold reload
+ * must still settle the cached-session UI rather than stay on the loader.
+ */
+let loadAllFailsForTest = false;
+export function __setOutboxLoadAllFailsForTest(v: boolean): void {
+  loadAllFailsForTest = v;
+}
 const TAIL_74_MASK = (1n << 74n) - 1n;
 const RAND_B_62_MASK = (1n << 62n) - 1n;
 
@@ -1009,6 +1020,9 @@ export class Outbox {
 
   static async load(storage: OutboxStorage, owner?: Id): Promise<Outbox> {
     const box = new Outbox(storage, owner ?? Outbox.tabOwner());
+    // c-reconnfu gate 43 item 2 test seam: open succeeded but the initial read
+    // fails — load must reject so the store's installer reports "unavailable".
+    if (loadAllFailsForTest) throw new Error("test: outbox getAll failed");
     for (const rec of (await storage.all()).filter((r) => commandIdFromKey(r.commandId))) {
       box.cache.set(rec.commandId, rec);
     }

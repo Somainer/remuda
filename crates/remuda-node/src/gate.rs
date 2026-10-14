@@ -2283,19 +2283,14 @@ impl DevNode {
                     }
                 }
             };
-            // On a normal child exit, join the stderr pump FIRST so every
-            // rejected/error line is in `captured_stderr` before the verdict
-            // arms read it (the Output's own stderr is empty — see above).
-            // R8(b): the join is bounded by the absolute land deadline.
-            if matches!(land_outcome, Ok(Some(_)))
-                && let Some(task) = land_stderr_task.take()
-            {
-                let _ = tokio::time::timeout(
-                    Duration::from_secs(2).min(remaining(land_deadline)),
-                    task,
-                )
-                .await;
-            }
+            // r21 item 2: the stderr (and stdout) reader handles are RETAINED
+            // through survivor cleanup and the leader reap on every arm below.
+            // They are joined only AFTER the reap, with the remaining absolute
+            // budget; an incomplete or failed drain of either pipe makes the
+            // verdict uncertain. No reader is joined, timed out and discarded
+            // here before cleanup (the old owner did exactly that, so a
+            // blocked stderr pump was ignored and a definitive verdict was
+            // returned while the reader was still blocked).
             match land_outcome {
                 Err(()) => {
                     // Timeout OR an abortLanding message. THIS run task is the
@@ -2399,24 +2394,44 @@ impl DevNode {
                         }
                         ObservedExit::Reaped(status) => Some(status),
                     };
-                    // Join the concurrent stdout drain with the REMAINING
-                    // absolute budget. A reader still blocked at the deadline,
-                    // or a reader task that failed, leaves the final report
-                    // unreadable: the verdict is UNCERTAIN (the push may have
-                    // landed) rather than a parse failure or — worse — a
-                    // definitive land built on no report.
-                    let stdout_bytes = if remaining(land_deadline).is_zero() {
+                    // r21 item 2 — THE OWNER CONTRACT's drain step: join BOTH
+                    // reader tasks here. They drained CONCURRENTLY with the exit
+                    // observation and were RETAINED through survivor cleanup and
+                    // the reap; each is now awaited with only the REMAINING
+                    // absolute budget. An incomplete OR failed drain of EITHER
+                    // pipe is UNCERTAINTY, never a definitive land: a descendant
+                    // in ANOTHER session (`setsid sleep … >/dev/null &` keeps
+                    // stderr in a session the group KILL cannot reach) can hold a
+                    // pipe long after the leader's reaping, and no verdict may
+                    // be built while a pipe is still open or its reader failed.
+                    let mut drain_ok = !remaining(land_deadline).is_zero();
+                    let stdout_bytes = if !drain_ok {
                         None
                     } else if let Some(task) = land_stdout_task.take() {
                         match tokio::time::timeout(remaining(land_deadline), task).await {
                             Ok(Ok(bytes)) => Some(bytes),
-                            _ => None,
+                            _ => {
+                                // Blocked at the deadline OR a failed task.
+                                drain_ok = false;
+                                None
+                            }
                         }
                     } else {
                         Some(Vec::new())
                     };
-                    let land_output = match (land_status, stdout_bytes) {
-                        (Some(status), Some(stdout)) => Some(std::process::Output {
+                    if drain_ok
+                        && let Some(task) = land_stderr_task.take()
+                        && tokio::time::timeout(remaining(land_deadline), task)
+                            .await
+                            .is_err()
+                    {
+                        // The stderr pump did not reach EOF in the remaining
+                        // budget (or its join failed): its captured lines are
+                        // partial and the pipe is still held.
+                        drain_ok = false;
+                    }
+                    let land_output = match (land_status, stdout_bytes, drain_ok) {
+                        (Some(status), Some(stdout), true) => Some(std::process::Output {
                             status,
                             stdout,
                             stderr: Vec::new(),
@@ -2511,6 +2526,29 @@ impl DevNode {
                                     result.error = Some(error);
                                 }
                             }
+                        }
+                        None if land_status.is_some() && !drain_ok => {
+                            // r21 item 2: the leader genuinely exited and was
+                            // reaped, but at least one pipe did not drain to
+                            // EOF (or its reader failed) before the absolute
+                            // deadline. That is uncertainty, never a definitive
+                            // land: the push may already have reached the
+                            // remote and a reader still blocked means the
+                            // captured output is partial.
+                            result.status = "uncertain".into();
+                            result.error = Some(
+                                "the released land leader exited and was reaped, but its \
+                                 stdout/stderr did not both drain to EOF before the absolute \
+                                 cleanup deadline (a surviving pipe holder outside the land \
+                                 group can cause this); the push may have reached the remote; \
+                                 the Hub reconciles against the exact granted merge"
+                                    .into(),
+                            );
+                            result.reason = Some(
+                                "land pipe drain incomplete at the absolute deadline; push \
+                                 outcome uncertain"
+                                    .into(),
+                            );
                         }
                         None => {
                             // r16 item 4: no wait status after the release is
@@ -5466,6 +5504,35 @@ echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\"
 exit 0
 "#;
 
+    /// r21 item 2 / R8(b): the released land leader prints its valid final
+    /// JSON and exits 0, but FIRST starts a process in ANOTHER session
+    /// (`setsid … &`) that detaches stdout to /dev/null and KEEPS THE CAPTURED
+    /// STDERR. The owner's same-group cleanup cannot signal another session, so
+    /// the stderr reader stays blocked after the leader is reaped. A definitive
+    /// verdict is forbidden: the blocked/failed drain must make the land
+    /// uncertain at the absolute deadline.
+    const OTHER_SESSION_STDERR_LAND_SCRIPT: &str = r#"
+dir=$(dirname "$0")
+echo "$*" >> "$dir/args.txt"
+base=$(git rev-parse main 2>/dev/null || echo "1111111111111111111111111111111111111111")
+head=$(git rev-parse wt/fake/task 2>/dev/null || echo "2222222222222222222222222222222222222222")
+if ! printf '%s\n' "$*" | grep -q -- '--land'; then
+  echo "{\"exitCode\":0,\"status\":\"verified\",\"base\":\"$base\",\"head\":\"$head\",\"merged\":\"$head\",\"steps\":[]}"
+  exit 0
+fi
+if [ "${REMUDA_START_BARRIER_FD-}" != "0" ]; then
+  exit 0
+fi
+byte=""
+IFS= read -r -n 1 -t 30 byte || exit 4
+[ -n "$byte" ] || exit 4
+# Another SESSION: stdout to /dev/null but the captured STDERR is inherited.
+# The land group's TERM/KILL can never reach it; the owner must fail closed.
+setsid sh -c 'exec sleep 47.22' >/dev/null &
+echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\":\"$head\",\"steps\":[]}"
+exit 0
+"#;
+
     const BARRIER_LAND_SCRIPT: &str = r#"
 dir=$(dirname "$0")
 echo "$*" >> "$dir/args.txt"
@@ -5934,6 +6001,58 @@ echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\"
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// r21 item 2 / R8(b): the leader exits 0 with a valid landed report while
+    /// a process it started in ANOTHER SESSION (`setsid … >/dev/null &`) keeps
+    /// the captured STDERR open. Same-group cleanup cannot reach it, so the
+    /// stderr reader is still blocked after the leader is reaped. The owner
+    /// must retain BOTH reader handles through cleanup and reap, await them
+    /// with the remaining absolute budget, and answer UNCERTAIN when the stderr
+    /// drain does not complete — never `landed`. The old owner took the stderr
+    /// handle before cleanup, ignored its 2 s timeout and landed anyway.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_blocked_stderr_drain_after_a_clean_exit_makes_the_land_uncertain() {
+        let fixture = fixture(OTHER_SESSION_STDERR_LAND_SCRIPT);
+        let base_main = origin_main(&fixture);
+        let mut p = params(&fixture, "land");
+        p.push = false;
+        p.job_id = "gjb_other_session_stderr".into();
+        p.generation = 1;
+        // Tight soft budget; the absolute deadline (budget + the fixed owner
+        // cleanup allowance) still bounds the blocked drain.
+        fixture
+            .node
+            .gate_test_set_land_timeout(Duration::from_secs(2))
+            .await;
+        let started = std::time::Instant::now();
+        let result = fixture.node.run_gate_typed(p).await.unwrap();
+        assert_eq!(
+            result.status, "uncertain",
+            "a blocked stderr drain after the leader exited is uncertainty, got: {result:?}"
+        );
+        assert!(
+            result
+                .reason
+                .as_deref()
+                .is_some_and(|t| t.contains("drain")),
+            "the uncertainty names the incomplete pipe drain: {:?}",
+            result.reason
+        );
+        // The verdict waits for the REMAINING absolute budget, not the
+        // holder's 47 s sleep, and well beyond the instant the old (buggy)
+        // owner returned `landed`.
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "the absolute deadline bounds the blocked drain: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(origin_main(&fixture), base_main, "push=false moves nothing");
+        // The other-session holder is unreachable by design; clean up OUR OWN
+        // spawned marker process so it cannot outlive the test on a shared box.
+        let _ = std::process::Command::new("pkill")
+            .args(["-f", "sleep 47.22"])
+            .output();
     }
 
     /// r18 item 10: the barrier fake must reject a ZERO-byte read (EOF), not

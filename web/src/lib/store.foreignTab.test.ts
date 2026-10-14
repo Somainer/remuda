@@ -8950,15 +8950,16 @@ it("GATE44 item 2 (ruling U): unavailable outbox storage installs the connection
     vi.spyOn(api, "hello").mockRejectedValue(new RestNetworkError("offline"));
 
     // Real IndexedDB backend (not the localStorage fallback): open and the
-    // write probe (put+delete) succeed, but the initial readonly getAll
-    // TRANSACTION rejects — a genuine post-open read failure injected INSIDE
-    // the storage operation (gate 45 item 2). Assert the operation sequence.
-    const seq: string[] = [];
+    // write probe (put+delete in two readwrite transactions) COMMIT, but the
+    // initial readonly getAll TRANSACTION errors/aborts and NEVER completes —
+    // a genuine post-open read failure injected INSIDE the storage operation
+    // (gate 45 item 2; gate 47 item 3 records the TRANSACTION-level events).
+    const events: string[] = [];
     const failGetAll = true;
     g = globalThis as unknown as { indexedDB?: IDBFactory };
     origIndexeddb = g.indexedDB;
     const installFailingIndexeddb = () => {
-      const makeRequest = (): IDBRequest => {
+      const makeRequest = (txId: number, mode: IDBTransactionMode, op: string): IDBRequest => {
         const req = {
           onsuccess: null as ((e: unknown) => void) | null,
           onerror: null as ((e: unknown) => void) | null,
@@ -8966,63 +8967,57 @@ it("GATE44 item 2 (ruling U): unavailable outbox storage installs the connection
           error: null as Error | null,
         };
         queueMicrotask(() => {
-          if (req.error) req.onerror?.({ target: req });
-          else req.onsuccess?.({ target: req });
+          const failed = failGetAll && mode === "readonly" && op === "getAll";
+          events.push(`tx#${txId}:${mode}:request:${op}:${failed ? "error" : "success"}`);
+          if (failed) {
+            req.error = new Error("getAll rejected") as IDBRequest["error"];
+            req.onerror?.({ target: req });
+          } else {
+            req.onsuccess?.({ target: req });
+          }
         });
         return req as unknown as IDBRequest;
       };
-      const makeStore = (mode: IDBTransactionMode): IDBObjectStore => ({
-        put: () => {
-          seq.push("put");
-          return makeRequest();
-        },
-        delete: () => {
-          seq.push("delete");
-          return makeRequest();
-        },
+      const makeStore = (txId: number, mode: IDBTransactionMode): IDBObjectStore => ({
+        put: () => makeRequest(txId, mode, "put"),
+        delete: () => makeRequest(txId, mode, "delete"),
         getAll: () => {
-          seq.push("getAll");
-          const req = makeRequest() as IDBRequest & {
+          const req = makeRequest(txId, mode, "getAll") as IDBRequest & {
             error: Error | null; result: unknown;
           };
-          if (failGetAll && mode === "readonly") {
-            // Gate 46 item 5: a failed READ must ERROR/ABORT the transaction,
-            // not complete. Mark the tx; makeTx fires onerror+onabort (and
-            // suppresses oncomplete) when it sees this.
-            req.error = new Error("getAll rejected") as IDBRequest['error'];
-            (currentTx as { readFailed: boolean }).readFailed = true;
-          } else {
-            req.result = [];
-          }
+          if (mode === "readonly") req.result = [];
           return req;
         },
-        add: () => makeRequest(),
-        get: () => makeRequest(),
-        clear: () => makeRequest(),
-        count: () => makeRequest(),
+        add: () => makeRequest(txId, mode, "add"),
+        get: () => makeRequest(txId, mode, "get"),
+        clear: () => makeRequest(txId, mode, "clear"),
+        count: () => makeRequest(txId, mode, "count"),
       } as unknown as IDBObjectStore);
-      let currentTx: { readFailed: boolean } | null = null;
+      let txSeq = 0;
       const makeTx = (mode: IDBTransactionMode): IDBTransaction => {
+        const txId = ++txSeq;
         const tx = {
-          objectStore: () => {
-            currentTx = { readFailed: false };
-            return makeStore(mode);
-          },
+          objectStore: () => makeStore(txId, mode),
           oncomplete: null as ((e: unknown) => void) | null,
           onabort: null as ((e: unknown) => void) | null,
           onerror: null as ((e: unknown) => void) | null,
           abort: () => undefined,
           error: null as Error | null,
         };
-        // After the store's request settles: a failed READ aborts/errors the
-        // transaction (oncomplete is suppressed); otherwise it commits.
+        // After the REQUEST event settles: the failed READ errors+aborts the
+        // transaction and oncomplete is SUPPRESSED; the two probe transactions
+        // each commit exactly once.
         queueMicrotask(() =>
           queueMicrotask(() => {
-            if (currentTx?.readFailed) {
-              tx.error = new Error("readonly getAll failed");
+            const readFailed = failGetAll && mode === "readonly";
+            if (readFailed) {
+              tx.error = new Error("readonly getAll failed") as IDBTransaction["error"];
+              events.push(`tx#${txId}:${mode}:error`);
               tx.onerror?.({ target: tx });
+              events.push(`tx#${txId}:${mode}:abort`);
               tx.onabort?.({ target: tx });
             } else {
+              events.push(`tx#${txId}:${mode}:complete`);
               tx.oncomplete?.({ target: tx });
             }
           }),
@@ -9033,7 +9028,6 @@ it("GATE44 item 2 (ruling U): unavailable outbox storage installs the connection
         objectStoreNames: { contains: () => true },
         createObjectStore: () => undefined,
         transaction: (name: string, mode: IDBTransactionMode) => {
-          seq.push(`tx:${mode}`);
           void name;
           return makeTx(mode);
         },
@@ -9041,7 +9035,6 @@ it("GATE44 item 2 (ruling U): unavailable outbox storage installs the connection
       } as unknown as IDBDatabase;
       g!.indexedDB = {
         open: () => {
-          seq.push("open");
           const openReq = {
             onupgradeneeded: null as ((e: unknown) => void) | null,
             onsuccess: null as ((e: unknown) => void) | null,
@@ -9049,7 +9042,10 @@ it("GATE44 item 2 (ruling U): unavailable outbox storage installs the connection
             result: db,
             error: null as Error | null,
           } as unknown as IDBOpenDBRequest;
-          queueMicrotask(() => openReq.onsuccess?.({ target: openReq } as unknown as Event));
+          queueMicrotask(() => {
+            events.push("open-success");
+            openReq.onsuccess?.({ target: openReq } as unknown as Event);
+          });
           return openReq;
         },
       } as unknown as IDBFactory;
@@ -9083,12 +9079,27 @@ it("GATE44 item 2 (ruling U): unavailable outbox storage installs the connection
     expect(addSpy.mock.calls.filter((c: unknown[]) => c[0] === "online")).toHaveLength(1);
     expect(addSpy.mock.calls.filter((c: unknown[]) => c[0] === "offline")).toHaveLength(1);
 
-    // Operation sequence: open ok, write probe (put + delete committed), then
-    // the initial getAll read rejected — injected INSIDE the storage op, not
-    // by replacing storage.all() outright.
-    expect(seq.slice(0, 3)).toEqual(["open", "tx:readwrite", "put"]);
-    expect(seq).toContain("delete");
-    expect(seq).toContain("getAll");
+    // Gate 47 item 3 — the ORDERED TRANSACTION-level sequence: open succeeds;
+    // BOTH probe transactions commit (put, then delete, each request success
+    // followed by its transaction commit); then the readonly getAll request
+    // errors and its TRANSACTION errors then aborts.
+    expect(events).toEqual([
+      "open-success",
+      "tx#1:readwrite:request:put:success",
+      "tx#1:readwrite:complete",
+      "tx#2:readwrite:request:delete:success",
+      "tx#2:readwrite:complete",
+      "tx#3:readonly:request:getAll:error",
+      "tx#3:readonly:error",
+      "tx#3:readonly:abort",
+    ]);
+    // The failed readonly transaction NEVER completes; exactly the two probe
+    // transactions committed.
+    expect(events.filter((e) => e === "tx#3:readonly:complete")).toHaveLength(0);
+    expect(events.filter((e) => e.endsWith(":complete"))).toEqual([
+      "tx#1:readwrite:complete",
+      "tx#2:readwrite:complete",
+    ]);
 
     // A send while degraded carries a command id through the keyed DIRECT
     // fallback (no outbox) — never an id-less POST.
@@ -9110,7 +9121,9 @@ it("GATE44 item 2 (ruling U): unavailable outbox storage installs the connection
     Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
     sessionStorage.removeItem("remuda-outbox-owner");
   }
-})
+});;
+
+
 it("GATE47 item 2(a) (S3): a same-tab login waits for a held bootstrap to settle; a delayed 401 cannot clear the later login and stale list results never publish over its session (401 and stale-success variants)", async () => {
   for (const variant of ["delayed-401", "stale-success"] as const) {
     vi.useFakeTimers();

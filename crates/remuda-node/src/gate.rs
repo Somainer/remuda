@@ -3155,96 +3155,130 @@ fn resolve_landing_after_restart(
     if request.merge_sha.trim().is_empty() {
         return unknown("no granted merge sha recorded".into());
     }
-    // R6: ONE absolute deadline (< Hub 30 s RPC) bounds the fetch, coalescing
-    // and every deepen. Expiry is Unknown.
-    let probe_deadline = std::time::Instant::now() + LANDING_PROBE_DEADLINE;
-    // Initial recovery fetch, bounded by min(its cap, remaining probe time).
-    let fetch_budget = RECOVERY_FETCH_DEADLINE.min(remaining(probe_deadline));
+    // R7/R6: ONE absolute deadline (< Hub 30 s RPC) bounds EVERY recovery
+    // subprocess (fetch, ref read, shallow check, ancestry). Each runs through
+    // the R6 owner with at most the remaining time; timeout/spawn failure →
+    // Unknown. Gate recovery does NOT deepen shallow history.
+    let deadline = std::time::Instant::now() + LANDING_PROBE_DEADLINE;
+    // R7/R6: the recovery fetch runs through the owner, capped per-command.
+    let fetch_budget = RECOVERY_GIT_CAP.min(remaining(deadline));
     if fetch_budget.is_zero() {
         return unknown("landing probe deadline exhausted before the recovery fetch".into());
     }
-    match owned_git(
-        &repo,
-        &["fetch", "-q", "origin"],
-        fetch_budget,
-        KillScope::Group,
-    ) {
+    match owned_git(&repo, &["fetch", "-q", "origin"], fetch_budget) {
         Ok(run) if run.timed_out() => {
             return unknown(format!(
                 "recovery fetch exceeded the {fetch_budget:?} probe bound and was killed; push \
                  outcome unknown"
             ));
         }
-        Ok(run) if !run.is_success() => {
+        Ok(run) if !run.status_success() => {
             return unknown("fetch origin failed".into());
         }
         Err(error) => return unknown(format!("fetch origin: {error}")),
         Ok(_) => {}
     }
     let remote_base = format!("origin/{}", request.base_branch);
-    let base_sha = match block_git(&repo, &["rev-parse", &remote_base]) {
-        Ok(sha) => sha,
-        Err(error) => return unknown(format!("resolve {remote_base}: {error}")),
+    let run_owned = |args: &[&str],
+                     what: &str,
+                     require_success: bool|
+     -> Result<std::process::Output, GateResolveLandingResult> {
+        let budget = RECOVERY_GIT_CAP.min(remaining(deadline));
+        if budget.is_zero() {
+            return Err(unknown(format!(
+                "landing probe deadline ({LANDING_PROBE_DEADLINE:?}) exhausted before {what} \
+                     in {repo:?}; ancestry unknown"
+            )));
+        }
+        match owned_git(&repo, args, budget) {
+            Ok(run) if run.timed_out() => Err(unknown(format!(
+                "{what} exceeded the {budget:?} probe bound and was killed; push outcome unknown"
+            ))),
+            Ok(run) => {
+                let output = run.into_output();
+                if require_success && !output.status.success() {
+                    return Err(unknown(format!(
+                        "{what} exited {:?}; push outcome unknown",
+                        output.status.code()
+                    )));
+                }
+                Ok(output)
+            }
+            Err(error) => Err(unknown(format!("{what} could not run: {error}"))),
+        }
     };
-    // merge-base --is-ancestor exits 0 iff merge_sha is reachable from the
-    // remote base — i.e. the granted push actually landed there. r16 item 3:
-    // exit 0, exit 1 and an abnormal termination are distinguished; a signal
-    // or any other non-0/1 exit is Unknown, and exit 1 proves non-ancestry
-    // ONLY with complete (non-shallow) history — a bounded safe deepen is
-    // attempted first, otherwise the answer stays Unknown.
-    match establish_ancestry(&repo, &request.merge_sha, &remote_base, probe_deadline) {
-        AncestryVerdict::Ancestor => GateResolveLandingResult {
+    let base_output = match run_owned(&["rev-parse", &remote_base], "remote base ref read", true) {
+        Ok(o) => o,
+        Err(result) => return result,
+    };
+    let base_sha = String::from_utf8_lossy(&base_output.stdout)
+        .trim()
+        .to_owned();
+
+    // R7: shallow history is never deepened; absence is undecidable → Unknown.
+    let shallow_output = match run_owned(
+        &["rev-parse", "--is-shallow-repository"],
+        "shallow check",
+        true,
+    ) {
+        Ok(o) => o,
+        Err(result) => return result,
+    };
+    if String::from_utf8_lossy(&shallow_output.stdout).trim() == "true" {
+        return unknown(format!(
+            "{repo:?} is a shallow clone; gate recovery does not deepen, so ancestry of {} \
+             cannot be decided locally after one bounded fetch; push outcome unknown (perform a \
+             full clone to enable remote reconciliation)",
+            request.merge_sha
+        ));
+    }
+    // merge-base --is-ancestor: exit 0 landed, exit 1 not-ancestor (valid only
+    // with complete history, checked above), anything else Unknown.
+    let ancestry_output = match run_owned(
+        &[
+            "merge-base",
+            "--is-ancestor",
+            &request.merge_sha,
+            &remote_base,
+        ],
+        "ancestry check",
+        false,
+    ) {
+        Ok(o) => o,
+        Err(result) => return result,
+    };
+    match ancestry_output.status.code() {
+        Some(0) => GateResolveLandingResult {
             job_id: request.job_id.clone(),
             status: "landed".into(),
             base_sha: Some(base_sha),
             error: None,
         },
-        AncestryVerdict::NotAncestor if !land_group_verified_dead => unknown(format!(
-            "{} is not an ancestor of {remote_base} but the granted land group's death is not \
-             authoritatively established (no live ESRCH or death certificate; a missing ledger is \
-             not proof); push outcome unknown",
-            request.merge_sha
-        )),
-        AncestryVerdict::NotAncestor => GateResolveLandingResult {
+        Some(1) if land_group_verified_dead => GateResolveLandingResult {
             job_id: request.job_id.clone(),
             status: "absent".into(),
             base_sha: Some(base_sha),
             error: None,
         },
-        AncestryVerdict::Unknown(error) => unknown(format!(
-            "cannot establish whether {} reached {remote_base}: {error}",
+        Some(1) => unknown(format!(
+            "{} is not an ancestor of {remote_base} but the granted land group's death is not \
+             authoritatively established (no live ESRCH or death certificate; a missing ledger is \
+             not proof); push outcome unknown",
+            request.merge_sha
+        )),
+        other => unknown(format!(
+            "merge-base --is-ancestor ended abnormally ({other:?}); ancestry of {} unknown",
             request.merge_sha
         )),
     }
 }
 
-/// An ancestry read that distinguishes an Established fact from Unknown
-/// (r16 item 3, R5): exit 0 / exit 1 / anything else are separate outcomes.
-#[derive(Debug, PartialEq, Eq)]
-enum AncestryVerdict {
-    Ancestor,
-    NotAncestor,
-    Unknown(String),
-}
-
-/// Same bounded, additive deepen schedule as the merge CLI (r16 item 3): a
-/// deepen only adds history and never rewrites refs.
-const ANCESTRY_DEEPEN_ARGS: [&[&str]; 2] = [
-    &["fetch", "-q", "--deepen=256", "origin"],
-    &["fetch", "-q", "--deepen=4096", "origin"],
-];
-
-/// Wall-clock bound for ONE deepen fetch subprocess. Two steps stay well under
-/// the probe's absolute deadline (which is itself below the Hub 30 s RPC).
+/// Per-subprocess cap so one git command cannot consume the whole probe.
 #[cfg(unix)]
-const ANCESTRY_DEEPEN_DEADLINE: Duration = Duration::from_secs(8);
-/// Bound on the initial recovery fetch within the probe.
-#[cfg(unix)]
-const RECOVERY_FETCH_DEADLINE: Duration = Duration::from_secs(12);
-/// ABSOLUTE deadline for a whole read-only landing probe: covers the initial
-/// fetch, the coalescing wait and every bounded deepen, and stays below the
-/// Hub's 30 s `gate.resolveLanding` RPC timeout (R6 — one deadline for the
-/// probe; expiry is Unknown, fail closed).
+const RECOVERY_GIT_CAP: Duration = Duration::from_secs(10);
+/// ABSOLUTE deadline for a whole read-only landing probe: covers the fetch,
+/// ref read, shallow check and ancestry read, and stays below the Hub's 30 s
+/// `gate.resolveLanding` RPC timeout (R7/R6 — one deadline for the probe).
 #[cfg(unix)]
 const LANDING_PROBE_DEADLINE: Duration = Duration::from_secs(25);
 /// Owner poll granularity.
@@ -3253,6 +3287,10 @@ const OWNED_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// After a deadline SIGKILL, how long to wait for the group/process to clear.
 #[cfg(unix)]
 const OWNED_KILL_GRACE: Duration = Duration::from_millis(500);
+/// How long to join a pipe reader after the leader exited/group was killed
+/// before abandoning it (R7 — never join an inherited pipe unboundedly).
+#[cfg(unix)]
+const OWNED_DRAIN_GRACE: Duration = Duration::from_millis(500);
 
 /// What an owned subprocess did relative to its deadline (R6 single owner).
 #[cfg(unix)]
@@ -3270,7 +3308,7 @@ impl OwnedRun {
     fn timed_out(&self) -> bool {
         matches!(self, OwnedRun::TimedOut(_))
     }
-    fn is_success(&self) -> bool {
+    fn status_success(&self) -> bool {
         match self {
             OwnedRun::Completed(output) => output.status.success(),
             OwnedRun::TimedOut(_) => false,
@@ -3281,18 +3319,6 @@ impl OwnedRun {
             OwnedRun::Completed(output) | OwnedRun::TimedOut(output) => output,
         }
     }
-}
-
-/// How the owner kills a subprocess that passes its deadline (R6). The Node's
-/// git probes always place the child in its own new group and SIGKILL the whole
-/// group (git + ssh/git-remote). The land CLI's in-group deepen uses the same
-/// owner helper but the PID scope instead (implemented in merge.rs).
-#[cfg(unix)]
-#[derive(Clone, Copy)]
-pub(crate) enum KillScope {
-    /// The child was placed in its OWN new process group (`process_group(0)`);
-    /// SIGKILL the whole group — git and any ssh/git-remote child die together.
-    Group,
 }
 
 /// Drain one child pipe to EOF on a reader thread that never reaps the leader
@@ -3310,22 +3336,44 @@ fn drain_pipe<R: std::io::Read + Send + 'static>(
     })
 }
 
-/// R6 single-owner subprocess runner: the CALLING thread alone arbitrates
+/// Bound a draining reader's join: return its bytes once it reaches EOF, or
+/// ABANDON the thread (dropping the `JoinHandle` detaches it) after `grace`.
+/// R7 — pipe draining is never joined unboundedly: a surviving transport
+/// grandchild (ssh) that inherited a pipe can otherwise pin the join forever
+/// after the owner killed the child's group. The abandoned thread reaches EOF
+/// on its own once the killed group's last fd closes.
+#[cfg(unix)]
+fn join_drained(handle: std::thread::JoinHandle<Vec<u8>>, grace: Duration) -> Vec<u8> {
+    let deadline = std::time::Instant::now() + grace;
+    loop {
+        if handle.is_finished() {
+            return handle.join().unwrap_or_default();
+        }
+        if std::time::Instant::now() >= deadline {
+            drop(handle);
+            return Vec::new();
+        }
+        std::thread::sleep(OWNED_POLL_INTERVAL);
+    }
+}
+
+/// R6/R7 single-owner subprocess runner. The CALLING thread alone arbitrates
 /// completion vs deadline by polling `try_wait` (no second reaper thread);
-/// reader threads drain stdout/stderr without reaping. On deadline the owner
-/// SIGKILLs the group/pid WHILE THE LEADER IS STILL UNREAPED (an unreaped
-/// leader pins its pid/pgid against reuse) and then reaps exactly once.
+/// reader threads drain stdout/stderr without reaping. The child is placed in
+/// its OWN new process group so git and any ssh/git-remote descendant share
+/// one kill target (these are read-only recovery probes; the granted land's
+/// actual push stays in the Node-tracked land group). On deadline the owner
+/// SIGKILLs the whole group WHILE THE LEADER IS STILL UNREAPED (an unreaped
+/// leader pins its pid/pgid against reuse), reaps exactly once, and bounds the
+/// reader joins (R7 — never blocked on an inherited pipe).
 #[cfg(unix)]
 fn run_owned_process(
     mut command: std::process::Command,
     deadline: Duration,
-    scope: KillScope,
 ) -> std::io::Result<OwnedRun> {
     use std::os::unix::process::CommandExt;
 
-    if matches!(scope, KillScope::Group) {
-        command.process_group(0);
-    }
+    command.process_group(0);
     command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -3338,10 +3386,13 @@ fn run_owned_process(
     loop {
         match child.try_wait()? {
             Some(status) => {
+                // The leader exited. A same-group transport descendant may
+                // still hold a pipe; the join is bounded and a blocked reader
+                // abandoned rather than joined forever (R7).
                 return Ok(OwnedRun::Completed(std::process::Output {
                     status,
-                    stdout: out_handle.join().unwrap_or_default(),
-                    stderr: err_handle.join().unwrap_or_default(),
+                    stdout: join_drained(out_handle, OWNED_DRAIN_GRACE),
+                    stderr: join_drained(err_handle, OWNED_DRAIN_GRACE),
                 }));
             }
             None if started.elapsed() >= deadline => {
@@ -3377,10 +3428,12 @@ fn run_owned_process(
                         "owned process killed at deadline but could not be reaped",
                     ));
                 };
+                // Group was SIGKILLed before the reap, so EOF arrives promptly;
+                // the joins are still bounded (R7).
                 return Ok(OwnedRun::TimedOut(std::process::Output {
                     status,
-                    stdout: out_handle.join().unwrap_or_default(),
-                    stderr: err_handle.join().unwrap_or_default(),
+                    stdout: join_drained(out_handle, OWNED_DRAIN_GRACE),
+                    stderr: join_drained(err_handle, OWNED_DRAIN_GRACE),
                 }));
             }
             None => std::thread::sleep(OWNED_POLL_INTERVAL),
@@ -3388,99 +3441,17 @@ fn run_owned_process(
     }
 }
 
-/// Run a git command through the R6 owner. Returns the owned verdict; the
-/// caller treats TimedOut as Unknown.
+/// Run a git command through the R6/R7 owner (own group, whole-group kill,
+/// bounded drains). Returns the owned verdict; the caller treats TimedOut as
+/// Unknown.
 #[cfg(unix)]
-fn owned_git(
-    repo: &Path,
-    args: &[&str],
-    deadline: Duration,
-    scope: KillScope,
-) -> Result<OwnedRun, std::io::Error> {
+fn owned_git(repo: &Path, args: &[&str], deadline: Duration) -> Result<OwnedRun, std::io::Error> {
     let mut command = std::process::Command::new("git");
     command
         .current_dir(repo)
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0");
-    run_owned_process(command, deadline, scope)
-}
-
-/// Per-repository SINGLE-FLIGHT for shallow deepening (r18 item 5). The first
-/// probe runs the bounded deepen; concurrent same-repo probes WAIT (bounded by
-/// the probe deadline), reuse the result, and re-read ancestry themselves —
-/// never a second `git fetch --deepen`. Deepening is repository-global.
-#[cfg(unix)]
-static DEEPEN_FLIGHTS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Arc<DeepenFlight>>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-
-#[cfg(unix)]
-struct DeepenFlight {
-    result: std::sync::Mutex<Option<Result<(), String>>>,
-    cvar: std::sync::Condvar,
-}
-
-#[cfg(unix)]
-#[derive(PartialEq, Eq)]
-enum DeepenShare {
-    /// This caller RAN the deepen sequence; it must release the slot.
-    Leader,
-    /// This caller WAITED for an in-flight deepen and should re-check ancestry
-    /// without fetching.
-    Follower,
-    /// The bounded wait elapsed.
-    TimedOut,
-}
-
-#[cfg(unix)]
-fn acquire_deepen_flight(repo: &Path, wait: Duration) -> (Arc<DeepenFlight>, DeepenShare) {
-    let key = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
-    let flight = {
-        let mut map = DEEPEN_FLIGHTS.lock().unwrap();
-        if let Some(flight) = map.get(&key) {
-            flight.clone()
-        } else {
-            let flight = Arc::new(DeepenFlight {
-                result: std::sync::Mutex::new(None),
-                cvar: std::sync::Condvar::new(),
-            });
-            map.insert(key, flight.clone());
-            return (flight, DeepenShare::Leader);
-        }
-    };
-    let is_done = {
-        let guard = flight.result.lock().unwrap();
-        let (guard, timed_out) = flight
-            .cvar
-            .wait_timeout_while(guard, wait, |result| result.is_none())
-            .map(|(g, timeout)| (g, timeout.timed_out()))
-            .unwrap_or((flight.result.lock().unwrap(), true));
-        if timed_out {
-            DeepenShare::TimedOut
-        } else if guard.is_some() {
-            DeepenShare::Follower
-        } else {
-            DeepenShare::TimedOut
-        }
-    };
-    (flight, is_done)
-}
-
-#[cfg(unix)]
-fn finish_deepen_flight(flight: &DeepenFlight, result: Result<(), String>) {
-    *flight.result.lock().unwrap() = Some(result);
-    flight.cvar.notify_all();
-}
-
-#[cfg(unix)]
-fn release_deepen_flight(repo: &Path) {
-    let key = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
-    DEEPEN_FLIGHTS.lock().unwrap().remove(&key);
-}
-
-#[cfg(unix)]
-fn deepen_flight_result(flight: &DeepenFlight) -> Option<Result<(), String>> {
-    flight.result.lock().unwrap().clone()
+    run_owned_process(command, deadline)
 }
 
 /// Remaining time until an absolute deadline (saturates at zero).
@@ -3489,180 +3460,6 @@ fn remaining(deadline: std::time::Instant) -> Duration {
     deadline
         .checked_duration_since(std::time::Instant::now())
         .unwrap_or(Duration::ZERO)
-}
-
-/// Map a finished merge-base process to the tri-state verdict (r16 item 3):
-/// exit 0 / exit 1 are the only Established outcomes; any other exit code or
-/// death by signal (no exit code) is Unknown, never a guessed boolean.
-fn classify_ancestry_output(output: &std::process::Output) -> AncestryVerdict {
-    match output.status.code() {
-        Some(0) => AncestryVerdict::Ancestor,
-        Some(1) => AncestryVerdict::NotAncestor,
-        other => AncestryVerdict::Unknown(format!(
-            "merge-base --is-ancestor ended abnormally ({other:?}): {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )),
-    }
-}
-
-/// Run `git merge-base --is-ancestor` once, mapping raw process outcomes.
-fn raw_ancestry(repo: &Path, ancestor: &str, descendant: &str) -> AncestryVerdict {
-    match std::process::Command::new("git")
-        .current_dir(repo)
-        .args(["merge-base", "--is-ancestor", ancestor, descendant])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-    {
-        Ok(output) => classify_ancestry_output(&output),
-        Err(error) => AncestryVerdict::Unknown(format!("spawn merge-base: {error}")),
-    }
-}
-
-/// True iff the repo has no shallow graft (a read error is itself Unknown, so
-/// reported as shallow to force a deepen/refusal rather than trusting exit 1).
-fn git_is_shallow(repo: &Path) -> bool {
-    match std::process::Command::new("git")
-        .current_dir(repo)
-        .args(["rev-parse", "--is-shallow-repository"])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-    {
-        Ok(output) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).trim() == "true"
-        }
-        _ => true,
-    }
-}
-
-/// Count reachable commits; used to detect whether a shallow `--deepen` added
-/// history. A read failure is `None` (the caller then cannot prove progress).
-fn git_reachable_commit_count(repo: &Path) -> Option<u64> {
-    let output = std::process::Command::new("git")
-        .current_dir(repo)
-        .args(["rev-list", "--count", "--all"])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
-}
-
-/// Read ancestry as Established-or-Unknown (r16 item 3, R5; r18 items 3/5/6).
-/// An exit-1 "not ancestor" is trusted only when the history spanning both tips
-/// is complete; in a shallow clone a repository-global bounded deepen runs ONCE
-/// per probe via a single-flight (concurrent probes reuse it), the read is
-/// re-checked, and everything — fetch, coalescing wait, deepen — is bounded by
-/// `probe_deadline`. A timeout/failure/no-progress keeps the answer Unknown.
-fn establish_ancestry(
-    repo: &Path,
-    ancestor: &str,
-    descendant: &str,
-    probe_deadline: std::time::Instant,
-) -> AncestryVerdict {
-    match raw_ancestry(repo, ancestor, descendant) {
-        // Complete history: the raw exit-0/exit-1 answer is itself the fact.
-        verdict if !git_is_shallow(repo) => verdict,
-        // Shallow but exit 0 (present edge) needs no extra history.
-        verdict @ AncestryVerdict::Ancestor => verdict,
-        AncestryVerdict::Unknown(error) => AncestryVerdict::Unknown(error),
-        AncestryVerdict::NotAncestor => {
-            // Single-flight: the leader runs the bounded deepen sequence;
-            // followers wait (bounded) and reuse its result, then fall through
-            // to their OWN ancestry re-read without fetching.
-            let (flight, share) = acquire_deepen_flight(repo, remaining(probe_deadline));
-            let deepen_error = match share {
-                DeepenShare::Leader => {
-                    let result = run_bounded_deepens(repo, ancestor, descendant, probe_deadline);
-                    finish_deepen_flight(&flight, result.clone());
-                    release_deepen_flight(repo);
-                    result.err()
-                }
-                DeepenShare::TimedOut => Some(
-                    "the bounded wait for an in-flight shallow deepen exceeded the probe deadline; \
-                     ancestry unknown"
-                        .to_owned(),
-                ),
-                DeepenShare::Follower => match deepen_flight_result(&flight) {
-                    Some(Err(error)) => Some(error),
-                    _ => None,
-                },
-            };
-            if let Some(error) = deepen_error {
-                return AncestryVerdict::Unknown(error);
-            }
-            // Deepen completed (this caller ran it or reused a flight): re-read
-            // ancestry with now-more-complete history.
-            match raw_ancestry(repo, ancestor, descendant) {
-                AncestryVerdict::Ancestor => AncestryVerdict::Ancestor,
-                AncestryVerdict::Unknown(error) => AncestryVerdict::Unknown(error),
-                AncestryVerdict::NotAncestor if !git_is_shallow(repo) => {
-                    AncestryVerdict::NotAncestor
-                }
-                AncestryVerdict::NotAncestor => AncestryVerdict::Unknown(
-                    "after the bounded deepens merge-base still says not-ancestor and history is \
-                     shallow; ancestry unknown"
-                        .into(),
-                ),
-            }
-        }
-    }
-}
-
-/// Run the bounded, additive deepen sequence (single-flight leader). Each fetch
-/// is owned by the R6 helper with a per-step deadline capped by the probe's
-/// absolute remaining time; returns Ok(()) when the history becomes complete or
-/// makes progress (the caller re-reads ancestry), Err on timeout/failure/no
-/// progress.
-fn run_bounded_deepens(
-    repo: &Path,
-    ancestor: &str,
-    descendant: &str,
-    probe_deadline: std::time::Instant,
-) -> Result<(), String> {
-    let mut last_count = git_reachable_commit_count(repo);
-    for args in ANCESTRY_DEEPEN_ARGS {
-        let budget = ANCESTRY_DEEPEN_DEADLINE.min(remaining(probe_deadline));
-        if budget.is_zero() {
-            return Err(
-                "the landing probe deadline was reached during shallow deepening; ancestry unknown"
-                    .into(),
-            );
-        }
-        let run = owned_git(repo, args, budget, KillScope::Group)
-            .map_err(|error| format!("the bounded deepen could not run: {error}"))?;
-        if run.timed_out() {
-            return Err(format!(
-                "the bounded deepen exceeded {budget:?} and was killed; ancestry unknown"
-            ));
-        }
-        let output = run.into_output();
-        if !output.status.success() {
-            return Err(format!(
-                "the bounded deepen failed ({}): {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-        // Re-read immediately: the edge may be revealed while still shallow.
-        match raw_ancestry(repo, ancestor, descendant) {
-            AncestryVerdict::Ancestor | AncestryVerdict::NotAncestor if !git_is_shallow(repo) => {
-                return Ok(());
-            }
-            AncestryVerdict::Ancestor => return Ok(()),
-            AncestryVerdict::Unknown(error) => return Err(error),
-            AncestryVerdict::NotAncestor => {}
-        }
-        let next_count = git_reachable_commit_count(repo);
-        if next_count == last_count {
-            return Err(
-                "the bounded deepen added no history (a shallow remote?); ancestry unknown".into(),
-            );
-        }
-        last_count = next_count;
-    }
-    Ok(())
 }
 
 fn git_output(repo: &Path, args: &[&str]) -> Result<String, String> {
@@ -7191,40 +6988,6 @@ head -c 1 >/dev/null || exit 4
         git(&fixture.lane, &["rev-parse", "origin/main"])
     }
 
-    /// r16 item 3: raw merge-base termination is tri-state. Exit 0 / exit 1
-    /// are the only Established outcomes; death by signal (raw wait status 9 =
-    /// SIGKILL) and any other code are Unknown, never a guessed boolean.
-    #[cfg(unix)]
-    #[test]
-    fn ancestry_output_distinguishes_zero_one_and_signals() {
-        use std::os::unix::process::ExitStatusExt;
-        use std::process::{ExitStatus, Output};
-        fn output(raw: i32) -> Output {
-            Output {
-                status: ExitStatus::from_raw(raw),
-                stdout: Vec::new(),
-                stderr: b"boom".to_vec(),
-            }
-        }
-        assert_eq!(
-            super::classify_ancestry_output(&output(0)),
-            super::AncestryVerdict::Ancestor
-        );
-        assert_eq!(
-            super::classify_ancestry_output(&output(1 << 8)),
-            super::AncestryVerdict::NotAncestor
-        );
-        assert!(matches!(
-            super::classify_ancestry_output(&output(2 << 8)),
-            super::AncestryVerdict::Unknown(_)
-        ));
-        // Killed by SIGKILL before exiting: no exit code at all → Unknown.
-        assert!(matches!(
-            super::classify_ancestry_output(&output(9)),
-            super::AncestryVerdict::Unknown(_)
-        ));
-    }
-
     /// R6 single-owner determinism:
     ///  - a child that exits within the deadline yields Completed (exit 0) and
     ///    the leader is reaped exactly once (its pid gone);
@@ -7248,9 +7011,7 @@ head -c 1 >/dev/null || exit 4
 
         // Completed path: a generous deadline, normal exit, reaped once.
         let command = std::process::Command::new(quick.to_str().unwrap());
-        match super::run_owned_process(command, Duration::from_secs(5), super::KillScope::Group)
-            .unwrap()
-        {
+        match super::run_owned_process(command, Duration::from_secs(5)).unwrap() {
             super::OwnedRun::Completed(output) => {
                 assert!(output.status.success(), "quick exit 0");
             }
@@ -7261,9 +7022,7 @@ head -c 1 >/dev/null || exit 4
         // SIGKILLed while the leader is unreaped.
         let started = std::time::Instant::now();
         let command = std::process::Command::new(long.to_str().unwrap());
-        let outcome =
-            super::run_owned_process(command, Duration::from_millis(300), super::KillScope::Group)
-                .unwrap();
+        let outcome = super::run_owned_process(command, Duration::from_millis(300)).unwrap();
         assert!(started.elapsed() < Duration::from_secs(5), "bound applies");
         let output = match outcome {
             super::OwnedRun::TimedOut(output) => output,
@@ -7331,13 +7090,15 @@ head -c 1 >/dev/null || exit 4
         );
     }
 
-    /// r16 item 3 through the production read-only resolver: a genuinely
-    /// unrelated merge in a depth-1 clone of the FULL origin is established
-    /// `absent` after the bounded safe deepen completes the history — even
-    /// though the first raw merge-base also said exit 1.
+    /// r19 item 2 / R7: gate recovery NEVER deepens shallow history. Even with
+    /// the granted merge genuinely absent and a death certificate proving the
+    /// land group dead, a depth-1 clone makes ancestry undecidable locally, so
+    /// the production read-only resolver answers Unknown with an operator
+    /// message naming the repository. The clone stays shallow — no
+    /// `git fetch --deepen` is attempted.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn resolve_landing_deepens_shallow_history_before_attesting_absence() {
+    async fn resolve_landing_shallow_repo_is_unknown_and_never_deepens() {
         let fixture = fixture(PASSING_SCRIPT);
         let origin = fixture._bare.path().join("origin.git");
         let lane = fixture._dir.path().join("shallow-full");
@@ -7354,59 +7115,13 @@ head -c 1 >/dev/null || exit 4
 
         let dir = fixture.node.gate_registry().land_fence_dir.clone();
         let record = serde_json::json!({
-            "jobId": "gjb_shallow_full", "generation": 1, "pgid": 5252, "startTick": 7
+            "jobId": "gjb_shallow_r7", "generation": 1, "pgid": 5353, "startTick": 7
         });
-        super::write_land_group_dead_cert(&dir, &record, 5252).unwrap();
+        super::write_land_group_dead_cert(&dir, &record, 5353).unwrap();
         let reply = fixture
             .node
             .run_gate_resolve_landing(&serde_json::json!({
-                "jobId": "gjb_shallow_full",
-                "repoPath": lane.to_string_lossy(),
-                "baseBranch": "main",
-                "mergeSha": orphan,
-            }))
-            .await
-            .unwrap();
-        assert_eq!(reply["status"], json!("absent"), "{reply}");
-        assert_eq!(
-            git(&lane, &["rev-parse", "--is-shallow-repository"]),
-            "false",
-            "the safe deepen unshallows the lane"
-        );
-    }
-
-    /// r16 item 3: when the remote is ITSELF depth-1 shallow the bounded
-    /// deepens add no history and the exit-1 "not ancestor" cannot be
-    /// confirmed — the resolver stays UNKNOWN even with a death certificate
-    /// (absence is never attested on incomplete history).
-    #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn resolve_landing_with_an_uncompletable_shallow_history_stays_unknown() {
-        let fixture = fixture(PASSING_SCRIPT);
-        let root = fixture._dir.path();
-        let origin = fixture._bare.path().join("origin.git");
-        let server = root.join("shallow-server");
-        let lane = root.join("shallow-client");
-        shallow_clone(&origin, &server, "1");
-        shallow_clone(&server, &lane, "1");
-        git(&lane, &["config", "user.email", "t@example.com"]);
-        git(&lane, &["config", "user.name", "T"]);
-        assert_eq!(
-            git(&lane, &["rev-parse", "--is-shallow-repository"]),
-            "true"
-        );
-        let tree = git(&lane, &["rev-parse", "origin/main^{tree}"]);
-        let orphan = git(&lane, &["commit-tree", &tree, "-m", "orphan"]);
-
-        let dir = fixture.node.gate_registry().land_fence_dir.clone();
-        let record = serde_json::json!({
-            "jobId": "gjb_shallow_stuck", "generation": 1, "pgid": 6262, "startTick": 8
-        });
-        super::write_land_group_dead_cert(&dir, &record, 6262).unwrap();
-        let reply = fixture
-            .node
-            .run_gate_resolve_landing(&serde_json::json!({
-                "jobId": "gjb_shallow_stuck",
+                "jobId": "gjb_shallow_r7",
                 "repoPath": lane.to_string_lossy(),
                 "baseBranch": "main",
                 "mergeSha": orphan,
@@ -7414,16 +7129,122 @@ head -c 1 >/dev/null || exit 4
             .await
             .unwrap();
         assert_eq!(reply["status"], json!("unknown"), "{reply}");
+        let error = reply["error"].as_str().unwrap_or("");
         assert!(
-            reply["error"]
-                .as_str()
-                .unwrap_or("")
-                .contains("added no history"),
-            "the unknown names the uncompletable shallow deepen: {reply}"
+            error.contains("shallow"),
+            "the operator message names the shallow condition: {reply}"
+        );
+        assert!(
+            error.contains(&*lane.to_string_lossy()),
+            "the operator message names the repository: {reply}"
         );
         assert_eq!(
             git(&lane, &["rev-parse", "--is-shallow-repository"]),
-            "true"
+            "true",
+            "R7 recovery never deepens: the lane must stay shallow"
         );
+    }
+
+    /// r19 item 2 / R7: a recovery fetch whose transport stalls is killed at
+    /// the per-command cap (well within the probe deadline and the Hub's 30 s
+    /// RPC timeout), the resolver answers Unknown BEFORE the deadline, and no
+    /// fetch/transport process survives the owner's group kill.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_recovery_fetch_is_unknown_before_the_deadline_with_no_leftover_process() {
+        let fixture = fixture(PASSING_SCRIPT);
+        let root = fixture._dir.path();
+        let origin = fixture._bare.path().join("origin.git");
+        let lane = root.join("stall-fetch");
+        shallow_clone(&origin, &lane, "1");
+        git(&lane, &["config", "user.email", "t@example.com"]);
+        git(&lane, &["config", "user.name", "T"]);
+        // Fake transport: git invokes this instead of ssh; it never speaks, so
+        // `git fetch origin` blocks until the owner kills the group.
+        let hang = root.join("hang-ssh-r19.sh");
+        // Answer git's `ssh -G host` settings probe directly; only the real
+        // upload-pack connection stalls.
+        std::fs::write(
+            &hang,
+            "#!/bin/sh\ncase \"$1\" in\n  -G) printf 'hostname %s\\nuser git\\nport 22\\n' \"$2\"; exit 0 ;;\nesac\nexec sleep 47.53\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hang, std::fs::Permissions::from_mode(0o755)).unwrap();
+        git(
+            &lane,
+            &["remote", "set-url", "origin", "ssh://example.test/repo.git"],
+        );
+        git(
+            &lane,
+            &["config", "core.sshCommand", hang.to_str().unwrap()],
+        );
+        let tree = git(&lane, &["rev-parse", "origin/main^{tree}"]);
+        let orphan = git(&lane, &["commit-tree", &tree, "-m", "orphan"]);
+
+        let started = std::time::Instant::now();
+        let reply = fixture
+            .node
+            .run_gate_resolve_landing(&serde_json::json!({
+                "jobId": "gjb_stall_r7",
+                "repoPath": lane.to_string_lossy(),
+                "baseBranch": "main",
+                "mergeSha": orphan,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(reply["status"], json!("unknown"), "{reply}");
+        let error = reply["error"].as_str().unwrap_or("");
+        assert!(
+            error.contains("recovery fetch") && error.contains("probe bound"),
+            "the unknown names the bounded recovery fetch: {reply}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(13),
+            "the probe must fail closed at the cap, not hang: {:?}",
+            started.elapsed()
+        );
+        // The transport grandchild was killed with the owner's group; no live
+        // marker process lingers (the git leader is reaped by the owner).
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let left = live_marker_processes("sleep 47.53");
+            if left == 0 || std::time::Instant::now() >= deadline {
+                assert_eq!(left, 0, "the stalled transport survived the owner kill");
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Count LIVE (non-zombie) processes whose /proc/<pid>/cmdline contains the
+    /// marker — r19 item 2/3 leftover-process assertion.
+    #[cfg(unix)]
+    fn live_marker_processes(marker: &str) -> usize {
+        std::fs::read_dir(super::proc_root())
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+                    .filter_map(|name| name.parse::<i32>().ok())
+                    .filter(|pid| {
+                        let base = super::proc_root().join(pid.to_string());
+                        let Ok(cmd) = std::fs::read_to_string(base.join("cmdline")) else {
+                            return false;
+                        };
+                        if !cmd.contains(marker) {
+                            return false;
+                        }
+                        if let Ok(stat) = std::fs::read_to_string(base.join("stat"))
+                            && let Some(after) = stat.rsplit_once(')').map(|(_, r)| r)
+                        {
+                            let state = after.split_whitespace().next().unwrap_or("");
+                            return state != "Z";
+                        }
+                        true
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
     }
 }

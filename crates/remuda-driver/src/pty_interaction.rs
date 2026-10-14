@@ -949,7 +949,11 @@ mod tests {
     }
 
     impl ShortSocketDir {
-        fn new(tag: &str) -> Self {
+        /// `socket_name` must be the EXACT file name the caller will bind
+        /// (`dir.path().join(socket_name)`): the fit check runs against that
+        /// full address, not a shorter placeholder, so a root that passes for
+        /// "herdr.sock" but not for "restarted-herdr.sock" is skipped.
+        fn new(tag: &str, socket_name: &str) -> Self {
             static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let name = format!(
                 "drvtest-{}-{}-{tag}",
@@ -959,7 +963,7 @@ mod tests {
             let path = crate::launch::runtime_dir::runtime_socket_candidates()
                 .into_iter()
                 .map(|root| root.join(&name))
-                .find(|dir| remuda_signal::runtime_dir::path_fits_sun_path(&dir.join("herdr.sock")))
+                .find(|dir| remuda_signal::runtime_dir::path_fits_sun_path(&dir.join(socket_name)))
                 .expect("a short runtime socket candidate exists");
             std::fs::create_dir_all(&path).expect("create short socket dir");
             Self { path }
@@ -1099,7 +1103,7 @@ mod tests {
         // Witness "Herdr": accepts connections, counts every byte received,
         // never replies — a permanently stalled RPC, exactly like the carrier
         // that is restarting.
-        let dir = ShortSocketDir::new("stalled");
+        let dir = ShortSocketDir::new("stalled", "parked-herdr.sock");
         let socket = dir.path().join("parked-herdr.sock");
         let listener = UnixListener::bind(&socket).expect("bind parked herdr");
         let observed_bytes = Arc::new(AtomicU64::new(0));
@@ -1198,7 +1202,7 @@ mod tests {
         use tokio::io::AsyncReadExt;
         use tokio::net::UnixListener;
 
-        let dir = ShortSocketDir::new("restart");
+        let dir = ShortSocketDir::new("restart", "restarted-herdr.sock");
         let socket = dir.path().join("restarted-herdr.sock");
 
         // Original carrier: accept exactly the pinned connection and HOLD it

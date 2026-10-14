@@ -322,9 +322,11 @@ pub struct Store {
         Arc<std::sync::Mutex<Option<(String, crate::gatequeue::TestGateFinishBeforeWrite)>>>,
     /// Test-only one-shot: the NEXT `insert_gate_log` writer deletes the old
     /// row and then fails its insert (ma-initiator r9 item 3), proving the
-    /// atomic transaction rolls the delete back.
+    /// atomic transaction rolls the delete back. r21 item 5: a counter so one
+    /// arm can fail the next N inserts (the finished event AND the RPC reply),
+    /// exercising the deferred-settlement retry without a third delivery.
     #[cfg(any(test, feature = "test-faults"))]
-    gate_log_insert_fault: Arc<std::sync::atomic::AtomicBool>,
+    gate_log_insert_fault: Arc<std::sync::atomic::AtomicUsize>,
     /// Test-only barriers at the apply_result boundaries (r10 item 5).
     #[cfg(any(test, feature = "test-faults"))]
     gate_apply_barrier: Arc<crate::gatequeue::GateApplyBarrier>,
@@ -2424,7 +2426,7 @@ impl Store {
             #[cfg(any(test, feature = "test-faults"))]
             test_finish_before_gate_mutate: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(any(test, feature = "test-faults"))]
-            gate_log_insert_fault: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            gate_log_insert_fault: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-faults"))]
             gate_apply_barrier: Arc::new(crate::gatequeue::GateApplyBarrier::new()),
             #[cfg(any(test, feature = "test-faults"))]
@@ -2656,7 +2658,36 @@ impl Store {
     #[cfg(any(test, feature = "test-faults"))]
     pub fn test_arm_gate_log_insert_fault(&self) {
         self.gate_log_insert_fault
-            .store(true, std::sync::atomic::Ordering::Release);
+            .store(1, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Test-only: fail the next `n` `insert_gate_log` writes, then recover —
+    /// r21 item 5 (the finished notification AND the RPC reply both hit a
+    /// transient failure; settlement must be retried, not consumed).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_arm_gate_log_insert_faults(&self, n: usize) {
+        self.gate_log_insert_fault
+            .store(n, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Test-only: fail EVERY `insert_gate_log` write until
+    /// [`Self::test_clear_gate_log_insert_fault`] — holds the evidence
+    /// deferral open so a test can assert the standing-down state despite the
+    /// r21 item 5 automatic retry (r21 item 4).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_arm_gate_log_insert_fault_sticky(&self) {
+        self.gate_log_insert_fault
+            .store(usize::MAX, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Test-only: recover storage after a sticky fault.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_clear_gate_log_insert_fault(&self) {
+        self.gate_log_insert_fault
+            .store(0, std::sync::atomic::Ordering::Release);
     }
 
     /// Test-only access to the apply_result boundary barrier.
@@ -2672,11 +2703,33 @@ impl Store {
         &self.gate_after_persist_barrier
     }
 
-    /// Test-only: consume (and clear) the armed insert fault.
+    /// Test-only: consume one armed insert fault (the counter counts down;
+    /// `true` while failures remain, `false` once storage has "recovered").
     #[cfg(any(test, feature = "test-faults"))]
     pub(crate) fn take_gate_log_insert_fault(&self) -> bool {
-        self.gate_log_insert_fault
-            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        use std::sync::atomic::Ordering;
+        loop {
+            let remaining = self.gate_log_insert_fault.load(Ordering::Acquire);
+            if remaining == 0 {
+                return false;
+            }
+            if self
+                .gate_log_insert_fault
+                .compare_exchange(
+                    remaining,
+                    if remaining == usize::MAX {
+                        usize::MAX
+                    } else {
+                        remaining - 1
+                    },
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return true;
+            }
+        }
     }
 
     /// Test-only: drain (at most) the armed project-patch fence.

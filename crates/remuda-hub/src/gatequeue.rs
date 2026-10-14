@@ -1934,6 +1934,17 @@ pub(crate) async fn apply_result(
     // after the writer stands down.
     let non_authoritative_landing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let non_authoritative_landing_writer = non_authoritative_landing.clone();
+    // Set by the writer when a definitive settlement STOOD DOWN solely because
+    // this arrival's supplied run log was not persisted as its own digest
+    // (r21 item 5). That is a DEFERRAL, not a terminal/stale rejection: the
+    // exact result + authority tuple are retained and re-driven (persist plus
+    // settlement) on a bounded retry, with every generation/session/merge check
+    // re-applied, so a transient insert outage that hits BOTH the finished
+    // event and the RPC reply heals without a third delivery.
+    let evidence_deferred = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let evidence_deferred_writer = evidence_deferred.clone();
+    // The verdict is moved into the writer; keep an exact copy for the retry.
+    let retry_result = result.clone();
     let outcome = state
         .store
         .mutate_gate_job(job_id, move |row, conn| {
@@ -1973,44 +1984,50 @@ pub(crate) async fn apply_result(
             //    Otherwise it DEFERS (returns false): the job stays
             //    unsettled for a retry rather than settling under ANOTHER
             //    result's old log. No run_log leaves the check vacuous.
-            let evidence_is_own =
-                |new_object_id: Option<&String>, row_object_id: Option<&str>| -> bool {
-                    let Some(run_log) = result.run_log.as_ref() else {
-                        return true;
-                    };
-                    let own_digest =
-                        crate::config::sha256_hex(&serde_json::to_vec(run_log).unwrap_or_default());
-                    let digest_of = |id: &str| -> Option<String> {
-                        conn.query_row(
-                            "SELECT digest FROM gate_log_objects WHERE id = ?1",
-                            params![id],
-                            |r| r.get(0),
-                        )
-                        .optional()
-                        .unwrap_or(None)
-                        .flatten()
-                    };
-                    if let Some(new_object_id) = new_object_id {
-                        return digest_of(new_object_id) == Some(own_digest);
+            let evidence_is_own = |new_object_id: Option<&String>,
+                                   row_object_id: Option<&str>|
+             -> bool {
+                let Some(run_log) = result.run_log.as_ref() else {
+                    return true;
+                };
+                let own_digest =
+                    crate::config::sha256_hex(&serde_json::to_vec(run_log).unwrap_or_default());
+                let digest_of = |id: &str| -> Option<String> {
+                    conn.query_row(
+                        "SELECT digest FROM gate_log_objects WHERE id = ?1",
+                        params![id],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .unwrap_or(None)
+                    .flatten()
+                };
+                if let Some(new_object_id) = new_object_id {
+                    let own = digest_of(new_object_id) == Some(own_digest);
+                    if !own {
+                        evidence_deferred_writer.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
-                    // r20 item 7: no object from THIS arrival. An existing
-                    // reference settles only when its bytes ARE this result's
-                    // log (content-addressed identity); an absent or
-                    // different-digest reference defers the settlement.
-                    match row_object_id.and_then(digest_of) {
-                        Some(existing_digest) if existing_digest == own_digest => true,
-                        linked => {
-                            tracing::info!(
-                                ?linked,
-                                own_digest,
-                                "deferring definitive gate settlement: the supplied run log was \
+                    return own;
+                }
+                // r20 item 7: no object from THIS arrival. An existing
+                // reference settles only when its bytes ARE this result's
+                // log (content-addressed identity); an absent or
+                // different-digest reference defers the settlement.
+                match row_object_id.and_then(digest_of) {
+                    Some(existing_digest) if existing_digest == own_digest => true,
+                    linked => {
+                        evidence_deferred_writer.store(true, std::sync::atomic::Ordering::Relaxed);
+                        tracing::info!(
+                            ?linked,
+                            own_digest,
+                            "deferring definitive gate settlement: the supplied run log was \
                                  not persisted and the linked evidence is absent or another \
                                  result's log"
-                            );
-                            false
-                        }
+                        );
+                        false
                     }
-                };
+                }
+            };
             // Landing: settle the GRANTED attempt's land verdict. Cancel is not
             // grantable once Landing (the grant writer only takes Running), so
             // there is no Canceling sub-case here. Idempotent on the dual
@@ -2338,6 +2355,14 @@ pub(crate) async fn apply_result(
                 .and_then(|job| job.host_id.map(|host| host.as_id().to_string()));
             schedule_landing_reconcile(state, host);
         }
+        // r21 item 5: the stand-down was an EVIDENCE DEFERRAL (the supplied log
+        // did not persist as its own digest), not a stale/terminal rejection.
+        // Retain the exact result + authority tuple and re-drive persistence
+        // plus settlement on a bounded schedule; a store outage that failed
+        // both dual deliveries heals without another delivery.
+        if evidence_deferred.load(std::sync::atomic::Ordering::Acquire) {
+            schedule_evidence_retry(state, job_id, retry_result, source_session);
+        }
         #[cfg(any(test, feature = "test-faults"))]
         barrier.note_completed();
         return;
@@ -2389,6 +2414,55 @@ pub(crate) async fn apply_result(
     // (persist + writer + side effects) has returned.
     #[cfg(any(test, feature = "test-faults"))]
     barrier.note_completed();
+}
+
+/// r21 item 5: retry an evidence-DEFERRED settlement. Each tick re-runs the
+/// REAL [`apply_result`] with the EXACT result and authority tuple (persist
+/// the log, then settle), so the in-transaction generation/session/merge
+/// guards and the own-digest predicate all re-apply: a retry never outranks a
+/// newer attempt, a replaced carrier or a different granted merge. The chain
+/// stops once the row leaves the live states (settled, canceled, or
+/// legitimately requeued). Best-effort and in-memory — the dual
+/// finished-event/RPC-reply delivery starts two independent chains, and the
+/// remote reconciler remains the durable backstop for a long outage.
+fn schedule_evidence_retry(
+    state: &AppState,
+    job_id: &str,
+    result: GateRunResult,
+    source_session: Option<u64>,
+) {
+    const RETRY_DELAYS: &[Duration] = &[
+        Duration::from_millis(75),
+        Duration::from_millis(250),
+        Duration::from_millis(500),
+        Duration::from_secs(1),
+        Duration::from_secs(2),
+        Duration::from_secs(4),
+        Duration::from_secs(8),
+    ];
+    let state = state.clone();
+    let job_id = job_id.to_owned();
+    tokio::spawn(async move {
+        for delay in RETRY_DELAYS {
+            tokio::time::sleep(*delay).await;
+            apply_result(&state, &job_id, result.clone(), source_session).await;
+            let still_live = state
+                .store
+                .get_gate_job(&job_id)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|job| {
+                    matches!(
+                        job.state,
+                        GateJobState::Running | GateJobState::Canceling | GateJobState::Landing
+                    )
+                });
+            if !still_live {
+                return;
+            }
+        }
+    });
 }
 
 /// Serialize and store the bounded run log as an immutable,

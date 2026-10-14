@@ -1202,17 +1202,32 @@ class HubStore {
    */
   private authGen = 0;
   /**
-   * EXTERNAL-identity epoch (c-reconnfu gate 38, the ONE mechanism for work
-   * suspended across an external change). Incremented ONLY by an identity
+   * EXTERNAL-identity epoch (c-reconnfu gate 38/39, the ONE mechanism for auth
+   * work suspended across an external change). Incremented ONLY by an identity
    * change originating OUTSIDE this tab's serialized credential chain — local
    * logout, bootstrap's 401 session clear, and a peer-tab login/logout
    * observed via storage. Ordinary credential succession (login B after login
-   * A in this tab) does NOT bump it. Every auth flow captures the epoch when
-   * it starts and validates it SYNCHRONOUSLY immediately before each
-   * externally visible effect (session write/publish, obligation creation or
-   * transfer, outbox/connection installation, publishing authed:true); a
-   * mismatch means the identity is gone — stop silently, publish/install
-   * nothing, settle the caller's promise as superseded/failed, never hang.
+   * A in this tab) does NOT bump it.
+   *
+   * The complete rule:
+   *  R-a: every PUBLIC auth entry point (login, pair, passkeyLogin, bootstrap,
+   *       any other that leads to session/resources) captures extEpoch at
+   *       ENTRY, BEFORE its first await, and carries that original value
+   *       through transitions and settlement.
+   *  R-b: every internal helper that installs resources or publishes identity
+   *       (initConnection, ensureOutbox, startOutboxInit, connection-machine
+   *       creation, row restore, session write/publish, authed publication)
+   *       takes the caller's epoch as a PARAMETER and validates it
+   *       synchronously immediately before each install/publish; a retired
+   *       caller gets an obsolete result. No helper captures a fresh epoch on
+   *       behalf of a caller.
+   *  R-c: an EXTERNAL change always leaves the UI SETTLED — the external
+   *       application of this change publishes ready:true, authed:false,
+   *       session:null synchronously; retired continuations then stay silent.
+   *
+   * A mismatch anywhere means the identity is gone — stop silently,
+   * publish/install nothing more, settle the caller's promise as
+   * superseded/failed, never hang.
    */
   private extEpoch = 0;
   /**
@@ -1331,6 +1346,18 @@ class HubStore {
       // in-memory session in THIS tab so readSession()/hasDeviceSession()
       // cannot resurrect the old identity.
       clearCachedSession();
+      // Gate 39 R-c: leave the UI in a SETTLED state synchronously. A peer
+      // logout observed while no entry point is running (or while one is
+      // parked) must not strand protected pages on the loading screen waiting
+      // on a bootstrap that will now return silently; the logout/401 callers
+      // emit their own identical state right after this, so this is an
+      // idempotent publish.
+      this.emit({
+        ready: true,
+        authed: false,
+        session: null,
+        connection: "offline",
+      });
     }
     this.disposeOutboxForAuthChange();
   }

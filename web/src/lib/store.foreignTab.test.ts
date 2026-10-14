@@ -8177,3 +8177,76 @@ it("GATE39 item 2: bootstrap parked INSIDE connection initialization across a pe
     sessionStorage.removeItem("remuda-outbox-owner");
   }
 });
+
+it("GATE39 item 3: a peer logout during initial bootstrap (health parked) settles the UI itself — ready true, authed false — before health is released OK", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_330_000);
+  const I = "ins_g39_3";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 3_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g39_3");
+    // Protected-route reload: session A exists in THIS tab (persisted + cached).
+    localStorage.setItem("runtime.device-session", JSON.stringify({ deviceId: "devA_g39_3", name: "A" }));
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+    vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+    vi.spyOn(api, "instanceList").mockResolvedValue({ items: [], nextCursor: null } as never);
+    vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+    let releaseHello: (() => void) | null = null;
+    let helloCalls = 0;
+    vi.spyOn(api, "hello").mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          helloCalls += 1;
+          releaseHello = () => resolve({} as Awaited<ReturnType<Api["hello"]>>);
+        }),
+    );
+
+    const h = hubStore as unknown as {
+      bootstrap: () => Promise<void>;
+      state: { ready: boolean; authed: boolean; session: unknown; connection: string };
+    };
+    const boot = h.bootstrap();
+    for (let i = 0; i < 4_000 && helloCalls < 1; i += 1) await Promise.resolve();
+    expect(helloCalls).toBe(1);
+    // Protected page is still on the loading screen: not ready yet.
+    expect(h.state.ready).toBe(false);
+
+    // PEER logout while the health request is parked. The external change ITSELF
+    // must publish the settled logged-out state (the stale bootstrap will only
+    // be released afterwards and must stay silent).
+    localStorage.removeItem("runtime.device-session");
+    window.dispatchEvent(
+      new StorageEvent("storage", { key: "runtime.device-session", oldValue: "{}", newValue: null }),
+    );
+    await pump(500);
+    expect(h.state.ready).toBe(true);
+    expect(h.state.authed).toBe(false);
+    expect(h.state.session).toBeNull();
+
+    // Release the health request OK: the retired bootstrap publishes nothing
+    // (no late authed flicker) and settles.
+    releaseHello!();
+    await boot;
+    await pump(2_000);
+    expect(h.state.ready).toBe(true);
+    expect(h.state.authed).toBe(false);
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});

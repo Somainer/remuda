@@ -8992,18 +8992,19 @@ it("GATE43 item 1 (i): obsolete reload bootstrap and its joined caller wait for 
   }
 });
 
-it("GATE43 item 1 (ii): successful login A parked, login B invalidates it and then fails — A resolves only after a current-gen install", async () => {
+it("GATE44 item 3: successful login A parked at its own install, later successor B fails — A fulfils only when the current-generation install completes", async () => {
   vi.useFakeTimers();
   vi.setSystemTime(1_410_000);
-  const I = "ins_g43_1ii";
+  const I = "ins_g44_3";
   const originalNavigator = globalThis.navigator;
   Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
   localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
   const pump = async (n = 5_000) => {
     for (let i = 0; i < n; i += 1) await Promise.resolve();
   };
+  let seams: Record<string, unknown> | null = null;
   try {
-    sessionStorage.setItem("remuda-outbox-owner", "owner_g43_1ii");
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g44_3");
     localStorage.setItem("runtime.logged-out", "1");
     const { api, hubStore } = await fresh();
     vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
@@ -9027,16 +9028,16 @@ it("GATE43 item 1 (ii): successful login A parked, login B invalidates it and th
     let releaseA: () => void = () => undefined;
     const { HubHttpError } = await import("./httpError");
     vi.spyOn(api, "login").mockImplementationOnce(
-      () => new Promise((resolve) => { releaseA = () => resolve({ deviceId: "devA_g43_1ii", token: "tokA", name: "A" }); }),
+      () => new Promise((resolve) => { releaseA = () => resolve({ deviceId: "devA_g44_3", token: "tokA", name: "A" }); }),
     ).mockImplementationOnce(
       () => Promise.reject(new HubHttpError(503, "busy", "host busy")),
     );
 
-    // Every storage initializer parks (A's own, B's finalizer init, and the
-    // current-gen recovery install) with its own release, so the recovery
-    // install is genuinely parked when A's obsolete run hands over to it.
+    // EVERY storage initializer parks with its own release (A's own install,
+    // the successor finalizer install, any current-gen recovery install).
     const storageReleases: Array<() => void> = [];
     const internals = hubStore as unknown as Record<string, unknown>;
+    seams = internals;
     (internals.setOutboxOpenGateForTest as (g: ((r: () => void) => void) | null) => void)((resolve) => {
       storageReleases.push(resolve);
     });
@@ -9045,47 +9046,71 @@ it("GATE43 item 1 (ii): successful login A parked, login B invalidates it and th
     const h = hubStore as unknown as {
       login: (k: "bootstrap", s: string, d: string) => Promise<void>;
       connection: unknown;
-      state: { authed: boolean; bubbles: Array<{ clientRequestId: string }> };
+      state: { ready: boolean; authed: boolean; bubbles: Array<{ clientRequestId: string }> };
     };
+
+    // 1) Complete A's credentials. A acquires; its continuation clears the
+    // bootstrap obligation and its own bootstrap parks inside the STORAGE
+    // initializer (the installation is parked, nothing built yet).
     const loginAP = h.login("bootstrap", "a", "devA");
+    await pump(200); // A's credential body is parked.
+    releaseA!();
     await pump(800);
-
-    // B queues behind parked A.
-    const loginBP = h.login("bootstrap", "b", "devB");
-    await pump(300);
-
-    // A releases (success, parked install); B acquires, fails (503): the
-    // obligation transferred from superseded A to B's generation, so B's
-    // failed settlement starts a current-gen recovery install.
+    expect(storageReleases.length).toBeGreaterThanOrEqual(1);
     let aFulfilled = false;
     void loginAP.then(() => { aFulfilled = true; });
-    releaseA!();
-    await pump(600);
-    // A's obsolete initializer and the current-gen recovery install (B's
-    // failed settlement AWAITS the surviving obligation's bootstrap) are both
-    // parked; nothing installed and A is still unfulfilled.
-    expect(storageReleases.length).toBeGreaterThanOrEqual(2);
+    await pump(200);
     expect(aFulfilled).toBe(false);
     expect(h.connection).toBeNull();
 
-    // Release every parked initializer: the current-generation recovery
-    // install completes; A fulfils and B's login rejects (its settlement
-    // awaited that same install before rethrowing).
-    for (const r of storageReleases) r!();
+    // 2) Successor B starts and FAILS (503): its acquisition invalidates A's
+    // parked initializer; the surviving obligation drives a current-gen
+    // install, which parks behind the next storage gate.
+    const loginBP = h.login("bootstrap", "b", "devB");
     await expect(loginBP).rejects.toThrow(/busy/);
+    await pump(600);
+    expect(storageReleases.length).toBeGreaterThanOrEqual(2);
+    // The current-gen replacement install is still parked and A has not
+    // fulfilled even though A's own (obsolete) initializer is now releasable.
+    expect(aFulfilled).toBe(false);
+    expect(h.connection).toBeNull();
+
+    // 3) Seed a durable row NOW, so only the current-generation machine can
+    // restore it (A's obsolete run must never restore/build).
+    const seed = new (await import("./outbox")).LocalStorageOutboxStorage();
+    await seed.put({
+      commandId: "cmd_g44_3", clientRequestId: "local_g44_3", instanceId: I,
+      prompt: "g44 3", createdAt: 1, attempts: 0, state: "pending",
+    });
+
+    // 4) Release ALL parked initializers. A fulfils ONLY once the
+    // current-generation install finishes; assert the complete settled state
+    // INSIDE A's fulfilment callback.
+    let assertedInFulfilment = false;
+    void loginAP.then(() => {
+      expect(h.state.ready).toBe(true);
+      expect(h.state.authed).toBe(true);
+      expect(h.connection).not.toBeNull();
+      expect(h.state.bubbles.filter((b) => b.clientRequestId === "local_g44_3")).toHaveLength(1);
+      expect(addSpy.mock.calls.filter((c) => c[0] === "online")).toHaveLength(1);
+      assertedInFulfilment = true;
+    });
+    for (const r of storageReleases) r!();
     await loginAP;
     await pump(6_000);
     expect(aFulfilled).toBe(true);
-    expect(h.connection).not.toBeNull();
-    expect(h.state.authed).toBe(true);
-    // Exactly one machine from the recovery install.
+    expect(assertedInFulfilment).toBe(true);
+    // Exactly one machine from the current-generation install.
     expect(addSpy.mock.calls.filter((c) => c[0] === "online")).toHaveLength(1);
   } finally {
+    if (seams) {
+      (seams.setOutboxOpenGateForTest as (g: ((r: () => void) => void) | null) => void)(null);
+    }
     vi.useRealTimers();
     Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
     sessionStorage.removeItem("remuda-outbox-owner");
   }
-});
+});;
 
 it("GATE44 item 2 (ruling U): unavailable outbox storage still installs the connection machine; it recovers live and a degraded send uses the keyed fallback", async () => {
   vi.useFakeTimers();

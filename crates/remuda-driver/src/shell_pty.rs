@@ -603,6 +603,22 @@ impl ShellPtyDriver {
         false
     }
 
+    /// c-usagefu r20 item 5 test seam: clone the run's event sender so a test
+    /// can deliberately FILL the bounded channel and stall finalization
+    /// publication.
+    #[cfg(any(test, feature = "test-stub"))]
+    pub async fn test_events_sender(&self) -> Option<mpsc::Sender<remuda_protocol::Observation>> {
+        self.events_tx.lock().await.clone()
+    }
+
+    /// c-usagefu r20 item 5 test seam: a stamped throwaway observation used to
+    /// fill the run channel in cancellation tests.
+    #[cfg(any(test, feature = "test-stub"))]
+    pub async fn test_filler_observation(&self) -> Option<remuda_protocol::Observation> {
+        let ctx = self.promote_ctx.lock().await.clone()?;
+        Some(promotion::test_filler_observation(&ctx))
+    }
+
     /// Build a driver whose promotion detection reads `table` instead of the
     /// host process table. Tests drive detection from a fixture this way.
     #[must_use]
@@ -6869,18 +6885,47 @@ mod tests {
         crate::adapters::codex_discovery::shutdown_unconfirmed_guards(None);
     }
 
-    #[tokio::test]
-    async fn an_abort_inside_finalization_delivers_finished_usage_exactly_once() {
-        // c-usagefu r19 item 2: the poller breaks normally and enters finalize;
-        // mapper.finish() maps the open turn into the GUARD-OWNED pending
-        // queue; the flush parks on the test gate (standing in for a
-        // cancellation landing on the awaited send). Aborting there used to
-        // find the guard hydrator None and the mapped observations in a local
-        // Vec — all lost. The guard now owns both and Drop delivers them.
+    /// c-usagefu r20 item 5 shared harness: fill the bounded run channel so the
+    /// next awaited publication parks, then free exactly one slot on demand.
+    /// Dummy observations are tagged so the test can ignore them when reading.
+    async fn fill_event_channel(
+        sender: &mpsc::Sender<remuda_protocol::Observation>,
+        filler: &remuda_protocol::Observation,
+    ) {
+        while sender.capacity() > 0 {
+            sender
+                .send(filler.clone())
+                .await
+                .expect("fill the run channel");
+        }
+    }
+
+    /// True iff an observation is the buffered open turn's usage payload.
+    fn is_open_turn_usage(observation: &remuda_protocol::Observation) -> bool {
+        match &observation.body {
+            remuda_protocol::ObservationPayload::Usage(payload) => {
+                payload.output_tokens == remuda_protocol::Knowledge::Known { value: U64(13) }
+            }
+            _ => false,
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_abort_during_a_full_channel_finalize_delivers_usage_exactly_once() {
+        // c-usagefu r20 items 1/2/5 — CLOSE path. The poller parks at the
+        // post-production gate (mapper.finish() already in the guard queue,
+        // nothing awaited yet); the test then FILLS the channel and releases
+        // the gate, so publication parks on a capacity reservation while the
+        // usage observation is still guard-owned. One slot freed, then abort on
+        // the current-thread runtime: the freed slot is unclaimed by any other
+        // sender; the guard's Drop delivers exactly once. Reverting rule (c)
+        // (pop before the awaited send) loses the observation deterministically.
         let dir = tempfile::tempdir().unwrap();
         let (driver, mut events, _cwd, _session) = driver_with_buffered_open_turn(dir.path()).await;
+        let sender = driver.test_events_sender().await.expect("run sender");
+        let filler = driver.test_filler_observation().await.expect("filler");
 
-        // Break the loop (same as close's cooperative shutdown).
+        let park = promotion::test_acquire_finalise_publish_park().await;
         driver
             .state()
             .await
@@ -6890,21 +6935,25 @@ mod tests {
         if let Some(shutdown) = driver.poller_shutdown.lock().await.take() {
             let _ = shutdown.send(true);
         }
-        // The in-finalize gate: the finish() group is queued behind it.
-        let park = promotion::test_acquire_finalise_send_park().await;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
-        while !promotion::test_finalise_send_park_held() {
+        while !promotion::test_finalise_publish_park_held() {
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "the poller parks inside finalization"
+                "poller parks pre-publish"
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        // Drain anything published before the gate.
-        let _ = drain_observations(&mut events, |body| Some(body.clone())).len();
+        // Fill WHILE parked: production completed, publication never started.
+        fill_event_channel(&sender, &filler).await;
+        drop(park);
+        // Publication now parks on reserve().await with the full channel.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-        // Abort exactly as close's deadline does when a finalize send never
-        // returns: the task is cancelled INSIDE finalization.
+        // Take the parked handle (the poller never locks its own JoinHandle),
+        // then ABORT while the channel is still full, free ONE slot, and only
+        // then await the cancelled task. Its woken send body never resumes
+        // (cancelled before the next poll); the guard's cancellation Drop runs
+        // with the freed slot available — deterministic on every runtime.
         let poller = driver
             .poller
             .lock()
@@ -6912,27 +6961,90 @@ mod tests {
             .take()
             .expect("the real poller handle");
         poller.abort();
+        let _freed = events.recv().await.expect("one filler drains");
         let _ = poller.await;
-        drop(park);
 
-        // The guard's Drop found the finish() group in its pending queue and
-        // delivered it (the hydrator was consumed, so no finish_sync rerun).
-        let payloads = buffered_usage_payloads(&mut events);
+        let mut delivered = Vec::new();
+        while let Ok(Some(observation)) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), events.recv()).await
+        {
+            if is_open_turn_usage(&observation) {
+                delivered.push(observation);
+            }
+        }
         assert_eq!(
-            payloads.len(),
+            delivered.len(),
             1,
-            "the finish() group survives cancellation inside finalization once"
-        );
-        assert_eq!(
-            payloads[0].output_tokens,
-            remuda_protocol::Knowledge::Known { value: U64(13) }
+            "buffered usage survives abort during a full-channel finalize, once"
         );
 
         Driver::close(&driver).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert!(
             buffered_usage_payloads(&mut events).is_empty(),
-            "no second publication"
+            "no second usage publication"
+        );
+        crate::adapters::codex_discovery::shutdown_unconfirmed_guards(None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_abort_during_a_full_channel_rebind_delivers_usage_exactly_once() {
+        // c-usagefu r20 items 1/2/5 — REBIND path (rule (d)): a second
+        // authenticated SessionStart rebinds the foreground; the old hydrator
+        // is produced into guard storage and publication parks at the SAME
+        // post-production gate. Fill, release, free one slot, abort: the old
+        // turn's usage is delivered from the guard exactly once.
+        let dir = tempfile::tempdir().unwrap();
+        let (driver, mut events, _cwd, _session) = driver_with_buffered_open_turn(dir.path()).await;
+        let sender = driver.test_events_sender().await.expect("run sender");
+        let filler = driver.test_filler_observation().await.expect("filler");
+        let pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
+        let hooks = driver.hooks.lock().await.clone().expect("hook session");
+
+        let park = promotion::test_acquire_finalise_publish_park().await;
+        // A SECOND, different SessionStart on the same foreground pid is an
+        // authenticated rebind: the next tick finalizes the old hydrator and
+        // reaches the gate.
+        let second = dir.path().join("second.jsonl");
+        r7_send_session_start(&hooks, pgid, "r20-second-session", &second).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !promotion::test_finalise_publish_park_held() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "poller reaches rebind publish gate"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        fill_event_channel(&sender, &filler).await;
+        drop(park);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let poller = driver
+            .poller
+            .lock()
+            .await
+            .take()
+            .expect("the real poller handle");
+        poller.abort();
+        let _freed = events.recv().await.expect("one filler drains");
+        let _ = poller.await;
+
+        let mut delivered = Vec::new();
+        while let Ok(Some(observation)) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), events.recv()).await
+        {
+            if is_open_turn_usage(&observation) {
+                delivered.push(observation);
+            }
+        }
+        assert_eq!(
+            delivered.len(),
+            1,
+            "the rebound hydrator's buffered usage survives abort, once"
+        );
+        Driver::close(&driver).await.unwrap();
+        assert!(
+            buffered_usage_payloads(&mut events).is_empty(),
+            "no second usage publication after the abort rebind"
         );
         crate::adapters::codex_discovery::shutdown_unconfirmed_guards(None);
     }

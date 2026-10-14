@@ -1416,6 +1416,17 @@ class HubStore {
       // waiter — no waiter may outlive its epoch. They wake, re-read extEpoch
       // at the fulfilment-loop top and return silently.
       this.notifyBootstrapSettledWaiters();
+      // Release any OPEN credential transition blocker so queued/running
+      // transitions waiting on the chain (a parked predecessor's fulfilment,
+      // and B/C runAuthTransition calls parked at `await prev`) wake and
+      // observe the new epoch -> obsolete, instead of hanging behind a held
+      // successor body that never resolves.
+      if (this.resolveAuthTransition) {
+        const resolve = this.resolveAuthTransition;
+        this.resolveAuthTransition = null;
+        this.authTransition = null;
+        resolve();
+      }
       // Gate 39 R-c: leave the UI in a SETTLED state synchronously. A peer
       // logout observed while no entry point is running (or while one is
       // parked) must not strand protected pages on the loading screen waiting

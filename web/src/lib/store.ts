@@ -1430,11 +1430,17 @@ class HubStore {
    * a stale continuation never bootstraps — readSession()'s cached in-memory
    * session is consulted only AFTER those checks and cannot outlive the peer
    * logout for this decision.
+   *
+   * Gate 37 item 2: returns the bootstrap promise so the PUBLIC login
+   * continuations can await it; a final owner's login resolves only once the
+   * authenticated UI is published (AuthGate no longer bounces a too-early
+   * navigation back to /login), while a superseded caller transfers the
+   * obligation and returns immediately without waiting on its successor.
    */
-  private settleAuthBootstrap(outcome:
+  private async settleAuthBootstrap(outcome:
     | { ok: true; result: DeviceSession; superseded: boolean; acquired: AuthTransitionOwner }
     | { ok: false; error: unknown; superseded: boolean; acquired: AuthTransitionOwner },
-  ): void {
+  ): Promise<void> {
     const ownsNow = () =>
       this.authGen === outcome.acquired.gen && this.transitionSeq === outcome.acquired.seq;
     if (outcome.ok) {
@@ -1448,7 +1454,7 @@ class HubStore {
       }
       this.authBootstrapOwed = null;
       if (!ownsNow()) return; // external change after settlement preparation
-      void this.bootstrap().catch(() => undefined);
+      await this.bootstrap().catch(() => undefined);
       return;
     }
     // Failed final owner: discharge a predecessor's obligation ONLY while this
@@ -1461,7 +1467,7 @@ class HubStore {
       readSession()
     ) {
       this.authBootstrapOwed = null;
-      void this.bootstrap().catch(() => undefined);
+      await this.bootstrap().catch(() => undefined);
     }
   }
 
@@ -4308,13 +4314,19 @@ class HubStore {
         : api.login(secret, deviceName),
     );
     if (!outcome.ok) {
-      this.settleAuthBootstrap(outcome);
+      // A failed superseded caller transfers the obligation and settles on the
+      // rejection WITHOUT awaiting its successor; the final owner owns it.
+      await this.settleAuthBootstrap(outcome);
       throw outcome.error;
     }
     writeSession(outcome.result, { mock: api.mock });
     // bootstrap marks the session authenticated after cookie-backed reads finish.
     this.emit({ session: readSession(), error: null });
-    this.settleAuthBootstrap(outcome);
+    // Gate 37 item 2: AWAIT the final-owner bootstrap so the login promise
+    // resolves only after the authenticated UI is published — LoginPage
+    // navigates in this promise's .then(), and resolving earlier made
+    // AuthGate bounce back to /login (remount, passkey mediation restart).
+    await this.settleAuthBootstrap(outcome);
   }
 
   /** Whether the browser exposes WebAuthn on this origin. */
@@ -4347,12 +4359,16 @@ class HubStore {
       api.passkeyLoginFinish(envelope.challengeId, assertion, deviceName),
     );
     if (!outcome.ok) {
-      this.settleAuthBootstrap(outcome);
+      // A failed superseded caller transfers the obligation and settles on the
+      // rejection WITHOUT awaiting its successor; the final owner owns it.
+      await this.settleAuthBootstrap(outcome);
       throw outcome.error;
     }
     writeSession(outcome.result, { mock: api.mock });
     this.emit({ session: readSession(), error: null });
-    this.settleAuthBootstrap(outcome);
+    // Gate 37 item 2: await the final-owner bootstrap for the same reason as
+    // password/pair login — no /login bounce after passkey navigation.
+    await this.settleAuthBootstrap(outcome);
     return { assertion, challengeId: envelope.challengeId };
   }
 

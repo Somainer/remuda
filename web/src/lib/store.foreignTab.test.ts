@@ -7709,3 +7709,67 @@ it("GATE37 item 1: a PEER logout between login A's success and queued login B's 
     }
   }
 });
+
+it("GATE37 item 2: a successful login resolves only AFTER bootstrap publishes the authenticated UI — a delayed bootstrap response keeps the login promise pending and authed false", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_280_000);
+  const I = "ins_g37_2";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 3_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g37_2");
+    localStorage.removeItem("runtime.device-session");
+    localStorage.setItem("runtime.logged-out", "1");
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+    vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+    vi.spyOn(api, "instanceList").mockResolvedValue({
+      items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
+      nextCursor: null,
+    } as never);
+    vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+
+    // The bootstrap HEALTH response is the delayed piece (the credential
+    // body resolves immediately).
+    let releaseHello: () => void = () => undefined;
+    vi.spyOn(api, "hello").mockImplementation(
+      () => new Promise((resolve) => { releaseHello = () => resolve({} as never); }),
+    );
+    vi.spyOn(api, "login").mockResolvedValue({ deviceId: "dev_g37_2", token: "tok", name: "g37_2" });
+
+    const h = hubStore as unknown as {
+      login: (k: "bootstrap", s: string, d: string) => Promise<void>;
+      state: { authed: boolean };
+    };
+    let loginSettled = false;
+    const loginP = h.login("bootstrap", "secret", "dev").then(() => { loginSettled = true; });
+    await pump(1_000);
+    // Credential body already resolved, but bootstrap's health request is
+    // still open: the login promise must NOT resolve and authed stays false
+    // (otherwise LoginPage navigates and AuthGate bounces back to /login).
+    expect(loginSettled).toBe(false);
+    expect(h.state.authed).toBe(false);
+
+    releaseHello();
+    await loginP;
+    // Only now, with the authenticated UI published, does login resolve.
+    expect(loginSettled).toBe(true);
+    expect(h.state.authed).toBe(true);
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});

@@ -1958,45 +1958,59 @@ pub(crate) async fn apply_result(
                 );
                 return None;
             }
-            // r19 item 4: bind EVERY definitive settlement to THIS result's
-            // OWN evidence. The object id is content-addressed and immutable;
-            // when this arrival persisted a run_log (new_object_id is Some),
-            // the linked row must hold exactly that log's digest — read inside
-            // this write transaction, so a same-grant result whose object was
-            // attached by an interleaved writer is observed and the verdict
-            // stands down. No run_log, or a persist that produced no object
-            // (nothing is rebound), leaves the check vacuous.
-            let evidence_is_own = |new_object_id: Option<&String>| -> bool {
-                let Some(run_log) = result.run_log.as_ref() else {
-                    return true;
+            // r19 item 4 / r20 item 7: bind EVERY definitive settlement to
+            // THIS result's OWN evidence.
+            //  * this arrival PERSISTED its run_log (`new_object_id` Some):
+            //    the object must have exactly this log's sha256 — read inside
+            //    this write transaction, so a same-grant result whose object
+            //    was attached by an interleaved writer is observed and the
+            //    verdict stands down;
+            //  * this arrival SUPPLIED a run_log but did NOT persist one
+            //    (`new_object_id` None — failed insert, oversize log, refused
+            //    write): settlement is allowed ONLY when the row already
+            //    references an object of the SAME digest (an identical
+            //    redelivery whose bytes are already the bound evidence).
+            //    Otherwise it DEFERS (returns false): the job stays
+            //    unsettled for a retry rather than settling under ANOTHER
+            //    result's old log. No run_log leaves the check vacuous.
+            let evidence_is_own =
+                |new_object_id: Option<&String>, row_object_id: Option<&str>| -> bool {
+                    let Some(run_log) = result.run_log.as_ref() else {
+                        return true;
+                    };
+                    let own_digest =
+                        crate::config::sha256_hex(&serde_json::to_vec(run_log).unwrap_or_default());
+                    let digest_of = |id: &str| -> Option<String> {
+                        conn.query_row(
+                            "SELECT digest FROM gate_log_objects WHERE id = ?1",
+                            params![id],
+                            |r| r.get(0),
+                        )
+                        .optional()
+                        .unwrap_or(None)
+                        .flatten()
+                    };
+                    if let Some(new_object_id) = new_object_id {
+                        return digest_of(new_object_id) == Some(own_digest);
+                    }
+                    // r20 item 7: no object from THIS arrival. An existing
+                    // reference settles only when its bytes ARE this result's
+                    // log (content-addressed identity); an absent or
+                    // different-digest reference defers the settlement.
+                    match row_object_id.and_then(digest_of) {
+                        Some(existing_digest) if existing_digest == own_digest => true,
+                        linked => {
+                            tracing::info!(
+                                ?linked,
+                                own_digest,
+                                "deferring definitive gate settlement: the supplied run log was \
+                                 not persisted and the linked evidence is absent or another \
+                                 result's log"
+                            );
+                            false
+                        }
+                    }
                 };
-                let Some(new_object_id) = new_object_id else {
-                    return true;
-                };
-                let own_digest =
-                    crate::config::sha256_hex(&serde_json::to_vec(run_log).unwrap_or_default());
-                let linked: Option<String> = conn
-                    .query_row(
-                        "SELECT digest FROM gate_log_objects WHERE id = ?1",
-                        params![new_object_id],
-                        |r| r.get(0),
-                    )
-                    .optional()
-                    .unwrap_or(None)
-                    .flatten();
-                if linked.as_deref() != Some(own_digest.as_str()) {
-                    tracing::info!(
-                        new_object_id,
-                        own_digest,
-                        ?linked,
-                        "dropping definitive gate settlement: linked evidence is another result's \
-                         log"
-                    );
-                    false
-                } else {
-                    true
-                }
-            };
             // Landing: settle the GRANTED attempt's land verdict. Cancel is not
             // grantable once Landing (the grant writer only takes Running), so
             // there is no Canceling sub-case here. Idempotent on the dual
@@ -2108,7 +2122,7 @@ pub(crate) async fn apply_result(
                         // r18 item 7 / r19 item 4: the winning landed verdict
                         // is bound to ITS OWN evidence object (digest checked in
                         // this transaction); a mismatch keeps the row Landing.
-                        if !evidence_is_own(log_object_id.as_ref()) {
+                        if !evidence_is_own(log_object_id.as_ref(), row.log_object_id.as_deref()) {
                             return None;
                         }
                         row.state = GateJobState::Landed;
@@ -2136,7 +2150,7 @@ pub(crate) async fn apply_result(
                         // own evidence, so a same-grant base-moved result can
                         // never pin another arrival's log (r18 only checked the
                         // landed arm).
-                        if !evidence_is_own(log_object_id.as_ref()) {
+                        if !evidence_is_own(log_object_id.as_ref(), row.log_object_id.as_deref()) {
                             return None;
                         }
                         row.state = GateJobState::Failed;
@@ -2189,7 +2203,7 @@ pub(crate) async fn apply_result(
                     // The lane already pushed before the cancel reached it;
                     // main moved. Keep the truth rather than claim a cancel —
                     // bound to this result's own evidence (r19 item 4).
-                    if !evidence_is_own(log_object_id.as_ref()) {
+                    if !evidence_is_own(log_object_id.as_ref(), row.log_object_id.as_deref()) {
                         return None;
                     }
                     row.state = GateJobState::Landed;
@@ -2262,7 +2276,7 @@ pub(crate) async fn apply_result(
             } else if result.status == "landed" {
                 // r19 item 4: a definitive landed settlement binds its own
                 // evidence digest.
-                if !evidence_is_own(log_object_id.as_ref()) {
+                if !evidence_is_own(log_object_id.as_ref(), row.log_object_id.as_deref()) {
                     return None;
                 }
                 row.state = GateJobState::Landed;
@@ -2284,7 +2298,7 @@ pub(crate) async fn apply_result(
                 // r19 item 4: a definitive failure (incl. an attempt-cap
                 // base-moved Failed reached through this arm) binds its own
                 // evidence digest.
-                if !evidence_is_own(log_object_id.as_ref()) {
+                if !evidence_is_own(log_object_id.as_ref(), row.log_object_id.as_deref()) {
                     return None;
                 }
                 row.state = GateJobState::Failed;

@@ -2429,8 +2429,12 @@ async fn a_late_runlog_never_overwrites_the_jobs_legacy_log_object() {
 }
 
 /// A failed INSERT in the immutable log writer must leave the previously
-/// referenced object served (nothing is deleted) and the job keeps its prior
-/// reference because no new object is bound.
+/// referenced object served (nothing is deleted). r20 item 7: the definitive
+/// settlement also STANDS DOWN — the job stays Running and keeps its prior
+/// reference because the new result supplied a log that was never persisted;
+/// it may not fail the job under another result's old bytes. A later retry
+/// (the one-shot fault is consumed) persists the new evidence and settles,
+/// bound to its OWN object.
 #[tokio::test]
 async fn a_failed_log_insert_keeps_the_previous_object_served() {
     let (ctx, _node) = Ctx::boot().await.unwrap();
@@ -2442,6 +2446,20 @@ async fn a_failed_log_insert_keeps_the_previous_object_served() {
         .test_apply_gate_result(&job_id, failed_result_with_log(&job_id, "never stored"))
         .await
         .unwrap();
+
+    // r20 item 7: the definitive Failed settlement DEFERS — the job is still
+    // Running, not failed under the legacy log.
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(
+        doc["state"],
+        json!("running"),
+        "settlement must stand down: {doc}"
+    );
+    assert_eq!(
+        doc["logObjectId"],
+        json!(legacy_id),
+        "no new reference is bound by a failed persist: {doc}"
+    );
 
     // The transaction rolled back: the OLD object is still served, by object
     // id and by job id.
@@ -2476,6 +2494,43 @@ async fn a_failed_log_insert_keeps_the_previous_object_served() {
     assert_eq!(by_job["objectId"], json!(legacy_id), "{by_job}");
     // The old headline already proves the original bytes survived.
     let _ = old_bytes;
+
+    // RETRY: the one-shot fault is consumed, the same definitive result
+    // persists its OWN object and the deferred settlement now commits Failed
+    // bound to it (never to the legacy bytes).
+    ctx.hub
+        .test_apply_gate_result(&job_id, failed_result_with_log(&job_id, "never stored"))
+        .await
+        .unwrap();
+    let settled = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(
+        settled["state"],
+        json!("failed"),
+        "the retry settles: {settled}"
+    );
+    let new_id = settled["logObjectId"]
+        .as_str()
+        .expect("the retry binds its persisted object")
+        .to_owned();
+    assert_ne!(
+        new_id, legacy_id,
+        "the settled evidence is not the legacy log"
+    );
+    let (status, served) = ctx
+        .send(
+            "GET",
+            &format!("/v1/gate/logs/{new_id}"),
+            &ctx.human,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{served}");
+    assert_eq!(
+        served["log"]["headline"],
+        json!("never stored"),
+        "the Failed settlement is bound to the retried result's own bytes: {served}"
+    );
 }
 
 /// The Node delivers a FAILED verdict with runLog through BOTH real Hub

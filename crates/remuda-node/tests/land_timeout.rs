@@ -266,7 +266,8 @@ if [ "$mode" = "gate" ]; then
   printf '{"exitCode":0,"status":"verified","base":"%s","head":"%s","merged":"%s"}\n' "$base" "$head" "$(git rev-parse HEAD)"
 else
   # CAS lost: nonzero exit, but the structured verdict is still on stdout.
-  printf '{"exitCode":3,"status":"base_moved","currentMain":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","error":"remote main moved"}\n'
+  # r18 item 1: the refusal carries the attempted merge (the verified HEAD).
+  printf '{"exitCode":3,"status":"base_moved","merged":"%s","currentMain":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","error":"remote main moved"}\n' "$(git rev-parse HEAD)"
   exit 3
 fi
 "#;
@@ -530,7 +531,8 @@ if [ "$mode" = "gate" ]; then
 else
   # 300 KiB of rejection diagnostics to stderr.
   head -c 300000 /dev/zero | tr '\0' 'x' 1>&2
-  printf '{"exitCode":3,"status":"base_moved","currentMain":"cccccccccccccccccccccccccccccccccccccccc","error":"remote main moved"}\n'
+  # r18 item 1: the base_moved refusal carries the attempted merge sha.
+  printf '{"exitCode":3,"status":"base_moved","merged":"%s","currentMain":"cccccccccccccccccccccccccccccccccccccccc","error":"remote main moved"}\n' "$(git rev-parse HEAD)"
   exit 3
 fi
 "#;

@@ -933,6 +933,48 @@ mod tests {
             "fixture".into(),
         )
     }
+
+    /// Per-test directory for a LIVE-bound Unix socket whose full address
+    /// must fit `sockaddr_un.sun_path` regardless of how deep the gate's
+    /// build/TMPDIR tree is.
+    ///
+    /// `tempfile::tempdir()` honours `TMPDIR`; under a long gate checkout
+    /// the joined socket path exceeds SUN_LEN and `bind` panics. Reuse the
+    /// SAME candidate roots production redirects sockets onto
+    /// ([`crate::launch::runtime_dir::runtime_socket_candidates`] — the
+    /// fixed `/tmp/remuda-<uid>` placement is always among them), pick the
+    /// first whose root + socket name fits, and clean up on drop.
+    struct ShortSocketDir {
+        path: std::path::PathBuf,
+    }
+
+    impl ShortSocketDir {
+        fn new(tag: &str) -> Self {
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let name = format!(
+                "drvtest-{}-{}-{tag}",
+                std::process::id(),
+                SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            );
+            let path = crate::launch::runtime_dir::runtime_socket_candidates()
+                .into_iter()
+                .map(|root| root.join(&name))
+                .find(|dir| remuda_signal::runtime_dir::path_fits_sun_path(&dir.join("herdr.sock")))
+                .expect("a short runtime socket candidate exists");
+            std::fs::create_dir_all(&path).expect("create short socket dir");
+            Self { path }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    impl Drop for ShortSocketDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
     #[tokio::test]
     async fn closing_blocked_prompt_does_not_wait_for_optional_observer() {
         for detached in [false, true] {
@@ -1057,9 +1099,7 @@ mod tests {
         // Witness "Herdr": accepts connections, counts every byte received,
         // never replies — a permanently stalled RPC, exactly like the carrier
         // that is restarting.
-        let dir = tempfile::Builder::new()
-            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
-            .expect("in-crate temp dir");
+        let dir = ShortSocketDir::new("stalled");
         let socket = dir.path().join("parked-herdr.sock");
         let listener = UnixListener::bind(&socket).expect("bind parked herdr");
         let observed_bytes = Arc::new(AtomicU64::new(0));
@@ -1158,9 +1198,7 @@ mod tests {
         use tokio::io::AsyncReadExt;
         use tokio::net::UnixListener;
 
-        let dir = tempfile::Builder::new()
-            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
-            .expect("in-crate temp dir");
+        let dir = ShortSocketDir::new("restart");
         let socket = dir.path().join("restarted-herdr.sock");
 
         // Original carrier: accept exactly the pinned connection and HOLD it

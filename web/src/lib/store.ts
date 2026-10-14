@@ -4415,14 +4415,19 @@ class HubStore {
     // republish authed from a cached session.
     const extAtBoot = this.extEpoch;
     const extLive = () => this.extEpoch === extAtBoot;
-    const gen = ++this.bootGen;
+    // bootGen is still bumped so a list poll issued by an older bootstrap is
+    // dropped when a newer one starts (refresh captures it), but it no longer
+    // retires THIS bootstrap (gate 40: epoch owns that).
+    ++this.bootGen;
     if (api.mock && readLoggedOut() && !readSession()) {
       this.emit({ ready: true, authed: false, session: null, devices: [], passkeys: [], connection: "offline" });
       return;
     }
     if (api.mock && !readSession()) {
       const session = await api.login(MOCK_BOOTSTRAP_TOKEN, readDeviceSettings().deviceName);
-      if (gen !== this.bootGen || !extLive()) return;
+      // Gate 40: epoch is the only retirement gate (not bootGen — see the catch
+      // block); an external change while this step was parked retires the run.
+      if (!extLive()) return;
       // First identity establishment: route through the same helper so the
       // initial Outbox initializer starts under a defined, current generation.
       this.applyAuthIdentityChange();
@@ -4431,7 +4436,9 @@ class HubStore {
     }
     try {
       await api.hello();
-      if (gen !== this.bootGen || !extLive()) return;
+      // Gate 40: epoch is the only retirement gate (not bootGen — see the catch
+      // block); an external change while this step was parked retires the run.
+      if (!extLive()) return;
       if (!api.mock && !api.hasDeviceSession()) {
         this.emit({ ready: true, authed: false, error: null, connection: "live" });
         return;
@@ -4443,7 +4450,9 @@ class HubStore {
         api.deviceList().catch(() => ({ items: [] as PairedDevice[] })),
         api.passkeyList().catch(() => ({ items: [] as PasskeyView[] })),
       ]);
-      if (gen !== this.bootGen || !extLive()) return;
+      // Gate 40: epoch is the only retirement gate (not bootGen — see the catch
+      // block); an external change while this step was parked retires the run.
+      if (!extLive()) return;
       const registeredHosts = mergeHostWorkspaces(hosts.items, this.state.hosts);
       this.emit({
         ready: true,
@@ -4501,7 +4510,13 @@ class HubStore {
       this.startPoll();
       this.installDevHandle();
     } catch (err) {
-      if (gen !== this.bootGen || !extLive()) return;
+      // Gate 40: the external epoch is the ONLY silent-retirement gate here;
+      // no bootGen check (that generation is bumped by ordinary logout and by
+      // an overlapping bootstrap on a page reload — a stale-generation
+      // transient failure used to bail without publishing, stranding AuthGate
+      // on the loading screen). An explicit 401 moves the epoch itself below
+      // and still emits; a CURRENT-identity transient/network failure always
+      // settles the UI (offline/authed as appropriate).
       const unauth = isUnauthorized(err);
       if (unauth) {
         // c-reconnfu gate 33 item 1: a 401 means the current session is gone;

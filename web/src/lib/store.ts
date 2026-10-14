@@ -69,7 +69,7 @@ type BootstrapOutcome =
  * caller settles silently (resolves, never throws — nothing was attempted).
  */
 type AuthTransitionOutcome<T> =
-  | { obsolete: true }
+  | { obsolete: true; issuedSeq: number }
   | {
       obsolete: false;
       superseded: boolean;
@@ -1412,6 +1412,10 @@ class HubStore {
       // that publishes its own state. The logout/401 callers also dispose via
       // their own teardown, so this is idempotent for them.
       this.disposeConnectionForAuthChange();
+      // Gate 46 item 3: an external identity change retires EVERY settlement
+      // waiter — no waiter may outlive its epoch. They wake, re-read extEpoch
+      // at the fulfilment-loop top and return silently.
+      this.notifyBootstrapSettledWaiters();
       // Gate 39 R-c: leave the UI in a SETTLED state synchronously. A peer
       // logout observed while no entry point is running (or while one is
       // parked) must not strand protected pages on the loading screen waiting
@@ -1499,7 +1503,11 @@ class HubStore {
       // released the blocker and nulled the obligation; the chain tail simply
       // resolves so a later fresh transition can acquire.
       if (this.extEpoch !== myExt) {
-        return { obsolete: true };
+        // Gate 46 item 3: carry the issued sequence so the public login
+        // continuation settles THAT sequence (settleAuthBootstrap bumps
+        // transitionSettledSeq), preventing an obsolete queued C from stalling
+        // later settlement waiters forever.
+        return { obsolete: true, issuedSeq: myIssuedSeq };
       }
       this.transitionSeq = myIssuedSeq;
       // Gate 37 item 1: this transition's OWN acquisition routes through
@@ -1605,9 +1613,11 @@ class HubStore {
   private async settleAuthBootstrap(outcome:
     | AuthTransitionOutcome<DeviceSession>,
   ): Promise<void> {
-    // Gate 45 item 1: a queued-obsolete transition settles with no install.
+    // Gate 45 item 1 / gate 46 item 3: a queued-obsolete transition settles with
+    // no install but MUST settle its OWN issued sequence so later settlement
+    // waiters never stall behind it.
     if (outcome.obsolete) {
-      this.transitionSettledSeq = this.transitionIssuedSeq;
+      this.transitionSettledSeq = Math.max(this.transitionSettledSeq, outcome.issuedSeq);
       this.notifyBootstrapSettledWaiters();
       return;
     }
@@ -4603,10 +4613,16 @@ class HubStore {
    *    settle silently (R-c already published the logged-out state).
    */
   /**
-   * Gate 45 item 1: waiters parked by obsolete bootstrap continuations while a
-   * successor credential transition is between "blocker released" and
-   * "bootstrap slot launched". settleAuthBootstrap notifies them once it has
-   * decided whether to run a bootstrap (the slot then exists) or not.
+   * c-reconnfu gate 46 — ONE RULE for bootstrap completion: every await in
+   * runBootstrap / fulfilBootstrap / initConnection / settleAuthBootstrap is
+   * followed by a synchronous check of BOTH the caller's external epoch and
+   * credential generation BEFORE any publication, polling, installation or
+   * caller fulfilment.
+   *  - external epoch changed -> retire silently (never wait, never publish);
+   *  - credential generation changed within the same epoch -> obsolete ->
+   *    follow the CURRENT-generation run.
+   * Every settlement/transition waiter is also woken and retired by an
+   * external identity change — no waiter outlives its epoch.
    */
   private bootstrapSettledWaiters: Array<() => void> = [];
   private notifyBootstrapSettledWaiters(): void {
@@ -4617,53 +4633,49 @@ class HubStore {
 
   private async fulfilBootstrap(first: Promise<BootstrapOutcome>, callerExt: number): Promise<void> {
     let result = await first;
-    // Gate 45 item 1: a SETTLED outcome is accepted only while its carried
-    // credential generation is still current; a login acquiring in the
-    // install-return window bumps authGen, so such a result becomes obsolete
-    // and follows the current run. eslint-disable-next-line no-constant-condition
+    // Gate 46 item 2: revalidate after the FIRST await. External epoch moved ->
+    // retire silently (R-c published the logged-out state). Same-epoch gen move
+    // falls into the obsolete handoff below.
+    // eslint-disable-next-line no-constant-condition
     while (true) {
       if (result.kind !== "obsolete") {
-        if (this.extEpoch !== callerExt || result.gen !== this.authGen) return;
+        if (this.extEpoch !== callerExt) return; // retired externally
+        if (result.gen !== this.authGen) {
+          // Settled outcome whose generation was superseded in the SAME epoch:
+          // treat as obsolete and follow the current generation (don't return
+          // success for a stale install).
+          result = { kind: "obsolete", gen: result.gen };
+          continue;
+        }
         return;
       }
-      if (this.extEpoch !== callerExt) return;
-      // Gate 45: a credential transition for the CURRENT generation is still
-      // open — the successor owns the chain and runs its own finalizer
-      // bootstrap. Wait for it instead of launching a competing run (whose
-      // ensureOutbox can only observe the open transition as obsolete).
+      if (this.extEpoch !== callerExt) return; // retired externally, never wait
+      // Gate 45/46: an OPEN successor transition owns the chain. Await its
+      // blocker but re-check the caller epoch IMMEDIATELY after (a logout
+      // interleaved with the blocker release must strand no waiter).
       if (this.authTransition) {
         await this.authTransition;
+        if (this.extEpoch !== callerExt) return;
       }
-      // The blocker may have released while the successor's issue() promise is
-      // still settling (authTransition already null, settleAuthBootstrap not run
-      // yet): wait until settleAuthBootstrap has at least PUBLISHED a
-      // current-generation bootstrap slot (or determined none is needed),
-      // without racing it. We poll the settled-seq AND the slot.
+      // Wait for the successor's post-issue settlement; an external change
+      // wakes this waiter via notifyBootstrapSettledWaiters and the epoch
+      // re-check at the loop top retires it.
       for (let guard = 0; guard < 1_000; guard += 1) {
-        const settling = this.transitionIssuedSeq > this.transitionSettledSeq;
-        if (!settling) break;
+        if (this.transitionIssuedSeq <= this.transitionSettledSeq) break;
         if (this.bootstrapInFlight && this.bootstrapInFlight.gen === this.authGen) break;
+        if (this.extEpoch !== callerExt) return;
         await new Promise<void>((resolve) => {
           this.bootstrapSettledWaiters.push(resolve);
         });
       }
+      if (this.extEpoch !== callerExt) return;
       const awaited = this.bootstrapInFlight;
       if (awaited) {
         result = await awaited.promise;
-        // The joined run can itself go obsolete if a successor transition
-        // (re)opened while it ran — re-evaluate at the top of the loop.
-        continue;
+        continue; // re-evaluate identity at the top
       }
-      if (this.extEpoch !== callerExt) return;
-      const current = this.bootstrapInFlight;
-      if (current && current.promise !== first) {
-        result = await current.promise;
-        // The joined run can itself go obsolete if a successor transition
-        // (re)opened while it ran — re-evaluate at the top of the loop.
-        continue;
-      }
-      // No open transition and no in-flight run (successor failed without
-      // bootstrapping): install for the current generation now.
+      // No in-flight run (successor failed without bootstrapping): install for
+      // the current generation now.
       result = await this.launchBootstrapRun(this.extEpoch, this.authGen);
     }
   }
@@ -4824,9 +4836,12 @@ class HubStore {
       const hasSession = api.hasDeviceSession();
       if (!unauth && hasSession) {
         const installOffline = await this.initConnection(true, extAtBoot);
+        // Gate 46 item 1: BOTH coordinates after the offline install await,
+        // BEFORE publishing/polling. The offline branch must publish only for
+        // the generation that owned the install — a gen moved here goes
+        // obsolete and follows the current run (same as the healthy branch).
         if (!extLive()) return obsoleteOutcome();
-        // Gate 43 (b): gen-superseded while the epoch is current — never fulfil
-        // here; fulfilBootstrap joins/starts the current generation's install.
+        if (installOffline.gen !== this.authGen) return obsoleteOutcome();
         if (installOffline.kind === "obsolete") return obsoleteOutcome();
         // installed OR unavailable (gate 43 (c)): either way settle the cached
         // authenticated session, start polling/recovery, and fulfil.

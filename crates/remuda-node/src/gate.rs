@@ -156,6 +156,11 @@ const DEFAULT_GATE_TIMEOUT_SECS: u64 = 60 * 60;
 const DEFAULT_THEN_TIMEOUT_SECS: u64 = 10 * 60;
 /// Default cap for a home-host land (fetch of the merge + leased push).
 const DEFAULT_LAND_TIMEOUT_SECS: u64 = 10 * 60;
+/// r20 items 4+5 / R8(b): fixed owner-cleanup allowance added to the soft land
+/// cap to form the ABSOLUTE deadline — group TERM/KILL settle, the bounded
+/// leader reap and the bounded pipe drains. Platform-independent constants so
+/// the deadline exists on every target; the actual group signalling is unix.
+const LAND_OWNER_CLEANUP_BUDGET: Duration = Duration::from_millis(750 + 500 + 2_000);
 /// Captured output retained in a result.
 const OUTPUT_CAP_BYTES: usize = 16 * 1024;
 
@@ -2221,12 +2226,14 @@ impl DevNode {
             // wait_with_output), so on timeout the child is still owned here
             // and can be killed and reaped.
             let land_budget = registry.land_timeout().await;
-            // r20 items 4+5 / R8(b): ONE absolute deadline bounds the wait and
-            // every subsequent owner step (survivor cleanup, leader reap, pipe
-            // drains). A leader reap or pipe drain that is still blocked at the
-            // deadline is abandoned inside this owner (detached reaper/task)
-            // and the response is uncertain; it never blocks the settlement.
-            let land_deadline = std::time::Instant::now() + land_budget;
+            // r20 items 4+5 / R8(b): the land_budget is the SOFT cap (when a
+            // still-running leader is KILLed); the ABSOLUTE deadline adds the
+            // fixed owner cleanup allowance (TERM/KILL settle + bounded reap +
+            // pipe drains) and bounds the ENTIRE sequence. A reap or pipe
+            // reader still blocked at the absolute deadline is abandoned inside
+            // this owner (detached reaper/task) and the response is uncertain;
+            // it never blocks the settlement.
+            let land_deadline = std::time::Instant::now() + land_budget + LAND_OWNER_CLEANUP_BUDGET;
             // r19 item 1 / R6: abort is a MESSAGE to this child's unique owner.
             // Subscribe before the barrier release so an abort latched while the
             // child is still parked is observed by the select below.
@@ -2288,13 +2295,14 @@ impl DevNode {
                                 .await
                                 .ok();
                         }
-                        // Reap the land leader BOUNDED (a SIGKILL'd zombie is
-                        // normally collected within the grace). R8(b): if the
+                        // Reap the land leader BOUNDED by the absolute
+                        // deadline (a SIGKILL'd zombie is normally collected
+                        // well within the cleanup allowance). R8(b): if the
                         // reap is still blocked, hand the child to a detached
                         // owner task and respond anyway — never block the
                         // uncertain settlement on an unreaped leader.
                         let reaped =
-                            tokio::time::timeout(OWNED_KILL_GRACE, land_child.wait()).await;
+                            tokio::time::timeout(remaining(land_deadline), land_child.wait()).await;
                         if reaped.is_err() {
                             tokio::spawn(async move {
                                 let _ = land_child.wait().await;
@@ -3749,8 +3757,9 @@ fn owned_git(
     run_owned_process(command, cap, deadline)
 }
 
-/// Remaining time until an absolute deadline (saturates at zero).
-#[cfg(unix)]
+/// Remaining time until an absolute deadline (saturates at zero). Used by the
+/// unix-only recovery owner AND the platform-independent land owner, so it is
+/// not itself cfg-gated.
 fn remaining(deadline: std::time::Instant) -> Duration {
     deadline
         .checked_duration_since(std::time::Instant::now())

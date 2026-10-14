@@ -197,10 +197,10 @@ fn shadow_home(root: &Path, id: &remuda_protocol::InstanceId) -> PathBuf {
         .join("codex-home")
 }
 
-/// Write an otherwise-eligible rollout (matching session/cwd/prompt) into the
-/// instance's shadow codex home.
-fn write_eligible_rollout(shadow_home: &Path, cwd: &Path, owner: &str) {
-    remuda_driver::adapters::codex_discovery::record_input(cwd, owner, PROMPT);
+/// Write an otherwise-eligible rollout (matching session/cwd/prompt) into a
+/// shadow codex home under `session`.
+fn write_rollout_into(shadow_home: &Path, cwd: &Path, prompt_owner: &str, session: &str) {
+    remuda_driver::adapters::codex_discovery::record_input(cwd, prompt_owner, PROMPT);
     let started = time::OffsetDateTime::now_utc();
     let month_dir = shadow_home.join("sessions").join(format!(
         "{:04}/{:02}/{:02}",
@@ -213,9 +213,9 @@ fn write_eligible_rollout(shadow_home: &Path, cwd: &Path, owner: &str) {
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap();
     std::fs::write(
-        month_dir.join("rollout-r19epoch.jsonl"),
+        month_dir.join(format!("rollout-{session}.jsonl")),
         format!(
-            "{{\"timestamp\":\"{rfc}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{SESSION}\",\"session_id\":\"{SESSION}\",\"cwd\":\"{}\",\"timestamp\":\"{rfc}\"}}}}\n\
+            "{{\"timestamp\":\"{rfc}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session}\",\"session_id\":\"{session}\",\"cwd\":\"{}\",\"timestamp\":\"{rfc}\"}}}}\n\
              {{\"timestamp\":\"{rfc}\",\"ordinal\":1,\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"id\":\"m\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{PROMPT}\"}}],\"internal_chat_message_metadata_passthrough\":{{\"content_item_kinds\":[\"user.text\"]}}}}}}\n",
             cwd.display()
         ),
@@ -223,19 +223,31 @@ fn write_eligible_rollout(shadow_home: &Path, cwd: &Path, owner: &str) {
     .unwrap();
 }
 
-/// A prompt-only probe (no lifetime of its own beyond the adapter window):
-/// returns true iff it binds in `cwd`.
-fn prompt_only_binds(shadow_home: &Path, cwd: &Path, owner: &str) -> bool {
-    let mut probe = remuda_driver::adapters::codex_adapter::CodexAdapter::new(AdapterHome {
+/// A fresh prompt-only discoverer with its OWN owner and a launch floor
+/// sampled AFTER the rollout was written: the strict floor and owner-prompt
+/// checks pass, so the ONLY thing that can refuse it is the census overlap.
+fn prompt_only_binds(shadow_home: &Path, cwd: &Path) -> bool {
+    // Owner and rollout are created FIRST (owner's prompt evidence + a fresh,
+    // unclaimed rollout); the discoverer is constructed AFTER with a floor in
+    // the tiny window between creation and now, so the ONLY possible rejection
+    // is the census sole-live overlap — never the launch floor, owner prompt,
+    // stale claim or index tier.
+    let owner = format!("probe-{}", std::process::id());
+    write_rollout_into(shadow_home, cwd, &owner, SESSION);
+    let floor = time::OffsetDateTime::now_utc() + time::Duration::milliseconds(100);
+    let mut adapter = remuda_driver::adapters::codex_adapter::CodexAdapter::new(AdapterHome {
         home: shadow_home.to_path_buf(),
         cwd: cwd.to_path_buf(),
         pid: None,
-        launched_at: Some(time::OffsetDateTime::now_utc()),
+        launched_at: Some(floor),
         resume_session_id: None,
     })
-    .with_instance_key(Some(owner.to_owned()));
-    let _ = probe.poll();
-    probe.binding().is_some()
+    .with_instance_key(Some(owner));
+    // Wait past the floor so the rollout (created just before it) is eligible
+    // on every check EXCEPT the census overlap.
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let _ = adapter.poll();
+    adapter.binding().is_some()
 }
 
 async fn launch_real_codex(
@@ -339,7 +351,7 @@ async fn shared_native_epoch_retirement_unblocks_recomposed_native_discovery() {
     let id_a = created_a.instance.meta.id.clone();
     // The driver registers before its file adapter can bind; write the
     // eligible rollout into the shadow home FIRST, then wait for the bind.
-    write_eligible_rollout(&home_a, &cwd_a, id_a.as_id().as_str());
+    write_rollout_into(&home_a, &cwd_a, id_a.as_id().as_str(), SESSION);
     wait_driver_bound(&node_a, &id_a, "Node A").await;
 
     // Forced incomplete close on the real driver.
@@ -355,7 +367,7 @@ async fn shared_native_epoch_retirement_unblocks_recomposed_native_discovery() {
     // owned by A still makes an independent prompt-only launch refuse.
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
     assert!(
-        !prompt_only_binds(&home_a, &cwd_a, "probe-a-blocked"),
+        !prompt_only_binds(&home_a, &cwd_a),
         "an otherwise-eligible rollout is refused while A's block is live"
     );
 
@@ -365,7 +377,7 @@ async fn shared_native_epoch_retirement_unblocks_recomposed_native_discovery() {
     let node_c = compose_native(root_c.path(), workspace_c.clone());
     let (created_c, cwd_c, home_c) = launch_real_codex(&node_c, root_c.path(), &workspace_c).await;
     let id_c = created_c.instance.meta.id.clone();
-    write_eligible_rollout(&home_c, &cwd_c, id_c.as_id().as_str());
+    write_rollout_into(&home_c, &cwd_c, id_c.as_id().as_str(), SESSION);
     wait_driver_bound(&node_c, &id_c, "Node C").await;
     live_driver(&node_c, &id_c)
         .await
@@ -396,7 +408,7 @@ async fn shared_native_epoch_retirement_unblocks_recomposed_native_discovery() {
     let id_b = created_b.instance.meta.id.clone();
     // B's own launch floor was sampled before the rollout; write the eligible
     // rollout into B's fresh shadow home and let B's OWN adapter poll it.
-    write_eligible_rollout(&home_b, &cwd_a, id_b.as_id().as_str());
+    write_rollout_into(&home_b, &cwd_a, id_b.as_id().as_str(), SESSION);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     let driver_b = live_driver(&node_b, &id_b).await;
     while !driver_b.test_codex_bound() && tokio::time::Instant::now() < deadline {
@@ -417,6 +429,5 @@ async fn shared_native_epoch_retirement_unblocks_recomposed_native_discovery() {
 
     // Cleanup detached test census state.
     remuda_driver::adapters::codex_discovery::forget_lifetime(&cwd_c, id_c.as_id().as_str());
-    remuda_driver::adapters::codex_discovery::forget_lifetime(&cwd_a, "probe-a-blocked");
     remuda_driver::adapters::codex_discovery::forget_lifetime(&cwd_a, id_b.as_id().as_str());
 }

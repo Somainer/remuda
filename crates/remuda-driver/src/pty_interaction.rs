@@ -131,8 +131,11 @@ pub(crate) struct PtyInteractions {
 pub(crate) struct DispatchGate {
     /// Fired once, strictly after the final check passes.
     arrived: tokio::sync::oneshot::Sender<()>,
-    /// The parked dispatch proceeds only once this is notified.
-    release: Arc<tokio::sync::Notify>,
+    /// The parked dispatch proceeds only once this receiver resolves. Using a
+    /// oneshot (rather than `Notify::notify_waiters`) RETAINS the release for
+    /// a waiter that has not parked yet, so a release can never be lost to
+    /// scheduling.
+    release: tokio::sync::oneshot::Receiver<()>,
 }
 
 impl PtyInteractions {
@@ -607,7 +610,9 @@ impl PtyInteractions {
                 // test waits on this before revoking, so it can never mistake
                 // an early ControlUnavailable for the post-check window.
                 let _ = gate.arrived.send(());
-                gate.release.notified().await;
+                // Retained wait: a value sent on oneshot is held for a waiter
+                // that has not parked yet (unlike Notify::notify_waiters).
+                let _ = gate.release.await;
             }
         }
         conn.agent_send_keys(&self.target, keys)
@@ -1190,11 +1195,12 @@ mod tests {
         // acknowledgement is fired INSIDE the seam strictly after the final
         // check, so waiting on it deterministically proves the request reached
         // the race window (no sleep-based guess).
-        let release = Arc::new(tokio::sync::Notify::new());
+        // Sender kept until the release moment; the seam holds the receiver.
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
         interactions.arm_pre_dispatch_gate(DispatchGate {
             arrived: arrived_tx,
-            release: release.clone(),
+            release: release_rx,
         });
 
         // The request: connects to the ORIGINAL carrier, passes the check,
@@ -1255,8 +1261,10 @@ mod tests {
         // Release the parked request: its pinned connection is the dead
         // original boot's, so the write must fail with a TRANSPORT error —
         // never the local ControlUnavailable, which would mean it was revoked
-        // before the check and never exercised this window.
-        release.notify_waiters();
+        // before the check and never exercised this window. The retained
+        // oneshot release is not lost if the request has not parked yet (a
+        // non-retaining notify_waiters would race the release away).
+        release_tx.send(()).expect("release receiver is alive");
         let result = tokio::time::timeout(Duration::from_secs(10), request)
             .await
             .expect("dispatch resolves")
@@ -1268,7 +1276,26 @@ mod tests {
         assert!(
             !matches!(err, DriverError::ControlUnavailable),
             "an early ControlUnavailable means the request never reached the \
-             post-check window; the failure must be a transport error, got {err:?}"
+             post-check window, got {err:?}"
+        );
+        // Positive assertion: the mapped failure is a BROKEN TRANSPORT on the
+        // pinned connection (write to the half-closed socket), proving the
+        // write was attempted against the dead original carrier rather than
+        // refused before dispatch or retried onto the replacement boot.
+        let broken_transport = matches!(
+            &err,
+            DriverError::Io(io) if matches!(
+                io.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionAborted
+            )
+        );
+        assert!(
+            broken_transport,
+            "expected a broken-transport error from the pinned connection, \
+             got {err:?}"
         );
 
         // Give a buggy (reconnecting) build a beat to dial the replacement.

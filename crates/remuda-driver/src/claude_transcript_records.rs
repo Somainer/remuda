@@ -399,12 +399,22 @@ impl Group {
     /// position, clearing the dirty flag (but retaining the run) so a later
     /// same-id record publishes at its OWN strictly newer position. `None`
     /// when the run carries no usage.
+    ///
+    /// Per-field merging (c-ctxusage r26 item 3) applies only to records that
+    /// coalesce within ONE unpublished flush; a later record is published with
+    /// exactly the buckets it reported (omitted stay Unknown). The ACCUMULATED
+    /// USAGE is therefore consumed — but its native timestamp/position
+    /// provenance is retained: a later record of the same message group that
+    /// carries only fresh counters still rides the group's known native time
+    /// (a group's records share one envelope), whereas a record arriving in a
+    /// genuinely new group stamps its own.
     pub(crate) fn take_usage(&mut self) -> Option<PendingUsage> {
         let head = self.head.as_ref()?;
         let usage = self.last_usage.clone()?;
         let source_position = self.last_usage_position?;
         self.usage_published = true;
         self.usage_dirty = false;
+        self.last_usage = None;
         let message_id = head
             .pointer("/message/id")
             .and_then(Value::as_str)

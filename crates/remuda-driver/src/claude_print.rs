@@ -10211,51 +10211,62 @@ mod partial_usage_poll_boundary_tests {
             .expect("the group published at least one usage observation")
     }
 
-    /// c-ctxusage r26 item 3: the FINAL counters for a full-then-partial usage
-    /// sequence must be identical whether the two records land in ONE poll
-    /// (coalesced before the mapper flushes) or across a poll boundary. Before
-    /// the per-field group merge the coalesced ordering published output-only.
+    /// c-ctxusage r26 item 3: records that coalesce within ONE poll (one
+    /// unpublished flush) merge per field before publication — a later
+    /// output-only frame must not erase the earlier input/cache counters.
     #[test]
-    fn coalesced_and_split_polls_produce_identical_final_counters() {
-        let coalesced = {
+    fn coalesced_records_in_one_poll_merge_per_field() {
+        let payload = {
             let mut mapper = mapper();
             mapper.map_line(&full_record()).expect("map full");
             mapper.map_line(&output_only_record()).expect("map partial");
             last_usage(mapper.flush().expect("flush"))
         };
-        let split = {
-            let mut mapper = mapper();
-            mapper.map_line(&full_record()).expect("map full");
-            let _provisional = mapper.flush().expect("first poll flush");
-            mapper.map_line(&output_only_record()).expect("map partial");
-            last_usage(mapper.flush().expect("second poll flush"))
-        };
+        assert_eq!(payload.input_tokens, Knowledge::Known { value: U64(100) });
+        assert_eq!(payload.output_tokens, Knowledge::Known { value: U64(20) });
+        assert_eq!(
+            payload.cache_read_tokens,
+            Knowledge::Known { value: U64(0) },
+            "earlier cache read retained"
+        );
+        assert_eq!(
+            payload.cache_write_tokens,
+            Knowledge::Known { value: U64(3) },
+            "earlier TTL-split cache write retained (1+2)"
+        );
+        assert_eq!(payload.total_tokens, Knowledge::Known { value: U64(123) });
+    }
 
-        for (label, payload) in [("coalesced", coalesced), ("split", split)] {
-            assert_eq!(
-                payload.input_tokens,
-                Knowledge::Known { value: U64(100) },
-                "{label}: partial later frame must not erase input"
-            );
-            assert_eq!(
-                payload.output_tokens,
-                Knowledge::Known { value: U64(20) },
-                "{label}: latest output wins"
-            );
-            assert_eq!(
-                payload.cache_read_tokens,
-                Knowledge::Known { value: U64(0) },
-                "{label}: earlier cache read retained"
-            );
-            assert_eq!(
-                payload.cache_write_tokens,
-                Knowledge::Known { value: U64(3) },
-                "{label}: earlier TTL-split cache write retained (1+2)"
-            );
-            assert_eq!(
-                payload.total_tokens,
-                Knowledge::Known { value: U64(123) },
-                "{label}: 100 + 20 + 0 + 3"
+    /// c-ctxusage r26 item 3 / U1 across a poll boundary: once a flush has
+    /// published, the group's accumulated usage is consumed. A later record
+    /// in another poll is published with exactly the buckets IT reported —
+    /// omitted buckets stay Unknown on the wire (never retained from the
+    /// earlier frame, never zero). The Hub's `merged_over` combines it with
+    /// the prior stored frame (end-to-end identity is pinned in
+    /// remuda-node `usage_turn_revision`).
+    #[test]
+    fn a_partial_record_in_a_later_poll_stays_partial_on_the_wire() {
+        let mut mapper = mapper();
+        mapper.map_line(&full_record()).expect("map full");
+        let first = last_usage(mapper.flush().expect("first poll flush"));
+        assert_eq!(first.input_tokens, Knowledge::Known { value: U64(100) });
+
+        mapper.map_line(&output_only_record()).expect("map partial");
+        let second = last_usage(mapper.flush().expect("second poll flush"));
+        assert_eq!(
+            second.output_tokens,
+            Knowledge::Known { value: U64(20) },
+            "the later frame's output reports"
+        );
+        for omitted in [
+            &second.input_tokens,
+            &second.cache_read_tokens,
+            &second.cache_write_tokens,
+            &second.total_tokens,
+        ] {
+            assert!(
+                matches!(omitted, Knowledge::Unknown { .. }),
+                "an omitted bucket is Unknown across a poll boundary, got {omitted:?}"
             );
         }
     }

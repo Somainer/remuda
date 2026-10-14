@@ -1001,6 +1001,11 @@ async fn resolve_project_job(
     let expected_attempts = request.expected_attempts;
     let expected_epoch = request.expected_session_epoch.clone();
     let expected_merge = request.expected_merge_sha.clone();
+    // r19 item 1 / R6: stop the granted land group — and wait for the Node's
+    // unique owner to kill/reap/release the lane — BEFORE the terminal/requeue
+    // state becomes visible. Otherwise a periodic scheduler tick could hand the
+    // still-held lane to the next dispatch between the row commit and the abort.
+    abort_landing_run(&state, &job).await;
     let outcome = state
         .store
         .mutate_gate_job(&job_id, move |row, _conn| {
@@ -1068,13 +1073,9 @@ async fn resolve_project_job(
         ));
     };
     if requeue {
-        // Stop the granted land group BEFORE the scheduler can hand the lane
-        // to the fresh attempt (an unresolved late verdict is generation-fenced).
-        abort_landing_run(&state, &job).await;
         journal(&state, &device.id, "gate.base-moved-requeue", &outcome).await;
         schedule_once(&state);
     } else {
-        abort_landing_run(&state, &job).await;
         journal(&state, &device.id, "gate.failed", &outcome).await;
         drop_job_refs(&state, &outcome).await;
     }
@@ -1259,7 +1260,7 @@ async fn schedule(state: &AppState) -> Result<(), HubError> {
         }
     }
     // Group queued jobs per project in FIFO order; once an earlier queued job
-    // cannot be dispatched this tick, later ones wait too (queue order).
+    // cannot dispatch this tick, later ones wait too (queue order).
     let mut queued: std::collections::BTreeMap<String, Vec<&GateJob>> =
         std::collections::BTreeMap::new();
     for job in jobs.iter().filter(|job| job.state == GateJobState::Queued) {

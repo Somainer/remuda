@@ -1343,6 +1343,9 @@ impl DevNode {
                 NodeError::InvalidRequest(format!("invalid gate.abortLanding params: {error}"))
             })?;
         let registry = self.gate_registry();
+        // Whether the land child had spawned (its owner will reap it); if not,
+        // the verify child is cancelled instead.
+        let mut land_spawned = false;
         {
             let mut table = registry.runs.lock().await;
             // r15 item 2: act only on the LIVE run of EXACTLY this generation;
@@ -1356,8 +1359,7 @@ impl DevNode {
                 // MESSAGE to the unique owner; latches if the land child is
                 // still parked behind its start barrier or not yet waited.
                 run.land_abort.send(true).ok();
-                // If no land child spawned, also release the verify child.
-                let land_spawned = run
+                land_spawned = run
                     .land_pgid
                     .lock()
                     .unwrap_or_else(|poison| poison.into_inner())
@@ -1367,6 +1369,31 @@ impl DevNode {
                 }
             }
             table.record_cancel(&request.job_id, request.generation);
+        }
+        // R6: this handler never signals; but it waits (bounded) for the run
+        // task — the child's unique owner — to finish killing/reaping and
+        // UNREGISTER, so a freshly queued re-dispatch does not race onto a lane
+        // whose old owner is still unwinding (the pre-r19 external-kill path had
+        // the same synchronous ordering). Pure observation; if the land child
+        // had not spawned (verify cancel), or the run is already gone, skip.
+        if land_spawned {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let gone = {
+                    let table = registry.runs.lock().await;
+                    table
+                        .runs
+                        .get(&request.job_id)
+                        .is_none_or(|run| run.generation != request.generation)
+                };
+                if gone {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
         }
 
         Ok(serde_json::json!({
@@ -1633,11 +1660,15 @@ impl DevNode {
 
         let outcome = self.execute_gate(&request, live.clone(), cancel_rx).await;
 
+        // Release the lane lock BEFORE unregistering the run: a registry entry
+        // must therefore imply the lane is still held, so an abort that waits for
+        // the entry to disappear is guaranteed the lane guard is free (r19
+        // item 1 / R6).
+        drop(lane_guard);
         {
             let mut table = registry.runs.lock().await;
             table.runs.remove(&request.job_id);
         }
-        drop(lane_guard);
 
         // The finished event is authoritative even if the RPC reply is lost.
         let _ = registry.events.send(GateEventParams {

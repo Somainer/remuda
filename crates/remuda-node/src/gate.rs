@@ -188,8 +188,21 @@ struct LiveRun {
     /// Granted LAND child process group. `None` until the grant was taken and
     /// the land child spawned. A read-only `gate.resolveLanding` probe treats a
     /// live land group as "the push may still happen" and reports `unknown`
-    /// rather than `absent` (r14 R1).
+    /// rather than `absent` (r14 R1). Read-only for liveness; the land child's
+    /// unique OWNER (the run task) is the only thing that signals it — abort is
+    /// delivered as a MESSAGE over [`LiveRun::land_abort`] (r19 item 1 / R6),
+    /// never by signalling this saved pgid from another task.
     land_pgid: std::sync::Mutex<Option<i32>>,
+    /// Latch for an abortLanding request aimed at THIS run's land child. The
+    /// land owner selects on a receiver of this; firing it makes the owner kill
+    /// the group WHILE the leader is unreaped and reap it. An abort that lands
+    /// before the land child spawns latches and is honoured once it does.
+    land_abort: watch::Sender<bool>,
+    /// Kept alive so `land_abort.send(true)` succeeds (and retains its value
+    /// for a later owner subscriber) even before the land child owner
+    /// subscribes — tokio watch drops a value sent with zero receivers.
+    #[allow(dead_code)]
+    land_abort_keep_rx: watch::Receiver<bool>,
 }
 
 /// Bounded FIFO of text lines. Long runs (a 39-minute cargo-test) stream
@@ -1316,57 +1329,44 @@ impl DevNode {
     }
 
     /// Handle `gate.abortLanding` — the Hub settled a Landing WITHOUT a landed
-    /// push (the merge is provably absent with the group dead, or an operator
-    /// resolved it). Terminate the granted LAND process group the same way a
-    /// land timeout does (TERM → bounded wait → KILL the whole group; the run
-    /// task reaps the leader and releases the durable fence record) so the lane
-    /// frees for a re-queued attempt and an operator-failed job cannot push
-    /// after the fact. The generation is tombstoned like a cancel, so the
-    /// killed run's late verdict refuses. A run that has already gone (the
-    /// common established-absent case) makes this a no-op. r14 R1.
+    /// push. r19 item 1 / R6: this handler NEVER signals a saved process group
+    /// (the run task may already have reaped its leader, after which the pgid can
+    /// be reused). It delivers an abort MESSAGE to the live run's unique land
+    /// owner under the registry lock; the owner alone kills the group while its
+    /// leader is unreaped and reaps it, and the run verdict becomes uncertain.
+    /// If the land child has not spawned yet the latch also stops the
+    /// verify-phase child via the cancel message. A run already gone is a no-op.
+    /// The generation is tombstoned like a cancel. r14 R1.
     pub(crate) async fn abort_gate_landing(&self, params: &Value) -> Result<Value, NodeError> {
         let request: GateAbortLandingParams =
             serde_json::from_value(params.clone()).map_err(|error| {
                 NodeError::InvalidRequest(format!("invalid gate.abortLanding params: {error}"))
             })?;
         let registry = self.gate_registry();
-        let target = {
+        {
             let mut table = registry.runs.lock().await;
-            // r15 item 2: a delayed abort for an OLDER generation must not
-            // touch the NEWER attempt that reused the job slot. Decide against
-            // the LIVE row's generation UNDER THIS LOCK, and only carry the
-            // pgid out when the generations are equal. A newer live run is
-            // left entirely alone (its land child keeps pushing under its own
-            // grant); the tombstone is still recorded so the stale RPC stands
-            // down.
-            let run = table.runs.get(&request.job_id);
-            let same_generation = run.is_some_and(|run| run.generation == request.generation);
-            let land_pgid = if same_generation {
-                let run = run.expect("same_generation implies a run");
-                let land_pgid = *run
+            // r15 item 2: act only on the LIVE run of EXACTLY this generation;
+            // a newer attempt is left entirely alone, but the tombstone is still
+            // recorded.
+            if let Some(run) = table
+                .runs
+                .get(&request.job_id)
+                .filter(|run| run.generation == request.generation)
+            {
+                // MESSAGE to the unique owner; latches if the land child is
+                // still parked behind its start barrier or not yet waited.
+                run.land_abort.send(true).ok();
+                // If no land child spawned, also release the verify child.
+                let land_spawned = run
                     .land_pgid
                     .lock()
-                    .unwrap_or_else(|poison| poison.into_inner());
-                if land_pgid.is_none() {
-                    // The grant never got to spawn its land child (or the row
-                    // was settled while the verify group was the live one):
-                    // release its cancel flag so a verify-phase child stands
-                    // down too.
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .is_some();
+                if !land_spawned {
                     run.cancel.send(true).ok();
                 }
-                land_pgid
-            } else {
-                None
-            };
+            }
             table.record_cancel(&request.job_id, request.generation);
-            land_pgid
-        };
-        #[cfg(unix)]
-        if let Some(pgid) = target {
-            let _ = tokio::task::spawn_blocking(move || {
-                terminate_and_verify_group(pgid, LAND_GROUP_TERM_GRACE);
-            })
-            .await;
         }
 
         Ok(serde_json::json!({
@@ -1386,19 +1386,15 @@ impl DevNode {
             })?;
         let registry = self.gate_registry();
         let mut table = registry.runs.lock().await;
-        let mut group_to_kill: Option<i32> = None;
         if let Some(run) = table.runs.get(&request.job_id) {
-            // r15 item 2: only the live run that belongs to EXACTLY this
-            // dispatch generation may be signalled. A cancel frame delayed
-            // past a re-dispatch (the job slot reused by a newer attempt)
-            // records its tombstone below but must not kill the newer
-            // attempt's verify group — the newer run is authorized on its own
-            // generation and the stale cancel has no authority over it.
+            // r15 item 2 + r19 item 1 (R6): only the live run of EXACTLY this
+            // generation receives the cancel MESSAGE; a stale cancel for a newer
+            // attempt records its tombstone but never signals. The run task is
+            // the child's unique owner — selecting on this watch it kills its
+            // own verify group while the leader is unreaped and reaps it; this
+            // handler never signals a saved pgid itself.
             if run.generation == request.generation {
                 run.cancel.send(true).ok();
-                if let Some(pgid) = *run.pgid.lock().unwrap_or_else(|poison| poison.into_inner()) {
-                    group_to_kill = Some(pgid);
-                }
             }
         }
         // Record the canceled generation whether or not the run is registered
@@ -1409,11 +1405,6 @@ impl DevNode {
         // evicting an older job's authority.
         let recorded = table.record_cancel(&request.job_id, request.generation);
         drop(table);
-        // r14 item 4: force-kill a cancel that ignored TERM. Detached so the
-        // bounded kill never holds the registry lock or the RPC pump.
-        if let Some(pgid) = group_to_kill {
-            tokio::task::spawn_blocking(move || terminate_group(pgid));
-        }
         if !recorded {
             return Err(NodeError::InvalidRequest(format!(
                 "gate.cancel: too many canceled gate jobs ({MAX_CANCELED_RECORDS}); \
@@ -1579,11 +1570,16 @@ impl DevNode {
         };
 
         let (cancel_tx, cancel_rx) = watch::channel(false);
+        // Keep the first receiver alive (stored on LiveRun) so the land-abort
+        // value is retained even before the land child owner subscribes.
+        let (land_abort_tx, land_abort_keep_rx) = watch::channel(false);
         let live = Arc::new(LiveRun {
             generation: request.generation,
             cancel: cancel_tx,
             pgid: std::sync::Mutex::new(None),
             land_pgid: std::sync::Mutex::new(None),
+            land_abort: land_abort_tx,
+            land_abort_keep_rx,
         });
         {
             let mut table = registry.runs.lock().await;
@@ -2190,14 +2186,35 @@ impl DevNode {
             // wait_with_output), so on timeout the child is still owned here
             // and can be killed and reaped.
             let land_budget = registry.land_timeout().await;
+            // r19 item 1 / R6: abort is a MESSAGE to this child's unique owner.
+            // Subscribe before the barrier release so an abort latched while the
+            // child is still parked is observed by the select below.
+            let mut land_abort_rx = live.land_abort.subscribe();
+            let mut land_aborted = false;
             // Scope the waiting future so its borrow of `land_child` is
             // released before the timeout arm kills and reaps the child.
             let land_outcome: Result<Option<std::process::Output>, ()> = {
                 let wait = land_child.wait_with_output_piped(land_stdout);
                 tokio::pin!(wait);
+                // Resolves if a latch was already set OR on a later send.
+                let land_abort_fired = async {
+                    loop {
+                        if *land_abort_rx.borrow_and_update() {
+                            return;
+                        }
+                        if land_abort_rx.changed().await.is_err() {
+                            // Sender dropped without abort: never fire.
+                            return std::future::pending::<()>().await;
+                        }
+                    }
+                };
                 tokio::select! {
                     output = &mut wait => Ok(output),
                     _ = tokio::time::sleep(land_budget) => Err(()),
+                    _ = land_abort_fired => {
+                        land_aborted = true;
+                        Err(())
+                    }
                 }
             };
             // On a normal child exit, join the stderr pump FIRST so every
@@ -2210,14 +2227,12 @@ impl DevNode {
             }
             match land_outcome {
                 Err(()) => {
-                    // The budget expired. Terminate the WHOLE land group
-                    // synchronously (TERM, bounded wait, KILL, reap) before
-                    // reporting, so a SIGTERM-ignoring git/ssh descendant cannot
-                    // keep pushing after this verdict. Even then, the remote may
-                    // already have accepted the ref before the client hung, so
-                    // the outcome is reported UNCERTAIN — never "failed": the
-                    // Hub keeps the Landing row and reconciles against the exact
-                    // granted merge on the remote (r13 item 5).
+                    // Timeout OR an abortLanding message. THIS run task is the
+                    // land child's unique owner (r19 item 1 / R6): it alone
+                    // terminates the WHOLE land group (TERM, bounded wait, KILL)
+                    // WHILE THE LEADER IS UNREAPED and then reaps it — no other
+                    // task signals the saved pgid. Report UNCERTAIN either way
+                    // (the remote may already hold the ref); the Hub reconciles.
                     #[cfg(unix)]
                     {
                         if let Some(pgid) = land_pgid {
@@ -2234,15 +2249,24 @@ impl DevNode {
                         let _ = land_child.wait().await;
                     }
                     result.status = "uncertain".into();
-                    result.error = Some(format!(
-                        "land exceeded {}s; terminated the land process group; push outcome \
-                         unknown (the Hub reconciles against the remote)",
-                        land_budget.as_secs()
-                    ));
-                    result.reason = Some(format!(
-                        "land timed out after {}s; push outcome uncertain",
-                        land_budget.as_secs()
-                    ));
+                    if land_aborted {
+                        result.error = Some(
+                            "land was aborted; the land process group was terminated by its owner; \
+                             the push outcome is unknown (the Hub reconciles against the remote)"
+                                .into(),
+                        );
+                        result.reason = Some("land aborted; push outcome uncertain".into());
+                    } else {
+                        result.error = Some(format!(
+                            "land exceeded {}s; terminated the land process group; push outcome \
+                             unknown (the Hub reconciles against the remote)",
+                            land_budget.as_secs()
+                        ));
+                        result.reason = Some(format!(
+                            "land timed out after {}s; push outcome uncertain",
+                            land_budget.as_secs()
+                        ));
+                    }
                 }
                 Ok(Some(land_output)) if land_output.status.success() => {
                     // r17 item 4: a zero exit does NOT bypass validation. The
@@ -5170,6 +5194,28 @@ fi
     /// fake PROCEEDS immediately (writes `bypassed.marker`, emits landed) — that
     /// is the dangerous path the env-clear-ordering bug exposed, and the
     /// held-child regression asserts it never happens.
+    /// Land phase parks on the barrier then SLEEPS (a long in-flight push), so
+    /// an abort message delivered while parked deterministically wins the
+    /// owner's select rather than racing a quick natural exit.
+    const ABORT_LAND_SCRIPT: &str = r#"
+dir=$(dirname "$0")
+echo "$*" >> "$dir/args.txt"
+base=$(git rev-parse main 2>/dev/null || echo "1111111111111111111111111111111111111111")
+head=$(git rev-parse wt/fake/task 2>/dev/null || echo "2222222222222222222222222222222222222222")
+if ! printf '%s\n' "$*" | grep -q -- '--land'; then
+  echo "{\"exitCode\":0,\"status\":\"verified\",\"base\":\"$base\",\"head\":\"$head\",\"merged\":\"$head\",\"steps\":[]}"
+  exit 0
+fi
+if [ "${REMUDA_START_BARRIER_FD-}" != "0" ]; then
+  exit 0
+fi
+byte=""
+IFS= read -r -n 1 -t 30 byte || exit 4
+[ -n "$byte" ] || exit 4
+echo released > "$dir/abort-released.marker"
+sleep 30
+"#;
+
     const BARRIER_LAND_SCRIPT: &str = r#"
 dir=$(dirname "$0")
 echo "$*" >> "$dir/args.txt"
@@ -5337,6 +5383,105 @@ echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\"
             origin_main(&fixture),
             base_main,
             "a fenced-off child never pushes"
+        );
+    }
+
+    /// r19 item 1 / R6: abortLanding is a MESSAGE to the land child's unique
+    /// owner, never an external signal of a saved pgid. With the child parked
+    /// behind the start barrier (fence persisted, hold latched), the abort
+    /// message latches; releasing the hold starts the child and the owner's
+    /// select observes the abort and is the SOLE thing that kills+reaps the
+    /// group. Result is uncertain; nothing is pushed; no process survives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_landing_message_makes_the_owner_kill_and_reap_uncertain() {
+        let fixture = fixture(ABORT_LAND_SCRIPT);
+        let base_main = origin_main(&fixture);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        // fail:false — the fence DOES persist; the hold still parks the run so
+        // we can interleave the abort before the child is released.
+        fixture
+            .node
+            .gate_registry()
+            .set_land_fence_fault(LandFenceFault {
+                entered: entered.clone(),
+                release: release.clone(),
+                fail: false,
+            });
+        fixture
+            .node
+            .gate_test_set_land_timeout(Duration::from_secs(2))
+            .await;
+        let mut p = params(&fixture, "land");
+        p.push = false;
+        p.job_id = "gjb_abort_msg".into();
+        p.generation = 1;
+        let node = fixture.node.clone();
+        let run = tokio::spawn(async move { node.run_gate_typed(p).await });
+        tokio::time::timeout(Duration::from_secs(15), entered.notified())
+            .await
+            .expect("fence persistence entered (child parked)");
+        // Wait until the land argv line is present (child spawned).
+        let argv_path = fixture.bin.parent().unwrap().join("args.txt");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let text = std::fs::read_to_string(&argv_path).unwrap_or_default();
+            if text.lines().any(|l| l.contains("--land")) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Deliver the abort as a MESSAGE (the handler under test) while the
+        // child is parked and the run is still in flight.
+        let abort_params = serde_json::json!({
+            "jobId": "gjb_abort_msg",
+            "generation": 1u32,
+        });
+        fixture
+            .node
+            .abort_gate_landing(&abort_params)
+            .await
+            .expect("abortLanding accepted");
+        assert!(
+            !run.is_finished(),
+            "the parked child keeps the run alive until released"
+        );
+        // Release: fence persists, barrier opens; the owner select sees the
+        // latched abort and kills+reaps its own group.
+        {
+            let (lock, cvar) = &*release;
+            let mut done = lock.lock().unwrap();
+            *done = true;
+            cvar.notify_one();
+        }
+        let result = tokio::time::timeout(Duration::from_secs(30), run)
+            .await
+            .expect("run finished")
+            .expect("joined")
+            .expect("run_gate returned");
+        assert_eq!(
+            result.status, "uncertain",
+            "an owner-aborted land is uncertain, never failed: {result:?}"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|t| t.contains("aborted")),
+            "the error names the abort: {:?}",
+            result.error
+        );
+        assert_eq!(origin_main(&fixture), base_main, "nothing was pushed");
+        // The land run is gone and its pgid is no longer live.
+        assert!(
+            fixture
+                .node
+                .gate_registry()
+                .land_push_liveness("gjb_abort_msg")
+                .await
+                != LandPushLiveness::MayPush,
+            "the aborted land group is not live afterwards"
         );
     }
 

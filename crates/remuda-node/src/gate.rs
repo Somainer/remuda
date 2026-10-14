@@ -711,6 +711,13 @@ pub(crate) struct LandDrainSeams {
     /// SAME detached owner continuation still runs cleanup and the single
     /// reap.
     pub(crate) cleanup_hold: Option<Arc<CleanupHold>>,
+    /// r22 item 6: one-shot, portable replacement for the external-`setsid`
+    /// blocked-stderr test. When taken, the stderr reader PARKS at EOF instead
+    /// of returning — exactly modelling a surviving holder in ANOTHER session
+    /// that keeps the captured stderr write end open after the leader exits
+    /// (which same-group cleanup cannot signal). No descendant, no `setsid`,
+    /// no timing: valid on macOS.
+    pub(crate) stderr_eof_hold: bool,
 }
 
 /// r22 item 4 test-only hold at the granted-land owner's final drain
@@ -919,6 +926,26 @@ impl GateRegistry {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .stderr_read_fault
+    }
+
+    /// r22 item 6 test-only: arm/clear the portable blocked-stderr seam — the
+    /// reader parks at EOF instead of finishing (a surviving pipe holder in
+    /// another session).
+    #[cfg(any(test, feature = "test-faults"))]
+    pub(crate) fn set_land_stderr_eof_hold(&self, on: bool) {
+        self.land_drain_seams
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .stderr_eof_hold = on;
+    }
+
+    /// r22 item 6 test-only: whether the land stderr reader parks at EOF.
+    #[cfg(any(test, feature = "test-faults"))]
+    fn land_stderr_eof_hold(&self) -> bool {
+        self.land_drain_seams
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .stderr_eof_hold
     }
 
     /// r22 item 4 test-only: arm the one-shot final drain-acceptance hold.
@@ -1426,6 +1453,15 @@ impl DevNode {
     #[cfg(any(test, feature = "test-faults"))]
     pub async fn gate_test_set_land_stderr_read_fault(&self, on: bool) {
         self.gate_registry().set_land_stderr_read_fault(on);
+    }
+
+    /// Test-only (r22 item 6): make the granted-land owner's stderr reader
+    /// park at EOF instead of finishing — the portable, macOS-valid
+    /// replacement for an external `setsid` holder keeping stderr open.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn gate_test_set_land_stderr_eof_hold(&self, on: bool) {
+        self.gate_registry().set_land_stderr_eof_hold(on);
     }
 
     /// Test-only (r22 item 4): arm the one-shot hold at the granted-land
@@ -2392,7 +2428,24 @@ impl DevNode {
                     };
                     loop {
                         match stderr.read(&mut buf).await {
-                            Ok(0) => break,
+                            Ok(0) => {
+                                // r22 item 6 portable seam: a surviving holder
+                                // in ANOTHER session keeps the captured stderr
+                                // open after the leader exits, so EOF never
+                                // really arrives and the drain must stay
+                                // pending (the owner's bounded join then fails
+                                // closed). Park instead of finishing — no
+                                // descendant or `setsid`, valid on macOS. The
+                                // task is detached and aborted at test-runtime
+                                // shutdown, exactly like a real abandoned
+                                // reader.
+                                #[cfg(any(test, feature = "test-faults"))]
+                                if node.gate_registry().land_stderr_eof_hold() {
+                                    std::future::pending::<()>().await;
+                                    unreachable!("the EOF hold parks until runtime shutdown");
+                                }
+                                break;
+                            }
                             Ok(n) => {
                                 if let Ok(mut raw) = captured.lock() {
                                     raw.extend_from_slice(&buf[..n]);
@@ -5531,35 +5584,6 @@ echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\"
 exit 0
 "#;
 
-    /// r21 item 2 / R8(b): the released land leader prints its valid final
-    /// JSON and exits 0, but FIRST starts a process in ANOTHER session
-    /// (`setsid … &`) that detaches stdout to /dev/null and KEEPS THE CAPTURED
-    /// STDERR. The owner's same-group cleanup cannot signal another session, so
-    /// the stderr reader stays blocked after the leader is reaped. A definitive
-    /// verdict is forbidden: the blocked/failed drain must make the land
-    /// uncertain at the absolute deadline.
-    const OTHER_SESSION_STDERR_LAND_SCRIPT: &str = r#"
-dir=$(dirname "$0")
-echo "$*" >> "$dir/args.txt"
-base=$(git rev-parse main 2>/dev/null || echo "1111111111111111111111111111111111111111")
-head=$(git rev-parse wt/fake/task 2>/dev/null || echo "2222222222222222222222222222222222222222")
-if ! printf '%s\n' "$*" | grep -q -- '--land'; then
-  echo "{\"exitCode\":0,\"status\":\"verified\",\"base\":\"$base\",\"head\":\"$head\",\"merged\":\"$head\",\"steps\":[]}"
-  exit 0
-fi
-if [ "${REMUDA_START_BARRIER_FD-}" != "0" ]; then
-  exit 0
-fi
-byte=""
-IFS= read -r -n 1 -t 30 byte || exit 4
-[ -n "$byte" ] || exit 4
-# Another SESSION: stdout to /dev/null but the captured STDERR is inherited.
-# The land group's TERM/KILL can never reach it; the owner must fail closed.
-setsid sh -c 'exec sleep 47.22' >/dev/null &
-echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\":\"$head\",\"steps\":[]}"
-exit 0
-"#;
-
     /// r22 item 3: the released land leader writes a line of INVALID UTF-8 to
     /// stderr (a byte sequence `lines()` cannot decode), then a valid `landed`
     /// report on stdout, and exits 0. Portable — no `setsid`, no descendant,
@@ -6059,30 +6083,37 @@ echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\"
         }
     }
 
-    /// r21 item 2 / R8(b): the leader exits 0 with a valid landed report while
-    /// a process it started in ANOTHER SESSION (`setsid … >/dev/null &`) keeps
-    /// the captured STDERR open. Same-group cleanup cannot reach it, so the
-    /// stderr reader is still blocked after the leader is reaped. The owner
-    /// must retain BOTH reader handles through cleanup and reap, await them
-    /// with the remaining absolute budget, and answer UNCERTAIN when the stderr
-    /// drain does not complete — never `landed`. The old owner took the stderr
-    /// handle before cleanup, ignored its 2 s timeout and landed anyway.
+    /// r22 item 6 (was r21 item 2): the leader exits 0 with a valid landed
+    /// report while a survivor in ANOTHER session keeps the captured STDERR
+    /// open. The owner must retain BOTH reader handles through cleanup and
+    /// reap, await them with the remaining absolute budget, and answer
+    /// UNCERTAIN when the stderr drain never completes — never `landed`.
+    ///
+    /// PORTABLE replacement for the external-`setsid` test: the surviving
+    /// holder is the injected reader-completion seam — the raw stderr reader
+    /// parks at EOF instead of finishing — so there is no `setsid` dependency
+    /// (absent on macOS), no unsynchronised descendant that cleanup could kill
+    /// first, and no `/proc` timing. The reader parks entirely inside the
+    /// Node's own task and is aborted with the test runtime.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_blocked_stderr_drain_after_a_clean_exit_makes_the_land_uncertain() {
-        let fixture = fixture(OTHER_SESSION_STDERR_LAND_SCRIPT);
+        let fixture = fixture(RAW_STDERR_LAND_SCRIPT);
         let base_main = origin_main(&fixture);
         let mut p = params(&fixture, "land");
         p.push = false;
-        p.job_id = "gjb_other_session_stderr".into();
+        p.job_id = "gjb_stderr_eof_hold".into();
         p.generation = 1;
-        // Tight soft budget; the absolute deadline (budget + the fixed owner
-        // cleanup allowance) still bounds the blocked drain.
+        // Soft budget 2 s; the absolute deadline (budget + the fixed owner
+        // cleanup allowance) bounds the blocked drain.
         fixture
             .node
             .gate_test_set_land_timeout(Duration::from_secs(2))
             .await;
+        // The portable other-session holder: the stderr reader parks at EOF.
+        fixture.node.gate_test_set_land_stderr_eof_hold(true).await;
         let started = std::time::Instant::now();
         let result = fixture.node.run_gate_typed(p).await.unwrap();
+        fixture.node.gate_test_set_land_stderr_eof_hold(false).await;
         assert_eq!(
             result.status, "uncertain",
             "a blocked stderr drain after the leader exited is uncertainty, got: {result:?}"
@@ -6095,20 +6126,14 @@ echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\"
             "the uncertainty names the incomplete pipe drain: {:?}",
             result.reason
         );
-        // The verdict waits for the REMAINING absolute budget, not the
-        // holder's 47 s sleep, and well beyond the instant the old (buggy)
-        // owner returned `landed`.
+        // The verdict waits only for the absolute deadline, not a real
+        // long-lived holder's sleep.
         assert!(
             started.elapsed() < Duration::from_secs(8),
             "the absolute deadline bounds the blocked drain: {:?}",
             started.elapsed()
         );
         assert_eq!(origin_main(&fixture), base_main, "push=false moves nothing");
-        // The other-session holder is unreachable by design; clean up OUR OWN
-        // spawned marker process so it cannot outlive the test on a shared box.
-        let _ = std::process::Command::new("pkill")
-            .args(["-f", "sleep 47.22"])
-            .output();
     }
 
     /// r22 item 3: a FAILED stderr drain makes even a clean, valid land

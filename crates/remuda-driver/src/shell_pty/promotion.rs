@@ -24,6 +24,10 @@
 //! foreground pid starts a new epoch and resets the tail and hydrated state.
 
 use super::{PROMOTE_POLL, PtyState};
+
+/// Release build: `spawn` returns just the task handle.
+#[cfg(not(test))]
+pub(crate) type PollerTask = tokio::task::JoinHandle<()>;
 use crate::claude_print::TranscriptMapper;
 use crate::claude_pty::now_ts;
 use crate::claude_transcript::{
@@ -878,7 +882,9 @@ pub(super) fn spawn(
     // that is done, so close never aborts a first-bind pump mid-`finish()`.
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     finalised: tokio::sync::oneshot::Sender<()>,
-) -> tokio::task::JoinHandle<()> {
+) -> PollerTask {
+    #[cfg(not(any(test, feature = "test-stub")))]
+    type PollerTask = tokio::task::JoinHandle<()>;
     // Abort-path safety net: even if the task is aborted while a first-bind
     // pump is still mapping a large transcript, the guard's Drop runs the
     // mapper's synchronous `finish()` and best-effort delivers the
@@ -908,198 +914,408 @@ pub(super) fn spawn(
     // can use it while it holds the `&mut guard.hydrator` reborrow.
     let finalise_pending: Arc<std::sync::Mutex<Vec<Observation>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
+    // c-usagefu r21 item 3: a PER-SPAWN cancellation-test gate (permit +
+    // stage + pending-permit acknowledgement). Unlike a process-global gate,
+    // another poller's finalization cannot satisfy this driver's wait.
+    #[cfg(test)]
+    let finalise_gate: Arc<FinalisePublishGate> = Arc::new(FinalisePublishGate::new());
     let mut finalise_guard = FinaliseGuard::new(
         events.clone(),
         Arc::clone(&seq),
         ctx.clone(),
         Arc::clone(&finalise_pending),
     );
-    tokio::spawn(async move {
-        let mut promote = PromoteState::default();
-        // Borrowed ownership of the live hydrator — created, replaced and
-        // finalised through this reborrow but stored in `finalise_guard`.
-        let hydrator: &mut Option<Hydrator> = &mut finalise_guard.hydrator;
-        // Raise-only + blocked latch across the whole promoted session
-        // (design §2.4 rule 6, §10 anchor ④). The stateless screen read feeds
-        // it; its verdict is what we both journal and expose via the status
-        // slot. Reset on every demotion below.
-        let mut screen_latch = remuda_screen::ScreenLatch::new();
-        // Spinner-line projection (verb/tokens/phrase/interruptible), one
-        // observation per distinct reading; reset with the raise latch below.
-        let mut live_latch = remuda_screen::ScreenLiveLatch::new();
-        // Sticky hook-tier health for this promoted epoch. A transient
-        // `ps` miss (found == None) or a hook relay child taking the sampled
-        // row must not read as "no hook tier" and release the raise: the
-        // SessionStart/turn binding, once observed for this foreground pid,
-        // stays live until that pid demotes or a hook confirms the turn end.
-        let mut hook_ever_live = false;
-        // c-usagefu r12 item 1 (Ruling A2'): the promoted-codex census
-        // intervals are registered HERE, BEFORE the detection is published to
-        // the `current` slot the file-adapter watch reads, but OWNED by the
-        // driver: every detected codex pid gets a fresh interval whose guard is
-        // handed to the driver in `promoted_lifetimes`. The poller never closes
-        // one — a demotion only forgets the pid so the next codex foreground
-        // registers another interval. r11 owned the guard in a poller local
-        // and closed it on demotion, so a codex that left the foreground (or a
-        // poller that was shut down) lost its census before the session's
-        // process terminated: a rollout created during close could be
-        // attributed to a competing same-cwd discovery.
-        let mut census_pid: Option<i32> = None;
-        let mut last_status: Option<ScreenStatus> = None;
-        // Once the hook tier is merely *stale*, the screen decides the idle
-        // edge — but one sample is not proof: the emulator can miss the TUI's
-        // 1 s spinner repaint and read a single idle frame during a genuinely
-        // running, hook-quiet tool. Count consecutive idle polls and only lower
-        // busy after a stable idle; a finished turn reads idle every poll and
-        // confirms quickly, a flicker resets and never lowers.
-        let mut screen_idle_confirms: u32 = 0;
-        // Last announced binding state, deduping lifecycle emission:
-        // None = nothing announced yet this epoch.
-        let mut announced: Option<String> = None;
-        let mut bypass_announced = false;
-        let mut tui_released = false;
-        // One trust-dialog answer per promoted epoch (D-022). Reset on
-        // promotion: a relaunched agent that hits the dialog again must not be
-        // blocked by an answer spent on the previous foreground pid.
-        let mut trust_attempted = false;
-        // Hook-silence diagnostic: probe at a slower cadence than the 800 ms
-        // screen poll, and journal only when the named reason changes, so the
-        // badge copy is an edge, never a per-tick record. `None` = not probed
-        // yet; `Some(None)` = healthy; `Some(Some(r))` = a failed check.
-        let mut silence_ticks: u32 = 0;
-        let mut last_silence: Option<Option<remuda_signal::hook_silence::HookSilenceReason>> = None;
-        // Sticky tri-state (item 4) for the Remuda-launched pre_resume_mode:
-        // the boundary proves one (pid, session) only. A plain Option could
-        // not say "applied, then invalidated by a rebind", so the rebound arm
-        // used to clear the slot and the next tick immediately re-applied the
-        // stale launch mode to the new session.
-        let mut launch_mode = LaunchModeBinding::Unbound;
-        // r6 items 3/4: one boundary per (pid, session) measured at its
-        // SessionStart report. The first session reported per pid is the
-        // launched process's own; every later key is an in-TUI rebind.
-        let mut session_modes = SessionModeTable::default();
-        // r7 item 4(c): the last read offset per (pid, session), so a
-        // demote/re-promotion continues the same transcript where it left
-        // off instead of re-emitting it from the sticky anchor.
-        let mut read_anchors = std::collections::HashMap::new();
-        // c-effortread r10 item 6: (pid, session) pairs whose bound transcript
-        // was EXPLICITLY withdrawn while no hydrator could prove it stayed in
-        // place (the session was renamed/resumed away, or the bound file
-        // vanished/changed identity). Persisted independently of anchor
-        // capture — a demote with no successful final pump leaves only a
-        // stale verified anchor in `read_anchors`; this set forces an
-        // unverified EOF continuation (and boundary fallback) even after the
-        // session is restored and even when the restored file keeps the same
-        // inode. Sticky for the promotion loop's lifetime (fail closed).
-        let mut withdrawn_sessions: std::collections::HashSet<(i32, String)> =
-            std::collections::HashSet::new();
-        // The (pid, session) the LIVE hydrator is currently reading, so a
-        // rebind/demote arm knows which session an explicit withdrawal marks.
-        let mut active_session: Option<(i32, String)> = None;
-        // c-effortread r8 item 5: EffortTracker latch per (pid, session),
-        // captured from every pump and re-seeded into the replacement mapper
-        // on demote/re-promotion.
-        let mut effort_seeds: std::collections::HashMap<(i32, String), EffortTrackerSeed> =
-            std::collections::HashMap::new();
-        let mut tick = tokio::time::interval(PROMOTE_POLL);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut closing = false;
-        loop {
-            tokio::select! {
-                // Wakes close between ticks; a tick still drives normal polls.
-                _ = shutdown.changed() => {
-                    closing = *shutdown.borrow_and_update();
+    #[cfg(test)]
+    let task_finalise_gate: Arc<FinalisePublishGate> = Arc::clone(&finalise_gate);
+    let handle = tokio::spawn({
+        #[cfg(test)]
+        let finalise_gate = Arc::clone(&task_finalise_gate);
+        async move {
+            let mut promote = PromoteState::default();
+            // Borrowed ownership of the live hydrator — created, replaced and
+            // finalised through this reborrow but stored in `finalise_guard`.
+            let hydrator: &mut Option<Hydrator> = &mut finalise_guard.hydrator;
+            // Raise-only + blocked latch across the whole promoted session
+            // (design §2.4 rule 6, §10 anchor ④). The stateless screen read feeds
+            // it; its verdict is what we both journal and expose via the status
+            // slot. Reset on every demotion below.
+            let mut screen_latch = remuda_screen::ScreenLatch::new();
+            // Spinner-line projection (verb/tokens/phrase/interruptible), one
+            // observation per distinct reading; reset with the raise latch below.
+            let mut live_latch = remuda_screen::ScreenLiveLatch::new();
+            // Sticky hook-tier health for this promoted epoch. A transient
+            // `ps` miss (found == None) or a hook relay child taking the sampled
+            // row must not read as "no hook tier" and release the raise: the
+            // SessionStart/turn binding, once observed for this foreground pid,
+            // stays live until that pid demotes or a hook confirms the turn end.
+            let mut hook_ever_live = false;
+            // c-usagefu r12 item 1 (Ruling A2'): the promoted-codex census
+            // intervals are registered HERE, BEFORE the detection is published to
+            // the `current` slot the file-adapter watch reads, but OWNED by the
+            // driver: every detected codex pid gets a fresh interval whose guard is
+            // handed to the driver in `promoted_lifetimes`. The poller never closes
+            // one — a demotion only forgets the pid so the next codex foreground
+            // registers another interval. r11 owned the guard in a poller local
+            // and closed it on demotion, so a codex that left the foreground (or a
+            // poller that was shut down) lost its census before the session's
+            // process terminated: a rollout created during close could be
+            // attributed to a competing same-cwd discovery.
+            let mut census_pid: Option<i32> = None;
+            let mut last_status: Option<ScreenStatus> = None;
+            // Once the hook tier is merely *stale*, the screen decides the idle
+            // edge — but one sample is not proof: the emulator can miss the TUI's
+            // 1 s spinner repaint and read a single idle frame during a genuinely
+            // running, hook-quiet tool. Count consecutive idle polls and only lower
+            // busy after a stable idle; a finished turn reads idle every poll and
+            // confirms quickly, a flicker resets and never lowers.
+            let mut screen_idle_confirms: u32 = 0;
+            // Last announced binding state, deduping lifecycle emission:
+            // None = nothing announced yet this epoch.
+            let mut announced: Option<String> = None;
+            let mut bypass_announced = false;
+            let mut tui_released = false;
+            // One trust-dialog answer per promoted epoch (D-022). Reset on
+            // promotion: a relaunched agent that hits the dialog again must not be
+            // blocked by an answer spent on the previous foreground pid.
+            let mut trust_attempted = false;
+            // Hook-silence diagnostic: probe at a slower cadence than the 800 ms
+            // screen poll, and journal only when the named reason changes, so the
+            // badge copy is an edge, never a per-tick record. `None` = not probed
+            // yet; `Some(None)` = healthy; `Some(Some(r))` = a failed check.
+            let mut silence_ticks: u32 = 0;
+            let mut last_silence: Option<Option<remuda_signal::hook_silence::HookSilenceReason>> =
+                None;
+            // Sticky tri-state (item 4) for the Remuda-launched pre_resume_mode:
+            // the boundary proves one (pid, session) only. A plain Option could
+            // not say "applied, then invalidated by a rebind", so the rebound arm
+            // used to clear the slot and the next tick immediately re-applied the
+            // stale launch mode to the new session.
+            let mut launch_mode = LaunchModeBinding::Unbound;
+            // r6 items 3/4: one boundary per (pid, session) measured at its
+            // SessionStart report. The first session reported per pid is the
+            // launched process's own; every later key is an in-TUI rebind.
+            let mut session_modes = SessionModeTable::default();
+            // r7 item 4(c): the last read offset per (pid, session), so a
+            // demote/re-promotion continues the same transcript where it left
+            // off instead of re-emitting it from the sticky anchor.
+            let mut read_anchors = std::collections::HashMap::new();
+            // c-effortread r10 item 6: (pid, session) pairs whose bound transcript
+            // was EXPLICITLY withdrawn while no hydrator could prove it stayed in
+            // place (the session was renamed/resumed away, or the bound file
+            // vanished/changed identity). Persisted independently of anchor
+            // capture — a demote with no successful final pump leaves only a
+            // stale verified anchor in `read_anchors`; this set forces an
+            // unverified EOF continuation (and boundary fallback) even after the
+            // session is restored and even when the restored file keeps the same
+            // inode. Sticky for the promotion loop's lifetime (fail closed).
+            let mut withdrawn_sessions: std::collections::HashSet<(i32, String)> =
+                std::collections::HashSet::new();
+            // The (pid, session) the LIVE hydrator is currently reading, so a
+            // rebind/demote arm knows which session an explicit withdrawal marks.
+            let mut active_session: Option<(i32, String)> = None;
+            // c-effortread r8 item 5: EffortTracker latch per (pid, session),
+            // captured from every pump and re-seeded into the replacement mapper
+            // on demote/re-promotion.
+            let mut effort_seeds: std::collections::HashMap<(i32, String), EffortTrackerSeed> =
+                std::collections::HashMap::new();
+            let mut tick = tokio::time::interval(PROMOTE_POLL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut closing = false;
+            loop {
+                tokio::select! {
+                    // Wakes close between ticks; a tick still drives normal polls.
+                    _ = shutdown.changed() => {
+                        closing = *shutdown.borrow_and_update();
+                    }
+                    _ = tick.tick() => {}
                 }
-                _ = tick.tick() => {}
-            }
-            if closing || state.closed.load(Ordering::SeqCst) || events.is_closed() {
-                break;
-            }
-            let Sample { rows, mut found } = sample(&state, table.as_ref(), alias.as_ref()).await;
-            // Detection can still be late: `ps` has not caught the exec yet,
-            // or the agent runs under a name neither the table nor the alias
-            // covers. An authenticated SessionStart whose pid is in this PTY's
-            // foreground group says what the process table has not said yet,
-            // and binding it is what gives the session its nativeId and
-            // transcript (without it `claude --resume` has nothing to resume
-            // and the drill-in read has no session directory).
-            if found.is_none()
-                && let Some(hooks) = hooks.as_ref()
-                && let Some(binding) = hooks.binding()
-            {
-                found = promote_from_hook_binding(
-                    &rows,
-                    &binding,
-                    alias.as_ref().map_or(AgentKind::Claude, |alias| alias.kind),
-                );
-            }
-            // Census transition judged from the SAME sample that is about to
-            // be published. A codex entering the foreground registers BEFORE
-            // the slot write, so a same-cwd generic launch discovering during
-            // the promotion window already sees this unknown-boundary
-            // instance and refuses prompt-only attribution. A codex leaving
-            // (demotion or a different foreground process) does NOT close the
-            // interval here: ownership is the driver's, and the interval
-            // closes only once the stop ladder confirms the process terminated
-            // (Ruling A2', r12 item 1). A codex -> codex foreground change
-            // hands the driver a second live interval — the poller cannot
-            // prove the earlier pid is dead, so both stay in the census.
-            let next_codex_pid = found
-                .as_ref()
-                .and_then(|f| (f.kind == AgentKind::Codex).then_some(f.pid));
-            if next_codex_pid != census_pid {
-                if let Some(pid) = next_codex_pid {
-                    let guard = crate::adapters::codex_discovery::begin_lifetime_for_epoch(
-                        &ctx.cwd,
-                        &format!("promoted-codex-{pid}"),
-                        None,
-                        node_epoch,
+                if closing || state.closed.load(Ordering::SeqCst) || events.is_closed() {
+                    break;
+                }
+                let Sample { rows, mut found } =
+                    sample(&state, table.as_ref(), alias.as_ref()).await;
+                // Detection can still be late: `ps` has not caught the exec yet,
+                // or the agent runs under a name neither the table nor the alias
+                // covers. An authenticated SessionStart whose pid is in this PTY's
+                // foreground group says what the process table has not said yet,
+                // and binding it is what gives the session its nativeId and
+                // transcript (without it `claude --resume` has nothing to resume
+                // and the drill-in read has no session directory).
+                if found.is_none()
+                    && let Some(hooks) = hooks.as_ref()
+                    && let Some(binding) = hooks.binding()
+                {
+                    found = promote_from_hook_binding(
+                        &rows,
+                        &binding,
+                        alias.as_ref().map_or(AgentKind::Claude, |alias| alias.kind),
                     );
-                    promoted_lifetimes
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push(guard);
                 }
-                census_pid = next_codex_pid;
-            }
-            // `send` reads this to decide bracketed-paste delivery, so it must
-            // track the live foreground even between journaled transitions.
-            if let Ok(mut slot) = current.lock() {
-                slot.clone_from(&found);
-            }
-            let Ok(now) = now_ts() else { continue };
-            let mut saw_demote = false;
-            let mut saw_promote = false;
-            for (completeness, payload) in transition(&mut promote, found.as_ref(), &now) {
-                if let ObservationPayload::Lifecycle(lifecycle) = &payload
-                    && let LifecyclePayload::Native(native) = lifecycle.as_ref()
+                // Census transition judged from the SAME sample that is about to
+                // be published. A codex entering the foreground registers BEFORE
+                // the slot write, so a same-cwd generic launch discovering during
+                // the promotion window already sees this unknown-boundary
+                // instance and refuses prompt-only attribution. A codex leaving
+                // (demotion or a different foreground process) does NOT close the
+                // interval here: ownership is the driver's, and the interval
+                // closes only once the stop ladder confirms the process terminated
+                // (Ruling A2', r12 item 1). A codex -> codex foreground change
+                // hands the driver a second live interval — the poller cannot
+                // prove the earlier pid is dead, so both stay in the census.
+                let next_codex_pid = found
+                    .as_ref()
+                    .and_then(|f| (f.kind == AgentKind::Codex).then_some(f.pid));
+                if next_codex_pid != census_pid {
+                    if let Some(pid) = next_codex_pid {
+                        let guard = crate::adapters::codex_discovery::begin_lifetime_for_epoch(
+                            &ctx.cwd,
+                            &format!("promoted-codex-{pid}"),
+                            None,
+                            node_epoch,
+                        );
+                        promoted_lifetimes
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(guard);
+                    }
+                    census_pid = next_codex_pid;
+                }
+                // `send` reads this to decide bracketed-paste delivery, so it must
+                // track the live foreground even between journaled transitions.
+                if let Ok(mut slot) = current.lock() {
+                    slot.clone_from(&found);
+                }
+                let Ok(now) = now_ts() else { continue };
+                let mut saw_demote = false;
+                let mut saw_promote = false;
+                for (completeness, payload) in transition(&mut promote, found.as_ref(), &now) {
+                    if let ObservationPayload::Lifecycle(lifecycle) = &payload
+                        && let LifecyclePayload::Native(native) = lifecycle.as_ref()
+                    {
+                        saw_demote |= native.native_name == DEMOTED;
+                        saw_promote |= native.native_name == PROMOTED;
+                    }
+                    if emit(
+                        &events,
+                        &seq,
+                        &ctx,
+                        SourceChannel::Runtime,
+                        completeness,
+                        payload,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
+                }
+                // Epoch boundaries reset tail, hydrated state, the picker, and the
+                // screen raise/blocked latch — a new foreground starts unraised.
+                if saw_demote {
+                    screen_latch = remuda_screen::ScreenLatch::new();
+                    live_latch = remuda_screen::ScreenLiveLatch::new();
+                    hook_ever_live = false;
+                    interrupt_pid.store(0, Ordering::SeqCst);
+                    if let Some(payload) = bindings.invalidate_picker()
+                        && emit(
+                            &events,
+                            &seq,
+                            &ctx,
+                            SourceChannel::Runtime,
+                            Completeness::Structured,
+                            payload,
+                        )
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    bindings.demobilize();
+                    if let Some(mut old) = hydrator.take() {
+                        produce_replaced(&mut old, &finalise_pending);
+                        #[cfg(test)]
+                        publish_pending_gated(
+                            &finalise_pending,
+                            &events,
+                            &seq,
+                            &ctx,
+                            &finalise_gate,
+                        )
+                        .await;
+                        #[cfg(not(test))]
+                        publish_pending(&finalise_pending, &events, &seq, &ctx).await;
+                    }
+                    announced = None;
+                }
+                if saw_promote {
+                    bindings.begin_epoch(&ctx.cwd, &ctx.claude_home);
+                    if let Some(mut old) = hydrator.take() {
+                        produce_replaced(&mut old, &finalise_pending);
+                        #[cfg(test)]
+                        publish_pending_gated(
+                            &finalise_pending,
+                            &events,
+                            &seq,
+                            &ctx,
+                            &finalise_gate,
+                        )
+                        .await;
+                        #[cfg(not(test))]
+                        publish_pending(&finalise_pending, &events, &seq, &ctx).await;
+                    }
+                    announced = None;
+                    bypass_announced = false;
+                    trust_attempted = false;
+                }
+
+                // The socket's SessionStart is also channel A for transcript
+                // binding. Without this bridge only Claude's separate pid file
+                // could hydrate, leaving a spurious manual picker over a hooked
+                // session. begin_epoch must happen first so it cannot erase it.
+                //
+                // r6 items 3/4: the report's (pid, session) gets a boundary
+                // measured at THIS instant — absent/empty transcript → Fresh
+                // (`/clear` or a brand-new session whose file is created lazily),
+                // otherwise an unverified anchor at current EOF (`/resume` of an
+                // older session). It is stored once and applied on every bind of
+                // the session, including the first one, so a fresh launch with no
+                // transcript whose user /resume'd before typing is never tailed
+                // byte 0 as current.
+                if let Some(hooks) = hooks.as_ref()
+                    && let Some(binding) = hooks.binding()
+                    && found.as_ref().is_some_and(|found| found.pid == binding.pid)
                 {
-                    saw_demote |= native.native_name == DEMOTED;
-                    saw_promote |= native.native_name == PROMOTED;
+                    // Only an authenticated SessionStart for the observed
+                    // foreground agent can release the deterministic start pin.
+                    // A /tui relaunch keeps the same --settings argv, so its file
+                    // must stop overriding the user's new renderer preference.
+                    if !tui_released {
+                        match hooks.release_tui_pin() {
+                            Ok(()) => tui_released = true,
+                            Err(error) => {
+                                tracing::warn!(%error, "could not release launch renderer pin")
+                            }
+                        }
+                    }
+                    // One production seam (c-effortread r11 item 7): classify the
+                    // bus-derived report, run the authenticated rebind/first-claim
+                    // arm and the explicit-withdrawal marking, then ingest. The
+                    // same function is what tests drive — never a hand-built
+                    // record/rebind sequence.
+                    if apply_native_session_binding(
+                        &bindings,
+                        found.as_ref().expect("matched foreground"),
+                        &binding,
+                        pre_resume_mode,
+                        &mut session_modes,
+                        &mut read_anchors,
+                        &mut withdrawn_sessions,
+                        &mut active_session,
+                    ) {
+                        // c-usagefu r17 item 2: the authenticated report rebound
+                        // this foreground to a DIFFERENT native session, so publish
+                        // the old hydrator's buffered group — its open turn's usage
+                        // is only emitted by mapper.finish() — BEFORE discarding it.
+                        // Dropping it outright (`hydrator = None`) lost every token
+                        // of the in-flight turn on /clear and /resume rebinds. The
+                        // binding seam above and the withdrawal bookkeeping inside
+                        // `apply_native_session_binding` are unchanged.
+                        if let Some(mut old) = hydrator.take() {
+                            produce_replaced(&mut old, &finalise_pending);
+                            #[cfg(test)]
+                            publish_pending_gated(
+                                &finalise_pending,
+                                &events,
+                                &seq,
+                                &ctx,
+                                &finalise_gate,
+                            )
+                            .await;
+                            #[cfg(not(test))]
+                            publish_pending(&finalise_pending, &events, &seq, &ctx).await;
+                        }
+                        announced = None;
+                    }
                 }
-                if emit(
-                    &events,
-                    &seq,
-                    &ctx,
-                    SourceChannel::Runtime,
-                    completeness,
-                    payload,
-                )
-                .await
-                .is_err()
+
+                if !bypass_announced
+                    && let (Some(found), Some(hooks)) = (found.as_ref(), hooks.as_ref())
+                    && shim_bypassed(found, hooks, expect_shim)
                 {
-                    return;
+                    bypass_announced = true;
+                    let (completeness, payload) = native(
+                        LifecycleTopic::Diagnostic,
+                        SHIM_BYPASSED,
+                        Knowledge::NotApplicable,
+                        "claude 未经 shim 启动，hook 不可用",
+                        BTreeMap::from([
+                            ("kind".into(), "claude".into()),
+                            ("pid".into(), found.pid.to_string()),
+                            ("signalTier".into(), "screen".into()),
+                        ]),
+                        Severity::Warning,
+                    );
+                    if emit(
+                        &events,
+                        &seq,
+                        &ctx,
+                        SourceChannel::Runtime,
+                        completeness,
+                        payload,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
                 }
-            }
-            // Epoch boundaries reset tail, hydrated state, the picker, and the
-            // screen raise/blocked latch — a new foreground starts unraised.
-            if saw_demote {
-                screen_latch = remuda_screen::ScreenLatch::new();
-                live_latch = remuda_screen::ScreenLiveLatch::new();
-                hook_ever_live = false;
-                interrupt_pid.store(0, Ordering::SeqCst);
-                if let Some(payload) = bindings.invalidate_picker()
-                    && emit(
+
+                // Screen-derived readiness, on the same evidence class claude-pty
+                // takes from herdr. Only latch transitions are journaled.
+                //
+                // The grid is the emulator's when `REMUDA_PTY_EMULATOR=1`, and the
+                // ANSI-stripped ring tail otherwise — the same input the matchers
+                // read before D-028, so the default path is unchanged (§13 P0).
+                let (interruption_count, grid) = state.screen_evidence();
+                // Pre-launch config seeding is the first line of defence against
+                // the folder-trust dialog, but an inherited operator home or an
+                // ancestor project entry with `hasTrustDialogAccepted: false` can
+                // still put it on screen. When the Node granted auto-trust for this
+                // registered workspace, answer the EXACT dialog once with its own
+                // key sequence (D-022, same gate and same narrow matcher the herdr
+                // carrier uses) — never by touching the operator's real config.
+                if auto_trust_workspace
+                    && !trust_attempted
+                    && found
+                        .as_ref()
+                        .is_some_and(|found| found.kind == AgentKind::Claude)
+                    && let Some(keys) = remuda_screen::trust_dialog_keys(&grid)
+                {
+                    trust_attempted = true;
+                    let result = state.write_bytes(&logical_keys_to_bytes(&keys)).await;
+                    let success = result.is_ok();
+                    tracing::info!(
+                        ?keys,
+                        success,
+                        "folder-trust dialog observed on the native carrier; answering once (registered workspace)"
+                    );
+                    let (_, payload) = native(
+                        LifecycleTopic::Diagnostic,
+                        "trust-dialog",
+                        Knowledge::NotApplicable,
+                        if success {
+                            "trust-dialog auto-accepted (registered workspace)"
+                        } else {
+                            "trust-dialog automatic answer delivery failed; not replayed"
+                        },
+                        BTreeMap::new(),
+                        if success {
+                            Severity::Info
+                        } else {
+                            Severity::Warning
+                        },
+                    );
+                    if emit(
                         &events,
                         &seq,
                         &ctx,
@@ -1109,487 +1325,342 @@ pub(super) fn spawn(
                     )
                     .await
                     .is_err()
+                    {
+                        return;
+                    }
+                }
+                // Esc can end a Claude turn without a Stop hook. A newly rendered
+                // native interruption marker settles the pending request, while an
+                // old marker already present when cancel was sent cannot do so.
+                if let Some(found) = found.as_ref()
+                    && found.kind == AgentKind::Claude
+                    && found.pid > 0
+                    && interrupt_pid.load(Ordering::SeqCst) == found.pid
+                    && interrupt_screen_markers
+                        .lock()
+                        .is_ok_and(|mut baseline| baseline.confirmed(interruption_count, &grid))
+                    && interrupt_pid
+                        .compare_exchange(found.pid, 0, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
                 {
-                    return;
+                    if let Some(hooks) = hooks.as_ref() {
+                        hooks.confirm_screen_interrupt(found.pid);
+                    }
+                    let (_, payload) = native(
+                        LifecycleTopic::Turn,
+                        "interrupted",
+                        Knowledge::NotApplicable,
+                        "idle",
+                        BTreeMap::from([
+                            ("kind".into(), "claude".into()),
+                            ("pid".into(), found.pid.to_string()),
+                            ("requestedBy".into(), "instance.cancel".into()),
+                        ]),
+                        Severity::Info,
+                    );
+                    if emit(
+                        &events,
+                        &seq,
+                        &ctx,
+                        SourceChannel::Pty,
+                        Completeness::ScreenDerived,
+                        payload,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
                 }
-                bindings.demobilize();
-                if let Some(mut old) = hydrator.take() {
-                    produce_replaced(&mut old, &finalise_pending);
-                    publish_pending(&finalise_pending, &events, &seq, &ctx).await;
+                // Rule 6 (design §2.4): the screen/OSC tier may raise busy and
+                // latch blocked, but it never lowers busy while a hook tier is
+                // live for this foreground process. The HookSession's
+                // `turn_active(pid)` is the §2.6 decision: `Some(true)` holds
+                // busy, `Some(false)`/`None` differ only by whether this run ever
+                // materialised a hook tier. That "ever materialised" bit is
+                // sticky per epoch so a transient process-table miss cannot lower
+                // the guard.
+                let (turn_state, hook_last_seen) = match (found.as_ref(), hooks.as_ref()) {
+                    (Some(found), Some(hooks)) if found.pid > 0 => (
+                        hooks.turn_active(found.pid),
+                        hooks.hook_last_seen(found.pid),
+                    ),
+                    _ => (None, None),
+                };
+                match turn_state {
+                    Some(true) => hook_ever_live = true,
+                    Some(false) if hook_ever_live => {
+                        // A hook-confirmed turn end: the screen idle edge is now
+                        // allowed. Clear the epoch stickiness for the next turn —
+                        // the next UserPromptSubmit sets it again.
+                        hook_ever_live = false;
+                    }
+                    _ => {}
                 }
-                announced = None;
-            }
-            if saw_promote {
-                bindings.begin_epoch(&ctx.cwd, &ctx.claude_home);
-                if let Some(mut old) = hydrator.take() {
-                    produce_replaced(&mut old, &finalise_pending);
-                    publish_pending(&finalise_pending, &events, &seq, &ctx).await;
-                }
-                announced = None;
-                bypass_announced = false;
-                trust_attempted = false;
-            }
-
-            // The socket's SessionStart is also channel A for transcript
-            // binding. Without this bridge only Claude's separate pid file
-            // could hydrate, leaving a spurious manual picker over a hooked
-            // session. begin_epoch must happen first so it cannot erase it.
-            //
-            // r6 items 3/4: the report's (pid, session) gets a boundary
-            // measured at THIS instant — absent/empty transcript → Fresh
-            // (`/clear` or a brand-new session whose file is created lazily),
-            // otherwise an unverified anchor at current EOF (`/resume` of an
-            // older session). It is stored once and applied on every bind of
-            // the session, including the first one, so a fresh launch with no
-            // transcript whose user /resume'd before typing is never tailed
-            // byte 0 as current.
-            if let Some(hooks) = hooks.as_ref()
-                && let Some(binding) = hooks.binding()
-                && found.as_ref().is_some_and(|found| found.pid == binding.pid)
-            {
-                // Only an authenticated SessionStart for the observed
-                // foreground agent can release the deterministic start pin.
-                // A /tui relaunch keeps the same --settings argv, so its file
-                // must stop overriding the user's new renderer preference.
-                if !tui_released {
-                    match hooks.release_tui_pin() {
-                        Ok(()) => tui_released = true,
-                        Err(error) => {
-                            tracing::warn!(%error, "could not release launch renderer pin")
+                // Freshness bound: a hook turn that has sent no record within a
+                // small multiple of the poll cadence downgrades Healthy→Stalled so
+                // the screen can lower busy once the turn is actually over. A hook
+                // `Stop` (Some(false)) and a tier that never materialised are
+                // unchanged; only a stuck-but-once-live channel loses its veto.
+                let hook_fresh = hook_last_seen.is_some_and(|at| {
+                    at.elapsed() <= PROMOTE_POLL.saturating_mul(HOOK_STALL_POLLS)
+                });
+                let hook_health = hook_health_for(turn_state, hook_ever_live, hook_fresh);
+                let raw_status = screen_latch.update(&grid, hook_health);
+                // Once the hook tier is merely stale the OSC busy bit alone cannot
+                // end the turn: a long, hook-quiet tool reads that bit as idle
+                // while the TUI is still showing its spinner. Require BOTH that no
+                // spinner line is on screen this poll AND a run of consecutive such
+                // polls (a torn repaint never lowers; a finished turn — idle prompt
+                // on every poll — confirms within a couple of seconds). While hooks
+                // are fresh Healthy already holds Working, and a tier that never
+                // materialised lowers immediately exactly as before.
+                let spinner_present = remuda_screen::screen_live(&grid).is_some();
+                let status = if raw_status == Some(ScreenStatus::Idle)
+                    && hook_health == remuda_screen::HookHealth::Stalled
+                {
+                    if spinner_present {
+                        screen_idle_confirms = 0;
+                        Some(ScreenStatus::Working)
+                    } else {
+                        screen_idle_confirms = screen_idle_confirms.saturating_add(1);
+                        if screen_idle_confirms >= SCREEN_IDLE_CONFIRM_POLLS {
+                            Some(ScreenStatus::Idle)
+                        } else {
+                            Some(ScreenStatus::Working)
                         }
                     }
-                }
-                // One production seam (c-effortread r11 item 7): classify the
-                // bus-derived report, run the authenticated rebind/first-claim
-                // arm and the explicit-withdrawal marking, then ingest. The
-                // same function is what tests drive — never a hand-built
-                // record/rebind sequence.
-                if apply_native_session_binding(
-                    &bindings,
-                    found.as_ref().expect("matched foreground"),
-                    &binding,
-                    pre_resume_mode,
-                    &mut session_modes,
-                    &mut read_anchors,
-                    &mut withdrawn_sessions,
-                    &mut active_session,
-                ) {
-                    // c-usagefu r17 item 2: the authenticated report rebound
-                    // this foreground to a DIFFERENT native session, so publish
-                    // the old hydrator's buffered group — its open turn's usage
-                    // is only emitted by mapper.finish() — BEFORE discarding it.
-                    // Dropping it outright (`hydrator = None`) lost every token
-                    // of the in-flight turn on /clear and /resume rebinds. The
-                    // binding seam above and the withdrawal bookkeeping inside
-                    // `apply_native_session_binding` are unchanged.
-                    if let Some(mut old) = hydrator.take() {
-                        produce_replaced(&mut old, &finalise_pending);
-                        publish_pending(&finalise_pending, &events, &seq, &ctx).await;
-                    }
-                    announced = None;
-                }
-            }
-
-            if !bypass_announced
-                && let (Some(found), Some(hooks)) = (found.as_ref(), hooks.as_ref())
-                && shim_bypassed(found, hooks, expect_shim)
-            {
-                bypass_announced = true;
-                let (completeness, payload) = native(
-                    LifecycleTopic::Diagnostic,
-                    SHIM_BYPASSED,
-                    Knowledge::NotApplicable,
-                    "claude 未经 shim 启动，hook 不可用",
-                    BTreeMap::from([
-                        ("kind".into(), "claude".into()),
-                        ("pid".into(), found.pid.to_string()),
-                        ("signalTier".into(), "screen".into()),
-                    ]),
-                    Severity::Warning,
-                );
-                if emit(
-                    &events,
-                    &seq,
-                    &ctx,
-                    SourceChannel::Runtime,
-                    completeness,
-                    payload,
-                )
-                .await
-                .is_err()
-                {
-                    return;
-                }
-            }
-
-            // Screen-derived readiness, on the same evidence class claude-pty
-            // takes from herdr. Only latch transitions are journaled.
-            //
-            // The grid is the emulator's when `REMUDA_PTY_EMULATOR=1`, and the
-            // ANSI-stripped ring tail otherwise — the same input the matchers
-            // read before D-028, so the default path is unchanged (§13 P0).
-            let (interruption_count, grid) = state.screen_evidence();
-            // Pre-launch config seeding is the first line of defence against
-            // the folder-trust dialog, but an inherited operator home or an
-            // ancestor project entry with `hasTrustDialogAccepted: false` can
-            // still put it on screen. When the Node granted auto-trust for this
-            // registered workspace, answer the EXACT dialog once with its own
-            // key sequence (D-022, same gate and same narrow matcher the herdr
-            // carrier uses) — never by touching the operator's real config.
-            if auto_trust_workspace
-                && !trust_attempted
-                && found
-                    .as_ref()
-                    .is_some_and(|found| found.kind == AgentKind::Claude)
-                && let Some(keys) = remuda_screen::trust_dialog_keys(&grid)
-            {
-                trust_attempted = true;
-                let result = state.write_bytes(&logical_keys_to_bytes(&keys)).await;
-                let success = result.is_ok();
-                tracing::info!(
-                    ?keys,
-                    success,
-                    "folder-trust dialog observed on the native carrier; answering once (registered workspace)"
-                );
-                let (_, payload) = native(
-                    LifecycleTopic::Diagnostic,
-                    "trust-dialog",
-                    Knowledge::NotApplicable,
-                    if success {
-                        "trust-dialog auto-accepted (registered workspace)"
-                    } else {
-                        "trust-dialog automatic answer delivery failed; not replayed"
-                    },
-                    BTreeMap::new(),
-                    if success {
-                        Severity::Info
-                    } else {
-                        Severity::Warning
-                    },
-                );
-                if emit(
-                    &events,
-                    &seq,
-                    &ctx,
-                    SourceChannel::Runtime,
-                    Completeness::Structured,
-                    payload,
-                )
-                .await
-                .is_err()
-                {
-                    return;
-                }
-            }
-            // Esc can end a Claude turn without a Stop hook. A newly rendered
-            // native interruption marker settles the pending request, while an
-            // old marker already present when cancel was sent cannot do so.
-            if let Some(found) = found.as_ref()
-                && found.kind == AgentKind::Claude
-                && found.pid > 0
-                && interrupt_pid.load(Ordering::SeqCst) == found.pid
-                && interrupt_screen_markers
-                    .lock()
-                    .is_ok_and(|mut baseline| baseline.confirmed(interruption_count, &grid))
-                && interrupt_pid
-                    .compare_exchange(found.pid, 0, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
-            {
-                if let Some(hooks) = hooks.as_ref() {
-                    hooks.confirm_screen_interrupt(found.pid);
-                }
-                let (_, payload) = native(
-                    LifecycleTopic::Turn,
-                    "interrupted",
-                    Knowledge::NotApplicable,
-                    "idle",
-                    BTreeMap::from([
-                        ("kind".into(), "claude".into()),
-                        ("pid".into(), found.pid.to_string()),
-                        ("requestedBy".into(), "instance.cancel".into()),
-                    ]),
-                    Severity::Info,
-                );
-                if emit(
-                    &events,
-                    &seq,
-                    &ctx,
-                    SourceChannel::Pty,
-                    Completeness::ScreenDerived,
-                    payload,
-                )
-                .await
-                .is_err()
-                {
-                    return;
-                }
-            }
-            // Rule 6 (design §2.4): the screen/OSC tier may raise busy and
-            // latch blocked, but it never lowers busy while a hook tier is
-            // live for this foreground process. The HookSession's
-            // `turn_active(pid)` is the §2.6 decision: `Some(true)` holds
-            // busy, `Some(false)`/`None` differ only by whether this run ever
-            // materialised a hook tier. That "ever materialised" bit is
-            // sticky per epoch so a transient process-table miss cannot lower
-            // the guard.
-            let (turn_state, hook_last_seen) = match (found.as_ref(), hooks.as_ref()) {
-                (Some(found), Some(hooks)) if found.pid > 0 => (
-                    hooks.turn_active(found.pid),
-                    hooks.hook_last_seen(found.pid),
-                ),
-                _ => (None, None),
-            };
-            match turn_state {
-                Some(true) => hook_ever_live = true,
-                Some(false) if hook_ever_live => {
-                    // A hook-confirmed turn end: the screen idle edge is now
-                    // allowed. Clear the epoch stickiness for the next turn —
-                    // the next UserPromptSubmit sets it again.
-                    hook_ever_live = false;
-                }
-                _ => {}
-            }
-            // Freshness bound: a hook turn that has sent no record within a
-            // small multiple of the poll cadence downgrades Healthy→Stalled so
-            // the screen can lower busy once the turn is actually over. A hook
-            // `Stop` (Some(false)) and a tier that never materialised are
-            // unchanged; only a stuck-but-once-live channel loses its veto.
-            let hook_fresh = hook_last_seen
-                .is_some_and(|at| at.elapsed() <= PROMOTE_POLL.saturating_mul(HOOK_STALL_POLLS));
-            let hook_health = hook_health_for(turn_state, hook_ever_live, hook_fresh);
-            let raw_status = screen_latch.update(&grid, hook_health);
-            // Once the hook tier is merely stale the OSC busy bit alone cannot
-            // end the turn: a long, hook-quiet tool reads that bit as idle
-            // while the TUI is still showing its spinner. Require BOTH that no
-            // spinner line is on screen this poll AND a run of consecutive such
-            // polls (a torn repaint never lowers; a finished turn — idle prompt
-            // on every poll — confirms within a couple of seconds). While hooks
-            // are fresh Healthy already holds Working, and a tier that never
-            // materialised lowers immediately exactly as before.
-            let spinner_present = remuda_screen::screen_live(&grid).is_some();
-            let status = if raw_status == Some(ScreenStatus::Idle)
-                && hook_health == remuda_screen::HookHealth::Stalled
-            {
-                if spinner_present {
-                    screen_idle_confirms = 0;
-                    Some(ScreenStatus::Working)
                 } else {
-                    screen_idle_confirms = screen_idle_confirms.saturating_add(1);
-                    if screen_idle_confirms >= SCREEN_IDLE_CONFIRM_POLLS {
-                        Some(ScreenStatus::Idle)
-                    } else {
-                        Some(ScreenStatus::Working)
+                    if raw_status != Some(ScreenStatus::Idle) {
+                        screen_idle_confirms = 0;
+                    }
+                    raw_status
+                };
+                if let Ok(mut slot) = status_slot.lock() {
+                    *slot = status;
+                }
+                // Journal only on an actual latch transition.
+                if let Some(status) = status
+                    && last_status != Some(status)
+                {
+                    last_status = Some(status);
+                    if emit(
+                        &events,
+                        &seq,
+                        &ctx,
+                        SourceChannel::Pty,
+                        // A screen read is not proof; say so in the envelope.
+                        Completeness::ScreenDerived,
+                        agent_status(status),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
                     }
                 }
-            } else {
-                if raw_status != Some(ScreenStatus::Idle) {
-                    screen_idle_confirms = 0;
-                }
-                raw_status
-            };
-            if let Ok(mut slot) = status_slot.lock() {
-                *slot = status;
-            }
-            // Journal only on an actual latch transition.
-            if let Some(status) = status
-                && last_status != Some(status)
-            {
-                last_status = Some(status);
-                if emit(
-                    &events,
-                    &seq,
-                    &ctx,
-                    SourceChannel::Pty,
-                    // A screen read is not proof; say so in the envelope.
-                    Completeness::ScreenDerived,
-                    agent_status(status),
-                )
-                .await
-                .is_err()
+                // Why is the hook tier quiet? Only worth naming once the screen
+                // has actually decided the turn is idle: a running-but-hook-quiet
+                // tool still shows its spinner, and there "no events for a few
+                // seconds" is normal, not a broken channel (the plain amber note is
+                // enough). At the screen-idle end, probe — at a slow cadence — the
+                // pinned relay and the instance hook socket, and journal the first
+                // failed check only when it changes.
+                //
+                // We deliberately do NOT claim `link-stalled` here: this screen
+                // poller cannot see the Node transport's journal-pump cursor, and a
+                // finished session simply emits no hooks — so an old hook timestamp
+                // with a healthy relay+socket is an ordinary quiet end, not a stalled
+                // pump (the `link-stalled` check belongs to a caller that holds the
+                // real flush cursor). A fresh tier (a clean Stop that just landed)
+                // is skipped entirely, so a normal turn never writes a record.
+                if status == Some(ScreenStatus::Idle)
+                    && !hook_fresh
+                    && silence_paths.is_some()
+                    && found.as_ref().is_some_and(|f| f.pid > 0)
                 {
-                    return;
-                }
-            }
-            // Why is the hook tier quiet? Only worth naming once the screen
-            // has actually decided the turn is idle: a running-but-hook-quiet
-            // tool still shows its spinner, and there "no events for a few
-            // seconds" is normal, not a broken channel (the plain amber note is
-            // enough). At the screen-idle end, probe — at a slow cadence — the
-            // pinned relay and the instance hook socket, and journal the first
-            // failed check only when it changes.
-            //
-            // We deliberately do NOT claim `link-stalled` here: this screen
-            // poller cannot see the Node transport's journal-pump cursor, and a
-            // finished session simply emits no hooks — so an old hook timestamp
-            // with a healthy relay+socket is an ordinary quiet end, not a stalled
-            // pump (the `link-stalled` check belongs to a caller that holds the
-            // real flush cursor). A fresh tier (a clean Stop that just landed)
-            // is skipped entirely, so a normal turn never writes a record.
-            if status == Some(ScreenStatus::Idle)
-                && !hook_fresh
-                && silence_paths.is_some()
-                && found.as_ref().is_some_and(|f| f.pid > 0)
-            {
-                silence_ticks = silence_ticks.saturating_add(1);
-                if silence_ticks >= HOOK_SILENCE_PROBE_TICKS
-                    && let Some(paths) = silence_paths.as_ref()
-                {
-                    silence_ticks = 0;
-                    let relay_ok =
-                        remuda_signal::hook_silence::relay_executable(Some(paths.relay.as_path()));
-                    let socket_ok =
-                        remuda_signal::hook_silence::socket_listening(paths.socket.as_path()).await;
-                    let reason = silence_reason_for(hook_fresh, relay_ok, socket_ok);
-                    if last_silence != Some(reason) {
-                        last_silence = Some(reason);
-                        if let Some(reason) = reason {
-                            let (_, payload) = native(
-                                LifecycleTopic::Hook,
-                                "hook.silence",
-                                Knowledge::NotApplicable,
-                                "observed",
-                                BTreeMap::from([("reason".into(), reason.as_str().into())]),
-                                Severity::Info,
-                            );
-                            if emit(
-                                &events,
-                                &seq,
-                                &ctx,
-                                SourceChannel::Pty,
-                                Completeness::ScreenDerived,
-                                payload,
-                            )
-                            .await
-                            .is_err()
-                            {
-                                return;
+                    silence_ticks = silence_ticks.saturating_add(1);
+                    if silence_ticks >= HOOK_SILENCE_PROBE_TICKS
+                        && let Some(paths) = silence_paths.as_ref()
+                    {
+                        silence_ticks = 0;
+                        let relay_ok = remuda_signal::hook_silence::relay_executable(Some(
+                            paths.relay.as_path(),
+                        ));
+                        let socket_ok =
+                            remuda_signal::hook_silence::socket_listening(paths.socket.as_path())
+                                .await;
+                        let reason = silence_reason_for(hook_fresh, relay_ok, socket_ok);
+                        if last_silence != Some(reason) {
+                            last_silence = Some(reason);
+                            if let Some(reason) = reason {
+                                let (_, payload) = native(
+                                    LifecycleTopic::Hook,
+                                    "hook.silence",
+                                    Knowledge::NotApplicable,
+                                    "observed",
+                                    BTreeMap::from([("reason".into(), reason.as_str().into())]),
+                                    Severity::Info,
+                                );
+                                if emit(
+                                    &events,
+                                    &seq,
+                                    &ctx,
+                                    SourceChannel::Pty,
+                                    Completeness::ScreenDerived,
+                                    payload,
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    return;
+                                }
                             }
                         }
                     }
+                } else if status != Some(ScreenStatus::Idle) {
+                    silence_ticks = 0;
                 }
-            } else if status != Some(ScreenStatus::Idle) {
-                silence_ticks = 0;
-            }
-            // The spinner status line is richer status than the busy bit:
-            // verb, streamed token estimate, phrase and the interrupt hint.
-            // Status only (design §2.4); the latch itself enforces one
-            // observation per distinct reading and a single clear on leave.
-            // The latched verdict already folds rule 6 (OSC idle while the
-            // hook tier is alive stays Working) and the blocked latch; feed
-            // it as the authoritative working hint so a screen clear can
-            // only land when this carrier itself stopped claiming busy.
-            let known_working = match status {
-                Some(ScreenStatus::Working) => Some(true),
-                Some(ScreenStatus::Idle) | Some(ScreenStatus::Blocked) => Some(false),
-                None => None,
-            };
-            if let Some(change) = live_latch.observe_with(&grid, known_working) {
-                let payload = match change {
-                    remuda_screen::ScreenLiveChange::Active(live) => {
-                        live_status_payload(&live, now_utc())
-                    }
-                    remuda_screen::ScreenLiveChange::Inactive => live_status_inactive(),
+                // The spinner status line is richer status than the busy bit:
+                // verb, streamed token estimate, phrase and the interrupt hint.
+                // Status only (design §2.4); the latch itself enforces one
+                // observation per distinct reading and a single clear on leave.
+                // The latched verdict already folds rule 6 (OSC idle while the
+                // hook tier is alive stays Working) and the blocked latch; feed
+                // it as the authoritative working hint so a screen clear can
+                // only land when this carrier itself stopped claiming busy.
+                let known_working = match status {
+                    Some(ScreenStatus::Working) => Some(true),
+                    Some(ScreenStatus::Idle) | Some(ScreenStatus::Blocked) => Some(false),
+                    None => None,
                 };
-                if emit(
-                    &events,
-                    &seq,
-                    &ctx,
-                    SourceChannel::Pty,
-                    Completeness::ScreenDerived,
-                    payload,
-                )
-                .await
-                .is_err()
-                {
-                    return;
-                }
-            }
-
-            // c-usagefu r20 item 2: demote/rebind/degrade finalization routes
-            // the replaced hydrator through the FINALISE GUARD (synchronous
-            // production into guard storage + cancellation-safe publication),
-            // never through a local queue.
-            let events_ref: &mpsc::Sender<Observation> = &events;
-            let seq_ref: &AtomicU64 = &seq;
-            let ctx_ref: &PromoteCtx = &ctx;
-            // Borrows the task's pending Arc and channel/ctx refs only while
-            // building the future; the returned future owns its own clones.
-            let mut finalize_replaced = |mut old: Hydrator| {
-                let pending = Arc::clone(&finalise_pending);
-                async move {
-                    produce_replaced(&mut old, &pending);
-                    publish_pending(&pending, events_ref, seq_ref, ctx_ref).await;
-                }
-            };
-
-            match (&promote.kind, &found) {
-                // Claude is the only kind that hydrates a transcript in the MVP.
-                (Some(AgentKind::Claude), Some(found)) if found.hydrates_transcript => {
-                    maintain_binding_inner(
-                        &bindings,
-                        &ctx,
-                        found,
-                        hydrator,
-                        &mut announced,
+                if let Some(change) = live_latch.observe_with(&grid, known_working) {
+                    let payload = match change {
+                        remuda_screen::ScreenLiveChange::Active(live) => {
+                            live_status_payload(&live, now_utc())
+                        }
+                        remuda_screen::ScreenLiveChange::Inactive => live_status_inactive(),
+                    };
+                    if emit(
                         &events,
                         &seq,
-                        effort_bridge.as_ref(),
-                        launch_effort,
-                        model.as_ref(),
-                        permission_bridge.as_ref(),
-                        launch_permission,
-                        &mut session_modes,
-                        &mut launch_mode,
-                        pre_resume_mode,
-                        &mut read_anchors,
-                        &mut effort_seeds,
-                        &mut withdrawn_sessions,
-                        &mut active_session,
-                        &mut finalize_replaced,
+                        &ctx,
+                        SourceChannel::Pty,
+                        Completeness::ScreenDerived,
+                        payload,
                     )
-                    .await;
-                }
-                _ => {
-                    if let Some(old) = hydrator.take() {
-                        finalize_replaced(old).await;
+                    .await
+                    .is_err()
+                    {
+                        return;
                     }
                 }
+
+                // c-usagefu r20 item 2: demote/rebind/degrade finalization routes
+                // the replaced hydrator through the FINALISE GUARD (synchronous
+                // production into guard storage + cancellation-safe publication),
+                // never through a local queue.
+                let events_ref: &mpsc::Sender<Observation> = &events;
+                let seq_ref: &AtomicU64 = &seq;
+                let ctx_ref: &PromoteCtx = &ctx;
+                // Borrows the task's pending Arc and channel/ctx refs only while
+                // building the future; the returned future owns its own clones.
+                let mut finalize_replaced = |mut old: Hydrator| {
+                    let pending = Arc::clone(&finalise_pending);
+                    #[cfg(test)]
+                    let gate = Arc::clone(&finalise_gate);
+                    async move {
+                        produce_replaced(&mut old, &pending);
+                        #[cfg(test)]
+                        publish_pending_gated(&pending, events_ref, seq_ref, ctx_ref, &gate).await;
+                        #[cfg(not(test))]
+                        publish_pending(&pending, events_ref, seq_ref, ctx_ref).await;
+                    }
+                };
+
+                match (&promote.kind, &found) {
+                    // Claude is the only kind that hydrates a transcript in the MVP.
+                    (Some(AgentKind::Claude), Some(found)) if found.hydrates_transcript => {
+                        maintain_binding_inner(
+                            &bindings,
+                            &ctx,
+                            found,
+                            hydrator,
+                            &mut announced,
+                            &events,
+                            &seq,
+                            effort_bridge.as_ref(),
+                            launch_effort,
+                            model.as_ref(),
+                            permission_bridge.as_ref(),
+                            launch_permission,
+                            &mut session_modes,
+                            &mut launch_mode,
+                            pre_resume_mode,
+                            &mut read_anchors,
+                            &mut effort_seeds,
+                            &mut withdrawn_sessions,
+                            &mut active_session,
+                            &mut finalize_replaced,
+                        )
+                        .await;
+                    }
+                    _ => {
+                        if let Some(old) = hydrator.take() {
+                            finalize_replaced(old).await;
+                        }
+                    }
+                }
+                // c-ctxusage r5 item 6: close can land while this iteration's pump
+                // is still mapping. Check before waiting another tick so the final
+                // finalise runs now (close awaits it via `finalised`), never after
+                // a 2 s abort.
+                if state.closed.load(Ordering::SeqCst) || *shutdown.borrow() {
+                    break;
+                }
+                if events.is_closed() {
+                    // Channel already gone: nothing can receive the finalise.
+                    break;
+                }
             }
-            // c-ctxusage r5 item 6: close can land while this iteration's pump
-            // is still mapping. Check before waiting another tick so the final
-            // finalise runs now (close awaits it via `finalised`), never after
-            // a 2 s abort.
-            if state.closed.load(Ordering::SeqCst) || *shutdown.borrow() {
-                break;
-            }
-            if events.is_closed() {
-                // Channel already gone: nothing can receive the finalise.
-                break;
-            }
+            // c-ctxusage r4 item 2 / r5 item 6: cooperative shutdown finalises the
+            // last assistant run (usage with no stop_reason) instead of dropping
+            // the hydrator on close/process exit. This awaits the current pump's
+            // completion first and must finish before close aborts the task.
+            //
+            // c-usagefu r18 items 1/5 test gate: when a test holds the park permit,
+            // the poller stops HERE — after the cooperative break, immediately
+            // before the final finalise — so a close waiting on the poller handle
+            // is deterministically parked and its abort-after-deadline path (which
+            // must run the guard's finish_sync on the live mapper) is drivable.
+            test_park_before_final_finalise().await;
+            // c-usagefu r20 items 1/2: synchronously PRODUCE the final tail read
+            // and mapper.finish() into the guard's pending storage FIRST (no await,
+            // nothing cancellable); the hydrator leaves the slot only after that.
+            // Publication below awaits channel CAPACITY while every observation is
+            // still guard-owned, so an abort can never strand a mapped group.
+            produce_slot_shutdown(&mut finalise_guard.hydrator, &finalise_pending);
+            #[cfg(test)]
+            publish_pending_gated(&finalise_pending, &events, &seq, &ctx, &finalise_gate).await;
+            #[cfg(not(test))]
+            publish_pending(&finalise_pending, &events, &seq, &ctx).await;
+            // Finalization completed and the queue drained; mark done so Drop does
+            // nothing.
+            finalise_guard.mark_done();
+            let _ = finalised.send(());
         }
-        // c-ctxusage r4 item 2 / r5 item 6: cooperative shutdown finalises the
-        // last assistant run (usage with no stop_reason) instead of dropping
-        // the hydrator on close/process exit. This awaits the current pump's
-        // completion first and must finish before close aborts the task.
-        //
-        // c-usagefu r18 items 1/5 test gate: when a test holds the park permit,
-        // the poller stops HERE — after the cooperative break, immediately
-        // before the final finalise — so a close waiting on the poller handle
-        // is deterministically parked and its abort-after-deadline path (which
-        // must run the guard's finish_sync on the live mapper) is drivable.
-        test_park_before_final_finalise().await;
-        // c-usagefu r20 items 1/2: synchronously PRODUCE the final tail read
-        // and mapper.finish() into the guard's pending storage FIRST (no await,
-        // nothing cancellable); the hydrator leaves the slot only after that.
-        // Publication below awaits channel CAPACITY while every observation is
-        // still guard-owned, so an abort can never strand a mapped group.
-        produce_slot_shutdown(&mut finalise_guard.hydrator, &finalise_pending);
-        publish_pending(&finalise_pending, &events, &seq, &ctx).await;
-        // Finalization completed and the queue drained; mark done so Drop does
-        // nothing.
-        finalise_guard.mark_done();
-        let _ = finalised.send(());
-    })
+    });
+    #[cfg(test)]
+    {
+        PollerTask {
+            handle,
+            finalise_gate,
+        }
+    }
+    #[cfg(not(test))]
+    {
+        handle
+    }
 }
 
 /// Guard-owned finalization storage shared between the poller task and the
@@ -1671,17 +1742,35 @@ fn produce_replaced(old: &mut Hydrator, pending: &FinalisePending) {
 /// observation stays in the shared queue; pop, stamp and hand it to the permit
 /// SYNCHRONOUSLY after the await completes — no cancellation point between
 /// removal and the send.
+#[cfg(not(test))]
 async fn publish_pending(
     pending: &FinalisePending,
     events: &mpsc::Sender<Observation>,
     seq: &AtomicU64,
     ctx: &PromoteCtx,
 ) {
-    // c-usagefu r20 item 5 deterministic test gate: parks AFTER production
-    // (final tail mapped + mapper.finish() in the shared queue) and BEFORE the
-    // first capacity reservation, for every finalization path (shutdown and
-    // demote/rebind). A test fills the channel while the poller is parked here.
-    test_park_before_publish().await;
+    publish_pending_inner(pending, events, seq, ctx).await;
+}
+
+/// Test build: same publication with the per-spawn cancellation gate.
+#[cfg(test)]
+async fn publish_pending_gated(
+    pending: &FinalisePending,
+    events: &mpsc::Sender<Observation>,
+    seq: &AtomicU64,
+    ctx: &PromoteCtx,
+    gate: &Arc<FinalisePublishGate>,
+) {
+    gate.hold().await;
+    publish_pending_inner(pending, events, seq, ctx).await;
+}
+
+async fn publish_pending_inner(
+    pending: &FinalisePending,
+    events: &mpsc::Sender<Observation>,
+    seq: &AtomicU64,
+    ctx: &PromoteCtx,
+) {
     loop {
         if pending.lock().expect("finalise pending").is_empty() {
             return;
@@ -1733,6 +1822,116 @@ impl Drop for FinaliseGuard {
                 }
             }
         }
+    }
+}
+
+/// c-usagefu r21 item 3: the poller task + its per-spawn cancellation gate.
+/// Tests acquire the gate and observe THIS poller's finalization only.
+#[cfg(test)]
+pub(crate) struct PollerTask {
+    handle: tokio::task::JoinHandle<()>,
+    #[cfg(test)]
+    finalise_gate: Arc<FinalisePublishGate>,
+}
+
+#[cfg(test)]
+impl PollerTask {
+    /// This poller's per-spawn cancellation gate.
+    pub(crate) fn gate(&self) -> Arc<FinalisePublishGate> {
+        Arc::clone(&self.finalise_gate)
+    }
+
+    /// Consume into the raw task handle (used by close and resume transfer).
+    pub(crate) fn into_handle(self) -> tokio::task::JoinHandle<()> {
+        self.handle
+    }
+}
+
+/// Per-spawn gate around the first finalization capacity reservation.
+///
+/// - A test acquires [`Self::permit`] (an owned token keyed to this gate).
+/// - The poller, when finalization reaches publication, parks on
+///   [`Self::parked`] until it reaches the gate and sets `entered`.
+/// - Once the channel is filled and the caller releases the 2-party barrier,
+///   the poller enters the pending reserve() on the full channel; the test
+///   then aborts with one slot freed and joins — exactly-once delivery comes
+///   either from the woken reservation or FinaliseGuard::drop, never both.
+#[cfg(test)]
+pub(crate) struct FinalisePublishGate {
+    /// One parked slot per poller; None unless a test holds the gate open.
+    slot: tokio::sync::Mutex<Option<ParkSlot>>,
+}
+
+#[cfg(test)]
+struct ParkSlot {
+    /// Set when the poller arrives at the gate.
+    entered: tokio::sync::watch::Sender<bool>,
+    /// 2-party barrier: the poller waits here until the test releases it into
+    /// the full-channel reservation.
+    release: Arc<tokio::sync::Barrier>,
+}
+
+#[cfg(test)]
+impl FinalisePublishGate {
+    fn new() -> Self {
+        Self {
+            slot: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// Acquire this poller's finalization gate. Returns a permit the caller
+    /// uses to release the poller into the reserve() park.
+    pub(crate) async fn permit(self: &Arc<Self>) -> PublishPermit {
+        let mut slot = self.slot.lock().await;
+        // A prior gate on this same poller must be cleared first.
+        *slot = None;
+        let (entered_tx, entered_rx) = tokio::sync::watch::channel(false);
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        *slot = Some(ParkSlot {
+            entered: entered_tx,
+            release: Arc::clone(&release),
+        });
+        PublishPermit {
+            entered: entered_rx,
+            release,
+        }
+    }
+
+    /// Poller-side: signal arrival and wait on the release barrier until the
+    /// test has filled the channel and releases the poller into reserve().
+    async fn hold(&self) {
+        let release = {
+            let mut guard = self.slot.lock().await;
+            let Some(slot) = guard.as_mut() else {
+                return;
+            };
+            slot.entered.send(true).ok();
+            Arc::clone(&slot.release)
+        };
+        release.wait().await;
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct PublishPermit {
+    entered: tokio::sync::watch::Receiver<bool>,
+    release: Arc<tokio::sync::Barrier>,
+}
+
+#[cfg(test)]
+impl PublishPermit {
+    pub(crate) async fn wait_entered(&mut self) {
+        if *self.entered.borrow() {
+            return;
+        }
+        let _ = self.entered.changed().await;
+    }
+
+    /// Release the parked poller into reserve() on the FULL channel. The
+    /// 2-party barrier returns only after the poller has also arrived, so on a
+    /// current-thread runtime its reserve() is guaranteed pending.
+    pub(crate) async fn release_to_pending_reserve(&mut self) {
+        self.release.wait().await;
     }
 }
 
@@ -1829,39 +2028,6 @@ pub(crate) async fn test_acquire_final_finalise_park() -> tokio::sync::MutexGuar
 #[cfg(test)]
 pub(crate) fn test_final_finalise_park_held() -> bool {
     TEST_FINAL_FINALISE_PARK.try_lock().is_err()
-}
-
-/// c-usagefu r20 item 5 deterministic gate: parks AFTER production and BEFORE
-/// the first capacity reservation in [`publish_pending`].
-#[cfg(test)]
-static TEST_FINALISE_PUBLISH_PARK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
-    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
-
-/// Per-invocation acknowledgement (c-usagefu r20 item 5): reset when a test
-/// acquires the permit and set when the poller arrives at the gate.
-#[cfg(test)]
-static TEST_FINALISE_PUBLISH_STAGE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-#[cfg(test)]
-async fn test_park_before_publish() {
-    TEST_FINALISE_PUBLISH_STAGE.store(true, std::sync::atomic::Ordering::SeqCst);
-    let _parked = TEST_FINALISE_PUBLISH_PARK.lock().await;
-}
-
-#[cfg(not(test))]
-async fn test_park_before_publish() {}
-
-#[cfg(test)]
-pub(crate) async fn test_acquire_finalise_publish_park() -> tokio::sync::MutexGuard<'static, ()> {
-    TEST_FINALISE_PUBLISH_STAGE.store(false, std::sync::atomic::Ordering::SeqCst);
-    TEST_FINALISE_PUBLISH_PARK.lock().await
-}
-
-#[cfg(test)]
-pub(crate) fn test_finalise_publish_park_held() -> bool {
-    TEST_FINALISE_PUBLISH_STAGE.load(std::sync::atomic::Ordering::SeqCst)
-        && TEST_FINALISE_PUBLISH_PARK.try_lock().is_err()
 }
 
 /// A shim records its exec PID before Claude can enter the foreground. Missing

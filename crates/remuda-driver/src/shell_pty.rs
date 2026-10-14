@@ -476,6 +476,9 @@ pub struct ShellPtyDriver {
     /// Deterministic transcript binding for the current promotion epoch.
     bindings: promotion::BindingHandle,
     /// Promotion poller, stopped on close.
+    #[cfg(any(test, feature = "test-stub"))]
+    poller: Mutex<Option<promotion::PollerTask>>,
+    #[cfg(not(any(test, feature = "test-stub")))]
     poller: Mutex<Option<JoinHandle<()>>>,
     /// Cooperative-shutdown signal for the promotion poller and the channel its
     /// `finish()` completes on (c-ctxusage r5 item 6): close waits for the last
@@ -589,6 +592,19 @@ impl ShellPtyDriver {
                 .as_ref()
                 .map(|state| state.pgid.load(Ordering::SeqCst))
         })
+    }
+
+    /// c-usagefu r21 item 3 test seam: this driver's poller finalization gate
+    /// (per-spawn, per-invocation acknowledgement).
+    #[cfg(any(test, feature = "test-stub"))]
+    #[cfg(any(test, feature = "test-stub"))]
+    #[cfg(test)]
+    pub(crate) async fn test_poller_gate(&self) -> Option<Arc<promotion::FinalisePublishGate>> {
+        self.poller
+            .lock()
+            .await
+            .as_ref()
+            .map(promotion::PollerTask::gate)
     }
 
     /// c-usagefu r19 item 1 test seam: whether the live codex file adapter has
@@ -2132,7 +2148,11 @@ impl ShellPtyDriver {
         // operations have to reach the process that was just started.
         *self.inner.lock().await = resumed.inner.lock().await.take();
         *self.hooks.lock().await = resumed.hooks.lock().await.take();
-        *self.poller.lock().await = resumed.poller.lock().await.take();
+        *self.poller.lock().await = {
+            // Transfer the resumed driver's gate-bearing task whole (the gate
+            // is per-driver; test builds read it through the same field).
+            resumed.poller.lock().await.take()
+        };
         *self.poller_shutdown.lock().await = resumed.poller_shutdown.lock().await.take();
         *self.poller_finalised.lock().await = resumed.poller_finalised.lock().await.take();
         *self.waiter.lock().await = resumed.waiter.lock().await.take();
@@ -3300,6 +3320,9 @@ impl Driver for ShellPtyDriver {
             const PROMOTER_FINALISE_TIMEOUT: std::time::Duration =
                 std::time::Duration::from_secs(15);
             let finalised = self.poller_finalised.lock().await.take();
+            #[cfg(test)]
+            let mut poller = poller.into_handle();
+            #[cfg(not(test))]
             let mut poller = poller;
             let finished = if let Some(finalised) = finalised {
                 tokio::pin!(finalised);
@@ -6857,7 +6880,8 @@ mod tests {
             .lock()
             .await
             .take()
-            .expect("the real poller handle");
+            .expect("the real poller handle")
+            .into_handle();
         poller.abort();
         let _ = poller.await;
         drop(park);
@@ -6900,11 +6924,6 @@ mod tests {
         }
     }
 
-    /// The r20 cancellation tests share the process-global finalize publish
-    /// gate; serialize them so one cannot hold the other's gate.
-    static R20_CANCEL_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
-        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
-
     /// True iff an observation is the buffered open turn's usage payload.
     fn is_open_turn_usage(observation: &remuda_protocol::Observation) -> bool {
         match &observation.body {
@@ -6915,60 +6934,72 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn an_abort_during_a_full_channel_finalize_delivers_usage_exactly_once() {
-        let _serial = R20_CANCEL_LOCK.lock().await;
-        // c-usagefu r20 items 1/2/5 — CLOSE path. The poller parks at the
-        // post-production gate (mapper.finish() already in the guard queue,
-        // nothing awaited yet); the test then FILLS the channel and releases
-        // the gate, so publication parks on a capacity reservation while the
-        // usage observation is still guard-owned. One slot freed, then abort on
-        // the current-thread runtime: the freed slot is unclaimed by any other
-        // sender; the guard's Drop delivers exactly once. Reverting rule (c)
-        // (pop before the awaited send) loses the observation deterministically.
-        let dir = tempfile::tempdir().unwrap();
-        let (driver, mut events, _cwd, _session) = driver_with_buffered_open_turn(dir.path()).await;
+    /// Shared helper for the r21 cancellation regressions: drive the poller to
+    /// release into a pending reserve(), abort, free one slot and join. Returns
+    /// the observations delivered after the abort.
+    #[allow(clippy::too_many_lines)]
+    async fn abort_at_pending_reservation(
+        driver: &ShellPtyDriver,
+        events: &mut mpsc::Receiver<remuda_protocol::Observation>,
+        rebind: Option<(&crate::launch::HookSession, i32, &std::path::Path)>,
+    ) -> Vec<remuda_protocol::Observation> {
         let sender = driver.test_events_sender().await.expect("run sender");
         let filler = driver.test_filler_observation().await.expect("filler");
+        // Per-driver, per-invocation permit (c-usagefu r21 item 3).
+        let gate = driver.test_poller_gate().await.expect("poller gate");
+        let mut permit = gate.permit().await;
 
-        let park = promotion::test_acquire_finalise_publish_park().await;
-        driver
-            .state()
-            .await
-            .unwrap()
-            .closed
-            .store(true, Ordering::SeqCst);
-        if let Some(shutdown) = driver.poller_shutdown.lock().await.take() {
-            let _ = shutdown.send(true);
+        if let Some((hooks, pgid, second)) = rebind {
+            std::fs::write(second, b"{}").unwrap();
+            r7_send_session_start(hooks, pgid, "r20-second-session", second).await;
+        } else {
+            driver
+                .state()
+                .await
+                .unwrap()
+                .closed
+                .store(true, Ordering::SeqCst);
+            if let Some(shutdown) = driver.poller_shutdown.lock().await.take() {
+                let _ = shutdown.send(true);
+            }
         }
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
-        while !promotion::test_finalise_publish_park_held() {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "poller parks pre-publish"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        // Fill WHILE parked: production completed, publication never started.
+        // Wait for THIS poller's invocation to reach the gate after
+        // production (no sleep: acknowledgement is per-spawn).
+        permit.wait_entered().await;
+        // Fill the bounded channel while publication is still gated off.
         fill_event_channel(&sender, &filler).await;
-        drop(park);
-        // Publication now parks on reserve().await with the full channel.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // Release into reserve(); the channel is full so the reservation is
+        // pending. current_thread: the poller cannot run until this fn awaits,
+        // so this returns with the reservation guaranteed pending.
+        permit.release_to_pending_reserve().await;
 
-        // Take the parked handle (the poller never locks its own JoinHandle),
-        // then ABORT while the channel is still full, free ONE slot, and only
-        // then await the cancelled task. Its woken send body never resumes
-        // (cancelled before the next poll); the guard's cancellation Drop runs
-        // with the freed slot available — deterministic on every runtime.
-        let poller = driver
+        // Abort while full, then free exactly ONE slot and join.
+        // current_thread: the poller is parked on reserve(); abort schedules a
+        // cancellation poll; freeing the slot wakes it. The two compete, but
+        // both converge to exactly-once: the woken send delivers and Drop sees
+        // an empty queue, OR the cancellation drops the future first and Drop
+        // try_sends the queued observation into the freed slot. The assertion
+        // is exactly one either way; reverting reserve-before-pop leaves
+        // NOTHING in the queue for Drop and the woken future is cancelled.
+        let handle = driver
             .poller
             .lock()
             .await
             .take()
-            .expect("the real poller handle");
-        poller.abort();
-        let _freed = events.recv().await.expect("one filler drains");
-        let _ = poller.await;
+            .expect("the real poller handle")
+            .into_handle();
+        handle.abort();
+        // Free one slot SYNCHRONOUSLY (try_recv releases the semaphore permit
+        // and wakes the queued sender without polling the runtime), then yield
+        // the current-thread runtime exactly ONCE: either the queued send
+        // completes (observation delivered, queue empty) or the cancel poll
+        // runs (future dropped, guard try_sends) — both exactly-once. Multiple
+        // yields would let the woken send race the cancel poll; one yield is
+        // sufficient because the cancel is already scheduled.
+        let freed = events.try_recv().expect("one filler drains synchronously");
+        let _ = freed;
+        tokio::task::yield_now().await;
+        let _ = handle.await;
 
         let mut delivered = Vec::new();
         while let Ok(Some(observation)) =
@@ -6978,6 +7009,18 @@ mod tests {
                 delivered.push(observation);
             }
         }
+        delivered
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_abort_during_a_full_channel_finalize_delivers_usage_exactly_once() {
+        // c-usagefu r21 item 3 — CLOSE path, per-spawn acknowledgement: abort
+        // lands on THIS invocation's pending reservation; the buffered open
+        // turn is delivered exactly once.
+        let dir = tempfile::tempdir().unwrap();
+        let (driver, mut events, _cwd, _session) = driver_with_buffered_open_turn(dir.path()).await;
+
+        let delivered = abort_at_pending_reservation(&driver, &mut events, None).await;
         assert_eq!(
             delivered.len(),
             1,
@@ -6994,60 +7037,21 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn an_abort_during_a_full_channel_rebind_delivers_usage_exactly_once() {
-        let _serial = R20_CANCEL_LOCK.lock().await;
-        // c-usagefu r20 items 1/2/5 — REBIND path (rule (d)): a second
-        // authenticated SessionStart rebinds the foreground; the old hydrator
-        // is produced into guard storage and publication parks at the SAME
-        // post-production gate. Fill, release, free one slot, abort: the old
-        // turn's usage is delivered from the guard exactly once.
+        // c-usagefu r21 item 3 — REBIND path: a second authenticated
+        // SessionStart finalizes the old hydrator; the per-spawn gate proves
+        // THIS invocation parked (no other poller can satisfy it); abort at its
+        // pending reservation delivers the old turn once.
         let dir = tempfile::tempdir().unwrap();
         let (driver, mut events, _cwd, _session) = driver_with_buffered_open_turn(dir.path()).await;
-        let sender = driver.test_events_sender().await.expect("run sender");
-        let filler = driver.test_filler_observation().await.expect("filler");
         let pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
         let hooks = driver.hooks.lock().await.clone().expect("hook session");
-
-        let park = promotion::test_acquire_finalise_publish_park().await;
-        // A SECOND, different SessionStart on the same foreground pid is an
-        // authenticated rebind: the next tick finalizes the old hydrator and
-        // reaches the gate. The candidate transcript must live in the cwd's
-        // project directory (rebind_authenticated_start verifies it belongs).
         let home = dir.path().join("claude-home");
         let slug = crate::claude_transcript::project_dir(&home, dir.path());
         std::fs::create_dir_all(&slug).unwrap();
         let second = slug.join("r20-second-session.jsonl");
-        std::fs::write(&second, b"{}").unwrap();
-        r7_send_session_start(&hooks, pgid, "r20-second-session", &second).await;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
-        while !promotion::test_finalise_publish_park_held() {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "poller reaches rebind publish gate"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        fill_event_channel(&sender, &filler).await;
-        drop(park);
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-        let poller = driver
-            .poller
-            .lock()
-            .await
-            .take()
-            .expect("the real poller handle");
-        poller.abort();
-        let _freed = events.recv().await.expect("one filler drains");
-        let _ = poller.await;
-
-        let mut delivered = Vec::new();
-        while let Ok(Some(observation)) =
-            tokio::time::timeout(std::time::Duration::from_secs(2), events.recv()).await
-        {
-            if is_open_turn_usage(&observation) {
-                delivered.push(observation);
-            }
-        }
+        let delivered =
+            abort_at_pending_reservation(&driver, &mut events, Some((&hooks, pgid, &second))).await;
         assert_eq!(
             delivered.len(),
             1,

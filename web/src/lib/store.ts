@@ -1442,7 +1442,7 @@ class HubStore {
         resolve?.();
         const stillOwns =
           this.transitionSeq === myIssuedSeq && this.authGen === myGen && this.extEpoch === myExt;
-        if (stillOwns) void this.ensureOutbox().catch(() => undefined);
+        if (stillOwns) void this.ensureOutbox(myExt).catch(() => undefined);
       }
       // A NEWER transition was issued before this one settled (whether or not
       // it has acquired yet): this caller must not run the post-login
@@ -1592,33 +1592,47 @@ class HubStore {
    *    the legacy direct POST may run, but ALWAYS carrying the client command
    *    id as its dedupe id.
    */
-  private async ensureOutbox(): Promise<"ok" | "obsolete" | "unavailable"> {
+  private async ensureOutbox(ext?: number): Promise<"ok" | "obsolete" | "unavailable"> {
+    // Gate 39 R-b: `ext` is the epoch the CALLER captured at ITS public entry.
+    // Production callers always pass it; the helper never adopts a fresh epoch
+    // on their behalf. The parameter is optional ONLY for the private test
+    // seam.
+    const epoch = ext ?? this.extEpoch;
     // c-reconnfu gate 35 item 2: LOOP while any credential transition is open.
     // Overlapping logins are serialized: each release can be followed by a
     // queued transition acquiring, so re-await until the chain fully settles.
+    // Gate 39 R-b: revalidate the caller's epoch at EVERY pass, including
+    // immediately after the open-transition wait — a continuation parked here
+    // across an external logout resumes "obsolete" and never starts an
+    // initializer under the new identity.
     // eslint-disable-next-line no-constant-condition
     while (true) {
+      if (this.extEpoch !== epoch) return "obsolete";
       if (this.outbox) return "ok";
       const open = this.authTransition;
       if (!open) break;
       // eslint-disable-next-line no-await-in-loop
       await open;
     }
+    if (this.extEpoch !== epoch) return "obsolete";
     if (this.outbox) return "ok";
-    return this.startOutboxInit();
+    return this.startOutboxInit(epoch);
   }
 
-  private startOutboxInit(): Promise<"ok" | "obsolete" | "unavailable"> {
+  private startOutboxInit(ext: number): Promise<"ok" | "obsolete" | "unavailable"> {
+    // Gate 39 R-b: the CALLER's epoch is validated synchronously BEFORE any
+    // install. A retired caller (an external change after its public entry)
+    // gets "obsolete" — this helper never captures a fresh epoch for it.
+    if (this.extEpoch !== ext) return Promise.resolve("obsolete");
     if (this.outboxInit) return this.outboxInit;
     this.registerPeerAuthWatch();
     // Capture the auth generation this initializer starts under (gate 33
     // item 2). It may complete after an auth change bumped authGen; in that
     // case it must not install the box it built nor run its post-load flush.
-    // Gate 38: an EXTERNAL identity change (logout/401/peer) additionally
-    // moves extEpoch and retires the initializer even where the generation
-    // accounting alone would still match.
+    // Gate 38/39: the CALLER's external epoch gates every install point; an
+    // external change (logout/401/peer) retires the initializer even where the
+    // generation accounting alone would still match.
     const gen = this.authGen;
-    const ext = this.extEpoch;
     const obsolete = () => gen !== this.authGen || ext !== this.extEpoch;
     this.outboxInit = (async (): Promise<"ok" | "obsolete" | "unavailable"> => {
       try {
@@ -2868,22 +2882,34 @@ class HubStore {
    * at offline instead of an optimistic live, so cached UI shows an honest
    * state and the outbox still restores/flushes on recovery.
    */
-  private async initConnection(offline = false) {
+  private async initConnection(offline = false, ext?: number) {
+    // Gate 39 R-b: the CALLER's external epoch (captured at its public entry)
+    // gates every install here. Optional ONLY for the private test seam.
+    const epoch = ext ?? this.extEpoch;
+    const live = () => this.extEpoch === epoch;
     // c-reconnfu gate 34 item 4: a REPLACEMENT login keeps this.connection but
     // the old box was disposed by runAuthIdentityChange. Ensure a current-
     // generation outbox on EVERY init path even when the connection machine is
     // reused, otherwise pending durable rows sit unserviced until another send
     // or a reload. (When the connection is brand new this also runs, as before.)
+    // Gate 39: an "obsolete" result (the caller's epoch moved while waiting on
+    // an open transition) stops this install entirely — never adopt the box the
+    // NEW identity created.
     const connectionReused = this.connection !== null;
     if (connectionReused) {
-      await this.ensureOutbox();
+      const status = await this.ensureOutbox(epoch);
+      if (status !== "ok" || !live() || !this.outbox) return;
       return;
     }
-    await this.ensureOutbox();
+    const status = await this.ensureOutbox(epoch);
+    if (status !== "ok" || !live()) return;
     const box = this.outbox;
     if (!box) return;
 
     // Reload: restore unsent rows as bubbles, keyed to their stored instances.
+    // Gate 39 R-b: identity-publishing/resource work — revalidate synchronously
+    // before the restore emit and machine creation.
+    if (!live()) return;
     const restored = box.unresolved();
     if (restored.length) {
       // Offline reload never ran the instance list. Restore the LAST KNOWN
@@ -2914,6 +2940,13 @@ class HubStore {
       }
     }
 
+    // Gate 39 R-b: revalidate synchronously immediately before constructing
+    // the connection machine; a retirement between the outbox install and here
+    // stops the machine from being built or published.
+    if (!live()) {
+      box.dispose();
+      return;
+    }
     const machine = new ConnectionMachine({
       resume: () => this.resumeConnection(),
       probe: () => this.connectionProbe(),
@@ -2940,6 +2973,12 @@ class HubStore {
       },
     });
     this.connection = machine;
+    // Gate 39 R-b: do not start/attach a machine if the identity retired during
+    // construction.
+    if (!live()) {
+      this.connection = null;
+      return;
+    }
     // A successful REST bootstrap proves reachability, but on the list/new
     // pages there is no follow socket to watchdog yet: start live WITHOUT a
     // frame timer. The instant a session's follow socket binds
@@ -4355,7 +4394,7 @@ class HubStore {
       // setup must not be followed by a stale machine/install, and again after
       // the install settles before starting polls.
       if (!extLive()) return;
-      await this.initConnection();
+      await this.initConnection(false, extAtBoot);
       if (!extLive()) return;
       this.startPoll();
       this.installDevHandle();
@@ -4382,7 +4421,7 @@ class HubStore {
       // and let the connection machine reconnect. Only a real 401 logs out.
       const hasSession = api.hasDeviceSession();
       if (!unauth && hasSession) {
-        await this.initConnection(true);
+        await this.initConnection(true, extAtBoot);
         if (!extLive()) return;
         this.emit({
           ready: true,
@@ -5464,8 +5503,12 @@ class HubStore {
     const sendGen = this.authGen;
     const sendTransitionSeq = this.transitionSeq;
     const sendTransitionOpen = this.authTransition !== null;
+    // Gate 39 R-b: this public entry's external epoch, threaded into
+    // ensureOutbox — the outbox installer must never adopt a newer epoch on
+    // this send's behalf.
+    const sendExt = this.extEpoch;
 
-    const outboxStatus = await this.ensureOutbox();
+    const outboxStatus = await this.ensureOutbox(sendExt);
     // c-reconnfu gate 34 item 1:
     //  - unavailable storage: still mint C so the legacy direct POST carries
     //    it as the dedupe id (never an unkeyed POST).
@@ -5474,7 +5517,7 @@ class HubStore {
     //    available the send proceeds normally under it; otherwise stop without
     //    any POST (no durable row was created, no action executed).
     if (outboxStatus === "obsolete") {
-      const retry = await this.ensureOutbox();
+      const retry = await this.ensureOutbox(sendExt);
       if (retry !== "ok") return false;
     }
     const haveOutbox = this.outbox !== null;
@@ -5740,7 +5783,9 @@ class HubStore {
     // a steer of a later row clicked in the same burst cannot overtake an
     // earlier row's persistence; the flush chain itself serialises the POSTs
     // in createdAt order.
-    if ((await this.ensureOutbox()) !== "ok") return;
+    // Gate 39 R-b: pass this entry's epoch to the installer (captured
+    // synchronously — no await precedes it here).
+    if ((await this.ensureOutbox(this.extEpoch)) !== "ok") return;
     const items = this.heldBubbles(instanceId);
     for (const item of items) {
       const current = this.state.bubbles.find((b) => b.clientRequestId === item.clientRequestId);
@@ -5883,7 +5928,10 @@ class HubStore {
       (b) => b.clientRequestId === bubbleId && b.instanceId === instanceId && b.state === "queued",
     );
     if (!bubble) return false;
-    if ((await this.ensureOutbox()) !== "ok" || !this.outbox) return false;
+    // Gate 39 R-b: this entry's external epoch (synchronous capture — the
+    // enqueue below is the first await) goes to the installer.
+    const steerExt = this.extEpoch;
+    if ((await this.ensureOutbox(steerExt)) !== "ok" || !this.outbox) return false;
 
     // enqueueBubble is idempotent: it assigns the single commandId if still
     // held, or promotes the existing queued row to steer; a racing

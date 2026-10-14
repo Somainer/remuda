@@ -8059,3 +8059,121 @@ it("GATE39 item 1: passkeyLogin captures the external epoch at ENTRY — a peer 
     }
   }
 });
+
+it("GATE39 item 2: bootstrap parked INSIDE connection initialization across a peer logout recreates nothing — the retired caller's ensureOutbox/initConnection return obsolete; a fresh post-logout login installs its own resources", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_320_000);
+  const I = "ins_g39_2";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 4_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g39_2");
+    localStorage.removeItem("runtime.device-session");
+    localStorage.setItem("runtime.logged-out", "1");
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+    vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+    vi.spyOn(api, "instanceList").mockResolvedValue({
+      items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
+      nextCursor: null,
+    } as never);
+    vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+
+    // A's bootstrap HEALTH parks; everything after is a fresh healthy login.
+    let releaseHello: ((e: unknown) => void) | null = null;
+    let helloCalls = 0;
+    vi.spyOn(api, "hello").mockImplementation(
+      () => {
+        helloCalls += 1;
+        if (helloCalls === 1) {
+          return new Promise((_resolve, reject) => {
+            releaseHello = (e: unknown) => reject(e);
+          });
+        }
+        return Promise.resolve({} as Awaited<ReturnType<Api["hello"]>>);
+      },
+    );
+    // An existing session A: bootstrap is started DIRECTLY (a reload), not via
+    // a login transition, so it runs the health request itself.
+    localStorage.setItem(
+      "runtime.device-session",
+      JSON.stringify({ deviceId: "devA_g39_2", name: "A" }),
+    );
+    vi.mocked(api.hasDeviceSession).mockReturnValue(true);
+
+    const h = hubStore as unknown as {
+      bootstrap: () => Promise<void>;
+      login: (k: "bootstrap", s: string, d: string) => Promise<void>;
+      outbox: { lifetime: string } | null;
+      connection: unknown;
+      state: { authed: boolean };
+    };
+    const bootA = h.bootstrap();
+    for (let i = 0; i < 4_000 && helloCalls < 1; i += 1) await Promise.resolve();
+    expect(helloCalls).toBe(1); // A's bootstrap is suspended at the health await
+
+    // While health is parked, login B starts and its transition opens.
+    let releaseB: () => void = () => undefined;
+    vi.spyOn(api, "login").mockImplementationOnce(
+      () => new Promise((resolve) => { releaseB = () => resolve({ deviceId: "devB_g39_2", token: "tokB", name: "B" }); }),
+    );
+    const loginB = h.login("bootstrap", "b", "devB");
+    await pump(400);
+
+    // A's health rejects TRANSIENTLY while B's transition is open and NO
+    // external change has happened yet: A takes the offline branch and parks
+    // INSIDE initConnection -> ensureOutbox's open-transition wait.
+    releaseHello!(new Error("transient health failure"));
+    for (let i = 0; i < 4_000 && h.outbox !== null; i += 1) {
+      // A's catch has run into the offline branch and is waiting on B's
+      // transition; outbox stays null while B is open.
+      await Promise.resolve();
+    }
+    await pump(300);
+    expect(h.outbox).toBeNull();
+
+    // PEER logout only now, while A is suspended inside connection
+    // initialization — the parked continuation must not be allowed to capture
+    // the new epoch and install resources when B releases it.
+    localStorage.removeItem("runtime.device-session");
+    window.dispatchEvent(
+      new StorageEvent("storage", { key: "runtime.device-session", oldValue: "{}", newValue: null }),
+    );
+    await pump(300);
+
+    // B (issued BEFORE the peer logout) settles successfully but is itself
+    // retired; it releases A's wait without installing anything.
+    releaseB();
+    await loginB;
+    await bootA;
+    await pump(5_000);
+    expect(h.state.authed).toBe(false);
+    expect(h.outbox).toBeNull();
+    expect(h.connection).toBeNull();
+
+    // A FRESH post-logout login (new external epoch) is fully serviced.
+    vi.mocked(api.login).mockImplementationOnce(() => Promise.resolve({ deviceId: "devC_g39_2", token: "tokC", name: "C" }));
+    const loginC = h.login("bootstrap", "c", "devC");
+    await loginC;
+    await pump(5_000);
+    expect(h.state.authed).toBe(true);
+    expect(h.outbox).not.toBeNull();
+    expect(h.connection).not.toBeNull();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});

@@ -5190,7 +5190,16 @@ if [ "${REMUDA_START_BARRIER_FD-}" != "0" ]; then
   echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\":\"$head\",\"steps\":[]}"
   exit 0
 fi
-head -c 1 >/dev/null || { echo "start barrier closed before release" >&2; exit 4; }
+# r18 item 10: a SINGLE one-byte read that returns nonzero/empty on EOF and 0
+# only when a real release byte arrives — mirroring merge.rs
+# await_start_barrier (read()==0 -> exit 4). `head -c1` alone returns 0 even
+# on EOF and would falsely release; read -n1 distinguishes the two.
+byte=""
+IFS= read -r -n 1 -t 30 byte || { echo "start barrier: no release byte (EOF/zero)" >&2; exit 4; }
+if [ -z "$byte" ]; then
+  echo "start barrier released a zero byte" >&2
+  exit 4
+fi
 echo released > "$dir/released.marker"
 echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\":\"$head\",\"steps\":[]}"
 "#;
@@ -5328,6 +5337,59 @@ echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\"
             origin_main(&fixture),
             base_main,
             "a fenced-off child never pushes"
+        );
+    }
+
+    /// r18 item 10: the barrier fake must reject a ZERO-byte read (EOF), not
+    /// treat it like a one-byte release — the real `remuda merge`
+    /// await_start_barrier exits 4 on `read()==0`. A byte released proceeds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_barrier_fake_rejects_a_zero_byte_release_but_accepts_a_byte() {
+        let fixture = fixture(BARRIER_LAND_SCRIPT);
+        let dir = fixture.bin.parent().unwrap();
+        std::fs::remove_file(dir.join("released.marker")).ok();
+
+        // EOF (zero-byte read): must exit 4 and NOT release.
+        let mut eof = std::process::Command::new(&fixture.bin);
+        eof.current_dir(dir)
+            .env("REMUDA_START_BARRIER_FD", "0")
+            .args(["merge", "--land", "--onto", "main"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let output = eof.output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(4),
+            "a zero-byte/EOF barrier read must exit 4 like the real CLI: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !dir.join("released.marker").exists(),
+            "EOF must never release the land phase"
+        );
+
+        // One release byte: proceeds and writes the marker.
+        std::fs::remove_file(dir.join("released.marker")).ok();
+        let mut ok = std::process::Command::new(&fixture.bin);
+        ok.current_dir(dir)
+            .env("REMUDA_START_BARRIER_FD", "0")
+            .args(["merge", "--land", "--onto", "main"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = ok.spawn().unwrap();
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(&[1u8]).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "a real release byte must run the land phase: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            dir.join("released.marker").exists(),
+            "a one-byte release must pass the barrier"
         );
     }
 

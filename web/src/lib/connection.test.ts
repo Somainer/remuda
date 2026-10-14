@@ -1385,4 +1385,50 @@ describe("ConnectionMachine", () => {
   // resume/probe/liveness; it now lives as a REAL-store regression in
   // store.foreignTab.test.ts ("GATE19 item 6b (real store)…"), driving the
   // store's actual reopenFollow/openFollowSocket/resumeAfterReconnect path.
+it("gate41 S2: dispose permanently retires a machine — a pending probe resolving false afterwards never publishes or schedules", async () => {
+  const { clock, machine, probe, onState, resume, isFollowLive } = setupTracked();
+  // Drive into stale with a REST probe already pending (frame silence).
+  isFollowLive.mockReturnValue(false);
+  machine.startLive();
+  clock.advance(LIVE_FRAME_MS);
+  expect(machine.state).toBe("stale");
+  const pendingProbe = Promise.resolve(false);
+  probe.mockReturnValueOnce(pendingProbe);
+  clock.advance(REST_PROBE_MS); // arms the probe, now in flight
+  expect(probe).toHaveBeenCalled();
+
+  // A NEW owner installs a replacement machine and is happily live.
+  const replacement = setup();
+  replacement.machine.startLive();
+
+  // The old machine is disposed WHILE its probe is still in flight.
+  machine.dispose();
+  expect(clock.pendingCount()).toBe(0); // every timer cancelled
+  await pendingProbe;
+  await Promise.resolve();
+  await Promise.resolve();
+
+  // The dead machine never published offline, never armed a reconnect.
+  expect(machine.state).toBe("stale");
+  const oldStates = onState.mock.calls.map((c) => c[0]);
+  expect(oldStates).not.toContain("offline");
+  expect(oldStates).not.toContain("recovering");
+  expect(resume).not.toHaveBeenCalled();
+  expect(clock.pendingCount()).toBe(0); // probe(false) scheduled nothing
+
+  // It is permanently inert to every entry point.
+  machine.dispatch({ type: "frame" });
+  machine.startLive();
+  machine.setStateOffline();
+  machine.noteBinding(99);
+  expect(machine.state).toBe("stale");
+  expect(clock.pendingCount()).toBe(0);
+  // Idempotent.
+  machine.dispose();
+
+  // The replacement machine keeps running unaffected.
+  expect(replacement.machine.state).toBe("live");
+  replacement.clock.advance(LIVE_FRAME_MS);
+  expect(replacement.machine.state).toBe("stale"); // still functional
+});
 });

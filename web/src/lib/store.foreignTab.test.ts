@@ -1,6 +1,6 @@
 import { afterEach, expect, it, vi } from "vitest";
 import type { ConnectionMachine } from "./connection";
-import { REST_PROBE_MS } from "./connection";
+import { LIVE_FRAME_MS, REST_PROBE_MS } from "./connection";
 import { CLAIM_WAKE_MAX_FAILURES, OUTBOX_LS_KEY, type OutboxRecord } from "./outbox";
 
 const INSTANCE = "ins_foreign_tab";
@@ -8552,6 +8552,103 @@ it("GATE41 item 1: a retired bootstrap's delayed 401 does not log out the succes
     expect(h.state.session?.deviceId).toBe("devB_g41_1");
     expect(h.outbox).not.toBeNull();
     expect(h.connection).not.toBeNull();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});
+
+it("GATE41 item 2 (S2): a disposed machine's late probe cannot overwrite the replacement's live connection state", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_370_000);
+  const I = "ins_g41_2";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 5_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g41_2");
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+    vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+    vi.spyOn(api, "instanceList").mockResolvedValue({
+      items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
+      nextCursor: null,
+    } as never);
+    vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+    vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+    vi.spyOn(api, "login")
+      .mockResolvedValueOnce({ deviceId: "devA_g41_2", token: "tokA", name: "A" })
+      .mockResolvedValueOnce({ deviceId: "devB_g41_2", token: "tokB", name: "B" });
+
+    // Hold the machine's REST probe so it can resolve AFTER disposal.
+    let releaseProbe: ((ok: boolean) => void) | null = null;
+    vi.spyOn(
+      hubStore as unknown as { connectionProbe: () => Promise<boolean> },
+      "connectionProbe",
+    ).mockImplementation(
+      () =>
+        new Promise<boolean>((resolve) => {
+          releaseProbe = (ok: boolean) => resolve(ok);
+        }),
+    );
+
+    const h = hubStore as unknown as {
+      login: (k: "bootstrap", s: string, d: string) => Promise<void>;
+      connection: { dispatch: (e: unknown) => void; state: string } | null;
+      state: { connection: string; authed: boolean };
+    };
+    // A authenticates; its machine is live (bootstrapLive, no frame timer yet).
+    await h.login("bootstrap", "a", "devA");
+    await pump(4_000);
+    const machineA = h.connection;
+    expect(machineA?.state).toBe("live");
+
+    // Drive A: a frame arms the watchdog, silence degrades to stale, then the
+    // stale REST probe is armed and parks on the held promise.
+    machineA!.dispatch({ type: "frame" });
+    await vi.advanceTimersByTimeAsync(LIVE_FRAME_MS);
+    expect(machineA?.state).toBe("stale");
+    await vi.advanceTimersByTimeAsync(REST_PROBE_MS);
+    await pump(200);
+    expect(releaseProbe).not.toBeNull();
+
+    // PEER logout disposes A's machine while the probe is still pending.
+    localStorage.removeItem("runtime.device-session");
+    window.dispatchEvent(
+      new StorageEvent("storage", { key: "runtime.device-session", oldValue: "{}", newValue: null }),
+    );
+    await pump(300);
+
+    // B logs in healthily and builds a fresh LIVE machine.
+    await h.login("bootstrap", "b", "devB");
+    await pump(5_000);
+    const machineB = h.connection;
+    expect(machineB).not.toBe(machineA);
+    expect(h.state.authed).toBe(true);
+    expect(h.state.connection).toBe("live");
+
+    // A's held probe now resolves FALSE. Under S2 the dead machine must not
+    // publish offline nor schedule a reconnect over B's live state.
+    releaseProbe!(false);
+    await pump(3_000);
+    await vi.advanceTimersByTimeAsync(60_000);
+    await pump(1_000);
+
+    expect(h.connection).toBe(machineB);
+    expect(h.state.connection).toBe("live");
+    expect(h.state.authed).toBe(true);
   } finally {
     vi.useRealTimers();
     Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });

@@ -3042,11 +3042,16 @@ class HubStore {
       probe: () => this.connectionProbe(),
       isFollowLive: () => this.followSocketLive(),
       onState: (state) => {
+        // Gate 41 S2: a callback from a machine that has since been disposed
+        // and replaced (peer logout mid-probe, then a healthy re-login) must
+        // never overwrite the installed machine's published state.
+        if (this.connection !== machine) return;
         this.emit({ connection: state, outboxPending: box.pendingCount() });
         // A socket-level recovery is also a moment to deliver the queue.
         if (state === "live") void this.flushAllOutbox();
       },
       onAttemptFinish: (info) => {
+        if (this.connection !== machine) return;
         // gate 6 item 2: a hung resume the watchdog gave up on is a follow
         // that will never honour its drained-row debt. The bound instance may
         // still be reachable over REST, so fold it now rather than leaving the

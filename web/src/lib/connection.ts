@@ -81,6 +81,15 @@ type TimerName = "stale" | "offline" | "reconnect" | "watchdog" | "probe" | "bin
 
 export class ConnectionMachine {
   state: ConnectionState = "offline";
+  /**
+   * c-reconnfu gate 41 S2 — PERMANENT disposal. Once dispose() returns the
+   * machine is retired forever: it never dispatches, publishes state or
+   * schedules another timer, and every pending attempt/probe continuation is
+   * invalidated. A disposed machine is replaced (never reused) by the store;
+   * without this flag a REST probe/resume parked across a logout could resolve
+   * afterwards and overwrite the replacement machine's published state.
+   */
+  private disposed = false;
   /** Consecutive failed/ongoing attempts; reset on any real recovery. */
   private attempt = 0;
   private timers = new Map<TimerName, unknown>();
@@ -143,6 +152,9 @@ export class ConnectionMachine {
   }
 
   private setState(next: ConnectionState, detail?: { pendingCount?: number }) {
+    // Gate 41 S2: a permanently disposed machine never publishes again, even
+    // if a late probe/resume continuation reaches here.
+    if (this.disposed) return;
     if (next === this.state) return;
     this.state = next;
     // Gate 9 item 1: the stale-entry deadline must not survive stale itself.
@@ -172,12 +184,16 @@ export class ConnectionMachine {
    * orphan fires inside a later state episode.
    */
   private setTimer(name: TimerName, ms: number, fn: () => void) {
+    // Gate 41 S2: a disposed machine schedules nothing — late arming attempts
+    // (a reopen/probe continuation racing disposal) must die here.
+    if (this.disposed) return;
     this.clearTimer(name);
     this.timers.set(name, this.schedule(fn, ms));
   }
 
   /** Start with an optimistic live assumption (bootstrap just succeeded). */
   startLive() {
+    if (this.disposed) return;
     this.attempt = 0;
     this.armFrameWatchdog();
     this.setState("live");
@@ -192,6 +208,7 @@ export class ConnectionMachine {
    * frozen transcript can never sit behind 已连接.
    */
   bootstrapLive() {
+    if (this.disposed) return;
     this.attempt = 0;
     this.clearTimers("stale", "offline", "probe", "reconnect", "watchdog", "bind");
     this.setState("live");
@@ -287,6 +304,8 @@ export class ConnectionMachine {
    * watchdog off the machine's own retry/probe rhythm.
    */
   setStateOffline() {
+    // Gate 41 S2: no re-arm on a retired machine.
+    if (this.disposed) return;
     this.attempt = 0;
     this.clearTimers("stale", "offline", "probe", "reconnect", "watchdog");
     this.setState("offline");
@@ -294,6 +313,10 @@ export class ConnectionMachine {
   }
 
   dispatch(event: ConnectionEvent) {
+    // Gate 41 S2: a permanently disposed machine ignores EVERY event — events
+    // queued by a parked socket/probe across logout must not touch state after
+    // the store has replaced this machine.
+    if (this.disposed) return;
     switch (event.type) {
       case "frame":
         // A frame proves the link: live, backoff reset, watchdog re-armed.
@@ -488,6 +511,7 @@ export class ConnectionMachine {
    * resume immediately on return.
    */
   setVisibility(visible: boolean) {
+    if (this.disposed) return;
     if (visible) this.dispatch({ type: "resume" });
     else if (this.state === "offline") this.clearTimer("reconnect");
   }
@@ -552,6 +576,8 @@ export class ConnectionMachine {
       const gen = this.latestBindGen;
       const probeAttemptId = this.resumeAttemptId;
       void this.deps.probe().then((ok) => {
+        // Gate 41 S2: the probe was parked across dispose; drop its answer.
+        if (this.disposed) return;
         if (gen !== this.latestBindGen) return;
         if (probeAttemptId !== this.resumeAttemptId) return;
         this.dispatch({ type: "probe", ok });
@@ -586,6 +612,9 @@ export class ConnectionMachine {
     void this.deps
       .probe()
       .then((ok) => {
+        // Gate 41 S2: parked across dispose — never settle from the dead
+        // machine (its goOffline would publish over the replacement).
+        if (this.disposed) return;
         if (gen !== this.latestBindGen) return;
         if (attemptId !== this.resumeAttemptId) return;
         // A newer attempt owns the state.
@@ -608,6 +637,8 @@ export class ConnectionMachine {
         }
       })
       .catch(() => {
+        // Gate 41 S2: same retirement for a parked probe rejection.
+        if (this.disposed) return;
         if (!this.resumeInFlight && !this.deps.isFollowLive() && this.state !== "live") {
           this.goOfflineAndSchedule();
         }
@@ -678,12 +709,18 @@ export class ConnectionMachine {
    * bounds the attempt.
    */
   private quietReopen() {
-    if (this.resumeInFlight) return;
+    if (this.disposed || this.resumeInFlight) return;
     const attemptId = this.armResumeAttemptQuiet(this.latestBindGen);
     void this.deps
       .resume()
-      .then(() => this.dispatch({ type: "resumeAttempt", ok: true, attemptId }))
-      .catch(() => this.dispatch({ type: "resumeAttempt", ok: false, attemptId }));
+      .then(() => {
+        if (this.disposed) return;
+        this.dispatch({ type: "resumeAttempt", ok: true, attemptId });
+      })
+      .catch(() => {
+        if (this.disposed) return;
+        this.dispatch({ type: "resumeAttempt", ok: false, attemptId });
+      });
   }
 
   /** beginResume variant that keeps a REST-proven stale state banner-less. */
@@ -724,12 +761,19 @@ export class ConnectionMachine {
   private beginResume() {
     // Coalesce only an attempt for the CURRENT binding: one armed for a mount
     // the user navigated away from is superseded and replaced wholesale.
+    if (this.disposed) return;
     if (this.resumeInFlight && this.resumeBindGen === this.latestBindGen) return;
     const attemptId = this.armResumeAttempt();
     void this.deps
       .resume()
-      .then(() => this.dispatch({ type: "resumeAttempt", ok: true, attemptId }))
-      .catch(() => this.dispatch({ type: "resumeAttempt", ok: false, attemptId }));
+      .then(() => {
+        if (this.disposed) return;
+        this.dispatch({ type: "resumeAttempt", ok: true, attemptId });
+      })
+      .catch(() => {
+        if (this.disposed) return;
+        this.dispatch({ type: "resumeAttempt", ok: false, attemptId });
+      });
   }
 
   /**
@@ -746,6 +790,7 @@ export class ConnectionMachine {
    * other half — it settles the abandoned instance's own debt over REST.
    */
   noteBinding(gen: number) {
+    if (this.disposed) return;
     if (gen === this.latestBindGen) return;
     this.latestBindGen = gen;
     // Gate 17 item 4: a binding change invalidates the OLD attempt's
@@ -771,6 +816,7 @@ export class ConnectionMachine {
    * tell whether THIS attempt owed the row.
    */
   attemptRef(): { gen: number; attemptId: number } | null {
+    if (this.disposed) return null;
     if (!this.resumeInFlight || this.resumeBindGen !== this.latestBindGen) return null;
     return { gen: this.resumeBindGen, attemptId: this.resumeAttemptId };
   }
@@ -781,6 +827,7 @@ export class ConnectionMachine {
    * attempt a superseded mount still owned (its watchdog becomes a no-op).
    */
   followRebindLive() {
+    if (this.disposed) return;
     this.resumeInFlight = false;
     this.attempt = 0;
     this.clearTimers("watchdog", "reconnect");
@@ -797,6 +844,7 @@ export class ConnectionMachine {
    * (whose later failure would then be ignored, leaving a false live).
    */
   followAttemptLive(attemptId: number, gen: number) {
+    if (this.disposed) return;
     if (gen !== this.latestBindGen) return;
     if (!this.resumeInFlight || this.resumeAttemptId !== attemptId) return;
     this.followRebindLive();
@@ -818,6 +866,7 @@ export class ConnectionMachine {
    * fresh attempt and A's later end is ignored.
    */
   followAttemptBegin(gen: number = this.latestBindGen): number {
+    if (this.disposed) return this.resumeAttemptId;
     if (this.resumeInFlight && gen === this.resumeBindGen) return this.resumeAttemptId;
     return this.armResumeAttempt(gen);
   }
@@ -828,6 +877,7 @@ export class ConnectionMachine {
    * certify B, a late A failure must not take B offline.
    */
   followAttemptEnd(ok: boolean, attemptId: number, gen: number = this.latestBindGen) {
+    if (this.disposed) return;
     if (gen !== this.latestBindGen) return;
     this.dispatch({ type: "resumeAttempt", ok, attemptId });
   }
@@ -891,7 +941,23 @@ export class ConnectionMachine {
     return attemptId;
   }
 
+  /**
+   * Gate 41 S2 — PERMANENTLY retire this machine. Idempotent.
+   *
+   * Cancels every timer, invalidates the in-flight resume attempt AND bumps
+   * the attempt id (so a parked resume/probe completion carrying the old id is
+   * dropped even where a continuation checks attempt identity directly), and
+   * flips the disposed flag that gates dispatch/publication/scheduling: a
+   * pending REST probe resolving afterwards can no longer publish offline or
+   * arm a reconnect that competes with the replacement machine.
+   */
   dispose() {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.resumeInFlight = false;
+    this.resumeRetiredOffline = false;
+    this.closedDuringResume = false;
+    this.resumeAttemptId += 1;
     for (const h of this.timers.values()) this.cancel(h);
     this.timers.clear();
   }

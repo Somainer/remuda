@@ -2295,6 +2295,18 @@ pub(crate) async fn apply_result(
                     row.error = None;
                     row.reason = Some("cancel arrived after the lane had pushed main".into());
                 } else {
+                    // r22 item 2: this Canceled transition is result-driven,
+                    // so the own-evidence predicate gates it exactly like the
+                    // Passed/Failed settlements: a verdict that SUPPLIED a log
+                    // which did not persist as its own digest must DEFER (the
+                    // row stays Canceling and the result is re-supplied),
+                    // never record "verified but not landed" — or a supplied
+                    // "canceled" verdict — under missing or another result's
+                    // bytes. A verdict with no run_log leaves the predicate
+                    // vacuous.
+                    if !evidence_is_own(log_object_id.as_ref(), row.log_object_id.as_deref()) {
+                        return None;
+                    }
                     row.state = GateJobState::Canceled;
                     if result.status == "passed" {
                         // The run verified green; only the land was skipped.
@@ -2319,9 +2331,24 @@ pub(crate) async fn apply_result(
                 return Some(());
             }
             if result.status == "canceled" {
+                // r22 item 2: a direct supplied-log canceled verdict is a
+                // definitive settlement — bind it to its OWN persisted digest
+                // and defer (Running) when its supplied log did not persist,
+                // exactly like every other supplied-log settlement.
+                if !evidence_is_own(log_object_id.as_ref(), row.log_object_id.as_deref()) {
+                    return None;
+                }
+                if let Some(object_id) = &log_object_id {
+                    row.log_object_id = Some(object_id.clone());
+                }
+                row.failed_step = result.failed_step.clone();
                 row.state = GateJobState::Canceled;
                 row.finished_at = Some(now_ts());
                 row.error = result.error.clone();
+                row.reason = result
+                    .reason
+                    .clone()
+                    .or_else(|| Some("canceled".to_owned()));
                 return Some(());
             }
             for step in &result.steps {

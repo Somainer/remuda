@@ -2790,6 +2790,221 @@ async fn an_oversized_run_log_is_persisted_truncated_and_settles_normally() {
     );
 }
 
+/// r22 item 2: a Canceling job's Canceled transition is result-driven too. A
+/// completed Passed-with-keepLogs verdict racing the cancel must only commit
+/// Canceled ("verified but not landed") bound to its OWN persisted log; if
+/// its insert fails the Canceled settlement DEFERS (the row stays Canceling
+/// with the prior reference), and redelivery after recovery settles it once.
+#[tokio::test]
+async fn a_canceling_passed_verdict_with_missing_evidence_defers_its_cancel_settlement() {
+    let (ctx, _node) = Ctx::boot().await.unwrap();
+    let (status, body) = ctx
+        .agent_post(
+            &format!("/v1/projects/{}/gate", ctx.project),
+            json!({"branch":"wt/gate/cancel-passed-evidence","mode":"verify"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let job_id = body["id"].as_str().unwrap().to_owned();
+    let claimed = ctx
+        .hub
+        .test_claim_gate_job(&job_id, "lane1", &ctx.host)
+        .await
+        .unwrap()
+        .expect("the queued verify job claims to running");
+    assert_eq!(claimed["state"], json!("running"), "{claimed}");
+    // The operator cancel commits while the green result is still in flight.
+    let db = rusqlite::Connection::open(ctx.db_path()).unwrap();
+    db.execute(
+        "UPDATE gate_jobs
+            SET state = 'canceling',
+                doc_json = json_set(doc_json, '$.state', 'canceling'),
+                revision = revision + 1,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          WHERE id = ?1",
+        rusqlite::params![job_id],
+    )
+    .unwrap();
+    drop(db);
+
+    let passed = json!({
+        "jobId": job_id,
+        "generation": 1,
+        "status": "passed",
+        "runLog": {
+            "step": "*",
+            "kind": "kept",
+            "attempts": 1,
+            "headline": "green when the cancel landed",
+            "summary": ["cargo test ... ok"],
+            "tail": ["Finished", "test result: ok"],
+            "capturedLines": 2,
+            "truncated": false
+        }
+    });
+
+    // The green verdict's evidence cannot persist: the result-driven Canceled
+    // transition must stand down rather than record "verified but not landed"
+    // with no bound evidence.
+    ctx.store().test_arm_gate_log_insert_fault_sticky();
+    ctx.hub
+        .test_apply_gate_result(&job_id, passed.clone())
+        .await
+        .unwrap();
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(
+        doc["state"],
+        json!("canceling"),
+        "the cancel settlement must defer without its own persisted log: {doc}"
+    );
+    assert!(
+        doc["logObjectId"].is_null(),
+        "a failed persist must not bind evidence during deferral: {doc}"
+    );
+
+    // Storage recovers and the existing path re-supplies the verdict: it now
+    // settles Canceled exactly once, bound to its own kept log.
+    ctx.store().test_clear_gate_log_insert_fault();
+    ctx.hub
+        .test_apply_gate_result(&job_id, passed.clone())
+        .await
+        .unwrap();
+    let settled = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(settled["state"], json!("canceled"), "{settled}");
+    assert_eq!(
+        settled["reason"],
+        json!("canceled; verified but not landed"),
+        "{settled}"
+    );
+    let object_id = settled["logObjectId"]
+        .as_str()
+        .expect("the Canceled settlement binds the kept log")
+        .to_owned();
+    ctx.hub
+        .test_apply_gate_result(&job_id, passed)
+        .await
+        .unwrap();
+    let again = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(
+        again["logObjectId"],
+        json!(object_id),
+        "the duplicate redelivery must not rebind the Canceled evidence: {again}"
+    );
+    let (status, served) = ctx
+        .send(
+            "GET",
+            &format!("/v1/gate/logs/{object_id}"),
+            &ctx.human,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{served}");
+    assert_eq!(
+        served["log"]["headline"],
+        json!("green when the cancel landed"),
+        "the Canceled evidence is the green run's own bytes: {served}"
+    );
+}
+
+/// r22 item 2: a direct supplied-log `canceled` verdict on a Running row is a
+/// definitive settlement and must bind its own persisted digest. With a
+/// failed insert it defers (Running); redelivery after recovery settles
+/// Canceled exactly once.
+#[tokio::test]
+async fn a_supplied_log_canceled_verdict_requires_its_own_persisted_digest() {
+    let (ctx, _node) = Ctx::boot().await.unwrap();
+    let (status, body) = ctx
+        .agent_post(
+            &format!("/v1/projects/{}/gate", ctx.project),
+            json!({"branch":"wt/gate/supplied-canceled","mode":"verify"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let job_id = body["id"].as_str().unwrap().to_owned();
+    let claimed = ctx
+        .hub
+        .test_claim_gate_job(&job_id, "lane1", &ctx.host)
+        .await
+        .unwrap()
+        .expect("the queued verify job claims to running");
+    assert_eq!(claimed["state"], json!("running"), "{claimed}");
+
+    let canceled = |headline: &str| {
+        json!({
+            "jobId": job_id,
+            "generation": 1,
+            "status": "canceled",
+            "error": "canceled by the operator",
+            "runLog": {
+                "step": "cargo-test",
+                "kind": "failed",
+                "attempts": 1,
+                "headline": headline,
+                "summary": ["run interrupted before completion"],
+                "tail": ["canceled"],
+                "capturedLines": 1,
+                "truncated": false
+            }
+        })
+    };
+
+    // A failed persist defers the Canceled settlement.
+    ctx.store().test_arm_gate_log_insert_fault_sticky();
+    ctx.hub
+        .test_apply_gate_result(&job_id, canceled("the canceled run"))
+        .await
+        .unwrap();
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(
+        doc["state"],
+        json!("running"),
+        "a supplied-log canceled verdict must defer when its log does not persist: {doc}"
+    );
+    assert!(doc["logObjectId"].is_null(), "{doc}");
+
+    // Recovery + redelivery settles Canceled bound to its own object.
+    ctx.store().test_clear_gate_log_insert_fault();
+    let verdict = canceled("the canceled run");
+    ctx.hub
+        .test_apply_gate_result(&job_id, verdict.clone())
+        .await
+        .unwrap();
+    let settled = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(settled["state"], json!("canceled"), "{settled}");
+    let object_id = settled["logObjectId"]
+        .as_str()
+        .expect("the Canceled settlement binds its persisted log")
+        .to_owned();
+    // A further redelivery settles no second time and keeps the object.
+    ctx.hub
+        .test_apply_gate_result(&job_id, verdict)
+        .await
+        .unwrap();
+    let again = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(again["state"], json!("canceled"), "{again}");
+    assert_eq!(
+        again["logObjectId"],
+        json!(object_id),
+        "the duplicate redelivery rebound the Canceled evidence: {again}"
+    );
+    let (status, served) = ctx
+        .send(
+            "GET",
+            &format!("/v1/gate/logs/{object_id}"),
+            &ctx.human,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{served}");
+    assert_eq!(
+        served["log"]["headline"],
+        json!("the canceled run"),
+        "the Canceled evidence is the verdict's own bytes: {served}"
+    );
+}
+
 /// The Node delivers a FAILED verdict with runLog through BOTH real Hub
 /// entry points — the `gate.event` finished NOTIFICATION and the gate.run
 /// RPC REPLY — not a shared in-process helper. The event lands while the

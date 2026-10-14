@@ -1056,9 +1056,9 @@ pub fn aggregate_supply(
     conn.query_row(
         "WITH winning_sessions AS (
             SELECT total_tokens, input_tokens, output_tokens, cost_usd,
-                   scope_id, profile_id, model FROM (
+                   scope_id, profile_id, model, instance_id FROM (
                 SELECT total_tokens, input_tokens, output_tokens, cost_usd,
-                       scope_id, profile_id, model,
+                       scope_id, profile_id, model, instance_id,
                        ROW_NUMBER() OVER (
                            PARTITION BY instance_id, scope_id
                            ORDER BY seq DESC, rowid DESC
@@ -1069,7 +1069,7 @@ pub fn aggregate_supply(
               AND profile_id = ?1 AND model = ?2
             UNION ALL
             SELECT total_tokens, input_tokens, output_tokens, cost_usd,
-                   scope_id, profile_id, model
+                   scope_id, profile_id, model, instance_id
             FROM usage_events
             WHERE scope = 'session' AND scope_id IS NULL
               AND profile_id = ?1 AND model = ?2
@@ -1077,7 +1077,7 @@ pub fn aggregate_supply(
          winning_turns AS (
             SELECT total_tokens, input_tokens, output_tokens, cost_usd FROM (
                 SELECT total_tokens, input_tokens, output_tokens, cost_usd,
-                       source_session_id, profile_id, model,
+                       instance_id, source_session_id, profile_id, model,
                        ROW_NUMBER() OVER (
                            PARTITION BY instance_id, scope_id
                            ORDER BY seq DESC, rowid DESC
@@ -1088,7 +1088,9 @@ pub fn aggregate_supply(
               AND profile_id = ?1 AND model = ?2
               AND NOT EXISTS (
                   SELECT 1 FROM winning_sessions s
-                  WHERE s.scope_id IS NOT NULL AND t.source_session_id = s.scope_id
+                  WHERE s.scope_id IS NOT NULL
+                    AND t.instance_id = s.instance_id
+                    AND t.source_session_id = s.scope_id
               )
             UNION ALL
             SELECT total_tokens, input_tokens, output_tokens, cost_usd
@@ -1096,7 +1098,8 @@ pub fn aggregate_supply(
             WHERE scope = 'turn' AND t.scope_id IS NULL
               AND profile_id = ?1 AND model = ?2
               AND NOT EXISTS (
-                  SELECT 1 FROM winning_sessions s WHERE s.scope_id IS NULL
+                  SELECT 1 FROM winning_sessions s
+                  WHERE s.scope_id IS NULL AND t.instance_id = s.instance_id
               )
          )
          SELECT COUNT(*),
@@ -6303,5 +6306,137 @@ mod tests {
         assert_eq!(instance.events, 1, "one logical turn across both lineages");
         assert_eq!(instance.total_tokens, Some(200));
         assert_eq!(instance.cost_usd, Some(2.0));
+    }
+
+    /// c-ctxusage r26 item 2: NULL-scope legacy coverage is scoped PER
+    /// INSTANCE. A legacy turn in instance A ($1) and a legacy cumulative
+    /// session row in instance B ($2) are unrelated even though neither could
+    /// be attributed a native session; B's session must not suppress A's turn
+    /// in the shared (profile, model) supply.
+    #[test]
+    fn a_legacy_session_in_another_instance_does_not_suppress_a_legacy_turn() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let profile = "pvp_legacy_scope";
+        let model = "m-legacy";
+
+        // Instance A: one unscoped legacy TURN, $1.
+        let legacy_turn = UsageEventRow {
+            instance_id: "ins_legacy_a".into(),
+            seq: 1,
+            profile_id: Some(profile.into()),
+            model: Some(model.into()),
+            scope: "turn".into(),
+            scope_id: None,
+            mode: "snapshot".into(),
+            metric_revision: 1,
+            source_session_id: None,
+            total_tokens: Some(110),
+            input_tokens: Some(100),
+            output_tokens: Some(10),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            cost_usd: Some("1.00".into()),
+            accounting: "estimated".into(),
+            observed_at: "2026-10-13T00:00:00.000Z".into(),
+            observed_at_source: "ingest".into(),
+        };
+        assert!(insert_usage_event(&conn, &legacy_turn).unwrap());
+
+        // Instance B: one unscoped legacy cumulative SESSION row, $2.
+        let legacy_session = UsageEventRow {
+            instance_id: "ins_legacy_b".into(),
+            scope: "session".into(),
+            seq: 1,
+            ..legacy_turn.clone()
+        };
+        let legacy_session = UsageEventRow {
+            total_tokens: Some(220),
+            input_tokens: Some(200),
+            output_tokens: Some(20),
+            cost_usd: Some("2.00".into()),
+            ..legacy_session
+        };
+        assert!(insert_usage_event(&conn, &legacy_session).unwrap());
+
+        let supply = aggregate_supply(&conn, profile, model).unwrap();
+        assert_eq!(supply.events, 2, "$1 turn and $2 session are distinct rows");
+        assert_eq!(supply.total_tokens, Some(330));
+        assert_eq!(supply.input_tokens, Some(300));
+        assert_eq!(supply.output_tokens, Some(30));
+        assert_eq!(supply.cost_usd, Some(3.0));
+
+        // Each instance-level fold independently sees only its own row.
+        assert_eq!(aggregate_instance(&conn, "ins_legacy_a").unwrap().events, 1);
+        assert_eq!(aggregate_instance(&conn, "ins_legacy_b").unwrap().events, 1);
+    }
+
+    /// c-ctxusage r26 item 2: a scoped session stock only covers turns of the
+    /// SAME instance sharing its native session id. A same-named session in a
+    /// different instance must not suppress another instance's turn.
+    #[test]
+    fn a_scoped_session_in_another_instance_does_not_suppress_a_scoped_turn() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let profile = "pvp_scoped_scope";
+        let model = "m-scoped";
+
+        // Instance A: a scoped turn attributed to native session "sess-x".
+        let turn = UsageEventRow {
+            instance_id: "ins_scoped_a".into(),
+            seq: 1,
+            profile_id: Some(profile.into()),
+            model: Some(model.into()),
+            scope: "turn".into(),
+            scope_id: Some("msg-1".into()),
+            mode: "snapshot".into(),
+            metric_revision: 1,
+            source_session_id: Some("sess-x".into()),
+            total_tokens: Some(101),
+            input_tokens: Some(100),
+            output_tokens: Some(1),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            cost_usd: Some("1.00".into()),
+            accounting: "estimated".into(),
+            observed_at: "2026-10-13T00:00:00.000Z".into(),
+            observed_at_source: "native".into(),
+        };
+        assert!(insert_usage_event(&conn, &turn).unwrap());
+
+        // Instance B: a winning session stock for the SAME native session id,
+        // unrelated to A's turn.
+        let session = UsageEventRow {
+            instance_id: "ins_scoped_b".into(),
+            seq: 1,
+            scope: "session".into(),
+            scope_id: Some("sess-x".into()),
+            source_session_id: Some("sess-x".into()),
+            ..turn.clone()
+        };
+        assert!(insert_usage_event(&conn, &session).unwrap());
+
+        let supply = aggregate_supply(&conn, profile, model).unwrap();
+        assert_eq!(
+            supply.events, 2,
+            "B's session stock never covers A's turn across instances"
+        );
+
+        // Same instance + same native session: coverage still applies (the
+        // Codex turn+stock shape folds the turn away).
+        let session_same = UsageEventRow {
+            instance_id: "ins_scoped_a".into(),
+            seq: 2,
+            scope: "session".into(),
+            scope_id: Some("sess-x".into()),
+            source_session_id: Some("sess-x".into()),
+            ..turn
+        };
+        assert!(insert_usage_event(&conn, &session_same).unwrap());
+        let supply = aggregate_supply(&conn, profile, model).unwrap();
+        assert_eq!(
+            supply.events, 2,
+            "A's turn is covered by A's own stock; B's stock still counts"
+        );
     }
 }

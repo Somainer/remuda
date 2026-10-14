@@ -472,6 +472,13 @@ enum Registration {
 pub struct DriverRegistry {
     drivers: Arc<RwLock<BTreeMap<DriverKind, Registration>>>,
     census_epoch: remuda_driver::NodeEpoch,
+    /// Whether this registry object graph has already been adopted by a Node.
+    /// Clones share the flag (cloning a registry does NOT mint a new graph),
+    /// so the same registry — including a `registry.clone()` — cannot back two
+    /// independent Nodes: the second [`DevNode`] construction is rejected
+    /// (c-usagefu r20 item 3). Independent Nodes get independent registries
+    /// (`native_driver_registry` / `with_fake`), hence distinct epochs.
+    adopted: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Default for DriverRegistry {
@@ -479,11 +486,25 @@ impl Default for DriverRegistry {
         Self {
             drivers: Arc::new(RwLock::new(BTreeMap::new())),
             census_epoch: remuda_driver::NodeEpoch::mint(),
+            adopted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
 
 impl DriverRegistry {
+    /// Claim this registry for exactly one Node. Returns an error if it (or a
+    /// clone of it) was already adopted — two Nodes sharing one registry would
+    /// share shutdown ownership and census-retirement buckets (c-usagefu r20
+    /// item 3).
+    pub(crate) fn claim_adoption(&self) -> Result<(), NodeError> {
+        if self.adopted.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Err(NodeError::InvalidConfig(
+                "driver registry already adopted by another Node; build a fresh registry per Node"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
     /// The census epoch shared by every driver this registry builds and the
     /// Node it is installed into (c-usagefu r19 item 1).
     #[must_use]

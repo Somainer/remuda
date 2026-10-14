@@ -226,7 +226,10 @@ impl DevNode {
     /// Build a Node around supplied parts and a persisted Host identity.
     ///
     /// The Node adopts the registry's census epoch — the same epoch every
-    /// driver built from that registry carries (c-usagefu r19 item 1).
+    /// driver built from that registry carries (c-usagefu r19 item 1). One
+    /// registry backs at most one Node: adopting the same registry (or a clone
+    /// of it) twice is rejected so two Nodes can never share shutdown/retire
+    /// ownership (c-usagefu r20 item 3).
     pub fn with_parts_on_host(
         config: &crate::DevServerConfig,
         store: Arc<dyn LocalStore>,
@@ -238,6 +241,8 @@ impl DevNode {
                 "instance queue capacity must be positive".to_owned(),
             ));
         }
+        // Fail before ANY Node state exists if another Node owns this registry.
+        drivers.claim_adoption()?;
         let census_epoch = drivers.census_epoch();
         let host = fixture_host(host_id.clone())?;
         let workspace_registry = crate::workspace::WorkspaceRegistry::open(config, host_id)?;

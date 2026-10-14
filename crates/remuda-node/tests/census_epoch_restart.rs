@@ -103,6 +103,54 @@ fn compose_native(root: &Path, workspace: PathBuf) -> DevNode {
     .expect("compose native Node")
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn one_registry_backs_only_one_node_and_fresh_registries_get_distinct_epochs() {
+    // c-usagefu r20 item 3: a registry (including a clone of it) may be
+    // adopted by exactly ONE DevNode. Building two Nodes from the same
+    // registry object graph would make the second share the first's shutdown
+    // flag and census-retirement bucket.
+    let root_a = tempfile::tempdir().unwrap();
+    let root_c = tempfile::tempdir().unwrap();
+    let config = || {
+        let mut http = DevServerConfig::loopback(0);
+        http.workspace_roots = Some(remuda_testing::test_workspace_roots!());
+        http
+    };
+    let store = |root: &Path| {
+        Arc::new(remuda_node::MemoryStore::open_journaled(root.join("node-data"), 64).unwrap())
+    };
+
+    let registry = remuda_node::native_driver_registry(NativeDriverConfig::new(
+        root_a.path().join("node-data"),
+    ))
+    .expect("registry");
+    let epoch_clone = registry.census_epoch();
+
+    // The CLONE backs Node A.
+    let _node_a =
+        remuda_node::DevNode::with_parts(&config(), store(root_a.path()), registry.clone())
+            .expect("first adoption (registry clone) succeeds");
+
+    // The ORIGINAL cannot back Node C: same adopted flag (shared Arc).
+    let second = remuda_node::DevNode::with_parts(&config(), store(root_c.path()), registry);
+    assert!(
+        second.is_err(),
+        "a cloned registry must not be adopted by a second Node"
+    );
+
+    // Independent registries mint independent epochs (so properly built Nodes
+    // can never share shutdown/retirement ownership).
+    let other = remuda_node::native_driver_registry(NativeDriverConfig::new(
+        root_c.path().join("node-data"),
+    ))
+    .expect("second registry");
+    assert_ne!(
+        format!("{epoch_clone:?}"),
+        format!("{:?}", other.census_epoch()),
+        "fresh registries must mint distinct epochs"
+    );
+}
+
 fn codex_request(binary: PathBuf) -> CreateInstanceRequest {
     CreateInstanceRequest {
         origin: remuda_protocol::InputOrigin::Human,

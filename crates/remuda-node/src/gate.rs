@@ -5268,6 +5268,32 @@ echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\"
 exit 0
 "#;
 
+    /// r20 item 3 / R8(c): once released, the land leader CLOSES its captured
+    /// stdout AND stderr (both reads reach EOF) but keeps WORKING — sleeping
+    /// well past the land budget. Closing the pipes is NOT an exit. The owner
+    /// must keep its non-reaping waitid observer running and kill the group
+    /// only at the real land timeout, never when read_to_end returns.
+    const CLOSED_OUTPUT_LAND_SCRIPT: &str = r#"
+dir=$(dirname "$0")
+echo "$*" >> "$dir/args.txt"
+base=$(git rev-parse main 2>/dev/null || echo "1111111111111111111111111111111111111111")
+head=$(git rev-parse wt/fake/task 2>/dev/null || echo "2222222222222222222222222222222222222222")
+if ! printf '%s\n' "$*" | grep -q -- '--land'; then
+  echo "{\"exitCode\":0,\"status\":\"verified\",\"base\":\"$base\",\"head\":\"$head\",\"merged\":\"$head\",\"steps\":[]}"
+  exit 0
+fi
+if [ "${REMUDA_START_BARRIER_FD-}" != "0" ]; then
+  exit 0
+fi
+byte=""
+IFS= read -r -n 1 -t 30 byte || exit 4
+[ -n "$byte" ] || exit 4
+# Detach BOTH captured pipes: every Node reader sees EOF while this leader is
+# still alive and still inside its land group.
+exec >/dev/null 2>&1
+sleep 47.37
+"#;
+
     const BARRIER_LAND_SCRIPT: &str = r#"
 dir=$(dirname "$0")
 echo "$*" >> "$dir/args.txt"
@@ -5595,6 +5621,93 @@ echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\"
             LandPushLiveness::VerifiedDead,
             "the land group must settle (death certificate) after pre-reap cleanup"
         );
+    }
+
+    /// r20 item 3 / R8(c): closing the captured stdout/stderr is not an exit.
+    /// The released land leader closes BOTH pipes and keeps working past the
+    /// land budget. The owner must NOT observe an early "exit" (the old
+    /// waitid flags returned EINVAL, which was wrongly mapped to exited, so the
+    /// still-live group got TERM/KILLed): the leader stays alive until the real
+    /// land timeout elapses, and only then is the group terminated → uncertain.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_land_leader_that_closed_its_output_is_not_killed_before_its_timeout() {
+        let fixture = fixture(CLOSED_OUTPUT_LAND_SCRIPT);
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        fixture
+            .node
+            .gate_registry()
+            .set_land_fence_fault(LandFenceFault {
+                entered: entered.clone(),
+                release: release.clone(),
+                fail: false,
+            });
+        // A short but observable budget: the child sleeps ~47 s.
+        let budget = Duration::from_secs(2);
+        fixture.node.gate_test_set_land_timeout(budget).await;
+        let mut p = params(&fixture, "land");
+        p.push = false;
+        p.job_id = "gjb_closed_output".into();
+        p.generation = 1;
+        let node = fixture.node.clone();
+        let run = tokio::spawn(async move { node.run_gate_typed(p).await });
+        tokio::time::timeout(Duration::from_secs(15), entered.notified())
+            .await
+            .expect("fence persistence entered (child parked)");
+        // Release the leader; it closes both pipes and keeps sleeping.
+        let released = std::time::Instant::now();
+        {
+            let (lock, cvar) = &*release;
+            let mut done = lock.lock().unwrap();
+            *done = true;
+            cvar.notify_one();
+        }
+        // Half a budget in, the "exited on EOF" bug would already have
+        // TERM/KILLed the group: the marker sleep must still be running.
+        tokio::time::sleep(budget / 2).await;
+        assert!(
+            !run.is_finished(),
+            "the run must still own the pipe-closed, still-alive land at half the budget"
+        );
+        assert!(
+            live_marker_processes("sleep 47.37") >= 1,
+            "the pipe-closed leader was killed before its land timeout"
+        );
+        let result = tokio::time::timeout(Duration::from_secs(30), run)
+            .await
+            .expect("run finished")
+            .expect("joined")
+            .expect("run_gate returned");
+        assert_eq!(
+            result.status, "uncertain",
+            "a budget kill of a released land is uncertain: {result:?}"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|t| t.contains("exceeded")),
+            "the uncertainty is the land timeout, not an early EOF-exit: {:?}",
+            result.error
+        );
+        // From release to verdict the run lasts essentially the WHOLE budget
+        // (half-budget sleep above plus the remaining wait): the EOF at the
+        // pipes never shortened it. Generous slack for a loaded shared box.
+        assert!(
+            released.elapsed() >= budget - Duration::from_millis(500),
+            "the pipe-closed land was settled before its timeout: {:?} (budget {budget:?})",
+            released.elapsed()
+        );
+        // No marker process survives the real budget kill.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let left = live_marker_processes("sleep 47.37");
+            if left == 0 || std::time::Instant::now() >= deadline {
+                assert_eq!(left, 0, "the budget-killed leader survived its owner");
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// r18 item 10: the barrier fake must reject a ZERO-byte read (EOF), not

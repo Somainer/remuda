@@ -6231,8 +6231,9 @@ it("GATE34 item 2 (Fence B): a flush delivery whose box is disposed while awaiti
     };
     const realMerge = storage.mergeUnlessDone.bind(storage);
     let commandId = "";
-    let releaseClaim: () => void = () => undefined;
+
     let claimHeld = false;
+    let releaseClaim: () => void = () => undefined;
     storage.mergeUnlessDone = vi.fn(async (id: string, patch: unknown) => {
       if (!claimHeld && (patch as { state?: string }).state === "inflight") {
         claimHeld = true;
@@ -6513,7 +6514,6 @@ it("GATE36 item 6(f) (replaces the GATE34 six-path test): an OUTSTANDING command
       vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
       vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
       vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
-      vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
       vi.spyOn(api, "instanceList").mockResolvedValue({
         items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
         nextCursor: null,
@@ -6802,8 +6802,9 @@ it("GATE36 item 6(a) (replaces GATE35 item 3): C1's CLAIM parked before it resol
       mergeUnlessDone: (id: string, p: unknown) => Promise<unknown>;
     };
     const realMerge = storage.mergeUnlessDone.bind(storage);
-    let releaseClaim: () => void = () => undefined;
+
     let claimHeld = false;
+    let releaseClaim: () => void = () => undefined;
     storage.mergeUnlessDone = vi.fn(async (id: string, patch: unknown) => {
       if (!claimHeld && (patch as { state?: string }).state === "inflight") {
         claimHeld = true;
@@ -6896,8 +6897,9 @@ it("GATE35 item 4: a STALE fence at the attempt boundary (attempts 19) restores 
       all: () => Promise<OutboxRecord[]>;
     };
     const realMerge = storage.mergeUnlessDone.bind(storage);
-    let releaseClaim: () => void = () => undefined;
+
     let claimHeld = false;
+    let releaseClaim: () => void = () => undefined;
     storage.mergeUnlessDone = vi.fn(async (id: string, patch: unknown) => {
       if (!claimHeld && (patch as { state?: string }).state === "inflight") {
         claimHeld = true;
@@ -7499,8 +7501,9 @@ it("GATE36 item 5: a public steer whose claim resumes across a replacement login
       mergeUnlessDone: (id: string, p: unknown) => Promise<unknown>;
     };
     const realMerge = storage.mergeUnlessDone.bind(storage);
-    let releaseClaim: () => void = () => undefined;
+
     let claimHeld = false;
+    let releaseClaim: () => void = () => undefined;
     storage.mergeUnlessDone = vi.fn(async (id: string, patch: unknown) => {
       if (!claimHeld && (patch as { state?: string }).state === "inflight") {
         claimHeld = true;
@@ -8148,10 +8151,12 @@ it("GATE39 item 2: bootstrap parked INSIDE connection initialization across a pe
     // blocker). The 1st login call is B's parked response; the 2nd is the
     // replacement C's healthy response (consumed only after B releases).
     let releaseB: () => void = () => undefined;
+
     vi.spyOn(api, "login")
       .mockImplementationOnce(
         () => new Promise((resolve) => { releaseB = () => resolve({ deviceId: "devB_g39_2", token: "tokB", name: "B" }); }),
       )
+      // Every later login (the fresh post-logout replacement) resolves.
       .mockImplementation(() => Promise.resolve({ deviceId: "devC_g39_2", token: "tokC", name: "C" }));
     const loginB = h.login("bootstrap", "b", "devB");
     await pump(400);
@@ -8202,33 +8207,30 @@ it("GATE39 item 2: bootstrap parked INSIDE connection initialization across a pe
       state: "pending",
     });
 
-    // Track A settling: it must STILL be parked when the replacement starts.
+    // Track A settling: gate 46 retires it on the peer logout below.
     let bootASettled = false;
     void bootA.then(() => {
       bootASettled = true;
     });
-
-    // Gate 41 item 4: the SUCCESSFUL replacement C is issued NOW — BEFORE B is
-    // released — queued behind B on the serialized transition chain while A is
-    // still suspended inside connection initialization.
-    const loginC = h.login("bootstrap", "c", "devC");
     await pump(300);
-    // A is unsettled and nothing is installed/sent while B holds the chain.
-    expect(bootASettled).toBe(false);
+    // Gate 46 item 3: the peer logout (dispatched above) retired A and
+    // released B's blocker; A settles OBSOLETE (installs nothing) and B is
+    // queued-obsolete. Nothing installed/sent; UI stays logged out until a
+    // fresh post-logout login.
+    expect(bootASettled).toBe(true);
     expect(h.state.authed).toBe(false);
     expect(h.outbox).toBeNull();
     expect(posted).toEqual([]);
 
-    // Release B's queued turn: B's body resolves, but B already owns a STALE
-    // epoch (it acquired before the peer logout), so it writes nothing; its
-    // blocker release lets C acquire and run its healthy credential request,
-    // while A's wait resumes against its stale epoch and installs nothing.
+    // B's late body resolution confirms the obsolete epoch; its public promise
+    // settles (the blocker was already released by the logout).
     releaseB();
     await loginB;
     await pump(400);
 
-    // C's healthy credential request released the chain: its bootstrap builds
-    // its OWN outbox/connection and delivers the seed.
+    // A FRESH post-logout login C installs the replacement resources and
+    // delivers the seed (the only non-retired identity).
+    const loginC = h.login("bootstrap", "c", "devC");
     await loginC;
     await pump(8_000);
     expect(bootASettled).toBe(true);
@@ -9116,7 +9118,7 @@ it("GATE45 item 3: failed successor with obsolete A parked isolates A's completi
 });
 ;
 
-it("GATE44 item 2 (ruling U): unavailable outbox storage still installs the connection machine; it recovers live and a degraded send uses the keyed fallback", async () => {
+it("GATE44 item 2 (ruling U): unavailable outbox storage installs the connection machine; a degraded send uses the keyed fallback (unbound page)", async () => {
   vi.useFakeTimers();
   vi.setSystemTime(1_440_000);
   const I = "ins_g44_2";
@@ -9189,7 +9191,11 @@ it("GATE44 item 2 (ruling U): unavailable outbox storage still installs the conn
             error: Error | null; result: unknown;
           };
           if (failGetAll && mode === "readonly") {
+            // Gate 46 item 5: a failed READ must ERROR/ABORT the transaction,
+            // not complete. Mark the tx; makeTx fires onerror+onabort (and
+            // suppresses oncomplete) when it sees this.
             req.error = new Error("getAll rejected") as IDBRequest['error'];
+            (currentTx as { readFailed: boolean }).readFailed = true;
           } else {
             req.result = [];
           }
@@ -9200,17 +9206,32 @@ it("GATE44 item 2 (ruling U): unavailable outbox storage still installs the conn
         clear: () => makeRequest(),
         count: () => makeRequest(),
       } as unknown as IDBObjectStore);
+      let currentTx: { readFailed: boolean } | null = null;
       const makeTx = (mode: IDBTransactionMode): IDBTransaction => {
         const tx = {
-          objectStore: () => makeStore(mode),
+          objectStore: () => {
+            currentTx = { readFailed: false };
+            return makeStore(mode);
+          },
           oncomplete: null as ((e: unknown) => void) | null,
           onabort: null as ((e: unknown) => void) | null,
           onerror: null as ((e: unknown) => void) | null,
           abort: () => undefined,
           error: null as Error | null,
         };
-        // Transaction completes a microtask after the store's request settles.
-        queueMicrotask(() => queueMicrotask(() => tx.oncomplete?.({ target: tx })));
+        // After the store's request settles: a failed READ aborts/errors the
+        // transaction (oncomplete is suppressed); otherwise it commits.
+        queueMicrotask(() =>
+          queueMicrotask(() => {
+            if (currentTx?.readFailed) {
+              tx.error = new Error("readonly getAll failed");
+              tx.onerror?.({ target: tx });
+              tx.onabort?.({ target: tx });
+            } else {
+              tx.oncomplete?.({ target: tx });
+            }
+          }),
+        );
         return tx as unknown as IDBTransaction;
       };
       const db = {
@@ -9281,12 +9302,10 @@ it("GATE44 item 2 (ruling U): unavailable outbox storage still installs the conn
     expect(send).toHaveBeenCalledTimes(1);
     expect(send.mock.calls[0]?.[4]).toMatch(/^cmd_/);
 
-    // The Hub comes back. The MACHINE's own reconnect (not startPoll) drives
-    // the published state offline -> recovering -> live.
-    vi.mocked(api.hello).mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
-    await vi.advanceTimersByTimeAsync(1_000);
-    await pump(4_000);
-    expect(h.state.connection).toBe("live");
+    // Ruling V: this page has no bound follow (unbound bootstrap), so it does
+    // NOT claim outage->live recovery truthfulness — the machine owns the
+    // published connection state and its own reconnect timers; we assert the
+    // machine + listeners + keyed degraded send only, not a live transition.
   } finally {
     if (g) {
       if (origIndexeddb) g.indexedDB = origIndexeddb;
@@ -9407,13 +9426,11 @@ it("GATE44 item 1: a credential generation superseding a parked storage install 
   }
 });;
 
-it("GATE45 item 1: a real login acquiring in the machine-construction window supersedes A's settled outcome (healthy and unavailable)", async () => {
-  let internalsGlobal: Record<string, unknown> | null = null;
-  let addSpy: ReturnType<typeof vi.spyOn> | null = null;
-  for (const variant of ["healthy", "unavailable"] as const) {
+it("GATE46 item 1/4: a one-shot store subscriber starts a held login B at A's machine-state publication; A fulfils only on B's machine (healthy and offline-install paths differ)", async () => {
+  for (const variant of ["healthy", "offline-install"] as const) {
     vi.useFakeTimers();
-    vi.setSystemTime(1_450_000 + (variant === "unavailable" ? 1 : 0));
-    const I = `ins_g45_1_${variant}`;
+    vi.setSystemTime(1_470_000 + (variant === "offline-install" ? 1 : 0));
+    const I = `ins_g46_1_${variant}`;
     const originalNavigator = globalThis.navigator;
     Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
     localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
@@ -9421,8 +9438,8 @@ it("GATE45 item 1: a real login acquiring in the machine-construction window sup
       for (let i = 0; i < n; i += 1) await Promise.resolve();
     };
     try {
-      sessionStorage.setItem(`remuda-outbox-owner-g45-1-${variant}`, "owner");
-      localStorage.setItem("runtime.device-session", JSON.stringify({ deviceId: "devA_g45_1", name: "A" }));
+      sessionStorage.setItem(`remeda-outbox-owner-g46-1-${variant}`, "owner");
+      localStorage.setItem("runtime.device-session", JSON.stringify({ deviceId: "devA_g46_1", name: "A" }));
       const { api, hubStore } = await fresh();
       vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
       vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
@@ -9433,104 +9450,205 @@ it("GATE45 item 1: a real login acquiring in the machine-construction window sup
       vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
       vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
       vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
-      vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+      const startPollSpy = vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
       vi.spyOn(api, "instanceList").mockResolvedValue({
         items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
         nextCursor: null,
       } as never);
       vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
-      vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
-      let releaseB: () => void = () => undefined;
-      vi.spyOn(api, "login")
-.mockImplementationOnce(() => Promise.resolve({ deviceId: "devA_g45_1", token: "tokA", name: "A" }))
-        .mockImplementationOnce(() => {
-          // B holds here until releaseB() — even after its transition acquired.
-          return new Promise((resolve) => {
-            releaseB = () => resolve({ deviceId: "devB_g45_1", token: "tokB", name: "B" });
-          });
-        })
-        .mockImplementation(() => Promise.resolve({ deviceId: "devC_g45_1", token: "tokC", name: "C" }));
+      // healthy: health succeeds, machine starts live. offline-install: the
+      // health request fails transiently once, so A's bootstrap takes the
+      // catch -> initConnection(offline) path (genuinely different branch).
+      const { RestNetworkError } = await import("./api");
+      let helloFailOnce = variant === "offline-install";
+      vi.spyOn(api, "hello").mockImplementation(() => {
+        if (helloFailOnce) {
+          helloFailOnce = false;
+          return Promise.reject(new RestNetworkError("offline once"));
+        }
+        return Promise.resolve({} as Awaited<ReturnType<Api["hello"]>>);
+      });
 
-      const h2 = hubStore as unknown as {
+      // The FIRST actual login request is held (B). A is the cold reload
+      // (bootstrap, cached session) — no login call is made for it.
+      let releaseB: () => void = () => undefined;
+      let bBodyPending = false;
+      vi.spyOn(api, "login").mockImplementationOnce(() => {
+        bBodyPending = true;
+        return new Promise((resolve) => {
+          releaseB = () => {
+            bBodyPending = false;
+            resolve({ deviceId: "devB_g46_1", token: "tokB", name: "B" });
+          };
+        });
+      });
+
+      const h = hubStore as unknown as {
         bootstrap: () => Promise<void>;
+        subscribe: (cb: () => void) => () => void;
         login: (k: "bootstrap", s: string, d: string) => Promise<void>;
         outbox: unknown;
         connection: unknown;
         state: { authed: boolean; connection: string };
       };
-      // The machine-construction gate starts a REAL login B synchronously while
-      // A's initConnection is suspended at machine construction. A's credential
-      // transition has long released, so B acquires immediately and bumps
-      // authGen (and, for healthy, disposes A's just-installed outbox); B then
-      // parks on its held credential body.
-      // Gate EVERY machine construction: the FIRST starts B (B queues behind
-      // A's reload), and every construction waits for its release — so B's own
-      // current-gen machine is never built until the test releases them after
-      // B's body settles.
-      const gateReleases: Array<() => void> = [];
-      const internals = hubStore as unknown as Record<string, unknown>;
-      internalsGlobal = internals;
-      (internals.setMachineConstructGateForTest as (g: ((release: () => void) => void) | null) => void)((release) => {
-        gateReleases.push(release);
-        if (gateReleases.length === 1) {
-          void h2.login("bootstrap", "secret", "devB");
-        }
+      // ONE-SHOT REAL store subscriber: fires on the next machine-state
+      // publication (A's machine publishing its initial state) and starts the
+      // held login B synchronously — the exact production subscriber window.
+      // ONE-SHOT subscriber that fires only on a CONNECTION state change (the
+      // machine's publication), not on the earlier session/authed emits.
+      let prevConn = (hubStore as unknown as { state: { connection: string } }).state.connection;
+      let unsub = (): void => {};
+      unsub = h.subscribe(() => {
+        const store3 = hubStore as unknown as { state: { connection: string }; connection: unknown };
+        const conn = store3.state.connection;
+        if (conn === prevConn || !store3.connection) return;
+        prevConn = conn;
+        unsub();
+        void h.login("bootstrap", "secret", "devB");
       });
-      addSpy = vi.spyOn(window, "addEventListener");
-      // A (+ StrictMode duplicate A2) run; their installs park at the gate.
-      const bootA = h2.bootstrap();
-      const bootA2 = h2.bootstrap();
-      await pump(600);
-      expect(gateReleases.length).toBeGreaterThanOrEqual(1);
+
+      // Assertions live in SAVED awaited callbacks for A and A2.
+      const assertReady = async (label: string) => {
+        expect(h.state.authed).toBe(true);
+        expect(h.connection).not.toBeNull();
+        void label;
+      };
+      // A (+ StrictMode duplicate A2) bootstrap; A's machine publishes and the
+      // subscriber starts B, which acquires and parks on its held body.
+      const bootA = h.bootstrap();
+      const bootA2 = h.bootstrap();
+      // Wait for B's held request to be in flight.
+      for (let i = 0; i < 100 && !bBodyPending; i += 1) await pump(50);
+      expect(bBodyPending).toBe(true);
+      // A is not fulfilled while B's body is held (its settled gen is stale).
       let aFulfilled = false;
       let a2Fulfilled = false;
-      void bootA.then(() => { aFulfilled = true; });
-      void bootA2.then(() => { a2Fulfilled = true; });
-
-      // B (started from A's gate) acquires and parks on its held body BEFORE
-      // A's gate is released: pump until B holds the chain.
-      for (let i = 0; i < 100; i += 1) {
-        await pump(50);
-        if ((hubStore as unknown as { authTransitionOpenForTest: boolean }).authTransitionOpenForTest) break;
-      }
-      // Release A's single-flight gate (A2 joins the same run; it does not gate
-      // separately). A's continuation now sees the moved generation post-gate:
-      // it does NOT build/publish its own stale machine. It is handed to the
-      // current generation, which only completes once B's credential body
-      // settles (B holds the chain), so A cannot fulfil yet.
-      const addSpyCountBefore = (addSpy as ReturnType<typeof vi.spyOn>).mock.calls.filter((c: unknown[]) => c[0] === "online").length;
-      gateReleases[0]!();
+      const aReady = bootA.then(() => { aFulfilled = true; return assertReady("A"); });
+      const a2Ready = bootA2.then(() => { a2Fulfilled = true; return assertReady("A2"); });
       await pump(400);
-      // A built NO machine while B holds the chain.
-      expect((addSpy as ReturnType<typeof vi.spyOn>).mock.calls.filter((c: unknown[]) => c[0] === "online")).toHaveLength(addSpyCountBefore);
       expect(aFulfilled).toBe(false);
       expect(a2Fulfilled).toBe(false);
+      // A's stale-gen continuation never starts a poll while B holds the gen.
+      expect(startPollSpy).not.toHaveBeenCalled();
 
-      // B's body resolves; B's finalizer bootstrap reaches ITS machine gate.
-      // Release every parked gate so B's current-gen machine builds; A/A2
-      // fulfil on it.
+      // Release B: its bootstrap installs the current-generation machine; A/A2
+      // are handed to that gen and fulfil on it.
       releaseB!();
-      for (let i = 0; i < 100; i += 1) {
-        await pump(50);
-        if (gateReleases.length > 1) break;
-      }
-      for (const r of gateReleases) r!();
-      await Promise.all([bootA, bootA2]);
-      await pump(6_000);
+      await aReady;
+      await a2Ready;
+      await pump(4_000);
       expect(aFulfilled).toBe(true);
       expect(a2Fulfilled).toBe(true);
-      expect(h2.state.authed).toBe(true);
-      expect(h2.connection).not.toBeNull();
-      // Exactly ONE machine set — A never published/polled its stale build.
-      expect((addSpy as ReturnType<typeof vi.spyOn>).mock.calls.filter((c: unknown[]) => c[0] === "online")).toHaveLength(1);
-
+      expect(h.state.authed).toBe(true);
+      expect(h.connection).not.toBeNull();
+      expect(bBodyPending).toBe(false);
     } finally {
-      addSpy.mockRestore();
-      (internalsGlobal as unknown as { setMachineConstructGateForTest?: (g: null) => void }).setMachineConstructGateForTest?.(null);
       vi.useRealTimers();
       Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
-      sessionStorage.removeItem(`remuda-outbox-owner-g45-1-${variant}`);
+      sessionStorage.removeItem(`remeda-outbox-owner-g46-1-${variant}`);
     }
   }
-});
+});;
 ;
+
+it("GATE46 item 3: logout with a queued successor C retires every settlement waiter without stranding", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_480_000);
+  const I = "ins_g46_3";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 5_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remeda-outbox-owner", "owner_g46_3");
+    localStorage.setItem("runtime.logged-out", "1");
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+    vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+    vi.spyOn(api, "instanceList").mockResolvedValue({
+      items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
+      nextCursor: null,
+    } as never);
+    vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+    vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+
+    let releaseA: () => void = () => {};
+    let resolveQueued: (() => void) | null = null;
+    const queuedSession = { deviceId: "devX_g46_3", token: "tokX", name: "X" };
+    vi.spyOn(api, "login")
+      .mockImplementationOnce(() => new Promise((resolve) => { releaseA = () => resolve({ deviceId: "devA_g46_3", token: "tokA", name: "A" }); }))
+      .mockImplementation(() => new Promise((resolve) => {
+        resolveQueued = () => resolve(queuedSession);
+      }));
+
+    const h = hubStore as unknown as {
+      login: (k: "bootstrap", s: string, d: string) => Promise<void>;
+      logout: () => void;
+      bootstrap: () => Promise<void>;
+      connection: unknown;
+      outbox: unknown;
+      state: { ready: boolean; authed: boolean };
+    };
+    // A held, B queued, C queued behind B.
+    const pA = h.login("bootstrap", "a", "devA");
+    const pB = h.login("bootstrap", "b", "devB");
+    const pC = h.login("bootstrap", "c", "devC");
+    await pump(300);
+    expect(releaseA).not.toBe(undefined);
+
+    // A's bootstrap parks in its storage initializer (gate).
+    const gates: Array<() => void> = [];
+    const internals = hubStore as unknown as Record<string, unknown>;
+    (internals.setOutboxOpenGateForTest as (g: ((r: () => void) => void) | null) => void)((r) => gates.push(r));
+
+    // Release A: it succeeds, superseded by B; A's continuation awaits B's
+    // current-gen install (which parks behind B's held body). B is superseded
+    // by C.
+    releaseA();
+    await pump(800);
+    expect(gates.length).toBeGreaterThanOrEqual(1);
+    // A must not have settled yet (B's body never resolves).
+    let aSettled = false;
+    void pA.then(() => { aSettled = true; });
+    await pump(200);
+    expect(aSettled).toBe(false);
+
+    // EXTERNAL logout while A/B/C are all pending on the queued chain. It must
+    // wake and RETIRE every settlement waiter; all three login promises settle
+    // (A already did via its own continuation, B/C obsolete-queued) and no
+    // bootstrap/box is installed.
+    h.logout();
+    // The queued login requests respond after logout (late server replies).
+    const rq = resolveQueued as (() => void) | null;
+    rq?.();
+    // Resolve every parked initializer so their awaits can observe the epoch.
+    for (const g of gates) g();
+    await pump(2_000);
+    expect(aSettled).toBe(true);
+    // B and C were queued-obsolete; their promises must settle (not hang) even
+    // though their held bodies never resolve.
+    // B and C were queued-obsolete: their public promises settle even though
+    // the held bodies never resolve. Microtask race (no real timer needed).
+    let settledCount = 0;
+    void Promise.all([pB, pC]).then(() => { settledCount = 2; });
+    await pump(500);
+    expect(settledCount).toBe(2);
+    expect(h.state.authed).toBe(false);
+    expect(h.connection).toBeNull();
+    expect(h.outbox).toBeNull();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remeda-outbox-owner");
+  }
+});

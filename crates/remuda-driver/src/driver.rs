@@ -264,4 +264,22 @@ pub trait Driver: Send + Sync {
             "start_resumed requires a session-capable driver".into(),
         ))
     }
+
+    /// Test seam: force the NEXT close's stop ladder verdict (the real ladder
+    /// still runs; only its conclusion is substituted). c-usagefu r19 item 1
+    /// Node census-epoch tests drive the real DevNode close this way.
+    #[cfg(any(test, feature = "test-stub"))]
+    fn test_force_stop_outcome(&self, _outcome: crate::shell_pty::lifecycle::StopOutcome) {}
+
+    /// Test seam: the spawned child's process group.
+    #[cfg(any(test, feature = "test-stub"))]
+    fn test_pgid(&self) -> Option<i32> {
+        None
+    }
+
+    /// Test seam: whether the live codex file adapter has bound a session.
+    #[cfg(any(test, feature = "test-stub"))]
+    fn test_codex_bound(&self) -> bool {
+        false
+    }
 }

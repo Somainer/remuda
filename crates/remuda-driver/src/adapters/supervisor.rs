@@ -86,6 +86,9 @@ pub struct AdapterCtx {
 /// Handle to a running adapter task. Dropping/aborting it stops the poll loop.
 pub struct AdapterHandle {
     pub(crate) tasks: Vec<JoinHandle<()>>,
+    /// Set the first time a file adapter's poll reports it bound a session
+    /// (c-usagefu r19 item 1 test seam).
+    bound: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AdapterHandle {
@@ -94,6 +97,21 @@ impl AdapterHandle {
     pub fn abort(&self) {
         for task in &self.tasks {
             task.abort();
+        }
+    }
+
+    /// Test seam: whether any adapter in this handle has bound a session.
+    #[cfg(any(test, feature = "test-stub"))]
+    pub fn is_bound(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.bound.load(Ordering::SeqCst)
+    }
+
+    /// Construct a handle for an externally spawned (non-file-adapter) task.
+    pub(crate) fn from_tasks(tasks: Vec<JoinHandle<()>>) -> Self {
+        Self {
+            tasks,
+            bound: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
@@ -190,58 +208,68 @@ pub fn spawn_file_adapters(
 }
 
 fn run<A: FileSignalAdapter + 'static>(mut adapter: A, ctx: AdapterCtx) -> AdapterHandle {
-    let task = tokio::spawn(async move {
-        let mut tick = tokio::time::interval(ADAPTER_POLL);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tick.tick().await;
-            if ctx.events.is_closed() {
-                break;
-            }
-            // Hook > File: a SessionStart bound to the agent pid confirms the
-            // adapter's session before file discovery guesses.
-            if let Some(hooks) = &ctx.hooks
-                && let Some(binding) = hooks.binding()
-                && let Some(session_id) =
-                    confirmed_session(binding.pid, ctx.agent_pid, &binding.session_id)
-            {
-                adapter.confirm_session(&session_id);
-            }
-            let polled = adapter.poll();
-            // Resolve every synchronous result before an `.await`: the adapter
-            // is `Send` but not `Sync`, so a borrow of it may not cross an
-            // await inside a `tokio::spawn`ed task.
-            let (observations, session_id) = match polled {
-                Ok(observations) => {
-                    let session_id = adapter
-                        .session_id()
-                        .map_or(ctx.stamp.session_id.clone(), str::to_owned);
-                    (observations, session_id)
+    let bound = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let task = tokio::spawn({
+        let bound = Arc::clone(&bound);
+        async move {
+            let mut tick = tokio::time::interval(ADAPTER_POLL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                if ctx.events.is_closed() {
+                    break;
                 }
-                Err(error) => {
-                    // A tail error is retried next tick (the file may simply
-                    // not exist yet). Persistent errors are debug-logged, never
-                    // fatal: losing the file channel must degrade, not crash.
-                    tracing::debug!(%error, kind = ?adapter.kind(), "file adapter poll failed");
+                // Hook > File: a SessionStart bound to the agent pid confirms the
+                // adapter's session before file discovery guesses.
+                if let Some(hooks) = &ctx.hooks
+                    && let Some(binding) = hooks.binding()
+                    && let Some(session_id) =
+                        confirmed_session(binding.pid, ctx.agent_pid, &binding.session_id)
+                {
+                    adapter.confirm_session(&session_id);
+                }
+                let polled = adapter.poll();
+                // Resolve every synchronous result before an `.await`: the adapter
+                // is `Send` but not `Sync`, so a borrow of it may not cross an
+                // await inside a `tokio::spawn`ed task.
+                let (observations, session_id) = match polled {
+                    Ok(observations) => {
+                        let session_id = adapter
+                            .session_id()
+                            .map_or(ctx.stamp.session_id.clone(), str::to_owned);
+                        if adapter.session_id().is_some() {
+                            bound.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        (observations, session_id)
+                    }
+                    Err(error) => {
+                        // A tail error is retried next tick (the file may simply
+                        // not exist yet). Persistent errors are debug-logged, never
+                        // fatal: losing the file channel must degrade, not crash.
+                        tracing::debug!(%error, kind = ?adapter.kind(), "file adapter poll failed");
+                        continue;
+                    }
+                };
+                if observations.is_empty() {
                     continue;
                 }
-            };
-            if observations.is_empty() {
-                continue;
-            }
-            let stamp = StampCtx {
-                session_id,
-                ..ctx.stamp.clone()
-            };
-            if forward_all(observations, &stamp, &ctx.events, &ctx.seq)
-                .await
-                .is_err()
-            {
-                break;
+                let stamp = StampCtx {
+                    session_id,
+                    ..ctx.stamp.clone()
+                };
+                if forward_all(observations, &stamp, &ctx.events, &ctx.seq)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
             }
         }
     });
-    AdapterHandle { tasks: vec![task] }
+    AdapterHandle {
+        tasks: vec![task],
+        bound,
+    }
 }
 
 /// Stamp and send every adapter observation. Free of adapter borrows so the

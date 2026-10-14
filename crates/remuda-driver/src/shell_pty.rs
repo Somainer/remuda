@@ -591,6 +591,18 @@ impl ShellPtyDriver {
         })
     }
 
+    /// c-usagefu r19 item 1 test seam: whether the live codex file adapter has
+    /// bound a session yet.
+    #[cfg(any(test, feature = "test-stub"))]
+    pub fn test_codex_bound(&self) -> bool {
+        if let Ok(handle) = self.adapters.try_lock()
+            && let Some(handle) = handle.as_ref()
+        {
+            return handle.is_bound();
+        }
+        false
+    }
+
     /// Build a driver whose promotion detection reads `table` instead of the
     /// host process table. Tests drive detection from a fixture this way.
     #[must_use]
@@ -1847,7 +1859,7 @@ impl ShellPtyDriver {
                 }
             }
         });
-        crate::adapters::supervisor::AdapterHandle { tasks: vec![task] }
+        crate::adapters::supervisor::AdapterHandle::from_tasks(vec![task])
     }
 
     /// Run the stop ladder against this PTY's process group (§5.3).
@@ -3508,6 +3520,21 @@ impl Driver for ShellPtyDriver {
             ));
         }
         self.start_resumed_inner(Some(spec), session_id).await
+    }
+
+    #[cfg(any(test, feature = "test-stub"))]
+    fn test_force_stop_outcome(&self, outcome: lifecycle::StopOutcome) {
+        ShellPtyDriver::test_force_stop_outcome(self, outcome);
+    }
+
+    #[cfg(any(test, feature = "test-stub"))]
+    fn test_pgid(&self) -> Option<i32> {
+        ShellPtyDriver::test_pgid(self)
+    }
+
+    #[cfg(any(test, feature = "test-stub"))]
+    fn test_codex_bound(&self) -> bool {
+        ShellPtyDriver::test_codex_bound(self)
     }
 }
 

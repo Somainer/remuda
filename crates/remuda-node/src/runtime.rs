@@ -148,6 +148,12 @@ impl DevNode {
     pub fn census_epoch(&self) -> remuda_driver::NodeEpoch {
         self.inner.census_epoch.clone()
     }
+
+    /// Test seam (c-usagefu r19 item 1): the live instance-local driver.
+    #[cfg(feature = "test-stub")]
+    pub async fn test_instance_driver(&self, id: &InstanceId) -> Option<Arc<dyn Driver>> {
+        self.inner.instance_drivers.read().await.get(id).cloned()
+    }
 }
 
 /// Last-clone teardown.
@@ -218,35 +224,21 @@ impl DevNode {
     }
 
     /// Build a Node around supplied parts and a persisted Host identity.
+    ///
+    /// The Node adopts the registry's census epoch — the same epoch every
+    /// driver built from that registry carries (c-usagefu r19 item 1).
     pub fn with_parts_on_host(
         config: &crate::DevServerConfig,
         store: Arc<dyn LocalStore>,
         drivers: DriverRegistry,
         host_id: HostId,
     ) -> Result<Self, NodeError> {
-        Self::with_parts_on_host_epoch(
-            config,
-            store,
-            drivers,
-            host_id,
-            remuda_driver::NodeEpoch::mint(),
-        )
-    }
-
-    /// Like [`Self::with_parts_on_host`] with an explicit census epoch shared
-    /// with the driver registries built in `compose` (c-usagefu r18 items 2/3).
-    pub fn with_parts_on_host_epoch(
-        config: &crate::DevServerConfig,
-        store: Arc<dyn LocalStore>,
-        drivers: DriverRegistry,
-        host_id: HostId,
-        census_epoch: remuda_driver::NodeEpoch,
-    ) -> Result<Self, NodeError> {
         if config.instance_queue_capacity == 0 {
             return Err(NodeError::InvalidConfig(
                 "instance queue capacity must be positive".to_owned(),
             ));
         }
+        let census_epoch = drivers.census_epoch();
         let host = fixture_host(host_id.clone())?;
         let workspace_registry = crate::workspace::WorkspaceRegistry::open(config, host_id)?;
         let workspace = workspace_registry

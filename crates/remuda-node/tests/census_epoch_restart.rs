@@ -1,250 +1,374 @@
-//! c-usagefu r18 items 2/3 — census blocks are scoped to the owning Node epoch.
+//! c-usagefu r19 item 1 — stop-incomplete census blocks are scoped to the Node
+//! that built the driver, exercised ONLY through the REAL native construction
+//! path (`native_driver_registry` + `compose`; no manual `node_epoch`
+//! injection).
 //!
-//! Through the REAL `compose()` -> `DevNode::shutdown()` -> `compose()`
-//! in-process restart:
-//! 1. a driver carrying Node A's epoch ends a close with a forced
-//!    stop-incomplete verdict (the real ladder still runs) -> its codex
-//!    census interval stays OPEN and same-cwd prompt-only discovery refuses;
-//! 2. Node A shutting down retires ONLY its own intervals — removed without
-//!    a recorded close — so Node B (fresh epoch, same process, same cwd) can
-//!    attribute a prompt-only discovery again;
-//! 3. a second live Node C with a retained block in ANOTHER cwd is unaffected
-//!    by A's shutdown, and C's own shutdown then retires its block.
+//! 1. Node A creates a real codex shell-pty instance; after its forced
+//!    stop-incomplete close, an otherwise-eligible same-cwd rollout stays
+//!    refused to prompt-only discovery while A runs.
+//! 2. A's real shutdown retires ITS block without recording a close; a
+//!    second live Node C (its own registry, another cwd) is unaffected.
+//! 3. An in-process recompose Node B launches its OWN codex driver from its
+//!    OWN registry in the same cwd; B's own file adapter binds an eligible
+//!    rollout (the census A blocked is gone). C retires only with C.
 #![cfg(unix)]
+// The node test binary only enters the native shell-pty agent arm when
+// REMUDA_PTY_CARRIER=native is set in its process env, so the test re-execs
+// itself under that env (the unsafe std::env::set_var is forbidden in this
+// crate).
 
-use remuda_driver::adapters::codex_adapter::CodexAdapter;
-use remuda_driver::adapters::codex_discovery::{
-    NodeEpoch, census_lifetime_is_live, forget_lifetime, record_input,
-};
+use remuda_driver::adapters::codex_discovery::census_lifetime_is_live;
 use remuda_driver::adapters::{AdapterHome, FileSignalAdapter};
-use remuda_driver::shell_pty::StopRung;
-use remuda_driver::shell_pty::{AgentLaunch, HookConfig, ShellPtyDriver, ShellPtyOptions};
-use remuda_driver::{
-    Delegation, Driver, LaunchOrigin, ProviderHealth, ProviderKind, ProviderProfile,
-    TestStopOutcome,
+use remuda_node::{
+    CreateInstanceRequest, CreateInstanceResponse, DevNode, DevServerConfig, LocalDrivers,
+    NativeDriverConfig, ServeConfig,
 };
-use remuda_node::{DevNode, DevServerConfig, LocalDrivers, ServeConfig};
-use remuda_protocol::{AgentKind, DriverKind, InstanceId, InstanceSpec};
+use remuda_protocol::{AgentKind, DriverKind};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-const RUN_MARKER: &str = "r18-node-epoch-child";
+const SESSION: &str = "r19epoch";
+const PROMPT: &str = "r19 shared epoch restart prompt";
+const RUN_MARKER: &str = "REMUDA_R19_CENSUS_CHILD";
+const CARRIER_ENV: &str = "REMUDA_PTY_CARRIER";
 const EMULATOR_ENV: &str = "REMUDA_PTY_EMULATOR";
+const HOOKS_ENV: &str = "REMUDA_PTY_HOOKS";
 
-/// Write the fake codex binary the driver launches: answers `--version` and
-/// `version`, then idles (the real ladder kills its group; the test only
-/// substitutes the ladder VERDICT afterwards).
+/// Fake codex on PATH: answers version probes, fires a real SessionStart hook
+/// through the materialized relay (so the driver's file adapter gets the
+/// hook-confirmed session), then idles until the real stop ladder kills its
+/// group.
 fn install_fake_codex(root: &Path) -> PathBuf {
     let install = root.join("opt/bin");
     std::fs::create_dir_all(&install).unwrap();
     let dest = install.join("codex");
     std::fs::write(
         &dest,
-        "#!/bin/sh
-case \"$1\" in --version|version) echo 'codex 0.154.0'; exit 0;; esac
+        r##"#!/bin/sh
+case "$1" in --version|version) echo 'codex 0.154.0'; exit 0;; esac
+# Real codex fires SessionStart at startup through the hook relay the Node
+# materialized into $CODEX_HOME/hooks.json. The first registered command IS
+# SessionStart. Fire it inline (the relay acks {} and exits); this sh process
+# is the Node-spawned child, so the relay's ppid matches the agent pid.
+if [ -n "$CODEX_HOME" ] && [ -f "$CODEX_HOME/hooks.json" ]; then
+    cmd=$(sed -n 's/^[[:space:]]*"command": "\(.*\)",$/\1/p' "$CODEX_HOME/hooks.json" | head -1)
+    if [ -n "$cmd" ]; then
+        # The command is single-quote tokenized by the materializer; word
+        # split it (no glob chars) into argv and exec with the payload on
+        # stdin — a direct exec keeps the relay's ppid equal to ours.
+        eval "set -- $cmd"
+        printf '{"session_id":"r19epoch","cwd":"%s"}' "$PWD" | exec "$@" >"$PWD/r19-fake.log" 2>&1
+    fi
+fi
 sleep 60
-",
+"##,
     )
     .unwrap();
     std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).unwrap();
     dest
 }
 
-fn compose_node(data_dir: PathBuf) -> DevNode {
-    let http =
-        DevServerConfig::loopback(0).with_workspace_roots(remuda_testing::test_workspace_roots!());
-    remuda_node::compose(&ServeConfig {
-        http,
-        data_dir,
-        drivers: LocalDrivers::Fake,
-    })
-    .expect("compose")
+/// The real remuda binary the materialized hook relay invokes.
+fn relay_bin() -> PathBuf {
+    if let Ok(path) = std::env::var("REMUDA_NATIVE_LIVE_RELAY") {
+        return PathBuf::from(path);
+    }
+    let deps = std::env::current_exe().unwrap();
+    let deps = deps.parent().unwrap();
+    for candidate in [deps.join("remuda"), deps.join("../remuda")] {
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    remuda_testing::workspace_root().join("target/debug/remuda")
 }
 
-fn forced_incomplete(pgid: i32) -> TestStopOutcome {
-    TestStopOutcome {
-        rung: StopRung::Kill,
-        group_gone: false,
-        pgid: Some(pgid),
-        survivors: vec![pgid],
+fn compose_native(root: &Path, workspace: PathBuf) -> DevNode {
+    let mut native = NativeDriverConfig::new(root.join("node-data"));
+    // Hooks on with a no-op relay so the real shell-pty codex path runs its
+    // confirmed-launch registration and file-adapter spawn; the relay binary
+    // itself is never executed by the fixture.
+    native.pty_hooks = true;
+    native.relay_binary = Some(Box::new(relay_bin()));
+    let mut http = DevServerConfig::loopback(0);
+    http.workspace_root = workspace.clone();
+    http.workspace_roots = Some(remuda_testing::test_workspace_roots!());
+    std::fs::create_dir_all(&http.workspace_root).unwrap();
+    remuda_node::compose(&ServeConfig {
+        http,
+        data_dir: root.join("node-data"),
+        drivers: LocalDrivers::Native(native),
+    })
+    .expect("compose native Node")
+}
+
+fn codex_request(binary: PathBuf) -> CreateInstanceRequest {
+    CreateInstanceRequest {
+        origin: remuda_protocol::InputOrigin::Human,
+        agent_credential: None,
+        command_id: None,
+        instance_id: None,
+        host_id: None,
+        workspace_id: None,
+        kind: AgentKind::Codex,
+        driver: DriverKind::ShellPty,
+        model: "fake".to_owned(),
+        args: Vec::new(),
+        provider_profile_id: "dev-fake".to_owned(),
+        permission_mode: "dontAsk".to_owned(),
+        sandbox: None,
+        prompt: String::new(),
+        cwd: None,
+        delegation: None,
+        settings_overlay_path: None,
+        claude_config_dir: None,
+        binary_path: Some(binary.to_string_lossy().into_owned()),
+        binary_sha256: None,
+        max_budget_usd: None,
+        provider_overlay: None,
+        provider_auth_token: None,
+        resume_session_id: None,
+        resumed_from: None,
+        effort: None,
+        tui: None,
+        extra_env: std::collections::BTreeMap::new(),
+        capabilities: Default::default(),
+        api_route: None,
+        api_relay_endpoint: None,
     }
 }
 
-/// Build a REAL codex shell-pty driver carrying `epoch`, spawn it, force the
-/// next close to a stop-incomplete verdict, close it, and return the
-/// `(cwd, owner)` whose census interval must now be retained open.
-async fn retained_incomplete_block(
-    root: &Path,
-    epoch: NodeEpoch,
-    instance_id: &InstanceId,
-) -> (PathBuf, String) {
-    let cwd = root.join("workspace");
-    std::fs::create_dir_all(&cwd).unwrap();
-    let instance_dir = root.join(instance_id.as_id().as_str());
-    let binary = install_fake_codex(root);
-    let mut options = ShellPtyOptions::agent(
-        cwd.clone(),
-        AgentKind::Codex,
-        AgentLaunch {
-            profile: Box::new(ProviderProfile {
-                id: "pvp_01990000-0000-7000-8000-000000000001".parse().unwrap(),
-                kind: ProviderKind::OpenaiResponses,
-                base_url: String::new(),
-                delegation: Delegation::None,
-                secret_ref: None,
-                models: vec!["fake".to_owned()],
-                health: ProviderHealth::Healthy,
-            }),
-            launch_dir: instance_dir.join("launch"),
-            native_home: root.join("codex-native-home"),
-            binary: Some(binary),
-            origin: LaunchOrigin::Human,
-            native_home_managed: true,
-            settings_overlay: None,
-        },
-    );
-    options.instance_id = Some(instance_id.clone());
-    options.node_epoch = Some(epoch);
-    options.hooks = Some(HookConfig {
-        instance_dir,
-        relay_binary: PathBuf::from("/bin/true"),
-        tui: remuda_driver::TuiMode::Default,
-    });
-    options.extra_env.insert(RUN_MARKER.into(), "1".to_owned());
-    options
-        .extra_env
-        .insert(EMULATOR_ENV.into(), "1".to_owned());
-
-    let driver = ShellPtyDriver::new(options);
-    let mut spec: InstanceSpec = serde_json::from_str(include_str!(
-        "../../remuda-driver/tests/fixtures/instance-spec.json"
-    ))
-    .unwrap();
-    spec.driver = DriverKind::ShellPty;
-    spec.kind = AgentKind::Codex;
-    spec.cwd = cwd.to_string_lossy().into_owned();
-    spec.model_id = Some("fake".to_owned());
-    let _run = driver
-        .start(spec)
-        .await
-        .expect("the real codex fixture spawns");
-    let pgid = driver.test_pgid().expect("the spawned child has a pgid");
-    assert!(pgid > 0);
-    driver.test_force_stop_outcome(forced_incomplete(pgid));
-    Driver::close(&driver).await.expect("close settles");
-    (
-        std::fs::canonicalize(&cwd).unwrap(),
-        instance_id.as_id().to_string(),
-    )
+/// The file-adapter shadow home for an instance:
+/// `<data_dir>/instances/<id>/launch/codex-home`.
+fn shadow_home(root: &Path, id: &remuda_protocol::InstanceId) -> PathBuf {
+    root.join("node-data")
+        .join("instances")
+        .join(id.as_id().as_str())
+        .join("launch")
+        .join("codex-home")
 }
 
-/// A later same-cwd, prompt-only launch is attributable through the REAL
-/// discovery path: one fresh rollout carrying a matching prompt binds.
-fn prompt_only_discovery_binds(codex_home: &Path, cwd: &Path, owner: &str, session: &str) {
-    let home = codex_home.to_path_buf();
-    let floor = time::OffsetDateTime::now_utc() + time::Duration::milliseconds(500);
-    let mut adapter = CodexAdapter::new(AdapterHome {
-        home,
-        cwd: cwd.to_path_buf(),
-        pid: None,
-        launched_at: Some(floor),
-        resume_session_id: None,
-    })
-    .with_instance_key(Some(owner.to_owned()));
-    let prompt = "r18 W0 epoch restart prompt";
-    record_input(cwd, owner, prompt);
-    let date_dir = format!(
+/// Write an otherwise-eligible rollout (matching session/cwd/prompt) into the
+/// instance's shadow codex home.
+fn write_eligible_rollout(shadow_home: &Path, cwd: &Path, owner: &str) {
+    remuda_driver::adapters::codex_discovery::record_input(cwd, owner, PROMPT);
+    let started = time::OffsetDateTime::now_utc();
+    let month_dir = shadow_home.join("sessions").join(format!(
         "{:04}/{:02}/{:02}",
-        floor.year(),
-        u8::from(floor.month()),
-        floor.day()
-    );
-    let month_dir = codex_home.join("sessions").join(date_dir);
+        started.year(),
+        u8::from(started.month()),
+        started.day()
+    ));
     std::fs::create_dir_all(&month_dir).unwrap();
-    let rfc = floor
+    let rfc = started
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap();
     std::fs::write(
-        month_dir.join("rollout-r18epoch.jsonl"),
+        month_dir.join("rollout-r19epoch.jsonl"),
         format!(
-            "{{\"timestamp\":\"{rfc}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session}\",\"session_id\":\"{session}\",\"cwd\":\"{}\",\"timestamp\":\"{rfc}\"}}}}\n\
-             {{\"timestamp\":\"{rfc}\",\"ordinal\":1,\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"id\":\"m\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{prompt}\"}}],\"internal_chat_message_metadata_passthrough\":{{\"content_item_kinds\":[\"user.text\"]}}}}}}\n",
+            "{{\"timestamp\":\"{rfc}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{SESSION}\",\"session_id\":\"{SESSION}\",\"cwd\":\"{}\",\"timestamp\":\"{rfc}\"}}}}\n\
+             {{\"timestamp\":\"{rfc}\",\"ordinal\":1,\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"id\":\"m\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{PROMPT}\"}}],\"internal_chat_message_metadata_passthrough\":{{\"content_item_kinds\":[\"user.text\"]}}}}}}\n",
             cwd.display()
         ),
     )
     .unwrap();
-    let observed = adapter.poll().expect("real discover()");
-    assert!(
-        adapter.binding().is_some(),
-        "prompt-only discovery binds after the dead Node's intervals were retired: {observed:?}"
-    );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shutdown_retires_one_nodes_blocks_and_recompose_discovers_again() {
-    let root = tempfile::tempdir().unwrap();
-    let codex_home = root.path().join("codex-home");
-
-    // Node A: real incomplete block in cwd A.
-    let node_a = compose_node(root.path().join("node-data-a"));
-    let id_a = InstanceId::new();
-    let (cwd_a, owner_a) =
-        retained_incomplete_block(root.path(), node_a.census_epoch(), &id_a).await;
-    assert!(
-        census_lifetime_is_live(&cwd_a, &owner_a),
-        "Node A's stop-incomplete interval stays live while A runs"
-    );
-
-    // Node C (also still live) holds its own block in a different cwd.
-    let node_c = compose_node(root.path().join("node-data-c"));
-    let root_c = root.path().join("node-c");
-    let id_c = InstanceId::new();
-    let (cwd_c, owner_c) = retained_incomplete_block(&root_c, node_c.census_epoch(), &id_c).await;
-    assert!(census_lifetime_is_live(&cwd_c, &owner_c));
-
-    // A prompt-only launch in A's cwd refuses while A still runs.
-    let mut refusing = CodexAdapter::new(AdapterHome {
-        home: codex_home.clone(),
-        cwd: cwd_a.clone(),
+/// A prompt-only probe (no lifetime of its own beyond the adapter window):
+/// returns true iff it binds in `cwd`.
+fn prompt_only_binds(shadow_home: &Path, cwd: &Path, owner: &str) -> bool {
+    let mut probe = remuda_driver::adapters::codex_adapter::CodexAdapter::new(AdapterHome {
+        home: shadow_home.to_path_buf(),
+        cwd: cwd.to_path_buf(),
         pid: None,
         launched_at: Some(time::OffsetDateTime::now_utc()),
         resume_session_id: None,
     })
-    .with_instance_key(Some("r18-competitor-a".to_owned()));
-    record_input(&cwd_a, "r18-competitor-a", "anything");
+    .with_instance_key(Some(owner.to_owned()));
+    let _ = probe.poll();
+    probe.binding().is_some()
+}
+
+async fn launch_real_codex(
+    node: &DevNode,
+    root: &Path,
+    workspace: &Path,
+) -> (CreateInstanceResponse, PathBuf, PathBuf) {
+    let binary = install_fake_codex(root);
+    let created = node
+        .create_instance(codex_request(binary))
+        .await
+        .expect("create codex instance");
+    let cwd = std::fs::canonicalize(workspace).unwrap();
+    let home = shadow_home(root, &created.instance.meta.id);
+    (created, cwd, home)
+}
+
+async fn live_driver(
+    node: &DevNode,
+    id: &remuda_protocol::InstanceId,
+) -> Arc<dyn remuda_node::Driver> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Some(driver) = node.test_instance_driver(id).await {
+            return driver;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "driver registers");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Wait until the live driver is registered, then until its real file adapter
+/// reports a bound session.
+async fn wait_driver_bound(node: &DevNode, id: &remuda_protocol::InstanceId, what: &str) {
+    let driver = live_driver(node, id).await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !driver.test_codex_bound() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     assert!(
-        refusing.poll().unwrap().is_empty() && refusing.binding().is_none(),
-        "prompt-only discovery refuses under a live stop-incomplete block"
+        driver.test_codex_bound(),
+        "{what}: the real codex adapter binds"
     );
-    drop(refusing);
+}
 
-    // REAL Node A shutdown (the incomplete closes already happened; this is
-    // the epoch retirement wiring in DevNode::shutdown).
-    node_a.shutdown().await.expect("Node A shuts down");
+async fn close_instance(node: &DevNode, id: &remuda_protocol::InstanceId) {
+    node.submit_command(
+        id,
+        remuda_node::InstanceCommandRequest {
+            origin: remuda_protocol::InputOrigin::Human,
+            command_id: None,
+            operation: remuda_node::CommandAction::Close,
+            prompt: None,
+            prompt_mode: None,
+            attachments: Vec::new(),
+            run_id: None,
+            interaction_id: None,
+            answer: None,
+            keys: None,
+            model: None,
+            effort_name: None,
+            effort_index: None,
+            effort_ultracode: None,
+            effort_axis: None,
+            effort_request_id: None,
+            permission_mode: None,
+        },
+    )
+    .await
+    .expect("close command settles");
+}
 
-    // A's intervals are retired (removed, not closed); C's block is untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_native_epoch_retirement_unblocks_recomposed_native_discovery() {
+    // Re-exec under the native-carrier env before touching any driver.
+    if std::env::var(RUN_MARKER).is_err() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "shared_native_epoch_retirement_unblocks_recomposed_native_discovery",
+                "--nocapture",
+            ])
+            .env(RUN_MARKER, "1")
+            .env(CARRIER_ENV, "native")
+            .env(EMULATOR_ENV, "1")
+            .env(HOOKS_ENV, "1")
+            .output()
+            .expect("re-exec native-carrier child");
+        assert!(
+            output.status.success(),
+            "re-exec child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    // ---- Node A: a REAL codex instance from the real native registry. ----
+    let root_a = tempfile::tempdir().unwrap();
+    let workspace_a = root_a.path().join("workspace");
+    let node_a = compose_native(root_a.path(), workspace_a.clone());
+    let (created_a, cwd_a, home_a) = launch_real_codex(&node_a, root_a.path(), &workspace_a).await;
+    let id_a = created_a.instance.meta.id.clone();
+    // The driver registers before its file adapter can bind; write the
+    // eligible rollout into the shadow home FIRST, then wait for the bind.
+    write_eligible_rollout(&home_a, &cwd_a, id_a.as_id().as_str());
+    wait_driver_bound(&node_a, &id_a, "Node A").await;
+
+    // Forced incomplete close on the real driver.
+    live_driver(&node_a, &id_a)
+        .await
+        .test_force_stop_incomplete();
+    close_instance(&node_a, &id_a).await;
     assert!(
-        !census_lifetime_is_live(&cwd_a, &owner_a),
+        census_lifetime_is_live(&cwd_a, id_a.as_id().as_str()),
+        "A's interval stays open after the incomplete close"
+    );
+    // Give the adapter a poll cycle to bind the eligible rollout; the census
+    // owned by A still makes an independent prompt-only launch refuse.
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert!(
+        !prompt_only_binds(&home_a, &cwd_a, "probe-a-blocked"),
+        "an otherwise-eligible rollout is refused while A's block is live"
+    );
+
+    // ---- Node C in a different root/cwd, still live. ----
+    let root_c = tempfile::tempdir().unwrap();
+    let workspace_c = root_c.path().join("workspace");
+    let node_c = compose_native(root_c.path(), workspace_c.clone());
+    let (created_c, cwd_c, home_c) = launch_real_codex(&node_c, root_c.path(), &workspace_c).await;
+    let id_c = created_c.instance.meta.id.clone();
+    write_eligible_rollout(&home_c, &cwd_c, id_c.as_id().as_str());
+    wait_driver_bound(&node_c, &id_c, "Node C").await;
+    live_driver(&node_c, &id_c)
+        .await
+        .test_force_stop_incomplete();
+    close_instance(&node_c, &id_c).await;
+    assert!(census_lifetime_is_live(&cwd_c, id_c.as_id().as_str()));
+
+    // ---- A's real shutdown retires A only. ----
+    node_a.shutdown().await.expect("A shuts down");
+    assert!(
+        !census_lifetime_is_live(&cwd_a, id_a.as_id().as_str()),
         "A's block retires with A's shutdown"
     );
     assert!(
-        census_lifetime_is_live(&cwd_c, &owner_c),
-        "a second live Node's retained block is unaffected"
+        census_lifetime_is_live(&cwd_c, id_c.as_id().as_str()),
+        "a second live Node's block is unaffected by A's shutdown"
     );
 
-    // In-process recompose: Node B, same process, fresh epoch. Its same-cwd
-    // prompt-only discovery attributes again.
-    let _node_b = compose_node(root.path().join("node-data-b"));
-    prompt_only_discovery_binds(&codex_home, &cwd_a, "r18-competitor-b", "r18epochb");
-
-    // C shutting down retires its own block too.
-    node_c.shutdown().await.expect("Node C shuts down");
+    // ---- In-process recompose Node B in A's SAME cwd. ----
+    //
+    // B is composed from a fresh registry (fresh epoch) but its workspace is
+    // A's directory. B builds its OWN codex driver; the rollout is otherwise
+    // eligible and A's stale interval is gone, so B's own file adapter must
+    // bind — proving the unblock through B's driver, not a hand-built probe.
+    let root_b = tempfile::tempdir().unwrap();
+    let node_b = compose_native(root_b.path(), workspace_a.clone());
+    let (created_b, _cwd_b, home_b) = launch_real_codex(&node_b, root_b.path(), &workspace_a).await;
+    let id_b = created_b.instance.meta.id.clone();
+    // B's own launch floor was sampled before the rollout; write the eligible
+    // rollout into B's fresh shadow home and let B's OWN adapter poll it.
+    write_eligible_rollout(&home_b, &cwd_a, id_b.as_id().as_str());
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let driver_b = live_driver(&node_b, &id_b).await;
+    while !driver_b.test_codex_bound() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     assert!(
-        !census_lifetime_is_live(&cwd_c, &owner_c),
+        driver_b.test_codex_bound(),
+        "the replacement Node's OWN driver binds in A's cwd after A retired"
+    );
+    node_b.shutdown().await.expect("B shuts down");
+
+    // C's own shutdown finally retires C.
+    node_c.shutdown().await.expect("C shuts down");
+    assert!(
+        !census_lifetime_is_live(&cwd_c, id_c.as_id().as_str()),
         "C's block retires with C"
     );
 
-    // Clean up detached test state.
-    forget_lifetime(&cwd_c, &owner_c);
-    forget_lifetime(&cwd_a, "r18-competitor-b");
+    // Cleanup detached test census state.
+    remuda_driver::adapters::codex_discovery::forget_lifetime(&cwd_c, id_c.as_id().as_str());
+    remuda_driver::adapters::codex_discovery::forget_lifetime(&cwd_a, "probe-a-blocked");
+    remuda_driver::adapters::codex_discovery::forget_lifetime(&cwd_a, id_b.as_id().as_str());
 }

@@ -134,23 +134,18 @@ pub fn compose(config: &ServeConfig) -> Result<DevNode, NodeError> {
         &config.data_dir,
         config.http.follow_buffer_capacity,
     )?);
-    // c-usagefu r18 items 2/3: one census epoch shared by the driver factories
-    // and this Node, so stop-incomplete blocks are scoped to THIS composed
-    // Node (an in-process recompose mints a fresh epoch).
-    let census_epoch = remuda_driver::NodeEpoch::mint();
+    // c-usagefu r19 item 1: the native registry owns the shared census epoch;
+    // with_parts_on_host adopts that same epoch from it.
     let drivers = match &config.drivers {
         LocalDrivers::Fake => DriverRegistry::with_fake()?,
-        LocalDrivers::Native(native) => {
-            crate::native_driver_registry_for_epoch(native.clone(), Some(census_epoch.clone()))?
-        }
+        LocalDrivers::Native(native) => crate::native_driver_registry(native.clone())?,
     };
     let host_id = crate::enroll::load_or_create(&config.data_dir)?.host_id;
     let http = config
         .http
         .clone()
         .with_workspace_registry(config.data_dir.clone());
-    let node =
-        DevNode::with_parts_on_host_epoch(&http, store, drivers, host_id, census_epoch.clone())?;
+    let node = DevNode::with_parts_on_host(&http, store, drivers, host_id)?;
     node.configure_doctor(crate::DoctorContext {
         data_dir: Some(config.data_dir.clone()),
         listeners: Vec::new(),

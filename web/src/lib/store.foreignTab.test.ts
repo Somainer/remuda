@@ -7773,3 +7773,90 @@ it("GATE37 item 2: a successful login resolves only AFTER bootstrap publishes th
     sessionStorage.removeItem("remuda-outbox-owner");
   }
 });
+
+it("GATE38 item 1: an external logout (local and peer-tab) while login A's body is parked invalidates A's session write and obligation, and queued B's finalizer — no session write, no bootstrap, authed false, no outbox", async () => {
+  for (const variant of ["local", "peer"] as const) {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_290_000 + (variant === "peer" ? 1 : 0));
+    const I = `ins_g38_1_${variant}`;
+    const originalNavigator = globalThis.navigator;
+    Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+    localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+    const pump = async (n = 4_000) => {
+      for (let i = 0; i < n; i += 1) await Promise.resolve();
+    };
+    const sessionKey = `remuda-outbox-owner-g38-1-${variant}`;
+    try {
+      sessionStorage.setItem(sessionKey, "owner");
+      localStorage.removeItem("runtime.device-session");
+      localStorage.setItem("runtime.logged-out", "1");
+      const { api, hubStore } = await fresh();
+      vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+      vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+      vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+      vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+      vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+      vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+      vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+      vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+      vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+      vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+      vi.spyOn(api, "instanceList").mockResolvedValue({
+        items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
+        nextCursor: null,
+      } as never);
+      const send = vi.spyOn(api, "instanceSend");
+      // A successful bootstrap must NEVER run in this test (no hello).
+      const hello = vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+      vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+
+      const h = hubStore as unknown as {
+        login: (k: "bootstrap", s: string, d: string) => Promise<void>;
+        logout: () => void;
+        outbox: unknown;
+        state: { authed: boolean; session: unknown };
+      };
+      const { HubHttpError: HE } = await import("./httpError");
+
+      let releaseA: () => void = () => undefined;
+      vi.spyOn(api, "login")
+        .mockImplementationOnce(() => new Promise((resolve) => {
+          releaseA = () => resolve({ deviceId: "devA_g38_1", token: "tokA", name: "A" });
+        }))
+        .mockImplementationOnce(() => Promise.reject(new HE(503, "busy", "host busy")));
+      const loginA = h.login("bootstrap", "a", "devA");
+      const loginB = h.login("bootstrap", "b", "devB");
+      await pump(400); // A acquired with its body parked; B queued
+
+      // External logout WHILE A's response body is parked and B is queued.
+      if (variant === "local") {
+        h.logout();
+      } else {
+        // A peer tab removes the session; this tab only observes the event.
+        localStorage.removeItem("runtime.device-session");
+        window.dispatchEvent(
+          new StorageEvent("storage", { key: "runtime.device-session", oldValue: "{}", newValue: null }),
+        );
+      }
+      await pump(200);
+
+      // Release A successfully: its continuation must RESOLVE (never hang)
+      // but write NO session and bootstrap nothing — the external epoch moved.
+      releaseA();
+      await loginA;
+      await expect(loginB).rejects.toThrow(/busy/);
+      await pump(4_000);
+
+      expect(h.state.authed).toBe(false);
+      expect(h.state.session).toBeNull();
+      expect(h.outbox).toBeNull();
+      expect(localStorage.getItem("runtime.device-session")).toBeNull();
+      expect(hello).not.toHaveBeenCalled();
+      expect(send).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+      sessionStorage.removeItem(sessionKey);
+    }
+  }
+});

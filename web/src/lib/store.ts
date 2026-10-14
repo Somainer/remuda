@@ -30,10 +30,16 @@ type DeliveryToken = {
  * transition outcome so the PUBLIC continuation can re-validate synchronous
  * current ownership before bootstrapping (a peer logout bumps the generation
  * without touching the sequence).
+ *
+ * Gate 38 adds `ext`: the external-identity epoch captured when the
+ * transition was ISSUED. A logout/401/peer change while the credential
+ * request (or a queued successor) is suspended moves it; every externally
+ * visible effect of the continuation is then suppressed silently.
  */
 type AuthTransitionOwner = {
   gen: number;
   seq: number;
+  ext: number;
 };
 import { mapWorkspace, mergeHostWorkspaces } from "../features/workspaces/registry";
 import {
@@ -124,6 +130,7 @@ import { mockGappedTail, mockJournalIds } from "./mock";
 import { readDeviceSettings } from "../features/settings/prefs";
 import {
   MOCK_BOOTSTRAP_TOKEN,
+  clearCachedSession,
   clearSession,
   dropDeviceCookie,
   readLoggedOut,
@@ -1195,6 +1202,20 @@ class HubStore {
    */
   private authGen = 0;
   /**
+   * EXTERNAL-identity epoch (c-reconnfu gate 38, the ONE mechanism for work
+   * suspended across an external change). Incremented ONLY by an identity
+   * change originating OUTSIDE this tab's serialized credential chain — local
+   * logout, bootstrap's 401 session clear, and a peer-tab login/logout
+   * observed via storage. Ordinary credential succession (login B after login
+   * A in this tab) does NOT bump it. Every auth flow captures the epoch when
+   * it starts and validates it SYNCHRONOUSLY immediately before each
+   * externally visible effect (session write/publish, obligation creation or
+   * transfer, outbox/connection installation, publishing authed:true); a
+   * mismatch means the identity is gone — stop silently, publish/install
+   * nothing, settle the caller's promise as superseded/failed, never hang.
+   */
+  private extEpoch = 0;
+  /**
    * Monotonic id of the current/most-recent credential transition
    * (c-reconnfu gate 35). Incremented when a transition ACQUIRES ownership
    * (inside the serialized chain). A delivery token captures the seq at turn
@@ -1281,8 +1302,17 @@ class HubStore {
    * started under the previous identity can never install/flush. Durable rows
    * stay in storage; the next ensureOutbox (under the new generation) loads a
    * fresh Outbox with a new lifetime.
+   *
+   * `external` (c-reconnfu gate 38): the change originated OUTSIDE this tab's
+   * credential chain (local logout, bootstrap 401, peer-tab event). It ALSO
+   * increments {@link extEpoch} and clears the in-memory session cache, so
+   * auth work already suspended at an await (a login continuation, a running
+   * bootstrap) can neither publish/install anything nor answer hasDeviceSession
+   * from a stale cached session. Ordinary credential succession
+   * (runAuthTransition acquisition, the mock first-login) passes nothing and
+   * leaves the external epoch alone.
    */
-  private applyAuthIdentityChange() {
+  private applyAuthIdentityChange(external = false) {
     // Bump the auth generation and dispose the current outbox. A credential
     // transition ALSO bumps transitionSeq (in runAuthTransition); non-request
     // changes (logout/401/peer) bump the generation here so their generation
@@ -1295,6 +1325,13 @@ class HubStore {
     // afterwards (see runAuthTransition), so this only kills obligations whose
     // identity is gone.
     this.authBootstrapOwed = null;
+    if (external) {
+      this.extEpoch += 1;
+      // The peer tab removed persisted storage itself; also forget the cached
+      // in-memory session in THIS tab so readSession()/hasDeviceSession()
+      // cannot resurrect the old identity.
+      clearCachedSession();
+    }
     this.disposeOutboxForAuthChange();
   }
 
@@ -1337,6 +1374,15 @@ class HubStore {
     // transition was issued and hand the chain's obligations to it
     // (c-reconnfu gate 36 item 4).
     const myIssuedSeq = ++this.transitionIssuedSeq;
+    // Gate 38: a login can be in flight while the store is still logged out
+    // (no outbox initialized yet), so ensure the peer watch is live BEFORE the
+    // credential body can park — a peer logout during it must invalidate the
+    // continuation even though startOutboxInit has not run.
+    this.registerPeerAuthWatch();
+    // Gate 38: capture the EXTERNAL epoch at issue time. A logout/401/peer
+    // change before this transition settles moves it; the continuation and
+    // finalizer then suppress every externally visible effect.
+    const myExt = this.extEpoch;
     // Chain acquisition order equals issuance order (the chain serializes in
     // call order), so the issued id is also this transition's ownership seq.
     // Link onto the chain and publish the tail BEFORE awaiting so the next
@@ -1353,7 +1399,9 @@ class HubStore {
       // applyAuthIdentityChange (which invalidates any obligation as an
       // external change would). A predecessor's obligation is explicitly
       // TRANSFERRED to this chain owner and re-bound to the new generation —
-      // the only way an obligation survives an identity bump.
+      // the only way an obligation survives an identity bump. Gate 38: the
+      // transfer itself survives only while no EXTERNAL change happened before
+      // this successor acquired.
       const carriedObligation = this.authBootstrapOwed;
       this.applyAuthIdentityChange();
       // Gate 36 item 3: capture the auth generation THIS transition owns at
@@ -1362,8 +1410,8 @@ class HubStore {
       // credential request is still open, WITHOUT advancing transitionSeq;
       // that generation must invalidate this transition's recovery finalizer.
       const myGen = this.authGen;
-      const acquired: AuthTransitionOwner = { gen: myGen, seq: myIssuedSeq };
-      if (carriedObligation) this.authBootstrapOwed = { gen: myGen };
+      const acquired: AuthTransitionOwner = { gen: myGen, seq: myIssuedSeq, ext: myExt };
+      if (carriedObligation && this.extEpoch === myExt) this.authBootstrapOwed = { gen: myGen };
       this.authTransition = new Promise<void>((resolve) => {
         this.resolveAuthTransition = resolve;
       });
@@ -1379,12 +1427,15 @@ class HubStore {
         // Release the blocker. Run current-generation initialization in the
         // finalizer (gate 35 item 1) only while this transition still owns
         // BOTH the sequence and the generation it acquired — a queued newer
-        // transition OR a logout/401/peer change invalidates it.
+        // transition OR a logout/401/peer change invalidates it. Gate 38 adds
+        // the external epoch: a transition issued before an external logout
+        // never installs an outbox after it.
         const resolve = this.resolveAuthTransition;
         this.resolveAuthTransition = null;
         this.authTransition = null;
         resolve?.();
-        const stillOwns = this.transitionSeq === myIssuedSeq && this.authGen === myGen;
+        const stillOwns =
+          this.transitionSeq === myIssuedSeq && this.authGen === myGen && this.extEpoch === myExt;
         if (stillOwns) void this.ensureOutbox().catch(() => undefined);
       }
       // A NEWER transition was issued before this one settled (whether or not
@@ -1436,11 +1487,19 @@ class HubStore {
    * authenticated UI is published (AuthGate no longer bounces a too-early
    * navigation back to /login), while a superseded caller transfers the
    * obligation and returns immediately without waiting on its successor.
+   *
+   * Gate 38: the captured external epoch gates EVERY effect here. An external
+   * logout/401/peer change after the transition was issued (or after the
+   * successor acquired) makes the continuation return silently — no
+   * obligation (re)created, no bootstrap — so a stale result is never re-bound
+   * to the current generation and readSession() (its cache cleared) cannot
+   * supply the old identity.
    */
   private async settleAuthBootstrap(outcome:
     | { ok: true; result: DeviceSession; superseded: boolean; acquired: AuthTransitionOwner }
     | { ok: false; error: unknown; superseded: boolean; acquired: AuthTransitionOwner },
   ): Promise<void> {
+    const extLive = () => this.extEpoch === outcome.acquired.ext;
     const ownsNow = () =>
       this.authGen === outcome.acquired.gen && this.transitionSeq === outcome.acquired.seq;
     if (outcome.ok) {
@@ -1448,20 +1507,22 @@ class HubStore {
         // Explicit transfer to the chain's final owner. This continuation can
         // resume AFTER the successor already acquired (so this.authGen is the
         // successor's generation): bind the obligation to the generation that
-        // is current NOW. An external change after this nulls it again.
-        this.authBootstrapOwed = { gen: this.authGen };
+        // is current NOW. Only through this VERIFIED succession — and never
+        // after an external change, which nulls the obligation instead.
+        if (extLive()) this.authBootstrapOwed = { gen: this.authGen };
         return;
       }
       this.authBootstrapOwed = null;
-      if (!ownsNow()) return; // external change after settlement preparation
+      if (!extLive() || !ownsNow()) return;
       await this.bootstrap().catch(() => undefined);
       return;
     }
-    // Failed final owner: discharge a predecessor's obligation ONLY while this
-    // continuation is the current owner, the obligation is bound to THIS
-    // generation (an external change nulls it), and a session really exists.
+    // Failed final owner: discharge a predecessor's obligation ONLY while no
+    // external change happened, this continuation is the current owner, the
+    // obligation is bound to THIS generation, and a session really exists.
     if (
       !outcome.superseded &&
+      extLive() &&
       ownsNow() &&
       this.authBootstrapOwed?.gen === this.authGen &&
       readSession()
@@ -1499,10 +1560,11 @@ class HubStore {
   ]);
   private onPeerAuthChange = (event: StorageEvent) => {
     if (!event.key || !HubStore.SESSION_STORAGE_KEYS.has(event.key)) return;
-    // A peer logged in/out or replaced the session: rotate generation and
-    // dispose our outbox through the single identity-change helper. No
-    // reconnect here — the UI/next action decides whether this tab re-auths.
-    this.applyAuthIdentityChange();
+    // A peer logged in/out or replaced the session: an EXTERNAL change — rotate
+    // the auth generation AND external epoch (clearing this tab's cached
+    // session), dispose the outbox, and invalidate suspended auth work
+    // (gate 38). No reconnect here — the UI/next action decides re-auth.
+    this.applyAuthIdentityChange(true);
   };
   private peerAuthWatchRegistered = false;
   private registerPeerAuthWatch() {
@@ -3057,7 +3119,7 @@ class HubStore {
     return this.authGen;
   }
   applyAuthIdentityChangeForTest(): void {
-    this.applyAuthIdentityChange();
+    this.applyAuthIdentityChange(true);
   }
   /** Test seam: true while a Fence-A credential transition is open. */
   get authTransitionOpenForTest(): boolean {
@@ -4189,6 +4251,10 @@ class HubStore {
   }
 
   async bootstrap() {
+    // Gate 38: bootstrap is itself auth work suspended across many awaits — a
+    // peer logout must be observable for its whole duration (the watch is
+    // otherwise only registered lazily by outbox init).
+    this.registerPeerAuthWatch();
     const gen = ++this.bootGen;
     if (api.mock && readLoggedOut() && !readSession()) {
       this.emit({ ready: true, authed: false, session: null, devices: [], passkeys: [], connection: "offline" });
@@ -4273,8 +4339,10 @@ class HubStore {
       if (unauth) {
         // c-reconnfu gate 33 item 1: a 401 means the current session is gone;
         // dispose the outbox (and invalidate its initializer) before clearing
-        // the session, so no delivery runs under the revoked identity.
-        this.applyAuthIdentityChange();
+        // the session, so no delivery runs under the revoked identity. Gate 38:
+        // this is an EXTERNAL change — bump extEpoch and drop the cached
+        // session so any other suspended auth continuation stops silently.
+        this.applyAuthIdentityChange(true);
         clearSession();
         dropDeviceCookie();
       }
@@ -4318,6 +4386,13 @@ class HubStore {
       // rejection WITHOUT awaiting its successor; the final owner owns it.
       await this.settleAuthBootstrap(outcome);
       throw outcome.error;
+    }
+    // Gate 38: an EXTERNAL logout/401/peer change while the credential body was
+    // suspended retires this result — write/publish NOTHING (the promise still
+    // resolves; the caller navigates nowhere because no session appeared).
+    if (this.extEpoch !== outcome.acquired.ext) {
+      await this.settleAuthBootstrap(outcome);
+      return;
     }
     writeSession(outcome.result, { mock: api.mock });
     // bootstrap marks the session authenticated after cookie-backed reads finish.
@@ -4363,6 +4438,11 @@ class HubStore {
       // rejection WITHOUT awaiting its successor; the final owner owns it.
       await this.settleAuthBootstrap(outcome);
       throw outcome.error;
+    }
+    // Gate 38: suppress every effect of a result retired by an external change.
+    if (this.extEpoch !== outcome.acquired.ext) {
+      await this.settleAuthBootstrap(outcome);
+      return;
     }
     writeSession(outcome.result, { mock: api.mock });
     this.emit({ session: readSession(), error: null });
@@ -4495,8 +4575,10 @@ class HubStore {
     // identity-change helper — bumps authGen and disposes the outbox (and any
     // in-flight initializer) BEFORE the logged-out identity can be used; the
     // next bootstrap loads a fresh Outbox with a new lifetime. The helper also
-    // nulls the pending bootstrap obligation (gate 37 item 1).
-    this.applyAuthIdentityChange();
+    // nulls the pending bootstrap obligation (gate 37 item 1). Gate 38:
+    // EXTERNAL — bump extEpoch and clear the cached session so suspended login
+    // continuations and an in-flight bootstrap publish nothing afterwards.
+    this.applyAuthIdentityChange(true);
     if (this.unloadClearTimer) {
       clearTimeout(this.unloadClearTimer);
       this.unloadClearTimer = null;

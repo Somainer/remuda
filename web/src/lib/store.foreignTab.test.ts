@@ -9146,3 +9146,112 @@ it("GATE43 item 2: cold reload with cached session, Hub unreachable and a failin
     sessionStorage.removeItem("remuda-outbox-owner");
   }
 });
+
+it("GATE44 item 1: a credential generation superseding a parked storage install is classified obsolete — status ok with the outbox disposed never fulfils as unavailable", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_430_000);
+  const I = "ins_g44_1";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 5_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  let seams: Record<string, unknown> | null = null;
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g44_1");
+    localStorage.setItem("runtime.device-session", JSON.stringify({ deviceId: "devA_g44_1", name: "A" }));
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+    vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+    vi.spyOn(api, "instanceList").mockResolvedValue({
+      items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
+      nextCursor: null,
+    } as never);
+    vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+    const hello = vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+
+    // One durable row: restored exactly once, by the CURRENT generation.
+    const seed = new (await import("./outbox")).LocalStorageOutboxStorage();
+    await seed.put({
+      commandId: "cmd_g44_1", clientRequestId: "local_g44_1", instanceId: I,
+      prompt: "g44 1", createdAt: 1, attempts: 0, state: "pending",
+    });
+
+    const internals = hubStore as unknown as Record<string, unknown>;
+    seams = internals;
+    // The FIRST initializer parks AFTER installing its box; the interleave
+    // supersedes its generation and disposes the box while the continuation is
+    // parked. Later initializers (the current-generation recovery) run normally.
+    let firstInstallGate = false;
+    let releaseInstall: (() => void) | null = null;
+    (internals.setOutboxInstalledGateForTest as (g: ((r: () => void) => void) | null) => void)((resolve) => {
+      if (!firstInstallGate) {
+        firstInstallGate = true;
+        releaseInstall = resolve;
+      } else {
+        resolve();
+      }
+    });
+
+    const addSpy = vi.spyOn(window, "addEventListener");
+    const h = hubStore as unknown as {
+      bootstrap: () => Promise<void>;
+      connection: unknown;
+      state: { ready: boolean; authed: boolean; bubbles: Array<{ clientRequestId: string }> };
+    };
+    // Reload A (+ StrictMode duplicate A2) enters bootstrap; the initializer
+    // installs its box and parks at the interleave gate.
+    const bootA = h.bootstrap();
+    const bootA2 = h.bootstrap();
+    await pump(400);
+    expect(releaseInstall).not.toBeNull();
+    expect(hello).toHaveBeenCalledTimes(1);
+
+    // Interleave the credential supersession: generation advances and the
+    // just-installed box is disposed (external epoch unchanged).
+    let aFulfilled = false;
+    let a2Fulfilled = false;
+    void bootA.then(() => {
+      aFulfilled = true;
+      // Readiness at fulfilment: the CURRENT generation installed exactly one
+      // machine; A never fulfilled from its stale "ok"/null result.
+      expect(h.connection).not.toBeNull();
+      expect(addSpy.mock.calls.filter((c) => c[0] === "online")).toHaveLength(1);
+    });
+    void bootA2.then(() => { a2Fulfilled = true; });
+
+    (internals.credentialGenerationSupersedeForTest as () => void)();
+    releaseInstall!();
+    // A's stale continuation resumes with status "ok" but the box gone. The
+    // fix classifies it obsolete and hands the callers to a CURRENT-generation
+    // run, which performs its OWN bootstrap pass: A/A2 fulfil only once that
+    // pass completes (second health call), with exactly one machine.
+    await Promise.all([bootA, bootA2]);
+    await pump(8_000);
+    expect(aFulfilled).toBe(true);
+    expect(a2Fulfilled).toBe(true);
+    // A stale direct fulfilment would have resolved after the ORIGINAL single
+    // health pass; the mandatory current-generation handoff adds a second.
+    expect(hello.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(addSpy.mock.calls.filter((c) => c[0] === "online")).toHaveLength(1);
+    expect(h.state.ready).toBe(true);
+    expect(h.state.authed).toBe(true);
+    expect(h.state.bubbles.filter((b) => b.clientRequestId === "local_g44_1")).toHaveLength(1);
+  } finally {
+    if (seams) {
+      (seams.setOutboxInstalledGateForTest as (g: ((r: () => void) => void) | null) => void)(null);
+    }
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});;

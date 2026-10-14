@@ -1815,6 +1815,14 @@ class HubStore {
           this.toast("待发队列连续读取或投递失败，已暂停自动重试；恢复后将在下次发送时继续");
         };
         this.emit({ outboxPending: box.pendingCount() });
+        // Test gate (c-reconnfu gate 44 item 1): fires AFTER the box is installed
+        // but before the initializer reports "ok", letting a regression
+        // interleave a credential-generation supersession (which disposes the
+        // just-installed box) exactly between the two — the window in which a
+        // parked initConnection used to read "ok" with this.outbox null.
+        if (this.outboxInstalledGateForTest) {
+          await new Promise<void>((resolve) => this.outboxInstalledGateForTest?.(resolve));
+        }
         if (opened.degraded) this.toast("本机无法可靠保存待发消息（存储不可用）");
         // Rows left inflight by a closed tab are due immediately — but never
         // from an initializer whose identity is already obsolete (it may have
@@ -3033,7 +3041,16 @@ class HubStore {
     // entry before its first await) is REQUIRED; this installer never reads a
     // fresh epoch for the caller.
     const epoch = ext;
-    const live = () => this.extEpoch === epoch;
+    // Gate 44 item 1: capture the CREDENTIAL generation this installation is
+    // for BEFORE awaiting the outbox. A subscriber-triggered login can acquire
+    // the transition WHILE this call is parked in ensureOutbox: it bumps authGen
+    // and disposes the outbox, so on resume storage may report "ok" while
+    // this.outbox is null (the newer transition owns it). Treating that as
+    // "unavailable" wrongly fulfilled this caller instead of the successor's
+    // install. A generation mismatch is "obsolete" — checked immediately after
+    // the await, BEFORE any storage-availability classification.
+    const installGen = this.authGen;
+    const sameIdentity = () => this.extEpoch === epoch && this.authGen === installGen;
     // c-reconnfu gate 34 item 4: a REPLACEMENT login keeps this.connection but
     // the old box was disposed by runAuthIdentityChange. Ensure a current-
     // generation outbox on EVERY init path even when the connection machine is
@@ -3043,15 +3060,9 @@ class HubStore {
     // an open transition) stops this install entirely — never adopt the box the
     // NEW identity created.
     const status = await this.ensureOutbox(epoch);
-    // Gate 43: epoch moved (external logout) retires regardless of status.
-    if (!live()) return "obsolete";
-    // Gate 43: the caller's generation was superseded by a same-epoch
-    // credential transition while storage opened — never build a machine from
-    // the stale run; fulfilBootstrap hands the caller to the current gen.
-    if (status === "obsolete") return "obsolete";
-    // Gate 43 (c): storage genuinely unavailable for the CURRENT generation.
-    // No machine this pass; the caller publishes the settled degraded state.
-    if (status === "unavailable" || !this.outbox) return "unavailable";
+    // Gate 44 item 1: revalidate BOTH identity coordinates immediately after
+    // the storage await, before classifying availability (see installGen).
+    if (!sameIdentity()) return "obsolete";
     // Gate 41 S1: a connection machine installed for THIS epoch is already
     // owned — either by a replacement login's reused machine or by a
     // concurrent same-epoch bootstrap that won the single-flight/reload race.
@@ -3061,12 +3072,15 @@ class HubStore {
     if (this.connection && this.connectionInstallEpoch === epoch) {
       return "installed";
     }
+    // Storage genuinely unavailable for the CURRENT generation. Item 1 keeps
+    // this as a distinct result; gate 44 item 2 installs a machine anyway.
+    if (status === "unavailable" || !this.outbox) return "unavailable";
     const box = this.outbox;
 
     // Reload: restore unsent rows as bubbles, keyed to their stored instances.
-    // Gate 39 R-b: identity-publishing/resource work — revalidate synchronously
-    // before the restore emit and machine creation.
-    if (!live()) return "obsolete";
+    // Gate 39/44 R-b: identity-publishing/resource work — revalidate
+    // synchronously before the restore emit and machine creation.
+    if (!sameIdentity()) return "obsolete";
     const restored = box.unresolved();
     if (restored.length) {
       // Offline reload never ran the instance list. Restore the LAST KNOWN
@@ -3097,10 +3111,10 @@ class HubStore {
       }
     }
 
-    // Gate 39 R-b: revalidate synchronously immediately before constructing
+    // Gate 39/44 R-b: revalidate synchronously immediately before constructing
     // the connection machine; a retirement between the outbox install and here
     // stops the machine from being built or published.
-    if (!live()) {
+    if (!sameIdentity()) {
       box.dispose();
       return "obsolete";
     }
@@ -3138,9 +3152,9 @@ class HubStore {
     // Gate 41 S1: stamp the installing epoch so a concurrent same-epoch
     // initConnection adopts this machine instead of building another.
     this.connectionInstallEpoch = epoch;
-    // Gate 39 R-b: do not start/attach a machine if the identity retired during
-    // construction.
-    if (!live()) {
+    // Gate 39/44 R-b: do not start/attach a machine if the identity retired
+    // during construction.
+    if (!sameIdentity()) {
       machine.dispose();
       this.connection = null;
       this.connectionInstallEpoch = null;
@@ -3358,6 +3372,22 @@ class HubStore {
   private outboxOpenGateForTest: ((resolve: () => void) => void) | null = null;
   setOutboxOpenGateForTest(gate: ((resolve: () => void) => void) | null): void {
     this.outboxOpenGateForTest = gate;
+  }
+  /** Gate after the box is installed but before the initializer returns (gate 44). */
+  private outboxInstalledGateForTest: ((resolve: () => void) => void) | null = null;
+  setOutboxInstalledGateForTest(gate: ((resolve: () => void) => void) | null): void {
+    this.outboxInstalledGateForTest = gate;
+  }
+  /**
+   * Test seam (c-reconnfu gate 44 item 1): simulate a credential-generation
+   * supersession WITHOUT an external-identity change — bumps authGen and
+   * disposes the current outbox exactly like the credential part of an
+   * interleaved login acquisition, leaving extEpoch current.
+   */
+  credentialGenerationSupersedeForTest(): void {
+    this.authGen += 1;
+    this.authBootstrapOwed = null;
+    this.disposeOutboxForAuthChange();
   }
   /** Gate the Outbox.load step (second suspension point) for gate-34 item 5. */
   private outboxLoadGateForTest: ((resolve: () => void) => void) | null = null;

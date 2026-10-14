@@ -148,6 +148,15 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     // transaction so an interruption never leaves the schema half-migrated.
     let tx = conn.unchecked_transaction()?;
     tx.execute_batch("DROP INDEX IF EXISTS usage_events_scope_dedupe;")?;
+    // c-ctxusage r30 item 1: the r16 turn index MUST be dropped BEFORE the
+    // turn-identity backfill. An already-r28 database can hold a legacy turn
+    // (NULL identity) proven by the journal as (T, S) alongside a later
+    // qualified replay (T, S): backfilling the legacy row while the unique
+    // index still exists violates it and rolls back the whole migration
+    // (Hub cannot start). Multiple NULL rows restoring to the same (T, S)
+    // collide during the first UPDATE too. Recreated below after the
+    // duplicate collapse.
+    tx.execute_batch("DROP INDEX IF EXISTS usage_events_turn_dedupe;")?;
     // c-ctxusage r9 item 5: rows written in the pre-scopeId world have a NULL
     // scope_id, but the matching retained journal payload (keyed by
     // (instance_id, seq)) can still PROVE which session the cumulative stock
@@ -157,6 +166,13 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     // from the SAME retained evidence, so a pre-scopeId Codex turn is covered
     // by its (now scoped) cumulative stock instead of double-counting.
     backfill_legacy_turn_identity(&tx)?;
+    // Collapse turn-lineage duplicates IMMEDIATELY after the backfill (r30
+    // item 1): the identity UPDATE can merge a legacy row with a later
+    // qualified replay of the same turn, and the surviving frame must be the
+    // fold winner (newest accepted seq) before the identical-counters
+    // consolidation below — which keeps the oldest row for session stocks —
+    // ever sees the pair.
+    collapse_duplicate_turn_lineage_rows(&tx)?;
     consolidate_identical_scoped_rows(&tx)?;
     // c-ctxusage r11 item 1: rows imported by the backfill (and any scoped
     // chains last written by pre-acceptance-rule code) were never run through
@@ -165,17 +181,12 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     // inserts use, in acceptance (rowid) order, before rowid order is allowed
     // to mean "accepted history" for current-stock selection and floors.
     normalise_scoped_session_chains(&tx)?;
-    // c-ctxusage r16 item 3 (T1'): the turn authority watermark is kept PER
-    // LINEAGE `(scope_id, source_session_id)` — NULL (the unqualified legacy
-    // lineage) and every qualified native session id each hold their own mark
-    // and their own revision-replaced row. The old index allowed only one turn
-    // row per scope_id, so accepting one lineage erased another lineage's
-    // watermark. Drop it, collapse only WITHIN a lineage (kept distinct by
-    // COALESCE — NULL and a real id can never share a key, since empty ids are
-    // normalised to NULL at projection), and recreate the unique index over
-    // the lineage key.
-    tx.execute_batch("DROP INDEX IF EXISTS usage_events_turn_dedupe;")?;
-    collapse_duplicate_turn_lineage_rows(&tx)?;
+    // c-ctxusage r16 item 3 (T1'): recreate the unique index over the
+    // PER-LINEAGE turn key `(scope_id, COALESCE(source_session_id, ''))` —
+    // NULL (the unqualified legacy lineage) and every qualified native
+    // session id each hold their own mark. The old index was dropped above
+    // (r30 item 1: before the turn backfill) and the lineage collapse
+    // already ran.
     tx.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS usage_events_turn_dedupe
              ON usage_events(
@@ -189,20 +200,32 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 /// Within one turn lineage `(instance, scope_id, COALESCE(source_session_id,
-/// ''))` keep the oldest durable row (smallest rowid); rows in DIFFERENT
-/// lineages for the same scope id are retained — each lineage owns its
-/// revision-replaced row (c-ctxusage r16 item 3).
+/// '')) keep the same WINNER the read folds pick — the newest accepted frame
+/// (`seq DESC, rowid DESC`, matching `WINNING_TURN_ROWS_SQL`); rows in
+/// DIFFERENT native-session lineages for the same scope id are retained —
+/// each lineage keeps its own revision-replaced row (c-ctxusage r16 item 3).
+///
+/// The newest frame is the authority: a resume replay (r30 item 1) is how a
+/// pre-scopeId legacy turn and its later qualified frame become one lineage,
+/// and the replay carries the native timestamp/revision the read model uses;
+/// keeping the older durable row would silently change the fold and the
+/// native-time windows.
 fn collapse_duplicate_turn_lineage_rows(conn: &Connection) -> rusqlite::Result<usize> {
     conn.execute(
         "DELETE FROM usage_events
          WHERE scope = 'turn'
            AND scope_id IS NOT NULL
            AND rowid NOT IN (
-               SELECT MIN(rowid)
-               FROM usage_events
-               WHERE scope = 'turn' AND scope_id IS NOT NULL
-               GROUP BY instance_id, scope_id,
-                        COALESCE(source_session_id, '')
+               SELECT rowid FROM (
+                   SELECT rowid, ROW_NUMBER() OVER (
+                       PARTITION BY instance_id, scope_id,
+                                    COALESCE(source_session_id, '')
+                       ORDER BY seq DESC, rowid DESC
+                   ) AS lineage_winner
+                   FROM usage_events
+                   WHERE scope = 'turn' AND scope_id IS NOT NULL
+               )
+               WHERE lineage_winner = 1
            )",
         [],
     )
@@ -6895,5 +6918,225 @@ mod tests {
         assert_eq!(supply.total_tokens, Some(165));
         assert_eq!(supply.input_tokens, Some(150));
         assert_eq!(supply.output_tokens, Some(15));
+    }
+    /// Create an r28-era usage_events table: all identity columns present AND
+    /// the r16 partial unique index already in place.
+    fn create_r28_usage_table_with_turn_index(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE usage_events (
+                instance_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                profile_id TEXT,
+                model TEXT,
+                scope TEXT NOT NULL,
+                scope_id TEXT,
+                mode TEXT NOT NULL,
+                metric_revision INTEGER NOT NULL DEFAULT 1,
+                source_session_id TEXT,
+                total_tokens INTEGER,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                cache_read_tokens INTEGER,
+                cache_write_tokens INTEGER,
+                cost_usd TEXT,
+                accounting TEXT NOT NULL DEFAULT 'estimated',
+                observed_at TEXT NOT NULL,
+                observed_at_source TEXT NOT NULL DEFAULT 'ingest',
+                PRIMARY KEY (instance_id, seq)
+             );
+             CREATE UNIQUE INDEX usage_events_turn_dedupe
+                 ON usage_events(instance_id, scope, scope_id,
+                                 COALESCE(source_session_id, ''))
+                 WHERE scope = 'turn' AND scope_id IS NOT NULL;",
+        )
+        .unwrap();
+    }
+
+    /// Count surviving scoped turn rows of one lineage.
+    fn lineage_turn_rows(conn: &Connection, instance: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM usage_events
+             WHERE instance_id = ?1 AND scope = 'turn'
+               AND scope_id = 'turn-1'
+               AND COALESCE(source_session_id, '') = 'sess-codex'",
+            params![instance],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// c-ctxusage r30 item 1: the r29 turn backfill runs while the r16
+    /// partial unique index is still present on an r28 database, so a legacy
+    /// turn proven as (T, S) beside a later qualified replay (T, S) made the
+    /// migration fail on first startup. The index must be dropped before the
+    /// backfill and the duplicate lineage collapsed to the fold winner.
+    #[test]
+    fn r28_indexed_database_backfills_turn_lineage_without_collision() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_r28_usage_table_with_turn_index(&conn);
+        create_journal_table(&conn);
+        let instance = "ins_r30a";
+        // Legacy turn from the pre-scopeId producer (identity columns NULL).
+        conn.execute(
+            "INSERT INTO usage_events
+                (instance_id, seq, profile_id, model, scope, mode,
+                 metric_revision, source_session_id, scope_id, total_tokens,
+                 input_tokens, output_tokens, cache_read_tokens,
+                 cache_write_tokens, accounting, observed_at,
+                 observed_at_source)
+             VALUES (?1, 1, 'pvp_r29', 'm-r29', 'turn', 'snapshot',
+                     1, NULL, NULL, 110, 100, 10, 0, 0, 'estimated',
+                     '2020-01-01T00:00:00.000Z', 'ingest')",
+            params![instance],
+        )
+        .unwrap();
+        // The cumulative stock the resume replayed.
+        conn.execute(
+            "INSERT INTO usage_events
+                (instance_id, seq, profile_id, model, scope, mode,
+                 metric_revision, source_session_id, scope_id, total_tokens,
+                 input_tokens, output_tokens, cache_read_tokens,
+                 cache_write_tokens, accounting, observed_at,
+                 observed_at_source)
+             VALUES (?1, 2, 'pvp_r29', 'm-r29', 'session', 'snapshot',
+                     1, 'sess-codex', 'sess-codex', 110, 100, 10, 0, 0,
+                     'estimated', '2020-01-01T00:00:00.000Z', 'ingest')",
+            params![instance],
+        )
+        .unwrap();
+        // The later qualified replay of the SAME turn (the r16 index admits
+        // it while the legacy row is still NULL-identity).
+        conn.execute(
+            "INSERT INTO usage_events
+                (instance_id, seq, profile_id, model, scope, mode,
+                 metric_revision, source_session_id, scope_id, total_tokens,
+                 input_tokens, output_tokens, cache_read_tokens,
+                 cache_write_tokens, accounting, observed_at,
+                 observed_at_source)
+             VALUES (?1, 3, 'pvp_r29', 'm-r29', 'turn', 'snapshot',
+                     1, 'sess-codex', 'turn-1', 110, 100, 10, 0, 0,
+                     'estimated', '2020-01-02T00:00:00.000Z', 'native')",
+            params![instance],
+        )
+        .unwrap();
+        // Retained evidence proves the legacy turn as turn-1/sess-codex.
+        insert_journal_raw(
+            &conn,
+            &journal_usage_with_envelope(
+                1,
+                instance,
+                "turn",
+                Some("turn-1"),
+                "2020-01-01T00:00:00.000Z",
+                "known",
+            ),
+        );
+        insert_journal_raw(
+            &conn,
+            &journal_usage_with_envelope(
+                2,
+                instance,
+                "session",
+                Some("sess-codex"),
+                "2020-01-01T00:00:00.000Z",
+                "known",
+            ),
+        );
+
+        // The migration must succeed — the unique index is dropped before the
+        // identity UPDATE that would otherwise violate it.
+        migrate(&conn).unwrap();
+        assert_eq!(
+            lineage_turn_rows(&conn, instance),
+            1,
+            "duplicate lineage collapsed"
+        );
+        let rollup = rollup_instance(&conn, instance, "codex", Some("m-r29"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(rollup.session_input_tokens, Some(100), "100/10, not 200/20");
+        assert_eq!(rollup.session_output_tokens, Some(10));
+        // The fold winner (newest accepted frame, seq 3, native time) survives.
+        let (seq, source): (i64, String) = conn
+            .query_row(
+                "SELECT seq, observed_at_source FROM usage_events
+                 WHERE instance_id = ?1 AND scope='turn' AND scope_id='turn-1'",
+                params![instance],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(seq, 3, "the fold winner (qualified replay) survives");
+        assert_eq!(source, "native");
+        // The index is back in place after the migration.
+        let index_present: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='index' AND name='usage_events_turn_dedupe'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_present, 1);
+
+        // (b) A SECOND migration changes nothing: idempotent, index rebuilt,
+        // still one row and the same totals.
+        migrate(&conn).unwrap();
+        assert_eq!(lineage_turn_rows(&conn, instance), 1);
+        let rollup = rollup_instance(&conn, instance, "codex", Some("m-r29"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(rollup.session_input_tokens, Some(100));
+        assert_eq!(rollup.session_output_tokens, Some(10));
+    }
+
+    /// c-ctxusage r30 item 1 (c): an origin/main database with TWO NULL-scope
+    /// turn rows whose retained evidence restores them both to the same
+    /// (T, S). The first identity UPDATE alone creates identical indexed
+    /// keys, so the index must already be gone; the duplicates collapse and
+    /// the turn is counted once.
+    #[test]
+    fn origin_main_two_null_turns_restoring_to_one_lineage_collapse() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_main_usage_table(&conn);
+        create_journal_table(&conn);
+        let instance = "ins_r30c";
+        let at = "2020-01-01T00:00:00.000Z";
+        // Two replayed NULL-identity rows for the one logical turn.
+        insert_main_usage_row(&conn, instance, 1, "turn", 100, 10, at);
+        insert_main_usage_row(&conn, instance, 3, "turn", 100, 10, at);
+        insert_main_usage_row(&conn, instance, 2, "session", 100, 10, at);
+        insert_journal_raw(
+            &conn,
+            &journal_usage_with_envelope(1, instance, "turn", Some("turn-1"), at, "known"),
+        );
+        insert_journal_raw(
+            &conn,
+            &journal_usage_with_envelope(3, instance, "turn", Some("turn-1"), at, "known"),
+        );
+        insert_journal_raw(
+            &conn,
+            &journal_usage_with_envelope(2, instance, "session", Some("sess-codex"), at, "known"),
+        );
+
+        migrate(&conn).unwrap();
+        assert_eq!(
+            lineage_turn_rows(&conn, instance),
+            1,
+            "the two restored rows collapse to one"
+        );
+        let rollup = rollup_instance(&conn, instance, "codex", Some("m-r29"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(rollup.session_input_tokens, Some(100), "counted once");
+        assert_eq!(rollup.session_output_tokens, Some(10));
+        assert_eq!(rollup.turns, 1);
+        // Idempotent re-run.
+        migrate(&conn).unwrap();
+        assert_eq!(lineage_turn_rows(&conn, instance), 1);
+        let rollup = rollup_instance(&conn, instance, "codex", Some("m-r29"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(rollup.session_input_tokens, Some(100));
+        assert_eq!(rollup.session_output_tokens, Some(10));
     }
 }

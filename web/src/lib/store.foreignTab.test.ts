@@ -9190,12 +9190,16 @@ it("GATE47 item 2(a) (S3): a same-tab login waits for a held bootstrap to settle
       void bootA.then(() => { bootASettled = true; });
       let bRequestStarted = false;
       let bootSettledAtBRequest: boolean | null = null;
-      vi.spyOn(api, "login").mockImplementation((() =>
-        new Promise((resolve) => {
+      vi.spyOn(api, "login").mockImplementation(((secret: string, deviceName: string) => {
+        if (deviceName === "devD_g47_2a") {
+          return Promise.resolve({ deviceId: "devD_g47_2a", token: "tokD", name: "D" });
+        }
+        return new Promise((resolve) => {
           bRequestStarted = true;
           bootSettledAtBRequest = bootASettled;
           resolve({ deviceId: "devB_g47_2a", token: "tokB", name: "B" });
-        })) as unknown as Api["login"]);
+        });
+      }) as unknown as Api["login"]);
       const loginB = h.login("bootstrap", "secretB", "devB_g47_2a");
       await pump(300);
       expect(bRequestStarted).toBe(false); // B waits for A — S3 serialization
@@ -9209,31 +9213,45 @@ it("GATE47 item 2(a) (S3): a same-tab login waits for a held bootstrap to settle
       } else {
         releaseHello!({} as Awaited<ReturnType<Api["hello"]>>);
       }
-      for (let i = 0; i < 2_000 && !bRequestStarted; i += 1) await Promise.resolve();
-
-      // B's credential request starts ONLY after A's whole op settled.
-      expect(bRequestStarted).toBe(true);
-      expect(bootSettledAtBRequest).toBe(true);
-      // In the 401 variant B runs at the NEW epoch (queued credentials are
-      // fresh auth intent across a bootstrap 401, not cancelled).
-      if (variant === "delayed-401") {
-        expect((hubStore as unknown as { extEpochForTest: number }).extEpochForTest).toBe(extAtStart + 1);
-      }
-
       await loginB;
       await bootA;
-      await pump(4_000);
+      await pump(2_000);
 
-      // B ends authed on B's OWN session in both variants; A's delayed 401
-      // could not clear a session whose request had not even been sent, and
-      // A's stale list projection never remains over B's session.
-      expect(h.state.authed).toBe(true);
-      expect(h.state.session?.deviceId).toBe("devB_g47_2a");
-      expect(h.state.instances.map((i) => i.id)).toContain(I);
-      expect(localStorage.getItem("runtime.device-session")).toContain("devB_g47_2a");
-      // Exactly ONE credential request (B); A never sent a login in this
-      // cached-session variant.
-      expect(vi.mocked(api.login)).toHaveBeenCalledTimes(1);
+      if (variant === "delayed-401") {
+        // Gate 48 item 1: the bootstrap 401 RETIRED the queued B — B's
+        // credential request was NEVER sent (its session had not been
+        // established and the 401 invalidated everything queued behind A),
+        // the epoch bumped and the UI settled logged out (R-c).
+        expect(bRequestStarted).toBe(false);
+        expect(vi.mocked(api.login)).not.toHaveBeenCalled();
+        expect((hubStore as unknown as { extEpochForTest: number }).extEpochForTest).toBe(extAtStart + 1);
+        expect(h.state.authed).toBe(false);
+        expect(h.state.session).toBeNull();
+        // A replacement requires a FRESH invocation after retirement: D
+        // queues on the post-retirement epoch and logs in successfully.
+        await h.login("bootstrap", "secretD", "devD_g47_2a");
+        await pump(4_000);
+        expect(vi.mocked(api.login)).toHaveBeenCalledTimes(1); // only D — B never sent
+        expect(h.state.authed).toBe(true);
+        expect(h.state.session?.deviceId).toBe("devD_g47_2a");
+        expect(h.state.instances.map((i) => i.id)).toContain(I);
+        expect(localStorage.getItem("runtime.device-session")).toContain("devD_g47_2a");
+      } else {
+        // stale-success: B's request starts only after A's whole op settled
+        // and B ends authed on its OWN session; A's stale list projection
+        // never remains over B.
+        for (let i = 0; i < 2_000 && !bRequestStarted; i += 1) await Promise.resolve();
+        expect(bRequestStarted).toBe(true);
+        expect(bootSettledAtBRequest).toBe(true);
+        await pump(4_000);
+        expect(h.state.authed).toBe(true);
+        expect(h.state.session?.deviceId).toBe("devB_g47_2a");
+        expect(h.state.instances.map((i) => i.id)).toContain(I);
+        expect(localStorage.getItem("runtime.device-session")).toContain("devB_g47_2a");
+        // Exactly ONE credential request (B); A never sent a login in this
+        // cached-session variant.
+        expect(vi.mocked(api.login)).toHaveBeenCalledTimes(1);
+      }
       void hasSession;
     } finally {
       vi.useRealTimers();

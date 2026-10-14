@@ -33,22 +33,16 @@ import type { AttachmentRef } from "./attachments";
  *    impossible (a credential successor waits for the gate), and every
  *    external bump moves extEpoch too.
  *
- * Retirement. An EXTERNAL identity change — local logout (HubStore.logout) or
- * a peer-tab storage event — calls externalIdentityRetire(): extEpoch bumps
- * (R-a/R-b/R-c below stay in force), the running credential request is
- * aborted best-effort (AbortSignal -> the REST write timeout still bounds it),
- * and EVERY queued waiter settles RETIRED immediately — each waiter races its
- * turn against the cancellation broadcast, and a retired waiter never sends
- * credentials and settles silently (the queue gate still opens, so a fresh
- * post-logout op is not blocked behind the retired body).
- *
- * Bootstrap 401 is deliberately different: it bumps extEpoch and publishes the
- * settled logged-out state (R-c), but does NOT cancel a queued credential op.
- * A login/passkey finish queued behind that bootstrap is the user's fresh
- * auth intent — when it reaches its turn it re-anchors to the CURRENT epoch
- * and proceeds; an explicit logout/peer change is the only thing that cancels
- * queued credentials (a queued request must never create a device session
- * after an explicit logout).
+ * Retirement. ANY external identity change — local logout (HubStore.logout),
+ * a peer-tab storage event, OR a bootstrap 401 (gate 48 item 1) — calls
+ * externalIdentityRetire(): extEpoch bumps (R-a/R-b/R-c below stay in force),
+ * the running credential request is aborted best-effort (AbortSignal -> the
+ * REST write timeout still bounds it), and EVERY queued waiter settles RETIRED
+ * immediately — each waiter races its turn against the cancellation broadcast,
+ * and a retired waiter never sends credentials (the queue gate still opens, so
+ * a fresh post-retirement op is not blocked behind the retired body). Each op
+ * carries its ISSUING epoch; after retirement a replacement login requires a
+ * fresh invocation, which runs at the new epoch.
  *
  * Deleted by S3 (the overlap it serialized is now impossible): the
  * same-epoch credential-generation handoff — obsolete-follows-current run
@@ -1405,13 +1399,11 @@ class HubStore {
 
   /**
    * Full external retirement for an EXPLICIT external identity change — local
-   * logout and the peer-tab storage event (S3). Beyond applyAuthIdentityChange
+   * logout, the peer-tab storage event, and a bootstrap 401 (S3; gate 48
+   * item 1 makes the 401 use this SAME path). Beyond applyAuthIdentityChange
    * (epoch bump, dispose, R-c publish) this CANCELS the S3 auth queue: the
    * running credential request is aborted best-effort and every queued waiter
-   * settles retired immediately, never sending credentials. Bootstrap's own
-   * 401 deliberately calls applyAuthIdentityChange(true) WITHOUT this: a
-   * credential op queued behind that bootstrap is fresh auth intent and runs
-   * at the new epoch once its turn comes (see the S3 comment at the top).
+   * settles retired immediately, never sending credentials.
    */
   private externalIdentityRetire(): void {
     this.applyAuthIdentityChange(true);
@@ -1496,9 +1488,10 @@ class HubStore {
       await Promise.resolve();
       await Promise.resolve();
       if (cancelledFlag) return { retired: true };
-      // The turn is ours. A bootstrap-401 epoch bump (no explicit cancel) is
-      // NOT retirement for a queued credential op: the body reads the CURRENT
-      // epoch at acquisition and proceeds as fresh auth intent.
+      // The turn is ours. Every epoch bump that must retire queued intent
+      // (logout, peer change, bootstrap 401) goes through cancelAuthOps, so a
+      // body admitted here either shares its issuing epoch or follows a
+      // same-epoch credential succession (which never bumps extEpoch).
       try {
         const value = await body({ signal: controller?.signal ?? null });
         return { retired: false, value };
@@ -4401,9 +4394,11 @@ class HubStore {
     };
     slot.promise = (async () => {
       const outcome = await this.enqueueAuthOp(
-        // Re-anchor at acquisition: like a credential op, a bootstrap queued
-        // behind a predecessor that ended on a 401 runs at the new epoch.
-        () => this.runBootstrap(this.extEpoch),
+        // Gate 48 item 1: carry the ISSUING epoch. A predecessor ending in a
+        // 401/logout has already retired this queued op via cancelAuthOps (the
+        // cancelledFlag gate before the body fires), so this never runs at a
+        // post-401 epoch as a stolen intent.
+        () => this.runBootstrap(ext),
         "bootstrap",
       );
       // The public wrapper never fulfils an installation after retirement:
@@ -4545,12 +4540,14 @@ class HubStore {
       if (!extLive()) return "retired";
       const unauth = isUnauthorized(err);
       if (unauth) {
-        // A 401 means the current session is gone: dispose the outbox (and
-        // invalidate its initializer) before clearing the session, so no
-        // delivery runs under the revoked identity. This bumps extEpoch and
-        // publishes the settled logged-out state (R-c), but deliberately does
-        // NOT cancel queued credential ops — see externalIdentityRetire.
-        this.applyAuthIdentityChange(true);
+        // Gate 48 item 1: a bootstrap 401 is an EXPLICIT external identity
+        // change — it retires through the SAME broadcast as logout/peer
+        // events: the epoch bumps, the cached session/outbox/machine are
+        // disposed, and every queued op (including a login/passkey finish
+        // queued behind this bootstrap) is cancelled BEFORE it can send
+        // credentials for the now-revoked session. A replacement login must
+        // be a FRESH invocation after retirement.
+        this.externalIdentityRetire();
         clearSession();
         dropDeviceCookie();
       }
@@ -4583,6 +4580,10 @@ class HubStore {
     // Peer watch must be live BEFORE the credential body can park (a peer
     // logout during it retires the queued/running op).
     this.registerPeerAuthWatch();
+    // Gate 48 item 1: capture the ISSUING epoch at entry; the turn body runs
+    // under it (it is cancelled outright if a 401/logout retires the queue
+    // before it starts — see enqueueAuthOp's cancelledFlag).
+    const issuingExt = this.extEpoch;
     // S3: the whole credential operation (request + session write + install)
     // is ONE serialized auth turn. Retired while queued/running — resolve
     // silently, never throw (nothing was attempted/written); a request
@@ -4595,6 +4596,7 @@ class HubStore {
               ? api.pairRedeem(secret, deviceName, abortSignal)
               : api.login(secret, deviceName, abortSignal),
           signal,
+          issuingExt,
         ),
       "credential",
     );
@@ -4605,16 +4607,18 @@ class HubStore {
    * The body of one serialized credential turn (S3). Runs only after the turn
    * is acquired: Fence A dispose/bump + blocker, the credential request, then
    * the session write and the install INLINE (a separate bootstrap op cannot
-   * interleave — it waits for this turn's gate). Re-anchors extEpoch AT
-   * ACQUISITION so a login queued behind a bootstrap that ended on 401 runs at
-   * the new epoch; an explicit logout/peer change cancels the op before this
-   * body runs.
+   * interleave — it waits for this turn's gate). `issuingExt` is the epoch the
+   * public call captured at entry; the turn is cancelled before this body
+   * runs whenever a logout, peer change or bootstrap 401 moved it, so the
+   * epoch equality here is effectively always true — kept as defence in depth
+   * (a publication-subscriber external change racing the acquisition hops).
    */
   private async performCredentialTurn(
     issue: (signal: AbortSignal | undefined) => Promise<DeviceSession>,
     queueSignal: AbortSignal | null,
+    issuingExt: number,
   ): Promise<"settled" | "retired"> {
-    const ext = this.extEpoch;
+    const ext = issuingExt;
     // Fence A: dispose/bump BEFORE the credential request (the new cookie
     // lands in response HEADERS before the body parses); the blocker holds
     // SEND-driven outbox init/delivery until the body settles.
@@ -4688,6 +4692,9 @@ class HubStore {
         this.performCredentialTurn(
           (abortSignal) => api.passkeyLoginFinish(envelope.challengeId, assertion, deviceName, abortSignal),
           finishSignal,
+          // Gate 48 item 1: issuing epoch (captured as extAtEntry); the queued
+          // finish is cancelled if a 401/logout/peer change retires the queue.
+          extAtEntry,
         ),
       "credential",
     );

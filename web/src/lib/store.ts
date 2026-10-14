@@ -1447,21 +1447,20 @@ class HubStore {
       fireCancelled = resolve;
     });
     let finished = false;
-    // Set SYNCHRONOUSLY by an explicit-retirement broadcast, before the gate
-    // opens. Decisive at acquisition: when the predecessor gate and the
-    // cancel broadcast resolve in the same synchronous pass, the microtask
-    // race can settle either way, so the body is admitted ONLY when this flag
-    // is still false. A bootstrap-401 bump (no cancel) never sets it — a
-    // queued credential op then re-anchors and runs at the new epoch.
+    // Set SYNCHRONOUSLY by an externalIdentityRetire() broadcast
+    // (logout/peer change/bootstrap 401), before the gate opens. Decisive at
+    // BOTH acquisition and execution: a retire arriving while the body is
+    // already running races the body promise and settles the public promise as
+    // retired at once (gate 48 item 2).
     let cancelledFlag = false;
     const finish = () => {
       if (finished) return;
       finished = true;
       this.authOpCancelSubs.delete(onCancel);
       // Best-effort abort when the op ends WITHOUT an explicit cancel: covers
-      // a retire reaching the body through extEpoch while the fetch is parked
-      // (bootstrap 401), so a successor does not share a live credential
-      // request. No-op once the fetch settled.
+      // a retire reaching the body through extEpoch while the fetch is parked,
+      // so a successor does not share a live credential request. No-op once
+      // the fetch settled.
       controller?.abort();
       openGate();
     };
@@ -1492,10 +1491,38 @@ class HubStore {
       // (logout, peer change, bootstrap 401) goes through cancelAuthOps, so a
       // body admitted here either shares its issuing epoch or follows a
       // same-epoch credential succession (which never bumps extEpoch).
+      //
+      // Gate 48 item 2: the RUNNING body races retirement too. A retire
+      // broadcast arriving while `body()` is parked (a held credential
+      // request, a bootstrap in initConnection/flush) settles the PUBLIC
+      // promise as retired IMMEDIATELY — the caller never waits out the body
+      // (e.g. the REST write timeout) and never receives a false "success".
+      // The body is detached: its eventual value is discarded and its
+      // rejection is swallowed here (the abort signal cuts the fetch; epoch
+      // guards inside runBootstrap/performCredentialTurn suppress late
+      // effects). The gate has ALREADY opened on cancel, so a fresh op is not
+      // blocked behind the detached body.
+      const bodyPromise = body({ signal: controller?.signal ?? null }).then(
+        (value): { retired: false; value: T } => ({ retired: false, value }),
+      );
       try {
-        const value = await body({ signal: controller?.signal ?? null });
-        return { retired: false, value };
+        const winner = await Promise.race([
+          bodyPromise,
+          cancelled.then((): { retired: true } => ({ retired: true })),
+        ]);
+        if (winner.retired) {
+          // Detach without awaiting: swallow completion and rejection.
+          void bodyPromise.then(
+            () => undefined,
+            () => undefined,
+          );
+          return { retired: true };
+        }
+        return winner;
       } finally {
+        // Open the gate on BOTH a returned value and a propagated body
+        // rejection (request failure after acquisition reaches the caller).
+        // finish() is idempotent — the cancel path already opened it.
         finish();
       }
     })();

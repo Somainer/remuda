@@ -9190,7 +9190,7 @@ it("GATE47 item 2(a) (S3): a same-tab login waits for a held bootstrap to settle
       void bootA.then(() => { bootASettled = true; });
       let bRequestStarted = false;
       let bootSettledAtBRequest: boolean | null = null;
-      vi.spyOn(api, "login").mockImplementation(((secret: string, deviceName: string) => {
+      vi.spyOn(api, "login").mockImplementation(((_secret: string, deviceName: string) => {
         if (deviceName === "devD_g47_2a") {
           return Promise.resolve({ deviceId: "devD_g47_2a", token: "tokD", name: "D" });
         }
@@ -9457,5 +9457,94 @@ it("GATE47 item 2(c) (S3): logout while B's credential body is held retires the 
     vi.useRealTimers();
     Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
     sessionStorage.removeItem("remeda-outbox-owner-g47-2c");
+  }
+});
+
+it("GATE48 item 2: logout retires the RUNNING credential op immediately — the public promise settles before the parked body does (no 15 s wait, late resolution swallowed)", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_493_000);
+  const I = "ins_g48_2";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 5_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner-g48-2", "owner");
+    localStorage.setItem("runtime.logged-out", "1");
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true } as never);
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] } as never);
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+    vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+    vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+    vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+    vi.spyOn(api, "instanceList").mockResolvedValue({
+      items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
+      nextCursor: null,
+    } as never);
+
+    // B's credential body parks and LATER resolves successfully (the result
+    // must be swallowed — it never writes a session).
+    let resolveBody: (s: unknown) => void = () => {};
+    let abortSeen: AbortSignal | undefined;
+    vi.spyOn(api, "login").mockImplementation(
+      ((_secret: string, _deviceName: string, signal?: AbortSignal) => {
+        abortSeen = signal;
+        return new Promise((resolve) => {
+          resolveBody = resolve;
+        });
+      }) as unknown as Api["login"],
+    );
+
+    const h = hubStore as unknown as {
+      login: (k: "bootstrap", s: string, d: string) => Promise<void>;
+      logout: () => void;
+      state: { authed: boolean; session: { deviceId: string } | null };
+      outbox: unknown;
+      connection: unknown;
+    };
+    const pB = h.login("bootstrap", "b", "devB_g48_2");
+    await pump(1_000);
+    expect(abortSeen).toBeTruthy(); // running, holding the queue
+
+    // Explicit logout WHILE the body is parked.
+    let settledAtLogout: boolean | null = null;
+    void pB.then(() => { settledAtLogout = true; });
+    h.logout();
+
+    // Gate 48 item 2: the RUNNING op's PUBLIC promise settles on the SAME
+    // microtask tick as the retirement (microtask pump only — the REST write
+    // timer is never advanced and the body is still pending).
+    await pump(400);
+    expect(settledAtLogout).toBe(true);
+    expect(h.state.authed).toBe(false);
+    expect(h.state.session).toBeNull();
+    expect(h.outbox).toBeNull();
+    expect(h.connection).toBeNull();
+    // The abort signal fired so the real fetch would be cut too.
+    expect(abortSeen?.aborted).toBe(true);
+
+    // The parked body resolves a successful session LATE — it must be
+    // swallowed: no session is written and the UI stays logged out.
+    resolveBody({ deviceId: "devB_g48_2", token: "tokB-late", name: "B" });
+    await pump(2_000);
+    expect(h.state.authed).toBe(false);
+    expect(h.state.session).toBeNull();
+    expect(localStorage.getItem("runtime.device-session")).toBeNull();
+
+    // No unhandled rejection from the detached body either.
+    await expect(pB).resolves.toBeUndefined();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner-g48-2");
   }
 });

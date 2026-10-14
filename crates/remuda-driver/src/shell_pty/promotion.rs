@@ -1560,6 +1560,15 @@ pub(super) fn spawn(
                 // the replaced hydrator through the FINALISE GUARD (synchronous
                 // production into guard storage + cancellation-safe publication),
                 // never through a local queue.
+                //
+                // CANCELLATION-SAFETY (coordinator note, c-usagefu r21): the
+                // hydrator is MOVED into this callback rather than borrowed,
+                // but it remains safe — `produce_replaced` synchronously maps
+                // the final read and mapper.finish() into the shared
+                // `finalise_pending` storage BEFORE the awaited publication,
+                // so an abort at any await drops only the now-empty hydrator;
+                // all produced observations live in the guard queue (rule
+                // (a)/(b)/(d)).
                 let events_ref: &mpsc::Sender<Observation> = &events;
                 let seq_ref: &AtomicU64 = &seq;
                 let ctx_ref: &PromoteCtx = &ctx;

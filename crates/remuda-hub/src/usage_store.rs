@@ -1673,15 +1673,107 @@ fn latest_turn_basket(conn: &Connection, instance_id: &str) -> rusqlite::Result<
 /// Session-wide totals of one rollup query.
 struct RollupTotals {
     turns: i64,
-    /// Additive sums over scope='turn' rows; used for the totals only when no
-    /// cumulative session snapshot exists (the Claude shape).
-    turn_input: Option<i64>,
-    turn_output: Option<i64>,
-    turn_cache_read: Option<i64>,
-    turn_cache_write: Option<i64>,
+    /// Whether the instance has any winning turn / session rows at all.
     has_turn: bool,
     has_session: bool,
     last_turn_at: Option<String>,
+}
+
+/// Fold the instance's session stocks and uncovered turn flows into the
+/// rollup's session totals (c-ctxusage r28 item 1).
+///
+/// The covering stocks are exactly the rows [`latest_session_stock`] sums:
+/// when scoped session rows exist, the latest accepted point per native
+/// session (acceptance order, `rowid DESC`) covers — an UNPROVEN legacy
+/// NULL-scope row floors nothing (c-ctxusage r8 item 8); with no scoped rows
+/// the single newest legacy NULL-scope point is the stock and covers the
+/// legacy NULL-lineage turns. Winning turns whose native session has no
+/// covering stock are added as flows. Turn ↔ session correlation is the same
+/// per-native-session rule [`aggregate_instance`]/[`aggregate_supply`] use
+/// (`source_session_id = scope_id`). Every bucket uses the U1
+/// COUNT(col)=COUNT(*) gate: one constituent omitting the bucket makes it
+/// Unknown, never a fabricated zero.
+/// The four additive session rollup buckets, each Unknown until every
+/// constituent reports it (U1).
+type SessionRollupBuckets = (Option<i64>, Option<i64>, Option<i64>, Option<i64>);
+
+fn session_rollup_totals(
+    conn: &Connection,
+    instance_id: &str,
+) -> rusqlite::Result<SessionRollupBuckets> {
+    conn.query_row(
+        "WITH scoped_sessions AS (
+             SELECT * FROM (
+                 SELECT input_tokens, output_tokens,
+                        cache_read_tokens, cache_write_tokens, scope_id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY scope_id ORDER BY rowid DESC
+                        ) AS rn
+                 FROM usage_events
+                 WHERE instance_id = ?1 AND scope = 'session' AND scope_id IS NOT NULL
+             ) WHERE rn = 1
+         ),
+         legacy_stock AS (
+             SELECT input_tokens, output_tokens,
+                    cache_read_tokens, cache_write_tokens
+             FROM usage_events
+             WHERE instance_id = ?1 AND scope = 'session' AND scope_id IS NULL
+             ORDER BY rowid DESC LIMIT 1
+         ),
+         covering_sessions AS (
+             SELECT input_tokens, output_tokens,
+                    cache_read_tokens, cache_write_tokens
+             FROM scoped_sessions
+             UNION ALL
+             -- The legacy point covers only when no proven scoped stock exists.
+             SELECT l.input_tokens, l.output_tokens,
+                    l.cache_read_tokens, l.cache_write_tokens
+             FROM legacy_stock l
+             WHERE (SELECT COUNT(*) FROM scoped_sessions) = 0
+         ),
+         constituents AS (
+             SELECT input_tokens, output_tokens,
+                    cache_read_tokens, cache_write_tokens
+             FROM covering_sessions
+             UNION ALL
+             SELECT t.input_tokens, t.output_tokens,
+                    t.cache_read_tokens, t.cache_write_tokens
+             FROM (
+                 SELECT * FROM (
+                     SELECT *, ROW_NUMBER() OVER (
+                         PARTITION BY scope_id ORDER BY seq DESC, rowid DESC
+                     ) AS turn_lineage_rn
+                     FROM usage_events
+                     WHERE instance_id = ?1 AND scope = 'turn' AND scope_id IS NOT NULL
+                 ) WHERE turn_lineage_rn = 1
+                 UNION ALL
+                 SELECT *, NULL AS turn_lineage_rn
+                 FROM usage_events
+                 WHERE instance_id = ?1 AND scope = 'turn' AND scope_id IS NULL
+             ) t
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM scoped_sessions s
+                 WHERE t.source_session_id IS NOT NULL
+                   AND t.source_session_id = s.scope_id
+             )
+             AND NOT EXISTS (
+                 SELECT 1 FROM legacy_stock l
+                 WHERE (SELECT COUNT(*) FROM scoped_sessions) = 0
+                   AND t.source_session_id IS NULL
+             )
+         )
+         SELECT CASE WHEN COUNT(*) = COUNT(input_tokens)
+                     THEN SUM(input_tokens) END,
+                CASE WHEN COUNT(*) = COUNT(output_tokens)
+                     THEN SUM(output_tokens) END,
+                CASE WHEN COUNT(*) = COUNT(cache_read_tokens)
+                     THEN SUM(cache_read_tokens) END,
+                CASE WHEN COUNT(*) = COUNT(cache_write_tokens)
+                     THEN SUM(cache_write_tokens) END
+         FROM constituents",
+        params![instance_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )
 }
 
 /// Fold every persisted usage event of one instance into
@@ -1716,19 +1808,17 @@ pub fn rollup_instance(
     // their stock is read via latest_session_stock). U1 (c-ctxusage r16
     // item 4): a bucket omitted by ANY winning turn makes the folded sum
     // Unknown — SUM ignores NULLs, so gate on COUNT(col) = COUNT(*).
+    // Turn count / newest native turn time come from the WINNING row per scope
+    // id (one logical turn even when several native-session lineages hold
+    // revision-replaced rows for the same assistant message id). The token
+    // SUMS are folded per native session in session_rollup_totals instead:
+    // counting them here used to replace uncovered sessions' turns whenever
+    // any session stock existed (c-ctxusage r28 item 1).
     let totals = conn.query_row(
         &format!(
             "WITH winning_turns AS ({WINNING_TURN_ROWS_SQL})
              SELECT
                  (SELECT COUNT(*) FROM winning_turns),
-                 (SELECT CASE WHEN COUNT(*) = COUNT(input_tokens)
-                              THEN SUM(input_tokens) END FROM winning_turns),
-                 (SELECT CASE WHEN COUNT(*) = COUNT(output_tokens)
-                              THEN SUM(output_tokens) END FROM winning_turns),
-                 (SELECT CASE WHEN COUNT(*) = COUNT(cache_read_tokens)
-                              THEN SUM(cache_read_tokens) END FROM winning_turns),
-                 (SELECT CASE WHEN COUNT(*) = COUNT(cache_write_tokens)
-                              THEN SUM(cache_write_tokens) END FROM winning_turns),
                  (SELECT MAX(observed_at) FROM winning_turns
                   WHERE observed_at_source = 'native')"
         ),
@@ -1737,13 +1827,9 @@ pub fn rollup_instance(
             let turns: i64 = row.get(0)?;
             Ok(RollupTotals {
                 turns,
-                turn_input: row.get(1)?,
-                turn_output: row.get(2)?,
-                turn_cache_read: row.get(3)?,
-                turn_cache_write: row.get(4)?,
                 has_turn: turns > 0,
                 has_session: false,
-                last_turn_at: row.get(5)?,
+                last_turn_at: row.get(1)?,
             })
         },
     )?;
@@ -1770,23 +1856,15 @@ pub fn rollup_instance(
         (SessionStock::default(), false)
     };
 
-    // Session totals: the authoritative cumulative stock when present, else the
-    // sum of the per-turn flows.
-    let (session_input, session_output, cache_read, cache_creation) = if totals.has_session {
-        (
-            stock.input,
-            stock.output,
-            stock.cache_read,
-            stock.cache_write,
-        )
-    } else {
-        (
-            totals.turn_input,
-            totals.turn_output,
-            totals.turn_cache_read,
-            totals.turn_cache_write,
-        )
-    };
+    // Session totals use the SAME per-native-session stock-vs-flow rule as
+    // aggregate_instance (c-ctxusage r28 item 1): the latest accepted stock of
+    // each native session PLUS the winning turns of sessions that have no
+    // covering stock. Stock never covers another session's turns: a Codex
+    // session A stock of 100/10 plus an uncovered Claude session B turn of
+    // 7/1 totals 107/11, not 100/10. U1: any constituent row omitting a
+    // bucket makes that bucket Unknown for the whole fold.
+    let (session_input, session_output, cache_read, cache_creation) =
+        session_rollup_totals(conn, instance_id)?;
 
     // Context basket: the newest turn call; for a stock-only harness the
     // stock's current counters.
@@ -2221,7 +2299,10 @@ mod tests {
             scope_id: Some(format!("turn-{seq}")),
             mode: "snapshot".into(),
             metric_revision: seq,
-            source_session_id: None,
+            // Production Codex turns are qualified to their native session;
+            // that lineage is what lets the session stock cover them
+            // (c-ctxusage r28 item 1).
+            source_session_id: Some("codex-session".into()),
             total_tokens: Some(input + output),
             input_tokens: Some(input),
             output_tokens: Some(output),
@@ -2570,6 +2651,22 @@ mod tests {
         let supply = aggregate_supply(&conn, "pvp", "m").unwrap();
         assert_eq!(supply.events, 2);
         assert_eq!(supply.total_tokens, Some(118));
+
+        // c-ctxusage r28 item 1: the INSTANCE rollup applies the stock
+        // coverage PER NATIVE SESSION — "covered"'s stock covers only its own
+        // turn; the uncovered turn of another session is still added. It used
+        // to return 100/10 whenever any session row existed.
+        let rollup = rollup_instance(&conn, "ins_mix", "codex", Some("m"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rollup.session_input_tokens,
+            Some(107),
+            "100 stock of 'covered' + 7 uncovered turn of another session"
+        );
+        assert_eq!(rollup.session_output_tokens, Some(11));
+        assert_eq!(rollup.cache_read_tokens, Some(0));
+        assert_eq!(rollup.cache_creation_tokens, Some(0));
     }
 
     /// U1 (c-ctxusage r17 item 6), turn context basket: the newest call's
@@ -2903,6 +3000,13 @@ mod tests {
         }
     }
 
+    /// Qualify a turn record with its native session id, the production Codex
+    /// shape that lets a session stock cover the turn (c-ctxusage r28 item 1).
+    fn with_source_session(mut rec: JournalRecord, session_id: &str) -> JournalRecord {
+        rec.event["payload"]["sourceSessionId"] = json!(session_id);
+        rec
+    }
+
     fn insert(conn: &Connection, rec: &JournalRecord) -> bool {
         let row = project_usage_event(rec, None, None).unwrap();
         insert_usage_event(conn, &row).unwrap()
@@ -3151,34 +3255,42 @@ mod tests {
 
         // Two per-turn flows that only PARTIALLY cover the cumulative total.
         // t1: input 100 / output 50 / cache_read 900; t2: input 100 / output 50.
+        // Both are qualified to native session s1 (the production Codex
+        // shape), so s1's cumulative stock covers them.
         assert!(insert(
             &conn,
-            &scoped_record(
-                1,
-                "ins_mix",
-                "turn",
-                Some("t1"),
-                1,
-                100,
-                50,
-                900,
-                0,
-                Some(&recent(5))
+            &with_source_session(
+                scoped_record(
+                    1,
+                    "ins_mix",
+                    "turn",
+                    Some("t1"),
+                    1,
+                    100,
+                    50,
+                    900,
+                    0,
+                    Some(&recent(5))
+                ),
+                "s1"
             )
         ));
         assert!(insert(
             &conn,
-            &scoped_record(
-                2,
-                "ins_mix",
-                "turn",
-                Some("t2"),
-                1,
-                100,
-                50,
-                0,
-                0,
-                Some(&recent(2))
+            &with_source_session(
+                scoped_record(
+                    2,
+                    "ins_mix",
+                    "turn",
+                    Some("t2"),
+                    1,
+                    100,
+                    50,
+                    0,
+                    0,
+                    Some(&recent(2))
+                ),
+                "s1"
             )
         ));
         // Cumulative session snapshot exceeds the turn sum (partial coverage):
@@ -5857,20 +5969,24 @@ mod tests {
             )
         ));
         // The Turn snapshot the real Codex adapter emits beside the Session
-        // snapshot at the same turn end (native time, per-call flow).
+        // snapshot at the same turn end (native time, per-call flow),
+        // qualified to native session c1.
         assert!(insert(
             &conn,
-            &scoped_record(
-                5,
-                "ins_cx",
-                "turn",
-                Some("msg_cx_t1"),
-                1,
-                7,
-                2,
-                0,
-                0,
-                Some(&now)
+            &with_source_session(
+                scoped_record(
+                    5,
+                    "ins_cx",
+                    "turn",
+                    Some("msg_cx_t1"),
+                    1,
+                    7,
+                    2,
+                    0,
+                    0,
+                    Some(&now)
+                ),
+                "c1"
             )
         ));
 

@@ -20,3 +20,17 @@ pub use imp::ObservedChildExit;
 
 #[cfg(unix)]
 pub use imp::observe_exit_without_reaping;
+
+#[cfg(unix)]
+mod owner;
+
+/// THE OWNER CONTRACT single-owner subprocess runner (Node recovery and the
+/// merge CLI recovery).
+#[cfg(unix)]
+pub use owner::OwnedRun;
+
+#[cfg(unix)]
+pub use owner::clean_surviving_group_until;
+
+#[cfg(unix)]
+pub use owner::run_owned_process;

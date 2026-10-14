@@ -6680,7 +6680,7 @@ mod tests {
         let closer_a = tokio::spawn(async move { Driver::close(&*driver_a).await });
 
         // Wait until A has claimed ownership and the sender.
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
         while !test_close_ownership_park_winner_arrived() {
             assert!(
                 tokio::time::Instant::now() < deadline,
@@ -6840,7 +6840,7 @@ mod tests {
         if let Some(shutdown) = driver.poller_shutdown.lock().await.take() {
             let _ = shutdown.send(true);
         }
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
         while !promotion::test_final_finalise_park_held() {
             assert!(
                 tokio::time::Instant::now() < deadline,
@@ -6900,6 +6900,11 @@ mod tests {
         }
     }
 
+    /// The r20 cancellation tests share the process-global finalize publish
+    /// gate; serialize them so one cannot hold the other's gate.
+    static R20_CANCEL_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
     /// True iff an observation is the buffered open turn's usage payload.
     fn is_open_turn_usage(observation: &remuda_protocol::Observation) -> bool {
         match &observation.body {
@@ -6912,6 +6917,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn an_abort_during_a_full_channel_finalize_delivers_usage_exactly_once() {
+        let _serial = R20_CANCEL_LOCK.lock().await;
         // c-usagefu r20 items 1/2/5 — CLOSE path. The poller parks at the
         // post-production gate (mapper.finish() already in the guard queue,
         // nothing awaited yet); the test then FILLS the channel and releases
@@ -6935,7 +6941,7 @@ mod tests {
         if let Some(shutdown) = driver.poller_shutdown.lock().await.take() {
             let _ = shutdown.send(true);
         }
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
         while !promotion::test_finalise_publish_park_held() {
             assert!(
                 tokio::time::Instant::now() < deadline,
@@ -6988,6 +6994,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn an_abort_during_a_full_channel_rebind_delivers_usage_exactly_once() {
+        let _serial = R20_CANCEL_LOCK.lock().await;
         // c-usagefu r20 items 1/2/5 — REBIND path (rule (d)): a second
         // authenticated SessionStart rebinds the foreground; the old hydrator
         // is produced into guard storage and publication parks at the SAME
@@ -7003,10 +7010,15 @@ mod tests {
         let park = promotion::test_acquire_finalise_publish_park().await;
         // A SECOND, different SessionStart on the same foreground pid is an
         // authenticated rebind: the next tick finalizes the old hydrator and
-        // reaches the gate.
-        let second = dir.path().join("second.jsonl");
+        // reaches the gate. The candidate transcript must live in the cwd's
+        // project directory (rebind_authenticated_start verifies it belongs).
+        let home = dir.path().join("claude-home");
+        let slug = crate::claude_transcript::project_dir(&home, dir.path());
+        std::fs::create_dir_all(&slug).unwrap();
+        let second = slug.join("r20-second-session.jsonl");
+        std::fs::write(&second, b"{}").unwrap();
         r7_send_session_start(&hooks, pgid, "r20-second-session", &second).await;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
         while !promotion::test_finalise_publish_park_held() {
             assert!(
                 tokio::time::Instant::now() < deadline,

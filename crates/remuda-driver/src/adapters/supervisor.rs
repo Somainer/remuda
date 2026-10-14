@@ -87,7 +87,9 @@ pub struct AdapterCtx {
 pub struct AdapterHandle {
     pub(crate) tasks: Vec<JoinHandle<()>>,
     /// Set the first time a file adapter's poll reports it bound a session
-    /// (c-usagefu r19 item 1 test seam).
+    /// (c-usagefu r19/r20 item 6 test seam; compiled out of release builds
+    /// together with its accessor).
+    #[cfg(any(test, feature = "test-stub"))]
     bound: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -111,6 +113,7 @@ impl AdapterHandle {
     pub(crate) fn from_tasks(tasks: Vec<JoinHandle<()>>) -> Self {
         Self {
             tasks,
+            #[cfg(any(test, feature = "test-stub"))]
             bound: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
@@ -208,8 +211,10 @@ pub fn spawn_file_adapters(
 }
 
 fn run<A: FileSignalAdapter + 'static>(mut adapter: A, ctx: AdapterCtx) -> AdapterHandle {
+    #[cfg(any(test, feature = "test-stub"))]
     let bound = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let task = tokio::spawn({
+        #[cfg(any(test, feature = "test-stub"))]
         let bound = Arc::clone(&bound);
         async move {
             let mut tick = tokio::time::interval(ADAPTER_POLL);
@@ -238,6 +243,7 @@ fn run<A: FileSignalAdapter + 'static>(mut adapter: A, ctx: AdapterCtx) -> Adapt
                             .session_id()
                             .map_or(ctx.stamp.session_id.clone(), str::to_owned);
                         if adapter.session_id().is_some() {
+                            #[cfg(any(test, feature = "test-stub"))]
                             bound.store(true, std::sync::atomic::Ordering::SeqCst);
                         }
                         (observations, session_id)
@@ -268,6 +274,7 @@ fn run<A: FileSignalAdapter + 'static>(mut adapter: A, ctx: AdapterCtx) -> Adapt
     });
     AdapterHandle {
         tasks: vec![task],
+        #[cfg(any(test, feature = "test-stub"))]
         bound,
     }
 }

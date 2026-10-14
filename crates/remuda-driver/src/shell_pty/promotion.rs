@@ -1771,7 +1771,7 @@ async fn publish_pending_gated(
     gate: &Arc<FinalisePublishGate>,
 ) {
     gate.hold().await;
-    publish_pending_inner(pending, events, seq, ctx).await;
+    publish_pending_inner(pending, events, seq, ctx, Some(gate)).await;
 }
 
 async fn publish_pending_inner(
@@ -1779,13 +1779,26 @@ async fn publish_pending_inner(
     events: &mpsc::Sender<Observation>,
     seq: &AtomicU64,
     ctx: &PromoteCtx,
+    #[cfg(test)] ack: Option<&FinalisePublishGate>,
 ) {
     loop {
         if pending.lock().expect("finalise pending").is_empty() {
             return;
         }
         // The only await in the loop, and the observation is still queued.
-        let Ok(permit) = events.reserve().await else {
+        //
+        // c-usagefu r22 item 1 test seam: the ACTUAL reservation future is
+        // box-pinned inside [`AckPendingReservation`] (tokio's reserve future
+        // is !Unpin) and polled in place; the gate is signalled only when one
+        // of ITS polls returns Poll::Pending. The same future keeps being
+        // polled afterwards — it is never re-created — so the harness
+        // acknowledgement proves this invocation reached a genuinely pending
+        // reserve() before it aborts.
+        #[cfg(test)]
+        let reserve = AckPendingReservation::new(ack, events.reserve());
+        #[cfg(not(test))]
+        let reserve = events.reserve();
+        let Ok(permit) = reserve.await else {
             // Channel closed: nothing more can be delivered.
             return;
         };
@@ -1862,9 +1875,12 @@ impl PollerTask {
 /// - The poller, when finalization reaches publication, parks on
 ///   [`Self::parked`] until it reaches the gate and sets `entered`.
 /// - Once the channel is filled and the caller releases the 2-party barrier,
-///   the poller enters the pending reserve() on the full channel; the test
-///   then aborts with one slot freed and joins — exactly-once delivery comes
-///   either from the woken reservation or FinaliseGuard::drop, never both.
+///   the poller enters the pending reserve() on the full channel.
+/// - The caller then awaits `reserve_pending`: an acknowledgement emitted from
+///   polling the ACTUAL reservation future once a poll returns Pending. The
+///   barrier alone is insufficient on a current-thread runtime (its last
+///   participant returns before the released task resumes), so only this ack
+///   proves the poller reached a genuinely pending reservation before abort.
 #[cfg(test)]
 pub(crate) struct FinalisePublishGate {
     /// One parked slot per poller; None unless a test holds the gate open.
@@ -1875,6 +1891,9 @@ pub(crate) struct FinalisePublishGate {
 struct ParkSlot {
     /// Set when the poller arrives at the gate.
     entered: tokio::sync::watch::Sender<bool>,
+    /// Set when the poller's ACTUAL reservation future has been polled and
+    /// that poll returned Poll::Pending.
+    reserve_pending: tokio::sync::watch::Sender<bool>,
     /// 2-party barrier: the poller waits here until the test releases it into
     /// the full-channel reservation.
     release: Arc<tokio::sync::Barrier>,
@@ -1895,13 +1914,16 @@ impl FinalisePublishGate {
         // A prior gate on this same poller must be cleared first.
         *slot = None;
         let (entered_tx, entered_rx) = tokio::sync::watch::channel(false);
+        let (reserve_tx, reserve_rx) = tokio::sync::watch::channel(false);
         let release = Arc::new(tokio::sync::Barrier::new(2));
         *slot = Some(ParkSlot {
             entered: entered_tx,
+            reserve_pending: reserve_tx,
             release: Arc::clone(&release),
         });
         PublishPermit {
             entered: entered_rx,
+            reserve_pending: reserve_rx,
             release,
         }
     }
@@ -1919,11 +1941,24 @@ impl FinalisePublishGate {
         };
         release.wait().await;
     }
+
+    /// Test seam (c-usagefu r22 item 1): acknowledge that the poller's ACTUAL
+    /// reservation future was polled and returned Pending. `try_lock` keeps
+    /// polling synchronous; the slot is uncontended here because `permit()`
+    /// finished before the poller was released into reserve().
+    fn signal_reserve_pending(&self) {
+        if let Ok(mut guard) = self.slot.try_lock()
+            && let Some(slot) = guard.as_mut()
+        {
+            slot.reserve_pending.send(true).ok();
+        }
+    }
 }
 
 #[cfg(test)]
 pub(crate) struct PublishPermit {
     entered: tokio::sync::watch::Receiver<bool>,
+    reserve_pending: tokio::sync::watch::Receiver<bool>,
     release: Arc<tokio::sync::Barrier>,
 }
 
@@ -1936,11 +1971,69 @@ impl PublishPermit {
         let _ = self.entered.changed().await;
     }
 
-    /// Release the parked poller into reserve() on the FULL channel. The
-    /// 2-party barrier returns only after the poller has also arrived, so on a
-    /// current-thread runtime its reserve() is guaranteed pending.
+    /// Release the parked poller toward reserve() on the FULL channel. The
+    /// barrier returning does NOT guarantee the poller has resumed (on a
+    /// current-thread runtime the last participant returns immediately); the
+    /// caller must follow with [`Self::wait_reserve_pending`] before aborting.
     pub(crate) async fn release_to_pending_reserve(&mut self) {
         self.release.wait().await;
+    }
+
+    /// Wait for the acknowledgement emitted from polling the ACTUAL
+    /// reservation future once a poll returned Poll::Pending. Per-invocation:
+    /// only this gate's poller can set this permit's watch.
+    pub(crate) async fn wait_reserve_pending(&mut self) {
+        if *self.reserve_pending.borrow() {
+            return;
+        }
+        let _ = self.reserve_pending.changed().await;
+    }
+}
+
+/// c-usagefu r22 item 1 test seam: wraps the ACTUAL channel reservation
+/// future. The inner future is box-pinned with the wrapper and the SAME future
+/// is re-polled on every wake — it is never re-created — while `gate` is
+/// signalled after every poll that returns Pending.
+#[cfg(test)]
+struct AckPendingReservation<'a, F> {
+    gate: Option<&'a FinalisePublishGate>,
+    inner: std::pin::Pin<Box<F>>,
+}
+
+#[cfg(test)]
+impl<'a, F: std::future::Future> AckPendingReservation<'a, F> {
+    fn new(gate: Option<&'a FinalisePublishGate>, inner: F) -> Self {
+        Self {
+            gate,
+            inner: Box::pin(inner),
+        }
+    }
+}
+
+#[cfg(test)]
+impl<F: std::future::Future> std::future::Future for AckPendingReservation<'_, F> {
+    type Output = F::Output;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<F::Output> {
+        // Pin<Box<F>> is Unpin for any F, so the wrapper is Unpin and the
+        // pinned reservation future can be re-polled in place through the
+        // reborrow — the same future instance every time, never re-created.
+        let this = self.get_mut();
+        let gate = this.gate;
+        match this.inner.as_mut().poll(cx) {
+            std::task::Poll::Pending => {
+                // Signal only AFTER the actual reservation poll returned
+                // Pending; the pinned inner future stays and is polled again.
+                if let Some(gate) = gate {
+                    gate.signal_reserve_pending();
+                }
+                std::task::Poll::Pending
+            }
+            std::task::Poll::Ready(output) => std::task::Poll::Ready(output),
+        }
     }
 }
 

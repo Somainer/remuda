@@ -6968,10 +6968,14 @@ mod tests {
         permit.wait_entered().await;
         // Fill the bounded channel while publication is still gated off.
         fill_event_channel(&sender, &filler).await;
-        // Release into reserve(); the channel is full so the reservation is
-        // pending. current_thread: the poller cannot run until this fn awaits,
-        // so this returns with the reservation guaranteed pending.
+        // Release the poller toward reserve() on the FULL channel.
         permit.release_to_pending_reserve().await;
+        // c-usagefu r22 item 1: on a current-thread runtime the barrier's last
+        // participant returns before the poller resumes. Wait for the ack from
+        // polling the ACTUAL reservation future (a poll returned Pending) so
+        // the abort below cannot land while the poller is still before
+        // reserve() — which let pop-before-reserve regressions pass.
+        permit.wait_reserve_pending().await;
 
         // Abort while full, then free exactly ONE slot and join.
         // current_thread: the poller is parked on reserve(); abort schedules a

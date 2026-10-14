@@ -491,20 +491,52 @@ impl Default for DriverRegistry {
     }
 }
 
+/// Reservation on a registry's single-adoption slot
+/// (c-usagefu r21 item 4). On construction failure the constructor calls
+/// [`AdoptionGuard::rollback`]-by-drop and the registry stays adoptable; on
+/// success the Node commits and the flag stays set when the guard is dropped.
+pub(crate) struct AdoptionGuard {
+    adopted: Arc<std::sync::atomic::AtomicBool>,
+    committed: bool,
+}
+
+impl Drop for AdoptionGuard {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.adopted
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+impl AdoptionGuard {
+    /// Commit the adoption: the Node was fully constructed and owns the
+    /// registry.
+    pub(crate) fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
 impl DriverRegistry {
-    /// Claim this registry for exactly one Node. Returns an error if it (or a
-    /// clone of it) was already adopted — two Nodes sharing one registry would
-    /// share shutdown ownership and census-retirement buckets (c-usagefu r20
-    /// item 3).
-    pub(crate) fn claim_adoption(&self) -> Result<(), NodeError> {
+    /// Reserve this registry for exactly one Node. Returns an error if it (or a
+    /// clone of it) was already committed — two Nodes sharing one registry
+    /// would share shutdown ownership and census-retirement buckets. The
+    /// reservation is rolled back automatically if the returned guard is
+    /// dropped without [`AdoptionGuard::commit`] (c-usagefu r20 item 3, r21
+    /// item 4).
+    pub(crate) fn claim_adoption(&self) -> Result<AdoptionGuard, NodeError> {
         if self.adopted.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return Err(NodeError::InvalidConfig(
                 "driver registry already adopted by another Node; build a fresh registry per Node"
                     .to_owned(),
             ));
         }
-        Ok(())
+        Ok(AdoptionGuard {
+            adopted: Arc::clone(&self.adopted),
+            committed: false,
+        })
     }
+
     /// The census epoch shared by every driver this registry builds and the
     /// Node it is installed into (c-usagefu r19 item 1).
     #[must_use]

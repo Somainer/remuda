@@ -241,8 +241,10 @@ impl DevNode {
                 "instance queue capacity must be positive".to_owned(),
             ));
         }
-        // Fail before ANY Node state exists if another Node owns this registry.
-        drivers.claim_adoption()?;
+        // Reserve before ANY Node state exists; the reservation rolls back on
+        // the `?` paths below and commits only when the completed Node is
+        // returned (c-usagefu r21 item 4).
+        let adoption = drivers.claim_adoption()?;
         let census_epoch = drivers.census_epoch();
         let host = fixture_host(host_id.clone())?;
         let workspace_registry = crate::workspace::WorkspaceRegistry::open(config, host_id)?;
@@ -254,7 +256,7 @@ impl DevNode {
                 NodeError::InvalidConfig("initial workspace registry is empty".into())
             })?;
         let interactions = InteractionRuntime::spawn(Arc::clone(&store))?;
-        Ok(Self {
+        let node = Self {
             inner: Arc::new(DevNodeInner {
                 store,
                 drivers,
@@ -283,7 +285,9 @@ impl DevNode {
                 #[cfg(test)]
                 create_reservation_barrier: tokio::sync::RwLock::new(None),
             }),
-        })
+        };
+        adoption.commit();
+        Ok(node)
     }
 
     /// Install the create reservation test barrier (c-dirpicker round 4

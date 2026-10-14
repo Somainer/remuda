@@ -151,6 +151,41 @@ async fn one_registry_backs_only_one_node_and_fresh_registries_get_distinct_epoc
     );
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn failed_node_construction_rolls_back_registry_adoption() {
+    // c-usagefu r21 item 4: a constructor failure must not consume the
+    // registry's single-adoption slot; the corrected retry with the SAME
+    // registry succeeds.
+    let root = tempfile::tempdir().unwrap();
+    let registry =
+        remuda_node::native_driver_registry(NativeDriverConfig::new(root.path().join("node-data")))
+            .expect("registry");
+    let store = || {
+        Arc::new(
+            remuda_node::MemoryStore::open_journaled(root.path().join("node-data"), 64).unwrap(),
+        )
+    };
+
+    // A config with no workspace root: workspace construction fails after the
+    // adoption reservation.
+    let mut bad = DevServerConfig::loopback(0);
+    bad.workspace_roots = Some(remuda_testing::test_workspace_roots!());
+    bad.workspace_root = root.path().join("does-not-matter");
+    bad.workspace_roots = Some(vec![]);
+    let bad_result = remuda_node::DevNode::with_parts(&bad, store(), registry.clone());
+    assert!(
+        bad_result.is_err(),
+        "empty workspace roots must fail Node construction"
+    );
+
+    // Corrected config with the retained ORIGINAL registry now succeeds.
+    let mut good = DevServerConfig::loopback(0);
+    good.workspace_roots = Some(remuda_testing::test_workspace_roots!());
+    std::fs::create_dir_all(&good.workspace_root).unwrap();
+    let _retry = remuda_node::DevNode::with_parts(&good, store(), registry)
+        .expect("the registry must still be adoptable after the failed attempt");
+}
+
 fn codex_request(binary: PathBuf) -> CreateInstanceRequest {
     CreateInstanceRequest {
         origin: remuda_protocol::InputOrigin::Human,

@@ -966,6 +966,14 @@ impl HeldJobDecision {
     }
 }
 
+/// r30 item 3 TEST-ONLY: number of `HeldJobDecision` Drops that observed the
+/// registry lock already held by another task (and therefore took the
+/// blocking path). Lets the contention regression acknowledge the dropper
+/// actually reached the contended lock before the test releases it — no sleep.
+#[cfg(test)]
+static DROPS_THAT_FOUND_THE_LOCK_HELD: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 impl Drop for HeldJobDecision {
     fn drop(&mut self) {
         // Release our own clone FIRST. When the map is then the sole
@@ -977,11 +985,21 @@ impl Drop for HeldJobDecision {
         // registry mutex is synchronous with only non-awaiting sections, so
         // blocking here briefly is safe and makes prune reliable (r29 item 2).
         drop(self.mutex.take());
-        let mut per_job = self
-            .registry
-            .per_job
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Try once first: when contended, block on the real lock so the entry
+        // is never abandoned (r29 item 2), and record the observation for the
+        // deterministic contention test.
+        let mut per_job = match self.registry.per_job.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                #[cfg(test)]
+                DROPS_THAT_FOUND_THE_LOCK_HELD.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                self.registry
+                    .per_job
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            }
+        };
         let sole = per_job
             .get(&self.job)
             .is_some_and(|entry| std::sync::Arc::strong_count(entry) == 1);
@@ -5834,15 +5852,19 @@ mod decision_guard_tests {
         }
     }
 
-    /// r29 item 2: when the final handle for a completed job drops WHILE another
-    /// worker holds the registry mutex (a concurrent hold()), the drop blocks
-    /// briefly and still prunes once the registry lock is released — the entry
-    /// must never be silently abandoned. The job is never looked up again.
+    /// r29 item 2 / r30 item 3: when the final handle for a completed job drops
+    /// WHILE another worker holds the registry mutex, Drop blocks and still
+    /// prunes once the lock is released — the entry is never abandoned. The
+    /// test acknowledges deterministically (via Drop's contention counter)
+    /// that the dropper reached the held lock BEFORE releasing it, with no
+    /// sleep and no later lookup of the job.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pruning_waits_for_registry_contention_without_a_revisit() {
+        use std::sync::atomic::Ordering;
         let guards = GateDecisionGuards::new();
         let handle = guards.hold("gjb_contended").await;
         assert_eq!(guards.per_job.lock().unwrap().len(), 1);
+        super::DROPS_THAT_FOUND_THE_LOCK_HELD.store(0, Ordering::Release);
 
         // Hold the registry lock on THIS thread and drop the final handle on a
         // separate thread; its Drop must block instead of giving up.
@@ -5859,8 +5881,17 @@ mod decision_guard_tests {
                 drop(handle);
             })
         };
-        // Give the dropping thread time to block on the registry mutex.
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Deterministic rendezvous: wait until the dropper's Drop actually
+        // observed the registry lock held (it is now parked on the blocking
+        // lock), instead of sleeping and hoping.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while super::DROPS_THAT_FOUND_THE_LOCK_HELD.load(Ordering::Acquire) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the dropper never reached the contended registry lock"
+            );
+            std::thread::yield_now();
+        }
         assert_eq!(
             per_job.len(),
             1,

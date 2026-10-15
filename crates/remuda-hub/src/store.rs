@@ -345,6 +345,11 @@ pub struct Store {
     /// r18 item 7 test-only: park after evidence persist, before settlement.
     #[cfg(any(test, feature = "test-faults"))]
     gate_after_persist_barrier: Arc<crate::gatequeue::SimpleBarrier>,
+    /// r27 item 2 test-only: park a legacy `/resolve` while its final Landing
+    /// probe is outstanding, keyed by job id, so a race test can commit an
+    /// evidence-deferral transition before abort admission.
+    #[cfg(any(test, feature = "test-faults"))]
+    gate_resolve_probe_barrier: Arc<crate::gatequeue::SimpleBarrier>,
     /// Per-Store test fault flags (`test-faults` feature only). Shared via
     /// [`Arc`] so every clone of the store arms the SAME flags.
     #[cfg(any(test, feature = "test-faults"))]
@@ -2446,6 +2451,8 @@ impl Store {
             #[cfg(any(test, feature = "test-faults"))]
             gate_after_persist_barrier: Arc::new(crate::gatequeue::SimpleBarrier::new()),
             #[cfg(any(test, feature = "test-faults"))]
+            gate_resolve_probe_barrier: Arc::new(crate::gatequeue::SimpleBarrier::new()),
+            #[cfg(any(test, feature = "test-faults"))]
             faults: Arc::new(test_faults::FaultFlags::default()),
         })
     }
@@ -2741,6 +2748,13 @@ impl Store {
     #[cfg(any(test, feature = "test-faults"))]
     pub fn gate_after_persist_barrier(&self) -> &crate::gatequeue::SimpleBarrier {
         &self.gate_after_persist_barrier
+    }
+
+    /// r27 item 2: per-job barrier parking a legacy `/resolve` while its final
+    /// Landing probe is outstanding (test-only).
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn gate_resolve_probe_barrier(&self) -> &crate::gatequeue::SimpleBarrier {
+        &self.gate_resolve_probe_barrier
     }
 
     /// Test-only: consume one armed insert fault (the counter counts down;

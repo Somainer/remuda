@@ -5192,6 +5192,163 @@ async fn the_legacy_resolve_route_refuses_an_evidence_uncertain_landing_after_re
     assert_eq!(after_offline["laneId"], json!("lane1"), "{after_offline}");
 }
 
+/// r27 item 2: evidence uncertainty arriving WHILE a legacy `/resolve`
+/// probe is outstanding must not cause an abort. The request starts on a
+/// PLAIN recovery-expired Landing (no condition); the final probe is held at
+/// its test barrier; a delayed landed verdict whose evidence persist fails
+/// records the evidence-deferral condition; the probe is then released with an
+/// Unknown answer. The fresh pre-abort validation must see the new condition
+/// and answer 409 — serialized against the deferral transition by the per-job
+/// decision guard — with NO `gate.abortLanding` frame and a byte-identical row.
+#[tokio::test]
+async fn an_evidence_deferral_during_the_legacy_resolve_probe_never_aborts() {
+    let (ctx, mut node) = Ctx::boot().await.unwrap();
+    ctx.configure_gate_lane().await;
+
+    // Grant a LAND and age it into a PLAIN recovery-expired Landing (no
+    // evidence condition yet).
+    let job_id = queued_land_job(&ctx).await;
+    ctx.hub
+        .test_claim_gate_job(&job_id, "lane1", &ctx.host)
+        .await
+        .unwrap()
+        .expect("claimed");
+    let session = ctx
+        .hub
+        .test_node_session(&ctx.host)
+        .await
+        .expect("carrier live");
+    let merge = "d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7";
+    let grant = ctx
+        .hub
+        .test_gate_land_grant(&job_id, &ctx.host, merge, session)
+        .await
+        .unwrap();
+    assert_eq!(grant["granted"], json!(true), "{grant}");
+    let epoch = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap()["landingSessionEpoch"]
+        .as_str()
+        .expect("grant epoch")
+        .to_owned();
+
+    node.set_resolve_reply(json!({ "jobId": job_id, "status": "unknown" }))
+        .await;
+    ctx.hub
+        .test_set_landing_at(&job_id, "2000-01-01T00:00:00Z")
+        .await
+        .unwrap();
+    ctx.hub.test_force_landing_reconcile(&ctx.host).await;
+    let parked_plain = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(parked_plain["state"], json!("landing"), "{parked_plain}");
+    assert_eq!(
+        parked_plain["landingOutcomeUnknown"],
+        json!(true),
+        "{parked_plain}"
+    );
+    assert!(
+        parked_plain["evidenceUncertain"].is_null(),
+        "the resolve starts WITHOUT an evidence condition: {parked_plain}"
+    );
+
+    // Arm the probe barrier and fire the legacy resolve; it parks while the
+    // final probe is outstanding.
+    let probe_barrier = ctx.store().gate_resolve_probe_barrier();
+    probe_barrier.arm();
+    let resolve_path = format!("/v1/projects/{}/gate/jobs/{job_id}/resolve", ctx.project);
+    let body = json!({
+        "resolution": "failed",
+        "expectedAttempts": 1,
+        "expectedSessionEpoch": epoch,
+        "expectedMergeSha": merge,
+        "rationale": "operator resolve while a delayed verdict is still arriving",
+    });
+    let resolve_call = tokio::spawn({
+        let http = ctx.http.clone();
+        let base = ctx.base();
+        let human = ctx.human.clone();
+        async move {
+            let response = http
+                .post(format!("{base}{resolve_path}"))
+                .bearer_auth(&human)
+                .json(&body)
+                .send()
+                .await
+                .expect("resolve response");
+            let status = response.status();
+            let value = response.json().await.unwrap_or(json!(null));
+            (status, value)
+        }
+    });
+    probe_barrier.wait_parked(1).await;
+
+    // While the probe is held: the delayed landed verdict arrives with
+    // retained logs, and its evidence persist FAILS — the Hub records the
+    // evidence-deferral condition without moving the Landing.
+    let landed_result = json!({
+        "jobId": job_id,
+        "generation": 1,
+        "status": "landed",
+        "mergeSha": merge,
+        "runLog": {
+            "step": "*", "kind": "kept", "headline": "landed; log retained by --keep-logs",
+            "summary": [], "tail": ["Finished land successfully"],
+            "capturedLines": 1, "truncated": false, "attempts": 1,
+        },
+    });
+    ctx.store().test_arm_gate_log_insert_fault_sticky();
+    ctx.hub
+        .test_apply_gate_result(&job_id, landed_result)
+        .await
+        .unwrap();
+    ctx.store().test_clear_gate_log_insert_fault();
+    let uncertain = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(uncertain["state"], json!("landing"), "{uncertain}");
+    assert!(
+        uncertain["evidenceUncertain"].is_object(),
+        "the deferred condition is parked while the probe is held: {uncertain}"
+    );
+
+    // Release the probe with its Unknown answer: 409, no abort, row unchanged.
+    probe_barrier.release_key(&job_id).await;
+    let (status, reply) = tokio::time::timeout(Duration::from_secs(15), resolve_call)
+        .await
+        .expect("the held resolve must finish after the probe releases")
+        .expect("the resolve task joins");
+    assert_eq!(
+        status, 409,
+        "a resolve whose row picked up uncertainty mid-probe is refused: {reply}"
+    );
+    assert!(
+        reply["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("resolve-evidence"),
+        "the conflict directs the operator to the evidence route: {reply}"
+    );
+
+    // The held probe's resolveLanding frame may be queued; nothing after it may
+    // be a gate.abortLanding.
+    let drain_deadline = std::time::Instant::now() + Duration::from_millis(500);
+    while std::time::Instant::now() < drain_deadline {
+        if let Ok((method, params)) =
+            tokio::time::timeout(Duration::from_millis(100), node.next_frame()).await
+        {
+            assert_ne!(
+                method, "gate.abortLanding",
+                "the legacy resolution aborted the land after uncertainty arrived: {params}"
+            );
+        }
+    }
+    // The probe itself must have been answered (not skipped), and the row is
+    // byte-identical to the parked uncertain row.
+    let after = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(
+        after, uncertain,
+        "the uncertain Landing row must be unchanged by the refused resolve: {after}"
+    );
+    assert_eq!(after["state"], json!("landing"), "{after}");
+    assert!(after["evidenceUncertain"].is_object(), "{after}");
+}
+
 /// r24 item 1 audit: the periodic Landing reconciler is an authorized settler
 /// too. An evidence-uncertain Landing whose read-only probe ESTABLISHES the
 /// merge absent with the land process group verified dead is requeued (or

@@ -139,6 +139,9 @@ pub struct AppState {
     /// Round 6 item 3: test-only park points in the real unregister/task-bind
     /// handlers; empty (no-op) in production.
     pub(crate) race_barriers: crate::workspaces::RaceBarriers,
+    /// r27 item 2: per-job guards serializing legacy gate `/resolve`
+    /// validation/abort against verdict-applied evidence-deferral transitions.
+    pub(crate) gate_decision_guards: crate::gatequeue::GateDecisionGuards,
 }
 
 impl AppState {
@@ -1483,6 +1486,7 @@ async fn spawn_inner(
         challenges: passkeys::ChallengeStore::default(),
         gate_ref_swept_at: Arc::new(std::sync::Mutex::new(None)),
         race_barriers: crate::workspaces::RaceBarriers::default(),
+        gate_decision_guards: crate::gatequeue::GateDecisionGuards::new(),
     };
     let (_, lost_settlement) = store.expire_lost_hosts(config.host_lost_grace_ms).await?;
     state.broadcast_settlement(&lost_settlement);

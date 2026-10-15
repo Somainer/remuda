@@ -927,6 +927,39 @@ struct ResolveLandingRequest {
     rationale: String,
 }
 
+/// r27 item 2: PER-JOB decision guards serializing the legacy `/resolve`
+/// critical section (fresh validation → abort admission → terminal writer)
+/// against the verdict-application row transition that may RECORD AN
+/// EVIDENCE DEFERRAL (`apply_result`'s mutate). Without this ordering an
+/// evidence-uncertain condition could commit between the resolve's fresh row
+/// read and its abort RPC: the writer predicate refused the row (409) but the
+/// forbidden `gate.abortLanding` had already been sent. Jobs are independent;
+/// the short map-lock is released before any holder parks.
+#[derive(Clone, Default)]
+pub(crate) struct GateDecisionGuards {
+    per_job: std::sync::Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
+        >,
+    >,
+}
+
+impl GateDecisionGuards {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// The serializing guard for one job. The returned `Arc` outlives the map
+    /// lock, so a parked holder never blocks entry creation for other jobs.
+    async fn for_job(&self, job_id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        let mut per_job = self.per_job.lock().await;
+        per_job
+            .entry(job_id.to_owned())
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+}
+
 /// `POST /v1/projects/{id}/gate/jobs/{jobId}/resolve`
 ///
 /// The explicit OPERATOR-ONLY escape hatch for a Landing whose outcome cannot
@@ -1039,6 +1072,15 @@ async fn resolve_project_job(
         // Absent-vs-Unknown distinction applies only to /resolve-evidence.
         LandedProbeSettlement::Absent | LandedProbeSettlement::Unknown => {}
     }
+    // r27 item 2: serialize the fresh validation, the abort admission AND the
+    // terminal writer against verdict-applied row transitions for THIS job —
+    // specifically the evidence-deferral transition inside `apply_result`.
+    // Without the guard, a deferral committing in the fresh-read → abort gap
+    // sent `gate.abortLanding` even though the writer predicate then refused
+    // the row (409). The long read-only probe above stays OUTSIDE the guard:
+    // it mutates nothing, and the fresh read under the guard decides.
+    let decision_guard = state.gate_decision_guards.for_job(&job_id).await;
+    let _decision_guard = decision_guard.lock().await;
     let operator = device.id.clone();
     let rationale = rationale.to_owned();
     let expected_attempts = request.expected_attempts;
@@ -1058,6 +1100,21 @@ async fn resolve_project_job(
         .ok_or(HubError::NotFound)?;
     if current.state != GateJobState::Landing || !current.landing_outcome_unknown {
         return Err(HubError::NotFound);
+    }
+    // r27 item 2: repeat the evidence-uncertain refusal in the FRESH
+    // pre-abort validation. The row may have picked the condition up while the
+    // probe was outstanding (a delayed verdict whose evidence failed to
+    // persist); the per-job decision guard above guarantees no such deferral
+    // can land after this read before the abort. Returns 409 having sent
+    // nothing; the writer predicate below stays as defense in depth.
+    if current.evidence_uncertain.is_some() {
+        return Err(HubError::Conflict(
+            "this Landing picked up an unpersisted-evidence uncertain condition while the probe \
+             was outstanding; the legacy resolution cannot abort or settle it — use \
+             /resolve-evidence, which settles an established Landed fact and permits an override \
+             only after the read-only probe authoritatively establishes absence"
+                .to_string(),
+        ));
     }
     if current.attempts != expected_attempts
         || current.landing_session_epoch.as_deref() != Some(expected_epoch.as_str())
@@ -2379,6 +2436,12 @@ pub(crate) async fn apply_result(
     // supplied bytes and persist_run_log bounds the stored object separately.
     let mut result = result;
     bound_gate_result_row_fields(&mut result);
+    // r27 item 2: the row transition this writer commits — including an
+    // evidence-deferral (record_evidence_deferral below) — serializes per job
+    // against the legacy /resolve fresh-read → abort → settle critical
+    // section, so an uncertain condition cannot appear in that gap.
+    let verdict_decision_guard = state.gate_decision_guards.for_job(job_id).await;
+    let verdict_decision_guard = verdict_decision_guard.lock().await;
     let outcome = state
         .store
         .mutate_gate_job(job_id, move |row, conn| {
@@ -2913,6 +2976,9 @@ pub(crate) async fn apply_result(
             Some(())
         })
         .await;
+    // The row transition is durable; release the per-job decision guard before
+    // the post-writer side effects (journal, scheduling) (r27 item 2).
+    drop(verdict_decision_guard);
     let Ok(Some(job)) = outcome else {
         // Writer stood down (terminal guard / duplicate / generation mismatch /
         // non-authoritative Landing). A non-authoritative Landing verdict keeps
@@ -4145,6 +4211,15 @@ async fn probe_settle_landed_under_guard(
     };
     // Only authoritative for a lane-pushed job (the probe's dead-group
     // attestation is the lane's own). The Landed fact is valid either way.
+    // r27 item 2 TEST-ONLY seam: park while this final probe is outstanding so
+    // a race test can commit an evidence-deferral transition before the
+    // Unknown answer reaches abort admission.
+    #[cfg(any(test, feature = "test-faults"))]
+    state
+        .store
+        .gate_resolve_probe_barrier()
+        .wait_key(job.id.as_id().as_str())
+        .await;
     match probe_landing_outcome(state, job).await {
         LandingProbe::Landed => {}
         LandingProbe::Absent => return Ok(LandedProbeSettlement::Absent),

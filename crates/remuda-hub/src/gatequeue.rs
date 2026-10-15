@@ -938,6 +938,11 @@ struct ResolveLandingRequest {
 /// authority guard the reconciler uses and makes one final read-only probe —
 /// a probe that establishes the merge on the remote settles LANDED, and the
 /// operator's failed/requeue is discarded (r15 item 4).
+///
+/// r26 item 1: a Landing that ALSO carries an evidence-uncertain condition is
+/// refused here (409, before the probe and any abort, and again inside the
+/// writer) and directed to `/resolve-evidence`; this route's Unknown-probe
+/// tolerance must not release evidence-uncertain parking occupancy.
 async fn resolve_project_job(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -989,6 +994,25 @@ async fn resolve_project_job(
                 .to_string(),
         ));
     }
+    // r26 item 1 — EVIDENCE-UNCERTAIN RULE: a recovery-expired Landing can
+    // carry BOTH flags (reconciliation marks it outcome-unknown without
+    // touching the evidence-uncertain condition). This legacy route lets the
+    // explicit operator decision stand on a merely Unknown probe; that is safe
+    // for an ordinary outcome-unknown Landing but releases parked occupancy
+    // without AUTHORITATIVE absence for an evidence-uncertain row — exactly
+    // the override the parking rule reserves to /resolve-evidence (whose probe
+    // fails closed: Unknown or missing authority is a conflict, only an
+    // established-Absent answer permits failed/requeue). Refuse here BEFORE
+    // the probe or any abort; the writer predicate below repeats the guard.
+    if job.evidence_uncertain.is_some() {
+        return Err(HubError::Conflict(
+            "this Landing is parked with an unpersisted-evidence uncertain condition; the legacy \
+             resolution cannot override it while probe authority is undecidable — use \
+             /resolve-evidence, which settles an established Landed fact and permits an override \
+             only after the read-only probe authoritatively establishes absence"
+                .to_string(),
+        ));
+    }
     // Final read-only remote check under the per-host authority guard: an
     // ESTABLISHED landed fact always beats the operator's failed/requeue. The
     // guard pins the live carrier session across probe + commit exactly like
@@ -1006,12 +1030,13 @@ async fn resolve_project_job(
                 landed.state.as_str()
             )));
         }
-        // r25 item 2: this is the outcome-UNKNOWN Landing route (its bounded
-        // recovery window has elapsed), not the evidence-uncertain route: the
-        // r15 operator ruling lets the explicit decision stand whether the
-        // probe established absence or merely could not decide. The
-        // fail-closed Absent-vs-Unknown distinction applies only to
-        // /resolve-evidence.
+        // r25 item 2: rows reaching this arm are plain outcome-UNKNOWN
+        // Landings (the bounded recovery window elapsed) WITHOUT an
+        // evidence-uncertain condition — those were refused above in r26 item
+        // 1 and directed to /resolve-evidence. The r15 operator ruling lets
+        // the explicit decision stand here whether the probe established
+        // absence or merely could not decide; the fail-closed
+        // Absent-vs-Unknown distinction applies only to /resolve-evidence.
         LandedProbeSettlement::Absent | LandedProbeSettlement::Unknown => {}
     }
     let operator = device.id.clone();
@@ -1054,6 +1079,12 @@ async fn resolve_project_job(
         .store
         .mutate_gate_job(&job_id, move |row, _conn| {
             if row.state != GateJobState::Landing || !row.landing_outcome_unknown {
+                return None;
+            }
+            // r26 item 1: repeat the evidence-uncertain refusal inside the
+            // writer — a condition the row picked up (or still carries) must
+            // never be cleared by this endpoint.
+            if row.evidence_uncertain.is_some() {
                 return None;
             }
             // r15 item 4: the writer validates the exact granted tuple the
@@ -1101,7 +1132,7 @@ async fn resolve_project_job(
         .await
         .map_err(map_store)?;
     let Some(outcome) = outcome else {
-        // Distinguish the two writer refusals for the caller.
+        // Distinguish the writer refusals for the caller.
         let current = state
             .store
             .get_gate_job(&job_id)
@@ -1110,6 +1141,13 @@ async fn resolve_project_job(
             .ok_or(HubError::NotFound)?;
         if current.state != GateJobState::Landing || !current.landing_outcome_unknown {
             return Err(HubError::NotFound);
+        }
+        if current.evidence_uncertain.is_some() {
+            return Err(HubError::Conflict(
+                "this Landing is parked with an unpersisted-evidence uncertain condition; resolve \
+                 it through /resolve-evidence after authoritative absence is established"
+                    .to_string(),
+            ));
         }
         return Err(HubError::Conflict(
             "the live Landing is no longer the granted attempt/epoch/merge this resolution named; \

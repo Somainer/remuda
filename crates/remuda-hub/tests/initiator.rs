@@ -4913,6 +4913,188 @@ async fn an_undecidable_probe_keeps_the_uncertain_landing_and_blocks_failed_or_r
     assert!(reply["evidenceUncertain"].is_null(), "{reply}");
 }
 
+/// r26 item 1: recovery expiry can leave an evidence-uncertain Landing ALSO
+/// flagged `landingOutcomeUnknown` — reconciliation flips the expiry flag
+/// without touching the parked condition. The legacy `POST .../resolve` route
+/// tolerates an Unknown probe for an ordinary outcome-unknown Landing, which
+/// used to let it clear `evidenceUncertain` and release parked lane/land
+/// occupancy with no authoritative absence. Such a row is now refused (409)
+/// and directed to `/resolve-evidence`: with the carrier answering Unknown and
+/// again with the carrier offline, `/resolve` returns 409, sends no abort and
+/// leaves the entire row (and its lane occupancy) untouched.
+#[tokio::test]
+async fn the_legacy_resolve_route_refuses_an_evidence_uncertain_landing_after_recovery_expiry() {
+    let (ctx, mut node) = Ctx::boot().await.unwrap();
+    ctx.configure_gate_lane().await;
+
+    // Park a LAND as evidence-uncertain: a landed/keep-logs verdict whose two
+    // log-persist attempts both fail leaves the row Landing with a condition.
+    let job_id = queued_land_job(&ctx).await;
+    ctx.hub
+        .test_claim_gate_job(&job_id, "lane1", &ctx.host)
+        .await
+        .unwrap()
+        .expect("claimed");
+    let session = ctx
+        .hub
+        .test_node_session(&ctx.host)
+        .await
+        .expect("carrier live");
+    let merge = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let grant = ctx
+        .hub
+        .test_gate_land_grant(&job_id, &ctx.host, merge, session)
+        .await
+        .unwrap();
+    assert_eq!(grant["granted"], json!(true), "{grant}");
+    let epoch = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap()["landingSessionEpoch"]
+        .as_str()
+        .expect("grant epoch")
+        .to_owned();
+    let landed_result = json!({
+        "jobId": job_id,
+        "generation": 1,
+        "status": "landed",
+        "mergeSha": merge,
+        "runLog": {
+            "step": "*", "kind": "kept", "headline": "landed; log retained by --keep-logs",
+            "summary": [], "tail": ["Finished land successfully"],
+            "capturedLines": 1, "truncated": false, "attempts": 1,
+        },
+    });
+    ctx.store().test_arm_gate_log_insert_fault_sticky();
+    ctx.hub
+        .test_apply_gate_result(&job_id, landed_result.clone())
+        .await
+        .unwrap();
+    ctx.hub
+        .test_apply_gate_result(&job_id, landed_result)
+        .await
+        .unwrap();
+    ctx.store().test_clear_gate_log_insert_fault();
+
+    // Age the Landing past the recovery window; with the carrier answering
+    // Unknown the reconciler ALSO marks it outcome-unknown. Both flags stand.
+    ctx.hub
+        .test_set_landing_at(&job_id, "2000-01-01T00:00:00Z")
+        .await
+        .unwrap();
+    node.set_resolve_reply(json!({ "jobId": job_id, "status": "unknown" }))
+        .await;
+    ctx.hub.test_force_landing_reconcile(&ctx.host).await;
+    let parked = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(parked["state"], json!("landing"), "{parked}");
+    assert_eq!(
+        parked["landingOutcomeUnknown"],
+        json!(true),
+        "recovery expiry set the unknown flag: {parked}"
+    );
+    assert!(
+        parked["evidenceUncertain"].is_object(),
+        "the evidence condition survived recovery expiry: {parked}"
+    );
+
+    let resolve_path = format!("/v1/projects/{}/gate/jobs/{job_id}/resolve", ctx.project);
+    let request = || {
+        json!({
+            "resolution": "failed",
+            "expectedAttempts": 1,
+            "expectedSessionEpoch": epoch,
+            "expectedMergeSha": merge,
+            "rationale": "operator tried the legacy route while the probe was undecidable",
+        })
+    };
+
+    // Occupancy is live while the carrier is connected: a verify pinned to
+    // lane1 must not dispatch while the row is parked.
+    let hook = node
+        .arm_gate_run(json!({ "jobId": "placeholder", "status": "failed" }))
+        .await;
+    let (status, enqueued) = ctx
+        .agent_post(
+            &format!("/v1/projects/{}/gate", ctx.project),
+            json!({"branch":"wt/gate/legacy-resolve-blocked","mode":"verify","laneId":"lane1"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{enqueued}");
+    let blocker = enqueued["id"].as_str().unwrap().to_owned();
+
+    // 1) Carrier live, probe authority Unknown -> 409 before probe/abort.
+    let (status, reply) = ctx
+        .send("POST", &resolve_path, &ctx.human, None, Some(request()))
+        .await;
+    assert_eq!(
+        status, 409,
+        "an evidence-uncertain Landing is refused on the legacy route: {reply}"
+    );
+    assert!(
+        reply["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("resolve-evidence"),
+        "the conflict directs the operator to the evidence route: {reply}"
+    );
+    // No abort of the granted land is queued by the refused call.
+    let drain_deadline = std::time::Instant::now() + Duration::from_millis(400);
+    while std::time::Instant::now() < drain_deadline {
+        if let Ok((method, params)) =
+            tokio::time::timeout(Duration::from_millis(100), node.next_frame()).await
+        {
+            assert_ne!(
+                method, "gate.abortLanding",
+                "the legacy resolution aborted the parked land: {params}"
+            );
+        }
+    }
+    // The whole row is unchanged and the blocked verify still has not moved.
+    let after = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(
+        after, parked,
+        "the uncertain Landing row must be unchanged: {after}"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(900), hook.wait_arrived())
+            .await
+            .is_err(),
+        "the parked lane must not dispatch the verify job"
+    );
+    let blocked = ctx.hub.test_get_gate_job(&blocker).await.unwrap().unwrap();
+    assert_eq!(blocked["state"], json!("queued"), "{blocked}");
+
+    // 2) Carrier offline, no probe authority at all -> the same 409, no abort,
+    // row still byte-identical.
+    node.disconnect();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while ctx.hub.test_node_session(&ctx.host).await.is_some() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "host never went offline"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let (status, reply) = ctx
+        .send("POST", &resolve_path, &ctx.human, None, Some(request()))
+        .await;
+    assert_eq!(
+        status, 409,
+        "missing probe authority must still be refused on the legacy route: {reply}"
+    );
+    assert!(
+        reply["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("resolve-evidence"),
+        "{reply}"
+    );
+    let after_offline = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(
+        after_offline, parked,
+        "the uncertain Landing row must be unchanged while offline: {after_offline}"
+    );
+    assert_eq!(after_offline["hostId"], json!(ctx.host), "{after_offline}");
+    assert_eq!(after_offline["laneId"], json!("lane1"), "{after_offline}");
+}
+
 /// r24 item 1 audit: the periodic Landing reconciler is an authorized settler
 /// too. An evidence-uncertain Landing whose read-only probe ESTABLISHES the
 /// merge absent with the land process group verified dead is requeued (or

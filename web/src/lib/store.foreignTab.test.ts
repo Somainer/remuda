@@ -1,7 +1,7 @@
 import { afterEach, expect, it, vi } from "vitest";
 import type { ConnectionMachine } from "./connection";
 import { LIVE_FRAME_MS, REST_PROBE_MS } from "./connection";
-import { CLAIM_WAKE_MAX_FAILURES, OUTBOX_LS_KEY, type OutboxRecord } from "./outbox";
+import { CLAIM_WAKE_MAX_FAILURES, OUTBOX_LS_KEY, Outbox, type OutboxRecord } from "./outbox";
 
 const INSTANCE = "ins_foreign_tab";
 const JOURNAL = "obj_foreign_tab_journal";
@@ -5159,6 +5159,27 @@ it("GATE28 a: a claim that fails before commit stamps no issuer — the stale co
 
     // Logout disposes the outbox; reinit creates a new outbox (new lifetime).
     a.logout();
+
+    // Gate 50 item 1: the replacement box delivers through its INSTALL-time
+    // bounded flush (not only the manual one later), so the B claim fault is
+    // installed at the Outbox.patch boundary BEFORE the new box is created —
+    // whichever flush/box/storage claims C inflight aborts pre-commit. Box A
+    // already completed its own (storage-level) faults before this spy is set.
+    // The live Outbox class is imported dynamically: fresh() reset modules, so
+    // the store's post-reset Outbox differs from the test's top-level import.
+    const { Outbox: LiveOutbox } = await import("./outbox");
+    const realPatchB = LiveOutbox.prototype.patch;
+    let bClaimFaults = 0;
+    const bClaimSpy = vi.spyOn(LiveOutbox.prototype, "patch").mockImplementation(
+      async function (this: Outbox, id: string, patch: Partial<OutboxRecord>) {
+        if (id === cId && patch.state === "inflight") {
+          bClaimFaults += 1;
+          throw new Error("g28 a B claim pre-commit abort");
+        }
+        return realPatchB.call(this, id, patch);
+      },
+    );
+
     const reopened = await (a as unknown as { ensureOutboxForTest: () => Promise<boolean> }).ensureOutboxForTest();
     expect(reopened).toBe("ok");
     const boxB = () => (a as unknown as { outbox: { isDeliveryExhausted: (i: string) => boolean; pendingLeaseWakeups: () => string[] } | null }).outbox;
@@ -5172,20 +5193,10 @@ it("GATE28 a: a claim that fails before commit stamps no issuer — the stale co
     await vi.advanceTimersByTimeAsync(120_000);
     expect(boxB()!.isDeliveryExhausted(I)).toBe(true);
 
-    // Locks recover and ONE flush runs: C is first in FIFO but its real claim
-    // aborts BEFORE commit (fault re-armed on B's storage), so the flush stops
-    // and nothing POSTs. Gate 27's selection-time mark wrongly assigns C to B
+    // Locks recover and a flush runs: C is first in FIFO but its real claim
+    // aborts BEFORE commit (the prototype fault), so the flush stops and
+    // nothing POSTs. Gate 27's selection-time mark wrongly assigns C to B
     // here; gate 28 stamps nothing because no claim committed.
-    const bStorage = (a as unknown as { outbox: { storage: { mergeUnlessDone: (id: string, p: Partial<OutboxRecord>) => Promise<OutboxRecord | null> } } }).outbox.storage;
-    const realMergeB = bStorage.mergeUnlessDone.bind(bStorage);
-    let bClaimFaults = 0;
-    bStorage.mergeUnlessDone = vi.fn(async (id, patch) => {
-      if (id === cId && (patch as { state?: string }).state === "inflight") {
-        bClaimFaults += 1;
-        throw new Error("g28 a B claim pre-commit abort");
-      }
-      return await realMergeB(id, patch);
-    });
     locks = good;
     await (a as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
     await pump(2_000);
@@ -5193,6 +5204,7 @@ it("GATE28 a: a claim that fails before commit stamps no issuer — the stale co
     expect(sendA).not.toHaveBeenCalled();
     expect(g28Row(cId)?.issuerLifetime).toBeUndefined();
     expect(g28Row(pRowId)?.state).toBe("pending");
+    bClaimSpy.mockRestore();
 
     // The stale epoch-A subscription settles C accepted/done.
     onBatchA({
@@ -10201,5 +10213,142 @@ it("GATE49 item 6 (low): a one-shot subscriber that logs out during the cold moc
     vi.useRealTimers();
     Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
     sessionStorage.removeItem("remuda-outbox-owner-g49-6");
+  }
+});
+
+it("GATE50 item 1: active POST A + queued sibling + same-box flush B behind it — bounded bootstrap and a queued login both proceed within the bound", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_501_000);
+  const I = "ins_g50_1";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 5_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  let releasePostA: () => void = () => {};
+  let releaseSibling: () => void = () => {};
+  try {
+    sessionStorage.setItem("remuda-outbox-owner-g50-1", "owner");
+    localStorage.setItem("runtime.device-session", JSON.stringify({ deviceId: "devA_g50_1", name: "A" }));
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true } as never);
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] } as never);
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+    vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+    vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+    vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+    vi.spyOn(api, "instanceList").mockResolvedValue({
+      items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
+      nextCursor: null,
+    } as never);
+
+    // Seed TWO pending rows: the active delivery A posts the first and parks
+    // mid-POST; the second keeps an ORDINARY same-box flush B runnable —
+    // without it B's instance enumeration would be empty (the first row is
+    // inflight) and B would never append to the flushChain.
+    const seed = new (await import("./outbox")).LocalStorageOutboxStorage();
+    await seed.put({
+      commandId: "cmd_g50_1", clientRequestId: "local_g50_1", instanceId: I,
+      prompt: "g50 1", createdAt: 1, attempts: 0, state: "pending",
+    });
+    await seed.put({
+      commandId: "cmd_g50_2", clientRequestId: "local_g50_2", instanceId: I,
+      prompt: "g50 2", createdAt: 2, attempts: 0, state: "pending",
+    });
+    await hubStore.bootstrap();
+    await pump(8_000);
+
+    // Delivery A: the active POST parks holding the instance lock.
+    const postAHeld = new Promise<void>((resolve) => { releasePostA = resolve; });
+    vi.spyOn(api, "instanceSend")
+      .mockImplementationOnce((async () => {
+        await postAHeld;
+        return { relatedCommandIds: [], command: { commandId: "cmd_g50_1", id: "cmd_g50_1", state: "accepted", revision: "1", dispatch: "native-acknowledged", resolution: "clear" } };
+      }) as unknown as Api["instanceSend"])
+      .mockImplementation((async (_iid?: string, _prompt?: string, _att?: unknown, _mode?: unknown, commandId?: string) => ({
+        relatedCommandIds: [],
+        command: { commandId: commandId ?? "cmd_g50_2", id: commandId ?? "cmd_g50_2", state: "accepted", revision: "1", dispatch: "native-acknowledged", resolution: "clear" },
+      })) as unknown as Api["instanceSend"]);
+    void (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+    await pump(2_000);
+    expect(vi.mocked(api.instanceSend)).toHaveBeenCalledTimes(1); // A is mid-POST
+
+    // A SIBLING tab queues an ordinary blocking Web-Lock request behind A.
+    const siblingQueued = new Promise<void>((resolve) => { releaseSibling = resolve; });
+    globalThis.navigator.locks.request(
+      `remuda-outbox-${I}`,
+      { mode: "exclusive" },
+      () => siblingQueued,
+    );
+    await pump(200);
+
+    // A same-box ORDINARY flush/steer B appends behind A on the flushChain
+    // (it will later sit in the Web-Lock FIFO behind the sibling).
+    void (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+    await pump(2_000);
+
+    // One-hop settlement probe: gate 50 bounded turns must not park on the
+    // unstarted B chain node — after pumping, the promise must already be
+    // settled (no fake-timer or wall-clock wait involved).
+    const probe = <T>(p: Promise<T>) =>
+      Promise.race([
+        p.then(
+          () => "settled" as const,
+          () => "settled" as const,
+        ),
+        Promise.resolve().then(() => "pending" as const),
+      ]);
+
+    // BOUNDED bootstrap (same identity): its drain finds A actively holding and
+    // a queued same-box B behind it, skips without queueing, and settles while
+    // A is still mid-POST and the sibling suspended.
+    const bootP = hubStore.bootstrap();
+    await pump(5_000);
+    expect(await probe(bootP)).toBe("settled");
+    await bootP;
+
+    // A login QUEUED BEHIND bootstrap: its bounded turn likewise proceeds
+    // within the bound while A is held and the sibling is suspended.
+    let bodyStarted = false;
+    vi.spyOn(api, "login").mockImplementation((() => {
+      bodyStarted = true;
+      return Promise.resolve({ deviceId: "devA_g50_1", token: "tokA", name: "A" });
+    }) as unknown as Api["login"]);
+    const loginP = hubStore.login("bootstrap", "secret", "devA_g50_1");
+    await pump(5_000);
+    expect(await probe(loginP)).toBe("settled");
+    await loginP;
+    expect(bodyStarted).toBe(true);
+
+    // Only the one active POST (A) went out — the bounded turns never queued
+    // another delivery past the held lock/suspended sibling.
+    expect(vi.mocked(api.instanceSend)).toHaveBeenCalledTimes(1);
+
+    // Release A, then the suspended sibling. The queued same-box turn B was
+    // captured on the PRE-auth-replacement box: a login identity replacement
+    // disposes that box, so B's granted callback reads an empty snapshot by
+    // design (exactly-once across the replacement). The surviving row belongs
+    // to the LIVE box, whose reconciliation owns the next attempt — one final
+    // ordinary flush delivers it with no double POST.
+    releasePostA();
+    await pump(2_000);
+    releaseSibling();
+    await pump(4_000);
+    await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+    await pump(4_000);
+    expect(vi.mocked(api.instanceSend)).toHaveBeenCalledTimes(2);
+    const finalRows = await seed.all();
+    expect(finalRows.every((r) => r.state === "sent" || r.state === "done")).toBe(true);
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner-g50-1");
   }
 });

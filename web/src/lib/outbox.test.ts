@@ -2404,3 +2404,174 @@ it("GATE32 item 1: a pending retry whose captured lifetime no longer equals the 
   }
 });
 
+
+/**
+ * Gate 50 item 1: minimal FIFO Web Locks shim — exclusive, FIFO queuing, and
+ * the real ifAvailable semantics (busy lock or nonempty queue → callback with
+ * null, never queued).
+ */
+function gate50FifoLocks() {
+  const heldNow = new Set<string>();
+  const queues = new Map<string, Array<() => void>>();
+  const pop = (name: string) => queues.get(name)?.shift()?.();
+  const locks = {
+    query: async () => ({ held: [...heldNow].map((name) => ({ name, mode: "exclusive" as const })) }),
+    request(
+      name: string,
+      options: { ifAvailable?: boolean } | unknown,
+      cb: (lock: { name: string } | null) => Promise<unknown>,
+    ): Promise<unknown> {
+      return new Promise((resolve, reject) => {
+        if (
+          (options as { ifAvailable?: boolean })?.ifAvailable &&
+          (heldNow.has(name) || (queues.get(name)?.length ?? 0) > 0)
+        ) {
+          Promise.resolve()
+            .then(() => cb(null))
+            .then(resolve, reject);
+          return;
+        }
+        const run = () => {
+          heldNow.add(name);
+          Promise.resolve()
+            .then(() => cb({ name }))
+            .then(
+              (v) => {
+                heldNow.delete(name);
+                resolve(v);
+                pop(name);
+              },
+              (e) => {
+                heldNow.delete(name);
+                reject(e);
+                pop(name);
+              },
+            );
+        };
+        if (heldNow.has(name) || (queues.get(name)?.length ?? 0) > 0) {
+          const q = queues.get(name) ?? [];
+          q.push(run);
+          queues.set(name, q);
+        } else {
+          run();
+        }
+      });
+    },
+  };
+  return { locks };
+}
+
+const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+const pump = async (n = 8) => {
+  for (let i = 0; i < n; i += 1) await tick();
+};
+
+describe("GATE50 item 1: bounded auth drain never waits on an unstarted queued chain task", () => {
+  const originalLocks = (globalThis.navigator as { locks?: LockManager }).locks;
+  const install = (locks: unknown) => {
+    Object.defineProperty(globalThis.navigator, "locks", {
+      configurable: true,
+      writable: true,
+      value: locks,
+    });
+  };
+  const restore = () => {
+    Object.defineProperty(globalThis.navigator, "locks", {
+      configurable: true,
+      writable: true,
+      value: originalLocks,
+    });
+  };
+
+  it("delivery A active mid-POST; sibling queued; same-box ordinary B appended — the bounded drain settles within the bound while A is still held", async () => {
+    // Exact review defect (outbox.ts:2140): gate 49 marks A in an active-holder
+    // set and then lets a bounded caller await the ENTIRE flushChain tail —
+    // which is B, an UNSTARTED ordinary request parked behind the queued
+    // sibling. The bounded drain (and any login queued behind the bootstrap)
+    // must not block on B: with A still mid-POST the drain settles at once with
+    // "lock-unavailable"; B runs only after the FIFO queue drains.
+    const shim = gate50FifoLocks();
+    install(shim.locks);
+    try {
+      const storage = new MemStorage();
+      const box = await Outbox.load(storage, "owner_g50_i1");
+      const instanceId = "ins_g50_i1";
+      const name = instanceDeliveryLockName(instanceId);
+
+      // (A) same-box delivery acquires and stays mid-POST.
+      let releaseA!: () => void;
+      const aHeld = new Promise<void>((resolve) => {
+        releaseA = resolve;
+      });
+      let aEntered = false;
+      const aP = box.withInstanceLock(instanceId, async () => {
+        aEntered = true;
+        await aHeld;
+        return "A" as const;
+      });
+      await pump();
+      expect(aEntered).toBe(true);
+
+      // A sibling TAB queues an ordinary request behind A.
+      let siblingEntered = false;
+      const siblingP = (
+        globalThis.navigator.locks as unknown as {
+          request: (
+            n: string,
+            o: unknown,
+            cb: () => Promise<unknown>,
+          ) => Promise<unknown>;
+        }
+      ).request(name, {}, async () => {
+        siblingEntered = true;
+      });
+      await pump();
+      expect(siblingEntered).toBe(false);
+
+      // (B) a same-box ordinary flush/steer appends behind A on flushChain.
+      let bEntered = false;
+      const bP = box.withInstanceLock(instanceId, async () => {
+        bEntered = true;
+        return "B" as const;
+      });
+      await pump();
+      expect(bEntered).toBe(false);
+
+      // Bounded auth drain: it has a short bound. On gate 49 it awaits B's
+      // unstarted chain node and blows the bound; fixed code only probes the
+      // captured ACTIVE callback for one hop, finds A still mid-POST, and
+      // settles "lock-unavailable" immediately.
+      let drainEntered = false;
+      const drainP = box.withInstanceLock(
+        instanceId,
+        async () => {
+          drainEntered = true;
+          return "drained" as const;
+        },
+        { ifAvailable: true },
+      );
+      const bound = new Promise<string>((resolve) =>
+        setTimeout(() => resolve("bound-exceeded"), 100),
+      );
+      const outcome = await Promise.race([drainP, bound]);
+      expect(outcome).toBe("lock-unavailable");
+      expect(drainEntered).toBe(false);
+      expect(bEntered).toBe(false);
+      expect(siblingEntered).toBe(false);
+
+      // After A finishes the queued ordinary work proceeds in FIFO order.
+      releaseA();
+      await expect(aP).resolves.toBe("A");
+      await siblingP;
+      expect(siblingEntered).toBe(true);
+      await expect(bP).resolves.toBe("B");
+      expect(bEntered).toBe(true);
+      // Drain callback never ran while A was held; settle the captured promise
+      // before teardown regardless of implementation.
+      const drained = await drainP;
+      expect(drained === "lock-unavailable" || drainEntered).toBe(true);
+    } finally {
+      restore();
+    }
+  });
+});

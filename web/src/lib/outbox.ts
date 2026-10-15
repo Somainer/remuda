@@ -1732,17 +1732,13 @@ export class Outbox {
   private async runUnderInstanceLock<T>(instanceId: Id, fn: () => Promise<T>): Promise<T> {
     const locks = (globalThis as { navigator?: Navigator & { locks?: LockManager } }).navigator?.locks;
     if (locks?.request) {
-      // Gate 49 item 3: load-time reclamation / lease-wake reads mark the
-      // active-run set too, so a bounded initializer drain that finds the lock
-      // held by THIS in-flight reclaim awaits it and retries instead of
-      // treating it as an unboundable holder.
+      // Gate 50 item 1: track the active callback INSIDE the granted lock
+      // (never before locks.request), so a bounded drain cannot mistake a
+      // still-queued task for an actively-holding one.
       const name = instanceDeliveryLockName(instanceId);
-      this.runningSelfLocks.add(name);
-      try {
-        return await locks.request(name, { mode: "exclusive" }, fn);
-      } finally {
-        this.runningSelfLocks.delete(name);
-      }
+      return await locks.request(name, { mode: "exclusive" }, async () =>
+        this.runActiveCallback(name, Promise.resolve().then(fn)),
+      );
     }
     return await fn();
   }
@@ -2128,19 +2124,30 @@ export class Outbox {
     opts: { ifAvailable?: boolean } = {},
   ): Promise<T | null | "lock-unavailable"> {
     if (opts.ifAvailable) {
-      // Gate 49 item 2: bounded acquisition.
-      //  - No chain yet: register a chain node and acquire with ifAvailable
-      //    (keeps later callers serialized; the node itself never queues an
-      //    ordinary lock request).
-      //  - A chain whose run is ACTIVELY HOLDING the lock: await its
-      //    REST-bounded completion, then retry ifAvailable once.
-      //  - A chain that is merely queued in the Web-Lock FIFO (it may be
-      //    parked behind a suspended sibling): return "lock-unavailable".
+      // Gate 50 item 1: if an actively-holding same-context callback exists
+      // (the EXACT captured promise — a same-box delivery in progress), give it
+      // a single bounded microtask to finish, then try ifAvailable. NEVER await
+      // the flushChain tail (it may hold an UNSTARTED ordinary request queued
+      // behind a suspended sibling), and never block on the active POST past
+      // one hop: an in-flight delivery already owns the instance's rows, so a
+      // mid-POST holder yields "lock-unavailable" and the auth turn proceeds
+      // (remaining delivery is owned by the active task / queued same-box
+      // flush / normal recovery). No active callback → ifAvailable directly.
       const name = instanceDeliveryLockName(instanceId);
-      if (this.flushChain.has(instanceId) && !this.runningSelfLocks.has(name)) {
-        return "lock-unavailable";
+      const active = this.activeLockCallbacks.get(name);
+      if (active) {
+        // One-hop bounded predecessor wait: resolves "active" if the captured
+        // callback is already/immediately done, otherwise "deferred".
+        const raced = await Promise.race([
+          Promise.resolve(active).then(
+            () => "active" as const,
+            () => "active" as const,
+          ),
+          Promise.resolve().then(() => "deferred" as const),
+        ]);
+        if (raced === "active") await Promise.resolve();
       }
-      return await this.runAfterChain(instanceId, fn, opts);
+      return await this.acquireLock(instanceId, fn, opts);
     }
     if (this.queuedFlush.has(instanceId)) return (await this.queuedFlush.get(instanceId)!) as T | null;
     if (this.flushChain.has(instanceId)) {
@@ -2163,19 +2170,17 @@ export class Outbox {
   private runAfterChain<T>(
     instanceId: Id,
     fn: (instanceId: Id, deliverable: OutboxRecord[]) => Promise<T>,
-    opts: { ifAvailable?: boolean } = {},
-  ): Promise<T | null | "lock-unavailable"> {
-    // Every caller (bounded or unbounded) registers a chain node so later
-    // callers observe its completion; a bounded node acquires via ifAvailable
-    // only and never queues an ordinary Web-Lock request (gate 49 item 2).
+  ): Promise<T | null> {
+    // Unbounded callers serialize on the chain; bounded callers bypass this
+    // (gate 50 item 1 — they await only the captured active callback).
     const prev = this.flushChain.get(instanceId) ?? Promise.resolve();
     // A rejected predecessor must not poison the chain (its entry is cleared by
     // `clear`), but a rejected run must NEVER silently re-invoke fn: the
     // deliverer may already have POSTed once, and exactly-once is the property
     // this lock exists for. Callers retry from the outside under the same id.
     const run = prev.then(
-      () => this.acquireLock(instanceId, fn, opts),
-      () => this.acquireLock(instanceId, fn, opts),
+      () => this.acquireLock(instanceId, fn) as Promise<T | null>,
+      () => this.acquireLock(instanceId, fn) as Promise<T | null>,
     );
     const clear = () => {
       if (this.flushChain.get(instanceId) === run) this.flushChain.delete(instanceId);
@@ -2186,20 +2191,26 @@ export class Outbox {
   }
 
   /**
-   * Max time a BOUNDED acquisition waits for a busy lock before giving up
-  /**
-   * DOCUMENT-LEVEL registry of lock deliveries CURRENTLY HOLDING the lock
-   * (their Web-Lock callback is actively running), keyed by lock name (gate
-   * 49 item 2). Unlike flushChain (which can be parked in the FIFO queue
-   * behind a suspended sibling), an entry here is by definition already
-   * RUNNING and therefore bounded by the REST timeouts. The registry is owned
-   * by HubStore and survives an Outbox identity replacement, so a fresh
-   * Outbox's bounded drain can await an OLD box's in-flight POST. A bounded
-   * caller awaits ONLY this running task (then retries ifAvailable) — never a
-   * merely-queued FIFO waiter and never an ordinary lock request.
+   * The EXACT promise of a lock callback CURRENTLY HOLDING the lock for each
+   * name (gate 50 item 1). It is set INSIDE the granted Web-Lock callback
+   * once the work starts and cleared in finally — never while merely queued.
+   * Unlike `flushChain` (whose tail can be an UNSTARTED ordinary request
+   * parked behind a suspended sibling), awaiting this guarantees the holder
+   * is an active, REST-bounded task. A bounded caller awaits ONLY this
+   * captured promise and then retries ifAvailable; it never awaits queued
+   * chain work and never submits an ordinary request.
    */
+  private readonly activeLockCallbacks = new Map<string, Promise<unknown>>();
 
-  private readonly runningSelfLocks = new Set<string>();
+  /** Register the actively-running callback promise for `name`. */
+  private runActiveCallback<T>(name: string, task: Promise<T>): Promise<T> {
+    this.activeLockCallbacks.set(name, task);
+    return task.finally(() => {
+      if (this.activeLockCallbacks.get(name) === task) {
+        this.activeLockCallbacks.delete(name);
+      }
+    });
+  }
 
   private async acquireLock<T>(
     instanceId: Id,
@@ -2210,14 +2221,8 @@ export class Outbox {
     const locks = g.navigator?.locks;
     if (locks?.request) {
       const name = instanceDeliveryLockName(instanceId);
-      const run = async (): Promise<T> => {
-        this.runningSelfLocks.add(name);
-        try {
-          return await this.runDeliverer(instanceId, fn);
-        } finally {
-          this.runningSelfLocks.delete(name);
-        }
-      };
+      const run = async (): Promise<T> =>
+        this.runActiveCallback(name, this.runDeliverer(instanceId, fn));
       if (opts.ifAvailable) {
         // Gate 49 item 2: pure ifAvailable (chain/active-run awaiting is the
         // caller's job in withInstanceLock). Busy → "lock-unavailable", never

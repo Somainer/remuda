@@ -508,10 +508,10 @@ mod tests {
         // priced one, emitting a cumulative Session cost that could shrink and
         // stall the Hub freeze check. Unknown is sticky; tokens keep summing.
         let mut totals = UsageTotals::default();
-        let tokens = |n| TokenCounters {
-            uncached_input: Some(n),
-            ..TokenCounters::default()
-        };
+        // c-ctxusage U1: every billing bucket must be structurally present for
+        // a call to be priceable (an omitted bucket is Unknown, not zero), so
+        // the unused output/cache tiers are explicit zeros.
+        let tokens = |n| TokenCounters::known(n, 0, 0, 0, 0);
         totals.add(&event(
             UsageSource::ClaudeTranscript,
             Some("t1"),

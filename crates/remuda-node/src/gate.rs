@@ -496,6 +496,13 @@ fn first_line(text: &str) -> String {
         .to_owned()
 }
 
+/// Clip a field and report whether it lost bytes, so callers can fold the
+/// clipping into their truncation marker (r24 item 6).
+fn clip_field_track(text: String, max_bytes: usize) -> (String, bool) {
+    let clipped = text.len() > max_bytes;
+    (clip_field(text, max_bytes), clipped)
+}
+
 /// Build the bounded failure log for a failed step from a captured trace.
 fn build_failure_log(
     trace: &RunTrace,
@@ -504,7 +511,7 @@ fn build_failure_log(
     step_error: Option<&str>,
     extra: Option<&str>,
 ) -> GateRunLog {
-    let (tail, source_lines, truncated) = match trace.by_step.get(step) {
+    let (tail, source_lines, mut truncated) = match trace.by_step.get(step) {
         Some(ring) => {
             let (tail, dropped) = ring.last(TAIL_LINES, TAIL_CAP_BYTES);
             let seen = ring.seen_lines;
@@ -512,8 +519,7 @@ fn build_failure_log(
         }
         None => {
             let (tail, dropped) = trace.global.last(TAIL_LINES, TAIL_CAP_BYTES);
-            let seen = trace.global.seen_lines;
-            (tail, seen, dropped)
+            (tail, trace.global.seen_lines, dropped)
         }
     };
     let detail = extra
@@ -527,19 +533,35 @@ fn build_failure_log(
     // r23 item 2: bound every variable-length field at the source — the step
     // name (a gate.jsonl/GateStep name may exceed the marker cap), the
     // headline (built from a free-form error) and every summary line.
+    // r24 item 6: clipping any field IS truncation — OR it into the ring's
+    // own drop marker in BOTH builders, or the Hub's under-cap fast path
+    // stores a log that lost bytes while explicitly claiming it did not.
+    let mut clip_any = |clipped: bool| truncated |= clipped;
     let summary = extract_summary(step, &tail)
         .into_iter()
-        .map(|line| clip_field(line, MAX_STEP_FIELD_BYTES))
+        .map(|line| {
+            let (line, clipped) = clip_field_track(line, MAX_STEP_FIELD_BYTES);
+            clip_any(clipped);
+            line
+        })
         .collect();
     let tail = tail
         .into_iter()
-        .map(|line| clip_field(line, MAX_STEP_FIELD_BYTES))
+        .map(|line| {
+            let (line, clipped) = clip_field_track(line, MAX_STEP_FIELD_BYTES);
+            clip_any(clipped);
+            line
+        })
         .collect();
+    let (step_name, clipped) = clip_field_track(step.to_owned(), MAX_STEP_NAME_BYTES);
+    clip_any(clipped);
+    let (headline, clipped) = clip_field_track(headline, MAX_HEADLINE_BYTES);
+    clip_any(clipped);
     GateRunLog {
-        step: clip_field(step.to_owned(), MAX_STEP_NAME_BYTES),
+        step: step_name,
         kind: "failed".into(),
         attempts,
-        headline: clip_field(headline, MAX_HEADLINE_BYTES),
+        headline,
         summary,
         tail,
         captured_lines: source_lines,
@@ -549,16 +571,22 @@ fn build_failure_log(
 
 /// Build the whole-run `kept` log (`--keep-logs`) after a green run.
 fn build_kept_log(trace: &RunTrace, headline: &str) -> GateRunLog {
-    let (tail, truncated) = trace.global.last(TAIL_LINES, TAIL_CAP_BYTES);
+    let (tail, mut truncated) = trace.global.last(TAIL_LINES, TAIL_CAP_BYTES);
     let tail = tail
         .into_iter()
-        .map(|line| clip_field(line, MAX_STEP_FIELD_BYTES))
+        .map(|line| {
+            let (line, clipped) = clip_field_track(line, MAX_STEP_FIELD_BYTES);
+            truncated |= clipped;
+            line
+        })
         .collect();
+    let (headline, clipped) = clip_field_track(headline.to_owned(), MAX_HEADLINE_BYTES);
+    truncated |= clipped;
     GateRunLog {
         step: "*".into(),
         kind: "kept".into(),
         attempts: 0,
-        headline: clip_field(headline.to_owned(), MAX_HEADLINE_BYTES),
+        headline,
         summary: Vec::new(),
         tail,
         captured_lines: trace.global.seen_lines,
@@ -7697,6 +7725,53 @@ JSON
         let clipped = super::clip_field("€".repeat(20), 7);
         assert!(clipped.len() <= 7, "{clipped:?}");
         assert!(std::str::from_utf8(clipped.as_bytes()).is_ok());
+    }
+
+    /// r24 item 6: clipping a captured line to the field byte cap IS
+    /// truncation. One stderr line of 2,000 '€' (6,000 bytes) fits the
+    /// character-count and ring budgets, so the ring's own drop marker stays
+    /// false; the field clipper removes bytes and BOTH the failure and kept
+    /// log builders must surface that in `GateRunLog.truncated`.
+    #[test]
+    fn byte_clipping_a_captured_multibyte_line_marks_the_log_truncated() {
+        let euro_line = "€".repeat(2_000);
+        assert_eq!(euro_line.chars().count(), 2_000);
+        assert_eq!(euro_line.len(), 6_000);
+        let mut trace = super::RunTrace::new();
+        trace.push("gate: cargo-test".to_owned());
+        trace.push(euro_line.clone());
+
+        let failure = super::build_failure_log(&trace, "cargo-test", 1, None, None);
+        assert!(
+            failure.truncated,
+            "the failure log lost bytes to field clipping but claims untruncated"
+        );
+        assert!(
+            failure
+                .tail
+                .iter()
+                .all(|line| line.len() <= super::MAX_STEP_FIELD_BYTES),
+            "every tail line stays within the field cap"
+        );
+        assert!(
+            failure.tail.iter().any(|line| line.ends_with('…')),
+            "the clipped line carries the cut marker: {:?}",
+            failure.tail
+        );
+
+        let kept = super::build_kept_log(&trace, "passed; log retained by --keep-logs");
+        assert!(
+            kept.truncated,
+            "the kept log lost bytes to field clipping but claims untruncated"
+        );
+        assert!(kept.tail.iter().any(|line| line.ends_with('…')));
+
+        // An in-cap line leaves the marker false.
+        let mut clean = super::RunTrace::new();
+        clean.push("gate: cargo-test".to_owned());
+        clean.push("all good".to_owned());
+        let clean_log = super::build_failure_log(&clean, "cargo-test", 1, None, None);
+        assert!(!clean_log.truncated, "{clean_log:?}");
     }
 
     /// r23 item 4: a valid multi-byte character split ACROSS reads must not be

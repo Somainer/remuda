@@ -3457,9 +3457,58 @@ class HubStore {
     return this.outboxDegraded;
   }
 
+  /**
+   * Reachability proof for an UNBOUND connection — the session list /
+   * new-session page, where no follow socket exists and therefore no frame can
+   * certify the link (c-unboundresume). Exactly ONE bounded authenticated GET,
+   * `api.instanceList()`: `rest()` arms its own read deadline, so a stalled
+   * half-open forward rejects with a RestNetworkError instead of parking
+   * forever. The read runs as a bootstrap-kind S3 auth op — serialized one
+   * auth operation at a time, never parallel to a credential turn (it queues
+   * behind a parked login and then sends the FRESH session; no parallel auth
+   * path).
+   *
+   * Resolves only when the Hub actually answered. A network failure/timeout
+   * rejects, so the resume action rejects too and the machine's resume-failure
+   * settlement (its own probe) takes the link loud-offline into the reconnect
+   * backoff — live is never published from a swallowed error. A CURRENT-epoch
+   * 401 is an explicit identity retirement through the SAME path as a
+   * bootstrap 401 (gate 48 item 1); the retirement cancels this queued op,
+   * which likewise must never certify.
+   */
+  private async proveHubReachable(): Promise<void> {
+    const ext = this.extEpoch;
+    const outcome = await this.enqueueAuthOp(async () => {
+      try {
+        await api.instanceList();
+      } catch (err) {
+        if (this.extEpoch === ext && isUnauthorized(err)) {
+          this.externalIdentityRetire();
+          clearSession();
+          dropDeviceCookie();
+        }
+        throw err;
+      }
+    }, "bootstrap");
+    if (outcome.retired) throw new Error("auth op retired before the unbound reachability probe");
+  }
+
   private async connectionProbe(): Promise<boolean> {
     const journalId = this.connectionBoundJournal;
-    if (!journalId) return true;
+    if (!journalId) {
+      // c-unboundresume: the unbound probe must prove reachability with the
+      // same single bounded auth-queued GET the unbound resume uses, not
+      // return true for free. A free "true" here let a rejected unbound
+      // resume's failure settlement (settleResumeFailureViaProbe) certify a
+      // Hub that was unreachable, stranding the list page in quiet stale with
+      // the reconnect backoff disarmed.
+      try {
+        await this.proveHubReachable();
+        return true;
+      } catch {
+        return false;
+      }
+    }
     try {
       await api.eventsRead({ journalId, limit: 1 });
       return true;
@@ -3469,10 +3518,13 @@ class HubStore {
   }
 
   /**
-   * The machine's resume action. It certifies live ONLY when the follow socket
-   * reopened AND the bounded journal catch-up succeeded — REST reachability
-   * alone is not enough (a dead follow stream with working HTTP otherwise
-   * leaves the transcript frozen under a false live).
+   * The machine's resume action. With a bound follow it certifies live ONLY
+   * when the follow socket reopened AND the bounded journal catch-up
+   * succeeded — REST reachability alone is not enough (a dead follow stream
+   * with working HTTP otherwise leaves the transcript frozen under a false
+   * live). With NO bound follow, {@link proveHubReachable} is the certifier:
+   * one bounded auth-queued GET must actually answer before live; its
+   * rejection falls through the same failure/backoff path (c-unboundresume).
    *
    * Neither outbox delivery nor the post-delivery screen refresh gates the
    * reopen: deliverOneRow's journal resync rides the fast journal chain the
@@ -3505,6 +3557,12 @@ class HubStore {
         // never carries the Node-bound screen read, so this cannot stall behind
         // a saturated Node.
         await this.reopenFollow(this.connectionBoundTo);
+      } else {
+        // c-unboundresume: no follow can frame-certify here, so the resume may
+        // resolve ONLY after the one bounded auth-queued GET answered. A
+        // network error/read-deadline rejects the resume into the machine's
+        // probe settlement (offline + reconnect backoff); a 401 retires.
+        await this.proveHubReachable();
       }
     } catch (err) {
       // gate 6 item 2: the bound follow just failed while it owned a drained
@@ -3517,15 +3575,21 @@ class HubStore {
       }
       throw err;
     }
-    // c-reconnfu gate 7: the trailing REST bootstrap must NOT decide the
-    // resume outcome. Under gate load the follow socket can be open and
-    // streaming while the /v1/instances list read is slow/fails; rejecting
-    // (or succeeding) here only certifies/denies the LINK via the machine —
-    // a failed list read is not a dead follow (the socket's frame watchdog
-    // and close own that), and a successful read does not certify live.
-    // Treating it as either flapped the machine offline↔recovering on every
-    // resume while the restored page's follow was otherwise healthy.
-    void Promise.all([this.refresh().catch(() => undefined), this.refreshHosts().catch(() => undefined)]);
+    if (this.connectionBoundTo) {
+      // c-reconnfu gate 7: the trailing REST bootstrap must NOT decide the
+      // resume outcome. Under gate load the follow socket can be open and
+      // streaming while the /v1/instances list read is slow/fails; rejecting
+      // (or succeeding) here only certifies/denies the LINK via the machine —
+      // a failed list read is not a dead follow (the socket's frame watchdog
+      // and close own that), and a successful read does not certify live.
+      // Treating it as either flapped the machine offline↔recovering on every
+      // resume while the restored page's follow was otherwise healthy.
+      // Bound-follow only: the unbound resume's single GET above IS the
+      // reachability proof, and the 2 s poll owns list-page hydration — a
+      // second read would be a parallel unproven refresh whose error the old
+      // code swallowed into false live (c-unboundresume).
+      void Promise.all([this.refresh().catch(() => undefined), this.refreshHosts().catch(() => undefined)]);
+    }
   }
 
   /**

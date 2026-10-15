@@ -1,5 +1,4 @@
 import { afterEach, expect, it, vi } from "vitest";
-import { HubHttpError } from "./httpError";
 import { RestNetworkError } from "./api";
 import { OUTBOX_LS_KEY } from "./outbox";
 
@@ -138,8 +137,9 @@ it("unbound resume publishes live only after exactly one successful bounded prob
 
   hubStore.resumeActive(null);
   await vi.waitFor(() => expect(hubStore.getSnapshot().connection).toBe("recovering"));
-  // The probe is in flight (exactly one) and may not certify live unanswered.
-  expect(list).toHaveBeenCalledTimes(1);
+  // The single probe acquires the S3 auth queue (a couple of microtask hops),
+  // then is in flight exactly once and may not certify live unanswered.
+  await vi.waitFor(() => expect(list).toHaveBeenCalledTimes(1));
   await new Promise((resolve) => setTimeout(resolve, 50));
   expect(hubStore.getSnapshot().connection).toBe("recovering");
 
@@ -153,6 +153,9 @@ it("unbound resume publishes live only after exactly one successful bounded prob
 
 it("unbound resume probe answering 401 takes the logout/retirement path, never live", async () => {
   const { hubStore, list } = await bootUnbound();
+  // Imported AFTER resetModules so it is the SAME class realm the re-imported
+  // store checks with instanceof inside isUnauthorized.
+  const { HubHttpError } = await import("./httpError");
   const states: string[] = [];
   hubStore.subscribe(() => states.push(hubStore.getSnapshot().connection));
 

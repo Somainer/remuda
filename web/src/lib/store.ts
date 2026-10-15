@@ -57,6 +57,11 @@ type DeliveryToken = {
   authGen: number;
   transitionSeq: number;
 };
+/**
+ * Public result of {@link HubStore.bootstrap} (gate 49 item 1). See the
+ * bootstrap() doc comment for the meaning of each value.
+ */
+export type BootstrapOutcome = "ready" | "retired" | "unavailable";
 import { mapWorkspace, mergeHostWorkspaces } from "../features/workspaces/registry";
 import {
   api,
@@ -1186,7 +1191,7 @@ class HubStore {
    * later bootstrap for the still-current identity (manual retry, a 401-test
    * re-run) must execute a fresh pass, never join a stale resolved run.
    */
-  private bootstrapCallSlot: { ext: number; gen: number; promise: Promise<void> } | null = null;
+  private bootstrapCallSlot: { ext: number; gen: number; promise: Promise<BootstrapOutcome> } | null = null;
   private outbox: Outbox | null = null;
   private outboxUnsubscribe: (() => void) | null = null;
   private outboxDegraded = false;
@@ -4437,7 +4442,18 @@ class HubStore {
     this.emit({ bubbles: next });
   }
 
-  async bootstrap(): Promise<void> {
+  /**
+   * Discriminated PUBLIC bootstrap outcome (gate 49 item 1):
+   *  - "ready": the issuing identity settled (authed UI installed, or the
+   *    logged-out/no-device live state published);
+   *  - "unavailable": settled with a DEGRADED outbox (ruling U — machine
+   *    installed, sends fall back to the direct path);
+   *  - "retired": an external identity change (logout/peer/401) or a queued
+   *    cancellation retired the op BEFORE it settled — NOT success. Callers
+   *    that just trigger bootstrap (Root) treat this as a no-op; callers that
+   *    need to distinguish retirement await the value.
+   */
+  async bootstrap(): Promise<BootstrapOutcome> {
     this.registerPeerAuthWatch();
     const ext = this.extEpoch;
     const gen = this.authGen;
@@ -4447,12 +4463,12 @@ class HubStore {
     // same identity runs a fresh pass rather than joining a stale run.
     const existing = this.bootstrapCallSlot;
     if (existing && existing.ext === ext && existing.gen === gen) return existing.promise;
-    const slot: { ext: number; gen: number; promise: Promise<void> } = {
+    const slot: { ext: number; gen: number; promise: Promise<BootstrapOutcome> } = {
       ext,
       gen,
-      promise: undefined as unknown as Promise<void>,
+      promise: undefined as unknown as Promise<BootstrapOutcome>,
     };
-    slot.promise = (async () => {
+    slot.promise = (async (): Promise<BootstrapOutcome> => {
       const outcome = await this.enqueueAuthOp(
         // Gate 48 item 1: carry the ISSUING epoch. A predecessor ending in a
         // 401/logout has already retired this queued op via cancelAuthOps (the
@@ -4461,11 +4477,14 @@ class HubStore {
         () => this.runBootstrap(ext),
         "bootstrap",
       );
-      // The public wrapper never fulfils an installation after retirement:
-      // runBootstrap installs/publishes nothing after an epoch move, and this
-      // tail also covers an external change dispatched by a publication
-      // subscriber in the microtask gap before this continuation.
-      if (outcome.retired || outcome.value === "retired" || this.extEpoch !== ext) return;
+      // Gate 49 item 1: surface a DISTINGUISHABLE retired outcome instead of
+      // fulfilling undefined like a success. runBootstrap installs/publishes
+      // nothing after an epoch move, and this tail also covers an external
+      // change dispatched by a publication subscriber in the microtask gap
+      // before this continuation.
+      if (outcome.retired) return "retired";
+      if (this.extEpoch !== ext) return "retired";
+      return outcome.value;
     })();
     this.bootstrapCallSlot = slot;
     void slot.promise.finally(() => {
@@ -4474,7 +4493,7 @@ class HubStore {
     return slot.promise;
   }
 
-  private async runBootstrap(extAtBoot: number): Promise<"settled" | "retired"> {
+  private async runBootstrap(extAtBoot: number): Promise<Exclude<BootstrapOutcome, "retired"> | "retired"> {
     // S3: after EVERY await below only extEpoch is re-checked. A same-epoch
     // authGen supersession is impossible — a credential operation waits for
     // this op's queue gate and can neither acquire nor bump the generation
@@ -4489,7 +4508,7 @@ class HubStore {
     ++this.bootGen;
     if (api.mock && readLoggedOut() && !readSession()) {
       this.emit({ ready: true, authed: false, session: null, devices: [], passkeys: [], connection: "offline" });
-      return "settled";
+      return "ready";
     }
     if (api.mock && !readSession()) {
       const session = await api.login(MOCK_BOOTSTRAP_TOKEN, readDeviceSettings().deviceName);
@@ -4512,7 +4531,7 @@ class HubStore {
       if (!extLive()) return "retired";
       if (!api.mock && !api.hasDeviceSession()) {
         this.emit({ ready: true, authed: false, error: null, connection: "live" });
-        return "settled";
+        return "ready";
       }
       const [instances, hosts, interactions, devices, passkeys] = await Promise.all([
         api.instanceList(),
@@ -4587,9 +4606,10 @@ class HubStore {
       // under a sibling-held lock are left to the holder plus normal recovery
       // (claim wakes / the next flush); an in-flight POST this drain started
       // carries its existing claim recovery, so it is never stranded.
+      // Gate 49 item 1: distinguish a degraded install (no durable box).
       if (this.outbox) await this.flushAllOutbox(new Set(), false, true).catch(() => undefined);
       if (!extLive()) return "retired";
-      return "settled";
+      return install === "unavailable" ? "unavailable" : "ready";
     } catch (err) {
       // RETIREMENT FIRST. If an external change advanced the epoch while the
       // health/list request was parked — possibly AFTER a queued credential op
@@ -4624,7 +4644,7 @@ class HubStore {
         // authenticated session, start polling/recovery, and fulfil.
         this.publishCachedSessionSettled(err);
         this.startPoll();
-        return "settled";
+        return installOffline === "unavailable" ? "unavailable" : "ready";
       }
       this.emit({
         ready: true,
@@ -4633,7 +4653,7 @@ class HubStore {
         error: err instanceof Error ? err.message : "bootstrap failed",
         connection: "offline",
       });
-      return "settled";
+      return "ready";
     }
   }
 

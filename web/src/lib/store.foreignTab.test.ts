@@ -9642,7 +9642,7 @@ it("GATE48 item 3: a sibling-held instance lock cannot block the bootstrap auth 
     const boot = hubStore.bootstrap();
     await pump(8_000);
     // The bootstrap turn settles even though the sibling still holds the lock.
-    await expect(boot).resolves.toBeUndefined();
+    await expect(boot).resolves.toBe("ready");
     expect(send).not.toHaveBeenCalled(); // locked instance skipped, no POST
 
     // A login issued AFTER bootstrap acquires immediately and sends its
@@ -9834,5 +9834,84 @@ it("GATE48 item 7: a reused connection machine emits the LIVE outbox's pending c
     vi.useRealTimers();
     Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
     sessionStorage.removeItem("remuda-outbox-owner-g48-7");
+  }
+});
+
+it("GATE49 item 1: the public bootstrap promise resolves a DISTINGUISHABLE retired outcome (not undefined) on logout and on peer change while held", async () => {
+  for (const cause of ["logout", "peer"] as const) {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_497_000 + (cause === "peer" ? 1 : 0));
+    const I = `ins_g49_1_${cause}`;
+    const originalNavigator = globalThis.navigator;
+    Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+    localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+    const pump = async (n = 5_000) => {
+      for (let i = 0; i < n; i += 1) await Promise.resolve();
+    };
+    try {
+      sessionStorage.setItem(`remuda-outbox-owner-g49-1-${cause}`, "owner");
+      localStorage.setItem("runtime.device-session", JSON.stringify({ deviceId: `devA_g49_1_${cause}`, name: "A" }));
+      const { api, hubStore } = await fresh();
+      vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true } as never);
+      vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] } as never);
+      vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+      vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+      vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+      vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+      vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+      vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+      vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+      vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+      vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+      vi.spyOn(api, "instanceList").mockResolvedValue({
+        items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
+        nextCursor: null,
+      } as never);
+
+      // Hold bootstrap's health response.
+      let rejectHello: ((e: unknown) => void) | null = null;
+      let helloCalls = 0;
+      vi.spyOn(api, "hello").mockImplementation(
+        () =>
+          new Promise((_resolve, reject) => {
+            helloCalls += 1;
+            if (helloCalls === 1) rejectHello = reject;
+            else _resolve({} as Awaited<ReturnType<Api["hello"]>>);
+          }),
+      );
+
+      const h = hubStore as unknown as {
+        bootstrap: () => Promise<"ready" | "retired" | "unavailable">;
+        logout: () => void;
+        state: { authed: boolean; session: unknown };
+      };
+      const bootP = h.bootstrap();
+      for (let i = 0; i < 200 && !rejectHello; i += 1) await Promise.resolve();
+      expect(rejectHello).not.toBeNull();
+      let settled: "ready" | "retired" | "unavailable" | null = null;
+      void bootP.then((v) => { settled = v; });
+      await pump(100);
+      expect(settled).toBeNull(); // still running, not resolved like success
+
+      // Retire externally WHILE the health request is held.
+      if (cause === "logout") {
+        h.logout();
+      } else {
+        localStorage.removeItem("runtime.device-session");
+        window.dispatchEvent(new StorageEvent("storage", { key: "runtime.device-session", oldValue: "{}", newValue: null }));
+      }
+      await pump(2_000);
+
+      // The PUBLIC bootstrap promise resolves the distinct "retired" outcome —
+      // never undefined/success — even though the health request is still
+      // parked.
+      expect(settled).toBe("retired");
+      await expect(bootP).resolves.toBe("retired");
+      expect(h.state.authed).toBe(false);
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+      sessionStorage.removeItem(`remuda-outbox-owner-g49-1-${cause}`);
+    }
   }
 });

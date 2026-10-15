@@ -10,7 +10,7 @@ mod web_e2e;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use anyhow::{Context, Result, ensure};
 use clap::Args;
@@ -999,167 +999,102 @@ fn push_main_cas(repo: &Path, merged: &str, expected: &str) -> Result<()> {
     successful(&output)
 }
 
-/// Distinguishes process-wide recovery invocations so their private refs never
-/// collide even within the same nanosecond.
-static RECOVERY_REF_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// A unique, FLAT recovery ref name for THIS invocation (see the Node
-/// gateway's identical rule): no branch hierarchy, so concurrent recoveries
-/// never share a destination and a leftover ref cannot obstruct a base rename.
-fn unique_recovery_ref() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let counter = RECOVERY_REF_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    format!(
-        "refs/remuda/recovery/{}-{nanos}-{counter}",
-        std::process::id()
-    )
-}
-
 /// An object ID in the repository's native format: SHA-1 (40 hex) or SHA-256
-/// (64 hex). Git resolved and canonicalized the string; this bounds shapes.
+/// (64 hex). Git itself emitted the string from ls-remote; this bounds shapes.
 fn is_native_object_hex(sha: &str) -> bool {
     (sha.len() == 40 || sha.len() == 64) && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-/// Parse the epoch NANOS embedded in a private recovery ref name
-/// (`<pid>-<nanos>-<counter>`); returns None for any other shape.
-fn recovery_ref_epoch_nanos(name: &str) -> Option<u128> {
-    let rest = name.split_once('-')?.1;
-    let nanos = rest.split_once('-')?.0;
-    if nanos.is_empty() || !nanos.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    nanos.parse().ok()
-}
-
-/// Leftover recovery refs older than this are abandoned (crashed recovery, a
-/// cleanup killed at the deadline, or a fetch that failed after installing its
-/// ref) and safe to reclaim. Ten times the whole recovery deadline, so a ref a
-/// live recovery can still own is never touched.
-const RECOVERY_REF_RECLAIM_HORIZON: std::time::Duration = LAND_RECOVERY_DEADLINE.saturating_mul(10);
-
-/// Best-effort, owner-run, deadline-bounded deletion of ONE recovery ref. A
-/// missing ref or a failed command is intentionally ignored.
-fn delete_recovery_ref(repo: &Path, recovery_ref: &str, deadline: Instant) {
-    let _ = recovery_git(
-        repo,
-        &["update-ref", "-d", recovery_ref],
-        "post-push recovery ref cleanup",
-        false,
-        deadline,
-    );
-}
-
-/// Reclaim abandoned recovery refs from crashed or deadline-exhausted earlier
-/// recoveries. Every git command goes through the R6 owner under the caller's
-/// remaining deadline; failures are ignored (the next recovery retries).
-/// Younger refs and unrecognized names are never touched.
-fn reclaim_abandoned_recovery_refs(repo: &Path, deadline: Instant) {
-    let output = match recovery_git(
-        repo,
-        &[
-            "for-each-ref",
-            "--format=%(refname)",
-            "refs/remuda/recovery/",
-        ],
-        "post-push abandoned-ref reclamation",
-        true,
-        deadline,
-    ) {
-        Ok(output) => output,
-        Err(_) => return,
-    };
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    for refname in String::from_utf8_lossy(&output.stdout)
+/// Parse `git ls-remote --exit-code origin refs/heads/<base>` output. Exactly
+/// one line naming the requested ref with a native-format object ID; an
+/// absent base, ambiguous output or a malformed line is an error.
+fn parse_ls_remote_base(output: &[u8], base_branch: &str) -> std::result::Result<String, String> {
+    let expected_ref = format!("refs/heads/{base_branch}");
+    let mut matches = Vec::new();
+    for line in String::from_utf8_lossy(output)
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
     {
-        let Some(name) = refname.strip_prefix("refs/remuda/recovery/") else {
-            continue;
+        let mut parts = line.split_whitespace();
+        let (Some(sha), Some(refname)) = (parts.next(), parts.next()) else {
+            return Err("ls-remote returned a malformed line".to_owned());
         };
-        let Some(created_nanos) = recovery_ref_epoch_nanos(name) else {
-            continue;
-        };
-        if now.saturating_sub(created_nanos) < RECOVERY_REF_RECLAIM_HORIZON.as_nanos() {
-            continue;
+        if parts.next().is_some() {
+            return Err("ls-remote returned a malformed line".to_owned());
         }
-        delete_recovery_ref(repo, refname, deadline);
+        if refname == expected_ref {
+            matches.push(sha.to_owned());
+        }
+    }
+    match matches.as_slice() {
+        [sha] if is_native_object_hex(sha) => Ok(sha.clone()),
+        [] => Err("the remote does not advertise the requested base branch".to_owned()),
+        _ => Err("ls-remote advertised the requested base more than once".to_owned()),
     }
 }
 
-/// Fetch the requested remote base into a private recovery ref, capture the
-/// immutable commit SHA it points at, and delete the ref (best effort, under
-/// the same owner and absolute deadline). Any failure is PushUncertain —
-/// recovery never guesses. The captured SHA (not the ref) feeds every later
-/// ancestry check, so a concurrent recovery cannot swap the snapshot.
+/// Read the authoritative remote `main` tip WITHOUT WRITING ANY REFS and
+/// classify a failed push against it. Any failure is PushUncertain — recovery
+/// never guesses.
+///
+/// R10 (r30): ref-free recovery, identical in shape to the Node gateway:
+/// 1. `git ls-remote --exit-code origin refs/heads/main` reads the exact
+///    advertised tip (a configured remote.origin.fetch cannot stale it);
+/// 2. `git fetch --no-tags --no-write-fetch-head origin <sha>` fetches the
+///    commit's objects with no destination refspec — no ref is created and
+///    FETCH_HEAD is never written; --no-tags defeats a configured tagOpt
+///    clobber;
+/// 3. `git cat-file -e <sha>^{commit}` verifies the object.
+///
+/// Every command goes through the R6 owner under one absolute deadline.
 fn recovery_fetch_base_sha(repo: &Path, base: &str, deadline: Instant) -> Result<String> {
-    let recovery_ref = unique_recovery_ref();
-    let fetch_refspec = format!("+refs/heads/{base}:{recovery_ref}");
-    // Reclaim refs abandoned by crashed or deadline-exhausted earlier
-    // recoveries before doing anything else.
-    reclaim_abandoned_recovery_refs(repo, deadline);
-    let fetch_outcome = recovery_git(
+    // 1. Authoritative advertised tip. Exit 2 with no matching line means "not
+    // advertised" — let the parser produce that error; timeouts/spawn failures
+    // remain PushUncertain.
+    let remote_ref = format!("refs/heads/{base}");
+    let listing = recovery_git(
         repo,
-        &["fetch", "-q", "origin", &fetch_refspec],
-        "post-push recovery fetch",
-        true,
+        &["ls-remote", "--exit-code", "origin", &remote_ref],
+        "post-push remote base ls-remote",
+        false,
         deadline,
-    )
-    .map(|_| ());
-    // r29 item 1: a non-atomic fetch can install the private ref and still
-    // fail. Delete the ref before propagating the original error; on success
-    // the ref stays until the SHA is captured.
-    if let Err(error) = fetch_outcome {
-        delete_recovery_ref(repo, &recovery_ref, deadline);
-        return Err(error);
-    }
-    // r28 item 1 TEST-ONLY seam: park with the private ref installed and
-    // before the SHA is captured.
+    )?;
+    let remote_tip = parse_ls_remote_base(&listing.stdout, base)
+        .map_err(|message| MergeStop::PushUncertain(format!("{message}; push outcome unknown")))?;
+    // r30 item 1 TEST-ONLY seam: park after the remote SHA was read.
     #[cfg(test)]
-    recovery_capture_park(repo);
-    // `^{commit}` peels an annotated tag; a missing or unreadable fetched base
-    // is PushUncertain, never an "absent" classification.
-    let tip_result = recovery_git(
+    recovery_read_park(repo);
+    // 2. Fetch the objects of THAT commit with an object-ID refspec and no
+    // destination: no ref writes, --no-tags defeats tagOpt=--tags.
+    recovery_git(
         repo,
         &[
-            "rev-parse",
-            "--verify",
-            &format!("{recovery_ref}^{{commit}}"),
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "origin",
+            &remote_tip,
         ],
-        "post-push remote tip read",
+        "post-push remote base object fetch",
         true,
         deadline,
-    );
-    // Remove the private ref before propagating ANY capture result (best
-    // effort, same owner/deadline); an aging leftover is reclaimed by the next
-    // recovery even if this cleanup is killed at the deadline.
-    delete_recovery_ref(repo, &recovery_ref, deadline);
-    let tip_output = tip_result?;
-    let remote_tip = String::from_utf8_lossy(&tip_output.stdout)
-        .trim()
-        .to_owned();
-    if !is_native_object_hex(&remote_tip) {
-        return Err(MergeStop::PushUncertain(format!(
-            "the recovery fetch did not yield a readable remote {base} ({remote_tip:?}); push \
-             outcome unknown"
-        ))
-        .into());
-    }
+    )?;
+    // 3. The fetched object must peel to a commit.
+    recovery_git(
+        repo,
+        &["cat-file", "-e", &format!("{remote_tip}^{{commit}}")],
+        "post-push fetched base commit verification",
+        true,
+        deadline,
+    )?;
     Ok(remote_tip)
 }
 
-/// r28 item 1 TEST-ONLY seam: parks a CLI recovery after its fetch installed
-/// the private recovery ref and before it captures the SHA. Keyed by
-/// repository path so recoveries for OTHER fixtures pass straight through.
+/// r30 item 1 TEST-ONLY seam: parks a CLI recovery after its `ls-remote` read
+/// and before the object fetch. Keyed by repository path.
 #[cfg(test)]
-mod recovery_overlap_seam {
+mod recovery_read_seam {
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
@@ -1167,7 +1102,6 @@ mod recovery_overlap_seam {
     pub(super) struct Slot {
         pub(super) arrived: AtomicBool,
         pub(super) released: AtomicBool,
-        pub(super) release_notify: tokio::sync::Notify,
     }
 
     pub(super) struct Park {
@@ -1189,7 +1123,6 @@ mod recovery_overlap_seam {
                 Arc::new(Slot {
                     arrived: AtomicBool::new(false),
                     released: AtomicBool::new(false),
-                    release_notify: tokio::sync::Notify::new(),
                 })
             })
             .collect();
@@ -1214,18 +1147,11 @@ mod recovery_overlap_seam {
             }
         };
         let index = park.parked.fetch_add(1, Ordering::AcqRel);
-        assert!(
-            index < park.expected,
-            "more recoveries parked than the seam armed ({})",
-            park.expected
-        );
+        assert!(index < park.expected, "more recoveries parked than armed");
         let slot = park.slots.lock().expect("slots")[index].clone();
         slot.arrived.store(true, Ordering::Release);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        loop {
-            if slot.released.load(Ordering::Acquire) {
-                return;
-            }
+        while !slot.released.load(Ordering::Acquire) {
             assert!(
                 std::time::Instant::now() < deadline,
                 "recovery park never released"
@@ -1237,7 +1163,7 @@ mod recovery_overlap_seam {
     fn park_for(repo: &Path) -> Arc<Park> {
         let guard = seam().lock().expect("seam");
         let park = guard.as_ref().expect("seam armed").clone();
-        assert_eq!(park.repo, repo.to_string_lossy(), "seam repo mismatch");
+        assert_eq!(park.repo, repo.to_string_lossy());
         park
     }
 
@@ -1260,13 +1186,12 @@ mod recovery_overlap_seam {
     pub(super) fn release(repo: &Path, index: usize) {
         let slot = slot(repo, index);
         slot.released.store(true, Ordering::Release);
-        slot.release_notify.notify_waiters();
     }
 }
 
 #[cfg(test)]
-fn recovery_capture_park(repo: &Path) {
-    recovery_overlap_seam::park(repo);
+fn recovery_read_park(repo: &Path) {
+    recovery_read_seam::park(repo);
 }
 
 fn branch_ref(branch: &str) -> Result<String> {
@@ -2417,8 +2342,8 @@ mod tests {
             "PushUncertain, got {error:#}"
         );
         assert!(
-            error.to_string().contains("recovery fetch"),
-            "the uncertainty names the recovery fetch: {error}"
+            error.to_string().contains("ls-remote"),
+            "the uncertainty names the bounded remote read: {error}"
         );
         assert!(
             error.to_string().contains("recovery bound"),
@@ -2490,153 +2415,123 @@ mod tests {
         (keep, full, base, merge, remote_r)
     }
 
-    /// r28 item 1 (a): two CLI post-push recoveries interleave at the
-    /// fetch→capture boundary. A fetches while remote main is the divergent R;
-    /// M is then merged into remote main (D, containing M); B fetches D. With
-    /// the r27 SHARED destination forced back to R after B's fetch, B classified
-    /// the already-landed M as a base move; unique private refs make each
-    /// recovery read its own snapshot (B → Ok/Landed, A → BaseMoved), and no
-    /// recovery ref survives.
+    /// The FULL for-each-ref listing with object IDs — R10 requires it to be
+    /// byte-identical across a recovery.
+    fn refs_listing(repo: &Path) -> String {
+        tgit_ok(repo, &["for-each-ref", "--format=%(refname) %(objectname)"])
+    }
+
+    /// R10: ls-remote parsing accepts exactly one well-formed line for the
+    /// requested ref and rejects everything else.
     #[test]
-    fn overlapping_cli_recoveries_each_see_their_own_fetched_sha() {
-        use super::recovery_overlap_seam as seam;
+    fn ls_remote_base_parsing() {
+        let sha1 = "0123456789abcdef0123456789abcdef01234567";
+        let sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            parse_ls_remote_base(format!("{sha1}\trefs/heads/main\n").as_bytes(), "main").unwrap(),
+            sha1
+        );
+        assert_eq!(
+            parse_ls_remote_base(format!("{sha256}\trefs/heads/x\n").as_bytes(), "x").unwrap(),
+            sha256
+        );
+        assert!(parse_ls_remote_base(b"", "main").is_err());
+        assert!(
+            parse_ls_remote_base(format!("{sha1}\trefs/heads/other\n").as_bytes(), "main").is_err()
+        );
+        assert!(
+            parse_ls_remote_base(
+                format!("{sha1}\trefs/heads/main\n{sha1}\trefs/heads/main\n").as_bytes(),
+                "main"
+            )
+            .is_err()
+        );
+        assert!(parse_ls_remote_base(b"garbage\n", "main").is_err());
+        assert!(parse_ls_remote_base(b"zz\trefs/heads/main\n", "main").is_err());
+        assert!(
+            parse_ls_remote_base(
+                format!("{}\trefs/heads/main\n", &sha1[..39]).as_bytes(),
+                "main"
+            )
+            .is_err()
+        );
+        assert_eq!(
+            parse_ls_remote_base(
+                format!("{sha1}\trefs/heads/main\n{sha1}\trefs/tags/v1^{{}}\n").as_bytes(),
+                "main"
+            )
+            .unwrap(),
+            sha1
+        );
+    }
+
+    /// R10: two overlapping post-push recoveries never swap snapshots — each
+    /// reads the authoritative advertised tip with ls-remote: B (D containing
+    /// M) certifies Landed; A (R, before M landed) classifies BaseMoved.
+    #[test]
+    fn overlapping_cli_recoveries_read_distinct_tips_without_writing_refs() {
+        use super::recovery_read_seam as seam;
         let (keep, full, base_b, merge_m, remote_r) = divergence_fixture();
-        let spawn_recovery = |job_tag: &'static str| {
+        let spawn_recovery = || {
             let repo = full.clone();
             let merged = merge_m.clone();
             let expected = base_b.clone();
-            std::thread::spawn(move || {
-                let _ = job_tag;
-                push_main_cas(&repo, &merged, &expected)
-            })
+            std::thread::spawn(move || push_main_cas(&repo, &merged, &expected))
         };
 
         seam::arm(&full, 2);
-        let a = spawn_recovery("A");
+        let a = spawn_recovery();
         seam::wait_arrived(&full, 0);
-        // A's recovery fetched R. Land M on the remote for real: merge R into
-        // the M-based main, producing D which contains both, and publish it.
+        // A read R. Land M on the remote for real: merge R into the M-based
+        // main, producing D which contains both, and publish it.
         tgit_ok(&full, &["fetch", "-q", "origin"]);
         tgit_ok(&full, &["merge", "-q", "--no-ff", "-m", "D", "origin/main"]);
-        let remote_d = tgit_ok(&full, &["rev-parse", "main"]);
-        assert_ne!(remote_d, remote_r);
         tgit_ok(&full, &["push", "-q", "origin", "main"]);
+        let before = refs_listing(&full);
 
-        let b = spawn_recovery("B");
+        let b = spawn_recovery();
         seam::wait_arrived(&full, 1);
-        // The exact r27 interleave: the shared destination is forced back to
-        // A's stale R AFTER B fetched D. Unique refs make this harmless.
-        tgit_ok(
-            &full,
-            &["update-ref", "refs/remuda/recovery/main", &remote_r],
-        );
         seam::release(&full, 1);
         let result_b = b.join().expect("recovery B joins");
         seam::release(&full, 0);
         let result_a = a.join().expect("recovery A joins");
         seam::disarm();
-        // Drop the test artifact (production never writes that name).
-        tgit_ok(&full, &["update-ref", "-d", "refs/remuda/recovery/main"]);
 
         assert!(
             result_b.is_ok(),
-            "B fetched D containing M — Landed must win despite the stale shared-ref write: {:?}",
+            "B read D containing M — Landed must win: {:?}",
             result_b
                 .as_ref()
                 .err()
                 .map(std::string::ToString::to_string)
         );
-        let err_a = result_a.expect_err("A honestly fetched R, which does not contain M");
+        let err_a = result_a.expect_err("A read R, which does not contain M");
         assert!(
             matches!(err_a.downcast_ref::<MergeStop>(), Some(MergeStop::BaseMoved(_, tip)) if tip == &remote_r),
-            "A must classify against its OWN snapshot R (BaseMoved): {err_a:#}"
+            "A must classify against its OWN read R: {err_a:#}"
         );
         assert_eq!(
-            tgit_ok(
-                &full,
-                &[
-                    "for-each-ref",
-                    "--format=%(refname)",
-                    "refs/remuda/recovery/"
-                ]
-            ),
-            "",
-            "no recovery refs may remain after either recovery"
+            refs_listing(&full),
+            before,
+            "either recovery created, updated or deleted no ref"
         );
         drop(keep);
     }
 
-    /// r29 item 3: probe SHA-256 support precisely — spawn errors and unrelated
-    /// init failures must FAIL the test; only a recognized
-    /// unsupported-object-format diagnostic skips.
-    fn git_supports_sha256(probe_repo: &Path) -> bool {
-        let output = match std::process::Command::new("git")
-            .args([
-                "init",
-                "-q",
-                "--object-format=sha256",
-                "-b",
-                "main",
-                probe_repo.to_str().unwrap(),
-            ])
-            .output()
-        {
-            Ok(output) => output,
-            Err(error) => panic!("failed to spawn git for the SHA-256 support probe: {error}"),
-        };
-        if output.status.success() {
-            return true;
-        }
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let recognized_unsupported = (stderr.contains("object-format")
-            || stderr.to_ascii_lowercase().contains("sha256"))
-            && [
-                "unknown",
-                "invalid",
-                "unrecognized",
-                "unrecognised",
-                "not supported",
-                "unsupported",
-            ]
-            .iter()
-            .any(|needle| stderr.to_ascii_lowercase().contains(needle));
-        if recognized_unsupported {
-            eprintln!(
-                "skipping: this git lacks SHA-256 support: {}",
-                stderr.trim()
-            );
-            false
-        } else {
-            panic!("SHA-256 probe init failed for an unrelated reason: {stderr}");
-        }
-    }
-
-    /// r29 item 3: an SHA-256 probe init failing for an UNRELATED reason must
-    /// FAIL the test, never be misreported as unsupported-git skip.
+    /// R10: a configured tagOpt=--tags with a clobbered local tag used to
+    /// abort recovery fetch; ref-free recovery uses --no-tags and still
+    /// certifies Landed, leaving every ref byte-identical.
     #[test]
-    fn an_unrelated_sha256_probe_failure_is_not_a_skip() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a-file"), b"x").unwrap();
-        let bogus = dir.path().join("a-file").join("repo");
-        let panicked =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| git_supports_sha256(&bogus)))
-                .is_err();
-        assert!(
-            panicked,
-            "an unrelated init failure must panic, not be reported as unsupported SHA-256"
-        );
-    }
-
-    /// r29 item 1: a recovery fetch that installs the private ref and then
-    /// fails (a clobbered tag under tagOpt=--tags) must still leave the
-    /// recovery namespace empty and return PushUncertain.
-    #[test]
-    fn a_failed_fetch_that_installed_the_ref_leaves_no_recovery_ref() {
+    fn a_clobbered_tag_with_tagopt_does_not_break_ref_free_recovery() {
         let (keep, full, base_b, merge_m, _remote_r) = divergence_fixture();
-        // Local tag pinned at B; remote tag moved sideways to an orphan AFTER
-        // the fixture's bare origin exists.
+        // Remote main already contains M in this fixture (R and M are both
+        // children of B; the published main is R — merge M into it remotely).
+        tgit_ok(&full, &["fetch", "-q", "origin"]);
+        tgit_ok(&full, &["merge", "-q", "--no-ff", "-m", "D", "origin/main"]);
+        tgit_ok(&full, &["push", "-q", "origin", "main"]);
+        // Clobber: local tag at B, remote tag moved to an orphan after clone.
         tgit_ok(&full, &["tag", "v1", &base_b]);
-        let orphan = tgit_ok(&full, &["commit-tree", "HEAD^{tree}", "-m", "sideways tag"]);
+        let orphan = tgit_ok(&full, &["commit-tree", "HEAD^{tree}", "-m", "sideways"]);
         tgit_ok(
             &full,
             &[
@@ -2648,29 +2543,46 @@ mod tests {
             ],
         );
         tgit_ok(&full, &["config", "remote.origin.tagOpt", "--tags"]);
-        // Sanity: fetch exits non-zero but does install the requested ref.
-        let probe_ref = "refs/remuda/recovery/probe-failure";
-        let output = tgit(
-            &full,
+        // Sanity: a plain fetch honoring tagOpt still fails on the clobber.
+        assert!(!tgit(&full, &["fetch", "-q", "origin"]).status.success());
+        let before = refs_listing(&full);
+
+        push_main_cas(&full, &merge_m, &base_b)
+            .expect("--no-tags bypasses the clobber; M is contained in remote main");
+        assert_eq!(
+            refs_listing(&full),
+            before,
+            "recovery created, updated or deleted no ref"
+        );
+        assert_eq!(
+            tgit_ok(&full, &["rev-parse", "refs/tags/v1"]),
+            base_b,
+            "the clobbered local tag is untouched"
+        );
+        drop(keep);
+    }
+
+    /// R10: a recovery whose base is not advertised (or whose origin is
+    /// unreachable) is PushUncertain and writes no ref on either path.
+    #[test]
+    fn a_failed_ref_free_recovery_writes_no_refs() {
+        let (keep, _origin, _topic, main) = ancestry_fixture();
+        let repo = keep.path().join("full");
+        let merged = main.clone();
+        let expected = tgit_ok(&repo, &["rev-parse", &format!("{main}^1")]);
+        let before = refs_listing(&repo);
+
+        tgit_ok(
+            &repo,
             &[
-                "fetch",
-                "-q",
+                "remote",
+                "set-url",
                 "origin",
-                &format!("+refs/heads/main:{probe_ref}"),
+                keep.path().join("no-such-origin-r30.git").to_str().unwrap(),
             ],
         );
-        assert!(!output.status.success(), "the tag clobber must fail fetch");
-        assert_eq!(
-            tgit_ok(&full, &["rev-parse", "--verify", "--quiet", probe_ref]),
-            _remote_r,
-            "the failed fetch really installed the requested ref"
-        );
-        tgit_ok(&full, &["update-ref", "-d", probe_ref]);
-
-        // The push of M is rejected (remote main is the divergent R); recovery
-        // fetch then fails on the tag clobber — PushUncertain, no refs left.
-        let error = push_main_cas(&full, &merge_m, &base_b)
-            .expect_err("a clobbered-tag recovery fetch stays uncertain");
+        let error = push_main_cas(&repo, &merged, &expected)
+            .expect_err("an unreachable remote stays uncertain");
         assert!(
             matches!(
                 error.downcast_ref::<MergeStop>(),
@@ -2679,71 +2591,34 @@ mod tests {
             "PushUncertain, got {error:#}"
         );
         assert_eq!(
-            tgit_ok(
-                &full,
-                &[
-                    "for-each-ref",
-                    "--format=%(refname)",
-                    "refs/remuda/recovery/"
-                ]
-            ),
-            "",
-            "the failed fetch's private ref must be deleted"
+            refs_listing(&repo),
+            before,
+            "the failed recovery created, updated or deleted no ref"
         );
         drop(keep);
     }
 
-    /// r29 item 1: an old abandoned recovery ref is reclaimed by the next
-    /// recovery; a younger one is retained (it may belong to a live probe).
+    /// R10: post-push recovery in a SHA-256 repository reads the native
+    /// 64-hex advertised tip, fetches objects without writing a ref, and
+    /// recognizes a merge already contained in remote main.
     #[test]
-    fn an_old_abandoned_cli_recovery_ref_is_reclaimed_but_a_fresh_one_is_kept() {
-        let (keep, full, _base_b, merge_m, _remote_r) = divergence_fixture();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let old_nanos = now - 1_000 * 1_000_000_000;
-        let old_ref = format!("refs/remuda/recovery/1-{old_nanos}-0");
-        let fresh_ref = format!("refs/remuda/recovery/1-{now}-0");
-        tgit_ok(&full, &["update-ref", &old_ref, &_remote_r]);
-        tgit_ok(&full, &["update-ref", &fresh_ref, &_remote_r]);
-
-        // Recovery runs (push rejected; remote R doesn't contain M →
-        // BaseMoved), reclamation happens at fetch start regardless.
-        let error = push_main_cas(&full, &merge_m, &_base_b)
-            .expect_err("remote diverged; recovery classifies BaseMoved");
-        assert!(
-            matches!(
-                error.downcast_ref::<MergeStop>(),
-                Some(MergeStop::BaseMoved(_, _))
-            ),
-            "BaseMoved, got {error:#}"
-        );
-        assert_eq!(
-            tgit_ok(
-                &full,
-                &[
-                    "for-each-ref",
-                    "--format=%(refname)",
-                    "refs/remuda/recovery/"
-                ]
-            ),
-            fresh_ref,
-            "only the young ref must survive reclamation"
-        );
-        tgit_ok(&full, &["update-ref", "-d", &fresh_ref]);
-        drop(keep);
-    }
-
-    /// r28 item 2: post-push recovery in a SHA-256 repository accepts the
-    /// native 64-hex object IDs and still recognizes a merge already on remote
-    /// main. Skips (printed reason only) when this git lacks SHA-256 support.
-    #[test]
-    fn recovery_in_a_sha256_repo_lands_a_merge_on_remote() {
+    fn recovery_in_a_sha256_repo_reads_a_64_hex_tip_without_refs() {
         let probe = tempfile::tempdir().unwrap();
-        let supported = git_supports_sha256(&probe.path().join("p"));
+        let supported = std::process::Command::new("git")
+            .args([
+                "init",
+                "-q",
+                "--object-format=sha256",
+                "-b",
+                "main",
+                probe.path().join("p").to_str().unwrap(),
+            ])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
         drop(probe);
         if !supported {
+            eprintln!("skipping: this git build lacks --object-format=sha256 support");
             return;
         }
 
@@ -2767,11 +2642,10 @@ mod tests {
         tgit_ok(&full, &["add", "m"]);
         tgit_ok(&full, &["commit", "-q", "-m", "M"]);
         let merged = tgit_ok(&full, &["rev-parse", "main"]);
-        // Remote advances past M to D, which contains M.
+        // Remote advances to D, containing M.
         std::fs::write(full.join("d"), "d\n").unwrap();
         tgit_ok(&full, &["add", "d"]);
         tgit_ok(&full, &["commit", "-q", "-m", "D"]);
-        let remote_tip = tgit_ok(&full, &["rev-parse", "main"]);
         let output = std::process::Command::new("git")
             .args([
                 "init",
@@ -2791,7 +2665,7 @@ mod tests {
             &["remote", "add", "origin", origin.to_str().unwrap()],
         );
         tgit_ok(&full, &["push", "-q", "origin", "main", "topic"]);
-        // Post-crash stale checkout: tracking pinned to B, fetch restricted.
+        // Stale post-crash checkout.
         tgit_ok(&full, &["update-ref", "refs/remotes/origin/main", &base]);
         tgit_ok(
             &full,
@@ -2801,47 +2675,38 @@ mod tests {
                 "+refs/heads/topic:refs/remotes/origin/topic",
             ],
         );
+        let before = refs_listing(&full);
 
         push_main_cas(&full, &merged, &base)
-            .expect("a 64-hex remote tip must not be rejected as unreadable; M landed");
+            .expect("a 64-hex advertised tip must not be rejected; M landed");
         assert_eq!(
-            tgit_ok(
-                &full,
-                &[
-                    "for-each-ref",
-                    "--format=%(refname)",
-                    "refs/remuda/recovery/"
-                ]
-            ),
-            "",
-            "the sha256 recovery must leave no ref behind"
+            refs_listing(&full),
+            before,
+            "the sha256 recovery created, updated or deleted no ref"
         );
-        assert_eq!(remote_tip.len(), 64);
+        assert_eq!(
+            tgit_ok(&full, &["rev-parse", "refs/remotes/origin/main"]),
+            base,
+            "the configured tracking ref is never touched"
+        );
     }
 
-    /// r27 item 1 / R5: post-push recovery under a restricted
-    /// `remote.origin.fetch` refspec and a STALE refs/remotes/origin/main must
-    /// still recognize a granted merge already contained in remote main (a
-    /// lost-ack landing the remote moved past) as Ok — Landed wins. A recovery
-    /// fetch that cannot reach the requested base is PushUncertain, never an
-    /// established failure.
+    /// R5 fail-open: a restricted remote.origin.fetch leaves the configured
+    /// tracking ref stale, but recovery reads the advertised tip DIRECTLY and
+    /// certifies Landed without touching any ref; an unreachable origin is
+    /// PushUncertain, likewise ref-free.
     #[test]
-    fn recovery_with_a_restricted_refspec_lands_a_merge_already_on_remote() {
+    fn recovery_reads_the_advertised_base_past_a_restricted_refspec() {
         let (keep, _origin, _topic, main) = ancestry_fixture();
         let repo = keep.path().join("full");
         let merged = main.clone();
         let expected = tgit_ok(&repo, &["rev-parse", &format!("{main}^1")]);
-        // Remote main advances to a descendant D that CONTAINS the granted
-        // merge M (the push landed; the remote moved on before recovery).
         tgit_ok(&repo, &["checkout", "-q", "main"]);
         std::fs::write(repo.join("post-land.txt"), "remote moved\n").unwrap();
         tgit_ok(&repo, &["add", "post-land.txt"]);
         tgit_ok(&repo, &["commit", "-q", "-m", "later remote commit D"]);
         tgit_ok(&repo, &["push", "-q", "origin", "main"]);
-        let remote_tip = tgit_ok(&repo, &["rev-parse", "main"]);
-        assert_ne!(remote_tip, merged);
-        // Recreate the stale post-crash checkout: origin/main pinned back at
-        // the granted base B, origin.fetch restricted to a non-base branch.
+        assert_ne!(tgit_ok(&repo, &["rev-parse", "main"]), merged);
         tgit_ok(
             &repo,
             &["update-ref", "refs/remotes/origin/main", &expected],
@@ -2854,52 +2719,39 @@ mod tests {
                 "+refs/heads/topic:refs/remotes/origin/topic",
             ],
         );
-        // Sanity: a plain fetch honors the restricted refspec and leaves the
-        // stale tracking ref at B.
         tgit_ok(&repo, &["fetch", "-q", "origin"]);
         assert_eq!(
             tgit_ok(&repo, &["rev-parse", "refs/remotes/origin/main"]),
-            expected
+            expected,
+            "the restricted fetch leaves origin/main stale"
         );
-        // Pushing M is rejected non-fast-forward by remote D, so recovery must
-        // classify the already-landed merge against the REAL remote tip.
+        let before = refs_listing(&repo);
+
         push_main_cas(&repo, &merged, &expected).expect(
             "a merge already contained in remote main is Landed despite a stale tracking ref",
         );
-        // r28 item 1: the probe used a private per-invocation ref and deleted
-        // it after capturing the SHA — the recovery namespace is empty and the
-        // configured (restricted) tracking ref is untouched.
         assert_eq!(
-            tgit_ok(
-                &repo,
-                &[
-                    "for-each-ref",
-                    "--format=%(refname)",
-                    "refs/remuda/recovery/"
-                ]
-            ),
-            "",
-            "no recovery refs may remain after a successful recovery"
+            refs_listing(&repo),
+            before,
+            "a successful recovery creates, updates or deletes no ref"
         );
         assert_eq!(
             tgit_ok(&repo, &["rev-parse", "refs/remotes/origin/main"]),
             expected,
-            "recovery must not touch the configured origin/main tracking ref"
+            "the configured tracking ref is never touched"
         );
 
-        // A recovery fetch that cannot reach the remote → PushUncertain, never
-        // an established failure.
         tgit_ok(
             &repo,
             &[
                 "remote",
                 "set-url",
                 "origin",
-                keep.path().join("no-such-origin-r27.git").to_str().unwrap(),
+                keep.path().join("no-such-origin-r30.git").to_str().unwrap(),
             ],
         );
         let error = push_main_cas(&repo, &merged, &expected)
-            .expect_err("an unreachable recovery fetch stays uncertain");
+            .expect_err("an unreachable recovery stays uncertain");
         assert!(
             matches!(
                 error.downcast_ref::<MergeStop>(),
@@ -2907,9 +2759,10 @@ mod tests {
             ),
             "PushUncertain, got {error:#}"
         );
-        assert!(
-            error.to_string().contains("recovery fetch"),
-            "the uncertainty names the recovery fetch: {error}"
+        assert_eq!(
+            refs_listing(&repo),
+            before,
+            "a failed recovery creates, updates or deletes no ref"
         );
     }
 

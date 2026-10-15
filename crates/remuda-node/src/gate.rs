@@ -4097,35 +4097,34 @@ fn run_git(repo: &Path, args: &[&str]) -> Result<(), String> {
     block_git(repo, args).map(|_| ())
 }
 
-/// Read-only landing resolution. Fetches the EXACT requested remote base
-/// branch into THIS invocation's private recovery ref and reports:
+/// Read-only landing resolution. Reads the authoritative remote base tip
+/// WITHOUT WRITING ANY REFS and reports:
 /// * `landed` when the granted merge is already an ancestor of the immutable
-///   base SHA written by that fetch;
-/// * `absent` when a fresh fetch succeeded, the merge is NOT an ancestor, and
-///   `land_group_verified_dead` is true — the caller holds AUTHORITATIVE death
-///   evidence for the exact attempt's land group (a live kernel ESRCH or a
-///   durable death certificate; r14 R1, r16 item 2 R5);
-/// * `unknown` for every fetch/parse/ancestry failure, non-ancestry without
-///   authoritative death evidence, and crucially a MISSING OR UNREADABLE
-///   ledger (missing proof is not proof of death). It never pushes and never
-///   asserts a push it cannot prove.
+///   remote base SHA;
+/// * `absent` when the remote tip was freshly read and fetched, the merge is
+///   NOT an ancestor, and `land_group_verified_dead` is true — the caller holds
+///   AUTHORITATIVE death evidence for the exact attempt's land group (a live
+///   kernel ESRCH or a durable death certificate; r14 R1, r16 item 2 R5);
+/// * `unknown` for every read/fetch/parse/ancestry failure, non-ancestry
+///   without authoritative death evidence, and crucially a MISSING OR
+///   UNREADABLE ledger (missing proof is not proof of death). It never pushes
+///   and never asserts a push it cannot prove.
 ///
-/// r27 item 1 (R5 fail-open): the fetch is an EXPLICIT refspec
-/// (`refs/heads/<base>` → a private recovery ref), never a bare
-/// `git fetch origin`. The latter honors the repository's configured
-/// `remote.origin.fetch`, which may omit the base branch entirely: the fetch
-/// then SUCCEEDS while `origin/<base>` stays stale, and ancestry against that
-/// stale tip certifies a landed merge absent.
+/// R10 (r30): recovery is REF-FREE and therefore immune to ref substitution,
+/// symbolic-ref deletion, base-rename prefix collisions, clock-based
+/// reclamation and leftover-ref accumulation:
+/// 1. `git ls-remote --exit-code origin refs/heads/<base>` reads the exact
+///    advertised tip — configured remote.origin.fetch refspecs cannot make it
+///    stale (the original R5 fail-open);
+/// 2. `git fetch --no-tags --no-write-fetch-head origin <sha>` fetches that
+///    commit's objects with NO destination refspec, so it creates no ref and
+///    never reads or writes FETCH_HEAD; `--no-tags` also defeats a configured
+///    tagOpt=--tags tag clobber;
+/// 3. `git cat-file -e <sha>^{commit}` verifies the object before ancestry is
+///    checked against the SHA.
 ///
-/// r28 item 1: the destination is a unique, FLAT per-invocation ref
-/// (`refs/remuda/recovery/<pid>-<nanos>-<counter>`). Overlapping probes never
-/// overwrite one another's snapshot between fetch and SHA capture — with one
-/// shared per-base ref, probe A could force its stale fetch back over probe
-/// B's fresh one and certify B's already-landed merge Absent; and the flat
-/// name embeds no branch hierarchy, so a leftover ref can never obstruct a
-/// later base rename (`release` → `release/v2`). The ref is deleted (best
-/// effort, through the same owner/deadline) as soon as its SHA is captured;
-/// every later check runs against the captured SHA.
+/// Every git command runs through the R6 owner under one absolute deadline;
+/// any failure is Unknown, never Absent.
 fn resolve_landing_after_restart(
     request: &GateResolveLandingParams,
     land_group_verified_dead: bool,
@@ -4144,9 +4143,8 @@ fn resolve_landing_after_restart(
     // subprocess AND its whole cleanup (survivor kill, reap, pipe drains); the
     // per-command soft cap only decides when a still-running git is KILLed.
     let deadline = std::time::Instant::now() + LANDING_PROBE_DEADLINE;
-    // Fetch the requested base into this invocation's private recovery ref and
-    // capture the immutable SHA. On return the private ref is already removed;
-    // every check below uses the captured SHA.
+    // Read the remote tip and fetch its objects without touching any ref. On
+    // error the probe is Unknown.
     let base_sha = match recovery_fetch_base_sha(&repo, &request.base_branch, deadline) {
         Ok(sha) => sha,
         Err(message) => return unknown(message),
@@ -4199,7 +4197,7 @@ fn resolve_landing_after_restart(
     }
     // merge-base --is-ancestor: exit 0 landed, exit 1 not-ancestor (valid only
     // with complete history, checked above), anything else Unknown. The
-    // descendant is this invocation's captured SHA, never a shared ref.
+    // descendant is the immutable remote SHA read by ls-remote.
     let ancestry_output = match run_owned(
         &["merge-base", "--is-ancestor", &request.merge_sha, &base_sha],
         "ancestry check",
@@ -4223,8 +4221,8 @@ fn resolve_landing_after_restart(
             error: None,
         },
         Some(1) => unknown(format!(
-            "{} is not an ancestor of {base_preview} (the fetched remote base) but the granted \
-             land group's death is not authoritatively established (no live ESRCH or death \
+            "{} is not an ancestor of {base_preview} (the freshly read remote base) but the \
+             granted land group's death is not authoritatively established (no live ESRCH or death \
              certificate; a missing ledger is not proof); push outcome unknown",
             request.merge_sha
         )),
@@ -4235,221 +4233,126 @@ fn resolve_landing_after_restart(
     }
 }
 
-/// Distinguishes process-wide recovery invocations so their private refs never
-/// collide even within the same nanosecond.
-static RECOVERY_REF_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// A unique, FLAT recovery ref name for THIS invocation. No branch hierarchy:
-/// two overlapping recoveries never share a destination, and a leftover flat
-/// ref can never block a later base rename (`release` vs `release/v2`).
-fn unique_recovery_ref() -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let counter = RECOVERY_REF_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    format!(
-        "refs/remuda/recovery/{}-{nanos}-{counter}",
-        std::process::id()
-    )
-}
-
 /// An object ID in the repository's native format: SHA-1 (40 hex) or SHA-256
-/// (64 hex). Git itself resolved and canonicalized the string; this only
-/// bounds the accepted shapes.
+/// (64 hex). Git itself emitted the string from ls-remote; this only bounds
+/// the accepted shapes.
 fn is_native_object_hex(sha: &str) -> bool {
     (sha.len() == 40 || sha.len() == 64) && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-/// Parse the epoch NANOS embedded in a private recovery ref name
-/// (`<pid>-<nanos>-<counter>`); returns None for any name that does not match
-/// the produced shape.
-fn recovery_ref_epoch_nanos(name: &str) -> Option<u128> {
-    let rest = name.split_once('-')?.1;
-    let nanos = rest.split_once('-')?.0;
-    if nanos.is_empty() || !nanos.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    nanos.parse().ok()
-}
-
-/// Leftover recovery refs older than this are abandoned (a crashed probe, a
-/// cleanup killed at the deadline, or a fetch that failed after installing its
-/// ref) and safe to reclaim. It is well beyond the maximum lifetime of any
-/// live probe — ten times the absolute probe deadline — so a ref a running
-/// recovery can still own is never touched.
-#[cfg(unix)]
-const RECOVERY_REF_RECLAIM_HORIZON: Duration = LANDING_PROBE_DEADLINE.saturating_mul(10);
-
-/// Best-effort, owner-run, deadline-bounded deletion of ONE recovery ref. A
-/// missing ref (spawn-failure path, a reclamation race with another reaper) is
-/// not an error: update-ref's status is intentionally ignored.
-#[cfg(unix)]
-fn delete_recovery_ref(repo: &Path, recovery_ref: &str, deadline: std::time::Instant) {
-    if remaining(deadline).is_zero() {
-        return;
-    }
-    let _ = owned_git(
-        repo,
-        &["update-ref", "-d", recovery_ref],
-        RECOVERY_GIT_CAP,
-        deadline,
-    );
-}
-
-/// Reclaim abandoned recovery refs from CRASHED or cleanup-exhausted earlier
-/// recoveries. Runs through the R6 owner under the caller's remaining
-/// deadline; any read/delete failure is ignored (the next recovery retries).
-/// Refs younger than [`RECOVERY_REF_RECLAIM_HORIZON`], or whose name does not
-/// match the produced shape, are never touched — they may belong to a live
-/// probe.
-#[cfg(unix)]
-fn reclaim_abandoned_recovery_refs(repo: &Path, deadline: std::time::Instant) {
-    if remaining(deadline).is_zero() {
-        return;
-    }
-    let run = match owned_git(
-        repo,
-        &[
-            "for-each-ref",
-            "--format=%(refname)",
-            "refs/remuda/recovery/",
-        ],
-        RECOVERY_GIT_CAP,
-        deadline,
-    ) {
-        Ok(run) if !run.timed_out() => run.into_output(),
-        _ => return,
-    };
-    if !run.status.success() {
-        return;
-    }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    for refname in String::from_utf8_lossy(&run.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-    {
-        let Some(name) = refname.strip_prefix("refs/remuda/recovery/") else {
-            continue;
-        };
-        let Some(created_nanos) = recovery_ref_epoch_nanos(name) else {
-            continue;
-        };
-        if now.saturating_sub(created_nanos) < RECOVERY_REF_RECLAIM_HORIZON.as_nanos() {
+/// Parse `git ls-remote --exit-code origin refs/heads/<base>` output. Exactly
+/// one line naming the requested ref with a native-format object ID; an
+/// absent base (no lines, exit 2), ambiguous output or a malformed line is an
+/// error — never a guessed tip.
+fn parse_ls_remote_base(output: &[u8], base_branch: &str) -> std::result::Result<String, String> {
+    let expected_ref = format!("refs/heads/{base_branch}");
+    let mut matches = Vec::new();
+    for line in String::from_utf8_lossy(output).lines().map(str::trim) {
+        if line.is_empty() {
             continue;
         }
-        delete_recovery_ref(repo, refname, deadline);
+        let mut parts = line.split_whitespace();
+        let (Some(sha), Some(refname)) = (parts.next(), parts.next()) else {
+            return Err("ls-remote returned a malformed line".to_owned());
+        };
+        if parts.next().is_some() {
+            return Err("ls-remote returned a malformed line".to_owned());
+        }
+        if refname == expected_ref {
+            matches.push(sha.to_owned());
+        }
+    }
+    match matches.as_slice() {
+        [sha] if is_native_object_hex(sha) => Ok(sha.clone()),
+        [] => Err("the remote does not advertise the requested base branch".to_owned()),
+        _ => Err("ls-remote advertised the requested base more than once".to_owned()),
     }
 }
 
-/// Fetch the requested remote base into a private recovery ref, capture the
-/// immutable commit SHA it points at, and delete the ref (best effort, under
-/// the same owner and absolute deadline). Every failure is an Unknown
-/// message — never a guessed absence. The captured SHA (not the ref) feeds all
-/// later ancestry checks, so a concurrent recovery cannot swap the snapshot.
+/// R10 ref-free remote-tip acquisition. All three commands go through the R6
+/// owner under the caller's absolute deadline; every failure is an Unknown
+/// message, never a guessed absence. No local ref is created, updated or
+/// deleted at any point.
 #[cfg(unix)]
 fn recovery_fetch_base_sha(
     repo: &Path,
     base_branch: &str,
     deadline: std::time::Instant,
 ) -> std::result::Result<String, String> {
-    let recovery_ref = unique_recovery_ref();
-    let fetch_refspec = format!("+refs/heads/{base_branch}:{recovery_ref}");
-    // Reclaim refs abandoned by crashed or deadline-exhausted earlier probes
-    // before doing anything else.
-    reclaim_abandoned_recovery_refs(repo, deadline);
-    // R7/R6: the recovery fetch runs through the owner, capped per-command.
-    if remaining(deadline).is_zero() {
-        return Err("landing probe deadline exhausted before the recovery fetch".to_owned());
-    }
-    let fetch_outcome: std::result::Result<(), String> = match owned_git(
-        repo,
-        &["fetch", "-q", "origin", &fetch_refspec],
-        RECOVERY_GIT_CAP,
-        deadline,
-    ) {
-        Ok(run) if run.timed_out() => Err(format!(
-            "recovery fetch exceeded the {RECOVERY_GIT_CAP:?} probe bound and was killed; push \
-             outcome unknown"
-        )),
-        Ok(run) if !run.status_success() => Err(
-            "recovery fetch of the requested base branch failed; push outcome unknown".to_owned(),
-        ),
-        Err(error) => Err(format!("recovery fetch of the requested base: {error}")),
-        Ok(_) => Ok(()),
-    };
-    // r29 item 1: a fetch is NOT atomic — it can install our private ref and
-    // still fail (a rejected tag update aborts after the branch ref commits;
-    // the cap can kill fetch after its committed phase). On a FAILED fetch the
-    // ref is always deleted (owned, deadline-bounded) before the original
-    // error propagates; on success the ref stays until the SHA is captured.
-    if let Err(message) = fetch_outcome {
-        delete_recovery_ref(repo, &recovery_ref, deadline);
-        return Err(message);
-    }
-    // r28 item 1 TEST-ONLY seam: park with the private ref installed and
-    // before the SHA is captured, so an overlap test can interleave two
-    // recoveries at exactly the fetch→capture boundary.
-    #[cfg(test)]
-    recovery_capture_park(repo);
-    // Capture the immutable commit SHA (`^{commit}` peels an annotated tag)
-    // while this invocation's own ref is the only name that resolves it.
-    let sha = if remaining(deadline).is_zero() {
-        Err("landing probe deadline exhausted before the recovery base ref read".to_owned())
-    } else {
-        match owned_git(
-            repo,
-            &[
-                "rev-parse",
-                "--verify",
-                &format!("{recovery_ref}^{{commit}}"),
-            ],
-            RECOVERY_GIT_CAP,
-            deadline,
-        ) {
+    let owned = |args: &[&str],
+                 what: &str,
+                 require_success: bool|
+     -> std::result::Result<std::process::Output, String> {
+        if remaining(deadline).is_zero() {
+            return Err(format!(
+                "landing probe deadline ({LANDING_PROBE_DEADLINE:?}) exhausted before {what}; push \
+                 outcome unknown"
+            ));
+        }
+        match owned_git(repo, args, RECOVERY_GIT_CAP, deadline) {
             Ok(run) if run.timed_out() => Err(format!(
-                "recovery base ref read exceeded the {RECOVERY_GIT_CAP:?} probe bound and was \
-                 killed; push outcome unknown"
+                "{what} exceeded the {RECOVERY_GIT_CAP:?} probe bound and was killed; push outcome \
+                 unknown"
             )),
             Ok(run) => {
                 let output = run.into_output();
-                if !output.status.success() {
-                    Err(
-                        "recovery fetch did not produce a readable base commit; push outcome \
-                         unknown"
-                            .to_owned(),
-                    )
-                } else {
-                    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+                if require_success && !output.status.success() {
+                    return Err(format!(
+                        "{what} exited {:?}: {}; push outcome unknown",
+                        output.status.code(),
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ));
                 }
+                Ok(output)
             }
-            Err(error) => Err(format!("recovery base ref read could not run: {error}")),
+            Err(error) => Err(format!("{what} could not run: {error}")),
         }
     };
-    // Remove the private ref as soon as the SHA is captured (best effort, same
-    // owner/deadline). The captured SHA names the commit object directly, so
-    // the ref is not needed afterwards; a cleanup failure never turns a good
-    // snapshot into Unknown — the next recovery's reclamation removes it once
-    // it ages past the horizon.
-    delete_recovery_ref(repo, &recovery_ref, deadline);
-    let sha = sha?;
-    if !is_native_object_hex(&sha) {
-        return Err(format!(
-            "the recovery fetch did not yield a readable base sha ({sha:?}); push outcome unknown"
-        ));
-    }
+    // 1. The authoritative advertised tip. ls-remote consults the remote
+    // directly; a stale configured tracking ref cannot be read here. Exit 2
+    // with no matching line is git's "ref not advertised" — run it without the
+    // success requirement so the parser produces the precise error; timeouts,
+    // spawn failures and non-empty garbage still fail this command.
+    let remote_ref = format!("refs/heads/{base_branch}");
+    let listing = owned(
+        &["ls-remote", "--exit-code", "origin", &remote_ref],
+        "remote base ls-remote",
+        false,
+    )?;
+    let sha = parse_ls_remote_base(&listing.stdout, base_branch)?;
+    // r30 item 1 TEST-ONLY seam: park after the remote SHA was read and
+    // before its objects are fetched, so an overlap regression can move the
+    // remote tip deterministically while a second recovery is in flight.
+    #[cfg(test)]
+    recovery_read_park(repo);
+    // 2. Fetch the objects of THAT commit with an explicit object-ID
+    // refspec and NO destination: git writes no ref, --no-tags defeats a
+    // configured tagOpt=--tags clobber, and FETCH_HEAD is never written. A
+    // tip that moved so the SHA is no longer fetchable fails here → Unknown.
+    owned(
+        &[
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "origin",
+            &sha,
+        ],
+        "remote base object fetch",
+        true,
+    )?;
+    // 3. The fetched object must exist locally and peel to a commit.
+    owned(
+        &["cat-file", "-e", &format!("{sha}^{{commit}}")],
+        "fetched base commit verification",
+        true,
+    )?;
     Ok(sha)
 }
 
-/// r28 item 1 TEST-ONLY seam: parks a recovery after its fetch installed the
-/// private recovery ref and before it captures the SHA. Keyed by repository
-/// path so recoveries for OTHER fixtures pass straight through.
+/// r30 item 1 TEST-ONLY seam: parks a recovery after its `ls-remote` read and
+/// before the object fetch. Keyed by repository path so other fixtures pass.
 #[cfg(test)]
-mod recovery_overlap_seam {
+mod recovery_read_seam {
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
@@ -4457,7 +4360,6 @@ mod recovery_overlap_seam {
     pub(super) struct Slot {
         pub(super) arrived: AtomicBool,
         pub(super) released: AtomicBool,
-        pub(super) release_notify: tokio::sync::Notify,
     }
 
     pub(super) struct Park {
@@ -4473,14 +4375,12 @@ mod recovery_overlap_seam {
         SEAM.get_or_init(|| Mutex::new(None))
     }
 
-    /// Arm for exactly `expected` recoveries in `repo`; replaces prior arms.
     pub(super) fn arm(repo: &Path, expected: usize) {
         let slots = (0..expected)
             .map(|_| {
                 Arc::new(Slot {
                     arrived: AtomicBool::new(false),
                     released: AtomicBool::new(false),
-                    release_notify: tokio::sync::Notify::new(),
                 })
             })
             .collect();
@@ -4496,8 +4396,6 @@ mod recovery_overlap_seam {
         *seam().lock().expect("seam") = None;
     }
 
-    /// Park the n-th recovery for the armed repo (arrival order); recoveries
-    /// in other repositories pass through.
     pub(super) fn park(repo: &Path) {
         let park = {
             let guard = seam().lock().expect("seam");
@@ -4507,18 +4405,11 @@ mod recovery_overlap_seam {
             }
         };
         let index = park.parked.fetch_add(1, Ordering::AcqRel);
-        assert!(
-            index < park.expected,
-            "more recoveries parked than the seam armed ({})",
-            park.expected
-        );
+        assert!(index < park.expected, "more recoveries parked than armed");
         let slot = park.slots.lock().expect("slots")[index].clone();
         slot.arrived.store(true, Ordering::Release);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        loop {
-            if slot.released.load(Ordering::Acquire) {
-                return;
-            }
+        while !slot.released.load(Ordering::Acquire) {
             assert!(
                 std::time::Instant::now() < deadline,
                 "recovery park never released"
@@ -4530,7 +4421,7 @@ mod recovery_overlap_seam {
     fn park_for(repo: &Path) -> Arc<Park> {
         let guard = seam().lock().expect("seam");
         let park = guard.as_ref().expect("seam armed").clone();
-        assert_eq!(park.repo, repo.to_string_lossy(), "seam repo mismatch");
+        assert_eq!(park.repo, repo.to_string_lossy());
         park
     }
 
@@ -4553,13 +4444,12 @@ mod recovery_overlap_seam {
     pub(super) fn release(repo: &Path, index: usize) {
         let slot = slot(repo, index);
         slot.released.store(true, Ordering::Release);
-        slot.release_notify.notify_waiters();
     }
 }
 
 #[cfg(test)]
-fn recovery_capture_park(repo: &Path) {
-    recovery_overlap_seam::park(repo);
+fn recovery_read_park(repo: &Path) {
+    recovery_read_seam::park(repo);
 }
 
 /// Per-subprocess cap so one git command cannot consume the whole probe.
@@ -4605,17 +4495,6 @@ fn git_output(repo: &Path, args: &[&str]) -> Result<String, String> {
 
 // ── granted-land process-group fence (r14 R1) ──────────────────────────────
 //
-// A granted land child runs in its own process group with kill_on_drop(false):
-// if the Node dies mid-push the group is orphaned but can still update the
-// remote. The Hub must never guess that outcome, so the Node keeps a DURABLE
-// ledger (`<data_dir>/gate-land/land-<job>.json`, pgid + leader start tick):
-// written right after the land child spawns, removed only once the whole group
-// is verified gone, and fenced (TERM → bounded wait → KILL → ESRCH) at the next
-// boot before any carrier is served. A read-only landing probe reports `absent`
-// only with AUTHORITATIVE death evidence: a live kernel ESRCH on the group it
-// spawned, or a durable DEATH CERTIFICATE (`dead-<job>.json`) written only when
-// the kernel verified the group ESRCH. A missing or unreadable ledger/cert is
-// Unknown — never proof the push is dead (r16 item 2, R5).
 
 /// What the Node can establish about a granted land's push liveness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9646,19 +9525,76 @@ head -c 1 >/dev/null || exit 4
         (dir, bare, lane, base)
     }
 
-    /// r28 item 1 (a): two recoveries for the SAME repo/base interleave at the
-    /// fetch→capture boundary. A fetches while the remote is at B; merge M
-    /// lands; B then fetches M. While B is parked pre-capture, the OLD shared
-    /// destination is forced back to A's stale B (exactly the review's
-    /// interleave). With unique private refs each recovery captures its own
-    /// fetched SHA: B certifies Landed, A (group not verified dead) stays
-    /// Unknown, and neither invocation leaves a recovery ref behind.
+    /// R10: the FULL for-each-ref listing before and after a recovery must be
+    /// byte-identical — recovery writes no refs anywhere (heads, tags, notes,
+    /// recovery namespace, nothing).
+    #[cfg(unix)]
+    fn refs_listing(repo: &Path) -> String {
+        git(repo, &["for-each-ref", "--format=%(refname) %(objectname)"])
+    }
+
+    /// R10: ls-remote parsing accepts exactly one well-formed line for the
+    /// requested ref and rejects everything else as an unknown tip.
     #[cfg(unix)]
     #[test]
-    fn overlapping_recoveries_each_see_their_own_fetched_sha() {
-        use super::recovery_overlap_seam as seam;
+    fn ls_remote_base_parsing() {
+        let sha1 = "0123456789abcdef0123456789abcdef01234567";
+        let sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let one = format!("{sha1}\trefs/heads/main\n");
+        assert_eq!(
+            super::parse_ls_remote_base(one.as_bytes(), "main").unwrap(),
+            sha1
+        );
+        assert_eq!(
+            super::parse_ls_remote_base(format!("{sha256}\trefs/heads/x\n").as_bytes(), "x")
+                .unwrap(),
+            sha256
+        );
+        // Absent base: no lines.
+        assert!(super::parse_ls_remote_base(b"", "main").is_err());
+        // Another ref advertised, but not the requested one.
+        assert!(
+            super::parse_ls_remote_base(format!("{sha1}\trefs/heads/other\n").as_bytes(), "main")
+                .is_err()
+        );
+        // Duplicate lines, malformed lines, bad hex are all errors.
+        assert!(
+            super::parse_ls_remote_base(
+                format!("{sha1}\trefs/heads/main\n{sha1}\trefs/heads/main\n").as_bytes(),
+                "main"
+            )
+            .is_err()
+        );
+        assert!(super::parse_ls_remote_base(b"garbage line\n", "main").is_err());
+        assert!(super::parse_ls_remote_base(b"zz\trefs/heads/main\n", "main").is_err());
+        assert!(
+            super::parse_ls_remote_base(
+                format!("{}\trefs/heads/main\n", &sha1[..39]).as_bytes(),
+                "main"
+            )
+            .is_err()
+        );
+        // A peeled tag line beside the head line is not a second match.
+        assert_eq!(
+            super::parse_ls_remote_base(
+                format!("{sha1}\trefs/heads/main\n{sha1}\trefs/tags/v1\n").as_bytes(),
+                "main"
+            )
+            .unwrap(),
+            sha1
+        );
+    }
+
+    /// R10: two overlapping recoveries never swap snapshots — recovery reads
+    /// the authoritative remote tip with ls-remote and writes no refs, so a
+    /// remote move between A's read and its object fetch leaves each probe with
+    /// its own honest SHA: B (M) certifies Landed; A (B, no death evidence)
+    /// stays Unknown.
+    #[cfg(unix)]
+    #[test]
+    fn overlapping_recoveries_read_distinct_tips_without_writing_refs() {
+        use super::recovery_read_seam as seam;
         let (_dir, _bare, lane, base_b) = recovery_branch_fixture("main", None);
-        // M is a local descendant of B (present for ancestry) not yet pushed.
         std::fs::write(lane.join("overlap.txt"), "M\n").unwrap();
         git(&lane, &["add", "overlap.txt"]);
         git(&lane, &["commit", "-q", "-m", "granted merge M"]);
@@ -9668,77 +9604,72 @@ head -c 1 >/dev/null || exit 4
         let params = |job: &'static str, dead: bool| {
             let lane = lane.clone();
             let merge_m = merge_m.clone();
-            (
-                std::thread::spawn(move || {
-                    let request = remuda_protocol::GateResolveLandingParams {
-                        job_id: job.into(),
-                        repo_path: lane.to_string_lossy().into_owned(),
-                        base_branch: "main".into(),
-                        merge_sha: merge_m,
-                    };
-                    super::resolve_landing_after_restart(&request, dead)
-                }),
-                dead,
-            )
+            std::thread::spawn(move || {
+                let request = remuda_protocol::GateResolveLandingParams {
+                    job_id: job.into(),
+                    repo_path: lane.to_string_lossy().into_owned(),
+                    base_branch: "main".into(),
+                    merge_sha: merge_m,
+                };
+                super::resolve_landing_after_restart(&request, dead)
+            })
         };
 
         seam::arm(&lane, 2);
-        let (a, _) = params("gjb_r28_ov_a", false);
+        let a = params("gjb_r30_ov_a", false);
         seam::wait_arrived(&lane, 0);
-        // M reaches the remote between A's fetch (B) and B's fetch (M).
+        // M reaches the remote between A's read (B) and its object fetch.
         git(&lane, &["push", "-q", "origin", "main"]);
-        let (b, _) = params("gjb_r28_ov_b", true);
+        // Baseline AFTER the test's own push (which legitimately moves the
+        // lane's tracking refs); parked A has not fetched anything yet.
+        let before = refs_listing(&lane);
+        let b = params("gjb_r30_ov_b", true);
         seam::wait_arrived(&lane, 1);
-        // The r27 shared destination forced back to A's stale B AFTER B fetched
-        // M — a stale fetch rewriting the ref another probe is about to read.
-        // Unique private refs make this write irrelevant to B.
-        git(&lane, &["update-ref", "refs/remuda/recovery/main", &base_b]);
         seam::release(&lane, 1);
         let reply_b = b.join().expect("probe B joins");
         seam::release(&lane, 0);
         let reply_a = a.join().expect("probe A joins");
         seam::disarm();
-        // The simulated shared ref is a test artifact; remove it before the
-        // leak assertion (production never writes that name anymore).
-        run_git(&lane, &["update-ref", "-d", "refs/remuda/recovery/main"]).unwrap();
 
         assert_eq!(
             reply_b.status, "landed",
-            "B fetched M, must stay Landed: {reply_b:?}"
+            "B read M, must stay Landed: {reply_b:?}"
         );
         assert_eq!(
             reply_b.base_sha.as_deref(),
             Some(merge_m.as_str()),
-            "B must read its OWN fetched snapshot: {reply_b:?}"
+            "{reply_b:?}"
         );
         assert_eq!(
             reply_a.status, "unknown",
-            "A honestly fetched B before M landed and has no death evidence: {reply_a:?}"
+            "A read B with no death evidence: {reply_a:?}"
         );
-        assert_ne!(
-            reply_a.base_sha.as_deref(),
-            Some(merge_m.as_str()),
-            "A must not read B's fetched snapshot"
+        assert_eq!(
+            reply_a.base_sha, None,
+            "an Unknown (non-ancestry without death evidence) carries no base SHA: {reply_a:?}"
         );
-        let leftovers = git(
-            &lane,
-            &[
-                "for-each-ref",
-                "--format=%(refname)",
-                "refs/remuda/recovery/",
-            ],
+        assert!(
+            reply_a
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains(&base_b[..12]),
+            "A's classification is against its OWN read tip B: {reply_a:?}"
         );
-        assert!(leftovers.is_empty(), "recovery refs leaked: {leftovers}");
+        assert_eq!(
+            refs_listing(&lane),
+            before,
+            "overlapping recoveries created, updated or deleted no refs"
+        );
     }
 
-    /// r28 item 1 (b): recovery for base `release` leaves nothing that can
-    /// block a later migration to `release/v2`. Both recoveries certify Landed
-    /// against their own fetched bases.
+    /// R10: recovering `release`, then after a remote migration recovering
+    /// `release/v2`, certifies Landed both times without any ref writes (there
+    /// is no branch-shaped local ref whose prefix could collide).
     #[cfg(unix)]
     #[test]
-    fn recovery_survives_a_base_branch_rename_without_ref_collisions() {
+    fn recovery_survives_a_base_branch_rename_and_writes_no_refs() {
         let (_dir, _bare, lane, _base_b) = recovery_branch_fixture("release", None);
-        // Granted merge M on release, pushed and already on the remote.
         std::fs::write(lane.join("m.txt"), "M\n").unwrap();
         git(&lane, &["add", "m.txt"]);
         git(&lane, &["commit", "-q", "-m", "granted merge M"]);
@@ -9747,36 +9678,26 @@ head -c 1 >/dev/null || exit 4
 
         let recover = |base: &'static str| {
             let request = remuda_protocol::GateResolveLandingParams {
-                job_id: "gjb_r28_rename".into(),
+                job_id: "gjb_r30_rename".into(),
                 repo_path: lane.to_string_lossy().into_owned(),
                 base_branch: base.into(),
                 merge_sha: merge_m.clone(),
             };
             super::resolve_landing_after_restart(&request, true)
         };
+        // Each recovery must leave the repository's refs byte-identical; the
+        // remote MIGRATION below legitimately moves the tracking refs, so the
+        // snapshots bracket each recovery individually.
+        let before_first = refs_listing(&lane);
         let first = recover("release");
         assert_eq!(
             first.status, "landed",
             "first recovery on release: {first:?}"
         );
-        assert!(
-            git(
-                &lane,
-                &[
-                    "for-each-ref",
-                    "--format=%(refname)",
-                    "refs/remuda/recovery/"
-                ]
-            )
-            .is_empty(),
-            "the first recovery must remove its private ref"
-        );
+        assert_eq!(refs_listing(&lane), before_first);
 
-        // Migrate: delete the old remote release branch first (the bare
-        // remote cannot hold `release` and `release/v2` simultaneously), then
-        // publish the later commit D — containing M — as release/v2. The bare
-        // origin's HEAD still points at release, so allow deleting its current
-        // branch (an operator migration resets HEAD separately).
+        // Migrate the remote branch release -> release/v2 (delete first; the
+        // bare server cannot hold both names).
         let origin = _bare.path().join("origin.git");
         git(&origin, &["config", "receive.denyDeleteCurrent", "ignore"]);
         std::fs::write(lane.join("d.txt"), "D\n").unwrap();
@@ -9788,102 +9709,33 @@ head -c 1 >/dev/null || exit 4
             &["push", "-q", "origin", "HEAD:refs/heads/release/v2"],
         );
 
-        let second = recover("release/v2");
+        let second = {
+            let before_second = refs_listing(&lane);
+            let reply = recover("release/v2");
+            assert_eq!(
+                refs_listing(&lane),
+                before_second,
+                "the second recovery created, updated or deleted no ref"
+            );
+            reply
+        };
         assert_eq!(
             second.status, "landed",
-            "M is contained in release/v2; a flat unique ref name cannot collide with the prior \
-             recovery's ref: {second:?}"
-        );
-        assert!(
-            git(
-                &lane,
-                &[
-                    "for-each-ref",
-                    "--format=%(refname)",
-                    "refs/remuda/recovery/"
-                ]
-            )
-            .is_empty(),
-            "the second recovery must leave no ref behind"
+            "M is contained in release/v2 with no local ref collision: {second:?}"
         );
     }
 
-    /// r29 item 3: probe SHA-256 support precisely. A spawn failure (FD limit,
-    /// etc.) PANICS — it is not "unsupported git". An unsuccessful init skips
-    /// ONLY for a recognized unsupported-object-format diagnostic; every other
-    /// init failure panics with git's actual output.
-    #[cfg(unix)]
-    fn git_supports_sha256(probe_repo: &Path) -> bool {
-        let output = match std::process::Command::new("git")
-            .args([
-                "init",
-                "-q",
-                "--object-format=sha256",
-                "-b",
-                "main",
-                probe_repo.to_str().unwrap(),
-            ])
-            .output()
-        {
-            Ok(output) => output,
-            Err(error) => panic!("failed to spawn git for the SHA-256 support probe: {error}"),
-        };
-        if output.status.success() {
-            return true;
-        }
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let recognized_unsupported = (stderr.contains("object-format")
-            || stderr.to_ascii_lowercase().contains("sha256"))
-            && [
-                "unknown",
-                "invalid",
-                "unrecognized",
-                "unrecognised",
-                "not supported",
-                "unsupported",
-            ]
-            .iter()
-            .any(|needle| stderr.to_ascii_lowercase().contains(needle));
-        if recognized_unsupported {
-            eprintln!(
-                "skipping: this git lacks SHA-256 support: {}",
-                stderr.trim()
-            );
-            false
-        } else {
-            panic!("SHA-256 probe init failed for an unrelated reason: {stderr}");
-        }
-    }
-
-    /// r29 item 3: an SHA-256 probe init that fails for an UNRELATED reason
-    /// (target under a path occupied by a regular file) must FAIL the test —
-    /// never be misreported as "unsupported git, skipping".
+    /// R10: a configured `remote.origin.tagOpt=--tags` with a clobbered local
+    /// tag used to make fetch fail — recovery now uses --no-tags, so it still
+    /// certifies Landed, and the clobbered tag and every other ref stay
+    /// byte-identical.
     #[cfg(unix)]
     #[test]
-    fn an_unrelated_sha256_probe_failure_is_not_a_skip() {
-        let dir = TempDir::new().unwrap();
-        std::fs::write(dir.path().join("a-file"), b"x").unwrap();
-        let bogus = dir.path().join("a-file").join("repo");
-        let panicked =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| git_supports_sha256(&bogus)))
-                .is_err();
-        assert!(
-            panicked,
-            "an unrelated init failure must panic, not be reported as unsupported SHA-256"
-        );
-    }
-
-    /// r29 item 1: a fetch that INSTALLS the private recovery ref and then
-    /// fails must still leave an empty recovery namespace (the rejected tag
-    /// update aborts fetch with exit 1 after the requested branch ref commits).
-    #[cfg(unix)]
-    #[test]
-    fn a_failed_fetch_that_installed_the_ref_leaves_no_recovery_ref() {
+    fn a_clobbered_tag_with_tagopt_does_not_break_ref_free_recovery() {
         let (dir, _bare, lane, base_b) = recovery_branch_fixture("main", None);
         let seed = dir.path().join("seed");
-        // Local lane tag pinned at B; AFTER the clone the remote tag moves
-        // sideways to an orphan (non-fast-forward) and remote main advances to
-        // M. tagOpt=--tags makes the recovery fetch carry refs/tags/* too.
+        // Local lane tag pinned at B; remote tag moved sideways AFTER the
+        // clone; remote main advances to M containing B.
         git(&lane, &["tag", "v1", &base_b]);
         let orphan = git(&seed, &["commit-tree", "HEAD^{tree}", "-m", "sideways tag"]);
         git(
@@ -9902,65 +9754,49 @@ head -c 1 >/dev/null || exit 4
         let merge_m = git(&seed, &["rev-parse", "main"]);
         git(&seed, &["push", "-q", "origin", "main"]);
         git(&lane, &["config", "remote.origin.tagOpt", "--tags"]);
-        // Sanity: the exact failure shape — fetch exits 1 but installs the ref.
-        let probe_ref = "refs/remuda/recovery/probe-failure";
+        // Sanity: a PLAIN fetch honoring tagOpt still fails on the clobber.
         let status = std::process::Command::new("git")
             .current_dir(&lane)
-            .args([
-                "fetch",
-                "-q",
-                "origin",
-                &format!("+refs/heads/main:{probe_ref}"),
-            ])
+            .args(["fetch", "-q", "origin"])
             .status()
             .unwrap();
-        assert!(!status.success(), "the tag clobber must make fetch fail");
-        assert_eq!(
-            git(&lane, &["rev-parse", "--verify", "--quiet", probe_ref]),
-            merge_m,
-            "the failed fetch really did install the requested ref"
+        assert!(
+            !status.success(),
+            "the plain fetch must still hit the tag clobber"
         );
-        run_git(&lane, &["update-ref", "-d", probe_ref]).unwrap();
+        let before = refs_listing(&lane);
 
         let request = remuda_protocol::GateResolveLandingParams {
-            job_id: "gjb_r29_tagclobber".into(),
+            job_id: "gjb_r30_tagclobber".into(),
             repo_path: lane.to_string_lossy().into_owned(),
             base_branch: "main".into(),
             merge_sha: merge_m.clone(),
         };
         let reply = super::resolve_landing_after_restart(&request, true);
         assert_eq!(
-            reply.status, "unknown",
-            "the failed fetch stays Unknown: {reply:?}"
+            reply.status, "landed",
+            "--no-tags bypasses the clobber; M is on remote main: {reply:?}"
         );
-        assert!(
-            reply
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("recovery fetch"),
+        assert_eq!(
+            reply.base_sha.as_deref(),
+            Some(merge_m.as_str()),
             "{reply:?}"
         );
-        let leftovers = git(
-            &lane,
-            &[
-                "for-each-ref",
-                "--format=%(refname)",
-                "refs/remuda/recovery/",
-            ],
+        assert_eq!(
+            refs_listing(&lane),
+            before,
+            "the tag and every other ref must be untouched"
         );
-        assert!(
-            leftovers.is_empty(),
-            "the failed fetch's private ref must be deleted: {leftovers}"
-        );
+        // The clobbered tag really is still pinned at B.
+        assert_eq!(git(&lane, &["rev-parse", "refs/tags/v1"]), base_b);
     }
 
-    /// r29 item 1: abandoned recovery refs older than the reclamation horizon
-    /// are deleted by the next recovery; younger refs (which a live probe may
-    /// own) are never touched.
+    /// R10: a recovery whose base the remote does not advertise (ls-remote
+    /// fails / finds nothing) is Unknown and creates, updates or deletes no
+    /// ref — the failure path is as ref-free as the success path.
     #[cfg(unix)]
     #[test]
-    fn an_old_abandoned_recovery_ref_is_reclaimed_but_a_fresh_one_is_kept() {
+    fn a_failed_ref_free_recovery_writes_no_refs() {
         let (dir, _bare, lane, base_b) = recovery_branch_fixture("main", None);
         let seed = dir.path().join("seed");
         std::fs::write(seed.join("m.txt"), "M\n").unwrap();
@@ -9968,69 +9804,84 @@ head -c 1 >/dev/null || exit 4
         git(&seed, &["commit", "-q", "-m", "M"]);
         let merge_m = git(&seed, &["rev-parse", "main"]);
         git(&seed, &["push", "-q", "origin", "main"]);
+        let before = refs_listing(&lane);
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        // 1000 s older than the 250 s horizon; a clearly fresh one.
-        let old_nanos = now - 1_000 * 1_000_000_000;
-        let old_ref = format!("refs/remuda/recovery/1-{old_nanos}-0");
-        let fresh_ref = format!("refs/remuda/recovery/1-{now}-0");
-        git(&lane, &["update-ref", &old_ref, &base_b]);
-        git(&lane, &["update-ref", &fresh_ref, &base_b]);
-
+        // (a) Base not advertised by the remote at all.
         let request = remuda_protocol::GateResolveLandingParams {
-            job_id: "job".into(),
+            job_id: "gjb_r30_nobase".into(),
+            repo_path: lane.to_string_lossy().into_owned(),
+            base_branch: "no-such-base-r30".into(),
+            merge_sha: merge_m.clone(),
+        };
+        let reply = super::resolve_landing_after_restart(&request, true);
+        assert_eq!(reply.status, "unknown", "{reply:?}");
+        assert!(
+            reply
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("does not advertise"),
+            "the Unknown names the missing advertised base: {reply:?}"
+        );
+        assert_eq!(refs_listing(&lane), before);
+
+        // (b) Origin unreachable: ls-remote cannot connect at all.
+        git(
+            &lane,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                dir.path().join("no-such-origin-r30.git").to_str().unwrap(),
+            ],
+        );
+        let request = remuda_protocol::GateResolveLandingParams {
+            job_id: "gjb_r30_nohost".into(),
             repo_path: lane.to_string_lossy().into_owned(),
             base_branch: "main".into(),
             merge_sha: merge_m.clone(),
         };
         let reply = super::resolve_landing_after_restart(&request, true);
-        assert_eq!(reply.status, "landed", "{reply:?}");
-
-        let remaining = git(
-            &lane,
-            &[
-                "for-each-ref",
-                "--format=%(refname)",
-                "refs/remuda/recovery/",
-            ],
-        );
         assert_eq!(
-            remaining, fresh_ref,
-            "only the young ref must survive reclamation: {remaining:?}"
+            reply.status, "unknown",
+            "an unreachable remote stays Unknown: {reply:?}"
         );
-        // Fixture teardown: remove the intentionally-retained fresh ref.
-        run_git(&lane, &["update-ref", "-d", &fresh_ref]).unwrap();
+        assert_eq!(refs_listing(&lane), before, "{}", base_b);
     }
 
-    /// r28 item 2: a SHA-256 repository reports 64-hex object IDs; recovery
-    /// must accept the repository's native object format instead of rejecting
-    /// them as unreadable (the old len()==40 check → permanent Unknown).
+    /// r28 item 2: a SHA-256 repository reports 64-hex object IDs; the
+    /// ref-free recovery reads the advertised 64-hex tip and certifies Landed.
     #[cfg(unix)]
     #[test]
-    fn recovery_in_a_sha256_repo_accepts_64_hex_object_ids() {
-        // Skip (with a printed reason) only when this git lacks SHA-256.
+    fn recovery_in_a_sha256_repo_reads_a_64_hex_tip_without_refs() {
         let probe = TempDir::new().unwrap();
-        let supported = git_supports_sha256(&probe.path().join("sha256-probe"));
+        let supported = std::process::Command::new("git")
+            .args([
+                "init",
+                "-q",
+                "--object-format=sha256",
+                "-b",
+                "main",
+                probe.path().join("sha256-probe").to_str().unwrap(),
+            ])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
         drop(probe);
         if !supported {
+            eprintln!("skipping: this git build lacks --object-format=sha256 support");
             return;
         }
 
         let (_dir, _bare, lane, stale_base) = recovery_branch_fixture("main", Some("sha256"));
-        // A second branch the restricted refspec will be allowed to fetch.
         git(&lane, &["branch", "topic", "main"]);
-        // Granted merge M reaches remote main after the lane's last fetch.
         std::fs::write(lane.join("landed.txt"), "landed\n").unwrap();
         git(&lane, &["add", "landed.txt"]);
         git(&lane, &["commit", "-q", "-m", "granted merge M (sha256)"]);
         let merge_m = git(&lane, &["rev-parse", "main"]);
         assert_eq!(merge_m.len(), 64, "fixture must be SHA-256: {merge_m}");
         git(&lane, &["push", "-q", "origin", "main", "topic"]);
-        // Recreate the stale post-crash checkout: tracking pinned to B, fetch
-        // restricted to topic.
+        // Stale post-crash checkout: tracking pinned to B, fetch restricted.
         git(
             &lane,
             &["update-ref", "refs/remotes/origin/main", &stale_base],
@@ -10043,9 +9894,10 @@ head -c 1 >/dev/null || exit 4
                 "+refs/heads/topic:refs/remotes/origin/topic",
             ],
         );
+        let before = refs_listing(&lane);
 
         let request = remuda_protocol::GateResolveLandingParams {
-            job_id: "gjb_r28_sha256".into(),
+            job_id: "gjb_r30_sha256".into(),
             repo_path: lane.to_string_lossy().into_owned(),
             base_branch: "main".into(),
             merge_sha: merge_m.clone(),
@@ -10053,7 +9905,7 @@ head -c 1 >/dev/null || exit 4
         let reply = super::resolve_landing_after_restart(&request, true);
         assert_eq!(
             reply.status, "landed",
-            "a 64-hex base SHA must not be rejected as unreadable: {reply:?}"
+            "a 64-hex advertised tip must not be rejected as unreadable: {reply:?}"
         );
         let base_sha = reply
             .base_sha
@@ -10061,39 +9913,29 @@ head -c 1 >/dev/null || exit 4
             .expect("landed reply carries the base sha");
         assert_eq!(base_sha.len(), 64, "{base_sha}");
         assert_eq!(base_sha, merge_m, "{reply:?}");
-        assert!(
-            git(
-                &lane,
-                &[
-                    "for-each-ref",
-                    "--format=%(refname)",
-                    "refs/remuda/recovery/"
-                ]
-            )
-            .is_empty(),
-            "the sha256 recovery must leave no ref behind"
+        assert_eq!(
+            refs_listing(&lane),
+            before,
+            "the sha256 recovery created, updated or deleted no ref"
+        );
+        assert_eq!(
+            git(&lane, &["rev-parse", "refs/remotes/origin/main"]),
+            stale_base,
+            "the configured tracking ref is never touched"
         );
     }
 
-    /// r27 item 1 / R5 fail-open: with a restricted `remote.origin.fetch`
-    /// refspec a bare `git fetch origin` can SUCCEED while `origin/main` stays
-    /// stale, so certifying absence against that tracking ref falsely fails a
-    /// merge that is already on remote main. Recovery must fetch the EXACT
-    /// requested base into its own recovery ref and answer Landed against THAT
-    /// immutable tip even when authoritative death evidence is held. A base the
-    /// remote does not carry makes the explicit fetch fail → Unknown: a missing
-    /// fetched base is never Absent.
+    /// R5 fail-open with a stale configured origin: a restricted
+    /// `remote.origin.fetch` can make a plain `git fetch origin` leave
+    /// `origin/main` stale, but recovery reads the remote tip DIRECTLY with
+    /// ls-remote and certifies Landed against the advertised SHA — touching no
+    /// ref at all. A base the remote does not carry is Unknown.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn recovery_fetches_the_requested_base_past_a_restricted_refspec() {
+    async fn recovery_reads_the_advertised_base_past_a_restricted_refspec() {
         let fixture = fixture(PASSING_SCRIPT);
         let lane = fixture.lane.clone();
         let stale_base = git(&lane, &["rev-parse", "origin/main"]);
-        // The granted merge M reaches remote main after the lane's last fetch
-        // (the orphaned land group finished its push before the Node died):
-        // build it on main, push it, then recreate the post-crash state — pin
-        // the local tracking ref back to B and restrict origin.fetch to a
-        // different branch.
         git(&lane, &["checkout", "-q", "main"]);
         std::fs::write(lane.join("landed.txt"), "landed\n").unwrap();
         git(&lane, &["add", "landed.txt"]);
@@ -10113,26 +9955,27 @@ head -c 1 >/dev/null || exit 4
                 "+refs/heads/wt/fake/task:refs/remotes/origin/wt/fake/task",
             ],
         );
-        // Sanity: the stale-tracking fail-open the bug relied on — a plain
-        // fetch honors the restricted refspec and leaves origin/main at B.
+        // Sanity: the stale-tracking fail-open shape still exists for a plain
+        // fetch; recovery itself never uses this configured refspec.
         git(&lane, &["fetch", "-q", "origin"]);
         assert_eq!(
             git(&lane, &["rev-parse", "refs/remotes/origin/main"]),
             stale_base,
             "a restricted fetch must leave the origin/main tracking ref stale"
         );
+        let before = refs_listing(&lane);
 
-        // Authoritative death evidence is present; under the OLD resolver this
-        // combination certified Absent against stale B.
+        // Authoritative death evidence is present; under the OLD stale-tip
+        // resolver this combination certified Absent against B.
         let dir = fixture.node.gate_registry().land_fence_dir.clone();
         let record = serde_json::json!({
-            "jobId": "gjb_r27_refspec", "generation": 1, "pgid": 6127, "startTick": 11
+            "jobId": "gjb_r30_refspec", "generation": 1, "pgid": 6127, "startTick": 11
         });
         super::write_land_group_dead_cert(&dir, &record, 6127).unwrap();
         let reply = fixture
             .node
             .run_gate_resolve_landing(&serde_json::json!({
-                "jobId": "gjb_r27_refspec",
+                "jobId": "gjb_r30_refspec",
                 "repoPath": lane.to_string_lossy(),
                 "baseBranch": "main",
                 "mergeSha": merge_sha,
@@ -10142,39 +9985,28 @@ head -c 1 >/dev/null || exit 4
         assert_eq!(
             reply["status"],
             json!("landed"),
-            "M is on remote main; the explicit recovery fetch must establish Landed, not Absent: \
-             {reply}"
+            "M is advertised on remote main; recovery must establish Landed, not Absent: {reply}"
         );
         assert_eq!(reply["baseSha"], json!(merge_sha), "{reply}");
-        // r28 item 1: the probe uses a private per-invocation ref and deletes
-        // it once the SHA is captured — nothing remains under the recovery
-        // namespace, and the stale configured tracking ref is never touched.
-        assert!(
-            git(
-                &lane,
-                &[
-                    "for-each-ref",
-                    "--format=%(refname)",
-                    "refs/remuda/recovery/"
-                ]
-            )
-            .is_empty(),
-            "no recovery refs may remain after a successful probe"
+        assert_eq!(
+            refs_listing(&lane),
+            before,
+            "a successful probe creates, updates or deletes no ref"
         );
         assert_eq!(
             git(&lane, &["rev-parse", "refs/remotes/origin/main"]),
             stale_base,
-            "recovery must not touch the configured origin/main tracking ref"
+            "recovery never touches the configured origin/main tracking ref"
         );
 
-        // A requested base the remote does not carry: the explicit fetch fails
-        // → Unknown, never a certified Absent, and leaves no recovery ref.
+        // A base the remote does not advertise → Unknown, never Absent, still
+        // no ref writes.
         let reply = fixture
             .node
             .run_gate_resolve_landing(&serde_json::json!({
-                "jobId": "gjb_r27_refspec",
+                "jobId": "gjb_r30_refspec",
                 "repoPath": lane.to_string_lossy(),
-                "baseBranch": "no-such-base-r27",
+                "baseBranch": "no-such-base-r30",
                 "mergeSha": merge_sha,
             }))
             .await
@@ -10184,23 +10016,15 @@ head -c 1 >/dev/null || exit 4
             reply["error"]
                 .as_str()
                 .unwrap_or("")
-                .contains("recovery fetch"),
-            "the Unknown names the failed recovery fetch: {reply}"
+                .contains("does not advertise"),
+            "the Unknown names the missing advertised base: {reply}"
         );
-        assert!(
-            git(
-                &lane,
-                &[
-                    "for-each-ref",
-                    "--format=%(refname)",
-                    "refs/remuda/recovery/"
-                ]
-            )
-            .is_empty(),
-            "a failed fetch must leave no recovery ref behind"
+        assert_eq!(
+            refs_listing(&lane),
+            before,
+            "a failed probe creates, updates or deletes no ref"
         );
     }
-
     /// r19 item 2 / R7: a recovery fetch whose transport stalls is killed at
     /// the per-command cap (well within the probe deadline and the Hub's 30 s
     /// RPC timeout), the resolver answers Unknown BEFORE the deadline, and no
@@ -10252,8 +10076,8 @@ head -c 1 >/dev/null || exit 4
         assert_eq!(reply["status"], json!("unknown"), "{reply}");
         let error = reply["error"].as_str().unwrap_or("");
         assert!(
-            error.contains("recovery fetch") && error.contains("probe bound"),
-            "the unknown names the bounded recovery fetch: {reply}"
+            error.contains("ls-remote") && error.contains("probe bound"),
+            "the unknown names the bounded remote read: {reply}"
         );
         assert!(
             started.elapsed() < Duration::from_secs(13),

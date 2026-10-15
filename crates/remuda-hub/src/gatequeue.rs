@@ -944,19 +944,69 @@ pub(crate) struct GateDecisionGuards {
     >,
 }
 
+/// An acquired per-job decision guard. The job mutex serializes the critical
+/// section; dropping this handle prunes the registry entry once the map is the
+/// SOLE remaining reference — an entry another holder or waiter still
+/// references is always kept (r28 item 3).
+pub(crate) struct HeldJobDecision {
+    registry: GateDecisionGuards,
+    job: String,
+    mutex: Option<std::sync::Arc<tokio::sync::Mutex<()>>>,
+}
+
+impl HeldJobDecision {
+    /// The serializing per-job mutex; the returned guard must be held across
+    /// the critical section and outlives this handle.
+    pub(crate) fn mutex(&self) -> &std::sync::Arc<tokio::sync::Mutex<()>> {
+        self.mutex
+            .as_ref()
+            .expect("decision handle already dropped")
+    }
+}
+
+impl Drop for HeldJobDecision {
+    fn drop(&mut self) {
+        // Release our own clone FIRST. When the map is then the sole
+        // reference, no other holder or lock waiter can exist: remove the
+        // entry so completed jobs do not accumulate for the Hub's lifetime.
+        // Count >= 2 means another task holds a clone (a fresh critical
+        // section between hold() and lock(), or a parked lock waiter) — the
+        // entry must survive so that task serializes on the SAME mutex.
+        // try_lock keeps Drop synchronous: under registry contention the
+        // entry simply stays for the next completed handle to prune.
+        drop(self.mutex.take());
+        if let Ok(mut per_job) = self.registry.per_job.try_lock() {
+            let sole = per_job
+                .get(&self.job)
+                .is_some_and(|entry| std::sync::Arc::strong_count(entry) == 1);
+            if sole {
+                per_job.remove(&self.job);
+            }
+        }
+    }
+}
+
 impl GateDecisionGuards {
     pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    /// The serializing guard for one job. The returned `Arc` outlives the map
-    /// lock, so a parked holder never blocks entry creation for other jobs.
-    async fn for_job(&self, job_id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
-        let mut per_job = self.per_job.lock().await;
-        per_job
-            .entry(job_id.to_owned())
-            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+    /// Acquire the serializing guard for one job. The `Arc` outlives the map
+    /// lock, so a parked holder never blocks entry creation for other jobs;
+    /// the registry entry is pruned when the returned handle drops.
+    pub(crate) async fn hold(&self, job_id: &str) -> HeldJobDecision {
+        let mutex = {
+            let mut per_job = self.per_job.lock().await;
+            per_job
+                .entry(job_id.to_owned())
+                .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        HeldJobDecision {
+            registry: self.clone(),
+            job: job_id.to_owned(),
+            mutex: Some(mutex),
+        }
     }
 }
 
@@ -1079,8 +1129,8 @@ async fn resolve_project_job(
     // sent `gate.abortLanding` even though the writer predicate then refused
     // the row (409). The long read-only probe above stays OUTSIDE the guard:
     // it mutates nothing, and the fresh read under the guard decides.
-    let decision_guard = state.gate_decision_guards.for_job(&job_id).await;
-    let _decision_guard = decision_guard.lock().await;
+    let decision_handle = state.gate_decision_guards.hold(&job_id).await;
+    let _decision_guard = decision_handle.mutex().lock().await;
     let operator = device.id.clone();
     let rationale = rationale.to_owned();
     let expected_attempts = request.expected_attempts;
@@ -2440,8 +2490,8 @@ pub(crate) async fn apply_result(
     // evidence-deferral (record_evidence_deferral below) — serializes per job
     // against the legacy /resolve fresh-read → abort → settle critical
     // section, so an uncertain condition cannot appear in that gap.
-    let verdict_decision_guard = state.gate_decision_guards.for_job(job_id).await;
-    let verdict_decision_guard = verdict_decision_guard.lock().await;
+    let verdict_decision_handle = state.gate_decision_guards.hold(job_id).await;
+    let verdict_decision_guard = verdict_decision_handle.mutex().lock().await;
     let outcome = state
         .store
         .mutate_gate_job(job_id, move |row, conn| {
@@ -2977,8 +3027,11 @@ pub(crate) async fn apply_result(
         })
         .await;
     // The row transition is durable; release the per-job decision guard before
-    // the post-writer side effects (journal, scheduling) (r27 item 2).
+    // the post-writer side effects (journal, scheduling) (r27 item 2). The
+    // handle drop prunes the registry entry when no other holder remains
+    // (r28 item 3).
     drop(verdict_decision_guard);
+    drop(verdict_decision_handle);
     let Ok(Some(job)) = outcome else {
         // Writer stood down (terminal guard / duplicate / generation mismatch /
         // non-authoritative Landing). A non-authoritative Landing verdict keeps
@@ -5689,4 +5742,87 @@ fn schedule_once(state: &AppState) {
     tokio::spawn(async move {
         tick(&state).await;
     });
+}
+
+#[cfg(test)]
+mod decision_guard_tests {
+    use super::GateDecisionGuards;
+
+    /// r28 item 3: overlapping critical sections share ONE mutex; the registry
+    /// entry is pruned only once every handle (and therefore every holder and
+    /// lock waiter) is gone. While a second handle or contended waiter exists
+    /// the entry must survive.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn per_job_entries_are_shared_then_pruned_when_undisturbed() {
+        let guards = GateDecisionGuards::new();
+
+        // Two handles for the same job name the same mutex.
+        let h1 = guards.hold("gjb_prune").await;
+        let h2 = guards.hold("gjb_prune").await;
+        assert!(
+            std::sync::Arc::ptr_eq(h1.mutex(), h2.mutex()),
+            "overlapping critical sections must serialize on one mutex"
+        );
+        {
+            let per_job = guards.per_job.lock().await;
+            assert_eq!(per_job.len(), 1, "one entry per job, not per handle");
+        }
+
+        // A contended lock waiter holds the mutex's Arc for the duration of
+        // its pending lock, so dropping one handle while another is parked must
+        // not prune.
+        let held = h1.mutex().lock().await;
+        let waiter_mutex = h2.mutex().clone();
+        let waiter = tokio::spawn(async move {
+            let _guard = waiter_mutex.lock().await;
+        });
+        // Let the waiter park on the contended mutex.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        drop(h2);
+        {
+            let per_job = guards.per_job.lock().await;
+            assert_eq!(
+                per_job.len(),
+                1,
+                "an entry with a live lock waiter must never be pruned"
+            );
+        }
+        drop(held);
+        waiter
+            .await
+            .expect("the parked waiter proceeds once released");
+        {
+            let per_job = guards.per_job.lock().await;
+            assert_eq!(
+                per_job.len(),
+                1,
+                "h1 still holds a handle: the entry survives"
+            );
+        }
+
+        // A distinct job is a distinct mutex and entry.
+        let other = guards.hold("gjb_other").await;
+        assert!(!std::sync::Arc::ptr_eq(h1.mutex(), other.mutex()));
+        {
+            let per_job = guards.per_job.lock().await;
+            assert_eq!(per_job.len(), 2);
+        }
+        drop(other);
+        // The last handle for the other job drops with no holder/waiter: its
+        // entry is pruned even while gjb_prune remains.
+        {
+            let per_job = guards.per_job.lock().await;
+            assert_eq!(per_job.len(), 1);
+            assert!(per_job.contains_key("gjb_prune"));
+        }
+        drop(h1);
+        {
+            let per_job = guards.per_job.lock().await;
+            assert!(
+                per_job.is_empty(),
+                "completed jobs must not retain decision mutexes"
+            );
+        }
+    }
 }

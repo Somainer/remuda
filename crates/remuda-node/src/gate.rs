@@ -1320,6 +1320,20 @@ impl GateRegistry {
             .map(|run| (run.generation, *run.cancel.borrow()))
     }
 
+    /// r23 item 3 test-only: the recorded land process-group id for a live run,
+    /// so a blocking-pool saturation regression can poll the kernel for the
+    /// group a detached owner was still terminating after the response
+    /// returned.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn gate_test_live_land_pgid(&self, job_id: &str) -> Option<i32> {
+        self.runs.lock().await.runs.get(job_id).and_then(|run| {
+            *run.land_pgid
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+        })
+    }
+
     /// Test-only: drop all local canceled records, simulating a Node process
     /// restart that begins with an empty registry.
     #[doc(hidden)]
@@ -1450,6 +1464,13 @@ impl DevNode {
     #[cfg(any(test, feature = "test-faults"))]
     pub async fn gate_test_live_run_state(&self, job_id: &str) -> Option<(u32, bool)> {
         self.gate_registry().gate_test_live_run_state(job_id).await
+    }
+
+    /// r23 item 3 test-only passthrough for the live land pgid.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn gate_test_live_land_pgid(&self, job_id: &str) -> Option<i32> {
+        self.gate_registry().gate_test_live_land_pgid(job_id).await
     }
 
     /// Test-only: install a Hub-authority hook directly (drives the pre-run
@@ -2613,24 +2634,56 @@ impl DevNode {
                     // WHILE THE LEADER IS UNREAPED and then reaps it — no other
                     // task signals the saved pgid. Report UNCERTAIN either way
                     // (the remote may already hold the ref); the Hub reconciles.
+                    //
+                    // r23 item 3: the ordered terminate→reap sequence is ONE
+                    // owner continuation raced against the ORIGINAL absolute
+                    // deadline, exactly like the normal-exit arm. The blocking
+                    // terminate (which itself waits on Tokio's blocking pool)
+                    // is no longer joined unbounded: when the pool is saturated
+                    // so the closure stays QUEUED past the deadline, the SAME
+                    // continuation detaches and finishes terminate + the single
+                    // reap while the response already returned uncertain.
                     #[cfg(unix)]
                     {
-                        if let Some(pgid) = land_pgid {
-                            tokio::task::spawn_blocking(move || terminate_group(pgid))
-                                .await
-                                .ok();
-                        }
-                        // Reap the land leader BOUNDED by the absolute
-                        // deadline (a SIGKILL'd zombie is normally collected
-                        // well within the cleanup allowance). R8(b): if the
-                        // reap is still blocked, hand the child to a detached
-                        // owner task and respond anyway — never block the
-                        // uncertain settlement on an unreaped leader.
-                        let reaped =
-                            tokio::time::timeout(remaining(land_deadline), land_child.wait()).await;
-                        if reaped.is_err() {
+                        let term_pgid = land_pgid;
+                        #[cfg(any(test, feature = "test-faults"))]
+                        let cleanup_hold = registry.take_cleanup_hold();
+                        let mut continuation: std::pin::Pin<
+                            Box<dyn std::future::Future<Output = ()> + Send>,
+                        > = Box::pin(async move {
+                            if let Some(pgid) = term_pgid {
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    // Same pool-contention hold seam as the
+                                    // normal-exit cleanup, so a test may park
+                                    // the executing closure too.
+                                    #[cfg(any(test, feature = "test-faults"))]
+                                    if let Some(hold) = cleanup_hold {
+                                        hold.entered
+                                            .store(true, std::sync::atomic::Ordering::Release);
+                                        let (rel_lock, rel_cvar) = &*hold.release;
+                                        let mut released = rel_lock
+                                            .lock()
+                                            .unwrap_or_else(|poison| poison.into_inner());
+                                        while !*released {
+                                            released = rel_cvar
+                                                .wait(released)
+                                                .unwrap_or_else(|poison| poison.into_inner());
+                                        }
+                                    }
+                                    terminate_group(pgid);
+                                })
+                                .await;
+                            }
+                            // Reap the leader exactly once, AFTER the
+                            // terminate finished — the only reap on this arm.
+                            let _ = land_child.wait().await;
+                        });
+                        if tokio::time::timeout(remaining(land_deadline), continuation.as_mut())
+                            .await
+                            .is_err()
+                        {
                             tokio::spawn(async move {
-                                let _ = land_child.wait().await;
+                                continuation.await;
                             });
                         }
                     }
@@ -2999,9 +3052,30 @@ impl DevNode {
             // surviving group member, verify the group is ESRCH, then release
             // the durable fence record so a later remote probe may attest
             // `absent`. Never release it while the group can still push.
+            //
+            // r23 item 3: this non-signalling finalizer is BOUNDED by the
+            // original absolute deadline. It only OBSERVES killpg and, when the
+            // group is gone, certifies/removes the fence — it never signals — so
+            // if a saturated blocking pool keeps its closure queued past the
+            // deadline the response returns uncertain and the already-queued
+            // blocking closure keeps running detached (dropping a
+            // spawn_blocking JoinHandle does not cancel the task); a group it
+            // still finds present (or never reaches) simply keeps the fence for
+            // the next-boot reconciler. No unbounded blocking join on the
+            // response path.
             #[cfg(unix)]
             if let Some(pgid) = land_pgid {
-                registry.settle_land_group(&request.job_id, pgid).await;
+                let settle = registry.settle_land_group(&request.job_id, pgid);
+                if tokio::time::timeout(remaining(land_deadline), settle)
+                    .await
+                    .is_err()
+                {
+                    tracing::debug!(
+                        job_id = %request.job_id,
+                        "land fence finalizer still queued/running at the absolute deadline; \
+                         it continues detached and the fence stays for reconciliation"
+                    );
+                }
             }
         }
         attach_failure_evidence(&mut result, &trace, request.keep_logs);
@@ -5693,6 +5767,23 @@ echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\"
 exit 0
 "#;
 
+    /// r23 item 3: passes the verify invocation instantly, then blocks in the
+    /// granted --land phase (after consuming the start-barrier byte) until the
+    /// owner's soft timeout kills it — exercises the timeout/abort arm.
+    const SLOW_LAND_SCRIPT: &str = r#"
+base=$(git rev-parse main 2>/dev/null || echo "1111111111111111111111111111111111111111")
+head=$(git rev-parse wt/fake/task 2>/dev/null || echo "2222222222222222222222222222222222222222")
+if ! printf '%s\n' "$*" | grep -q -- '--land'; then
+  echo "{\"exitCode\":0,\"status\":\"verified\",\"base\":\"$base\",\"head\":\"$head\",\"merged\":\"$head\",\"steps\":[]}"
+  exit 0
+fi
+if [ "${REMUDA_START_BARRIER_FD-}" != "0" ]; then
+  exit 0
+fi
+IFS= read -r -n 1 -t 30 byte || exit 4
+sleep 30
+"#;
+
     const BARRIER_LAND_SCRIPT: &str = r#"
 dir=$(dirname "$0")
 echo "$*" >> "$dir/args.txt"
@@ -6436,6 +6527,146 @@ echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\"
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(origin_main(&fixture), base_main, "push=false moves nothing");
+    }
+
+    /// r23 item 3: REAL blocking-pool saturation on the timeout/abort arm.
+    /// A granted land runs on a runtime whose ENTIRE blocking pool is held by
+    /// latch tasks once the child is running, so the ordered
+    /// terminate_group spawn_blocking (and the fence finalizer) stay QUEUED —
+    /// they never even start — past the absolute land deadline. The response
+    /// must still return at the deadline, uncertain, with NO unbounded
+    /// blocking-task join; after the response the SAME detached owner runs the
+    /// queued terminate and reaps the leader, and the group reaches ESRCH.
+    #[cfg(unix)]
+    #[test]
+    fn a_saturated_blocking_pool_keeps_the_timeout_response_bounded_and_the_detached_owner_finishes()
+     {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            // Small, fully-saturatable pool: every thread below is held by a
+            // latch task for the whole deadline window.
+            .max_blocking_threads(3)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async move {
+            let fixture = fixture(SLOW_LAND_SCRIPT);
+            let base_main = origin_main(&fixture);
+            let node = fixture.node.clone();
+            let mut p = params(&fixture, "land");
+            p.push = false;
+            p.job_id = "gjb_blocking_pool_saturated".into();
+            p.generation = 1;
+            // 0.5 s soft budget + 3.25 s owner allowance = 3.75 s deadline.
+            fixture
+                .node
+                .gate_test_set_land_timeout(Duration::from_millis(500))
+                .await;
+
+            let node_for_run = node.clone();
+            let run = tokio::spawn(async move { node_for_run.run_gate_typed(p).await });
+
+            // Wait until the granted child is running and its pgid/fence are
+            // recorded (the fence write is synchronous before child release).
+            let pgid = {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    if let Some(pgid) = node
+                        .gate_test_live_land_pgid("gjb_blocking_pool_saturated")
+                        .await
+                    {
+                        break pgid;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the land child never recorded a pgid"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            };
+            // Tiny grace so the run reaches its select (fence durable).
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            // Saturate ALL blocking threads until the latch is released. The
+            // terminate/fence closures queue behind these and cannot run.
+            let latch = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+            let mut saturators = Vec::new();
+            for _ in 0..3 {
+                let latch = latch.clone();
+                saturators.push(tokio::task::spawn_blocking(move || {
+                    let (lock, cvar) = &*latch;
+                    let guard = lock.lock().unwrap();
+                    // Bounded self-release so a failure that never unblocks the
+                    // response cannot park a blocking thread for the whole
+                    // binary; the happy path notifies well before this.
+                    let (mut guard, _) = cvar
+                        .wait_timeout(guard, Duration::from_secs(20))
+                        .unwrap_or_else(|poison| poison.into_inner());
+                    *guard = true;
+                }));
+            }
+
+            // Response bounded by the ORIGINAL deadline (~3.75s), even though
+            // the terminate/fence blocking tasks never ran while we hold the
+            // pool. No unbounded join: it cannot wait for the saturators.
+            let started = std::time::Instant::now();
+            let result = tokio::time::timeout(Duration::from_secs(8), run)
+                .await
+                .expect("the response never returned while the pool was saturated")
+                .expect("run task panicked")
+                .expect("run_gate_typed returned an error");
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < Duration::from_millis(6_000),
+                "the response blocked on the saturated pool for {elapsed:?}"
+            );
+            assert_eq!(
+                result.status, "uncertain",
+                "a deadline-expired timeout owner yields uncertainty, got: {result:?}"
+            );
+            assert!(
+                result
+                    .reason
+                    .as_deref()
+                    .is_some_and(|t| t.contains("uncertain")),
+                "{:?}",
+                result.reason
+            );
+            // The group is STILL ALIVE at response time: its terminate was
+            // queued behind the saturated pool and has not run.
+            assert!(
+                !super::gate_test_alive_pids_in_group(pgid).is_empty(),
+                "the terminate closure must still be queued when the uncertain response returns"
+            );
+
+            // Release the pool: the SAME detached owner's queued terminate
+            // runs (TERM/KILL/ESRCH) and reaps the leader; the bounded fence
+            // finalizer then certifies.
+            {
+                let (lock, cvar) = &*latch;
+                let mut done = lock.lock().unwrap();
+                *done = true;
+                cvar.notify_all();
+            }
+            for handle in saturators {
+                let _ = handle.await;
+            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(8);
+            loop {
+                if super::gate_test_alive_pids_in_group(pgid).is_empty() {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the detached owner never terminated/reaped the queued land group {pgid}"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert_eq!(origin_main(&fixture), base_main, "push=false moves nothing");
+        });
+
+        rt.shutdown_timeout(Duration::from_secs(5));
     }
 
     /// r18 item 10: the barrier fake must reject a ZERO-byte read (EOF), not

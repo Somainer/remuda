@@ -1547,6 +1547,9 @@ class HubStore {
    */
   private disposeOutboxForAuthChange() {
     this.outbox?.dispose();
+    // Gate 48 item 7: publish a ZERO pending count for the disposed box so a
+    // retained machine cannot later republish the stale capture's count.
+    this.emit({ outboxPending: 0 });
     this.outbox = null;
     this.outboxUnsubscribe?.();
     this.outboxUnsubscribe = null;
@@ -3025,7 +3028,12 @@ class HubStore {
         // and replaced (peer logout mid-probe, then a healthy re-login) must
         // never overwrite the installed machine's published state.
         if (this.connection !== machine) return;
-        this.emit({ connection: state, outboxPending: box?.pendingCount() ?? 0 });
+        // Gate 48 item 7: `box` is the outbox captured when THIS machine was
+        // built; it may since have been disposed by an identity change while a
+        // different box (or no box) is current. Read the LIVE outbox's count
+        // so a reused machine cannot publish a stale disposed box's pending
+        // number.
+        this.emit({ connection: state, outboxPending: this.outbox?.pendingCount() ?? 0 });
         // A socket-level recovery is also a moment to deliver the queue.
         // Gate 48 item 3: the install's initial live transition fires inside
         // the auth turn — use the bounded lock; later live transitions (post-
@@ -3076,7 +3084,8 @@ class HubStore {
     // reload. (bootstrapLive already emitted on the recovering/offline->live
     // change, so this is skipped in the healthy path.)
     if (this.state.connection !== machine.state) {
-      this.emit({ connection: machine.state, outboxPending: box?.pendingCount() ?? 0 });
+      // Gate 48 item 7: read the live outbox, not the install-time capture.
+      this.emit({ connection: machine.state, outboxPending: this.outbox?.pendingCount() ?? 0 });
     }
 
     if (typeof window !== "undefined") {

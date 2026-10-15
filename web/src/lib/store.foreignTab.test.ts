@@ -10153,3 +10153,53 @@ it("GATE49 item 3: an EXPIRED inflight row reclaimed at bootstrap load while a s
     sessionStorage.removeItem("remuda-outbox-owner-g49-3");
   }
 });
+
+it("GATE49 item 6 (low): a one-shot subscriber that logs out during the cold mock bootstrap leaves no session written or published", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_500_000);
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 5_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner-g49-6", "owner");
+    localStorage.removeItem("runtime.device-session");
+    localStorage.setItem("runtime.logged-out", "1");
+    const { api, hubStore } = await fresh();
+    // The cold mock bootstrap makes ONE credential request (MOCK_BOOTSTRAP_TOKEN).
+    vi.spyOn(api, "login").mockResolvedValue({
+      deviceId: "devCold_g49_6", token: "tokCold", name: "cold",
+    });
+
+    const { readSession } = await import("./session");
+    // One-shot subscriber: on the FIRST ready/authed publication produced by
+    // the mock first-login's applyAuthIdentityChange, log out synchronously.
+    let fired = false;
+    const unsub = hubStore.subscribe(() => {
+      if (fired) return;
+      const s = hubStore.getSnapshot();
+      if (s.ready && !s.session) {
+        fired = true;
+        hubStore.logout();
+      }
+    });
+
+    const outcome = await hubStore.bootstrap();
+    await pump(4_000);
+    unsub();
+
+    expect(fired).toBe(true);
+    // The retirement was observed (not a ready success) and NOTHING persisted
+    // the cold session: no stored session, no authed published UI.
+    expect(outcome).toBe("retired");
+    expect(readSession()).toBeNull();
+    expect(hubStore.getSnapshot().session).toBeNull();
+    expect(hubStore.stateAuthed()).toBe(false);
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner-g49-6");
+  }
+});

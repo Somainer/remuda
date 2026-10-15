@@ -3540,15 +3540,144 @@ async fn carrier_disconnect_preserves_an_evidence_uncertain_canceling_row() {
     assert!(doc["evidenceUncertain"].is_object(), "{doc}");
 }
 
-/// r25 item 3: an evidence-uncertain CANCELING job keeps BOTH scheduler
-/// occupancies: its lane checkout (`busy_lanes`) and, for a land, the
-/// project's single land slot (`land_active`). Two lanes are configured: a
-/// second LAND pinned to the free lane is blocked by the land slot alone, and
-/// a second VERIFY pinned to the parked job's lane is blocked by the lane
-/// alone. Neither dispatches until an authorized settlement releases the first
-/// job; then both run, each on its own lane.
+/// r26 item 2 (a): an evidence-uncertain CANCELING verify job keeps its LANE
+/// checkout (`busy_lanes`). The candidate is a verify pinned to the SAME lane
+/// and is the ONLY queued job — no earlier blocked job can break the project
+/// FIFO loop and mask the check. It must not dispatch while the condition
+/// stands (even though a verify candidate holds no land slot at all) and runs
+/// on the lane only after an authorized settlement releases A.
 #[tokio::test]
-async fn an_evidence_uncertain_canceling_job_keeps_both_lane_and_land_slot_occupancy() {
+async fn an_evidence_uncertain_canceling_verify_job_keeps_its_lane_occupancy() {
+    let (ctx, node) = Ctx::boot().await.unwrap();
+    ctx.configure_gate_lane().await;
+    let barrier = ctx.store().gate_apply_barrier();
+
+    // Job A: a verify pinned to lane1 whose definitive verdict cannot persist.
+    let seed_a = "wt/gate/evidence-lane-occupancy-a";
+    let hook_a = node
+        .arm_gate_run(failed_gate_result("placeholder", seed_a))
+        .await;
+    let (status, enqueued) = ctx
+        .agent_post(
+            &format!("/v1/projects/{}/gate", ctx.project),
+            json!({"branch":seed_a,"mode":"verify","laneId":"lane1"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{enqueued}");
+    let job_a = enqueued["id"].as_str().unwrap().to_owned();
+    hook_a.set_result(failed_gate_result(&job_a, seed_a));
+    hook_a.wait_arrived().await;
+    barrier.arm();
+    node.send_raw(json!({
+        "jsonrpc": "2.0",
+        "method": "gate.event",
+        "params": {
+            "jobId": job_a,
+            "generation": 1,
+            "kind": "finished",
+            "result": failed_gate_result(&job_a, seed_a),
+        }
+    }));
+    hook_a.release_and_wait_proceeded().await;
+    barrier.wait_parked(2).await;
+    ctx.store().test_arm_gate_log_insert_faults(2);
+    barrier.release();
+    barrier.wait_completed(2).await;
+    let doc = ctx.hub.test_get_gate_job(&job_a).await.unwrap().unwrap();
+    assert_eq!(doc["state"], json!("running"), "{doc}");
+    assert_eq!(doc["mode"], json!("verify"), "{doc}");
+    assert_eq!(doc["laneId"], json!("lane1"), "{doc}");
+    assert!(doc["evidenceUncertain"].is_object(), "{doc}");
+
+    // A cancel moves it to Canceling WITH the parked condition.
+    let (status, reply) = ctx
+        .agent_post(
+            &format!("/v1/projects/{}/gate/jobs/{job_a}/cancel", ctx.project),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["state"], json!("canceling"), "{reply}");
+    assert!(reply["evidenceUncertain"].is_object(), "{reply}");
+
+    // The candidate: a verify for the SAME lane, and the ONLY queued job, so
+    // FIFO blocking cannot mask the busy-lane check.
+    let hook_b = node
+        .arm_gate_run(json!({ "jobId": "placeholder", "status": "failed" }))
+        .await;
+    let seed_b = "wt/gate/evidence-lane-occupancy-b";
+    let (status, enqueued_b) = ctx
+        .agent_post(
+            &format!("/v1/projects/{}/gate", ctx.project),
+            json!({"branch":seed_b,"mode":"verify","laneId":"lane1"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{enqueued_b}");
+    let job_b = enqueued_b["id"].as_str().unwrap().to_owned();
+
+    // Across scheduler ticks the candidate stays queued and no gate.run moves.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1400), hook_b.wait_arrived())
+            .await
+            .is_err(),
+        "the verify for the parked job's lane must not dispatch while A is uncertain Canceling"
+    );
+    let doc_b = ctx.hub.test_get_gate_job(&job_b).await.unwrap().unwrap();
+    assert_eq!(
+        doc_b["state"],
+        json!("queued"),
+        "B blocked by the busy lane: {doc_b}"
+    );
+
+    // An authorized exact-tuple settlement releases A (Failed).
+    let (status, reply) = ctx
+        .send(
+            "POST",
+            &format!(
+                "/v1/projects/{}/gate/jobs/{job_a}/resolve-evidence",
+                ctx.project
+            ),
+            &ctx.human,
+            None,
+            Some(json!({
+                "resolution": "failed",
+                "expectedAttempts": 1,
+                "rationale": "operator settled the parked canceling verify",
+            })),
+        )
+        .await;
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["state"], json!("failed"), "{reply}");
+    assert!(reply["evidenceUncertain"].is_null(), "{reply}");
+
+    // The candidate now dispatches once, taking the released lane.
+    hook_b.wait_arrived().await;
+    let doc_b = async {
+        loop {
+            let doc = ctx.hub.test_get_gate_job(&job_b).await.unwrap().unwrap();
+            if doc["state"] == json!("running") {
+                break doc;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+    .await;
+    assert_eq!(doc_b["attempts"], json!(1), "B dispatched once: {doc_b}");
+    assert_eq!(
+        doc_b["laneId"],
+        json!("lane1"),
+        "B takes A's old lane: {doc_b}"
+    );
+}
+
+/// r26 item 2 (b): an evidence-uncertain CANCELING LAND job keeps the
+/// project's single LAND SLOT (`land_active`). Two lanes are configured; the
+/// candidate is a land pinned to the OTHER, FREE lane and is the ONLY queued
+/// job. Its lane is available, so only the land-slot occupancy can block it:
+/// it must not dispatch while the condition stands and runs only after an
+/// authorized settlement releases A.
+#[tokio::test]
+async fn an_evidence_uncertain_canceling_land_job_keeps_the_project_land_slot() {
     let (ctx, node) = Ctx::boot().await.unwrap();
     // Two lanes on the one connected host.
     let (status, body) = ctx
@@ -3592,7 +3721,7 @@ async fn an_evidence_uncertain_canceling_job_keeps_both_lane_and_land_slot_occup
     let barrier = ctx.store().gate_apply_barrier();
 
     // Job A: a land pinned to lane1 whose definitive verdict cannot persist.
-    let seed_a = "wt/gate/evidence-occupancy-a";
+    let seed_a = "wt/gate/evidence-landslot-occupancy-a";
     let hook_a = node
         .arm_gate_run(failed_gate_result("placeholder", seed_a))
         .await;
@@ -3624,6 +3753,7 @@ async fn an_evidence_uncertain_canceling_job_keeps_both_lane_and_land_slot_occup
     barrier.wait_completed(2).await;
     let doc = ctx.hub.test_get_gate_job(&job_a).await.unwrap().unwrap();
     assert_eq!(doc["state"], json!("running"), "{doc}");
+    assert_eq!(doc["mode"], json!("land"), "{doc}");
     assert_eq!(doc["laneId"], json!("lane1"), "{doc}");
     assert!(doc["evidenceUncertain"].is_object(), "{doc}");
 
@@ -3638,13 +3768,12 @@ async fn an_evidence_uncertain_canceling_job_keeps_both_lane_and_land_slot_occup
     assert_eq!(reply["state"], json!("canceling"), "{reply}");
     assert!(reply["evidenceUncertain"].is_object(), "{reply}");
 
-    // The next gate.run that DOES go out must be latched, then enqueue B
-    // (land, free lane2: blocked only by the project land slot) and C (verify,
-    // pinned to A's lane1: blocked only by busy_lanes).
+    // The candidate: a land for the FREE lane2, and the ONLY queued job. Its
+    // lane is unoccupied, so the land slot is the only thing that can block.
     let hook_b = node
         .arm_gate_run(json!({ "jobId": "placeholder", "status": "failed" }))
         .await;
-    let seed_b = "wt/gate/evidence-occupancy-b";
+    let seed_b = "wt/gate/evidence-landslot-occupancy-b";
     let (status, enqueued_b) = ctx
         .agent_post(
             &format!("/v1/projects/{}/gate", ctx.project),
@@ -3653,35 +3782,19 @@ async fn an_evidence_uncertain_canceling_job_keeps_both_lane_and_land_slot_occup
         .await;
     assert_eq!(status, 200, "{enqueued_b}");
     let job_b = enqueued_b["id"].as_str().unwrap().to_owned();
-    let seed_c = "wt/gate/evidence-occupancy-c";
-    let (status, enqueued_c) = ctx
-        .agent_post(
-            &format!("/v1/projects/{}/gate", ctx.project),
-            json!({"branch":seed_c,"mode":"verify","laneId":"lane1"}),
-        )
-        .await;
-    assert_eq!(status, 200, "{enqueued_c}");
-    let job_c = enqueued_c["id"].as_str().unwrap().to_owned();
 
-    // Across scheduler ticks neither queued job moves and no gate.run goes out.
+    // Across scheduler ticks the land candidate stays queued and no gate.run.
     assert!(
         tokio::time::timeout(Duration::from_millis(1400), hook_b.wait_arrived())
             .await
             .is_err(),
-        "the land job for the FREE lane must not dispatch while A holds the project land slot"
+        "the land for the FREE lane must not dispatch while A holds the project land slot"
     );
-    tokio::time::sleep(Duration::from_millis(300)).await;
     let doc_b = ctx.hub.test_get_gate_job(&job_b).await.unwrap().unwrap();
-    let doc_c = ctx.hub.test_get_gate_job(&job_c).await.unwrap().unwrap();
     assert_eq!(
         doc_b["state"],
         json!("queued"),
-        "B blocked by the land slot: {doc_b}"
-    );
-    assert_eq!(
-        doc_c["state"],
-        json!("queued"),
-        "C blocked by busy lane1: {doc_c}"
+        "B blocked by the project land slot: {doc_b}"
     );
 
     // An authorized exact-tuple settlement releases A (Failed).
@@ -3697,7 +3810,7 @@ async fn an_evidence_uncertain_canceling_job_keeps_both_lane_and_land_slot_occup
             Some(json!({
                 "resolution": "failed",
                 "expectedAttempts": 1,
-                "rationale": "operator settled the parked canceling job",
+                "rationale": "operator settled the parked canceling land",
             })),
         )
         .await;
@@ -3705,7 +3818,7 @@ async fn an_evidence_uncertain_canceling_job_keeps_both_lane_and_land_slot_occup
     assert_eq!(reply["state"], json!("failed"), "{reply}");
     assert!(reply["evidenceUncertain"].is_null(), "{reply}");
 
-    // Both queued jobs now dispatch concurrently, each pinned to its own lane.
+    // The land candidate now dispatches once on the free lane.
     hook_b.wait_arrived().await;
     let doc_b = async {
         loop {
@@ -3722,22 +3835,6 @@ async fn an_evidence_uncertain_canceling_job_keeps_both_lane_and_land_slot_occup
         doc_b["laneId"],
         json!("lane2"),
         "B takes the free lane: {doc_b}"
-    );
-    let doc_c = async {
-        loop {
-            let doc = ctx.hub.test_get_gate_job(&job_c).await.unwrap().unwrap();
-            if doc["state"] == json!("running") {
-                break doc;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    }
-    .await;
-    assert_eq!(doc_c["attempts"], json!(1), "C dispatched once: {doc_c}");
-    assert_eq!(
-        doc_c["laneId"],
-        json!("lane1"),
-        "C takes A's old lane: {doc_c}"
     );
 }
 

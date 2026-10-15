@@ -2566,6 +2566,67 @@ mod tests {
         drop(keep);
     }
 
+    /// r29 item 3: probe SHA-256 support precisely — spawn errors and unrelated
+    /// init failures must FAIL the test; only a recognized
+    /// unsupported-object-format diagnostic skips.
+    fn git_supports_sha256(probe_repo: &Path) -> bool {
+        let output = match std::process::Command::new("git")
+            .args([
+                "init",
+                "-q",
+                "--object-format=sha256",
+                "-b",
+                "main",
+                probe_repo.to_str().unwrap(),
+            ])
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) => panic!("failed to spawn git for the SHA-256 support probe: {error}"),
+        };
+        if output.status.success() {
+            return true;
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let recognized_unsupported = (stderr.contains("object-format")
+            || stderr.to_ascii_lowercase().contains("sha256"))
+            && [
+                "unknown",
+                "invalid",
+                "unrecognized",
+                "unrecognised",
+                "not supported",
+                "unsupported",
+            ]
+            .iter()
+            .any(|needle| stderr.to_ascii_lowercase().contains(needle));
+        if recognized_unsupported {
+            eprintln!(
+                "skipping: this git lacks SHA-256 support: {}",
+                stderr.trim()
+            );
+            false
+        } else {
+            panic!("SHA-256 probe init failed for an unrelated reason: {stderr}");
+        }
+    }
+
+    /// r29 item 3: an SHA-256 probe init failing for an UNRELATED reason must
+    /// FAIL the test, never be misreported as unsupported-git skip.
+    #[test]
+    fn an_unrelated_sha256_probe_failure_is_not_a_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a-file"), b"x").unwrap();
+        let bogus = dir.path().join("a-file").join("repo");
+        let panicked =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| git_supports_sha256(&bogus)))
+                .is_err();
+        assert!(
+            panicked,
+            "an unrelated init failure must panic, not be reported as unsupported SHA-256"
+        );
+    }
+
     /// r29 item 1: a recovery fetch that installs the private ref and then
     /// fails (a clobbered tag under tagOpt=--tags) must still leave the
     /// recovery namespace empty and return PushUncertain.
@@ -2680,23 +2741,11 @@ mod tests {
     #[test]
     fn recovery_in_a_sha256_repo_lands_a_merge_on_remote() {
         let probe = tempfile::tempdir().unwrap();
-        let supported = std::process::Command::new("git")
-            .args([
-                "init",
-                "-q",
-                "--object-format=sha256",
-                "-b",
-                "main",
-                probe.path().join("p").to_str().unwrap(),
-            ])
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
+        let supported = git_supports_sha256(&probe.path().join("p"));
+        drop(probe);
         if !supported {
-            eprintln!("skipping: this git build lacks --object-format=sha256 support");
             return;
         }
-        drop(probe);
 
         let keep = tempfile::tempdir().unwrap();
         let full = keep.path().join("full");

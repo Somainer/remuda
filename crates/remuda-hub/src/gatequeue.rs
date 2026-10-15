@@ -937,10 +937,12 @@ struct ResolveLandingRequest {
 /// the short map-lock is released before any holder parks.
 #[derive(Clone, Default)]
 pub(crate) struct GateDecisionGuards {
+    // r29 item 2: a SYNCHRONOUS mutex. Every registry critical section is a
+    // handful of non-awaiting HashMap operations, so a contended holder
+    // releases in microseconds; using std here lets Drop reliably prune
+    // instead of abandoning the entry when try_lock would fail.
     per_job: std::sync::Arc<
-        tokio::sync::Mutex<
-            std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
-        >,
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
     >,
 }
 
@@ -971,17 +973,20 @@ impl Drop for HeldJobDecision {
         // entry so completed jobs do not accumulate for the Hub's lifetime.
         // Count >= 2 means another task holds a clone (a fresh critical
         // section between hold() and lock(), or a parked lock waiter) — the
-        // entry must survive so that task serializes on the SAME mutex.
-        // try_lock keeps Drop synchronous: under registry contention the
-        // entry simply stays for the next completed handle to prune.
+        // entry must survive so that task serializes on the SAME mutex. The
+        // registry mutex is synchronous with only non-awaiting sections, so
+        // blocking here briefly is safe and makes prune reliable (r29 item 2).
         drop(self.mutex.take());
-        if let Ok(mut per_job) = self.registry.per_job.try_lock() {
-            let sole = per_job
-                .get(&self.job)
-                .is_some_and(|entry| std::sync::Arc::strong_count(entry) == 1);
-            if sole {
-                per_job.remove(&self.job);
-            }
+        let mut per_job = self
+            .registry
+            .per_job
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let sole = per_job
+            .get(&self.job)
+            .is_some_and(|entry| std::sync::Arc::strong_count(entry) == 1);
+        if sole {
+            per_job.remove(&self.job);
         }
     }
 }
@@ -996,7 +1001,10 @@ impl GateDecisionGuards {
     /// the registry entry is pruned when the returned handle drops.
     pub(crate) async fn hold(&self, job_id: &str) -> HeldJobDecision {
         let mutex = {
-            let mut per_job = self.per_job.lock().await;
+            let mut per_job = self
+                .per_job
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             per_job
                 .entry(job_id.to_owned())
                 .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
@@ -5764,7 +5772,7 @@ mod decision_guard_tests {
             "overlapping critical sections must serialize on one mutex"
         );
         {
-            let per_job = guards.per_job.lock().await;
+            let per_job = guards.per_job.lock().unwrap();
             assert_eq!(per_job.len(), 1, "one entry per job, not per handle");
         }
 
@@ -5781,7 +5789,7 @@ mod decision_guard_tests {
         tokio::task::yield_now().await;
         drop(h2);
         {
-            let per_job = guards.per_job.lock().await;
+            let per_job = guards.per_job.lock().unwrap();
             assert_eq!(
                 per_job.len(),
                 1,
@@ -5793,7 +5801,7 @@ mod decision_guard_tests {
             .await
             .expect("the parked waiter proceeds once released");
         {
-            let per_job = guards.per_job.lock().await;
+            let per_job = guards.per_job.lock().unwrap();
             assert_eq!(
                 per_job.len(),
                 1,
@@ -5805,24 +5813,65 @@ mod decision_guard_tests {
         let other = guards.hold("gjb_other").await;
         assert!(!std::sync::Arc::ptr_eq(h1.mutex(), other.mutex()));
         {
-            let per_job = guards.per_job.lock().await;
+            let per_job = guards.per_job.lock().unwrap();
             assert_eq!(per_job.len(), 2);
         }
         drop(other);
         // The last handle for the other job drops with no holder/waiter: its
         // entry is pruned even while gjb_prune remains.
         {
-            let per_job = guards.per_job.lock().await;
+            let per_job = guards.per_job.lock().unwrap();
             assert_eq!(per_job.len(), 1);
             assert!(per_job.contains_key("gjb_prune"));
         }
         drop(h1);
         {
-            let per_job = guards.per_job.lock().await;
+            let per_job = guards.per_job.lock().unwrap();
             assert!(
                 per_job.is_empty(),
                 "completed jobs must not retain decision mutexes"
             );
         }
+    }
+
+    /// r29 item 2: when the final handle for a completed job drops WHILE another
+    /// worker holds the registry mutex (a concurrent hold()), the drop blocks
+    /// briefly and still prunes once the registry lock is released — the entry
+    /// must never be silently abandoned. The job is never looked up again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pruning_waits_for_registry_contention_without_a_revisit() {
+        let guards = GateDecisionGuards::new();
+        let handle = guards.hold("gjb_contended").await;
+        assert_eq!(guards.per_job.lock().unwrap().len(), 1);
+
+        // Hold the registry lock on THIS thread and drop the final handle on a
+        // separate thread; its Drop must block instead of giving up.
+        let per_job = guards
+            .per_job
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dropper = {
+            let guards = guards.clone();
+            std::thread::spawn(move || {
+                // Touches the same job key only inside Drop; the test never
+                // calls hold("gjb_contended") again.
+                let _guards = guards;
+                drop(handle);
+            })
+        };
+        // Give the dropping thread time to block on the registry mutex.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(
+            per_job.len(),
+            1,
+            "the entry cannot be pruned while the registry lock is held"
+        );
+        drop(per_job);
+        dropper.join().expect("the contended drop completes");
+
+        assert!(
+            guards.per_job.lock().unwrap().is_empty(),
+            "the contended drop still pruned its entry with no later lookup"
+        );
     }
 }

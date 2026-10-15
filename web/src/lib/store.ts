@@ -1693,7 +1693,9 @@ class HubStore {
         if (this.outboxLoadGateForTest) {
           await new Promise<void>((resolve) => this.outboxLoadGateForTest?.(resolve));
         }
-        const box = await Outbox.load(opened.storage);
+        // Gate 49 item 3: auth-initialization reclamation is bounded so a
+        // sibling-held instance lock can never park bootstrap/login.
+        const box = await Outbox.load(opened.storage, undefined, true);
         if (obsolete() || !this.outboxInit) {
           // Another identity won: dispose the box we just built and leave the
           // current outbox (if a newer initializer installed one) untouched.

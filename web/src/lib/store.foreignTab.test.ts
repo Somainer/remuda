@@ -10040,3 +10040,87 @@ it("GATE49 item 2: old outbox holds the lock mid-POST with a SIBLING queued in F
     sessionStorage.removeItem("remuda-outbox-owner-g49-2");
   }
 });
+
+it("GATE49 item 3: an EXPIRED inflight row reclaimed at bootstrap load while a sibling holds its lock — queued login starts within the bound (bounded load-time reclamation)", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_499_000);
+  const I = "ins_g49_3";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 5_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner-g49-3", "owner");
+    localStorage.setItem("runtime.device-session", JSON.stringify({ deviceId: "devA_g49_3", name: "A" }));
+    // An EXPIRED inflight row owned by THIS owner from a prior context: load()
+    // reclaims it under the instance lock (LEASE_TTL_MS in the past).
+    const expiredLease = { owner: "owner", until: Date.now() - 120_000, claimToken: "old-token" };
+    const preStorage = new (await import("./outbox")).LocalStorageOutboxStorage();
+    await preStorage.put({
+      commandId: "cmd_g49_3", clientRequestId: "local_g49_3", instanceId: I,
+      prompt: "g49 3 reclaimed", createdAt: 1, attempts: 1, state: "inflight",
+      lease: expiredLease,
+    });
+
+    // Sibling holder keeps the instance lock held across the whole bootstrap.
+    let releaseSibling: () => void = () => {};
+    const siblingHeld = new Promise<void>((resolve) => { releaseSibling = resolve; });
+    globalThis.navigator.locks.request(
+      `remuda-outbox-${I}`,
+      { mode: "exclusive" },
+      () => siblingHeld,
+    );
+    await pump(100);
+
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true } as never);
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] } as never);
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+    vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+    vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+    vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+    vi.spyOn(api, "instanceList").mockResolvedValue({
+      items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
+      nextCursor: null,
+    } as never);
+    vi.spyOn(api, "instanceSend").mockImplementation((() => Promise.resolve({
+      relatedCommandIds: [],
+      command: { commandId: "cmd_g49_3", id: "cmd_g49_3", state: "accepted", revision: "1", dispatch: "native-acknowledged", resolution: "clear" },
+    })) as unknown as Api["instanceSend"]);
+
+    // A queued login behind bootstrap.
+    let bodyStarted = false;
+    vi.spyOn(api, "login").mockImplementation((() => {
+      bodyStarted = true;
+      return Promise.resolve({ deviceId: "devB_g49_3", token: "tokB", name: "B" });
+    }) as unknown as Api["login"]);
+    const loginP = hubStore.login("bootstrap", "secret", "devB_g49_3");
+
+    // Bootstrap must not hang on the load-time reclaim blocked by the sibling
+    // holder: the reclaim is bounded and the install settles, so the queued
+    // login proceeds within the bound even though the sibling still holds.
+    const boot = hubStore.bootstrap();
+    await pump(8_000);
+    await expect(boot).resolves.toBeDefined();
+    await expect(loginP).resolves.toBeUndefined();
+    expect(bodyStarted).toBe(true);
+    // The reclaimed row stays pending and is left untouched (no POST while
+    // sibling holds); its later delivery is owned by normal recovery.
+    expect(vi.mocked(api.instanceSend)).not.toHaveBeenCalled();
+
+    releaseSibling();
+    await pump(400);
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner-g49-3");
+  }
+});

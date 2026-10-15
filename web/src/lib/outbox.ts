@@ -1007,7 +1007,11 @@ export class Outbox {
     }
   }
 
-  static async load(storage: OutboxStorage, owner?: Id): Promise<Outbox> {
+  static async load(
+    storage: OutboxStorage,
+    owner?: Id,
+    boundedReclaim = false,
+  ): Promise<Outbox> {
     const box = new Outbox(storage, owner ?? Outbox.tabOwner());
     for (const rec of (await storage.all()).filter((r) => commandIdFromKey(r.commandId))) {
       box.cache.set(rec.commandId, rec);
@@ -1100,7 +1104,13 @@ export class Outbox {
         // if a sibling holds the lock it leaves the (expired) rows unchanged
         // for the installed outbox's lease recovery instead of parking the
         // bootstrap/login turn behind the Web-Lock queue.
-        const stored = await box.runUnderInstanceLock(instanceId, reclaim);
+        const stored = boundedReclaim
+          ? await box.withInstanceLock(
+              instanceId,
+              () => reclaim(),
+              { ifAvailable: true },
+            ).then((v) => (v === "lock-unavailable" ? null : (v as OutboxRecord | null)))
+          : await box.runUnderInstanceLock(instanceId, reclaim);
         if (stored) {
           // Authoritative current row — reclaimed to pending, terminal, or a
           // replacement inflight lease a live owner renewed while this load
@@ -1722,7 +1732,17 @@ export class Outbox {
   private async runUnderInstanceLock<T>(instanceId: Id, fn: () => Promise<T>): Promise<T> {
     const locks = (globalThis as { navigator?: Navigator & { locks?: LockManager } }).navigator?.locks;
     if (locks?.request) {
-      return await locks.request(instanceDeliveryLockName(instanceId), { mode: "exclusive" }, fn);
+      // Gate 49 item 3: load-time reclamation / lease-wake reads mark the
+      // active-run set too, so a bounded initializer drain that finds the lock
+      // held by THIS in-flight reclaim awaits it and retries instead of
+      // treating it as an unboundable holder.
+      const name = instanceDeliveryLockName(instanceId);
+      this.runningSelfLocks.add(name);
+      try {
+        return await locks.request(name, { mode: "exclusive" }, fn);
+      } finally {
+        this.runningSelfLocks.delete(name);
+      }
     }
     return await fn();
   }

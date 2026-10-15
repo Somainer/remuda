@@ -10281,7 +10281,7 @@ it("GATE50 item 2 (low): a synchronous logout during the cold mock bootstrap's d
   }
 });
 
-it("GATE50 item 1: active POST A + queued sibling + same-box flush B behind it — bounded bootstrap and a queued login both proceed within the bound", async () => {
+it("GATE51 item 2: active POST A + queued sibling + same-box flush B — a login QUEUED BEHIND the bounded bootstrap (enqueued while bootstrap is still in its bounded drain) proceeds within the bound", async () => {
   vi.useFakeTimers();
   vi.setSystemTime(1_501_000);
   const I = "ins_g50_1";
@@ -10371,24 +10371,60 @@ it("GATE50 item 1: active POST A + queued sibling + same-box flush B behind it �
         Promise.resolve().then(() => "pending" as const),
       ]);
 
-    // BOUNDED bootstrap (same identity): its drain finds A actively holding and
-    // a queued same-box B behind it, skips without queueing, and settles while
-    // A is still mid-POST and the sibling suspended.
-    const bootP = hubStore.bootstrap();
-    await pump(5_000);
-    expect(await probe(bootP)).toBe("settled");
-    await bootP;
-
-    // A login QUEUED BEHIND bootstrap: its bounded turn likewise proceeds
-    // within the bound while A is held and the sibling is suspended.
+    // Gate 51 item 2: install the login spy BEFORE starting bootstrap.
     let bodyStarted = false;
     vi.spyOn(api, "login").mockImplementation((() => {
       bodyStarted = true;
       return Promise.resolve({ deviceId: "devA_g50_1", token: "tokA", name: "A" });
     }) as unknown as Api["login"]);
-    const loginP = hubStore.login("bootstrap", "secret", "devA_g50_1");
+
+    // Enqueue the login from INSIDE the bounded drain's ifAvailable request —
+    // that request is issued from bootstrap's call stack while the bootstrap
+    // auth op is still running (A is mid-POST and the sibling is suspended).
+    // This makes the login genuinely QUEUED BEHIND bootstrap; awaiting
+    // bootstrap first (the gate50 version) let login reserve the S3 queue
+    // after bootstrap had already left it.
+    let loginP: Promise<unknown> | undefined;
+    let enqueuedDuringBoot = false;
+    let sendsAtEnqueue = -1;
+    const lockName = `remuda-outbox-${I}`;
+    const locksObj = globalThis.navigator.locks as unknown as {
+      request: (
+        name: string,
+        opts: unknown,
+        cb: (lock: { name: string } | null) => Promise<unknown>,
+      ) => Promise<unknown>;
+    };
+    const rawRequest = locksObj.request.bind(locksObj) as typeof locksObj.request;
+    locksObj.request = (name, opts, cb) => {
+      if (
+        loginP === undefined &&
+        name === lockName &&
+        (opts as { ifAvailable?: boolean })?.ifAvailable
+      ) {
+        enqueuedDuringBoot = true;
+        sendsAtEnqueue = vi.mocked(api.instanceSend).mock.calls.length;
+        loginP = hubStore.login("bootstrap", "secret", "devA_g50_1");
+      }
+      return rawRequest(name, opts, cb);
+    };
+
+    // BOUNDED bootstrap (same identity): its drain finds A actively holding and
+    // a queued same-box B behind it, skips without queueing, and settles while
+    // A is still mid-POST and the sibling suspended. The login is enqueued
+    // mid-turn, before bootstrap settles.
+    const bootP = hubStore.bootstrap();
     await pump(5_000);
-    expect(await probe(loginP)).toBe("settled");
+    expect(enqueuedDuringBoot).toBe(true);
+    expect(sendsAtEnqueue).toBe(1); // A mid-POST; B was never POSTed
+    expect(await probe(bootP)).toBe("settled");
+    await bootP;
+
+    // The queued login's credential request starts and the turn settles while
+    // A is held and the sibling is suspended.
+    expect(loginP).toBeDefined();
+    await pump(5_000);
+    expect(await probe(loginP!)).toBe("settled");
     await loginP;
     expect(bodyStarted).toBe(true);
 

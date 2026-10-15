@@ -422,6 +422,13 @@ struct Mapper {
     /// locally-written turns rather than a process-global counter or
     /// `result_index`.
     turns: TurnBook,
+    /// True once this run emitted per-call usage from an assistant /
+    /// message_delta frame. When set, a `result` frame's summed `usage` is
+    /// NOT re-emitted as a Turn snapshot (c-usagefu: per-call frames are the
+    /// authority; the result would double count); a result on a stream that
+    /// produced no per-call usage (e.g. a bare print result) still emits its
+    /// tokens so the TPM window folds them (c-ctxusage).
+    saw_per_call_usage: bool,
     /// ma-sdk-state r6 item 5: status/error text of the most recent completed
     /// turn whose settle was deferred behind a newer outstanding turn, used to
     /// emit the deferred settle if that newer turn's write fails.
@@ -742,6 +749,7 @@ fn build_inner(
             channel: SourceChannel::Stdout,
             media_stager,
             turns: TurnBook::default(),
+            saw_per_call_usage: false,
             deferred_result: None,
         }),
         launch: tokio::sync::Mutex::new(None),
@@ -1215,6 +1223,7 @@ impl ClaudePrintDriver {
                 channel: SourceChannel::Stdout,
                 media_stager: self.options.media_stager.clone(),
                 turns: TurnBook::default(),
+                saw_per_call_usage: false,
                 deferred_result: None,
             };
         }
@@ -5710,7 +5719,7 @@ fn map_result(mapper: &mut Mapper, result: &ResultMessage) -> DriverResult<Vec<O
         related,
         affects_completion,
     )?];
-    if let Some(mut usage) = usage_from_result(mapper, result)? {
+    for mut usage in usage_from_result(mapper, result)? {
         // c-ctxusage r6 item 2 (kept under ruling D): a LIVE print/sdk terminal
         // result read at process receipt carries the receipt time as its native
         // call time, so the Hub's TPM/lastTurnAt windows fold live print/sdk
@@ -5834,7 +5843,7 @@ fn turn_usage_observation(
 fn usage_from_result(
     mapper: &mut Mapper,
     result: &ResultMessage,
-) -> DriverResult<Option<Observation>> {
+) -> DriverResult<Vec<Observation>> {
     // Learn native per-model windows from modelUsage for later calls.
     if let Some(model_usage) = result.model_usage.as_ref().and_then(Value::as_object) {
         for (model, blob) in model_usage {
@@ -5851,8 +5860,6 @@ fn usage_from_result(
         amount: amount.to_string(),
         currency: "USD".into(),
     });
-    // A single reported window only when the result named exactly one model;
-    // a multi-model session total cannot be pinned to one window.
     let window = result
         .model_usage
         .as_ref()
@@ -5866,32 +5873,146 @@ fn usage_from_result(
                 .and_then(Value::as_u64)
                 .filter(|window| *window > 0)
         });
-    // Both print and SDK take per-call counters from the assistant /
-    // message_delta frames (item (a) and c-usagefu r2 item 3). The result
-    // frame's summed usage is NEVER emitted as a cumulative Session stock:
-    // doing so summed every call's context (the exit-plan fixture showed
-    // 134,448 = 67% of 200k instead of the real last-call 33,718 = 17%) and
-    // then froze/replaced per-turn buckets. The SDK uses the identical
-    // stream-json argv apart from `-p`, so it has the same per-call channel —
-    // the old "SDK has no per-call assistant channel" reason was wrong. The
-    // result contributes ONLY the cumulative reported cost and the native
-    // modelUsage window.
-    if cost.is_none() && window.is_none() {
-        return Ok(None);
+    // c-ctxusage x c-usagefu reconciliation — the result frame produces TWO
+    // usage observations, satisfying both accepted contracts:
+    //
+    // 1. A TURN-scoped snapshot carrying the frame's summed turn `usage`
+    //    (c-ctxusage: the live result receipt with its nativeAt feeds the
+    //    per-call TPM window; scope keyed on the zero-based result index so
+    //    successive frames merge revision-wise). When per-call durable
+    //    Messages also cover the same turn the Hub fold suppresses this row,
+    //    so print/SDK frames that already carry per-call counters never
+    //    double count.
+    // 2. A SESSION-scoped cost/window carrier with NO token stock
+    //    (c-usagefu: `result.usage` sums every call's context and must never
+    //    become cumulative session totals; the reported cumulative cost and
+    //    the modelUsage contextWindow ride this observation).
+    //
+    // A frame with no tokens, cost or window produces nothing.
+    let usage = result.usage.as_ref().filter(|u| u.is_object());
+    let result_input = usage
+        .and_then(|u| u.get("input_tokens"))
+        .and_then(Value::as_u64);
+    let result_output = usage
+        .and_then(|u| u.get("output_tokens"))
+        .and_then(Value::as_u64);
+    let result_cache_read = usage
+        .and_then(|u| {
+            u.get("cache_read_input_tokens")
+                .or_else(|| u.get("cached_input_tokens"))
+        })
+        .and_then(Value::as_u64);
+    let result_cache_write = usage
+        .and_then(|u| {
+            u.get("cache_creation_input_tokens")
+                .or_else(|| u.get("cache_write_input_tokens"))
+        })
+        .and_then(Value::as_u64);
+    if result_input.is_none()
+        && result_output.is_none()
+        && result_cache_read.is_none()
+        && result_cache_write.is_none()
+        && cost.is_none()
+        && window.is_none()
+    {
+        return Ok(Vec::new());
     }
-    // Monotonic across turns and the two Workflow sub-results.
-    let revision = result
+    // An all-ZERO call with no cost/window is a no-op too: every reported
+    // bucket is a structural zero (or omitted), so there is nothing to count
+    // and nothing to bill.
+    let all_token_buckets_zero_or_absent = [
+        result_input,
+        result_output,
+        result_cache_read,
+        result_cache_write,
+    ]
+    .iter()
+    .all(|value| value.is_none() || *value == Some(0));
+    if all_token_buckets_zero_or_absent && cost.is_none() && window.is_none() {
+        return Ok(Vec::new());
+    }
+    // Turn position: raw result index (0-based -> revision 1/2/3), matching
+    // how the transcript mapper stamps successive result frames.
+    let turn_revision = result.result_index.map(|index| index + 1).unwrap_or(1);
+    let scope_id = match (result.num_turns, result.result_index) {
+        (Some(turn), Some(index)) => format!("{turn}:{index}"),
+        (Some(turn), None) => turn.to_string(),
+        (None, Some(index)) => index.to_string(),
+        (None, None) => "0".into(),
+    };
+    // The session carrier revision stays monotonic across turns AND Workflow
+    // sub-results (num_turns*1000 + position).
+    let session_revision = result
         .num_turns
         .unwrap_or(1)
         .saturating_mul(1000)
-        .saturating_add(result.result_index.map(|index| index + 1).unwrap_or(1));
+        .saturating_add(turn_revision);
     let session_id = mapper.session_id.clone();
-    let mut payload = UsagePayload {
+    let total = result_input
+        .zip(result_output)
+        .map(|(input, output)| input.saturating_add(output));
+
+    let mut observations = Vec::new();
+
+    // (1) Turn-scoped snapshot.
+    //
+    // When this run already emitted per-call usage (assistant /
+    // message_delta), the result frame's summed usage is suppressed here —
+    // including its cost, which rides the SESSION carrier below — so exactly
+    // the per-call Turn rows exist (c-usagefu: the result re-sums the same
+    // calls). When the run had no per-call channel, the result tokens ARE
+    // the only turn evidence and ride this row (c-ctxusage TPM window); a
+    // cost-only frame on such a stream revises the same Turn row.
+    let emit_turn = !mapper.saw_per_call_usage;
+    let result_has_tokens = result_input.is_some()
+        || result_output.is_some()
+        || result_cache_read.is_some()
+        || result_cache_write.is_some();
+    if emit_turn && (result_has_tokens || cost.is_some()) {
+        let mut turn_payload = UsagePayload {
+            usage_id: Id::new("obj")?,
+            scope: UsageScope::Turn,
+            scope_id: scope_id.clone(),
+            mode: UsageMode::Snapshot,
+            metric_revision: U64(turn_revision),
+            source_session_id: None,
+            input_tokens: opt_u64(result_input),
+            input_accounting: InputAccounting::Unknown,
+            output_tokens: opt_u64(result_output),
+            reasoning_tokens: unknown("not-emitted"),
+            cache_read_tokens: opt_u64(result_cache_read),
+            cache_write_tokens: opt_u64(result_cache_write),
+            total_tokens: opt_u64(total),
+            cost: cost
+                .as_ref()
+                .map(|cost| Knowledge::Known {
+                    value: cost.clone(),
+                })
+                .unwrap_or_else(|| unknown("not-emitted")),
+            accounting: remuda_protocol::Accounting::Reported,
+            native_fields_ref: None,
+            context_window: window.map(U64),
+        };
+        turn_payload.usage_id = Id::derive(
+            "obj",
+            mapper.instance_id.as_id().as_str(),
+            &format!("usage:result-turn:{scope_id}"),
+        )?;
+        observations.push(mapper.observation(
+            Completeness::Structured,
+            NativeRequestKey::None,
+            ObservationPayload::Usage(Box::new(turn_payload)),
+        )?);
+    }
+
+    // (2) Session-scoped cost/window carrier — token-less by design.
+    let mut session_payload = UsagePayload {
         usage_id: Id::new("obj")?,
         scope: UsageScope::Session,
-        scope_id: session_id.clone(),
+        scope_id: session_id,
         mode: UsageMode::Snapshot,
-        metric_revision: U64(revision),
+        metric_revision: U64(session_revision),
+        source_session_id: None,
         input_tokens: unknown("not-emitted-on-result"),
         input_accounting: InputAccounting::Unknown,
         output_tokens: unknown("not-emitted-on-result"),
@@ -5899,24 +6020,28 @@ fn usage_from_result(
         cache_read_tokens: unknown("not-emitted-on-result"),
         cache_write_tokens: unknown("not-emitted-on-result"),
         total_tokens: unknown("not-emitted-on-result"),
-        cost: unknown("not-emitted"),
+        cost: cost
+            .as_ref()
+            .map(|cost| Knowledge::Known {
+                value: cost.clone(),
+            })
+            .unwrap_or_else(|| unknown("not-emitted")),
         accounting: remuda_protocol::Accounting::Estimated,
         native_fields_ref: None,
-        source_session_id: None,
-        context_window: None,
+        context_window: window.map(U64),
     };
-    // The result frame is the source of truth for reported cost; the native
-    // modelUsage window rides along. Both carriers keep these.
-    if let Some(cost) = cost {
-        payload.cost = Knowledge::Known { value: cost };
-        payload.accounting = remuda_protocol::Accounting::Reported;
-    }
-    payload.context_window = window.map(U64);
-    Ok(Some(mapper.observation(
+    session_payload.usage_id = Id::derive(
+        "obj",
+        mapper.instance_id.as_id().as_str(),
+        &format!("usage:result-session:{session_revision}"),
+    )?;
+    observations.push(mapper.observation(
         Completeness::Structured,
         NativeRequestKey::None,
-        ObservationPayload::Usage(Box::new(payload)),
-    )?))
+        ObservationPayload::Usage(Box::new(session_payload)),
+    )?);
+
+    Ok(observations)
 }
 
 fn map_task_started(mapper: &mut Mapper, task: &TaskStarted) -> DriverResult<Vec<Observation>> {
@@ -6935,6 +7060,17 @@ fn unknown<T>(reason: &str) -> Knowledge<T> {
     }
 }
 
+/// A known numeric knowledge value, or `None` (absent bucket).
+fn opt_u64(value: Option<u64>) -> Knowledge<U64> {
+    match value {
+        Some(value) => Knowledge::Known { value: U64(value) },
+        None => Knowledge::Unknown {
+            reason: "not-emitted".into(),
+            evidence_event_ids: Vec::new(),
+        },
+    }
+}
+
 fn tool_category(name: &str) -> ToolCategory {
     match name {
         "Bash" => ToolCategory::Shell,
@@ -7030,6 +7166,7 @@ impl StdoutMapper {
                 channel: SourceChannel::Stdout,
                 media_stager: None,
                 turns: TurnBook::default(),
+                saw_per_call_usage: false,
                 deferred_result: None,
             },
         }
@@ -7231,6 +7368,7 @@ impl TranscriptMapper {
                 channel: SourceChannel::Transcript,
                 media_stager: None,
                 turns: TurnBook::default(),
+                saw_per_call_usage: false,
                 deferred_result: None,
             },
             group: records::Group::default(),
@@ -8787,6 +8925,7 @@ pub mod review {
                     channel: SourceChannel::Stdout,
                     media_stager: None,
                     turns: TurnBook::default(),
+                    saw_per_call_usage: false,
                     deferred_result: None,
                 },
             }
@@ -8829,6 +8968,7 @@ pub mod review {
             channel: SourceChannel::Stdout,
             media_stager: None,
             turns: TurnBook::default(),
+            saw_per_call_usage: false,
             deferred_result: None,
         };
         map_outbound(&mut mapper, &frame)

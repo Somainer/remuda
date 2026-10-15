@@ -30,8 +30,13 @@ fn feed_live_result() -> (Observation, String) {
     let observations = mapper.map(frame).expect("result frame maps");
     let usage = observations
         .into_iter()
-        .find(|o| matches!(o.body, ObservationPayload::Usage(_)))
-        .expect("a result frame yields one usage observation");
+        .find(|o| {
+            matches!(
+                &o.body,
+                ObservationPayload::Usage(u) if u.scope == remuda_protocol::UsageScope::Turn
+            )
+        })
+        .expect("a result frame yields a Turn usage observation");
     let native_at = match &usage.native_at {
         remuda_protocol::Knowledge::Known { value } => String::from(value.clone()),
         other => panic!("live result native_at must be Known, got {other:?}"),
@@ -120,8 +125,14 @@ fn a_partial_result_frame_merges_over_known_counters_end_to_end() {
             .map(frame)
             .expect("result frame maps")
             .into_iter()
-            .find(|o| matches!(o.body, ObservationPayload::Usage(_)))
-            .expect("a result frame yields one usage observation")
+            .find(|o| {
+                matches!(
+                    &o.body,
+                    ObservationPayload::Usage(u)
+                        if u.scope == remuda_protocol::UsageScope::Turn
+                )
+            })
+            .expect("a result frame yields a Turn usage observation")
     }
 
     // Promote a real mapper observation to a strictly newer transcript source
@@ -162,6 +173,7 @@ fn a_partial_result_frame_merges_over_known_counters_end_to_end() {
     );
 
     if let ObservationPayload::Usage(payload) = &second.body {
+        assert_eq!(payload.scope, remuda_protocol::UsageScope::Turn);
         assert_eq!(payload.scope_id, "1:0");
         assert!(
             matches!(

@@ -217,6 +217,7 @@ pub(super) fn map_stream(
             if let Some(usage_obs) =
                 super::turn_usage_observation(mapper, &native, model.as_deref(), &final_usage, 2)?
             {
+                mapper.saw_per_call_usage = true;
                 return Ok(vec![usage_obs]);
             }
         }
@@ -470,6 +471,7 @@ pub(super) fn map_assistant(
         && stream_usage_carrier(mapper.driver_kind)
         && let Some(usage_obs) = super::usage_from_assistant_message(mapper, msg)?
     {
+        mapper.saw_per_call_usage = true;
         out.push(usage_obs);
     }
     if let Some(id) = &msg.uuid {

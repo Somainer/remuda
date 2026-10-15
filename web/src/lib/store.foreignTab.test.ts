@@ -10166,7 +10166,7 @@ it("GATE49 item 3: an EXPIRED inflight row reclaimed at bootstrap load while a s
   }
 });
 
-it("GATE49 item 6 (low): a one-shot subscriber that logs out during the cold mock bootstrap leaves no session written or published", async () => {
+it("GATE50 item 2 (low): a synchronous logout during the cold mock bootstrap's disposal publication persists/publishes no session", async () => {
   vi.useFakeTimers();
   vi.setSystemTime(1_500_000);
   const originalNavigator = globalThis.navigator;
@@ -10175,27 +10175,46 @@ it("GATE49 item 6 (low): a one-shot subscriber that logs out during the cold moc
   const pump = async (n = 5_000) => {
     for (let i = 0; i < n; i += 1) await Promise.resolve();
   };
+  // Build the MOCK api (fresh() re-evaluates api.ts after resetModules): the
+  // vulnerable branch is the api.mock cold first-login.
+  vi.stubEnv("VITE_MOCK", "1");
   try {
-    sessionStorage.setItem("remuda-outbox-owner-g49-6", "owner");
+    sessionStorage.setItem("remuda-outbox-owner-g50-2", "owner");
     localStorage.removeItem("runtime.device-session");
-    localStorage.setItem("runtime.logged-out", "1");
+    // Gate 50 item 2: NO logged-out marker — the cold credential path really
+    // runs (the gate49 version took the early marker return and the mocked
+    // credential request was never reached).
+    localStorage.removeItem("runtime.logged-out");
     const { api, hubStore } = await fresh();
-    // The cold mock bootstrap makes ONE credential request (MOCK_BOOTSTRAP_TOKEN).
-    vi.spyOn(api, "login").mockResolvedValue({
-      deviceId: "devCold_g49_6", token: "tokCold", name: "cold",
-    });
+    const { MOCK_BOOTSTRAP_TOKEN, readSession } = await import("./session");
 
-    const { readSession } = await import("./session");
-    // One-shot subscriber: on the FIRST ready/authed publication produced by
-    // the mock first-login's applyAuthIdentityChange, log out synchronously.
+    // The cold mock bootstrap makes exactly ONE credential request.
+    let loginCalls = 0;
+    vi.spyOn(api, "login").mockImplementation(((token?: string) => {
+      loginCalls += 1;
+      expect(token).toBe(MOCK_BOOTSTRAP_TOKEN);
+      return Promise.resolve({ deviceId: "devCold_g50_2", token: "tokCold", name: "cold" });
+    }) as unknown as Api["login"]);
+
+    // One-shot subscriber firing on the ACTUAL disposal publication:
+    // applyAuthIdentityChange() in the cold first-login path emits
+    // outboxPending:0 synchronously (its first emit after the credential
+    // request began). Logging out there bumps the issuing epoch inside the
+    // listener stack.
     let fired = false;
+    let publishedSessionAfterFire = false;
+    let publishedAuthedAfterFire = false;
     const unsub = hubStore.subscribe(() => {
-      if (fired) return;
       const s = hubStore.getSnapshot();
-      if (s.ready && !s.session) {
-        fired = true;
-        hubStore.logout();
+      if (!fired) {
+        if (loginCalls > 0) {
+          fired = true;
+          hubStore.logout();
+        }
+        return;
       }
+      if (s.session) publishedSessionAfterFire = true;
+      if (s.authed) publishedAuthedAfterFire = true;
     });
 
     const outcome = await hubStore.bootstrap();
@@ -10203,16 +10222,23 @@ it("GATE49 item 6 (low): a one-shot subscriber that logs out during the cold moc
     unsub();
 
     expect(fired).toBe(true);
-    // The retirement was observed (not a ready success) and NOTHING persisted
-    // the cold session: no stored session, no authed published UI.
+    // The cold credential request ran exactly once with the bootstrap token.
+    expect(loginCalls).toBe(1);
+    expect(vi.mocked(api.login)).toHaveBeenCalledTimes(1);
+    // The run retired: no session persisted, no authed session published after
+    // the disposal publication, public state is logged out.
     expect(outcome).toBe("retired");
     expect(readSession()).toBeNull();
+    expect(localStorage.getItem("runtime.device-session")).toBeNull();
     expect(hubStore.getSnapshot().session).toBeNull();
     expect(hubStore.stateAuthed()).toBe(false);
+    expect(publishedSessionAfterFire).toBe(false);
+    expect(publishedAuthedAfterFire).toBe(false);
   } finally {
     vi.useRealTimers();
+    vi.unstubAllEnvs();
     Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
-    sessionStorage.removeItem("remuda-outbox-owner-g49-6");
+    sessionStorage.removeItem("remuda-outbox-owner-g50-2");
   }
 });
 

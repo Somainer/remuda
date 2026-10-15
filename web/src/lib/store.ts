@@ -4527,8 +4527,19 @@ class HubStore {
       // Define the generation under which the initial Outbox initializer
       // starts, THEN persist/publish the session.
       this.applyAuthIdentityChange();
+      // Gate 50 item 2: applyAuthIdentityChange() publishes SYNCHRONOUSLY —
+      // its disposeOutboxForAuthChange emits outboxPending:0 and every
+      // subscriber runs inside this same stack. A one-shot subscriber that
+      // logs out on that disposal publication has already retired this run
+      // (extEpoch bumped) by the time this returns. Recheck the issuing epoch
+      // before the session is persisted AND after the session publication
+      // below: a retired cold bootstrap must never write or republish its
+      // session (otherwise a later reload restores the mock login even though
+      // the public result was "retired").
+      if (!extLive()) return "retired";
       writeSession(session, { mock: api.mock });
       this.emit({ session: readSession() });
+      if (!extLive()) return "retired";
     }
     // No open-credential-transition wait here: under S3 a credential op can
     // never be open while a bootstrap turn runs (a login releases its blocker

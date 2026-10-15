@@ -4154,6 +4154,182 @@ async fn a_stale_evidence_resolution_for_attempt_n_does_not_touch_attempt_n_plus
     );
 }
 
+/// r24 item 3: a keepLogs land PUSHED the exact granted merge to remote main,
+/// but BOTH supplied-log inserts failed, so the row stays Landing with
+/// evidence uncertainty. When the operator then requests `failed` (or
+/// `requeue`), the resolver must run its read-only remote-main probe FIRST and
+/// settle Landed — an established landed fact beats the operator override; the
+/// merge is never marked failed or re-pushed.
+#[tokio::test]
+async fn an_evidence_resolution_settles_landed_when_the_merge_is_already_on_remote_main() {
+    let (ctx, node) = Ctx::boot().await.unwrap();
+    ctx.configure_gate_lane().await;
+    let job_id = queued_land_job(&ctx).await;
+    ctx.hub
+        .test_claim_gate_job(&job_id, "lane1", &ctx.host)
+        .await
+        .unwrap()
+        .expect("claimed");
+    let session = ctx
+        .hub
+        .test_node_session(&ctx.host)
+        .await
+        .expect("carrier live");
+    let merge = "cccccccccccccccccccccccccccccccccccccccc";
+    let grant = ctx
+        .hub
+        .test_gate_land_grant(&job_id, &ctx.host, merge, session)
+        .await
+        .unwrap();
+    assert_eq!(grant["granted"], json!(true), "{grant}");
+    let epoch = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap()["landingSessionEpoch"]
+        .as_str()
+        .expect("grant epoch")
+        .to_owned();
+
+    // Both real verdict deliveries (finished notification + gate.run reply)
+    // land with the pushed merge and a keepLogs (`kept`) log whose inserts
+    // both fail.
+    let landed_result = json!({
+        "jobId": job_id,
+        "generation": 1,
+        "status": "landed",
+        "mergeSha": merge,
+        "runLog": {
+            "step": "*", "kind": "kept", "headline": "landed; log retained by --keep-logs",
+            "summary": [], "tail": ["Finished land successfully"],
+            "capturedLines": 1, "truncated": false, "attempts": 1,
+        },
+    });
+    ctx.store().test_arm_gate_log_insert_fault_sticky();
+    ctx.hub
+        .test_apply_gate_result(&job_id, landed_result.clone())
+        .await
+        .unwrap();
+    ctx.hub
+        .test_apply_gate_result(&job_id, landed_result.clone())
+        .await
+        .unwrap();
+    ctx.store().test_clear_gate_log_insert_fault();
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(doc["state"], json!("landing"), "{doc}");
+    assert_eq!(doc["mergeSha"], json!(merge), "{doc}");
+    assert_eq!(doc["evidenceUncertain"]["status"], json!("landed"), "{doc}");
+    assert_eq!(
+        doc["evidenceUncertain"]["deliveriesDeferred"],
+        json!(2),
+        "{doc}"
+    );
+
+    // The read-only probe now establishes the exact granted merge on remote
+    // main.
+    node.set_resolve_reply(json!({
+        "jobId": job_id, "status": "landed",
+        "baseSha": "0123456789abcdef0123456789abcdef01234567",
+    }))
+    .await;
+
+    // The operator believes the evidence loss means the run failed and asks
+    // for `failed`; the landed fact wins.
+    let resolve_path = format!(
+        "/v1/projects/{}/gate/jobs/{job_id}/resolve-evidence",
+        ctx.project
+    );
+    let (status, reply) = ctx
+        .send(
+            "POST",
+            &resolve_path,
+            &ctx.human,
+            None,
+            Some(json!({
+                "resolution": "failed",
+                "expectedAttempts": 1,
+                "expectedSessionEpoch": epoch,
+                "expectedMergeSha": merge,
+                "rationale": "operator thought the missing keepLogs evidence meant failure",
+            })),
+        )
+        .await;
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["state"], json!("landed"), "landed fact wins: {reply}");
+    assert_eq!(reply["mergeSha"], json!(merge), "{reply}");
+    assert!(
+        reply["evidenceUncertain"].is_null(),
+        "condition cleared: {reply}"
+    );
+    assert!(
+        reply["error"].as_str().unwrap_or("").is_empty()
+            || !reply["error"].as_str().unwrap_or("").contains("operator"),
+        "no operator-failed error is recorded when the probe established landed: {reply}"
+    );
+
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(doc["state"], json!("landed"), "{doc}");
+    assert!(doc["evidenceUncertain"].is_null(), "{doc}");
+
+    // The same fact also beats `requeue`: a fresh row parked the same way
+    // stays Landed rather than re-running the pushed merge.
+    let job2 = queued_land_job(&ctx).await;
+    ctx.hub
+        .test_claim_gate_job(&job2, "lane1", &ctx.host)
+        .await
+        .unwrap()
+        .expect("claimed");
+    let session2 = ctx.hub.test_node_session(&ctx.host).await.unwrap();
+    let grant2 = ctx
+        .hub
+        .test_gate_land_grant(&job2, &ctx.host, merge, session2)
+        .await
+        .unwrap();
+    assert_eq!(grant2["granted"], json!(true), "{grant2}");
+    let epoch2 = ctx.hub.test_get_gate_job(&job2).await.unwrap().unwrap()["landingSessionEpoch"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut landed2 = landed_result.clone();
+    landed2["jobId"] = json!(&job2);
+    ctx.store().test_arm_gate_log_insert_fault_sticky();
+    ctx.hub
+        .test_apply_gate_result(&job2, landed2.clone())
+        .await
+        .unwrap();
+    ctx.hub
+        .test_apply_gate_result(&job2, landed2.clone())
+        .await
+        .unwrap();
+    ctx.store().test_clear_gate_log_insert_fault();
+    node.set_resolve_reply(json!({
+        "jobId": job2, "status": "landed",
+        "baseSha": "0123456789abcdef0123456789abcdef01234567",
+    }))
+    .await;
+    let (status, reply) = ctx
+        .send(
+            "POST",
+            &format!(
+                "/v1/projects/{}/gate/jobs/{job2}/resolve-evidence",
+                ctx.project
+            ),
+            &ctx.human,
+            None,
+            Some(json!({
+                "resolution": "requeue",
+                "expectedAttempts": 1,
+                "expectedSessionEpoch": epoch2,
+                "expectedMergeSha": merge,
+                "rationale": "operator wanted a rerun",
+            })),
+        )
+        .await;
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(
+        reply["state"],
+        json!("landed"),
+        "landed beats requeue: {reply}"
+    );
+    assert!(reply["evidenceUncertain"].is_null(), "{reply}");
+}
+
 // ── 6c. A narrowed Bot token acts for the live chapter (CLI path) ─────────
 #[tokio::test]
 async fn narrowed_bot_token_writes_a_live_chapter_even_after_a_fence_check() {

@@ -996,64 +996,17 @@ async fn resolve_project_job(
     // make the probe land on a different session. A carrier-less host (or a
     // home-pushed job whose group liveness is unattestable) falls through to
     // the explicit operator decision.
-    if let Some(lane_host) = landing_lane_host(&state, &job).await {
-        let guard = state
-            .nodes
-            .host_authority(lane_host.as_id().as_str())
-            .await
-            .read_owned()
-            .await;
-        if let Some(responder_session) = state.nodes.generation_of(lane_host.as_id().as_str()).await
-        {
-            // Only authoritative for a lane-pushed job (the probe's dead-group
-            // attestation is the lane's own). The Landed fact is valid either
-            // way.
-            if matches!(
-                probe_landing_outcome(&state, &job).await,
-                LandingProbe::Landed
-            ) {
-                let grant_session = state
-                    .store
-                    .gate_job_dispatch_session(&job_id)
-                    .await
-                    .ok()
-                    .flatten();
-                let expected_session =
-                    probe_expected_session(&state, grant_session, responder_session);
-                settle_landing_landed(
-                    &state,
-                    &job,
-                    expected_session,
-                    responder_session,
-                    &lane_host,
-                )
-                .await;
-                let landed = state
-                    .store
-                    .get_gate_job(&job_id)
-                    .await
-                    .map_err(map_store)?
-                    .ok_or(HubError::NotFound)?;
-                if landed.state == GateJobState::Landed {
-                    return Ok(Json(json!(landed)));
-                }
-                // r16 item 7: the exact merge was OBSERVED on the remote but
-                // the snapshot-settling writer refused (the live row advanced
-                // under the probe — a newer attempt/grant). The operator's
-                // failed/requeue must NEVER run from here (it would discard
-                // the established fact and requeue/fail a push that landed).
-                // Keep the Landing and hand the operator a 409 carrying the
-                // current state, exactly like any authority mismatch.
-                drop(guard);
-                return Err(HubError::Conflict(format!(
-                    "the remote probe established the exact granted merge landed, but the live row \
-                     no longer matches that snapshot (now {}); the Landing was kept — refresh and \
-                     resolve the current attempt",
-                    landed.state.as_str()
-                )));
-            }
+    match probe_settle_landed_under_guard(&state, &job).await? {
+        LandedProbeSettlement::Settled(landed) => return Ok(Json(json!(landed))),
+        LandedProbeSettlement::Refused(landed) => {
+            return Err(HubError::Conflict(format!(
+                "the remote probe established the exact granted merge landed, but the live row no \
+                 longer matches that snapshot (now {}); the Landing was kept — refresh and resolve \
+                 the current attempt",
+                landed.state.as_str()
+            )));
         }
-        drop(guard);
+        LandedProbeSettlement::NotEstablished => {}
     }
     let operator = device.id.clone();
     let rationale = rationale.to_owned();
@@ -1339,6 +1292,33 @@ async fn resolve_evidence_project_job(
         expected_merge.as_deref(),
     ) {
         return Err(HubError::Conflict(message.to_string()));
+    }
+    // r24 item 3 — EVIDENCE-UNCERTAIN RULE: before failing or requeuing a
+    // Landing, run the existing resolver's final read-only remote-main probe
+    // UNDER THE HOST AUTHORITY GUARD. A keepLogs land can have pushed the exact
+    // granted merge while BOTH supplied-log inserts failed, leaving the row
+    // Landing with evidence uncertainty. The established landed fact settles
+    // Landed (an authorized settlement for the tuple, which clears the
+    // condition) BEFORE any operator override; only when nothing landed can be
+    // established does the operator's failed/requeue run. A refused
+    // snapshot-settlement is a 409, never a fall-through to failed/requeue.
+    if job.state == GateJobState::Landing {
+        match probe_settle_landed_under_guard(&state, &job).await? {
+            LandedProbeSettlement::Settled(landed) => {
+                // settle_landing_landed already journaled gate.landed, dropped
+                // the pinned refs and ran the --then hook.
+                return Ok(Json(json!(landed)));
+            }
+            LandedProbeSettlement::Refused(landed) => {
+                return Err(HubError::Conflict(format!(
+                    "the remote probe established the exact granted merge landed, but the live row \
+                     no longer matches that snapshot (now {}); the Landing was kept — refresh and \
+                     resolve the current attempt",
+                    landed.state.as_str()
+                )));
+            }
+            LandedProbeSettlement::NotEstablished => {}
+        }
     }
     // r24 item 2: validate a FRESH row BEFORE any abort side effect. A delayed
     // frame for attempt N must not abort the granted run of an attempt N+1 the
@@ -4035,6 +4015,74 @@ fn probe_expected_session(
             Some(i64::try_from(responder_session).unwrap_or(0))
         }
         other => other,
+    }
+}
+
+/// Outcome of the final operator-route read-only remote-main probe.
+enum LandedProbeSettlement {
+    /// No carrier/host, no live session, or the probe did not establish the
+    /// exact merge on remote main: the operator's decision may proceed.
+    NotEstablished,
+    /// The probe established landed AND the snapshot-settling writer committed
+    /// Landed (also clearing any parked evidence-uncertain condition).
+    Settled(GateJob),
+    /// r16 item 7: landed was OBSERVED but the writer refused the stale
+    /// snapshot; the caller must 409, never fall through to failed/requeue.
+    Refused(GateJob),
+}
+
+/// Run the operator resolver's FINAL read-only remote-main probe under the
+/// per-host authority guard (shared by `/resolve` and `/resolve-evidence`): an
+/// ESTABLISHED landed fact always beats the operator's failed/requeue. The
+/// guard pins the live carrier session across probe + commit exactly like the
+/// periodic reconciler (r15 item 3), so a concurrent takeover cannot make the
+/// probe land on a different session. A carrier-less host (or a home-pushed
+/// job whose group liveness is unattestable) yields [`LandedProbeSettlement::
+/// NotEstablished`].
+async fn probe_settle_landed_under_guard(
+    state: &AppState,
+    job: &GateJob,
+) -> Result<LandedProbeSettlement, HubError> {
+    let Some(lane_host) = landing_lane_host(state, job).await else {
+        return Ok(LandedProbeSettlement::NotEstablished);
+    };
+    let guard = state
+        .nodes
+        .host_authority(lane_host.as_id().as_str())
+        .await
+        .read_owned()
+        .await;
+    let Some(responder_session) = state.nodes.generation_of(lane_host.as_id().as_str()).await
+    else {
+        return Ok(LandedProbeSettlement::NotEstablished);
+    };
+    // Only authoritative for a lane-pushed job (the probe's dead-group
+    // attestation is the lane's own). The Landed fact is valid either way.
+    if !matches!(
+        probe_landing_outcome(state, job).await,
+        LandingProbe::Landed
+    ) {
+        return Ok(LandedProbeSettlement::NotEstablished);
+    }
+    let job_id = job.id.as_id().to_string();
+    let grant_session = state
+        .store
+        .gate_job_dispatch_session(&job_id)
+        .await
+        .map_err(map_store)?;
+    let expected_session = probe_expected_session(state, grant_session, responder_session);
+    settle_landing_landed(state, job, expected_session, responder_session, &lane_host).await;
+    let landed = state
+        .store
+        .get_gate_job(&job_id)
+        .await
+        .map_err(map_store)?
+        .ok_or(HubError::NotFound)?;
+    drop(guard);
+    if landed.state == GateJobState::Landed {
+        Ok(LandedProbeSettlement::Settled(landed))
+    } else {
+        Ok(LandedProbeSettlement::Refused(landed))
     }
 }
 

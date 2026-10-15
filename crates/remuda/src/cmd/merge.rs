@@ -1018,8 +1018,8 @@ fn unique_recovery_ref() -> String {
     )
 }
 
-/// An object ID in the repository's SHA-1 object format (40 hex). Git
-/// resolved and canonicalized the string; this bounds the shape.
+/// An object ID in the repository's native format: SHA-1 (40 hex) or SHA-256
+/// (64 hex). Git resolved and canonicalized the string; this bounds shapes.
 fn is_native_object_hex(sha: &str) -> bool {
     (sha.len() == 40 || sha.len() == 64) && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
@@ -2489,6 +2489,102 @@ mod tests {
             "no recovery refs may remain after either recovery"
         );
         drop(keep);
+    }
+
+    /// r28 item 2: post-push recovery in a SHA-256 repository accepts the
+    /// native 64-hex object IDs and still recognizes a merge already on remote
+    /// main. Skips (printed reason only) when this git lacks SHA-256 support.
+    #[test]
+    fn recovery_in_a_sha256_repo_lands_a_merge_on_remote() {
+        let probe = tempfile::tempdir().unwrap();
+        let supported = std::process::Command::new("git")
+            .args([
+                "init",
+                "-q",
+                "--object-format=sha256",
+                "-b",
+                "main",
+                probe.path().join("p").to_str().unwrap(),
+            ])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !supported {
+            eprintln!("skipping: this git build lacks --object-format=sha256 support");
+            return;
+        }
+        drop(probe);
+
+        let keep = tempfile::tempdir().unwrap();
+        let full = keep.path().join("full");
+        let origin = keep.path().join("origin.git");
+        std::fs::create_dir_all(&full).unwrap();
+        tgit_ok(
+            &full,
+            &["init", "-q", "--object-format=sha256", "-b", "main"],
+        );
+        tgit_ok(&full, &["config", "user.email", "t@example.com"]);
+        tgit_ok(&full, &["config", "user.name", "T"]);
+        std::fs::write(full.join("f"), "b\n").unwrap();
+        tgit_ok(&full, &["add", "f"]);
+        tgit_ok(&full, &["commit", "-q", "-m", "B"]);
+        let base = tgit_ok(&full, &["rev-parse", "main"]);
+        assert_eq!(base.len(), 64, "fixture must be SHA-256: {base}");
+        tgit_ok(&full, &["branch", "topic"]);
+        std::fs::write(full.join("m"), "m\n").unwrap();
+        tgit_ok(&full, &["add", "m"]);
+        tgit_ok(&full, &["commit", "-q", "-m", "M"]);
+        let merged = tgit_ok(&full, &["rev-parse", "main"]);
+        // Remote advances past M to D, which contains M.
+        std::fs::write(full.join("d"), "d\n").unwrap();
+        tgit_ok(&full, &["add", "d"]);
+        tgit_ok(&full, &["commit", "-q", "-m", "D"]);
+        let remote_tip = tgit_ok(&full, &["rev-parse", "main"]);
+        let output = std::process::Command::new("git")
+            .args([
+                "init",
+                "-q",
+                "--bare",
+                "--object-format=sha256",
+                "-b",
+                "main",
+            ])
+            .current_dir(keep.path())
+            .arg(&origin)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        tgit_ok(
+            &full,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        tgit_ok(&full, &["push", "-q", "origin", "main", "topic"]);
+        // Post-crash stale checkout: tracking pinned to B, fetch restricted.
+        tgit_ok(&full, &["update-ref", "refs/remotes/origin/main", &base]);
+        tgit_ok(
+            &full,
+            &[
+                "config",
+                "remote.origin.fetch",
+                "+refs/heads/topic:refs/remotes/origin/topic",
+            ],
+        );
+
+        push_main_cas(&full, &merged, &base)
+            .expect("a 64-hex remote tip must not be rejected as unreadable; M landed");
+        assert_eq!(
+            tgit_ok(
+                &full,
+                &[
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    "refs/remuda/recovery/"
+                ]
+            ),
+            "",
+            "the sha256 recovery must leave no ref behind"
+        );
+        assert_eq!(remote_tip.len(), 64);
     }
 
     /// r27 item 1 / R5: post-push recovery under a restricted

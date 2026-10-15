@@ -9722,6 +9722,89 @@ head -c 1 >/dev/null || exit 4
         );
     }
 
+    /// r28 item 2: a SHA-256 repository reports 64-hex object IDs; recovery
+    /// must accept the repository's native object format instead of rejecting
+    /// them as unreadable (the old len()==40 check → permanent Unknown).
+    #[cfg(unix)]
+    #[test]
+    fn recovery_in_a_sha256_repo_accepts_64_hex_object_ids() {
+        // Skip (with a printed reason) only when this git lacks SHA-256.
+        let probe = TempDir::new().unwrap();
+        let probe_repo = probe.path().join("sha256-probe");
+        let supported = std::process::Command::new("git")
+            .args([
+                "init",
+                "-q",
+                "--object-format=sha256",
+                "-b",
+                "main",
+                probe_repo.to_str().unwrap(),
+            ])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !supported {
+            eprintln!("skipping: this git build lacks --object-format=sha256 support");
+            return;
+        }
+        drop(probe);
+
+        let (_dir, _bare, lane, stale_base) = recovery_branch_fixture("main", Some("sha256"));
+        // A second branch the restricted refspec will be allowed to fetch.
+        git(&lane, &["branch", "topic", "main"]);
+        // Granted merge M reaches remote main after the lane's last fetch.
+        std::fs::write(lane.join("landed.txt"), "landed\n").unwrap();
+        git(&lane, &["add", "landed.txt"]);
+        git(&lane, &["commit", "-q", "-m", "granted merge M (sha256)"]);
+        let merge_m = git(&lane, &["rev-parse", "main"]);
+        assert_eq!(merge_m.len(), 64, "fixture must be SHA-256: {merge_m}");
+        git(&lane, &["push", "-q", "origin", "main", "topic"]);
+        // Recreate the stale post-crash checkout: tracking pinned to B, fetch
+        // restricted to topic.
+        git(
+            &lane,
+            &["update-ref", "refs/remotes/origin/main", &stale_base],
+        );
+        git(
+            &lane,
+            &[
+                "config",
+                "remote.origin.fetch",
+                "+refs/heads/topic:refs/remotes/origin/topic",
+            ],
+        );
+
+        let request = remuda_protocol::GateResolveLandingParams {
+            job_id: "gjb_r28_sha256".into(),
+            repo_path: lane.to_string_lossy().into_owned(),
+            base_branch: "main".into(),
+            merge_sha: merge_m.clone(),
+        };
+        let reply = super::resolve_landing_after_restart(&request, true);
+        assert_eq!(
+            reply.status, "landed",
+            "a 64-hex base SHA must not be rejected as unreadable: {reply:?}"
+        );
+        let base_sha = reply
+            .base_sha
+            .clone()
+            .expect("landed reply carries the base sha");
+        assert_eq!(base_sha.len(), 64, "{base_sha}");
+        assert_eq!(base_sha, merge_m, "{reply:?}");
+        assert!(
+            git(
+                &lane,
+                &[
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    "refs/remuda/recovery/"
+                ]
+            )
+            .is_empty(),
+            "the sha256 recovery must leave no ref behind"
+        );
+    }
+
     /// r27 item 1 / R5 fail-open: with a restricted `remote.origin.fetch`
     /// refspec a bare `git fetch origin` can SUCCEED while `origin/main` stays
     /// stale, so certifying absence against that tracking ref falsely fails a

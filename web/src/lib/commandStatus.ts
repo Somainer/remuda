@@ -262,17 +262,20 @@ export function projectCommandStatus(facts: CommandStatusFacts): CommandStatusRo
   // outbox states are decided locally and narrow the old fallback:
   if (facts.outboxState === "rejected") return ROW_SEND_REJECTED;
   if (facts.outboxState === "unknown") return ROW_UNCONFIRMED;
-  // "sent" reached the Hub/Node and "done" is journal-confirmed.
   // "reconciling" was forwarded; a bounded GET (not a re-POST) is confirming
-  // it — it is already delivered, not 状态待确认.
-  if (facts.outboxState === "sent" || facts.outboxState === "reconciling") {
+  // it — it is already delivered, not 状态待确认. "inflight" has NO response
+  // yet, so both read as the in-flight row. A POST that came back with a
+  // CLEAR accepted/forwarded answer ("sent") is DISTINCT: the Hub accepted
+  // the command, so the chip reads 已受理 (not success — the journal join is
+  // still the execution proof), never the same 已发送，等待确认 as an
+  // unanswered POST.
+  if (facts.outboxState === "reconciling" || facts.outboxState === "inflight") {
     return ROW_SENT_AWAITING_ACK;
   }
-  if (facts.outboxState === "done") return ROW_ACCEPTED;
+  if (facts.outboxState === "sent" || facts.outboxState === "done") return ROW_ACCEPTED;
   // "held" reached the Hub but the Node was offline; the same id re-POSTs when
   // the host returns — show waiting-to-send, not 待确认.
   if (facts.outboxState === "held") return ROW_AWAITING_SEND;
-  if (facts.outboxState === "inflight") return ROW_SENT_AWAITING_ACK;
   if (facts.outboxState === "pending" && facts.offline) return ROW_PENDING_OFFLINE;
   if (instanceUnconfirmed(facts.instance)) return ROW_UNCONFIRMED;
   if (commandUnconfirmed(facts.command)) return ROW_UNCONFIRMED;

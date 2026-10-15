@@ -650,15 +650,15 @@ export type PasskeyAssertionBody = {
 
 export type HubApi = {
   mock: boolean;
-  login(bootstrapToken: string, deviceName: string): Promise<DeviceSession>;
-  pairRedeem(code: string, deviceName: string): Promise<DeviceSession>;
+  login(bootstrapToken: string, deviceName: string, signal?: AbortSignal): Promise<DeviceSession>;
+  pairRedeem(code: string, deviceName: string, signal?: AbortSignal): Promise<DeviceSession>;
   pairCode(): Promise<PairCode>;
   deviceList(): Promise<{ items: PairedDevice[] }>;
   deviceRevoke(deviceId: string): Promise<{ ok: boolean }>;
   passkeyRegisterStart(name: string): Promise<PasskeyEnvelope>;
   passkeyRegisterFinish(challengeId: string, attestation: PasskeyAttestationBody): Promise<PasskeyView>;
   passkeyLoginStart(mediation?: "conditional"): Promise<PasskeyEnvelope>;
-  passkeyLoginFinish(challengeId: string, assertion: PasskeyAssertionBody, deviceName?: string): Promise<DeviceSession>;
+  passkeyLoginFinish(challengeId: string, assertion: PasskeyAssertionBody, deviceName?: string, signal?: AbortSignal): Promise<DeviceSession>;
   passkeyList(): Promise<{ items: PasskeyView[] }>;
   passkeyRename(passkeyId: string, name: string): Promise<PasskeyView>;
   passkeyDelete(passkeyId: string): Promise<{ ok: boolean }>;
@@ -821,13 +821,17 @@ const REST_WRITE_TIMEOUT_MS = 15_000;
 
 /** Network-layer failure (timeout/offline), retriable by the outbox. */
 export class RestNetworkError extends Error {
-  constructor(message: string) {
-    super(message);
+  constructor(
+    message: string,
+    /** The underlying abort/network error (gate 48 item 4), if any. */
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
     this.name = "RestNetworkError";
   }
 }
 
-export async function rest<T>(path: string, req: RequestInit = {}): Promise<T> {
+export async function rest<T>(path: string, req: RequestInit = {}, cancelSignal?: AbortSignal): Promise<T> {
   const session = readSession();
   const headers = {
     "content-type": "application/json",
@@ -838,31 +842,48 @@ export async function rest<T>(path: string, req: RequestInit = {}): Promise<T> {
   const method = (req.method ?? "GET").toUpperCase();
   const isWrite = method !== "GET" && method !== "HEAD";
   const timeoutMs = isWrite ? REST_WRITE_TIMEOUT_MS : REST_READ_TIMEOUT_MS;
-  // A caller-supplied signal owns the timeout (e.g. the 65 s doctor probe);
-  // only attach our own when none was given.
+  // Gate 49 item 4: the internal read/write deadline is armed UNCONDITIONALLY,
+  // even when the caller supplied its own req.signal (e.g. the doctor probe).
+  // A caller/cancel abort and the internal timeout are independent ADDITIONAL
+  // abort sources; a live caller signal must never let the request or its body
+  // hang past the REST deadline.
   const external = req.signal;
   const controller = new AbortController();
   // The deadline must cover BOTH receiving headers AND reading the body: a
   // server that sends headers then stalls mid-body would otherwise leave the
   // fetch (and any outbox row/Web Lock behind it) pending forever. The timer
   // is only cleared once the body has been fully consumed (json/text below).
-  const timer = external
-    ? null
-    : setTimeout(
-        () => controller.abort(new DOMException("REST_TIMEOUT", "AbortError")),
-        timeoutMs,
-      );
+  const timer = setTimeout(
+    () => controller.abort(new DOMException("REST_TIMEOUT", "AbortError")),
+    timeoutMs,
+  );
   const clearTimer = () => {
-    if (timer) clearTimeout(timer);
+    clearTimeout(timer);
   };
   external?.addEventListener("abort", () => controller.abort(external.reason), { once: true });
+  cancelSignal?.addEventListener("abort", () => controller.abort(cancelSignal!.reason), { once: true });
+  // Gate 48 item 4: a signal ALREADY aborted before the call must reject
+  // WITHOUT issuing the fetch at all (an addEventListener("abort") on an
+  // already-aborted signal never fires, so forwarding alone used to miss it).
+  // Propagate the aborting signal's OWN reason so callers can distinguish a
+  // retirement/caller abort from a timeout.
+  const preAborted = cancelSignal?.aborted ? cancelSignal : external?.aborted ? external : null;
+  if (preAborted) {
+    clearTimer();
+    // The signal's own reason may be a DOMException (not an Error subclass in
+    // jsdom) or undefined; carry any truthy object through ErrorOptions.
+    const reason = preAborted.reason;
+    throw new RestNetworkError("request aborted", reason != null ? { cause: reason } : undefined);
+  }
   let res: Response;
   try {
     res = await fetch(`${hubBase()}${path}`, {
       credentials: "include",
       ...req,
       headers,
-      signal: external ?? controller.signal,
+      // Always driven by the internal controller so BOTH the deadline and any
+      // caller/cancel signal can abort it (it forwards each above).
+      signal: controller.signal,
     });
   } catch (err) {
     clearTimer();
@@ -870,9 +891,18 @@ export async function rest<T>(path: string, req: RequestInit = {}): Promise<T> {
     // retriable network error, never a business rejection (the outbox keeps
     // the same commandId and retries).
     if (err instanceof DOMException && err.name === "AbortError") {
-      throw new RestNetworkError(external?.aborted ? "request aborted" : `REST timeout after ${timeoutMs} ms`);
+      const aborted = external?.aborted || cancelSignal?.aborted;
+      if (aborted) {
+        const reason = cancelSignal?.aborted
+          ? cancelSignal.reason
+          : external?.reason;
+        throw new RestNetworkError("request aborted", reason != null ? { cause: reason } : undefined);
+      }
+      throw new RestNetworkError(`REST timeout after ${timeoutMs} ms`);
     }
-    throw new RestNetworkError(err instanceof Error ? err.message : String(err));
+    throw new RestNetworkError(err instanceof Error ? err.message : String(err), {
+      cause: err instanceof Error ? err : undefined,
+    });
   }
   if (!res.ok) {
     let text: string;
@@ -973,10 +1003,12 @@ function createMockApi(): HubApi {
   const subs = new Map<Id, (batch: EventsBatch["params"]) => void>();
   return {
     mock: true,
-    async login(bootstrapToken, deviceName) {
+    async login(bootstrapToken, deviceName, signal) {
+      void signal;
       return mockLogin(bootstrapToken, deviceName);
     },
-    async pairRedeem(code, deviceName) {
+    async pairRedeem(code, deviceName, signal) {
+      void signal;
       return mockPairRedeem(code, deviceName);
     },
     async pairCode() {
@@ -1000,9 +1032,10 @@ function createMockApi(): HubApi {
     async passkeyLoginStart(mediation) {
       return mockPasskeyLoginStart(mediation);
     },
-    async passkeyLoginFinish(challengeId, assertion, deviceName) {
+    async passkeyLoginFinish(challengeId, assertion, deviceName, signal) {
       void challengeId;
       void assertion;
+      void signal;
       return mockPasskeyLoginFinish(deviceName);
     },
     async passkeyList() {
@@ -1464,18 +1497,20 @@ function createLiveApi(): HubApi {
 
   return {
     mock: false,
-    async login(bootstrapToken, deviceName) {
-      const body = await rest<HubJson<"/v1/login", "post">>("/v1/login", {
-        method: "POST",
-        body: JSON.stringify({ bootstrapToken, deviceName }),
-      });
+    async login(bootstrapToken, deviceName, signal) {
+      const body = await rest<HubJson<"/v1/login", "post">>(
+        "/v1/login",
+        { method: "POST", body: JSON.stringify({ bootstrapToken, deviceName }) },
+        signal,
+      );
       return body;
     },
-    async pairRedeem(code, deviceName) {
-      const body = await rest<HubJson<"/v1/devices/pair", "post">>("/v1/devices/pair", {
-        method: "POST",
-        body: JSON.stringify({ code, deviceName }),
-      });
+    async pairRedeem(code, deviceName, signal) {
+      const body = await rest<HubJson<"/v1/devices/pair", "post">>(
+        "/v1/devices/pair",
+        { method: "POST", body: JSON.stringify({ code, deviceName }) },
+        signal,
+      );
       return body;
     },
     async pairCode() {
@@ -1509,11 +1544,13 @@ function createLiveApi(): HubApi {
         { method: "POST", body },
       ) as Promise<PasskeyEnvelope>;
     },
-    async passkeyLoginFinish(challengeId, assertion, deviceName) {
-      return rest<HubJson<"/v1/auth/passkeys/login/finish", "post">>(
+    async passkeyLoginFinish(challengeId, assertion, deviceName, signal) {
+      const body = await rest<HubJson<"/v1/auth/passkeys/login/finish", "post">>(
         "/v1/auth/passkeys/login/finish",
         { method: "POST", body: JSON.stringify({ challengeId, assertion, deviceName }) },
+        signal,
       );
+      return body;
     },
     async passkeyList() {
       return rest<HubJson<"/v1/auth/passkeys", "get">>("/v1/auth/passkeys");

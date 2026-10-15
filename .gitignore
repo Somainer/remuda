@@ -19,3 +19,4 @@ scripts/ci/private-tokens.local
 # gate lock file — ephemeral host-local state, never part of a delivery.
 /scratch/
 /locks/
+/target-load/

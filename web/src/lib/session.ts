@@ -64,6 +64,17 @@ export function clearSession(): void {
   }
 }
 
+/**
+ * Clear ONLY the in-memory session cache (no storage writes). Used when an
+ * EXTERNAL identity change is observed — a peer tab logging out removes the
+ * persisted session itself; this tab must additionally forget its cached
+ * session so readSession()/hasDeviceSession() cannot answer from a stale
+ * in-memory record after the peer logout (c-reconnfu gate 38 extEpoch).
+ */
+export function clearCachedSession(): void {
+  memorySession = null;
+}
+
 export function readLoggedOut(): boolean {
   try {
     return localStorage.getItem(LOGGED_OUT_KEY) === "1";

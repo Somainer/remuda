@@ -83,7 +83,8 @@ cleared on pageshow/visible (HIGH-6); REST deadline covers the body (HIGH-7);
 IndexedDB commit-complete durability (M8); socket recovery supersedes pending
 fill/resume via resume generation (M9); null-basis RPC / list-poll screen
 ordering (M10); self-close not a link failure (M11); canInterrupt true for
-stale (M12); delivered rows show 已送达 not 状态待确认 (M13); create refused
+stale (M12); delivered rows show 已发送，等待确认 then 已受理 (accepted
+answer in hand), never 状态待确认 (M13); create refused
 offline (M14); 已恢复 1.5s banner (M15).
 
 Tests: 1804 web unit tests (new pins for idempotent conversion, rejected

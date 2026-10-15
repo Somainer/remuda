@@ -24,7 +24,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 mod fake_node;
 use fake_node::{
     AckBarrier, FrameQueue, NodeWs, accept_instance_send, append_command_user, append_user_message,
-    send_rpc_ok, wait_frame_ack,
+    durable_command_append, send_command_result_reply, send_rpc_ok, wait_frame_ack,
 };
 
 const BOOTSTRAP: &str = "e2e-bootstrap-token";
@@ -978,6 +978,14 @@ async fn fake_node(
     // Scripted terminal answers: a spawned timer sends (instance, iid, answers)
     // back into this loop so journal appends stay single-writer.
     let (close_tx, mut close_rx) = tokio::sync::mpsc::channel::<(String, String, Value)>(8);
+    // c-reconnfu round 5: `__gate_journal__` parks its mirrored append
+    // OFF the shared RPC read loop. A spawned task polls the test-controlled
+    // release file and, only when it appears, sends the append work back
+    // through this channel so journal frames keep a single writer. On the 60 s
+    // poll timeout it sends NOTHING (no append), so a failed spec can never
+    // stall this loop (instance.close/purge and later specs must answer).
+    let (journal_gate_tx, mut journal_gate_rx) =
+        tokio::sync::mpsc::channel::<(String, Option<String>, String)>(8);
     // Scripted terminal answers awaiting their first `interaction.list`, keyed
     // by interaction id -> instance id. See the `ask-question-terminal` arm.
     let terminal_pending: Arc<Mutex<HashMap<String, String>>> =
@@ -1004,6 +1012,50 @@ async fn fake_node(
             biased;
             Some(frame) = requeue_rx.recv() => {
                 frame_queue.push_back(frame);
+            }
+            // c-reconnfu round 5: a __gate_journal__ append whose release
+            // gate the spec just opened. Runs on the read loop (single
+            // writer) after the parked poller task observed the gate file.
+            // c-reconnfu round 6: once the append has been journaled it
+            // writes the per-command ACK file the spec's teardown waits
+            // on, so no fixed sleep decides whether the parked append
+            // landed before instance deletion.
+            Some((gate_instance, gate_command, gate_prompt)) = journal_gate_rx.recv() => {
+                let gate_cid = gate_command.clone().unwrap_or_default();
+                // c-reconnfu gate-19 merge: the parked append runs the SAME
+                // shared durable append/ack path as accept_instance_send
+                // (strict j{seq} ack validation) — never a second append
+                // helper. The acceptance RPC (real typed CommandResult) was
+                // already answered when the send first arrived.
+                let (gate_seq, _gate_ack) = durable_command_append(
+                    &mut ws,
+                    &mut frame_queue,
+                    &gate_instance,
+                    append_n,
+                    &gate_prompt,
+                    gate_command.as_deref(),
+                    None,
+                    &AckBarrier::Immediate,
+                )
+                .await?;
+                append_n = gate_seq;
+                append_n = append_journal(
+                    &mut ws,
+                    &gate_instance,
+                    append_n,
+                    "assistant",
+                    &format!("echo: {gate_prompt}"),
+                )
+                .await?;
+                append_n =
+                    append_native_status(&mut ws, &gate_instance, append_n, "idle").await?;
+                // Every append drained its ack frame, so the Hub has the
+                // user observation; tell the spec it is safe to delete.
+                let ack = std::env::temp_dir().join(format!(
+                    "remuda-e2e-journal-ack-{}-{gate_cid}",
+                    addr.port()
+                ));
+                let _ = std::fs::write(&ack, "journaled\n");
             }
             Some((closed_instance, closed_iid, terminal_answers)) = close_rx.recv() => {
                 let Some(card) = pending.lock().await.remove(&closed_iid) else {
@@ -1807,6 +1859,102 @@ async fn fake_node(
                             &mut frame_queue,
                         )
                         .await?;
+                        continue;
+                    }
+                    // c-reconnfu: `__gate_journal__` answers the send with the
+                    // REAL typed CommandResult immediately (the shared
+                    // send_command_result_reply builder — never a hand-built
+                    // {accepted:true} envelope) and parks the mirrored durable
+                    // appends OFF this read loop; a spawned task polls the
+                    // spec-controlled release/cancel file (no socket IO) and,
+                    // on release, sends the append work back via
+                    // journal_gate_tx (single writer), where the SAME shared
+                    // durable_command_append/ack path journals it.
+                    if prompt == "__gate_journal__" {
+                        if let Some(cid) = command_id {
+                            send_command_result_reply(&mut ws, id, cid, &instance_id).await?;
+                            let tmp = std::env::temp_dir();
+                            let gate = tmp
+                                .join(format!("remuda-e2e-journal-release-{}-{cid}", addr.port()));
+                            let cancel = tmp
+                                .join(format!("remuda-e2e-journal-cancel-{}-{cid}", addr.port()));
+                            let ack =
+                                tmp.join(format!("remuda-e2e-journal-ack-{}-{cid}", addr.port()));
+                            let gate_tx = journal_gate_tx.clone();
+                            let gate_instance = instance_id.clone();
+                            let gate_prompt = prompt.to_string();
+                            let gate_cid = cid.to_string();
+                            tokio::spawn(async move {
+                                let step = Duration::from_millis(100);
+                                let max = Duration::from_secs(60);
+                                let mut waited = Duration::ZERO;
+                                let mut decision: Option<bool> = None;
+                                while waited < max {
+                                    if cancel.exists() {
+                                        let _ = std::fs::remove_file(&cancel);
+                                        decision = Some(false);
+                                        break;
+                                    }
+                                    if gate.exists() {
+                                        let _ = std::fs::remove_file(&gate);
+                                        decision = Some(true);
+                                        break;
+                                    }
+                                    tokio::time::sleep(step).await;
+                                    waited += step;
+                                }
+                                match decision {
+                                    Some(true) => {
+                                        let _ = gate_tx
+                                            .send((gate_instance, Some(gate_cid), gate_prompt))
+                                            .await;
+                                    }
+                                    Some(false) => {
+                                        let _ = std::fs::write(&ack, "cancelled\n");
+                                    }
+                                    None => {}
+                                }
+                            });
+                        }
+                        continue;
+                    }
+                    // c-reconnfu: `__hold_journal__:<ms>` answers the send
+                    // with the REAL typed CommandResult first (so the Hub row
+                    // is accepted and the bubble can leave the in-flight
+                    // label), then WITHHOLDS the mirrored durable user
+                    // observation for the scripted delay — the deterministic
+                    // lost-response replay window — before journaling through
+                    // the SAME shared durable append/ack path and completing
+                    // the turn.
+                    if let Some(ms) = prompt
+                        .strip_prefix("__hold_journal__:")
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        let hold_cid = command_id.context("instance.send requires commandId")?;
+                        send_command_result_reply(&mut ws, id, hold_cid, &instance_id).await?;
+                        tokio::time::sleep(Duration::from_millis(ms)).await;
+                        let (hold_seq, _hold_ack) = durable_command_append(
+                            &mut ws,
+                            &mut frame_queue,
+                            &instance_id,
+                            append_n,
+                            prompt,
+                            Some(hold_cid),
+                            None,
+                            &AckBarrier::Immediate,
+                        )
+                        .await?;
+                        append_n = hold_seq;
+                        append_n = append_journal(
+                            &mut ws,
+                            &instance_id,
+                            append_n,
+                            "assistant",
+                            &format!("echo: {prompt}"),
+                        )
+                        .await?;
+                        append_n =
+                            append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
                         continue;
                     }
                     // c-hubfakeack determinism regression (`__ackbarrier__:hold`

@@ -842,25 +842,23 @@ export async function rest<T>(path: string, req: RequestInit = {}, cancelSignal?
   const method = (req.method ?? "GET").toUpperCase();
   const isWrite = method !== "GET" && method !== "HEAD";
   const timeoutMs = isWrite ? REST_WRITE_TIMEOUT_MS : REST_READ_TIMEOUT_MS;
-  // A caller-supplied req.signal owns the timeout (e.g. the 65 s doctor
-  // probe); only attach our own when none was given. cancelSignal (S3 logout
-  // retirement) is an ADDITIONAL abort source — it never suppresses the
-  // internal read/write deadline, so a retired credential request stays
-  // bounded by BOTH the logout abort and the usual timeout.
+  // Gate 49 item 4: the internal read/write deadline is armed UNCONDITIONALLY,
+  // even when the caller supplied its own req.signal (e.g. the doctor probe).
+  // A caller/cancel abort and the internal timeout are independent ADDITIONAL
+  // abort sources; a live caller signal must never let the request or its body
+  // hang past the REST deadline.
   const external = req.signal;
   const controller = new AbortController();
   // The deadline must cover BOTH receiving headers AND reading the body: a
   // server that sends headers then stalls mid-body would otherwise leave the
   // fetch (and any outbox row/Web Lock behind it) pending forever. The timer
   // is only cleared once the body has been fully consumed (json/text below).
-  const timer = external
-    ? null
-    : setTimeout(
-        () => controller.abort(new DOMException("REST_TIMEOUT", "AbortError")),
-        timeoutMs,
-      );
+  const timer = setTimeout(
+    () => controller.abort(new DOMException("REST_TIMEOUT", "AbortError")),
+    timeoutMs,
+  );
   const clearTimer = () => {
-    if (timer) clearTimeout(timer);
+    clearTimeout(timer);
   };
   external?.addEventListener("abort", () => controller.abort(external.reason), { once: true });
   cancelSignal?.addEventListener("abort", () => controller.abort(cancelSignal!.reason), { once: true });

@@ -124,3 +124,55 @@ it("gate48 item 4: pre-aborted signals make api.login/pairRedeem reject without 
   await expect(api.pairRedeem("code", "dev", aborted.signal)).rejects.toThrow("request aborted");
   expect(fetchMock).not.toHaveBeenCalled();
 });
+
+it("gate49 item 4: stalled HEADERS with a LIVE caller signal still reject at the internal read deadline", async () => {
+  vi.useFakeTimers();
+  // Fetch itself never resolves (headers never arrive); the caller supplies a
+  // signal it NEVER aborts — the unconditional internal timer must still fire.
+  const liveCallerSignal = new AbortController().signal;
+  const fetchMock = vi.fn((_url: string, init: RequestInit) => {
+    const signal = init.signal!;
+    return new Promise<never>((_resolve, reject) => {
+      signal.addEventListener(
+        "abort",
+        () => reject(new DOMException("The operation was aborted.", "AbortError")),
+        { once: true },
+      );
+    });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+
+  const call = rest<unknown>("/v1/some-read", { signal: liveCallerSignal });
+  await vi.advanceTimersByTimeAsync(1_000);
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+  expect(liveCallerSignal.aborted).toBe(false); // the caller's signal stays live
+  const settled = expect(call).rejects.toThrow(/REST timeout/);
+  await vi.advanceTimersByTimeAsync(10_000);
+  await settled;
+});
+
+it("gate49 item 4: stalled BODY with a LIVE caller signal still reject at the internal write deadline", async () => {
+  vi.useFakeTimers();
+  const liveCaller = new AbortController();
+  const fetchMock = stubStalledBody(200, "json");
+  // stubStalledBody ignores init.signal beyond abort plumbing; ensure the live
+  // caller signal was forwarded into fetch.
+  const call = rest<{ ok: boolean }>("/v1/commands", {
+    method: "POST",
+    body: "{}",
+    signal: liveCaller.signal,
+  });
+  await vi.advanceTimersByTimeAsync(1_000);
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+  // rest() drives an internal controller signal (aborted by BOTH the caller
+  // signal and the internal deadline); the caller signal is forwarded via an
+  // abort listener, not passed verbatim.
+  expect(fetchMock.mock.calls[0]?.[1]?.signal).toBeInstanceOf(AbortSignal);
+  expect(liveCaller.signal.aborted).toBe(false);
+  const settled = expect(call).rejects.toThrow(/REST timeout/);
+  // 15 s write deadline (not the 10 s read one) — still pending just before.
+  await vi.advanceTimersByTimeAsync(14_000);
+  await expect(Promise.race([call.then(() => "done"), Promise.resolve("pending")])).resolves.toBe("pending");
+  await vi.advanceTimersByTimeAsync(1_000);
+  await settled;
+});

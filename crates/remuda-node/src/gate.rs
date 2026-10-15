@@ -837,6 +837,13 @@ pub(crate) struct LandDrainSeams {
     /// (which same-group cleanup cannot signal). No descendant, no `setsid`,
     /// no timing: valid on macOS.
     pub(crate) stderr_eof_hold: bool,
+    /// r24 item 4: one-shot hold taken by the fence FINALIZER's blocking task
+    /// (`settle_land_group`) at entry, modelling blocking-pool queueing or
+    /// stalled fence filesystem I/O AFTER every owner step (survivor cleanup,
+    /// leader reap, both drains) already completed. The response must latch
+    /// uncertainty at the absolute deadline even though the land child returned
+    /// a recognized definitive report.
+    pub(crate) finalize_hold: Option<Arc<CleanupHold>>,
 }
 
 /// r22 item 4 test-only hold at the granted-land owner's final drain
@@ -1113,6 +1120,25 @@ impl GateRegistry {
             .cleanup_hold = Some(hold);
     }
 
+    /// r24 item 4 test-only: take the armed fence-finalizer hold (one-shot).
+    #[cfg(any(test, feature = "test-faults"))]
+    fn take_finalize_hold(&self) -> Option<Arc<CleanupHold>> {
+        self.land_drain_seams
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .finalize_hold
+            .take()
+    }
+
+    /// r24 item 4 test-only: arm the fence-finalizer blocking-task hold.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub(crate) fn arm_finalize_hold(&self, hold: Arc<CleanupHold>) {
+        self.land_drain_seams
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .finalize_hold = Some(hold);
+    }
+
     #[cfg(any(test, feature = "test-faults"))]
     fn barrier_setup_fault(&self) -> bool {
         *self
@@ -1191,7 +1217,34 @@ impl GateRegistry {
     async fn settle_land_group(&self, job_id: &str, pgid: i32) {
         let dir = self.land_fence_dir.clone();
         let job_id = job_id.to_owned();
+        // r24 item 4 test-only: park the finalizer closure on entry AFTER every
+        // other owner step completed, so a test can expire the absolute
+        // deadline during finalization specifically.
+        #[cfg(any(test, feature = "test-faults"))]
+        let finalize_hold = self.take_finalize_hold();
         let _ = tokio::task::spawn_blocking(move || {
+            #[cfg(any(test, feature = "test-faults"))]
+            if let Some(hold) = finalize_hold {
+                hold.entered
+                    .store(true, std::sync::atomic::Ordering::Release);
+                let (rel_lock, rel_cvar) = &*hold.release;
+                let mut released = rel_lock
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                // Bounded self-release: a failed assertion that never notifies
+                // the hold must not park a blocking thread (and the dropping
+                // runtime) for the whole test binary; the happy path notifies
+                // well before this.
+                while !*released {
+                    let (next, timeout) = rel_cvar
+                        .wait_timeout(released, Duration::from_secs(20))
+                        .unwrap_or_else(|poison| poison.into_inner());
+                    released = next;
+                    if timeout.timed_out() {
+                        *released = true;
+                    }
+                }
+            }
             // Observe only — no signal. The owner killed stragglers before
             // reaping the leader; a still-present group after that is either a
             // group we can no longer safely identify or an EPERM case, both
@@ -1619,6 +1672,15 @@ impl DevNode {
     #[cfg(any(test, feature = "test-faults"))]
     pub fn gate_test_arm_cleanup_hold(&self, hold: Arc<CleanupHold>) {
         self.gate_registry().arm_cleanup_hold(hold);
+    }
+
+    /// Test-only (r24 item 4): arm the one-shot fence-finalizer blocking-task
+    /// hold, so a normal-exit land whose cleanup/reap/drains all finished in
+    /// time can still cross the absolute deadline in the finalizer.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn gate_test_arm_finalize_hold(&self, hold: Arc<CleanupHold>) {
+        self.gate_registry().arm_finalize_hold(hold);
     }
 
     /// Dispatch one Hub→Node gate RPC by method name.
@@ -3109,16 +3171,52 @@ impl DevNode {
             // the next-boot reconciler. No unbounded blocking join on the
             // response path.
             #[cfg(unix)]
+            let mut fence_finalization_expired = false;
+            #[cfg(unix)]
             if let Some(pgid) = land_pgid {
                 let settle = registry.settle_land_group(&request.job_id, pgid);
                 if tokio::time::timeout(remaining(land_deadline), settle)
                     .await
                     .is_err()
                 {
+                    fence_finalization_expired = true;
                     tracing::debug!(
                         job_id = %request.job_id,
                         "land fence finalizer still queued/running at the absolute deadline; \
                          it continues detached and the fence stays for reconciliation"
+                    );
+                }
+            }
+            // r24 item 4: the fence finalizer crossing the absolute deadline
+            // (a saturated blocking pool queuing its closure, or fence
+            // filesystem I/O stalling) is itself an expiry. The child may have
+            // returned a recognized definitive report and every earlier owner
+            // step (survivor cleanup, the single leader reap, both drains) may
+            // have finished in time — but the push could still complete only
+            // through fence I/O that has not returned, so a definitive
+            // landed/failed verdict carried here is unsafe. Latch uncertainty
+            // (an already-uncertain timeout/abort verdict keeps its own
+            // reason), and RECHECK THE ABSOLUTE CLOCK after finalization:
+            // tokio's timeout polls the inner future first, so a finalization
+            // accepted at/after a zero remaining budget reports Ok and must be
+            // caught here too. The Hub reconciles the exact granted merge
+            // against the remote; the detached finalizer still certifies the
+            // fence when it eventually completes.
+            #[cfg(unix)]
+            if fence_finalization_expired || std::time::Instant::now() >= land_deadline {
+                if result.status != "uncertain" {
+                    result.status = "uncertain".into();
+                    result.error = Some(
+                        "the land child returned a definitive report, but its fence finalization \
+                         did not complete before the absolute deadline (blocking-pool contention \
+                         or stalled fence I/O); the push outcome is unknown and the Hub reconciles \
+                         against the exact granted merge"
+                            .into(),
+                    );
+                    result.reason = Some(
+                        "land fence finalization crossed the absolute deadline; push outcome \
+                         uncertain"
+                            .into(),
                     );
                 }
             }
@@ -4802,6 +4900,17 @@ fn terminate_group(pgid: i32) {
 #[cfg(any(test, feature = "test-faults"))]
 pub fn gate_test_alive_pids_in_group(pgid: i32) -> Vec<i32> {
     alive_pids_in_group(pgid)
+}
+
+/// Test-only PORTABLE group-existence probe (`killpg(pgid, 0)`, r24 item 5):
+/// the kernel's authoritative answer works on every Unix (including macOS,
+/// which has no `/proc`). True while the group is reported present (including
+/// EPERM, which means present but not ours to signal); false only on ESRCH.
+#[cfg(unix)]
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-faults"))]
+pub fn gate_test_group_exists(pgid: i32) -> bool {
+    land_group_exists(pgid)
 }
 
 #[cfg(test)]
@@ -6712,6 +6821,113 @@ echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\"
         });
 
         rt.shutdown_timeout(Duration::from_secs(5));
+    }
+
+    /// r24 item 4: a NORMAL-EXIT land returns a recognized definitive `landed`
+    /// report and every ordered owner step (survivor cleanup, the single leader
+    /// reap, both pipe drains) finishes inside the deadline — but the fence
+    /// FINALIZER's blocking closure stalls (pool contention or fence I/O) past
+    /// the absolute deadline. The response must LATCH uncertainty rather than
+    /// return the earlier definitive verdict; the detached finalizer still
+    /// completes after release and certifies the already-reaped group.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_finalizer_stall_after_a_normal_exit_latches_uncertainty_not_the_landed_verdict() {
+        let fixture = fixture(RAW_STDERR_LAND_SCRIPT);
+        let base_main = origin_main(&fixture);
+        let mut p = params(&fixture, "land");
+        p.push = false;
+        p.job_id = "gjb_finalize_stall".into();
+        p.generation = 1;
+        // 0.5 s soft budget + 3.25 s owner allowance = 3.75 s absolute deadline.
+        fixture
+            .node
+            .gate_test_set_land_timeout(Duration::from_millis(500))
+            .await;
+
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        fixture
+            .node
+            .gate_test_arm_finalize_hold(Arc::new(CleanupHold {
+                entered: entered.clone(),
+                release: release.clone(),
+            }));
+
+        let node = fixture.node.clone();
+        let node_for_run = node.clone();
+        let run = tokio::spawn(async move { node_for_run.run_gate_typed(p).await });
+
+        // Wait for the granted child and its recorded pgid.
+        let pgid = {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(pgid) = node.gate_test_live_land_pgid("gjb_finalize_stall").await {
+                    break pgid;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no land pgid recorded"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+
+        // The finalizer closure ran and parked; every earlier owner step has
+        // already completed by the time the response returns below.
+        let entered_poll = async {
+            while !entered.load(std::sync::atomic::Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), entered_poll)
+            .await
+            .expect("the fence finalizer never entered its hold");
+
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(8), run)
+            .await
+            .expect("the response never returned while the finalizer was held")
+            .expect("run task panicked")
+            .expect("run_gate_typed returned an error");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(6_000),
+            "the response waited on the held finalizer for {elapsed:?}"
+        );
+        assert_eq!(
+            result.status, "uncertain",
+            "a definitive verdict is unsafe once fence finalization crosses the deadline, got: \
+             {result:?}"
+        );
+        assert!(
+            result
+                .reason
+                .as_deref()
+                .is_some_and(|t| t.contains("finalization")),
+            "the uncertainty names the finalizer deadline: {:?}",
+            result.reason
+        );
+
+        // The owner's ordered cleanup+reap already finished BEFORE the
+        // finalizer parked: the group is gone even while the finalizer is still
+        // held (proven via the portable killpg existence check).
+        assert!(
+            !super::gate_test_group_exists(pgid),
+            "the owner must have cleaned and reaped the group before finalization"
+        );
+
+        // Release the parked finalizer: the detached closure completes its
+        // observation and certifies/removes the fence without hanging.
+        {
+            let (lock, cvar) = &*release;
+            let mut done = lock.lock().unwrap();
+            *done = true;
+            cvar.notify_all();
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!super::gate_test_group_exists(pgid));
+        assert_eq!(origin_main(&fixture), base_main, "push=false moves nothing");
     }
 
     /// r18 item 10: the barrier fake must reject a ZERO-byte read (EOF), not

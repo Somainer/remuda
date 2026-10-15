@@ -146,6 +146,12 @@ pub use gate::LandGrantAnswer as GateLandGrantAnswer;
 #[cfg(any(test, feature = "test-faults"))]
 #[cfg(unix)]
 pub use gate::gate_test_alive_pids_in_group;
+/// Test-only: portable group-existence probe via `killpg(pgid, 0)` (r24
+/// item 5, macOS-safe).
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-faults"))]
+#[cfg(unix)]
+pub use gate::gate_test_group_exists;
 pub use remuda_signal::hook_silence::{
     HookSilenceProbes, HookSilenceReason, classify as classify_hook_silence,
     diagnose as diagnose_hook_silence, link_fresh as hook_link_fresh,

@@ -6788,9 +6788,11 @@ echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\"
                 result.reason
             );
             // The group is STILL ALIVE at response time: its terminate was
-            // queued behind the saturated pool and has not run.
+            // queued behind the saturated pool and has not run. The kernel's
+            // portable killpg(pgid, 0) is authoritative here (no Linux /proc,
+            // r24 item 5).
             assert!(
-                !super::gate_test_alive_pids_in_group(pgid).is_empty(),
+                super::gate_test_group_exists(pgid),
                 "the terminate closure must still be queued when the uncertain response returns"
             );
 
@@ -6808,7 +6810,8 @@ echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\"
             }
             let deadline = std::time::Instant::now() + Duration::from_secs(8);
             loop {
-                if super::gate_test_alive_pids_in_group(pgid).is_empty() {
+                // Portable eventual ESRCH (killpg(pgid, 0)); valid on macOS.
+                if !super::gate_test_group_exists(pgid) {
                     break;
                 }
                 assert!(
@@ -6928,6 +6931,61 @@ echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\"
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(!super::gate_test_group_exists(pgid));
         assert_eq!(origin_main(&fixture), base_main, "push=false moves nothing");
+    }
+
+    /// r24 item 5: the saturation regression used to prove group liveness by
+    /// enumerating `/proc`; ordinary macOS has no `/proc`, so the scan returns
+    /// an EMPTY vec for a group that is definitely alive and the test failed
+    /// despite correct runtime behavior. With `/proc` made unreadable (the
+    /// macOS condition), the portable kernel probe `killpg(pgid, 0)` must still
+    /// prove initial existence and eventual ESRCH after the group is reaped.
+    #[cfg(unix)]
+    #[test]
+    fn group_liveness_is_proven_with_portable_killpg_not_proc_enumeration() {
+        let _seq = proc_lock();
+        let child = spawn_grouped("sh", &["-c", "sleep 5"]);
+        let pgid = i32::try_from(child.id()).unwrap();
+
+        // On Linux the /proc scan happens to work; the portable probe must
+        // agree while the group is live.
+        assert!(
+            !super::alive_pids_in_group(pgid).is_empty(),
+            "Linux baseline: /proc enumerates the live group"
+        );
+        assert!(super::gate_test_group_exists(pgid), "killpg sees it");
+
+        // Simulate macOS: /proc cannot be read.
+        {
+            let _missing = MissingProc::set();
+            assert!(
+                super::alive_pids_in_group(pgid).is_empty(),
+                "the /proc scan returns empty for a LIVE group — exactly the macOS condition that \
+                 made the old saturation assertions fail"
+            );
+            assert!(
+                super::gate_test_group_exists(pgid),
+                "the portable killpg(pgid, 0) probe still proves initial existence without /proc"
+            );
+        }
+
+        // Eventual ESRCH after KILL and the leader reap.
+        {
+            use nix::sys::signal::{Signal, killpg};
+            use nix::unistd::Pid;
+            let _ = killpg(Pid::from_raw(pgid), Some(Signal::SIGKILL));
+        }
+        reap(child);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if !super::gate_test_group_exists(pgid) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "killpg never reached ESRCH for {pgid}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// r18 item 10: the barrier fake must reject a ZERO-byte read (EOF), not

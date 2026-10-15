@@ -10844,6 +10844,99 @@
         }
       }
     },
+    "/v1/projects/{id}/gate/jobs/{jobId}/resolve-evidence": {
+      "parameters": [
+        {
+          "description": "prj_… id",
+          "in": "path",
+          "name": "id",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "description": "gjb_… id",
+          "in": "path",
+          "name": "jobId",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "projectGateJobResolveEvidence",
+        "tags": [
+          "gate"
+        ],
+        "summary": "Operator-resolve a definitive verdict whose evidence could not be persisted",
+        "description": "Only a job in a pre-settlement state (running/canceling/landing) carrying evidenceUncertain accepts a resolution: both the finished notification and the gate.run reply failed to persist the supplied run log, the Node retains no copy and redelivers nothing, and the Hub runs no retry scheduler. `failed` settles it Failed; `requeue` releases the lane/land occupancy and re-enters the queue. The job keeps its occupancy until this resolution or an idempotent later redelivery settles it. Agent callers are refused.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true,
+                "required": [
+                  "resolution",
+                  "expectedGeneration",
+                  "rationale"
+                ],
+                "properties": {
+                  "resolution": {
+                    "type": "string",
+                    "enum": [
+                      "failed",
+                      "requeue"
+                    ]
+                  },
+                  "expectedGeneration": {
+                    "type": "integer",
+                    "format": "uint32",
+                    "minimum": 0,
+                    "description": "The attempt generation the operator saw parked as evidence-uncertain."
+                  },
+                  "rationale": {
+                    "type": "string",
+                    "description": "Mandatory non-empty human rationale, persisted on the row."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Settled job",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/v1/projects/{id}/gate/jobs/{jobId}/resolve": {
       "parameters": [
         {

@@ -1096,6 +1096,10 @@ export class Outbox {
         // Gate 12 item 5: serialize under the instance Web Lock WHENEVER
         // locks.request exists — independently of whether locks.query worked
         // (query failure is unknown OWNERSHIP, not absence of locking).
+        // Gate 49 item 3: during auth initialization the reclaim is BOUNDED —
+        // if a sibling holds the lock it leaves the (expired) rows unchanged
+        // for the installed outbox's lease recovery instead of parking the
+        // bootstrap/login turn behind the Web-Lock queue.
         const stored = await box.runUnderInstanceLock(instanceId, reclaim);
         if (stored) {
           // Authoritative current row — reclaimed to pending, terminal, or a
@@ -1718,17 +1722,7 @@ export class Outbox {
   private async runUnderInstanceLock<T>(instanceId: Id, fn: () => Promise<T>): Promise<T> {
     const locks = (globalThis as { navigator?: Navigator & { locks?: LockManager } }).navigator?.locks;
     if (locks?.request) {
-      const name = instanceDeliveryLockName(instanceId);
-      // Gate 48 item 3: record same-tab ownership so a bounded acquire knows a
-      // busy lock here is our own (safe to queue) rather than a sibling's.
-      return await locks.request(name, { mode: "exclusive" }, async () => {
-        Outbox.selfHeldLocks.add(name);
-        try {
-          return await fn();
-        } finally {
-          Outbox.selfHeldLocks.delete(name);
-        }
-      });
+      return await locks.request(instanceDeliveryLockName(instanceId), { mode: "exclusive" }, fn);
     }
     return await fn();
   }
@@ -2113,16 +2107,23 @@ export class Outbox {
     fn: (instanceId: Id, deliverable: OutboxRecord[]) => Promise<T>,
     opts: { ifAvailable?: boolean } = {},
   ): Promise<T | null | "lock-unavailable"> {
+    if (opts.ifAvailable) {
+      // Gate 49 item 2: bounded acquisition.
+      //  - No chain yet: register a chain node and acquire with ifAvailable
+      //    (keeps later callers serialized; the node itself never queues an
+      //    ordinary lock request).
+      //  - A chain whose run is ACTIVELY HOLDING the lock: await its
+      //    REST-bounded completion, then retry ifAvailable once.
+      //  - A chain that is merely queued in the Web-Lock FIFO (it may be
+      //    parked behind a suspended sibling): return "lock-unavailable".
+      const name = instanceDeliveryLockName(instanceId);
+      if (this.flushChain.has(instanceId) && !this.runningSelfLocks.has(name)) {
+        return "lock-unavailable";
+      }
+      return await this.runAfterChain(instanceId, fn, opts);
+    }
     if (this.queuedFlush.has(instanceId)) return (await this.queuedFlush.get(instanceId)!) as T | null;
     if (this.flushChain.has(instanceId)) {
-      if (opts.ifAvailable) {
-        // Gate 48 item 3: a bounded caller arriving while a same-tab chain
-        // run is ACTIVE coalesces onto THAT run instead of queueing a second
-        // lock turn: when the active run skipped a sibling-held lock this
-        // caller skips too (the sibling is the deliverer), and it never
-        // extends the auth turn behind the web-lock queue.
-        return (await this.flushChain.get(instanceId)!) as T | null | "lock-unavailable";
-      }
       // An unbounded caller joins the chain and takes the lock in sequence
       // (bounded by the same-tab predecessor's own REST timeouts).
       const queued = this.runAfterChain(instanceId, fn);
@@ -2136,7 +2137,7 @@ export class Outbox {
         .catch(() => undefined);
       return (await queued) as T | null;
     }
-    return (await this.runAfterChain(instanceId, fn, opts)) as T | null;
+    return (await this.runAfterChain(instanceId, fn)) as T | null;
   }
 
   private runAfterChain<T>(
@@ -2144,6 +2145,9 @@ export class Outbox {
     fn: (instanceId: Id, deliverable: OutboxRecord[]) => Promise<T>,
     opts: { ifAvailable?: boolean } = {},
   ): Promise<T | null | "lock-unavailable"> {
+    // Every caller (bounded or unbounded) registers a chain node so later
+    // callers observe its completion; a bounded node acquires via ifAvailable
+    // only and never queues an ordinary Web-Lock request (gate 49 item 2).
     const prev = this.flushChain.get(instanceId) ?? Promise.resolve();
     // A rejected predecessor must not poison the chain (its entry is cleared by
     // `clear`), but a rejected run must NEVER silently re-invoke fn: the
@@ -2162,40 +2166,43 @@ export class Outbox {
   }
 
   /**
-   * Names of instance locks CURRENTLY held by an Outbox delivery in THIS
-   * document context (gate 48 item 3). The Web Locks ifAvailable callback
-   * reports a busy lock without saying WHO holds it: a holder recorded here
-   * is our own same-tab deliverer (whose request is bounded by the REST
-   * timeouts and safe to queue behind for a few ms), whereas any other holder
-   * is a sibling TAB that could block forever and must be skipped.
+   * Max time a BOUNDED acquisition waits for a busy lock before giving up
+  /**
+   * DOCUMENT-LEVEL registry of lock deliveries CURRENTLY HOLDING the lock
+   * (their Web-Lock callback is actively running), keyed by lock name (gate
+   * 49 item 2). Unlike flushChain (which can be parked in the FIFO queue
+   * behind a suspended sibling), an entry here is by definition already
+   * RUNNING and therefore bounded by the REST timeouts. The registry is owned
+   * by HubStore and survives an Outbox identity replacement, so a fresh
+   * Outbox's bounded drain can await an OLD box's in-flight POST. A bounded
+   * caller awaits ONLY this running task (then retries ifAvailable) — never a
+   * merely-queued FIFO waiter and never an ordinary lock request.
    */
-  private static readonly selfHeldLocks = new Set<string>();
+
+  private readonly runningSelfLocks = new Set<string>();
 
   private async acquireLock<T>(
     instanceId: Id,
     fn: (instanceId: Id, deliverable: OutboxRecord[]) => Promise<T>,
     opts: { ifAvailable?: boolean } = {},
   ): Promise<T | null | "lock-unavailable"> {
-    const locks = (globalThis as { navigator?: Navigator & { locks?: LockManager } }).navigator?.locks;
+    const g = globalThis as { navigator?: Navigator & { locks?: LockManager } };
+    const locks = g.navigator?.locks;
     if (locks?.request) {
       const name = instanceDeliveryLockName(instanceId);
       const run = async (): Promise<T> => {
-        Outbox.selfHeldLocks.add(name);
+        this.runningSelfLocks.add(name);
         try {
           return await this.runDeliverer(instanceId, fn);
         } finally {
-          Outbox.selfHeldLocks.delete(name);
+          this.runningSelfLocks.delete(name);
         }
       };
-      // Gate 48 item 3: an AUTH TURN's drain passes ifAvailable:true so it can
-      // never queue without a deadline behind a SIBLING deliverer holding the
-      // lock. When it is not immediately free the callback receives `null`;
-      // if the holder is THIS context (a same-tab flush, bounded by REST
-      // timeouts) fall back to the normal queued request, otherwise skip.
       if (opts.ifAvailable) {
-        // Decide same-tab vs sibling SYNCHRONOUSLY at entry: selfHeldLocks can
-        // mutate in the microtask gap before the ifAvailable callback runs.
-        const sameTabHolder = Outbox.selfHeldLocks.has(name);
+        // Gate 49 item 2: pure ifAvailable (chain/active-run awaiting is the
+        // caller's job in withInstanceLock). Busy → "lock-unavailable", never
+        // an ordinary queued request, so a suspended sibling in the Web-Lock
+        // FIFO cannot block this acquisition.
         let delivered: T | undefined;
         const granted = await locks.request(
           name,
@@ -2207,11 +2214,7 @@ export class Outbox {
           },
         );
         if (granted) return delivered ?? null;
-        // Busy: same-tab holder → queue normally (bounded by REST timeouts);
-        // sibling tab → skip without touching the rows.
-        if (!sameTabHolder) {
-          return "lock-unavailable";
-        }
+        return "lock-unavailable";
       }
       return await locks.request(name, { mode: "exclusive" }, run);
     }

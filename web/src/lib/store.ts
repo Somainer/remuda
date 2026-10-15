@@ -3740,7 +3740,10 @@ class HubStore {
             // owns the rows; stop this bounded drain and leave everything it
             // does not cover to normal recovery (claim wakes / later flushes),
             // so the auth turn is not held here.
-            if (id === "lock-unavailable") return;
+            if (id === "lock-unavailable") {
+              if (boundedLock) continue;
+              return;
+            }
             if (id) {
               attempted.add(id);
               deliveredNew = true;
@@ -3756,6 +3759,8 @@ class HubStore {
             // for this instance: count the bounded attempt so the fresh
             // reconciliation in the finally arms the backed-off delivery wake
             // instead of hot-looping, and keep draining other instances.
+            // Gate 49 item 2: a BOUNDED caller never reaches this catch via a
+            // sibling-held lock (that returns "lock-unavailable" above), so an
             box.noteDeliveryFailure(instanceId);
           }
         }

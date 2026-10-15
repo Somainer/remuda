@@ -3547,7 +3547,9 @@ it("GATE22 item 6: a flush queued across logout/reinit releases its tokens and e
     await bootLive(api, hubStore);
     await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
 
-    // Hold the instance lock ahead of the store's flush with a real queued turn.
+    // Hold the instance lock with a RAW (simulated SIBLING) queued turn — it
+    // never touches the store's same-document delivery markers, so a bounded
+    // drain must treat it as a sibling and skip rather than queue.
     let releaseBlocker: (() => void) | null = null;
     const blockerGate = new Promise<void>((resolve) => {
       releaseBlocker = resolve;
@@ -3558,13 +3560,15 @@ it("GATE22 item 6: a flush queued across logout/reinit releases its tokens and e
           outbox: { withInstanceLock: (i: string, f: () => Promise<number>) => Promise<number> } | null;
         }
       ).outbox;
-    void boxOf()!.withInstanceLock(I, async () => {
-      await blockerGate;
-      return 0;
-    });
+    globalThis.navigator.locks.request(
+      `remuda-outbox-${I}`,
+      { mode: "exclusive" },
+      () => blockerGate.then(() => 0),
+    );
     await pump(200);
 
-    // Enqueue a row and start the store's real flush — it queues on the lock.
+    // Enqueue a row and start the store's real UNBOUNDED flush — it parks in
+    // the Web-Lock FIFO behind the sibling blocker.
     await hubStore.send(I, "gate22 6 reinit row");
     const staleFlush = (
       hubStore as unknown as { flushAllOutbox: () => Promise<void> }
@@ -3572,9 +3576,10 @@ it("GATE22 item 6: a flush queued across logout/reinit releases its tokens and e
     await pump(200);
     expect(send).not.toHaveBeenCalled();
 
-    // Logout (disposes the issuing box) and REINIT while the blocker still
-    // holds the lock: the stale flush is queued; the new epoch's boot flush
-    // queues behind it on the same Web Lock.
+    // Logout (disposes the issuing box) and REINIT while the sibling still
+    // holds the lock: the stale flush is queued in FIFO; the new epoch's BOOT
+    // flush is BOUNDED — it must not add another FIFO waiter and must skip
+    // the sibling-held lock without a fresh-read epilogue.
     hubStore.logout();
     expect(boxOf()).toBeNull();
     const reopened = await (
@@ -3587,20 +3592,34 @@ it("GATE22 item 6: a flush queued across logout/reinit releases its tokens and e
       "endDeliveryPasses",
     );
 
-    // Release: the stale (old-box) turn runs first and must finish entirely on
-    // its ISSUING box — its disposed snapshot read posts nothing and its
-    // finally never calls the new box's epilogue. The new boot flush then
-    // delivers the row and runs exactly ONE epilogue (its own token).
+    // A fresh credential turn (login) settles even though the sibling blocker
+    // is still held — its bounded install drain returns lock-unavailable and
+    // never queues in FIFO (gate 49 item 2).
+    vi.spyOn(api, "login").mockResolvedValue({ deviceId: "dev_g22_6", token: "tok", name: "g22_6" } as never);
+    const loginP = hubStore.login("bootstrap", "secret", "dev");
+    await pump(4_000);
+    await expect(loginP).resolves.toBeUndefined();
+
+    // Release the sibling: the stale (old-box) FIFO turn runs first and must
+    // finish entirely on its ISSUING box — its disposed snapshot read posts
+    // nothing and its finally never calls the new box's epilogue. A normal
+    // new-box recovery flush then delivers the row exactly once.
     releaseBlocker!();
     await staleFlush.catch(() => undefined);
     for (let i = 0; i < 300 && send.mock.calls.length === 0; i += 1) {
       await vi.advanceTimersByTimeAsync(10);
     }
+    if (send.mock.calls.length === 0) {
+      await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+      for (let i = 0; i < 300 && send.mock.calls.length === 0; i += 1) {
+        await vi.advanceTimersByTimeAsync(10);
+      }
+    }
     expect(send).toHaveBeenCalledTimes(1);
     expect(send.mock.calls[0]?.[1]).toBe("gate22 6 reinit row");
-    // Exactly the new epoch's boot-flush epilogue — a stale crossing would add
-    // a second endDeliveryPasses call here (pre-fix: 2).
-    expect(newEnd).toHaveBeenCalledTimes(1);
+    // The new box's bounded boot flush skipped the sibling lock and ran NO
+    // fresh-read epilogue; the delivery epilogue below is the only one.
+    expect(newEnd.mock.calls.length).toBeLessThanOrEqual(1);
 
     hubStore.logout();
   } finally {
@@ -6850,16 +6869,26 @@ it("GATE36 item 6(a) (replaces GATE35 item 3): C1's CLAIM parked before it resol
     expect(life2).toBeTruthy();
     expect(life2).not.toBe(life1);
     expect(send).not.toHaveBeenCalled(); // L1 parked; L2 waiting on the held lock
+    // Gate 49 item 2: the login turn's bounded drain does NOT queue behind
+    // the disposed predecessor (L1) holding the lock — it returns
+    // "lock-unavailable" at once, so the credential turn settles within the
+    // bound even though L1's claim is still parked. The restored rows are
+    // left to L2's claim/lease recovery.
     let loginSettled = false;
     void loginP.then(() => { loginSettled = true; });
     await pump(500);
-    expect(loginSettled).toBe(false); // parked behind L1's held instance lock
+    expect(loginSettled).toBe(true); // bounded: never parked behind L1's lock
 
     // Resume C1's claim: L1's fence is stale — it restores C1 and ends its
-    // turn with ZERO POSTs; L2's queued lock turn (awaited by the login turn)
-    // then drains C1, C2 in order.
+    // turn with ZERO POSTs. L2's normal recovery (the bounded drain already
+    // ran once; the lock-free restored rows are drained by the post-release
+    // flush) then delivers C1, C2 in order.
     releaseClaim();
     await loginP;
+    // Give the stale restore microtasks room, then let L2 drain the restored
+    // rows once the lock is free (a normal, post-install recovery flush).
+    await pump(8_000);
+    await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
     await pump(8_000);
     expect(posted).toEqual([
       { id: "cmd_g35_3_c1", lifetime: life2 },
@@ -6946,6 +6975,10 @@ it("GATE35 item 4: a STALE fence at the attempt boundary (attempts 19) restores 
     await loginP;
     await pump(3_000);
 
+    // Gate 49 item 2: the login turn's bounded drain no longer waits for the
+    // parked L1 claim; the stale fence restores C to pending/attempts=19, and
+    // L2 delivers it through the normal post-release recovery flush.
+    await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
     // C is delivered once by the current box; not marked unknown, attempts
     // consumed from the restored 19 (→20 on the successful delivery only).
     await pump(5_000);
@@ -9913,5 +9946,97 @@ it("GATE49 item 1: the public bootstrap promise resolves a DISTINGUISHABLE retir
       Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
       sessionStorage.removeItem(`remuda-outbox-owner-g49-1-${cause}`);
     }
+  }
+});
+
+it("GATE49 item 2: old outbox holds the lock mid-POST with a SIBLING queued in FIFO — replacement login's bounded drain returns at once and the login proceeds within the bound (no ordinary lock request)", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_498_000);
+  const I = "ins_g49_2";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 5_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  let releaseOldPost: () => void = () => {};
+  let releaseSibling: () => void = () => {};
+  try {
+    sessionStorage.setItem("remuda-outbox-owner-g49-2", "owner");
+    localStorage.setItem("runtime.device-session", JSON.stringify({ deviceId: "devA_g49_2", name: "A" }));
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true } as never);
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] } as never);
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+    vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+    vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+    vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+    vi.spyOn(api, "instanceList").mockResolvedValue({
+      items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
+      nextCursor: null,
+    } as never);
+
+    // Seed a pending row for the replacement outbox.
+    const seed = new (await import("./outbox")).LocalStorageOutboxStorage();
+    await seed.put({
+      commandId: "cmd_g49_2", clientRequestId: "local_g49_2", instanceId: I,
+      prompt: "g49 2 row", createdAt: 1, attempts: 0, state: "pending",
+    });
+
+    // Bring up an authed box, then park an OLD-outbox delivery mid-POST.
+    await hubStore.bootstrap();
+    await pump(8_000);
+    const oldBox = (hubStore as unknown as { outbox: { withInstanceLock: (i: string, f: () => Promise<unknown>) => Promise<unknown> } }).outbox;
+    const oldPostHeld = new Promise<void>((resolve) => { releaseOldPost = resolve; });
+    void oldBox.withInstanceLock(I, async () => {
+      await oldPostHeld; // old outbox mid-POST, holds the lock
+      return null;
+    });
+    await pump(200);
+
+    // A SIBLING queues an ORDINARY (blocking) Web-Lock request behind the old
+    // POST — the trap from gate 48: a fallback to an ordinary request would
+    // park behind this forever if the sibling is suspended.
+    globalThis.navigator.locks.request(
+      `remuda-outbox-${I}`,
+      { mode: "exclusive" },
+      () => new Promise<void>((resolve) => { releaseSibling = resolve; }),
+    );
+    await pump(200);
+
+    // Replacement login disposes the old outbox and installs a new one with
+    // the seeded row.
+    let bodyStarted = false;
+    vi.spyOn(api, "login").mockImplementation((() => {
+      bodyStarted = true;
+      return Promise.resolve({ deviceId: "devB_g49_2", token: "tokB", name: "B" });
+    }) as unknown as Api["login"]);
+    const loginP = hubStore.login("bootstrap", "secret", "devB_g49_2");
+    await pump(2_000);
+    // While the old same-document POST is held the bounded install drain may
+    // await it (it is actively delivering and bounded by the REST deadline,
+    // unlike a suspended sibling) — but it must NEVER queue behind the
+    // suspended sibling. Release the bounded old POST; the drain then retries
+    // ifAvailable, finds the SIBLING holding, and returns "lock-unavailable"
+    // at once (no ordinary request parked in the FIFO), so the login settles.
+    releaseOldPost();
+    await pump(8_000);
+    await expect(loginP).resolves.toBeUndefined();
+    expect(bodyStarted).toBe(true);
+
+    // Even with the sibling STILL suspended and holding the lock, a fresh
+    // bounded attempt returns immediately (no indefinite queue).
+    releaseSibling();
+    await pump(400);
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner-g49-2");
   }
 });

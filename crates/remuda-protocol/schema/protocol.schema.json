@@ -4977,6 +4977,53 @@
       ],
       "type": "object"
     },
+    "GateEvidenceUncertain": {
+      "description": "r23 (coordinator clarification of R9): a persisted UNCERTAIN condition for\na definitive verdict whose SUPPLIED run log could not be persisted.\n\nThe Node delivers each verdict exactly twice (the `finished` event and the\n`gate.run` reply) and retains/redelivers NOTHING, so once both deliveries\nhave deferred there is no replay that could heal the job. The Hub runs no\npersistence-retry scheduler (R9); instead it records this explicit\ncondition, leaves the job in its pre-settlement state (Running / Canceling\n/ Landing) STILL holding its lane or land-slot occupancy, surfaces it to\nthe operator feed, and waits for either an explicit operator resolution or\nan idempotent later redelivery of the same verdict. Elapsed time alone\nnever settles it (R5 fail closed).",
+      "properties": {
+        "deliveriesDeferred": {
+          "description": "How many deliveries of this verdict were consumed and deferred. The\ncondition is surfaced to the operator once both original deliveries\nhave deferred; a single deferral stays pending because the dual\ndelivery may still heal it.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "firstAt": {
+          "$ref": "#/$defs/Timestamp",
+          "description": "When the first delivery deferred (RFC3339)."
+        },
+        "generation": {
+          "description": "Attempt generation of the deferred verdict (the live row's `attempts`\nwhile the condition holds).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "reason": {
+          "description": "Human-readable reason persisted for the operator.",
+          "type": "string"
+        },
+        "status": {
+          "description": "The definitive verdict status the Node delivered but the Hub could not\nsettle (`failed` / `passed` / `landed` / …).",
+          "type": "string"
+        },
+        "suppliedDigest": {
+          "description": "sha256 of the supplied `GateRunLog` JSON that never persisted, so the\noperator (and a later identical redelivery) can recognize the verdict.",
+          "type": "string"
+        },
+        "updatedAt": {
+          "$ref": "#/$defs/Timestamp",
+          "description": "When the most recent delivery deferred (RFC3339)."
+        }
+      },
+      "required": [
+        "generation",
+        "status",
+        "suppliedDigest",
+        "deliveriesDeferred",
+        "firstAt",
+        "updatedAt",
+        "reason"
+      ],
+      "type": "object"
+    },
     "GateJob": {
       "description": "One queued gate/land job (Hub document; coordinator-hierarchy.md §8 row 6).",
       "properties": {
@@ -5022,6 +5069,17 @@
             "string",
             "null"
           ]
+        },
+        "evidenceUncertain": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GateEvidenceUncertain"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "r23 R9 clarification: set while a definitive verdict's supplied run\nlog could not be persisted and no redelivery remains that could supply\nit again. The row keeps its pre-settlement state and its occupancy;\nonly an idempotent same-verdict redelivery (which clears it) or an\nexplicit operator resolution settles the job."
         },
         "failedStep": {
           "description": "Name of the step that failed the last run (`cargo-test`, …).",

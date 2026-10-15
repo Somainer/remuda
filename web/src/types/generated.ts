@@ -1055,6 +1055,18 @@ export type GateEventParams = (({
   [key: string]: unknown;
 });
 
+/** r23 (coordinator clarification of R9): a persisted UNCERTAIN condition for a definitive verdict whose SUPPLIED run log could not be persisted.  The Node delivers each verdict exactly twice (the `finished` event and the `gate.run` reply) and retains/redelivers NOTHING, so once both deliveries have deferred there is no replay that could heal the job. The Hub runs no persistence-retry scheduler (R9); instead it records this explicit condition, leaves the job in its pre-settlement state (Running / Canceling / Landing) STILL holding its lane or land-slot occupancy, surfaces it to the operator feed, and waits for either an explicit operator resolution or an idempotent later redelivery of the same verdict. Elapsed time alone never settles it (R5 fail closed). */
+export type GateEvidenceUncertain = ({
+  "deliveriesDeferred": (number);
+  "firstAt": Timestamp;
+  "generation": (number);
+  "reason": (string);
+  "status": (string);
+  "suppliedDigest": (string);
+  "updatedAt": Timestamp;
+  [key: string]: unknown;
+});
+
 /** One queued gate/land job (Hub document; coordinator-hierarchy.md §8 row 6). */
 export type GateJob = ({
   "attempts": (number);
@@ -1063,6 +1075,7 @@ export type GateJob = ({
   "cancelRequestedAt"?: (Timestamp | (null));
   "currentMainSha"?: (string | null);
   "error"?: (string | null);
+  "evidenceUncertain"?: (GateEvidenceUncertain | (null));
   "failedStep"?: (string | null);
   "finishedAt"?: (Timestamp | (null));
   "headSha"?: (string | null);

@@ -301,6 +301,43 @@ pub struct GateRunLog {
     pub truncated: bool,
 }
 
+/// r23 (coordinator clarification of R9): a persisted UNCERTAIN condition for
+/// a definitive verdict whose SUPPLIED run log could not be persisted.
+///
+/// The Node delivers each verdict exactly twice (the `finished` event and the
+/// `gate.run` reply) and retains/redelivers NOTHING, so once both deliveries
+/// have deferred there is no replay that could heal the job. The Hub runs no
+/// persistence-retry scheduler (R9); instead it records this explicit
+/// condition, leaves the job in its pre-settlement state (Running / Canceling
+/// / Landing) STILL holding its lane or land-slot occupancy, surfaces it to
+/// the operator feed, and waits for either an explicit operator resolution or
+/// an idempotent later redelivery of the same verdict. Elapsed time alone
+/// never settles it (R5 fail closed).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GateEvidenceUncertain {
+    /// Attempt generation of the deferred verdict (the live row's `attempts`
+    /// while the condition holds).
+    pub generation: u32,
+    /// The definitive verdict status the Node delivered but the Hub could not
+    /// settle (`failed` / `passed` / `landed` / …).
+    pub status: String,
+    /// sha256 of the supplied `GateRunLog` JSON that never persisted, so the
+    /// operator (and a later identical redelivery) can recognize the verdict.
+    pub supplied_digest: String,
+    /// How many deliveries of this verdict were consumed and deferred. The
+    /// condition is surfaced to the operator once both original deliveries
+    /// have deferred; a single deferral stays pending because the dual
+    /// delivery may still heal it.
+    pub deliveries_deferred: u32,
+    /// When the first delivery deferred (RFC3339).
+    pub first_at: Timestamp,
+    /// When the most recent delivery deferred (RFC3339).
+    pub updated_at: Timestamp,
+    /// Human-readable reason persisted for the operator.
+    pub reason: String,
+}
+
 /// One queued gate/land job (Hub document; coordinator-hierarchy.md §8 row 6).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -370,6 +407,13 @@ pub struct GateJob {
     /// explicit operator resolution settles it; elapsed time alone never does.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub landing_outcome_unknown: bool,
+    /// r23 R9 clarification: set while a definitive verdict's supplied run
+    /// log could not be persisted and no redelivery remains that could supply
+    /// it again. The row keeps its pre-settlement state and its occupancy;
+    /// only an idempotent same-verdict redelivery (which clears it) or an
+    /// explicit operator resolution settles the job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_uncertain: Option<GateEvidenceUncertain>,
     /// Base (`main`) sha the merge was verified onto.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_sha: Option<String>,

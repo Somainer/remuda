@@ -3138,28 +3138,23 @@ async fn the_finished_event_and_the_gate_run_reply_both_feed_the_real_log_path()
     );
 }
 
-/// r22 item 8 (was r21 item 5 / review row 7): the two REAL deliveries of one
-/// verdict — the `gate.event` finished NOTIFICATION and the gate.run RPC
-/// REPLY — BOTH fail evidence persistence, and then the verdict settles via a
-/// RE-SUPPLY from the existing delivery path, exactly once.
-///
-/// The r21 test could pass WITHOUT both original deliveries failing: its
-/// completion counter also counted Hub-side retries, so A's retry (not the
-/// original RPC reply) could consume the second insert failure. R9 removed
-/// that retry scheduler entirely, which makes the masquerade impossible; this
-/// regression now asserts it directly — after the two separately-identified
-/// arrivals complete, the armed TWO-shot insert fault is fully SPENT (both
-/// original applications reached and failed their own insert), the job is
-/// Running with no bound object, it stays Running after storage recovers (no
-/// Hub self-retry), and a single re-supplied notification settles Failed bound
-/// to its own object; a duplicate re-supply changes nothing.
+/// r23 item 1 (r22 review defect 1; coordinator clarification of R9): the two
+/// REAL deliveries of one Failed-with-log verdict — the `gate.event` finished
+/// NOTIFICATION and the gate.run RPC REPLY — BOTH hit transient evidence
+/// persistence failures. The Node retains no copy and redelivers nothing, so
+/// after both deliveries defer the Hub must not leave a silently-Running row:
+/// it records an explicit, PERSISTED uncertain condition (second deferral),
+/// keeps the job Running with its lane occupancy, and exposes operator
+/// resolution. Storage recovering changes nothing; the operator settles the
+/// job Failed, and a later redelivery (which production never sends) stands
+/// down idempotently against the terminal row.
 #[tokio::test]
-async fn both_original_evidence_deliveries_fail_persistence_then_redelivery_settles_once() {
+async fn failed_verdict_without_persisted_evidence_becomes_persistently_uncertain() {
     let (ctx, node) = Ctx::boot().await.unwrap();
     ctx.configure_gate_lane().await;
     let barrier = ctx.store().gate_apply_barrier();
 
-    let job_seed = "wt/gate/deferred-retry";
+    let job_seed = "wt/gate/evidence-uncertain-failed";
     let hook = node
         .arm_gate_run(json!({ "jobId": "placeholder", "status": "failed" }))
         .await;
@@ -3173,15 +3168,9 @@ async fn both_original_evidence_deliveries_fail_persistence_then_redelivery_sett
     let job_id = enqueued["id"].as_str().unwrap().to_owned();
     hook.set_result(failed_gate_result(&job_id, job_seed));
     hook.wait_arrived().await;
-    assert_eq!(
-        ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap()["state"],
-        json!("running")
-    );
 
-    // Hold BOTH arrivals after their live-row pre-read and before either
-    // persists. Arrival 1 is the finished NOTIFICATION we inject; arrival 2 is
-    // the gate.run RPC REPLY released from the armed hook — two separately
-    // identified real deliveries, parked simultaneously.
+    // Park BOTH real arrivals (notification + RPC reply) after the pre-read,
+    // then fail exactly the next two inserts — one per delivery.
     barrier.arm();
     node.send_raw(json!({
         "jsonrpc": "2.0",
@@ -3195,63 +3184,143 @@ async fn both_original_evidence_deliveries_fail_persistence_then_redelivery_sett
     }));
     hook.release_and_wait_proceeded().await;
     barrier.wait_parked(2).await;
-    // Fail EXACTLY the next two inserts — one per original delivery.
     ctx.store().test_arm_gate_log_insert_faults(2);
     barrier.release();
     barrier.wait_completed(2).await;
-
-    // AIRTIGHT both-failures proof (r22 item 8): the cumulative FAILED-write
-    // counter reads 2, so BOTH separately identified original deliveries
-    // reached and failed their OWN persist — not one failure plus a later
-    // success (which also leaves the budget at zero). With R9 there is no Hub
-    // retry whose completion could masquerade as the second delivery.
     assert_eq!(
         ctx.store().test_gate_log_insert_faults_consumed(),
         2,
-        "both original deliveries must each consume one failed insert"
+        "both original deliveries each consumed one failed insert"
     );
-    assert_eq!(
-        ctx.store().test_gate_log_insert_faults_remaining(),
-        0,
-        "the two-shot transient fault must be fully spent"
-    );
-    // Nothing settled and nothing was persisted: Running, no bound object, and
-    // the by-job evidence lookup is a 404.
+
+    // The job is PERSISTENTLY UNCERTAIN: still Running, still holding the
+    // lane/host occupancy, carrying the explicit condition for the operator.
     let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(doc["state"], json!("running"), "{doc}");
+    assert!(
+        doc["hostId"].is_string(),
+        "occupancy (host) retained: {doc}"
+    );
     assert_eq!(
-        doc["state"],
-        json!("running"),
-        "two failed evidence persists keep the job Running: {doc}"
+        doc["laneId"],
+        json!("lane1"),
+        "lane occupancy retained: {doc}"
     );
     assert!(doc["logObjectId"].is_null(), "{doc}");
-    let (status, _) = ctx
+    let condition = &doc["evidenceUncertain"];
+    assert_eq!(condition["generation"], json!(1), "{doc}");
+    assert_eq!(condition["status"], json!("failed"), "{doc}");
+    assert_eq!(condition["deliveriesDeferred"], json!(2), "{doc}");
+    let digest = condition["suppliedDigest"]
+        .as_str()
+        .expect("the condition names the supplied log digest")
+        .to_owned();
+    assert_eq!(digest.len(), 64, "a sha256 hex digest: {digest}");
+    assert!(
+        condition["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("could not be persisted"),
+        "{doc}"
+    );
+    assert!(condition["firstAt"].is_string(), "{doc}");
+    assert!(condition["updatedAt"].is_string(), "{doc}");
+
+    // Storage recovers and the carrier stays connected, but there is no Hub
+    // retry and the Node sends nothing again: the condition is durable.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(doc["state"], json!("running"), "{doc}");
+    assert_eq!(
+        doc["evidenceUncertain"]["deliveriesDeferred"],
+        json!(2),
+        "{doc}"
+    );
+    assert!(doc["logObjectId"].is_null(), "{doc}");
+
+    // Only the operator resolution settles it. An AGENT caller is refused;
+    // empty rationale and a wrong generation are refused too.
+    let resolve_path = format!(
+        "/v1/projects/{}/gate/jobs/{job_id}/resolve-evidence",
+        ctx.project
+    );
+    let (status, reply) = ctx
         .send(
-            "GET",
-            &format!("/v1/gate/logs/{job_id}"),
-            &ctx.human,
+            "POST",
+            &resolve_path,
+            &ctx.agent,
             None,
-            None,
+            Some(json!({
+                "resolution": "failed",
+                "expectedGeneration": 1,
+                "rationale": "agent cannot resolve",
+            })),
         )
         .await;
     assert_eq!(
-        status, 404,
-        "no evidence object exists after both failed inserts"
+        status, 403,
+        "agent callers may not resolve uncertainty: {reply}"
     );
-
-    // Storage has recovered (the two-shot fault is spent), but R9 gives the
-    // Hub NO persistence-retry scheduler: the unconsumed verdicts do not
-    // self-settle. Wait well beyond the old scheduler's first 75 ms retry.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let (status, reply) = ctx
+        .send(
+            "POST",
+            &resolve_path,
+            &ctx.human,
+            None,
+            Some(json!({"resolution": "failed", "expectedGeneration": 1, "rationale": "  "})),
+        )
+        .await;
+    assert_eq!(status, 400, "{reply}");
+    let (status, reply) = ctx
+        .send(
+            "POST",
+            &resolve_path,
+            &ctx.human,
+            None,
+            Some(json!({
+                "resolution": "failed",
+                "expectedGeneration": 9,
+                "rationale": "wrong generation",
+            })),
+        )
+        .await;
+    assert_eq!(status, 409, "a stale generation is refused: {reply}");
     let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
     assert_eq!(
         doc["state"],
         json!("running"),
-        "the Hub must not self-retry after recovery: the result awaits \
-         re-supply by the existing delivery path: {doc}"
+        "refused resolutions keep it parked: {doc}"
     );
 
-    // The existing delivery path RE-SUPPLIES the exact verdict (the
-    // notification): it persists its OWN object and settles Failed.
+    // The operator settles Failed with a persisted rationale; the condition
+    // clears and the occupancy releases.
+    let (status, reply) = ctx
+        .send(
+            "POST",
+            &resolve_path,
+            &ctx.human,
+            None,
+            Some(json!({
+                "resolution": "failed",
+                "expectedGeneration": 1,
+                "rationale": "operator verified the cargo failure out of band; no redelivery possible",
+            })),
+        )
+        .await;
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["state"], json!("failed"), "{reply}");
+    assert!(reply["evidenceUncertain"].is_null(), "{reply}");
+    assert!(
+        reply["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("no redelivery possible"),
+        "the rationale is persisted on the row: {reply}"
+    );
+
+    // A later redelivery (production never sends one; this proves the
+    // idempotency the clarification requires) stands down against the
+    // terminal row and never manufactures evidence.
     node.send_raw(json!({
         "jsonrpc": "2.0",
         "method": "gate.event",
@@ -3262,58 +3331,226 @@ async fn both_original_evidence_deliveries_fail_persistence_then_redelivery_sett
             "result": failed_gate_result(&job_id, job_seed),
         }
     }));
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let final_doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(final_doc["state"], json!("failed"), "{final_doc}");
+    assert!(
+        final_doc["logObjectId"].is_null(),
+        "the terminal operator \
+        resolution is never rebound by a late frame: {final_doc}"
+    );
+}
+
+/// r23 item 1: the same persistent condition for a Passed-with-keepLogs
+/// verdict (a green run whose `kept` log cannot be persisted). If a
+/// redelivery EVER arrives later it remains idempotent: storage recovered,
+/// the single redelivery settles Passed exactly once bound to its OWN newly
+/// persisted object and clears the uncertain condition; a duplicate changes
+/// nothing. No Hub-side retry manufactures that delivery.
+#[tokio::test]
+async fn passed_keep_logs_without_persisted_evidence_is_uncertain_then_redelivery_settles_once() {
+    let (ctx, node) = Ctx::boot().await.unwrap();
+    ctx.configure_gate_lane().await;
+    let barrier = ctx.store().gate_apply_barrier();
+
+    let job_seed = "wt/gate/evidence-uncertain-passed";
+    let passed_result = json!({
+        "jobId": "placeholder",
+        "generation": 1,
+        "status": "passed",
+        "runLog": {
+            "step": "*",
+            "kind": "kept",
+            "attempts": 1,
+            "headline": "green; log retained by --keep-logs",
+            "summary": ["cargo test ... ok"],
+            "tail": ["Finished gate successfully"],
+            "capturedLines": 1,
+            "truncated": false
+        }
+    });
+    let hook = node.arm_gate_run(passed_result.clone()).await;
+    let (status, enqueued) = ctx
+        .agent_post(
+            &format!("/v1/projects/{}/gate", ctx.project),
+            json!({"branch":job_seed,"mode":"verify"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{enqueued}");
+    let job_id = enqueued["id"].as_str().unwrap().to_owned();
+    let mut for_job = passed_result.clone();
+    for_job["jobId"] = json!(job_id);
+    hook.set_result(for_job.clone());
+    hook.wait_arrived().await;
+
+    barrier.arm();
+    let mut event = json!({
+        "jsonrpc": "2.0",
+        "method": "gate.event",
+        "params": {
+            "jobId": job_id,
+            "generation": 1,
+            "kind": "finished",
+            "result": {},
+        }
+    });
+    event["params"]["result"] = for_job.clone();
+    node.send_raw(event);
+    hook.release_and_wait_proceeded().await;
+    barrier.wait_parked(2).await;
+    ctx.store().test_arm_gate_log_insert_faults(2);
+    barrier.release();
+    barrier.wait_completed(2).await;
+    assert_eq!(ctx.store().test_gate_log_insert_faults_consumed(), 2);
+
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(doc["state"], json!("running"), "{doc}");
+    assert_eq!(doc["laneId"], json!("lane1"), "occupancy retained: {doc}");
+    assert_eq!(doc["evidenceUncertain"]["status"], json!("passed"), "{doc}");
+    assert_eq!(
+        doc["evidenceUncertain"]["deliveriesDeferred"],
+        json!(2),
+        "{doc}"
+    );
+
+    // Recovery alone does not heal it.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(doc["state"], json!("running"), "{doc}");
+    assert!(doc["evidenceUncertain"].is_object(), "{doc}");
+
+    // One later redelivery settles Passed exactly once and clears the
+    // condition; the dual delivery this replaces is NOT manufactured by the
+    // Hub — nothing self-settled in the wait above.
+    let mut redelivery = json!({
+        "jsonrpc": "2.0",
+        "method": "gate.event",
+        "params": {
+            "jobId": job_id,
+            "generation": 1,
+            "kind": "finished",
+            "result": {},
+        }
+    });
+    redelivery["params"]["result"] = for_job.clone();
+    node.send_raw(redelivery);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let settled = loop {
         let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
-        if doc["state"] == json!("failed") {
+        if doc["state"] == json!("passed") {
             break doc;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the re-supplied verdict never settled: {doc}"
+            "never settled: {doc}"
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     };
+    assert!(
+        settled["evidenceUncertain"].is_null(),
+        "settlement clears the condition: {settled}"
+    );
     let object_id = settled["logObjectId"]
         .as_str()
-        .expect("the re-supplied verdict binds the persisted object")
-        .to_owned();
+        .expect("bound to its own object");
     assert!(object_id.starts_with("obj_"), "{object_id}");
 
-    // A DUPLICATE re-supply settles no second time and keeps the same object.
-    node.send_raw(json!({
+    // A duplicate redelivery is a no-op: same terminal state, same object.
+    let mut duplicate = json!({
         "jsonrpc": "2.0",
         "method": "gate.event",
         "params": {
             "jobId": job_id,
             "generation": 1,
             "kind": "finished",
-            "result": failed_gate_result(&job_id, job_seed),
+            "result": {},
         }
-    }));
+    });
+    duplicate["params"]["result"] = for_job;
+    node.send_raw(duplicate);
     tokio::time::sleep(Duration::from_millis(300)).await;
     let final_doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
-    assert_eq!(final_doc["state"], json!("failed"), "{final_doc}");
-    assert_eq!(
-        final_doc["logObjectId"],
-        json!(object_id),
-        "the duplicate re-supply rebound the evidence: {final_doc}"
-    );
-    let (status, by_job) = ctx
-        .send(
-            "GET",
-            &format!("/v1/gate/logs/{job_id}"),
-            &ctx.human,
-            None,
-            None,
+    assert_eq!(final_doc["state"], json!("passed"), "{final_doc}");
+    assert_eq!(final_doc["logObjectId"], json!(object_id), "{final_doc}");
+    assert!(final_doc["evidenceUncertain"].is_null(), "{final_doc}");
+}
+
+/// r23 item 1: the operator `requeue` resolution releases the parked
+/// occupancy and the fresh attempt runs; the uncertain condition and the
+/// stale evidence reference are cleared.
+#[tokio::test]
+async fn operator_requeue_releases_a_persistently_uncertain_jobs_occupancy() {
+    let (ctx, _node) = Ctx::boot().await.unwrap();
+    let (status, body) = ctx
+        .agent_post(
+            &format!("/v1/projects/{}/gate", ctx.project),
+            json!({"branch":"wt/gate/evidence-uncertain-requeue","mode":"verify"}),
         )
         .await;
-    assert_eq!(status, 200, "{by_job}");
-    assert_eq!(by_job["objectId"], json!(object_id), "{by_job}");
+    assert_eq!(status, 200, "{body}");
+    let job_id = body["id"].as_str().unwrap().to_owned();
+    let claimed = ctx
+        .hub
+        .test_claim_gate_job(&job_id, "lane1", &ctx.host)
+        .await
+        .unwrap()
+        .expect("the queued verify job claims to running");
+    assert_eq!(claimed["state"], json!("running"), "{claimed}");
+
+    // Both real handler entries (the notification and the reply) fail their
+    // insert against the sticky fault.
+    ctx.store().test_arm_gate_log_insert_fault_sticky();
+    ctx.hub
+        .test_apply_gate_result(&job_id, failed_gate_result(&job_id, "x"))
+        .await
+        .unwrap();
+    ctx.hub
+        .test_apply_gate_result(&job_id, failed_gate_result(&job_id, "x"))
+        .await
+        .unwrap();
+    ctx.store().test_clear_gate_log_insert_fault();
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(doc["state"], json!("running"), "{doc}");
     assert_eq!(
-        by_job["log"]["headline"],
-        json!("the two-path evidence"),
-        "the settlement binds the re-supplied result's own bytes: {by_job}"
+        doc["evidenceUncertain"]["deliveriesDeferred"],
+        json!(2),
+        "{doc}"
+    );
+
+    let (status, reply) = ctx
+        .send(
+            "POST",
+            &format!(
+                "/v1/projects/{}/gate/jobs/{job_id}/resolve-evidence",
+                ctx.project
+            ),
+            &ctx.human,
+            None,
+            Some(json!({
+                "resolution": "requeue",
+                "expectedGeneration": 1,
+                "rationale": "run it again; storage is healthy now",
+            })),
+        )
+        .await;
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["state"], json!("queued"), "{reply}");
+    assert!(reply["evidenceUncertain"].is_null(), "{reply}");
+    assert!(
+        reply["hostId"].is_null(),
+        "the lane occupancy is released: {reply}"
+    );
+    assert!(reply["laneId"].is_null(), "{reply}");
+    assert!(
+        reply["logObjectId"].is_null(),
+        "stale evidence reference cleared: {reply}"
+    );
+    assert!(
+        reply["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("run it again"),
+        "the rationale is persisted: {reply}"
     );
 }
 

@@ -277,6 +277,10 @@ pub fn routes() -> Router<AppState> {
             "/v1/projects/{id}/gate/jobs/{jobId}/resolve",
             post(resolve_project_job),
         )
+        .route(
+            "/v1/projects/{id}/gate/jobs/{jobId}/resolve-evidence",
+            post(resolve_evidence_project_job),
+        )
         .route("/v1/gate/jobs", get(list_all_jobs))
         .route("/v1/gate/logs/{id}", get(get_gate_log))
 }
@@ -735,6 +739,7 @@ async fn enqueue_job(
         then_output: None,
         landing_session_epoch: None,
         landing_outcome_unknown: false,
+        evidence_uncertain: None,
     };
     state.store.insert_gate_job(&job).await.map_err(map_store)?;
     journal(&state, &device.id, "gate.queued", &job).await;
@@ -1104,6 +1109,7 @@ async fn resolve_project_job(
             row.home_land_in_flight = false;
             row.landing_session_epoch = None;
             row.landing_outcome_unknown = false;
+            row.evidence_uncertain = None;
             if requeue {
                 row.state = GateJobState::Queued;
                 row.started_at = None;
@@ -1158,6 +1164,182 @@ async fn resolve_project_job(
     } else {
         journal(&state, &device.id, "gate.failed", &outcome).await;
         drop_job_refs(&state, &outcome).await;
+    }
+    Ok(Json(json!(outcome)))
+}
+
+/// r23 R9 clarification — body of the OPERATOR evidence-uncertain resolution
+/// request.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResolveEvidenceRequest {
+    /// `failed` — settle the job Failed with the operator's attestation (no
+    /// definitive verdict is auto-accepted without its persisted evidence);
+    /// `requeue` — release the occupancy and re-enter the queue for a fresh
+    /// run.
+    resolution: String,
+    /// The attempt generation the operator saw parked as uncertain.
+    expected_generation: u32,
+    /// Mandatory human rationale; persisted on the row and journaled.
+    rationale: String,
+}
+
+/// `POST /v1/projects/{id}/gate/jobs/{jobId}/resolve-evidence`
+///
+/// The explicit OPERATOR-ONLY escape hatch for an evidence-UNCERTAIN job: a
+/// definitive verdict (e.g. Failed-with-log or Passed-with-keepLogs) whose
+/// supplied run log could not be persisted on either of the Node's two
+/// deliveries. The Node retains no copy and redelivers nothing, and the Hub
+/// runs no retry scheduler, so the row parks in its pre-settlement state
+/// holding its lane/land occupancy until an operator resolves it here or an
+/// identical redelivery ever arrives (which settles idempotently and clears
+/// the condition on its own). Agent callers are refused; the request must pin
+/// the exact parked generation and carry a persisted rationale.
+async fn resolve_evidence_project_job(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, job_id)): Path<(String, String)>,
+    Json(request): Json<ResolveEvidenceRequest>,
+) -> Result<Json<Value>, HubError> {
+    require_origin(&headers, &state.config)?;
+    require_operator(&state, &headers).await?;
+    let device = caller(&state, &headers).await?;
+    let scope = caller_project_scope(&state, &device).await?;
+    if !scope.allows_project(&project) {
+        return Err(HubError::Forbidden);
+    }
+    let requeue = match request.resolution.as_str() {
+        "failed" => false,
+        "requeue" => true,
+        other => {
+            return Err(HubError::BadRequest(format!(
+                "resolution must be \"failed\" or \"requeue\", got {other:?}"
+            )));
+        }
+    };
+    let rationale = request.rationale.trim();
+    if rationale.is_empty() {
+        return Err(HubError::BadRequest(
+            "an operator evidence-uncertain resolution requires a non-empty rationale".to_string(),
+        ));
+    }
+    let expected_generation = request.expected_generation;
+    let job = state
+        .store
+        .get_gate_job(&job_id)
+        .await
+        .map_err(map_store)?
+        .ok_or(HubError::NotFound)?;
+    if job.project_id.as_id().as_str() != project {
+        return Err(HubError::NotFound);
+    }
+    let condition = match &job.evidence_uncertain {
+        Some(condition)
+            if matches!(
+                job.state,
+                GateJobState::Running | GateJobState::Canceling | GateJobState::Landing
+            ) =>
+        {
+            condition.clone()
+        }
+        _ => {
+            return Err(HubError::Conflict(
+                "only a job parked with an unpersisted-evidence uncertain condition accepts an \
+                 evidence resolution"
+                    .to_string(),
+            ));
+        }
+    };
+    if condition.generation != expected_generation {
+        return Err(HubError::Conflict(
+            "the live uncertain condition names a different attempt generation than this \
+             resolution; refresh and resolve the current attempt"
+                .to_string(),
+        ));
+    }
+    let was_landing = job.state == GateJobState::Landing;
+    // A Landing's granted land run has normally already settled its group by
+    // the time a verdict is delivered, but terminate/tombstone the generation
+    // exactly like the Landing operator resolve so an operator-failed Landing
+    // cannot push after the fact.
+    if was_landing {
+        abort_landing_run(&state, &job).await;
+    }
+    let operator = device.id.clone();
+    let rationale = rationale.to_owned();
+    let outcome = state
+        .store
+        .mutate_gate_job(&job_id, move |row, _conn| {
+            let Some(condition) = &row.evidence_uncertain else {
+                return None;
+            };
+            if !matches!(
+                row.state,
+                GateJobState::Running | GateJobState::Canceling | GateJobState::Landing
+            ) || condition.generation != expected_generation
+            {
+                return None;
+            }
+            row.home_land_in_flight = false;
+            row.landing_session_epoch = None;
+            row.landing_outcome_unknown = false;
+            row.evidence_uncertain = None;
+            if requeue {
+                row.state = GateJobState::Queued;
+                row.started_at = None;
+                row.host_id = None;
+                row.lane_id = None;
+                row.finished_at = None;
+                row.current_main_sha = None;
+                row.merge_ref = None;
+                row.merge_sha = None;
+                row.failed_step = None;
+                row.reason = None;
+                row.log_object_id = None;
+                row.error = Some(format!(
+                    "evidence could not be persisted for a definitive verdict; re-queued by \
+                     explicit operator resolution ({operator}): {rationale}"
+                ));
+            } else {
+                row.state = GateJobState::Failed;
+                row.finished_at = Some(now_ts());
+                row.error = Some(format!(
+                    "a definitive verdict's run log could not be persisted and no redelivery \
+                     remains; settled failed by explicit operator resolution ({operator}): \
+                     {rationale}"
+                ));
+                row.reason = Some(format!(
+                    "failed; evidence unavailable, resolved by operator: {rationale}"
+                ));
+            }
+            Some(())
+        })
+        .await
+        .map_err(map_store)?;
+    let Some(outcome) = outcome else {
+        let current = state
+            .store
+            .get_gate_job(&job_id)
+            .await
+            .map_err(map_store)?
+            .ok_or(HubError::NotFound)?;
+        if current.evidence_uncertain.is_none() {
+            return Err(HubError::NotFound);
+        }
+        return Err(HubError::Conflict(
+            "the live uncertain condition is no longer the attempt this resolution named; refresh \
+             and resolve the current attempt"
+                .to_string(),
+        ));
+    };
+    if requeue {
+        journal(&state, &device.id, "gate.base-moved-requeue", &outcome).await;
+        schedule_once(&state);
+    } else {
+        journal(&state, &device.id, "gate.failed", &outcome).await;
+        if was_landing {
+            drop_job_refs(&state, &outcome).await;
+        }
     }
     Ok(Json(json!(outcome)))
 }
@@ -1288,6 +1470,13 @@ async fn finish_expired_cancels(state: &AppState) {
         if job.home_land_in_flight {
             continue;
         }
+        // r23 R9: a Canceling row parked with an unpersisted definitive
+        // verdict is held for an idempotent redelivery or explicit operator
+        // resolution; the time-based cancel grace must not finish it and
+        // discard the condition.
+        if job.evidence_uncertain.is_some() {
+            continue;
+        }
         let Some(requested) = &job.cancel_requested_at else {
             continue;
         };
@@ -1298,7 +1487,10 @@ async fn finish_expired_cancels(state: &AppState) {
         let finished = state
             .store
             .mutate_gate_job(job.id.as_id().as_str(), |row, _conn| {
-                if row.state != GateJobState::Canceling || row.home_land_in_flight {
+                if row.state != GateJobState::Canceling
+                    || row.home_land_in_flight
+                    || row.evidence_uncertain.is_some()
+                {
                     return None;
                 }
                 row.state = GateJobState::Canceled;
@@ -2003,6 +2195,13 @@ pub(crate) async fn apply_result(
     // after the writer stands down.
     let non_authoritative_landing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let non_authoritative_landing_writer = non_authoritative_landing.clone();
+    // r23 R9 clarification: set when the writer records the SECOND deferral of
+    // the same unpersisted verdict — both the Node's deliveries are then
+    // consumed with no replay remaining, so apply_result surfaces the
+    // persisted UNCERTAIN condition to the operator feed.
+    let evidence_uncertain_surfaced =
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let evidence_uncertain_surfaced_writer = evidence_uncertain_surfaced.clone();
     let outcome = state
         .store
         .mutate_gate_job(job_id, move |row, conn| {
@@ -2096,6 +2295,62 @@ pub(crate) async fn apply_result(
                         }
                     }
                 };
+            // r23 R9 clarification (replaces the bare stand-down): the Node
+            // retains NO copy of a delivered verdict and redelivers nothing,
+            // so when this definitive result's supplied log cannot be
+            // persisted the Hub must not simply return and consume the verdict
+            // into a forever-Running row. Record an explicit, PERSISTED
+            // uncertain condition on the row WITHOUT moving its state (Running
+            // / Canceling / Landing all keep their lane or land-slot
+            // occupancy). The first deferral stays quiet — the dual delivery
+            // (finished event + gate.run reply) may still heal it; once a
+            // SECOND delivery of the SAME (generation, supplied digest)
+            // defers, the condition is surfaced for operator resolution. An
+            // idempotent later redelivery that persists clears it; there is
+            // still no Hub-side retry scheduler (R9).
+            let record_evidence_deferral = |row: &mut GateJob| {
+                let Some(run_log) = result.run_log.as_ref() else {
+                    return;
+                };
+                let supplied_digest =
+                    crate::config::sha256_hex(&serde_json::to_vec(run_log).unwrap_or_default());
+                let now = now_ts();
+                let deliveries_deferred = if row
+                    .evidence_uncertain
+                    .as_ref()
+                    .is_some_and(|condition| {
+                        condition.generation == result.generation
+                            && condition.supplied_digest == supplied_digest
+                    }) {
+                    let condition = row.evidence_uncertain.as_mut().expect("just matched Some");
+                    condition.deliveries_deferred =
+                        condition.deliveries_deferred.saturating_add(1);
+                    condition.updated_at = now;
+                    condition.deliveries_deferred
+                } else {
+                    row.evidence_uncertain =
+                        Some(remuda_protocol::GateEvidenceUncertain {
+                            generation: result.generation,
+                            status: result.status.clone(),
+                            supplied_digest,
+                            deliveries_deferred: 1,
+                            first_at: now.clone(),
+                            updated_at: now,
+                            reason: format!(
+                                "a definitive '{}' verdict supplied a run log that could not be \
+                                 persisted (transient storage failure); the Node retains no copy, \
+                                 so the job keeps its pre-settlement state and occupancy pending an \
+                                 identical redelivery or an explicit operator resolution",
+                                result.status
+                            ),
+                        });
+                    1
+                };
+                if deliveries_deferred >= 2 {
+                    evidence_uncertain_surfaced_writer
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            };
             // Landing: settle the GRANTED attempt's land verdict. Cancel is not
             // grantable once Landing (the grant writer only takes Running), so
             // there is no Canceling sub-case here. Idempotent on the dual
@@ -2208,14 +2463,19 @@ pub(crate) async fn apply_result(
                         // is bound to ITS OWN evidence object (digest checked in
                         // this transaction); a mismatch keeps the row Landing.
                         if !evidence_is_own(log_object_id.as_ref(), row.log_object_id.as_deref()) {
-                            return None;
+                            // r23: persist the explicit UNCERTAIN condition, keep the
+                            // pre-settlement state and its occupancy.
+                            record_evidence_deferral(row);
+                            return Some(());
                         }
+                        row.evidence_uncertain = None;
                         row.state = GateJobState::Landed;
                         row.error = None;
                     }
                     "base-moved" if row.attempts < MAX_LAND_ATTEMPTS => {
                         // The CAS lost: nothing was pushed. Re-queue a fresh
                         // verify onto the new base under the same attempt cap.
+                        row.evidence_uncertain = None;
                         row.state = GateJobState::Queued;
                         row.started_at = None;
                         row.host_id = None;
@@ -2236,8 +2496,12 @@ pub(crate) async fn apply_result(
                         // never pin another arrival's log (r18 only checked the
                         // landed arm).
                         if !evidence_is_own(log_object_id.as_ref(), row.log_object_id.as_deref()) {
-                            return None;
+                            // r23: persist the explicit UNCERTAIN condition, keep the
+                            // pre-settlement state and its occupancy.
+                            record_evidence_deferral(row);
+                            return Some(());
                         }
+                        row.evidence_uncertain = None;
                         row.state = GateJobState::Failed;
                         let error = result
                             .error
@@ -2289,8 +2553,12 @@ pub(crate) async fn apply_result(
                     // main moved. Keep the truth rather than claim a cancel —
                     // bound to this result's own evidence (r19 item 4).
                     if !evidence_is_own(log_object_id.as_ref(), row.log_object_id.as_deref()) {
-                        return None;
+                        // r23: persist the explicit UNCERTAIN condition, keep the
+                        // pre-settlement state and its occupancy.
+                        record_evidence_deferral(row);
+                        return Some(());
                     }
+                    row.evidence_uncertain = None;
                     row.state = GateJobState::Landed;
                     row.error = None;
                     row.reason = Some("cancel arrived after the lane had pushed main".into());
@@ -2305,8 +2573,12 @@ pub(crate) async fn apply_result(
                     // bytes. A verdict with no run_log leaves the predicate
                     // vacuous.
                     if !evidence_is_own(log_object_id.as_ref(), row.log_object_id.as_deref()) {
-                        return None;
+                        // r23: persist the explicit UNCERTAIN condition, keep the
+                        // pre-settlement state and its occupancy.
+                        record_evidence_deferral(row);
+                        return Some(());
                     }
+                    row.evidence_uncertain = None;
                     row.state = GateJobState::Canceled;
                     if result.status == "passed" {
                         // The run verified green; only the land was skipped.
@@ -2336,11 +2608,15 @@ pub(crate) async fn apply_result(
                 // and defer (Running) when its supplied log did not persist,
                 // exactly like every other supplied-log settlement.
                 if !evidence_is_own(log_object_id.as_ref(), row.log_object_id.as_deref()) {
-                    return None;
+                    // r23: persist the explicit UNCERTAIN condition, keep the
+                    // pre-settlement state and its occupancy.
+                    record_evidence_deferral(row);
+                    return Some(());
                 }
                 if let Some(object_id) = &log_object_id {
                     row.log_object_id = Some(object_id.clone());
                 }
+                row.evidence_uncertain = None;
                 row.failed_step = result.failed_step.clone();
                 row.state = GateJobState::Canceled;
                 row.finished_at = Some(now_ts());
@@ -2390,16 +2666,24 @@ pub(crate) async fn apply_result(
                 // result unconsumed, so the existing delivery path re-supplies
                 // it — there is no Hub-side retry (R9).
                 if !evidence_is_own(log_object_id.as_ref(), row.log_object_id.as_deref()) {
-                    return None;
+                    // r23: persist the explicit UNCERTAIN condition, keep the
+                    // pre-settlement state and its occupancy.
+                    record_evidence_deferral(row);
+                    return Some(());
                 }
+                row.evidence_uncertain = None;
                 row.state = GateJobState::Passed;
                 row.finished_at = Some(now_ts());
             } else if result.status == "landed" {
                 // r19 item 4: a definitive landed settlement binds its own
                 // evidence digest.
                 if !evidence_is_own(log_object_id.as_ref(), row.log_object_id.as_deref()) {
-                    return None;
+                    // r23: persist the explicit UNCERTAIN condition, keep the
+                    // pre-settlement state and its occupancy.
+                    record_evidence_deferral(row);
+                    return Some(());
                 }
+                row.evidence_uncertain = None;
                 row.state = GateJobState::Landed;
                 row.finished_at = Some(now_ts());
                 row.error = None;
@@ -2407,6 +2691,7 @@ pub(crate) async fn apply_result(
                 && row.mode == GateMode::Land
                 && row.attempts < MAX_LAND_ATTEMPTS
             {
+                row.evidence_uncertain = None;
                 row.state = GateJobState::Queued;
                 row.started_at = None;
                 row.host_id = None;
@@ -2420,8 +2705,12 @@ pub(crate) async fn apply_result(
                 // base-moved Failed reached through this arm) binds its own
                 // evidence digest.
                 if !evidence_is_own(log_object_id.as_ref(), row.log_object_id.as_deref()) {
-                    return None;
+                    // r23: persist the explicit UNCERTAIN condition, keep the
+                    // pre-settlement state and its occupancy.
+                    record_evidence_deferral(row);
+                    return Some(());
                 }
+                row.evidence_uncertain = None;
                 row.state = GateJobState::Failed;
                 row.finished_at = Some(now_ts());
                 row.error = result
@@ -2451,16 +2740,26 @@ pub(crate) async fn apply_result(
                 .and_then(|job| job.host_id.map(|host| host.as_id().to_string()));
             schedule_landing_reconcile(state, host);
         }
-        // r22 R9: an evidence DEFERRAL (the supplied log did not persist as
-        // its own digest) leaves the verdict UNCONSUMED and the job in its
-        // pre-settlement state. There is deliberately NO Hub-side retry
-        // scheduler: the existing delivery path re-supplies the verdict
-        // (Node redelivery, uncertain-landing reconciliation, or operator
-        // resolution — R5 fail closed if none exists for a case).
+        // r22 R9: a true stand-down (terminal guard / duplicate / generation
+        // mismatch / non-authoritative Landing) changes nothing. An evidence
+        // deferral is handled on the Some(()) path below: it persists an
+        // explicit uncertain condition rather than consuming the verdict
+        // silently.
         #[cfg(any(test, feature = "test-faults"))]
         barrier.note_completed();
         return;
     };
+    // r23 R9 clarification: the writer recorded the SECOND deferral of the
+    // same verdict (finished event AND gate.run reply both failed to persist
+    // the supplied log). No delivery remains that could re-supply it, so
+    // surface the persisted uncertain condition on the operator feed. The
+    // job's state and lane/land occupancy are deliberately untouched.
+    if evidence_uncertain_surfaced.load(std::sync::atomic::Ordering::Relaxed) {
+        journal(state, &job.requested_by, "gate.evidence-uncertain", &job).await;
+        #[cfg(any(test, feature = "test-faults"))]
+        barrier.note_completed();
+        return;
+    }
     // A claimed handoff: verified on the lane, now push from the home host.
     // The closure keeps the row `running` ONLY while the handoff still
     // stands: a cancel the writer found after the pre-check ended the row
@@ -2794,12 +3093,14 @@ async fn land_from_home(state: &AppState, job_id: &str, plan: HomeLandPlan) {
             // so rather than assert main did not move.
             if row.state == GateJobState::Canceling {
                 if landed.status == "landed" {
+                    row.evidence_uncertain = None;
                     row.state = GateJobState::Landed;
                     row.finished_at = Some(now_ts());
                     row.merge_sha = landed.merge_sha.clone().or(row.merge_sha.clone());
                     row.error = None;
                     row.reason = Some("cancel arrived after the home host pushed main".into());
                 } else {
+                    row.evidence_uncertain = None;
                     row.state = GateJobState::Canceled;
                     row.finished_at = Some(now_ts());
                     row.current_main_sha = landed
@@ -2822,6 +3123,7 @@ async fn land_from_home(state: &AppState, job_id: &str, plan: HomeLandPlan) {
             }
             match landed.status.as_str() {
                 "landed" => {
+                    row.evidence_uncertain = None;
                     row.state = GateJobState::Landed;
                     row.finished_at = Some(now_ts());
                     row.merge_sha = landed.merge_sha.clone().or(row.merge_sha.clone());
@@ -2829,6 +3131,7 @@ async fn land_from_home(state: &AppState, job_id: &str, plan: HomeLandPlan) {
                     row.reason = None;
                 }
                 "base-moved" if row.attempts < MAX_LAND_ATTEMPTS => {
+                    row.evidence_uncertain = None;
                     row.state = GateJobState::Queued;
                     row.started_at = None;
                     row.host_id = None;
@@ -2843,6 +3146,7 @@ async fn land_from_home(state: &AppState, job_id: &str, plan: HomeLandPlan) {
                     row.log_object_id = None;
                 }
                 other => {
+                    row.evidence_uncertain = None;
                     row.state = GateJobState::Failed;
                     row.finished_at = Some(now_ts());
                     row.current_main_sha = landed.current_main_sha.clone();
@@ -3088,6 +3392,12 @@ pub(crate) async fn reconcile(state: &AppState) {
     for job in jobs
         .into_iter()
         .filter(|job| matches!(job.state, GateJobState::Running | GateJobState::Canceling))
+        // r23 R9: a deliberately-parked evidence-uncertain job stays parked
+        // across a Hub restart, holding its occupancy for the operator: the
+        // restart requeue must not auto-run a fresh attempt over an
+        // unconsumed definitive verdict (no Hub-side retry scheduler). The
+        // operator resolve path works with no carrier.
+        .filter(|job| job.evidence_uncertain.is_none())
     {
         let _ = state
             .store

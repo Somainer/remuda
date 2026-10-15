@@ -4097,9 +4097,10 @@ fn run_git(repo: &Path, args: &[&str]) -> Result<(), String> {
     block_git(repo, args).map(|_| ())
 }
 
-/// Read-only landing resolution. Fetches the remote base branch and reports:
-/// * `landed` when the granted merge is already an ancestor of
-///   `origin/<base>`;
+/// Read-only landing resolution. Fetches the EXACT requested remote base
+/// branch into a dedicated recovery ref and reports:
+/// * `landed` when the granted merge is already an ancestor of the immutable
+///   base SHA written by that fetch;
 /// * `absent` when a fresh fetch succeeded, the merge is NOT an ancestor, and
 ///   `land_group_verified_dead` is true — the caller holds AUTHORITATIVE death
 ///   evidence for the exact attempt's land group (a live kernel ESRCH or a
@@ -4108,6 +4109,15 @@ fn run_git(repo: &Path, args: &[&str]) -> Result<(), String> {
 ///   authoritative death evidence, and crucially a MISSING OR UNREADABLE
 ///   ledger (missing proof is not proof of death). It never pushes and never
 ///   asserts a push it cannot prove.
+///
+/// r27 item 1 (R5 fail-open): the fetch is an EXPLICIT refspec
+/// (`refs/heads/<base>` → `refs/remuda/recovery/<base>`), never a bare
+/// `git fetch origin`. The latter honors the repository's configured
+/// `remote.origin.fetch`, which may omit the base branch entirely: the fetch
+/// then SUCCEEDS while `origin/<base>` stays stale, and ancestry against that
+/// stale tip certifies a landed merge absent. Every check below is pinned to
+/// the SHA the explicit fetch wrote; a missing or unreadable fetched base is
+/// Unknown, never Absent.
 fn resolve_landing_after_restart(
     request: &GateResolveLandingParams,
     land_group_verified_dead: bool,
@@ -4126,13 +4136,22 @@ fn resolve_landing_after_restart(
     // subprocess AND its whole cleanup (survivor kill, reap, pipe drains); the
     // per-command soft cap only decides when a still-running git is KILLed.
     let deadline = std::time::Instant::now() + LANDING_PROBE_DEADLINE;
+    // r27 item 1: fetch the EXACT requested base into a dedicated recovery
+    // ref. A bare `git fetch origin` only updates what remote.origin.fetch
+    // lists — under a restricted refspec it succeeds while leaving
+    // `origin/<base>` stale, so absence certified against that tracking ref is
+    // a false absent. The force (`+`) pins the recovery ref to exactly what
+    // this fetch observed; every check below uses its post-fetch SHA, which
+    // nothing else in the repository writes.
+    let recovery_ref = format!("refs/remuda/recovery/{}", request.base_branch);
+    let fetch_refspec = format!("+refs/heads/{}:{}", request.base_branch, recovery_ref);
     // R7/R6: the recovery fetch runs through the owner, capped per-command.
     if remaining(deadline).is_zero() {
         return unknown("landing probe deadline exhausted before the recovery fetch".into());
     }
     match owned_git(
         &repo,
-        &["fetch", "-q", "origin"],
+        &["fetch", "-q", "origin", &fetch_refspec],
         RECOVERY_GIT_CAP,
         deadline,
     ) {
@@ -4143,12 +4162,13 @@ fn resolve_landing_after_restart(
             ));
         }
         Ok(run) if !run.status_success() => {
-            return unknown("fetch origin failed".into());
+            return unknown(
+                "recovery fetch of the requested base branch failed; push outcome unknown".into(),
+            );
         }
-        Err(error) => return unknown(format!("fetch origin: {error}")),
+        Err(error) => return unknown(format!("recovery fetch of the requested base: {error}")),
         Ok(_) => {}
     }
-    let remote_base = format!("origin/{}", request.base_branch);
     let run_owned = |args: &[&str],
                      what: &str,
                      require_success: bool|
@@ -4177,13 +4197,25 @@ fn resolve_landing_after_restart(
             Err(error) => Err(unknown(format!("{what} could not run: {error}"))),
         }
     };
-    let base_output = match run_owned(&["rev-parse", &remote_base], "remote base ref read", true) {
+    // Read the immutable base SHA the explicit recovery fetch just wrote. A
+    // missing or unreadable fetched base is Unknown, never Absent.
+    let base_output = match run_owned(
+        &["rev-parse", "--verify", &recovery_ref],
+        "recovery base ref read",
+        true,
+    ) {
         Ok(o) => o,
         Err(result) => return result,
     };
     let base_sha = String::from_utf8_lossy(&base_output.stdout)
         .trim()
         .to_owned();
+    if base_sha.len() != 40 || !base_sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return unknown(format!(
+            "the recovery fetch did not yield a readable base sha ({base_sha:?}); push outcome \
+             unknown"
+        ));
+    }
 
     // R7: shallow history is never deepened; absence is undecidable → Unknown.
     let shallow_output = match run_owned(
@@ -4203,14 +4235,11 @@ fn resolve_landing_after_restart(
         ));
     }
     // merge-base --is-ancestor: exit 0 landed, exit 1 not-ancestor (valid only
-    // with complete history, checked above), anything else Unknown.
+    // with complete history, checked above), anything else Unknown. The
+    // descendant is the immutable SHA from the recovery fetch — never the
+    // stale `origin/<base>` tracking ref.
     let ancestry_output = match run_owned(
-        &[
-            "merge-base",
-            "--is-ancestor",
-            &request.merge_sha,
-            &remote_base,
-        ],
+        &["merge-base", "--is-ancestor", &request.merge_sha, &base_sha],
         "ancestry check",
         false,
     ) {
@@ -4231,10 +4260,11 @@ fn resolve_landing_after_restart(
             error: None,
         },
         Some(1) => unknown(format!(
-            "{} is not an ancestor of {remote_base} but the granted land group's death is not \
+            "{} is not an ancestor of {} ({recovery_ref}) but the granted land group's death is not \
              authoritatively established (no live ESRCH or death certificate; a missing ledger is \
              not proof); push outcome unknown",
-            request.merge_sha
+            request.merge_sha,
+            &base_sha[..12]
         )),
         other => unknown(format!(
             "merge-base --is-ancestor ended abnormally ({other:?}); ancestry of {} unknown",
@@ -9267,6 +9297,111 @@ head -c 1 >/dev/null || exit 4
             git(&lane, &["rev-parse", "--is-shallow-repository"]),
             "true",
             "R7 recovery never deepens: the lane must stay shallow"
+        );
+    }
+
+    /// r27 item 1 / R5 fail-open: with a restricted `remote.origin.fetch`
+    /// refspec a bare `git fetch origin` can SUCCEED while `origin/main` stays
+    /// stale, so certifying absence against that tracking ref falsely fails a
+    /// merge that is already on remote main. Recovery must fetch the EXACT
+    /// requested base into its own recovery ref and answer Landed against THAT
+    /// immutable tip even when authoritative death evidence is held. A base the
+    /// remote does not carry makes the explicit fetch fail → Unknown: a missing
+    /// fetched base is never Absent.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recovery_fetches_the_requested_base_past_a_restricted_refspec() {
+        let fixture = fixture(PASSING_SCRIPT);
+        let lane = fixture.lane.clone();
+        let stale_base = git(&lane, &["rev-parse", "origin/main"]);
+        // The granted merge M reaches remote main after the lane's last fetch
+        // (the orphaned land group finished its push before the Node died):
+        // build it on main, push it, then recreate the post-crash state — pin
+        // the local tracking ref back to B and restrict origin.fetch to a
+        // different branch.
+        git(&lane, &["checkout", "-q", "main"]);
+        std::fs::write(lane.join("landed.txt"), "landed\n").unwrap();
+        git(&lane, &["add", "landed.txt"]);
+        git(&lane, &["commit", "-q", "-m", "granted merge M"]);
+        let merge_sha = git(&lane, &["rev-parse", "main"]);
+        assert_ne!(merge_sha, stale_base);
+        git(&lane, &["push", "-q", "origin", "main"]);
+        git(
+            &lane,
+            &["update-ref", "refs/remotes/origin/main", &stale_base],
+        );
+        git(
+            &lane,
+            &[
+                "config",
+                "remote.origin.fetch",
+                "+refs/heads/wt/fake/task:refs/remotes/origin/wt/fake/task",
+            ],
+        );
+        // Sanity: the stale-tracking fail-open the bug relied on — a plain
+        // fetch honors the restricted refspec and leaves origin/main at B.
+        git(&lane, &["fetch", "-q", "origin"]);
+        assert_eq!(
+            git(&lane, &["rev-parse", "refs/remotes/origin/main"]),
+            stale_base,
+            "a restricted fetch must leave the origin/main tracking ref stale"
+        );
+
+        // Authoritative death evidence is present; under the OLD resolver this
+        // combination certified Absent against stale B.
+        let dir = fixture.node.gate_registry().land_fence_dir.clone();
+        let record = serde_json::json!({
+            "jobId": "gjb_r27_refspec", "generation": 1, "pgid": 6127, "startTick": 11
+        });
+        super::write_land_group_dead_cert(&dir, &record, 6127).unwrap();
+        let reply = fixture
+            .node
+            .run_gate_resolve_landing(&serde_json::json!({
+                "jobId": "gjb_r27_refspec",
+                "repoPath": lane.to_string_lossy(),
+                "baseBranch": "main",
+                "mergeSha": merge_sha,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            reply["status"],
+            json!("landed"),
+            "M is on remote main; the explicit recovery fetch must establish Landed, not Absent: \
+             {reply}"
+        );
+        assert_eq!(reply["baseSha"], json!(merge_sha), "{reply}");
+        // The probe pins its own ref to the observed tip and does NOT pretend
+        // the stale configured tracking ref moved.
+        assert_eq!(
+            git(&lane, &["rev-parse", "refs/remuda/recovery/main"]),
+            merge_sha
+        );
+        assert_eq!(
+            git(&lane, &["rev-parse", "refs/remotes/origin/main"]),
+            stale_base,
+            "recovery must not touch the configured origin/main tracking ref"
+        );
+
+        // A requested base the remote does not carry: the explicit fetch fails
+        // → Unknown, never a certified Absent.
+        let reply = fixture
+            .node
+            .run_gate_resolve_landing(&serde_json::json!({
+                "jobId": "gjb_r27_refspec",
+                "repoPath": lane.to_string_lossy(),
+                "baseBranch": "no-such-base-r27",
+                "mergeSha": merge_sha,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(reply["status"], json!("unknown"), "{reply}");
+        assert!(
+            reply["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("recovery fetch"),
+            "the Unknown names the failed recovery fetch: {reply}"
         );
     }
 

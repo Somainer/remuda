@@ -968,23 +968,28 @@ fn push_main_cas(repo: &Path, merged: &str, expected: &str) -> Result<()> {
     // r19 item 2 / R7: ONE absolute deadline (< the Hub's 30 s RPC timeout)
     // bounds EVERY recovery subprocess — fetch, ancestry, shallow and ref
     // reads — each routed through the R6 owner; expiry is PushUncertain.
-    let remote = "refs/remotes/origin/main";
+    //
+    // r27 item 1 / R5: fetch the EXACT requested base into a DEDICATED
+    // recovery ref. A bare `git fetch origin` honors the configured
+    // remote.origin.fetch refspec, which may omit main entirely — the fetch
+    // then succeeds while refs/remotes/origin/main stays stale, and a lost-ack
+    // landing gets classified against the old tip (false absent / false base
+    // move). Every recovery read below is pinned to the immutable SHA the
+    // explicit fetch wrote.
     let deadline = Instant::now() + LAND_RECOVERY_DEADLINE;
+    let recovery_ref = "refs/remuda/recovery/main";
+    let fetch_refspec = format!("+refs/heads/main:{recovery_ref}");
     recovery_git(
         repo,
-        &["fetch", "-q", "origin"],
+        &["fetch", "-q", "origin", &fetch_refspec],
         "post-push recovery fetch",
         true,
         deadline,
     )?;
-    // The exact granted merge IS on remote main: the push landed, only the
-    // acknowledgement failed. Treat as success — never failed/base-moved.
-    if owned_is_ancestor(repo, merged, remote, deadline)? {
-        return Ok(());
-    }
+    // A missing or unreadable fetched base is PushUncertain, never "absent".
     let tip_output = recovery_git(
         repo,
-        &["rev-parse", remote],
+        &["rev-parse", "--verify", recovery_ref],
         "post-push remote tip read",
         true,
         deadline,
@@ -992,6 +997,18 @@ fn push_main_cas(repo: &Path, merged: &str, expected: &str) -> Result<()> {
     let remote_tip = String::from_utf8_lossy(&tip_output.stdout)
         .trim()
         .to_owned();
+    if remote_tip.len() != 40 || !remote_tip.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(MergeStop::PushUncertain(format!(
+            "the recovery fetch did not yield a readable remote main ({remote_tip:?}); push \
+             outcome unknown"
+        ))
+        .into());
+    }
+    // The exact granted merge IS on remote main: the push landed, only the
+    // acknowledgement failed. Treat as success — never failed/base-moved.
+    if owned_is_ancestor(repo, merged, &remote_tip, deadline)? {
+        return Ok(());
+    }
     if remote_tip != expected && owned_is_ancestor(repo, expected, &remote_tip, deadline)? {
         // Origin-only base move: the merge is absent but main advanced from our
         // base to another commit — the real CAS loss the caller requeues on.
@@ -2175,6 +2192,91 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+    }
+
+    /// r27 item 1 / R5: post-push recovery under a restricted
+    /// `remote.origin.fetch` refspec and a STALE refs/remotes/origin/main must
+    /// still recognize a granted merge already contained in remote main (a
+    /// lost-ack landing the remote moved past) as Ok — Landed wins. A recovery
+    /// fetch that cannot reach the requested base is PushUncertain, never an
+    /// established failure.
+    #[test]
+    fn recovery_with_a_restricted_refspec_lands_a_merge_already_on_remote() {
+        let (keep, _origin, _topic, main) = ancestry_fixture();
+        let repo = keep.path().join("full");
+        let merged = main.clone();
+        let expected = tgit_ok(&repo, &["rev-parse", &format!("{main}^1")]);
+        // Remote main advances to a descendant D that CONTAINS the granted
+        // merge M (the push landed; the remote moved on before recovery).
+        tgit_ok(&repo, &["checkout", "-q", "main"]);
+        std::fs::write(repo.join("post-land.txt"), "remote moved\n").unwrap();
+        tgit_ok(&repo, &["add", "post-land.txt"]);
+        tgit_ok(&repo, &["commit", "-q", "-m", "later remote commit D"]);
+        tgit_ok(&repo, &["push", "-q", "origin", "main"]);
+        let remote_tip = tgit_ok(&repo, &["rev-parse", "main"]);
+        assert_ne!(remote_tip, merged);
+        // Recreate the stale post-crash checkout: origin/main pinned back at
+        // the granted base B, origin.fetch restricted to a non-base branch.
+        tgit_ok(
+            &repo,
+            &["update-ref", "refs/remotes/origin/main", &expected],
+        );
+        tgit_ok(
+            &repo,
+            &[
+                "config",
+                "remote.origin.fetch",
+                "+refs/heads/topic:refs/remotes/origin/topic",
+            ],
+        );
+        // Sanity: a plain fetch honors the restricted refspec and leaves the
+        // stale tracking ref at B.
+        tgit_ok(&repo, &["fetch", "-q", "origin"]);
+        assert_eq!(
+            tgit_ok(&repo, &["rev-parse", "refs/remotes/origin/main"]),
+            expected
+        );
+        // Pushing M is rejected non-fast-forward by remote D, so recovery must
+        // classify the already-landed merge against the REAL remote tip.
+        push_main_cas(&repo, &merged, &expected).expect(
+            "a merge already contained in remote main is Landed despite a stale tracking ref",
+        );
+        // The probe keeps its own ref at the observed remote tip and does not
+        // rewrite the configured (restricted) tracking ref.
+        assert_eq!(
+            tgit_ok(&repo, &["rev-parse", "refs/remuda/recovery/main"]),
+            remote_tip
+        );
+        assert_eq!(
+            tgit_ok(&repo, &["rev-parse", "refs/remotes/origin/main"]),
+            expected,
+            "recovery must not touch the configured origin/main tracking ref"
+        );
+
+        // A recovery fetch that cannot reach the remote → PushUncertain, never
+        // an established failure.
+        tgit_ok(
+            &repo,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                keep.path().join("no-such-origin-r27.git").to_str().unwrap(),
+            ],
+        );
+        let error = push_main_cas(&repo, &merged, &expected)
+            .expect_err("an unreachable recovery fetch stays uncertain");
+        assert!(
+            matches!(
+                error.downcast_ref::<MergeStop>(),
+                Some(MergeStop::PushUncertain(_))
+            ),
+            "PushUncertain, got {error:#}"
+        );
+        assert!(
+            error.to_string().contains("recovery fetch"),
+            "the uncertainty names the recovery fetch: {error}"
+        );
     }
 
     /// Count LIVE (non-zombie) processes whose /proc/<pid>/cmdline carries the

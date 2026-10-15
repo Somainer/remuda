@@ -1857,6 +1857,24 @@ async fn fail_rpc_inner(state: &AppState, job_id: &str, expected_generation: u32
             if row.home_land_in_flight {
                 return None;
             }
+            // r24 item 1 — EVIDENCE-UNCERTAIN RULE: the condition is bound to
+            // the current attempt (attempt, epoch, merge); only an authorized
+            // settlement or an authorized operator resolution for exactly that
+            // tuple clears it. The outstanding RPC reply was lost or timed out,
+            // but a definitive verdict for THIS attempt has already been
+            // recorded as unpersisted evidence (the finished notification
+            // parked the condition). Settling Failed here would discard the
+            // parked verdict and release its occupancy; this RPC-error writer
+            // is neither kind of authorized clearing, so it preserves the
+            // condition and leaves the row parked.
+            if row.evidence_uncertain.is_some() {
+                tracing::info!(
+                    expected_generation,
+                    "gate.run RPC failure while evidence is uncertain for the current attempt; \
+                     preserving the parked condition"
+                );
+                return None;
+            }
             row.state = GateJobState::Failed;
             row.finished_at = Some(now_ts());
             row.reason = Some(message.lines().next().unwrap_or(&message).to_owned());
@@ -4869,6 +4887,17 @@ impl Store {
                 let Ok(mut job) = serde_json::from_str::<GateJob>(&text) else {
                     continue;
                 };
+                // r24 item 1 — EVIDENCE-UNCERTAIN RULE: a Canceling row parked
+                // with an unpersisted definitive verdict stays parked across a
+                // carrier loss, exactly as it does across a Hub restart and the
+                // cancel-grace finisher: a dead carrier is neither an
+                // authorized settlement nor an operator resolution, so finishing
+                // it Canceled here would release the occupancy and discard the
+                // condition. It remains resolvable through /resolve-evidence
+                // with no carrier at all.
+                if job.state == GateJobState::Canceling && job.evidence_uncertain.is_some() {
+                    continue;
+                }
                 let now = now();
                 let cancelling = job.state == GateJobState::Canceling;
                 if cancelling {
@@ -4881,6 +4910,14 @@ impl Store {
                     }
                     job.reason = Some("canceled; carrier session changed".into());
                 } else {
+                    // r24 item 1: the requeue PRESERVES a parked
+                    // evidence-uncertain condition. The condition is bound to
+                    // THIS attempt (its generation/epoch/merge tuple, recorded
+                    // at deferral); once the row is re-claimed and row.attempts
+                    // advances, the stale tuple can no longer be resolved, so a
+                    // re-run cannot be aborted or settled by a resolution aimed
+                    // at the lost attempt. Clearing it here would silently let
+                    // the unconsumed definitive verdict vanish.
                     job.state = GateJobState::Queued;
                     job.started_at = None;
                     job.host_id = None;
@@ -4976,6 +5013,13 @@ impl Store {
                 job.home_land_in_flight = false;
                 job.landing_session_epoch = None;
                 job.landing_outcome_unknown = false;
+                // r24 item 1: an ESTABLISHED remote landed fact is an authorized
+                // settlement for the exact granted tuple, so it clears a parked
+                // evidence-uncertain condition (the merge really is on remote
+                // main). The absent/requeue arms below deliberately PRESERVE
+                // the condition, which keeps binding the old attempt after a
+                // requeue.
+                job.evidence_uncertain = None;
                 job.finished_at = Some(now_ts());
                 job.state = GateJobState::Landed;
                 job.error = None;

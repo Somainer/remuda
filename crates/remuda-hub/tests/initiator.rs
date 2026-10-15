@@ -3449,6 +3449,250 @@ async fn failed_verdict_without_persisted_evidence_becomes_persistently_uncertai
     );
 }
 
+/// r24 item 1: carrier recovery must not discard a persisted evidence-uncertain
+/// condition. Both deliveries of a definitive failed verdict defer (inserts
+/// fail), the job parks Running with its condition; a cancel then parks it
+/// Canceling, and the carrier disconnects while that verdict is still
+/// unpersisted. Recovery must NOT finish the row Canceled and release its
+/// occupancy: it stays Canceling, still carrying the condition for the
+/// operator, exactly as the cancel-grace finisher and the startup reconcile
+/// already preserve such rows.
+#[tokio::test]
+async fn carrier_disconnect_preserves_an_evidence_uncertain_canceling_row() {
+    let (ctx, node) = Ctx::boot().await.unwrap();
+    ctx.configure_gate_lane().await;
+    let barrier = ctx.store().gate_apply_barrier();
+
+    let job_seed = "wt/gate/evidence-uncertain-disconnect";
+    let hook = node
+        .arm_gate_run(failed_gate_result("placeholder", job_seed))
+        .await;
+    let (status, enqueued) = ctx
+        .agent_post(
+            &format!("/v1/projects/{}/gate", ctx.project),
+            json!({"branch":job_seed,"mode":"verify"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{enqueued}");
+    let job_id = enqueued["id"].as_str().unwrap().to_owned();
+    hook.set_result(failed_gate_result(&job_id, job_seed));
+    hook.wait_arrived().await;
+
+    barrier.arm();
+    node.send_raw(json!({
+        "jsonrpc": "2.0",
+        "method": "gate.event",
+        "params": {
+            "jobId": job_id,
+            "generation": 1,
+            "kind": "finished",
+            "result": failed_gate_result(&job_id, job_seed),
+        }
+    }));
+    hook.release_and_wait_proceeded().await;
+    barrier.wait_parked(2).await;
+    ctx.store().test_arm_gate_log_insert_faults(2);
+    barrier.release();
+    barrier.wait_completed(2).await;
+
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(doc["state"], json!("running"), "{doc}");
+    assert_eq!(doc["evidenceUncertain"]["generation"], json!(1), "{doc}");
+    assert_eq!(
+        doc["evidenceUncertain"]["deliveriesDeferred"],
+        json!(2),
+        "{doc}"
+    );
+
+    // A cancel arrives while the definitive verdict is parked.
+    let (status, reply) = ctx
+        .agent_post(
+            &format!("/v1/projects/{}/gate/jobs/{job_id}/cancel", ctx.project),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["state"], json!("canceling"), "{reply}");
+    assert!(reply["evidenceUncertain"].is_object(), "{reply}");
+
+    // The carrier drops. Recovery must leave the row parked Canceling with its
+    // occupancy and condition, not finish it Canceled.
+    node.disconnect();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(
+        doc["state"],
+        json!("canceling"),
+        "carrier recovery must not finish an evidence-uncertain Canceling row: {doc}"
+    );
+    assert_eq!(doc["hostId"], json!(ctx.host), "occupancy retained: {doc}");
+    assert_eq!(doc["laneId"], json!("lane1"), "lane retained: {doc}");
+    assert!(
+        doc["evidenceUncertain"].is_object(),
+        "the condition survives carrier recovery: {doc}"
+    );
+    assert_eq!(doc["evidenceUncertain"]["generation"], json!(1), "{doc}");
+
+    // A second wait through scheduler ticks changes nothing.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(doc["state"], json!("canceling"), "{doc}");
+    assert!(doc["evidenceUncertain"].is_object(), "{doc}");
+}
+
+/// r24 item 1: a Running evidence-uncertain row whose carrier is lost is
+/// re-queued (the dead session holds the lane no longer) but the condition is
+/// PRESERVED on the queued row, still bound to attempt 1.
+#[tokio::test]
+async fn carrier_disconnect_requeues_an_evidence_uncertain_running_row_without_clearing_it() {
+    let (ctx, node) = Ctx::boot().await.unwrap();
+    ctx.configure_gate_lane().await;
+    let barrier = ctx.store().gate_apply_barrier();
+
+    let job_seed = "wt/gate/evidence-uncertain-disconnect-run";
+    let hook = node
+        .arm_gate_run(failed_gate_result("placeholder", job_seed))
+        .await;
+    let (status, enqueued) = ctx
+        .agent_post(
+            &format!("/v1/projects/{}/gate", ctx.project),
+            json!({"branch":job_seed,"mode":"verify"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{enqueued}");
+    let job_id = enqueued["id"].as_str().unwrap().to_owned();
+    hook.set_result(failed_gate_result(&job_id, job_seed));
+    hook.wait_arrived().await;
+
+    barrier.arm();
+    node.send_raw(json!({
+        "jsonrpc": "2.0",
+        "method": "gate.event",
+        "params": {
+            "jobId": job_id,
+            "generation": 1,
+            "kind": "finished",
+            "result": failed_gate_result(&job_id, job_seed),
+        }
+    }));
+    hook.release_and_wait_proceeded().await;
+    barrier.wait_parked(2).await;
+    ctx.store().test_arm_gate_log_insert_faults(2);
+    barrier.release();
+    barrier.wait_completed(2).await;
+
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(doc["state"], json!("running"), "{doc}");
+    assert_eq!(doc["evidenceUncertain"]["generation"], json!(1), "{doc}");
+
+    node.disconnect();
+    let requeued = async {
+        loop {
+            let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+            if doc["state"] == json!("queued") {
+                break doc;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+    .await;
+    assert!(requeued["hostId"].is_null(), "{requeued}");
+    assert!(requeued["laneId"].is_null(), "{requeued}");
+    assert!(
+        requeued["evidenceUncertain"].is_object(),
+        "the requeue preserves the parked condition: {requeued}"
+    );
+    assert_eq!(
+        requeued["evidenceUncertain"]["generation"],
+        json!(1),
+        "still bound to the lost attempt: {requeued}"
+    );
+
+    // No carrier exists to re-claim it; the row waits for the operator.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(doc["state"], json!("queued"), "{doc}");
+    assert_eq!(
+        doc["attempts"],
+        json!(1),
+        "not re-claimed while hostless: {doc}"
+    );
+    assert!(doc["evidenceUncertain"].is_object(), "{doc}");
+}
+
+/// r24 item 1: after the finished notification has parked an evidence-uncertain
+/// condition, loss of the outstanding gate.run RPC reply must not let the
+/// RPC-error writer settle the job Failed without its evidence.
+#[tokio::test]
+async fn a_lost_rpc_reply_while_evidence_uncertain_preserves_the_condition() {
+    let (ctx, node) = Ctx::boot().await.unwrap();
+    ctx.configure_gate_lane().await;
+
+    let job_seed = "wt/gate/evidence-uncertain-rpc-lost";
+    let hook = node
+        .arm_gate_run(failed_gate_result("placeholder", job_seed))
+        .await;
+    let (status, enqueued) = ctx
+        .agent_post(
+            &format!("/v1/projects/{}/gate", ctx.project),
+            json!({"branch":job_seed,"mode":"verify"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{enqueued}");
+    let job_id = enqueued["id"].as_str().unwrap().to_owned();
+    hook.set_result(failed_gate_result(&job_id, job_seed));
+    hook.wait_arrived().await;
+
+    // The finished notification is the FIRST delivery and its single evidence
+    // insert fails (one-shot fault armed while the RPC reply is still parked),
+    // so the definitive verdict defers with deliveriesDeferred=1.
+    ctx.store().test_arm_gate_log_insert_faults(1);
+    node.send_raw(json!({
+        "jsonrpc": "2.0",
+        "method": "gate.event",
+        "params": {
+            "jobId": job_id,
+            "generation": 1,
+            "kind": "finished",
+            "result": failed_gate_result(&job_id, job_seed),
+        }
+    }));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+        if doc["evidenceUncertain"]["deliveriesDeferred"] == json!(1) {
+            assert_eq!(doc["state"], json!("running"), "{doc}");
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never deferred: {doc}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(ctx.store().test_gate_log_insert_faults_consumed(), 1);
+
+    // The outstanding gate.run reply is lost: the fake answers with a real
+    // JSON-RPC error frame, driving fail_rpc through its production callback.
+    hook.reply_error();
+    hook.release_and_wait_proceeded().await;
+    let rpc_barrier = ctx.store().gate_apply_barrier();
+    let before = rpc_barrier.rpc_completed_count();
+    rpc_barrier.wait_rpc_completed(before + 1).await;
+
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(
+        doc["state"],
+        json!("running"),
+        "the RPC-error writer must not fail an evidence-uncertain job: {doc}"
+    );
+    assert!(
+        doc["evidenceUncertain"].is_object(),
+        "the parked condition survives the lost reply: {doc}"
+    );
+    assert_eq!(doc["evidenceUncertain"]["generation"], json!(1), "{doc}");
+}
+
 /// r23 item 1: the same persistent condition for a Passed-with-keepLogs
 /// verdict (a green run whose `kept` log cannot be persisted). If a
 /// redelivery EVER arrives later it remains idempotent: storage recovered,

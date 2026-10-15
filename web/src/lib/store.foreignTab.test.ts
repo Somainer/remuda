@@ -3598,7 +3598,7 @@ it("GATE22 item 6: a flush queued across logout/reinit releases its tokens and e
     vi.spyOn(api, "login").mockResolvedValue({ deviceId: "dev_g22_6", token: "tok", name: "g22_6" } as never);
     const loginP = hubStore.login("bootstrap", "secret", "dev");
     await pump(4_000);
-    await expect(loginP).resolves.toBeUndefined();
+    await expect(loginP).resolves.toBe("settled");
 
     // Release the sibling: the stale (old-box) FIFO turn runs first and must
     // finish entirely on its ISSUING box — its disposed snapshot read posts
@@ -9614,8 +9614,9 @@ it("GATE48 item 2: logout retires the RUNNING credential op immediately — the 
     expect(h.state.session).toBeNull();
     expect(localStorage.getItem("runtime.device-session")).toBeNull();
 
-    // No unhandled rejection from the detached body either.
-    await expect(pB).resolves.toBeUndefined();
+    // No unhandled rejection from the detached body either; the public
+    // promise settles with the discriminated retired outcome (gate 50 item 3).
+    await expect(pB).resolves.toBe("retired");
   } finally {
     vi.useRealTimers();
     Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
@@ -9699,7 +9700,7 @@ it("GATE48 item 3: a sibling-held instance lock cannot block the bootstrap auth 
     }) as unknown as Api["login"]);
     const pLogin = hubStore.login("bootstrap", "secret", "devB_g48_3");
     await pump(8_000);
-    await expect(pLogin).resolves.toBeUndefined();
+    await expect(pLogin).resolves.toBe("settled");
     expect(bodyStarted).toBe(true);
   } finally {
     releaseSibling();
@@ -10068,7 +10069,7 @@ it("GATE49 item 2: old outbox holds the lock mid-POST with a SIBLING queued in F
     // at once (no ordinary request parked in the FIFO), so the login settles.
     releaseOldPost();
     await pump(8_000);
-    await expect(loginP).resolves.toBeUndefined();
+    await expect(loginP).resolves.toBe("settled");
     expect(bodyStarted).toBe(true);
 
     // Even with the sibling STILL suspended and holding the lock, a fresh
@@ -10151,7 +10152,7 @@ it("GATE49 item 3: an EXPIRED inflight row reclaimed at bootstrap load while a s
     const boot = hubStore.bootstrap();
     await pump(8_000);
     await expect(boot).resolves.toBeDefined();
-    await expect(loginP).resolves.toBeUndefined();
+    await expect(loginP).resolves.toBe("settled");
     expect(bodyStarted).toBe(true);
     // The reclaimed row stays pending and is left untouched (no POST while
     // sibling holds); its later delivery is owned by normal recovery.

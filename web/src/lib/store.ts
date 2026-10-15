@@ -62,12 +62,13 @@ type DeliveryToken = {
  * bootstrap() doc comment for the meaning of each value.
  */
 export type BootstrapOutcome = "ready" | "retired" | "unavailable";
+/** Gate 50 item 3: explicit credential submission settlement. */
+export type CredentialOutcome = "settled" | "retired";
 import { mapWorkspace, mergeHostWorkspaces } from "../features/workspaces/registry";
 import {
   api,
   isScreenNodeBusy,
   type InstanceCreateSpec,
-  type PasskeyAssertionBody,
   type PasskeyAttestationBody,
   type PasskeyView,
   type PtyKey,
@@ -4675,7 +4676,19 @@ class HubStore {
     }
   }
 
-  async login(kind: "bootstrap" | "pair", secret: string, deviceName: string) {
+  /**
+   * Discriminated outcome of an explicit credential submission (gate 50 item
+   * 3): "settled" means the credential turn installed an authenticated
+   * session; "retired" means a logout/peer change/bootstrap 401 retired the
+   * queued or running turn — NOT success. UI callers navigate only after a
+   * settled outcome under current authed state; a retired resolution keeps
+   * the login/pair form and route.
+   */
+  async login(
+    kind: "bootstrap" | "pair",
+    secret: string,
+    deviceName: string,
+  ): Promise<CredentialOutcome> {
     // Peer watch must be live BEFORE the credential body can park (a peer
     // logout during it retires the queued/running op).
     this.registerPeerAuthWatch();
@@ -4699,7 +4712,8 @@ class HubStore {
         ),
       "credential",
     );
-    if (outcome.retired || outcome.value === "retired") return;
+    if (outcome.retired || outcome.value === "retired") return "retired";
+    return "settled";
   }
 
   /**
@@ -4794,22 +4808,22 @@ class HubStore {
     mediation: "required" | "conditional",
     deviceName?: string,
     signal?: AbortSignal,
-  ): Promise<{ assertion: PasskeyAssertionBody; challengeId: string } | void> {
+  ): Promise<CredentialOutcome> {
     // The challenge/ceremony awaits are OUTSIDE the S3 queue (a conditional
     // mediation can stay pending forever and must not block a cold bootstrap):
     // capture the external epoch at ENTRY and revalidate after every
     // preliminary await, so a peer/local logout while the challenge or the
     // WebAuthn assertion is parked stops the flow BEFORE the finish request is
-    // issued (no session, no bootstrap; the promise resolves void). Only the
-    // finish goes through the serialized credential queue.
+    // issued (no session, no bootstrap; the promise resolves "retired"). Only
+    // the finish goes through the serialized credential queue.
     this.registerPeerAuthWatch();
     const extAtEntry = this.extEpoch;
     const retired = () => this.extEpoch !== extAtEntry;
     const envelope = await api.passkeyLoginStart(mediation === "conditional" ? "conditional" : undefined);
-    if (retired()) return;
+    if (retired()) return "retired";
     const options = envelope.options as ServerRequestOptions;
     const assertion = await getPasskey(options, mediation, signal);
-    if (retired()) return;
+    if (retired()) return "retired";
     const outcome = await this.enqueueAuthOp(
       ({ signal: finishSignal }) =>
         this.performCredentialTurn(
@@ -4821,8 +4835,8 @@ class HubStore {
         ),
       "credential",
     );
-    if (outcome.retired || outcome.value === "retired") return;
-    return { assertion, challengeId: envelope.challengeId };
+    if (outcome.retired || outcome.value === "retired") return "retired";
+    return "settled";
   }
 
   /** Register a new passkey from settings (requires an authenticated device). */

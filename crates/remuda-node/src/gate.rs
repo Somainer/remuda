@@ -7022,13 +7022,20 @@ echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\"
         let child = spawn_grouped("sh", &["-c", "sleep 5"]);
         let pgid = i32::try_from(child.id()).unwrap();
 
-        // On Linux the /proc scan happens to work; the portable probe must
-        // agree while the group is live.
+        // The portable killpg(pgid, 0) probe proves initial existence on
+        // EVERY Unix platform (macOS has no /proc at all).
+        assert!(super::gate_test_group_exists(pgid), "killpg sees it");
+
+        // Linux-only baseline: there the /proc scan happens to work, and it
+        // must agree with the portable probe while the group is live. This
+        // assertion can never run on macOS (its /proc cannot be enumerated),
+        // so it is compiled on Linux alone; the portable assertions below are
+        // the contract on every Unix.
+        #[cfg(target_os = "linux")]
         assert!(
             !super::alive_pids_in_group(pgid).is_empty(),
             "Linux baseline: /proc enumerates the live group"
         );
-        assert!(super::gate_test_group_exists(pgid), "killpg sees it");
 
         // Simulate macOS: /proc cannot be read.
         {

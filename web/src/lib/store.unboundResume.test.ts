@@ -151,6 +151,75 @@ it("unbound resume publishes live only after exactly one successful bounded prob
   hubStore.logout();
 });
 
+it("r2 item 1: a held unbound probe cannot certify the first follow before its seed; the seed's failure runs bound recovery", async () => {
+  const { api, hubStore, list } = await bootUnbound();
+  const states: string[] = [];
+  hubStore.subscribe(() => states.push(hubStore.getSnapshot().connection));
+
+  // Foreground unbound resume on the list page; hold its single GET.
+  let releaseProbe: (() => void) | null = null;
+  list.mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        releaseProbe = () => resolve({ items: [], nextCursor: null });
+      }),
+  );
+  hubStore.resumeActive(null);
+  await vi.waitFor(() => expect(list).toHaveBeenCalledTimes(1));
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  expect(hubStore.getSnapshot().connection).toBe("recovering");
+
+  // Navigate into the FIRST session while that probe is parked. The mount's
+  // journal seed is held as well.
+  const INSTANCE = "ins_unbound_bind";
+  const JOURNAL = "obj_unbound_bind_journal";
+  vi.spyOn(api, "instanceGet").mockResolvedValue({
+    id: INSTANCE,
+    journalId: JOURNAL,
+    revision: "0",
+    durableSeq: "0",
+    lifecycle: "running",
+  } as Awaited<ReturnType<Api["instanceGet"]>>);
+  let seedCalls = 0;
+  let releaseSeed: ((err: unknown) => void) | null = null;
+  vi.spyOn(api, "eventsRead").mockImplementation(
+    () =>
+      new Promise((_resolve, reject) => {
+        seedCalls += 1;
+        if (seedCalls === 1) releaseSeed = (err) => reject(err);
+        else reject(new RestNetworkError("connect ECONNREFUSED"));
+      }),
+  );
+  // The seed is held, so a subscribe must never be attempted.
+  vi.spyOn(api, "eventsSubscribe").mockImplementation(() => {
+    throw new Error("subscribe must not open while the seed is held");
+  });
+
+  const mount = hubStore.follow(INSTANCE);
+  void mount.catch(() => undefined);
+  await vi.waitFor(() => expect(seedCalls).toBe(1));
+
+  // The list probe answers FIRST. The old null->journal binding kept the same
+  // generation, so the follow reused the unbound attempt: the probe consumed
+  // it and published live before the follow seeded/opened.
+  releaseProbe!();
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  expect(hubStore.getSnapshot().connection).not.toBe("live");
+  expect(states).not.toContain("live");
+
+  // The seed then fails. Its failure MUST reach the mount's OWN attempt:
+  // settle probe fails -> offline with the reconnect clock armed, and the
+  // clock re-attempts the bound mount seed (bound-follow recovery runs).
+  releaseSeed!(new RestNetworkError("seed ECONNRESET"));
+  await vi.waitFor(() => expect(hubStore.getSnapshot().connection).toBe("offline"), { timeout: 4_000 });
+  expect(states).not.toContain("live");
+  const seedCallsAtOffline = seedCalls;
+  await vi.waitFor(() => expect(seedCalls).toBeGreaterThan(seedCallsAtOffline), { timeout: 4_000 });
+  expect(hubStore.getSnapshot().connection).not.toBe("live");
+
+  hubStore.logout();
+});
+
 it("unbound resume probe answering 401 takes the logout/retirement path, never live", async () => {
   const { hubStore, list } = await bootUnbound();
   // Imported AFTER resetModules so it is the SAME class realm the re-imported

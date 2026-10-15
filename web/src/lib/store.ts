@@ -3227,17 +3227,24 @@ class HubStore {
   private followFrameAt = new Map<Id, number>();
 
   /**
-   * Bind the connection machine to a session. The generation bumps only when
-   * the journal changes: the reconnect resume's nested follow() of the SAME
-   * journal shares the in-flight attempt, while a user navigation A → B
-   * supersedes any attempt A still owns. Returns the generation the mount
-   * must report back with.
+   * Bind the connection machine to a session. The generation bumps when the
+   * journal CHANGES, including the null→first-journal ownership hand-off and
+   * its inverse: the reconnect resume's nested follow() of the SAME journal
+   * shares the in-flight attempt, while a user navigation A → B supersedes any
+   * attempt A still owns. The null→journal case is an ownership change too
+   * (c-unboundresume r2 item 1): an unbound resume's reachability probe owns
+   * the machine until the first follow binds, and without a bump the follow's
+   * followAttemptBegin reused the unbound attempt id, so the probe's success
+   * certified live before the follow seeded/opened and the seed's later
+   * failure was dropped as a stale-attempt completion. Returns the generation
+   * the mount must report back with.
    */
   private bindConnection(instanceId: Id, journalId: Id): number {
     const reboundAway =
       this.connectionBoundJournal !== null && this.connectionBoundJournal !== journalId;
+    const ownershipChanged = this.connectionBoundJournal !== journalId;
     const prevBoundTo = this.connectionBoundTo;
-    if (reboundAway) this.connectionBindGen += 1;
+    if (ownershipChanged) this.connectionBindGen += 1;
     this.connectionBoundTo = instanceId;
     this.connectionBoundJournal = journalId;
     this.connection?.noteBinding(this.connectionBindGen);

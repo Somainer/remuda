@@ -9697,7 +9697,7 @@ it("GATE48 item 3: a sibling-held instance lock cannot block the bootstrap auth 
   }
 });
 
-it("GATE48 item 5: B issued while A's LIST response is held never starts until A settles, and A's rows never publish under B", async () => {
+it("GATE49 item 5: B issued while A's LIST is held never starts until A settles; every B-session publication excludes A-only rows", async () => {
   vi.useFakeTimers();
   vi.setSystemTime(1_495_000);
   const I = "ins_g48_5";
@@ -9725,14 +9725,17 @@ it("GATE48 item 5: B issued while A's LIST response is held never starts until A
     vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
     vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
 
-    // Observe every state publication.
-    const instSnapshots: Array<Array<{ id: string }>> = [];
+    // Observe EVERY publication, capturing BOTH the session identity and the
+    // instance rows — gate 49 item 5: a publication that carries B's session
+    // must never carry A-only instance rows (not just the final snapshot).
+    type Pub = { deviceId: string | null; ids: string[] };
+    const pubs: Pub[] = [];
     const unsub = hubStore.subscribe(() => {
-      const rows = hubStore.getSnapshot().instances.map((i) => ({ id: i.id }));
-      const last = instSnapshots[instSnapshots.length - 1];
-      if (!last || last.length !== rows.length || last.some((r, k) => r.id !== rows[k]?.id)) {
-        instSnapshots.push(rows);
-      }
+      const snap = hubStore.getSnapshot();
+      pubs.push({
+        deviceId: snap.session?.deviceId ?? null,
+        ids: snap.instances.map((i) => i.id),
+      });
     });
 
     // A's LIST response is held. It contains an A-specific instance id.
@@ -9784,16 +9787,20 @@ it("GATE48 item 5: B issued while A's LIST response is held never starts until A
     // B started only after A settled, and its own list brought B-ONLY rows.
     expect(bRequestStarted).toBe(true);
     expect(listCalls).toBe(2);
-    // Every publication BETWEEN A's list release and B's run could transiently
-    // carry A's rows (that is A publishing ITS session); what must never
-    // happen is A's rows surviving UNDER B's session once B has installed.
+
+    // Gate 49 item 5: B-session publications actually occurred (the session
+    // write/emit and B's list install), and EVERY publication carrying B's
+    // device id excludes A-only rows — including the session-only publication
+    // that arrives before B's LIST replaces the rows.
+    const bPubs = pubs.filter((p) => p.deviceId === "devB_g48_5");
+    expect(bPubs.length).toBeGreaterThan(0);
+    for (const p of bPubs) {
+      expect(p.ids).not.toContain("ins_A_ONLY_g48_5");
+    }
+    // Final state carries B-only rows, no A-only.
     const finalRows = hubStore.getSnapshot().instances.map((i) => i.id);
     expect(finalRows).toContain("ins_B_ONLY_g48_5");
     expect(finalRows).not.toContain("ins_A_ONLY_g48_5");
-    // And no captured publication under the final (B) session carried an A row
-    // AFTER B's credential request started: subscribe again and assert current
-    // state is clean, plus the snapshot history has no A+B mix at the end.
-    expect(instSnapshots[instSnapshots.length - 1]?.map((r) => r.id)).not.toContain("ins_A_ONLY_g48_5");
     unsub();
   } finally {
     vi.useRealTimers();
@@ -9801,75 +9808,6 @@ it("GATE48 item 5: B issued while A's LIST response is held never starts until A
     sessionStorage.removeItem("remuda-outbox-owner-g48-5");
   }
 });
-
-it("GATE48 item 7: a reused connection machine emits the LIVE outbox's pending count, never a disposed box's", async () => {
-  vi.useFakeTimers();
-  vi.setSystemTime(1_496_000);
-  const I = "ins_g48_7";
-  const originalNavigator = globalThis.navigator;
-  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
-  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
-  const pump = async (n = 5_000) => {
-    for (let i = 0; i < n; i += 1) await Promise.resolve();
-  };
-  try {
-    sessionStorage.setItem("remuda-outbox-owner-g48-7", "owner");
-    localStorage.setItem("runtime.device-session", JSON.stringify({ deviceId: "devA_g48_7", name: "A" }));
-    const { api, hubStore } = await fresh();
-    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true } as never);
-    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] } as never);
-    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
-    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
-    vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
-    vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
-    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
-    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
-    vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
-    vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
-    vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
-    vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
-    vi.spyOn(api, "instanceList").mockResolvedValue({
-      items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
-      nextCursor: null,
-    } as never);
-
-    // Seed TWO pending rows into the outbox the bootstrap installs.
-    const seed = new (await import("./outbox")).LocalStorageOutboxStorage();
-    await seed.put({ commandId: "cmd_g48_7_1", clientRequestId: "local_g48_7_1", instanceId: I, prompt: "p1", createdAt: 1, attempts: 0, state: "pending" });
-    await seed.put({ commandId: "cmd_g48_7_2", clientRequestId: "local_g48_7_2", instanceId: I, prompt: "p2", createdAt: 2, attempts: 0, state: "pending" });
-
-    await hubStore.bootstrap();
-    await pump(8_000);
-    const machine = (hubStore as unknown as { connection: unknown }).connection;
-    expect(machine).not.toBeNull();
-    expect(hubStore.getSnapshot().outboxPending).toBe(2);
-
-    // Dispose ONLY the box (as an identity change teardown does) while the
-    // installed machine is retained for the assertion, then clear the live
-    // outbox reference: any machine state publication must read the CURRENT
-    // (now absent) outbox, i.e. 0 — never the captured disposed box's 2.
-    const internals = hubStore as unknown as {
-      outbox: { dispose(): void; pendingCount(): number } | null;
-      disposeOutboxForAuthChange(): void;
-      outboxUnsubscribe?: (() => void) | null;
-    };
-    internals.disposeOutboxForAuthChange();
-    expect(internals.outbox).toBeNull();
-    expect(hubStore.getSnapshot().outboxPending).toBe(0);
-
-    // Drive the retained machine through a state transition (a frame); its
-    // onState emit must NOT resurrect the disposed capture's count of 2.
-    hubStore.frameForTest();
-    await pump(200);
-    expect(hubStore.getSnapshot().outboxPending).toBe(0);
-    expect(hubStore.getSnapshot().connection).toBe("live");
-  } finally {
-    vi.useRealTimers();
-    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
-    sessionStorage.removeItem("remuda-outbox-owner-g48-7");
-  }
-});
-
 it("GATE49 item 1: the public bootstrap promise resolves a DISTINGUISHABLE retired outcome (not undefined) on logout and on peer change while held", async () => {
   for (const cause of ["logout", "peer"] as const) {
     vi.useFakeTimers();

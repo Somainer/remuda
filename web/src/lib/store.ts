@@ -4707,6 +4707,11 @@ class HubStore {
     issuingExt: number,
   ): Promise<"settled" | "retired"> {
     const ext = issuingExt;
+    // Gate 49 item 6: the PREDECESSOR session (if any) captured before Fence A
+    // — if the new credential establishes a DIFFERENT device identity, the
+    // session publication must not leave the old identity's instance rows in
+    // the snapshot (B-session-with-A-rows leak).
+    const previousDeviceId = readSession()?.deviceId ?? null;
     // Fence A: dispose/bump BEFORE the credential request (the new cookie
     // lands in response HEADERS before the body parses); the blocker holds
     // SEND-driven outbox init/delivery until the body settles.
@@ -4729,9 +4734,23 @@ class HubStore {
       throw err as Error;
     }
     this.releaseCredentialBlocker(ext);
+    // Gate 49 item 6: recheck the ISSUING epoch immediately before persisting
+    // and publishing the session. applyAuthIdentityChange()/the blocker and
+    // every await above can invoke a subscriber synchronously (one-shot logout
+    // in the cold mock path, a peer event); if the epoch moved after the last
+    // check, write/publish nothing.
     if (this.extEpoch !== ext) return "retired";
     writeSession(session, { mock: api.mock });
-    this.emit({ session: readSession(), error: null });
+    // Gate 49 items 5/6: when the credential establishes a DIFFERENT identity,
+    // do not republish the predecessor's instance rows under the new session:
+    // clear the instance projection in the same emit. B's own bootstrap list
+    // repopulates it moments later; a same-identity re-login keeps the rows.
+    const identityChanged = previousDeviceId !== null && previousDeviceId !== session.deviceId;
+    this.emit({
+      session: readSession(),
+      error: null,
+      ...(identityChanged ? { instances: [] } : {}),
+    });
     const result = await this.runBootstrap(ext);
     if (result === "retired" || this.extEpoch !== ext) return "retired";
     return "settled";

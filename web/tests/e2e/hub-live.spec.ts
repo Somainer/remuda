@@ -769,3 +769,29 @@ test("structured view streams assistant text and separates injected records", as
     .poll(async () => (await page.request.get(`/v1/instances/${instanceId}`)).status())
     .toBe(404);
 });
+
+test("the unbound session list never shows live while the Hub is unreachable (c-unboundresume)", async ({
+  page,
+}) => {
+  // Desktop lands on /sessions with NO bound follow — the unbound resume path.
+  await login(page);
+  const header = page.getByTestId("session-list").locator("header");
+  await expect(header).toContainText("live", { timeout: 20_000 });
+
+  // Hub-only outage: abort every /v1 request (REST + follow upgrades) while
+  // the browser stays online, then drive a foreground resume the way a real
+  // offline->online change does. No bounded GET can answer.
+  await page.context().route(/\/v1\//, (route) => route.abort("failed"));
+  await page.evaluate(() => window.dispatchEvent(new Event("online")));
+
+  // The unbound resume must not certify live from a swallowed refresh error:
+  // the pill is recovering/offline immediately and stays non-live across at
+  // least one reconnect-backoff retry.
+  await expect(header).toContainText(/recovering|offline/, { timeout: 10_000 });
+  await page.waitForTimeout(1_500);
+  expect(await header.textContent()).not.toMatch(/live/);
+  expect(await header.textContent()).toMatch(/recovering|offline/);
+
+  // Lift routes so this test's afterEach host sweep can reach the Hub.
+  await page.context().unroute(/\/v1\//);
+});

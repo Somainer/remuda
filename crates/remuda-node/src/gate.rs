@@ -2778,6 +2778,13 @@ impl DevNode {
                     // so the closure stays QUEUED past the deadline, the SAME
                     // continuation detaches and finishes terminate + the single
                     // reap while the response already returned uncertain.
+                    // r24 item 7: whether the ordered terminate→reap
+                    // continuation actually COMPLETED before the response. When
+                    // it detached past the deadline the group may still be
+                    // alive and may still push, so the verdict text must say
+                    // cleanup is pending in the owner rather than claim the
+                    // group was terminated.
+                    let mut cleanup_completed = true;
                     #[cfg(unix)]
                     {
                         let term_pgid = land_pgid;
@@ -2817,6 +2824,7 @@ impl DevNode {
                             .await
                             .is_err()
                         {
+                            cleanup_completed = false;
                             tokio::spawn(async move {
                                 continuation.await;
                             });
@@ -2828,7 +2836,29 @@ impl DevNode {
                         let _ = land_child.wait().await;
                     }
                     result.status = "uncertain".into();
-                    if land_aborted {
+                    if !cleanup_completed {
+                        // The detached owner continuation still owes the
+                        // terminate→reap: do not claim the group is dead (it
+                        // may push while the cleanup is queued).
+                        let detail = if land_aborted {
+                            "land was aborted, but owner cleanup (terminating and reaping the land \
+                             process group) had not completed by the response deadline — cleanup is \
+                             pending in the owner and the group is not yet confirmed terminated; \
+                             the push outcome is unknown (the Hub reconciles against the remote)"
+                        } else {
+                            "land exceeded the time budget, but owner cleanup (terminating and \
+                             reaping the land process group) had not completed by the response \
+                             deadline — cleanup is pending in the owner and the group is not yet \
+                             confirmed terminated; the push outcome is unknown (the Hub reconciles \
+                             against the remote)"
+                        };
+                        result.error = Some(detail.into());
+                        result.reason = Some(
+                            "cleanup pending in owner; land group termination not yet confirmed; \
+                             push outcome uncertain"
+                                .into(),
+                        );
+                    } else if land_aborted {
                         result.error = Some(
                             "land was aborted; the land process group was terminated by its owner; \
                              the push outcome is unknown (the Hub reconciles against the remote)"
@@ -6814,6 +6844,25 @@ echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\"
                     .is_some_and(|t| t.contains("uncertain")),
                 "{:?}",
                 result.reason
+            );
+            // r24 item 7: at response time the group is provably still alive,
+            // so the verdict must not claim it "was terminated"; it reports
+            // cleanup pending in the owner.
+            assert!(
+                result
+                    .reason
+                    .as_deref()
+                    .is_some_and(|t| t.contains("cleanup pending in owner")),
+                "the detached-cleanup verdict must not claim the group was terminated: {:?}",
+                result.reason
+            );
+            assert!(
+                result
+                    .error
+                    .as_deref()
+                    .is_some_and(|t| t.contains("not yet confirmed terminated")),
+                "{:?}",
+                result.error
             );
             // The group is STILL ALIVE at response time: its terminate was
             // queued behind the saturated pool and has not run. The kernel's

@@ -777,24 +777,28 @@ test("the unbound session list never shows live while the Hub is unreachable (c-
   // create one instance through the API CONTEXT (page.request shares the
   // device cookie but mounts nothing in the browser): the list page never
   // opens a follow socket, which is exactly the unbound state under test.
+  // The active space is a server-persisted device pref (it survives fresh
+  // contexts), so read the pressed space's [hostId, workspaceId] key from the
+  // panel rather than guessing the first workspace.
   await login(page);
-  const hosts = (await (await page.request.get("/v1/hosts")).json()) as {
-    items?: { id?: string; hostId?: string; label?: string }[];
-  };
-  const hostId = (hosts.items ?? []).find((h) => h.label === "e2e-fake-node")?.id
-    ?? (hosts.items ?? [])[0]?.hostId;
-  expect(hostId).toBeTruthy();
+  await page.goto("/sessions");
+  const activeKey = await page
+    .locator('[data-testid="space-select"][aria-pressed="true"]')
+    .first()
+    .getAttribute("data-space-id");
+  expect(activeKey).toBeTruthy();
+  const [activeHostId, activeWorkspaceId] = JSON.parse(activeKey!) as [string, string];
   const workspaces = (await (
-    await page.request.get(`/v1/hosts/${hostId}/workspaces`)
+    await page.request.get(`/v1/hosts/${activeHostId}/workspaces`)
   ).json()) as { workspaces: { workspaceId: string; root: string }[] };
-  const workspace = workspaces.workspaces[0];
+  const workspace = workspaces.workspaces.find((w) => w.workspaceId === activeWorkspaceId);
   expect(workspace).toBeTruthy();
   const create = await page.request.post("/v1/instances", {
     headers: { Origin: new URL(page.url()).origin },
     data: {
-      hostId,
-      workspaceId: workspace.workspaceId,
-      cwd: workspace.root,
+      hostId: activeHostId,
+      workspaceId: workspace!.workspaceId,
+      cwd: workspace!.root,
       kind: "terminal",
       driver: "shell-pty",
       name: "unboundresume",
@@ -808,8 +812,8 @@ test("the unbound session list never shows live while the Hub is unreachable (c-
   const createdId = instancePayload.instance.instanceId ?? instancePayload.instance.id;
   expect(createdId).toBeTruthy();
 
-  // Reload the list (workspace 0 is the default active space): the row renders
-  // the full header and NO follow upgrade is opened from the list page.
+  // Reload the list: the row renders the full header and NO follow upgrade is
+  // opened from the list page.
   await page.goto("/sessions");
   const header = page.getByTestId("session-list").locator("header");
   // Word boundary: "offline" must not match \blive\b.

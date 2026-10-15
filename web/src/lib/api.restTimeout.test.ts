@@ -63,3 +63,64 @@ it("headers received but the error body stalls past the deadline -> RestNetworkE
   await settled;
   await expect(call).rejects.toBeInstanceOf(RestNetworkError);
 });
+
+it("gate48 item 4: a pre-aborted CANCEL signal rejects rest() without issuing a fetch", async () => {
+  const fetchMock = vi.fn(async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({}),
+    text: async () => "",
+  }));
+  vi.stubGlobal("fetch", fetchMock);
+  const controller = new AbortController();
+  const reason = new DOMException("retired", "AbortError");
+  controller.abort(reason);
+
+  await expect(rest("/v1/devices", { method: "POST", body: "{}" }, controller.signal)).rejects.toBeInstanceOf(
+    RestNetworkError,
+  );
+  await expect(
+    rest("/v1/devices", { method: "POST", body: "{}" }, controller.signal),
+  ).rejects.toThrow("request aborted");
+  // The abort reason propagates through the error cause.
+  try {
+    await rest("/v1/devices", { method: "POST", body: "{}" }, controller.signal);
+    throw new Error("unreachable");
+  } catch (err) {
+    expect((err as RestNetworkError).cause).toBe(reason);
+  }
+  // NEVER reached the network layer.
+  expect(fetchMock).not.toHaveBeenCalled();
+});
+
+it("gate48 item 4: a pre-aborted req.signal rejects rest() without issuing a fetch", async () => {
+  const fetchMock = vi.fn(async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({}),
+    text: async () => "",
+  }));
+  vi.stubGlobal("fetch", fetchMock);
+  const controller = new AbortController();
+  controller.abort(new DOMException("caller cancelled", "AbortError"));
+
+  await expect(rest("/v1/some-read", { signal: controller.signal })).rejects.toThrow("request aborted");
+  expect(fetchMock).not.toHaveBeenCalled();
+});
+
+it("gate48 item 4: pre-aborted signals make api.login/pairRedeem reject without a fetch", async () => {
+  const { api } = await import("./api");
+  const fetchMock = vi.fn(async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ deviceId: "d", token: "t", name: "n" }),
+    text: async () => "",
+  }));
+  vi.stubGlobal("fetch", fetchMock);
+  const aborted = new AbortController();
+  aborted.abort(new DOMException("retired", "AbortError"));
+
+  await expect(api.login("secret", "dev", aborted.signal)).rejects.toThrow("request aborted");
+  await expect(api.pairRedeem("code", "dev", aborted.signal)).rejects.toThrow("request aborted");
+  expect(fetchMock).not.toHaveBeenCalled();
+});

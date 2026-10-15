@@ -821,8 +821,12 @@ const REST_WRITE_TIMEOUT_MS = 15_000;
 
 /** Network-layer failure (timeout/offline), retriable by the outbox. */
 export class RestNetworkError extends Error {
-  constructor(message: string) {
-    super(message);
+  constructor(
+    message: string,
+    /** The underlying abort/network error (gate 48 item 4), if any. */
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
     this.name = "RestNetworkError";
   }
 }
@@ -860,6 +864,19 @@ export async function rest<T>(path: string, req: RequestInit = {}, cancelSignal?
   };
   external?.addEventListener("abort", () => controller.abort(external.reason), { once: true });
   cancelSignal?.addEventListener("abort", () => controller.abort(cancelSignal!.reason), { once: true });
+  // Gate 48 item 4: a signal ALREADY aborted before the call must reject
+  // WITHOUT issuing the fetch at all (an addEventListener("abort") on an
+  // already-aborted signal never fires, so forwarding alone used to miss it).
+  // Propagate the aborting signal's OWN reason so callers can distinguish a
+  // retirement/caller abort from a timeout.
+  const preAborted = cancelSignal?.aborted ? cancelSignal : external?.aborted ? external : null;
+  if (preAborted) {
+    clearTimer();
+    // The signal's own reason may be a DOMException (not an Error subclass in
+    // jsdom) or undefined; carry any truthy object through ErrorOptions.
+    const reason = preAborted.reason;
+    throw new RestNetworkError("request aborted", reason != null ? { cause: reason } : undefined);
+  }
   let res: Response;
   try {
     res = await fetch(`${hubBase()}${path}`, {
@@ -877,9 +894,17 @@ export async function rest<T>(path: string, req: RequestInit = {}, cancelSignal?
     // the same commandId and retries).
     if (err instanceof DOMException && err.name === "AbortError") {
       const aborted = external?.aborted || cancelSignal?.aborted;
-      throw new RestNetworkError(aborted ? "request aborted" : `REST timeout after ${timeoutMs} ms`);
+      if (aborted) {
+        const reason = cancelSignal?.aborted
+          ? cancelSignal.reason
+          : external?.reason;
+        throw new RestNetworkError("request aborted", reason != null ? { cause: reason } : undefined);
+      }
+      throw new RestNetworkError(`REST timeout after ${timeoutMs} ms`);
     }
-    throw new RestNetworkError(err instanceof Error ? err.message : String(err));
+    throw new RestNetworkError(err instanceof Error ? err.message : String(err), {
+      cause: err instanceof Error ? err : undefined,
+    });
   }
   if (!res.ok) {
     let text: string;

@@ -226,12 +226,18 @@ fn run<A: FileSignalAdapter + 'static>(mut adapter: A, ctx: AdapterCtx) -> Adapt
                 if ctx.events.is_closed() {
                     break;
                 }
-                // Hook > File: a SessionStart bound to the agent pid confirms the
-                // adapter's session before file discovery guesses.
+                // Hook > File: a SessionStart bound to the agent pid (or its
+                // captured process group — harnesses run hooks through a
+                // transient shell wrapper whose pid is already reaped here)
+                // confirms the adapter's session before file discovery guesses.
                 if let Some(hooks) = &ctx.hooks
                     && let Some(binding) = hooks.binding()
-                    && let Some(session_id) =
-                        confirmed_session(binding.pid, ctx.agent_pid, &binding.session_id)
+                    && let Some(session_id) = confirmed_session(
+                        binding.pid,
+                        binding.pgid,
+                        ctx.agent_pid,
+                        &binding.session_id,
+                    )
                 {
                     adapter.confirm_session(&session_id);
                 }
@@ -329,20 +335,35 @@ pub fn promoted_home(kind: AgentKind, cwd: PathBuf, pid: Option<u32>) -> Option<
 /// The session id a file adapter should follow given a hook-confirmed binding.
 ///
 /// Pure helper so the driver can pre-confirm without owning adapter state: it
-/// filters to the agent pid the supervisor is following, which is what stops a
-/// second terminal's hooks binding this instance (same rule as
+/// filters to the agent process (group) the supervisor is following, which is
+/// what stops a second terminal's hooks binding this instance (same rule as
 /// `remuda_node::signal::binds_instance`).
+///
+/// `agent_pid` is the PTY-launched carrier's process-GROUP leader (the
+/// materializer starts a login shell in its own process group; the real agent
+/// and its SessionStart hook are descendants). Harnesses often invoke the hook
+/// through a transient `/bin/sh` wrapper, so the exact hook `pid` is a wrapper
+/// already reaped by poll time; the bus-captured `hook_pgid` (the wrapper's
+/// group at delivery) is the durable agent-job identity. A match on either the
+/// pid or the captured group is accepted. The generic-pty/promoted callers
+/// pass the real agent pid, whose group contains only that agent's own
+/// processes.
 #[must_use]
-pub fn confirmed_session(pid: i32, agent_pid: Option<i32>, session_id: &str) -> Option<String> {
+pub fn confirmed_session(
+    pid: i32,
+    hook_pgid: Option<i32>,
+    agent_pid: Option<i32>,
+    session_id: &str,
+) -> Option<String> {
     let session_id = session_id.trim();
     if session_id.is_empty() {
         return None;
     }
-    match agent_pid {
-        Some(agent_pid) if agent_pid == pid => Some(session_id.to_owned()),
-        Some(_) => None,
-        None => Some(session_id.to_owned()),
-    }
+    let matches = match agent_pid {
+        Some(agent_pid) => pid == agent_pid || hook_pgid == Some(agent_pid),
+        None => true,
+    };
+    matches.then(|| session_id.to_owned())
 }
 
 /// Observation alias re-export for callers that build their own pump.

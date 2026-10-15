@@ -3620,6 +3620,71 @@ async fn carrier_disconnect_requeues_an_evidence_uncertain_running_row_without_c
     assert!(doc["evidenceUncertain"].is_object(), "{doc}");
 }
 
+/// r24 item 1 audit: an EXPLICIT caller cancel of a Queued row that carries a
+/// preserved evidence-uncertain condition (carrier recovery requeued it) is an
+/// authorized terminal transition: the row settles Canceled and the condition
+/// is cleared, rather than dangling on a terminal row.
+#[tokio::test]
+async fn an_explicit_cancel_clears_a_queued_rows_preserved_evidence_uncertainty() {
+    let (ctx, node) = Ctx::boot().await.unwrap();
+    ctx.configure_gate_lane().await;
+    let barrier = ctx.store().gate_apply_barrier();
+
+    let job_seed = "wt/gate/evidence-uncertain-queued-cancel";
+    let hook = node
+        .arm_gate_run(failed_gate_result("placeholder", job_seed))
+        .await;
+    let (status, enqueued) = ctx
+        .agent_post(
+            &format!("/v1/projects/{}/gate", ctx.project),
+            json!({"branch":job_seed,"mode":"verify"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{enqueued}");
+    let job_id = enqueued["id"].as_str().unwrap().to_owned();
+    hook.set_result(failed_gate_result(&job_id, job_seed));
+    hook.wait_arrived().await;
+
+    barrier.arm();
+    node.send_raw(json!({
+        "jsonrpc": "2.0", "method": "gate.event",
+        "params": {
+            "jobId": job_id, "generation": 1, "kind": "finished",
+            "result": failed_gate_result(&job_id, job_seed),
+        }
+    }));
+    hook.release_and_wait_proceeded().await;
+    barrier.wait_parked(2).await;
+    ctx.store().test_arm_gate_log_insert_faults(2);
+    barrier.release();
+    barrier.wait_completed(2).await;
+    node.disconnect();
+    let _ = async {
+        loop {
+            let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+            if doc["state"] == json!("queued") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+    .await;
+
+    // The enqueuer explicitly cancels the parked Queued job.
+    let (status, reply) = ctx
+        .agent_post(
+            &format!("/v1/projects/{}/gate/jobs/{job_id}/cancel", ctx.project),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["state"], json!("canceled"), "{reply}");
+    assert!(
+        reply["evidenceUncertain"].is_null(),
+        "the authorized cancel clears the condition: {reply}"
+    );
+}
+
 /// r24 item 1: after the finished notification has parked an evidence-uncertain
 /// condition, loss of the outstanding gate.run RPC reply must not let the
 /// RPC-error writer settle the job Failed without its evidence.

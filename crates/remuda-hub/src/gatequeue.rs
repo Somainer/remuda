@@ -4495,6 +4495,11 @@ impl Store {
             let prior = job.state;
             match job.state {
                 GateJobState::Queued => {
+                    // r24 item 1 audit: a carrier recovery can leave a Queued
+                    // row carrying a preserved evidence-uncertain condition.
+                    // The caller's explicit cancel is an authorized terminal
+                    // transition, so it settles and clears the condition.
+                    job.evidence_uncertain = None;
                     job.state = GateJobState::Canceled;
                     job.finished_at = Some(now_ts());
                     job.error = Some("canceled while queued".into());
@@ -4583,6 +4588,13 @@ impl Store {
             {
                 match error {
                     crate::store::StoreError::Fenced => {
+                        // r24 item 1 audit: a Queued row may carry a preserved
+                        // evidence-uncertain condition (a carrier recovery
+                        // requeue keeps it). The authority fence is an
+                        // authorized terminal cancellation, so clear the
+                        // condition here too — a terminal Canceled row must not
+                        // dangle a condition no route can ever resolve.
+                        job.evidence_uncertain = None;
                         job.state = GateJobState::Canceled;
                         job.finished_at = Some(now_ts());
                         job.reason = Some("fenced".into());

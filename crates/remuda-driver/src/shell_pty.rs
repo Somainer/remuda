@@ -3328,7 +3328,13 @@ impl Driver for ShellPtyDriver {
         if let Some(worker) = self.permission_worker.lock().await.take() {
             worker.abort();
         }
-        self.events_tx.lock().await.take();
+        // Claim the run's observation sender ONCE, here at the top of close
+        // (c-ctxusage r4 item 2: the poller holds its own clone, so winding it
+        // down below still delivers finalised observations). It MUST survive
+        // to the teardown-ownership claim: the stop ladder's stop-incomplete
+        // warning (c-usagefu Ruling W0) is sent through it, so this is a move,
+        // not a drop.
+        let run_events = self.events_tx.lock().await.take();
         // c-ctxusage r4 item 2: cooperative poller shutdown. Signal closure
         // first, then give the poller one window to read the final append and
         // publish its last turn via `finish()` (an assistant record with usage
@@ -3429,9 +3435,12 @@ impl Driver for ShellPtyDriver {
         let close_ctx;
         let claimed = {
             let Some(state) = self.inner.lock().await.take() else {
+                // No teardown to own; release the claimed sender with the
+                // early return (a serialized second close always finds None).
+                drop(run_events);
                 return Ok(DriverAck::not_dispatched());
             };
-            close_events = self.events_tx.lock().await.take();
+            close_events = run_events;
             close_ctx = self.promote_ctx.lock().await.clone();
             state
         };
@@ -4321,7 +4330,13 @@ mod tests {
             .unwrap();
         let native_home = root.join("native-home");
         std::fs::create_dir_all(&native_home).unwrap();
-        let instance_dir = root.join("instance");
+        // c-usagefu r6: a driver launch's rollout claim is keyed by the STABLE
+        // instance id and outlives each per-run adapter (including the resumed
+        // scratch driver), so name the instance dir after a fixed instance id
+        // exactly as the Node does (native.rs always sets options.instance_id
+        // and the hook overlay lives under `<that id>/launch`).
+        let instance_id = InstanceId::new();
+        let instance_dir = root.join(instance_id.as_id().as_str());
 
         // Install a `codex` wrapper around the deterministic fake-harness.
         // The production argv carries no dialect selector (the real binary's
@@ -4376,6 +4391,9 @@ mod tests {
         );
         let mut options = launch;
         options.claude_home = Some(native_home);
+        // Stable identity shared by the first run and the `--resume` run below,
+        // so the resumed file adapter reclaims the same rollout claim.
+        options.instance_id = Some(instance_id);
         options.hooks = Some(HookConfig {
             instance_dir: instance_dir.clone(),
             relay_binary,
@@ -4581,6 +4599,12 @@ mod tests {
 
     /// Drain a run handle until the turn usage observation for `turn` arrives
     /// and assert its output counters.
+    ///
+    /// c-ctxusage × c-usagefu merge: the final codex adapter emits one
+    /// MESSAGE-scoped usage observation per model response (durable
+    /// file/offset scope id), carrying the native turn id on the observation
+    /// source (`with_turn`); the end-of-turn Turn emission was removed in
+    /// c-usagefu r6 item 5. The adoption guarantee this test pins is unchanged.
     async fn r25_expect_turn_usage(
         events: &mut mpsc::Receiver<remuda_protocol::Observation>,
         turn: &str,
@@ -4593,8 +4617,11 @@ mod tests {
                 panic!("turn usage for {turn} never observed through the run handle");
             };
             if let remuda_protocol::ObservationPayload::Usage(usage) = &observation.body
-                && usage.scope == remuda_protocol::UsageScope::Turn
-                && usage.scope_id == turn
+                && usage.scope == remuda_protocol::UsageScope::Message
+                && observation.source.native_turn_id
+                    == (remuda_protocol::Knowledge::Known {
+                        value: turn.to_owned(),
+                    })
             {
                 assert_eq!(
                     usage.output_tokens,

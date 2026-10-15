@@ -10083,12 +10083,14 @@ it("GATE49 item 2: old outbox holds the lock mid-POST with a SIBLING queued in F
   }
 });
 
-it("GATE49 item 3: an EXPIRED inflight row reclaimed at bootstrap load while a sibling holds its lock — queued login starts within the bound (bounded load-time reclamation)", async () => {
+it("GATE50 item 4 (test): expired inflight row — bootstrap reaches the bounded load reclaim FIRST, a login enqueued afterward starts, and the row and lease stay unchanged while a sibling holds", async () => {
   vi.useFakeTimers();
   vi.setSystemTime(1_499_000);
   const I = "ins_g49_3";
+  const lockName = `remuda-outbox-${I}`;
   const originalNavigator = globalThis.navigator;
-  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  const shim = fifoWebLocks();
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: shim.locks } });
   localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
   const pump = async (n = 5_000) => {
     for (let i = 0; i < n; i += 1) await Promise.resolve();
@@ -10097,7 +10099,7 @@ it("GATE49 item 3: an EXPIRED inflight row reclaimed at bootstrap load while a s
     sessionStorage.setItem("remuda-outbox-owner-g49-3", "owner");
     localStorage.setItem("runtime.device-session", JSON.stringify({ deviceId: "devA_g49_3", name: "A" }));
     // An EXPIRED inflight row owned by THIS owner from a prior context: load()
-    // reclaims it under the instance lock (LEASE_TTL_MS in the past).
+    // would reclaim it under the instance lock (LEASE_TTL_MS in the past).
     const expiredLease = { owner: "owner", until: Date.now() - 120_000, claimToken: "old-token" };
     const preStorage = new (await import("./outbox")).LocalStorageOutboxStorage();
     await preStorage.put({
@@ -10106,15 +10108,35 @@ it("GATE49 item 3: an EXPIRED inflight row reclaimed at bootstrap load while a s
       lease: expiredLease,
     });
 
-    // Sibling holder keeps the instance lock held across the whole bootstrap.
+    // Sibling holder keeps the instance lock held across bootstrap.
     let releaseSibling: () => void = () => {};
     const siblingHeld = new Promise<void>((resolve) => { releaseSibling = resolve; });
-    globalThis.navigator.locks.request(
-      `remuda-outbox-${I}`,
-      { mode: "exclusive" },
-      () => siblingHeld,
-    );
+    void shim.locks.request(lockName, { mode: "exclusive" }, () => siblingHeld);
     await pump(100);
+
+    // Observe the bounded LOAD RECLAIM: it is the FIRST ifAvailable request
+    // for the instance name issued by the bootstrap install (the bounded
+    // drain's ifAvailable request comes later).
+    let reclaimProbed = false;
+    const rawRequest = shim.locks.request.bind(shim.locks) as (
+      name: string,
+      opts: unknown,
+      cb: (lock: { name: string } | null) => Promise<unknown>,
+    ) => Promise<unknown>;
+    (
+      shim.locks as unknown as {
+        request: (
+          name: string,
+          opts: unknown,
+          cb: (lock: { name: string } | null) => Promise<unknown>,
+        ) => Promise<unknown>;
+      }
+    ).request = (name, opts, cb) => {
+      if (!reclaimProbed && name === lockName && (opts as { ifAvailable?: boolean })?.ifAvailable) {
+        reclaimProbed = true;
+      }
+      return rawRequest(name, opts, cb);
+    };
 
     const { api, hubStore } = await fresh();
     vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true } as never);
@@ -10137,35 +10159,51 @@ it("GATE49 item 3: an EXPIRED inflight row reclaimed at bootstrap load while a s
       relatedCommandIds: [],
       command: { commandId: "cmd_g49_3", id: "cmd_g49_3", state: "accepted", revision: "1", dispatch: "native-acknowledged", resolution: "clear" },
     })) as unknown as Api["instanceSend"]);
-
-    // A queued login behind bootstrap.
+    // The queued credential request: record when its BODY starts (S3 queue
+    // acquired), not merely when login() is called.
     let bodyStarted = false;
     vi.spyOn(api, "login").mockImplementation((() => {
       bodyStarted = true;
       return Promise.resolve({ deviceId: "devB_g49_3", token: "tokB", name: "B" });
     }) as unknown as Api["login"]);
-    const loginP = hubStore.login("bootstrap", "secret", "devB_g49_3");
 
-    // Bootstrap must not hang on the load-time reclaim blocked by the sibling
-    // holder: the reclaim is bounded and the install settles, so the queued
-    // login proceeds within the bound even though the sibling still holds.
+    // Correct order (gate 50 item 4): bootstrap FIRST.
     const boot = hubStore.bootstrap();
+    // Wait for the install to actually reach the bounded load/reclaim path.
+    for (let i = 0; i < 30_000; i += 1) {
+      if (reclaimProbed) break;
+      await Promise.resolve();
+    }
+    expect(reclaimProbed).toBe(true);
+    // The sibling still holds; the reclaim could not have run, so the expired
+    // row is untouched.
+    expect((await preStorage.all())[0]!).toMatchObject({ state: "inflight", lease: expiredLease });
+
+    // THEN enqueue the login behind bootstrap.
+    const loginP = hubStore.login("bootstrap", "secret", "devB_g49_3");
     await pump(8_000);
+
+    // Before releasing the sibling: bootstrap settled, the queued credential
+    // request's body started, and no command POST went out.
     await expect(boot).resolves.toBeDefined();
     await expect(loginP).resolves.toBe("settled");
     expect(bodyStarted).toBe(true);
-    // The reclaimed row stays pending and is left untouched (no POST while
-    // sibling holds); its later delivery is owned by normal recovery.
     expect(vi.mocked(api.instanceSend)).not.toHaveBeenCalled();
 
+    // The expired row's STATE and LEASE are unchanged (bounded reclaim skipped
+    // it for the installed outbox's lease recovery rather than mutating it).
+    const untouched = (await preStorage.all()).find((r) => r.commandId === "cmd_g49_3")!;
+    expect(untouched.state).toBe("inflight");
+    expect(untouched.lease).toEqual(expiredLease);
+
     releaseSibling();
-    await pump(400);
+    await pump(2_000);
   } finally {
     vi.useRealTimers();
     Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
     sessionStorage.removeItem("remuda-outbox-owner-g49-3");
   }
-});
+});;
 
 it("GATE50 item 2 (low): a synchronous logout during the cold mock bootstrap's disposal publication persists/publishes no session", async () => {
   vi.useFakeTimers();

@@ -68,6 +68,15 @@ export type MachineDeps = {
    * silent, or a closed, socket forces reopen.
    */
   isFollowLive: () => boolean;
+  /**
+   * Whether a follow is BOUND to the current binding (false on the session
+   * list / new-session page, where no follow socket exists). A quiet stale
+   * probe that succeeds while UNBOUND certifies the link itself — there is no
+   * follow to reopen, and running the resume action would issue a SECOND GET
+   * whose tail could cross the carried stale deadline and publish a false
+   * offline (c-unboundresume r2 item 2).
+   */
+  isFollowBound: () => boolean;
   schedule?: Scheduler;
   cancel?: ScheduleCancel;
   /** Injectable clock (tests with fake timers pass their clock's now()). */
@@ -209,6 +218,23 @@ export class ConnectionMachine {
    */
   bootstrapLive() {
     if (this.disposed) return;
+    this.attempt = 0;
+    this.clearTimers("stale", "offline", "probe", "reconnect", "watchdog", "bind");
+    this.setState("live");
+  }
+
+  /**
+   * Certify live for an UNBOUND binding whose quiet stale probe just
+   * succeeded (c-unboundresume r2 item 2): the one bounded GET that answered
+   * IS the reachability proof, so no resume action (and no second GET) may
+   * follow. Leaving stale discards the carried episode deadline via setState,
+   * and NO frame watchdog is armed — exactly like {@link bootstrapLive}, the
+   * unbound list/new-session page has no socket whose silence could be
+   * watched (foreground/online/focus resumes and the next mount own
+   * revalidation). Only callable while stale; callers re-check state.
+   */
+  private certifyUnboundLive() {
+    if (this.disposed || this.state !== "stale") return;
     this.attempt = 0;
     this.clearTimers("stale", "offline", "probe", "reconnect", "watchdog", "bind");
     this.setState("live");
@@ -573,14 +599,25 @@ export class ConnectionMachine {
       // foreground resume fails after it — the failed attempt settles quiet
       // stale via its own settle probe Q, and P answering false afterwards
       // must not take Q's stale offline (attempt id moved on).
+      // c-unboundresume r2 item 2: capture whether a follow was BOUND when the
+      // probe started. An unbound ok certifies the list-page link itself —
+      // quietReopen's resume would run proveHubReachable a SECOND time, and on
+      // a slow Hub that second GET straddles the carried episode deadline and
+      // publishes offline despite two successful reads.
       const gen = this.latestBindGen;
       const probeAttemptId = this.resumeAttemptId;
+      const bound = this.deps.isFollowBound();
       void this.deps.probe().then((ok) => {
         // Gate 41 S2: the probe was parked across dispose; drop its answer.
         if (this.disposed) return;
         if (gen !== this.latestBindGen) return;
         if (probeAttemptId !== this.resumeAttemptId) return;
-        this.dispatch({ type: "probe", ok });
+        if (this.state !== "stale") return;
+        if (ok && !bound) {
+          this.certifyUnboundLive();
+        } else {
+          this.dispatch({ type: "probe", ok });
+        }
       });
     });
     this.setTimer("offline", offlineMs, () => {

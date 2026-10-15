@@ -3073,6 +3073,9 @@ class HubStore {
       resume: () => this.resumeConnection(),
       probe: () => this.connectionProbe(),
       isFollowLive: () => this.followSocketLive(),
+      // c-unboundresume r2 item 2: the unbound quiet-stale probe certifies
+      // without a follow-reopen resume (no second reachability GET).
+      isFollowBound: () => this.connectionBoundJournal !== null,
       onState: (state) => {
         // Gate 41 S2: a callback from a machine that has since been disposed
         // and replaced (peer logout mid-probe, then a healthy re-login) must

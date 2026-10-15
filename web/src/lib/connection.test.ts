@@ -47,12 +47,16 @@ function setup() {
   const resume = vi.fn(() => Promise.resolve());
   const probe = vi.fn(() => Promise.resolve(true));
   const isFollowLive = vi.fn(() => false);
+  // Whether a follow is BOUND to the current binding (false = unbound list /
+  // new-session page).
+  const isFollowBound = vi.fn(() => true);
   const onState = vi.fn();
   const onAttemptFinish = vi.fn();
   const machine = new ConnectionMachine({
     resume,
     probe,
     isFollowLive,
+    isFollowBound,
     schedule: clock.schedule,
     cancel: clock.cancel,
     now: clock.now,
@@ -60,7 +64,7 @@ function setup() {
     onState,
     onAttemptFinish,
   });
-  return { clock, resume, probe, onState, onAttemptFinish, machine, isFollowLive };
+  return { clock, resume, probe, isFollowBound, onState, onAttemptFinish, machine, isFollowLive };
 }
 
 describe("ConnectionMachine", () => {
@@ -256,6 +260,55 @@ describe("ConnectionMachine", () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(machine.state).toBe("stale");
+  });
+
+  it("c-unboundresume r2 item 2: one successful UNBOUND stale probe certifies live — no quiet resume and no episode-deadline offline", async () => {
+    // Review scenario (unbound list page, slow-but-reachable Hub):
+    //  t=15 frame-silence deadline → stale; the REST probe starts (GET #1)
+    //  t=24 GET #1 answers ok. The old code ran quietReopen → the unbound
+    //       resume issued GET #2; both 9 s reads were inside their own 10 s
+    //       deadlines, yet the episode deadline carried from t=0 fired at t=30
+    //       and published offline while GET #2 was still running.
+    // Fix: with NO bound follow the successful probe certifies its
+    // still-current binding itself — resume() is never called (no second GET)
+    // and the live certification discards the stale episode deadline.
+    const { clock, machine, resume, probe, isFollowBound, onState } = setupTracked();
+    isFollowBound.mockReturnValue(false); // unbound: session list page
+    let resolveProbe: ((ok: boolean) => void) | null = null;
+    probe.mockImplementation(() => new Promise<boolean>((resolve) => void (resolveProbe = resolve)));
+    // GET #2 (the old quiet resume's own reachability read) stays parked past
+    // the carried episode deadline, exactly like the review's t=24→33 read.
+    resume.mockImplementation(() => new Promise<void>(() => {}));
+
+    machine.startLive();
+    clock.advance(LIVE_FRAME_MS); // t=15: stale, probe timer armed
+    expect(machine.state).toBe("stale");
+    clock.advance(REST_PROBE_MS); // t=30: GET #1 in flight (held)
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(resume).not.toHaveBeenCalled();
+
+    // GET #1 answers ok 9 s later (still inside the carried 30 s episode
+    // deadline, as in the review timeline).
+    clock.advance(9_000);
+    const offlineEvents: string[] = [];
+    onState.mockImplementation((s: string) => {
+      if (s === "offline") offlineEvents.push(s);
+    });
+    resolveProbe!(true);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // The probe itself certifies the unbound binding live: no resume GET.
+    expect(machine.state).toBe("live");
+    expect(resume).not.toHaveBeenCalled();
+    expect(probe).toHaveBeenCalledTimes(1);
+
+    // Past the stale episode's 30 s deadline the certification must hold:
+    // the deadline was discarded on live, so no offline/reconnect fires.
+    clock.advance(60_000);
+    expect(machine.state).toBe("live");
+    expect(offlineEvents).toEqual([]);
+    expect(resume).not.toHaveBeenCalled();
   });
 
   it("GATE7: a blocked follow upgrade during a quiet stale reopen keeps the machine quiet stale", async () => {

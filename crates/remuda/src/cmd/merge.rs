@@ -1024,6 +1024,76 @@ fn is_native_object_hex(sha: &str) -> bool {
     (sha.len() == 40 || sha.len() == 64) && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// Parse the epoch NANOS embedded in a private recovery ref name
+/// (`<pid>-<nanos>-<counter>`); returns None for any other shape.
+fn recovery_ref_epoch_nanos(name: &str) -> Option<u128> {
+    let rest = name.split_once('-')?.1;
+    let nanos = rest.split_once('-')?.0;
+    if nanos.is_empty() || !nanos.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    nanos.parse().ok()
+}
+
+/// Leftover recovery refs older than this are abandoned (crashed recovery, a
+/// cleanup killed at the deadline, or a fetch that failed after installing its
+/// ref) and safe to reclaim. Ten times the whole recovery deadline, so a ref a
+/// live recovery can still own is never touched.
+const RECOVERY_REF_RECLAIM_HORIZON: std::time::Duration = LAND_RECOVERY_DEADLINE.saturating_mul(10);
+
+/// Best-effort, owner-run, deadline-bounded deletion of ONE recovery ref. A
+/// missing ref or a failed command is intentionally ignored.
+fn delete_recovery_ref(repo: &Path, recovery_ref: &str, deadline: Instant) {
+    let _ = recovery_git(
+        repo,
+        &["update-ref", "-d", recovery_ref],
+        "post-push recovery ref cleanup",
+        false,
+        deadline,
+    );
+}
+
+/// Reclaim abandoned recovery refs from crashed or deadline-exhausted earlier
+/// recoveries. Every git command goes through the R6 owner under the caller's
+/// remaining deadline; failures are ignored (the next recovery retries).
+/// Younger refs and unrecognized names are never touched.
+fn reclaim_abandoned_recovery_refs(repo: &Path, deadline: Instant) {
+    let output = match recovery_git(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/remuda/recovery/",
+        ],
+        "post-push abandoned-ref reclamation",
+        true,
+        deadline,
+    ) {
+        Ok(output) => output,
+        Err(_) => return,
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    for refname in String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let Some(name) = refname.strip_prefix("refs/remuda/recovery/") else {
+            continue;
+        };
+        let Some(created_nanos) = recovery_ref_epoch_nanos(name) else {
+            continue;
+        };
+        if now.saturating_sub(created_nanos) < RECOVERY_REF_RECLAIM_HORIZON.as_nanos() {
+            continue;
+        }
+        delete_recovery_ref(repo, refname, deadline);
+    }
+}
+
 /// Fetch the requested remote base into a private recovery ref, capture the
 /// immutable commit SHA it points at, and delete the ref (best effort, under
 /// the same owner and absolute deadline). Any failure is PushUncertain —
@@ -1032,13 +1102,24 @@ fn is_native_object_hex(sha: &str) -> bool {
 fn recovery_fetch_base_sha(repo: &Path, base: &str, deadline: Instant) -> Result<String> {
     let recovery_ref = unique_recovery_ref();
     let fetch_refspec = format!("+refs/heads/{base}:{recovery_ref}");
-    recovery_git(
+    // Reclaim refs abandoned by crashed or deadline-exhausted earlier
+    // recoveries before doing anything else.
+    reclaim_abandoned_recovery_refs(repo, deadline);
+    let fetch_outcome = recovery_git(
         repo,
         &["fetch", "-q", "origin", &fetch_refspec],
         "post-push recovery fetch",
         true,
         deadline,
-    )?;
+    )
+    .map(|_| ());
+    // r29 item 1: a non-atomic fetch can install the private ref and still
+    // fail. Delete the ref before propagating the original error; on success
+    // the ref stays until the SHA is captured.
+    if let Err(error) = fetch_outcome {
+        delete_recovery_ref(repo, &recovery_ref, deadline);
+        return Err(error);
+    }
     // r28 item 1 TEST-ONLY seam: park with the private ref installed and
     // before the SHA is captured.
     #[cfg(test)]
@@ -1057,15 +1138,9 @@ fn recovery_fetch_base_sha(repo: &Path, base: &str, deadline: Instant) -> Result
         deadline,
     );
     // Remove the private ref before propagating ANY capture result (best
-    // effort, same owner/deadline). The SHA names the commit object directly;
-    // later invocations use distinct flat names regardless of this result.
-    let _ = recovery_git(
-        repo,
-        &["update-ref", "-d", &recovery_ref],
-        "post-push recovery ref cleanup",
-        false,
-        deadline,
-    );
+    // effort, same owner/deadline); an aging leftover is reclaimed by the next
+    // recovery even if this cleanup is killed at the deadline.
+    delete_recovery_ref(repo, &recovery_ref, deadline);
     let tip_output = tip_result?;
     let remote_tip = String::from_utf8_lossy(&tip_output.stdout)
         .trim()
@@ -2488,6 +2563,114 @@ mod tests {
             "",
             "no recovery refs may remain after either recovery"
         );
+        drop(keep);
+    }
+
+    /// r29 item 1: a recovery fetch that installs the private ref and then
+    /// fails (a clobbered tag under tagOpt=--tags) must still leave the
+    /// recovery namespace empty and return PushUncertain.
+    #[test]
+    fn a_failed_fetch_that_installed_the_ref_leaves_no_recovery_ref() {
+        let (keep, full, base_b, merge_m, _remote_r) = divergence_fixture();
+        // Local tag pinned at B; remote tag moved sideways to an orphan AFTER
+        // the fixture's bare origin exists.
+        tgit_ok(&full, &["tag", "v1", &base_b]);
+        let orphan = tgit_ok(&full, &["commit-tree", "HEAD^{tree}", "-m", "sideways tag"]);
+        tgit_ok(
+            &full,
+            &[
+                "push",
+                "-q",
+                "-f",
+                "origin",
+                &format!("{orphan}:refs/tags/v1"),
+            ],
+        );
+        tgit_ok(&full, &["config", "remote.origin.tagOpt", "--tags"]);
+        // Sanity: fetch exits non-zero but does install the requested ref.
+        let probe_ref = "refs/remuda/recovery/probe-failure";
+        let output = tgit(
+            &full,
+            &[
+                "fetch",
+                "-q",
+                "origin",
+                &format!("+refs/heads/main:{probe_ref}"),
+            ],
+        );
+        assert!(!output.status.success(), "the tag clobber must fail fetch");
+        assert_eq!(
+            tgit_ok(&full, &["rev-parse", "--verify", "--quiet", probe_ref]),
+            _remote_r,
+            "the failed fetch really installed the requested ref"
+        );
+        tgit_ok(&full, &["update-ref", "-d", probe_ref]);
+
+        // The push of M is rejected (remote main is the divergent R); recovery
+        // fetch then fails on the tag clobber — PushUncertain, no refs left.
+        let error = push_main_cas(&full, &merge_m, &base_b)
+            .expect_err("a clobbered-tag recovery fetch stays uncertain");
+        assert!(
+            matches!(
+                error.downcast_ref::<MergeStop>(),
+                Some(MergeStop::PushUncertain(_))
+            ),
+            "PushUncertain, got {error:#}"
+        );
+        assert_eq!(
+            tgit_ok(
+                &full,
+                &[
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    "refs/remuda/recovery/"
+                ]
+            ),
+            "",
+            "the failed fetch's private ref must be deleted"
+        );
+        drop(keep);
+    }
+
+    /// r29 item 1: an old abandoned recovery ref is reclaimed by the next
+    /// recovery; a younger one is retained (it may belong to a live probe).
+    #[test]
+    fn an_old_abandoned_cli_recovery_ref_is_reclaimed_but_a_fresh_one_is_kept() {
+        let (keep, full, _base_b, merge_m, _remote_r) = divergence_fixture();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let old_nanos = now - 1_000 * 1_000_000_000;
+        let old_ref = format!("refs/remuda/recovery/1-{old_nanos}-0");
+        let fresh_ref = format!("refs/remuda/recovery/1-{now}-0");
+        tgit_ok(&full, &["update-ref", &old_ref, &_remote_r]);
+        tgit_ok(&full, &["update-ref", &fresh_ref, &_remote_r]);
+
+        // Recovery runs (push rejected; remote R doesn't contain M →
+        // BaseMoved), reclamation happens at fetch start regardless.
+        let error = push_main_cas(&full, &merge_m, &_base_b)
+            .expect_err("remote diverged; recovery classifies BaseMoved");
+        assert!(
+            matches!(
+                error.downcast_ref::<MergeStop>(),
+                Some(MergeStop::BaseMoved(_, _))
+            ),
+            "BaseMoved, got {error:#}"
+        );
+        assert_eq!(
+            tgit_ok(
+                &full,
+                &[
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    "refs/remuda/recovery/"
+                ]
+            ),
+            fresh_ref,
+            "only the young ref must survive reclamation"
+        );
+        tgit_ok(&full, &["update-ref", "-d", &fresh_ref]);
         drop(keep);
     }
 

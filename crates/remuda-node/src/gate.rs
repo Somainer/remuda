@@ -4261,6 +4261,91 @@ fn is_native_object_hex(sha: &str) -> bool {
     (sha.len() == 40 || sha.len() == 64) && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// Parse the epoch NANOS embedded in a private recovery ref name
+/// (`<pid>-<nanos>-<counter>`); returns None for any name that does not match
+/// the produced shape.
+fn recovery_ref_epoch_nanos(name: &str) -> Option<u128> {
+    let rest = name.split_once('-')?.1;
+    let nanos = rest.split_once('-')?.0;
+    if nanos.is_empty() || !nanos.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    nanos.parse().ok()
+}
+
+/// Leftover recovery refs older than this are abandoned (a crashed probe, a
+/// cleanup killed at the deadline, or a fetch that failed after installing its
+/// ref) and safe to reclaim. It is well beyond the maximum lifetime of any
+/// live probe — ten times the absolute probe deadline — so a ref a running
+/// recovery can still own is never touched.
+#[cfg(unix)]
+const RECOVERY_REF_RECLAIM_HORIZON: Duration = LANDING_PROBE_DEADLINE.saturating_mul(10);
+
+/// Best-effort, owner-run, deadline-bounded deletion of ONE recovery ref. A
+/// missing ref (spawn-failure path, a reclamation race with another reaper) is
+/// not an error: update-ref's status is intentionally ignored.
+#[cfg(unix)]
+fn delete_recovery_ref(repo: &Path, recovery_ref: &str, deadline: std::time::Instant) {
+    if remaining(deadline).is_zero() {
+        return;
+    }
+    let _ = owned_git(
+        repo,
+        &["update-ref", "-d", recovery_ref],
+        RECOVERY_GIT_CAP,
+        deadline,
+    );
+}
+
+/// Reclaim abandoned recovery refs from CRASHED or cleanup-exhausted earlier
+/// recoveries. Runs through the R6 owner under the caller's remaining
+/// deadline; any read/delete failure is ignored (the next recovery retries).
+/// Refs younger than [`RECOVERY_REF_RECLAIM_HORIZON`], or whose name does not
+/// match the produced shape, are never touched — they may belong to a live
+/// probe.
+#[cfg(unix)]
+fn reclaim_abandoned_recovery_refs(repo: &Path, deadline: std::time::Instant) {
+    if remaining(deadline).is_zero() {
+        return;
+    }
+    let run = match owned_git(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/remuda/recovery/",
+        ],
+        RECOVERY_GIT_CAP,
+        deadline,
+    ) {
+        Ok(run) if !run.timed_out() => run.into_output(),
+        _ => return,
+    };
+    if !run.status.success() {
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    for refname in String::from_utf8_lossy(&run.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let Some(name) = refname.strip_prefix("refs/remuda/recovery/") else {
+            continue;
+        };
+        let Some(created_nanos) = recovery_ref_epoch_nanos(name) else {
+            continue;
+        };
+        if now.saturating_sub(created_nanos) < RECOVERY_REF_RECLAIM_HORIZON.as_nanos() {
+            continue;
+        }
+        delete_recovery_ref(repo, refname, deadline);
+    }
+}
+
 /// Fetch the requested remote base into a private recovery ref, capture the
 /// immutable commit SHA it points at, and delete the ref (best effort, under
 /// the same owner and absolute deadline). Every failure is an Unknown
@@ -4274,29 +4359,37 @@ fn recovery_fetch_base_sha(
 ) -> std::result::Result<String, String> {
     let recovery_ref = unique_recovery_ref();
     let fetch_refspec = format!("+refs/heads/{base_branch}:{recovery_ref}");
+    // Reclaim refs abandoned by crashed or deadline-exhausted earlier probes
+    // before doing anything else.
+    reclaim_abandoned_recovery_refs(repo, deadline);
     // R7/R6: the recovery fetch runs through the owner, capped per-command.
     if remaining(deadline).is_zero() {
         return Err("landing probe deadline exhausted before the recovery fetch".to_owned());
     }
-    match owned_git(
+    let fetch_outcome: std::result::Result<(), String> = match owned_git(
         repo,
         &["fetch", "-q", "origin", &fetch_refspec],
         RECOVERY_GIT_CAP,
         deadline,
     ) {
-        Ok(run) if run.timed_out() => {
-            return Err(format!(
-                "recovery fetch exceeded the {RECOVERY_GIT_CAP:?} probe bound and was killed; push \
-                 outcome unknown"
-            ));
-        }
-        Ok(run) if !run.status_success() => {
-            return Err(
-                "recovery fetch of the requested base branch failed; push outcome unknown".into(),
-            );
-        }
-        Err(error) => return Err(format!("recovery fetch of the requested base: {error}")),
-        Ok(_) => {}
+        Ok(run) if run.timed_out() => Err(format!(
+            "recovery fetch exceeded the {RECOVERY_GIT_CAP:?} probe bound and was killed; push \
+             outcome unknown"
+        )),
+        Ok(run) if !run.status_success() => Err(
+            "recovery fetch of the requested base branch failed; push outcome unknown".to_owned(),
+        ),
+        Err(error) => Err(format!("recovery fetch of the requested base: {error}")),
+        Ok(_) => Ok(()),
+    };
+    // r29 item 1: a fetch is NOT atomic — it can install our private ref and
+    // still fail (a rejected tag update aborts after the branch ref commits;
+    // the cap can kill fetch after its committed phase). On a FAILED fetch the
+    // ref is always deleted (owned, deadline-bounded) before the original
+    // error propagates; on success the ref stays until the SHA is captured.
+    if let Err(message) = fetch_outcome {
+        delete_recovery_ref(repo, &recovery_ref, deadline);
+        return Err(message);
     }
     // r28 item 1 TEST-ONLY seam: park with the private ref installed and
     // before the SHA is captured, so an overlap test can interleave two
@@ -4340,16 +4433,9 @@ fn recovery_fetch_base_sha(
     // Remove the private ref as soon as the SHA is captured (best effort, same
     // owner/deadline). The captured SHA names the commit object directly, so
     // the ref is not needed afterwards; a cleanup failure never turns a good
-    // snapshot into Unknown — later invocations use distinct flat names and
-    // nothing iterates this namespace for recovery decisions.
-    if remaining(deadline).as_nanos() > 0 {
-        let _ = owned_git(
-            repo,
-            &["update-ref", "-d", &recovery_ref],
-            RECOVERY_GIT_CAP,
-            deadline,
-        );
-    }
+    // snapshot into Unknown — the next recovery's reclamation removes it once
+    // it ages past the horizon.
+    delete_recovery_ref(repo, &recovery_ref, deadline);
     let sha = sha?;
     if !is_native_object_hex(&sha) {
         return Err(format!(
@@ -9720,6 +9806,138 @@ head -c 1 >/dev/null || exit 4
             .is_empty(),
             "the second recovery must leave no ref behind"
         );
+    }
+
+    /// r29 item 1: a fetch that INSTALLS the private recovery ref and then
+    /// fails must still leave an empty recovery namespace (the rejected tag
+    /// update aborts fetch with exit 1 after the requested branch ref commits).
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_fetch_that_installed_the_ref_leaves_no_recovery_ref() {
+        let (dir, _bare, lane, base_b) = recovery_branch_fixture("main", None);
+        let seed = dir.path().join("seed");
+        // Local lane tag pinned at B; AFTER the clone the remote tag moves
+        // sideways to an orphan (non-fast-forward) and remote main advances to
+        // M. tagOpt=--tags makes the recovery fetch carry refs/tags/* too.
+        git(&lane, &["tag", "v1", &base_b]);
+        let orphan = git(&seed, &["commit-tree", "HEAD^{tree}", "-m", "sideways tag"]);
+        git(
+            &seed,
+            &[
+                "push",
+                "-q",
+                "-f",
+                "origin",
+                &format!("{orphan}:refs/tags/v1"),
+            ],
+        );
+        std::fs::write(seed.join("m.txt"), "M\n").unwrap();
+        git(&seed, &["add", "m.txt"]);
+        git(&seed, &["commit", "-q", "-m", "M"]);
+        let merge_m = git(&seed, &["rev-parse", "main"]);
+        git(&seed, &["push", "-q", "origin", "main"]);
+        git(&lane, &["config", "remote.origin.tagOpt", "--tags"]);
+        // Sanity: the exact failure shape — fetch exits 1 but installs the ref.
+        let probe_ref = "refs/remuda/recovery/probe-failure";
+        let status = std::process::Command::new("git")
+            .current_dir(&lane)
+            .args([
+                "fetch",
+                "-q",
+                "origin",
+                &format!("+refs/heads/main:{probe_ref}"),
+            ])
+            .status()
+            .unwrap();
+        assert!(!status.success(), "the tag clobber must make fetch fail");
+        assert_eq!(
+            git(&lane, &["rev-parse", "--verify", "--quiet", probe_ref]),
+            merge_m,
+            "the failed fetch really did install the requested ref"
+        );
+        run_git(&lane, &["update-ref", "-d", probe_ref]).unwrap();
+
+        let request = remuda_protocol::GateResolveLandingParams {
+            job_id: "gjb_r29_tagclobber".into(),
+            repo_path: lane.to_string_lossy().into_owned(),
+            base_branch: "main".into(),
+            merge_sha: merge_m.clone(),
+        };
+        let reply = super::resolve_landing_after_restart(&request, true);
+        assert_eq!(
+            reply.status, "unknown",
+            "the failed fetch stays Unknown: {reply:?}"
+        );
+        assert!(
+            reply
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("recovery fetch"),
+            "{reply:?}"
+        );
+        let leftovers = git(
+            &lane,
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/remuda/recovery/",
+            ],
+        );
+        assert!(
+            leftovers.is_empty(),
+            "the failed fetch's private ref must be deleted: {leftovers}"
+        );
+    }
+
+    /// r29 item 1: abandoned recovery refs older than the reclamation horizon
+    /// are deleted by the next recovery; younger refs (which a live probe may
+    /// own) are never touched.
+    #[cfg(unix)]
+    #[test]
+    fn an_old_abandoned_recovery_ref_is_reclaimed_but_a_fresh_one_is_kept() {
+        let (dir, _bare, lane, base_b) = recovery_branch_fixture("main", None);
+        let seed = dir.path().join("seed");
+        std::fs::write(seed.join("m.txt"), "M\n").unwrap();
+        git(&seed, &["add", "m.txt"]);
+        git(&seed, &["commit", "-q", "-m", "M"]);
+        let merge_m = git(&seed, &["rev-parse", "main"]);
+        git(&seed, &["push", "-q", "origin", "main"]);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        // 1000 s older than the 250 s horizon; a clearly fresh one.
+        let old_nanos = now - 1_000 * 1_000_000_000;
+        let old_ref = format!("refs/remuda/recovery/1-{old_nanos}-0");
+        let fresh_ref = format!("refs/remuda/recovery/1-{now}-0");
+        git(&lane, &["update-ref", &old_ref, &base_b]);
+        git(&lane, &["update-ref", &fresh_ref, &base_b]);
+
+        let request = remuda_protocol::GateResolveLandingParams {
+            job_id: "job".into(),
+            repo_path: lane.to_string_lossy().into_owned(),
+            base_branch: "main".into(),
+            merge_sha: merge_m.clone(),
+        };
+        let reply = super::resolve_landing_after_restart(&request, true);
+        assert_eq!(reply.status, "landed", "{reply:?}");
+
+        let remaining = git(
+            &lane,
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/remuda/recovery/",
+            ],
+        );
+        assert_eq!(
+            remaining, fresh_ref,
+            "only the young ref must survive reclamation: {remaining:?}"
+        );
+        // Fixture teardown: remove the intentionally-retained fresh ref.
+        run_git(&lane, &["update-ref", "-d", &fresh_ref]).unwrap();
     }
 
     /// r28 item 2: a SHA-256 repository reports 64-hex object IDs; recovery

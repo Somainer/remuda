@@ -465,6 +465,15 @@ hello 在单 writer 前排成一串，尾延迟 ≈ N × 单 hello 串行时间�
   无限延续，也不允许把上一 episode 的截止带进新 episode（gate 9：那会让
   REST 已恢复的链路上线即离线、亚秒级重连风暴）。一次真实 frame 重新认证 live
   后该截止清零。
+* **无 follow 的 resume/probe 必须自证可达（c-unboundresume，2026-10）**：在会话列表/新会话页没有 follow socket，
+  没有任何 frame 可以认证 live——resume 动作只有在**一次有界 REST GET 确实应答之后**才允许解析成功并发布 live。
+  该 GET 复用既有的 `rest()` 读截止（半开转发拖死时按 10 s 读超时拒绝）并以 bootstrap 类操作走 S3
+  「一次一个认证操作」队列，绝不另开并行认证路径（排队中的登录先发完、探测再用新会话发请求）。网络错误/读超时
+  → resume 拒绝，经既有的失败 settle probe 判定后发布 offline 并交给 reconnect 退避时钟，绝不在吞掉错误的情况下
+  发布 live；无 follow 的 settle/quiet probe 同样必须发真实请求，不得无偿返回 true（旧实现因此在 Hub 不可达时
+  把列表页静置于 quiet stale、退避被解除）。当前 epoch 的 401 走与 bootstrap 401 相同的登出/退役路径。
+  bound follow 行为不变（socket+追帧成功才是 live）；列表页的数据水合由 2 s 轮询负责，resume 不再尾随第二次
+  refresh——可达性证明恰好是一次探测。
 
 ### 5.2.1 定时器归属表（c-reconnfu gate 10 item 0；gate 11 items 1/6/7、gate 12 item 8、gate 13 item 5、gate 14 item 4 校订）
 

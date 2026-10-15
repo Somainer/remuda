@@ -7653,6 +7653,31 @@ fn apply_instance_projection(
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
+        let prev_lifecycle: Option<String> = conn
+            .query_row(
+                "SELECT lifecycle FROM instances WHERE id = ?1",
+                [&instance_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        // c-dirpicker r8 (real-node unregister race): a non-terminal
+        // ready/starting event must NOT resurrect a row an OPERATOR (or the
+        // stale-create sweep) marked failed — that mark is authoritative
+        // terminal evidence until a genuine process-end/restart event
+        // (terminal entity, or daemon inventory revival) clears it. A live
+        // shell that keeps emitting ready heartbeats must not flip a
+        // deliberately-failed row back to running mid-test/operator action.
+        let non_terminal = !matches!(lifecycle, "exited" | "failed" | "closed");
+        let stored_attested_failed = prev_lifecycle.as_deref() == Some("failed");
+        if non_terminal && stored_attested_failed {
+            // Advance durable_seq/updated_at only; leave lifecycle failed.
+            conn.execute(
+                "UPDATE instances SET durable_seq = ?1, updated_at = ?2 WHERE id = ?3",
+                params![seq, now, instance_id],
+            )?;
+            return Ok(());
+        }
         conn.execute(
             "UPDATE instances SET durable_seq = ?1, lifecycle = ?2,
                     last_error = COALESCE(?3, last_error), updated_at = ?4

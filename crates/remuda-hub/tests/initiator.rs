@@ -4438,6 +4438,280 @@ async fn an_evidence_resolution_settles_landed_when_the_merge_is_already_on_remo
     assert!(reply["evidenceUncertain"].is_null(), "{reply}");
 }
 
+/// r25 item 2: an UNDECIDABLE remote-main probe must not permit an operator
+/// Failed/Requeue override of an evidence-uncertain Landing. A fetch error, a
+/// carrier offline, or an Unknown response each leave the Landing, its
+/// condition and its lane/land occupancy untouched and return a 409 conflict.
+/// Only an AUTHORITATIVE Absent probe (fresh fetch, merge absent, land group
+/// verified dead) releases the override; an established Landed fact still
+/// wins (covered separately).
+#[tokio::test]
+async fn an_undecidable_probe_keeps_the_uncertain_landing_and_blocks_failed_or_requeue() {
+    async fn park_uncertain_land(ctx: &Ctx, seed: &str) -> (String, String, String) {
+        let job_id = queued_land_job(ctx).await;
+        ctx.hub
+            .test_claim_gate_job(&job_id, "lane1", &ctx.host)
+            .await
+            .unwrap()
+            .expect("claimed");
+        let session = ctx
+            .hub
+            .test_node_session(&ctx.host)
+            .await
+            .expect("carrier live");
+        let merge = format!("{:e>40}", seed);
+        let grant = ctx
+            .hub
+            .test_gate_land_grant(&job_id, &ctx.host, &merge, session)
+            .await
+            .unwrap();
+        assert_eq!(grant["granted"], json!(true), "{grant}");
+        let epoch =
+            ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap()["landingSessionEpoch"]
+                .as_str()
+                .expect("grant epoch")
+                .to_owned();
+        let landed_result = json!({
+            "jobId": job_id,
+            "generation": 1,
+            "status": "landed",
+            "mergeSha": merge,
+            "runLog": {
+                "step": "*", "kind": "kept", "headline": "landed; log retained by --keep-logs",
+                "summary": [], "tail": ["Finished land successfully"],
+                "capturedLines": 1, "truncated": false, "attempts": 1,
+            },
+        });
+        ctx.store().test_arm_gate_log_insert_fault_sticky();
+        ctx.hub
+            .test_apply_gate_result(&job_id, landed_result.clone())
+            .await
+            .unwrap();
+        ctx.hub
+            .test_apply_gate_result(&job_id, landed_result)
+            .await
+            .unwrap();
+        ctx.store().test_clear_gate_log_insert_fault();
+        let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+        assert_eq!(doc["state"], json!("landing"), "{doc}");
+        assert!(doc["evidenceUncertain"].is_object(), "{doc}");
+        (job_id, epoch, merge)
+    }
+
+    let (ctx, node) = Ctx::boot().await.unwrap();
+    ctx.configure_gate_lane().await;
+    let (job_id, epoch, merge) = park_uncertain_land(&ctx, "a").await;
+    let resolve_path = format!(
+        "/v1/projects/{}/gate/jobs/{job_id}/resolve-evidence",
+        ctx.project
+    );
+    let assert_still_parked = |reply: &Value| {
+        assert!(
+            !reply["state"]
+                .as_str()
+                .is_some_and(|s| s == "failed" || s == "queued"),
+            "an undecidable probe must not settle the Landing: {reply}"
+        );
+    };
+
+    // 1) Fetch error: the Node reports the recovery fetch failed (Unknown).
+    node.set_resolve_reply(json!({
+        "jobId": job_id,
+        "status": "unknown",
+        "error": "fetch origin failed",
+    }))
+    .await;
+    let (status, reply) = ctx
+        .send(
+            "POST",
+            &resolve_path,
+            &ctx.human,
+            None,
+            Some(json!({
+                "resolution": "failed",
+                "expectedAttempts": 1,
+                "expectedSessionEpoch": epoch,
+                "expectedMergeSha": merge,
+                "rationale": "operator guessed failure while the fetch was failing",
+            })),
+        )
+        .await;
+    assert_eq!(
+        status, 409,
+        "a fetch error is undecidable: the override must conflict: {reply}"
+    );
+    assert_still_parked(&reply);
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(
+        doc["state"],
+        json!("landing"),
+        "Landing kept after fetch error: {doc}"
+    );
+    assert_eq!(doc["hostId"], json!(ctx.host), "occupancy kept: {doc}");
+    assert_eq!(doc["laneId"], json!("lane1"), "lane kept: {doc}");
+    assert!(
+        doc["evidenceUncertain"].is_object(),
+        "condition kept: {doc}"
+    );
+
+    // 2) Plain Unknown response (shallow history / group death unattested /
+    // malformed probe) — requeue is blocked just the same.
+    node.set_resolve_reply(json!({ "jobId": job_id, "status": "unknown" }))
+        .await;
+    let (status, reply) = ctx
+        .send(
+            "POST",
+            &resolve_path,
+            &ctx.human,
+            None,
+            Some(json!({
+                "resolution": "requeue",
+                "expectedAttempts": 1,
+                "expectedSessionEpoch": epoch,
+                "expectedMergeSha": merge,
+                "rationale": "operator wanted a rerun without an authoritative answer",
+            })),
+        )
+        .await;
+    assert_eq!(
+        status, 409,
+        "an Unknown probe response must not permit a requeue: {reply}"
+    );
+    assert_still_parked(&reply);
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(doc["state"], json!("landing"), "{doc}");
+    assert!(doc["evidenceUncertain"].is_object(), "{doc}");
+
+    // 3) Carrier offline: no probe authority at all.
+    node.disconnect();
+    let (status, reply) = ctx
+        .send(
+            "POST",
+            &resolve_path,
+            &ctx.human,
+            None,
+            Some(json!({
+                "resolution": "failed",
+                "expectedAttempts": 1,
+                "expectedSessionEpoch": epoch,
+                "expectedMergeSha": merge,
+                "rationale": "operator tried while the lane host was gone",
+            })),
+        )
+        .await;
+    assert_eq!(
+        status, 409,
+        "missing probe authority must conflict, not settle: {reply}"
+    );
+    assert_still_parked(&reply);
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(
+        doc["state"],
+        json!("landing"),
+        "Landing kept while offline: {doc}"
+    );
+    assert_eq!(doc["hostId"], json!(ctx.host), "{doc}");
+    assert_eq!(doc["laneId"], json!("lane1"), "{doc}");
+    assert!(doc["evidenceUncertain"].is_object(), "{doc}");
+
+    // The carrier returns. The post-hello forced reconcile runs first with no
+    // scripted answer (the fake's default Unknown): let it finish and confirm
+    // it leaves the row parked while arming the per-row probe cooldown.
+    let node_b = FakeNode::reconnect(&ctx.hub, &ctx.creds, &ctx.workspace)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(
+        doc["state"],
+        json!("landing"),
+        "Unknown hello pass keeps it: {doc}"
+    );
+    assert!(doc["evidenceUncertain"].is_object(), "{doc}");
+
+    // The operator probe now AUTHORITATIVELY establishes absence (fresh fetch,
+    // merge not on the remote, land group verified dead): the requeue is
+    // permitted and clears the condition.
+    node_b
+        .set_resolve_reply(json!({
+            "jobId": job_id,
+            "status": "absent",
+            "baseSha": null,
+            "error": "merge absent and land group verified gone",
+        }))
+        .await;
+    let (status, reply) = ctx
+        .send(
+            "POST",
+            &resolve_path,
+            &ctx.human,
+            None,
+            Some(json!({
+                "resolution": "requeue",
+                "expectedAttempts": 1,
+                "expectedSessionEpoch": epoch,
+                "expectedMergeSha": merge,
+                "rationale": "absence established; rerun it",
+            })),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "authoritative absence permits the requeue: {reply}"
+    );
+    assert_eq!(reply["state"], json!("queued"), "{reply}");
+    assert!(
+        reply["evidenceUncertain"].is_null(),
+        "condition cleared: {reply}"
+    );
+    assert!(reply["hostId"].is_null(), "occupancy released: {reply}");
+    assert!(reply["laneId"].is_null(), "{reply}");
+
+    // Authoritative Absent permits Failed too, on a second parked Landing. Let
+    // one forced pass consume the fake's default Unknown (arming the probe
+    // cooldown so only the endpoint reads the scripted Absent below).
+    let (job2, epoch2, merge2) = park_uncertain_land(&ctx, "b").await;
+    ctx.hub.test_force_landing_reconcile(&ctx.host).await;
+    let doc = ctx.hub.test_get_gate_job(&job2).await.unwrap().unwrap();
+    assert_eq!(
+        doc["state"],
+        json!("landing"),
+        "Unknown keeps the second row: {doc}"
+    );
+    assert!(doc["evidenceUncertain"].is_object(), "{doc}");
+    node_b
+        .set_resolve_reply(json!({
+            "jobId": job2,
+            "status": "absent",
+            "baseSha": null,
+        }))
+        .await;
+    let (status, reply) = ctx
+        .send(
+            "POST",
+            &format!(
+                "/v1/projects/{}/gate/jobs/{job2}/resolve-evidence",
+                ctx.project
+            ),
+            &ctx.human,
+            None,
+            Some(json!({
+                "resolution": "failed",
+                "expectedAttempts": 1,
+                "expectedSessionEpoch": epoch2,
+                "expectedMergeSha": merge2,
+                "rationale": "absence established; settle it failed",
+            })),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "authoritative absence permits the failed override: {reply}"
+    );
+    assert_eq!(reply["state"], json!("failed"), "{reply}");
+    assert!(reply["evidenceUncertain"].is_null(), "{reply}");
+}
+
 /// r24 item 1 audit: the periodic Landing reconciler is an authorized settler
 /// too. An evidence-uncertain Landing whose read-only probe ESTABLISHES the
 /// merge absent with the land process group verified dead is requeued (or

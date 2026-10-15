@@ -1006,7 +1006,13 @@ async fn resolve_project_job(
                 landed.state.as_str()
             )));
         }
-        LandedProbeSettlement::NotEstablished => {}
+        // r25 item 2: this is the outcome-UNKNOWN Landing route (its bounded
+        // recovery window has elapsed), not the evidence-uncertain route: the
+        // r15 operator ruling lets the explicit decision stand whether the
+        // probe established absence or merely could not decide. The
+        // fail-closed Absent-vs-Unknown distinction applies only to
+        // /resolve-evidence.
+        LandedProbeSettlement::Absent | LandedProbeSettlement::Unknown => {}
     }
     let operator = device.id.clone();
     let rationale = rationale.to_owned();
@@ -1320,7 +1326,24 @@ async fn resolve_evidence_project_job(
                     landed.state.as_str()
                 )));
             }
-            LandedProbeSettlement::NotEstablished => {}
+            // r25 item 2 — EVIDENCE-UNCERTAIN RULE: an operator override is
+            // allowed ONLY after the read-only probe AUTHORITATIVELY
+            // establishes absence. Unknown or missing probe authority (fetch
+            // or RPC error, carrier offline, shallow history, an unattested
+            // group death, an Unknown answer) fails closed: the Landing keeps
+            // its condition and occupancy and the operator gets a conflict;
+            // nothing is aborted, failed or requeued.
+            LandedProbeSettlement::Unknown => {
+                return Err(HubError::Conflict(
+                    "the read-only remote-main probe could not establish whether the exact granted \
+                     merge landed (carrier unavailable, fetch/RPC failure, shallow history or an \
+                     unknown answer); the Landing, its uncertain condition and its lane/land \
+                     occupancy are retained — retry once the lane is reachable, or resolve only \
+                     after absence is established authoritatively"
+                        .to_string(),
+                ));
+            }
+            LandedProbeSettlement::Absent => {}
         }
     }
     // r24 item 2: validate a FRESH row BEFORE any abort side effect. A delayed
@@ -4023,9 +4046,18 @@ fn probe_expected_session(
 
 /// Outcome of the final operator-route read-only remote-main probe.
 enum LandedProbeSettlement {
-    /// No carrier/host, no live session, or the probe did not establish the
-    /// exact merge on remote main: the operator's decision may proceed.
-    NotEstablished,
+    /// The probe AUTHORITATIVELY established absence: a fresh fetch proved
+    /// the exact merge is not on remote main AND the lane attested the land
+    /// process group verified dead. The operator's failed/requeue decision
+    /// may proceed.
+    Absent,
+    /// The outcome was UNDECIDABLE — no carrier/host/live session, a fetch or
+    /// RPC error, shallow history, an unattested land-group death, or an
+    /// Unknown response. Nothing may be failed or re-run on this; the
+    /// `/resolve-evidence` route fails closed with a conflict, while the
+    /// older `/resolve` route (its own unknown-Landing ruling) still lets the
+    /// explicit operator decision stand.
+    Unknown,
     /// The probe established landed AND the snapshot-settling writer committed
     /// Landed (also clearing any parked evidence-uncertain condition).
     Settled(GateJob),
@@ -4039,15 +4071,19 @@ enum LandedProbeSettlement {
 /// ESTABLISHED landed fact always beats the operator's failed/requeue. The
 /// guard pins the live carrier session across probe + commit exactly like the
 /// periodic reconciler (r15 item 3), so a concurrent takeover cannot make the
-/// probe land on a different session. A carrier-less host (or a home-pushed
-/// job whose group liveness is unattestable) yields [`LandedProbeSettlement::
-/// NotEstablished`].
+/// probe land on a different session.
+///
+/// r25 item 2: absence and undecidability are distinct outcomes. A carrier-less
+/// host (or a home-pushed job whose group liveness is unattestable), a failed
+/// fetch/RPC and an explicit Unknown answer all return
+/// [`LandedProbeSettlement::Unknown`]; only a fresh probe that proves the merge
+/// absent AND the land group dead returns [`LandedProbeSettlement::Absent`].
 async fn probe_settle_landed_under_guard(
     state: &AppState,
     job: &GateJob,
 ) -> Result<LandedProbeSettlement, HubError> {
     let Some(lane_host) = landing_lane_host(state, job).await else {
-        return Ok(LandedProbeSettlement::NotEstablished);
+        return Ok(LandedProbeSettlement::Unknown);
     };
     let guard = state
         .nodes
@@ -4057,15 +4093,14 @@ async fn probe_settle_landed_under_guard(
         .await;
     let Some(responder_session) = state.nodes.generation_of(lane_host.as_id().as_str()).await
     else {
-        return Ok(LandedProbeSettlement::NotEstablished);
+        return Ok(LandedProbeSettlement::Unknown);
     };
     // Only authoritative for a lane-pushed job (the probe's dead-group
     // attestation is the lane's own). The Landed fact is valid either way.
-    if !matches!(
-        probe_landing_outcome(state, job).await,
-        LandingProbe::Landed
-    ) {
-        return Ok(LandedProbeSettlement::NotEstablished);
+    match probe_landing_outcome(state, job).await {
+        LandingProbe::Landed => {}
+        LandingProbe::Absent => return Ok(LandedProbeSettlement::Absent),
+        LandingProbe::Unknown => return Ok(LandedProbeSettlement::Unknown),
     }
     let job_id = job.id.as_id().to_string();
     let grant_session = state

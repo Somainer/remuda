@@ -4986,6 +4986,13 @@
           "minimum": 0,
           "type": "integer"
         },
+        "epoch": {
+          "description": "r24 item 2: the Running → Landing grant epoch the job carried when the\nverdict deferred (`landingSessionEpoch`); `None` for a pre-grant\nverify. With [`Self::merge_sha`] this binds the condition to the FULL\n(attempt, epoch, merge) tuple, so a resolution aimed at an attempt the\nrow has advanced past is refused even when its ordinal still matches.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "firstAt": {
           "$ref": "#/$defs/Timestamp",
           "description": "When the first delivery deferred (RFC3339)."
@@ -4995,6 +5002,13 @@
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
+        },
+        "mergeSha": {
+          "description": "r24 item 2: the exact granted/verified merge sha the deferred verdict\nnamed (`mergeSha` at deferral); `None` for a pre-grant verify.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "reason": {
           "description": "Human-readable reason persisted for the operator.",

@@ -1168,8 +1168,8 @@ async fn resolve_project_job(
     Ok(Json(json!(outcome)))
 }
 
-/// r23 R9 clarification — body of the OPERATOR evidence-uncertain resolution
-/// request.
+/// r23 R9 clarification / r24 item 2 — body of the OPERATOR
+/// evidence-uncertain resolution request.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ResolveEvidenceRequest {
@@ -1178,10 +1178,84 @@ struct ResolveEvidenceRequest {
     /// `requeue` — release the occupancy and re-enter the queue for a fresh
     /// run.
     resolution: String,
-    /// The attempt generation the operator saw parked as uncertain.
-    expected_generation: u32,
+    /// The attempt ordinal (`row.attempts`) the operator saw parked as
+    /// uncertain. The LIVE row — not the condition's embedded generation — is
+    /// the authority.
+    expected_attempts: u32,
+    /// The Running → Landing grant epoch the parked tuple carries
+    /// (`landingSessionEpoch`). Required/non-empty for a Landing resolution;
+    /// omitted/null for a pre-grant verify row.
+    #[serde(default)]
+    expected_session_epoch: Option<String>,
+    /// The exact merge sha the parked verdict named. Required/non-empty for a
+    /// Landing resolution; omitted/null for a pre-grant verify row.
+    #[serde(default)]
+    expected_merge_sha: Option<String>,
     /// Mandatory human rationale; persisted on the row and journaled.
     rationale: String,
+}
+
+/// The pre-settlement states a parked evidence-uncertain condition accepts a
+/// resolution from. `Queued` is included because r24 item 1 lets carrier
+/// recovery requeue a Running row while PRESERVING its condition.
+fn evidence_resolvable_state(state: GateJobState) -> bool {
+    matches!(
+        state,
+        GateJobState::Queued
+            | GateJobState::Running
+            | GateJobState::Canceling
+            | GateJobState::Landing
+    )
+}
+
+/// Why an operator evidence resolution cannot act on a freshly-read row.
+///
+/// r24 item 2 — EVIDENCE-UNCERTAIN RULE: the condition is bound to the CURRENT
+/// attempt's full (attempt, epoch, merge) tuple. The LIVE row is the authority
+/// — never the condition's embedded generation — and the request's tuple must
+/// equal BOTH the live row and the condition's binding:
+///
+/// 1. the condition must still be bound to the current attempt (after a
+///    requeue/re-claim/re-grant `condition.generation` lags `row.attempts` and
+///    its epoch/merge name the old grant);
+/// 2. the request must pin that same tuple.
+///
+/// Returns `None` when every predicate holds.
+fn evidence_resolution_mismatch(
+    row: &GateJob,
+    expected_attempts: u32,
+    expected_epoch: Option<&str>,
+    expected_merge: Option<&str>,
+) -> Option<&'static str> {
+    if !evidence_resolvable_state(row.state) || row.evidence_uncertain.is_none() {
+        return Some(
+            "only a job parked with an unpersisted-evidence uncertain condition accepts an \
+             evidence resolution",
+        );
+    }
+    let condition = row
+        .evidence_uncertain
+        .as_ref()
+        .expect("presence just checked");
+    if condition.generation != row.attempts
+        || condition.epoch.as_deref() != row.landing_session_epoch.as_deref()
+        || condition.merge_sha.as_deref() != row.merge_sha.as_deref()
+    {
+        return Some(
+            "the live attempt has advanced past the parked uncertain condition; refresh and \
+             resolve the current attempt",
+        );
+    }
+    if row.attempts != expected_attempts
+        || row.landing_session_epoch.as_deref() != expected_epoch
+        || row.merge_sha.as_deref() != expected_merge
+    {
+        return Some(
+            "the live uncertain condition is no longer the (attempt, epoch, merge) tuple this \
+             resolution named; refresh and resolve the current attempt",
+        );
+    }
+    None
 }
 
 /// `POST /v1/projects/{id}/gate/jobs/{jobId}/resolve-evidence`
@@ -1194,7 +1268,8 @@ struct ResolveEvidenceRequest {
 /// holding its lane/land occupancy until an operator resolves it here or an
 /// identical redelivery ever arrives (which settles idempotently and clears
 /// the condition on its own). Agent callers are refused; the request must pin
-/// the exact parked generation and carry a persisted rationale.
+/// the exact parked (attempt, epoch, merge) tuple and carry a persisted
+/// rationale.
 async fn resolve_evidence_project_job(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1223,60 +1298,89 @@ async fn resolve_evidence_project_job(
             "an operator evidence-uncertain resolution requires a non-empty rationale".to_string(),
         ));
     }
-    let expected_generation = request.expected_generation;
-    let job = state
-        .store
-        .get_gate_job(&job_id)
-        .await
-        .map_err(map_store)?
-        .ok_or(HubError::NotFound)?;
+    let expected_attempts = request.expected_attempts;
+    let expected_epoch = request
+        .expected_session_epoch
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let expected_merge = request
+        .expected_merge_sha
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+
+    let read_job = || {
+        let state = &state;
+        let job_id = &job_id;
+        async move {
+            state
+                .store
+                .get_gate_job(job_id)
+                .await
+                .map_err(map_store)?
+                .ok_or(HubError::NotFound)
+        }
+    };
+    let job = read_job().await?;
     if job.project_id.as_id().as_str() != project {
         return Err(HubError::NotFound);
     }
-    let condition = match &job.evidence_uncertain {
-        Some(condition)
-            if matches!(
-                job.state,
-                GateJobState::Running | GateJobState::Canceling | GateJobState::Landing
-            ) =>
-        {
-            condition.clone()
-        }
-        _ => {
-            return Err(HubError::Conflict(
-                "only a job parked with an unpersisted-evidence uncertain condition accepts an \
-                 evidence resolution"
-                    .to_string(),
-            ));
-        }
-    };
-    if condition.generation != expected_generation {
-        return Err(HubError::Conflict(
-            "the live uncertain condition names a different attempt generation than this \
-             resolution; refresh and resolve the current attempt"
+    if job.state == GateJobState::Landing && (expected_epoch.is_none() || expected_merge.is_none())
+    {
+        return Err(HubError::BadRequest(
+            "an operator evidence resolution for a Landing must name the expected attempt, grant \
+             epoch and merge"
                 .to_string(),
         ));
     }
-    let was_landing = job.state == GateJobState::Landing;
+    if let Some(message) = evidence_resolution_mismatch(
+        &job,
+        expected_attempts,
+        expected_epoch.as_deref(),
+        expected_merge.as_deref(),
+    ) {
+        return Err(HubError::Conflict(message.to_string()));
+    }
+    // r24 item 2: validate a FRESH row BEFORE any abort side effect. A delayed
+    // frame for attempt N must not abort the granted run of an attempt N+1 the
+    // scheduler claimed/re-granted between the pre-read and here.
+    let current = read_job().await?;
+    if current.project_id.as_id().as_str() != project {
+        return Err(HubError::NotFound);
+    }
+    if let Some(message) = evidence_resolution_mismatch(
+        &current,
+        expected_attempts,
+        expected_epoch.as_deref(),
+        expected_merge.as_deref(),
+    ) {
+        return Err(HubError::Conflict(message.to_string()));
+    }
+    let was_landing = current.state == GateJobState::Landing;
     // A Landing's granted land run has normally already settled its group by
     // the time a verdict is delivered, but terminate/tombstone the generation
     // exactly like the Landing operator resolve so an operator-failed Landing
-    // cannot push after the fact.
+    // cannot push after the fact. The abort carries the VALIDATED current row;
+    // the writer below re-asserts the tuple and refuses if it moved.
     if was_landing {
-        abort_landing_run(&state, &job).await;
+        abort_landing_run(&state, &current).await;
     }
     let operator = device.id.clone();
     let rationale = rationale.to_owned();
     let outcome = state
         .store
         .mutate_gate_job(&job_id, move |row, _conn| {
-            let Some(condition) = &row.evidence_uncertain else {
-                return None;
-            };
-            if !matches!(
-                row.state,
-                GateJobState::Running | GateJobState::Canceling | GateJobState::Landing
-            ) || condition.generation != expected_generation
+            // r24 item 2: repeat EVERY predicate INSIDE the writer against the
+            // live doc — state/condition presence, the condition's binding to
+            // the current attempt, and the request tuple. A row advanced to a
+            // newer attempt between the fresh read and this transaction makes
+            // the closure return None and sends no failure/requeue.
+            if evidence_resolution_mismatch(
+                row,
+                expected_attempts,
+                expected_epoch.as_deref(),
+                expected_merge.as_deref(),
+            )
+            .is_some()
             {
                 return None;
             }
@@ -1317,18 +1421,13 @@ async fn resolve_evidence_project_job(
         .await
         .map_err(map_store)?;
     let Some(outcome) = outcome else {
-        let current = state
-            .store
-            .get_gate_job(&job_id)
-            .await
-            .map_err(map_store)?
-            .ok_or(HubError::NotFound)?;
+        let current = read_job().await?;
         if current.evidence_uncertain.is_none() {
             return Err(HubError::NotFound);
         }
         return Err(HubError::Conflict(
-            "the live uncertain condition is no longer the attempt this resolution named; refresh \
-             and resolve the current attempt"
+            "the live uncertain condition is no longer the (attempt, epoch, merge) tuple this \
+             resolution named; refresh and resolve the current attempt"
                 .to_string(),
         ));
     };
@@ -2352,9 +2451,19 @@ pub(crate) async fn apply_result(
                     condition.updated_at = now;
                     condition.deliveries_deferred
                 } else {
+                    // r24 item 2 — EVIDENCE-UNCERTAIN RULE: the condition is
+                    // bound to the CURRENT attempt's full (attempt, epoch, merge)
+                    // tuple as the LIVE row carries it at deferral; it is never
+                    // re-derived from the embedded values alone. An operator
+                    // resolution must re-validate the tuple against a fresh row,
+                    // so a delayed resolution for an attempt the row has since
+                    // left (requeue → re-claim → re-grant) is refused and cannot
+                    // abort or settle the newer attempt.
                     row.evidence_uncertain =
                         Some(remuda_protocol::GateEvidenceUncertain {
                             generation: result.generation,
+                            epoch: row.landing_session_epoch.clone(),
+                            merge_sha: row.merge_sha.clone(),
                             status: result.status.clone(),
                             supplied_digest,
                             deliveries_deferred: 1,

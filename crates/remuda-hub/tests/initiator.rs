@@ -3360,7 +3360,7 @@ async fn failed_verdict_without_persisted_evidence_becomes_persistently_uncertai
             None,
             Some(json!({
                 "resolution": "failed",
-                "expectedGeneration": 1,
+                "expectedAttempts": 1,
                 "rationale": "agent cannot resolve",
             })),
         )
@@ -3375,7 +3375,7 @@ async fn failed_verdict_without_persisted_evidence_becomes_persistently_uncertai
             &resolve_path,
             &ctx.human,
             None,
-            Some(json!({"resolution": "failed", "expectedGeneration": 1, "rationale": "  "})),
+            Some(json!({"resolution": "failed", "expectedAttempts": 1, "rationale": "  "})),
         )
         .await;
     assert_eq!(status, 400, "{reply}");
@@ -3387,7 +3387,7 @@ async fn failed_verdict_without_persisted_evidence_becomes_persistently_uncertai
             None,
             Some(json!({
                 "resolution": "failed",
-                "expectedGeneration": 9,
+                "expectedAttempts": 9,
                 "rationale": "wrong generation",
             })),
         )
@@ -3410,7 +3410,7 @@ async fn failed_verdict_without_persisted_evidence_becomes_persistently_uncertai
             None,
             Some(json!({
                 "resolution": "failed",
-                "expectedGeneration": 1,
+                "expectedAttempts": 1,
                 "rationale": "operator verified the cargo failure out of band; no redelivery possible",
             })),
         )
@@ -3880,7 +3880,7 @@ async fn operator_requeue_releases_a_persistently_uncertain_jobs_occupancy() {
             None,
             Some(json!({
                 "resolution": "requeue",
-                "expectedGeneration": 1,
+                "expectedAttempts": 1,
                 "rationale": "run it again; storage is healthy now",
             })),
         )
@@ -3903,6 +3903,254 @@ async fn operator_requeue_releases_a_persistently_uncertain_jobs_occupancy() {
             .unwrap_or("")
             .contains("run it again"),
         "the rationale is persisted: {reply}"
+    );
+}
+
+/// r24 item 2: an evidence-uncertain condition is bound to the CURRENT
+/// attempt's full (attempt, epoch, merge) tuple. Attempt N parks the condition,
+/// carrier recovery requeues it, the scheduler re-claims attempt N+1 and grants
+/// it a FRESH Landing (epoch/merge). A delayed operator resolution still
+/// naming attempt N must be refused with 409 and must NOT abort or settle the
+/// newer attempt; only a resolution pinning the live tuple acts.
+#[tokio::test]
+async fn a_stale_evidence_resolution_for_attempt_n_does_not_touch_attempt_n_plus_one() {
+    let (ctx, node) = Ctx::boot().await.unwrap();
+    ctx.configure_gate_lane().await;
+    let barrier = ctx.store().gate_apply_barrier();
+
+    let job_seed = "wt/gate/evidence-stale-tuple";
+    let hook = node
+        .arm_gate_run(failed_gate_result("placeholder", job_seed))
+        .await;
+    let (status, enqueued) = ctx
+        .agent_post(
+            &format!("/v1/projects/{}/gate", ctx.project),
+            json!({"branch":job_seed,"mode":"land"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{enqueued}");
+    let job_id = enqueued["id"].as_str().unwrap().to_owned();
+    hook.set_result(failed_gate_result(&job_id, job_seed));
+    hook.wait_arrived().await;
+
+    // Both deliveries of attempt N's definitive verdict defer: attempt N
+    // parks evidence-uncertain (tuple (1, null, null)).
+    barrier.arm();
+    node.send_raw(json!({
+        "jsonrpc": "2.0",
+        "method": "gate.event",
+        "params": {
+            "jobId": job_id,
+            "generation": 1,
+            "kind": "finished",
+            "result": failed_gate_result(&job_id, job_seed),
+        }
+    }));
+    hook.release_and_wait_proceeded().await;
+    barrier.wait_parked(2).await;
+    ctx.store().test_arm_gate_log_insert_faults(2);
+    barrier.release();
+    barrier.wait_completed(2).await;
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(doc["state"], json!("running"), "{doc}");
+    assert_eq!(doc["attempts"], json!(1), "{doc}");
+
+    // Carrier recovery requeues while PRESERVING the condition (r24 item 1).
+    node.disconnect();
+    let requeued = async {
+        loop {
+            let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+            if doc["state"] == json!("queued") {
+                break doc;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+    .await;
+    assert_eq!(
+        requeued["evidenceUncertain"]["generation"],
+        json!(1),
+        "{requeued}"
+    );
+
+    // The carrier returns; the scheduler really re-claims and dispatches
+    // attempt N+1. Park its gate.run so it cannot finish on its own.
+    let mut node_b = FakeNode::reconnect(&ctx.hub, &ctx.creds, &ctx.workspace)
+        .await
+        .unwrap();
+    let hook2 = node_b
+        .arm_gate_run(json!({ "jobId": "placeholder", "status": "failed" }))
+        .await;
+    hook2.wait_arrived().await;
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(doc["state"], json!("running"), "{doc}");
+    assert_eq!(doc["attempts"], json!(2), "attempt N+1 claimed: {doc}");
+    assert!(
+        doc["evidenceUncertain"].is_object(),
+        "the condition for attempt N is still attached: {doc}"
+    );
+
+    // Attempt N+1 is granted Landing with a fresh epoch and merge.
+    let session_b = ctx.hub.test_node_session(&ctx.host).await.expect("B live");
+    let merge2 = "dddddddddddddddddddddddddddddddddddddddd";
+    let grant = ctx
+        .hub
+        .test_gate_land_grant(&job_id, &ctx.host, merge2, session_b)
+        .await
+        .unwrap();
+    assert_eq!(grant["granted"], json!(true), "{grant}");
+    let granted_doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    let epoch2 = granted_doc["landingSessionEpoch"]
+        .as_str()
+        .expect("fresh grant epoch")
+        .to_owned();
+    let doc = granted_doc;
+    assert_eq!(doc["state"], json!("landing"), "{doc}");
+    assert_eq!(doc["attempts"], json!(2), "{doc}");
+    assert_eq!(doc["mergeSha"], json!(merge2), "{doc}");
+
+    // The delayed resolution still names attempt N (1) without an epoch/merge
+    // (N never reached Landing): refused with no abort — a Landing resolution
+    // must name the full tuple, so it cannot even reach the abort.
+    let resolve_path = format!(
+        "/v1/projects/{}/gate/jobs/{job_id}/resolve-evidence",
+        ctx.project
+    );
+    let (status, reply) = ctx
+        .send(
+            "POST",
+            &resolve_path,
+            &ctx.human,
+            None,
+            Some(json!({
+                "resolution": "failed",
+                "expectedAttempts": 1,
+                "rationale": "delayed resolution for the lost attempt",
+            })),
+        )
+        .await;
+    assert_eq!(
+        status, 400,
+        "a stale attempt-N Landing resolution lacking the tuple is refused: {reply}"
+    );
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(
+        doc["state"],
+        json!("landing"),
+        "N+1 Landing untouched: {doc}"
+    );
+    assert_eq!(doc["attempts"], json!(2), "{doc}");
+    assert_eq!(doc["mergeSha"], json!(merge2), "{doc}");
+    assert!(
+        doc["evidenceUncertain"].is_object(),
+        "condition kept: {doc}"
+    );
+
+    // No abort frame for N+1 was sent (drain whatever the reconnect produced).
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(600);
+    while tokio::time::Instant::now() < drain_deadline {
+        if let Ok((method, _)) =
+            tokio::time::timeout(Duration::from_millis(200), node_b.next_frame()).await
+        {
+            assert_ne!(
+                method, "gate.abortLanding",
+                "the stale resolution must not abort the attempt-N+1 land run"
+            );
+        }
+    }
+
+    // A Landing resolution missing the tuple is a 400; a tuple naming N with
+    // the epoch/merge N never had is a stale-tuple 409.
+    let (status, _reply) = ctx
+        .send(
+            "POST",
+            &resolve_path,
+            &ctx.human,
+            None,
+            Some(json!({
+                "resolution": "failed",
+                "expectedAttempts": 2,
+                "rationale": "landing without tuple",
+            })),
+        )
+        .await;
+    assert_eq!(status, 400, "a Landing resolution must pin epoch and merge");
+    let (status, _reply) = ctx
+        .send(
+            "POST",
+            &resolve_path,
+            &ctx.human,
+            None,
+            Some(json!({
+                "resolution": "failed",
+                "expectedAttempts": 1,
+                "expectedSessionEpoch": epoch2,
+                "expectedMergeSha": merge2,
+                "rationale": "mismatched tuple",
+            })),
+        )
+        .await;
+    assert_eq!(
+        status, 409,
+        "naming N with the N+1 epoch/merge still mismatches the live row"
+    );
+
+    // Even the FULL live tuple is refused while the condition is still bound
+    // to attempt N: the condition's embedded generation is never accepted as a
+    // substitute for the live row. The stale condition clears only with N+1's
+    // OWN settlement (an authorized settlement for the current attempt), never
+    // by an operator acting on N. No abort was ever sent.
+    let (status, _reply) = ctx
+        .send(
+            "POST",
+            &resolve_path,
+            &ctx.human,
+            None,
+            Some(json!({
+                "resolution": "failed",
+                "expectedAttempts": 2,
+                "expectedSessionEpoch": epoch2,
+                "expectedMergeSha": merge2,
+                "rationale": "current attempt, stale condition",
+            })),
+        )
+        .await;
+    assert_eq!(
+        status, 409,
+        "a condition bound to N cannot resolve attempt N+1"
+    );
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(doc["state"], json!("landing"), "{doc}");
+    assert_eq!(doc["attempts"], json!(2), "{doc}");
+    assert_eq!(doc["mergeSha"], json!(merge2), "{doc}");
+    assert_eq!(doc["evidenceUncertain"]["generation"], json!(1), "{doc}");
+
+    // N+1's OWN definitive (non-landed) settlement clears the stale condition
+    // as an authorized settlement of the current attempt — no abort frame
+    // either, since this is the live verdict writer, not the operator route.
+    ctx.hub
+        .test_apply_gate_result(
+            &job_id,
+            json!({
+                "jobId": job_id,
+                "generation": 2,
+                "status": "base-moved",
+                "mergeSha": merge2,
+                "currentMainSha": "0123456789abcdef0123456789abcdef01234567",
+            }),
+        )
+        .await
+        .unwrap();
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(
+        doc["state"],
+        json!("queued"),
+        "N+1 base-moved requeues: {doc}"
+    );
+    assert_eq!(doc["attempts"], json!(2), "{doc}");
+    assert!(
+        doc["evidenceUncertain"].is_null(),
+        "the current attempt's settlement clears the stale condition: {doc}"
     );
 }
 

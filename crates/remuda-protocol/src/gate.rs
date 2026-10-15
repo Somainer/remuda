@@ -319,6 +319,17 @@ pub struct GateEvidenceUncertain {
     /// Attempt generation of the deferred verdict (the live row's `attempts`
     /// while the condition holds).
     pub generation: u32,
+    /// r24 item 2: the Running → Landing grant epoch the job carried when the
+    /// verdict deferred (`landingSessionEpoch`); `None` for a pre-grant
+    /// verify. With [`Self::merge_sha`] this binds the condition to the FULL
+    /// (attempt, epoch, merge) tuple, so a resolution aimed at an attempt the
+    /// row has advanced past is refused even when its ordinal still matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<String>,
+    /// r24 item 2: the exact granted/verified merge sha the deferred verdict
+    /// named (`mergeSha` at deferral); `None` for a pre-grant verify.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_sha: Option<String>,
     /// The definitive verdict status the Node delivered but the Hub could not
     /// settle (`failed` / `passed` / `landed` / …).
     pub status: String,

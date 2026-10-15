@@ -10871,7 +10871,7 @@
           "gate"
         ],
         "summary": "Operator-resolve a definitive verdict whose evidence could not be persisted",
-        "description": "Only a job in a pre-settlement state (running/canceling/landing) carrying evidenceUncertain accepts a resolution: both the finished notification and the gate.run reply failed to persist the supplied run log, the Node retains no copy and redelivers nothing, and the Hub runs no retry scheduler. `failed` settles it Failed; `requeue` releases the lane/land occupancy and re-enters the queue. The job keeps its occupancy until this resolution or an idempotent later redelivery settles it. Agent callers are refused.",
+        "description": "Only a job in a pre-settlement state (queued/running/canceling/landing) carrying evidenceUncertain accepts a resolution: both the finished notification and the gate.run reply failed to persist the supplied run log, the Node retains no copy and redelivers nothing, and the Hub runs no retry scheduler. `failed` settles it Failed; `requeue` releases the lane/land occupancy and re-enters the queue. The request must pin the exact parked (attempt, grant epoch, merge) tuple the live row carries; a delayed resolution aimed at an attempt the row has since left is refused with 409 (epoch/merge are required and non-empty for a Landing, omitted for a pre-grant verify). Before failing or requeuing a Landing the Hub runs its read-only remote-main probe, and an established landed fact settles Landed instead. The job keeps its occupancy until this resolution or an idempotent later redelivery settles it. Agent callers are refused.",
         "requestBody": {
           "required": true,
           "content": {
@@ -10881,7 +10881,7 @@
                 "additionalProperties": true,
                 "required": [
                   "resolution",
-                  "expectedGeneration",
+                  "expectedAttempts",
                   "rationale"
                 ],
                 "properties": {
@@ -10892,11 +10892,25 @@
                       "requeue"
                     ]
                   },
-                  "expectedGeneration": {
+                  "expectedAttempts": {
                     "type": "integer",
                     "format": "uint32",
                     "minimum": 0,
-                    "description": "The attempt generation the operator saw parked as evidence-uncertain."
+                    "description": "The attempt ordinal (the live row's attempts) the operator saw parked as evidence-uncertain."
+                  },
+                  "expectedSessionEpoch": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "description": "The Running-to-Landing grant epoch of the parked tuple; required and non-empty for a Landing resolution, omitted/null for a pre-grant verify."
+                  },
+                  "expectedMergeSha": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "description": "The exact merge sha of the parked tuple; required and non-empty for a Landing resolution, omitted/null for a pre-grant verify."
                   },
                   "rationale": {
                     "type": "string",

@@ -4452,6 +4452,77 @@ fn recovery_read_park(repo: &Path) {
     recovery_read_seam::park(repo);
 }
 
+/// R10/r30 item 2: true ONLY for the exact diagnostics git emits when the
+/// installed build cannot create a SHA-256 repository. Matching is anchored
+/// to the message forms themselves (with surrounding whitespace/punctuation),
+/// never to substrings that could appear in a PATH — so a bad-config error
+/// whose filename happens to contain "sha256" or "invalid" is not a skip.
+#[cfg(test)]
+pub(crate) fn is_unsupported_sha256_diagnostic(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    // Old builds rejected the option; newer builds that lack the compiled
+    // backend reject the algorithm. Each line must carry BOTH the option/topic
+    // and a "not available" verdict; paths are not inspected.
+    const SHAPES: &[(&str, &str)] = &[
+        ("unknown option `object-format'", ""),
+        ("unknown option '--object-format", ""),
+        ("unknown value for --object-format", ""),
+        ("unknown hash algorithm 'sha256'", ""),
+        ("attempt to use sha256 has not been compiled in", ""),
+        ("sha256 repositories are not supported", ""),
+        ("unknown option for --object-format", ""),
+    ];
+    for (needle, _) in SHAPES {
+        if s.contains(needle) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Run `git init --object-format=sha256` through `program` and classify the
+/// outcome: true when the repository is created; false ONLY on a recognized
+/// unsupported-format diagnostic; a spawn failure or any other init error
+/// panics with the underlying detail.
+#[cfg(unix)]
+#[cfg(test)]
+pub(crate) fn probe_sha256_support_with(program: &str, probe_repo: &Path) -> bool {
+    let output = match std::process::Command::new(program)
+        .args([
+            "init",
+            "-q",
+            "--object-format=sha256",
+            "-b",
+            "main",
+            probe_repo.to_str().unwrap(),
+        ])
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) => panic!("failed to spawn {program} for the SHA-256 support probe: {error}"),
+    };
+    if output.status.success() {
+        return true;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if is_unsupported_sha256_diagnostic(&stderr) {
+        eprintln!(
+            "skipping: this git lacks SHA-256 support: {}",
+            stderr.trim()
+        );
+        false
+    } else {
+        panic!("SHA-256 probe init failed for an unrelated reason: {stderr}");
+    }
+}
+
+/// Default SHA-256 support probe using the PATH `git`.
+#[cfg(unix)]
+#[cfg(test)]
+pub(crate) fn probe_sha256_support(program: &str, probe_repo: &Path) -> bool {
+    probe_sha256_support_with(program, probe_repo)
+}
+
 /// Per-subprocess cap so one git command cannot consume the whole probe.
 #[cfg(unix)]
 const RECOVERY_GIT_CAP: Duration = Duration::from_secs(10);
@@ -9849,27 +9920,74 @@ head -c 1 >/dev/null || exit 4
         assert_eq!(refs_listing(&lane), before, "{}", base_b);
     }
 
+    /// r30 item 2: exact diagnostics that mean "git lacks SHA-256". Pure
+    /// classifier with controlled strings, independent of the installed git.
+    #[cfg(unix)]
+    fn unsupported_sha256_diagnostic(stderr: &str) -> bool {
+        super::is_unsupported_sha256_diagnostic(stderr)
+    }
+
+    /// r30 item 2: recognize ONLY the exact unsupported-format forms.
+    #[cfg(unix)]
+    #[test]
+    fn sha256_unsupported_classifier_is_precise() {
+        for stderr in [
+            "fatal: unknown hash algorithm 'sha256'\n",
+            "fatal: attempt to use sha256 has not been compiled in\n",
+            "error: unknown option `object-format'\nusage: git init ...",
+            "error: unknown option '--object-format=sha256'\n",
+            "fatal: unknown value for --object-format: sha256\n",
+        ] {
+            assert!(
+                unsupported_sha256_diagnostic(stderr),
+                "must recognize the unsupported form: {stderr:?}"
+            );
+        }
+        // A bad config file whose PATH contains both trigger words must NOT be
+        // mistaken for an unsupported-format diagnostic.
+        for stderr in [
+            "fatal: bad config line 3 in file /home/dev/invalid-sha256-config\n",
+            "error: invalid key in /etc/gitconfig: foo.sha256.invalid\n",
+            "fatal: unknown hash algorithm 'bogus'\n",
+            "",
+        ] {
+            assert!(
+                !unsupported_sha256_diagnostic(stderr),
+                "must not skip on an unrelated diagnostic: {stderr:?}"
+            );
+        }
+    }
+
+    /// r30 item 2: a spawn failure of the probe program is a hard test
+    /// failure, never a silent skip (uses a nonexistent probe executable, so
+    /// it depends on no global PATH state).
+    #[cfg(unix)]
+    #[test]
+    fn a_sha256_probe_spawn_failure_panics() {
+        let dir = TempDir::new().unwrap();
+        let bogus = dir
+            .path()
+            .join("no-such-git-dir")
+            .join("git")
+            .to_string_lossy()
+            .into_owned();
+        let target = dir.path().join("p");
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::probe_sha256_support_with(&bogus, &target)
+        }))
+        .is_err();
+        assert!(panicked, "a spawn failure must panic, not skip");
+    }
+
     /// r28 item 2: a SHA-256 repository reports 64-hex object IDs; the
     /// ref-free recovery reads the advertised 64-hex tip and certifies Landed.
     #[cfg(unix)]
     #[test]
     fn recovery_in_a_sha256_repo_reads_a_64_hex_tip_without_refs() {
         let probe = TempDir::new().unwrap();
-        let supported = std::process::Command::new("git")
-            .args([
-                "init",
-                "-q",
-                "--object-format=sha256",
-                "-b",
-                "main",
-                probe.path().join("sha256-probe").to_str().unwrap(),
-            ])
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
+        let supported = super::probe_sha256_support("git", &probe.path().join("sha256-probe"));
         drop(probe);
         if !supported {
-            eprintln!("skipping: this git build lacks --object-format=sha256 support");
             return;
         }
 

@@ -5184,9 +5184,15 @@ impl Store {
                     job.reason = Some("landed; confirmed on remote main by reconciliation".into());
                 }
             } else if job.attempts < MAX_LAND_ATTEMPTS {
+                // r24 item 1 audit: an ESTABLISHED absent fact (fresh fetch +
+                // the land group verified dead) is an authorized settlement of
+                // this tuple, exactly like the Landed arm — it clears a parked
+                // evidence-uncertain condition instead of requeueing the row
+                // with a stale condition a later attempt could never resolve.
                 job.home_land_in_flight = false;
                 job.landing_session_epoch = None;
                 job.landing_outcome_unknown = false;
+                job.evidence_uncertain = None;
                 job.state = GateJobState::Queued;
                 job.started_at = None;
                 job.host_id = None;
@@ -5207,6 +5213,7 @@ impl Store {
                 job.home_land_in_flight = false;
                 job.landing_session_epoch = None;
                 job.landing_outcome_unknown = false;
+                job.evidence_uncertain = None;
                 job.state = GateJobState::Failed;
                 job.finished_at = Some(now_ts());
                 job.error = Some(

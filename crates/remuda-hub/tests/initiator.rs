@@ -4330,6 +4330,80 @@ async fn an_evidence_resolution_settles_landed_when_the_merge_is_already_on_remo
     assert!(reply["evidenceUncertain"].is_null(), "{reply}");
 }
 
+/// r24 item 1 audit: the periodic Landing reconciler is an authorized settler
+/// too. An evidence-uncertain Landing whose read-only probe ESTABLISHES the
+/// merge absent with the land process group verified dead is requeued (or
+/// failed at the cap) with the stale condition CLEARED — the fact-based
+/// settlement is the same authority as a Landed probe, so the condition must
+/// not dangle on the requeued row where a later attempt could never resolve it.
+#[tokio::test]
+async fn a_proven_absent_probe_clears_an_evidence_uncertain_landing_on_requeue() {
+    let (ctx, node) = Ctx::boot().await.unwrap();
+    ctx.configure_gate_lane().await;
+    let job_id = queued_land_job(&ctx).await;
+    ctx.hub
+        .test_claim_gate_job(&job_id, "lane1", &ctx.host)
+        .await
+        .unwrap()
+        .expect("claimed");
+    let session = ctx.hub.test_node_session(&ctx.host).await.unwrap();
+    let merge = "cccccccccccccccccccccccccccccccccccccccc";
+    let grant = ctx
+        .hub
+        .test_gate_land_grant(&job_id, &ctx.host, merge, session)
+        .await
+        .unwrap();
+    assert_eq!(grant["granted"], json!(true), "{grant}");
+
+    // A definitive landed verdict whose keepLogs evidence cannot persist
+    // twice: the row stays Landing with the uncertain condition.
+    let result = json!({
+        "jobId": job_id,
+        "generation": 1,
+        "status": "landed",
+        "mergeSha": merge,
+        "runLog": {
+            "step": "*", "kind": "kept", "headline": "landed; log retained by --keep-logs",
+            "summary": [], "tail": ["Finished land successfully"], "capturedLines": 1,
+            "truncated": false, "attempts": 1,
+        },
+    });
+    ctx.store().test_arm_gate_log_insert_fault_sticky();
+    ctx.hub
+        .test_apply_gate_result(&job_id, result.clone())
+        .await
+        .unwrap();
+    ctx.hub
+        .test_apply_gate_result(&job_id, result.clone())
+        .await
+        .unwrap();
+    ctx.store().test_clear_gate_log_insert_fault();
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(doc["state"], json!("landing"), "{doc}");
+    assert!(doc["evidenceUncertain"].is_object(), "{doc}");
+
+    // The probe establishes absent with the group verified dead.
+    node.set_resolve_reply(json!({
+        "jobId": job_id, "status": "absent",
+        "baseSha": null, "error": "merge absent and land group verified gone",
+    }))
+    .await;
+    ctx.hub.test_force_landing_reconcile(&ctx.host).await;
+
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(
+        doc["state"],
+        json!("queued"),
+        "established absent (under the attempt cap) requeues: {doc}"
+    );
+    assert!(
+        doc["evidenceUncertain"].is_null(),
+        "the fact-based absent settlement clears the parked condition: {doc}"
+    );
+    assert!(doc["mergeSha"].is_null(), "{doc}");
+    assert!(doc["landingSessionEpoch"].is_null(), "{doc}");
+}
+
 // ── 6c. A narrowed Bot token acts for the live chapter (CLI path) ─────────
 #[tokio::test]
 async fn narrowed_bot_token_writes_a_live_chapter_even_after_a_fence_check() {

@@ -232,6 +232,22 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     )?;
     // c-usagefu (c): native per-model context window reported on the payload.
     crate::store::ensure_column(conn, "usage_events", "native_context_window", "INTEGER")?;
+    // c-ctxusage × c-usagefu merge: provenance tag separating rows that
+    // already existed at this migration (pre-upgrade producers, including
+    // rows written while an earlier migration window was rolled back and
+    // recovered from the journal below) from rows projected LIVE after the
+    // upgrade. The fold treats an unprovable LEGACY turn next to scoped stock
+    // as conservative Unknown (c-ctxusage r29 ambiguity), while a live turn
+    // the current codex adapter projected follows Ruling B flow billing even
+    // beside stock; the two shapes are otherwise identical, so without the
+    // tag the two rulings cannot be distinguished. Existing rows are tagged
+    // only on the migration that INTRODUCES the column: on a later restart the
+    // column already exists and post-upgrade live rows (NULL) stay live.
+    let tag_legacy_rows = !crate::store::column_exists(conn, "usage_events", "lineage_state")?;
+    crate::store::ensure_column(conn, "usage_events", "lineage_state", "TEXT")?;
+    if tag_legacy_rows {
+        conn.execute("UPDATE usage_events SET lineage_state = 'legacy'", [])?;
+    }
     conn.execute_batch(META_DDL)?;
     // c-ctxusage r10/r29-r31 + c-usagefu r13-r16 identity recovery: the whole
     // scope/lineage consolidation and the fallback-field reconstruction run in
@@ -241,43 +257,46 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     // the already-complete-r14/r28 shapes directly), but the usagefu fallback
     // projection (turn_id / native time / revision / context window for rows
     // written while an earlier migration window was rolled back) still runs.
-    let tx = conn.unchecked_transaction()?;
+    // `conn` IS the outer migration transaction opened by `migrate`
+    // (Ruling M1: exactly one migration transaction, never nested); alias it
+    // so the steps below read as transactional work.
+    let tx = conn;
     // c-usagefu r15 item 1 test seam: a forced failure AFTER the additive DDL
     // rolls the columns back too, exercising the legacy-shape fallback.
     #[cfg(any(test, feature = "test-faults"))]
-    if test_failure_forced(&tx)? {
+    if test_failure_forced(tx)? {
         tx.execute_batch("SELECT remuda_test_force_usage_migration_failure();")?;
     }
+    // c-ctxusage r10 item 2 / r30 item 1: the obsolete shared and per-scope
+    // unique indexes MUST be dropped BEFORE any journal backfill stamps
+    // scope_id on previously-NULL rows — stamping two rows with one id under
+    // the old (instance_id, scope, scope_id) index aborts the migration.
+    tx.execute_batch("DROP INDEX IF EXISTS usage_events_scope_dedupe;")?;
+    tx.execute_batch("DROP INDEX IF EXISTS usage_events_turn_dedupe;")?;
     // c-usagefu r13/r16: recover scope_id and the fallback-only projection
     // fields (native turn id, native time, revision, context window) from the
     // retained journal BEFORE the lineage collapse below.
-    backfill_scope_ids_from_journal(&tx)?;
-    reconstruct_fallback_projection_from_journal(&tx)?;
-    // c-ctxusage r10 item 2: the obsolete shared unique index MUST be dropped
-    // BEFORE the retained-journal backfill stamps NULL-scope rows.
-    tx.execute_batch("DROP INDEX IF EXISTS usage_events_scope_dedupe;")?;
-    // c-ctxusage r30 item 1: drop the per-scope turn index before the lineage
-    // backfill (already-r28 DBs hold legacy + qualified rows for one lineage).
-    tx.execute_batch("DROP INDEX IF EXISTS usage_events_turn_dedupe;")?;
+    backfill_scope_ids_from_journal(tx)?;
+    reconstruct_fallback_projection_from_journal(tx)?;
     // c-ctxusage r9/r29: session-scope then turn-scope identity/lineage from
     // retained evidence (the scope backfill above is the same idempotent
     // update for scope ids; these also stamp session scope_id and the
     // turn→native-session lineage).
-    backfill_legacy_scope_ids(&tx)?;
-    backfill_legacy_turn_identity(&tx)?;
+    backfill_legacy_scope_ids(tx)?;
+    backfill_legacy_turn_identity(tx)?;
     // c-usagefu r14 (M1): make same-key turn rows index-safe before any unique
     // index is created.
-    reconcile_duplicate_turn_keys(&tx)?;
+    reconcile_duplicate_turn_keys(tx)?;
     // r30: identity UPDATE can merge a legacy turn with a later qualified
     // replay; collapse to the fold winner BEFORE identical-counter
     // consolidation (which keeps the oldest row for stocks).
-    collapse_duplicate_turn_lineage_rows(&tx)?;
+    collapse_duplicate_turn_lineage_rows(tx)?;
     // c-usagefu: identical Message duplicates collapse to highest seq.
-    consolidate_message_duplicates(&tx)?;
-    consolidate_identical_scoped_rows(&tx)?;
+    consolidate_message_duplicates(tx)?;
+    consolidate_identical_scoped_rows(tx)?;
     // r11 item 1: replay the cumulative-growth acceptance rule for imported /
     // pre-acceptance chains before rowid order means accepted history.
-    normalise_scoped_session_chains(&tx)?;
+    normalise_scoped_session_chains(tx)?;
     // r16 item 3 (T1'): recreate the per-LINEAGE turn unique index.
     tx.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS usage_events_turn_dedupe
@@ -287,7 +306,7 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
              )
              WHERE scope = 'turn' AND scope_id IS NOT NULL;",
     )?;
-    tx.commit()?;
+    // The outer `migrate` owns the single transaction and commits it.
     // Record completion for usagefu r15's one-time marker (no-op on older paths).
     set_meta_marker(conn, MARKER_SCOPE_CONSOLIDATION)?;
     Ok(())
@@ -914,9 +933,12 @@ fn consolidate_message_duplicates(conn: &Connection) -> rusqlite::Result<()> {
                GROUP BY instance_id, scope, scope_id);
 
          DROP INDEX IF EXISTS usage_events_scope_dedupe;
-         CREATE UNIQUE INDEX IF NOT EXISTS usage_events_turn_dedupe
-             ON usage_events(instance_id, scope, scope_id)
-             WHERE scope = 'turn' AND scope_id IS NOT NULL;
+         -- The TURN dedupe index is intentionally NOT recreated here: the
+         -- lineage-aware index (instance_id, scope, scope_id, COALESCE(
+         -- source_session_id, '')) is created at the end of the migration;
+         -- main's 3-column index would win via IF NOT EXISTS and forbid two
+         -- proven lineages that legitimately share a scope id
+         -- (c-ctxusage r16 item 3 / T1').
          -- c-usagefu r7 item 5: codex Message rows are keyed on the durable
          -- per-response id; re-promoting/replaying a rollout byte-0 re-emits
          -- the same response and must not double the Message totals.
@@ -1195,10 +1217,10 @@ fn insert_row(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> 
     let inserted = conn.execute(
         "INSERT OR IGNORE INTO usage_events
             (instance_id, seq, profile_id, model, scope, scope_id, turn_id, mode,
-             metric_revision, total_tokens, input_tokens, output_tokens,
+             metric_revision, source_session_id, total_tokens, input_tokens, output_tokens,
              cache_read_tokens, cache_write_tokens, cost_usd, accounting,
              observed_at, observed_at_source, native_context_window)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
         params![
             row.instance_id,
             row.seq,
@@ -1575,45 +1597,24 @@ fn upsert_turn_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Res
     // (never COALESCE: an unqualified update targets the NULL row and stays
     // NULL, and can never inherit a retained qualified id).
     if !reports_counters {
+        // Cost-only channel: touch ONLY seq/position/lineage/bill. The stored
+        // counters, context window, accounting and clock are left exactly as
+        // they were (the earlier block comment promises exactly that); an
+        // unreported bill keeps the stored one via COALESCE. Scoped by rowid,
+        // never by the nullable (instance, scope_id) key.
         conn.execute(
-            "UPDATE usage_events SET
-                seq = ?1,
-                profile_id = ?2,
-                model = ?3,
-                mode = ?4,
-                metric_revision = ?5,
-                total_tokens = ?6,
-                input_tokens = ?7,
-                output_tokens = ?8,
-                cache_read_tokens = ?9,
-                cache_write_tokens = ?10,
-                cost_usd = ?11,
-                accounting = ?12,
-                observed_at = ?13,
-                observed_at_source = ?14,
-                native_context_window = ?15
-             WHERE instance_id = ?16 AND scope = 'turn' AND scope_id = ?17",
+            "UPDATE usage_events
+             SET seq = ?1,
+                 metric_revision = ?2,
+                 source_session_id = ?3,
+                 cost_usd = COALESCE(?4, cost_usd)
+             WHERE rowid = ?5",
             params![
                 row.seq,
                 row.metric_revision,
                 row.source_session_id,
                 row.cost_usd,
-                row.accounting,
-                // The clock follows the newer frame: an ingest fallback never
-                // overwrites a native time (c-ctxusage r4 item 5).
-                if row.observed_at_source == "native" || stored.observed_at_source != "native" {
-                    row.observed_at.clone()
-                } else {
-                    stored.observed_at.clone()
-                },
-                if row.observed_at_source == "native" || stored.observed_at_source != "native" {
-                    row.observed_at_source.clone()
-                } else {
-                    stored.observed_at_source.clone()
-                },
-                row.native_context_window,
-                row.instance_id,
-                row.scope_id,
+                stored.rowid,
             ],
         )?;
         return Ok(true);
@@ -2035,33 +2036,78 @@ fn turn_fully_covered_sql(inst: &str, tid: &str) -> String {
     conds.join(" AND ")
 }
 
-/// True when instance `instance_expr` has at least one eligible flow row
-/// (see [`eligible_flow_predicate`]). Legacy NULL-scope Turn rows count.
-fn has_eligible_flow_sql(instance_expr: &str) -> String {
+/// The unified usage fold shared by the instance/provider aggregates, the
+/// session rollup and the TPM rate windows (c-ctxusage × c-usagefu merge).
+///
+/// It reconciles two independently-reviewed billing models:
+///
+/// * **Lineage fold (c-ctxusage):** turn rows fold to ONE winner per
+///   `(instance_id, scope_id)` across native-session lineages; a cumulative
+///   SESSION stock of session `S` covers only a turn whose provenance stamps
+///   `source_session_id = S`; an unprovable NATIVE-time turn beside scoped
+///   stock is *ambiguous* — dropped from the fold and poisoned to Unknown,
+///   never guessed.
+/// * **Flow vs stock, durable Messages (c-usagefu Ruling B / r7-r10):**
+///   codex emits per-call durable Message rows; a Turn a matching Message
+///   fully covers is dropped (bucket-sum coverage proof, [`turn_fully_covered_sql`]);
+///   an INGEST-time unqualified turn is live per-call flow — when any such
+///   flow exists it bills and every session stock of the instance stands down
+///   (the sticky-Unknown / freeze fix); stock is summed per session ONLY for
+///   flow-less sessions (c-ctxusage r28 per-session composition).
+///
+/// The native/ingest distinction on unqualified turns is what the two rulings
+/// disagree on: an UNPROVEN backfilled NATIVE turn next to stock stays Unknown
+/// (the conservative c-ctxusage answer), while a live INGEST-provenance flow
+/// row bills per Ruling B. The final codex adapter emits no live turn rows at
+/// all, so the two shapes never meet in production.
+///
+/// `domain_pred` filters the final CTEs: `"instance_id = ?1"` for the instance
+/// aggregate, `"profile_id = ?1 AND model = ?2"` for provider supply. All
+/// bindings reuse SQLite NUMBERED positional parameters, so one/two bindings
+/// cover every occurrence.
+fn unified_fold_ctes(domain_pred: &str) -> String {
+    // Qualify a standalone-domain predicate ("instance_id = ?1" or
+    // "profile_id = ?1 AND model = ?2") for a specific table alias. Word
+    // boundaries are essential: a plain `replace("model", ..)` would also
+    // rewrite the `id`/`instance_id` column text.
+    let d = |alias: &str| {
+        // Qualify each whole-identifier occurrence of the three domain
+        // columns (they share substrings, so byte-level boundaries matter).
+        let qualify = |input: &str, col: &str| -> String {
+            let mut out = String::with_capacity(input.len());
+            let bytes = input.as_bytes();
+            let mut cursor = 0usize;
+            while let Some(rel) = input[cursor..].find(col) {
+                let idx = cursor + rel;
+                let before_ok =
+                    idx == 0 || !(bytes[idx - 1].is_ascii_alphanumeric() || bytes[idx - 1] == b'_');
+                let after = idx + col.len();
+                let after_ok = after == bytes.len()
+                    || !(bytes[after].is_ascii_alphanumeric() || bytes[after] == b'_');
+                out.push_str(&input[cursor..idx]);
+                if before_ok && after_ok {
+                    out.push_str(alias);
+                    out.push('.');
+                }
+                out.push_str(col);
+                cursor = after;
+            }
+            out.push_str(&input[cursor..]);
+            out
+        };
+        let mut out = domain_pred.to_owned();
+        for col in ["instance_id", "profile_id", "model"] {
+            out = qualify(&out, col);
+        }
+        out
+    };
+    let message_eligible = eligible_flow_predicate("m");
+    let turn_covered = turn_fully_covered_sql("t.instance_id", "t.scope_id");
     format!(
-        "EXISTS (
-            SELECT 1 FROM usage_events _ef_e
-            WHERE _ef_e.instance_id = {instance_expr}
-              AND {}
-        )",
-        eligible_flow_predicate("_ef_e")
-    )
-}
-
-/// Token-sum CASE arm for the shared flow relation (`column` is one token
-/// bucket on the outer `usage_events` row): a `WHEN … THEN …` fragment to
-/// embed inside an outer CASE.
-fn flow_case_arm(column: &str) -> String {
-    format!(
-        "WHEN {} THEN {column}",
-        eligible_flow_predicate("usage_events")
-    )
-}
-
-const FOLD_CTES_SQL: &str = "global_scoped_sessions AS (
+        "global_scoped_sessions AS (
             SELECT * FROM (
                 SELECT *, ROW_NUMBER() OVER (
-                    PARTITION BY instance_id, scope_id ORDER BY rowid DESC
+                    PARTITION BY instance_id, scope_id ORDER BY seq DESC, rowid DESC
                 ) AS stock_rn
                 FROM usage_events
                 WHERE scope = 'session' AND scope_id IS NOT NULL
@@ -2079,83 +2125,431 @@ const FOLD_CTES_SQL: &str = "global_scoped_sessions AS (
             WHERE legacy_rn = 1
          ),
          global_winning_turns AS (
+            -- rowid is projected explicitly: the rate-window query correlates
+            -- winning rows against g_ambiguous_turns BY rowid (NULL scope_ids
+            -- cannot be joined by value), and a UNION ALL result exposes
+            -- rowid only when both branches SELECT it under the same name.
             SELECT * FROM (
-                SELECT *, ROW_NUMBER() OVER (
-                    PARTITION BY instance_id, scope_id ORDER BY seq DESC, rowid DESC
+                SELECT rowid AS winning_rowid, t.*, ROW_NUMBER() OVER (
+                    PARTITION BY t.instance_id, t.scope_id ORDER BY t.seq DESC, t.rowid DESC
                 ) AS turn_rn
-                FROM usage_events
-                WHERE scope = 'turn' AND scope_id IS NOT NULL
+                FROM usage_events t
+                WHERE t.scope = 'turn' AND t.scope_id IS NOT NULL
             )
             WHERE turn_rn = 1
             UNION ALL
-            SELECT *, NULL AS turn_rn
-            FROM usage_events
-            WHERE scope = 'turn' AND scope_id IS NULL
+            SELECT rowid AS winning_rowid, u.*, NULL AS turn_rn
+            FROM usage_events u
+            WHERE u.scope = 'turn' AND u.scope_id IS NULL
          ),
-         scoped_sessions AS (
-            SELECT instance_id, total_tokens, input_tokens, output_tokens,
-                   cost_usd, cache_read_tokens, cache_write_tokens, scope_id,
-                   profile_id, model
-            FROM global_scoped_sessions
-            WHERE {domain}
+g_flow_messages AS (
+            -- `eligible_flow_predicate` covers BOTH scopes (it is main's
+            -- outer-relation predicate); restrict it to Messages here because
+            -- winning Turns go through the lineage CTEs below. Computed
+            -- GLOBALLY (instance-wide classification) before domain filtering.
+            SELECT m.* FROM usage_events m
+            WHERE m.scope = 'message' AND ({message_eligible})
          ),
-         legacy_stock AS (
-            SELECT l.instance_id, l.total_tokens, l.input_tokens, l.output_tokens,
-                   l.cost_usd, l.cache_read_tokens, l.cache_write_tokens
-            FROM global_legacy_stock l
-            WHERE {domain_l}
-              AND NOT EXISTS (
-                  SELECT 1 FROM global_scoped_sessions s
-                  WHERE s.instance_id = l.instance_id
+         g_session_turn_flow AS (
+            -- Per-native-session sums of the winning TURN rows (all of them:
+            -- a stock can only be certified against the complete retained
+            -- turn flow, including rows the durable Messages represent).
+            SELECT t.instance_id AS instance_id,
+                   t.source_session_id AS sid,
+                   COUNT(*) AS turn_count,
+                   MAX(t.metric_revision) AS max_revision,
+                   SUM(t.total_tokens) AS sum_total,
+                   SUM(t.input_tokens) AS sum_input,
+                   SUM(t.output_tokens) AS sum_output,
+                   SUM(t.cache_read_tokens) AS sum_cache_read,
+                   SUM(t.cache_write_tokens) AS sum_cache_write,
+                   COUNT(t.total_tokens) AS known_total,
+                   COUNT(t.input_tokens) AS known_input,
+                   COUNT(t.output_tokens) AS known_output,
+                   COUNT(t.cache_read_tokens) AS known_cache_read,
+                   COUNT(t.cache_write_tokens) AS known_cache_write
+            FROM global_winning_turns t
+            WHERE t.source_session_id IS NOT NULL
+            GROUP BY t.instance_id, t.source_session_id
+         ),
+         g_fully_covered_sessions AS (
+            -- The latest cumulative stock certifies its turn flow: a strictly
+            -- NEWER position is authoritative whatever the retained sums; at
+            -- an equal position every bucket the stock reports must match the
+            -- turn sums exactly. A stock ABOVE the retained flow (partial
+            -- coverage) cannot certify: Ruling B flow wins and stock stands
+            -- down (r9 items 4/5).
+            SELECT s.instance_id AS instance_id, s.scope_id AS sid
+            FROM global_scoped_sessions s
+            JOIN g_session_turn_flow f
+              ON f.instance_id = s.instance_id AND f.sid = s.scope_id
+            WHERE f.turn_count > 0
+              AND (
+                  f.max_revision < s.metric_revision
+                  OR (
+                      f.max_revision = s.metric_revision
+                      AND (s.total_tokens IS NULL
+                           OR (f.known_total = f.turn_count
+                               AND f.sum_total = s.total_tokens))
+                      AND (s.input_tokens IS NULL
+                           OR (f.known_input = f.turn_count
+                               AND f.sum_input = s.input_tokens))
+                      AND (s.output_tokens IS NULL
+                           OR (f.known_output = f.turn_count
+                               AND f.sum_output = s.output_tokens))
+                      AND (s.cache_read_tokens IS NULL
+                           OR (f.known_cache_read = f.turn_count
+                               AND f.sum_cache_read = s.cache_read_tokens))
+                      AND (s.cache_write_tokens IS NULL
+                           OR (f.known_cache_write = f.turn_count
+                               AND f.sum_cache_write = s.cache_write_tokens))
+                  )
               )
          ),
-         winning_turns AS (
-            SELECT * FROM global_winning_turns WHERE {domain}
+         g_proven_flow_turns AS (
+            -- A lineage-qualified winning turn counts when its session's stock
+            -- does NOT certify the turn flow and durable Messages do not cover
+            -- it (durable coverage suppresses the Turn in favour of Messages).
+            SELECT t.* FROM global_winning_turns t
+            WHERE t.source_session_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM g_fully_covered_sessions c
+                  WHERE c.instance_id = t.instance_id AND c.sid = t.source_session_id
+              )
+              AND NOT ({turn_covered})
          ),
-         proven_turns AS (
-            SELECT * FROM winning_turns t
+         g_unmatched_flow_turns AS (
+            -- Live per-call flow for an identified turn with no proven session
+            -- lineage (Ruling B): bills alongside Messages and makes stock
+            -- stand down. Pre-upgrade 'legacy' rows take the conservative
+            -- ambiguity/open paths instead.
+            SELECT t.* FROM global_winning_turns t
+            WHERE t.scope_id IS NOT NULL
+              AND t.source_session_id IS NULL
+              AND COALESCE(t.lineage_state, '') <> 'legacy'
+              AND NOT ({turn_covered})
+         ),
+         g_legacy_open_turns AS (
+            -- A legacy (or NULL-identity) turn when NO scoped stock exists:
+            -- ordinary per-call flow.
+            SELECT t.* FROM global_winning_turns t
             WHERE (
-                t.source_session_id IS NOT NULL
-                AND NOT EXISTS (
-                    SELECT 1 FROM global_scoped_sessions s
-                    WHERE s.instance_id = t.instance_id
-                      AND s.scope_id = t.source_session_id
-                )
-            ) OR (
-                t.source_session_id IS NULL
-                AND NOT EXISTS (
-                    SELECT 1 FROM global_scoped_sessions s
-                    WHERE s.instance_id = t.instance_id
-                )
-                AND NOT EXISTS (
-                    SELECT 1 FROM global_legacy_stock l
-                    WHERE l.instance_id = t.instance_id
-                )
-            )
+                  COALESCE(t.lineage_state, '') = 'legacy'
+                  OR t.scope_id IS NULL
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM global_scoped_sessions s
+                  WHERE s.instance_id = t.instance_id
+              )
+              AND NOT ({turn_covered})
          ),
-         ambiguous_turns AS (
-            SELECT * FROM winning_turns t
+         g_legacy_flow_turns AS (
+            -- An identified pre-upgrade turn beside scoped stock bills when
+            -- another per-call exists (Ruling B flow mode instance-wide).
+            SELECT t.* FROM global_winning_turns t
+            WHERE t.scope_id IS NOT NULL
+              AND COALESCE(t.lineage_state, '') = 'legacy'
+              AND EXISTS (
+                  SELECT 1 FROM global_scoped_sessions s
+                  WHERE s.instance_id = t.instance_id
+              )
+              AND EXISTS (
+                  SELECT 1 FROM usage_events e
+                  WHERE e.instance_id = t.instance_id
+                    AND (
+                        e.scope = 'message'
+                        OR (e.scope = 'turn'
+                            AND e.scope_id IS NOT NULL
+                            AND e.scope_id <> t.scope_id)
+                    )
+              )
+              AND NOT ({turn_covered})
+         ),
+         g_ambiguous_turns AS (
+            -- Unprovable turn beside scoped stock: dropped from sums, poisoned
+            -- to Unknown (c-ctxusage r29 ambiguity / r34 NULL-identity supply
+            -- flag). A live post-upgrade identified turn is never ambiguous.
+            SELECT t.* FROM global_winning_turns t
             WHERE t.source_session_id IS NULL
               AND EXISTS (
                   SELECT 1 FROM global_scoped_sessions s
                   WHERE s.instance_id = t.instance_id
               )
-         )";
+              AND NOT ({turn_covered})
+              AND (
+                  t.scope_id IS NULL
+                  OR (
+                      COALESCE(t.lineage_state, '') = 'legacy'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM usage_events e
+                          WHERE e.instance_id = t.instance_id
+                            AND (
+                                e.scope = 'message'
+                                OR (e.scope = 'turn'
+                                    AND e.scope_id IS NOT NULL
+                                    AND e.scope_id <> t.scope_id)
+                            )
+                      )
+                  )
+              )
+         ),
+         g_flow_turns AS (
+            SELECT * FROM g_proven_flow_turns
+            UNION ALL SELECT * FROM g_unmatched_flow_turns
+            UNION ALL SELECT * FROM g_legacy_open_turns
+            UNION ALL SELECT * FROM g_legacy_flow_turns
+         ),
+         override_instances AS (
+            -- Instance-wide Ruling B stock-stand-down: triggered by durable
+            -- Messages or by a surviving UNQUALIFIED live/legacy turn flow.
+            -- Lineage-PROVEN turns are deliberately NOT here: they follow the
+            -- per-session coverage/certification rule instead (a covered stock
+            -- still counts when another session has an uncovered proven turn).
+            SELECT instance_id FROM g_flow_messages
+            UNION
+            SELECT instance_id FROM g_unmatched_flow_turns
+            UNION
+            SELECT instance_id FROM g_legacy_open_turns
+            UNION
+            SELECT instance_id FROM g_legacy_flow_turns
+         ),
+         -- DOMAIN PROJECTION: the classification above is instance-global so a
+         -- row stays correctly suppressed/ambiguous under every supply view;
+         -- only the final projection filters by instance or profile/model.
+         flow_messages AS (
+            SELECT m.* FROM g_flow_messages m WHERE {dm}
+         ),
+         flow_turns AS (
+            SELECT t.* FROM g_flow_turns t WHERE {dt}
+         ),
+         ambiguous_turns AS (
+            SELECT t.* FROM g_ambiguous_turns t WHERE {dt}
+         ),
+         stock_sessions AS (
+            -- Flow-less sessions count their stock unless a Ruling B
+            -- instance-wide override (message/unqualified flow) stands it down.
+            SELECT g.* FROM global_scoped_sessions g
+            WHERE {dg}
+              AND g.instance_id NOT IN (SELECT instance_id FROM override_instances)
+              AND NOT EXISTS (
+                  SELECT 1 FROM g_session_turn_flow f
+                  WHERE f.instance_id = g.instance_id AND f.sid = g.scope_id
+              )
+            UNION ALL
+            -- Sessions with lineage-certified turn flow: the stock counts
+            -- when it certifies the flow (equal/newer position), provided no
+            -- instance-wide Ruling B override is active; a surviving uncovered
+            -- proven turn of THIS session drops the stock via the missing
+            -- coverage match below.
+            SELECT g.* FROM global_scoped_sessions g
+            WHERE {dg}
+              AND g.instance_id NOT IN (SELECT instance_id FROM override_instances)
+              AND EXISTS (
+                  SELECT 1 FROM g_fully_covered_sessions c
+                  WHERE c.instance_id = g.instance_id AND c.sid = g.scope_id
+              )
+         ),
+         legacy_stock AS (
+            SELECT l.* FROM global_legacy_stock l
+            WHERE {dl}
+              AND l.instance_id NOT IN (
+                  SELECT instance_id FROM global_scoped_sessions
+              )
+              AND l.instance_id NOT IN (
+                  SELECT instance_id FROM override_instances
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM g_flow_turns p WHERE p.instance_id = l.instance_id
+              )
+         ),
+         contributions AS (
+            SELECT total_tokens, input_tokens, output_tokens,
+                   cache_read_tokens, cache_write_tokens, cost_usd
+            FROM stock_sessions
+            UNION ALL
+            SELECT total_tokens, input_tokens, output_tokens,
+                   cache_read_tokens, cache_write_tokens, cost_usd
+            FROM legacy_stock
+            UNION ALL
+            SELECT total_tokens, input_tokens, output_tokens,
+                   cache_read_tokens, cache_write_tokens, cost_usd
+            FROM flow_turns
+            UNION ALL
+            SELECT total_tokens, input_tokens, output_tokens,
+                   cache_read_tokens, cache_write_tokens, cost_usd
+            FROM flow_messages
+         )",
+        dm = d("m"),
+        dt = d("t"),
+        dg = d("g"),
+        dl = d("l"),
+    )
+}
 
-/// Aggregate all persisted events for one instance.
-///
-/// Turn rows are folded to one winner per scope id before summing so that
-/// several native-session lineages proving one message id never double-count
-/// the turn (c-ctxusage r16 item 3); every other row (session growth points,
-/// legacy NULL-scope events) is summed as before.
-/// Aggregate all persisted events for one instance.
-///
-/// Turn rows fold to one winner per scope id; cumulative SESSION snapshots
-/// fold to their LATEST accepted stock per session (c-ctxusage r22 item 2),
-/// never a sum of snapshots. A per-turn flow is included only when no session
-/// stock covers its native session — emitters like Codex send BOTH per turn and
-/// a cumulative session snapshot that already contains the turn's totals, so
-/// adding the turn on top would double count.
+/// Final aggregate SELECT over a [`unified_fold_ctes`] block. The U1
+/// all-buckets-known gate applies to the TURN+STOCK relation (a turn
+/// snapshot or cumulative point is one complete accounting frame); durable
+/// per-response Message rows are summed independently with NULLs ignored
+/// (c-usagefu: codex reports per-call partial baskets, and an omitted bucket
+/// on one response is not the same as a missing Turn frame). Token buckets
+/// are therefore `U1-sum(turn/stock) + SUM(messages)`. An ambiguous turn
+/// poisons the turn/stock half only; a sticky-Unknown stock cost poisons; an
+/// unpriced TURN on a turn-only (Claude) instance poisons, while durable
+/// Message costs always sum (unpriced = 0).
+fn aggregate_select_sql() -> &'static str {
+    "SELECT
+        (SELECT COALESCE(SUM(n), 0) FROM (
+            SELECT COUNT(*) AS n FROM flow_turns
+            UNION ALL SELECT COUNT(*) FROM flow_messages
+            UNION ALL SELECT COUNT(*) FROM stock_sessions
+            UNION ALL SELECT COUNT(*) FROM legacy_stock
+        )),
+        (SELECT COUNT(*) FROM ambiguous_turns),
+        (SELECT CASE
+                 WHEN EXISTS (
+                     SELECT 1 FROM ambiguous_turns WHERE total_tokens IS NOT NULL
+                 ) THEN NULL
+                 WHEN COUNT(*) = 0 THEN 0
+                 WHEN COUNT(*) = COUNT(total_tokens) THEN SUM(total_tokens)
+             END
+            FROM (
+                SELECT total_tokens FROM flow_turns
+                UNION ALL SELECT total_tokens FROM stock_sessions
+                UNION ALL SELECT total_tokens FROM legacy_stock
+            )
+        )
+        + COALESCE((SELECT SUM(total_tokens) FROM flow_messages), 0),
+        + (SELECT CASE
+                 WHEN EXISTS (
+                     SELECT 1 FROM ambiguous_turns WHERE input_tokens IS NOT NULL
+                 ) THEN NULL
+                 WHEN COUNT(*) = 0 THEN 0
+                 WHEN COUNT(*) = COUNT(input_tokens) THEN SUM(input_tokens)
+             END
+            FROM (
+                SELECT input_tokens FROM flow_turns
+                UNION ALL SELECT input_tokens FROM stock_sessions
+                UNION ALL SELECT input_tokens FROM legacy_stock
+            )
+        )
+        + COALESCE((SELECT SUM(input_tokens) FROM flow_messages), 0),
+        + (SELECT CASE
+                 WHEN EXISTS (
+                     SELECT 1 FROM ambiguous_turns WHERE output_tokens IS NOT NULL
+                 ) THEN NULL
+                 WHEN COUNT(*) = 0 THEN 0
+                 WHEN COUNT(*) = COUNT(output_tokens) THEN SUM(output_tokens)
+             END
+            FROM (
+                SELECT output_tokens FROM flow_turns
+                UNION ALL SELECT output_tokens FROM stock_sessions
+                UNION ALL SELECT output_tokens FROM legacy_stock
+            )
+        )
+        + COALESCE((SELECT SUM(output_tokens) FROM flow_messages), 0),
+        + (SELECT CASE
+                 WHEN EXISTS (
+                     SELECT 1 FROM ambiguous_turns WHERE cache_read_tokens IS NOT NULL
+                 ) THEN NULL
+                 WHEN COUNT(*) = 0 THEN 0
+                 WHEN COUNT(*) = COUNT(cache_read_tokens) THEN SUM(cache_read_tokens)
+             END
+            FROM (
+                SELECT cache_read_tokens FROM flow_turns
+                UNION ALL SELECT cache_read_tokens FROM stock_sessions
+                UNION ALL SELECT cache_read_tokens FROM legacy_stock
+            )
+        )
+        + COALESCE((SELECT SUM(cache_read_tokens) FROM flow_messages), 0),
+        + (SELECT CASE
+                 WHEN EXISTS (
+                     SELECT 1 FROM ambiguous_turns WHERE cache_write_tokens IS NOT NULL
+                 ) THEN NULL
+                 WHEN COUNT(*) = 0 THEN 0
+                 WHEN COUNT(*) = COUNT(cache_write_tokens) THEN SUM(cache_write_tokens)
+             END
+            FROM (
+                SELECT cache_write_tokens FROM flow_turns
+                UNION ALL SELECT cache_write_tokens FROM stock_sessions
+                UNION ALL SELECT cache_write_tokens FROM legacy_stock
+            )
+        )
+        + COALESCE((SELECT SUM(cache_write_tokens) FROM flow_messages), 0),
+        CASE
+            WHEN (SELECT COALESCE(SUM(n), 0) FROM (
+                SELECT COUNT(*) AS n FROM flow_turns
+                UNION ALL SELECT COUNT(*) FROM flow_messages
+                UNION ALL SELECT COUNT(*) FROM stock_sessions
+                UNION ALL SELECT COUNT(*) FROM legacy_stock
+            )) = 0 THEN NULL
+            WHEN EXISTS (
+                SELECT 1 FROM ambiguous_turns WHERE cost_usd IS NOT NULL
+            ) THEN NULL
+            -- Stock cost: a sticky-Unknown newest point poisons the stock.
+            WHEN (
+                SELECT COUNT(*) FROM (
+                    SELECT cost_usd FROM stock_sessions
+                    UNION ALL
+                    SELECT cost_usd FROM legacy_stock
+                )
+            ) > 0
+            AND EXISTS (
+                SELECT 1 FROM (
+                    SELECT cost_usd FROM stock_sessions
+                    UNION ALL
+                    SELECT cost_usd FROM legacy_stock
+                ) WHERE cost_usd IS NULL
+            ) THEN NULL
+            -- Per-turn FLOW cost: on a TURN-ONLY instance (Claude) one
+            -- unpriced turn makes the estimate Unknown (c-ctxusage sticky-
+            -- Unknown); alongside Session rows (Codex mixed shape) per-call
+            -- flow follows Ruling B and an unpriced call bills 0.
+            WHEN EXISTS (
+                SELECT 1 FROM flow_turns ft
+                WHERE ft.cost_usd IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM usage_events sx
+                      WHERE sx.instance_id = ft.instance_id
+                        AND sx.scope = 'session'
+                  )
+            ) THEN NULL
+            ELSE COALESCE((
+                SELECT SUM(CAST(cost_usd AS REAL)) FROM (
+                    SELECT cost_usd FROM stock_sessions
+                    UNION ALL
+                    SELECT cost_usd FROM legacy_stock
+                )
+            ), 0.0)
+            + COALESCE((SELECT SUM(CAST(cost_usd AS REAL)) FROM flow_turns), 0.0)
+            -- Durable Message flow: an unpriced Message contributes 0
+            -- (Ruling B per-call billing, c-usagefu r10).
+            + COALESCE((
+                SELECT SUM(CAST(cost_usd AS REAL)) FROM flow_messages
+            ), 0.0)
+        END
+     -- No FROM: every column is a scalar subquery over the fold CTEs, so the
+     -- row must materialize even when `contributions` is empty (an empty
+     -- aggregate SELECT over a zero-row FROM would otherwise return no rows).
+     "
+}
+
+fn row_to_aggregate(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageAggregate> {
+    let ambiguous: i64 = row.get(1)?;
+    Ok(UsageAggregate {
+        // An empty fold returns one all-NULL row from the scalar subqueries;
+        // its proven-event count is zero in that case.
+        events: row.get::<_, Option<i64>>(0)?.unwrap_or(0),
+        ambiguous_events: ambiguous,
+        ambiguous: ambiguous != 0,
+        total_tokens: row.get(2)?,
+        input_tokens: row.get(3)?,
+        output_tokens: row.get(4)?,
+        cost_usd: row.get(7)?,
+        unavailable: false,
+    })
+}
+
+/// Aggregate all persisted events for one instance through the unified fold.
 pub fn aggregate_instance(
     conn: &Connection,
     instance_id: &str,
@@ -2167,144 +2561,56 @@ pub fn aggregate_instance(
     if !usage_schema_is_current(conn)? {
         return Ok(UsageAggregate::unavailable());
     }
-    let fold = FOLD_CTES_SQL
-        .replace("{domain_l}", "l.instance_id = ?1")
-        .replace("{domain}", "instance_id = ?1");
+    let ctes = unified_fold_ctes("instance_id = ?1");
     conn.query_row(
-        &format!(
-            "WITH {fold},
-             contributions AS (
-                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
-                 FROM scoped_sessions
-                 UNION ALL
-                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
-                 FROM legacy_stock
-                 UNION ALL
-                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
-                 FROM proven_turns
-                 UNION ALL
-                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
-                 FROM usage_events
-                 WHERE instance_id = ?1 AND scope NOT IN ('turn', 'session')
-             )
-             SELECT
-                 (SELECT COUNT(*) FROM contributions),
-                 (SELECT COUNT(*) FROM ambiguous_turns),
-                 CASE WHEN NOT EXISTS (
-                          SELECT 1 FROM ambiguous_turns WHERE total_tokens IS NOT NULL
-                      ) AND COUNT(*) = COUNT(total_tokens)
-                      THEN SUM(total_tokens) END,
-                 CASE WHEN NOT EXISTS (
-                          SELECT 1 FROM ambiguous_turns WHERE input_tokens IS NOT NULL
-                      ) AND COUNT(*) = COUNT(input_tokens)
-                      THEN SUM(input_tokens) END,
-                 CASE WHEN NOT EXISTS (
-                          SELECT 1 FROM ambiguous_turns WHERE output_tokens IS NOT NULL
-                      ) AND COUNT(*) = COUNT(output_tokens)
-                      THEN SUM(output_tokens) END,
-                 CASE WHEN NOT EXISTS (
-                          SELECT 1 FROM ambiguous_turns WHERE cost_usd IS NOT NULL
-                      ) AND COUNT(*) = COUNT(cost_usd)
-                      THEN SUM(CAST(cost_usd AS REAL)) END
-             FROM contributions",
-            fold = fold
-        ),
+        &format!("WITH {ctes} {select}", select = aggregate_select_sql()),
         params![instance_id],
-        |row| {
-            Ok(UsageAggregate {
-                events: row.get(0)?,
-                ambiguous_events: row.get(1)?,
-                ambiguous: row.get::<_, i64>(1)? != 0,
-                total_tokens: row.get(2)?,
-                input_tokens: row.get(3)?,
-                output_tokens: row.get(4)?,
-                cost_usd: row.get(5)?,
-                unavailable: false,
-            })
-        },
+        row_to_aggregate,
     )
 }
 
-/// Aggregate persisted events for one `(profile, model)`. Same per-scope
-/// turn-lineage fold as [`aggregate_instance`] (c-ctxusage r16 item 3).
-///
-/// c-ctxusage r18 item 2: scoped turns are ranked across ALL profiles and
-/// models BEFORE the supply filter. Filtering first used to rank within one
-/// model, so a row superseded by a newer accepted frame for the same message
-/// id under ANOTHER model/profile still won inside its own filtered set and
-/// kept contributing to that model's provider totals. The winner of the
-/// logical turn is chosen globally per `(instance_id, scope_id)`; the
-/// profile/model predicate then decides whether that WINNING row belongs to
-/// this supply (its model/profile columns are carried through the CTE).
+/// Aggregate persisted events for one `(profile, model)`. Turn winners are
+/// ranked GLOBALLY per `(instance_id, scope_id)` BEFORE the supply filter
+/// (c-ctxusage r18 item 2): a row superseded by a newer accepted frame for the
+/// same message id under another model must not keep contributing here.
 pub fn aggregate_supply(
     conn: &Connection,
     profile_id: &str,
     model: &str,
 ) -> rusqlite::Result<UsageAggregate> {
-    // c-usagefu r15 item 1: legacy-shape fallback; c-usagefu r16 item 7 reports
-    // the explicit Unavailable state instead of a zero spend.
     if !usage_schema_is_current(conn)? {
         return Ok(UsageAggregate::unavailable());
     }
-    let fold = FOLD_CTES_SQL
-        .replace("{domain_l}", "l.profile_id = ?1 AND l.model = ?2")
-        .replace("{domain}", "profile_id = ?1 AND model = ?2");
+    let ctes = unified_fold_ctes("profile_id = ?1 AND model = ?2");
+    // Count surviving rows in THIS domain first: a zero-row fold is "model
+    // absent from the data", not "model spent zero", so its token/cost
+    // columns must surface as NULL rather than the empty-fold zero defaults.
+    let total_rows: i64 = conn.query_row(
+        &format!("WITH {ctes} SELECT COUNT(*) FROM contributions"),
+        params![profile_id, model],
+        |row| row.get(0),
+    )?;
     conn.query_row(
-        &format!(
-            "WITH {fold},
-             contributions AS (
-                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
-                 FROM scoped_sessions
-                 UNION ALL
-                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
-                 FROM legacy_stock
-                 UNION ALL
-                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
-                 FROM proven_turns
-                 UNION ALL
-                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
-                 FROM usage_events
-                 WHERE profile_id = ?1 AND model = ?2
-                   AND scope NOT IN ('turn', 'session')
-             )
-             SELECT
-                 (SELECT COUNT(*) FROM contributions),
-                 (SELECT COUNT(*) FROM ambiguous_turns),
-                 CASE WHEN NOT EXISTS (
-                          SELECT 1 FROM ambiguous_turns WHERE total_tokens IS NOT NULL
-                      ) AND COUNT(*) = COUNT(total_tokens)
-                      THEN SUM(total_tokens) END,
-                 CASE WHEN NOT EXISTS (
-                          SELECT 1 FROM ambiguous_turns WHERE input_tokens IS NOT NULL
-                      ) AND COUNT(*) = COUNT(input_tokens)
-                      THEN SUM(input_tokens) END,
-                 CASE WHEN NOT EXISTS (
-                          SELECT 1 FROM ambiguous_turns WHERE output_tokens IS NOT NULL
-                      ) AND COUNT(*) = COUNT(output_tokens)
-                      THEN SUM(output_tokens) END,
-                 CASE WHEN NOT EXISTS (
-                          SELECT 1 FROM ambiguous_turns WHERE cost_usd IS NOT NULL
-                      ) AND COUNT(*) = COUNT(cost_usd)
-                      THEN SUM(CAST(cost_usd AS REAL)) END
-             FROM contributions",
-            fold = fold
-        ),
+        &format!("WITH {ctes} {select}", select = aggregate_select_sql()),
         params![profile_id, model],
         |row| {
             Ok(UsageAggregate {
-                events: row.get(0)?,
+                events: if total_rows == 0 {
+                    0
+                } else {
+                    row.get::<_, Option<i64>>(0)?.unwrap_or(0)
+                },
                 ambiguous_events: row.get(1)?,
                 ambiguous: row.get::<_, i64>(1)? != 0,
-                total_tokens: row.get(2)?,
-                input_tokens: row.get(3)?,
-                output_tokens: row.get(4)?,
-                cost_usd: row.get(5)?,
+                total_tokens: if total_rows == 0 { None } else { row.get(2)? },
+                input_tokens: if total_rows == 0 { None } else { row.get(3)? },
+                output_tokens: if total_rows == 0 { None } else { row.get(4)? },
+                cost_usd: if total_rows == 0 { None } else { row.get(7)? },
                 unavailable: false,
             })
         },
     )
 }
-
 /// Per-session token/context rollup backing the composer's context chip
 /// popover (context-usage-1).
 ///
@@ -2383,17 +2689,68 @@ fn sum_turn_tokens_since(
     instance_id: &str,
     since: &str,
 ) -> rusqlite::Result<(Option<i64>, Option<i64>)> {
+    // Fold to the lineage WINNER per scope id BEFORE the native-time/window
+    // filter (c-ctxusage r17 item 5 / r22 item 1): ranking inside the window
+    // would count a superseded in-window lineage, and filtering native rows
+    // first would let an ingest-timed newer winner lose to an older native
+    // row. Winners then pass the unified flow relation (message coverage
+    // proof, session provenance, ambiguity) from [`unified_fold_ctes`].
+    let ctes = unified_fold_ctes("instance_id = ?1");
+    let turn_covered = turn_fully_covered_sql("t.instance_id", "t.scope_id");
     conn.query_row(
         &format!(
-            "SELECT CASE WHEN COUNT(*) = COUNT(input_tokens)
-                        THEN SUM(input_tokens) END,
-                   CASE WHEN COUNT(*) = COUNT(output_tokens)
-                        THEN SUM(output_tokens) END
-             FROM usage_events
-             WHERE instance_id = ?1 AND observed_at >= ?2
-               AND observed_at_source = 'native'
-               AND {eligible}",
-            eligible = eligible_flow_predicate("usage_events")
+            "WITH {ctes},
+             -- Rate windows are PER-CALL throughput: lineage-certified turns
+             -- still count even when the current stock certifies them (the
+             -- stock is cumulative, not throughput — c-ctxusage r4 item 6);
+             -- only a turn fully re-emitted as durable MESSAGES is excluded.
+             -- Turn-frame U1 and the independent Message sum are kept apart.
+             win_turn AS (
+                SELECT t.input_tokens, t.output_tokens
+                FROM global_winning_turns t
+                WHERE t.instance_id = ?1
+                  AND t.observed_at_source = 'native'
+                  AND t.observed_at >= ?2
+                  AND NOT ({turn_covered})
+                  AND NOT EXISTS (
+                      -- Exclude exactly the rows the fold classifies as
+                      -- ambiguous (identified unproven non-legacy turns beside
+                      -- scoped stock). Legacy/NULL-identity turns and lineage-
+                      -- certified turns are kept even if their scope id is
+                      -- NULL at SQL correlation time.
+                      SELECT 1 FROM g_ambiguous_turns a
+                      WHERE a.winning_rowid = t.winning_rowid
+                  )
+             ),
+             win_msg AS (
+                SELECT input_tokens, output_tokens FROM flow_messages
+                WHERE observed_at_source = 'native' AND observed_at >= ?2
+             )
+             SELECT
+                -- No rows at all in the window => Unknown (not a zero rate).
+                -- A turn/stock frame half is U1-gated: a NULL bucket poisons
+                -- the whole window half; per-response Messages sum
+                -- independently (NULL bucket = zero for that response).
+                CASE
+                    WHEN (SELECT COUNT(*) FROM win_turn) = 0
+                         AND (SELECT COUNT(*) FROM win_msg) = 0 THEN NULL
+                    WHEN (SELECT COUNT(*) FROM win_turn) = 0
+                         THEN COALESCE((SELECT SUM(input_tokens) FROM win_msg), 0)
+                    ELSE (SELECT CASE
+                             WHEN COUNT(*) = COUNT(input_tokens) THEN SUM(input_tokens)
+                          END FROM win_turn)
+                         + COALESCE((SELECT SUM(input_tokens) FROM win_msg), 0)
+                END,
+                CASE
+                    WHEN (SELECT COUNT(*) FROM win_turn) = 0
+                         AND (SELECT COUNT(*) FROM win_msg) = 0 THEN NULL
+                    WHEN (SELECT COUNT(*) FROM win_turn) = 0
+                         THEN COALESCE((SELECT SUM(output_tokens) FROM win_msg), 0)
+                    ELSE (SELECT CASE
+                             WHEN COUNT(*) = COUNT(output_tokens) THEN SUM(output_tokens)
+                          END FROM win_turn)
+                         + COALESCE((SELECT SUM(output_tokens) FROM win_msg), 0)
+                END"
         ),
         params![instance_id, since],
         |row| Ok((row.get(0)?, row.get(1)?)),
@@ -2434,15 +2791,23 @@ fn session_stock_increments(
 }
 
 /// One ordered cumulative-session point: the two rate buckets, its observed
-/// time, the session scope id (NULL for legacy rows) and the time source.
-type SessionPointRow = (Option<i64>, Option<i64>, String, Option<String>, String);
+/// time, the session scope id (NULL for legacy rows), the time source and the
+/// pre-upgrade lineage tag.
+type SessionPointRow = (
+    Option<i64>,
+    Option<i64>,
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+);
 
 /// Ordered session points; scoped or legacy NULL-scope only. EVERY accepted
 /// point is walked — including ingest-stamped historical replays — because a
 /// timestamp-free replay still ADVANCES the cumulative baseline: skipping it
 /// made the next native point diff against a stale stock and inflate a single
 /// increment (native 100 → untimed 120, 140 → native 150 read as +50 instead
-/// of the true +10). Only the increment EMISSION is native-gated
+/// of the true +10). Only the increment EMISSION is source/lineage-gated
 /// (c-ctxusage r9 item 3).
 ///
 /// c-ctxusage r10 item 3: the chain order is the ACCEPTED order (insertion
@@ -2463,7 +2828,8 @@ fn session_point_rows(
         "scope_id IS NULL"
     };
     let sql = format!(
-        "SELECT input_tokens, output_tokens, observed_at, scope_id, observed_at_source
+        "SELECT input_tokens, output_tokens, observed_at, scope_id,
+                observed_at_source, lineage_state
          FROM usage_events
          WHERE instance_id = ?1 AND scope = 'session' AND {predicate}
          ORDER BY scope_id ASC, rowid ASC"
@@ -2476,6 +2842,7 @@ fn session_point_rows(
             row.get(2)?,
             row.get(3)?,
             row.get(4)?,
+            row.get(5)?,
         ))
     })?
     .collect()
@@ -2483,23 +2850,26 @@ fn session_point_rows(
 
 /// Diff ordered points, restarting the chain at every scope boundary. Every
 /// point advances the predecessor baseline; an increment is emitted ONLY for
-/// a NATIVE-timed point against its IMMEDIATE predecessor (whatever that
-/// predecessor's source), and only when the predecessor exists. A native
-/// point with no predecessor, or an interval whose predecessor counters are
-/// unknown, yields no increment — the interval is unknown, never the stock
+/// a NATIVE-timed post-upgrade point — or a PRE-UPGRADE (`lineage_state =
+/// 'legacy'`) point, whose pre-split timestamp is the only time evidence
+/// available and is trusted (c-usagefu r8 item 5) — against its IMMEDIATE
+/// predecessor, and only when the predecessor exists. A native point with no
+/// predecessor, or an interval whose predecessor counters are unknown, yields
+/// no increment — the interval is unknown, never the stock
 /// (c-ctxusage r9 item 3). An unknown PREDECESSOR bucket stays unknown rather
 /// than being treated as zero: unknown→150 cannot be read as a 150 increment
 /// (c-ctxusage r10 item 4).
 fn diff_rows(rows: Vec<SessionPointRow>) -> rusqlite::Result<Vec<StockIncrement>> {
     let mut increments = Vec::new();
     let mut previous: Option<(Option<String>, Option<i64>, Option<i64>)> = None;
-    for (input, output, end_at, scope_id, source) in rows {
+    for (input, output, end_at, scope_id, source, lineage_state) in rows {
         let boundary = previous
             .as_ref()
             .map(|(prev_scope, _, _)| *prev_scope != scope_id)
             .unwrap_or(true);
+        let trusted_time = source == "native" || lineage_state.as_deref() == Some("legacy");
         if !boundary
-            && source == "native"
+            && trusted_time
             && let Some((_, prev_input, prev_output)) = &previous
         {
             // None for either side of a bucket means "unknown for this
@@ -2717,27 +3087,59 @@ fn add_optional(a: Option<i64>, b: Option<i64>) -> Option<i64> {
 ///
 /// c-ctxusage r4 item 4: "newest" is the NATIVE time, tie-broken by ingest
 /// seq — a late historical correction at a high seq never becomes current.
+/// c-ctxusage r4 item 4 / r17 item 6 / r18 item 1: the context basket is the
+/// newest surviving flow call — a lineage WINNER turn ([`unified_fold_ctes`]
+/// already folded superseded lineages) or an eligible Message — never a raw
+/// superseded turn row and never a cumulative session row. "Newest" is the
+/// reported time, tie-broken by seq. U1: the sum is Known only when that call
+/// reported input AND both cache buckets; one omission returns Unknown rather
+/// than summing the known baskets.
 fn latest_call_basket(conn: &Connection, instance_id: &str) -> rusqlite::Result<Option<i64>> {
-    Ok(conn
+    let ctes = unified_fold_ctes("instance_id = ?1");
+    let Some((input, cache_read, cache_write)) = conn
         .query_row(
-            "SELECT input_tokens, cache_read_tokens, cache_write_tokens
-         FROM usage_events
-         WHERE instance_id = ?1 AND scope IN ('message', 'turn')
-         ORDER BY CASE scope WHEN 'message' THEN 0 ELSE 1 END,
-                  observed_at DESC, seq DESC LIMIT 1",
+            &format!(
+                "WITH {ctes},
+                 baskets AS (
+                    SELECT input_tokens, cache_read_tokens, cache_write_tokens,
+                           observed_at, seq FROM flow_turns
+                    UNION ALL
+                    SELECT input_tokens, cache_read_tokens, cache_write_tokens,
+                           observed_at, seq FROM flow_messages
+                 )
+                 SELECT input_tokens, cache_read_tokens, cache_write_tokens
+                 FROM baskets
+                 ORDER BY observed_at DESC, seq DESC LIMIT 1"
+            ),
             params![instance_id],
             |row| {
-                let input: Option<i64> = row.get(0)?;
-                let cache_read: Option<i64> = row.get(1)?;
-                let cache_write: Option<i64> = row.get(2)?;
-                Ok([input, cache_read, cache_write]
-                    .into_iter()
-                    .flatten()
-                    .reduce(i64::saturating_add))
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
             },
         )
         .ok()
-        .flatten())
+    else {
+        return Ok(None);
+    };
+    let (Some(input), Some(cache_read), Some(cache_write)) = (input, cache_read, cache_write)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(
+        input.saturating_add(cache_read).saturating_add(cache_write),
+    ))
+}
+
+/// U1 stock-only context: Known only when the current stock reports input and
+/// BOTH cache buckets (c-ctxusage r17 item 6).
+fn known_context_total(baskets: [Option<i64>; 3]) -> Option<i64> {
+    baskets
+        .into_iter()
+        .collect::<Option<Vec<i64>>>()
+        .map(|known| known.into_iter().fold(0, i64::saturating_add))
 }
 
 /// The newest native per-model context window reported on a usage row.
@@ -2948,54 +3350,128 @@ pub fn rollup_instance(
         return Ok(Some(InstanceUsageRollup::unavailable()));
     }
     let instance_id = req.instance_id;
-    // Turn count over the ELIGIBLE flow rows: distinct turn id of every
-    // Message, distinct scope_id of every unmatched modern Turn, plus one
-    // per legacy NULL-scope_id Turn (r7 item 8). Legacy pre-scopeId Turns
-    // counted by seq fallback so upgraded instances do not report zero.
-    //
-    // Token sums use the same relation: a native Turn-only call and a
-    // Message-represented call both contribute exactly once.
-    let flow_input = format!("SUM(CASE {} END)", flow_case_arm("input_tokens"));
-    let flow_output = format!("SUM(CASE {} END)", flow_case_arm("output_tokens"));
-    let flow_cache_read = format!("SUM(CASE {} END)", flow_case_arm("cache_read_tokens"));
-    let flow_cache_write = format!("SUM(CASE {} END)", flow_case_arm("cache_write_tokens"));
+    // Totals come from the SAME unified fold as the aggregates
+    // ([`unified_fold_ctes`]): one winning turn per scope id across lineages,
+    // eligible durable Messages, per-session stock-vs-flow composition, and
+    // U1 / ambiguity Unknown gating. Legacy NULL-scope Turns count as
+    // individual winning rows.
+    let ctes = unified_fold_ctes("instance_id = ?1");
     let totals = conn.query_row(
         &format!(
-            "SELECT
-            COUNT(DISTINCT CASE
-                WHEN scope='message' THEN turn_id
-                WHEN scope='turn' AND scope_id IS NOT NULL AND NOT {matched} THEN scope_id
-                WHEN scope='workflow-member' THEN scope_id END)
-            + COUNT(CASE WHEN scope='turn' AND scope_id IS NULL THEN 1 END),
-            {flow_input},
-            {flow_output},
-            {flow_cache_read},
-            {flow_cache_write},
-            COUNT(CASE WHEN scope='session' THEN 1 END),
-            COUNT(*),
-            MAX(CASE WHEN scope IN ('turn','message') AND observed_at_source='native' THEN observed_at END)
-         FROM usage_events WHERE instance_id = ?1",
-            matched = "EXISTS (SELECT 1 FROM usage_events _ef_n
-                              WHERE _ef_n.instance_id = usage_events.instance_id
-                                AND _ef_n.scope = 'message'
-                                AND _ef_n.turn_id = usage_events.scope_id)",
+            "WITH {ctes}
+             SELECT
+                -- Turn identities: every winning turn row (a covered turn is
+                -- still an observed turn), plus one per eligible durable
+                -- Message whose turn has no winning Turn row, plus legacy
+                -- turn_id-less Messages only when the instance has no Turn at
+                -- all (c-usagefu r7 item 8).
+                (SELECT COUNT(*) FROM global_winning_turns
+                 WHERE instance_id = ?1)
+                + (SELECT COUNT(*) FROM (
+                    SELECT DISTINCT fm.turn_id FROM flow_messages fm
+                    WHERE fm.turn_id IS NOT NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM global_winning_turns wt
+                          WHERE wt.instance_id = fm.instance_id
+                            AND wt.scope_id = fm.turn_id
+                      )
+                    UNION ALL
+                    SELECT DISTINCT fm.turn_id FROM flow_messages fm
+                    WHERE fm.turn_id IS NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM global_winning_turns wt
+                          WHERE wt.instance_id = fm.instance_id
+                      )
+                  )),
+                EXISTS (
+                    SELECT 1 FROM usage_events
+                    WHERE instance_id = ?1 AND scope = 'session'
+                ),
+                -- U1 gate over the Turn/stock accounting frames only; durable
+                -- per-response Messages sum independently (NULLs ignored).
+                (SELECT CASE
+                         WHEN EXISTS (
+                             SELECT 1 FROM ambiguous_turns
+                             WHERE input_tokens IS NOT NULL
+                         ) THEN NULL
+                         WHEN COUNT(*) = 0 THEN 0
+                         WHEN COUNT(*) = COUNT(input_tokens) THEN SUM(input_tokens)
+                     END
+                    FROM (
+                        SELECT input_tokens FROM flow_turns
+                        UNION ALL SELECT input_tokens FROM stock_sessions
+                        UNION ALL SELECT input_tokens FROM legacy_stock
+                    )
+                )
+                + COALESCE((SELECT SUM(input_tokens) FROM flow_messages), 0),
+                (SELECT CASE
+                         WHEN EXISTS (
+                             SELECT 1 FROM ambiguous_turns
+                             WHERE output_tokens IS NOT NULL
+                         ) THEN NULL
+                         WHEN COUNT(*) = 0 THEN 0
+                         WHEN COUNT(*) = COUNT(output_tokens) THEN SUM(output_tokens)
+                     END
+                    FROM (
+                        SELECT output_tokens FROM flow_turns
+                        UNION ALL SELECT output_tokens FROM stock_sessions
+                        UNION ALL SELECT output_tokens FROM legacy_stock
+                    )
+                )
+                + COALESCE((SELECT SUM(output_tokens) FROM flow_messages), 0),
+                (SELECT CASE
+                         WHEN EXISTS (
+                             SELECT 1 FROM ambiguous_turns
+                             WHERE cache_read_tokens IS NOT NULL
+                         ) THEN NULL
+                         WHEN COUNT(*) = 0 THEN 0
+                         WHEN COUNT(*) = COUNT(cache_read_tokens) THEN SUM(cache_read_tokens)
+                     END
+                    FROM (
+                        SELECT cache_read_tokens FROM flow_turns
+                        UNION ALL SELECT cache_read_tokens FROM stock_sessions
+                        UNION ALL SELECT cache_read_tokens FROM legacy_stock
+                    )
+                )
+                + COALESCE((SELECT SUM(cache_read_tokens) FROM flow_messages), 0),
+                (SELECT CASE
+                         WHEN EXISTS (
+                             SELECT 1 FROM ambiguous_turns
+                             WHERE cache_write_tokens IS NOT NULL
+                         ) THEN NULL
+                         WHEN COUNT(*) = 0 THEN 0
+                         WHEN COUNT(*) = COUNT(cache_write_tokens) THEN SUM(cache_write_tokens)
+                     END
+                    FROM (
+                        SELECT cache_write_tokens FROM flow_turns
+                        UNION ALL SELECT cache_write_tokens FROM stock_sessions
+                        UNION ALL SELECT cache_write_tokens FROM legacy_stock
+                    )
+                )
+                + COALESCE((SELECT SUM(cache_write_tokens) FROM flow_messages), 0),
+                (SELECT MAX(observed_at) FROM (
+                    SELECT observed_at FROM flow_turns
+                     WHERE observed_at_source = 'native'
+                    UNION ALL
+                    SELECT observed_at FROM flow_messages
+                     WHERE observed_at_source = 'native'
+                 ))"
         ),
         params![instance_id],
         |row| {
             let turns: i64 = row.get(0)?;
             Ok(RollupTotals {
                 turns,
-                turn_input: row.get(1)?,
-                turn_output: row.get(2)?,
-                turn_cache_read: row.get(3)?,
-                turn_cache_write: row.get(4)?,
-                has_session: row.get::<_, i64>(5)? > 0,
-                last_turn_at: row.get(7)?,
+                turn_input: row.get(2)?,
+                turn_output: row.get(3)?,
+                turn_cache_read: row.get(4)?,
+                turn_cache_write: row.get(5)?,
+                has_session: row.get(1)?,
+                last_turn_at: row.get(6)?,
             })
         },
     )?;
-    // A row exists if there is any flow (turn/message with a distinct turn
-    // identity) OR any other row (legacy pre-scopeId turn / session).
+    // A row exists if there is any flow (turn/message) OR any session row.
     let total_rows: i64 = conn.query_row(
         "SELECT COUNT(*) FROM usage_events WHERE instance_id = ?1",
         params![instance_id],
@@ -3005,49 +3481,26 @@ pub fn rollup_instance(
         return Ok(None);
     }
 
-    // r9 item 5: does the instance have ANY eligible flow row? The decision
-    // includes legacy NULL-scope Turns.
-    let has_eligible_flow: bool = conn.query_row(
-        &format!("SELECT {}", has_eligible_flow_sql("?1")),
-        params![instance_id],
-        |row| row.get(0),
-    )?;
-
-    // The cumulative stock exists only for session-emitting harnesses.
+    // The cumulative stock exists only for session-emitting harnesses. It is
+    // the context-basket fallback only (token totals come from the fold).
     let (stock, _stock_scoped) = if totals.has_session {
         latest_session_stock(conn, instance_id)?
     } else {
         (SessionStock::default(), false)
     };
 
-    // Totals: eligible flow whenever any exists; the latest stock ONLY when
-    // the instance/session is flow-less. Never flow + stock, never a
-    // smaller-flow stock fallback (r9 items 4/5).
-    let use_flow = !totals.has_session || has_eligible_flow;
-    let (session_input, session_output, cache_read, cache_creation) = if use_flow {
-        (
-            totals.turn_input,
-            totals.turn_output,
-            totals.turn_cache_read,
-            totals.turn_cache_write,
-        )
-    } else {
-        (
-            stock.input,
-            stock.output,
-            stock.cache_read,
-            stock.cache_write,
-        )
-    };
+    let (session_input, session_output, cache_read, cache_creation) = (
+        totals.turn_input,
+        totals.turn_output,
+        totals.turn_cache_read,
+        totals.turn_cache_write,
+    );
 
-    // Context basket: the newest per-request/turn call; for a stock-only
-    // harness (or when no call rows exist) the current stock counters.
-    let context_used_tokens = latest_call_basket(conn, instance_id)?.or_else(|| {
-        [stock.input, stock.cache_read, stock.cache_write]
-            .into_iter()
-            .flatten()
-            .reduce(i64::saturating_add)
-    });
+    // Context basket: the newest surviving flow call (U1: Unknown unless that
+    // call knew every basket); for a stock-only harness the current stock
+    // counters under the same all-known rule.
+    let context_used_tokens = latest_call_basket(conn, instance_id)?
+        .or_else(|| known_context_total([stock.input, stock.cache_read, stock.cache_write]));
 
     let native_window = latest_native_window(conn, instance_id)?;
     let (context_window_tokens, window_approximate) =
@@ -3061,18 +3514,32 @@ pub fn rollup_instance(
         });
     let context_pct_approximate = context_pct.is_some() && window_approximate;
 
-    // Rate windows are summed from NATIVE-timestamped flow rows only (an
-    // ingest-stamped replay must not read as a burst). The route therefore
-    // depends on whether a native flow row EXISTS, not on has_turn: legacy
-    // NULL-scope Turn rows (upgraded pre-delivery DBs, source backfilled to
-    // 'ingest') make has_turn true, but the native-only flow query would
-    // return NULL for them, blanking TPM on an instance whose cumulative
-    // Session growth points can still supply increments (r8 item 5).
+    // Rate windows are summed from NATIVE-timestamped flow rows that SURVIVE
+    // the fold (an ingest-stamped replay or a lineage-ambiguous/covered turn
+    // must not read as a burst). The route depends on whether such a row
+    // EXISTS, not on raw has_turn: a covered legacy Turn makes has_turn true
+    // but contributes nothing, so an instance whose cumulative Session growth
+    // points can still supply increments must take the stock route (r8
+    // item 5 / c-ctxusage r28 coverage).
+    let fold_ctes = unified_fold_ctes("instance_id = ?1");
+    let route_covered = turn_fully_covered_sql("t.instance_id", "t.scope_id");
     let has_native_flow: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM usage_events
-                       WHERE instance_id = ?1
-                         AND scope IN ('turn', 'message')
-                         AND observed_at_source = 'native')",
+        &format!(
+            "WITH {fold_ctes}
+             SELECT EXISTS (
+                 SELECT 1 FROM global_winning_turns t
+                 WHERE t.observed_at_source = 'native'
+                   AND NOT ({route_covered})
+                   AND NOT EXISTS (
+                       SELECT 1 FROM ambiguous_turns a
+                       WHERE a.instance_id = t.instance_id
+                         AND COALESCE(a.scope_id, '') = COALESCE(t.scope_id, '')
+                   )
+                 UNION ALL
+                 SELECT 1 FROM flow_messages
+                 WHERE observed_at_source = 'native'
+             )"
+        ),
         params![instance_id],
         |row| row.get(0),
     )?;
@@ -8113,6 +8580,22 @@ mod tests {
                 Some("passthrough/ark/seed-evolving"),
             )
             .unwrap(),
+        )
+        .unwrap();
+        // c-ctxusage U1 merge note: the context basket is Known only when the
+        // call reports every basket explicitly; the adapter always emits cache
+        // zeros for Claude, so stamp them here (this test asserts WINDOW
+        // resolution on a /model switch, not omitted-bucket semantics).
+        let mut call = usage_record(1, 50_000, Some("0.01"));
+        call.event["payload"]["cacheReadTokens"] = json!({ "state": "known", "value": "0" });
+        call.event["payload"]["cacheWriteTokens"] = json!({ "state": "known", "value": "0" });
+        // Re-insert is a no-op (same instance/seq); open a fresh connection so
+        // the first projection carries the complete baskets.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        insert_usage_event(
+            &conn,
+            &project_usage_event(&call, None, Some("passthrough/ark/seed-evolving")).unwrap(),
         )
         .unwrap();
         let before = rollup_fold(

@@ -207,6 +207,55 @@ fn clip_field(text: String, max_bytes: usize) -> String {
     text
 }
 
+/// r23 item 4: incremental RAW-BYTE line framer for streamed logs.
+///
+/// Each `read()` chunk is appended UNDECODED; complete lines are framed by
+/// splitting only at the ASCII `\n` (which can never be a byte inside a
+/// multi-byte UTF-8 sequence), and only the framed line is lossily decoded.
+/// Thus a valid character whose bytes arrive across reads — e.g. read 1
+/// returns `E2`, read 2 returns `82 AC 0A` (`€` + newline) — stays assembled
+/// in the raw pending buffer and decodes to `€`, rather than being turned into
+/// two replacement characters by per-chunk `String::from_utf8_lossy`. Bytes
+/// that are genuinely invalid inside a completed line still decode to the
+/// replacement character (lossy), preserving the r22 raw-byte evidence
+/// behavior.
+struct LossyLineFramer {
+    pending: Vec<u8>,
+}
+
+impl LossyLineFramer {
+    fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+        }
+    }
+
+    /// Append one read chunk and emit every now-complete line (newline
+    /// stripped, a trailing CR trimmed).
+    fn push(&mut self, chunk: &[u8], mut emit: impl FnMut(String)) {
+        self.pending.extend_from_slice(chunk);
+        while let Some(newline) = self.pending.iter().position(|&byte| byte == b'\n') {
+            let rest = self.pending.split_off(newline + 1);
+            let mut line = std::mem::replace(&mut self.pending, rest);
+            while matches!(line.last(), Some(b'\n') | Some(b'\r')) {
+                line.pop();
+            }
+            emit(String::from_utf8_lossy(&line).into_owned());
+        }
+    }
+
+    /// Emit a final unterminated line at EOF, if any bytes remain.
+    fn finish(self, mut emit: impl FnMut(String)) {
+        let mut line = self.pending;
+        while matches!(line.last(), Some(b'\n') | Some(b'\r')) {
+            line.pop();
+        }
+        if !line.is_empty() {
+            emit(String::from_utf8_lossy(&line).into_owned());
+        }
+    }
+}
+
 /// One live gate run: cancel flag and the process group(s) to kill.
 struct LiveRun {
     /// The dispatch generation THIS run executes. A delayed gate.cancel /
@@ -2507,9 +2556,12 @@ impl DevNode {
                 tokio::spawn(async move {
                     use tokio::io::AsyncReadExt;
                     let mut buf = [0u8; 4096];
-                    // Decoded-but-incomplete tail carried across reads, used
-                    // only to split the lossy presentation into lines.
-                    let mut pending = String::new();
+                    // r23 item 4: raw-byte pending carried across reads, used
+                    // ONLY to split the lossy presentation into lines. Framing
+                    // on the raw bytes (not a per-chunk lossy String) keeps a
+                    // valid multi-byte character intact when it is split
+                    // across reads.
+                    let mut framer = LossyLineFramer::new();
                     let emit = |node: &DevNode, message: String| {
                         let _ = node.gate_registry().events.send(GateEventParams {
                             job_id: job_id.clone(),
@@ -2541,12 +2593,7 @@ impl DevNode {
                                 if let Ok(mut raw) = captured.lock() {
                                     raw.extend_from_slice(&buf[..n]);
                                 }
-                                pending.push_str(&String::from_utf8_lossy(&buf[..n]));
-                                while let Some(idx) = pending.find('\n') {
-                                    let line = pending[..idx].trim_end_matches('\r').to_owned();
-                                    pending.replace_range(..=idx, "");
-                                    emit(&node, line);
-                                }
+                                framer.push(&buf[..n], |line| emit(&node, line));
                                 // r22 item 3 deterministic seam: fail AFTER a
                                 // non-empty read so valid bytes exist but the
                                 // drain is explicitly unsuccessful.
@@ -2565,9 +2612,7 @@ impl DevNode {
                         }
                     }
                     // Flush the final unterminated line for presentation.
-                    if !pending.is_empty() {
-                        emit(&node, std::mem::take(&mut pending));
-                    }
+                    framer.finish(|line| emit(&node, line));
                     std::io::Result::Ok(())
                 })
             });
@@ -7378,6 +7423,59 @@ JSON
         let clipped = super::clip_field("€".repeat(20), 7);
         assert!(clipped.len() <= 7, "{clipped:?}");
         assert!(std::str::from_utf8(clipped.as_bytes()).is_ok());
+    }
+
+    /// r23 item 4: a valid multi-byte character split ACROSS reads must not be
+    /// corrupted into replacement characters in the streamed live log.
+    #[test]
+    fn lossy_framer_keeps_a_multibyte_char_split_across_reads_intact() {
+        // "€" is E2 82 AC; read 1 returns only E2, read 2 returns 82 AC 0A.
+        let mut lines = Vec::new();
+        let mut framer = super::LossyLineFramer::new();
+        framer.push(&[0xE2], |l| lines.push(l));
+        assert!(
+            lines.is_empty(),
+            "a lone lead byte emits no line: {lines:?}"
+        );
+        framer.push(&[0x82, 0xAC, b'\n'], |l| lines.push(l));
+        assert_eq!(
+            lines,
+            vec!["€".to_owned()],
+            "split char corrupted: {lines:?}"
+        );
+        framer.finish(|l| lines.push(l));
+        assert_eq!(
+            lines,
+            vec!["€".to_owned()],
+            "no spurious EOF line: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn lossy_framer_handles_multiple_lines_cr_and_unterminated_tail() {
+        let mut lines = Vec::new();
+        let mut framer = super::LossyLineFramer::new();
+        // Several lines in one chunk, CRLF, and an unterminated final line.
+        framer.push(b"one\r\ntwo\nth", |l| lines.push(l));
+        framer.finish(|l| lines.push(l));
+        assert_eq!(
+            lines,
+            vec!["one".to_owned(), "two".to_owned(), "th".to_owned()],
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn lossy_framer_lossily_decodes_a_genuinely_invalid_completed_line() {
+        // The r22 RAW_STDERR shape: an invalid lead byte inside a COMPLETE
+        // line becomes U+FFFD, but it does not terminate framing or corrupt
+        // the following valid line.
+        let mut lines = Vec::new();
+        let mut framer = super::LossyLineFramer::new();
+        framer.push(b"bad-\xFF-end\nok\n", |l| lines.push(l));
+        framer.finish(|_| {});
+        assert_eq!(lines[0], "bad-\u{FFFD}-end", "{lines:?}");
+        assert_eq!(lines[1], "ok", "{lines:?}");
     }
 
     #[test]

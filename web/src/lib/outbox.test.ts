@@ -2575,3 +2575,119 @@ describe("GATE50 item 1: bounded auth drain never waits on an unstarted queued c
     }
   });
 });
+
+describe("GATE51 item 1: no-Web-Locks fallback keeps the per-instance mutex for bounded drains", () => {
+  const originalLocks = (globalThis.navigator as { locks?: LockManager }).locks;
+  const noLocks = () => {
+    Object.defineProperty(globalThis.navigator, "locks", {
+      configurable: true,
+      writable: true,
+      value: undefined,
+    });
+  };
+  const restore = () => {
+    Object.defineProperty(globalThis.navigator, "locks", {
+      configurable: true,
+      writable: true,
+      value: originalLocks,
+    });
+  };
+  const wait = (ms = 5) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+  it("an ordinary flush mid-POST holds the fallback mutex: a bounded drain posts no second command and returns lock-unavailable until A settles", async () => {
+    noLocks();
+    try {
+      const storage = new MemStorage();
+      const box = await Outbox.load(storage, "owner_g51_i1_a");
+      const I = "ins_g51_i1_a";
+      await storage.put(rec({ commandId: "cmd_g51_a", clientRequestId: "local_a", instanceId: I, state: "pending" }));
+      await storage.put(rec({ commandId: "cmd_g51_b", clientRequestId: "local_b", instanceId: I, state: "pending" }));
+
+      // Ordinary delivery A parks mid-POST (models a slow REST response).
+      const posted: string[] = [];
+      let releaseA!: () => void;
+      const aHeld = new Promise<void>((resolve) => {
+        releaseA = resolve;
+      });
+      const ordinaryP = box.withInstanceLock(I, async (_iid, rows) => {
+        const first = rows[0];
+        if (!first) return null;
+        posted.push(first.commandId); // the one POST in flight (A)
+        await aHeld;
+        await storage.put({ ...first, state: "sent" });
+        return first.commandId;
+      });
+      await wait();
+      expect(posted).toEqual(["cmd_g51_a"]); // A is mid-POST
+
+      // A bounded drain (same-identity auth turn) must not POST B alongside
+      // A: the fallback reservation is occupied → lock-unavailable at once.
+      let boundedRan = false;
+      const boundedOutcome = await box.withInstanceLock(
+        I,
+        async (_iid, rows) => {
+          boundedRan = true;
+          for (const r of rows) posted.push(r.commandId);
+          return "drained" as const;
+        },
+        { ifAvailable: true },
+      );
+      expect(boundedOutcome).toBe("lock-unavailable");
+      expect(boundedRan).toBe(false);
+      expect(posted).toEqual(["cmd_g51_a"]); // B never POSTed while A was held
+
+      // After A settles a later bounded turn acquires and delivers B.
+      releaseA();
+      expect(await ordinaryP).toBe("cmd_g51_a");
+      const after = await box.withInstanceLock(
+        I,
+        async (_iid, rows) => rows.map((r) => r.commandId),
+        { ifAvailable: true },
+      );
+      expect(after).toEqual(["cmd_g51_b"]);
+      box.dispose();
+    } finally {
+      restore();
+    }
+  });
+
+  it("two bounded deliveries launched simultaneously deliver each command exactly once", async () => {
+    noLocks();
+    try {
+      const storage = new MemStorage();
+      const box = await Outbox.load(storage, "owner_g51_i1_b");
+      const I = "ins_g51_i1_b";
+      await storage.put(rec({ commandId: "cmd_g51_c", clientRequestId: "local_c", instanceId: I, state: "pending" }));
+
+      const posted: string[] = [];
+      let releaseC!: () => void;
+      const cHeld = new Promise<void>((resolve) => {
+        releaseC = resolve;
+      });
+      const deliver = async (_iid: string, rows: OutboxRecord[]) => {
+        const first = rows[0];
+        if (!first) return null;
+        posted.push(first.commandId); // exactly one POST for cmd_g51_c
+        await cHeld;
+        await storage.put({ ...first, state: "sent" });
+        return first.commandId;
+      };
+
+      // Both bounded calls are dispatched in ONE synchronous turn, before the
+      // first acquisition's durable claim can suspend: the second must lose
+      // the synchronous reservation and return lock-unavailable immediately.
+      const firstP = box.withInstanceLock(I, deliver, { ifAvailable: true });
+      const secondP = box.withInstanceLock(I, deliver, { ifAvailable: true });
+      await wait();
+      releaseC();
+      const [first, second] = await Promise.all([firstP, secondP]);
+      const outcomes = [first, second].filter((v) => v !== "lock-unavailable");
+      expect(outcomes).toEqual(["cmd_g51_c"]);
+      expect(first === "lock-unavailable" || second === "lock-unavailable").toBe(true);
+      expect(posted).toEqual(["cmd_g51_c"]); // no duplicate POST
+      box.dispose();
+    } finally {
+      restore();
+    }
+  });
+});

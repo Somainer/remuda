@@ -2103,6 +2103,7 @@ export class Outbox {
     this.disposed = true;
     this.cancelAllWakesForUnload();
     this.activeDeliveries.clear();
+    this.localReservations.clear();
     this.onClaimWake = null;
     this.onHeldLease = null;
     this.onReadRecoveryExhausted = null;
@@ -2243,9 +2244,65 @@ export class Outbox {
       }
       return await locks.request(name, { mode: "exclusive" }, run);
     }
-    // No Web Locks: the lease fallback cannot be ifAvailable-guarded, but it
-    // is already bounded (leases TTL-expire); auth-turn callers accept that.
-    return await this.runWithLease(instanceId, fn);
+    // No Web Locks: the durable lease serializes across documents; a
+    // SYNCHRONOUS per-instance reservation serializes turns on THIS box
+    // (gate 51 item 1 — the durable lease alone cannot, because every turn on
+    // this box carries the same leaseToken and both backends accept an
+    // already-owned lease). Bounded: occupied reservation or a live foreign
+    // durable lease → "lock-unavailable" at once, never a wait. Ordinary:
+    // await the reservation (the holder is a same-box REST-bounded turn),
+    // then the durable lease parks until the foreign holder releases/expires.
+    if (opts.ifAvailable) {
+      const release = this.tryReserveLocal(instanceId);
+      if (!release) return "lock-unavailable";
+      try {
+        return await this.runWithLease(instanceId, fn, { ifAvailable: true });
+      } finally {
+        release();
+      }
+    }
+    const release = await this.acquireLocal(instanceId);
+    try {
+      return await this.runWithLease(instanceId, fn);
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * SYNCHRONOUS, non-reentrant per-instance reservation for the no-Web-Locks
+   * fallback (gate 51 item 1). The durable lease record cannot serialize two
+   * turns on the SAME box (same leaseToken is always re-accepted), so bounded
+   * and ordinary callers share this in-memory mutex:
+   *  - a bounded caller that finds the instance reserved returns
+   *    "lock-unavailable" immediately (it never waits on queued work);
+   *  - an ordinary caller awaits the current holder ({@link acquireLocal}) —
+   *    a same-box turn already bounded by the REST timeouts.
+   * The returned release deletes ONLY this acquisition's entry.
+   */
+  private readonly localReservations = new Map<Id, Promise<void>>();
+
+  private tryReserveLocal(instanceId: Id): (() => void) | null {
+    if (this.localReservations.has(instanceId)) return null;
+    let releaseHolder!: () => void;
+    const held = new Promise<void>((resolve) => {
+      releaseHolder = resolve;
+    });
+    this.localReservations.set(instanceId, held);
+    return () => {
+      if (this.localReservations.get(instanceId) === held) {
+        this.localReservations.delete(instanceId);
+      }
+      releaseHolder();
+    };
+  }
+
+  private async acquireLocal(instanceId: Id): Promise<() => void> {
+    for (;;) {
+      const release = this.tryReserveLocal(instanceId);
+      if (release) return release;
+      await this.localReservations.get(instanceId)!.catch(() => undefined);
+    }
   }
 
   /**
@@ -2294,15 +2351,19 @@ export class Outbox {
    * ({@link OutboxStorage.acquireLease}) — read `__lock__:<instanceId>`, write
    * only when it is absent/expired/already ours — so two tabs without Web
    * Locks cannot both pass a check-then-act pair and run two deliverers
-   * (which would double-POST). A live foreign lease parks the caller until the
-   * owner releases or (if it crashed) the lease passes {@link LEASE_TTL_MS}.
-   * The owner releases in finally. localStorage has no cross-tab transactions;
-   * the single-tab degraded case is the supported one.
+   * (which would double-POST). Same-box serialization is the synchronous
+   * {@link tryReserveLocal} reservation the caller already holds. A live
+   * foreign lease parks the ORDINARY caller until the owner releases or (if it
+   * crashed) the lease passes {@link LEASE_TTL_MS}; the BOUNDED caller probes
+   * once and returns "lock-unavailable". The owner releases in finally.
+   * localStorage has no cross-tab transactions; the single-tab degraded case
+   * is the supported one.
    */
   private async runWithLease<T>(
     instanceId: Id,
     fn: (instanceId: Id, deliverable: OutboxRecord[]) => Promise<T>,
-  ): Promise<T> {
+    opts: { ifAvailable?: boolean } = {},
+  ): Promise<T | null | "lock-unavailable"> {
     const key = this.leaseKey(instanceId);
     const deadline = Date.now() + LEASE_TTL_MS + 5_000;
     for (;;) {
@@ -2324,8 +2385,7 @@ export class Outbox {
       try {
         acquired = await this.storage.acquireLease(key, leaseRec, now);
       } catch {
-        // A storage failure during the claim must never look like a grant:
-        // stay out of delivery and retry within the bounded deadline.
+        // A storage failure during the claim must never look like a grant.
         acquired = false;
       }
       if (acquired) {
@@ -2337,6 +2397,10 @@ export class Outbox {
           await this.storage.releaseLease(key, this.leaseToken).catch(() => undefined);
         }
       }
+      // Gate 51 item 1: a bounded turn never parks — occupied reservation was
+      // ruled out by the caller, so a failed single durable claim is a live
+      // FOREIGN document holding the lease: report unavailable immediately.
+      if (opts.ifAvailable) return "lock-unavailable";
       if (Date.now() > deadline) throw new Error("outbox lease wait timed out");
       await new Promise((r) => setTimeout(r, 250));
     }

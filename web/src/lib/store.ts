@@ -4751,6 +4751,11 @@ class HubStore {
       error: null,
       ...(identityChanged ? { instances: [] } : {}),
     });
+    // Gate 49 item 6 (low): recheck the issuing epoch AFTER every
+    // publication-bearing helper too — a subscriber invoked synchronously by
+    // the emit above (or the earlier applyAuthIdentityChange) may have logged
+    // out; never run the install/bootstrap of a retired session.
+    if (this.extEpoch !== ext) return "retired";
     const result = await this.runBootstrap(ext);
     if (result === "retired" || this.extEpoch !== ext) return "retired";
     return "settled";

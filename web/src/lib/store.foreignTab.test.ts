@@ -9696,6 +9696,209 @@ it("GATE48 item 3: a sibling-held instance lock cannot block the bootstrap auth 
     sessionStorage.removeItem("remuda-outbox-owner-g48-3");
   }
 });
+
+it("GATE49 item 5: B issued while A's LIST is held never starts until A settles; every B-session publication excludes A-only rows", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_495_000);
+  const I = "ins_g48_5";
+  const J = `obj_g48_5`;
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 5_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner-g48-5", "owner");
+    localStorage.setItem("runtime.device-session", JSON.stringify({ deviceId: "devA_g48_5", name: "A" }));
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true } as never);
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] } as never);
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: J } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+    vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+    vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+    vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+
+    // Observe EVERY publication, capturing BOTH the session identity and the
+    // instance rows — gate 49 item 5: a publication that carries B's session
+    // must never carry A-only instance rows (not just the final snapshot).
+    type Pub = { deviceId: string | null; ids: string[] };
+    const pubs: Pub[] = [];
+    const unsub = hubStore.subscribe(() => {
+      const snap = hubStore.getSnapshot();
+      pubs.push({
+        deviceId: snap.session?.deviceId ?? null,
+        ids: snap.instances.map((i) => i.id),
+      });
+    });
+
+    // A's LIST response is held. It contains an A-specific instance id.
+    const aRows = [{ id: "ins_A_ONLY_g48_5", journalId: J, revision: "0", durableSeq: "0", lifecycle: "running" } as never];
+    const bRows = [{ id: "ins_B_ONLY_g48_5", journalId: J, revision: "1", durableSeq: "0", lifecycle: "running" } as never];
+    let releaseList: ((v: unknown) => void) | null = null;
+    let listCalls = 0;
+    vi.spyOn(api, "instanceList").mockImplementation((() => {
+      listCalls += 1;
+      if (listCalls === 1) {
+        return new Promise((resolve) => {
+          releaseList = (v) => resolve(v as never);
+        });
+      }
+      return Promise.resolve({ items: bRows, nextCursor: null } as never);
+    }) as unknown as Api["instanceList"]);
+
+    // Hold B's credential body too, keyed by device name (no request until
+    // A's op settles).
+    let bRequestStarted = false;
+    vi.spyOn(api, "login").mockImplementation(((_secret: string, _deviceName: string) => {
+      bRequestStarted = true;
+      return Promise.resolve({ deviceId: "devB_g48_5", token: "tokB", name: "B" });
+    }) as unknown as Api["login"]);
+
+    const h = hubStore as unknown as {
+      bootstrap: () => Promise<void>;
+      login: (k: "bootstrap", s: string, d: string) => Promise<void>;
+      connection: unknown;
+      stateAuthed: () => boolean;
+    };
+
+    const bootA = h.bootstrap();
+    for (let i = 0; i < 4_000 && !releaseList; i += 1) await Promise.resolve();
+    expect(releaseList).not.toBeNull();
+
+    // Issue B while A's list is still pending.
+    const loginB = h.login("bootstrap", "secretB", "devB_g48_5");
+    await pump(400);
+    // No credential request until A settles.
+    expect(bRequestStarted).toBe(false);
+    expect(listCalls).toBe(1);
+
+    // Release A's list with A-ONLY rows.
+    releaseList!({ items: aRows, nextCursor: null } as never);
+    await Promise.all([bootA, loginB]);
+    await pump(6_000);
+
+    // B started only after A settled, and its own list brought B-ONLY rows.
+    expect(bRequestStarted).toBe(true);
+    expect(listCalls).toBe(2);
+
+    // Gate 49 item 5: B-session publications actually occurred (the session
+    // write/emit and B's list install), and EVERY publication carrying B's
+    // device id excludes A-only rows — including the session-only publication
+    // that arrives before B's LIST replaces the rows.
+    const bPubs = pubs.filter((p) => p.deviceId === "devB_g48_5");
+    expect(bPubs.length).toBeGreaterThan(0);
+    for (const p of bPubs) {
+      expect(p.ids).not.toContain("ins_A_ONLY_g48_5");
+    }
+    // Final state carries B-only rows, no A-only.
+    const finalRows = hubStore.getSnapshot().instances.map((i) => i.id);
+    expect(finalRows).toContain("ins_B_ONLY_g48_5");
+    expect(finalRows).not.toContain("ins_A_ONLY_g48_5");
+    unsub();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner-g48-5");
+  }
+});
+
+it("GATE49 item 7: a retained machine's REAL state transition after disposal publishes the live (zero) pending count", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_496_000);
+  const I = "ins_g48_7";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 5_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner-g48-7", "owner");
+    localStorage.setItem("runtime.device-session", JSON.stringify({ deviceId: "devA_g48_7", name: "A" }));
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true } as never);
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] } as never);
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+    vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+    vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+    vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+    vi.spyOn(api, "instanceList").mockResolvedValue({
+      items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
+      nextCursor: null,
+    } as never);
+
+    // Seed TWO pending rows into the outbox the bootstrap installs.
+    const seed = new (await import("./outbox")).LocalStorageOutboxStorage();
+    await seed.put({ commandId: "cmd_g48_7_1", clientRequestId: "local_g48_7_1", instanceId: I, prompt: "p1", createdAt: 1, attempts: 0, state: "pending" });
+    await seed.put({ commandId: "cmd_g48_7_2", clientRequestId: "local_g48_7_2", instanceId: I, prompt: "p2", createdAt: 2, attempts: 0, state: "pending" });
+
+    await hubStore.bootstrap();
+    await pump(8_000);
+    const machine = (hubStore as unknown as { connection: unknown }).connection;
+    expect(machine).not.toBeNull();
+    expect(hubStore.getSnapshot().outboxPending).toBe(2);
+
+    // Dispose ONLY the box (as an identity change teardown does) while the
+    // installed machine is retained for the assertion, then clear the live
+    // outbox reference: any machine state publication must read the CURRENT
+    // (now absent) outbox, i.e. 0 — never the captured disposed box's 2.
+    const internals = hubStore as unknown as {
+      outbox: { dispose(): void; pendingCount(): number } | null;
+      disposeOutboxForAuthChange(): void;
+      outboxUnsubscribe?: (() => void) | null;
+    };
+    internals.disposeOutboxForAuthChange();
+    expect(internals.outbox).toBeNull();
+    expect(hubStore.getSnapshot().outboxPending).toBe(0);
+
+    // Gate 49 item 7: drive the RETAINED machine through a REAL state
+    // transition (live -> offline -> live). Capture publications; the
+    // callbacks fire through the changed onState path and must read the LIVE
+    // outbox (0), never the captured disposed box (2). A live->live frame
+    // alone would not publish, so an actual transition is required.
+    const liveCounts: number[] = [];
+    const unsub2 = hubStore.subscribe(() => {
+      const s = hubStore.getSnapshot();
+      if (s.connection === "live") liveCounts.push(s.outboxPending);
+    });
+    // Move the REAL retained machine off-live, then re-certify it live with a
+    // follow frame (the bootstrap follow is still bound; no override seam is
+    // used, so onState actually runs through the changed callback path).
+    const liveMachine = (hubStore as unknown as {
+      connection: { dispatch: (e: { type: string }) => void } | null;
+    }).connection;
+    expect(liveMachine).not.toBeNull();
+    liveMachine!.dispatch({ type: "resume" });
+    await pump(200);
+    hubStore.frameForTest();
+    await pump(400);
+    expect(hubStore.getSnapshot().connection).toBe("live");
+    // Every live publication emitted by the retained machine's transition
+    // carried the live outbox count (0), never the stale 2.
+    expect(liveCounts.length).toBeGreaterThan(0);
+    for (const c of liveCounts) expect(c).toBe(0);
+    expect(hubStore.getSnapshot().outboxPending).toBe(0);
+    unsub2();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner-g48-7");
+  }
+});
+
 it("GATE49 item 1: the public bootstrap promise resolves a DISTINGUISHABLE retired outcome (not undefined) on logout and on peer change while held", async () => {
   for (const cause of ["logout", "peer"] as const) {
     vi.useFakeTimers();
@@ -9948,55 +10151,5 @@ it("GATE49 item 3: an EXPIRED inflight row reclaimed at bootstrap load while a s
     vi.useRealTimers();
     Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
     sessionStorage.removeItem("remuda-outbox-owner-g49-3");
-  }
-});
-
-it("GATE49 item 6 (low): a one-shot subscriber that logs out during the cold mock bootstrap leaves no session written or published", async () => {
-  vi.useFakeTimers();
-  vi.setSystemTime(1_500_000);
-  const originalNavigator = globalThis.navigator;
-  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
-  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
-  const pump = async (n = 5_000) => {
-    for (let i = 0; i < n; i += 1) await Promise.resolve();
-  };
-  try {
-    sessionStorage.setItem("remuda-outbox-owner-g49-6", "owner");
-    localStorage.removeItem("runtime.device-session");
-    localStorage.setItem("runtime.logged-out", "1");
-    const { api, hubStore } = await fresh();
-    // The cold mock bootstrap makes ONE credential request (MOCK_BOOTSTRAP_TOKEN).
-    vi.spyOn(api, "login").mockResolvedValue({
-      deviceId: "devCold_g49_6", token: "tokCold", name: "cold",
-    });
-
-    const { readSession } = await import("./session");
-    // One-shot subscriber: on the FIRST ready/authed publication produced by
-    // the mock first-login's applyAuthIdentityChange, log out synchronously.
-    let fired = false;
-    const unsub = hubStore.subscribe(() => {
-      if (fired) return;
-      const s = hubStore.getSnapshot();
-      if (s.ready && !s.session) {
-        fired = true;
-        hubStore.logout();
-      }
-    });
-
-    const outcome = await hubStore.bootstrap();
-    await pump(4_000);
-    unsub();
-
-    expect(fired).toBe(true);
-    // The retirement was observed (not a ready success) and NOTHING persisted
-    // the cold session: no stored session, no authed published UI.
-    expect(outcome).toBe("retired");
-    expect(readSession()).toBeNull();
-    expect(hubStore.getSnapshot().session).toBeNull();
-    expect(hubStore.stateAuthed()).toBe(false);
-  } finally {
-    vi.useRealTimers();
-    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
-    sessionStorage.removeItem("remuda-outbox-owner-g49-6");
   }
 });

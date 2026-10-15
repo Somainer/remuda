@@ -1627,7 +1627,17 @@ async fn schedule(state: &AppState) -> Result<(), HubError> {
     let mut busy_lanes: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut land_active: std::collections::HashSet<String> = std::collections::HashSet::new();
     for job in &jobs {
-        if matches!(job.state, GateJobState::Running | GateJobState::Landing) {
+        // r25 item 3 — EVIDENCE-UNCERTAIN RULE: a parked uncertain job keeps
+        // scheduler occupancy in EVERY occupancy calculation. Running and
+        // Landing already count; an evidence-uncertain CANCELING job (a
+        // definitive verdict whose supplied log could not persist, then a
+        // cancel) keeps BOTH its lane checkout and, for a land, the project's
+        // single land slot, until an authorized settlement or an exact-tuple
+        // operator resolution releases it. A normal Canceling job still frees
+        // both as the cancel takes effect.
+        let parked_canceling =
+            job.state == GateJobState::Canceling && job.evidence_uncertain.is_some();
+        if matches!(job.state, GateJobState::Running | GateJobState::Landing) || parked_canceling {
             if let Some(lane) = &job.lane_id {
                 busy_lanes.insert(format!("{}:{lane}", job.project_id.as_id()));
             }

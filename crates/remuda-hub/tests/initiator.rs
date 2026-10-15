@@ -3540,6 +3540,207 @@ async fn carrier_disconnect_preserves_an_evidence_uncertain_canceling_row() {
     assert!(doc["evidenceUncertain"].is_object(), "{doc}");
 }
 
+/// r25 item 3: an evidence-uncertain CANCELING job keeps BOTH scheduler
+/// occupancies: its lane checkout (`busy_lanes`) and, for a land, the
+/// project's single land slot (`land_active`). Two lanes are configured: a
+/// second LAND pinned to the free lane is blocked by the land slot alone, and
+/// a second VERIFY pinned to the parked job's lane is blocked by the lane
+/// alone. Neither dispatches until an authorized settlement releases the first
+/// job; then both run, each on its own lane.
+#[tokio::test]
+async fn an_evidence_uncertain_canceling_job_keeps_both_lane_and_land_slot_occupancy() {
+    let (ctx, node) = Ctx::boot().await.unwrap();
+    // Two lanes on the one connected host.
+    let (status, body) = ctx
+        .send(
+            "PATCH",
+            &format!("/v1/projects/{}", ctx.project),
+            &ctx.human,
+            None,
+            Some(json!({
+                "gate": {
+                    "affected": true,
+                    "web": "auto",
+                    "landSerialization": "global-cas",
+                    "lanes": [
+                        {
+                            "id": "lane1",
+                            "hostId": ctx.host,
+                            "repoPath": "/tmp/lane1/repo",
+                            "targetDir": "/tmp/lane1/target",
+                            "ports": "58400-58409",
+                            "env": {},
+                            "lockPath": "/tmp/remuda-agents/e2e.lock",
+                            "pwEndpoint": "ws://127.0.0.1:3177/"
+                        },
+                        {
+                            "id": "lane2",
+                            "hostId": ctx.host,
+                            "repoPath": "/tmp/lane2/repo",
+                            "targetDir": "/tmp/lane2/target",
+                            "ports": "58410-58419",
+                            "env": {},
+                            "lockPath": "/tmp/remuda-agents/e2e-2.lock",
+                            "pwEndpoint": "ws://127.0.0.1:3177/"
+                        }
+                    ]
+                }
+            })),
+        )
+        .await;
+    assert_eq!(status, 200, "configure two lanes: {body}");
+    let barrier = ctx.store().gate_apply_barrier();
+
+    // Job A: a land pinned to lane1 whose definitive verdict cannot persist.
+    let seed_a = "wt/gate/evidence-occupancy-a";
+    let hook_a = node
+        .arm_gate_run(failed_gate_result("placeholder", seed_a))
+        .await;
+    let (status, enqueued) = ctx
+        .agent_post(
+            &format!("/v1/projects/{}/gate", ctx.project),
+            json!({"branch":seed_a,"mode":"land","laneId":"lane1"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{enqueued}");
+    let job_a = enqueued["id"].as_str().unwrap().to_owned();
+    hook_a.set_result(failed_gate_result(&job_a, seed_a));
+    hook_a.wait_arrived().await;
+    barrier.arm();
+    node.send_raw(json!({
+        "jsonrpc": "2.0",
+        "method": "gate.event",
+        "params": {
+            "jobId": job_a,
+            "generation": 1,
+            "kind": "finished",
+            "result": failed_gate_result(&job_a, seed_a),
+        }
+    }));
+    hook_a.release_and_wait_proceeded().await;
+    barrier.wait_parked(2).await;
+    ctx.store().test_arm_gate_log_insert_faults(2);
+    barrier.release();
+    barrier.wait_completed(2).await;
+    let doc = ctx.hub.test_get_gate_job(&job_a).await.unwrap().unwrap();
+    assert_eq!(doc["state"], json!("running"), "{doc}");
+    assert_eq!(doc["laneId"], json!("lane1"), "{doc}");
+    assert!(doc["evidenceUncertain"].is_object(), "{doc}");
+
+    // A cancel moves it to Canceling WITH the parked condition.
+    let (status, reply) = ctx
+        .agent_post(
+            &format!("/v1/projects/{}/gate/jobs/{job_a}/cancel", ctx.project),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["state"], json!("canceling"), "{reply}");
+    assert!(reply["evidenceUncertain"].is_object(), "{reply}");
+
+    // The next gate.run that DOES go out must be latched, then enqueue B
+    // (land, free lane2: blocked only by the project land slot) and C (verify,
+    // pinned to A's lane1: blocked only by busy_lanes).
+    let hook_b = node
+        .arm_gate_run(json!({ "jobId": "placeholder", "status": "failed" }))
+        .await;
+    let seed_b = "wt/gate/evidence-occupancy-b";
+    let (status, enqueued_b) = ctx
+        .agent_post(
+            &format!("/v1/projects/{}/gate", ctx.project),
+            json!({"branch":seed_b,"mode":"land","laneId":"lane2"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{enqueued_b}");
+    let job_b = enqueued_b["id"].as_str().unwrap().to_owned();
+    let seed_c = "wt/gate/evidence-occupancy-c";
+    let (status, enqueued_c) = ctx
+        .agent_post(
+            &format!("/v1/projects/{}/gate", ctx.project),
+            json!({"branch":seed_c,"mode":"verify","laneId":"lane1"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{enqueued_c}");
+    let job_c = enqueued_c["id"].as_str().unwrap().to_owned();
+
+    // Across scheduler ticks neither queued job moves and no gate.run goes out.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1400), hook_b.wait_arrived())
+            .await
+            .is_err(),
+        "the land job for the FREE lane must not dispatch while A holds the project land slot"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let doc_b = ctx.hub.test_get_gate_job(&job_b).await.unwrap().unwrap();
+    let doc_c = ctx.hub.test_get_gate_job(&job_c).await.unwrap().unwrap();
+    assert_eq!(
+        doc_b["state"],
+        json!("queued"),
+        "B blocked by the land slot: {doc_b}"
+    );
+    assert_eq!(
+        doc_c["state"],
+        json!("queued"),
+        "C blocked by busy lane1: {doc_c}"
+    );
+
+    // An authorized exact-tuple settlement releases A (Failed).
+    let (status, reply) = ctx
+        .send(
+            "POST",
+            &format!(
+                "/v1/projects/{}/gate/jobs/{job_a}/resolve-evidence",
+                ctx.project
+            ),
+            &ctx.human,
+            None,
+            Some(json!({
+                "resolution": "failed",
+                "expectedAttempts": 1,
+                "rationale": "operator settled the parked canceling job",
+            })),
+        )
+        .await;
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["state"], json!("failed"), "{reply}");
+    assert!(reply["evidenceUncertain"].is_null(), "{reply}");
+
+    // Both queued jobs now dispatch concurrently, each pinned to its own lane.
+    hook_b.wait_arrived().await;
+    let doc_b = async {
+        loop {
+            let doc = ctx.hub.test_get_gate_job(&job_b).await.unwrap().unwrap();
+            if doc["state"] == json!("running") {
+                break doc;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+    .await;
+    assert_eq!(doc_b["attempts"], json!(1), "B dispatched once: {doc_b}");
+    assert_eq!(
+        doc_b["laneId"],
+        json!("lane2"),
+        "B takes the free lane: {doc_b}"
+    );
+    let doc_c = async {
+        loop {
+            let doc = ctx.hub.test_get_gate_job(&job_c).await.unwrap().unwrap();
+            if doc["state"] == json!("running") {
+                break doc;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+    .await;
+    assert_eq!(doc_c["attempts"], json!(1), "C dispatched once: {doc_c}");
+    assert_eq!(
+        doc_c["laneId"],
+        json!("lane1"),
+        "C takes A's old lane: {doc_c}"
+    );
+}
+
 /// r25 item 1: an evidence-uncertain RUNNING row whose carrier is lost is
 /// PARKED — it stays Running, keeps its lane/host occupancy and its binding to
 /// attempt 1, and is never re-dispatched. A carrier loss is neither an

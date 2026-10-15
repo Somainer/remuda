@@ -773,10 +773,56 @@ test("structured view streams assistant text and separates injected records", as
 test("the unbound session list never shows live while the Hub is unreachable (c-unboundresume)", async ({
   page,
 }) => {
-  // Desktop lands on /sessions with NO bound follow — the unbound resume path.
+  // The list's connection pill only renders in the non-empty list header, so
+  // create one instance through the API CONTEXT (page.request shares the
+  // device cookie but mounts nothing in the browser): the list page never
+  // opens a follow socket, which is exactly the unbound state under test.
   await login(page);
+  const hosts = (await (await page.request.get("/v1/hosts")).json()) as {
+    items?: { id?: string; hostId?: string; label?: string }[];
+  };
+  const hostId = (hosts.items ?? []).find((h) => h.label === "e2e-fake-node")?.id
+    ?? (hosts.items ?? [])[0]?.hostId;
+  expect(hostId).toBeTruthy();
+  const workspaces = (await (
+    await page.request.get(`/v1/hosts/${hostId}/workspaces`)
+  ).json()) as { workspaces: { workspaceId: string; root: string }[] };
+  const workspace = workspaces.workspaces[0];
+  expect(workspace).toBeTruthy();
+  const create = await page.request.post("/v1/instances", {
+    headers: { Origin: new URL(page.url()).origin },
+    data: {
+      hostId,
+      workspaceId: workspace.workspaceId,
+      cwd: workspace.root,
+      kind: "terminal",
+      driver: "shell-pty",
+      name: "unboundresume",
+      tui: "default",
+    },
+  });
+  expect(create.ok(), await create.text()).toBe(true);
+  const instancePayload = (await create.json()) as {
+    instance: { instanceId?: string; id?: string };
+  };
+  const createdId = instancePayload.instance.instanceId ?? instancePayload.instance.id;
+  expect(createdId).toBeTruthy();
+
+  // Reload the list (workspace 0 is the default active space): the row renders
+  // the full header and NO follow upgrade is opened from the list page.
+  await page.goto("/sessions");
   const header = page.getByTestId("session-list").locator("header");
-  await expect(header).toContainText("live", { timeout: 20_000 });
+  // Word boundary: "offline" must not match \blive\b.
+  await expect(header).toContainText(/\blive\b/, { timeout: 20_000 });
+  await expect(page.getByTestId("session-row").filter({ hasText: "unboundresume" })).toBeVisible({
+    timeout: 20_000,
+  });
+  const followUpgrades: string[] = [];
+  page.on("websocket", (ws) => {
+    if (ws.url().includes("/v1/follow")) followUpgrades.push(ws.url());
+  });
+  await page.waitForTimeout(500);
+  expect(followUpgrades).toEqual([]);
 
   // Hub-only outage: abort every /v1 request (REST + follow upgrades) while
   // the browser stays online, then drive a foreground resume the way a real
@@ -789,9 +835,11 @@ test("the unbound session list never shows live while the Hub is unreachable (c-
   // least one reconnect-backoff retry.
   await expect(header).toContainText(/recovering|offline/, { timeout: 10_000 });
   await page.waitForTimeout(1_500);
-  expect(await header.textContent()).not.toMatch(/live/);
+  expect(await header.textContent()).not.toMatch(/\blive\b/);
   expect(await header.textContent()).toMatch(/recovering|offline/);
 
-  // Lift routes so this test's afterEach host sweep can reach the Hub.
+  // Lift routes and release the placement slot (the afterEach sweep also
+  // deletes every fake-node instance).
   await page.context().unroute(/\/v1\//);
+  await page.request.delete(`/v1/instances/${createdId}?force=1`).catch(() => undefined);
 });

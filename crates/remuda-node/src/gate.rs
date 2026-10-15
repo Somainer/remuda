@@ -3261,22 +3261,22 @@ impl DevNode {
             // against the remote; the detached finalizer still certifies the
             // fence when it eventually completes.
             #[cfg(unix)]
-            if fence_finalization_expired || std::time::Instant::now() >= land_deadline {
-                if result.status != "uncertain" {
-                    result.status = "uncertain".into();
-                    result.error = Some(
-                        "the land child returned a definitive report, but its fence finalization \
-                         did not complete before the absolute deadline (blocking-pool contention \
-                         or stalled fence I/O); the push outcome is unknown and the Hub reconciles \
-                         against the exact granted merge"
-                            .into(),
-                    );
-                    result.reason = Some(
-                        "land fence finalization crossed the absolute deadline; push outcome \
-                         uncertain"
-                            .into(),
-                    );
-                }
+            if (fence_finalization_expired
+                || std::time::Instant::now() >= land_deadline)
+                && result.status != "uncertain"
+            {
+                result.status = "uncertain".into();
+                result.error = Some(
+                    "the land child returned a definitive report, but its fence finalization did \
+                     not complete before the absolute deadline (blocking-pool contention or stalled \
+                     fence I/O); the push outcome is unknown and the Hub reconciles against the \
+                     exact granted merge"
+                        .into(),
+                );
+                result.reason = Some(
+                    "land fence finalization crossed the absolute deadline; push outcome uncertain"
+                        .into(),
+                );
             }
         }
         attach_failure_evidence(&mut result, &trace, request.keep_logs);

@@ -3261,8 +3261,7 @@ impl DevNode {
             // against the remote; the detached finalizer still certifies the
             // fence when it eventually completes.
             #[cfg(unix)]
-            if (fence_finalization_expired
-                || std::time::Instant::now() >= land_deadline)
+            if (fence_finalization_expired || std::time::Instant::now() >= land_deadline)
                 && result.status != "uncertain"
             {
                 result.status = "uncertain".into();

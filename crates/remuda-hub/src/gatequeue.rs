@@ -1149,15 +1149,18 @@ struct ResolveEvidenceRequest {
 }
 
 /// The pre-settlement states a parked evidence-uncertain condition accepts a
-/// resolution from. `Queued` is included because r24 item 1 lets carrier
-/// recovery requeue a Running row while PRESERVING its condition.
+/// resolution from.
+///
+/// r25 item 1: `Queued` is deliberately absent. A parked uncertain job keeps
+/// its Running / Canceling / Landing state through every lifecycle writer
+/// (carrier recovery parks it; the claim refuses it), and the only ways into
+/// Queued — an operator requeue, a base-moved requeue, an established-absent
+/// probe settlement — clear the condition first as an authorized settlement.
+/// A Queued row therefore never carries a live condition.
 fn evidence_resolvable_state(state: GateJobState) -> bool {
     matches!(
         state,
-        GateJobState::Queued
-            | GateJobState::Running
-            | GateJobState::Canceling
-            | GateJobState::Landing
+        GateJobState::Running | GateJobState::Canceling | GateJobState::Landing
     )
 }
 
@@ -4495,11 +4498,19 @@ impl Store {
             let prior = job.state;
             match job.state {
                 GateJobState::Queued => {
-                    // r24 item 1 audit: a carrier recovery can leave a Queued
-                    // row carrying a preserved evidence-uncertain condition.
-                    // The caller's explicit cancel is an authorized terminal
-                    // transition, so it settles and clears the condition.
-                    job.evidence_uncertain = None;
+                    // r25 item 1: a Queued row can no longer carry an
+                    // evidence-uncertain condition — parking keeps an uncertain
+                    // Running/Canceling row in place, and an authorized requeue
+                    // clears the condition before anything enters Queued. A
+                    // plain queued cancel needs no condition handling.
+                    if job.evidence_uncertain.is_some() {
+                        tracing::error!(
+                            job_id = %id,
+                            "queued gate row unexpectedly carries evidence uncertainty; refusing \
+                             the queued cancel so the parked condition is not discarded"
+                        );
+                        return Ok(None);
+                    }
                     job.state = GateJobState::Canceled;
                     job.finished_at = Some(now_ts());
                     job.error = Some("canceled while queued".into());
@@ -4583,17 +4594,29 @@ impl Store {
             if job.state != GateJobState::Queued {
                 return Ok(GateJobClaim::NotReady);
             }
+            // r25 item 1 — EVIDENCE-UNCERTAIN RULE: a parked job is never
+            // re-dispatched or claimed while the condition stands. An
+            // evidence-uncertain row only reaches Queued after an AUTHORIZED
+            // settlement that cleared the condition (an operator requeue
+            // resolves the exact tuple BEFORE attempts can advance); this guard
+            // also fail-closes any stray Queued row still carrying one. The next
+            // scheduler tick retries after the operator resolves it.
+            if job.evidence_uncertain.is_some() {
+                tracing::info!(
+                    job_id = %id,
+                    "refusing to claim a queued gate job still parked with evidence uncertainty"
+                );
+                return Ok(GateJobClaim::NotReady);
+            }
             if let Err(error) =
                 crate::store::check_initiator(conn, job.initiator.as_ref(), device_id.as_deref())
             {
                 match error {
                     crate::store::StoreError::Fenced => {
-                        // r24 item 1 audit: a Queued row may carry a preserved
-                        // evidence-uncertain condition (a carrier recovery
-                        // requeue keeps it). The authority fence is an
-                        // authorized terminal cancellation, so clear the
-                        // condition here too — a terminal Canceled row must not
-                        // dangle a condition no route can ever resolve.
+                        // The authority fence is an authorized terminal
+                        // cancellation for a normal queued row. A parked
+                        // uncertain row was returned NotReady above, so no
+                        // condition is discarded here.
                         job.evidence_uncertain = None;
                         job.state = GateJobState::Canceled;
                         job.finished_at = Some(now_ts());
@@ -5026,10 +5049,13 @@ impl Store {
         .await
     }
 
-    /// r13 item 3: when a carrier session ends, requeue the host's `running`
-    /// jobs (and finish its `canceling` jobs) that were dispatched on EXACTLY
-    /// that session. One writer job; `landing` rows are excluded by the
-    /// caller's occupancy guarantee. Returns the recovered rows for journaling.
+    /// r13 item 3 / r25 item 1: when a carrier session ends, requeue the
+    /// host's `running` jobs (and finish its `canceling` jobs) that were
+    /// dispatched on EXACTLY that session. One writer job; `landing` rows are
+    /// excluded by the caller's occupancy guarantee. A job parked with an
+    /// evidence-uncertain condition — Running OR Canceling — is PARKED, never
+    /// recovered: it keeps its state, lane/host and dispatch pin. Returns the
+    /// recovered rows for journaling.
     pub(crate) async fn recover_ended_gate_jobs(
         &self,
         host_id: &str,
@@ -5056,15 +5082,18 @@ impl Store {
                 let Ok(mut job) = serde_json::from_str::<GateJob>(&text) else {
                     continue;
                 };
-                // r24 item 1 — EVIDENCE-UNCERTAIN RULE: a Canceling row parked
-                // with an unpersisted definitive verdict stays parked across a
-                // carrier loss, exactly as it does across a Hub restart and the
-                // cancel-grace finisher: a dead carrier is neither an
-                // authorized settlement nor an operator resolution, so finishing
-                // it Canceled here would release the occupancy and discard the
-                // condition. It remains resolvable through /resolve-evidence
-                // with no carrier at all.
-                if job.state == GateJobState::Canceling && job.evidence_uncertain.is_some() {
+                // r25 item 1 — EVIDENCE-UNCERTAIN RULE: a row parked with an
+                // unpersisted definitive verdict, whether it is Running or
+                // Canceling, stays PARKED across a carrier loss. A dead carrier
+                // is neither an authorized settlement nor an exact-tuple
+                // operator resolution: finishing it Canceled, or requeuing it
+                // (which releases the lane/host and lets the next claim advance
+                // attempts and break the condition's tuple binding), would
+                // discard the condition. The row keeps its state, occupancy and
+                // dispatch pin exactly as it does across a Hub restart and the
+                // cancel-grace finisher, and remains resolvable through
+                // /resolve-evidence with no carrier at all.
+                if job.evidence_uncertain.is_some() {
                     continue;
                 }
                 let now = now();
@@ -5079,14 +5108,10 @@ impl Store {
                     }
                     job.reason = Some("canceled; carrier session changed".into());
                 } else {
-                    // r24 item 1: the requeue PRESERVES a parked
-                    // evidence-uncertain condition. The condition is bound to
-                    // THIS attempt (its generation/epoch/merge tuple, recorded
-                    // at deferral); once the row is re-claimed and row.attempts
-                    // advances, the stale tuple can no longer be resolved, so a
-                    // re-run cannot be aborted or settled by a resolution aimed
-                    // at the lost attempt. Clearing it here would silently let
-                    // the unconsumed definitive verdict vanish.
+                    // No parked condition: an ordinary dead-carrier requeue.
+                    // An evidence-uncertain Running row never reaches here — it
+                    // is parked above so its attempt binding cannot be broken by
+                    // a re-claim (r25 item 1).
                     job.state = GateJobState::Queued;
                     job.started_at = None;
                     job.host_id = None;

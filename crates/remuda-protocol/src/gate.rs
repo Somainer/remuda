@@ -301,8 +301,9 @@ pub struct GateRunLog {
     pub truncated: bool,
 }
 
-/// r23 (coordinator clarification of R9): a persisted UNCERTAIN condition for
-/// a definitive verdict whose SUPPLIED run log could not be persisted.
+/// r23 (coordinator clarification of R9) / r25 item 1: a persisted UNCERTAIN
+/// condition for a definitive verdict whose SUPPLIED run log could not be
+/// persisted.
 ///
 /// The Node delivers each verdict exactly twice (the `finished` event and the
 /// `gate.run` reply) and retains/redelivers NOTHING, so once both deliveries
@@ -313,6 +314,26 @@ pub struct GateRunLog {
 /// the operator feed, and waits for either an explicit operator resolution or
 /// an idempotent later redelivery of the same verdict. Elapsed time alone
 /// never settles it (R5 fail closed).
+///
+/// r25 — THE COMPLETE PARKING RULE: an evidence-uncertain job is PARKED.
+///   * It keeps scheduler occupancy in EVERY occupancy calculation (both the
+///     busy-lane set and the project's single land slot) whether it is Running
+///     or Canceling.
+///   * It is never re-dispatched or claimed while the condition stands
+///     (carrier/session recovery, Hub-restart reconciliation and the scheduler
+///     all leave it in place with its lane/host and dispatch pin retained).
+///   * It is cleared ONLY by an authorized settlement (an identical
+///     redelivery that persists, the live verdict writer's own settlement, an
+///     established Landed/Absent remote-fact settlement) or an exact-tuple
+///     operator resolution (the request's (attempt, epoch, merge) tuple must
+///     equal BOTH the live row and the condition's binding).
+///   * For a Landing, an operator override (Failed/Requeue) is allowed ONLY
+///     after the read-only remote-main probe AUTHORITATIVELY establishes
+///     absence (fresh fetch, merge not on remote, land group verified dead).
+///     Unknown or missing probe authority — fetch/RPC error, carrier offline,
+///     shallow history, an Unknown response — keeps the Landing, the condition
+///     and the occupancy and returns a conflict.
+///   * An established Landed fact always wins over any operator override.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GateEvidenceUncertain {

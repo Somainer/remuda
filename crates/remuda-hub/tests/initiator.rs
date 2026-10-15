@@ -3540,16 +3540,21 @@ async fn carrier_disconnect_preserves_an_evidence_uncertain_canceling_row() {
     assert!(doc["evidenceUncertain"].is_object(), "{doc}");
 }
 
-/// r24 item 1: a Running evidence-uncertain row whose carrier is lost is
-/// re-queued (the dead session holds the lane no longer) but the condition is
-/// PRESERVED on the queued row, still bound to attempt 1.
+/// r25 item 1: an evidence-uncertain RUNNING row whose carrier is lost is
+/// PARKED — it stays Running, keeps its lane/host occupancy and its binding to
+/// attempt 1, and is never re-dispatched. A carrier loss is neither an
+/// authorized settlement nor an exact-tuple operator resolution: when the
+/// carrier returns the scheduler must NOT claim a fresh attempt (no second
+/// gate.run ever goes out) and `attempts` never advances while the condition
+/// stands. Only an authorized operator resolution for the exact tuple
+/// releases it.
 #[tokio::test]
-async fn carrier_disconnect_requeues_an_evidence_uncertain_running_row_without_clearing_it() {
+async fn carrier_loss_parks_an_evidence_uncertain_running_row_and_reconnect_dispatches_nothing() {
     let (ctx, node) = Ctx::boot().await.unwrap();
     ctx.configure_gate_lane().await;
     let barrier = ctx.store().gate_apply_barrier();
 
-    let job_seed = "wt/gate/evidence-uncertain-disconnect-run";
+    let job_seed = "wt/gate/evidence-uncertain-parked-run";
     let hook = node
         .arm_gate_run(failed_gate_result("placeholder", job_seed))
         .await;
@@ -3585,103 +3590,93 @@ async fn carrier_disconnect_requeues_an_evidence_uncertain_running_row_without_c
     assert_eq!(doc["state"], json!("running"), "{doc}");
     assert_eq!(doc["evidenceUncertain"]["generation"], json!(1), "{doc}");
 
+    // The carrier drops. Recovery must leave the row PARKED Running with its
+    // occupancy and condition — not requeue it and release the lane.
     node.disconnect();
-    let requeued = async {
-        loop {
-            let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
-            if doc["state"] == json!("queued") {
-                break doc;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    }
-    .await;
-    assert!(requeued["hostId"].is_null(), "{requeued}");
-    assert!(requeued["laneId"].is_null(), "{requeued}");
-    assert!(
-        requeued["evidenceUncertain"].is_object(),
-        "the requeue preserves the parked condition: {requeued}"
-    );
-    assert_eq!(
-        requeued["evidenceUncertain"]["generation"],
-        json!(1),
-        "still bound to the lost attempt: {requeued}"
-    );
-
-    // No carrier exists to re-claim it; the row waits for the operator.
     tokio::time::sleep(Duration::from_millis(1500)).await;
     let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
-    assert_eq!(doc["state"], json!("queued"), "{doc}");
+    assert_eq!(
+        doc["state"],
+        json!("running"),
+        "carrier recovery must not requeue an evidence-uncertain Running row: {doc}"
+    );
     assert_eq!(
         doc["attempts"],
         json!(1),
-        "not re-claimed while hostless: {doc}"
+        "the attempt binding is kept: {doc}"
     );
-    assert!(doc["evidenceUncertain"].is_object(), "{doc}");
-}
+    assert_eq!(
+        doc["hostId"],
+        json!(ctx.host),
+        "host occupancy retained: {doc}"
+    );
+    assert_eq!(
+        doc["laneId"],
+        json!("lane1"),
+        "lane occupancy retained: {doc}"
+    );
+    assert!(
+        doc["evidenceUncertain"].is_object(),
+        "the condition survives carrier recovery: {doc}"
+    );
+    assert_eq!(doc["evidenceUncertain"]["generation"], json!(1), "{doc}");
 
-/// r24 item 1 audit: an EXPLICIT caller cancel of a Queued row that carries a
-/// preserved evidence-uncertain condition (carrier recovery requeued it) is an
-/// authorized terminal transition: the row settles Canceled and the condition
-/// is cleared, rather than dangling on a terminal row.
-#[tokio::test]
-async fn an_explicit_cancel_clears_a_queued_rows_preserved_evidence_uncertainty() {
-    let (ctx, node) = Ctx::boot().await.unwrap();
-    ctx.configure_gate_lane().await;
-    let barrier = ctx.store().gate_apply_barrier();
-
-    let job_seed = "wt/gate/evidence-uncertain-queued-cancel";
-    let hook = node
-        .arm_gate_run(failed_gate_result("placeholder", job_seed))
+    // The carrier returns. Arm a gate.run hook BEFORE the hello so any
+    // unauthorized re-dispatch latches: none must arrive across scheduler
+    // ticks, and the attempt must never advance.
+    let node_b = FakeNode::reconnect(&ctx.hub, &ctx.creds, &ctx.workspace)
+        .await
+        .unwrap();
+    let hook2 = node_b
+        .arm_gate_run(json!({ "jobId": "placeholder", "status": "failed" }))
         .await;
-    let (status, enqueued) = ctx
-        .agent_post(
-            &format!("/v1/projects/{}/gate", ctx.project),
-            json!({"branch":job_seed,"mode":"verify"}),
-        )
-        .await;
-    assert_eq!(status, 200, "{enqueued}");
-    let job_id = enqueued["id"].as_str().unwrap().to_owned();
-    hook.set_result(failed_gate_result(&job_id, job_seed));
-    hook.wait_arrived().await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1400), hook2.wait_arrived())
+            .await
+            .is_err(),
+        "reconnect must not dispatch a fresh attempt for a parked uncertain job"
+    );
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(
+        doc["state"],
+        json!("running"),
+        "still parked after reconnect: {doc}"
+    );
+    assert_eq!(
+        doc["attempts"],
+        json!(1),
+        "no new attempt was claimed: {doc}"
+    );
+    assert_eq!(doc["hostId"], json!(ctx.host), "{doc}");
+    assert_eq!(doc["laneId"], json!("lane1"), "{doc}");
+    assert_eq!(doc["evidenceUncertain"]["generation"], json!(1), "{doc}");
 
-    barrier.arm();
-    node.send_raw(json!({
-        "jsonrpc": "2.0", "method": "gate.event",
-        "params": {
-            "jobId": job_id, "generation": 1, "kind": "finished",
-            "result": failed_gate_result(&job_id, job_seed),
-        }
-    }));
-    hook.release_and_wait_proceeded().await;
-    barrier.wait_parked(2).await;
-    ctx.store().test_arm_gate_log_insert_faults(2);
-    barrier.release();
-    barrier.wait_completed(2).await;
-    node.disconnect();
-    let _ = async {
-        loop {
-            let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
-            if doc["state"] == json!("queued") {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    }
-    .await;
-
-    // The enqueuer explicitly cancels the parked Queued job.
+    // Only an exact-tuple operator resolution releases the parked row.
     let (status, reply) = ctx
-        .agent_post(
-            &format!("/v1/projects/{}/gate/jobs/{job_id}/cancel", ctx.project),
-            json!({}),
+        .send(
+            "POST",
+            &format!(
+                "/v1/projects/{}/gate/jobs/{job_id}/resolve-evidence",
+                ctx.project
+            ),
+            &ctx.human,
+            None,
+            Some(json!({
+                "resolution": "failed",
+                "expectedAttempts": 1,
+                "rationale": "operator settled the parked attempt out of band",
+            })),
         )
         .await;
     assert_eq!(status, 200, "{reply}");
-    assert_eq!(reply["state"], json!("canceled"), "{reply}");
+    assert_eq!(reply["state"], json!("failed"), "{reply}");
+    assert!(reply["evidenceUncertain"].is_null(), "{reply}");
+    // The terminal row still never produced a second dispatch.
     assert!(
-        reply["evidenceUncertain"].is_null(),
-        "the authorized cancel clears the condition: {reply}"
+        tokio::time::timeout(Duration::from_millis(600), hook2.wait_arrived())
+            .await
+            .is_err(),
+        "settling the parked attempt must not dispatch anything either"
     );
 }
 
@@ -3971,12 +3966,15 @@ async fn operator_requeue_releases_a_persistently_uncertain_jobs_occupancy() {
     );
 }
 
-/// r24 item 2: an evidence-uncertain condition is bound to the CURRENT
-/// attempt's full (attempt, epoch, merge) tuple. Attempt N parks the condition,
-/// carrier recovery requeues it, the scheduler re-claims attempt N+1 and grants
-/// it a FRESH Landing (epoch/merge). A delayed operator resolution still
-/// naming attempt N must be refused with 409 and must NOT abort or settle the
-/// newer attempt; only a resolution pinning the live tuple acts.
+/// r25 item 1 / r24 item 2: an evidence-uncertain condition is bound to the
+/// CURRENT attempt's full (attempt, epoch, merge) tuple, and a parked
+/// uncertain job is never re-dispatched across a carrier loss. Attempt N parks
+/// the condition; disconnect + reconnect must not claim attempt N+1. Only an
+/// AUTHORIZED operator requeue for the exact N tuple clears the condition
+/// BEFORE attempts advance, after which the scheduler claims a clean attempt
+/// N+1 and grants it a FRESH Landing (epoch/merge). Any delayed resolution
+/// still naming attempt N is then refused with 409 and must NOT abort or settle
+/// the newer attempt.
 #[tokio::test]
 async fn a_stale_evidence_resolution_for_attempt_n_does_not_touch_attempt_n_plus_one() {
     let (ctx, node) = Ctx::boot().await.unwrap();
@@ -4020,39 +4018,97 @@ async fn a_stale_evidence_resolution_for_attempt_n_does_not_touch_attempt_n_plus
     assert_eq!(doc["state"], json!("running"), "{doc}");
     assert_eq!(doc["attempts"], json!(1), "{doc}");
 
-    // Carrier recovery requeues while PRESERVING the condition (r24 item 1).
-    node.disconnect();
-    let requeued = async {
-        loop {
-            let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
-            if doc["state"] == json!("queued") {
-                break doc;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    }
-    .await;
+    // A stale resolution (naming attempt 2 while attempt 1 is parked) is a
+    // tuple 409 and changes nothing.
+    let resolve_path = format!(
+        "/v1/projects/{}/gate/jobs/{job_id}/resolve-evidence",
+        ctx.project
+    );
+    let (status, _reply) = ctx
+        .send(
+            "POST",
+            &resolve_path,
+            &ctx.human,
+            None,
+            Some(json!({
+                "resolution": "failed",
+                "expectedAttempts": 2,
+                "rationale": "jumping ahead of the parked attempt",
+            })),
+        )
+        .await;
     assert_eq!(
-        requeued["evidenceUncertain"]["generation"],
-        json!(1),
-        "{requeued}"
+        status, 409,
+        "a resolution naming a non-current attempt is refused while parked"
     );
 
-    // The carrier returns; the scheduler really re-claims and dispatches
-    // attempt N+1. Park its gate.run so it cannot finish on its own.
+    // Carrier loss + return: the row stays PARKED Running — no recovery
+    // requeue, no reclaim, no second gate.run, no attempt advance.
+    node.disconnect();
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(
+        doc["state"],
+        json!("running"),
+        "parked through recovery: {doc}"
+    );
+    assert_eq!(doc["attempts"], json!(1), "{doc}");
     let mut node_b = FakeNode::reconnect(&ctx.hub, &ctx.creds, &ctx.workspace)
         .await
         .unwrap();
     let hook2 = node_b
         .arm_gate_run(json!({ "jobId": "placeholder", "status": "failed" }))
         .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1200), hook2.wait_arrived())
+            .await
+            .is_err(),
+        "reconnect alone must not dispatch attempt N+1 while the condition stands"
+    );
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(doc["state"], json!("running"), "{doc}");
+    assert_eq!(doc["attempts"], json!(1), "still attempt N: {doc}");
+    assert_eq!(
+        doc["evidenceUncertain"]["generation"],
+        json!(1),
+        "the condition for attempt N is still attached: {doc}"
+    );
+
+    // Only the AUTHORIZED requeue naming the exact N tuple releases it; the
+    // condition clears BEFORE the attempt can advance.
+    let (status, reply) = ctx
+        .send(
+            "POST",
+            &resolve_path,
+            &ctx.human,
+            None,
+            Some(json!({
+                "resolution": "requeue",
+                "expectedAttempts": 1,
+                "rationale": "storage healed; run the attempt again cleanly",
+            })),
+        )
+        .await;
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["state"], json!("queued"), "{reply}");
+    assert!(
+        reply["evidenceUncertain"].is_null(),
+        "condition cleared first: {reply}"
+    );
+    assert_eq!(
+        reply["attempts"],
+        json!(1),
+        "attempts advance only at claim: {reply}"
+    );
+
+    // The scheduler now really claims and dispatches a CLEAN attempt N+1.
     hook2.wait_arrived().await;
     let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
     assert_eq!(doc["state"], json!("running"), "{doc}");
     assert_eq!(doc["attempts"], json!(2), "attempt N+1 claimed: {doc}");
     assert!(
-        doc["evidenceUncertain"].is_object(),
-        "the condition for attempt N is still attached: {doc}"
+        doc["evidenceUncertain"].is_null(),
+        "the fresh attempt carries no stale condition: {doc}"
     );
 
     // Attempt N+1 is granted Landing with a fresh epoch and merge.
@@ -4077,10 +4133,6 @@ async fn a_stale_evidence_resolution_for_attempt_n_does_not_touch_attempt_n_plus
     // The delayed resolution still names attempt N (1) without an epoch/merge
     // (N never reached Landing): refused with no abort — a Landing resolution
     // must name the full tuple, so it cannot even reach the abort.
-    let resolve_path = format!(
-        "/v1/projects/{}/gate/jobs/{job_id}/resolve-evidence",
-        ctx.project
-    );
     let (status, reply) = ctx
         .send(
             "POST",
@@ -4106,10 +4158,6 @@ async fn a_stale_evidence_resolution_for_attempt_n_does_not_touch_attempt_n_plus
     );
     assert_eq!(doc["attempts"], json!(2), "{doc}");
     assert_eq!(doc["mergeSha"], json!(merge2), "{doc}");
-    assert!(
-        doc["evidenceUncertain"].is_object(),
-        "condition kept: {doc}"
-    );
 
     // No abort frame for N+1 was sent (drain whatever the reconnect produced).
     let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(600);
@@ -4160,11 +4208,9 @@ async fn a_stale_evidence_resolution_for_attempt_n_does_not_touch_attempt_n_plus
         "naming N with the N+1 epoch/merge still mismatches the live row"
     );
 
-    // Even the FULL live tuple is refused while the condition is still bound
-    // to attempt N: the condition's embedded generation is never accepted as a
-    // substitute for the live row. The stale condition clears only with N+1's
-    // OWN settlement (an authorized settlement for the current attempt), never
-    // by an operator acting on N. No abort was ever sent.
+    // The FULL live tuple is refused too: the authorized requeue cleared the
+    // condition, so only N+1's OWN settlement can move the Landing. No abort
+    // was ever sent.
     let (status, _reply) = ctx
         .send(
             "POST",
@@ -4176,23 +4222,23 @@ async fn a_stale_evidence_resolution_for_attempt_n_does_not_touch_attempt_n_plus
                 "expectedAttempts": 2,
                 "expectedSessionEpoch": epoch2,
                 "expectedMergeSha": merge2,
-                "rationale": "current attempt, stale condition",
+                "rationale": "current attempt without a parked condition",
             })),
         )
         .await;
     assert_eq!(
         status, 409,
-        "a condition bound to N cannot resolve attempt N+1"
+        "without a parked condition only the attempt's own settlement acts"
     );
     let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
     assert_eq!(doc["state"], json!("landing"), "{doc}");
     assert_eq!(doc["attempts"], json!(2), "{doc}");
     assert_eq!(doc["mergeSha"], json!(merge2), "{doc}");
-    assert_eq!(doc["evidenceUncertain"]["generation"], json!(1), "{doc}");
+    assert!(doc["evidenceUncertain"].is_null(), "{doc}");
 
-    // N+1's OWN definitive (non-landed) settlement clears the stale condition
-    // as an authorized settlement of the current attempt — no abort frame
-    // either, since this is the live verdict writer, not the operator route.
+    // N+1's OWN definitive (non-landed) settlement settles the current attempt
+    // — no abort frame either, since this is the live verdict writer, not the
+    // operator route.
     ctx.hub
         .test_apply_gate_result(
             &job_id,
@@ -4213,10 +4259,7 @@ async fn a_stale_evidence_resolution_for_attempt_n_does_not_touch_attempt_n_plus
         "N+1 base-moved requeues: {doc}"
     );
     assert_eq!(doc["attempts"], json!(2), "{doc}");
-    assert!(
-        doc["evidenceUncertain"].is_null(),
-        "the current attempt's settlement clears the stale condition: {doc}"
-    );
+    assert!(doc["evidenceUncertain"].is_null(), "{doc}");
 }
 
 /// r24 item 3: a keepLogs land PUSHED the exact granted merge to remote main,

@@ -123,20 +123,27 @@ impl CodexUsage {
 /// Map a Codex usage object onto normalized buckets.
 ///
 /// Presence is preserved (c-ctxusage r15 item 5): an omitted bucket is
-/// Unknown, and the uncached derivation (input includes cache) requires the
-/// total and both cache buckets to be reported — otherwise the uncached
-/// bucket is Unknown. The absent 1-hour write tier is a structural zero for
-/// this provider, not an omission.
+/// Unknown. The uncached input derives from `input - cached - write`.
+/// `input_tokens` includes cache. The cache-write tier is reported under two
+/// spellings across codex/CLI builds (`cache_creation_input_tokens` is the
+/// OpenAI Responses field name the real harness and fixtures emit; older
+/// records say `cache_write_input_tokens`); a record that omits it entirely
+/// is treated as zero write — input minus cache is still exactly the uncached
+/// input, and structural absence must not blank that bucket (main behaviour).
+/// The absent 1-hour write tier is a structural zero for this provider.
 fn counters(usage: &serde_json::Value) -> TokenCounters {
     let known = |key: &str| usage.get(key).and_then(serde_json::Value::as_u64);
     let input = known("input_tokens");
     let cached = known("cached_input_tokens");
-    let write = known("cache_write_input_tokens");
+    let write = known("cache_write_input_tokens").or_else(|| known("cache_creation_input_tokens"));
     // input_tokens includes cache; never let a sparse/odd record go negative.
-    let uncached = match (input, cached, write) {
-        (Some(total), Some(cached), Some(write)) => {
-            Some(total.saturating_sub(cached).saturating_sub(write))
-        }
+    // Missing write defaults to zero (no 5-minute cache-creation tier).
+    let uncached = match (input, cached) {
+        (Some(total), Some(cached)) => Some(
+            total
+                .saturating_sub(cached)
+                .saturating_sub(write.unwrap_or(0)),
+        ),
         _ => None,
     };
     TokenCounters {

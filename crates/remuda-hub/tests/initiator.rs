@@ -2790,6 +2790,114 @@ async fn an_oversized_run_log_is_persisted_truncated_and_settles_normally() {
     );
 }
 
+/// r23 item 2: an oversized SCALAR metadata field — a 600 KiB `step` name and
+/// a 600 KiB `kind` — used to bypass the evidence cap entirely: the r22
+/// truncator only halved tail/summary and trimmed the headline, leaving step
+/// and kind unbounded, so the serialized object stayed over 512 KiB (a debug
+/// panic in dev, an oversized persisted row in release). EVERY variable
+/// length field is now bounded and the final serialized-byte cap is enforced
+/// at runtime, while the truncation marker survives.
+#[tokio::test]
+async fn an_oversized_step_and_kind_are_bounded_and_the_object_stays_under_the_cap() {
+    const EVIDENCE_CAP: usize = 512 * 1024;
+    const STEP_CAP: usize = 128;
+    const KIND_CAP: usize = 32;
+
+    let (ctx, _node) = Ctx::boot().await.unwrap();
+    let (status, body) = ctx
+        .agent_post(
+            &format!("/v1/projects/{}/gate", ctx.project),
+            json!({"branch":"wt/gate/oversized-metadata","mode":"verify"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let job_id = body["id"].as_str().unwrap().to_owned();
+    ctx.hub
+        .test_claim_gate_job(&job_id, "lane1", &ctx.host)
+        .await
+        .unwrap()
+        .expect("claims to running");
+
+    // Small tail/summary/headline; the ONLY oversized fields are step+kind.
+    // In the old code this serialized to ~1.2 MiB and never shrank.
+    let huge_step = "s".repeat(600 * 1024);
+    let huge_kind = "k".repeat(600 * 1024);
+    let failed_result = json!({
+        "jobId": job_id,
+        "generation": 1,
+        "status": "failed",
+        "failedStep": huge_step,
+        "error": "one test failed",
+        "reason": "one test failed",
+        "runLog": {
+            "step": huge_step,
+            "kind": huge_kind,
+            "attempts": 1,
+            "headline": "normal headline",
+            "summary": ["test it_one ... FAILED"],
+            "tail": ["failures:", "    it_one"],
+            "capturedLines": 2,
+            "truncated": false
+        }
+    });
+
+    ctx.hub
+        .test_apply_gate_result(&job_id, failed_result)
+        .await
+        .unwrap();
+
+    let settled = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(settled["state"], json!("failed"), "{settled}");
+    let object_id = settled["logObjectId"]
+        .as_str()
+        .expect("the bounded settlement binds its stored object")
+        .to_owned();
+
+    let (status, served) = ctx
+        .send(
+            "GET",
+            &format!("/v1/gate/logs/{object_id}"),
+            &ctx.human,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{served}");
+    let log = &served["log"];
+    let step = log["step"].as_str().expect("a string step: {log}");
+    let kind = log["kind"].as_str().expect("a string kind: {log}");
+    assert!(
+        step.len() <= STEP_CAP && step.ends_with('…'),
+        "the 600 KiB step is bounded and marked cut, got {} bytes",
+        step.len()
+    );
+    assert!(
+        kind.len() <= KIND_CAP && kind.ends_with('…'),
+        "the 600 KiB kind is bounded and marked cut, got {} bytes",
+        kind.len()
+    );
+    assert_eq!(log["truncated"], json!(true), "{log}");
+    let tail = log["tail"].as_array().expect("tail array: {log}");
+    assert!(
+        tail.iter()
+            .any(|line| line.as_str().is_some_and(|text| text.contains("truncated"))),
+        "the truncation marker survives: {log}"
+    );
+    let stored_bytes = serde_json::to_vec(log).unwrap();
+    assert!(
+        stored_bytes.len() <= EVIDENCE_CAP,
+        "the persisted object is {} bytes, over the {EVIDENCE_CAP} cap",
+        stored_bytes.len()
+    );
+
+    // The JOB ROW also has its free-form fields bounded (failedStep).
+    let failed_step = settled["failedStep"].as_str().expect("{settled}");
+    assert!(
+        failed_step.len() <= STEP_CAP,
+        "the job row failedStep is bounded, got {} bytes",
+        failed_step.len()
+    );
+}
 /// r22 item 2: a Canceling job's Canceled transition is result-driven too. A
 /// completed Passed-with-keepLogs verdict racing the cancel must only commit
 /// Canceled ("verified but not landed") bound to its OWN persisted log; if

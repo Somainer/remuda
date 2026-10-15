@@ -179,6 +179,33 @@ const FAILURES_SECTION_MAX: usize = 160;
 const STANDALONE_SUMMARY_MAX: usize = 40;
 const PLAYWRIGHT_TITLES_MAX: usize = 20;
 const PLAYWRIGHT_BLOCK_MAX: usize = 100;
+// r23 item 2: EVERY variable-length field the Node records is bounded at the
+// source, not only the output tail. A `gate: <name>` marker whose name is too
+// long is NOT a marker (so a subprocess emitting a 600 KiB "gate: aaa…" line
+// cannot create a 600 KiB RunTrace key / GateRunLog.step); GateStep free-form
+// fields read from gate.jsonl and the built evidence headline are clipped on a
+// UTF-8 boundary. The Hub's evidence truncator (its own, smaller final-byte
+// cap) is the second line of defense for supplied logs.
+const MAX_STEP_NAME_BYTES: usize = 128;
+const MAX_HEADLINE_BYTES: usize = MAX_LINE_CHARS;
+const MAX_STEP_FIELD_BYTES: usize = MAX_LINE_CHARS;
+
+/// Clip a free-form string for a bounded verdict/evidence field on a UTF-8
+/// boundary, marking the cut. Input already within the cap is returned
+/// verbatim.
+fn clip_field(text: String, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut cut = max_bytes.saturating_sub("…".len());
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut text = text;
+    text.truncate(cut);
+    text.push('…');
+    text
+}
 
 /// One live gate run: cancel flag and the process group(s) to kill.
 struct LiveRun {
@@ -308,6 +335,7 @@ fn parse_step_marker(line: &str) -> Option<(String, bool)> {
         None => (rest, false),
     };
     if name.is_empty()
+        || name.len() > MAX_STEP_NAME_BYTES
         || !name
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
@@ -447,12 +475,22 @@ fn build_failure_log(
     if attempts > 1 {
         headline.push_str(&format!(", attempts {attempts}, retried"));
     }
-    let summary = extract_summary(step, &tail);
+    // r23 item 2: bound every variable-length field at the source — the step
+    // name (a gate.jsonl/GateStep name may exceed the marker cap), the
+    // headline (built from a free-form error) and every summary line.
+    let summary = extract_summary(step, &tail)
+        .into_iter()
+        .map(|line| clip_field(line, MAX_STEP_FIELD_BYTES))
+        .collect();
+    let tail = tail
+        .into_iter()
+        .map(|line| clip_field(line, MAX_STEP_FIELD_BYTES))
+        .collect();
     GateRunLog {
-        step: step.to_owned(),
+        step: clip_field(step.to_owned(), MAX_STEP_NAME_BYTES),
         kind: "failed".into(),
         attempts,
-        headline,
+        headline: clip_field(headline, MAX_HEADLINE_BYTES),
         summary,
         tail,
         captured_lines: source_lines,
@@ -463,11 +501,15 @@ fn build_failure_log(
 /// Build the whole-run `kept` log (`--keep-logs`) after a green run.
 fn build_kept_log(trace: &RunTrace, headline: &str) -> GateRunLog {
     let (tail, truncated) = trace.global.last(TAIL_LINES, TAIL_CAP_BYTES);
+    let tail = tail
+        .into_iter()
+        .map(|line| clip_field(line, MAX_STEP_FIELD_BYTES))
+        .collect();
     GateRunLog {
         step: "*".into(),
         kind: "kept".into(),
         attempts: 0,
-        headline: headline.to_owned(),
+        headline: clip_field(headline.to_owned(), MAX_HEADLINE_BYTES),
         summary: Vec::new(),
         tail,
         captured_lines: trace.global.seen_lines,
@@ -524,6 +566,34 @@ fn attach_failure_evidence(
 /// Ensure every failed verdict carries a one-line `reason` (first error line)
 /// even when the failure happened before the gate produced step evidence.
 fn finalize(mut result: GateRunResult) -> GateRunResult {
+    // r23 item 2: the verdict parsed from the consumed merge CLI's JSON is
+    // also untrusted input. Bound every variable-length field the Hub
+    // persists (steps, failedStep, reason, error) here — the single
+    // chokepoint every GateRunResult passes through — so the bounded
+    // run-log builder above is not the only bound on a supplied verdict.
+    for step in &mut result.steps {
+        step.name = clip_field(std::mem::take(&mut step.name), MAX_STEP_NAME_BYTES);
+        step.error = step
+            .error
+            .take()
+            .map(|text| clip_field(text, MAX_STEP_FIELD_BYTES));
+        step.reason = step
+            .reason
+            .take()
+            .map(|text| clip_field(text, MAX_STEP_FIELD_BYTES));
+    }
+    result.failed_step = result
+        .failed_step
+        .take()
+        .map(|text| clip_field(text, MAX_STEP_NAME_BYTES));
+    result.error = result
+        .error
+        .take()
+        .map(|text| clip_field(text, OUTPUT_CAP_BYTES));
+    result.reason = result
+        .reason
+        .take()
+        .map(|text| clip_field(text, MAX_HEADLINE_BYTES));
     if result.reason.is_none()
         && let Some(error) = &result.error
     {
@@ -3306,10 +3376,20 @@ async fn stream_gate_report(
                     let chunk = &text[start..];
                     *prev = bytes.len() as u64;
                     for line in chunk.lines() {
-                        let Ok(step) = serde_json::from_str::<remuda_protocol::GateStep>(line)
+                        let Ok(mut step) = serde_json::from_str::<remuda_protocol::GateStep>(line)
                         else {
                             continue;
                         };
+                        // r23 item 2: bound every variable-length GateStep
+                        // field at the source — the Hub job row persists these
+                        // alongside the bounded evidence object.
+                        step.name = clip_field(step.name, MAX_STEP_NAME_BYTES);
+                        step.error = step
+                            .error
+                            .map(|text| clip_field(text, MAX_STEP_FIELD_BYTES));
+                        step.reason = step
+                            .reason
+                            .map(|text| clip_field(text, MAX_STEP_FIELD_BYTES));
                         let dedupe = format!("{}:{}:{}", step.name, step.status, step.duration_ms);
                         if !seen.insert(dedupe) {
                             continue;
@@ -6578,6 +6658,63 @@ JSON
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 
+    /// r23 item 2: a subprocess writes `gate: ` + 600 KiB of letters and is
+    /// then killed by the gate timeout. The over-long token must NOT be parsed
+    /// as a step name (no 600 KiB RunTrace key / GateRunLog.step) and every
+    /// retained field — step, headline, each tail/summary line — stays
+    /// bounded, so the whole verdict serializes well under the evidence cap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_oversized_marker_line_on_a_timeout_cannot_escape_the_field_bounds() {
+        let huge = 600 * 1024;
+        let script = format!(
+            "printf 'gate: ' >&2\nhead -c {huge} /dev/zero | tr '\\0' 'a' >&2\nprintf '\\n' >&2\nsleep 30\n"
+        );
+        let fixture = fixture(&script);
+        let mut p = params(&fixture, "verify");
+        p.gate_timeout_secs = 1;
+        let result = fixture.node.run_gate_typed(p).await.unwrap();
+        assert_eq!(result.status, "failed", "{:?}", result.error);
+        let log = result
+            .run_log
+            .as_ref()
+            .expect("a timeout attaches bounded failure evidence");
+        assert!(
+            log.step.len() <= super::MAX_STEP_NAME_BYTES,
+            "the 600 KiB marker never became a step name; got {} bytes: {log:?}",
+            log.step.len()
+        );
+        assert_eq!(
+            log.step, "gate",
+            "the rejected marker leaves the runner-fallback step, not the huge letters"
+        );
+        assert!(
+            log.headline.len() <= super::MAX_HEADLINE_BYTES,
+            "headline {} bytes",
+            log.headline.len()
+        );
+        for line in log.tail.iter().chain(log.summary.iter()) {
+            assert!(
+                line.len() <= super::MAX_LINE_CHARS,
+                "a retained line is {} bytes: {line:?}",
+                line.len()
+            );
+        }
+        assert!(
+            result
+                .failed_step
+                .as_deref()
+                .is_none_or(|step| step.len() <= super::MAX_STEP_NAME_BYTES),
+            "failedStep is bounded: {:?}",
+            result.failed_step
+        );
+        let encoded = serde_json::to_vec(&result).unwrap();
+        assert!(
+            encoded.len() < 512 * 1024,
+            "the whole verdict serialized to {} bytes",
+            encoded.len()
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_stale_generation_cancel_never_signals_the_newer_live_attempt() {
         // r15 item 2: the job slot is reused by attempt 2. A delayed
@@ -6975,6 +7112,41 @@ JSON
         assert!(super::parse_step_marker("gate: Rust tests: remuda (full)").is_none());
         assert!(super::parse_step_marker("  gate: cargo-test").is_none());
         assert!(super::parse_step_marker("gate: Cargo-Test").is_none());
+    }
+
+    /// r23 item 2: a marker with an over-long name is NOT a step marker, so a
+    /// subprocess emitting `gate: ` + hundreds of KiB of letters cannot create
+    /// an unbounded RunTrace key / GateRunLog.step.
+    #[test]
+    fn an_overlong_step_marker_name_is_rejected() {
+        let at_cap = "a".repeat(super::MAX_STEP_NAME_BYTES);
+        assert_eq!(
+            super::parse_step_marker(&format!("gate: {at_cap}")),
+            Some((at_cap.clone(), false)),
+            "a name exactly at the cap is accepted"
+        );
+        let over = "a".repeat(super::MAX_STEP_NAME_BYTES + 1);
+        assert!(
+            super::parse_step_marker(&format!("gate: {over}")).is_none(),
+            "a name one byte over the cap is rejected"
+        );
+        // The exact regression shape: 600 KiB of letters.
+        let huge = "a".repeat(600 * 1024);
+        assert!(super::parse_step_marker(&format!("gate: {huge}")).is_none());
+    }
+
+    /// r23 item 2: the field clipper keeps in-cap text verbatim and bounds
+    /// over-cap text on a UTF-8 boundary with a cut marker.
+    #[test]
+    fn clip_field_bounds_on_a_utf8_boundary() {
+        assert_eq!(super::clip_field("short".into(), 16), "short");
+        let clipped = super::clip_field("a".repeat(100), 10);
+        assert!(clipped.len() <= 10, "{clipped:?}");
+        assert!(clipped.ends_with('…'));
+        // A multibyte boundary is never split.
+        let clipped = super::clip_field("€".repeat(20), 7);
+        assert!(clipped.len() <= 7, "{clipped:?}");
+        assert!(std::str::from_utf8(clipped.as_bytes()).is_ok());
     }
 
     #[test]

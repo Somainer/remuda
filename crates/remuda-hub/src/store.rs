@@ -106,6 +106,12 @@ pub enum StoreError {
     /// rather than risk repeating one.
     #[error("gate session boot epoch regressed: {0}")]
     GateEpochRegressed(String),
+    /// r23 item 2: runtime enforcement of the final serialized-byte cap on a
+    /// gate evidence object. The truncator must guarantee the bound before
+    /// insert; reaching the store over the cap is a fail-closed bug, never a
+    /// reason to persist the oversized row.
+    #[error("gate evidence object exceeds the {size}-byte cap (max {max})")]
+    EvidenceTooLarge { size: usize, max: usize },
     /// An injected test fault (`test-faults` feature only).
     #[cfg(any(test, feature = "test-faults"))]
     #[error("injected store fault: {0}")]

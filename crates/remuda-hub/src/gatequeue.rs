@@ -2202,6 +2202,12 @@ pub(crate) async fn apply_result(
     let evidence_uncertain_surfaced =
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let evidence_uncertain_surfaced_writer = evidence_uncertain_surfaced.clone();
+    // r23 item 2: bound the row-bound free-form fields (steps, failedStep,
+    // reason, error) before they are copied into the persisted job doc. The
+    // supplied run_log is left intact — the evidence digest binds its exact
+    // supplied bytes and persist_run_log bounds the stored object separately.
+    let mut result = result;
+    bound_gate_result_row_fields(&mut result);
     let outcome = state
         .store
         .mutate_gate_job(job_id, move |row, conn| {
@@ -2864,11 +2870,77 @@ const GATE_LOG_TRUNCATION_MARKER: &str = "... run log truncated: it exceeded \
 the 512 KiB evidence cap, so output beyond the stored tail was discarded \
 before persistence ...";
 
+// r23 item 2: per-field byte bounds for EVERY variable-length serialized
+// field of a supplied GateRunLog. The Node bounds these at capture, but a
+// log can arrive from any carrier version, so the Hub persistence path
+// enforces them too before the final byte cap. All are far larger than a
+// real value but small enough that their sum (plus the bounded tail/summary)
+// cannot approach GATE_LOG_MAX_BYTES.
+const GATE_LOG_STEP_MAX_BYTES: usize = 128;
+const GATE_LOG_KIND_MAX_BYTES: usize = 32;
+const GATE_LOG_HEADLINE_MAX_BYTES: usize = 8 * 1024;
+const GATE_LOG_LINE_MAX_BYTES: usize = 8 * 1024;
+// r23 item 2: bounds for the verdict's free-form fields that land in the JOB
+// ROW (steps, failedStep, reason, error). The Node clips these at capture;
+// the Hub enforces the same bounds before persisting any supplied verdict.
+const GATE_JOB_REASON_MAX_BYTES: usize = 8 * 1024;
+const GATE_JOB_ERROR_MAX_BYTES: usize = 16 * 1024;
+
+/// Clip a free-form evidence field on a UTF-8 boundary, marking the cut.
+/// Input already within the cap is returned verbatim.
+fn clip_evidence_field(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    let mut cut = max_bytes.saturating_sub("…".len());
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut out = text[..cut].to_owned();
+    out.push('…');
+    out
+}
+
+/// r23 item 2: bound every variable-length field of a supplied verdict that
+/// is persisted into the gate JOB ROW (not the separate evidence object,
+/// which [`persisted_run_log_bytes`] bounds). The `run_log` is deliberately
+/// left untouched: its supplied bytes are what the evidence digest binds, and
+/// persistence truncates that object independently.
+fn bound_gate_result_row_fields(result: &mut GateRunResult) {
+    for step in &mut result.steps {
+        step.name = clip_evidence_field(&step.name, GATE_LOG_STEP_MAX_BYTES);
+        step.error = step
+            .error
+            .take()
+            .map(|text| clip_evidence_field(&text, GATE_JOB_REASON_MAX_BYTES));
+        step.reason = step
+            .reason
+            .take()
+            .map(|text| clip_evidence_field(&text, GATE_JOB_REASON_MAX_BYTES));
+    }
+    result.failed_step = result
+        .failed_step
+        .take()
+        .map(|text| clip_evidence_field(&text, GATE_LOG_STEP_MAX_BYTES));
+    result.reason = result
+        .reason
+        .take()
+        .map(|text| clip_evidence_field(&text, GATE_JOB_REASON_MAX_BYTES));
+    result.error = result
+        .error
+        .take()
+        .map(|text| clip_evidence_field(&text, GATE_JOB_ERROR_MAX_BYTES));
+}
+
 /// Serialize a supplied run log for persistence. Logs within the cap are
-/// stored verbatim; an oversized log is truncated (tail lines first, then
-/// summary, then the headline) with [`GATE_LOG_TRUNCATION_MARKER`] kept as the
-/// first tail line and the `truncated` flag set, and the digest is computed
-/// by the caller over EXACTLY the returned bytes.
+/// stored verbatim; an oversized log is bounded on EVERY variable-length
+/// field (step, kind, headline, each summary/tail line), then truncated
+/// (tail lines first, then summary, then the headline) with
+/// [`GATE_LOG_TRUNCATION_MARKER`] kept as the first tail line and the
+/// `truncated` flag set, and the digest is computed by the caller over
+/// EXACTLY the returned bytes. The 512 KiB cap is enforced in RUNTIME code
+/// (not a debug assert): a value that still cannot be bounded is an error,
+/// so an oversized object is never persisted in any build.
 fn persisted_run_log_bytes(
     run_log: &remuda_protocol::GateRunLog,
 ) -> Result<(Vec<u8>, bool), HubError> {
@@ -2882,6 +2954,25 @@ fn persisted_run_log_bytes(
     let mut bounded = run_log.clone();
     bounded.truncated = true;
     bounded.captured_lines = run_log.captured_lines.max(run_log.tail.len());
+    // Bound the scalar fields and every individual line FIRST, so an enormous
+    // step/kind/headline or a single huge line cannot survive the
+    // line-count halving passes below (the r22 truncator only halved tail and
+    // summary and trimmed the headline, leaving step/kind unbounded).
+    bounded.step = clip_evidence_field(&bounded.step, GATE_LOG_STEP_MAX_BYTES);
+    bounded.kind = clip_evidence_field(&bounded.kind, GATE_LOG_KIND_MAX_BYTES);
+    bounded.headline = clip_evidence_field(&bounded.headline, GATE_LOG_HEADLINE_MAX_BYTES);
+    bounded.summary = bounded
+        .summary
+        .iter()
+        .map(|line| clip_evidence_field(line, GATE_LOG_LINE_MAX_BYTES))
+        .collect();
+    bounded.tail = bounded
+        .tail
+        .iter()
+        .map(|line| clip_evidence_field(line, GATE_LOG_LINE_MAX_BYTES))
+        .collect();
+    // The marker is inserted AFTER per-line clipping so it is never itself
+    // cut, and it stays index 0 so the halving truncates below always keep it.
     bounded
         .tail
         .insert(0, GATE_LOG_TRUNCATION_MARKER.to_owned());
@@ -2899,23 +2990,35 @@ fn persisted_run_log_bytes(
         bytes = encode(&bounded)?;
     }
     if bytes.len() > GATE_LOG_MAX_BYTES {
-        // A single enormous tail/headline line: keep only the marker and trim
-        // the headline on a UTF-8 boundary to leave room for the JSON frame.
+        // Keep only the marker and trim the headline on a UTF-8 boundary to
+        // leave room for the JSON frame.
         bounded.tail.truncate(1);
         bounded.summary.clear();
         bytes = encode(&bounded)?;
         if bytes.len() > GATE_LOG_MAX_BYTES {
             let framing = bytes.len().saturating_sub(bounded.headline.len());
             let budget = GATE_LOG_MAX_BYTES.saturating_sub(framing + 64);
-            let mut cut = bounded.headline.len().min(budget);
-            while cut > 0 && !bounded.headline.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            bounded.headline.truncate(cut);
+            bounded.headline = clip_evidence_field(&bounded.headline, budget);
             bytes = encode(&bounded)?;
         }
     }
-    debug_assert!(bytes.len() <= GATE_LOG_MAX_BYTES);
+    if bytes.len() > GATE_LOG_MAX_BYTES {
+        // Last-resort guarantee: marker + minimal scalars only.
+        bounded.headline.clear();
+        bounded.step = clip_evidence_field(&bounded.step, 16);
+        bounded.kind = clip_evidence_field(&bounded.kind, 8);
+        bytes = encode(&bounded)?;
+    }
+    // Runtime enforcement in EVERY build: the persisted object cannot exceed
+    // the cap. Reaching here is a fail-closed internal error rather than an
+    // oversized insert.
+    if bytes.len() > GATE_LOG_MAX_BYTES {
+        return Err(HubError::Internal(format!(
+            "gate run log of {} bytes could not be bounded under the {} byte evidence cap",
+            bytes.len(),
+            GATE_LOG_MAX_BYTES
+        )));
+    }
     Ok((bytes, true))
 }
 
@@ -4519,6 +4622,15 @@ impl Store {
         #[cfg(any(test, feature = "test-faults"))]
         let insert_fault = self.take_gate_log_insert_fault();
         self.run_named("insert_gate_log", move |conn| {
+            // r23 item 2: enforce the final serialized-byte cap in RUNTIME
+            // code, as defense in depth behind persisted_run_log_bytes. An
+            // oversized object is rejected in every build, never persisted.
+            if bytes.len() > GATE_LOG_MAX_BYTES {
+                return Err(crate::store::StoreError::EvidenceTooLarge {
+                    size: bytes.len(),
+                    max: GATE_LOG_MAX_BYTES,
+                });
+            }
             let tx = crate::store::immediate_tx(conn)?;
             let now = now();
             let expires_at = gate_log_expiry(&now);

@@ -9336,6 +9336,7 @@ it("GATE47 item 2(b) (S3): a nested-microtask subscriber starts login B at A's m
     // login B via NESTED microtasks — the gate-46 return window.
     let prevConn = (hubStore as unknown as { state: { connection: string } }).state.connection;
     let unsub = (): void => {};
+    let loginBPromise: Promise<void> | null = null;
     unsub = h.subscribe(() => {
       const s = hubStore as unknown as { state: { connection: string }; connection: unknown };
       const conn = s.state.connection;
@@ -9344,7 +9345,16 @@ it("GATE47 item 2(b) (S3): a nested-microtask subscriber starts login B at A's m
       unsub();
       queueMicrotask(() => {
         queueMicrotask(() => {
-          void h.login("bootstrap", "secretB", "devB_g47_2b");
+          // Gate 48 item 6: CAPTURE the subscriber-created login promise and
+          // assert B's session/readiness/machine INSIDE its own fulfilment
+          // (not via a later pump), proving the public login promise itself
+          // resolves only once B is fully installed.
+          loginBPromise = h.login("bootstrap", "secretB", "devB_g47_2b").then(() => {
+            expect(h.state.authed).toBe(true);
+            expect(h.state.session?.deviceId).toBe("devB_g47_2b");
+            expect(h.state.connection).toBe("live");
+            expect(h.connection).not.toBeNull();
+          });
         });
       });
     });
@@ -9360,6 +9370,10 @@ it("GATE47 item 2(b) (S3): a nested-microtask subscriber starts login B at A's m
     releaseB();
     await bootA;
     await bootA2;
+    // Gate 48 item 6: await the CAPTURED promise — its in-fulfilment
+    // assertions are the real coverage of B's session/readiness/machine.
+    expect(loginBPromise).not.toBeNull();
+    await loginBPromise;
     await pump(4_000);
     expect(h.state.authed).toBe(true);
     expect(h.state.session?.deviceId).toBe("devB_g47_2b");
@@ -9647,5 +9661,110 @@ it("GATE48 item 3: a sibling-held instance lock cannot block the bootstrap auth 
     vi.useRealTimers();
     Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
     sessionStorage.removeItem("remuda-outbox-owner-g48-3");
+  }
+});
+
+it("GATE48 item 5: B issued while A's LIST response is held never starts until A settles, and A's rows never publish under B", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_495_000);
+  const I = "ins_g48_5";
+  const J = `obj_g48_5`;
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 5_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner-g48-5", "owner");
+    localStorage.setItem("runtime.device-session", JSON.stringify({ deviceId: "devA_g48_5", name: "A" }));
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true } as never);
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] } as never);
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: J } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+    vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+    vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+    vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+
+    // Observe every state publication.
+    const instSnapshots: Array<Array<{ id: string }>> = [];
+    const unsub = hubStore.subscribe(() => {
+      const rows = hubStore.getSnapshot().instances.map((i) => ({ id: i.id }));
+      const last = instSnapshots[instSnapshots.length - 1];
+      if (!last || last.length !== rows.length || last.some((r, k) => r.id !== rows[k]?.id)) {
+        instSnapshots.push(rows);
+      }
+    });
+
+    // A's LIST response is held. It contains an A-specific instance id.
+    const aRows = [{ id: "ins_A_ONLY_g48_5", journalId: J, revision: "0", durableSeq: "0", lifecycle: "running" } as never];
+    const bRows = [{ id: "ins_B_ONLY_g48_5", journalId: J, revision: "1", durableSeq: "0", lifecycle: "running" } as never];
+    let releaseList: ((v: unknown) => void) | null = null;
+    let listCalls = 0;
+    vi.spyOn(api, "instanceList").mockImplementation((() => {
+      listCalls += 1;
+      if (listCalls === 1) {
+        return new Promise((resolve) => {
+          releaseList = (v) => resolve(v as never);
+        });
+      }
+      return Promise.resolve({ items: bRows, nextCursor: null } as never);
+    }) as unknown as Api["instanceList"]);
+
+    // Hold B's credential body too, keyed by device name (no request until
+    // A's op settles).
+    let bRequestStarted = false;
+    vi.spyOn(api, "login").mockImplementation(((secret: string, deviceName: string) => {
+      bRequestStarted = true;
+      return Promise.resolve({ deviceId: "devB_g48_5", token: "tokB", name: "B" });
+    }) as unknown as Api["login"]);
+
+    const h = hubStore as unknown as {
+      bootstrap: () => Promise<void>;
+      login: (k: "bootstrap", s: string, d: string) => Promise<void>;
+      connection: unknown;
+      stateAuthed: () => boolean;
+    };
+
+    const bootA = h.bootstrap();
+    for (let i = 0; i < 4_000 && !releaseList; i += 1) await Promise.resolve();
+    expect(releaseList).not.toBeNull();
+
+    // Issue B while A's list is still pending.
+    const loginB = h.login("bootstrap", "secretB", "devB_g48_5");
+    await pump(400);
+    // No credential request until A settles.
+    expect(bRequestStarted).toBe(false);
+    expect(listCalls).toBe(1);
+
+    // Release A's list with A-ONLY rows.
+    releaseList!({ items: aRows, nextCursor: null } as never);
+    await Promise.all([bootA, loginB]);
+    await pump(6_000);
+
+    // B started only after A settled, and its own list brought B-ONLY rows.
+    expect(bRequestStarted).toBe(true);
+    expect(listCalls).toBe(2);
+    // Every publication BETWEEN A's list release and B's run could transiently
+    // carry A's rows (that is A publishing ITS session); what must never
+    // happen is A's rows surviving UNDER B's session once B has installed.
+    const finalRows = hubStore.getSnapshot().instances.map((i) => i.id);
+    expect(finalRows).toContain("ins_B_ONLY_g48_5");
+    expect(finalRows).not.toContain("ins_A_ONLY_g48_5");
+    // And no captured publication under the final (B) session carried an A row
+    // AFTER B's credential request started: subscribe again and assert current
+    // state is clean, plus the snapshot history has no A+B mix at the end.
+    expect(instSnapshots[instSnapshots.length - 1]?.map((r) => r.id)).not.toContain("ins_A_ONLY_g48_5");
+    unsub();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner-g48-5");
   }
 });

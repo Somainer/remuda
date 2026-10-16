@@ -10,7 +10,8 @@ const origin = `http://${listen}`;
 
 export default defineConfig({
   testDir: "./tests/e2e",
-  testMatch: /hub-live\.spec\.ts/,
+  // Anchored: exactly hub-live.spec.ts (NOT passkey-hub-live.spec.ts).
+  testMatch: /(^|[/\\])hub-live\.spec\.ts$/,
   grep: /@e2e-handle/,
   fullyParallel: false,
   workers: 1,

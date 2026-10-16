@@ -11,7 +11,9 @@ const origin = `http://${listen}`;
 
 export default defineConfig({
   testDir: "./tests/e2e",
-  testMatch: /hub-live\.spec\.ts|hub-security\.spec\.ts/,
+  // Anchored: exactly hub-live.spec.ts (NOT passkey-hub-live.spec.ts, which is
+  // a separate CDP-authenticator suite with its own configuration).
+  testMatch: /(^|[/\\])hub-live\.spec\.ts$|(^|[/\\])hub-security\.spec\.ts$/,
   grepInvert: /@e2e-handle/,
   fullyParallel: false,
   workers: 1,

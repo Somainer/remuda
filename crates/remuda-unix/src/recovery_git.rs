@@ -31,6 +31,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(any(test, feature = "test-faults"))]
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// Fetch subcommand flags appended after `fetch`. Kept here so Node and CLI

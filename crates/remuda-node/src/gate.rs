@@ -4143,9 +4143,16 @@ fn resolve_landing_after_restart(
     // subprocess AND its whole cleanup (survivor kill, reap, pipe drains); the
     // per-command soft cap only decides when a still-running git is KILLed.
     let deadline = std::time::Instant::now() + LANDING_PROBE_DEADLINE;
+    // R11: one hardening guard for the whole probe (env + config + fetch flags;
+    // its scratch hooks dir is removed when the probe returns).
+    let hardening = match remuda_unix::RecoveryGit::enter(&repo) {
+        Ok(h) => h,
+        Err(error) => return unknown(format!("could not prepare recovery hardening: {error}")),
+    };
     // Read the remote tip and fetch its objects without touching any ref. On
     // error the probe is Unknown.
-    let base_sha = match recovery_fetch_base_sha(&repo, &request.base_branch, deadline) {
+    let base_sha = match recovery_fetch_base_sha(&repo, &request.base_branch, deadline, &hardening)
+    {
         Ok(sha) => sha,
         Err(message) => return unknown(message),
     };
@@ -4159,7 +4166,7 @@ fn resolve_landing_after_restart(
                      in {repo:?}; ancestry unknown"
             )));
         }
-        match owned_git(&repo, args, RECOVERY_GIT_CAP, deadline) {
+        match owned_git(&repo, args, RECOVERY_GIT_CAP, deadline, &hardening) {
             Ok(run) if run.timed_out() => Err(unknown(format!(
                 "{what} exceeded the {RECOVERY_GIT_CAP:?} probe bound and was killed; push outcome \
                  unknown"
@@ -4283,6 +4290,7 @@ fn recovery_fetch_base_sha(
     repo: &Path,
     base_branch: &str,
     deadline: std::time::Instant,
+    hardening: &remuda_unix::RecoveryGit,
 ) -> std::result::Result<String, String> {
     let owned = |args: &[&str],
                  what: &str,
@@ -4294,7 +4302,7 @@ fn recovery_fetch_base_sha(
                  outcome unknown"
             ));
         }
-        match owned_git(repo, args, RECOVERY_GIT_CAP, deadline) {
+        match owned_git(repo, args, RECOVERY_GIT_CAP, deadline, hardening) {
             Ok(run) if run.timed_out() => Err(format!(
                 "{what} exceeded the {RECOVERY_GIT_CAP:?} probe bound and was killed; push outcome \
                  unknown"
@@ -4351,7 +4359,7 @@ fn recovery_fetch_base_sha(
     //    FETCH_HEAD is not a ref, recovery never reads it, and writing it
     //    cannot create or move any branch/tag; it is harmless.
     let mut fetch_args: Vec<&str> = vec!["fetch"];
-    fetch_args.extend_from_slice(RECOVERY_FETCH_FLAGS);
+    fetch_args.extend_from_slice(remuda_unix::RECOVERY_FETCH_FLAGS);
     fetch_args.push("origin");
     fetch_args.push(&sha);
     owned(&fetch_args, "remote base object fetch", true)?;
@@ -4558,13 +4566,6 @@ pub(crate) fn probe_sha256_support(program: &str, probe_repo: &Path) -> bool {
     probe_sha256_support_with(program, probe_repo)
 }
 
-/// Flags the recovery object-fetch ALWAYS passes. Deliberately NOT including
-/// `--no-write-fetch-head`: older git builds reject it (r31 item 2); FETCH_HEAD
-/// is not a ref and recovery never reads it. Test-visible so the exact flag
-/// set is asserted.
-#[cfg(unix)]
-pub(crate) const RECOVERY_FETCH_FLAGS: &[&str] = &["--no-tags", "--no-prune", "--refmap="];
-
 /// Per-subprocess cap so one git command cannot consume the whole probe.
 #[cfg(unix)]
 const RECOVERY_GIT_CAP: Duration = Duration::from_secs(10);
@@ -4584,12 +4585,12 @@ fn owned_git(
     args: &[&str],
     cap: Duration,
     deadline: std::time::Instant,
+    hardening: &remuda_unix::RecoveryGit,
 ) -> std::io::Result<remuda_unix::OwnedRun> {
-    let mut command = std::process::Command::new("git");
-    command
-        .current_dir(repo)
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0");
+    // R11: every recovery git invocation goes through the single hardened
+    // builder (replacement/graft/prompt env, no-maintenance/no-submodule/
+    // no-hooks config); no recovery call can bypass it.
+    let command = hardening.command(repo, args);
     remuda_unix::run_owned_process(command, cap, deadline)
 }
 
@@ -9652,13 +9653,13 @@ head -c 1 >/dev/null || exit 4
     #[test]
     fn recovery_fetch_flags_never_write_fetch_head() {
         assert!(
-            super::RECOVERY_FETCH_FLAGS
+            remuda_unix::RECOVERY_FETCH_FLAGS
                 .iter()
                 .all(|flag| *flag != "--no-write-fetch-head")
         );
-        assert!(super::RECOVERY_FETCH_FLAGS.contains(&"--refmap="));
-        assert!(super::RECOVERY_FETCH_FLAGS.contains(&"--no-prune"));
-        assert!(super::RECOVERY_FETCH_FLAGS.contains(&"--no-tags"));
+        assert!(remuda_unix::RECOVERY_FETCH_FLAGS.contains(&"--refmap="));
+        assert!(remuda_unix::RECOVERY_FETCH_FLAGS.contains(&"--no-prune"));
+        assert!(remuda_unix::RECOVERY_FETCH_FLAGS.contains(&"--no-tags"));
     }
 
     /// R10: ls-remote parsing accepts exactly one well-formed line for the
@@ -9955,6 +9956,113 @@ head -c 1 >/dev/null || exit 4
             refs_listing(&lane),
             before,
             "a stale tracking ref must survive despite fetch.prune=true"
+        );
+    }
+
+    /// R11 item 1 (HIGH): a local replacement graft (or legacy
+    /// .git/info/grafts) must not fabricate ancestry. Real remote tip R
+    /// diverged from the granted M (R does not contain M); with `git replace
+    /// --graft R M` an ordinary merge-base falsely reports M an ancestor, so
+    /// unhardened recovery would return Landed. Hardened recovery disables
+    /// replacements and grafts and returns Absent (death evidence is held),
+    /// never Landed.
+    #[cfg(unix)]
+    #[test]
+    fn a_local_replace_or_graft_cannot_fabricate_landed() {
+        let (_dir, _bare, lane, base_b) = recovery_branch_fixture("main", None);
+        let seed = _dir.path().join("seed");
+        // Make sure R's objects are present in the lane (needed for a valid
+        // replacement) by publishing R first and object-fetching it, and make
+        // the granted M locally on the SAME base so both are full commits.
+        // Granted merge M on a side branch, not pushed to the remote.
+        git(&lane, &["checkout", "-q", "-b", "work"]);
+        std::fs::write(lane.join("m.txt"), "M\n").unwrap();
+        git(&lane, &["add", "m.txt"]);
+        git(&lane, &["commit", "-q", "-m", "granted merge M"]);
+        let merge_m = git(&lane, &["rev-parse", "HEAD"]);
+        assert_ne!(merge_m, base_b);
+        // Remote main independently advances to R, which does NOT contain M.
+        std::fs::write(seed.join("r.txt"), "R\n").unwrap();
+        git(&seed, &["add", "r.txt"]);
+        git(&seed, &["commit", "-q", "-m", "R"]);
+        let remote_r = git(&seed, &["rev-parse", "main"]);
+        git(&seed, &["push", "-q", "origin", "main"]);
+        // Bring R's real objects into the lane without writing refs.
+        run_git(
+            &lane,
+            &[
+                "fetch",
+                "--no-tags",
+                "--no-prune",
+                "--refmap=",
+                "origin",
+                &remote_r,
+            ],
+        )
+        .unwrap();
+        // Recovery fetches R's objects (R is the real tip; M's objects are
+        // already local from the lane's own commit).
+        let request = remuda_protocol::GateResolveLandingParams {
+            job_id: "gjb_r32_repl".into(),
+            repo_path: lane.to_string_lossy().into_owned(),
+            base_branch: "main".into(),
+            merge_sha: merge_m.clone(),
+        };
+        // Baseline: R genuinely does not contain M -> Absent (death held).
+        assert!(
+            block_git(&lane, &["merge-base", "--is-ancestor", &merge_m, &remote_r]).is_err(),
+            "real remote R must not contain M before the graft"
+        );
+
+        for graft in ["replace", "legacy-graft"] {
+            // Attack setup uses raw commands: the replacement may or may not
+            // already exist at the top of the loop, and test git() asserts
+            // success (it is the strict fixture helper).
+            let raw_git = |args: &[&str]| {
+                let _ = std::process::Command::new("git")
+                    .current_dir(&lane)
+                    .args(args)
+                    .env("GIT_TERMINAL_PROMPT", "0")
+                    .status();
+            };
+            raw_git(&["replace", "-d", &remote_r]);
+            std::fs::remove_file(lane.join(".git/info/grafts")).ok();
+            if graft == "replace" {
+                // Fabricate ancestry: replace R's parent chain with M.
+                git(&lane, &["replace", "--graft", &remote_r, &merge_m]);
+            } else {
+                // Same attack through the deprecated grafts file.
+                let grafts = lane.join(".git/info/grafts");
+                std::fs::create_dir_all(grafts.parent().unwrap()).unwrap();
+                std::fs::write(&grafts, format!("{remote_r} {merge_m}\n")).unwrap();
+                git(&lane, &["config", "advice.graftFileDeprecated", "false"]);
+            }
+            // The vulnerable command now falsely sees M in R.
+            assert!(
+                block_git(&lane, &["merge-base", "--is-ancestor", &merge_m, &remote_r]).is_ok(),
+                "sanity: {graft} fabricates M as an ancestor of R"
+            );
+            // Hardened recovery is NOT fooled: Absent with death evidence.
+            let reply = super::resolve_landing_after_restart(&request, true);
+            assert_eq!(
+                reply.status, "absent",
+                "hardened recovery must not report Landed through a {graft}: {reply:?}"
+            );
+            assert_eq!(reply.base_sha.as_deref(), Some(remote_r.as_str()));
+        }
+        // Clear all attack state for the final Unknown assertion.
+        let _ = std::process::Command::new("git")
+            .current_dir(&lane)
+            .args(["replace", "-d", &remote_r])
+            .status();
+        std::fs::remove_file(lane.join(".git/info/grafts")).ok();
+        git(&lane, &["replace", "--graft", &remote_r, &merge_m]);
+        let reply = super::resolve_landing_after_restart(&request, false);
+        assert_eq!(reply.status, "unknown", "{reply:?}");
+        // The recovery scratch hooks directory must not be left behind.
+        assert!(
+            !lane.join(".git-r32-recovery-no-hooks").exists(),
+            "recovery must clean its hardening scratch dir"
         );
     }
 

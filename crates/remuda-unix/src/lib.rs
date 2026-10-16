@@ -24,6 +24,14 @@ pub use imp::observe_exit_without_reaping;
 #[cfg(unix)]
 mod owner;
 
+#[cfg(unix)]
+mod recovery_git;
+
+/// R11 hardening for every recovery git invocation (replacement/graft/prompt
+/// env, no-maintenance/no-submodule/no-hooks config, fetch flags).
+#[cfg(unix)]
+pub use recovery_git::{RECOVERY_FETCH_FLAGS, RecoveryGit};
+
 /// THE OWNER CONTRACT single-owner subprocess runner (Node recovery and the
 /// merge CLI recovery).
 #[cfg(unix)]

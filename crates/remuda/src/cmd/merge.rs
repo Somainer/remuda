@@ -982,13 +982,20 @@ fn push_main_cas(repo: &Path, merged: &str, expected: &str) -> Result<()> {
     // snapshot between fetch and SHA capture, and no leftover ref can block a
     // base rename. Every read below is pinned to the captured SHA.
     let deadline = Instant::now() + LAND_RECOVERY_DEADLINE;
-    let remote_tip = recovery_fetch_base_sha(repo, "main", deadline)?;
+    // R11: one hardening guard for the whole post-push recovery; its scratch
+    // hooks directory is removed when recovery returns.
+    let hardening = remuda_unix::RecoveryGit::enter(repo).map_err(|error| {
+        MergeStop::PushUncertain(format!("could not prepare recovery hardening: {error}"))
+    })?;
+    let remote_tip = recovery_fetch_base_sha(repo, "main", deadline, &hardening)?;
     // The exact granted merge IS on remote main: the push landed, only the
     // acknowledgement failed. Treat as success — never failed/base-moved.
-    if owned_is_ancestor(repo, merged, &remote_tip, deadline)? {
+    if owned_is_ancestor(repo, merged, &remote_tip, deadline, &hardening)? {
         return Ok(());
     }
-    if remote_tip != expected && owned_is_ancestor(repo, expected, &remote_tip, deadline)? {
+    if remote_tip != expected
+        && owned_is_ancestor(repo, expected, &remote_tip, deadline, &hardening)?
+    {
         // Origin-only base move: the merge is absent but main advanced from our
         // base to another commit — the real CAS loss the caller requeues on.
         return Err(MergeStop::BaseMoved(expected.to_owned(), remote_tip).into());
@@ -1136,7 +1143,12 @@ fn probe_sha256_support(program: &str, probe_repo: &Path) -> bool {
 /// 3. `git cat-file -e <sha>^{commit}` verifies the object.
 ///
 /// Every command goes through the R6 owner under one absolute deadline.
-fn recovery_fetch_base_sha(repo: &Path, base: &str, deadline: Instant) -> Result<String> {
+fn recovery_fetch_base_sha(
+    repo: &Path,
+    base: &str,
+    deadline: Instant,
+    hardening: &remuda_unix::RecoveryGit,
+) -> Result<String> {
     // 1. Authoritative advertised tip. Exit 2 means the base ref is not
     // advertised (the parser names that precisely); any other non-zero exit is
     // a transport/command failure; timeouts/spawn failures fail too.
@@ -1147,6 +1159,7 @@ fn recovery_fetch_base_sha(repo: &Path, base: &str, deadline: Instant) -> Result
         "post-push remote base ls-remote",
         false,
         deadline,
+        hardening,
     )?;
     if listing.status.code() != Some(2) && !listing.status.success() {
         return Err(MergeStop::PushUncertain(format!(
@@ -1171,7 +1184,7 @@ fn recovery_fetch_base_sha(repo: &Path, base: &str, deadline: Instant) -> Result
     // every recovery PushUncertain forever). FETCH_HEAD is not a ref and
     // recovery never reads it, so writing it is harmless.
     let mut fetch_args: Vec<&str> = vec!["fetch"];
-    fetch_args.extend_from_slice(RECOVERY_FETCH_FLAGS);
+    fetch_args.extend_from_slice(remuda_unix::RECOVERY_FETCH_FLAGS);
     fetch_args.push("origin");
     fetch_args.push(&remote_tip);
     recovery_git(
@@ -1180,6 +1193,7 @@ fn recovery_fetch_base_sha(repo: &Path, base: &str, deadline: Instant) -> Result
         "post-push remote base object fetch",
         true,
         deadline,
+        hardening,
     )?;
     // 3. The fetched object must peel to a commit.
     recovery_git(
@@ -1188,6 +1202,7 @@ fn recovery_fetch_base_sha(repo: &Path, base: &str, deadline: Instant) -> Result
         "post-push fetched base commit verification",
         true,
         deadline,
+        hardening,
     )?;
     Ok(remote_tip)
 }
@@ -1477,10 +1492,6 @@ fn gate_summary(report: &MergeReport) -> String {
 
 /// r19 item 2 / R7: per-subprocess cap so one recovery git command cannot
 /// consume the whole recovery budget.
-/// Flags the recovery object-fetch ALWAYS passes; see the Node gateway. No
-/// `--no-write-fetch-head` — older git rejects it, FETCH_HEAD is not a ref.
-const RECOVERY_FETCH_FLAGS: &[&str] = &["--no-tags", "--no-prune", "--refmap="];
-
 const RECOVERY_GIT_CAP: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// r19 item 2 / R7: ONE absolute deadline for the whole post-push recovery
@@ -1504,12 +1515,11 @@ fn owned_git(
     args: &[&str],
     cap: std::time::Duration,
     deadline: Instant,
+    hardening: &remuda_unix::RecoveryGit,
 ) -> std::io::Result<remuda_unix::OwnedRun> {
-    let mut command = std::process::Command::new("git");
-    command
-        .current_dir(repo)
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0");
+    // R11: every post-push recovery git invocation goes through the single
+    // hardened builder; no recovery call can bypass it.
+    let command = hardening.command(repo, args);
     remuda_unix::run_owned_process(command, cap, deadline)
 }
 
@@ -1586,6 +1596,7 @@ fn recovery_git(
     what: &str,
     require_success: bool,
     deadline: Instant,
+    hardening: &remuda_unix::RecoveryGit,
 ) -> Result<std::process::Output> {
     if remaining(deadline).is_zero() {
         return Err(MergeStop::PushUncertain(format!(
@@ -1596,7 +1607,7 @@ fn recovery_git(
     }
     // R8(b): the per-command soft cap decides when a still-running git is
     // KILLed; the ABSOLUTE deadline bounds the reap and every pipe drain.
-    let run = owned_git(repo, args, RECOVERY_GIT_CAP, deadline).map_err(|error| {
+    let run = owned_git(repo, args, RECOVERY_GIT_CAP, deadline, hardening).map_err(|error| {
         MergeStop::PushUncertain(format!(
             "{what} could not run ({error}); push outcome unknown"
         ))
@@ -1621,13 +1632,18 @@ fn recovery_git(
 
 /// Shallow check through the owned recovery helper; a failed read is Unknown
 /// (PushUncertain), not a guessed boolean.
-fn owned_repository_is_shallow(repo: &Path, deadline: Instant) -> Result<bool> {
+fn owned_repository_is_shallow(
+    repo: &Path,
+    deadline: Instant,
+    hardening: &remuda_unix::RecoveryGit,
+) -> Result<bool> {
     let output = recovery_git(
         repo,
         &["rev-parse", "--is-shallow-repository"],
         "post-push shallow check",
         true,
         deadline,
+        hardening,
     )?;
     Ok(String::from_utf8_lossy(&output.stdout).trim() == "true")
 }
@@ -1640,6 +1656,7 @@ fn owned_is_ancestor(
     ancestor: &str,
     descendant: &str,
     deadline: Instant,
+    hardening: &remuda_unix::RecoveryGit,
 ) -> Result<bool> {
     let output = recovery_git(
         repo,
@@ -1647,11 +1664,14 @@ fn owned_is_ancestor(
         "post-push ancestry read",
         false,
         deadline,
+        hardening,
     )?;
     match classify_ancestry_output(&output) {
         RawAncestry::Ancestor => Ok(true),
         RawAncestry::Abnormal(message) => Err(MergeStop::PushUncertain(message).into()),
-        RawAncestry::NotAncestor if !owned_repository_is_shallow(repo, deadline)? => Ok(false),
+        RawAncestry::NotAncestor if !owned_repository_is_shallow(repo, deadline, hardening)? => {
+            Ok(false)
+        }
         RawAncestry::NotAncestor => Err(MergeStop::PushUncertain(format!(
             "{repo:?} is a shallow clone: ancestry of {ancestor} in {descendant} cannot be \
              decided locally without deepening, which gate recovery never does; push outcome \
@@ -2526,13 +2546,13 @@ mod tests {
     #[test]
     fn recovery_fetch_flags_never_write_fetch_head() {
         assert!(
-            RECOVERY_FETCH_FLAGS
+            remuda_unix::RECOVERY_FETCH_FLAGS
                 .iter()
                 .all(|flag| *flag != "--no-write-fetch-head")
         );
-        assert!(RECOVERY_FETCH_FLAGS.contains(&"--refmap="));
-        assert!(RECOVERY_FETCH_FLAGS.contains(&"--no-prune"));
-        assert!(RECOVERY_FETCH_FLAGS.contains(&"--no-tags"));
+        assert!(remuda_unix::RECOVERY_FETCH_FLAGS.contains(&"--refmap="));
+        assert!(remuda_unix::RECOVERY_FETCH_FLAGS.contains(&"--no-prune"));
+        assert!(remuda_unix::RECOVERY_FETCH_FLAGS.contains(&"--no-tags"));
     }
 
     /// R10: ls-remote parsing accepts exactly one well-formed line for the
@@ -2705,6 +2725,141 @@ mod tests {
             before,
             "stale tracking ref must survive"
         );
+        drop(keep);
+    }
+
+    /// R11 item 1 (HIGH): a local `git replace --graft` / legacy grafts file
+    /// must not make post-push recovery report the lost-ack push as landed
+    /// when the real remote tip R does not contain M. Hardened recovery reads
+    /// true ancestry; with R genuinely divergent the outcome is BaseMoved
+    /// (not Ok), exactly as without the graft.
+    #[test]
+    fn a_local_replace_or_graft_cannot_fabricate_landed() {
+        let keep = tempfile::tempdir().unwrap();
+        let full = keep.path().join("full");
+        let origin = keep.path().join("origin.git");
+        let seed = keep.path().join("seed");
+        let lane = keep.path().join("lane");
+        tgit_ok(
+            keep.path(),
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                origin.to_str().unwrap(),
+            ],
+        );
+        tgit_ok(
+            keep.path(),
+            &["init", "-q", "-b", "main", seed.to_str().unwrap()],
+        );
+        tgit_ok(&seed, &["config", "user.email", "t@example.com"]);
+        tgit_ok(&seed, &["config", "user.name", "T"]);
+        std::fs::write(seed.join("f"), "b\n").unwrap();
+        tgit_ok(&seed, &["add", "f"]);
+        tgit_ok(&seed, &["commit", "-q", "-m", "B"]);
+        let base_b = tgit_ok(&seed, &["rev-parse", "main"]);
+        tgit_ok(
+            &seed,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        tgit_ok(&seed, &["push", "-q", "origin", "main"]);
+        tgit_ok(
+            keep.path(),
+            &[
+                "clone",
+                "-q",
+                &format!("file://{}", origin.display()),
+                lane.to_str().unwrap(),
+            ],
+        );
+        tgit_ok(&lane, &["config", "user.email", "t@example.com"]);
+        tgit_ok(&lane, &["config", "user.name", "T"]);
+        // The lane (lander) commits M.
+        std::fs::write(lane.join("m"), "m\n").unwrap();
+        tgit_ok(&lane, &["add", "m"]);
+        tgit_ok(&lane, &["commit", "-q", "-m", "M"]);
+        let merge_m = tgit_ok(&lane, &["rev-parse", "main"]);
+        // Remote main advances to R (does not contain M).
+        std::fs::write(seed.join("r"), "r\n").unwrap();
+        tgit_ok(&seed, &["add", "r"]);
+        tgit_ok(&seed, &["commit", "-q", "-m", "R"]);
+        let remote_r = tgit_ok(&seed, &["rev-parse", "main"]);
+        tgit_ok(&seed, &["push", "-q", "origin", "main"]);
+        // R objects must be local for a valid replacement.
+        tgit_ok(
+            &lane,
+            &[
+                "fetch",
+                "--no-tags",
+                "--no-prune",
+                "--refmap=",
+                "origin",
+                &remote_r,
+            ],
+        );
+        // True ancestry: M is not in R -> BaseMoved.
+        let baseline = push_main_cas(&lane, &merge_m, &base_b);
+        assert!(
+            matches!(
+                baseline
+                    .as_ref()
+                    .map_err(|e| e.downcast_ref::<MergeStop>())
+                    .err()
+                    .flatten(),
+                Some(MergeStop::BaseMoved(_, _))
+            ),
+            "real divergence is BaseMoved, got {baseline:?}"
+        );
+        // Build the SAME full repo layout used by push_main_cas (it uses the
+        // caller's cwd); here we exercise the helper directly through a
+        // worktree copy is unnecessary: call push_main_cas on `lane`, but the
+        // production push itself is irrelevant — only recovery matters.
+        for graft in ["replace", "legacy-graft"] {
+            // raw teardown/setup (replacement may or may not be present)
+            let raw = |args: &[&str]| {
+                let _ = std::process::Command::new("git")
+                    .current_dir(&lane)
+                    .args(args)
+                    .status();
+            };
+            raw(&["replace", "-d", &remote_r]);
+            std::fs::remove_file(lane.join(".git/info/grafts")).ok();
+            if graft == "replace" {
+                tgit_ok(&lane, &["replace", "--graft", &remote_r, &merge_m]);
+            } else {
+                let grafts = lane.join(".git/info/grafts");
+                std::fs::create_dir_all(grafts.parent().unwrap()).unwrap();
+                std::fs::write(&grafts, format!("{remote_r} {merge_m}\n")).unwrap();
+                tgit_ok(&lane, &["config", "advice.graftFileDeprecated", "false"]);
+            }
+            // The VULNERABLE command now fabricates ancestry.
+            assert!(
+                tgit(&lane, &["merge-base", "--is-ancestor", &merge_m, &remote_r])
+                    .status
+                    .success(),
+                "sanity: {graft} fabricates M ancestor of R"
+            );
+            // Hardened recovery is NOT fooled: still BaseMoved, never Ok.
+            let result = push_main_cas(&lane, &merge_m, &base_b);
+            assert!(
+                matches!(
+                    result
+                        .as_ref()
+                        .map_err(|e| e.downcast_ref::<MergeStop>())
+                        .err()
+                        .flatten(),
+                    Some(MergeStop::BaseMoved(_, _))
+                ),
+                "hardened recovery must not report Landed through a {graft}: {result:?}"
+            );
+        }
+        // Hardening scratch dir cleaned.
+        assert!(!lane.join(".git-r32-recovery-no-hooks").exists());
+        // Suppress unused-binding warnings for the duplicated fixture names.
+        let _ = full;
         drop(keep);
     }
 

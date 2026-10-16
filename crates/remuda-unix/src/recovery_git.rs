@@ -31,6 +31,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Fetch subcommand flags appended after `fetch`. Kept here so Node and CLI
 /// recovery cannot drift. See [`RecoveryGit::command`] for the env/config layer.
@@ -139,6 +140,65 @@ impl RecoveryGit {
         HARDENING_CONFIG
             .try_into()
             .expect("HARDENING_CONFIG has exactly four entries")
+    }
+}
+
+/// One git invocation observed at the actual owner-spawn boundary
+/// ([`run_owned_process`]), so tests can prove the REAL recovery paths issue
+/// every command through [`RecoveryGit`] — a caller bypassing the builder
+/// would show missing argv/env entries here.
+#[cfg(any(test, feature = "test-faults"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordedGit {
+    /// Full argv (argv[0] omitted), including the hardening `-c` prefix.
+    pub args: Vec<String>,
+    /// The explicitly-set environment on the spawned command (the hardening
+    /// env is set explicitly, so it is observable here).
+    pub env: Vec<(String, String)>,
+}
+
+/// The optional process-wide recorder installed by tests for the duration of a
+/// recovery run. `None` (the production default) records nothing and adds only
+/// a cheap `Option` check at spawn time.
+#[cfg(any(test, feature = "test-faults"))]
+type SpawnLog = Arc<Mutex<Vec<RecordedGit>>>;
+
+#[cfg(any(test, feature = "test-faults"))]
+static GIT_SPAWN_RECORDER: OnceLock<Mutex<Option<SpawnLog>>> = OnceLock::new();
+
+#[cfg(any(test, feature = "test-faults"))]
+fn recorder() -> &'static Mutex<Option<SpawnLog>> {
+    GIT_SPAWN_RECORDER.get_or_init(|| Mutex::new(None))
+}
+
+/// Install (or clear with `None`) the spawn recorder used by recovery tests.
+#[cfg(any(test, feature = "test-faults"))]
+pub fn set_git_spawn_recorder(log: Option<Arc<Mutex<Vec<RecordedGit>>>>) {
+    *recorder().lock().expect("recorder lock") = log;
+}
+
+/// Record `command` at spawn time when a test recorder is installed. Called by
+/// [`crate::run_owned_process`] before the child is spawned.
+#[cfg(any(test, feature = "test-faults"))]
+pub(crate) fn record_spawn(command: &Command) {
+    let guard = recorder().lock().expect("recorder lock");
+    if let Some(log) = guard.as_ref() {
+        let args = command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let env = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.unwrap_or_default().to_string_lossy().into_owned(),
+                )
+            })
+            .collect();
+        log.lock()
+            .expect("record log lock")
+            .push(RecordedGit { args, env });
     }
 }
 

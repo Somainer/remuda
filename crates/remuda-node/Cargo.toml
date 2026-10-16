@@ -64,6 +64,7 @@ plist = { version = "1.10.1", default-features = false }
 
 [dev-dependencies]
 portable-pty.workspace = true
+remuda-unix = { workspace = true, features = ["test-faults"] }
 remuda-driver = { workspace = true, features = ["test-stub"] }
 remuda-hub.workspace = true
 # Self dependency enabling the test-only race/fault hooks in `cargo test`

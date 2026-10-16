@@ -264,6 +264,10 @@ pub fn run_owned_process(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    // r33 item 2: observe the command at the real spawn boundary when a test
+    // recorder is installed (argv/env, including the R11 hardening prefix).
+    #[cfg(any(test, feature = "test-faults"))]
+    crate::recovery_git::record_spawn(&command);
     let mut child = command.spawn()?;
     let leader_pid = child.id() as i32;
     // Step 1: readers drain both pipes for the whole sequence.

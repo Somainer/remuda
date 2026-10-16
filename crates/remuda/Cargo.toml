@@ -47,6 +47,7 @@ time.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
+remuda-unix = { workspace = true, features = ["test-faults"] }
 base64 = "0.22"
 futures.workspace = true
 nix = { version = "0.28", features = ["signal"] }

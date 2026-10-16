@@ -10370,6 +10370,206 @@ head -c 1 >/dev/null || exit 4
         out
     }
 
+    /// r33 item 2: drive the REAL production recovery over success,
+    /// object-fetch failure, negative-ancestry and shallow paths, and assert
+    /// EVERY git command spawned at the owner boundary carries the full R11
+    /// hardening set. A caller bypassing the builder would miss entries here.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_production_recovery_invocation_carries_full_hardening() {
+        use std::sync::{Arc, Mutex};
+
+        /// Re-run assertions over one recorded production recovery.
+        fn assert_recorded_hardening(log: &[remuda_unix::RecordedGit]) {
+            assert!(
+                !log.is_empty(),
+                "recovery must spawn at least one git command"
+            );
+            for (index, rec) in log.iter().enumerate() {
+                for (key, value) in remuda_unix::RecoveryGit::env_pairs() {
+                    assert!(
+                        rec.env.iter().any(|(k, v)| k == key && v == value),
+                        "recorded command {index} missing env {key}={value}: {rec:?}"
+                    );
+                }
+                // Exactly four leading "-c key=value" pairs, in order.
+                let pairs = remuda_unix::RecoveryGit::config_pairs();
+                assert!(
+                    rec.args.len() >= 2 * pairs.len(),
+                    "recorded command {index} too short for hardening prefix: {rec:?}"
+                );
+                for (pair_index, (key, value)) in pairs.iter().enumerate() {
+                    assert_eq!(
+                        rec.args[2 * pair_index],
+                        "-c",
+                        "command {index}: pair {pair_index}"
+                    );
+                    assert_eq!(
+                        rec.args[2 * pair_index + 1],
+                        format!("{key}={value}"),
+                        "command {index}: pair {pair_index} value"
+                    );
+                }
+                // Fetch carries every fetch-only flag.
+                if rec.args[2 * pairs.len()] == "fetch" {
+                    for flag in remuda_unix::RECOVERY_FETCH_FLAGS {
+                        assert!(
+                            rec.args.iter().any(|a| a == flag),
+                            "recorded fetch {index} missing {flag}: {rec:?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        let install = || {
+            let log: Arc<Mutex<Vec<remuda_unix::RecordedGit>>> = Arc::new(Mutex::new(Vec::new()));
+            remuda_unix::set_git_spawn_recorder(Some(log.clone()));
+            log
+        };
+
+        // (1) SUCCESS: real divergent-but-contained tip, death held -> Landed.
+        let (dir, _bare, lane, _base) = recovery_branch_fixture("main", None);
+        let seed = dir.path().join("seed");
+        git(&lane, &["checkout", "-q", "-b", "work"]);
+        std::fs::write(lane.join("m.txt"), "M\n").unwrap();
+        git(&lane, &["add", "m.txt"]);
+        git(&lane, &["commit", "-q", "-m", "M"]);
+        let merge_m = git(&lane, &["rev-parse", "HEAD"]);
+        std::fs::write(seed.join("r.txt"), "R\n").unwrap();
+        git(&seed, &["add", "r.txt"]);
+        git(&seed, &["commit", "-q", "-m", "R"]);
+        git(&seed, &["push", "-q", "origin", "main"]);
+        let remote_r = git(&seed, &["rev-parse", "main"]);
+        // Merge R into M so the advertised remote tip D contains M.
+        git(&seed, &["fetch", "-q", lane.to_str().unwrap(), &merge_m]);
+        git(&seed, &["merge", "-q", "--no-ff", "-m", "D", &merge_m]);
+        git(&seed, &["push", "-q", "origin", "main"]);
+        let remote_d = git(&seed, &["rev-parse", "main"]);
+
+        let log = install();
+        let request = remuda_protocol::GateResolveLandingParams {
+            job_id: "gjb_r33_rec_ok".into(),
+            repo_path: lane.to_string_lossy().into_owned(),
+            base_branch: "main".into(),
+            merge_sha: merge_m.clone(),
+        };
+        let reply = super::resolve_landing_after_restart(&request, true);
+        assert_eq!(reply.status, "landed", "{reply:?}");
+        assert_eq!(reply.base_sha.as_deref(), Some(remote_d.as_str()));
+        assert_recorded_hardening(&std::mem::take(&mut *log.lock().unwrap()));
+
+        // (2) NEGATIVE ANCESTRY without death -> Unknown: an orphan commit the
+        // advertised D cannot contain (the lane holds its objects locally, so
+        // the fetch short-circuits but the real merge-base runs and fails).
+        let orphan_tree = git(&lane, &["rev-parse", "HEAD^{tree}"]);
+        let orphan = git(&lane, &["commit-tree", &orphan_tree, "-m", "orphan grant"]);
+        let log = install();
+        let negative_request = remuda_protocol::GateResolveLandingParams {
+            job_id: "gjb_r33_rec_negative".into(),
+            repo_path: lane.to_string_lossy().into_owned(),
+            base_branch: "main".into(),
+            merge_sha: orphan,
+        };
+        let reply = super::resolve_landing_after_restart(&negative_request, false);
+        assert_eq!(reply.status, "unknown", "{reply:?}");
+        assert_recorded_hardening(&std::mem::take(&mut *log.lock().unwrap()));
+
+        // (3) OBJECT-FETCH FAILURE after successful listing: publish one more
+        // tip E the lane genuinely lacks, then at the read seam swap to an
+        // empty remote so the fetch fails deterministically ("not our ref").
+        use super::recovery_read_seam as seam;
+        std::fs::write(
+            seed.join("e.txt"),
+            "E
+",
+        )
+        .unwrap();
+        git(&seed, &["add", "e.txt"]);
+        git(&seed, &["commit", "-q", "-m", "E"]);
+        git(&seed, &["push", "-q", "origin", "main"]);
+        git(
+            &lane,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                _bare.path().join("origin.git").to_str().unwrap(),
+            ],
+        );
+        let empty = dir.path().join("empty.git");
+        std::process::Command::new("git")
+            .args([
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                empty.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        let log = install();
+        seam::arm(&lane, 1);
+        let lane_t = lane.clone();
+        let request_t = remuda_protocol::GateResolveLandingParams {
+            job_id: "gjb_r33_rec_fetchfail".into(),
+            repo_path: lane.to_string_lossy().into_owned(),
+            base_branch: "main".into(),
+            merge_sha: merge_m.clone(),
+        };
+        let probe =
+            std::thread::spawn(move || super::resolve_landing_after_restart(&request_t, true));
+        seam::wait_arrived(&lane, 0);
+        git(
+            &lane,
+            &["remote", "set-url", "origin", empty.to_str().unwrap()],
+        );
+        seam::release(&lane, 0);
+        let reply = probe.join().unwrap();
+        seam::disarm(&lane);
+        assert_eq!(reply.status, "unknown", "{reply:?}");
+        assert!(
+            reply
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("object fetch"),
+            "{reply:?}"
+        );
+        assert_recorded_hardening(&std::mem::take(&mut *log.lock().unwrap()));
+
+        // (4) SHALLOW: a depth-1 clone, an orphan commit -> Unknown naming the
+        // shallow condition; every command (including the shallow check) is
+        // hardened.
+        let fixture2 = fixture(PASSING_SCRIPT);
+        let origin2 = fixture2._bare.path().join("origin.git");
+        let lane2 = fixture2._dir.path().join("shallow-r33");
+        shallow_clone(&origin2, &lane2, "1");
+        git(&lane2, &["config", "user.email", "t@example.com"]);
+        git(&lane2, &["config", "user.name", "T"]);
+        let tree = git(&lane2, &["rev-parse", "origin/main^{tree}"]);
+        let orphan = git(&lane2, &["commit-tree", &tree, "-m", "orphan"]);
+        let log = install();
+        let request2 = remuda_protocol::GateResolveLandingParams {
+            job_id: "gjb_r33_rec_shallow".into(),
+            repo_path: lane2.to_string_lossy().into_owned(),
+            base_branch: "main".into(),
+            merge_sha: orphan,
+        };
+        let reply = super::resolve_landing_after_restart(&request2, true);
+        assert_eq!(reply.status, "unknown", "{reply:?}");
+        assert!(
+            reply.error.as_deref().unwrap_or("").contains("shallow"),
+            "{reply:?}"
+        );
+        assert_recorded_hardening(&std::mem::take(&mut *log.lock().unwrap()));
+
+        remuda_unix::set_git_spawn_recorder(None);
+        let _ = remote_r;
+        let _ = lane_t;
+    }
+
     /// R11 item 1 (HIGH): a local replacement graft (or legacy
     /// .git/info/grafts) must not fabricate ancestry. Real remote tip R
     /// diverged from the granted M (R does not contain M); with `git replace

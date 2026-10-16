@@ -3115,6 +3115,192 @@ mod tests {
         drop(keep);
     }
 
+    /// r33 item 2 (CLI): drive the REAL post-push recovery over success,
+    /// object-fetch failure and negative-ancestry paths and assert EVERY git
+    /// spawn at the owner boundary carries the full hardening set.
+    #[test]
+    fn every_production_cli_recovery_invocation_carries_full_hardening() {
+        use std::sync::{Arc, Mutex};
+        fn assert_recorded_hardening(log: &[remuda_unix::RecordedGit]) {
+            assert!(!log.is_empty(), "recovery must spawn git");
+            for (index, rec) in log.iter().enumerate() {
+                for (key, value) in remuda_unix::RecoveryGit::env_pairs() {
+                    assert!(
+                        rec.env.iter().any(|(k, v)| k == key && v == value),
+                        "command {index} missing env {key}={value}: {rec:?}"
+                    );
+                }
+                let pairs = remuda_unix::RecoveryGit::config_pairs();
+                assert!(
+                    rec.args.len() >= 2 * pairs.len(),
+                    "command {index}: {rec:?}"
+                );
+                for (pair_index, (key, value)) in pairs.iter().enumerate() {
+                    assert_eq!(&rec.args[2 * pair_index], "-c", "pair {pair_index}");
+                    assert_eq!(
+                        rec.args[2 * pair_index + 1],
+                        format!("{key}={value}"),
+                        "pair {pair_index} value"
+                    );
+                }
+                if rec.args[2 * pairs.len()] == "fetch" {
+                    for flag in remuda_unix::RECOVERY_FETCH_FLAGS {
+                        assert!(rec.args.iter().any(|a| a == flag), "fetch missing {flag}");
+                    }
+                }
+            }
+        }
+        let install = || {
+            let log: Arc<Mutex<Vec<remuda_unix::RecordedGit>>> = Arc::new(Mutex::new(Vec::new()));
+            remuda_unix::set_git_spawn_recorder(Some(log.clone()));
+            log
+        };
+
+        let keep = tempfile::tempdir().unwrap();
+        let root = keep.path();
+        let origin = root.join("origin.git");
+        let seed = root.join("seed");
+        let lane = root.join("lane");
+        tgit_ok(
+            root,
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                origin.to_str().unwrap(),
+            ],
+        );
+        tgit_ok(root, &["init", "-q", "-b", "main", seed.to_str().unwrap()]);
+        tgit_ok(&seed, &["config", "user.email", "t@example.com"]);
+        tgit_ok(&seed, &["config", "user.name", "T"]);
+        std::fs::write(seed.join("f"), "b\n").unwrap();
+        tgit_ok(&seed, &["add", "f"]);
+        tgit_ok(&seed, &["commit", "-q", "-m", "B"]);
+        let base_b = tgit_ok(&seed, &["rev-parse", "main"]);
+        tgit_ok(
+            &seed,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        tgit_ok(&seed, &["push", "-q", "origin", "main"]);
+        tgit_ok(
+            root,
+            &[
+                "clone",
+                "-q",
+                &format!("file://{}", origin.display()),
+                lane.to_str().unwrap(),
+            ],
+        );
+        tgit_ok(&lane, &["config", "user.email", "t@example.com"]);
+        tgit_ok(&lane, &["config", "user.name", "T"]);
+        std::fs::write(lane.join("m"), "m\n").unwrap();
+        tgit_ok(&lane, &["add", "m"]);
+        tgit_ok(&lane, &["commit", "-q", "-m", "M"]);
+        let merge_m = tgit_ok(&lane, &["rev-parse", "main"]);
+        // Remote D contains M.
+        tgit_ok(&seed, &["fetch", "-q", lane.to_str().unwrap(), &merge_m]);
+        tgit_ok(&seed, &["merge", "-q", "--no-ff", "-m", "D", &merge_m]);
+        tgit_ok(&seed, &["push", "-q", "origin", "main"]);
+        let remote_d = tgit_ok(&seed, &["rev-parse", "main"]);
+
+        // (1) success
+        let log = install();
+        push_main_cas(&lane, &merge_m, &base_b).expect("Landed");
+        assert_recorded_hardening(&std::mem::take(&mut *log.lock().unwrap()));
+
+        // (2) object-fetch failure: advance remote to E the lane lacks, swap
+        // to an empty remote at the read seam.
+        use super::recovery_read_seam as seam;
+        std::fs::write(seed.join("e"), "e\n").unwrap();
+        tgit_ok(&seed, &["add", "e"]);
+        tgit_ok(&seed, &["commit", "-q", "-m", "E"]);
+        tgit_ok(&seed, &["push", "-q", "origin", "main"]);
+        let empty = root.join("empty.git");
+        tgit_ok(
+            root,
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                empty.to_str().unwrap(),
+            ],
+        );
+        let log = install();
+        seam::arm(&lane, 1);
+        let repo_t = lane.clone();
+        let (merged_t, expected_t) = (merge_m.clone(), base_b.clone());
+        let result = std::thread::spawn(move || push_main_cas(&repo_t, &merged_t, &expected_t));
+        seam::wait_arrived(&lane, 0);
+        tgit_ok(
+            &lane,
+            &["remote", "set-url", "origin", empty.to_str().unwrap()],
+        );
+        seam::release(&lane, 0);
+        let error = result.join().unwrap().expect_err("uncertain");
+        seam::disarm(&lane);
+        assert!(
+            matches!(
+                error.downcast_ref::<MergeStop>(),
+                Some(MergeStop::PushUncertain(_))
+            ),
+            "{error}"
+        );
+        assert_recorded_hardening(&std::mem::take(&mut *log.lock().unwrap()));
+
+        // (3) SHALLOW / negative-ancestry path: a depth-1 clone of a remote
+        // with >=2 commits; the granted merge is OLDER than the advertised tip,
+        // so merge-base on the shallow edge is Unknown -> PushUncertain. A
+        // second B commit on the remote makes its depth-1 boundary hide the
+        // granted merge's ancestry.
+        std::fs::write(seed.join("f2"), "b2\n").unwrap();
+        tgit_ok(&seed, &["add", "f2"]);
+        tgit_ok(&seed, &["commit", "-q", "-m", "B2"]);
+        tgit_ok(&seed, &["push", "-q", "origin", "main"]);
+        let shallow_lane = root.join("shallow-lane");
+        tgit_ok(
+            root,
+            &[
+                "clone",
+                "-q",
+                "--depth",
+                "1",
+                &format!("file://{}", origin.display()),
+                shallow_lane.to_str().unwrap(),
+            ],
+        );
+        tgit_ok(&shallow_lane, &["config", "user.email", "t@example.com"]);
+        tgit_ok(&shallow_lane, &["config", "user.name", "T"]);
+        assert_eq!(
+            tgit_ok(&shallow_lane, &["rev-parse", "--is-shallow-repository"]),
+            "true"
+        );
+        // The depth-1 tip (B2) claims as its granted merge the older D commit,
+        // which the shallow history cannot prove contains -> uncertain.
+        let remote_b2 = tgit_ok(&seed, &["rev-parse", "main"]);
+        let log = install();
+        let result = push_main_cas(&shallow_lane, &remote_d, &remote_b2);
+        assert!(
+            matches!(
+                result
+                    .as_ref()
+                    .map_err(|e| e.downcast_ref::<MergeStop>())
+                    .err()
+                    .flatten(),
+                Some(MergeStop::PushUncertain(_))
+            ),
+            "shallow negative ancestry must be PushUncertain: {result:?}"
+        );
+        assert_recorded_hardening(&std::mem::take(&mut *log.lock().unwrap()));
+
+        remuda_unix::set_git_spawn_recorder(None);
+        let _ = remote_b2;
+        drop(keep);
+    }
+
     /// R11 item 1 (HIGH): a local `git replace --graft` / legacy grafts file
     /// must not make post-push recovery report the lost-ack push as landed
     /// when the real remote tip R does not contain M. Hardened recovery reads

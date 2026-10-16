@@ -363,6 +363,173 @@ it("r6 item 1: leaving a HELD pending route lets the list recover via a departur
   hubStore.logout();
 });
 
+it("r9 item 1: a retired cold-load seed cannot fail the REPLACEMENT identity's mount; epoch fence holds across logout/re-login", async () => {
+  const { api, hubStore } = await fresh();
+  const A = "ins_epoch_fence";
+  const JA = "obj_epoch_fence_journal";
+
+  // Hold the outbox initializer and every JA seed until explicitly released.
+  let releaseOutbox: (() => void) | null = null;
+  (
+    hubStore as unknown as {
+      setOutboxOpenGateForTest: (g: ((r: () => void) => void) | null) => void;
+    }
+  ).setOutboxOpenGateForTest((resolve) => {
+    releaseOutbox = resolve;
+  });
+
+  vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+  vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+  vi.spyOn(api, "hostList").mockResolvedValue({ items: [], nextCursor: null } as Awaited<
+    ReturnType<Api["hostList"]>
+  >);
+  vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as Awaited<ReturnType<Api["deviceList"]>>);
+  vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as Awaited<
+    ReturnType<Api["passkeyList"]>
+  >);
+  vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+  vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+  vi.spyOn(hubStore, "flushAllOutbox").mockResolvedValue(undefined);
+  vi.spyOn(api, "interactionList").mockResolvedValue([]);
+  vi.spyOn(api, "instanceList").mockResolvedValue({
+    items: [
+      { id: A, journalId: JA, revision: "0", durableSeq: "0", lifecycle: "running" } as never,
+    ],
+    nextCursor: null,
+  });
+
+  const seedResolvers: Array<() => void> = [];
+  let seedReject: ((e: unknown) => void) | null = null;
+  let seedN = 0;
+  vi.spyOn(api, "eventsRead").mockImplementation(
+    () =>
+      new Promise((resolve, reject) => {
+        const nth = seedN;
+        seedN += 1;
+        if (nth === 0) {
+          // OLD identity's cold-load seed is held for LATER rejection.
+          seedReject = (err) => reject(err);
+          return;
+        }
+        seedResolvers[nth] = () =>
+          resolve({
+            events: [],
+            durableSeq: "0",
+            windowFromSeq: null,
+            reachedAfterSeq: true,
+          });
+      }),
+  );
+
+  const liveSub = (id: string, subId: string, epoch: string) => ({
+    subscriptionId: subId,
+    journalId: id,
+    durableSeq: "0",
+    windowFromSeq: null,
+    reachedAfterSeq: true,
+    getReadyState: () => 1,
+    snapshot: {
+      projectionVersion: "v1",
+      projectionEpoch: epoch,
+      asOfSeq: "0",
+      instance: {} as never,
+      runs: [],
+      commands: [],
+      pendingInteractions: [],
+      nodes: [],
+      history: { earliestRetainedSeq: "0", complete: true },
+    },
+  });
+  vi.spyOn(api, "eventsSubscribe").mockImplementation(
+    (async (journalId: string) =>
+      liveSub(journalId, `sub_seed${seedN}_${journalId}`, `epoch_${seedN}_${journalId}`)) as Api["eventsSubscribe"],
+  );
+
+  const machineAccess = () =>
+    hubStore as unknown as {
+      connection: {
+        state: string;
+        resumeAttemptId: number;
+        resumeInFlight: boolean;
+      } | null;
+      journals: Map<string, unknown>;
+    };
+  const flush = async (rounds = 80) => {
+    for (let i = 0; i < rounds; i += 1) await Promise.resolve();
+  };
+
+  // --- identity 1 cold load: follow(A) parks with connection=null ---
+  const boot1 = hubStore.bootstrap();
+  await vi.waitFor(() => expect(hubStore.getSnapshot().instances.some((i) => i.id === A)).toBe(true));
+  expect(releaseOutbox).not.toBeNull();
+  void hubStore.follow(A);
+  await flush();
+  expect(seedReject).not.toBeNull(); // OLD seed pending (held for rejection)
+  expect(machineAccess().connection).toBeNull();
+
+  // Retire identity 1 WHILE its seed is still parked.
+  hubStore.logout();
+  releaseOutbox!();
+  await expect(boot1).resolves.toBeDefined();
+  // Second login: new outbox gate must re-arm.
+  let releaseOutbox2: (() => void) | null = null;
+  (
+    hubStore as unknown as {
+      setOutboxOpenGateForTest: (g: ((r: () => void) => void) | null) => void;
+    }
+  ).setOutboxOpenGateForTest((resolve) => {
+    releaseOutbox2 = resolve;
+  });
+
+  // --- identity 2: fresh bootstrap installs a new machine ---
+  const boot2 = hubStore.bootstrap();
+  await vi.waitFor(() => expect(releaseOutbox2).not.toBeNull());
+  releaseOutbox2!();
+  await expect(boot2).resolves.toBe("ready");
+  const machine2 = machineAccess().connection;
+  expect(machine2).not.toBeNull();
+
+  // The new identity follows the SAME A; its seed (seed #2) stays held.
+  void hubStore.follow(A);
+  await flush();
+  expect(seedResolvers[1]).toBeDefined();
+  // The new mount owns its OWN attempt (recovering, watchdog armed).
+  const stateBefore: [string, number, boolean] = [
+    machine2!.state,
+    machine2!.resumeAttemptId,
+    machine2!.resumeInFlight,
+  ];
+  const mountAttemptId = stateBefore[1];
+  expect(mountAttemptId).not.toBe(0);
+  expect(stateBefore[2]).toBe(true);
+  expect(stateBefore[0]).toBe("recovering");
+  const timersOf = () =>
+    [
+      ...(machine2 as unknown as { timers: Map<string, unknown> }).timers.keys(),
+    ] as string[];
+  const hasWatchdog = () => timersOf().includes("watchdog");
+  expect(hasWatchdog()).toBe(true);
+
+  // The RETIRED identity's seed rejects (logout doesn't cancel the REST
+  // request). With the epoch fence it must be a silent stale continuation:
+  // it must not end/clear the new mount's attempt.
+  seedReject!(new RestNetworkError("retired seed 502"));
+  await flush();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  expect(machineAccess().connection!.resumeAttemptId).toBe(mountAttemptId);
+  expect(machineAccess().connection!.resumeInFlight).toBe(true);
+  expect(hasWatchdog()).toBe(true);
+  expect(machineAccess().connection!.state).toBe(stateBefore[0]);
+
+  // Now the CURRENT identity's seed succeeds: it mounts normally.
+  seedResolvers[1]!();
+  await flush();
+  await vi.waitFor(() => expect(machineAccess().journals.has(JA)).toBe(true));
+  expect(machineAccess().connection!.state).toBe("live");
+
+  hubStore.logout();
+});
+
 it("r8 item 1: a session mount started during cold-load connection installation is adopted by the first machine; its seed then builds the journal", async () => {
   const { api, hubStore } = await fresh();
   const A = "ins_cold_load";

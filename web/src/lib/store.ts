@@ -876,6 +876,23 @@ type TargetToken = {
   /** null = no session target (session list / new-session page). */
   target: Id | null;
   gen: number;
+  /**
+   * Value of the monotonic install COUNTER at capture (c-unboundresume r9).
+   * Zero means the token predates the very first machine ever installed, which is
+   * the ONLY case allowed to adopt a null→first-installed machine.
+   */
+  installCount: number;
+  /**
+   * Whether any identity change (logout/401/store replacement) has torn down a
+   * machine in this store's lifetime (c-unboundresume r9). Never resets. A
+   * null-machine token captured during a genuine COLD load has this false; one
+   * captured before an install that later went obsolete has it false too — but
+   * after the first logout it is permanently true, so a retired request can
+   * never be adopted by a later login's machine.
+   */
+  hadIdentityTear: boolean;
+  /** Identity epoch of the installed machine; 0 when no machine exists. */
+  epoch: number;
 };
 
 /** Only Node-validated activity or its full Instance can change turn state. */
@@ -1225,6 +1242,25 @@ class HubStore {
    * not certify B and whose late failure must not take B offline.
    */
   private connectionBindGen = 0;
+  /**
+   * Monotonic IDENTITY epoch of the connection machine (c-unboundresume r9
+   * item 1). Incremented every time a machine is installed for a fresh
+   * connection lifetime — cold first install, and every replacement after
+   * logout / external-identity change / store replacement. Unlike
+   * {@link connectionBindGen} it is NEVER reset to zero and never repeats, so
+   * ownership tokens captured in an earlier identity can never match a later
+   * machine even when target id and binding generation coincide (logout resets
+   * bindGen to 0, so A→logout→A would otherwise reuse gen 1).
+   */
+  private connectionEpochCounter = 0;
+  /** Identity epoch of the CURRENT ownership lifetime, captured in every token. */
+  private connectionEpoch = 0;
+  /**
+   * Latches true the first time an identity change disposes a connection
+   * (logout/401/store replacement) and never resets (c-unboundresume r9).
+   * Gates null→installed adoption to genuine cold load only.
+   */
+  private connectionEverTorn = false;
   /**
    * Instances whose last drained send skipped the post-delivery REST
    * catch-up because THIS instance's follow owned recovery at that moment.
@@ -1601,6 +1637,12 @@ class HubStore {
     this.connectionBoundTo = null;
     this.connectionBoundJournal = null;
     this.connectionBindGen = 0;
+    // c-unboundresume r9: retirement ends the identity epoch; any in-flight
+    // token now owns nothing. The counter is NOT reset, so the next install
+    // gets a never-before-used epoch. The latch below permanently ends
+    // null→installed adoption for every subsequent identity.
+    this.connectionEpoch = 0;
+    this.connectionEverTorn = true;
     this.reconcileOwed.clear();
     this.owedReconcileRunning.clear();
     this.followReadyState.clear();
@@ -3129,6 +3171,11 @@ class HubStore {
     // Gate 41 S1: stamp the installing epoch so a concurrent same-epoch
     // initConnection adopts this machine instead of building another.
     this.connectionInstallEpoch = epoch;
+    // c-unboundresume r9 item 1: every installed machine starts a fresh,
+    // non-repeating identity epoch — the cross-logout fence for ownership
+    // tokens (binding generation alone resets and can be reused).
+    this.connectionEpochCounter += 1;
+    this.connectionEpoch = this.connectionEpochCounter;
     // R-b: do not start/attach a machine if the identity retired during
     // construction.
     if (!extLive()) {
@@ -3274,23 +3321,32 @@ class HubStore {
       connection: this.connection,
       target: instanceId,
       gen: this.connectionBindGen,
+      installCount: this.connectionEpochCounter,
+      hadIdentityTear: this.connectionEverTorn,
+      epoch: this.connectionEpoch,
     };
   }
 
   private ownsTarget(token: TargetToken): boolean {
-    // c-unboundresume r8 item 1: a mount whose token was captured before the
-    // first connection machine existed (cold load, outbox init parked) is
-    // ADOPTED by that machine; its target+gen still have to match. A genuine
-    // replacement (logout/identity change/store replacement) goes through the
-    // machine-disposal path and clears/changes the target or gen, so the other
-    // two checks still fence it.
-    const sameOrFirstInstall =
-      this.connection === token.connection || (token.connection === null && this.connection !== null);
-    return (
-      sameOrFirstInstall &&
-      this.connectionBoundTo === token.target &&
-      this.connectionBindGen === token.gen
-    );
+    // c-unboundresume r8/r9: a mount whose token was captured before the
+    // FIRST machine existed (cold load with outbox init parked) is ADOPTED
+    // by that machine: installCount===0 means no machine had ever been
+    // installed at capture. A post-logout token can never satisfy this —
+    // the counter is already ≥1 and never resets — so a retired request
+    // (logout/re-login reusing target id and bind generation 1) can
+    // neither own, adopt, nor acquire/end an attempt id.
+    if (this.connectionBoundTo !== token.target) return false;
+    if (this.connectionBindGen !== token.gen) return false;
+    if (this.connection === token.connection) return token.epoch === this.connectionEpoch;
+    if (token.connection === null && this.connection !== null) {
+      // The one null→installed adoption: genuine cold load only — no
+      // identity has EVER torn down a machine (the latch never resets),
+      // and the token predates the first successful install. After
+      // logout/re-login the latch is permanently true and a retired
+      // request cannot adopt the replacement identity's machine.
+      return token.installCount === 0 && !this.connectionEverTorn;
+    }
+    return false;
   }
 
   /**

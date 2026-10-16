@@ -9959,6 +9959,195 @@ head -c 1 >/dev/null || exit 4
         );
     }
 
+    /// Build a populated-submodule scenario for R11 item 2: returns
+    /// (keep dirs, superproject lane, submodule lane, S0). The superproject
+    /// remote main is at B; the submodule remote has advanced to S1 after the
+    /// recursive clone (its lane's tracking ref still points at S0). Both lanes
+    /// allow file:// transports (test-only) and the super is configured to
+    /// recurse submodules on fetch.
+    #[cfg(unix)]
+    fn populated_submodule_fixture() -> (TempDir, TempDir, PathBuf, PathBuf, String) {
+        let dir = TempDir::new().unwrap();
+        let bare = TempDir::new().unwrap();
+        let root = dir.path();
+        let sub_seed = root.join("sub-seed");
+        let sub_bare = bare.path().join("sub-origin.git");
+        let sup_seed = root.join("sup-seed");
+        let sup_bare = bare.path().join("sup-origin.git");
+        let lane = root.join("lane");
+        let sub_lane = lane.join("sub");
+
+        std::process::Command::new("git")
+            .args([
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                sub_bare.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main", sub_seed.to_str().unwrap()])
+            .output()
+            .unwrap();
+        git(&sub_seed, &["config", "user.email", "t@example.com"]);
+        git(&sub_seed, &["config", "user.name", "T"]);
+        std::fs::write(sub_seed.join("s"), "s0\n").unwrap();
+        git(&sub_seed, &["add", "s"]);
+        git(&sub_seed, &["commit", "-q", "-m", "S0"]);
+        let s0 = git(&sub_seed, &["rev-parse", "main"]);
+        git(
+            &sub_seed,
+            &["remote", "add", "origin", sub_bare.to_str().unwrap()],
+        );
+        git(&sub_seed, &["push", "-q", "origin", "main"]);
+
+        std::process::Command::new("git")
+            .args([
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                sup_bare.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main", sup_seed.to_str().unwrap()])
+            .output()
+            .unwrap();
+        git(&sup_seed, &["config", "user.email", "t@example.com"]);
+        git(&sup_seed, &["config", "user.name", "T"]);
+        std::fs::write(sup_seed.join("f"), "b\n").unwrap();
+        git(&sup_seed, &["add", "f"]);
+        git(&sup_seed, &["commit", "-q", "-m", "B"]);
+        git(
+            &sup_seed,
+            &["remote", "add", "origin", sup_bare.to_str().unwrap()],
+        );
+        // Register the submodule (file:// transport allowed for the test).
+        git(
+            &sup_seed,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                sub_bare.to_str().unwrap(),
+                "sub",
+            ],
+        );
+        git(&sup_seed, &["commit", "-q", "-m", "add submodule"]);
+        git(&sup_seed, &["push", "-q", "origin", "main"]);
+
+        // Recursive clone populates the submodule at S0.
+        git(
+            root,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "clone",
+                "-q",
+                "--recurse-submodules",
+                sup_bare.to_str().unwrap(),
+                lane.to_str().unwrap(),
+            ],
+        );
+        git(&lane, &["config", "user.email", "t@example.com"]);
+        git(&lane, &["config", "user.name", "T"]);
+        git(&lane, &["config", "protocol.file.allow", "always"]);
+        git(&sub_lane, &["config", "user.email", "t@example.com"]);
+        git(&sub_lane, &["config", "user.name", "T"]);
+        git(&sub_lane, &["config", "protocol.file.allow", "always"]);
+        // Recursion enabled in config; hardening must still suppress it.
+        git(&lane, &["config", "fetch.recurseSubmodules", "true"]);
+        // Submodule remote advances to S1 after the clone.
+        std::fs::write(sub_seed.join("s"), "s1\n").unwrap();
+        git(&sub_seed, &["add", "s"]);
+        git(&sub_seed, &["commit", "-q", "-m", "S1"]);
+        git(&sub_seed, &["push", "-q", "origin", "main"]);
+
+        (dir, bare, lane, sub_lane, s0)
+    }
+
+    /// R11 item 2: with fetch.recurseSubmodules=true and an advanced submodule
+    /// remote, recovery fetch must NOT recurse: the submodule's tracking refs
+    /// and the superproject's refs both stay byte-identical. An unreachable
+    /// submodule remote likewise must not fail recovery.
+    #[cfg(unix)]
+    #[test]
+    fn recovery_does_not_recurse_into_submodules_and_survives_dead_sub_remote() {
+        let (_dir, _bare, lane, sub_lane, _s0) = populated_submodule_fixture();
+        // Superproject remote advances to M (contains the base) so recovery
+        // certifies Landed.
+        std::fs::write(lane.join("m.txt"), "M\n").unwrap();
+        git(&lane, &["add", "m.txt"]);
+        git(&lane, &["commit", "-q", "-m", "M"]);
+        let merge_m = git(&lane, &["rev-parse", "main"]);
+        // Publish via a throwaway working clone of the bare super origin.
+        let publish = _dir.path().join("sup-publish");
+        let sup_bare = _bare.path().join("sup-origin.git");
+        git(
+            _dir.path(),
+            &[
+                "clone",
+                "-q",
+                sup_bare.to_str().unwrap(),
+                publish.to_str().unwrap(),
+            ],
+        );
+        git(&publish, &["config", "user.email", "t@example.com"]);
+        git(&publish, &["config", "user.name", "T"]);
+        std::fs::write(publish.join("m.txt"), "M\n").unwrap();
+        git(&publish, &["add", "m.txt"]);
+        git(&publish, &["commit", "-q", "-m", "M"]);
+        git(&publish, &["push", "-q", "origin", "main"]);
+
+        let sup_before = refs_listing(&lane);
+        let sub_before = refs_listing(&sub_lane);
+        // The submodule's remote really is ahead of its lane tracking ref.
+        let sub_local = git(&sub_lane, &["rev-parse", "refs/remotes/origin/main"]);
+        let sub_remote = git(&sub_lane, &["ls-remote", "origin", "refs/heads/main"]);
+        assert_ne!(sub_local, sub_remote);
+
+        let request = remuda_protocol::GateResolveLandingParams {
+            job_id: "gjb_r32_sub".into(),
+            repo_path: lane.to_string_lossy().into_owned(),
+            base_branch: "main".into(),
+            merge_sha: merge_m.clone(),
+        };
+        let reply = super::resolve_landing_after_restart(&request, true);
+        assert_eq!(reply.status, "landed", "{reply:?}");
+        assert_eq!(refs_listing(&lane), sup_before, "super refs changed");
+        assert_eq!(
+            refs_listing(&sub_lane),
+            sub_before,
+            "recovery recursion updated the submodule refs"
+        );
+
+        // An unreachable submodule remote does not fail recovery (no
+        // recursion means it is never contacted).
+        git(
+            &sub_lane,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                _dir.path().join("no-such-sub.git").to_str().unwrap(),
+            ],
+        );
+        let reply = super::resolve_landing_after_restart(&request, true);
+        assert_eq!(
+            reply.status, "landed",
+            "dead submodule remote must not fail recovery: {reply:?}"
+        );
+        assert_eq!(refs_listing(&lane), sup_before);
+        assert_eq!(refs_listing(&sub_lane), sub_before);
+    }
+
     /// R11 item 1 (HIGH): a local replacement graft (or legacy
     /// .git/info/grafts) must not fabricate ancestry. Real remote tip R
     /// diverged from the granted M (R does not contain M); with `git replace

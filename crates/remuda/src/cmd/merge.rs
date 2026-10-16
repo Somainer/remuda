@@ -2728,6 +2728,172 @@ mod tests {
         drop(keep);
     }
 
+    /// R11 item 2: CLI recovery fetch never recurses into submodules —
+    /// populated submodule with fetch.recurseSubmodules=true and an advanced
+    /// sub remote keeps BOTH super and sub ref listings byte-identical, and a
+    /// dead submodule remote does not fail recovery.
+    #[test]
+    fn cli_recovery_does_not_recurse_into_submodules_and_survives_dead_sub_remote() {
+        let keep = tempfile::tempdir().unwrap();
+        let root = keep.path();
+        let sub_seed = root.join("sub-seed");
+        let sub_bare = root.join("sub-origin.git");
+        let sup_seed = root.join("sup-seed");
+        let sup_bare = root.join("sup-origin.git");
+        let lane = root.join("lane");
+        let sub_lane = lane.join("sub");
+
+        tgit_ok(
+            root,
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                sub_bare.to_str().unwrap(),
+            ],
+        );
+        tgit_ok(
+            root,
+            &["init", "-q", "-b", "main", sub_seed.to_str().unwrap()],
+        );
+        tgit_ok(&sub_seed, &["config", "user.email", "t@example.com"]);
+        tgit_ok(&sub_seed, &["config", "user.name", "T"]);
+        std::fs::write(sub_seed.join("s"), "s0\n").unwrap();
+        tgit_ok(&sub_seed, &["add", "s"]);
+        tgit_ok(&sub_seed, &["commit", "-q", "-m", "S0"]);
+        tgit_ok(
+            &sub_seed,
+            &["remote", "add", "origin", sub_bare.to_str().unwrap()],
+        );
+        tgit_ok(&sub_seed, &["push", "-q", "origin", "main"]);
+
+        tgit_ok(
+            root,
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                sup_bare.to_str().unwrap(),
+            ],
+        );
+        tgit_ok(
+            root,
+            &["init", "-q", "-b", "main", sup_seed.to_str().unwrap()],
+        );
+        tgit_ok(&sup_seed, &["config", "user.email", "t@example.com"]);
+        tgit_ok(&sup_seed, &["config", "user.name", "T"]);
+        std::fs::write(sup_seed.join("f"), "b\n").unwrap();
+        tgit_ok(&sup_seed, &["add", "f"]);
+        tgit_ok(&sup_seed, &["commit", "-q", "-m", "B"]);
+        tgit_ok(
+            &sup_seed,
+            &["remote", "add", "origin", sup_bare.to_str().unwrap()],
+        );
+        tgit_ok(
+            &sup_seed,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                sub_bare.to_str().unwrap(),
+                "sub",
+            ],
+        );
+        tgit_ok(&sup_seed, &["commit", "-q", "-m", "add submodule"]);
+        tgit_ok(&sup_seed, &["push", "-q", "origin", "main"]);
+
+        tgit_ok(
+            root,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "clone",
+                "-q",
+                "--recurse-submodules",
+                sup_bare.to_str().unwrap(),
+                lane.to_str().unwrap(),
+            ],
+        );
+        tgit_ok(&lane, &["config", "user.email", "t@example.com"]);
+        tgit_ok(&lane, &["config", "user.name", "T"]);
+        tgit_ok(&lane, &["config", "protocol.file.allow", "always"]);
+        tgit_ok(&sub_lane, &["config", "user.email", "t@example.com"]);
+        tgit_ok(&sub_lane, &["config", "user.name", "T"]);
+        tgit_ok(&sub_lane, &["config", "protocol.file.allow", "always"]);
+        tgit_ok(&lane, &["config", "fetch.recurseSubmodules", "true"]);
+        // Submodule remote advances to S1 after the recursive clone.
+        std::fs::write(sub_seed.join("s"), "s1\n").unwrap();
+        tgit_ok(&sub_seed, &["add", "s"]);
+        tgit_ok(&sub_seed, &["commit", "-q", "-m", "S1"]);
+        tgit_ok(&sub_seed, &["push", "-q", "origin", "main"]);
+
+        // The lane is the lander: M locally; remote main advances to D which
+        // contains M.
+        std::fs::write(lane.join("m"), "m\n").unwrap();
+        tgit_ok(&lane, &["add", "m"]);
+        tgit_ok(&lane, &["commit", "-q", "-m", "M"]);
+        let merge_m = tgit_ok(&lane, &["rev-parse", "main"]);
+        tgit_ok(
+            &sup_seed,
+            &["fetch", "-q", lane.to_str().unwrap(), &merge_m],
+        );
+        tgit_ok(&sup_seed, &["merge", "-q", "--no-ff", "-m", "D", &merge_m]);
+        let remote_d = tgit_ok(&sup_seed, &["rev-parse", "main"]);
+        tgit_ok(&sup_seed, &["push", "-q", "origin", "main"]);
+
+        let sup_before = refs_listing(&lane);
+        let sub_before = refs_listing(&sub_lane);
+        assert_ne!(
+            tgit_ok(&sub_lane, &["rev-parse", "refs/remotes/origin/main"]),
+            remote_d,
+            "sanity harness marker (distinct repos)"
+        );
+        let sub_local = tgit_ok(&sub_lane, &["rev-parse", "refs/remotes/origin/main"]);
+        assert_ne!(
+            sub_local,
+            tgit_ok(&sub_lane, &["ls-remote", "origin", "refs/heads/main"]),
+            "the submodule remote must be ahead"
+        );
+
+        push_main_cas(
+            &lane,
+            &merge_m,
+            &tgit_ok(&lane, &["rev-parse", "refs/remotes/origin/main"]),
+        )
+        .expect("M contained in remote D: Landed");
+        assert_eq!(refs_listing(&lane), sup_before, "super refs changed");
+        assert_eq!(
+            refs_listing(&sub_lane),
+            sub_before,
+            "CLI recovery recursion updated the submodule refs"
+        );
+
+        // Dead submodule remote does not fail recovery.
+        tgit_ok(
+            &sub_lane,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                root.join("no-such-sub.git").to_str().unwrap(),
+            ],
+        );
+        push_main_cas(
+            &lane,
+            &merge_m,
+            &tgit_ok(&lane, &["rev-parse", "refs/remotes/origin/main"]),
+        )
+        .expect("dead submodule remote must not fail recovery");
+        assert_eq!(refs_listing(&lane), sup_before);
+        assert_eq!(refs_listing(&sub_lane), sub_before);
+        drop(keep);
+    }
+
     /// R11 item 1 (HIGH): a local `git replace --graft` / legacy grafts file
     /// must not make post-push recovery report the lost-ack push as landed
     /// when the real remote tip R does not contain M. Hardened recovery reads

@@ -262,6 +262,121 @@ it("r5 item 1: a held unbound list GET cannot certify a session entered through 
   hubStore.logout();
 });
 
+it("r5 item 2: a superseded pending lookup cannot reclaim the binding — A resolves after B is chosen, B mounts", async () => {
+  const { api, hubStore } = await bootUnbound();
+  const A = "ins_superseded_a";
+  const JA = "obj_superseded_a_journal";
+  const B = "ins_superseded_b";
+  const JB = "obj_superseded_b_journal";
+
+  // Lookup calls 1 (A) and 2 (B) are held independently; releasing an id
+  // resolves that id's held lookup AND every later lookup for the same id
+  // (reopenFollow → follow re-fetches the uncached record on mount).
+  const records: Record<string, { id: string; journalId: string }> = {
+    [A]: { id: A, journalId: JA },
+    [B]: { id: B, journalId: JB },
+  };
+  const released = new Set<string>();
+  const waiters = new Map<string, Array<() => void>>();
+  vi.spyOn(api, "instanceGet").mockImplementation(
+    (id: string) =>
+      new Promise((resolve) => {
+        const answer = () =>
+          resolve({
+            ...records[id],
+            revision: "0",
+            durableSeq: "0",
+            lifecycle: "running",
+          } as Awaited<ReturnType<Api["instanceGet"]>>);
+        if (released.has(id)) {
+          answer();
+          return;
+        }
+        const list = waiters.get(id) ?? [];
+        list.push(answer);
+        waiters.set(id, list);
+      }),
+  );
+  const release = (id: string) => {
+    released.add(id);
+    for (const answer of waiters.get(id) ?? []) answer();
+    waiters.delete(id);
+  };
+  const seedCalls: string[] = [];
+  vi.spyOn(api, "eventsRead").mockImplementation(((args: { journalId: string }) => {
+    seedCalls.push(args.journalId);
+    return Promise.resolve({
+      events: [],
+      durableSeq: "0",
+      windowFromSeq: null,
+      reachedAfterSeq: true,
+    });
+  }) as Api["eventsRead"]);
+  const subscribeJournals: string[] = [];
+  vi.spyOn(api, "eventsSubscribe").mockImplementation(
+    ((((journalId: string) => {
+      subscribeJournals.push(journalId);
+      return Promise.resolve({
+        subscriptionId: `sub_${journalId}`,
+        journalId,
+        durableSeq: "0",
+        windowFromSeq: null,
+        reachedAfterSeq: true,
+        getReadyState: () => 1,
+        snapshot: {
+          projectionVersion: "v1",
+          projectionEpoch: `epoch_${journalId}`,
+          asOfSeq: "0",
+          instance: {} as never,
+          runs: [],
+          commands: [],
+          pendingInteractions: [],
+          nodes: [],
+          history: { earliestRetainedSeq: "0", complete: true },
+        },
+      });
+    }) as unknown) as Api["eventsSubscribe"]),
+  );
+  const internal = hubStore as unknown as {
+    connectionBoundTo: string | null;
+    connectionBoundJournal: string | null;
+  };
+  const flush = async (rounds = 60) => {
+    for (let i = 0; i < rounds; i += 1) await Promise.resolve();
+  };
+
+  // A chosen first, its lookup held; B chosen next (new owner), held too.
+  hubStore.resumeActive(A);
+  await vi.waitFor(() => expect(waiters.has(A)).toBe(true));
+  hubStore.resumeActive(B);
+  await vi.waitFor(() => expect(waiters.has(B)).toBe(true));
+  await flush();
+  expect(internal.connectionBoundTo).toBe(B);
+
+  // A's stale lookup resolves and its queued reopen/seed work runs as far as
+  // it can: it must NOT rebind, seed, or subscribe.
+  release(A);
+  await flush();
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  expect(internal.connectionBoundTo).toBe(B);
+  expect(internal.connectionBoundJournal).toBeNull();
+  expect(hubStore.getSnapshot().connection).not.toBe("live");
+  expect(seedCalls).not.toContain(JA);
+  expect(subscribeJournals).not.toContain(JA);
+
+  // B's lookup resolves: only B seeds/subscribes and certifies live.
+  release(B);
+  await vi.waitFor(() => expect(subscribeJournals).toContain(JB), { timeout: 4_000 });
+  await flush();
+  expect(internal.connectionBoundTo).toBe(B);
+  expect(internal.connectionBoundJournal).toBe(JB);
+  expect(seedCalls).toEqual([JB]);
+  expect(subscribeJournals).toEqual([JB]);
+  expect(hubStore.getSnapshot().connection).toBe("live");
+
+  hubStore.logout();
+});
+
 it("r4 item 2: a held unbound list request cannot certify a NEWLY pending session; live waits for its seed+subscribe", async () => {
   const { api, hubStore, list } = await bootUnbound();
   const PENDING = "ins_pending_midresume";

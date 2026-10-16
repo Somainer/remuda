@@ -3730,16 +3730,27 @@ class HubStore {
 
   /** Reopen the follow socket for an already-mounted instance and resync. */
   private async reopenFollow(instanceId: Id) {
+    // Ruling Y (r5 item 2): capture ownership when the resume action starts
+    // and revalidate after the lookup and inside the queued chain job. A
+    // recovery whose target was superseded while its lookup was parked used to
+    // run follow(A) unconditionally, which re-bound A (fresh generation),
+    // retired the chosen B's attempt and let A publish live even though B had
+    // never mounted. The stale resume completion is also dropped by the
+    // machine's generation guard; here the ASYNC WORK itself is fenced.
+    const token = this.targetToken(instanceId);
     const instance =
       this.state.instances.find((i) => i.id === instanceId) ?? (await api.instanceGet(instanceId));
+    if (!this.ownsTarget(token)) return;
     const client = this.journals.get(instance.journalId);
     // Join the JOURNAL chain (never the Node-bound screen chain) so an older
     // journal resync cannot land after this fresher one; errors propagate to
     // the machine. A stalled /screen read cannot delay this reopen.
     await this.chainReconcile(instanceId, async () => {
+      if (!this.ownsTarget(token)) return;
       if (client) {
         await this.openFollowSocket(instance, client, client.appliedSeq);
         await client.resumeAfterReconnect();
+        if (!this.ownsTarget(token)) return;
         // This follow just did the authoritative catch-up the drained send was
         // waiting on; its debt is honoured. Fold the journal now. A throw from
         // either step skips the delete and rejects the job: resumeConnection's
@@ -3747,9 +3758,12 @@ class HubStore {
         this.reconcileOwed.delete(instanceId);
         this.settleFromJournal(instanceId, this.state.events[instanceId] ?? []);
       } else {
-        // A fresh follow mounts AND catches the journal up; reaching here means
-        // it certified — its debt is honoured too.
+        // A fresh follow mounts AND catches the journal up; follow() applies
+        // the same ownership discipline (its entry chooses/revalidates the
+        // current target). Re-check before folding the debt: a superseded
+        // mount must not delete another target's reconciliation state.
         await this.follow(instanceId);
+        if (!this.ownsTarget(token)) return;
         this.reconcileOwed.delete(instanceId);
         this.settleFromJournal(instanceId, this.state.events[instanceId] ?? []);
       }

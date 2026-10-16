@@ -5968,16 +5968,17 @@ fn usage_from_result(
     // the buckets declares NO total rather than a partial input+output sum
     // (250+25 would hide the 1_000 read / 300 creation); the Hub keeps the
     // stored basket partial and recomputes once it is complete.
-    let total = [
+    let total = match (
         result_input,
         result_output,
         result_cache_read,
         result_cache_write,
-    ]
-    .into_iter()
-    .fold(Some(0u64), |sum, bucket| {
-        sum.zip(bucket).map(|(s, n)| s + n)
-    });
+    ) {
+        (Some(input), Some(output), Some(cache_read), Some(cache_write)) => {
+            Some(input + output + cache_read + cache_write)
+        }
+        _ => None,
+    };
 
     let mut observations = Vec::new();
 

@@ -278,7 +278,7 @@ fn live_per_call_assistant_delta_usage_carries_native_time_into_tpm() {
         }))
         .expect("result maps");
 
-    fn turn_usage<'a>(obs: &'a [Observation]) -> Vec<&'a Observation> {
+    fn turn_usage(obs: &[Observation]) -> Vec<&Observation> {
         obs.iter()
             .filter(|o| {
                 matches!(&o.body, ObservationPayload::Usage(u)

@@ -1335,6 +1335,8 @@ impl GateRegistry {
             // the owner finalizes and unregisters).
             let is_requested_run = generation.is_none_or(|requested| run.generation == requested);
             if !is_requested_run {
+                // A different attempt owns the job right now: the requested
+                // attempt cannot be certified either way.
                 drop(table);
                 return LandPushLiveness::Unknown;
             }
@@ -1342,17 +1344,11 @@ impl GateRegistry {
                 .land_pgid
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
-            // ITEM-1-ONLY: original r33 live-arm (item 2 withholds on ESRCH;
-            // restored in the next commit).
             return match land_pgid {
-                Some(pgid) => {
-                    if land_group_exists(pgid) {
-                        LandPushLiveness::MayPush
-                    } else {
-                        LandPushLiveness::VerifiedDead
-                    }
-                }
-                None => LandPushLiveness::MayPush,
+                Some(pgid) if land_group_exists(pgid) => LandPushLiveness::MayPush,
+                // Gone, or group not yet recorded, but the owner still holds
+                // the lane — never VerifiedDead until it finalizes.
+                Some(_) | None => LandPushLiveness::Unknown,
             };
         }
         drop(table);
@@ -1477,6 +1473,33 @@ impl GateRegistry {
     /// remove it. Lets the withholding regression run deterministically
     /// without a full land child: while the owner is registered, an
     /// ESRCH-dead group must read Unknown (never Absent); after release, the
+    /// durable attempt-qualified certificate attests Absent.
+    #[cfg(test)]
+    pub(crate) async fn gate_test_insert_land_run(
+        &self,
+        job_id: &str,
+        generation: u32,
+        land_pgid: i32,
+    ) {
+        let (cancel_tx, _cancel_rx) = tokio::sync::watch::channel(false);
+        let (land_abort_tx, land_abort_keep_rx) = tokio::sync::watch::channel(false);
+        let live = Arc::new(LiveRun {
+            generation,
+            cancel: cancel_tx,
+            pgid: std::sync::Mutex::new(None),
+            land_pgid: std::sync::Mutex::new(Some(land_pgid)),
+            land_abort: land_abort_tx,
+            land_abort_keep_rx,
+        });
+        self.runs.lock().await.runs.insert(job_id.to_owned(), live);
+    }
+
+    /// r34 item 2 test-only: unregister the synthetic run.
+    #[cfg(test)]
+    pub(crate) async fn gate_test_remove_run(&self, job_id: &str) {
+        self.runs.lock().await.runs.remove(job_id);
+    }
+
     /// Test-only: drop all local canceled records, simulating a Node process
     /// restart that begins with an empty registry.
     #[doc(hidden)]
@@ -9153,6 +9176,60 @@ Running 8 tests across 2 projects
     /// until the owner unregisters; the attempt-qualified durable certificate
     /// then attests VerifiedDead. A different registered generation also reads
     /// Unknown.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registered_owner_withholds_absent_until_the_lane_is_released() {
+        use super::LandPushLiveness::*;
+        let fixture = fixture(PASSING_SCRIPT);
+        let registry = fixture.node.gate_registry();
+        let dir = registry.land_fence_dir.clone();
+        let job = "gjb_r34_owner_hold";
+        // A group id that does not exist (ESRCH on killpg).
+        let dead_pgid = {
+            // Spawn and immediately reap a grouped child to obtain a now-dead
+            // pid; the id is ESRCH by the time we register.
+            use std::os::unix::process::CommandExt;
+            let mut child = std::process::Command::new("true")
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let dead_pid = i32::try_from(child.id()).unwrap();
+            child.wait().unwrap();
+            dead_pid
+        };
+        assert!(!super::gate_test_group_exists(dead_pgid));
+
+        // No run registered, no cert: Unknown.
+        assert_eq!(registry.land_push_liveness(job, Some(1)).await, Unknown);
+
+        // Owner registers a live run (gen 1) whose group is already ESRCH —
+        // the slow-finalization window. Absent must be withheld: Unknown.
+        registry.gate_test_insert_land_run(job, 1, dead_pgid).await;
+        assert_eq!(
+            registry.land_push_liveness(job, Some(1)).await,
+            Unknown,
+            "a registered owner with an ESRCH group must read Unknown, never VerifiedDead"
+        );
+        // A probe for a DIFFERENT generation while the owner holds the job is
+        // also Unknown (the registered run is gen 1).
+        assert_eq!(registry.land_push_liveness(job, Some(2)).await, Unknown);
+
+        // The finalizer finishes: attempt-qualified cert for gen 1 lands on
+        // disk, then the run unregisters (owner released the lane).
+        let record = serde_json::json!({
+            "jobId": job, "generation": 1, "pgid": dead_pgid, "startTick": 7
+        });
+        super::write_land_group_dead_cert(&dir, &record, dead_pgid).unwrap();
+        registry.gate_test_remove_run(job).await;
+        assert_eq!(
+            registry.land_push_liveness(job, Some(1)).await,
+            VerifiedDead,
+            "after release the durable gen1 certificate attests Absent"
+        );
+        // The certificate never crosses generations.
+        assert_eq!(registry.land_push_liveness(job, Some(2)).await, Unknown);
+    }
+
     #[test]
     fn record_land_group_fails_when_the_fence_dir_cannot_be_written() {
         let _seq = proc_lock();

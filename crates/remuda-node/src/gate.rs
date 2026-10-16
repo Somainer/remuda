@@ -10148,6 +10148,45 @@ head -c 1 >/dev/null || exit 4
         assert_eq!(refs_listing(&sub_lane), sub_before);
     }
 
+    /// R11 item 3: recovery fetch must never start automatic gc/maintenance,
+    /// which git can DETACH outside the R6 owner group and deadline. A repo
+    /// configured with gc.auto=1 / autoPackLimit=1 / maintenance.auto=true
+    /// triggers `git maintenance run --auto --detach` on an unhardened fetch;
+    /// the hardened recovery trace must contain no such child process.
+    #[cfg(unix)]
+    #[test]
+    fn recovery_fetch_never_starts_gc_or_maintenance() {
+        let (dir, _bare, lane, _base) = recovery_branch_fixture("main", None);
+        // Aggressive auto-maintenance configuration.
+        git(&lane, &["config", "gc.auto", "1"]);
+        git(&lane, &["config", "gc.autoPackLimit", "1"]);
+        git(&lane, &["config", "maintenance.auto", "true"]);
+        // Several loose/pack objects so the threshold is crossed.
+        for i in 0..3 {
+            let name = format!("extra-{i}.txt");
+            let f = lane.join(&name);
+            std::fs::write(f, format!("x{i}\n")).unwrap();
+            let msg = format!("extra {i}");
+            git(&lane, &["add", &name]);
+            git(&lane, &["commit", "-q", "-m", &msg]);
+        }
+        let trace = dir.path().join("recovery-trace.log");
+        let hardening = remuda_unix::RecoveryGit::enter_traced(&lane, &trace).unwrap();
+        let deadline = std::time::Instant::now() + LANDING_PROBE_DEADLINE;
+        let sha = super::recovery_fetch_base_sha(&lane, "main", deadline, &hardening)
+            .expect("hardened recovery succeeds");
+        assert_eq!(sha.len(), 40);
+        let trace_text = std::fs::read_to_string(&trace).unwrap();
+        assert!(
+            !trace_text.contains("maintenance run"),
+            "recovery detached maintenance: {trace_text}"
+        );
+        assert!(
+            !trace_text.contains("git gc ") && !trace_text.contains("git-gc"),
+            "recovery started gc: {trace_text}"
+        );
+    }
+
     /// R11 item 1 (HIGH): a local replacement graft (or legacy
     /// .git/info/grafts) must not fabricate ancestry. Real remote tip R
     /// diverged from the granted M (R does not contain M); with `git replace

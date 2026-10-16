@@ -2894,6 +2894,69 @@ mod tests {
         drop(keep);
     }
 
+    /// R11 item 3: CLI post-push recovery fetch must never detach gc or
+    /// maintenance, even with gc.auto=1 / autoPackLimit=1 /
+    /// maintenance.auto=true configured. A traced hardened recovery must show
+    /// no `maintenance run`/gc child in GIT_TRACE.
+    #[test]
+    fn cli_recovery_fetch_never_starts_gc_or_maintenance() {
+        let keep = tempfile::tempdir().unwrap();
+        let root = keep.path();
+        let full = root.join("full");
+        let origin = root.join("origin.git");
+        std::process::Command::new("git")
+            .args([
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                origin.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main", full.to_str().unwrap()])
+            .status()
+            .unwrap();
+        tgit_ok(&full, &["config", "user.email", "t@example.com"]);
+        tgit_ok(&full, &["config", "user.name", "T"]);
+        std::fs::write(full.join("f"), "b\n").unwrap();
+        tgit_ok(&full, &["add", "f"]);
+        tgit_ok(&full, &["commit", "-q", "-m", "B"]);
+        tgit_ok(
+            &full,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        tgit_ok(&full, &["push", "-q", "origin", "main"]);
+        tgit_ok(&full, &["config", "gc.auto", "1"]);
+        tgit_ok(&full, &["config", "gc.autoPackLimit", "1"]);
+        tgit_ok(&full, &["config", "maintenance.auto", "true"]);
+        for i in 0..3 {
+            let name = format!("extra-{i}.txt");
+            std::fs::write(full.join(&name), format!("x{i}\n")).unwrap();
+            let msg = format!("extra {i}");
+            tgit_ok(&full, &["add", &name]);
+            tgit_ok(&full, &["commit", "-q", "-m", &msg]);
+        }
+        let deadline = Instant::now() + LAND_RECOVERY_DEADLINE;
+        let trace = root.join("cli-recovery-trace.log");
+        let hardening = remuda_unix::RecoveryGit::enter_traced(&full, &trace).unwrap();
+        let sha = recovery_fetch_base_sha(&full, "main", deadline, &hardening)
+            .expect("hardened recovery succeeds");
+        assert_eq!(sha.len(), 40);
+        let trace_text = std::fs::read_to_string(&trace).unwrap();
+        assert!(
+            !trace_text.contains("maintenance run"),
+            "detached maintenance: {trace_text}"
+        );
+        assert!(
+            !trace_text.contains("git gc ") && !trace_text.contains("git-gc"),
+            "started gc: {trace_text}"
+        );
+        drop(keep);
+    }
+
     /// R11 item 1 (HIGH): a local `git replace --graft` / legacy grafts file
     /// must not make post-push recovery report the lost-ack push as landed
     /// when the real remote tip R does not contain M. Hardened recovery reads

@@ -47,6 +47,9 @@ pub struct RecoveryGit {
     /// Empty directory handed to `core.hooksPath`; also anchors the
     /// nonexistent graft-file path.
     hooks_dir: PathBuf,
+    /// When set, every git command gets `GIT_TRACE=<path>`; recovery itself
+    /// leaves this `None`. Used by tests to prove no gc/maintenance spawns.
+    trace_file: Option<PathBuf>,
 }
 
 impl RecoveryGit {
@@ -56,7 +59,19 @@ impl RecoveryGit {
     pub fn enter(repo: &Path) -> std::io::Result<Self> {
         let hooks_dir = repo.join(".git-r32-recovery-no-hooks");
         std::fs::create_dir_all(&hooks_dir)?;
-        Ok(Self { hooks_dir })
+        Ok(Self {
+            hooks_dir,
+            trace_file: None,
+        })
+    }
+
+    /// Variant of [`Self::enter`] that also sends GIT_TRACE for every git
+    /// command to `trace_file`; used to prove recovery never spawns
+    /// gc/maintenance. Recovery's own entry point uses plain [`Self::enter`].
+    pub fn enter_traced(repo: &Path, trace_file: &Path) -> std::io::Result<Self> {
+        let mut guard = Self::enter(repo)?;
+        guard.trace_file = Some(trace_file.to_path_buf());
+        Ok(guard)
     }
 
     /// Build a hardened `git` command for the recovery subcommand in `args`
@@ -95,6 +110,11 @@ impl RecoveryGit {
         command.env("GIT_GRAFT_FILE", self.hooks_dir.join("nonexistent-grafts"));
         // Never block waiting for interactive credentials.
         command.env("GIT_TERMINAL_PROMPT", "0");
+        // Optionally trace every spawned child so gc/maintenance detachment
+        // is observable (tests only; recovery leaves this unset).
+        if let Some(trace_file) = &self.trace_file {
+            command.env("GIT_TRACE", trace_file);
+        }
         command
     }
 

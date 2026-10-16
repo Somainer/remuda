@@ -984,9 +984,7 @@ fn push_main_cas(repo: &Path, merged: &str, expected: &str) -> Result<()> {
     let deadline = Instant::now() + LAND_RECOVERY_DEADLINE;
     // R11: one hardening guard for the whole post-push recovery; its scratch
     // hooks directory is removed when recovery returns.
-    let hardening = remuda_unix::RecoveryGit::enter(repo).map_err(|error| {
-        MergeStop::PushUncertain(format!("could not prepare recovery hardening: {error}"))
-    })?;
+    let hardening = remuda_unix::RecoveryGit::new();
     let remote_tip = recovery_fetch_base_sha(repo, "main", deadline, &hardening)?;
     // The exact granted merge IS on remote main: the push landed, only the
     // acknowledgement failed. Treat as success — never failed/base-moved.
@@ -2943,7 +2941,7 @@ mod tests {
         }
         let deadline = Instant::now() + LAND_RECOVERY_DEADLINE;
         let trace = root.join("cli-recovery-trace.log");
-        let hardening = remuda_unix::RecoveryGit::enter_traced(&full, &trace).unwrap();
+        let hardening = remuda_unix::RecoveryGit::traced(&trace);
         let sha = recovery_fetch_base_sha(&full, "main", deadline, &hardening)
             .expect("hardened recovery succeeds");
         assert_eq!(sha.len(), 40);
@@ -2955,6 +2953,164 @@ mod tests {
         assert!(
             !trace_text.contains("git gc ") && !trace_text.contains("git-gc"),
             "started gc: {trace_text}"
+        );
+        drop(keep);
+    }
+
+    /// r33 R11 clarification (CLI): recovery creates no scratch path; a graft
+    /// planted at the OLD r32 scratch location and a legacy grafts file cannot
+    /// make a divergent remote tip classify as Landed. A reference-transaction
+    /// hook never runs (real-hooksPath positive control included), and
+    /// pre-existing valuable content survives with the working tree / .git
+    /// listing unchanged apart from objects/FETCH_HEAD.
+    #[test]
+    fn planted_grafts_at_old_scratch_path_and_hooks_cannot_affect_cli_recovery() {
+        let keep = tempfile::tempdir().unwrap();
+        let root = keep.path();
+        let origin = root.join("origin.git");
+        let seed = root.join("seed");
+        let lane = root.join("lane");
+        tgit_ok(
+            root,
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                origin.to_str().unwrap(),
+            ],
+        );
+        tgit_ok(root, &["init", "-q", "-b", "main", seed.to_str().unwrap()]);
+        tgit_ok(&seed, &["config", "user.email", "t@example.com"]);
+        tgit_ok(&seed, &["config", "user.name", "T"]);
+        std::fs::write(seed.join("f"), "b\n").unwrap();
+        tgit_ok(&seed, &["add", "f"]);
+        tgit_ok(&seed, &["commit", "-q", "-m", "B"]);
+        let base_b = tgit_ok(&seed, &["rev-parse", "main"]);
+        tgit_ok(
+            &seed,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        tgit_ok(&seed, &["push", "-q", "origin", "main"]);
+        tgit_ok(
+            root,
+            &[
+                "clone",
+                "-q",
+                &format!("file://{}", origin.display()),
+                lane.to_str().unwrap(),
+            ],
+        );
+        tgit_ok(&lane, &["config", "user.email", "t@example.com"]);
+        tgit_ok(&lane, &["config", "user.name", "T"]);
+        // Landed M on the lane; remote R diverges and never contains M.
+        std::fs::write(lane.join("m"), "m\n").unwrap();
+        tgit_ok(&lane, &["add", "m"]);
+        tgit_ok(&lane, &["commit", "-q", "-m", "M"]);
+        let merge_m = tgit_ok(&lane, &["rev-parse", "main"]);
+        std::fs::write(seed.join("r"), "r\n").unwrap();
+        tgit_ok(&seed, &["add", "r"]);
+        tgit_ok(&seed, &["commit", "-q", "-m", "R"]);
+        let remote_r = tgit_ok(&seed, &["rev-parse", "main"]);
+        tgit_ok(&seed, &["push", "-q", "origin", "main"]);
+        tgit_ok(
+            &lane,
+            &[
+                "fetch",
+                "--no-tags",
+                "--no-prune",
+                "--refmap=",
+                "origin",
+                &remote_r,
+            ],
+        );
+
+        // Plant both graft inputs + valuable content + a hook.
+        let old_scratch = lane.join(".git-r32-recovery-no-hooks");
+        std::fs::create_dir_all(&old_scratch).unwrap();
+        std::fs::write(
+            old_scratch.join("nonexistent-grafts"),
+            format!("{remote_r} {merge_m}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            lane.join(".git/info/grafts"),
+            format!("{remote_r} {merge_m}\n"),
+        )
+        .unwrap();
+        tgit_ok(&lane, &["config", "advice.graftFileDeprecated", "false"]);
+        std::fs::write(old_scratch.join("valuable-file"), "do not delete me\n").unwrap();
+        let marker = root.join("hook-marker");
+        let hook = lane.join(".git/hooks/reference-transaction");
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\necho fired >> {}\n", marker.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // Positive control: real hooksPath ref write fires the hook.
+        tgit_ok(
+            &lane,
+            &[
+                "-c",
+                "core.hooksPath=.git/hooks",
+                "fetch",
+                "--no-tags",
+                "origin",
+                &format!("+{remote_r}:refs/heads/probe"),
+            ],
+        );
+        assert!(
+            marker.exists(),
+            "control hook must fire with real hooksPath"
+        );
+        tgit_ok(
+            &lane,
+            &[
+                "-c",
+                "core.hooksPath=/dev/null",
+                "update-ref",
+                "-d",
+                "refs/heads/probe",
+            ],
+        );
+        let control_firings = std::fs::read_to_string(&marker).unwrap().lines().count();
+
+        let before = refs_listing(&lane);
+        let result = push_main_cas(&lane, &merge_m, &base_b);
+        assert!(
+            matches!(
+                result
+                    .as_ref()
+                    .map_err(|e| e.downcast_ref::<MergeStop>())
+                    .err()
+                    .flatten(),
+                Some(MergeStop::BaseMoved(_, _))
+            ),
+            "planted grafts must not fabricate Landed: {result:?}"
+        );
+        let after_firings = std::fs::read_to_string(&marker)
+            .map(|text| text.lines().count())
+            .unwrap_or(0);
+        assert_eq!(
+            after_firings, control_firings,
+            "recovery ran a repository hook"
+        );
+        assert_eq!(refs_listing(&lane), before);
+        assert_eq!(
+            std::fs::read_to_string(old_scratch.join("valuable-file")).unwrap(),
+            "do not delete me\n",
+            "pre-existing content must survive"
+        );
+        assert_eq!(
+            std::fs::read_to_string(old_scratch.join("nonexistent-grafts")).unwrap(),
+            format!("{remote_r} {merge_m}\n"),
+            "planted graft path must be preserved"
         );
         drop(keep);
     }

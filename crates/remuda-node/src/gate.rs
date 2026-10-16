@@ -4145,10 +4145,7 @@ fn resolve_landing_after_restart(
     let deadline = std::time::Instant::now() + LANDING_PROBE_DEADLINE;
     // R11: one hardening guard for the whole probe (env + config + fetch flags;
     // its scratch hooks dir is removed when the probe returns).
-    let hardening = match remuda_unix::RecoveryGit::enter(&repo) {
-        Ok(h) => h,
-        Err(error) => return unknown(format!("could not prepare recovery hardening: {error}")),
-    };
+    let hardening = remuda_unix::RecoveryGit::new();
     // Read the remote tip and fetch its objects without touching any ref. On
     // error the probe is Unknown.
     let base_sha = match recovery_fetch_base_sha(&repo, &request.base_branch, deadline, &hardening)
@@ -10170,7 +10167,7 @@ head -c 1 >/dev/null || exit 4
             git(&lane, &["commit", "-q", "-m", &msg]);
         }
         let trace = dir.path().join("recovery-trace.log");
-        let hardening = remuda_unix::RecoveryGit::enter_traced(&lane, &trace).unwrap();
+        let hardening = remuda_unix::RecoveryGit::traced(&trace);
         let deadline = std::time::Instant::now() + LANDING_PROBE_DEADLINE;
         let sha = super::recovery_fetch_base_sha(&lane, "main", deadline, &hardening)
             .expect("hardened recovery succeeds");
@@ -10184,6 +10181,193 @@ head -c 1 >/dev/null || exit 4
             !trace_text.contains("git gc ") && !trace_text.contains("git-gc"),
             "recovery started gc: {trace_text}"
         );
+    }
+
+    /// r33 R11 clarification: recovery creates NO scratch path and is immune to
+    /// a graft planted at the OLD r32 scratch location. Builds genuinely
+    /// divergent remote R (does not contain granted M), then plants BOTH
+    /// `<repo>/.git-r32-recovery-no-hooks/nonexistent-grafts` (the path r32 used
+    /// to trust) and a legacy `.git/info/grafts`, plus a valuable file in that
+    /// directory and a reference-transaction hook. Recovery must answer
+    /// Absent/Unknown (never Landed), run no hook, touch none of the planted
+    /// paths, and leave the working tree / .git (minus fetched objects and
+    /// FETCH_HEAD) byte-for-byte unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn planted_grafts_at_old_scratch_path_and_hooks_cannot_affect_recovery() {
+        let (dir, _bare, lane, base_b) = recovery_branch_fixture("main", None);
+        let seed = dir.path().join("seed");
+        // Granted M on a side branch.
+        git(&lane, &["checkout", "-q", "-b", "work"]);
+        std::fs::write(lane.join("m.txt"), "M\n").unwrap();
+        git(&lane, &["add", "m.txt"]);
+        git(&lane, &["commit", "-q", "-m", "granted merge M"]);
+        let merge_m = git(&lane, &["rev-parse", "HEAD"]);
+        // Real remote tip R diverges from M.
+        std::fs::write(seed.join("r.txt"), "R\n").unwrap();
+        git(&seed, &["add", "r.txt"]);
+        git(&seed, &["commit", "-q", "-m", "R"]);
+        let remote_r = git(&seed, &["rev-parse", "main"]);
+        git(&seed, &["push", "-q", "origin", "main"]);
+        run_git(
+            &lane,
+            &[
+                "fetch",
+                "--no-tags",
+                "--no-prune",
+                "--refmap=",
+                "origin",
+                &remote_r,
+            ],
+        )
+        .unwrap();
+        assert!(
+            block_git(&lane, &["merge-base", "--is-ancestor", &merge_m, &remote_r]).is_err(),
+            "R must genuinely lack M"
+        );
+
+        // (a) Plant grafts at BOTH locations the unhardened code would read.
+        let old_scratch = lane.join(".git-r32-recovery-no-hooks");
+        std::fs::create_dir_all(&old_scratch).unwrap();
+        let planted = old_scratch.join("nonexistent-grafts");
+        std::fs::write(&planted, format!("{remote_r} {merge_m}\n")).unwrap();
+        std::fs::write(
+            lane.join(".git/info/grafts"),
+            format!("{remote_r} {merge_m}\n"),
+        )
+        .unwrap();
+        git(&lane, &["config", "advice.graftFileDeprecated", "false"]);
+        // (b) Valuable pre-existing content recovery must preserve.
+        let valuable = old_scratch.join("valuable-file");
+        std::fs::write(&valuable, "do not delete me\n").unwrap();
+        // (c) A reference-transaction hook that records when it runs.
+        let marker = dir.path().join("hook-marker");
+        let hook = lane.join(".git/hooks/reference-transaction");
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\necho fired >> {}\n", marker.display()),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // Positive control: with hooksPath at the real hooks dir and a
+        // ref-writing fetch, the hook DOES fire and writes the marker.
+        run_git(
+            &lane,
+            &[
+                "-c",
+                "core.hooksPath=.git/hooks",
+                "fetch",
+                "--no-tags",
+                "origin",
+                &format!("+{remote_r}:refs/heads/probe"),
+            ],
+        )
+        .unwrap();
+        assert!(
+            marker.exists(),
+            "control: reference-transaction hook fires with real hooksPath"
+        );
+        run_git(
+            &lane,
+            &[
+                "-c",
+                "core.hooksPath=/dev/null",
+                "update-ref",
+                "-d",
+                "refs/heads/probe",
+            ],
+        )
+        .unwrap();
+        // Snapshot firings after the hardened cleanup.
+        let control_firings = std::fs::read_to_string(&marker).unwrap().lines().count();
+        // Snapshot the working tree and .git (objects/ and FETCH_HEAD are the
+        // only paths a ref-free recovery legitimately touches).
+        let work_before = git_dir_snapshot(&lane, &[]);
+        let git_excludes = ["objects".to_owned(), "FETCH_HEAD".to_owned()];
+        let git_before = git_dir_snapshot(&lane.join(".git"), &git_excludes);
+
+        // With death evidence: Absent, never Landed despite both planted grafts.
+        let request = remuda_protocol::GateResolveLandingParams {
+            job_id: "gjb_r33_plant".into(),
+            repo_path: lane.to_string_lossy().into_owned(),
+            base_branch: "main".into(),
+            merge_sha: merge_m.clone(),
+        };
+        let reply = super::resolve_landing_after_restart(&request, true);
+        assert_eq!(
+            reply.status, "absent",
+            "planted grafts must not fabricate Landed: {reply:?}"
+        );
+        // Without death evidence: Unknown.
+        let reply = super::resolve_landing_after_restart(&request, false);
+        assert_eq!(reply.status, "unknown", "{reply:?}");
+        // (c) no extra hook firings from recovery.
+        let after_firings = std::fs::read_to_string(&marker)
+            .map(|t| t.lines().count())
+            .unwrap_or(0);
+        assert_eq!(
+            after_firings, control_firings,
+            "recovery must not run any repository hook"
+        );
+        // (b) planted paths preserved exactly.
+        assert_eq!(
+            std::fs::read_to_string(&valuable).unwrap(),
+            "do not delete me\n",
+            "pre-existing valuable file must survive unchanged"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&planted).unwrap(),
+            format!("{remote_r} {merge_m}\n"),
+            "the planted graft path must be left in place"
+        );
+        assert_eq!(
+            git_dir_snapshot(&lane, &[]),
+            work_before,
+            "working tree changed"
+        );
+        assert_eq!(
+            git_dir_snapshot(&lane.join(".git"), &git_excludes),
+            git_before,
+            ".git changed apart from objects/ and FETCH_HEAD"
+        );
+        let _ = base_b;
+    }
+
+    /// Snapshot a directory: relative path -> contents hash for files, with
+    /// top-level entries in `excludes` skipped. Used to prove recovery leaves
+    /// pre-existing repository content byte-identical.
+    #[cfg(unix)]
+    fn git_dir_snapshot(root: &Path, excludes: &[String]) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let entry = entry.unwrap();
+                let rel = entry.path().strip_prefix(root).unwrap().to_path_buf();
+                if rel.components().count() == 1 && excludes.iter().any(|e| rel == Path::new(e)) {
+                    continue;
+                }
+                let kind = entry.file_type().unwrap();
+                if kind.is_dir() {
+                    stack.push(entry.path());
+                } else if kind.is_file() {
+                    let bytes = std::fs::read(entry.path()).unwrap();
+                    let hash = std::collections::hash_map::DefaultHasher::new();
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = hash;
+                    bytes.hash(&mut hasher);
+                    out.push((
+                        rel.to_string_lossy().into_owned(),
+                        format!("{:x}", hasher.finish()),
+                    ));
+                }
+            }
+        }
+        out.sort();
+        out
     }
 
     /// R11 item 1 (HIGH): a local replacement graft (or legacy

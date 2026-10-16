@@ -1165,6 +1165,7 @@ export type GatePushFrom = ("lane" | "home");
 /** `gate.resolveLanding` params: a read-only probe after a Hub restart left a job `landing`. */
 export type GateResolveLandingParams = ({
   "baseBranch": (string);
+  "generation"?: (number | null);
   "jobId": (string);
   "mergeSha": (string);
   "repoPath": (string);

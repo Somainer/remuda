@@ -5546,6 +5546,15 @@
           "description": "Base branch the CAS advanced (`main`).",
           "type": "string"
         },
+        "generation": {
+          "description": "r34 item 1: the attempt generation whose death/landing state is being\nprobed. Fence and death-certificate files are attempt-qualified\n(`land-<job>-g<gen>.json` / `dead-<job>-g<gen>.json`), so a probe\nattests facts ONLY about this exact attempt; an absent or different\ngeneration yields Unknown rather than accepting another attempt's\ncertificate. `None` stays conservative (Unknown for durable evidence).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "jobId": {
           "description": "Job whose granted push is being resolved.",
           "type": "string"

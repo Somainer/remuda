@@ -899,6 +899,14 @@ pub struct GateResolveLandingParams {
     /// The merge commit the grant was for; the remote base must contain it for
     /// the outcome to count as landed.
     pub merge_sha: String,
+    /// r34 item 1: the attempt generation whose death/landing state is being
+    /// probed. Fence and death-certificate files are attempt-qualified
+    /// (`land-<job>-g<gen>.json` / `dead-<job>-g<gen>.json`), so a probe
+    /// attests facts ONLY about this exact attempt; an absent or different
+    /// generation yields Unknown rather than accepting another attempt's
+    /// certificate. `None` stays conservative (Unknown for durable evidence).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u32>,
 }
 
 /// `gate.resolveLanding` verdict.

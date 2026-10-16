@@ -1256,9 +1256,7 @@ impl GateRegistry {
                 hold.entered
                     .store(true, std::sync::atomic::Ordering::Release);
                 let (rel_lock, rel_cvar) = &*hold.release;
-                let mut released = rel_lock
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner());
+                let mut released = rel_lock.lock().unwrap_or_else(|poison| poison.into_inner());
                 // Bounded self-release: a failed assertion that never notifies
                 // the hold must not park a blocking thread (and the dropping
                 // runtime) for the whole test binary; the happy path notifies
@@ -1286,21 +1284,16 @@ impl GateRegistry {
                 );
                 return;
             }
-            // Certify only the EXACT on-disk snapshot for this pgid. A missing
-            // or changed fence (a newer attempt re-fenced the job) is never
-            // certified from this run's stale pgid observation (r17 item 1).
-            let fence_path = land_fence_path(&dir, &job_id);
-            let text = match std::fs::read_to_string(&fence_path) {
-                Ok(text) => text,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-                Err(error) => {
-                    tracing::warn!(%error, job_id, "settling the land group could not read its fence");
-                    return;
-                }
-            };
-            let Ok(record) = serde_json::from_str::<Value>(&text) else {
-                tracing::warn!(job_id, "settling the land group found an unreadable fence; keeping it");
-                return;
+            // r34 item 1: fences are attempt-qualified
+            // (`land-<job>-g<gen>.json`); find THIS group's attempt fence by
+            // matching the recorded pgid. A newer attempt with a different
+            // group is left untouched; certify_dead_and_remove_fence then
+            // writes/unlinks only the matching attempt's own paths.
+            let record = match find_land_fence_record_for_pgid(&dir, &job_id, pgid) {
+                Some(record) => record,
+                // No attempt fence on disk for this exact pgid: never
+                // manufacture a certificate from the in-memory arguments.
+                None => return,
             };
             match certify_dead_and_remove_fence(&dir, &record, pgid) {
                 Ok(_) => {}
@@ -1329,16 +1322,29 @@ impl GateRegistry {
     ///   record, an unwitnessed crash), so a read-only probe must stay Unknown
     ///   rather than attest `absent`.
     #[cfg(unix)]
-    async fn land_push_liveness(&self, job_id: &str) -> LandPushLiveness {
+    async fn land_push_liveness(&self, job_id: &str, generation: Option<u32>) -> LandPushLiveness {
         let table = self.runs.lock().await;
         if let Some(run) = table.runs.get(job_id) {
+            // r34 item 2: the OWNER is still registered (its run has not
+            // finalized and released the lane). Even a live-kernel ESRCH must
+            // NOT be attested as absence while the owner holds the lane: the
+            // old finalizer may still be writing/releasing, and requeuing now
+            // races the next dispatch into a still-held lane (lane-busy ->
+            // spurious Failed). Hold: MayPush while the group is alive, Unknown
+            // once it is gone-but-still-owned (durable evidence comes only after
+            // the owner finalizes and unregisters).
+            let is_requested_run = generation.is_none_or(|requested| run.generation == requested);
+            if !is_requested_run {
+                drop(table);
+                return LandPushLiveness::Unknown;
+            }
             let land_pgid = *run
                 .land_pgid
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
+            // ITEM-1-ONLY: original r33 live-arm (item 2 withholds on ESRCH;
+            // restored in the next commit).
             return match land_pgid {
-                // The kernel's authoritative killpg(pgid, 0) answer on the
-                // exact group this process spawned and recorded.
                 Some(pgid) => {
                     if land_group_exists(pgid) {
                         LandPushLiveness::MayPush
@@ -1346,22 +1352,24 @@ impl GateRegistry {
                         LandPushLiveness::VerifiedDead
                     }
                 }
-                // The run exists and the grant may already have been taken but
-                // the land child has not recorded its group yet: conservative.
                 None => LandPushLiveness::MayPush,
             };
         }
         drop(table);
         let dir = self.land_fence_dir.clone();
         let job_id = job_id.to_owned();
-        tokio::task::spawn_blocking(move || land_ledger_liveness(&dir, &job_id))
+        tokio::task::spawn_blocking(move || land_ledger_liveness(&dir, &job_id, generation))
             .await
             .unwrap_or(LandPushLiveness::Unknown)
     }
 
     /// Platforms without process-group accounting can never attest death.
     #[cfg(not(unix))]
-    async fn land_push_liveness(&self, _job_id: &str) -> LandPushLiveness {
+    async fn land_push_liveness(
+        &self,
+        _job_id: &str,
+        _generation: Option<u32>,
+    ) -> LandPushLiveness {
         LandPushLiveness::Unknown
     }
 
@@ -1464,6 +1472,11 @@ impl GateRegistry {
         })
     }
 
+    /// r34 item 2 test-only: insert a synthetic registered live run for
+    /// `job_id`@`generation` whose recorded land group is `land_pgid`, then
+    /// remove it. Lets the withholding regression run deterministically
+    /// without a full land child: while the owner is registered, an
+    /// ESRCH-dead group must read Unknown (never Absent); after release, the
     /// Test-only: drop all local canceled records, simulating a Node process
     /// restart that begins with an empty registry.
     #[doc(hidden)]
@@ -1919,7 +1932,7 @@ impl DevNode {
         // Unknown, never "the push is dead".
         let land_group_verified_dead = matches!(
             self.gate_registry()
-                .land_push_liveness(&request.job_id)
+                .land_push_liveness(&request.job_id, request.generation)
                 .await,
             LandPushLiveness::VerifiedDead
         );
@@ -4625,11 +4638,21 @@ enum LandPushLiveness {
 /// the exact job exists. Missing both, a stat/read/parse error, or a cert for a
 /// different job is Unknown.
 #[cfg(unix)]
-fn land_ledger_liveness(dir: &std::path::Path, job_id: &str) -> LandPushLiveness {
-    match std::fs::metadata(land_fence_path(dir, job_id)) {
+fn land_ledger_liveness(
+    dir: &std::path::Path,
+    job_id: &str,
+    generation: Option<u32>,
+) -> LandPushLiveness {
+    // r34 item 1/2: durable evidence is read ONLY for the exact requested
+    // attempt. Without a requested generation, or when no attempt-qualified
+    // file exists for it, the answer is Unknown (never another attempt's cert).
+    let Some(generation) = generation else {
+        return LandPushLiveness::Unknown;
+    };
+    match std::fs::metadata(land_fence_path(dir, job_id, generation)) {
         Ok(_) => LandPushLiveness::MayPush,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            match read_land_group_dead_cert(dir, job_id) {
+            match read_land_group_dead_cert(dir, job_id, generation) {
                 Some(_) => LandPushLiveness::VerifiedDead,
                 None => LandPushLiveness::Unknown,
             }
@@ -4640,16 +4663,67 @@ fn land_ledger_liveness(dir: &std::path::Path, job_id: &str) -> LandPushLiveness
 }
 
 #[cfg(unix)]
-fn land_fence_path(dir: &std::path::Path, job_id: &str) -> std::path::PathBuf {
-    dir.join(format!("land-{}.json", land_slug(job_id)))
+fn land_fence_path(dir: &std::path::Path, job_id: &str, generation: u32) -> std::path::PathBuf {
+    // r34 item 1: attempt-qualified, IMMUTABLE fence path. Each granted attempt
+    // (a generation) gets its own file; a finalizer only ever unlinks its own
+    // attempt's fence, so a detached older finalizer cannot remove a newer
+    // attempt's live fence.
+    dir.join(format!("land-{}-g{}.json", land_slug(job_id), generation))
 }
 
 /// Durable DEATH CERTIFICATE path: written only after the kernel verified the
 /// granted land group ESRCH, and the only durable evidence that lets a later
 /// read-only probe attest the push cannot still land (r16 item 2, R5).
+/// r34 item 1: attempt-qualified like the fence — one certificate per
+/// generation, so an older attempt's certificate is never read as death
+/// evidence for a newer attempt.
 #[cfg(unix)]
-fn land_dead_cert_path(dir: &std::path::Path, job_id: &str) -> std::path::PathBuf {
-    dir.join(format!("dead-{}.json", land_slug(job_id)))
+fn land_dead_cert_path(dir: &std::path::Path, job_id: &str, generation: u32) -> std::path::PathBuf {
+    dir.join(format!("dead-{}-g{}.json", land_slug(job_id), generation))
+}
+
+/// Find the attempt fence record for `job_id` whose recorded group is exactly
+/// `pgid`. Fence files are attempt-qualified, so finalization scans the job's
+/// `land-<slug>-g*.json` files and acts only on the matching attempt; a newer
+/// attempt with a different group is never touched. None means no usable
+/// record for this group (missing/unparseable/wrong provenance).
+#[cfg(unix)]
+fn find_land_fence_record_for_pgid(
+    dir: &std::path::Path,
+    job_id: &str,
+    pgid: i32,
+) -> Option<Value> {
+    let slug = land_slug(job_id);
+    let prefix = format!("land-{slug}-g");
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !name.starts_with(&prefix) || !name.ends_with(".json") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        if record.get("jobId").and_then(Value::as_str) != Some(job_id) {
+            continue;
+        }
+        if record.get("generation").and_then(Value::as_u64).is_none()
+            || LeaderIdentity::from_record(&record).is_none()
+            || record.get("diedAt").is_some()
+            || record.get("cause").is_some()
+        {
+            continue;
+        }
+        if record.get("pgid").and_then(Value::as_i64) == Some(i64::from(pgid)) {
+            return Some(record);
+        }
+    }
+    None
 }
 
 #[cfg(unix)]
@@ -4691,8 +4765,18 @@ fn write_land_group_dead_cert(
             .unwrap_or(0)
     );
     cert["cause"] = json!("killpg-esrch");
-    let path = land_dead_cert_path(dir, job_id);
-    let temporary = dir.join(format!(".dead-{pgid}-{}.tmp", std::process::id()));
+    let generation = record
+        .get("generation")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| {
+            std::io::Error::other("land fence record has no generation for the death certificate")
+        })?;
+    let path = land_dead_cert_path(dir, job_id, generation);
+    let temporary = dir.join(format!(
+        ".dead-g{generation}-{pgid}-{}.tmp",
+        std::process::id()
+    ));
     std::fs::write(&temporary, serde_json::to_vec(&cert).unwrap_or_default())?;
     std::fs::rename(&temporary, &path)?;
     Ok(())
@@ -4703,10 +4787,18 @@ fn write_land_group_dead_cert(
 /// (pgid + leader identity) — every one of those is Unknown, never a valid
 /// death attestation.
 #[cfg(unix)]
-fn read_land_group_dead_cert(dir: &std::path::Path, job_id: &str) -> Option<Value> {
-    let text = std::fs::read_to_string(land_dead_cert_path(dir, job_id)).ok()?;
+fn read_land_group_dead_cert(
+    dir: &std::path::Path,
+    job_id: &str,
+    generation: u32,
+) -> Option<Value> {
+    let text = std::fs::read_to_string(land_dead_cert_path(dir, job_id, generation)).ok()?;
     let cert: Value = serde_json::from_str(&text).ok()?;
-    if cert.get("jobId").and_then(Value::as_str) != Some(job_id) {
+    // The certificate must attest the EXACT requested attempt: job AND
+    // generation, plus the required provenance (pgid + leader identity).
+    if cert.get("jobId").and_then(Value::as_str) != Some(job_id)
+        || cert.get("generation").and_then(Value::as_u64) != Some(u64::from(generation))
+    {
         return None;
     }
     cert.get("pgid")
@@ -4928,18 +5020,19 @@ fn write_land_fence(
         "pgid": pgid,
     });
     identity.write(&mut record);
-    let path = land_fence_path(dir, job_id);
-    // A new granted attempt supersedes any death certificate for the same job
-    // (e.g. a requeue): the old cert must never attest death for THIS attempt.
-    // r18 item 9: propagate every removal error except NotFound — a permission
-    // /IO failure must not be silently ignored (which would leave a stale cert
-    // able to certify the new attempt).
-    if let Err(error) = std::fs::remove_file(land_dead_cert_path(dir, job_id))
+    let path = land_fence_path(dir, job_id, generation);
+    // r34 item 1: remove only THIS attempt's stale certificate (same
+    // generation). Older/newer attempts' certificates are separate files and
+    // must never be touched; their paths are immutable and attempt-qualified.
+    if let Err(error) = std::fs::remove_file(land_dead_cert_path(dir, job_id, generation))
         && error.kind() != std::io::ErrorKind::NotFound
     {
         return Err(error);
     }
-    let temporary = dir.join(format!(".land-{pgid}-{}.tmp", std::process::id()));
+    let temporary = dir.join(format!(
+        ".land-g{generation}-{pgid}-{}.tmp",
+        std::process::id()
+    ));
     std::fs::write(&temporary, serde_json::to_vec(&record).unwrap_or_default())?;
     std::fs::rename(&temporary, &path)?;
     Ok(())
@@ -4982,6 +5075,52 @@ fn land_fence_snapshot_matches(a: &Value, b: &Value) -> bool {
     }
 }
 
+/// r34 item 1 TEST-ONLY: one-shot park inserted AFTER certify's snapshot
+/// comparison passes but BEFORE the death certificate is written and the fence
+/// unlinked — exactly the window in which an older attempt's detached
+/// finalizer used to be able to delete a newer attempt's live fence. A test
+/// parks the A finalizer here, installs attempt B's fence, resumes A, and
+/// proves B's fence survives and A's certificate never certifies B.
+#[cfg(test)]
+static CERTIFY_COMPARE_HOLD: std::sync::OnceLock<
+    std::sync::Mutex<Option<std::sync::Arc<CleanupHold>>>,
+> = std::sync::OnceLock::new();
+
+/// r34 item 1: park at the post-compare/pre-unlink certify seam.
+#[cfg(test)]
+fn park_certify_after_compare() {
+    let guard = CERTIFY_COMPARE_HOLD
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let Some(hold) = guard.as_ref().cloned() else {
+        return;
+    };
+    drop(guard);
+    hold.entered
+        .store(true, std::sync::atomic::Ordering::Release);
+    let (lock, cvar) = &*hold.release;
+    let mut released = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+    while !*released {
+        let (next, timeout) = cvar
+            .wait_timeout(released, std::time::Duration::from_secs(20))
+            .unwrap_or_else(|poison| poison.into_inner());
+        released = next;
+        if timeout.timed_out() {
+            *released = true;
+        }
+    }
+}
+
+/// r34 item 1 test helper: arm the post-compare certify hold (one-shot).
+#[cfg(test)]
+pub(crate) fn arm_certify_compare_hold(hold: std::sync::Arc<CleanupHold>) {
+    *CERTIFY_COMPARE_HOLD
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = Some(hold);
+}
+
 /// Authoritative group death has been observed (killpg ESRCH on the recorded
 /// pgid): persist the death certificate FROM THE OBSERVED FENCE SNAPSHOT, and
 /// only then remove the fence (r16 item 2; r17 item 1 hardening).
@@ -5013,7 +5152,12 @@ fn certify_dead_and_remove_fence(
     {
         return Ok(false);
     }
-    let fence_path = land_fence_path(dir, job_id);
+    let generation = observed
+        .get("generation")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .expect("validated above");
+    let fence_path = land_fence_path(dir, job_id, generation);
     let current_text = match std::fs::read_to_string(&fence_path) {
         Ok(text) => text,
         // The fence is already gone: never manufacture a certificate from a
@@ -5032,6 +5176,9 @@ fn certify_dead_and_remove_fence(
         );
         return Ok(false);
     }
+    // r34 item 1: test seam parks after the compare, before cert write/unlink.
+    #[cfg(test)]
+    park_certify_after_compare();
     write_land_group_dead_cert(dir, observed, observed_pgid)?;
     match std::fs::remove_file(&fence_path) {
         Ok(()) => Ok(true),
@@ -5042,7 +5189,7 @@ fn certify_dead_and_remove_fence(
             // The fence still exists and the unlink failed: roll the
             // certificate back so the fence remains the single, conservative
             // proof (fence presence reads as MayPush), then surface the error.
-            let _ = std::fs::remove_file(land_dead_cert_path(dir, job_id));
+            let _ = std::fs::remove_file(land_dead_cert_path(dir, job_id, generation));
             Err(error)
         }
     }
@@ -6565,7 +6712,7 @@ echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\"
             fixture
                 .node
                 .gate_registry()
-                .land_push_liveness("gjb_abort_msg")
+                .land_push_liveness("gjb_abort_msg", Some(1))
                 .await
                 != LandPushLiveness::MayPush,
             "the aborted land group is not live afterwards"
@@ -6625,7 +6772,7 @@ echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\"
             fixture
                 .node
                 .gate_registry()
-                .land_push_liveness("gjb_survivor")
+                .land_push_liveness("gjb_survivor", Some(1))
                 .await,
             LandPushLiveness::VerifiedDead,
             "the land group must settle (death certificate) after pre-reap cleanup"
@@ -8543,7 +8690,7 @@ Running 8 tests across 2 projects
         assert!(super::land_group_exists(pgid));
         assert!(super::sample_leader_identity(pgid).is_none());
         let dir = tempfile::TempDir::new().unwrap();
-        let path = super::land_fence_path(dir.path(), "ghost");
+        let path = super::land_fence_path(dir.path(), "ghost", 1);
         std::fs::write(
             &path,
             serde_json::json!({"jobId":"ghost","generation":1,"pgid":pgid,"startTick":42})
@@ -8599,7 +8746,7 @@ Running 8 tests across 2 projects
             other => panic!("expected a start tick, got {other:?}"),
         };
         std::fs::write(
-            super::land_fence_path(fence, "job-x"),
+            super::land_fence_path(fence, "job-x", 1),
             serde_json::json!({
                 "jobId": "job-x",
                 "generation": 1,
@@ -8616,7 +8763,7 @@ Running 8 tests across 2 projects
             "the reused-pid stranger must not have been signalled"
         );
         // ...and the record was kept (unknown ownership, Landing held).
-        assert!(super::land_fence_path(fence, "job-x").is_file());
+        assert!(super::land_fence_path(fence, "job-x", 1).is_file());
         let _ = stranger.kill();
         reap(stranger);
     }
@@ -8649,7 +8796,7 @@ Running 8 tests across 2 projects
         let mut record = serde_json::json!({"jobId":"job-orphan-live","generation":1,"pgid":pgid});
         identity.write(&mut record);
         std::fs::write(
-            super::land_fence_path(fence, "job-orphan-live"),
+            super::land_fence_path(fence, "job-orphan-live", 1),
             record.to_string(),
         )
         .unwrap();
@@ -8668,11 +8815,11 @@ Running 8 tests across 2 projects
         );
         // The fence is retained: the Landing stays Unknown for the operator.
         assert!(
-            super::land_fence_path(fence, "job-orphan-live").is_file(),
+            super::land_fence_path(fence, "job-orphan-live", 1).is_file(),
             "the live orphan's fence must be kept, never certified dead"
         );
         assert!(
-            super::read_land_group_dead_cert(fence, "job-orphan-live").is_none(),
+            super::read_land_group_dead_cert(fence, "job-orphan-live", 1).is_none(),
             "no death certificate may be written for a live group"
         );
         let _ = child.kill();
@@ -8687,7 +8834,7 @@ Running 8 tests across 2 projects
         let pgid = child.id() as i32;
         let identity = super::sample_leader_identity(pgid).expect("identity");
         let dir = tempfile::TempDir::new().unwrap();
-        let path = super::land_fence_path(dir.path(), "dead");
+        let path = super::land_fence_path(dir.path(), "dead", 1);
         let mut record = serde_json::json!({"jobId":"dead","generation":1,"pgid":pgid});
         identity.write(&mut record);
         std::fs::write(&path, record.to_string()).unwrap();
@@ -8704,15 +8851,15 @@ Running 8 tests across 2 projects
         // the exact job, so a later ledger read attests VerifiedDead instead of
         // guessing from the missing ledger (which is Unknown on its own).
         assert!(
-            super::read_land_group_dead_cert(dir.path(), "dead").is_some(),
+            super::read_land_group_dead_cert(dir.path(), "dead", 1).is_some(),
             "authoritative ESRCH at startup must leave a death certificate"
         );
         assert_eq!(
-            super::land_ledger_liveness(dir.path(), "dead"),
+            super::land_ledger_liveness(dir.path(), "dead", Some(1)),
             super::LandPushLiveness::VerifiedDead
         );
         assert_eq!(
-            super::land_ledger_liveness(dir.path(), "other-job"),
+            super::land_ledger_liveness(dir.path(), "other-job", Some(1)),
             super::LandPushLiveness::Unknown,
             "the certificate is scoped to the exact job"
         );
@@ -8756,7 +8903,7 @@ Running 8 tests across 2 projects
         assert!(present, "the orphaned member should hold the pgid");
 
         let dir = tempfile::TempDir::new().unwrap();
-        let path = super::land_fence_path(dir.path(), "orphan");
+        let path = super::land_fence_path(dir.path(), "orphan", 1);
         let mut record = serde_json::json!({"jobId":"orphan","generation":1,"pgid":pgid});
         identity.write(&mut record);
         std::fs::write(&path, record.to_string()).unwrap();
@@ -8824,11 +8971,11 @@ Running 8 tests across 2 projects
             "the live replacement group must not be signalled"
         );
         assert!(
-            super::land_fence_path(dir, job).exists(),
+            super::land_fence_path(dir, job, 2).exists(),
             "the live replacement fence must not be unlinked"
         );
         // No certificate was derived for the replacement snapshot.
-        let cert = super::read_land_group_dead_cert(dir, job).expect("cert still present");
+        let cert = super::read_land_group_dead_cert(dir, job, 1).expect("cert still present");
         assert_eq!(cert["pgid"], json!(dead_pgid), "{cert}");
         assert_eq!(cert["generation"], json!(1), "{cert}");
 
@@ -8846,7 +8993,7 @@ Running 8 tests across 2 projects
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path();
         let job = "gjb_certunlink";
-        let cert = super::land_dead_cert_path(dir, job);
+        let cert = super::land_dead_cert_path(dir, job, 1);
         // The cert path is a non-empty DIRECTORY: remove_file fails with
         // IsADirectory/EISDIR, not NotFound.
         std::fs::create_dir_all(cert.join("inside")).unwrap();
@@ -8861,7 +9008,7 @@ Running 8 tests across 2 projects
         // The new fence was NOT written, so the grant failure is honest rather
         // than leaving the stale directory cert in place behind a new fence.
         assert!(
-            !super::land_fence_path(dir, job).exists(),
+            !super::land_fence_path(dir, job, 2).exists(),
             "the fence must not be written when the old cert cannot be removed"
         );
     }
@@ -8887,15 +9034,125 @@ Running 8 tests across 2 projects
             "a mismatched on-disk snapshot must not be certified"
         );
         assert!(
-            super::land_fence_path(dir, job).exists(),
+            super::land_fence_path(dir, job, 2).exists(),
             "the current fence stays"
         );
         assert!(
-            super::read_land_group_dead_cert(dir, job).is_none(),
+            super::read_land_group_dead_cert(dir, job, 1).is_none(),
             "no certificate may be written for the wrong snapshot"
         );
     }
 
+    /// r34 item 1 (HIGH): attempt-qualified IMMUTABLE fence/cert paths. Attempt
+    /// A's finalizer passes its own snapshot comparison and parks; attempt B
+    /// then installs its own fence for the same job (generation 2). When A
+    /// resumes it must write ONLY A's certificate (`dead-<job>-g1.json`),
+    /// unlink ONLY A's fence (`land-<job>-g1.json`), and leave B's LIVE
+    /// `land-<job>-g2.json` untouched. A's certificate must never be accepted
+    /// as death evidence for B's generation.
+    #[test]
+    fn a_detached_finalizer_cannot_touch_a_newer_attempts_fence_or_certify_it() {
+        let _seq = proc_lock();
+        let dir = tempfile::TempDir::new().unwrap();
+        let dirp = dir.path();
+        let job = "gjb_r34_attempts";
+        let pgid_a = 4141;
+        let pgid_b = 4242;
+        // Attempt A fence (gen 1).
+        super::write_land_fence(dirp, job, 1, pgid_a, &super::LeaderIdentity::StartTick(7))
+            .unwrap();
+        let observed_a = serde_json::json!({
+            "jobId": job, "generation": 1, "pgid": pgid_a, "startTick": 7
+        });
+
+        // Arm the post-compare park and start A's finalizer in a thread.
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        super::arm_certify_compare_hold(Arc::new(CleanupHold {
+            entered: entered.clone(),
+            release: release.clone(),
+        }));
+        let dir_owned = dirp.to_path_buf();
+        let observed_owned = observed_a.clone();
+        let handle = std::thread::spawn(move || {
+            super::certify_dead_and_remove_fence(&dir_owned, &observed_owned, pgid_a)
+        });
+        // Wait until A passed the compare and is parked pre-unlink.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !entered.load(std::sync::atomic::Ordering::Acquire) {
+            assert!(std::time::Instant::now() < deadline, "A never parked");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Attempt B installs its own attempt-qualified fence while A is parked.
+        super::write_land_fence(dirp, job, 2, pgid_b, &super::LeaderIdentity::StartTick(22))
+            .unwrap();
+        let b_fence = super::land_fence_path(dirp, job, 2);
+        let b_fence_before = std::fs::read_to_string(&b_fence).unwrap();
+        assert!(b_fence_before.contains("\"generation\":2"));
+
+        // Resume A.
+        {
+            let (lock, cvar) = &*release;
+            let mut done = lock.lock().unwrap();
+            *done = true;
+            cvar.notify_all();
+        }
+        let certified = handle.join().expect("finalizer thread panicked").unwrap();
+        assert!(certified, "A certifies its own (gen1) attempt");
+
+        // B's LIVE fence survives untouched.
+        assert!(
+            b_fence.is_file(),
+            "A's finalizer deleted the newer attempt B's live fence"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&b_fence).unwrap(),
+            b_fence_before,
+            "B's fence content must be byte-identical"
+        );
+        // A's own fence is removed, its cert written attempt-qualified.
+        assert!(
+            !super::land_fence_path(dirp, job, 1).is_file(),
+            "A's fence removed"
+        );
+        assert!(
+            super::land_dead_cert_path(dirp, job, 1).is_file(),
+            "A's gen1 cert written"
+        );
+
+        // A's gen1 certificate NEVER certifies attempt B (gen 2).
+        assert!(
+            super::read_land_group_dead_cert(dirp, job, 2).is_none(),
+            "A's certificate must not be accepted as B's death evidence"
+        );
+        assert!(
+            super::read_land_group_dead_cert(dirp, job, 1).is_some(),
+            "A's certificate is valid for A's own generation"
+        );
+        // Attempt B's ledger liveness still reads MayPush (its fence is live).
+        assert_eq!(
+            super::land_ledger_liveness(dirp, job, Some(2)),
+            super::LandPushLiveness::MayPush
+        );
+        // Attempt A reads VerifiedDead from its own cert.
+        assert_eq!(
+            super::land_ledger_liveness(dirp, job, Some(1)),
+            super::LandPushLiveness::VerifiedDead
+        );
+        // A legacy unsuffixed probe (no generation pinned) stays Unknown.
+        assert_eq!(
+            super::land_ledger_liveness(dirp, job, None),
+            super::LandPushLiveness::Unknown
+        );
+    }
+
+    /// r34 item 2 (medium): while the OWNER is still registered (slow
+    /// finalization / lane not yet released), an ESRCH-dead land group must
+    /// NOT be attested Absent — requeuing then would race the next dispatch
+    /// into a held lane (lane-busy -> spurious Failed). Liveness stays Unknown
+    /// until the owner unregisters; the attempt-qualified durable certificate
+    /// then attests VerifiedDead. A different registered generation also reads
+    /// Unknown.
     #[test]
     fn record_land_group_fails_when_the_fence_dir_cannot_be_written() {
         let _seq = proc_lock();
@@ -8958,22 +9215,22 @@ Running 8 tests across 2 projects
         let dir = registry.land_fence_dir.clone();
         std::fs::create_dir_all(&dir).unwrap();
         let job = "gjb_liveness";
-        let fence = super::land_fence_path(&dir, job);
-        let cert = super::land_dead_cert_path(&dir, job);
+        let fence = super::land_fence_path(&dir, job, 1);
+        let cert = super::land_dead_cert_path(&dir, job, 1);
         let _ = std::fs::remove_file(&fence);
         let _ = std::fs::remove_file(&cert);
 
         // Nothing on disk: Unknown — never a death attestation.
-        assert_eq!(registry.land_push_liveness(job).await, Unknown);
+        assert_eq!(registry.land_push_liveness(job, Some(1)).await, Unknown);
 
         // A malformed fence ledger is still a PRESENT ledger: may push.
         std::fs::write(&fence, b"not json").unwrap();
-        assert_eq!(registry.land_push_liveness(job).await, MayPush);
+        assert_eq!(registry.land_push_liveness(job, Some(1)).await, MayPush);
 
         // Ledger gone, malformed cert: Unknown.
         std::fs::remove_file(&fence).unwrap();
         std::fs::write(&cert, b"not json").unwrap();
-        assert_eq!(registry.land_push_liveness(job).await, Unknown);
+        assert_eq!(registry.land_push_liveness(job, Some(1)).await, Unknown);
 
         // Cert present but missing its leader identity: Unknown.
         std::fs::write(
@@ -8981,18 +9238,21 @@ Running 8 tests across 2 projects
             br#"{"jobId":"gjb_liveness","generation":1,"pgid":12345}"#,
         )
         .unwrap();
-        assert_eq!(registry.land_push_liveness(job).await, Unknown);
+        assert_eq!(registry.land_push_liveness(job, Some(1)).await, Unknown);
 
         // Cert naming a different job never proves THIS job dead.
         let foreign =
             serde_json::json!({"jobId":"gjb_other","generation":1,"pgid":1,"startTick":7});
         super::write_land_group_dead_cert(&dir, &foreign, 1).unwrap();
-        assert_eq!(registry.land_push_liveness(job).await, Unknown);
+        assert_eq!(registry.land_push_liveness(job, Some(1)).await, Unknown);
 
         // A complete certificate for the exact job: VerifiedDead.
         let own = serde_json::json!({"jobId":job,"generation":1,"pgid":12345,"startTick":42});
         super::write_land_group_dead_cert(&dir, &own, 12345).unwrap();
-        assert_eq!(registry.land_push_liveness(job).await, VerifiedDead);
+        assert_eq!(
+            registry.land_push_liveness(job, Some(1)).await,
+            VerifiedDead
+        );
     }
 
     /// r16 item 2 end-to-end through the read-only `gate.resolveLanding` RPC:
@@ -9029,13 +9289,50 @@ Running 8 tests across 2 projects
             "{reply}"
         );
 
-        // A valid death certificate for the exact job attests VerifiedDead, so
-        // the non-ancestry result settles `absent` with the remote base sha.
+        // r34 item 1: a probe WITHOUT the attempt generation stays Unknown even
+        // when an attempt-qualified certificate exists (no cross-attempt
+        // evidence).
         let dir = fixture.node.gate_registry().land_fence_dir.clone();
         let record = serde_json::json!({
             "jobId": "gjb_deadprobe", "generation": 1, "pgid": 4242, "startTick": 99
         });
         super::write_land_group_dead_cert(&dir, &record, 4242).unwrap();
+        let reply = fixture
+            .node
+            .run_gate_resolve_landing(&params)
+            .await
+            .unwrap();
+        assert_eq!(
+            reply["status"],
+            json!("unknown"),
+            "no generation pinned: {reply}"
+        );
+        // A certificate for a DIFFERENT generation must not attest either.
+        let wrong_gen = serde_json::json!({
+            "jobId": "gjb_deadprobe",
+            "repoPath": fixture.lane.to_string_lossy(),
+            "baseBranch": "main",
+            "mergeSha": orphan,
+            "generation": 7,
+        });
+        let reply = fixture
+            .node
+            .run_gate_resolve_landing(&wrong_gen)
+            .await
+            .unwrap();
+        assert_eq!(
+            reply["status"],
+            json!("unknown"),
+            "wrong generation: {reply}"
+        );
+        // Pinning the exact attempt generation (1) settles absent.
+        let params = serde_json::json!({
+            "jobId": "gjb_deadprobe",
+            "repoPath": fixture.lane.to_string_lossy(),
+            "baseBranch": "main",
+            "mergeSha": orphan,
+            "generation": 1,
+        });
         let reply = fixture
             .node
             .run_gate_resolve_landing(&params)
@@ -9747,6 +10044,7 @@ head -c 1 >/dev/null || exit 4
             let merge_m = merge_m.clone();
             std::thread::spawn(move || {
                 let request = remuda_protocol::GateResolveLandingParams {
+                    generation: None,
                     job_id: job.into(),
                     repo_path: lane.to_string_lossy().into_owned(),
                     base_branch: "main".into(),
@@ -9819,6 +10117,7 @@ head -c 1 >/dev/null || exit 4
 
         let recover = |base: &'static str| {
             let request = remuda_protocol::GateResolveLandingParams {
+                generation: None,
                 job_id: "gjb_r30_rename".into(),
                 repo_path: lane.to_string_lossy().into_owned(),
                 base_branch: base.into(),
@@ -9896,6 +10195,7 @@ head -c 1 >/dev/null || exit 4
         );
         let before = refs_listing(&lane);
         let request = remuda_protocol::GateResolveLandingParams {
+            generation: None,
             job_id: "gjb_r31_map_absent".into(),
             repo_path: lane.to_string_lossy().into_owned(),
             base_branch: "main".into(),
@@ -9921,6 +10221,7 @@ head -c 1 >/dev/null || exit 4
         git(&lane, &["tag", "keep", &base_b]);
         let before = refs_listing(&lane);
         let request = remuda_protocol::GateResolveLandingParams {
+            generation: None,
             job_id: "gjb_r31_map_existing".into(),
             repo_path: lane.to_string_lossy().into_owned(),
             base_branch: "main".into(),
@@ -9941,6 +10242,7 @@ head -c 1 >/dev/null || exit 4
         git(&lane, &["update-ref", "refs/remotes/origin/gone", &base_b]);
         let before = refs_listing(&lane);
         let request = remuda_protocol::GateResolveLandingParams {
+            generation: None,
             job_id: "gjb_r31_prune".into(),
             repo_path: lane.to_string_lossy().into_owned(),
             base_branch: "main".into(),
@@ -10110,6 +10412,7 @@ head -c 1 >/dev/null || exit 4
         assert_ne!(sub_local, sub_remote);
 
         let request = remuda_protocol::GateResolveLandingParams {
+            generation: None,
             job_id: "gjb_r32_sub".into(),
             repo_path: lane.to_string_lossy().into_owned(),
             base_branch: "main".into(),
@@ -10291,6 +10594,7 @@ head -c 1 >/dev/null || exit 4
 
         // With death evidence: Absent, never Landed despite both planted grafts.
         let request = remuda_protocol::GateResolveLandingParams {
+            generation: None,
             job_id: "gjb_r33_plant".into(),
             repo_path: lane.to_string_lossy().into_owned(),
             base_branch: "main".into(),
@@ -10377,8 +10681,6 @@ head -c 1 >/dev/null || exit 4
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn every_production_recovery_invocation_carries_full_hardening() {
-        use std::sync::{Arc, Mutex};
-
         /// Re-run assertions over one recorded production recovery.
         fn assert_recorded_hardening(log: &[remuda_unix::RecordedGit]) {
             assert!(
@@ -10422,11 +10724,10 @@ head -c 1 >/dev/null || exit 4
             }
         }
 
-        let install = || {
-            let log: Arc<Mutex<Vec<remuda_unix::RecordedGit>>> = Arc::new(Mutex::new(Vec::new()));
-            remuda_unix::set_git_spawn_recorder(Some(log.clone()));
-            log
-        };
+        // r34 item 4: one RAII recorder scope for the whole test; each phase
+        // asserts only commands whose cwd is its fixture repo (parallel tests'
+        // subprocesses in other cwds are ignored; hardening is never filtered).
+        let recorder = remuda_unix::RecordingGuard::install();
 
         // (1) SUCCESS: real divergent-but-contained tip, death held -> Landed.
         let (dir, _bare, lane, _base) = recovery_branch_fixture("main", None);
@@ -10446,9 +10747,8 @@ head -c 1 >/dev/null || exit 4
         git(&seed, &["merge", "-q", "--no-ff", "-m", "D", &merge_m]);
         git(&seed, &["push", "-q", "origin", "main"]);
         let remote_d = git(&seed, &["rev-parse", "main"]);
-
-        let log = install();
         let request = remuda_protocol::GateResolveLandingParams {
+            generation: None,
             job_id: "gjb_r33_rec_ok".into(),
             repo_path: lane.to_string_lossy().into_owned(),
             base_branch: "main".into(),
@@ -10457,15 +10757,15 @@ head -c 1 >/dev/null || exit 4
         let reply = super::resolve_landing_after_restart(&request, true);
         assert_eq!(reply.status, "landed", "{reply:?}");
         assert_eq!(reply.base_sha.as_deref(), Some(remote_d.as_str()));
-        assert_recorded_hardening(&std::mem::take(&mut *log.lock().unwrap()));
+        assert_recorded_hardening(&recorder.for_repo(&lane));
 
         // (2) NEGATIVE ANCESTRY without death -> Unknown: an orphan commit the
         // advertised D cannot contain (the lane holds its objects locally, so
         // the fetch short-circuits but the real merge-base runs and fails).
         let orphan_tree = git(&lane, &["rev-parse", "HEAD^{tree}"]);
         let orphan = git(&lane, &["commit-tree", &orphan_tree, "-m", "orphan grant"]);
-        let log = install();
         let negative_request = remuda_protocol::GateResolveLandingParams {
+            generation: None,
             job_id: "gjb_r33_rec_negative".into(),
             repo_path: lane.to_string_lossy().into_owned(),
             base_branch: "main".into(),
@@ -10473,7 +10773,7 @@ head -c 1 >/dev/null || exit 4
         };
         let reply = super::resolve_landing_after_restart(&negative_request, false);
         assert_eq!(reply.status, "unknown", "{reply:?}");
-        assert_recorded_hardening(&std::mem::take(&mut *log.lock().unwrap()));
+        assert_recorded_hardening(&recorder.for_repo(&lane));
 
         // (3) OBJECT-FETCH FAILURE after successful listing: publish one more
         // tip E the lane genuinely lacks, then at the read seam swap to an
@@ -10509,10 +10809,10 @@ head -c 1 >/dev/null || exit 4
             ])
             .status()
             .unwrap();
-        let log = install();
         seam::arm(&lane, 1);
         let lane_t = lane.clone();
         let request_t = remuda_protocol::GateResolveLandingParams {
+            generation: None,
             job_id: "gjb_r33_rec_fetchfail".into(),
             repo_path: lane.to_string_lossy().into_owned(),
             base_branch: "main".into(),
@@ -10537,7 +10837,7 @@ head -c 1 >/dev/null || exit 4
                 .contains("object fetch"),
             "{reply:?}"
         );
-        assert_recorded_hardening(&std::mem::take(&mut *log.lock().unwrap()));
+        assert_recorded_hardening(&recorder.for_repo(&lane));
 
         // (4) SHALLOW: a depth-1 clone, an orphan commit -> Unknown naming the
         // shallow condition; every command (including the shallow check) is
@@ -10550,8 +10850,8 @@ head -c 1 >/dev/null || exit 4
         git(&lane2, &["config", "user.name", "T"]);
         let tree = git(&lane2, &["rev-parse", "origin/main^{tree}"]);
         let orphan = git(&lane2, &["commit-tree", &tree, "-m", "orphan"]);
-        let log = install();
         let request2 = remuda_protocol::GateResolveLandingParams {
+            generation: None,
             job_id: "gjb_r33_rec_shallow".into(),
             repo_path: lane2.to_string_lossy().into_owned(),
             base_branch: "main".into(),
@@ -10563,9 +10863,8 @@ head -c 1 >/dev/null || exit 4
             reply.error.as_deref().unwrap_or("").contains("shallow"),
             "{reply:?}"
         );
-        assert_recorded_hardening(&std::mem::take(&mut *log.lock().unwrap()));
+        assert_recorded_hardening(&recorder.for_repo(&lane2));
 
-        remuda_unix::set_git_spawn_recorder(None);
         let _ = remote_r;
         let _ = lane_t;
     }
@@ -10614,6 +10913,7 @@ head -c 1 >/dev/null || exit 4
         // Recovery fetches R's objects (R is the real tip; M's objects are
         // already local from the lane's own commit).
         let request = remuda_protocol::GateResolveLandingParams {
+            generation: None,
             job_id: "gjb_r32_repl".into(),
             repo_path: lane.to_string_lossy().into_owned(),
             base_branch: "main".into(),
@@ -10719,6 +11019,7 @@ head -c 1 >/dev/null || exit 4
         let before = refs_listing(&lane);
 
         let request = remuda_protocol::GateResolveLandingParams {
+            generation: None,
             job_id: "gjb_r30_tagclobber".into(),
             repo_path: lane.to_string_lossy().into_owned(),
             base_branch: "main".into(),
@@ -10760,6 +11061,7 @@ head -c 1 >/dev/null || exit 4
 
         // (a) Base not advertised by the remote at all.
         let request = remuda_protocol::GateResolveLandingParams {
+            generation: None,
             job_id: "gjb_r30_nobase".into(),
             repo_path: lane.to_string_lossy().into_owned(),
             base_branch: "no-such-base-r30".into(),
@@ -10788,6 +11090,7 @@ head -c 1 >/dev/null || exit 4
             ],
         );
         let request = remuda_protocol::GateResolveLandingParams {
+            generation: None,
             job_id: "gjb_r30_nohost".into(),
             repo_path: lane.to_string_lossy().into_owned(),
             base_branch: "main".into(),
@@ -10845,6 +11148,7 @@ head -c 1 >/dev/null || exit 4
         let merge_t = merge_m.clone();
         let probe = std::thread::spawn(move || {
             let request = remuda_protocol::GateResolveLandingParams {
+                generation: None,
                 job_id: "gjb_r31_fetchfail".into(),
                 repo_path: lane_t.to_string_lossy().into_owned(),
                 base_branch: "main".into(),
@@ -11004,6 +11308,7 @@ head -c 1 >/dev/null || exit 4
         let before = refs_listing(&lane);
 
         let request = remuda_protocol::GateResolveLandingParams {
+            generation: None,
             job_id: "gjb_r30_sha256".into(),
             repo_path: lane.to_string_lossy().into_owned(),
             base_branch: "main".into(),

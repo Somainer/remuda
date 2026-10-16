@@ -4373,6 +4373,9 @@ async fn probe_landing_outcome(state: &AppState, job: &GateJob) -> LandingProbe 
         repo_path: lane.repo_path.clone(),
         base_branch: project.default_base_branch.clone(),
         merge_sha,
+        // This test helper intentionally takes the conservative path (it
+        // asserts Unknown regardless); it does not pin an attempt generation.
+        generation: None,
     })
     .unwrap_or(Value::Null);
     let reply = state

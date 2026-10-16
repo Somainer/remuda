@@ -582,25 +582,163 @@ fn clear_disagreeing_recovered_turn_keys(conn: &Connection) -> rusqlite::Result<
 /// and the replay carries the native timestamp/revision the read model uses;
 /// keeping the older durable row would silently change the fold and the
 /// native-time windows.
+/// One recovered turn row participating in lineage collapse, ordered by live
+/// authority (highest revision, then seq/rowid) within its partition.
+struct CollapseTurnRow {
+    rowid: i64,
+    #[allow(dead_code)]
+    revision: i64,
+    total: Option<i64>,
+    input: Option<i64>,
+    output: Option<i64>,
+    cache_read: Option<i64>,
+    cache_write: Option<i64>,
+    cost: Option<String>,
+    observed_at: String,
+    observed_at_source: String,
+}
+
+/// Within one turn lineage `(instance_id, scope_id, COALESCE(source_session_id,
+/// '')) reconcile duplicate recovered rows using EXACTLY the live insertion
+/// rule (r39 item 1 / AA1, c-ctxusage r16):
+///
+/// * the surviving row is the strictly-highest `metric_revision`; `seq` (then
+///   rowid) only breaks ties of EQUAL revision — a later-ingestion STALE replay
+///   at a lower revision never wins (the read folds and live upsert then agree,
+///   so the established watermark cannot regress);
+/// * buckets/cost merge into the winner the way the live upsert does: a value
+///   the winner reported wins, and a bucket the newer winner did NOT report is
+///   retained from the best lower-revision row (a newer partial frame never
+///   erases a known bucket); a winner-unreported total derives from the merged
+///   all-known basket (U1);
+/// * an ingest clock never replaces a retained native timestamp.
 fn collapse_duplicate_turn_lineage_rows(conn: &Connection) -> rusqlite::Result<usize> {
+    let mut stmt = conn.prepare(
+        "SELECT rowid, metric_revision, total_tokens, input_tokens, output_tokens,
+                cache_read_tokens, cache_write_tokens, cost_usd,
+                observed_at, observed_at_source
+         FROM usage_events
+         WHERE scope = 'turn' AND scope_id IS NOT NULL
+         ORDER BY instance_id, scope_id, COALESCE(source_session_id, ''),
+                  metric_revision DESC, seq DESC, rowid DESC",
+    )?;
+    let ordered: Vec<CollapseTurnRow> = stmt
+        .query_map([], |r| {
+            Ok(CollapseTurnRow {
+                rowid: r.get(0)?,
+                revision: r.get(1)?,
+                total: r.get(2)?,
+                input: r.get(3)?,
+                output: r.get(4)?,
+                cache_read: r.get(5)?,
+                cache_write: r.get(6)?,
+                cost: r.get(7)?,
+                observed_at: r.get(8)?,
+                observed_at_source: r.get(9)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    let mut keys = conn.prepare(
+        "SELECT instance_id, scope_id, COALESCE(source_session_id, '')
+         FROM usage_events
+         WHERE scope = 'turn' AND scope_id IS NOT NULL
+         ORDER BY instance_id, scope_id, COALESCE(source_session_id, ''),
+                  metric_revision DESC, seq DESC, rowid DESC",
+    )?;
+    let keyed: Vec<(String, String, String)> = keys
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(keys);
+
+    let mut deleted = 0usize;
+    let mut cur: Option<(String, String, String)> = None;
+    let mut group: Vec<CollapseTurnRow> = Vec::new();
+    for (row, key) in ordered.into_iter().zip(keyed) {
+        if Some(&key) != cur.as_ref() {
+            deleted += collapse_one_turn_lineage(conn, &mut group)?;
+            cur = Some(key);
+        }
+        group.push(row);
+    }
+    deleted += collapse_one_turn_lineage(conn, &mut group)?;
+    Ok(deleted)
+}
+
+/// Merge one authority-ordered lineage group (winner first, losers following)
+/// into the winner row, then delete the losers. Returns the deleted count.
+fn collapse_one_turn_lineage(
+    conn: &Connection,
+    group: &mut Vec<CollapseTurnRow>,
+) -> rusqlite::Result<usize> {
+    if group.len() <= 1 {
+        group.clear();
+        return Ok(0);
+    }
+    let w = group.remove(0);
+    // Fill only buckets the winner did NOT report, from the first
+    // lower-authority row carrying each (group is in descending authority).
+    let pick = |w_val: Option<i64>, col: fn(&CollapseTurnRow) -> Option<i64>| {
+        w_val.or_else(|| group.iter().find_map(col))
+    };
+    let input = pick(w.input, |r| r.input);
+    let output = pick(w.output, |r| r.output);
+    let cache_read = pick(w.cache_read, |r| r.cache_read);
+    let cache_write = pick(w.cache_write, |r| r.cache_write);
+    // A winner-reported total stays authoritative; otherwise derive from the
+    // merged basket only when every basket is known (U1).
+    let baskets = [input, output, cache_read, cache_write];
+    let derived = baskets
+        .iter()
+        .all(Option::is_some)
+        .then(|| {
+            baskets
+                .iter()
+                .flatten()
+                .copied()
+                .reduce(i64::saturating_add)
+        })
+        .flatten();
+    let total = w.total.or(derived);
+    let cost = w.cost.or_else(|| group.iter().find_map(|r| r.cost.clone()));
+    // An ingest clock never replaces a retained native time.
+    let native_loser = group.iter().find(|r| r.observed_at_source == "native");
+    let (observed_at, observed_at_source) =
+        if w.observed_at_source == "native" || native_loser.is_none() {
+            (w.observed_at, w.observed_at_source)
+        } else {
+            let n = native_loser.unwrap();
+            (n.observed_at.clone(), n.observed_at_source.clone())
+        };
     conn.execute(
-        "DELETE FROM usage_events
-         WHERE scope = 'turn'
-           AND scope_id IS NOT NULL
-           AND rowid NOT IN (
-               SELECT rowid FROM (
-                   SELECT rowid, ROW_NUMBER() OVER (
-                       PARTITION BY instance_id, scope_id,
-                                    COALESCE(source_session_id, '')
-                       ORDER BY seq DESC, rowid DESC
-                   ) AS lineage_winner
-                   FROM usage_events
-                   WHERE scope = 'turn' AND scope_id IS NOT NULL
-               )
-               WHERE lineage_winner = 1
-           )",
-        [],
-    )
+        "UPDATE usage_events
+         SET total_tokens = ?1, input_tokens = ?2, output_tokens = ?3,
+             cache_read_tokens = ?4, cache_write_tokens = ?5,
+             cost_usd = ?6, observed_at = ?7, observed_at_source = ?8
+         WHERE rowid = ?9",
+        params![
+            total,
+            input,
+            output,
+            cache_read,
+            cache_write,
+            cost,
+            observed_at,
+            observed_at_source,
+            w.rowid
+        ],
+    )?;
+    let losers: Vec<i64> = group.iter().map(|r| r.rowid).collect();
+    let n = losers.len();
+    conn.execute(
+        &format!(
+            "DELETE FROM usage_events WHERE rowid IN ({})",
+            losers.iter().map(|_| "?").collect::<Vec<_>>().join(",")
+        ),
+        rusqlite::params_from_iter(losers),
+    )?;
+    group.clear();
+    Ok(n)
 }
 
 /// Collapse rows that became exact duplicates after the retained-journal
@@ -10963,6 +11101,228 @@ mod tests {
             rollup.session_input_tokens,
             Some(150),
             "rev 101 wins, not 250"
+        );
+    }
+
+    /// r39 item 1 (AA1), stale replay: recovery collapse must use the LIVE
+    /// revision authority, never "highest ingestion seq wins". An established
+    /// r28 rev100/100 row survives a later fallback-seq rev99/50 historical
+    /// replay even though the replay lands at seq 2.
+    #[test]
+    fn recovered_turn_collapse_keeps_the_higher_revision_over_a_later_stale_replay() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_r28_usage_table_with_turn_index(&conn);
+        create_journal_table(&conn);
+        // Established row: seq1 rev100 input100.
+        conn.execute(
+            "INSERT INTO usage_events
+                (instance_id, seq, profile_id, model, scope, scope_id, mode,
+                 metric_revision, source_session_id, total_tokens, input_tokens,
+                 output_tokens, cache_read_tokens, cache_write_tokens,
+                 accounting, observed_at, observed_at_source)
+             VALUES ('ins_r39i1a', 1, 'pvp', 'm', 'turn', 'msg-T', 'snapshot',
+                 100, 'sess-S', 100, 100, 0, 0, 0,
+                 'estimated', '2026-10-01T00:00:00.000Z', 'native')",
+            [],
+        )
+        .unwrap();
+        // Fallback row at seq2 (14-column shape): stale rev99 input50.
+        conn.execute(
+            "INSERT INTO usage_events
+                (instance_id, seq, profile_id, model, scope, mode, total_tokens,
+                 input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                 accounting, observed_at)
+             VALUES ('ins_r39i1a', 2, 'pvp', 'm', 'turn', 'snapshot', 50,
+                 50, 0, 0, 0,
+                 'estimated', '2026-10-01T00:00:02.000Z')",
+            [],
+        )
+        .unwrap();
+        let journal_turn = |revision: i64, input: i64, stamp: &str| {
+            json!({
+                "kind": "usage",
+                "nativeAt": {"state": "known", "value": stamp},
+                "source": {
+                    "nativeSessionId": {"state": "known", "value": "sess-S"},
+                    "nativeTurnId": {"state": "known", "value": "msg-T"}
+                },
+                "payload": {
+                    "scope": "turn",
+                    "scopeId": "msg-T",
+                    "mode": "snapshot",
+                    "metricRevision": revision.to_string(),
+                    "accounting": "estimated",
+                    "inputTokens": {"state": "known", "value": input.to_string()},
+                    "outputTokens": {"state": "known", "value": "0"},
+                    "cacheReadTokens": {"state": "known", "value": "0"},
+                    "cacheWriteTokens": {"state": "known", "value": "0"},
+                    "totalTokens": {"state": "known", "value": input.to_string()}
+                }
+            })
+        };
+        for (seq, rev, input, stamp) in [
+            (1i64, 100i64, 100i64, "2026-10-01T00:00:00.000Z"),
+            (2, 99, 50, "2026-10-01T00:00:02.000Z"),
+        ] {
+            conn.execute(
+                "INSERT INTO journal (instance_id, seq, event_id, payload_json, observed_at)
+                 VALUES ('ins_r39i1a', ?1, ?2, ?3, ?4)",
+                params![
+                    seq,
+                    format!("je{seq}"),
+                    journal_turn(rev, input, stamp).to_string(),
+                    stamp
+                ],
+            )
+            .unwrap();
+        }
+
+        migrate(&conn).unwrap();
+
+        let (count, revision, input): (i64, i64, Option<i64>) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(metric_revision), MAX(input_tokens)
+                 FROM usage_events WHERE instance_id='ins_r39i1a' AND scope='turn'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "one turn survives");
+        assert_eq!(revision, 100, "the higher REVISION wins, regardless of seq");
+        assert_eq!(
+            input,
+            Some(100),
+            "the stale rev99/50 replay never replaces it"
+        );
+    }
+
+    /// r39 item 1 (AA1), partial newer frame: the winning higher-revision
+    /// snapshot may omit buckets the older row knew; collapse must merge them
+    /// exactly like the live upsert (incoming reported wins, gaps retained),
+    /// never retain one raw snapshot wholesale.
+    #[test]
+    fn recovered_turn_collapse_merges_known_buckets_into_a_newer_partial_frame() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_r28_usage_table_with_turn_index(&conn);
+        create_journal_table(&conn);
+        // Complete rev100 frame: input100, cache read 50, total 150.
+        conn.execute(
+            "INSERT INTO usage_events
+                (instance_id, seq, profile_id, model, scope, scope_id, mode,
+                 metric_revision, source_session_id, total_tokens, input_tokens,
+                 output_tokens, cache_read_tokens, cache_write_tokens,
+                 accounting, observed_at, observed_at_source)
+             VALUES ('ins_r39i1b', 1, 'pvp', 'm', 'turn', 'msg-P', 'snapshot',
+                 100, 'sess-S', 150, 100, 0, 50, 0,
+                 'estimated', '2026-10-01T00:00:00.000Z', 'native')",
+            [],
+        )
+        .unwrap();
+        // Newer rev101 frame through the fallback path reports ONLY input 100:
+        // every other bucket and the total are unreported (NULL).
+        conn.execute(
+            "INSERT INTO usage_events
+                (instance_id, seq, profile_id, model, scope, mode, input_tokens,
+                 accounting, observed_at)
+             VALUES ('ins_r39i1b', 2, 'pvp', 'm', 'turn', 'snapshot', 100,
+                 'estimated', '2026-10-01T00:00:02.000Z')",
+            [],
+        )
+        .unwrap();
+        let journal_full = json!({
+            "kind": "usage",
+            "nativeAt": {"state": "known", "value": "2026-10-01T00:00:00.000Z"},
+            "source": {
+                "nativeSessionId": {"state": "known", "value": "sess-S"},
+                "nativeTurnId": {"state": "known", "value": "msg-P"}
+            },
+            "payload": {
+                "scope": "turn",
+                "scopeId": "msg-P",
+                "mode": "snapshot",
+                "metricRevision": "100",
+                "accounting": "estimated",
+                "inputTokens": {"state": "known", "value": "100"},
+                "outputTokens": {"state": "known", "value": "0"},
+                "cacheReadTokens": {"state": "known", "value": "50"},
+                "cacheWriteTokens": {"state": "known", "value": "0"},
+                "totalTokens": {"state": "known", "value": "150"}
+            }
+        });
+        let journal_partial = json!({
+            "kind": "usage",
+            "nativeAt": {"state": "known", "value": "2026-10-01T00:00:02.000Z"},
+            "source": {
+                "nativeSessionId": {"state": "known", "value": "sess-S"},
+                "nativeTurnId": {"state": "known", "value": "msg-P"}
+            },
+            "payload": {
+                "scope": "turn",
+                "scopeId": "msg-P",
+                "mode": "snapshot",
+                "metricRevision": "101",
+                "accounting": "estimated",
+                "inputTokens": {"state": "known", "value": "100"}
+            }
+        });
+        conn.execute(
+            "INSERT INTO journal (instance_id, seq, event_id, payload_json, observed_at)
+             VALUES ('ins_r39i1b', 1, 'je1', ?1, '2026-10-01T00:00:00.000Z'),
+                    ('ins_r39i1b', 2, 'je2', ?2, '2026-10-01T00:00:02.000Z')",
+            params![journal_full.to_string(), journal_partial.to_string()],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let row: (i64, i64, Option<i64>, Option<i64>, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(metric_revision),
+                        MAX(input_tokens), MAX(output_tokens),
+                        MAX(cache_read_tokens), MAX(cache_write_tokens)
+                 FROM usage_events WHERE instance_id='ins_r39i1b' AND scope='turn'",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let (count, revision, input, output, cache_read, cache_write) = row;
+        assert_eq!(count, 1, "one turn survives");
+        assert_eq!(revision, 101, "the newer revision is the winner");
+        assert_eq!(input, Some(100));
+        assert_eq!(
+            output,
+            Some(0),
+            "the newer partial keeps the older known bucket"
+        );
+        assert_eq!(
+            cache_read,
+            Some(50),
+            "known cache read survives the partial frame"
+        );
+        assert_eq!(cache_write, Some(0));
+        // U1: the merged all-known basket derives the total the partial frame
+        // did not report: 100 + 0 + 50 + 0 = 150.
+        let total: Option<i64> = conn
+            .query_row(
+                "SELECT total_tokens FROM usage_events
+                 WHERE instance_id='ins_r39i1b' AND scope='turn'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            total,
+            Some(150),
+            "total derives from the merged known basket"
         );
     }
 

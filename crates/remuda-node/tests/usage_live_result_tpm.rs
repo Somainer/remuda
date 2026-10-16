@@ -293,6 +293,115 @@ fn two_result_only_frames_bill_the_latest_cumulative_session_cost_once() {
     );
 }
 
+/// r39 item 4 (AA3): cost presence is independent of token presence. A
+/// token-bearing result under model A ($0.01), followed by a /model switch and
+/// a COST-ONLY result under model B ($0.03), must leave B a provider row with
+/// the reported bill and Unknown token buckets — the Ruling-B flow override
+/// must not hide the cost-only carrier, and A keeps its own tokens and bill.
+#[test]
+fn a_cost_only_result_after_a_model_switch_still_bills_the_new_model() {
+    let mut mapper = StdoutMapper::new(DriverKind::ClaudePrint, "sess");
+    // Result 1: tokens + cumulative $0.01.
+    let first = mapper
+        .map(serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "num_turns": 1,
+            "result_index": 0,
+            "stop_reason": "end_turn",
+            "total_cost_usd": 0.01,
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0
+            }
+        }))
+        .expect("result 1 maps");
+    // Result 2 after the configure/model switch: cost-only, cumulative $0.03.
+    let second = mapper
+        .map(serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "num_turns": 2,
+            "result_index": 1,
+            "stop_reason": "end_turn",
+            "total_cost_usd": 0.03
+        }))
+        .expect("result 2 maps");
+
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate(&conn).unwrap();
+    let mut seq = 0i64;
+    let mut put = |obs: &Observation, model: &str| {
+        seq += 1;
+        let record = JournalRecord {
+            instance_id: "ins_model_switch".into(),
+            seq,
+            event_id: format!("evt_switch_{seq}"),
+            observed_at: "2026-10-13T00:00:00.000Z".into(),
+            event: serde_json::to_value(obs).unwrap(),
+        };
+        // The Hub projects with the instance's CURRENT (post-switch) model.
+        let Some(row) = project_usage_event(&record, Some("pvp_switch"), Some(model)) else {
+            return;
+        };
+        insert_usage_event(&conn, &row).unwrap();
+    };
+    for obs in &first {
+        put(obs, "model-a");
+    }
+    for obs in &second {
+        put(obs, "model-b");
+    }
+
+    // Model A owns the token-bearing Turn and its 0.01 snapshot.
+    let supply_a = aggregate_supply(&conn, "pvp_switch", "model-a").unwrap();
+    assert_eq!(
+        supply_a.input_tokens,
+        Some(100),
+        "A keeps its token contribution"
+    );
+    assert!(supply_a.events >= 1);
+    assert!(
+        (supply_a.cost_usd.unwrap_or(-1.0) - 0.01).abs() < 1e-9,
+        "A carries its reported 0.01 snapshot, got {:?}",
+        supply_a.cost_usd
+    );
+
+    // Model B has only the cost-only carrier: a visible row, bill present,
+    // every token bucket Unknown.
+    let supply_b = aggregate_supply(&conn, "pvp_switch", "model-b").unwrap();
+    assert!(
+        supply_b.events >= 1,
+        "cost-only reported authority emits a provider row"
+    );
+    assert!(
+        (supply_b.cost_usd.unwrap_or(-1.0) - 0.03).abs() < 1e-9,
+        "B shows the cumulative 0.03 bill, got {:?}",
+        supply_b.cost_usd
+    );
+    assert_eq!(supply_b.total_tokens, None, "B reported no tokens");
+    assert_eq!(
+        supply_b.input_tokens, None,
+        "B token fields stay Unknown, not zero"
+    );
+    assert_eq!(supply_b.output_tokens, None);
+    assert_eq!(
+        format!("{:?}", supply_b.budget_status(Some(0.02))),
+        "Stop",
+        "the 0.03 B bill Stops a 0.02 model budget"
+    );
+
+    // The instance bill is the latest cumulative reported value.
+    let agg = aggregate_instance(&conn, "ins_model_switch").unwrap();
+    assert!(
+        (agg.cost_usd.unwrap_or(-1.0) - 0.03).abs() < 1e-9,
+        "instance bills the newest cumulative 0.03, got {:?}",
+        agg.cost_usd
+    );
+}
+
 /// the assistant (rev 1) and message_delta (rev 2) frames, and the following
 /// result's Turn is suppressed as a re-sum. Those per-call observations must
 /// carry the frame RECEIPT time as `nativeAt` — otherwise the only surviving

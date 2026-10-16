@@ -69,12 +69,16 @@ export type MachineDeps = {
    */
   isFollowLive: () => boolean;
   /**
-   * Whether a follow is BOUND to the current binding (false on the session
-   * list / new-session page, where no follow socket exists). A quiet stale
-   * probe that succeeds while UNBOUND certifies the link itself — there is no
-   * follow to reopen, and running the resume action would issue a SECOND GET
-   * whose tail could cross the carried stale deadline and publish a false
-   * offline (c-unboundresume r2 item 2).
+   * Whether follow recovery is OWED for the current binding: a mounted follow
+   * OR a pending session target whose first journal lookup has not resolved
+   * yet (store: boundTo set, boundJournal null). False only on the session
+   * list / new-session page with no session target, where no follow socket
+   * exists or is expected. A quiet stale probe that succeeds while unowned
+   * certifies the link itself — there is no follow to reopen, and running the
+   * resume action would issue a SECOND GET whose tail could cross the carried
+   * stale deadline and publish a false offline (c-unboundresume r2 item 2).
+   * A pending target must instead keep quiet-reopening until its real
+   * seed/subscribe completes (r3 item 1).
    */
   isFollowBound: () => boolean;
   schedule?: Scheduler;

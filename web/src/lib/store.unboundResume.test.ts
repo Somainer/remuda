@@ -55,6 +55,7 @@ async function bootUnbound(): Promise<{
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.useRealTimers();
   localStorage.removeItem(OUTBOX_LS_KEY);
 });
 
@@ -148,6 +149,103 @@ it("unbound resume publishes live only after exactly one successful bounded prob
   // Exactly one reachability probe gates live; no second, parallel auth read.
   expect(list).toHaveBeenCalledTimes(1);
 
+  hubStore.logout();
+});
+
+it("r3 item 1: a pending session target is never certified live by successful list probes; follow recovery must seed+subscribe first", async () => {
+  const { api, hubStore, list } = await bootUnbound();
+  const PENDING = "ins_pending_target";
+  const JOURNAL = "obj_pending_target_journal";
+
+  // Every LIST probe answers (REST reachable), but the pending session's own
+  // lookup fails twice and only the third recovery attempt resolves it.
+  list.mockResolvedValue({ items: [], nextCursor: null });
+  const instanceGet = vi.spyOn(api, "instanceGet");
+  instanceGet.mockReset();
+  let lookupCalls = 0;
+  instanceGet.mockImplementation(() => {
+    lookupCalls += 1;
+    if (lookupCalls < 3) return Promise.reject(new RestNetworkError("lookup ECONNRESET"));
+    return Promise.resolve({
+      id: PENDING,
+      journalId: JOURNAL,
+      revision: "0",
+      durableSeq: "0",
+      lifecycle: "running",
+    } as Awaited<ReturnType<Api["instanceGet"]>>);
+  });
+  vi.spyOn(api, "eventsRead").mockResolvedValue({
+    events: [],
+    durableSeq: "0",
+    windowFromSeq: null,
+    reachedAfterSeq: true,
+  });
+  const subscribe = vi.spyOn(api, "eventsSubscribe").mockImplementation(
+    (async () => ({
+      subscriptionId: "sub_pending_target",
+      journalId: JOURNAL,
+      durableSeq: "0",
+      windowFromSeq: null,
+      reachedAfterSeq: true,
+      getReadyState: () => 1,
+      snapshot: {
+        projectionVersion: "v1",
+        projectionEpoch: "epoch_pending_target",
+        asOfSeq: "0",
+        instance: {} as never,
+        runs: [],
+        commands: [],
+        pendingInteractions: [],
+        nodes: [],
+        history: { earliestRetainedSeq: "0", complete: true },
+      },
+    })) as Api["eventsSubscribe"],
+  );
+
+  // Machine timers run on fake time (15 s stale probe, 30 s episode deadline).
+  vi.useFakeTimers();
+  const flush = async (rounds = 30) => {
+    for (let i = 0; i < rounds; i += 1) await vi.advanceTimersByTimeAsync(0);
+  };
+  const tickUntil = async (pred: () => boolean) => {
+    for (let i = 0; i < 60; i += 1) {
+      if (pred()) return true;
+      await vi.advanceTimersByTimeAsync(1_000);
+    }
+    return pred();
+  };
+  const states: string[] = [];
+  hubStore.subscribe(() => states.push(hubStore.getSnapshot().connection));
+
+  // A session page whose initial follow lookup failed: foreground resume
+  // records a PENDING target (boundTo=id, boundJournal=null).
+  hubStore.resumeActive(PENDING);
+  await flush();
+  // The resume lookup failed and the settlement list probe succeeded ->
+  // quiet stale, NOT live.
+  expect(lookupCalls).toBe(1);
+  expect(hubStore.getSnapshot().connection).toBe("stale");
+  expect(states).not.toContain("live");
+
+  // Timer-driven recovery cycles: the stale probes keep answering ok. A
+  // pending target must run follow recovery (instanceGet retried); it must
+  // NEVER take the unbound probe's direct-live certification.
+  expect(await tickUntil(() => lookupCalls >= 2)).toBe(true);
+  await flush();
+  expect(hubStore.getSnapshot().connection).not.toBe("live");
+  expect(states).not.toContain("live");
+  expect(subscribe).not.toHaveBeenCalled();
+  const statesBeforeMount = [...states];
+
+  // The third lookup resolves: a real seed + subscribe completes the mount,
+  // and only THEN may the machine publish live.
+  expect(await tickUntil(() => subscribe.mock.calls.length >= 1)).toBe(true);
+  await flush();
+  expect(hubStore.getSnapshot().connection).toBe("live");
+  expect(statesBeforeMount).not.toContain("live");
+  expect(lookupCalls).toBeGreaterThanOrEqual(3);
+
+  vi.useRealTimers();
   hubStore.logout();
 });
 

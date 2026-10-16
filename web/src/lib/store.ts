@@ -3073,9 +3073,14 @@ class HubStore {
       resume: () => this.resumeConnection(),
       probe: () => this.connectionProbe(),
       isFollowLive: () => this.followSocketLive(),
-      // c-unboundresume r2 item 2: the unbound quiet-stale probe certifies
-      // without a follow-reopen resume (no second reachability GET).
-      isFollowBound: () => this.connectionBoundJournal !== null,
+      // c-unboundresume r2 item 2 / r3 item 1: the genuinely-unbound
+      // stale-probe certification applies ONLY with NO session target. A
+      // PENDING target (boundTo=id while its first journal lookup has not
+      // resolved, boundJournal=null) must keep follow recovery: the timer
+      // probe has to quiet-reopen so reopenFollow retries the mount instead
+      // of certifying live over a page stuck on its snapshot spinner. This
+      // matches resumeConnection's own bound/unbound branch.
+      isFollowBound: () => this.connectionBoundTo !== null,
       onState: (state) => {
         // Gate 41 S2: a callback from a machine that has since been disposed
         // and replaced (peer logout mid-probe, then a healthy re-login) must

@@ -1039,19 +1039,45 @@ fn parse_ls_remote_base(output: &[u8], base_branch: &str) -> std::result::Result
 /// the message forms, so a bad-config error whose PATH contains "sha256" or
 /// "invalid" is not mistaken for an unsupported build.
 #[cfg(test)]
+/// r31 item 3: true ONLY when git prints one of its exact unsupported-SHA-256
+/// diagnostic LINES. Matching is per line: the line must START with the exact
+/// prefix git prints and, where the message has operands, contain the exact
+/// operand — a recognized phrase inside a FILENAME on an unrelated error line
+/// (e.g. a bad-config path ".../unknown hash algorithm 'sha256'/config") never
+/// matches.
 fn is_unsupported_sha256_diagnostic(stderr: &str) -> bool {
-    let s = stderr.to_ascii_lowercase();
-    const SHAPES: &[&str] = &[
-        "unknown option `object-format'",
-        "unknown option '--object-format",
-        "unknown value for --object-format",
-        "unknown hash algorithm 'sha256'",
-        "attempt to use sha256 has not been compiled in",
-        "sha256 repositories are not supported",
+    // Exact whole-line forms (compared against each lowercased, trimmed line).
+    const WHOLE_LINES: &[&str] = &[
+        "fatal: unknown hash algorithm 'sha256'",
+        "fatal: attempt to use sha256 has not been compiled in",
+        "fatal: sha256 repositories are not supported",
+        "error: unknown option `object-format'",
+        "error: unknown option '--object-format=sha256'",
+        "error: unknown option '--object-format'",
     ];
-    SHAPES.iter().any(|needle| s.contains(needle))
+    // Prefix forms (the operand/usage text may follow on the SAME line); the
+    // prefix ends right after the option name so no filename text can precede
+    // the verdict.
+    const LINE_PREFIXES: &[&str] = &[
+        "fatal: unknown value for --object-format:",
+        "error: unknown option for --object-format",
+        "error: unknown option `--object-format",
+        "error: unknown option '--object-format",
+    ];
+    for raw_line in stderr.lines() {
+        // Match the ORIGINAL case: git's unsupported message is lowercase
+        // sha256; an uppercase "SHA256" is a different algorithm spelling and
+        // must not be treated as the unsupported-form diagnostic.
+        let line = raw_line.trim();
+        if WHOLE_LINES.contains(&line) {
+            return true;
+        }
+        if LINE_PREFIXES.iter().any(|prefix| line.starts_with(prefix)) {
+            return true;
+        }
+    }
+    false
 }
-
 /// Run `git init --object-format=sha256` via `program`: true when created;
 /// false ONLY on a recognized unsupported-format diagnostic; spawn or other
 /// init failures panic with the detail.
@@ -2499,9 +2525,9 @@ mod tests {
     #[test]
     fn recovery_fetch_flags_never_write_fetch_head() {
         assert!(
-            !RECOVERY_FETCH_FLAGS
+            RECOVERY_FETCH_FLAGS
                 .iter()
-                .any(|flag| *flag == "--no-write-fetch-head")
+                .all(|flag| *flag != "--no-write-fetch-head")
         );
         assert!(RECOVERY_FETCH_FLAGS.contains(&"--refmap="));
         assert!(RECOVERY_FETCH_FLAGS.contains(&"--no-prune"));
@@ -2762,10 +2788,15 @@ mod tests {
             );
         }
         for stderr in [
-            // A path containing both trigger words must NOT match.
+            // Filenames that embed the whole recognized phrase must NOT match.
+            "fatal: bad config line 1 in file /fixtures/fatal: unknown hash algorithm 'sha256'/config\n",
+            "error: cannot access /build/error: unknown option '--object-format=sha256'/src: No such file\n",
+            // Ordinary unrelated diagnostics.
             "fatal: bad config line 3 in file /home/dev/invalid-sha256-config\n",
             "error: invalid key: foo.sha256.invalid in /etc/gitconfig\n",
             "fatal: unknown hash algorithm 'bogus'\n",
+            "fatal: unknown hash algorithm 'SHA256'\n",
+            "  fatal: unknown hash algorithm 'sha256'  extra\n",
             "",
         ] {
             assert!(

@@ -4346,7 +4346,7 @@ fn recovery_fetch_base_sha(
     //    FETCH_HEAD is not a ref, recovery never reads it, and writing it
     //    cannot create or move any branch/tag; it is harmless.
     let mut fetch_args: Vec<&str> = vec!["fetch"];
-    fetch_args.extend_from_slice(&RECOVERY_FETCH_FLAGS);
+    fetch_args.extend_from_slice(RECOVERY_FETCH_FLAGS);
     fetch_args.push("origin");
     fetch_args.push(&sha);
     owned(&fetch_args, "remote base object fetch", true)?;
@@ -4469,27 +4469,49 @@ fn recovery_read_park(repo: &Path) {
 /// whose filename happens to contain "sha256" or "invalid" is not a skip.
 #[cfg(test)]
 pub(crate) fn is_unsupported_sha256_diagnostic(stderr: &str) -> bool {
-    let s = stderr.to_ascii_lowercase();
-    // Old builds rejected the option; newer builds that lack the compiled
-    // backend reject the algorithm. Each line must carry BOTH the option/topic
-    // and a "not available" verdict; paths are not inspected.
-    const SHAPES: &[(&str, &str)] = &[
-        ("unknown option `object-format'", ""),
-        ("unknown option '--object-format", ""),
-        ("unknown value for --object-format", ""),
-        ("unknown hash algorithm 'sha256'", ""),
-        ("attempt to use sha256 has not been compiled in", ""),
-        ("sha256 repositories are not supported", ""),
-        ("unknown option for --object-format", ""),
+    unsupported_sha256_diagnostic(stderr)
+}
+
+#[cfg(test)]
+/// r31 item 3: true ONLY when git prints one of its exact unsupported-SHA-256
+/// diagnostic LINES. Matching is per line: the line must START with the exact
+/// prefix git prints and, where the message has operands, contain the exact
+/// operand — a recognized phrase inside a FILENAME on an unrelated error line
+/// (e.g. a bad-config path ".../unknown hash algorithm 'sha256'/config") never
+/// matches.
+fn unsupported_sha256_diagnostic(stderr: &str) -> bool {
+    // Exact whole-line forms (compared against each lowercased, trimmed line).
+    const WHOLE_LINES: &[&str] = &[
+        "fatal: unknown hash algorithm 'sha256'",
+        "fatal: attempt to use sha256 has not been compiled in",
+        "fatal: sha256 repositories are not supported",
+        "error: unknown option `object-format'",
+        "error: unknown option '--object-format=sha256'",
+        "error: unknown option '--object-format'",
     ];
-    for (needle, _) in SHAPES {
-        if s.contains(needle) {
+    // Prefix forms (the operand/usage text may follow on the SAME line); the
+    // prefix ends right after the option name so no filename text can precede
+    // the verdict.
+    const LINE_PREFIXES: &[&str] = &[
+        "fatal: unknown value for --object-format:",
+        "error: unknown option for --object-format",
+        "error: unknown option `--object-format",
+        "error: unknown option '--object-format",
+    ];
+    for raw_line in stderr.lines() {
+        // Match the ORIGINAL case: git's unsupported message is lowercase
+        // sha256; an uppercase "SHA256" is a different algorithm spelling and
+        // must not be treated as the unsupported-form diagnostic.
+        let line = raw_line.trim();
+        if WHOLE_LINES.contains(&line) {
+            return true;
+        }
+        if LINE_PREFIXES.iter().any(|prefix| line.starts_with(prefix)) {
             return true;
         }
     }
     false
 }
-
 /// Run `git init --object-format=sha256` through `program` and classify the
 /// outcome: true when the repository is created; false ONLY on a recognized
 /// unsupported-format diagnostic; a spawn failure or any other init error
@@ -9627,9 +9649,9 @@ head -c 1 >/dev/null || exit 4
     #[test]
     fn recovery_fetch_flags_never_write_fetch_head() {
         assert!(
-            !super::RECOVERY_FETCH_FLAGS
+            super::RECOVERY_FETCH_FLAGS
                 .iter()
-                .any(|flag| *flag == "--no-write-fetch-head")
+                .all(|flag| *flag != "--no-write-fetch-head")
         );
         assert!(super::RECOVERY_FETCH_FLAGS.contains(&"--refmap="));
         assert!(super::RECOVERY_FETCH_FLAGS.contains(&"--no-prune"));
@@ -10048,7 +10070,9 @@ head -c 1 >/dev/null || exit 4
         super::is_unsupported_sha256_diagnostic(stderr)
     }
 
-    /// r30 item 2: recognize ONLY the exact unsupported-format forms.
+    /// r30 item 2 / r31 item 3: recognize ONLY the exact whole-line
+    /// unsupported-format forms; a recognized phrase appearing inside a
+    /// FILENAME on an unrelated error line must not match.
     #[cfg(unix)]
     #[test]
     fn sha256_unsupported_classifier_is_precise() {
@@ -10064,12 +10088,16 @@ head -c 1 >/dev/null || exit 4
                 "must recognize the unsupported form: {stderr:?}"
             );
         }
-        // A bad config file whose PATH contains both trigger words must NOT be
-        // mistaken for an unsupported-format diagnostic.
+        // Unrelated diagnostics — including filenames that embed the whole
+        // recognized phrase — must NOT be read as unsupported SHA-256.
         for stderr in [
             "fatal: bad config line 3 in file /home/dev/invalid-sha256-config\n",
             "error: invalid key in /etc/gitconfig: foo.sha256.invalid\n",
+            "fatal: bad config line 1 in file /fixtures/fatal: unknown hash algorithm 'sha256'/config\n",
+            "error: cannot access /build/error: unknown option '--object-format=sha256'/src: No such file\n",
             "fatal: unknown hash algorithm 'bogus'\n",
+            "fatal: unknown hash algorithm 'SHA256'\n",
+            "  fatal: unknown hash algorithm 'sha256'  extra\n",
             "",
         ] {
             assert!(

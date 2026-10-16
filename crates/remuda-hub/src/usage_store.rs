@@ -275,7 +275,11 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     tx.execute_batch("DROP INDEX IF EXISTS usage_events_turn_dedupe;")?;
     // c-usagefu r13/r16: recover scope_id and the fallback-only projection
     // fields (native turn id, native time, revision, context window) from the
-    // retained journal BEFORE the lineage collapse below.
+    // retained journal BEFORE the lineage collapse below. These stay
+    // UNCONDITIONAL: rows written through the legacy path while a migration
+    // stayed rolled back persist only the 14 legacy columns even when the
+    // older lineage columns already committed, so they must recover on every
+    // restart, not just on the first upgrade.
     backfill_scope_ids_from_journal(tx)?;
     reconstruct_fallback_projection_from_journal(tx)?;
     // c-ctxusage r9/r29: session-scope then turn-scope identity/lineage from
@@ -284,9 +288,17 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     // turn→native-session lineage).
     backfill_legacy_scope_ids(tx)?;
     backfill_legacy_turn_identity(tx)?;
-    // c-usagefu r14 (M1): make same-key turn rows index-safe before any unique
-    // index is created.
-    reconcile_duplicate_turn_keys(tx)?;
+    // c-usagefu r14 (M1): journal-recovered turn rows that share a key but
+    // disagree on counters are two degenerate-id calls, not one re-tail —
+    // return them to the legacy NULL-scope path before the fold winner is
+    // collapsed. Unconditional for the same reason the backfills above are:
+    // they re-stamp the intentionally-cleared ids on every restart, so the
+    // clear decision must be re-applied too. The companion DELETE the merge
+    // inherited is gone: [`collapse_duplicate_turn_lineage_rows`] already
+    // keeps exactly one fold winner per LINEAGE for identical (and every
+    // other) same-lineage group, while a matching row in a DIFFERENT lineage
+    // is a retained watermark that must never be deleted (r37 item 1).
+    clear_disagreeing_recovered_turn_keys(tx)?;
     // r30: identity UPDATE can merge a legacy turn with a later qualified
     // replay; collapse to the fold winner BEFORE identical-counter
     // consolidation (which keeps the oldest row for stocks).
@@ -407,30 +419,13 @@ fn backfill_legacy_turn_identity(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Make backfilled `turn` rows safe for the
-/// `(instance_id, scope, scope_id)` unique index (c-usagefu r14 item 1,
-/// Ruling M1).
-///
-/// origin/main wrote codex Turn rows without persisting `scope_id`, and the
-/// backfill above recovers it from the durable journal. Two distinct writes
-/// can recover the SAME key on a real main-shaped database:
-///
-/// * a promoted instance re-tailed after a demotion/resume re-emits the
-///   SAME native turn snapshot at a new journal seq: every token bucket is
-///   identical, and the call must be counted exactly once. Such a group is
-///   collapsed to the HIGHEST seq (the latest tail), the other rows deleted;
-/// * two genuinely different result frames recover the same scope id while
-///   reporting DIFFERENT counters (degenerate ids, e.g. both mapped to
-///   `"0"`). They are different calls: nothing is merged. Every row of such
-///   a group has its `scope_id` cleared back to NULL, so the rows stay on
-///   the legacy NULL-scope path — each keeps counting once, and they never
-///   collide with the unique index.
-///
-/// Agreement is on the five TOKEN buckets only, compared NULL-safely with
-/// `IS` (a byte-zero re-tail carries the identical sparse bucket set). Cost
-/// is a priced projection, never a call identity. Runs inside the migration
-/// transaction; idempotent — a second migration finds neither a disagreeing
-/// sibling nor a non-keeper duplicate.
+/// Backfill pre-`scopeId` NULL-scope session rows from the matching retained
+/// journal payloads (c-ctxusage r9 item 5). A legacy row's identity is
+/// provable when the journal's `(instance_id, seq)` event is a usage event
+/// whose `payload.scopeId` is a non-empty string; that id is stamped onto the
+/// row so the stock joins the scoped totals instead of vanishing on the first
+/// scoped point. No-op when the database has no `journal` table (standalone
+/// usage-store migrations).
 fn backfill_legacy_scope_ids(conn: &Connection) -> rusqlite::Result<()> {
     let has_journal: bool = conn.query_row(
         "SELECT EXISTS (
@@ -472,8 +467,39 @@ fn backfill_legacy_scope_ids(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-fn reconcile_duplicate_turn_keys(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(
+/// Return journal-recovered `turn` rows that share a key but disagree on
+/// counters to the legacy NULL-scope path before the fold winner is chosen
+/// (c-usagefu r14 item 1, Ruling M1; r37 item 1).
+///
+/// origin/main wrote codex Turn rows without persisting `scope_id`, and the
+/// backfill above recovers it from the durable journal. Two genuinely
+/// different result frames can recover the SAME id while reporting DIFFERENT
+/// counters (degenerate ids, e.g. both mapped to `"0"`): they are two calls,
+/// nothing is merged, and every row of such a group has its `scope_id`
+/// cleared back to NULL so each keeps counting once on the legacy NULL-scope
+/// path instead of collapsing into one fold winner. A byte-zero re-tail with
+/// IDENTICAL buckets is the same call, but nothing here has to remove it:
+/// [`collapse_duplicate_turn_lineage_rows`] keeps exactly one fold winner per
+/// lineage for every same-key group regardless of counters.
+///
+/// Siblings are matched on the FULL authority key
+/// `(instance_id, scope_id, source_session_id)`: two rows for one turn in
+/// DIFFERENT proven native-session lineages are both retained watermarks
+/// (one revision-replaced row per lineage, c-ctxusage r16 item 3), never
+/// degenerate duplicates of each other — this UPDATE can never clear one
+/// because of another session's row. NULL sessions match NULL sessions; the
+/// unqualified legacy lineage is its own key.
+///
+/// Agreement is on the five TOKEN buckets only, compared NULL-safely with
+/// `IS` (a byte-zero re-tail carries the identical sparse bucket set). Cost
+/// is a priced projection, never a call identity. Runs inside the migration
+/// transaction on EVERY migration: the journal backfills re-stamp
+/// intentionally-cleared ids unconditionally (fallback-period rows must
+/// recover on any restart), so the clear is re-applied right after them. It
+/// is idempotent — a settled database has at most one physical row per
+/// lineage key, so the EXISTS match finds nothing.
+fn clear_disagreeing_recovered_turn_keys(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute(
         "UPDATE usage_events
          SET scope_id = NULL
          WHERE scope = 'turn' AND scope_id IS NOT NULL
@@ -482,58 +508,30 @@ fn reconcile_duplicate_turn_keys(conn: &Connection) -> rusqlite::Result<()> {
                WHERE d.instance_id = usage_events.instance_id
                  AND d.scope = 'turn'
                  AND d.scope_id = usage_events.scope_id
+                 AND COALESCE(d.source_session_id, '')
+                     = COALESCE(usage_events.source_session_id, '')
                  AND d.rowid <> usage_events.rowid
                  AND (d.total_tokens     IS NOT usage_events.total_tokens
                    OR d.input_tokens     IS NOT usage_events.input_tokens
                    OR d.output_tokens    IS NOT usage_events.output_tokens
                    OR d.cache_read_tokens  IS NOT usage_events.cache_read_tokens
-                   OR d.cache_write_tokens IS NOT usage_events.cache_write_tokens));
-
-         DELETE FROM usage_events
-         WHERE scope = 'turn' AND scope_id IS NOT NULL
-           AND EXISTS (
-               SELECT 1 FROM usage_events s
-               WHERE s.instance_id = usage_events.instance_id
-                 AND s.scope = 'turn'
-                 AND s.scope_id = usage_events.scope_id
-                 AND s.rowid <> usage_events.rowid)
-           AND seq <> (
-               SELECT MAX(h.seq) FROM usage_events h
-               WHERE h.instance_id = usage_events.instance_id
-                 AND h.scope = 'turn'
-                 AND h.scope_id = usage_events.scope_id);",
+                   OR d.cache_write_tokens IS NOT usage_events.cache_write_tokens))",
+        [],
     )?;
     Ok(())
 }
 
-/// Collapse pre-r9 duplicate Message rows (same instance_id, scope,
-/// scope_id) into a single survivor each, then create the dedupe indexes.
+/// Within one turn lineage `(instance, scope_id, COALESCE(source_session_id,
+/// '')) keep the same WINNER the read folds pick — the newest accepted frame
+/// (`seq DESC, rowid DESC`, matching `WINNING_TURN_ROWS_SQL`); rows in
+/// DIFFERENT native-session lineages for the same scope id are retained —
+/// each lineage keeps its own revision-replaced row (c-ctxusage r16 item 3).
 ///
-/// Runs inside [`migrate`]'s single transaction (c-usagefu r14 item 1,
-/// Ruling M1): it opens no transaction of its own and a failure anywhere
-/// (including the unique-index creates) rolls the WHOLE migration back.
-///
-/// The survivor is the FIRST write (lowest rowid, preserving ingest
-/// ordering). Ruling C1 (c-usagefu r10 item 3; r11 item 8), made EXACT by
-/// c-usagefu r12 item 5 (Ruling C1'):
-/// - the highest metric_revision is determined FIRST. Counters/cost
-///   (total/input/output/cache buckets, cost_usd) AND the `accounting`
-///   authority come ONLY from rows AT that revision; among same-revision
-///   rows, the newest rowid reporting the bucket wins. A rev-1 row reporting
-///   input 7 / cost 0.10 / estimated and a rev-2 row reporting NULL input /
-///   NULL cost / reported leave the survivor at rev 2 with input and cost
-///   STILL NULL — the older revision's known values never fill the newer
-///   revision's gaps (the first-write 10/0.01/estimated never returns). A
-///   NULL bucket is repaired ONLY from another non-NULL row at the SAME
-///   highest revision;
-/// - revision: the maximum;
-/// - profile/model/turn id/native context window/observed time are
-///   ATTRIBUTION and merge best-known (any non-NULL sibling, at ANY
-///   revision; native time over ingest time), independent of which revision
-///   owned the accounting.
-///
-/// A second run changes nothing: one row per key makes the UPDATE/DELETE
-/// no-ops and the index creates are `IF NOT EXISTS`.
+/// The newest frame is the authority: a resume replay (r30 item 1) is how a
+/// pre-scopeId legacy turn and its later qualified frame become one lineage,
+/// and the replay carries the native timestamp/revision the read model uses;
+/// keeping the older durable row would silently change the fold and the
+/// native-time windows.
 fn collapse_duplicate_turn_lineage_rows(conn: &Connection) -> rusqlite::Result<usize> {
     conn.execute(
         "DELETE FROM usage_events
@@ -700,10 +698,11 @@ fn backfill_scope_ids_from_journal(conn: &Connection) -> rusqlite::Result<()> {
 /// `(instance_id, seq)` the same way [`project_usage_event`] reads the live
 /// event, filling ONLY missing/authoritative-default values (never overwriting
 /// a value a native projection already supplied), and runs BEFORE
-/// [`reconcile_duplicate_turn_keys`] / [`consolidate_message_duplicates`] and
-/// before the completion marker, so the consolidation COALESCE actually has
-/// native siblings to merge. Idempotent: every assignment is COALESCE/guarded,
-/// and the step only ever runs before the one-time marker is set.
+/// [`clear_disagreeing_recovered_turn_keys`] /
+/// [`collapse_duplicate_turn_lineage_rows`] /
+/// [`consolidate_message_duplicates`], so the fold winner and the
+/// consolidation COALESCE actually have native siblings to merge.
+/// Idempotent: every assignment is COALESCE/guarded.
 fn reconstruct_fallback_projection_from_journal(conn: &Connection) -> rusqlite::Result<()> {
     // Same existence gate as the scope-id backfill (unit fixtures have no
     // journal table).
@@ -795,38 +794,34 @@ fn reconstruct_fallback_projection_from_journal(conn: &Connection) -> rusqlite::
     Ok(())
 }
 
-/// Make backfilled `turn` rows safe for the
-/// `(instance_id, scope, scope_id)` unique index (c-usagefu r14 item 1,
-/// Ruling M1).
+/// Collapse pre-r9 duplicate Message rows (same instance_id, scope,
+/// scope_id) into a single survivor each, then create the dedupe indexes.
 ///
-/// origin/main wrote codex Turn rows without persisting `scope_id`, and the
-/// backfill above recovers it from the durable journal. Two distinct writes
-/// can recover the SAME key on a real main-shaped database:
+/// Runs inside [`migrate`]'s single transaction (c-usagefu r14 item 1,
+/// Ruling M1): it opens no transaction of its own and a failure anywhere
+/// (including the unique-index creates) rolls the WHOLE migration back.
 ///
-/// * a promoted instance re-tailed after a demotion/resume re-emits the
-///   SAME native turn snapshot at a new journal seq: every token bucket is
-///   identical, and the call must be counted exactly once. Such a group is
-///   collapsed to the HIGHEST seq (the latest tail), the other rows deleted;
-/// * two genuinely different result frames recover the same scope id while
-///   reporting DIFFERENT counters (degenerate ids, e.g. both mapped to
-///   `"0"`). They are different calls: nothing is merged. Every row of such
-///   a group has its `scope_id` cleared back to NULL, so the rows stay on
-///   the legacy NULL-scope path — each keeps counting once, and they never
-///   collide with the unique index.
+/// The survivor is the FIRST write (lowest rowid, preserving ingest
+/// ordering). Ruling C1 (c-usagefu r10 item 3; r11 item 8), made EXACT by
+/// c-usagefu r12 item 5 (Ruling C1'):
+/// - the highest metric_revision is determined FIRST. Counters/cost
+///   (total/input/output/cache buckets, cost_usd) AND the `accounting`
+///   authority come ONLY from rows AT that revision; among same-revision
+///   rows, the newest rowid reporting the bucket wins. A rev-1 row reporting
+///   input 7 / cost 0.10 / estimated and a rev-2 row reporting NULL input /
+///   NULL cost / reported leave the survivor at rev 2 with input and cost
+///   STILL NULL — the older revision's known values never fill the newer
+///   revision's gaps (the first-write 10/0.01/estimated never returns). A
+///   NULL bucket is repaired ONLY from another non-NULL row at the SAME
+///   highest revision;
+/// - revision: the maximum;
+/// - profile/model/turn id/native context window/observed time are
+///   ATTRIBUTION and merge best-known (any non-NULL sibling, at ANY
+///   revision; native time over ingest time), independent of which revision
+///   owned the accounting.
 ///
-/// Agreement is on the five TOKEN buckets only, compared NULL-safely with
-/// `IS` (a byte-zero re-tail carries the identical sparse bucket set). Cost
-/// is a priced projection, never a call identity. Runs inside the migration
-/// transaction; idempotent — a second migration finds neither a disagreeing
-/// sibling nor a non-keeper duplicate.
-///
-/// Backfill pre-`scopeId` NULL-scope session rows from the matching retained
-/// journal payloads (c-ctxusage r9 item 5). A legacy row's identity is
-/// provable when the journal's `(instance_id, seq)` event is a usage event
-/// whose `payload.scopeId` is a non-empty string; that id is stamped onto the
-/// row so the stock joins the scoped totals instead of vanishing on the first
-/// scoped point. No-op when the database has no `journal` table (standalone
-/// usage-store migrations).
+/// A second run changes nothing: one row per key makes the UPDATE/DELETE
+/// no-ops and the index creates are `IF NOT EXISTS`.
 fn consolidate_message_duplicates(conn: &Connection) -> rusqlite::Result<()> {
     // C1' (r12 item 5): the accounting assignments are generated from one
     // shared "highest revision first" fragment. The top revision is resolved
@@ -10290,6 +10285,86 @@ mod tests {
             ],
             "both lineages keep their own marks and counters"
         );
+    }
+
+    /// r37 item 1 (HIGH): the legacy duplicate-turn reconciliation is a
+    /// ONE-TIME fixup for the pre-lineage schema. On an already-committed
+    /// database it must not run again, and even on the one upgrade where it
+    /// runs it must group by the full lineage key: its old grouping ignored
+    /// `source_session_id`, so a Hub restart deleted a retained per-lineage
+    /// watermark (the other session's non-max-seq row), after which a stale
+    /// replay of that lineage found no own row, inserted fresh and won.
+    #[test]
+    fn restart_keeps_each_lineage_watermark_and_a_stale_replay_still_loses() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        // Native session A at revision 100 / seq 1.
+        assert!(insert(
+            &conn,
+            &qualified_record(1, "ins_r37i1", "msg-T", "sess-A", 100, 100, 10)
+        ));
+        // The SAME turn from session B at revision 1 / seq 2 with IDENTICAL
+        // buckets: two legitimate rows only under the per-lineage key.
+        assert!(insert(
+            &conn,
+            &qualified_record(2, "ins_r37i1", "msg-T", "sess-B", 1, 100, 10)
+        ));
+
+        // Hub reopen: the whole migration runs again.
+        migrate(&conn).unwrap();
+
+        let marks = conn
+            .prepare(
+                "SELECT source_session_id, metric_revision, seq
+                 FROM usage_events
+                 WHERE instance_id='ins_r37i1' AND scope_id='msg-T'
+                 ORDER BY source_session_id",
+            )
+            .unwrap()
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            marks,
+            vec![("sess-A".to_string(), 100, 1), ("sess-B".to_string(), 1, 2),],
+            "reopen keeps BOTH lineage watermarks, positions and seqs"
+        );
+
+        // A stale replay of A at revision 50 must still lose against A's own
+        // retained mark 100 — it must not find an empty lineage and win.
+        assert!(
+            !insert(
+                &conn,
+                &qualified_record(3, "ins_r37i1", "msg-T", "sess-A", 50, 100, 10)
+            ),
+            "the stale A replay is frozen by A's surviving watermark"
+        );
+        let a_revision: i64 = conn
+            .query_row(
+                "SELECT metric_revision FROM usage_events
+                 WHERE instance_id='ins_r37i1' AND scope_id='msg-T'
+                   AND source_session_id='sess-A'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(a_revision, 100, "A's watermark never moved");
+        let row_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_events
+                 WHERE instance_id='ins_r37i1' AND scope_id='msg-T'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(row_count, 2, "the rejected replay added no row");
     }
 
     /// c-ctxusage r16 item 3 (T1'), regression 2: a qualified alpha frame at

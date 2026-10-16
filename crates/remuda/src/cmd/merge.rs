@@ -1002,7 +1002,12 @@ fn push_main_cas(repo: &Path, merged: &str, expected: &str) -> Result<()> {
 /// An object ID in the repository's native format: SHA-1 (40 hex) or SHA-256
 /// (64 hex). Git itself emitted the string from ls-remote; this bounds shapes.
 fn is_native_object_hex(sha: &str) -> bool {
-    (sha.len() == 40 || sha.len() == 64) && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+    // r31 item 5: object IDs git advertises are lowercase; uppercase A-F must
+    // be rejected as uncertain (and never compared against a lowercase SHA).
+    (sha.len() == 40 || sha.len() == 64)
+        && sha
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// Parse `git ls-remote --exit-code origin refs/heads/<base>` output. Exactly
@@ -2557,6 +2562,22 @@ mod tests {
         );
         assert!(parse_ls_remote_base(b"garbage\n", "main").is_err());
         assert!(parse_ls_remote_base(b"zz\trefs/heads/main\n", "main").is_err());
+        // Uppercase A-F (40 and 64 chars) is not a git-advertised ID.
+        assert!(
+            parse_ls_remote_base(
+                b"ABCDEF0123456789ABCDEF0123456789ABCDEF01\trefs/heads/main\n",
+                "main"
+            )
+            .is_err()
+        );
+        assert!(
+            parse_ls_remote_base(
+                b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789ABCDEF\trefs/heads/x\n",
+                "x"
+            )
+            .is_err()
+        );
+
         assert!(
             parse_ls_remote_base(
                 format!("{}\trefs/heads/main\n", &sha1[..39]).as_bytes(),

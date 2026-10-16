@@ -4237,7 +4237,12 @@ fn resolve_landing_after_restart(
 /// (64 hex). Git itself emitted the string from ls-remote; this only bounds
 /// the accepted shapes.
 fn is_native_object_hex(sha: &str) -> bool {
-    (sha.len() == 40 || sha.len() == 64) && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+    // r31 item 5: object IDs git advertises are lowercase; uppercase A-F must
+    // be rejected as uncertain (and never compared against a lowercase SHA).
+    (sha.len() == 40 || sha.len() == 64)
+        && sha
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// Parse `git ls-remote --exit-code origin refs/heads/<base>` output. Exactly
@@ -9690,6 +9695,22 @@ head -c 1 >/dev/null || exit 4
         );
         assert!(super::parse_ls_remote_base(b"garbage line\n", "main").is_err());
         assert!(super::parse_ls_remote_base(b"zz\trefs/heads/main\n", "main").is_err());
+        // Uppercase A-F (40 and 64 chars) is not a git-advertised ID.
+        assert!(
+            super::parse_ls_remote_base(
+                b"ABCDEF0123456789ABCDEF0123456789ABCDEF01\trefs/heads/main\n",
+                "main"
+            )
+            .is_err()
+        );
+        assert!(
+            super::parse_ls_remote_base(
+                b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789ABCDEF\trefs/heads/x\n",
+                "x"
+            )
+            .is_err()
+        );
+
         assert!(
             super::parse_ls_remote_base(
                 format!("{}\trefs/heads/main\n", &sha1[..39]).as_bytes(),

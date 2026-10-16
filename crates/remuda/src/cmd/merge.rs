@@ -3120,7 +3120,6 @@ mod tests {
     /// spawn at the owner boundary carries the full hardening set.
     #[test]
     fn every_production_cli_recovery_invocation_carries_full_hardening() {
-        use std::sync::{Arc, Mutex};
         fn assert_recorded_hardening(log: &[remuda_unix::RecordedGit]) {
             assert!(!log.is_empty(), "recovery must spawn git");
             for (index, rec) in log.iter().enumerate() {
@@ -3150,11 +3149,6 @@ mod tests {
                 }
             }
         }
-        let install = || {
-            let log: Arc<Mutex<Vec<remuda_unix::RecordedGit>>> = Arc::new(Mutex::new(Vec::new()));
-            remuda_unix::set_git_spawn_recorder(Some(log.clone()));
-            log
-        };
 
         let keep = tempfile::tempdir().unwrap();
         let root = keep.path();
@@ -3203,12 +3197,14 @@ mod tests {
         tgit_ok(&seed, &["fetch", "-q", lane.to_str().unwrap(), &merge_m]);
         tgit_ok(&seed, &["merge", "-q", "--no-ff", "-m", "D", &merge_m]);
         tgit_ok(&seed, &["push", "-q", "origin", "main"]);
-        let remote_d = tgit_ok(&seed, &["rev-parse", "main"]);
 
+        // r34 item 4: one RAII recorder scope; per-phase assertions filter to
+        // the fixture cwd (parallel tests in other cwds are ignored; hardening
+        // itself is never used as a filter).
+        let recorder = remuda_unix::RecordingGuard::install();
         // (1) success
-        let log = install();
         push_main_cas(&lane, &merge_m, &base_b).expect("Landed");
-        assert_recorded_hardening(&std::mem::take(&mut *log.lock().unwrap()));
+        assert_recorded_hardening(&recorder.for_repo(&lane));
 
         // (2) object-fetch failure: advance remote to E the lane lacks, swap
         // to an empty remote at the read seam.
@@ -3229,7 +3225,6 @@ mod tests {
                 empty.to_str().unwrap(),
             ],
         );
-        let log = install();
         seam::arm(&lane, 1);
         let repo_t = lane.clone();
         let (merged_t, expected_t) = (merge_m.clone(), base_b.clone());
@@ -3249,17 +3244,16 @@ mod tests {
             ),
             "{error}"
         );
-        assert_recorded_hardening(&std::mem::take(&mut *log.lock().unwrap()));
+        assert_recorded_hardening(&recorder.for_repo(&lane));
 
-        // (3) SHALLOW / negative-ancestry path: a depth-1 clone of a remote
-        // with >=2 commits; the granted merge is OLDER than the advertised tip,
-        // so merge-base on the shallow edge is Unknown -> PushUncertain. A
-        // second B commit on the remote makes its depth-1 boundary hide the
-        // granted merge's ancestry.
-        std::fs::write(seed.join("f2"), "b2\n").unwrap();
-        tgit_ok(&seed, &["add", "f2"]);
-        tgit_ok(&seed, &["commit", "-q", "-m", "B2"]);
-        tgit_ok(&seed, &["push", "-q", "origin", "main"]);
+        // (3) SHALLOW / negative-ancestry path: a depth-1 clone of the remote
+        // tip. The granted merge is an AVAILABLE orphan commit (present object,
+        // refused non-ff push) that is genuinely not an ancestor of the
+        // advertised tip; on a shallow clone that negative edge is
+        // undecidable (R7), so recovery must reach the shallow branch and
+        // return PushUncertain naming the shallow condition — not the
+        // missing-object abnormal arm. The recorder must observe
+        // `rev-parse --is-shallow-repository`.
         let shallow_lane = root.join("shallow-lane");
         tgit_ok(
             root,
@@ -3278,26 +3272,48 @@ mod tests {
             tgit_ok(&shallow_lane, &["rev-parse", "--is-shallow-repository"]),
             "true"
         );
-        // The depth-1 tip (B2) claims as its granted merge the older D commit,
-        // which the shallow history cannot prove contains -> uncertain.
-        let remote_b2 = tgit_ok(&seed, &["rev-parse", "main"]);
-        let log = install();
-        let result = push_main_cas(&shallow_lane, &remote_d, &remote_b2);
-        assert!(
-            matches!(
-                result
-                    .as_ref()
-                    .map_err(|e| e.downcast_ref::<MergeStop>())
-                    .err()
-                    .flatten(),
-                Some(MergeStop::PushUncertain(_))
-            ),
-            "shallow negative ancestry must be PushUncertain: {result:?}"
+        // An available orphan built from the tip's tree (object is local, so
+        // merge-base runs instead of failing on a missing object).
+        let orphan_tree = tgit_ok(&shallow_lane, &["rev-parse", "HEAD^{tree}"]);
+        let orphan_merge = tgit_ok(
+            &shallow_lane,
+            &["commit-tree", &orphan_tree, "-m", "orphan grant"],
         );
-        assert_recorded_hardening(&std::mem::take(&mut *log.lock().unwrap()));
+        let remote_tip = tgit_ok(&seed, &["rev-parse", "main"]);
+        // Control: the negative edge really is exit-1 on the shallow clone.
+        assert!(
+            tgit(
+                &shallow_lane,
+                &["merge-base", "--is-ancestor", &orphan_merge, &remote_tip]
+            )
+            .status
+            .code()
+                == Some(1),
+            "the orphan must genuinely not be an ancestor"
+        );
+        let result = push_main_cas(&shallow_lane, &orphan_merge, &remote_tip);
+        let error = result
+            .as_ref()
+            .map_err(|e| e.downcast_ref::<MergeStop>())
+            .err()
+            .flatten()
+            .expect("shallow negative ancestry must be PushUncertain");
+        assert!(matches!(error, MergeStop::PushUncertain(_)), "{error:?}");
+        assert!(
+            error.to_string().contains("shallow clone"),
+            "the uncertainty must come from the SHALLOW branch, not the missing-object arm: {error}"
+        );
+        let recorded = recorder.for_repo(&shallow_lane);
+        // The recorder observed the shallow check on the REAL recovery path.
+        assert!(
+            recorded.iter().any(|rec| {
+                rec.args.iter().any(|a| a == "rev-parse")
+                    && rec.args.iter().any(|a| a == "--is-shallow-repository")
+            }),
+            "recovery did not run the shallow check: {recorded:?}"
+        );
+        assert_recorded_hardening(&recorded);
 
-        remuda_unix::set_git_spawn_recorder(None);
-        let _ = remote_b2;
         drop(keep);
     }
 

@@ -5824,11 +5824,25 @@ fn turn_usage_observation(
     {
         payload.context_window = Some(U64(window));
     }
-    Ok(Some(mapper.observation(
+    let mut observation = mapper.observation(
         Completeness::Structured,
         NativeRequestKey::None,
         ObservationPayload::Usage(Box::new(payload)),
-    )?))
+    )?;
+    // r37 item 7: on the LIVE stdout carriers the frame receipt time IS the
+    // native call time for per-call usage — the same rule map_result applies
+    // to the terminal result. Without this stamp the per-call Turn rows are
+    // the only token-bearing rows (the result Turn is suppressed) yet carry
+    // Unknown native time, so the Hub excludes them from every rate window
+    // and cannot derive stock increments from the tokenless session carrier.
+    // Transcript-hydrating pty carriers keep Unknown here; the group-gated
+    // flush/finish stamps their authoritative transcript time instead.
+    if stream::stream_usage_carrier(mapper.driver_kind) {
+        observation.native_at = Knowledge::Known {
+            value: observation.observed_at.clone(),
+        };
+    }
+    Ok(Some(observation))
 }
 
 /// Session-level evidence from one stream-json `result` frame.

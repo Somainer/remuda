@@ -89,6 +89,131 @@ fn live_print_result_flows_into_the_tpm_window_end_to_end() {
     assert_eq!(rollup.last_turn_at.as_deref(), Some(native_at.as_str()));
 }
 
+/// r37 item 7: on a normal live print/sdk stream the per-call Turn usage rides
+/// the assistant (rev 1) and message_delta (rev 2) frames, and the following
+/// result's Turn is suppressed as a re-sum. Those per-call observations must
+/// carry the frame RECEIPT time as `nativeAt` — otherwise the only surviving
+/// token rows are native-time Unknown, drop out of the Hub rate windows, and
+/// the surviving session carrier is token-less. Mapper -> project -> Hub
+/// rollup, end to end.
+#[test]
+fn live_per_call_assistant_delta_usage_carries_native_time_into_tpm() {
+    use remuda_protocol::UsageScope;
+    let mut mapper = StdoutMapper::new(DriverKind::ClaudePrint, "sess");
+
+    // Real order: message_start binds the active message, the assistant
+    // record emits revision 1, message_delta the final revision 2.
+    mapper
+        .map(serde_json::json!({"type":"stream_event","event":{
+        "type":"message_start","message":{
+            "id":"msg_pc","model":"claude-opus-4-7",
+            "usage":{"input_tokens":100,"cache_read_input_tokens":1000,
+                     "cache_creation_input_tokens":0,"output_tokens":8}
+        }}}))
+        .expect("message_start maps");
+    let assistant = mapper
+        .map(
+            serde_json::json!({"type":"assistant","uuid":"u1","message":{
+                "id":"msg_pc","role":"assistant",
+                "content":[{"type":"text","text":"done"}],
+                "model":"claude-opus-4-7",
+                "usage":{"input_tokens":100,"cache_read_input_tokens":1000,
+                         "cache_creation_input_tokens":0,"output_tokens":8}
+            }}),
+        )
+        .expect("assistant maps");
+    let delta = mapper
+        .map(serde_json::json!({"type":"stream_event","event":{
+            "type":"message_delta","delta":{"stop_reason":"end_turn"},
+            "usage":{"input_tokens":100,"cache_read_input_tokens":1000,
+                     "cache_creation_input_tokens":0,"output_tokens":30}
+        }}))
+        .expect("message_delta maps");
+    // The terminal result re-sums the same call: its Turn row is suppressed.
+    let result = mapper
+        .map(serde_json::json!({
+            "type":"result","subtype":"success","num_turns":1,
+            "result_index":0,"stop_reason":"end_turn","total_cost_usd":0.01,
+            "usage":{"input_tokens":100,"output_tokens":30,
+                     "cache_read_input_tokens":1000,
+                     "cache_creation_input_tokens":0}
+        }))
+        .expect("result maps");
+
+    fn turn_usage<'a>(obs: &'a [Observation]) -> Vec<&'a Observation> {
+        obs.iter()
+            .filter(|o| {
+                matches!(&o.body, ObservationPayload::Usage(u)
+                    if u.scope == UsageScope::Turn)
+            })
+            .collect()
+    }
+    let per_call = turn_usage(&assistant)
+        .into_iter()
+        .chain(turn_usage(&delta))
+        .collect::<Vec<_>>();
+    assert_eq!(per_call.len(), 2, "rev 1 assistant + rev 2 delta");
+    for observation in &per_call {
+        match &observation.native_at {
+            remuda_protocol::Knowledge::Known { value } => {
+                assert_eq!(
+                    String::from(value.clone()),
+                    String::from(observation.observed_at.clone()),
+                    "live per-call usage is stamped with its receipt time"
+                );
+            }
+            other => panic!("per-call native_at must be Known on live stdout, got {other:?}"),
+        }
+    }
+    assert!(
+        turn_usage(&result).is_empty(),
+        "the result Turn is suppressed after per-call usage"
+    );
+
+    // The final revision 2 observation projects to a NATIVE-timed hub row and
+    // its uncached input / output count in the current 60 s rate window.
+    let rev2 = per_call.last().expect("rev 2 observation");
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate(&conn).unwrap();
+    let record = JournalRecord {
+        instance_id: "ins_per_call".into(),
+        seq: rev2.seq.0 as i64,
+        event_id: "evt_per_call_1".into(),
+        // Deliberately ancient ingest time: only nativeAt may place the row.
+        observed_at: "2020-01-01T00:00:00.000Z".into(),
+        event: serde_json::to_value(*rev2).unwrap(),
+    };
+    let row = project_usage_event(&record, None, None).expect("projects");
+    assert_eq!(row.observed_at_source, "native");
+    assert_eq!(
+        row.observed_at,
+        match &rev2.native_at {
+            remuda_protocol::Knowledge::Known { value } => String::from(value.clone()),
+            _ => unreachable!(),
+        }
+    );
+    assert!(insert_usage_event(&conn, &row).unwrap());
+
+    let rollup = rollup_instance(
+        &conn,
+        &RollupRequest {
+            instance_id: "ins_per_call",
+            kind: "claude",
+            spec_model: None,
+            effective_model: None,
+            profile_id: None,
+        },
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        rollup.tpm_in_60s,
+        Some(100),
+        "the per-call uncached input counts in the live TPM window"
+    );
+    assert_eq!(rollup.tpm_out_60s, Some(30));
+}
+
 /// c-ctxusage r12 item 2 / r15 items 2-3: a PARTIAL later frame (the real
 /// mapper treats a missing input bucket as unknown, not zero) merges over the
 /// retained counters only when its source position is STRICTLY NEWER: input

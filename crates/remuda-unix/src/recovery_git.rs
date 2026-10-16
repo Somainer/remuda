@@ -151,16 +151,22 @@ impl RecoveryGit {
 #[cfg(any(test, feature = "test-faults"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecordedGit {
+    /// The spawned program (normally `git`; wrapper-based tests see their
+    /// wrapper), so a test can tell recovery git from unrelated parallel
+    /// subprocess tests.
+    pub executable: String,
+    /// The command's working directory — tests scope assertions to the fixture
+    /// repository and ignore subprocesses of other parallel tests.
+    pub cwd: Option<PathBuf>,
     /// Full argv (argv[0] omitted), including the hardening `-c` prefix.
     pub args: Vec<String>,
-    /// The explicitly-set environment on the spawned command (the hardening
-    /// env is set explicitly, so it is observable here).
+    /// The explicitly-set environment on the spawned command.
     pub env: Vec<(String, String)>,
 }
 
 /// The optional process-wide recorder installed by tests for the duration of a
-/// recovery run. `None` (the production default) records nothing and adds only
-/// a cheap `Option` check at spawn time.
+/// recovery run. `None` (production default) records nothing; spawn pays one
+/// cheap `Option` check.
 #[cfg(any(test, feature = "test-faults"))]
 type SpawnLog = Arc<Mutex<Vec<RecordedGit>>>;
 
@@ -172,18 +178,69 @@ fn recorder() -> &'static Mutex<Option<SpawnLog>> {
     GIT_SPAWN_RECORDER.get_or_init(|| Mutex::new(None))
 }
 
-/// Install (or clear with `None`) the spawn recorder used by recovery tests.
+/// Install (or clear with `None`) the spawn recorder. Prefer the RAII
+/// [`RecordingGuard`], which also clears the recorder on panic.
 #[cfg(any(test, feature = "test-faults"))]
 pub fn set_git_spawn_recorder(log: Option<Arc<Mutex<Vec<RecordedGit>>>>) {
     *recorder().lock().expect("recorder lock") = log;
 }
 
-/// Record `command` at spawn time when a test recorder is installed. Called by
+/// RAII recorder scope: captures every git spawned at the owner boundary until
+/// the guard drops (including on a panicking test), then clears the
+/// process-wide recorder so a parallel test never sees another test's
+/// commands. Assertions stay scoped to the fixture working directory via
+/// [`RecordingGuard::for_repo`]; they never filter by hardening content, which
+/// would conceal the bypass they exist to detect.
+#[cfg(any(test, feature = "test-faults"))]
+pub struct RecordingGuard {
+    log: Arc<Mutex<Vec<RecordedGit>>>,
+}
+
+#[cfg(any(test, feature = "test-faults"))]
+impl RecordingGuard {
+    /// Install a fresh process-wide recorder.
+    pub fn install() -> Self {
+        let log: Arc<Mutex<Vec<RecordedGit>>> = Arc::new(Mutex::new(Vec::new()));
+        *recorder().lock().expect("recorder lock") = Some(log.clone());
+        Self { log }
+    }
+
+    /// Snapshot all recorded commands.
+    pub fn snapshot(&self) -> Vec<RecordedGit> {
+        self.log.lock().expect("record log lock").clone()
+    }
+
+    /// Take (clear) the recorded commands.
+    pub fn take(&self) -> Vec<RecordedGit> {
+        std::mem::take(&mut *self.log.lock().expect("record log lock"))
+    }
+
+    /// Recorded commands whose working directory is exactly `repo`.
+    pub fn for_repo(&self, repo: &Path) -> Vec<RecordedGit> {
+        self.take()
+            .into_iter()
+            .filter(|rec| rec.cwd.as_deref() == Some(repo))
+            .collect()
+    }
+}
+
+#[cfg(any(test, feature = "test-faults"))]
+impl Drop for RecordingGuard {
+    fn drop(&mut self) {
+        // Clear even on panic so a failed test cannot leak its recorder into a
+        // parallel test.
+        *recorder().lock().expect("recorder lock on drop") = None;
+    }
+}
+
+/// Record `command` at spawn time when a recorder is installed. Called by
 /// [`crate::run_owned_process`] before the child is spawned.
 #[cfg(any(test, feature = "test-faults"))]
 pub(crate) fn record_spawn(command: &Command) {
     let guard = recorder().lock().expect("recorder lock");
     if let Some(log) = guard.as_ref() {
+        let executable = command.get_program().to_string_lossy().into_owned();
+        let cwd = command.get_current_dir().map(Path::to_path_buf);
         let args = command
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -197,9 +254,12 @@ pub(crate) fn record_spawn(command: &Command) {
                 )
             })
             .collect();
-        log.lock()
-            .expect("record log lock")
-            .push(RecordedGit { args, env });
+        log.lock().expect("record log lock").push(RecordedGit {
+            executable,
+            cwd,
+            args,
+            env,
+        });
     }
 }
 
@@ -296,6 +356,48 @@ mod tests {
             !tmp.join(".git-r32-recovery-no-hooks").exists(),
             "no scratch directory is created anywhere"
         );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// r34 item 4: the RAII guard records executable + cwd, filters by fixture
+    /// repository, and clears the process-wide recorder on drop (including when
+    /// the scoped assertion panics) so parallel subprocess tests cannot leak
+    /// into or pollute one another.
+    #[test]
+    fn recording_guard_scopes_by_cwd_and_clears_on_drop() {
+        let tmp = tempfile_like_scratch();
+        let repo_a = tmp.join("repo-a");
+        let repo_b = tmp.join("repo-b");
+        std::fs::create_dir_all(&repo_a).unwrap();
+        std::fs::create_dir_all(&repo_b).unwrap();
+        {
+            let guard = RecordingGuard::install();
+            // Simulate the owner-spawn boundary (run_owned_process calls
+            // record_spawn immediately before spawn): two recovery commands in
+            // DIFFERENT working directories.
+            let h_a = RecoveryGit::new();
+            record_spawn(&h_a.command(&repo_a, &["rev-parse", "--git-dir"]));
+            let h_b = RecoveryGit::new();
+            record_spawn(&h_b.command(&repo_b, &["rev-parse", "--git-dir"]));
+            // cwd scoping: only the matching repository is returned.
+            let only_a = guard.for_repo(&repo_a);
+            assert_eq!(only_a.len(), 1, "only repo-a's command, got {only_a:?}");
+            assert_eq!(only_a[0].cwd.as_deref(), Some(repo_a.as_path()));
+            assert!(only_a[0].executable.ends_with("git"));
+            // take() cleared the log.
+            assert!(guard.snapshot().is_empty());
+        }
+        // After the guard drops, the process-wide recorder is cleared: a later
+        // record_spawn is not captured.
+        let later = RecoveryGit::new();
+        record_spawn(&later.command(&tmp, &["rev-parse", "--git-dir"]));
+        {
+            let guard2 = RecordingGuard::install();
+            assert!(
+                guard2.snapshot().is_empty(),
+                "the prior command leaked past guard drop"
+            );
+        }
         std::fs::remove_dir_all(&tmp).ok();
     }
 

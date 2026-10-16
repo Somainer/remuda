@@ -34,7 +34,7 @@ pub use recovery_git::{RECOVERY_FETCH_FLAGS, RecoveryGit};
 
 /// Test-only spawn recorder proving the real recovery paths use [`RecoveryGit`].
 #[cfg(all(unix, any(test, feature = "test-faults")))]
-pub use recovery_git::{RecordedGit, set_git_spawn_recorder};
+pub use recovery_git::{RecordedGit, RecordingGuard, set_git_spawn_recorder};
 
 /// THE OWNER CONTRACT single-owner subprocess runner (Node recovery and the
 /// merge CLI recovery).

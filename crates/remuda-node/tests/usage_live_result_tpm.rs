@@ -7,8 +7,8 @@
 
 use remuda_driver::StdoutMapper;
 use remuda_hub::usage_store_test_support::{
-    JournalRecord, RollupRequest, aggregate_supply, insert_usage_event, migrate,
-    project_usage_event, rollup_instance,
+    JournalRecord, RollupRequest, aggregate_instance, aggregate_supply, insert_usage_event,
+    migrate, project_usage_event, rollup_instance,
 };
 use remuda_protocol::{
     DriverKind, InputAccounting, Knowledge, Observation, ObservationPayload, U64,
@@ -228,6 +228,71 @@ fn a_result_with_native_cost_labels_the_session_carrier_reported() {
     assert!(matches!(window_only.cost, Knowledge::Unknown { .. }));
 }
 
+/// r38 item 3: on a result-ONLY stream the native `total_cost_usd` is the
+/// CUMULATIVE bill for the session. It must ride only the session-level
+/// carrier (folded to its latest value once), never be copied onto each
+/// additive Turn — two results with $0.01 then $0.03 bill $0.03, not $0.04.
+#[test]
+fn two_result_only_frames_bill_the_latest_cumulative_session_cost_once() {
+    let mut mapper = StdoutMapper::new(DriverKind::ClaudePrint, "sess");
+    let mut all = Vec::new();
+    for (num_turns, result_index, cost) in [(1u64, 0u64, 0.01f64), (2u64, 1u64, 0.03f64)] {
+        let obs = mapper
+            .map(serde_json::json!({
+                "type": "result",
+                "subtype": "success",
+                "num_turns": num_turns,
+                "result_index": result_index,
+                "stop_reason": "end_turn",
+                "total_cost_usd": cost,
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 10,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0
+                }
+            }))
+            .expect("result frame maps");
+        all.extend(obs);
+    }
+
+    // The fallback Turn rows carry NO bill: cumulative cost is session-level.
+    for observation in &all {
+        if let ObservationPayload::Usage(u) = &observation.body
+            && u.scope == remuda_protocol::UsageScope::Turn
+        {
+            assert!(
+                matches!(u.cost, Knowledge::Unknown { .. }),
+                "a result-only Turn never copies the cumulative session bill"
+            );
+        }
+    }
+
+    // Project and insert EVERY observation, as the Node journal path would.
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate(&conn).unwrap();
+    for (seq, observation) in all.iter().enumerate() {
+        let record = JournalRecord {
+            instance_id: "ins_cumcost".into(),
+            seq: seq as i64 + 1,
+            event_id: format!("evt_cum_{seq}"),
+            observed_at: "2026-10-13T00:00:00.000Z".into(),
+            event: serde_json::to_value(observation).unwrap(),
+        };
+        let Some(row) = project_usage_event(&record, None, None) else {
+            continue;
+        };
+        insert_usage_event(&conn, &row).unwrap();
+    }
+
+    let agg = aggregate_instance(&conn, "ins_cumcost").unwrap();
+    assert!(
+        ((agg.cost_usd.unwrap_or(-1.0)) - 0.03).abs() < 1e-9,
+        "the bill is the latest cumulative reported cost once, got {:?}",
+        agg.cost_usd
+    );
+}
+
 /// the assistant (rev 1) and message_delta (rev 2) frames, and the following
 /// result's Turn is suppressed as a re-sum. Those per-call observations must
 /// carry the frame RECEIPT time as `nativeAt` — otherwise the only surviving
@@ -352,24 +417,22 @@ fn live_per_call_assistant_delta_usage_carries_native_time_into_tpm() {
     assert_eq!(rollup.tpm_out_60s, Some(30));
 }
 
-/// c-ctxusage r12 item 2 / r15 items 2-3: a PARTIAL later frame (the real
-/// mapper treats a missing input bucket as unknown, not zero) merges over the
-/// retained counters only when its source position is STRICTLY NEWER: input
-/// stays 100, output advances 10 -> 20, the derived total moves 110 -> 120,
-/// and a token-only frame with no cost keeps the known bill.
-///
-/// Under the r15 turn-authority ruling an EQUAL-position delivery changes
-/// NOTHING: the print result frames below all carry revision 1
-/// (result_index 0), so the re-delivered partial frame and the re-delivered
-/// cost-only frame are both frozen until re-stamped (as a transcript mapper
-/// would) at a strictly newer record position. A newer COST-ONLY frame
-/// corrects the bill and advances the watermark while keeping the counters
-/// and the turn clock; a counter frame at an older position is then rejected.
+/// c-ctxusage r12 item 2 / r15 items 2-3, updated r38 item 3: a PARTIAL later
+/// frame merges counters over the retained snapshot only when its source
+/// position is STRICTLY NEWER. The result's CUMULATIVE bill rides the SESSION
+/// carrier (folded to its newest reported value), never the additive Turn, so
+/// cost-only result frames carry no Turn at all; a later reported cumulative
+/// cost updates the session bill independently of counter revisions.
 #[test]
 fn a_partial_result_frame_merges_over_known_counters_end_to_end() {
-    use remuda_protocol::U64;
+    use remuda_protocol::{U64, UsageScope};
 
-    fn usage_for(usage: Option<serde_json::Value>, total_cost_usd: Option<f64>) -> Observation {
+    // Map a result frame and split its Turn (token) and Session (cumulative
+    // cost) observations. A cost-ONLY result produces no Turn after r38 item 3.
+    fn map_result(
+        usage: Option<serde_json::Value>,
+        total_cost_usd: Option<f64>,
+    ) -> (Option<Observation>, Option<Observation>) {
         let mut mapper = StdoutMapper::new(DriverKind::ClaudePrint, "sess");
         let mut frame = serde_json::json!({
             "type": "result",
@@ -384,30 +447,27 @@ fn a_partial_result_frame_merges_over_known_counters_end_to_end() {
         if let Some(cost) = total_cost_usd {
             frame["total_cost_usd"] = serde_json::json!(cost);
         }
-        mapper
-            .map(frame)
-            .expect("result frame maps")
-            .into_iter()
-            .find(|o| {
-                matches!(
-                    &o.body,
-                    ObservationPayload::Usage(u)
-                        if u.scope == remuda_protocol::UsageScope::Turn
-                )
-            })
-            .expect("a result frame yields a Turn usage observation")
+        let obs = mapper.map(frame).expect("result frame maps");
+        let mut turn = None;
+        let mut session = None;
+        for o in obs {
+            if let ObservationPayload::Usage(u) = &o.body {
+                match u.scope {
+                    UsageScope::Turn => turn = Some(o),
+                    UsageScope::Session => session = Some(o),
+                    _ => {}
+                }
+            }
+        }
+        (turn, session)
     }
 
-    // Promote a real mapper observation to a strictly newer transcript source
-    // position, exactly as the transcript mapper stamps later records.
     let at_revision = |mut observation: Observation, revision: u64| -> Observation {
         if let ObservationPayload::Usage(payload) = &mut observation.body {
             payload.metric_revision = U64(revision);
         }
         observation
     };
-    // Stamp a deterministic receipt time so the turn-clock assertions do not
-    // depend on the frames being mapped in different wall-clock milliseconds.
     let with_native_at = |mut observation: Observation, at: &str| -> Observation {
         observation.native_at = remuda_protocol::Knowledge::Known {
             value: remuda_protocol::Timestamp::try_from(at.to_string()).unwrap(),
@@ -415,26 +475,28 @@ fn a_partial_result_frame_merges_over_known_counters_end_to_end() {
         observation
     };
 
-    // First frame: full counters AND a reported cost (revision 1).
+    // First frame: full counters AND cumulative reported cost 0.5.
+    let (first_turn, first_session) = map_result(
+        Some(serde_json::json!({"input_tokens": 100, "output_tokens": 10})),
+        Some(0.5),
+    );
     let first = with_native_at(
-        usage_for(
-            Some(serde_json::json!({
-                "input_tokens": 100,
-                "output_tokens": 10,
-            })),
-            Some(0.5),
-        ),
+        first_turn.expect("full result yields a Turn"),
         "2026-10-10T00:00:00.000Z",
     );
-    // The real mapper accepts a result with no input_tokens bucket: it simply
-    // does not report that bucket — and a frame with no cost leaves the cost
-    // unreported rather than reporting zero. Print frames pin the revision at
-    // result_index 0 -> 1.
-    let second = with_native_at(
-        usage_for(Some(serde_json::json!({"output_tokens": 20})), None),
-        "2026-10-10T00:00:02.000Z",
+    let first_session = with_native_at(
+        first_session.expect("result yields a Session carrier"),
+        "2026-10-10T00:00:00.000Z",
     );
-
+    if let ObservationPayload::Usage(payload) = &first.body {
+        assert!(
+            matches!(payload.cost, remuda_protocol::Knowledge::Unknown { .. }),
+            "the fallback Turn never carries the cumulative session bill"
+        );
+    }
+    // A result missing input_tokens (no cost) still yields a partial Turn.
+    let (second_opt, _) = map_result(Some(serde_json::json!({"output_tokens": 20})), None);
+    let second = with_native_at(second_opt.unwrap(), "2026-10-10T00:00:02.000Z");
     if let ObservationPayload::Usage(payload) = &second.body {
         assert_eq!(payload.scope, remuda_protocol::UsageScope::Turn);
         assert_eq!(payload.scope_id, "1:0");
@@ -450,19 +512,24 @@ fn a_partial_result_frame_merges_over_known_counters_end_to_end() {
             "a missing cost projects as unknown, not a reported zero"
         );
     } else {
-        panic!("second frame must map to usage");
+        panic!("second frame must map to a Turn");
     }
 
-    // Cost-only frame: no usage buckets at all, just a corrected bill, at a
-    // receipt time LATER than the partial counter frame.
-    let third = with_native_at(usage_for(None, Some(0.75)), "2026-10-10T00:00:03.000Z");
+    // Cost-only frame: ONLY the Session carrier after r38 item 3.
+    let (third_turn, third_session) = map_result(None, Some(0.75));
+    assert!(
+        third_turn.is_none(),
+        "a cost-only result emits no additive Turn"
+    );
+    let third = with_native_at(
+        third_session.expect("a cost-only result still updates the session bill"),
+        "2026-10-10T00:00:03.000Z",
+    );
     const FIRST_CLOCK: &str = "2026-10-10T00:00:00.000Z";
     const SECOND_CLOCK: &str = "2026-10-10T00:00:02.000Z";
-    const THIRD_CLOCK: &str = "2026-10-10T00:00:03.000Z";
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     migrate(&conn).unwrap();
-
     let mut seq = 0i64;
     let mut next_seq = || {
         seq += 1;
@@ -476,13 +543,15 @@ fn a_partial_result_frame_merges_over_known_counters_end_to_end() {
             observed_at: "2020-01-01T00:00:00.000Z".into(),
             event: serde_json::to_value(observation).unwrap(),
         };
-        let row = project_usage_event(&record, None, None).expect("projects");
-        assert_eq!(row.scope_id.as_deref(), Some("1:0"));
+        let Some(row) = project_usage_event(&record, None, None) else {
+            return false;
+        };
         insert_usage_event(&conn, &row).expect("insert")
     };
 
-    // Baseline at revision 1: input 100 / output 10, bill 0.5.
+    // Baseline Turn rev1 (100/10) + the cumulative 0.5 session bill.
     assert!(insert_observation(next_seq(), &first));
+    assert!(insert_observation(next_seq(), &first_session));
     let clock: String = conn
         .query_row(
             "SELECT observed_at FROM usage_events \
@@ -495,9 +564,13 @@ fn a_partial_result_frame_merges_over_known_counters_end_to_end() {
         clock, FIRST_CLOCK,
         "the baseline turn clock is the first frame"
     );
+    let after_first = aggregate_instance(&conn, "ins_partial_merge").unwrap();
+    assert!(
+        (after_first.cost_usd.unwrap() - 0.5).abs() < 1e-9,
+        "the first cumulative bill is 0.5, never Turn + session 1.0"
+    );
 
-    // The re-delivered partial frame at the SAME position fills nothing:
-    // output stays 10 even though 20 is a growth (c-ctxusage r15 item 2).
+    // Equal-position partial frame changes nothing.
     assert!(
         !insert_observation(next_seq(), &second),
         "an equal-position partial frame must change nothing"
@@ -510,110 +583,60 @@ fn a_partial_result_frame_merges_over_known_counters_end_to_end() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(output, Some(10), "the equal-position 10→20 fill is frozen");
+    assert_eq!(output, Some(10), "the equal-position 10->20 fill is frozen");
 
-    // The same real-mapper partial frame at a STRICTLY NEWER position fills:
-    // input retained, output advances, total derived, bill kept.
+    // Strictly NEWER partial frame fills output; total stays U1-Unknown.
     assert!(
         insert_observation(next_seq(), &at_revision(second.clone(), 2)),
         "a strictly newer partial frame is applied"
     );
-    let (input, output, total, cost): (Option<i64>, Option<i64>, Option<i64>, Option<String>) =
-        conn.query_row(
-            "SELECT input_tokens, output_tokens, total_tokens, cost_usd FROM usage_events \
+    let (input, output, total): (Option<i64>, Option<i64>, Option<i64>) = conn
+        .query_row(
+            "SELECT input_tokens, output_tokens, total_tokens FROM usage_events \
              WHERE instance_id = 'ins_partial_merge' AND scope = 'turn' AND scope_id = '1:0'",
             [],
-            |r| {
-                Ok((
-                    r.get(0).unwrap(),
-                    r.get(1).unwrap(),
-                    r.get(2).unwrap(),
-                    r.get(3).unwrap(),
-                ))
-            },
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
-        .expect("the scoped row exists");
+        .unwrap();
     assert_eq!(input, Some(100), "the unreported input must be retained");
     assert_eq!(output, Some(20), "the reported output advances");
     assert_eq!(
         total, None,
-        "U1: the print baseline never reported the cache baskets, so the \
-         merged basket is partial and the derived total stays Unknown — \
-         never a 100+20 partial sum"
-    );
-    assert_eq!(
-        cost.as_deref(),
-        Some("0.5"),
-        "the token-only partial frame must not erase the known cost"
+        "U1: never-reported cache baskets keep the total Unknown"
     );
 
-    // The cost-only frame at the OLD revision 1 is position-gated: the bill
-    // stays 0.5 (c-ctxusage r15 item 3).
+    // Corrected cumulative bill on the SESSION carrier — applies independently
+    // of the counter watermark; counters/clock untouched; bill becomes 0.75
+    // once, never a sum.
     assert!(
-        !insert_observation(next_seq(), &third),
-        "a stale equal-position cost-only frame must change nothing"
+        insert_observation(next_seq(), &third),
+        "a cost-only session carrier corrects the cumulative bill"
     );
-    let cost: Option<String> = conn
+    let (input, output, total, clock): (Option<i64>, Option<i64>, Option<i64>, String) = conn
         .query_row(
-            "SELECT cost_usd FROM usage_events \
-             WHERE instance_id = 'ins_partial_merge' AND scope = 'turn' AND scope_id = '1:0'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        cost.as_deref(),
-        Some("0.5"),
-        "the stale bill correction is frozen"
-    );
-
-    // At a strictly newer position the cost-only frame is accepted on its own
-    // authority: bill corrected, watermark advanced, counters and clock kept.
-    assert!(
-        insert_observation(next_seq(), &at_revision(third.clone(), 3)),
-        "a newer cost-only frame corrects the bill"
-    );
-    let (input, output, total, cost, clock): (
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-        Option<String>,
-        String,
-    ) = conn
-        .query_row(
-            "SELECT input_tokens, output_tokens, total_tokens, cost_usd, observed_at FROM \
+            "SELECT input_tokens, output_tokens, total_tokens, observed_at FROM \
              usage_events WHERE instance_id = 'ins_partial_merge' AND scope = 'turn' AND \
              scope_id = '1:0'",
             [],
-            |r| {
-                Ok((
-                    r.get(0).unwrap(),
-                    r.get(1).unwrap(),
-                    r.get(2).unwrap(),
-                    r.get(3).unwrap(),
-                    r.get(4).unwrap(),
-                ))
-            },
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .unwrap();
     assert_eq!(
-        cost.as_deref(),
-        Some("0.75"),
-        "the newer cost-only frame updates the bill"
+        input,
+        Some(100),
+        "counters are untouched by the session bill"
     );
-    assert_eq!(input, Some(100), "cost-only keeps the retained input");
-    assert_eq!(output, Some(20), "cost-only keeps the retained output");
+    assert_eq!(output, Some(20));
     assert_eq!(
         total, None,
-        "the partial merged basket keeps the total Unknown (U1)"
+        "the partial basket keeps the total Unknown (U1)"
     );
     assert_eq!(
         clock, SECOND_CLOCK,
-        "a cost-only frame at {THIRD_CLOCK} never rewrites the turn clock"
+        "the session bill never moves the turn clock"
     );
 
-    // Replay the FIRST frame after the cost-only update: an equal/older
-    // position changes NOTHING — no counter, no cost, no clock.
+    // Replay the first frame at the older counter position: frozen.
     let replayed_first = JournalRecord {
         instance_id: "ins_partial_merge".into(),
         seq: next_seq(),
@@ -630,39 +653,28 @@ fn a_partial_result_frame_merges_over_known_counters_end_to_end() {
         !insert_usage_event(&conn, &replay_row).expect("replay insert"),
         "replaying the first frame at an older position must change nothing"
     );
-
-    // The cost-only watermark (3) also rejects the otherwise-growing rev-2
-    // counter snapshot arriving afterwards.
     assert!(
         !insert_observation(next_seq(), &at_revision(second.clone(), 2)),
-        "an older-position counter snapshot is rejected against the cost-only watermark"
+        "an equal-position counter snapshot changes nothing"
     );
-    let (input, output, total, cost, clock): (
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-        Option<String>,
-        String,
-    ) = conn
+    let (input, output, total): (Option<i64>, Option<i64>, Option<i64>) = conn
         .query_row(
-            "SELECT input_tokens, output_tokens, total_tokens, cost_usd, observed_at FROM \
-             usage_events WHERE instance_id = 'ins_partial_merge' AND scope = 'turn' AND \
-             scope_id = '1:0'",
+            "SELECT input_tokens, output_tokens, total_tokens FROM usage_events \
+             WHERE instance_id = 'ins_partial_merge' AND scope = 'turn' AND scope_id = '1:0'",
             [],
-            |r| {
-                Ok((
-                    r.get(0).unwrap(),
-                    r.get(1).unwrap(),
-                    r.get(2).unwrap(),
-                    r.get(3).unwrap(),
-                    r.get(4).unwrap(),
-                ))
-            },
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .unwrap();
     assert_eq!(input, Some(100), "input retained");
-    assert_eq!(output, Some(20), "the older-position growth is frozen");
+    assert_eq!(output, Some(20), "the equal-position growth is frozen");
     assert_eq!(total, None, "the Unknown derived total is retained (U1)");
-    assert_eq!(cost.as_deref(), Some("0.75"), "nothing rolls the bill back");
-    assert_eq!(clock, SECOND_CLOCK, "nothing moves the clock");
+
+    // Latest reported cumulative folded once: 0.5/0.75 are the same running
+    // counter, never added.
+    let final_agg = aggregate_instance(&conn, "ins_partial_merge").unwrap();
+    assert!(
+        (final_agg.cost_usd.unwrap() - 0.75).abs() < 1e-9,
+        "the bill is the newest cumulative reported value, not a sum: {:?}",
+        final_agg.cost_usd
+    );
 }

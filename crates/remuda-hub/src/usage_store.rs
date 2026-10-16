@@ -2213,6 +2213,25 @@ fn unified_fold_ctes(domain_pred: &str) -> String {
             )
             WHERE stock_rn = 1
          ),
+         global_reported_session_cost AS (
+            -- r38 item 3: a result-frame Session carrier reports the native
+            -- CUMULATIVE bill for one native session. The bill is the newest
+            -- KNOWN reported value per (instance, session), folded once — never
+            -- a sum (0.01 then 0.03 is 0.03). Newest KNOWN rather than newest
+            -- row: a later window-only result carries no cost and must not
+            -- erase the established cumulative bill. Independent of the
+            -- Ruling-B flow override that suppresses token stock selection.
+            SELECT instance_id, profile_id, model, scope_id, cost_usd FROM (
+                SELECT instance_id, profile_id, model, scope_id, cost_usd, ROW_NUMBER() OVER (
+                    PARTITION BY instance_id, scope_id
+                    ORDER BY CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END,
+                             seq DESC, rowid DESC
+                ) AS cost_rn
+                FROM usage_events
+                WHERE scope = 'session' AND accounting = 'reported'
+            )
+            WHERE cost_rn = 1 AND cost_usd IS NOT NULL
+         ),
          global_legacy_stock AS (
             SELECT * FROM (
                 SELECT *, ROW_NUMBER() OVER (
@@ -2469,6 +2488,11 @@ g_flow_messages AS (
                   SELECT 1 FROM g_flow_turns p WHERE p.instance_id = l.instance_id
               )
          ),
+         reported_session_cost AS (
+            -- r38 item 3: the newest reported cumulative bill per session,
+            -- domain-projected; billed once regardless of token-flow routing.
+            SELECT g.* FROM global_reported_session_cost g WHERE {dg}
+         ),
          contributions AS (
             SELECT total_tokens, input_tokens, output_tokens,
                    cache_read_tokens, cache_write_tokens, cost_usd
@@ -2583,6 +2607,15 @@ fn aggregate_select_sql() -> &'static str {
         )
         + COALESCE((SELECT SUM(cache_write_tokens) FROM flow_messages), 0),
         CASE
+            -- r38 item 3: a native REPORTED cumulative session bill is
+            -- session-level authority: the newest known value per native
+            -- session, summed across sessions, exactly once. It replaces
+            -- additive per-call estimates and is independent of the Ruling-B
+            -- flow override (result-only streams emit no per-call usage and
+            -- their token Turn rows carry no bill).
+            WHEN EXISTS (SELECT 1 FROM reported_session_cost)
+            THEN (SELECT COALESCE(SUM(CAST(cost_usd AS REAL)), 0.0)
+                  FROM reported_session_cost)
             WHEN (SELECT COALESCE(SUM(n), 0) FROM (
                 SELECT COUNT(*) AS n FROM flow_turns
                 UNION ALL SELECT COUNT(*) FROM flow_messages
@@ -10854,7 +10887,7 @@ mod tests {
         .unwrap();
         // The durable journal retains BOTH frames: scopeId T and confirmed
         // native session S, at revisions 100 and 101.
-        let journal_turn = |seq: i64, revision: i64, input: i64, stamp: &str| {
+        let journal_turn = |_seq: i64, revision: i64, input: i64, stamp: &str| {
             json!({
                 "kind": "usage",
                 "nativeAt": {"state": "known", "value": stamp},
@@ -11222,7 +11255,7 @@ mod tests {
         create_journal_table(&conn);
 
         // Journal retains BOTH frames at their original sequences.
-        let journal_usage = |seq: i64, revision: i64, input: i64| {
+        let journal_usage = |_seq: i64, revision: i64, input: i64| {
             json!({
                 "kind": "usage",
                 "nativeAt": {"state": "known", "value": "2026-10-13T00:00:00.000Z"},

@@ -5996,7 +5996,7 @@ fn usage_from_result(
         || result_output.is_some()
         || result_cache_read.is_some()
         || result_cache_write.is_some();
-    if emit_turn && (result_has_tokens || cost.is_some()) {
+    if emit_turn && result_has_tokens {
         let mut turn_payload = UsagePayload {
             usage_id: Id::new("obj")?,
             scope: UsageScope::Turn,
@@ -6014,13 +6014,12 @@ fn usage_from_result(
             cache_read_tokens: opt_u64(result_cache_read),
             cache_write_tokens: opt_u64(result_cache_write),
             total_tokens: opt_u64(total),
-            cost: cost
-                .as_ref()
-                .map(|cost| Knowledge::Known {
-                    value: cost.clone(),
-                })
-                .unwrap_or_else(|| unknown("not-emitted")),
-            accounting: remuda_protocol::Accounting::Reported,
+            // r38 item 3: result total_cost_usd is the session's CUMULATIVE
+            // native bill — it rides the session carrier below and must never
+            // be copied onto an additive Turn (two results would sum to more
+            // than the true bill). A cost-ONLY result emits no Turn row at all.
+            cost: unknown("not-emitted"),
+            accounting: remuda_protocol::Accounting::Estimated,
             native_fields_ref: None,
             context_window: window.map(U64),
         };

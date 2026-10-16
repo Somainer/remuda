@@ -1366,7 +1366,9 @@ exit 1
 /// never `gate_failed`.
 ///
 /// `fail`: "fetch" fails the ref-free remote-tip read (`ls-remote`, with
-/// `fetch` for older flows); "merge-base" fails the ancestry read.
+/// `fetch` for older flows); "merge-base" fails the ancestry read. Hardened
+/// recovery prepends `-c` options, so the wrapper scans ALL args for the
+/// subcommand instead of checking $1.
 fn install_failing_git_wrapper(parent: &Path, fail: &str) -> PathBuf {
     let real_git: PathBuf = {
         let path = std::env::var_os("PATH").expect("PATH");
@@ -1382,11 +1384,18 @@ fn install_failing_git_wrapper(parent: &Path, fail: &str) -> PathBuf {
         &wrapper,
         format!(
             r#"#!/bin/sh
-if [ "{fail}" = "fetch" ] && {{ [ "$1" = "fetch" ] || [ "$1" = "ls-remote" ]; }}; then
+# Recovery prepends -c options; find the subcommand anywhere in argv.
+sub=""
+for a in "$@"; do
+  case "$a" in
+    ls-remote|fetch|merge-base) sub="$a"; break ;;
+  esac
+done
+if [ "{fail}" = "fetch" ] && {{ [ "$sub" = "fetch" ] || [ "$sub" = "ls-remote" ]; }}; then
   echo "wrapper: simulated recovery fetch failure" >&2
   exit 1
 fi
-if [ "{fail}" = "merge-base" ] && [ "$1" = "merge-base" ]; then
+if [ "{fail}" = "merge-base" ] && [ "$sub" = "merge-base" ]; then
   echo "wrapper: simulated merge-base failure" >&2
   exit 2
 fi

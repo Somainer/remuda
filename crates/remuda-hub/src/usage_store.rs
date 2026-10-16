@@ -2294,15 +2294,21 @@ fn turn_fully_covered_sql(inst: &str, tid: &str) -> String {
 /// connection so planning happens once per process per statement.
 fn fold_ctes_instance() -> &'static str {
     static C: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    C.get_or_init(|| unified_fold_ctes("instance_id = ?1"))
+    C.get_or_init(|| unified_fold_ctes("instance_id = ?1", "global_reported_session_cost"))
 }
 
 fn fold_ctes_supply() -> &'static str {
     static C: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    C.get_or_init(|| unified_fold_ctes("profile_id = ?1 AND model = ?2"))
+    C.get_or_init(|| {
+        // Supply folds the newest bill per MODEL+session (r39 item 4).
+        unified_fold_ctes(
+            "profile_id = ?1 AND model = ?2",
+            "global_reported_cost_by_model",
+        )
+    })
 }
 
-fn unified_fold_ctes(domain_pred: &str) -> String {
+fn unified_fold_ctes(domain_pred: &str, reported_source: &str) -> String {
     // Qualify a standalone-domain predicate ("instance_id = ?1" or
     // "profile_id = ?1 AND model = ?2") for a specific table alias. Word
     // boundaries are essential: a plain `replace("model", ..)` would also
@@ -2352,23 +2358,82 @@ fn unified_fold_ctes(domain_pred: &str) -> String {
             WHERE stock_rn = 1
          ),
          global_reported_session_cost AS (
-            -- r38 item 3: a result-frame Session carrier reports the native
-            -- CUMULATIVE bill for one native session. The bill is the newest
-            -- KNOWN reported value per (instance, session), folded once — never
-            -- a sum (0.01 then 0.03 is 0.03). Newest KNOWN rather than newest
-            -- row: a later window-only result carries no cost and must not
-            -- erase the established cumulative bill. Independent of the
-            -- Ruling-B flow override that suppresses token stock selection.
-            SELECT instance_id, profile_id, model, scope_id, cost_usd FROM (
-                SELECT instance_id, profile_id, model, scope_id, cost_usd, ROW_NUMBER() OVER (
+            -- r38 item 3 / r39 items 2-4 (AA2): a result-frame Session carrier
+            -- reports the native CUMULATIVE bill for one native session. The
+            -- bill is the newest KNOWN reported value per (instance, session),
+            -- folded once — never a sum (0.01 then 0.03 is 0.03). Newest KNOWN
+            -- rather than newest row: a later window-only result carries no
+            -- cost and must not erase the established bill.
+            --
+            -- r39 item 3: the legacy NULL-scope reported bill is suppressed
+            -- once the instance has ANY scoped session evidence (the same
+            -- instance-global legacy-vs-scoped selection as legacy_stock) —
+            -- a $0.40 NULL bill followed by a scoped $0.50 bills $0.50, never
+            -- $0.90. The two branches therefore partition distinct keys:
+            -- scoped (instance, scope_id), and one NULL bill per legacy
+            -- instance with no scoped sessions.
+            SELECT rowid, instance_id, seq, profile_id, model, scope_id, cost_usd,
+                   total_tokens, input_tokens, output_tokens,
+                   cache_read_tokens, cache_write_tokens FROM (
+                SELECT rowid, instance_id, seq, profile_id, model, scope_id, cost_usd,
+                       total_tokens, input_tokens, output_tokens,
+                       cache_read_tokens, cache_write_tokens, ROW_NUMBER() OVER (
                     PARTITION BY instance_id, scope_id
                     ORDER BY CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END,
                              seq DESC, rowid DESC
                 ) AS cost_rn
                 FROM usage_events
                 WHERE scope = 'session' AND accounting = 'reported'
+                  AND scope_id IS NOT NULL
             )
             WHERE cost_rn = 1 AND cost_usd IS NOT NULL
+            UNION ALL
+            SELECT rowid, instance_id, seq, profile_id, model, scope_id, cost_usd,
+                   total_tokens, input_tokens, output_tokens,
+                   cache_read_tokens, cache_write_tokens FROM (
+                SELECT rowid, instance_id, seq, profile_id, model, scope_id, cost_usd,
+                       total_tokens, input_tokens, output_tokens,
+                       cache_read_tokens, cache_write_tokens,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY instance_id
+                           ORDER BY CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END,
+                                    seq DESC, rowid DESC
+                       ) AS legacy_cost_rn
+                FROM usage_events u
+                WHERE scope = 'session' AND accounting = 'reported'
+                  AND scope_id IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM usage_events s
+                      WHERE s.instance_id = u.instance_id
+                        AND s.scope = 'session' AND s.scope_id IS NOT NULL
+                  )
+            )
+            WHERE legacy_cost_rn = 1 AND cost_usd IS NOT NULL
+         ),
+         global_reported_cost_by_model AS (
+            -- r39 item 4 (AA3 provider attribution): the SAME session can
+            -- report cumulative snapshots against different models across a
+            -- /model switch. The instance fold (global_reported_session_cost)
+            -- takes the newest per session; the PROVIDER fold needs the newest
+            -- snapshot per (model, session) so an earlier model keeps its
+            -- reported bill instead of being hidden by the switched model.
+            -- Scoped only: a legacy NULL bill is instance-keyed and already in
+            -- the main relation.
+            SELECT rowid, instance_id, seq, profile_id, model, scope_id, cost_usd,
+                   total_tokens, input_tokens, output_tokens,
+                   cache_read_tokens, cache_write_tokens FROM (
+                SELECT rowid, instance_id, seq, profile_id, model, scope_id, cost_usd,
+                       total_tokens, input_tokens, output_tokens,
+                       cache_read_tokens, cache_write_tokens, ROW_NUMBER() OVER (
+                    PARTITION BY instance_id, profile_id, model, scope_id
+                    ORDER BY CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END,
+                             seq DESC, rowid DESC
+                ) AS model_cost_rn
+                FROM usage_events
+                WHERE scope = 'session' AND accounting = 'reported'
+                  AND scope_id IS NOT NULL
+            )
+            WHERE model_cost_rn = 1 AND cost_usd IS NOT NULL
          ),
          global_legacy_stock AS (
             SELECT * FROM (
@@ -2569,6 +2634,11 @@ g_flow_messages AS (
             -- Lineage-PROVEN turns are deliberately NOT here: they follow the
             -- per-session coverage/certification rule instead (a covered stock
             -- still counts when another session has an uncovered proven turn).
+            --
+            -- r39 (AA2): an instance with a native REPORTED cumulative bill is
+            -- removed — reported-cost authority keeps the session carrier alive
+            -- even on a result-only stream whose unqualified Turn set the
+            -- Ruling-B flag (otherwise its own bill would be suppressed).
             SELECT instance_id FROM g_flow_messages
             UNION
             SELECT instance_id FROM g_unmatched_flow_turns
@@ -2576,25 +2646,47 @@ g_flow_messages AS (
             SELECT instance_id FROM g_legacy_open_turns
             UNION
             SELECT instance_id FROM g_legacy_flow_turns
+            EXCEPT
+            SELECT instance_id FROM global_reported_session_cost
          ),
          -- DOMAIN PROJECTION: the classification above is instance-global so a
          -- row stays correctly suppressed/ambiguous under every supply view;
          -- only the final projection filters by instance or profile/model.
          flow_messages AS (
-            SELECT m.* FROM g_flow_messages m WHERE {dm}
+            SELECT m.* FROM g_flow_messages m
+            WHERE {dm}
+              AND m.instance_id NOT IN (SELECT instance_id FROM reported_instances)
          ),
          flow_turns AS (
+            -- AA2/AA3: flow Turns keep their TOKEN contribution even for
+            -- instances with reported-cost authority (tokens and cost are
+            -- independent); the cost CASE below excludes their cost. Ruling-B
+            -- override/stock selection is handled by the global CTEs above.
             SELECT t.* FROM g_flow_turns t WHERE {dt}
          ),
          ambiguous_turns AS (
             SELECT t.* FROM g_ambiguous_turns t WHERE {dt}
          ),
          stock_sessions AS (
-            -- Flow-less sessions count their stock unless a Ruling B
+            -- Token-bearing session stock. A r39 native REPORTED carrier with
+            -- real token buckets survives the Ruling-B flow override (reported
+            -- cost authority); a token-LESS reported carrier is excluded here
+            -- (its NULL buckets would poison U1) and contributes only via
+            -- reported_session_cost / cost_only_reported.
+            SELECT g.* FROM global_scoped_sessions g
+            WHERE {dg}
+              AND g.accounting = 'reported'
+              AND (g.total_tokens IS NOT NULL OR g.input_tokens IS NOT NULL
+                   OR g.output_tokens IS NOT NULL OR g.cache_read_tokens IS NOT NULL
+                   OR g.cache_write_tokens IS NOT NULL)
+            UNION ALL
+            -- Flow-less sessions count their token stock unless a Ruling B
             -- instance-wide override (message/unqualified flow) stands it down.
             SELECT g.* FROM global_scoped_sessions g
             WHERE {dg}
+              AND g.accounting <> 'reported'
               AND g.instance_id NOT IN (SELECT instance_id FROM override_instances)
+              AND g.instance_id NOT IN (SELECT instance_id FROM reported_instances)
               AND NOT EXISTS (
                   SELECT 1 FROM g_session_turn_flow f
                   WHERE f.instance_id = g.instance_id AND f.sid = g.scope_id
@@ -2607,7 +2699,9 @@ g_flow_messages AS (
             -- coverage match below.
             SELECT g.* FROM global_scoped_sessions g
             WHERE {dg}
+              AND g.accounting <> 'reported'
               AND g.instance_id NOT IN (SELECT instance_id FROM override_instances)
+              AND g.instance_id NOT IN (SELECT instance_id FROM reported_instances)
               AND EXISTS (
                   SELECT 1 FROM g_fully_covered_sessions c
                   WHERE c.instance_id = g.instance_id AND c.sid = g.scope_id
@@ -2622,14 +2716,38 @@ g_flow_messages AS (
               AND l.instance_id NOT IN (
                   SELECT instance_id FROM override_instances
               )
+              AND l.instance_id NOT IN (SELECT instance_id FROM reported_instances)
               AND NOT EXISTS (
                   SELECT 1 FROM g_flow_turns p WHERE p.instance_id = l.instance_id
               )
          ),
          reported_session_cost AS (
-            -- r38 item 3: the newest reported cumulative bill per session,
-            -- domain-projected; billed once regardless of token-flow routing.
-            SELECT g.* FROM global_reported_session_cost g WHERE {dg}
+            -- Newest reported cumulative bill per session (instance fold) or
+            -- per model+session (supply fold, r39 item 4), domain-projected.
+            SELECT g.* FROM {reported_source} g WHERE {dg}
+         ),
+         reported_instances AS (
+            -- r39 item 2 (AA2): instances in THIS domain with a reported bill.
+            -- Their cost comes solely from reported_session_cost; their
+            -- unqualified flow/stock estimates must not be added (nor, for a
+            -- different instance, suppressed).
+            SELECT DISTINCT instance_id FROM reported_session_cost
+         ),
+         -- r39 item 4 (AA3): a reported cost carrier whose SESSION frame
+         -- itself reported no tokens (a cost-only result after a model switch)
+         -- still gives the provider/model a cost row even when the Ruling-B
+         -- flow override hides the token-less stock — token presence is
+         -- independent of cost. Its token buckets are NULL so the U1 gates
+         -- surface Unknown tokens.
+         cost_only_reported AS (
+            SELECT rc.total_tokens, rc.input_tokens, rc.output_tokens,
+                   rc.cache_read_tokens, rc.cache_write_tokens, rc.cost_usd
+            FROM reported_session_cost rc
+            WHERE rc.total_tokens IS NULL
+              AND rc.input_tokens IS NULL
+              AND rc.output_tokens IS NULL
+              AND rc.cache_read_tokens IS NULL
+              AND rc.cache_write_tokens IS NULL
          ),
          contributions AS (
             SELECT total_tokens, input_tokens, output_tokens,
@@ -2647,11 +2765,16 @@ g_flow_messages AS (
             SELECT total_tokens, input_tokens, output_tokens,
                    cache_read_tokens, cache_write_tokens, cost_usd
             FROM flow_messages
+            UNION ALL
+            SELECT total_tokens, input_tokens, output_tokens,
+                   cache_read_tokens, cache_write_tokens, cost_usd
+            FROM cost_only_reported
          )",
         dm = d("m"),
         dt = d("t"),
         dg = d("g"),
         dl = d("l"),
+        reported_source = reported_source,
     )
 }
 
@@ -2672,13 +2795,20 @@ fn aggregate_select_sql() -> &'static str {
             UNION ALL SELECT COUNT(*) FROM flow_messages
             UNION ALL SELECT COUNT(*) FROM stock_sessions
             UNION ALL SELECT COUNT(*) FROM legacy_stock
+            UNION ALL SELECT COUNT(*) FROM cost_only_reported
         )),
         (SELECT COUNT(*) FROM ambiguous_turns),
         (SELECT CASE
                  WHEN EXISTS (
                      SELECT 1 FROM ambiguous_turns WHERE total_tokens IS NOT NULL
                  ) THEN NULL
-                 WHEN COUNT(*) = 0 THEN 0
+                 -- AA3: empty turn/stock half -> message sum when messages
+                 -- exist or no cost-only carrier; Unknown for cost-only.
+                 WHEN COUNT(*) = 0
+                      AND (SELECT COUNT(*) FROM flow_messages) > 0 THEN 0
+                 WHEN COUNT(*) = 0
+                      AND NOT EXISTS (SELECT 1 FROM cost_only_reported) THEN 0
+                 WHEN COUNT(*) = 0 THEN NULL
                  WHEN COUNT(*) = COUNT(total_tokens) THEN SUM(total_tokens)
              END
             FROM (
@@ -2692,7 +2822,14 @@ fn aggregate_select_sql() -> &'static str {
                  WHEN EXISTS (
                      SELECT 1 FROM ambiguous_turns WHERE input_tokens IS NOT NULL
                  ) THEN NULL
-                 WHEN COUNT(*) = 0 THEN 0
+                 -- AA3: with no turn/stock rows the value is the message
+                 -- sum (0 when there are no messages AND no cost-only
+                 -- carrier, but NULL when only a cost-only bill exists).
+                 WHEN COUNT(*) = 0
+                      AND (SELECT COUNT(*) FROM flow_messages) > 0 THEN 0
+                 WHEN COUNT(*) = 0
+                      AND NOT EXISTS (SELECT 1 FROM cost_only_reported) THEN 0
+                 WHEN COUNT(*) = 0 THEN NULL
                  WHEN COUNT(*) = COUNT(input_tokens) THEN SUM(input_tokens)
              END
             FROM (
@@ -2706,7 +2843,14 @@ fn aggregate_select_sql() -> &'static str {
                  WHEN EXISTS (
                      SELECT 1 FROM ambiguous_turns WHERE output_tokens IS NOT NULL
                  ) THEN NULL
-                 WHEN COUNT(*) = 0 THEN 0
+                 -- AA3: with no turn/stock rows the value is the message
+                 -- sum (0 when there are no messages AND no cost-only
+                 -- carrier, but NULL when only a cost-only bill exists).
+                 WHEN COUNT(*) = 0
+                      AND (SELECT COUNT(*) FROM flow_messages) > 0 THEN 0
+                 WHEN COUNT(*) = 0
+                      AND NOT EXISTS (SELECT 1 FROM cost_only_reported) THEN 0
+                 WHEN COUNT(*) = 0 THEN NULL
                  WHEN COUNT(*) = COUNT(output_tokens) THEN SUM(output_tokens)
              END
             FROM (
@@ -2720,7 +2864,14 @@ fn aggregate_select_sql() -> &'static str {
                  WHEN EXISTS (
                      SELECT 1 FROM ambiguous_turns WHERE cache_read_tokens IS NOT NULL
                  ) THEN NULL
-                 WHEN COUNT(*) = 0 THEN 0
+                 -- AA3: with no turn/stock rows the value is the message
+                 -- sum (0 when there are no messages AND no cost-only
+                 -- carrier, but NULL when only a cost-only bill exists).
+                 WHEN COUNT(*) = 0
+                      AND (SELECT COUNT(*) FROM flow_messages) > 0 THEN 0
+                 WHEN COUNT(*) = 0
+                      AND NOT EXISTS (SELECT 1 FROM cost_only_reported) THEN 0
+                 WHEN COUNT(*) = 0 THEN NULL
                  WHEN COUNT(*) = COUNT(cache_read_tokens) THEN SUM(cache_read_tokens)
              END
             FROM (
@@ -2734,7 +2885,14 @@ fn aggregate_select_sql() -> &'static str {
                  WHEN EXISTS (
                      SELECT 1 FROM ambiguous_turns WHERE cache_write_tokens IS NOT NULL
                  ) THEN NULL
-                 WHEN COUNT(*) = 0 THEN 0
+                 -- AA3: with no turn/stock rows the value is the message
+                 -- sum (0 when there are no messages AND no cost-only
+                 -- carrier, but NULL when only a cost-only bill exists).
+                 WHEN COUNT(*) = 0
+                      AND (SELECT COUNT(*) FROM flow_messages) > 0 THEN 0
+                 WHEN COUNT(*) = 0
+                      AND NOT EXISTS (SELECT 1 FROM cost_only_reported) THEN 0
+                 WHEN COUNT(*) = 0 THEN NULL
                  WHEN COUNT(*) = COUNT(cache_write_tokens) THEN SUM(cache_write_tokens)
              END
             FROM (
@@ -2744,66 +2902,78 @@ fn aggregate_select_sql() -> &'static str {
             )
         )
         + COALESCE((SELECT SUM(cache_write_tokens) FROM flow_messages), 0),
+        -- r38 item 3 / r39 items 2-4 (AA2/AA3): cost is composed PER
+        -- ATTRIBUTABLE INSTANCE. An instance with a native REPORTED cumulative
+        -- bill contributes exactly those bills (newest KNOWN per session,
+        -- summed across its sessions) — its per-call/stock estimates are not
+        -- added and, crucially, an unrelated instance's reported bill never
+        -- suppresses another instance's estimates. Everything else bills the
+        -- existing Ruling-B/U1 estimate (sticky-Unknown stock and unpriced
+        -- turn-only poison preserved). Presence is independent of tokens: a
+        -- cost-only reported carrier keeps this column non-NULL even when its
+        -- model has zero token contributions (AA3).
         CASE
-            -- r38 item 3: a native REPORTED cumulative session bill is
-            -- session-level authority: the newest known value per native
-            -- session, summed across sessions, exactly once. It replaces
-            -- additive per-call estimates and is independent of the Ruling-B
-            -- flow override (result-only streams emit no per-call usage and
-            -- their token Turn rows carry no bill).
-            WHEN EXISTS (SELECT 1 FROM reported_session_cost)
-            THEN (SELECT COALESCE(SUM(CAST(cost_usd AS REAL)), 0.0)
-                  FROM reported_session_cost)
-            WHEN (SELECT COALESCE(SUM(n), 0) FROM (
-                SELECT COUNT(*) AS n FROM flow_turns
-                UNION ALL SELECT COUNT(*) FROM flow_messages
-                UNION ALL SELECT COUNT(*) FROM stock_sessions
-                UNION ALL SELECT COUNT(*) FROM legacy_stock
+            WHEN (SELECT COUNT(*) FROM (
+                SELECT 1 FROM flow_turns
+                UNION ALL SELECT 1 FROM flow_messages
+                UNION ALL SELECT 1 FROM stock_sessions
+                UNION ALL SELECT 1 FROM legacy_stock
+                UNION ALL SELECT 1 FROM cost_only_reported
             )) = 0 THEN NULL
+            -- Ambiguous turn cost poisons only instances WITHOUT reported
+            -- authority (the reported bill is authoritative by definition).
             WHEN EXISTS (
                 SELECT 1 FROM ambiguous_turns WHERE cost_usd IS NOT NULL
+                  AND instance_id NOT IN (SELECT instance_id FROM reported_instances)
             ) THEN NULL
-            -- Stock cost: a sticky-Unknown newest point poisons the stock.
-            WHEN (
-                SELECT COUNT(*) FROM (
-                    SELECT cost_usd FROM stock_sessions
-                    UNION ALL
-                    SELECT cost_usd FROM legacy_stock
-                )
-            ) > 0
-            AND EXISTS (
+            -- Sticky-Unknown stock poisons the non-reported estimate.
+            WHEN EXISTS (
                 SELECT 1 FROM (
-                    SELECT cost_usd FROM stock_sessions
+                    SELECT instance_id, cost_usd FROM stock_sessions
                     UNION ALL
-                    SELECT cost_usd FROM legacy_stock
-                ) WHERE cost_usd IS NULL
+                    SELECT instance_id, cost_usd FROM legacy_stock
+                ) est
+                WHERE est.cost_usd IS NULL
+                  AND est.instance_id NOT IN (SELECT instance_id FROM reported_instances)
             ) THEN NULL
-            -- Per-turn FLOW cost: on a TURN-ONLY instance (Claude) one
-            -- unpriced turn makes the estimate Unknown (c-ctxusage sticky-
-            -- Unknown); alongside Session rows (Codex mixed shape) per-call
-            -- flow follows Ruling B and an unpriced call bills 0.
+            -- An unpriced turn on a turn-only instance poisons only when that
+            -- instance has no reported bill.
             WHEN EXISTS (
                 SELECT 1 FROM flow_turns ft
                 WHERE ft.cost_usd IS NULL
+                  AND ft.instance_id NOT IN (SELECT instance_id FROM reported_instances)
                   AND NOT EXISTS (
                       SELECT 1 FROM usage_events sx
                       WHERE sx.instance_id = ft.instance_id
                         AND sx.scope = 'session'
                   )
             ) THEN NULL
-            ELSE COALESCE((
-                SELECT SUM(CAST(cost_usd AS REAL)) FROM (
-                    SELECT cost_usd FROM stock_sessions
-                    UNION ALL
-                    SELECT cost_usd FROM legacy_stock
-                )
-            ), 0.0)
-            + COALESCE((SELECT SUM(CAST(cost_usd AS REAL)) FROM flow_turns), 0.0)
-            -- Durable Message flow: an unpriced Message contributes 0
-            -- (Ruling B per-call billing, c-usagefu r10).
-            + COALESCE((
-                SELECT SUM(CAST(cost_usd AS REAL)) FROM flow_messages
-            ), 0.0)
+            ELSE
+                -- Reported cumulative bills, once per attributable session.
+                COALESCE((
+                    SELECT SUM(CAST(cost_usd AS REAL)) FROM reported_session_cost
+                ), 0.0)
+                -- Non-reported instances: selected stock estimates.
+                + COALESCE((
+                    SELECT SUM(CAST(cost_usd AS REAL)) FROM (
+                        SELECT cost_usd FROM stock_sessions
+                        WHERE instance_id NOT IN (SELECT instance_id FROM reported_instances)
+                        UNION ALL
+                        SELECT cost_usd FROM legacy_stock
+                        WHERE instance_id NOT IN (SELECT instance_id FROM reported_instances)
+                    )
+                ), 0.0)
+                -- Non-reported per-turn flow.
+                + COALESCE((
+                    SELECT SUM(CAST(cost_usd AS REAL)) FROM flow_turns
+                    WHERE instance_id NOT IN (SELECT instance_id FROM reported_instances)
+                ), 0.0)
+                -- Durable Message flow: an unpriced Message contributes 0
+                -- (Ruling B per-call billing, c-usagefu r10).
+                + COALESCE((
+                    SELECT SUM(CAST(cost_usd AS REAL)) FROM flow_messages
+                    WHERE instance_id NOT IN (SELECT instance_id FROM reported_instances)
+                ), 0.0)
         END
      -- No FROM: every column is a scalar subquery over the fold CTEs, so the
      -- row must materialize even when `contributions` is empty (an empty
@@ -7754,6 +7924,18 @@ mod tests {
         revision: i64,
         cost: Option<&str>,
     ) -> JournalRecord {
+        tokenless_session_record_accounting(seq, scope_id, revision, cost, "estimated")
+    }
+
+    /// r39 items 2/3: session carrier with explicit accounting so the REPORTED
+    /// native-bill path is exercised (drivers mark result costs reported).
+    fn tokenless_session_record_accounting(
+        seq: i64,
+        scope_id: &str,
+        revision: i64,
+        cost: Option<&str>,
+        accounting: &str,
+    ) -> JournalRecord {
         let mut payload = serde_json::Map::new();
         payload.insert("scope".into(), json!("session"));
         payload.insert("scopeId".into(), json!(scope_id));
@@ -7771,7 +7953,7 @@ mod tests {
                 },
             ),
         );
-        payload.insert("accounting".into(), json!("estimated"));
+        payload.insert("accounting".into(), json!(accounting));
         JournalRecord {
             instance_id: "ins_test".into(),
             seq,
@@ -7907,6 +8089,142 @@ mod tests {
         );
     }
 
+    /// r39 item 2 (AA2): a REPORTED cumulative bill is authoritative only for
+    /// its own instance. Instance A reports $0.01; instance B has an uncovered
+    /// per-call ESTIMATE of $0.02 — the provider total is $0.03 (and a $0.02
+    /// budget must Stop), not just A's $0.01.
+
+    #[test]
+    fn a_reported_bill_in_one_instance_keeps_another_instances_estimate() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let project =
+            |rec: &JournalRecord| project_usage_event(rec, Some("pvp_aa2"), Some("m-aa2")).unwrap();
+        // A: native reported cumulative session bill 0.01.
+        assert!(
+            insert_usage_event(
+                &conn,
+                &project(&tokenless_session_record_for_accounting(
+                    "ins_a_rep",
+                    1,
+                    "sess-a",
+                    1,
+                    Some("0.01"),
+                    "reported"
+                ))
+            )
+            .unwrap()
+        );
+        // B: a priced per-call turn, no reported bill yet.
+        assert!(
+            insert_usage_event(
+                &conn,
+                &project(&priced_turn_record("ins_b_est", 1, "mb", "0.02"))
+            )
+            .unwrap()
+        );
+
+        let supply = aggregate_supply(&conn, "pvp_aa2", "m-aa2").unwrap();
+        assert!(
+            (supply.cost_usd.unwrap() - 0.03).abs() < 1e-9,
+            "A's reported 0.01 plus B's estimated 0.02, got {:?}",
+            supply.cost_usd
+        );
+        assert_eq!(
+            supply.budget_status(Some(0.02)),
+            BudgetStatus::Stop,
+            "the 0.03 spend must Stop a 0.02 budget"
+        );
+        // Per instance: each contributes only its own authority.
+        assert!(
+            (aggregate_instance(&conn, "ins_a_rep")
+                .unwrap()
+                .cost_usd
+                .unwrap()
+                - 0.01)
+                .abs()
+                < 1e-9
+        );
+        assert!(
+            (aggregate_instance(&conn, "ins_b_est")
+                .unwrap()
+                .cost_usd
+                .unwrap()
+                - 0.02)
+                .abs()
+                < 1e-9
+        );
+    }
+
+    /// r39 item 3 (AA2): a legacy NULL-scope REPORTED bill is suppressed once
+    /// scoped session evidence exists for the instance — same legacy-vs-scoped
+    /// selection as token stock. NULL $0.40 then scoped $0.50 bills $0.50.
+    #[test]
+    fn a_reported_legacy_null_bill_is_suppressed_once_scoped_evidence_exists() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        // Legacy world: NULL scope_id, REPORTED cumulative 0.40.
+        let mut legacy =
+            tokenless_session_record_accounting(1, "ignored", 1, Some("0.40"), "reported");
+        legacy.event["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("scopeId");
+        legacy.instance_id = "ins_aa3".into();
+        assert!(insert(&conn, &legacy));
+        // Scoped REPORTED cumulative 0.50 for the ongoing session.
+        assert!(
+            insert_usage_event(
+                &conn,
+                &project_usage_event(
+                    &tokenless_session_record_for_accounting(
+                        "ins_aa3",
+                        2,
+                        "s1",
+                        2,
+                        Some("0.50"),
+                        "reported"
+                    ),
+                    Some("pvp_aa3"),
+                    Some("m-aa3")
+                )
+                .unwrap()
+            )
+            .unwrap()
+        );
+
+        let agg = aggregate_instance(&conn, "ins_aa3").unwrap();
+        assert!(
+            (agg.cost_usd.unwrap() - 0.50).abs() < 1e-9,
+            "scoped reported bill alone counts, not 0.40+0.50, got {:?}",
+            agg.cost_usd
+        );
+        let supply = aggregate_supply(&conn, "pvp_aa3", "m-aa3").unwrap();
+        assert!((supply.cost_usd.unwrap() - 0.50).abs() < 1e-9);
+
+        // A legacy-only instance (no scoped evidence anywhere) still bills its
+        // NULL-scope reported cumulative value.
+        let legacy_only =
+            tokenless_session_record_accounting(1, "ignored", 1, Some("0.07"), "reported");
+        let mut legacy_only = legacy_only;
+        legacy_only.event["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("scopeId");
+        legacy_only.instance_id = "ins_aa3_legacy".into();
+        assert!(insert(&conn, &legacy_only));
+        assert!(
+            (aggregate_instance(&conn, "ins_aa3_legacy")
+                .unwrap()
+                .cost_usd
+                .unwrap()
+                - 0.07)
+                .abs()
+                < 1e-9,
+            "without scoped evidence the NULL reported bill still applies"
+        );
+    }
+
     #[test]
     fn priced_flow_cost_is_billed_alongside_an_unmatched_historical_turn_ignoring_stock() {
         // c-usagefu r10 item 6 (Ruling B): COST follows the exact eligible-flow
@@ -8006,6 +8324,22 @@ mod tests {
         cost: Option<&str>,
     ) -> JournalRecord {
         let mut rec = tokenless_session_record(seq, scope_id, revision, cost);
+        rec.instance_id = instance_id.into();
+        rec
+    }
+
+    /// r39: token-less session carrier for an arbitrary instance with explicit
+    /// accounting (REPORTED native bill vs ESTIMATED priced stock).
+    fn tokenless_session_record_for_accounting(
+        instance_id: &str,
+        seq: i64,
+        scope_id: &str,
+        revision: i64,
+        cost: Option<&str>,
+        accounting: &str,
+    ) -> JournalRecord {
+        let mut rec =
+            tokenless_session_record_accounting(seq, scope_id, revision, cost, accounting);
         rec.instance_id = instance_id.into();
         rec
     }

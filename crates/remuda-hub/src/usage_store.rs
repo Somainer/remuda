@@ -1729,6 +1729,26 @@ fn knowledge_u64(value: &Value) -> Option<i64> {
     inner.as_i64()
 }
 
+/// Decode an additive token bucket (`Knowledge<U64>`) the wire marks
+/// `not-applicable` as a STRUCTURAL ZERO rather than Unknown.
+///
+/// A model without a cache tier (or a frame that cannot produce a bucket)
+/// sends `{"state":"not-applicable"}`: that is a definite "this contributes
+/// 0", not "the value was not reported". Main's context-basket sum treated
+/// such a column as zero; the unified fold instead demanded a value in every
+/// bucket and dropped the whole context to Unknown whenever cache creation
+/// was N/A (the supply r2c shape), regressing the context chip (r37 gate
+/// triage: passes on cbac58e1, fails on the merge). An OMITTED key or an
+/// explicit `unknown` stays None — U1 still hides a genuinely unreported
+/// bucket.
+fn additive_knowledge_u64(value: Option<&Value>) -> Option<i64> {
+    let payload = value?;
+    if payload.get("state").and_then(Value::as_str) == Some("not-applicable") {
+        return Some(0);
+    }
+    knowledge_u64(payload)
+}
+
 /// Decode a bare protocol `U64` scalar — a canonical decimal string (`"2"`),
 /// tolerating a bare JSON number from non-Rust producers — as an `i64`.
 /// Distinct from [`knowledge_u64`], which unwraps a `Knowledge<U64>` enum's
@@ -1752,10 +1772,10 @@ pub fn project_usage_event(
     }
     let payload = record.event.get("payload")?;
     let total_tokens = payload.get("totalTokens").and_then(knowledge_u64);
-    let input_tokens = payload.get("inputTokens").and_then(knowledge_u64);
-    let output_tokens = payload.get("outputTokens").and_then(knowledge_u64);
-    let cache_read_tokens = payload.get("cacheReadTokens").and_then(knowledge_u64);
-    let cache_write_tokens = payload.get("cacheWriteTokens").and_then(knowledge_u64);
+    let input_tokens = additive_knowledge_u64(payload.get("inputTokens"));
+    let output_tokens = additive_knowledge_u64(payload.get("outputTokens"));
+    let cache_read_tokens = additive_knowledge_u64(payload.get("cacheReadTokens"));
+    let cache_write_tokens = additive_knowledge_u64(payload.get("cacheWriteTokens"));
     // c-usagefu (c): native per-model context window, additively optional.
     let native_context_window = payload.get("contextWindow").and_then(scalar_u64);
     let cost_usd = payload
@@ -11055,6 +11075,97 @@ mod tests {
             rollup_b.tpm_in_60s,
             Some(900),
             "B's own turn drives B's rate"
+        );
+    }
+
+    /// r37 gate fix: a wire Knowledge bucket marked `not-applicable` is a
+    /// STRUCTURAL ZERO ("this model/frame has no such cache tier"), not an
+    /// omitted value. The merge's context basket demanded a value in EVERY
+    /// bucket, so a real Claude usage frame with known input, known cache read
+    /// zero and `cacheWriteTokens: not-applicable` reported contextUsedTokens
+    /// null (the supply r2c integration shape; passes on cbac58e1, fails on the
+    /// post-merge tip). A genuinely OMITTED bucket still leaves the basket
+    /// Unknown (U1).
+    #[test]
+    fn a_not_applicable_cache_bucket_is_a_structural_zero_for_context() {
+        let wire = |cache_write: Value| {
+            json!({
+                "schemaVersion": 1,
+                "eventId": "evt_na",
+                "journalId": "obj_na",
+                "instanceId": "ins_r37na",
+                "hostId": "hst",
+                "processGeneration": "1",
+                "seq": "1",
+                "observedAt": "2026-10-09T10:00:00.000Z",
+                "kind": "usage",
+                "completeness": "structured",
+                "payload": {
+                    "usageId": "obj_na-turn",
+                    "scope": "turn",
+                    "scopeId": "msg_na",
+                    "mode": "snapshot",
+                    "metricRevision": "1",
+                    "inputAccounting": "uncached",
+                    "accounting": "estimated",
+                    "inputTokens": {"state": "known", "value": "100000"},
+                    "outputTokens": {"state": "known", "value": "1000"},
+                    "reasoningTokens": {"state": "known", "value": "0"},
+                    "cacheReadTokens": {"state": "known", "value": "0"},
+                    "cacheWriteTokens": cache_write,
+                    "totalTokens": {"state": "known", "value": "101000"}
+                }
+            })
+        };
+        let project = |event: Value| {
+            let rec = crate::store::JournalRecord {
+                instance_id: "ins_r37na".into(),
+                seq: 1,
+                event_id: "evt_na".into(),
+                event,
+                observed_at: "2026-10-09T10:00:00.000Z".into(),
+            };
+            project_usage_event(&rec, Some("pvp"), Some("claude-haiku-4-5")).unwrap()
+        };
+        let rollup_for = |row: &UsageEventRow| {
+            let conn = Connection::open_in_memory().unwrap();
+            migrate(&conn).unwrap();
+            assert!(insert_usage_event(&conn, row).unwrap());
+            rollup_instance(
+                &conn,
+                &RollupRequest {
+                    instance_id: "ins_r37na",
+                    kind: "claude",
+                    spec_model: Some("claude-haiku-4-5"),
+                    effective_model: None,
+                    profile_id: Some("pvp"),
+                },
+            )
+            .unwrap()
+            .unwrap()
+        };
+
+        // not-applicable projects to a stored zero and the context basket is
+        // known: 100,000 + 0 + 0.
+        let na_row = project(wire(json!({"state": "not-applicable"})));
+        assert_eq!(na_row.cache_write_tokens, Some(0));
+        let na_rollup = rollup_for(&na_row);
+        assert_eq!(na_rollup.context_used_tokens, Some(100_000));
+        assert_eq!(na_rollup.context_pct, Some(50));
+
+        // The same frame with the bucket genuinely OMITTED stays Unknown: U1
+        // never invents a zero for an unreported bucket.
+        let mut omitted_payload = wire(json!({"state": "unknown", "reason": "omitted"}));
+        omitted_payload["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("cacheWriteTokens");
+        let omitted_row = project(omitted_payload);
+        assert_eq!(omitted_row.cache_write_tokens, None);
+        let omitted_rollup = rollup_for(&omitted_row);
+        assert_eq!(
+            omitted_rollup.context_used_tokens, None,
+            "an unreported bucket keeps the context Unknown"
         );
     }
 

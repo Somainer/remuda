@@ -462,7 +462,8 @@ it("r9 item 1: a retired cold-load seed cannot fail the REPLACEMENT identity's m
   const boot1 = hubStore.bootstrap();
   await vi.waitFor(() => expect(hubStore.getSnapshot().instances.some((i) => i.id === A)).toBe(true));
   expect(releaseOutbox).not.toBeNull();
-  void hubStore.follow(A);
+  const follow1 = hubStore.follow(A);
+  void follow1.catch(() => undefined);
   await flush();
   expect(seedReject).not.toBeNull(); // OLD seed pending (held for rejection)
   expect(machineAccess().connection).toBeNull();

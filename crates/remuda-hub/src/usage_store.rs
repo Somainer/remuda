@@ -2065,6 +2065,22 @@ fn turn_fully_covered_sql(inst: &str, tid: &str) -> String {
 /// aggregate, `"profile_id = ?1 AND model = ?2"` for provider supply. All
 /// bindings reuse SQLite NUMBERED positional parameters, so one/two bindings
 /// cover every occurrence.
+/// The fold graph is a ~41 KB static SQL body parameterized only by a fixed
+/// domain predicate (exactly two shapes are ever used). Preparing it costs
+/// ~115 ms in SQLite's planner, so both the text and its prepared statements
+/// must be reused, never rebuilt/replanned per call. Memoize the text; the
+/// caller runs it through `Connection::prepare_cached` on the long-lived store
+/// connection so planning happens once per process per statement.
+fn fold_ctes_instance() -> &'static str {
+    static C: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    C.get_or_init(|| unified_fold_ctes("instance_id = ?1"))
+}
+
+fn fold_ctes_supply() -> &'static str {
+    static C: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    C.get_or_init(|| unified_fold_ctes("profile_id = ?1 AND model = ?2"))
+}
+
 fn unified_fold_ctes(domain_pred: &str) -> String {
     // Qualify a standalone-domain predicate ("instance_id = ?1" or
     // "profile_id = ?1 AND model = ?2") for a specific table alias. Word
@@ -2561,12 +2577,10 @@ pub fn aggregate_instance(
     if !usage_schema_is_current(conn)? {
         return Ok(UsageAggregate::unavailable());
     }
-    let ctes = unified_fold_ctes("instance_id = ?1");
-    conn.query_row(
-        &format!("WITH {ctes} {select}", select = aggregate_select_sql()),
-        params![instance_id],
-        row_to_aggregate,
-    )
+    let ctes = fold_ctes_instance();
+    let sql = format!("WITH {ctes} {select}", select = aggregate_select_sql());
+    let mut stmt = conn.prepare_cached(&sql)?;
+    stmt.query_row(params![instance_id], row_to_aggregate)
 }
 
 /// Aggregate persisted events for one `(profile, model)`. Turn winners are
@@ -2581,35 +2595,33 @@ pub fn aggregate_supply(
     if !usage_schema_is_current(conn)? {
         return Ok(UsageAggregate::unavailable());
     }
-    let ctes = unified_fold_ctes("profile_id = ?1 AND model = ?2");
+    let ctes = fold_ctes_supply();
     // Count surviving rows in THIS domain first: a zero-row fold is "model
     // absent from the data", not "model spent zero", so its token/cost
     // columns must surface as NULL rather than the empty-fold zero defaults.
-    let total_rows: i64 = conn.query_row(
-        &format!("WITH {ctes} SELECT COUNT(*) FROM contributions"),
-        params![profile_id, model],
-        |row| row.get(0),
-    )?;
-    conn.query_row(
-        &format!("WITH {ctes} {select}", select = aggregate_select_sql()),
-        params![profile_id, model],
-        |row| {
-            Ok(UsageAggregate {
-                events: if total_rows == 0 {
-                    0
-                } else {
-                    row.get::<_, Option<i64>>(0)?.unwrap_or(0)
-                },
-                ambiguous_events: row.get(1)?,
-                ambiguous: row.get::<_, i64>(1)? != 0,
-                total_tokens: if total_rows == 0 { None } else { row.get(2)? },
-                input_tokens: if total_rows == 0 { None } else { row.get(3)? },
-                output_tokens: if total_rows == 0 { None } else { row.get(4)? },
-                cost_usd: if total_rows == 0 { None } else { row.get(7)? },
-                unavailable: false,
-            })
-        },
-    )
+    let count_sql = format!("WITH {ctes} SELECT COUNT(*) FROM contributions");
+    let total_rows: i64 = {
+        let mut stmt = conn.prepare_cached(&count_sql)?;
+        stmt.query_row(params![profile_id, model], |row| row.get(0))?
+    };
+    let sql = format!("WITH {ctes} {select}", select = aggregate_select_sql());
+    let mut stmt = conn.prepare_cached(&sql)?;
+    stmt.query_row(params![profile_id, model], |row| {
+        Ok(UsageAggregate {
+            events: if total_rows == 0 {
+                0
+            } else {
+                row.get::<_, Option<i64>>(0)?.unwrap_or(0)
+            },
+            ambiguous_events: row.get(1)?,
+            ambiguous: row.get::<_, i64>(1)? != 0,
+            total_tokens: if total_rows == 0 { None } else { row.get(2)? },
+            input_tokens: if total_rows == 0 { None } else { row.get(3)? },
+            output_tokens: if total_rows == 0 { None } else { row.get(4)? },
+            cost_usd: if total_rows == 0 { None } else { row.get(7)? },
+            unavailable: false,
+        })
+    })
 }
 /// Per-session token/context rollup backing the composer's context chip
 /// popover (context-usage-1).
@@ -2695,11 +2707,10 @@ fn sum_turn_tokens_since(
     // first would let an ingest-timed newer winner lose to an older native
     // row. Winners then pass the unified flow relation (message coverage
     // proof, session provenance, ambiguity) from [`unified_fold_ctes`].
-    let ctes = unified_fold_ctes("instance_id = ?1");
+    let ctes = fold_ctes_instance();
     let turn_covered = turn_fully_covered_sql("t.instance_id", "t.scope_id");
-    conn.query_row(
-        &format!(
-            "WITH {ctes},
+    let window_sql = format!(
+        "WITH {ctes},
              -- Rate windows are PER-CALL throughput: lineage-certified turns
              -- still count even when the current stock certifies them (the
              -- stock is cumulative, not throughput — c-ctxusage r4 item 6);
@@ -2751,10 +2762,11 @@ fn sum_turn_tokens_since(
                           END FROM win_turn)
                          + COALESCE((SELECT SUM(output_tokens) FROM win_msg), 0)
                 END"
-        ),
-        params![instance_id, since],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )
+    );
+    let mut window_stmt = conn.prepare_cached(&window_sql)?;
+    window_stmt.query_row(params![instance_id, since], |row| {
+        Ok((row.get(0)?, row.get(1)?))
+    })
 }
 
 /// Per-bucket flow derived from two successive cumulative session snapshots.
@@ -3095,11 +3107,9 @@ fn add_optional(a: Option<i64>, b: Option<i64>) -> Option<i64> {
 /// reported input AND both cache buckets; one omission returns Unknown rather
 /// than summing the known baskets.
 fn latest_call_basket(conn: &Connection, instance_id: &str) -> rusqlite::Result<Option<i64>> {
-    let ctes = unified_fold_ctes("instance_id = ?1");
-    let Some((input, cache_read, cache_write)) = conn
-        .query_row(
-            &format!(
-                "WITH {ctes},
+    let ctes = fold_ctes_instance();
+    let basket_sql = format!(
+        "WITH {ctes},
                  baskets AS (
                     SELECT input_tokens, cache_read_tokens, cache_write_tokens,
                            observed_at, seq FROM flow_turns
@@ -3110,16 +3120,16 @@ fn latest_call_basket(conn: &Connection, instance_id: &str) -> rusqlite::Result<
                  SELECT input_tokens, cache_read_tokens, cache_write_tokens
                  FROM baskets
                  ORDER BY observed_at DESC, seq DESC LIMIT 1"
-            ),
-            params![instance_id],
-            |row| {
-                Ok((
-                    row.get::<_, Option<i64>>(0)?,
-                    row.get::<_, Option<i64>>(1)?,
-                    row.get::<_, Option<i64>>(2)?,
-                ))
-            },
-        )
+    );
+    let Some((input, cache_read, cache_write)) = conn
+        .prepare_cached(&basket_sql)?
+        .query_row(params![instance_id], |row| {
+            Ok((
+                row.get::<_, Option<i64>>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        })
         .ok()
     else {
         return Ok(None);
@@ -3350,15 +3360,27 @@ pub fn rollup_instance(
         return Ok(Some(InstanceUsageRollup::unavailable()));
     }
     let instance_id = req.instance_id;
+    // Ruling X fast path: with NO durable usage for this instance the fold
+    // below yields no turns, no session and zero rows — exactly the `None`
+    // "no channel" result it computes further down. Resolve that with one
+    // indexed EXISTS instead of planning the ~41 KB fold graph. This also makes
+    // the one-time (~115 ms) statement-plan cost lazy: instances that have not
+    // emitted usage (the common case right after create) never plan it, and the
+    // graph is cached via `prepare_cached` once an instance does have data.
+    let has_any_usage: bool = conn
+        .prepare_cached("SELECT 1 FROM usage_events WHERE instance_id = ?1 LIMIT 1")?
+        .exists(params![instance_id])?;
+    if !has_any_usage {
+        return Ok(None);
+    }
     // Totals come from the SAME unified fold as the aggregates
     // ([`unified_fold_ctes`]): one winning turn per scope id across lineages,
     // eligible durable Messages, per-session stock-vs-flow composition, and
     // U1 / ambiguity Unknown gating. Legacy NULL-scope Turns count as
     // individual winning rows.
-    let ctes = unified_fold_ctes("instance_id = ?1");
-    let totals = conn.query_row(
-        &format!(
-            "WITH {ctes}
+    let ctes = fold_ctes_instance();
+    let totals_sql = format!(
+        "WITH {ctes}
              SELECT
                 -- Turn identities: every winning turn row (a covered turn is
                 -- still an observed turn), plus one per eligible durable
@@ -3456,21 +3478,20 @@ pub fn rollup_instance(
                     SELECT observed_at FROM flow_messages
                      WHERE observed_at_source = 'native'
                  ))"
-        ),
-        params![instance_id],
-        |row| {
-            let turns: i64 = row.get(0)?;
-            Ok(RollupTotals {
-                turns,
-                turn_input: row.get(2)?,
-                turn_output: row.get(3)?,
-                turn_cache_read: row.get(4)?,
-                turn_cache_write: row.get(5)?,
-                has_session: row.get(1)?,
-                last_turn_at: row.get(6)?,
-            })
-        },
-    )?;
+    );
+    let mut totals_stmt = conn.prepare_cached(&totals_sql)?;
+    let totals = totals_stmt.query_row(params![instance_id], |row| {
+        let turns: i64 = row.get(0)?;
+        Ok(RollupTotals {
+            turns,
+            turn_input: row.get(2)?,
+            turn_output: row.get(3)?,
+            turn_cache_read: row.get(4)?,
+            turn_cache_write: row.get(5)?,
+            has_session: row.get(1)?,
+            last_turn_at: row.get(6)?,
+        })
+    })?;
     // A row exists if there is any flow (turn/message) OR any session row.
     let total_rows: i64 = conn.query_row(
         "SELECT COUNT(*) FROM usage_events WHERE instance_id = ?1",
@@ -3521,11 +3542,10 @@ pub fn rollup_instance(
     // but contributes nothing, so an instance whose cumulative Session growth
     // points can still supply increments must take the stock route (r8
     // item 5 / c-ctxusage r28 coverage).
-    let fold_ctes = unified_fold_ctes("instance_id = ?1");
+    let fold_ctes = fold_ctes_instance();
     let route_covered = turn_fully_covered_sql("t.instance_id", "t.scope_id");
-    let has_native_flow: bool = conn.query_row(
-        &format!(
-            "WITH {fold_ctes}
+    let native_flow_sql = format!(
+        "WITH {fold_ctes}
              SELECT EXISTS (
                  SELECT 1 FROM global_winning_turns t
                  WHERE t.observed_at_source = 'native'
@@ -3539,10 +3559,10 @@ pub fn rollup_instance(
                  SELECT 1 FROM flow_messages
                  WHERE observed_at_source = 'native'
              )"
-        ),
-        params![instance_id],
-        |row| row.get(0),
-    )?;
+    );
+    let mut native_flow_stmt = conn.prepare_cached(&native_flow_sql)?;
+    let has_native_flow: bool =
+        native_flow_stmt.query_row(params![instance_id], |row| row.get(0))?;
 
     // Rate windows: per-turn flows for harnesses that emit them; otherwise
     // timestamped increments between cumulative session snapshots (r4 item 6).

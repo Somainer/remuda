@@ -6014,10 +6014,10 @@ fn usage_from_result(
             cache_read_tokens: opt_u64(result_cache_read),
             cache_write_tokens: opt_u64(result_cache_write),
             total_tokens: opt_u64(total),
-            // r38 item 3: result total_cost_usd is the session's CUMULATIVE
-            // native bill — it rides the session carrier below and must never
-            // be copied onto an additive Turn (two results would sum to more
-            // than the true bill). A cost-ONLY result emits no Turn row at all.
+            // r38 item 3 / r39: result total_cost_usd is the session's
+            // CUMULATIVE native bill — it rides the session carrier below
+            // (folded to its latest value per session) and is never added to an
+            // additive Turn. A cost-ONLY result emits no Turn row at all.
             cost: unknown("not-emitted"),
             accounting: remuda_protocol::Accounting::Estimated,
             native_fields_ref: None,

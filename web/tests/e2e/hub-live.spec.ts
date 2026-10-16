@@ -770,7 +770,7 @@ test("structured view streams assistant text and separates injected records", as
     .toBe(404);
 });
 
-test("the unbound session list never shows live while the Hub is unreachable (c-unboundresume)", async ({
+test("the unbound session list never shows live while the Hub is unreachable @e2e-handle (c-unboundresume)", async ({
   page,
 }) => {
   // The e2e test handle (window.__remudaHub.stopPoll) is a COMPILE-TIME part

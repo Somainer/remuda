@@ -1,16 +1,18 @@
 import { defineConfig, devices } from "@playwright/test";
 
 // Exercise the ORDINARY production app (normal `pnpm build` → web/dist) behind
-// the Hub's real response headers, without Vite. Tests that need the e2e
-// __remudaHub handle run against the distinct web/dist-e2e artifact via
-// playwright.security-e2e.config.ts instead (c-unboundresume r4 item 1): the
+// the Hub's real response headers, without Vite. hub-live flows run here
+// against the normal bundle EXCEPT the @e2e-handle-tagged test, which needs
+// the compile-time test handle and runs against the distinct web/dist-e2e
+// artifact via playwright.security-e2e.config.ts (c-unboundresume r4/r5): the
 // normal production bundle must not contain the handle at all.
 const listen = process.env.HUB_E2E_LISTEN ?? "127.0.0.1:58880";
 const origin = `http://${listen}`;
 
 export default defineConfig({
   testDir: "./tests/e2e",
-  testMatch: /hub-security\.spec\.ts/,
+  testMatch: /hub-live\.spec\.ts|hub-security\.spec\.ts/,
+  grepInvert: /@e2e-handle/,
   fullyParallel: false,
   workers: 1,
   timeout: 90_000,

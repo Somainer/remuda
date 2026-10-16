@@ -1072,7 +1072,7 @@ describe("ConnectionMachine", () => {
 
   it("backoff is full-jitter within the doubling 30 s cap", () => {
     const withRandom = (r: number) =>
-      new ConnectionMachine({ resume: async () => {}, probe: async () => true, isFollowLive: () => true, random: () => r }).backoffDelay(10);
+      new ConnectionMachine({ resume: async () => {}, probe: async () => true, isFollowLive: () => true, isFollowBound: () => true, random: () => r }).backoffDelay(10);
     expect(withRandom(0)).toBe(0);
     expect(withRandom(1)).toBe(MAX_BACKOFF_MS);
   });

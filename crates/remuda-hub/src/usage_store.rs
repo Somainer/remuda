@@ -146,12 +146,30 @@ fn set_meta_marker(conn: &Connection, key: &str) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Whether the OPEN database carries the final usage schema. The migration is
-/// ONE atomic transaction (Ruling M1), so every post-main column exists iff a
-/// migration committed; `scope_id` is the first such column the origin/main
-/// shape lacks. A failed migration rolls the DDL back too, leaving the main
-/// shape — reads must then degrade to Unknown instead of issuing SQL that
-/// references missing columns (c-usagefu r15 item 1). A missing
+/// Columns the final schema of THIS delivery carries, in the order the
+/// migration adds them. The migration is ONE atomic transaction (Ruling M1),
+/// so a committed migration leaves all of these present and a rolled-back
+/// migration leaves the subset the OPENING release had — checking the whole
+/// set recognises a failed upgrade from the usagefu main-parent shape
+/// (cbac58e1), which already had `scope_id` but not the lineage columns
+/// (r37 item 4).
+const USAGE_REQUIRED_COLUMNS: &[&str] = &[
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "scope_id",
+    "turn_id",
+    "metric_revision",
+    "observed_at_source",
+    "native_context_window",
+    "source_session_id",
+    "lineage_state",
+];
+
+/// Whether the OPEN database carries the final usage schema. A failed
+/// migration rolls the DDL back too, leaving the previously-openable shape —
+/// reads must then degrade to Unknown instead of issuing SQL that references
+/// missing columns (c-usagefu r15 item 1; r37 item 4: the probe must check
+/// the COMPLETE required schema, not only `scope_id`). A missing
 /// `usage_events` table (nothing ever ingested, migration rolled back) is the
 /// same legacy shape.
 pub(crate) fn usage_schema_is_current(conn: &Connection) -> rusqlite::Result<bool> {
@@ -164,7 +182,12 @@ pub(crate) fn usage_schema_is_current(conn: &Connection) -> rusqlite::Result<boo
     if !table_exists {
         return Ok(false);
     }
-    crate::store::column_exists(conn, "usage_events", "scope_id")
+    for column in USAGE_REQUIRED_COLUMNS {
+        if !crate::store::column_exists(conn, "usage_events", column)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// All usage migration steps, in order. Runs inside [`migrate`]'s single
@@ -5866,6 +5889,187 @@ mod tests {
             rollup_instance(&conn, &req).unwrap().unwrap().turns,
             2,
             "the two recorded legacy NULL-scope turns fold again after recovery"
+        );
+    }
+
+    /// The usagefu MAIN-parent (cbac58e1) usage shape: every column that
+    /// release had — INCLUDING scope_id — but not this delivery's
+    /// source_session_id / lineage_state. A failed migration from HERE is the
+    /// dangerous case: a scope_id-only current-schema check would mistake it
+    /// for fully migrated (r37 item 4).
+    fn create_usagefu_shaped_usage_tables(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE journal (
+                instance_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                event_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                PRIMARY KEY (instance_id, seq)
+             );
+             CREATE TABLE usage_events (
+                instance_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                profile_id TEXT,
+                model TEXT,
+                scope TEXT NOT NULL,
+                scope_id TEXT,
+                turn_id TEXT,
+                mode TEXT NOT NULL,
+                total_tokens INTEGER,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                cache_read_tokens INTEGER,
+                cache_write_tokens INTEGER,
+                cost_usd TEXT,
+                accounting TEXT NOT NULL DEFAULT 'estimated',
+                observed_at TEXT NOT NULL,
+                observed_at_source TEXT NOT NULL DEFAULT 'ingest',
+                native_context_window INTEGER,
+                metric_revision INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (instance_id, seq)
+             );",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_failed_migration_from_the_usagefu_shape_degrades_without_sql_errors() {
+        // r37 item 4: the main-parent cbac58e1 schema already HAS scope_id
+        // (and turn_id / metric_revision / observed_at_source /
+        // native_context_window); only source_session_id and lineage_state are
+        // missing. When the new migration fails against a populated such
+        // database, the additive DDL rolls back, but a current-schema probe
+        // that checked scope_id alone reported "current": rollups then prepared
+        // SQL against the missing columns (SQL errors), and inserts skipped the
+        // legacy fallback. The probe must recognise the COMPLETE schema this
+        // delivery requires; reads then degrade to Unavailable/Unknown and the
+        // Hub still opens.
+        let conn = Connection::open_in_memory().unwrap();
+        create_usagefu_shaped_usage_tables(&conn);
+        let at = "2026-10-13T00:00:00.000Z";
+        // A retained usagefu-era row, written through that release's full
+        // column set (scope_id present).
+        conn.execute(
+            "INSERT INTO usage_events
+                (instance_id, seq, profile_id, model, scope, scope_id, turn_id,
+                 mode, total_tokens, input_tokens, output_tokens,
+                 cache_read_tokens, cache_write_tokens, cost_usd, accounting,
+                 observed_at, observed_at_source, native_context_window,
+                 metric_revision)
+             VALUES ('ins_r37i4', 1, 'pvp', 'm', 'turn', 'msg-1', 'nt-1',
+                 'snapshot', 110, 100, 10, 0, 0, '0.01', 'estimated',
+                 ?1, 'native', 200000, 1)",
+            params![at],
+        )
+        .unwrap();
+
+        conn.execute_batch("CREATE TABLE remuda_test_force_usage_migration_failure (x);")
+            .unwrap();
+        let failed = migrate(&conn);
+        assert!(failed.is_err(), "the sentinel fails the new migration");
+        assert!(
+            crate::store::column_exists(&conn, "usage_events", "scope_id").unwrap(),
+            "the usagefu column survives: this is NOT the much older shape"
+        );
+        assert!(
+            !crate::store::column_exists(&conn, "usage_events", "source_session_id").unwrap(),
+            "the new lineage column rolled back with the failed migration"
+        );
+        assert!(!crate::store::column_exists(&conn, "usage_events", "lineage_state").unwrap());
+
+        assert!(
+            !usage_schema_is_current(&conn).unwrap(),
+            "scope_id present but the delivery-required lineage columns are \
+             absent: not current, despite the failed migration"
+        );
+
+        // Every read degrades to Unavailable/Unknown — never a SQL error
+        // against the missing lineage columns.
+        let req = RollupRequest {
+            instance_id: "ins_r37i4",
+            kind: "claude",
+            spec_model: Some("m"),
+            effective_model: None,
+            profile_id: Some("pvp"),
+        };
+        let rollup = rollup_instance(&conn, &req).unwrap();
+        assert!(
+            rollup.as_ref().is_some_and(|r| r.unavailable),
+            "the near-current shape still reports an explicit Unavailable rollup"
+        );
+        assert!(
+            aggregate_instance(&conn, "ins_r37i4").unwrap().unavailable,
+            "instance aggregate is Unavailable, not a SQL error"
+        );
+        assert!(
+            aggregate_supply(&conn, "pvp", "m").unwrap().unavailable,
+            "supply aggregate is Unavailable, not a SQL error"
+        );
+
+        // Writes still land on the legacy fallback insert.
+        assert!(
+            insert_usage_event(
+                &conn,
+                &UsageEventRow {
+                    instance_id: "ins_r37i4".into(),
+                    seq: 2,
+                    profile_id: Some("pvp".into()),
+                    model: Some("m".into()),
+                    scope: "turn".into(),
+                    scope_id: Some("msg-2".into()),
+                    turn_id: Some("nt-2".into()),
+                    native_context_window: Some(200_000),
+                    mode: "snapshot".into(),
+                    metric_revision: 1,
+                    source_session_id: None,
+                    total_tokens: Some(55),
+                    input_tokens: Some(50),
+                    output_tokens: Some(5),
+                    cache_read_tokens: Some(0),
+                    cache_write_tokens: Some(0),
+                    cost_usd: Some("0.02".into()),
+                    accounting: "estimated".into(),
+                    observed_at: at.into(),
+                    observed_at_source: "native".into(),
+                }
+            )
+            .unwrap()
+        );
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_events WHERE instance_id='ins_r37i4'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2, "the event was recorded through the fallback path");
+
+        // The Hub store opens on the failed, near-current shape — a file-based
+        // reopen goes through the same Store::open continue-on-error path.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("hub.sqlite");
+        {
+            let pre = Connection::open(&db_path).unwrap();
+            create_usagefu_shaped_usage_tables(&pre);
+            pre.execute_batch("CREATE TABLE remuda_test_force_usage_migration_failure (x);")
+                .unwrap();
+        }
+        let store = crate::store::Store::open(dir.path())
+            .expect("Hub opens despite the failed migration from the usagefu shape");
+        drop(store);
+
+        // Once the fault clears, the migration commits and reads fold again.
+        conn.execute_batch("DROP TABLE remuda_test_force_usage_migration_failure;")
+            .unwrap();
+        migrate(&conn).unwrap();
+        assert!(crate::store::column_exists(&conn, "usage_events", "source_session_id").unwrap());
+        assert!(crate::store::column_exists(&conn, "usage_events", "lineage_state").unwrap());
+        assert!(usage_schema_is_current(&conn).unwrap());
+        assert_eq!(
+            rollup_instance(&conn, &req).unwrap().unwrap().turns,
+            2,
+            "both retained rows fold after recovery"
         );
     }
 

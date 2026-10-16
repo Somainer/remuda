@@ -4741,7 +4741,7 @@ class HubStore {
       if (!extLive()) return "retired";
       if (install === "obsolete") return "retired";
       this.startPoll();
-      this.installDevHandle();
+      this.installTestHandle();
       // Gate 48 item 3: the install turn drains the box with a BOUNDED lock
       // (ifAvailable): a sibling deliverer holding an instance lock never
       // blocks this turn without a deadline, and a queued login starts as soon
@@ -5007,11 +5007,31 @@ class HubStore {
     this.pollTimer = null;
   }
 
-  /** Dev-only debug handle (the hub e2e runs against the vite dev server):
+  /**
+   * Test handle for hub e2e specs. Present in every DEV build (Vite gate); in
+   * a production bundle (playwright.security.config.ts serves web/dist) it is
+   * installed ONLY when the spec context opted in before app boot via the
+   * `remuda:test-hooks` localStorage marker (addInitScript). The marker is
+   * test-side only — app code never sets it — and a spec that needs the
+   * handle requires its presence, so a missing handle fails the spec loudly
+   * instead of letting ordinary polling impersonate machine-driven requests.
+   */
+  private testHooksEnabled(): boolean {
+    if (import.meta.env.DEV) return true;
+    try {
+      return (
+        typeof localStorage !== "undefined" && localStorage.getItem("remuda:test-hooks") === "1"
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  /** Installs {@link testHooksEnabled}-gated handles (stopPoll and friends):
    * lets a spec halt the 2 s interaction poll so a UI change can be
    * attributed to the settlement follow frame instead of polling. */
-  private installDevHandle() {
-    if (!import.meta.env.DEV || typeof window === "undefined") return;
+  private installTestHandle() {
+    if (!this.testHooksEnabled() || typeof window === "undefined") return;
     (window as unknown as {
       __remudaHub?: {
         stopPoll: () => void;
@@ -5029,7 +5049,7 @@ class HubStore {
     };
   }
 
-  private clearDevHandle() {
+  private clearTestHandle() {
     if (typeof window !== "undefined") {
       delete (window as unknown as { __remudaHub?: unknown }).__remudaHub;
     }
@@ -5042,7 +5062,7 @@ class HubStore {
     dropDeviceCookie();
     api.disconnect();
     this.stopPoll();
-    this.clearDevHandle();
+    this.clearTestHandle();
     this.stopWorkspaceFollow?.();
     this.stopWorkspaceFollow = null;
     this.stopSettlementFollow?.();

@@ -3596,19 +3596,23 @@ pub fn rollup_instance(
     // EXISTS, not on raw has_turn: a covered legacy Turn makes has_turn true
     // but contributes nothing, so an instance whose cumulative Session growth
     // points can still supply increments must take the stock route (r8
-    // item 5 / c-ctxusage r28 coverage).
+    // item 5 / c-ctxusage r28 coverage). The probe is per-INSTANCE: every
+    // branch is domain-scoped to ?1 (flow_messages already is), so another
+    // instance's native turn can never pick the turn route here (r37 item 6).
+    // The ambiguity exclusion is the same rowid-exact one the real rate query
+    // in sum_turn_tokens_since uses.
     let fold_ctes = fold_ctes_instance();
     let route_covered = turn_fully_covered_sql("t.instance_id", "t.scope_id");
     let native_flow_sql = format!(
         "WITH {fold_ctes}
              SELECT EXISTS (
                  SELECT 1 FROM global_winning_turns t
-                 WHERE t.observed_at_source = 'native'
+                 WHERE t.instance_id = ?1
+                   AND t.observed_at_source = 'native'
                    AND NOT ({route_covered})
                    AND NOT EXISTS (
-                       SELECT 1 FROM ambiguous_turns a
-                       WHERE a.instance_id = t.instance_id
-                         AND COALESCE(a.scope_id, '') = COALESCE(t.scope_id, '')
+                       SELECT 1 FROM g_ambiguous_turns a
+                       WHERE a.winning_rowid = t.winning_rowid
                    )
                  UNION ALL
                  SELECT 1 FROM flow_messages
@@ -10950,6 +10954,108 @@ mod tests {
              never mark the winner covered"
         );
         assert_eq!(rollup.session_output_tokens, Some(20));
+    }
+
+    /// r37 item 6: the has_native_flow ROUTE probe scans winning turns across
+    /// EVERY instance. A native uncovered turn belonging to instance B must not
+    /// route instance A down the turn-rate path; A emits only cumulative
+    /// session stocks and must keep deriving its rate from stock increments
+    /// (100 -> 150 = 50 inside the window), not get Unknown.
+    #[test]
+    fn another_instances_native_turn_does_not_force_the_turn_rate_route() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let session_point = |seq: i64, input: i64, stamp: String| UsageEventRow {
+            instance_id: "ins_r37i6a".into(),
+            seq,
+            profile_id: Some("pvp".into()),
+            model: Some("m".into()),
+            scope: "session".into(),
+            scope_id: Some("sess-a".into()),
+            turn_id: None,
+            native_context_window: None,
+            mode: "snapshot".into(),
+            metric_revision: seq,
+            source_session_id: Some("sess-a".into()),
+            total_tokens: Some(input),
+            input_tokens: Some(input),
+            output_tokens: Some(0),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            cost_usd: None,
+            accounting: "estimated".into(),
+            observed_at: stamp,
+            observed_at_source: "native".into(),
+        };
+        // A: two native stocks, 100 -> 150, the increment inside 60 s.
+        assert!(insert_usage_event(&conn, &session_point(1, 100, ago(20))).unwrap());
+        assert!(insert_usage_event(&conn, &session_point(2, 150, ago(2))).unwrap());
+        // B: a native, uncovered winning Turn (a DIFFERENT instance).
+        assert!(
+            insert_usage_event(
+                &conn,
+                &UsageEventRow {
+                    instance_id: "ins_r37i6b".into(),
+                    seq: 1,
+                    profile_id: Some("pvp".into()),
+                    model: Some("m".into()),
+                    scope: "turn".into(),
+                    scope_id: Some("msg-b".into()),
+                    turn_id: None,
+                    native_context_window: None,
+                    mode: "snapshot".into(),
+                    metric_revision: 1,
+                    source_session_id: Some("sess-b".into()),
+                    total_tokens: Some(999),
+                    input_tokens: Some(900),
+                    output_tokens: Some(99),
+                    cache_read_tokens: Some(0),
+                    cache_write_tokens: Some(0),
+                    cost_usd: None,
+                    accounting: "estimated".into(),
+                    observed_at: ago(1),
+                    observed_at_source: "native".into(),
+                }
+            )
+            .unwrap()
+        );
+
+        let rollup_a = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_r37i6a",
+                kind: "grok",
+                spec_model: Some("m"),
+                effective_model: None,
+                profile_id: Some("pvp"),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            rollup_a.tpm_in_60s,
+            Some(50),
+            "A keeps the stock-increment route despite B's native turn"
+        );
+
+        // B itself DOES take the turn-rate route.
+        let rollup_b = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_r37i6b",
+                kind: "claude",
+                spec_model: Some("m"),
+                effective_model: None,
+                profile_id: Some("pvp"),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            rollup_b.tpm_in_60s,
+            Some(900),
+            "B's own turn drives B's rate"
+        );
     }
 
     /// c-ctxusage r16 item 3 (T1'), regression 2: a qualified alpha frame at

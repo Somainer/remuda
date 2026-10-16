@@ -3314,15 +3314,25 @@ class HubStore {
   /**
    * Route-departure transition (Ruling Y2): the active session page unmounted
    * (or a foreground resume happens off a /s/<id> route). Release ownership
-   * to "no target" SYNCHRONOUSLY so the machine certifies the LIST via its
-   * unbound REST proof instead of forever recovering a pending/failed route
-   * (which also refused session creation while offline/recovering). A no-op
-   * unless `instanceId` is still the current owner — navigating A → B runs
-   * A's cleanup before B's entry, and B then supersedes the released state.
+   * to "no target" SYNCHRONOUSLY so the LIST certifies via its unbound REST
+   * proof instead of recovering a departed/pending route forever (which also
+   * refused session creation while offline/recovering).
+   *
+   * A genuine departure (list / new-session page) launches a generation-scoped
+   * unbound resume — the mount watchdog was cancelled by noteBinding and
+   * nothing else would restart recovery. The resume is deferred a microtask so
+   * a navigation A → B and a StrictMode cleanup/replay (whose replacement
+   * follow() acquires a fresh generation synchronously in the same React
+   * commit) suppress it: a transient list proof must never race the new
+   * session owner.
    */
   releaseRouteTarget(instanceId: Id) {
     if (this.connectionBoundTo !== instanceId) return;
-    this.acquireTarget(null, null);
+    const token = this.acquireTarget(null, null);
+    queueMicrotask(() => {
+      if (!this.ownsTarget(token)) return; // A → B or StrictMode replay
+      this.connection?.dispatch({ type: "resume" });
+    });
   }
   /**
    * The follow link is genuinely live only when the socket is OPEN AND a frame

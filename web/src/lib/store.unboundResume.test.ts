@@ -301,15 +301,23 @@ it("r6 item 2: a held reopen subscription resolved after supersession opens/book
   hubStore.logout();
 });
 
-it("r6 item 1: leaving a failed pending route releases it; the list certifies via the unbound proof and A retries stop", async () => {
+it("r6 item 1: leaving a HELD pending route lets the list recover via a departure-scoped unbound proof, no injected resume", async () => {
   const { api, hubStore, list } = await bootUnbound();
   const A = "ins_dead_route";
 
-  // Every list/probe GET answers; A's lookup ALWAYS fails (deleted/uncached).
+  // List/probe GETs answer; A's lookup is HELD until the test rejects it
+  // AFTER navigation back to the list (the failure then belongs to a
+  // superseded, fenced continuation — it must not leave the list recovering).
   list.mockResolvedValue({ items: [], nextCursor: null });
+  let rejectLookup: ((e: unknown) => void) | null = null;
   let lookupCalls = 0;
   vi.spyOn(api, "instanceGet").mockImplementation(() => {
     lookupCalls += 1;
+    if (lookupCalls === 1) {
+      return new Promise((_resolve, reject) => {
+        rejectLookup = (err) => reject(err);
+      });
+    }
     return Promise.reject(new RestNetworkError("404 lookup failed"));
   });
 
@@ -318,19 +326,25 @@ it("r6 item 1: leaving a failed pending route releases it; the list certifies vi
     for (let i = 0; i < rounds; i += 1) await vi.advanceTimersByTimeAsync(0);
   };
 
-  // Navigate to the uncached session through the REAL route entry; its lookup
-  // fails and its recovery starts owning the machine.
+  // Navigate to the uncached session; its lookup stays pending and the mount
+  // attempt owns the machine (recovering, watchdog armed).
   const routeFollow = hubStore.follow(A);
   void routeFollow.catch(() => undefined);
-  await vi.waitFor(() => expect(lookupCalls).toBeGreaterThanOrEqual(1));
+  await vi.waitFor(() => expect(rejectLookup).not.toBeNull());
   await flush();
-  expect(hubStore.getSnapshot().connection).not.toBe("live");
+  expect(hubStore.getSnapshot().connection).toBe("recovering");
 
-  // Return to the list: SessionPage unmount releases the route, and the next
-  // foreground resume happens off /s/<id>.
+  // Real navigation back to the list while the lookup is still held — cleanup
+  // only; NO injected visibility/resume call (r7 item 1).
   hubStore.releaseRouteTarget(A);
-  hubStore.resumeActive(null);
   await flush();
+
+  // The departed lookup now fails: its continuation is fenced and must not
+  // strand or disturb the list.
+  rejectLookup!(new RestNetworkError("404 lookup failed"));
+  await flush();
+
+  // The departure-scoped unbound proof certifies the list by itself.
   for (let i = 0; i < 60 && hubStore.getSnapshot().connection !== "live"; i += 1) {
     await vi.advanceTimersByTimeAsync(250);
   }
@@ -346,6 +360,82 @@ it("r6 item 1: leaving a failed pending route releases it; the list certifies vi
   expect(hubStore.getSnapshot().connection).toBe("live");
 
   vi.useRealTimers();
+  hubStore.logout();
+});
+
+it("r7 item 1: an A → B navigation suppresses the departure's transient list proof; B owns recovery", async () => {
+  const { api, hubStore, list } = await bootUnbound();
+  const A = "ins_nav_a";
+  const JA = "obj_nav_a_journal";
+  const B = "ins_nav_b";
+  const JB = "obj_nav_b_journal";
+
+  // Both lookups stay held until released; every list GET is counted.
+  const listCallsBefore = list.mock.calls.length;
+  const releases = new Map<string, () => void>();
+  vi.spyOn(api, "instanceGet").mockImplementation(
+    (id: string) =>
+      new Promise((resolve) => {
+        releases.set(id, () =>
+          resolve({
+            id,
+            journalId: id === A ? JA : JB,
+            revision: "0",
+            durableSeq: "0",
+            lifecycle: "running",
+          } as Awaited<ReturnType<Api["instanceGet"]>>));
+      }),
+  );
+  vi.spyOn(api, "eventsRead").mockResolvedValue({
+    events: [],
+    durableSeq: "0",
+    windowFromSeq: null,
+    reachedAfterSeq: true,
+  });
+  vi.spyOn(api, "eventsSubscribe").mockImplementation(
+    (async (journalId: string) => ({
+      subscriptionId: `sub_${journalId}`,
+      journalId,
+      durableSeq: "0",
+      windowFromSeq: null,
+      reachedAfterSeq: true,
+      getReadyState: () => 1,
+      snapshot: {
+        projectionVersion: "v1",
+        projectionEpoch: `epoch_${journalId}`,
+        asOfSeq: "0",
+        instance: {} as never,
+        runs: [],
+        commands: [],
+        pendingInteractions: [],
+        nodes: [],
+        history: { earliestRetainedSeq: "0", complete: true },
+      },
+    })) as Api["eventsSubscribe"],
+  );
+
+  // Route A (lookup held), then the React navigation sequence: A's cleanup
+  // runs immediately before B's effect setup in the SAME commit.
+  const followA = hubStore.follow(A);
+  void followA.catch(() => undefined);
+  await vi.waitFor(() => expect(releases.has(A)).toBe(true));
+  hubStore.releaseRouteTarget(A);
+  const followB = hubStore.follow(B);
+  void followB.catch(() => undefined);
+  await vi.waitFor(() => expect(releases.has(B)).toBe(true));
+  // Drain the departure microtask and B's mount chain.
+  for (let i = 0; i < 60; i += 1) await Promise.resolve();
+
+  // No transient unbound list proof was dispatched: the only list GETs are
+  // the bootstrap-era calls counted before this test, and B is the owner.
+  expect(list.mock.calls.length).toBe(listCallsBefore);
+  const internal = hubStore as unknown as {
+    connectionBoundTo: string | null;
+    connectionBoundJournal: string | null;
+  };
+  expect(internal.connectionBoundTo).toBe(B);
+  expect(internal.connectionBoundJournal).toBeNull();
+
   hubStore.logout();
 });
 

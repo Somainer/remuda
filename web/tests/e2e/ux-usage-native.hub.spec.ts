@@ -428,7 +428,5 @@ test("native transcript usage drives the context chip through the real promoted 
     if (node) await stopNode(node);
     dataHandle?.close();
     await rm(dir, { recursive: true, force: true }).catch(() => {});
-    await context.close().catch(() => {});
   }
-  });
-}
+});

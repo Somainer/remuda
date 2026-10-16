@@ -3137,6 +3137,21 @@ class HubStore {
       this.connectionInstallEpoch = null;
       return "obsolete";
     }
+    // c-unboundresume r8 item 1 — ADOPT ON FIRST INSTALL. On a cold load the
+    // authenticated session route can render and start follow(A) while
+    // connection installation is parked behind outbox init: its mount captured a
+    // token with connection===null and its seed is awaiting this machine. A
+    // null → first-installed transition for an existing target is ADOPTION, not
+    // retirement: synchronise the new machine to the SAME binding generation
+    // (do NOT bump it — the pending continuation's token must stay current) so
+    // the mount proceeds to journal/subscribe without an injected resume. Real
+    // retirement/replacement never reaches here with a target: logout/identity
+    // change clears connectionBoundTo and the gen in
+    // disposeConnectionForAuthChange, and gate-41 machine reuse takes the early
+    // "already installed" return.
+    if (this.connectionBoundTo !== null) {
+      machine.noteBinding(this.connectionBindGen);
+    }
     // A successful REST bootstrap proves reachability, but on the list/new
     // pages there is no follow socket to watchdog yet: start live WITHOUT a
     // frame timer. The instant a session's follow socket binds
@@ -3263,8 +3278,16 @@ class HubStore {
   }
 
   private ownsTarget(token: TargetToken): boolean {
+    // c-unboundresume r8 item 1: a mount whose token was captured before the
+    // first connection machine existed (cold load, outbox init parked) is
+    // ADOPTED by that machine; its target+gen still have to match. A genuine
+    // replacement (logout/identity change/store replacement) goes through the
+    // machine-disposal path and clears/changes the target or gen, so the other
+    // two checks still fence it.
+    const sameOrFirstInstall =
+      this.connection === token.connection || (token.connection === null && this.connection !== null);
     return (
-      this.connection === token.connection &&
+      sameOrFirstInstall &&
       this.connectionBoundTo === token.target &&
       this.connectionBindGen === token.gen
     );
@@ -5469,11 +5492,20 @@ class HubStore {
     // unbound outcome with no attempt and no recovery. Nested inside a resume
     // for the same binding the begin shares the enclosing attempt/watchdog.
     const bindGen = token.gen;
-    const mountAttemptId = this.connection ? this.connection.followAttemptBegin(bindGen) : null;
+    // r8 item 1: on a cold load the first connection machine may not exist yet
+    // (connection installation is parked behind outbox init). The attempt is then
+    // armed LAZILY on the adopted machine when the mount settles, so success
+    // can certify and a late seed/subscribe failure still has a real recovery
+    // attempt to fail into instead of being swallowed.
+    let mountAttemptId = this.connection ? this.connection.followAttemptBegin(bindGen) : null;
+    const attemptIdFor = (): number | null => {
+      if (!this.ownsTarget(token) || !this.connection) return null;
+      if (mountAttemptId === null) mountAttemptId = this.connection.followAttemptBegin(bindGen);
+      return mountAttemptId;
+    };
     const endMountFailed = () => {
-      if (this.ownsTarget(token) && this.connection && mountAttemptId !== null) {
-        this.connection.followAttemptEnd(false, mountAttemptId, bindGen);
-      }
+      const id = attemptIdFor();
+      if (id !== null) this.connection?.followAttemptEnd(false, id, bindGen);
     };
 
     let instance: Instance = cached as Instance;
@@ -5521,9 +5553,6 @@ class HubStore {
       // below the middle of the window on a long journal. Older rows load on
       // demand via JournalClient.loadEarlier.
       const seed = await api.eventsRead({ journalId: instance.journalId, limit: 2000 });
-      // Ruling Y: superseded while the seed read was parked — the newer target
-      // owns the machine and the duplicate-mount winner owns this journal; do
-      // not emit, create a client, subscribe or certify for the old owner.
       if (!this.ownsTarget(token)) return;
       // Another mount may finish loading this journal while this read is pending.
       if (this.journals.has(instance.journalId)) {
@@ -5532,9 +5561,12 @@ class HubStore {
         // duplicate seed from an obsolete navigation (rapid A -> B -> A -> B)
         // must not certify the newest mount's machine. The winning mount's own
         // bracket settles the attempt when its socket is not live yet.
-        if (this.ownsTarget(token) && this.connection && mountAttemptId !== null && this.followSocketLive()) {
-          this.connection.followAttemptLive(mountAttemptId, bindGen);
-          return;
+        {
+          const id = attemptIdFor();
+          if (id !== null && this.followSocketLive()) {
+            this.connection?.followAttemptLive(id, bindGen);
+            return;
+          }
         }
         // Gate 18 item 5: the journal can be mounted WITHOUT a live socket:
         // an earlier attempt for this same navigation won the journals.set

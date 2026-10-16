@@ -363,6 +363,210 @@ it("r6 item 1: leaving a HELD pending route lets the list recover via a departur
   hubStore.logout();
 });
 
+it("r8 item 1: a session mount started during cold-load connection installation is adopted by the first machine; its seed then builds the journal", async () => {
+  const { api, hubStore } = await fresh();
+  const A = "ins_cold_load";
+  const JA = "obj_cold_load_journal";
+
+  // Hold the outbox initializer mid-open (initConnection awaits it) and the
+  // journal SEED, independently, in exactly the cold-load order.
+  let releaseOutbox: (() => void) | null = null;
+  (
+    hubStore as unknown as {
+      setOutboxOpenGateForTest: (g: ((r: () => void) => void) | null) => void;
+    }
+  ).setOutboxOpenGateForTest((resolve) => {
+    releaseOutbox = resolve;
+  });
+
+  vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+  vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+  vi.spyOn(api, "hostList").mockResolvedValue({ items: [], nextCursor: null } as Awaited<
+    ReturnType<Api["hostList"]>
+  >);
+  vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as Awaited<ReturnType<Api["deviceList"]>>);
+  vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as Awaited<
+    ReturnType<Api["passkeyList"]>
+  >);
+  vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+  vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+  vi.spyOn(hubStore, "flushAllOutbox").mockResolvedValue(undefined);
+  vi.spyOn(api, "interactionList").mockResolvedValue([]);
+  // A is in the bootstrap instance list (the list arrives BEFORE connection
+  // installation), so follow(A) finds the journal id with connection=null.
+  vi.spyOn(api, "instanceList").mockResolvedValue({
+    items: [
+      { id: A, journalId: JA, revision: "0", durableSeq: "0", lifecycle: "running" } as never,
+    ],
+    nextCursor: null,
+  });
+
+  // The seed is held until the machine has been installed.
+  let releaseSeed: (() => void) | null = null;
+  vi.spyOn(api, "eventsRead").mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        releaseSeed = () =>
+          resolve({
+            events: [],
+            durableSeq: "0",
+            windowFromSeq: null,
+            reachedAfterSeq: true,
+          });
+      }),
+  );
+  const subscribe = vi.spyOn(api, "eventsSubscribe").mockImplementation(
+    (async () => ({
+      subscriptionId: "sub_cold_load",
+      journalId: JA,
+      durableSeq: "0",
+      windowFromSeq: null,
+      reachedAfterSeq: true,
+      getReadyState: () => 1,
+      snapshot: {
+        projectionVersion: "v1",
+        projectionEpoch: "epoch_cold_load",
+        asOfSeq: "0",
+        instance: {} as never,
+        runs: [],
+        commands: [],
+        pendingInteractions: [],
+        nodes: [],
+        history: { earliestRetainedSeq: "0", complete: true },
+      },
+    })) as Api["eventsSubscribe"],
+  );
+
+  const flush = async (rounds = 80) => {
+    for (let i = 0; i < rounds; i += 1) await Promise.resolve();
+  };
+
+  // Cold load: bootstrap publishes the authed instance list while connection
+  // installation is parked behind the outbox gate — exactly when the session
+  // route renders and calls follow(A).
+  const bootstrap = hubStore.bootstrap();
+  await vi.waitFor(() => expect(hubStore.getSnapshot().instances.some((i) => i.id === A)).toBe(true));
+  expect(releaseOutbox).not.toBeNull();
+  const internal = hubStore as unknown as {
+    connection: unknown;
+    journals: Map<string, unknown>;
+    connectionBoundTo: string | null;
+  };
+  expect(internal.connection).toBeNull();
+
+  // Route entry: follow(A) with NO machine yet; its seed parks.
+  void hubStore.follow(A);
+  await flush();
+  expect(releaseSeed).not.toBeNull();
+  expect(subscribe).not.toHaveBeenCalled();
+
+  // First the connection machine installs (outbox gate opens)...
+  releaseOutbox!();
+  await vi.waitFor(() => expect(internal.connection).not.toBeNull());
+  // ...THEN the seed resolves. The null → first-install transition must ADOPT
+  // the pending target: the continuation proceeds to journal + subscription with
+  // no injected resume.
+  releaseSeed!();
+  await flush();
+
+  await expect(bootstrap).resolves.toBe("ready");
+  expect(internal.journals.has(JA)).toBe(true);
+  expect(subscribe).toHaveBeenCalledTimes(1);
+
+  hubStore.logout();
+});
+
+it("r8 item 1: a real machine replacement (logout/re-login) still fences the old continuation", async () => {
+  const { api, hubStore } = await fresh();
+  const A = "ins_replace_fence";
+  const JA = "obj_replace_fence_journal";
+
+  vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+  vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+  vi.spyOn(api, "hostList").mockResolvedValue({ items: [], nextCursor: null } as Awaited<
+    ReturnType<Api["hostList"]>
+  >);
+  vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as Awaited<ReturnType<Api["deviceList"]>>);
+  vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as Awaited<
+    ReturnType<Api["passkeyList"]>
+  >);
+  vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+  vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+  vi.spyOn(hubStore, "flushAllOutbox").mockResolvedValue(undefined);
+  vi.spyOn(api, "interactionList").mockResolvedValue([]);
+  vi.spyOn(api, "instanceList").mockResolvedValue({
+    items: [
+      { id: A, journalId: JA, revision: "0", durableSeq: "0", lifecycle: "running" } as never,
+    ],
+    nextCursor: null,
+  });
+
+  let releaseSeed: (() => void) | null = null;
+  vi.spyOn(api, "eventsRead").mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        releaseSeed = () =>
+          resolve({
+            events: [],
+            durableSeq: "0",
+            windowFromSeq: null,
+            reachedAfterSeq: true,
+          });
+      }),
+  );
+  vi.spyOn(api, "eventsSubscribe").mockImplementation(
+    (async () => ({
+      subscriptionId: "sub_replace_fence",
+      journalId: JA,
+      durableSeq: "0",
+      windowFromSeq: null,
+      reachedAfterSeq: true,
+      getReadyState: () => 1,
+      snapshot: {
+        projectionVersion: "v1",
+        projectionEpoch: "epoch_replace_fence",
+        asOfSeq: "0",
+        instance: {} as never,
+        runs: [],
+        commands: [],
+        pendingInteractions: [],
+        nodes: [],
+        history: { earliestRetainedSeq: "0", complete: true },
+      },
+    })) as Api["eventsSubscribe"],
+  );
+
+  // First login: bootstrap WITH A cached, then follow A under machine M1 with
+  // its seed held.
+  await hubStore.bootstrap();
+  void hubStore.follow(A);
+  await vi.waitFor(() => expect(releaseSeed).not.toBeNull());
+  const m1 = (hubStore as unknown as { connection: unknown }).connection;
+  expect(m1).not.toBeNull();
+
+  // Real identity reset: machine disposed and target/gen cleared.
+  hubStore.logout();
+  expect((hubStore as unknown as { connection: unknown }).connection).toBeNull();
+
+  // Second login on the SAME store installs a genuinely new machine M2 with no
+  // target. Releasing the old seed after that must not mount A under M2 — the
+  // identity fence holds even though the token's old connection was non-null.
+  const reboot = hubStore.bootstrap();
+  await expect(reboot).resolves.toBe("ready");
+  const m2 = (hubStore as unknown as { connection: unknown }).connection;
+  expect(m2).not.toBe(m1);
+
+  releaseSeed!();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  const internal = hubStore as unknown as {
+    journals: Map<string, unknown>;
+    connectionBoundTo: string | null;
+  };
+  expect(internal.connectionBoundTo).toBeNull();
+  expect(internal.journals.has(JA)).toBe(false);
+  hubStore.logout();
+});
+
 it("r7 item 1: an A → B navigation suppresses the departure's transient list proof; B owns recovery", async () => {
   const { api, hubStore, list } = await bootUnbound();
   const A = "ins_nav_a";

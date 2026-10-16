@@ -7,9 +7,12 @@
 
 use remuda_driver::StdoutMapper;
 use remuda_hub::usage_store_test_support::{
-    JournalRecord, RollupRequest, insert_usage_event, migrate, project_usage_event, rollup_instance,
+    JournalRecord, RollupRequest, aggregate_supply, insert_usage_event, migrate,
+    project_usage_event, rollup_instance,
 };
-use remuda_protocol::{DriverKind, Observation, ObservationPayload};
+use remuda_protocol::{
+    DriverKind, InputAccounting, Knowledge, Observation, ObservationPayload, U64,
+};
 
 fn feed_live_result() -> (Observation, String) {
     let mut mapper = StdoutMapper::new(DriverKind::ClaudePrint, "sess");
@@ -48,6 +51,35 @@ fn feed_live_result() -> (Observation, String) {
 fn live_print_result_flows_into_the_tpm_window_end_to_end() {
     let (observation, native_at) = feed_live_result();
 
+    // r37 item 8: the fallback result reports input 250 / output 25 / cache
+    // read 1_000 / cache creation 300. input_tokens is UNCACHED input, so the
+    // declared total is the all-bucket sum 1_575 — never input+output 275 —
+    // and the input accounting is Uncached. That declared total is what the
+    // provider aggregate sums initially.
+    if let ObservationPayload::Usage(payload) = &observation.body {
+        assert_eq!(
+            payload.total_tokens,
+            Knowledge::Known { value: U64(1_575) },
+            "250 + 25 + 1000 + 300 across every reported bucket"
+        );
+        assert_eq!(
+            payload.input_accounting,
+            InputAccounting::Uncached,
+            "result input_tokens excludes cached context"
+        );
+        assert_eq!(payload.input_tokens, Knowledge::Known { value: U64(250) });
+        assert_eq!(
+            payload.cache_read_tokens,
+            Knowledge::Known { value: U64(1_000) }
+        );
+        assert_eq!(
+            payload.cache_write_tokens,
+            Knowledge::Known { value: U64(300) }
+        );
+    } else {
+        panic!("feed_live_result must yield a usage observation");
+    }
+
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     migrate(&conn).unwrap();
 
@@ -60,10 +92,16 @@ fn live_print_result_flows_into_the_tpm_window_end_to_end() {
         observed_at: "2020-01-01T00:00:00.000Z".into(),
         event: serde_json::to_value(&observation).unwrap(),
     };
-    let row = project_usage_event(&record, None, None).expect("projects");
+    // Project with profile/model so the PROVIDER aggregate can select the row.
+    let row = project_usage_event(&record, Some("pvp_live"), Some("m")).expect("projects");
     // Live receipt time -> native source, never ingest.
     assert_eq!(row.observed_at_source, "native");
     assert_eq!(row.observed_at, native_at);
+    assert_eq!(
+        row.total_tokens,
+        Some(1_575),
+        "the initial stored row declares the all-bucket total, not 275"
+    );
     assert!(insert_usage_event(&conn, &row).unwrap());
 
     let rollup = rollup_instance(
@@ -87,6 +125,48 @@ fn live_print_result_flows_into_the_tpm_window_end_to_end() {
     );
     assert_eq!(rollup.tpm_out_60s, Some(25));
     assert_eq!(rollup.last_turn_at.as_deref(), Some(native_at.as_str()));
+
+    // The provider aggregate sums the declared per-row total: 1_575, once.
+    let supply = aggregate_supply(&conn, "pvp_live", "m").unwrap();
+    assert!(!supply.unavailable);
+    assert_eq!(
+        supply.total_tokens,
+        Some(1_575),
+        "provider aggregation sums the correct declared total"
+    );
+}
+
+/// r37 item 8: a result frame that omits a required bucket must declare an
+/// UNKNOWN total rather than a partial input+output sum (U1).
+#[test]
+fn a_result_without_cache_buckets_declares_an_unknown_total() {
+    let mut mapper = StdoutMapper::new(DriverKind::ClaudePrint, "sess");
+    let observation = mapper
+        .map(serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "num_turns": 1,
+            "result_index": 0,
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 100, "output_tokens": 10}
+        }))
+        .expect("result frame maps");
+    let turn = observation
+        .iter()
+        .find(|o| {
+            matches!(&o.body, ObservationPayload::Usage(u)
+                if u.scope == remuda_protocol::UsageScope::Turn)
+        })
+        .expect("turn usage observation");
+    if let ObservationPayload::Usage(payload) = &turn.body {
+        assert!(
+            matches!(payload.total_tokens, Knowledge::Unknown { .. }),
+            "100+10 without the cache baskets is not a declared total"
+        );
+        assert_eq!(payload.input_accounting, InputAccounting::Uncached);
+    } else {
+        panic!("turn observation must be usage");
+    }
 }
 
 /// r37 item 7: on a normal live print/sdk stream the per-call Turn usage rides

@@ -5962,9 +5962,22 @@ fn usage_from_result(
         .saturating_mul(1000)
         .saturating_add(turn_revision);
     let session_id = mapper.session_id.clone();
-    let total = result_input
-        .zip(result_output)
-        .map(|(input, output)| input.saturating_add(output));
+    // r37 item 8: the declared total is the sum of EVERY reported bucket
+    // (Anthropic result input_tokens is the UNCACHED input, so the cached
+    // context is added, never double counted). U1: a frame that omits one of
+    // the buckets declares NO total rather than a partial input+output sum
+    // (250+25 would hide the 1_000 read / 300 creation); the Hub keeps the
+    // stored basket partial and recomputes once it is complete.
+    let total = [
+        result_input,
+        result_output,
+        result_cache_read,
+        result_cache_write,
+    ]
+    .into_iter()
+    .fold(Some(0u64), |sum, bucket| {
+        sum.zip(bucket).map(|(s, n)| s + n)
+    });
 
     let mut observations = Vec::new();
 
@@ -5991,7 +6004,10 @@ fn usage_from_result(
             metric_revision: U64(turn_revision),
             source_session_id: None,
             input_tokens: opt_u64(result_input),
-            input_accounting: InputAccounting::Unknown,
+            // r37 item 8: Anthropic result input_tokens EXCLUDES cached
+            // context (cache buckets are broken out above), so it is the
+            // uncached input — never the generic Unknown classification.
+            input_accounting: InputAccounting::Uncached,
             output_tokens: opt_u64(result_output),
             reasoning_tokens: unknown("not-emitted"),
             cache_read_tokens: opt_u64(result_cache_read),

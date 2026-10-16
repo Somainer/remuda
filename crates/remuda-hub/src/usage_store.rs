@@ -2016,12 +2016,18 @@ fn turn_has_durable_message_sql(inst: &str, tid: &str, alias: &str) -> String {
     )
 }
 
-/// True when the DURABLE linked Messages of turn `(inst, tid)` match its Turn
-/// row on every token bucket the Turn row actually reports
-/// (COORDINATOR RULING U1, c-usagefu r13 item 2).
+/// True when the DURABLE linked Messages of turn `(inst, tid)` match its
+/// WINNING Turn row on every token bucket the winning row actually reports
+/// (COORDINATOR RULING U1, c-usagefu r13 item 2; r37 item 5).
 ///
-/// Bucket-sum equality between a Turn row and its durable linked Messages IS
-/// the completeness proof:
+/// The comparison row is the fold winner — the same `seq DESC, rowid DESC`
+/// ordering `global_winning_turns` uses across ALL native-session lineages —
+/// never an arbitrary raw row: per-lineage retention can leave several Turn
+/// rows for one scope id, and matching the Messages against the losing
+/// lineage's smaller buckets would suppress the real winner.
+///
+/// Bucket-sum equality between the winning Turn row and its durable linked
+/// Messages IS the completeness proof:
 ///
 /// - at least one linked Message carries the persisted durable (rollout file
 ///   identity, byte offset) identity the final adapter mints for EVERY
@@ -2029,14 +2035,14 @@ fn turn_has_durable_message_sql(inst: &str, tid: &str, alias: &str) -> String {
 ///   Messages only. Main wrote no codex Message rows at all and the final
 ///   schema writes none without the durable marker, so no per-record identity
 ///   mix can occur in an in-scope database;
-/// - for every TOKEN bucket the Turn row reports, the durable Messages' sum
-///   EQUALS it. A bucket the Turn leaves NULL (a sparse historical Turn never
-///   carried total/cache-write) cannot disprove coverage and is not compared;
-///   the Messages may additionally report buckets the Turn omitted. A
-///   zero-token record contributes nothing (it adds zero to the sums), so it
-///   neither creates nor breaks equality;
-/// - when the durable sums fall short of the Turn on any reported bucket the
-///   turn is NOT covered: the Turn is billed and its linked Messages are
+/// - for every TOKEN bucket the winning Turn row reports, the durable
+///   Messages' sum EQUALS it. A bucket the winner leaves NULL (a sparse
+///   historical Turn never carried total/cache-write) cannot disprove
+///   coverage and is not compared; the Messages may additionally report
+///   buckets the Turn omitted. A zero-token record contributes nothing (it
+///   adds zero to the sums), so it neither creates nor breaks equality;
+/// - when the durable sums fall short of the winner on any reported bucket
+///   the turn is NOT covered: the Turn is billed and its linked Messages are
 ///   dropped — never both.
 ///
 /// Cost is deliberately NOT part of the proof: it is a priced projection that
@@ -2055,12 +2061,16 @@ fn turn_fully_covered_sql(inst: &str, tid: &str) -> String {
         // Each condition is a full OR and MUST be parenthesized: the list is
         // joined with AND, and a bare `A IS NULL OR B = C` would let AND bind
         // tighter and silently flatten the coverage proof across buckets. The
-        // sum is scoped to DURABLE linked Messages (the marker prefix).
+        // sum is scoped to DURABLE linked Messages (the marker prefix). Both
+        // Turn lookups select the FOLD WINNER (seq DESC, rowid DESC): a bare
+        // scalar subquery over the per-lineage rows could return the losing
+        // lineage (r37 item 5).
         let marker = remuda_driver::adapters::codex_adapter::CODEX_DURABLE_RESPONSE_SCOPE_PREFIX;
         conds.push(format!(
             "((SELECT _fc_t.{bucket} FROM usage_events _fc_t
               WHERE _fc_t.instance_id = {inst}
-                AND _fc_t.scope = 'turn' AND _fc_t.scope_id = {tid}) IS NULL
+                AND _fc_t.scope = 'turn' AND _fc_t.scope_id = {tid}
+              ORDER BY _fc_t.seq DESC, _fc_t.rowid DESC LIMIT 1) IS NULL
              OR COALESCE((
                 SELECT SUM(_fc_s.{bucket}) FROM usage_events _fc_s
                 WHERE _fc_s.instance_id = {inst}
@@ -2069,7 +2079,8 @@ fn turn_fully_covered_sql(inst: &str, tid: &str) -> String {
              ), 0)
              = (SELECT _fc_t2.{bucket} FROM usage_events _fc_t2
                 WHERE _fc_t2.instance_id = {inst}
-                  AND _fc_t2.scope = 'turn' AND _fc_t2.scope_id = {tid}))",
+                  AND _fc_t2.scope = 'turn' AND _fc_t2.scope_id = {tid}
+                ORDER BY _fc_t2.seq DESC, _fc_t2.rowid DESC LIMIT 1))",
             len = marker.len(),
         ));
     }
@@ -10851,6 +10862,94 @@ mod tests {
         assert_eq!(rollup.tpm_out_60s, None);
         assert_eq!(rollup.tpm_in_5m, None);
         assert_eq!(rollup.tpm_out_5m, None);
+    }
+
+    /// r37 item 5: the durable-Message coverage proof compares its bucket sums
+    /// against the FOLD's winning turn. With per-lineage rows for one turn, the
+    /// coverage scalar subqueries used to re-read raw Turn rows without any
+    /// ordering, so they could match the LOSING lineage's smaller buckets and
+    /// suppress the actual (newer, larger) winner in favour of its Messages.
+    #[test]
+    fn message_coverage_is_measured_against_the_winning_lineage_turn() {
+        use remuda_driver::adapters::codex_adapter::CODEX_DURABLE_RESPONSE_SCOPE_PREFIX;
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let at = "2026-10-13T00:00:00.000Z";
+        let turn = |seq: i64, lineage: &str, input: i64, output: i64| UsageEventRow {
+            instance_id: "ins_r37i5".into(),
+            seq,
+            profile_id: Some("pvp".into()),
+            model: Some("m".into()),
+            scope: "turn".into(),
+            scope_id: Some("msg-T".into()),
+            turn_id: None,
+            native_context_window: None,
+            mode: "snapshot".into(),
+            metric_revision: 1,
+            source_session_id: Some(lineage.into()),
+            total_tokens: Some(input + output),
+            input_tokens: Some(input),
+            output_tokens: Some(output),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            cost_usd: None,
+            accounting: "estimated".into(),
+            observed_at: at.into(),
+            observed_at_source: "native".into(),
+        };
+        // Loser first (seq 1, 100/10), winner second (seq 2, 200/20).
+        assert!(insert_usage_event(&conn, &turn(1, "sess-a", 100, 10)).unwrap());
+        assert!(insert_usage_event(&conn, &turn(2, "sess-b", 200, 20)).unwrap());
+        // A DURABLE Message linked to the turn whose buckets match the LOSER
+        // (100/10), never the 200/20 winner.
+        assert!(
+            insert_usage_event(
+                &conn,
+                &UsageEventRow {
+                    instance_id: "ins_r37i5".into(),
+                    seq: 3,
+                    profile_id: Some("pvp".into()),
+                    model: Some("m".into()),
+                    scope: "message".into(),
+                    scope_id: Some(format!("{CODEX_DURABLE_RESPONSE_SCOPE_PREFIX}0:file-1")),
+                    turn_id: Some("msg-T".into()),
+                    native_context_window: None,
+                    mode: "snapshot".into(),
+                    metric_revision: 1,
+                    source_session_id: None,
+                    total_tokens: Some(110),
+                    input_tokens: Some(100),
+                    output_tokens: Some(10),
+                    cache_read_tokens: Some(0),
+                    cache_write_tokens: Some(0),
+                    cost_usd: None,
+                    accounting: "estimated".into(),
+                    observed_at: at.into(),
+                    observed_at_source: "native".into(),
+                }
+            )
+            .unwrap()
+        );
+
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_r37i5",
+                kind: "codex",
+                spec_model: Some("m"),
+                effective_model: None,
+                profile_id: Some("pvp"),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            rollup.session_input_tokens,
+            Some(200),
+            "the winner's 200 bills; matching the losing lineage's 100 must \
+             never mark the winner covered"
+        );
+        assert_eq!(rollup.session_output_tokens, Some(20));
     }
 
     /// c-ctxusage r16 item 3 (T1'), regression 2: a qualified alpha frame at

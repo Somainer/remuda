@@ -544,17 +544,22 @@ fn backfill_legacy_scope_ids(conn: &Connection) -> rusqlite::Result<()> {
 /// is idempotent — a settled database has at most one physical row per
 /// lineage key, so the EXISTS match finds nothing.
 fn clear_disagreeing_recovered_turn_keys(conn: &Connection) -> rusqlite::Result<()> {
+    // r38 item 2: only the HISTORICAL unqualified lineage (no proven session)
+    // is treated as degenerate-id calls. Successive snapshots journal recovery
+    // stamps with a confirmed common source_session_id are revisions of one
+    // turn even when counters differ; they keep scope/lineage and resolve to
+    // the fold winner, so the outer row and every sibling must be NULL.
     conn.execute(
         "UPDATE usage_events
          SET scope_id = NULL
          WHERE scope = 'turn' AND scope_id IS NOT NULL
+           AND source_session_id IS NULL
            AND EXISTS (
                SELECT 1 FROM usage_events d
                WHERE d.instance_id = usage_events.instance_id
                  AND d.scope = 'turn'
                  AND d.scope_id = usage_events.scope_id
-                 AND COALESCE(d.source_session_id, '')
-                     = COALESCE(usage_events.source_session_id, '')
+                 AND d.source_session_id IS NULL
                  AND d.rowid <> usage_events.rowid
                  AND (d.total_tokens     IS NOT usage_events.total_tokens
                    OR d.input_tokens     IS NOT usage_events.input_tokens
@@ -10808,6 +10813,124 @@ mod tests {
         assert_eq!(b.turns, 2, "two turns, not a doubled qualified turn");
         assert_eq!(b.session_input_tokens, Some(120), "100 + 20, not 220");
         assert_eq!(b.session_output_tokens, Some(12), "10 + 2, not 22");
+    }
+
+    /// r38 item 2: a final snapshot written through the 14-column fallback
+    /// insert while an upgrade was rolled back, then recovered from the journal
+    /// on the successful retry, is a LATER REVISION of one proven turn — not a
+    /// second degenerate call. The disagreeing-key reconciliation belongs to
+    /// the historical unqualified producer; recovered snapshots with proven
+    /// common lineage keep their scope/lineage and resolve to the fold winner.
+    #[test]
+    fn recovered_lineage_snapshots_resolve_through_revision_not_degenerate_ids() {
+        let conn = Connection::open_in_memory().unwrap();
+        // r28 shape, already migrated once: the established turn at rev 100.
+        create_r28_usage_table_with_turn_index(&conn);
+        create_journal_table(&conn);
+        conn.execute(
+            "INSERT INTO usage_events
+                (instance_id, seq, profile_id, model, scope, scope_id, mode,
+                 metric_revision, source_session_id, total_tokens, input_tokens,
+                 output_tokens, cache_read_tokens, cache_write_tokens,
+                 accounting, observed_at, observed_at_source)
+             VALUES ('ins_r38i2', 1, 'pvp', 'm', 'turn', 'msg-T', 'snapshot',
+                 100, 'sess-S', 100, 100, 0, 0, 0,
+                 'estimated', '2026-10-01T00:00:00.000Z', 'native')",
+            [],
+        )
+        .unwrap();
+        // While the upgrade stayed rolled back, the final rev-101 snapshot was
+        // recorded through the 14-column legacy path: identity columns NULL.
+        conn.execute(
+            "INSERT INTO usage_events
+                (instance_id, seq, profile_id, model, scope, mode, total_tokens,
+                 input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                 accounting, observed_at)
+             VALUES ('ins_r38i2', 2, 'pvp', 'm', 'turn', 'snapshot', 150,
+                 150, 0, 0, 0,
+                 'estimated', '2026-10-01T00:00:02.000Z')",
+            [],
+        )
+        .unwrap();
+        // The durable journal retains BOTH frames: scopeId T and confirmed
+        // native session S, at revisions 100 and 101.
+        let journal_turn = |seq: i64, revision: i64, input: i64, stamp: &str| {
+            json!({
+                "kind": "usage",
+                "nativeAt": {"state": "known", "value": stamp},
+                "source": {
+                    "nativeSessionId": {"state": "known", "value": "sess-S"},
+                    "nativeTurnId": {"state": "known", "value": "msg-T"}
+                },
+                "payload": {
+                    "scope": "turn",
+                    "scopeId": "msg-T",
+                    "mode": "snapshot",
+                    "metricRevision": revision.to_string(),
+                    "accounting": "estimated",
+                    "inputTokens": {"state": "known", "value": input.to_string()},
+                    "outputTokens": {"state": "known", "value": "0"},
+                    "cacheReadTokens": {"state": "known", "value": "0"},
+                    "cacheWriteTokens": {"state": "known", "value": "0"},
+                    "totalTokens": {"state": "known", "value": input.to_string()}
+                }
+            })
+        };
+        for (seq, rev, input, stamp) in [
+            (1i64, 100i64, 100i64, "2026-10-01T00:00:00.000Z"),
+            (2, 101, 150, "2026-10-01T00:00:02.000Z"),
+        ] {
+            conn.execute(
+                "INSERT INTO journal (instance_id, seq, event_id, payload_json, observed_at)
+                 VALUES ('ins_r38i2', ?1, ?2, ?3, ?4)",
+                params![
+                    seq,
+                    format!("je{seq}"),
+                    journal_turn(seq, rev, input, stamp).to_string(),
+                    stamp
+                ],
+            )
+            .unwrap();
+        }
+
+        // Successful retry of the delivery migration.
+        migrate(&conn).unwrap();
+
+        // One physical turn row survives, and it is the rev-101 winner with
+        // its proven scope and lineage intact.
+        let (count, scope, sid, revision, input): (i64, Option<String>, Option<String>, i64, i64) =
+            conn.query_row(
+                "SELECT COUNT(*), MIN(scope_id), MIN(source_session_id),
+                        MAX(metric_revision), MAX(input_tokens)
+                 FROM usage_events WHERE instance_id='ins_r38i2' AND scope='turn'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "the two snapshots are one turn, not two calls");
+        assert_eq!(scope.as_deref(), Some("msg-T"), "proven scope is retained");
+        assert_eq!(sid.as_deref(), Some("sess-S"), "proven lineage is retained");
+        assert_eq!(revision, 101, "the final revision survives");
+        assert_eq!(input, 150);
+
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_r38i2",
+                kind: "claude",
+                spec_model: Some("m"),
+                effective_model: None,
+                profile_id: Some("pvp"),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(rollup.turns, 1);
+        assert_eq!(
+            rollup.session_input_tokens,
+            Some(150),
+            "rev 101 wins, not 250"
+        );
     }
 
     /// r37 item 3: on an upgrade from the schema that ALREADY carried

@@ -71,9 +71,14 @@ pub struct UsageEventRow {
     /// Observed-at timestamp.
     pub observed_at: String,
     /// Whether `observed_at` came from the source's native timestamp
-    /// (`"native"`) or was stamped at journal ingest (`"ingest"`). Only a
-    /// native timestamp may authoritatively repair the stored time; ingest
-    /// fallbacks never overwrite one (c-ctxusage r4 item 5).
+    /// (`"native"`), was stamped at journal ingest (`"ingest"` — a
+    /// timestamp-free historical replay, NEVER time-authoritative), or was
+    /// defaulted by the migration on a database from BEFORE this column
+    /// existed (`"legacy"` — no provenance existed at all, so the retained
+    /// timestamp is trusted as the only evidence, c-usagefu r8 item 5; r37
+    /// item 3). Only a native timestamp may authoritatively repair the
+    /// stored time; ingest fallbacks never overwrite one (c-ctxusage r4
+    /// item 5).
     pub observed_at_source: String,
     /// Native per-model context window the harness reported (`result`/
     /// `modelUsage.contextWindow`, via `UsagePayload.contextWindow`). The
@@ -223,12 +228,29 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     crate::store::ensure_column(conn, "usage_events", "source_session_id", "TEXT")?;
     // c-ctxusage r4 item 5: remember whether observed_at is native-sourced or
     // an ingest fallback, so an unchanged-counters replay can repair the
-    // historical native time. Legacy rows are conservatively 'ingest'.
+    // historical native time.
+    //
+    // r37 item 3: the DEFAULT stamped onto column-less rows depends on the
+    // shape being upgraded. A database from before this column carried NO
+    // provenance at all, so its retained timestamp is the only evidence and
+    // gets 'legacy' (the c-usagefu r8 item 5 compatibility trust: upgraded
+    // instances still derive rates from their cumulative increments). A
+    // database that ALREADY had the column carries real provenance: an
+    // explicit 'ingest' is a timestamp-free historical replay whose time is
+    // the ingest clock, and the blanket upgrade tag must never promote it to
+    // time authority — so NULL/empty rows there default to 'ingest'.
+    let had_observed_at_source =
+        crate::store::column_exists(conn, "usage_events", "observed_at_source")?;
     crate::store::ensure_column(conn, "usage_events", "observed_at_source", "TEXT")?;
+    let default_observed_at_source = if had_observed_at_source {
+        "ingest"
+    } else {
+        "legacy"
+    };
     conn.execute(
-        "UPDATE usage_events SET observed_at_source = 'ingest'
+        "UPDATE usage_events SET observed_at_source = ?1
          WHERE observed_at_source IS NULL OR observed_at_source = ''",
-        [],
+        params![default_observed_at_source],
     )?;
     // c-usagefu (c): native per-model context window reported on the payload.
     crate::store::ensure_column(conn, "usage_events", "native_context_window", "INTEGER")?;
@@ -2806,23 +2828,15 @@ fn session_stock_increments(
 }
 
 /// One ordered cumulative-session point: the two rate buckets, its observed
-/// time, the session scope id (NULL for legacy rows), the time source and the
-/// pre-upgrade lineage tag.
-type SessionPointRow = (
-    Option<i64>,
-    Option<i64>,
-    String,
-    Option<String>,
-    String,
-    Option<String>,
-);
+/// time, the session scope id (NULL for legacy rows) and the time source.
+type SessionPointRow = (Option<i64>, Option<i64>, String, Option<String>, String);
 
 /// Ordered session points; scoped or legacy NULL-scope only. EVERY accepted
 /// point is walked — including ingest-stamped historical replays — because a
 /// timestamp-free replay still ADVANCES the cumulative baseline: skipping it
 /// made the next native point diff against a stale stock and inflate a single
 /// increment (native 100 → untimed 120, 140 → native 150 read as +50 instead
-/// of the true +10). Only the increment EMISSION is source/lineage-gated
+/// of the true +10). Only the increment EMISSION is source-gated
 /// (c-ctxusage r9 item 3).
 ///
 /// c-ctxusage r10 item 3: the chain order is the ACCEPTED order (insertion
@@ -2844,7 +2858,7 @@ fn session_point_rows(
     };
     let sql = format!(
         "SELECT input_tokens, output_tokens, observed_at, scope_id,
-                observed_at_source, lineage_state
+                observed_at_source
          FROM usage_events
          WHERE instance_id = ?1 AND scope = 'session' AND {predicate}
          ORDER BY scope_id ASC, rowid ASC"
@@ -2857,7 +2871,6 @@ fn session_point_rows(
             row.get(2)?,
             row.get(3)?,
             row.get(4)?,
-            row.get(5)?,
         ))
     })?
     .collect()
@@ -2865,24 +2878,29 @@ fn session_point_rows(
 
 /// Diff ordered points, restarting the chain at every scope boundary. Every
 /// point advances the predecessor baseline; an increment is emitted ONLY for
-/// a NATIVE-timed post-upgrade point — or a PRE-UPGRADE (`lineage_state =
-/// 'legacy'`) point, whose pre-split timestamp is the only time evidence
-/// available and is trusted (c-usagefu r8 item 5) — against its IMMEDIATE
-/// predecessor, and only when the predecessor exists. A native point with no
-/// predecessor, or an interval whose predecessor counters are unknown, yields
-/// no increment — the interval is unknown, never the stock
-/// (c-ctxusage r9 item 3). An unknown PREDECESSOR bucket stays unknown rather
-/// than being treated as zero: unknown→150 cannot be read as a 150 increment
-/// (c-ctxusage r10 item 4).
+/// a point whose timestamp is time-authoritative against its IMMEDIATE
+/// predecessor, and only when the predecessor exists. Two provenances carry
+/// authority: a post-upgrade `"native"` timestamp, and the migration-default
+/// `"legacy"` source stamped exclusively on databases from BEFORE the source
+/// column existed (c-usagefu r8 item 5: no provenance existed, the retained
+/// timestamp is the only evidence). An explicit `"ingest"` point — including
+/// a pre-upgrade replay retained through a database that already had the
+/// column — is NEVER trusted: its time is the ingest clock of a
+/// timestamp-free replay, and the lineage upgrade tag does not change that
+/// (r37 item 3). A native point with no predecessor, or an interval whose
+/// predecessor counters are unknown, yields no increment — the interval is
+/// unknown, never the stock (c-ctxusage r9 item 3). An unknown PREDECESSOR
+/// bucket stays unknown rather than being treated as zero: unknown→150
+/// cannot be read as a 150 increment (c-ctxusage r10 item 4).
 fn diff_rows(rows: Vec<SessionPointRow>) -> rusqlite::Result<Vec<StockIncrement>> {
     let mut increments = Vec::new();
     let mut previous: Option<(Option<String>, Option<i64>, Option<i64>)> = None;
-    for (input, output, end_at, scope_id, source, lineage_state) in rows {
+    for (input, output, end_at, scope_id, source) in rows {
         let boundary = previous
             .as_ref()
             .map(|(prev_scope, _, _)| *prev_scope != scope_id)
             .unwrap_or(true);
-        let trusted_time = source == "native" || lineage_state.as_deref() == Some("legacy");
+        let trusted_time = source == "native" || source == "legacy";
         if !boundary
             && trusted_time
             && let Some((_, prev_input, prev_output)) = &previous
@@ -3056,9 +3074,9 @@ fn latest_session_stock(
         return Ok((stock, true));
     }
     // Legacy fallback: the last ACCEPTED NULL-scope row (acceptance order,
-    // r10 item 3). Legacy rows predate source tracking and are conservatively
-    // 'ingest', so native_observed_at stays None — a legacy cumulative total
-    // cannot author a lastTurnAt.
+    // r10 item 3). These rows carry no 'native' source (they are 'ingest' or
+    // the migration-default 'legacy'), so native_observed_at stays None — a
+    // legacy cumulative total cannot author a lastTurnAt.
     let stock = conn
         .query_row(
             "SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, observed_at
@@ -4605,11 +4623,12 @@ mod tests {
         .unwrap();
         // r8 item 5: a second, pre-`scopeId` CODEX-style instance — its old
         // rows are NULL-scope Turn flow AND cumulative Session growth points
-        // (the pre-r6 codex shape). After migration every row's source is
-        // backfilled to 'ingest'; TPM must still come from the session-stock
-        // increments, not be blanked by a native-only turn query that has_turn
-        // routes to. Points: 100/60 twenty seconds ago, 160/84 two seconds ago
-        // (increment 60/24 inside both windows); a legacy turn row at 30s.
+        // (the pre-r6 codex shape). This shape predates the source column, so
+        // migration defaults its rows to 'legacy' and TPM still comes from the
+        // session-stock increments, not be blanked by a native-only turn query
+        // that has_turn routes to. Points: 100/60 twenty seconds ago, 160/84
+        // two seconds ago (increment 60/24 inside both windows); a legacy turn
+        // row at 30s.
         let at_30s = threshold_rfc3339(30);
         let at_20s = threshold_rfc3339(20);
         let at_2s = threshold_rfc3339(2);
@@ -10543,6 +10562,91 @@ mod tests {
         assert_eq!(b.turns, 2, "two turns, not a doubled qualified turn");
         assert_eq!(b.session_input_tokens, Some(120), "100 + 20, not 220");
         assert_eq!(b.session_output_tokens, Some(12), "10 + 2, not 22");
+    }
+
+    /// r37 item 3: on an upgrade from the schema that ALREADY carried
+    /// observed_at_source (c-ctxusage r28), an explicit 'ingest' provenance is
+    /// retained fact: the point's timestamp is the ingest time of a
+    /// timestamp-free historical replay, not native evidence. The blanket
+    /// 'legacy' migration tag must not promote it to trusted time — otherwise
+    /// the replay becomes a false live throughput increment. Only rows from a
+    /// shape that PRE-DATED the source column (no provenance existed) keep the
+    /// c-usagefu r8 item 5 compatibility trust.
+    #[test]
+    fn an_upgraded_ingest_only_replay_is_not_promoted_to_a_live_increment() {
+        let create_r28 = "CREATE TABLE usage_events (
+            instance_id TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            profile_id TEXT,
+            model TEXT,
+            scope TEXT NOT NULL,
+            scope_id TEXT,
+            mode TEXT NOT NULL,
+            total_tokens INTEGER,
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            cache_read_tokens INTEGER,
+            cache_write_tokens INTEGER,
+            cost_usd TEXT,
+            accounting TEXT NOT NULL DEFAULT 'estimated',
+            observed_at TEXT NOT NULL,
+            observed_at_source TEXT NOT NULL DEFAULT 'ingest',
+            metric_revision INTEGER NOT NULL DEFAULT 1,
+            source_session_id TEXT,
+            PRIMARY KEY (instance_id, seq)
+         );";
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(create_r28).unwrap();
+        let native_stamp = threshold_rfc3339(20);
+        let ingest_stamp = threshold_rfc3339(2);
+        // A native 100/60 stock, then a timestamp-free historical replay that
+        // carries 160/84 and is stored with its INGEST time and 'ingest'
+        // source — exactly the r28 live-path invariant.
+        conn.execute(
+            "INSERT INTO usage_events
+                (instance_id, seq, scope, scope_id, mode,
+                 input_tokens, output_tokens, cache_read_tokens,
+                 cache_write_tokens, accounting, observed_at,
+                 observed_at_source, metric_revision, source_session_id)
+             VALUES
+                ('ins_r37i3', 1, 'session', 'g1', 'snapshot',
+                 100, 60, 0, 0, 'estimated', ?1, 'native', 1, 'g1'),
+                ('ins_r37i3', 2, 'session', 'g1', 'snapshot',
+                 160, 84, 0, 0, 'estimated', ?2, 'ingest', 2, 'g1')",
+            params![native_stamp, ingest_stamp],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        // The tag never rewrites the explicit provenance.
+        let sources: Vec<String> = conn
+            .prepare(
+                "SELECT observed_at_source FROM usage_events
+                 WHERE instance_id='ins_r37i3' ORDER BY seq",
+            )
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(sources, vec!["native", "ingest"]);
+
+        let rollup = rollup_fold(&conn, "ins_r37i3", "grok", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rollup.session_input_tokens,
+            Some(160),
+            "the replayed cumulative stock still reports the retained total"
+        );
+        assert_eq!(
+            rollup.tpm_in_60s, None,
+            "an ingest-only replay is not a native 60-token increment"
+        );
+        assert_eq!(rollup.tpm_out_60s, None);
+        assert_eq!(rollup.tpm_in_5m, None);
+        assert_eq!(rollup.tpm_out_5m, None);
     }
 
     /// c-ctxusage r16 item 3 (T1'), regression 2: a qualified alpha frame at

@@ -152,6 +152,119 @@ it("unbound resume publishes live only after exactly one successful bounded prob
   hubStore.logout();
 });
 
+it("r4 item 2: a held unbound list request cannot certify a NEWLY pending session; live waits for its seed+subscribe", async () => {
+  const { api, hubStore, list } = await bootUnbound();
+  const PENDING = "ins_pending_midresume";
+  const JOURNAL = "obj_pending_midresume_journal";
+
+  // The FIRST list call (the list resume's reachability proof) stays held;
+  // every later list call (settlement / stale probes) answers immediately.
+  let releaseOld: (() => void) | null = null;
+  let firstHeld = false;
+  list.mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        if (firstHeld) {
+          resolve({ items: [], nextCursor: null });
+          return;
+        }
+        firstHeld = true;
+        releaseOld = () => resolve({ items: [], nextCursor: null });
+      }),
+  );
+
+  // The pending session's lookup fails once (its initial follow lookup also
+  // failed — the page only has a target id) and resolves on the next
+  // recovery attempt.
+  let lookupCalls = 0;
+  vi.spyOn(api, "instanceGet").mockImplementation(() => {
+    lookupCalls += 1;
+    if (lookupCalls < 2) return Promise.reject(new RestNetworkError("lookup ECONNRESET"));
+    return Promise.resolve({
+      id: PENDING,
+      journalId: JOURNAL,
+      revision: "0",
+      durableSeq: "0",
+      lifecycle: "running",
+    } as Awaited<ReturnType<Api["instanceGet"]>>);
+  });
+  vi.spyOn(api, "eventsRead").mockResolvedValue({
+    events: [],
+    durableSeq: "0",
+    windowFromSeq: null,
+    reachedAfterSeq: true,
+  });
+  const subscribe = vi.spyOn(api, "eventsSubscribe").mockImplementation(
+    (async () => ({
+      subscriptionId: "sub_pending_midresume",
+      journalId: JOURNAL,
+      durableSeq: "0",
+      windowFromSeq: null,
+      reachedAfterSeq: true,
+      getReadyState: () => 1,
+      snapshot: {
+        projectionVersion: "v1",
+        projectionEpoch: "epoch_pending_midresume",
+        asOfSeq: "0",
+        instance: {} as never,
+        runs: [],
+        commands: [],
+        pendingInteractions: [],
+        nodes: [],
+        history: { earliestRetainedSeq: "0", complete: true },
+      },
+    })) as Api["eventsSubscribe"],
+  );
+
+  vi.useFakeTimers();
+  const flush = async (rounds = 40) => {
+    for (let i = 0; i < rounds; i += 1) await vi.advanceTimersByTimeAsync(0);
+  };
+
+  // 1) Foreground unbound resume on the list; hold its reachability GET.
+  hubStore.resumeActive(null);
+  await flush();
+  expect(hubStore.getSnapshot().connection).toBe("recovering");
+  expect(list).toHaveBeenCalledTimes(1);
+
+  // 2) Navigate to the uncached session (its lookup fails) and come back to
+  // the foreground: Shell calls resumeActive(id). Entering the pending target
+  // must be an ownership transition that supersedes the held unbound attempt.
+  hubStore.resumeActive(PENDING);
+  await flush();
+
+  // 3) The OLD list request answers successfully. With the old code it
+  // certified live for the pending session (no generation change → the resume
+  // coalesced and its success published live before any seed/subscribe).
+  const stateAtSubscribe: string[] = [];
+  const rawSubscribe = subscribe.getMockImplementation();
+  subscribe.mockImplementation(((...args: unknown[]) => {
+    stateAtSubscribe.push(hubStore.getSnapshot().connection);
+    return (rawSubscribe as (...a: unknown[]) => unknown)(...args);
+  }) as Api["eventsSubscribe"]);
+  releaseOld!();
+  await flush();
+  for (let i = 0; i < 30 && hubStore.getSnapshot().connection === "recovering"; i += 1) {
+    await vi.advanceTimersByTimeAsync(100);
+  }
+  expect(hubStore.getSnapshot().connection).not.toBe("live");
+  expect(stateAtSubscribe).toHaveLength(0);
+
+  // 4) Recovery continues quietly: the stale probe proves REST reachable, the
+  // next reopen retries the pending lookup — which now mounts for real. Live
+  // is published only once seed + subscribe completed (not when it starts).
+  for (let i = 0; i < 60 && stateAtSubscribe.length === 0; i += 1) {
+    await vi.advanceTimersByTimeAsync(1_000);
+  }
+  await flush();
+  expect(stateAtSubscribe).toHaveLength(1);
+  expect(stateAtSubscribe[0]).not.toBe("live");
+  expect(hubStore.getSnapshot().connection).toBe("live");
+
+  vi.useRealTimers();
+  hubStore.logout();
+});
+
 it("r3 item 1: a pending session target is never certified live by successful list probes; follow recovery must seed+subscribe first", async () => {
   const { api, hubStore, list } = await bootUnbound();
   const PENDING = "ins_pending_target";

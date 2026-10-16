@@ -3269,6 +3269,36 @@ class HubStore {
     }
     return this.connectionBindGen;
   }
+
+  /**
+   * Record a session TARGET whose journal is not known yet — its initial
+   * follow lookup has not resolved (failed before bindConnection, or has not
+   * run), so resumeActive has only the id. Entering or replacing a pending
+   * target is an OWNERSHIP transition (c-unboundresume r4 item 2): without a
+   * generation bump an unbound reachability probe still in flight stayed the
+   * current attempt, and its success certified live for a session that had
+   * neither seeded nor subscribed. Keyed on TARGET IDENTITY, even with a null
+   * journal: list (no target) → pending A, and pending A → pending B, both
+   * supersede the old attempt. The later successful follow() binds the real
+   * journal (null→journal bump) and mounts under its own attempt. Re-entering
+   * the SAME pending target changes nothing (the resume dispatch that follows
+   * may still coalesce). The abandoned-session debt condition is identical to
+   * bindConnection's: only leaving a session whose journal was known.
+   */
+  private enterPendingTarget(instanceId: Id) {
+    const prevTarget = this.connectionBoundTo;
+    const prevJournal = this.connectionBoundJournal;
+    // Re-resume of the SAME target is never an ownership change (its journal,
+    // if already bound, must not be wiped by the state lookup missing once).
+    if (prevTarget === instanceId) return;
+    this.connectionBoundTo = instanceId;
+    this.connectionBoundJournal = null;
+    this.connectionBindGen += 1;
+    this.connection?.noteBinding(this.connectionBindGen);
+    if (prevJournal !== null && prevTarget && this.reconcileOwed.has(prevTarget)) {
+      this.runOwedReconcile(prevTarget);
+    }
+  }
   /**
    * The follow link is genuinely live only when the socket is OPEN AND a frame
    * arrived within LIVE_FRAME_MS. This is the ONLY thing that lets a
@@ -3739,10 +3769,7 @@ class HubStore {
     if (instanceId) {
       const j = this.state.instances.find((i) => i.id === instanceId)?.journalId;
       if (j) this.bindConnection(instanceId, j);
-      else {
-        this.connectionBoundTo = instanceId;
-        this.connectionBoundJournal = null;
-      }
+      else this.enterPendingTarget(instanceId);
     }
     this.connection?.dispatch({ type: "resume" });
     if (!this.connection && instanceId) void this.catchup(instanceId);

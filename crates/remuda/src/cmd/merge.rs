@@ -2671,23 +2671,29 @@ mod tests {
     fn configured_fetch_mappings_and_prune_write_no_refs_during_recovery() {
         let (keep, full, base_b, merge_m, _remote_r) = divergence_fixture();
         // Put M on remote main so recovery certifies Landed: merge the
-        // divergent R back into M, publish D.
+        // divergent R back into M, publish D. The mapping must use D — the
+        // ACTUAL advertised recovery tip (r32 item 5) — not M.
         tgit_ok(&full, &["fetch", "-q", "origin"]);
         tgit_ok(&full, &["merge", "-q", "--no-ff", "-m", "D", "origin/main"]);
         tgit_ok(&full, &["push", "-q", "origin", "main"]);
+        let remote_d = tgit_ok(&full, &["rev-parse", "main"]);
+        assert_ne!(remote_d, merge_m, "D is a descendant of M, distinct");
+        // Sanity: recovery really reads D as the advertised tip.
+        let advertised = tgit_ok(&full, &["ls-remote", "origin", "refs/heads/main"]);
+        assert_eq!(advertised, format!("{remote_d}\trefs/heads/main"));
 
-        // (a) destination ABSENT
+        // (a) destination ABSENT: map the advertised D to refs/tags/keep.
         tgit_ok(
             &full,
             &[
                 "config",
                 "--add",
                 "remote.origin.fetch",
-                &format!("+{merge_m}:refs/tags/keep"),
+                &format!("+{remote_d}:refs/tags/keep"),
             ],
         );
         let before = refs_listing(&full);
-        push_main_cas(&full, &merge_m, &base_b).expect("M is contained in remote main: Landed");
+        push_main_cas(&full, &merge_m, &base_b).expect("M is contained in remote D: Landed");
         assert_eq!(
             refs_listing(&full),
             before,
@@ -2703,7 +2709,8 @@ mod tests {
                 != Some(0)
         );
 
-        // (b) destination EXISTING at B
+        // (b) destination EXISTING at B; the configured D mapping would force it
+        // to D without --refmap.
         tgit_ok(&full, &["tag", "keep", &base_b]);
         let before = refs_listing(&full);
         push_main_cas(&full, &merge_m, &base_b).expect("Landed");

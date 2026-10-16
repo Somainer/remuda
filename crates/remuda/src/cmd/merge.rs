@@ -1046,17 +1046,9 @@ fn parse_ls_remote_base(output: &[u8], base_branch: &str) -> std::result::Result
     }
 }
 
-/// R10/r30 item 2: true ONLY for the exact diagnostics git emits when the
-/// installed build cannot create a SHA-256 repository; matching is anchored to
-/// the message forms, so a bad-config error whose PATH contains "sha256" or
-/// "invalid" is not mistaken for an unsupported build.
+/// R10/r30 item 2 / r32 item 4: true ONLY for the exact full-line diagnostics
+/// git emits when the installed build cannot create a SHA-256 repository.
 #[cfg(test)]
-/// r31 item 3: true ONLY when git prints one of its exact unsupported-SHA-256
-/// diagnostic LINES. Matching is per line: the line must START with the exact
-/// prefix git prints and, where the message has operands, contain the exact
-/// operand — a recognized phrase inside a FILENAME on an unrelated error line
-/// (e.g. a bad-config path ".../unknown hash algorithm 'sha256'/config") never
-/// matches.
 fn is_unsupported_sha256_diagnostic_impl(stderr: &str) -> bool {
     // r32 item 4: COMPLETE, case-sensitive diagnostics with the exact expected
     // operand. Each accepted form is the full line git prints; no
@@ -1089,6 +1081,7 @@ fn is_unsupported_sha256_diagnostic_impl(stderr: &str) -> bool {
         .any(|line| EXACT_LINES.contains(&line))
 }
 
+#[cfg(test)]
 fn is_unsupported_sha256_diagnostic(stderr: &str) -> bool {
     is_unsupported_sha256_diagnostic_impl(stderr)
 }

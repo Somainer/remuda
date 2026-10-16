@@ -873,7 +873,8 @@ type Listener = () => void;
 /** Ruling Y ownership token — see HubStore.acquireTarget/ownsTarget. */
 type TargetToken = {
   connection: ConnectionMachine | null;
-  target: Id;
+  /** null = no session target (session list / new-session page). */
+  target: Id | null;
   gen: number;
 };
 
@@ -3253,7 +3254,7 @@ class HubStore {
    * subscribing, certifying or taking over a newer generation. A stale token
    * makes the continuation a no-op — it can never acquire fresh ownership.
    */
-  private targetToken(instanceId: Id): TargetToken {
+  private targetToken(instanceId: Id | null): TargetToken {
     return {
       connection: this.connection,
       target: instanceId,
@@ -3270,21 +3271,22 @@ class HubStore {
   }
 
   /**
-   * Choose a connection target SYNCHRONOUSLY (Ruling Y). Called from
+   * Choose a connection target SYNCHRONOUSLY (Ruling Y / Y2). Called from
    * follow()/resumeActive()/catchup() entry BEFORE the first await, with the
-   * journal already known or null for a pending lookup.
+   * journal already known or null for a pending lookup — or with BOTH null
+   * when the active route leaves session scope (Y2 route departure).
    *
-   *  - new target identity (no target → A, A → B): ownership change — bump the
-   *    generation, record the target, noteBinding() (which retires any
-   *    in-flight attempt for the old owner), and service abandoned-session
-   *    debt exactly under the old condition (leaving a target whose journal
-   *    was KNOWN).
+   *  - new target identity (no target → A, A → B, A → no target): ownership
+   *    change — bump the generation, record the target, noteBinding() (which
+   *    retires any in-flight attempt for the old owner), and service
+   *    abandoned-session debt exactly under the old condition (leaving a
+   *    target whose journal was KNOWN).
    *  - SAME target whose journal resolved (pending null → journal): NOT an
    *    ownership change — fill the journal, keep the generation the entry
    *    captured, so the entry's own mount attempt stays current.
    *  - SAME target, same journal: nothing.
    */
-  private acquireTarget(instanceId: Id, journalId: Id | null): TargetToken {
+  private acquireTarget(instanceId: Id | null, journalId: Id | null): TargetToken {
     const prevTarget = this.connectionBoundTo;
     const prevJournal = this.connectionBoundJournal;
     if (prevTarget !== instanceId) {
@@ -3298,15 +3300,29 @@ class HubStore {
       // coalesced REST fallback for the abandoned instance so its accepted
       // row still settles (fix-5 item 1). Only a concrete bind-away from a
       // KNOWN journal orphans the debt — a pending target never had a follow
-      // that could owe one.
+      // that could owe one. Releasing to the list keeps the condition too.
       if (prevJournal !== null && prevTarget && this.reconcileOwed.has(prevTarget)) {
         this.runOwedReconcile(prevTarget);
       }
-    } else if (journalId !== null && prevJournal !== journalId) {
+    } else if (instanceId !== null && journalId !== null && prevJournal !== journalId) {
       // Same target, journal now known: record it without an ownership change.
       this.connectionBoundJournal = journalId;
     }
     return this.targetToken(instanceId);
+  }
+
+  /**
+   * Route-departure transition (Ruling Y2): the active session page unmounted
+   * (or a foreground resume happens off a /s/<id> route). Release ownership
+   * to "no target" SYNCHRONOUSLY so the machine certifies the LIST via its
+   * unbound REST proof instead of forever recovering a pending/failed route
+   * (which also refused session creation while offline/recovering). A no-op
+   * unless `instanceId` is still the current owner — navigating A → B runs
+   * A's cleanup before B's entry, and B then supersedes the released state.
+   */
+  releaseRouteTarget(instanceId: Id) {
+    if (this.connectionBoundTo !== instanceId) return;
+    this.acquireTarget(null, null);
   }
   /**
    * The follow link is genuinely live only when the socket is OPEN AND a frame
@@ -3793,6 +3809,11 @@ class HubStore {
       // Ruling Y: choose the target synchronously before the resume dispatch.
       const j = this.state.instances.find((i) => i.id === instanceId)?.journalId ?? null;
       this.acquireTarget(instanceId, j);
+    } else {
+      // Y2: a foreground resume off the session routes (list / new session)
+      // releases any route target so the unbound reachability proof owns the
+      // machine instead of a departed session's recovery.
+      this.acquireTarget(null, null);
     }
     this.connection?.dispatch({ type: "resume" });
     if (!this.connection && instanceId) void this.catchup(instanceId);

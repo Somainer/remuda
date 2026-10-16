@@ -152,6 +152,54 @@ it("unbound resume publishes live only after exactly one successful bounded prob
   hubStore.logout();
 });
 
+it("r6 item 1: leaving a failed pending route releases it; the list certifies via the unbound proof and A retries stop", async () => {
+  const { api, hubStore, list } = await bootUnbound();
+  const A = "ins_dead_route";
+
+  // Every list/probe GET answers; A's lookup ALWAYS fails (deleted/uncached).
+  list.mockResolvedValue({ items: [], nextCursor: null });
+  let lookupCalls = 0;
+  vi.spyOn(api, "instanceGet").mockImplementation(() => {
+    lookupCalls += 1;
+    return Promise.reject(new RestNetworkError("404 lookup failed"));
+  });
+
+  vi.useFakeTimers();
+  const flush = async (rounds = 40) => {
+    for (let i = 0; i < rounds; i += 1) await vi.advanceTimersByTimeAsync(0);
+  };
+
+  // Navigate to the uncached session through the REAL route entry; its lookup
+  // fails and its recovery starts owning the machine.
+  const routeFollow = hubStore.follow(A);
+  void routeFollow.catch(() => undefined);
+  await vi.waitFor(() => expect(lookupCalls).toBeGreaterThanOrEqual(1));
+  await flush();
+  expect(hubStore.getSnapshot().connection).not.toBe("live");
+
+  // Return to the list: SessionPage unmount releases the route, and the next
+  // foreground resume happens off /s/<id>.
+  hubStore.releaseRouteTarget(A);
+  hubStore.resumeActive(null);
+  await flush();
+  for (let i = 0; i < 60 && hubStore.getSnapshot().connection !== "live"; i += 1) {
+    await vi.advanceTimersByTimeAsync(250);
+  }
+  expect(hubStore.getSnapshot().connection).toBe("live");
+  // Writes are accepted on the list page (not offline/recovering).
+  expect(hubStore.canInterrupt).toBe(true);
+
+  // Across several later probe/watchdog cycles the departed route must never
+  // be retried; the list's unbound probes are list GETs, not A lookups.
+  const lookupsAtLive = lookupCalls;
+  for (let i = 0; i < 45; i += 1) await vi.advanceTimersByTimeAsync(1_000);
+  expect(lookupCalls).toBe(lookupsAtLive);
+  expect(hubStore.getSnapshot().connection).toBe("live");
+
+  vi.useRealTimers();
+  hubStore.logout();
+});
+
 it("r5 item 1: a held unbound list GET cannot certify a session entered through the real follow() route; its lookup failure runs its own recovery", async () => {
   const { api, hubStore, list } = await bootUnbound();
   const TARGET = "ins_route_entry";

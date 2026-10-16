@@ -295,6 +295,10 @@ pub mod store_test_support {
 
     pub use crate::store::{APPEND_CHUNK_MAX, JOURNAL_WINDOW_BYTES, JOURNAL_WINDOW_ROWS, Store};
 
+    /// Durable usage-event row shape for tests that seed usage through the
+    /// writer (see [`seed_usage_events`]).
+    pub use crate::usage_store::UsageEventRow;
+
     /// Test-only fault guard: arm failures on ONE store (per-Store flags,
     /// `test-faults` feature only) and clear them on drop, so a failed
     /// assertion can never leave a fault armed and other Stores are never
@@ -375,6 +379,27 @@ pub mod store_test_support {
             "host enrollment rejected"
         );
         Ok((store, host_id))
+    }
+
+    /// Test fixture: insert durable `usage_events` directly on the writer
+    /// connection (production projects them via `usage_store::observe_journal`
+    /// from `kind:"usage"` journal records). Returns how many were inserted.
+    pub async fn seed_usage_events(
+        store: &Store,
+        rows: Vec<crate::usage_store::UsageEventRow>,
+    ) -> anyhow::Result<usize> {
+        store
+            .run_named("test.seed_usage_events", move |conn| {
+                let mut inserted = 0usize;
+                for row in &rows {
+                    if crate::usage_store::insert_usage_event(conn, row)? {
+                        inserted += 1;
+                    }
+                }
+                Ok::<_, crate::store::StoreError>(inserted)
+            })
+            .await
+            .map_err(Into::into)
     }
 
     /// Test fixture: settle an ensured instance as `exited` and bind it to a

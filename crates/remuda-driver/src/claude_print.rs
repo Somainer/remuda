@@ -6056,7 +6056,14 @@ fn usage_from_result(
                 value: cost.clone(),
             })
             .unwrap_or_else(|| unknown("not-emitted")),
-        accounting: remuda_protocol::Accounting::Estimated,
+        // r37 item 10: a native total_cost_usd is the provider's own bill —
+        // reported, never estimated (c-usagefu classification). A carrier
+        // emitted with no cost (modelUsage window only) has no bill to label.
+        accounting: if cost.is_some() {
+            remuda_protocol::Accounting::Reported
+        } else {
+            remuda_protocol::Accounting::Estimated
+        },
         native_fields_ref: None,
         context_window: window.map(U64),
     };

@@ -169,7 +169,65 @@ fn a_result_without_cache_buckets_declares_an_unknown_total() {
     }
 }
 
-/// r37 item 7: on a normal live print/sdk stream the per-call Turn usage rides
+/// r37 item 10: a native `total_cost_usd` on the result is the provider's own
+/// bill, so the token-less Session cost carrier that copies it verbatim is
+/// `accounting: reported` — not estimated. A carrier emitted with no cost
+/// (modelUsage window only) has no native bill to label.
+#[test]
+fn a_result_with_native_cost_labels_the_session_carrier_reported() {
+    use remuda_protocol::{Accounting, UsageScope};
+    let session_carrier = |frame: serde_json::Value| {
+        let mut mapper = StdoutMapper::new(DriverKind::ClaudePrint, "sess");
+        mapper
+            .map(frame)
+            .expect("result maps")
+            .into_iter()
+            .find_map(|o| match o.body {
+                ObservationPayload::Usage(u) if u.scope == UsageScope::Session => Some(u),
+                _ => None,
+            })
+            .expect("a result yields a Session carrier")
+    };
+
+    // Native cost present -> reported, copied verbatim.
+    let billed = session_carrier(serde_json::json!({
+        "type": "result",
+        "subtype": "success",
+        "num_turns": 1,
+        "result_index": 0,
+        "stop_reason": "end_turn",
+        "total_cost_usd": 0.004,
+        "usage": {"input_tokens": 10, "output_tokens": 5}
+    }));
+    assert_eq!(billed.accounting, Accounting::Reported);
+    assert_eq!(
+        billed.cost,
+        Knowledge::Known {
+            value: remuda_protocol::Cost {
+                amount: "0.004".into(),
+                currency: "USD".into()
+            }
+        },
+        "the native bill is copied unchanged"
+    );
+
+    // No cost, only a model window -> no native bill to call reported.
+    let window_only = session_carrier(serde_json::json!({
+        "type": "result",
+        "subtype": "success",
+        "num_turns": 1,
+        "result_index": 0,
+        "stop_reason": "end_turn",
+        "modelUsage": {"claude-opus-4-7": {"contextWindow": 200000}}
+    }));
+    assert_eq!(
+        window_only.accounting,
+        Accounting::Estimated,
+        "a cost-less window carrier carries no reported bill"
+    );
+    assert!(matches!(window_only.cost, Knowledge::Unknown { .. }));
+}
+
 /// the assistant (rev 1) and message_delta (rev 2) frames, and the following
 /// result's Turn is suppressed as a re-sum. Those per-call observations must
 /// carry the frame RECEIPT time as `nativeAt` — otherwise the only surviving

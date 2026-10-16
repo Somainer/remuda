@@ -152,6 +152,155 @@ it("unbound resume publishes live only after exactly one successful bounded prob
   hubStore.logout();
 });
 
+it("r6 item 2: a held reopen subscription resolved after supersession opens/books nothing, and a stale resync rejection never marks readonly-stale", async () => {
+  const { api, hubStore } = await bootUnbound();
+  const A = "ins_resync_a";
+  const JA = "obj_resync_a_journal";
+  const B = "ins_resync_b";
+  const JB = "obj_resync_b_journal";
+
+  // Both instances cached so follow() binds immediately; A mounts once at
+  // setup, then a recovery reopen for A is steered.
+  const rec = (id: string, j: string) =>
+    ({ id, journalId: j, revision: "0", durableSeq: "0", lifecycle: "running" } as never);
+  vi.spyOn(api, "instanceGet").mockImplementation(async (id: string) =>
+    id === A ? rec(A, JA) : rec(B, JB));
+  const list = vi.mocked(api.instanceList);
+  list.mockResolvedValue({ items: [rec(A, JA), rec(B, JB)], nextCursor: null });
+  // Seed reads answer immediately. A's reopen resync (the next JA read after
+  // the seed) is HELD and later rejected to simulate a half-open link after
+  // navigation; every later read answers.
+  const emptyPage = {
+    events: [],
+    durableSeq: "0",
+    windowFromSeq: null,
+    reachedAfterSeq: true,
+  };
+  let readCalls = 0;
+  let rejectHeldResync: ((e: unknown) => void) | null = null;
+  vi.spyOn(api, "eventsRead").mockImplementation(
+    ((args: { journalId: string }) => {
+      readCalls += 1;
+      if (readCalls === 2 && args.journalId === JA && !rejectHeldResync) {
+        return new Promise((_resolve, reject) => {
+          rejectHeldResync = (err) => reject(err);
+        });
+      }
+      return Promise.resolve(emptyPage);
+    }) as Api["eventsRead"],
+  );
+
+  // Subscribe #1 (initial A mount) resolves live immediately. Subscribe #2
+  // (A's held reopen) is held until the test releases it.
+  let subCalls = 0;
+  let releaseHeldSub: (() => void) | null = null;
+  vi.spyOn(api, "eventsSubscribe").mockImplementation(
+    ((((journalId: string) => {
+      subCalls += 1;
+      if (subCalls === 2 && journalId === JA) {
+        return new Promise((resolve) => {
+          releaseHeldSub = () =>
+            resolve({
+              subscriptionId: "sub_a_reopen",
+              journalId: JA,
+              durableSeq: "0",
+              windowFromSeq: null,
+              reachedAfterSeq: true,
+              getReadyState: () => 1,
+              snapshot: {
+                projectionVersion: "v1",
+                projectionEpoch: "epoch_a_reopen",
+                asOfSeq: "0",
+                instance: {} as never,
+                runs: [],
+                commands: [],
+                pendingInteractions: [],
+                nodes: [],
+                history: { earliestRetainedSeq: "0", complete: true },
+              },
+            });
+        });
+      }
+      return Promise.resolve({
+        subscriptionId: `sub_${subCalls}_${journalId}`,
+        journalId,
+        durableSeq: "0",
+        windowFromSeq: null,
+        reachedAfterSeq: true,
+        getReadyState: () => 1,
+        snapshot: {
+          projectionVersion: "v1",
+          projectionEpoch: `epoch_${subCalls}_${journalId}`,
+          asOfSeq: "0",
+          instance: {} as never,
+          runs: [],
+          commands: [],
+          pendingInteractions: [],
+          nodes: [],
+          history: { earliestRetainedSeq: "0", complete: true },
+        },
+      });
+    }) as unknown) as Api["eventsSubscribe"]),
+  );
+
+  const flush = async (rounds = 60) => {
+    for (let i = 0; i < rounds; i += 1) await Promise.resolve();
+  };
+
+  // Initial A mount (live socket).
+  await hubStore.follow(A);
+  await flush();
+  expect(hubStore.getSnapshot().connection).toBe("live");
+  const internal = hubStore as unknown as {
+    setFollowLiveForTest: (o: boolean, f: boolean, j?: string) => void;
+    journals: Map<string, { status: string }>;
+    connectionBoundTo: string | null;
+    connectionBoundJournal: string | null;
+  };
+  internal.setFollowLiveForTest(true, true, JA);
+  const journalStatus = () => internal.journals.get(JA)?.status;
+  expect(journalStatus()).toBe("live");
+
+  // A recovery reopen with a HELD subscription (socket not yet open).
+  const reopen = (
+    hubStore as unknown as { reopenFollow: (id: string) => Promise<void> }
+  ).reopenFollow(A);
+  void reopen.catch(() => undefined);
+  await vi.waitFor(() => expect(subCalls).toBe(2));
+  // Mark the held socket dead before it opens (the reopen must not certify a
+  // dead socket); opening re-registers readiness from the live response.
+  internal.setFollowLiveForTest(false, false, JA);
+
+  // The subscription resolves WHILE A IS STILL THE OWNER: the socket opens
+  // legitimately and the resync read (#3) starts — held.
+  releaseHeldSub!();
+  await flush();
+  expect(internal.connectionBoundTo).toBe(A);
+  await vi.waitFor(() => expect(rejectHeldResync).not.toBeNull());
+
+  // Ownership changes DURING the resync: away to B, then back to A (the
+  // reopened socket is adopted live).
+  await hubStore.follow(B);
+  await flush();
+  expect(internal.connectionBoundTo).toBe(B);
+  await hubStore.follow(A);
+  await flush();
+  expect(internal.connectionBoundTo).toBe(A);
+  internal.setFollowLiveForTest(true, true, JA);
+  expect(journalStatus()).toBe("live");
+
+  // The old resync read now rejects: its ownership token is stale (new A
+  // generation), so it must be a silent stale attempt — NO readonly-stale on
+  // the current live A and no machine disturbance.
+  rejectHeldResync!(new RestNetworkError("resync 502"));
+  await flush();
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  expect(journalStatus()).not.toBe("readonly-stale");
+  expect(hubStore.getSnapshot().connection).toBe("live");
+
+  hubStore.logout();
+});
+
 it("r6 item 1: leaving a failed pending route releases it; the list certifies via the unbound proof and A retries stop", async () => {
   const { api, hubStore, list } = await bootUnbound();
   const A = "ins_dead_route";

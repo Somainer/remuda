@@ -3764,8 +3764,14 @@ class HubStore {
     await this.chainReconcile(instanceId, async () => {
       if (!this.ownsTarget(token)) return;
       if (client) {
-        await this.openFollowSocket(instance, client, client.appliedSeq);
-        await client.resumeAfterReconnect();
+        await this.openFollowSocket(instance, client, client.appliedSeq, null, token);
+        // Y2: ownership may have changed WHILE the subscription was opening;
+        // never start a journal resync for a superseded owner.
+        if (!this.ownsTarget(token)) return;
+        // Give the resync a live ownership predicate: its read can still be
+        // parked while the user navigates away and back — a rejection after
+        // that must NOT publish readonly-stale on the re-mounted live journal.
+        await client.resumeAfterReconnect({ isCurrent: () => this.ownsTarget(token) });
         if (!this.ownsTarget(token)) return;
         // This follow just did the authoritative catch-up the drained send was
         // waiting on; its debt is honoured. Fold the journal now. A throw from
@@ -5705,10 +5711,11 @@ class HubStore {
       // Ruling Y: do not even open the socket for an owner superseded during
       // the synchronous seed processing.
       if (!this.ownsTarget(token)) return;
+      if (!this.ownsTarget(token)) return;
       await this.openFollowSocket(instance, client, last, {
         earliestRetainedSeq: seed.windowFromSeq ?? "1",
         complete: seed.reachedAfterSeq,
-      });
+      }, token);
       // The seed AND the first subscribe succeeded for the CURRENT owner:
       // certify the mount's attempt (a frame already may have). Ruling Y: a
       // navigation that landed mid-subscribe makes this end a no-op — the
@@ -5740,14 +5747,25 @@ class HubStore {
     afterSeq: U64,
     /** REST-seed floor for the FIRST subscribe; null on a reopen (keep the client's). */
     seedFloor: { earliestRetainedSeq: string; complete: boolean } | null = null,
+    /**
+     * Ruling Y2: ownership token of the mount/reopen that opened this socket.
+     * When present, every post-subscribe mutation is skipped once the owner is
+     * superseded — no readiness/frame bookkeeping, no snapshot application, no
+     * machine certification. The raw socket (and its per-journal client) may
+     * still exist, but a stale open cannot certify or degrade any binding.
+     */
+    token?: TargetToken,
   ) {
+    const stillOwned = () => !token || this.ownsTarget(token);
     // The active session's link claim starts here: the machine requires a
     // frame within LIVE_FRAME_MS of the socket opening (a silent open must not
     // keep 已连接 over a frozen transcript). The subscribe snapshot/any event
     // dispatches {frame} and satisfies it. Only the CURRENTLY BOUND mount may
     // arm the claim: a superseded mount's socket opening late must not
     // start/reset the bind deadline for the new binding.
-    if (this.connectionBoundJournal === instance.journalId) this.connection?.followBound();
+    if (this.connectionBoundJournal === instance.journalId && stillOwned()) {
+      this.connection?.followBound();
+    }
     const sub = await api.eventsSubscribe(
       instance.journalId,
       afterSeq,
@@ -5789,6 +5807,12 @@ class HubStore {
         },
       },
     );
+    // Ruling Y2: the subscription resolved after this owner was superseded.
+    // Register NO readiness/frame state, apply NO snapshot, certify nothing —
+    // otherwise a late stale open could rebind/certify on re-navigation and a
+    // later stale resync could degrade the live journal. The raw socket
+    // remains available to its (inactive) journal client only.
+    if (!stillOwned()) return;
     this.subs.set(instance.journalId, sub.subscriptionId);
     // Hold the subscription's OWN live probe, never a sampled copy: a socket
     // that dies silently (no close callback, e.g. iOS background expiry) must
@@ -5819,6 +5843,7 @@ class HubStore {
         this.resolveFollowCaughtUp(instance.id, sub.snapshot.asOfSeq);
       }
     }
+    if (!stillOwned()) return;
     const tail = mockGappedTail(instance.journalId);
     if (tail) {
       setTimeout(() => {

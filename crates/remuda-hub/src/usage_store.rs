@@ -702,14 +702,13 @@ fn collapse_one_turn_lineage(
     let total = w.total.or(derived);
     let cost = w.cost.or_else(|| group.iter().find_map(|r| r.cost.clone()));
     // An ingest clock never replaces a retained native time.
-    let native_loser = group.iter().find(|r| r.observed_at_source == "native");
-    let (observed_at, observed_at_source) =
-        if w.observed_at_source == "native" || native_loser.is_none() {
-            (w.observed_at, w.observed_at_source)
-        } else {
-            let n = native_loser.unwrap();
-            (n.observed_at.clone(), n.observed_at_source.clone())
-        };
+    let (observed_at, observed_at_source) = if w.observed_at_source == "native" {
+        (w.observed_at, w.observed_at_source)
+    } else if let Some(n) = group.iter().find(|r| r.observed_at_source == "native") {
+        (n.observed_at.clone(), n.observed_at_source.clone())
+    } else {
+        (w.observed_at, w.observed_at_source)
+    };
     conn.execute(
         "UPDATE usage_events
          SET total_tokens = ?1, input_tokens = ?2, output_tokens = ?3,

@@ -1191,7 +1191,8 @@ fn recovery_fetch_base_sha(repo: &Path, base: &str, deadline: Instant) -> Result
 /// and before the object fetch. Keyed by repository path.
 #[cfg(test)]
 mod recovery_read_seam {
-    use std::path::Path;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
 
@@ -1201,16 +1202,16 @@ mod recovery_read_seam {
     }
 
     pub(super) struct Park {
-        pub(super) repo: String,
         pub(super) slots: Mutex<Vec<Arc<Slot>>>,
         pub(super) expected: usize,
         parked: AtomicUsize,
     }
 
-    static SEAM: OnceLock<Mutex<Option<Arc<Park>>>> = OnceLock::new();
+    // r31 item 4: per-repo parks so seam-using tests run in parallel.
+    static SEAM: OnceLock<Mutex<HashMap<PathBuf, Arc<Park>>>> = OnceLock::new();
 
-    fn seam() -> &'static Mutex<Option<Arc<Park>>> {
-        SEAM.get_or_init(|| Mutex::new(None))
+    fn seam() -> &'static Mutex<HashMap<PathBuf, Arc<Park>>> {
+        SEAM.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
     pub(super) fn arm(repo: &Path, expected: usize) {
@@ -1222,25 +1223,24 @@ mod recovery_read_seam {
                 })
             })
             .collect();
-        *seam().lock().expect("seam") = Some(Arc::new(Park {
-            repo: repo.to_string_lossy().into_owned(),
-            slots: Mutex::new(slots),
-            expected,
-            parked: AtomicUsize::new(0),
-        }));
+        seam().lock().expect("seam").insert(
+            repo.to_path_buf(),
+            Arc::new(Park {
+                slots: Mutex::new(slots),
+                expected,
+                parked: AtomicUsize::new(0),
+            }),
+        );
     }
 
-    pub(super) fn disarm() {
-        *seam().lock().expect("seam") = None;
+    pub(super) fn disarm(repo: &Path) {
+        seam().lock().expect("seam").remove(repo);
     }
 
     pub(super) fn park(repo: &Path) {
-        let park = {
-            let guard = seam().lock().expect("seam");
-            match guard.as_ref() {
-                Some(park) if park.repo == repo.to_string_lossy() => park.clone(),
-                _ => return,
-            }
+        let park = match seam().lock().expect("seam").get(repo) {
+            Some(park) => park.clone(),
+            None => return,
         };
         let index = park.parked.fetch_add(1, Ordering::AcqRel);
         assert!(index < park.expected, "more recoveries parked than armed");
@@ -1256,15 +1256,11 @@ mod recovery_read_seam {
         }
     }
 
-    fn park_for(repo: &Path) -> Arc<Park> {
-        let guard = seam().lock().expect("seam");
-        let park = guard.as_ref().expect("seam armed").clone();
-        assert_eq!(park.repo, repo.to_string_lossy());
-        park
-    }
-
     fn slot(repo: &Path, index: usize) -> Arc<Slot> {
-        park_for(repo).slots.lock().expect("slots")[index].clone()
+        let guard = seam().lock().expect("seam");
+        let park = guard.get(repo).expect("seam armed").clone();
+        drop(guard);
+        park.slots.lock().expect("slots")[index].clone()
     }
 
     pub(super) fn wait_arrived(repo: &Path, index: usize) {
@@ -2608,7 +2604,7 @@ mod tests {
         let result_b = b.join().expect("recovery B joins");
         seam::release(&full, 0);
         let result_a = a.join().expect("recovery A joins");
-        seam::disarm();
+        seam::disarm(&full);
 
         assert!(
             result_b.is_ok(),
@@ -2767,6 +2763,131 @@ mod tests {
             refs_listing(&repo),
             before,
             "the failed recovery created, updated or deleted no ref"
+        );
+        drop(keep);
+    }
+
+    /// r31 item 4: ls-remote succeeds with a real advertised SHA and the
+    /// OBJECT FETCH then fails deterministically (origin swapped to an empty
+    /// bare at the read seam) — PushUncertain named by the fetch, and the full
+    /// ref listing is unchanged.
+    #[test]
+    fn a_failed_object_fetch_after_successful_ls_remote_writes_no_refs() {
+        use super::recovery_read_seam as seam;
+        // The LANE is the lander: it holds its granted M locally. The remote
+        // independently advanced to D (descendant of M) after the clone; D's
+        // objects are genuinely absent from the lane, so the recovery object
+        // fetch cannot short-circuit when the origin is swapped away.
+        let keep = tempfile::tempdir().unwrap();
+        let origin = keep.path().join("origin.git");
+        let seed = keep.path().join("seed");
+        let lane = keep.path().join("lane");
+        tgit_ok(
+            keep.path(),
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                origin.to_str().unwrap(),
+            ],
+        );
+        tgit_ok(
+            keep.path(),
+            &["init", "-q", "-b", "main", seed.to_str().unwrap()],
+        );
+        tgit_ok(&seed, &["config", "user.email", "t@example.com"]);
+        tgit_ok(&seed, &["config", "user.name", "T"]);
+        std::fs::write(seed.join("f"), "b\n").unwrap();
+        tgit_ok(&seed, &["add", "f"]);
+        tgit_ok(&seed, &["commit", "-q", "-m", "B"]);
+        let base_b = tgit_ok(&seed, &["rev-parse", "main"]);
+        tgit_ok(
+            &seed,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        tgit_ok(&seed, &["push", "-q", "origin", "main"]);
+        tgit_ok(
+            keep.path(),
+            &[
+                "clone",
+                "-q",
+                &format!("file://{}", origin.display()),
+                lane.to_str().unwrap(),
+            ],
+        );
+        tgit_ok(&lane, &["config", "user.email", "t@example.com"]);
+        tgit_ok(&lane, &["config", "user.name", "T"]);
+        // The lane lands its own M (local only).
+        std::fs::write(lane.join("m"), "m\n").unwrap();
+        tgit_ok(&lane, &["add", "m"]);
+        tgit_ok(&lane, &["commit", "-q", "-m", "M"]);
+        let merge_m = tgit_ok(&lane, &["rev-parse", "main"]);
+        // Seed builds D on top of B+M: fetch M's objects from the lane repo,
+        // merge them onto seed main, publish D.
+        tgit_ok(&seed, &["fetch", "-q", lane.to_str().unwrap(), &merge_m]);
+        tgit_ok(&seed, &["merge", "-q", "--no-ff", "-m", "D", &merge_m]);
+        let remote_d = tgit_ok(&seed, &["rev-parse", "main"]);
+        tgit_ok(&seed, &["push", "-q", "origin", "main"]);
+        assert_ne!(remote_d, merge_m);
+        assert!(
+            !tgit(
+                &lane,
+                &["cat-file", "-e", &format!("{remote_d}^{{commit}}")]
+            )
+            .status
+            .success(),
+            "the lane must genuinely lack D"
+        );
+        let before = refs_listing(&lane);
+        let empty = keep.path().join("empty.git");
+        let output = std::process::Command::new("git")
+            .args([
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                empty.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+
+        seam::arm(&lane, 1);
+        let repo_t = lane.clone();
+        let (merged_t, expected_t) = (merge_m.clone(), base_b.clone());
+        let result = std::thread::spawn(move || push_main_cas(&repo_t, &merged_t, &expected_t));
+        seam::wait_arrived(&lane, 0);
+        // ls-remote read D from the real origin; swap to the empty remote so
+        // the object fetch fails.
+        tgit_ok(
+            &lane,
+            &["remote", "set-url", "origin", empty.to_str().unwrap()],
+        );
+        seam::release(&lane, 0);
+        let error = result
+            .join()
+            .expect("recovery joins")
+            .expect_err("uncertain");
+        seam::disarm(&lane);
+
+        assert!(
+            matches!(
+                error.downcast_ref::<MergeStop>(),
+                Some(MergeStop::PushUncertain(_))
+            ),
+            "PushUncertain, got {error:#}"
+        );
+        assert!(
+            error.to_string().contains("object fetch"),
+            "the uncertainty names the OBJECT fetch after listing succeeded: {error}"
+        );
+        assert_eq!(
+            refs_listing(&lane),
+            before,
+            "the failed object fetch created, updated or deleted no ref"
         );
         drop(keep);
     }

@@ -4363,7 +4363,8 @@ fn recovery_fetch_base_sha(
 /// before the object fetch. Keyed by repository path so other fixtures pass.
 #[cfg(test)]
 mod recovery_read_seam {
-    use std::path::Path;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
 
@@ -4373,16 +4374,18 @@ mod recovery_read_seam {
     }
 
     pub(super) struct Park {
-        pub(super) repo: String,
         pub(super) slots: Mutex<Vec<Arc<Slot>>>,
         pub(super) expected: usize,
         parked: AtomicUsize,
     }
 
-    static SEAM: OnceLock<Mutex<Option<Arc<Park>>>> = OnceLock::new();
+    // r31 item 4: parks are keyed by repository path so tests arming the seam
+    // on DIFFERENT fixture repos can run in parallel without clobbering each
+    // other.
+    static SEAM: OnceLock<Mutex<HashMap<PathBuf, Arc<Park>>>> = OnceLock::new();
 
-    fn seam() -> &'static Mutex<Option<Arc<Park>>> {
-        SEAM.get_or_init(|| Mutex::new(None))
+    fn seam() -> &'static Mutex<HashMap<PathBuf, Arc<Park>>> {
+        SEAM.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
     pub(super) fn arm(repo: &Path, expected: usize) {
@@ -4394,25 +4397,24 @@ mod recovery_read_seam {
                 })
             })
             .collect();
-        *seam().lock().expect("seam") = Some(Arc::new(Park {
-            repo: repo.to_string_lossy().into_owned(),
-            slots: Mutex::new(slots),
-            expected,
-            parked: AtomicUsize::new(0),
-        }));
+        seam().lock().expect("seam").insert(
+            repo.to_path_buf(),
+            Arc::new(Park {
+                slots: Mutex::new(slots),
+                expected,
+                parked: AtomicUsize::new(0),
+            }),
+        );
     }
 
-    pub(super) fn disarm() {
-        *seam().lock().expect("seam") = None;
+    pub(super) fn disarm(repo: &Path) {
+        seam().lock().expect("seam").remove(repo);
     }
 
     pub(super) fn park(repo: &Path) {
-        let park = {
-            let guard = seam().lock().expect("seam");
-            match guard.as_ref() {
-                Some(park) if park.repo == repo.to_string_lossy() => park.clone(),
-                _ => return,
-            }
+        let park = match seam().lock().expect("seam").get(repo) {
+            Some(park) => park.clone(),
+            None => return,
         };
         let index = park.parked.fetch_add(1, Ordering::AcqRel);
         assert!(index < park.expected, "more recoveries parked than armed");
@@ -4428,15 +4430,11 @@ mod recovery_read_seam {
         }
     }
 
-    fn park_for(repo: &Path) -> Arc<Park> {
-        let guard = seam().lock().expect("seam");
-        let park = guard.as_ref().expect("seam armed").clone();
-        assert_eq!(park.repo, repo.to_string_lossy());
-        park
-    }
-
     fn slot(repo: &Path, index: usize) -> Arc<Slot> {
-        park_for(repo).slots.lock().expect("slots")[index].clone()
+        let guard = seam().lock().expect("seam");
+        let park = guard.get(repo).expect("seam armed").clone();
+        drop(guard);
+        park.slots.lock().expect("slots")[index].clone()
     }
 
     pub(super) fn wait_arrived(repo: &Path, index: usize) {
@@ -9754,7 +9752,7 @@ head -c 1 >/dev/null || exit 4
         let reply_b = b.join().expect("probe B joins");
         seam::release(&lane, 0);
         let reply_a = a.join().expect("probe A joins");
-        seam::disarm();
+        seam::disarm(&lane);
 
         assert_eq!(
             reply_b.status, "landed",
@@ -10061,6 +10059,95 @@ head -c 1 >/dev/null || exit 4
             "an unreachable remote stays Unknown: {reply:?}"
         );
         assert_eq!(refs_listing(&lane), before, "{}", base_b);
+    }
+
+    /// r31 item 4: ls-remote must SUCCEED with a real advertised SHA and the
+    /// OBJECT FETCH then fail deterministically — proving the failure path
+    /// after listing is ref-free. At the read seam (after ls-remote, before
+    /// fetch) point origin at a fresh empty bare repo: the advertised SHA is
+    /// not served there, so upload-pack rejects it. Reaching the seam proves
+    /// fetch was about to run; the Unknown result and unchanged refs prove it
+    /// failed without writing anything.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_object_fetch_after_successful_ls_remote_writes_no_refs() {
+        use super::recovery_read_seam as seam;
+        let (dir, _bare, lane, _base_b) = recovery_branch_fixture("main", None);
+        let seed = dir.path().join("seed");
+        std::fs::write(seed.join("m.txt"), "M\n").unwrap();
+        git(&seed, &["add", "m.txt"]);
+        git(&seed, &["commit", "-q", "-m", "M"]);
+        let merge_m = git(&seed, &["rev-parse", "main"]);
+        git(&seed, &["push", "-q", "origin", "main"]);
+        // The lane genuinely lacks M (the clone predates the push), so the
+        // object fetch cannot short-circuit.
+        assert!(
+            block_git(&lane, &["cat-file", "-e", &format!("{merge_m}^{{commit}}")]).is_err(),
+            "the lane must genuinely lack M for the fetch to run"
+        );
+        // A second, EMPTY bare remote that will refuse the advertised SHA.
+        let empty = dir.path().join("empty.git");
+        std::process::Command::new("git")
+            .args([
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                empty.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        let before = refs_listing(&lane);
+
+        seam::arm(&lane, 1);
+        let lane_t = lane.clone();
+        let merge_t = merge_m.clone();
+        let probe = std::thread::spawn(move || {
+            let request = remuda_protocol::GateResolveLandingParams {
+                job_id: "gjb_r31_fetchfail".into(),
+                repo_path: lane_t.to_string_lossy().into_owned(),
+                base_branch: "main".into(),
+                merge_sha: merge_t,
+            };
+            super::resolve_landing_after_restart(&request, true)
+        });
+        // ls-remote against the REAL origin succeeded with M; we are parked
+        // right before its object fetch.
+        seam::wait_arrived(&lane, 0);
+        // Sanity: the empty remote really does not serve M.
+        let sanity = std::process::Command::new("git")
+            .current_dir(&lane)
+            .args(["ls-remote", "origin", "refs/heads/main"])
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&sanity.stdout).contains(&merge_m));
+        // Swap origin to the empty remote, then release: fetch runs and fails.
+        git(
+            &lane,
+            &["remote", "set-url", "origin", empty.to_str().unwrap()],
+        );
+        seam::release(&lane, 0);
+        let reply = probe.join().expect("probe joins");
+        seam::disarm(&lane);
+
+        assert_eq!(
+            reply.status, "unknown",
+            "the failed fetch stays Unknown: {reply:?}"
+        );
+        assert!(
+            reply
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("object fetch"),
+            "the Unknown names the OBJECT fetch (listing succeeded): {reply:?}"
+        );
+        assert_eq!(
+            refs_listing(&lane),
+            before,
+            "the failed object fetch created, updated or deleted no ref"
+        );
     }
 
     /// r30 item 2: exact diagnostics that mean "git lacks SHA-256". Pure

@@ -4309,16 +4309,23 @@ fn recovery_fetch_base_sha(
         }
     };
     // 1. The authoritative advertised tip. ls-remote consults the remote
-    // directly; a stale configured tracking ref cannot be read here. Exit 2
-    // with no matching line is git's "ref not advertised" — run it without the
-    // success requirement so the parser produces the precise error; timeouts,
-    // spawn failures and non-empty garbage still fail this command.
+    // directly; a stale configured tracking ref cannot be read here. git exits
+    // 2 when no advertised ref matches — let the parser report that precisely.
+    // Every other non-zero exit (a wrapper failure, a transport error) is an
+    // ordinary command failure; timeouts and spawn failures fail too.
     let remote_ref = format!("refs/heads/{base_branch}");
     let listing = owned(
         &["ls-remote", "--exit-code", "origin", &remote_ref],
         "remote base ls-remote",
         false,
     )?;
+    if listing.status.code() != Some(2) && !listing.status.success() {
+        return Err(format!(
+            "remote base ls-remote exited {:?}: {}; push outcome unknown",
+            listing.status.code(),
+            String::from_utf8_lossy(&listing.stderr).trim()
+        ));
+    }
     let sha = parse_ls_remote_base(&listing.stdout, base_branch)?;
     // r30 item 1 TEST-ONLY seam: park after the remote SHA was read and
     // before its objects are fetched, so an overlap regression can move the

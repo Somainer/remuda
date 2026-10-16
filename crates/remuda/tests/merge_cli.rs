@@ -1365,8 +1365,8 @@ exit 1
 /// prove r15 R5: a failed recovery read after a rejected push is `uncertain`,
 /// never `gate_failed`.
 ///
-/// `fail`: "fetch" fails `git fetch -q origin`; "merge-base" fails the ancestry
-/// read.
+/// `fail`: "fetch" fails the ref-free remote-tip read (`ls-remote`, with
+/// `fetch` for older flows); "merge-base" fails the ancestry read.
 fn install_failing_git_wrapper(parent: &Path, fail: &str) -> PathBuf {
     let real_git: PathBuf = {
         let path = std::env::var_os("PATH").expect("PATH");
@@ -1382,8 +1382,8 @@ fn install_failing_git_wrapper(parent: &Path, fail: &str) -> PathBuf {
         &wrapper,
         format!(
             r#"#!/bin/sh
-if [ "{fail}" = "fetch" ] && [ "$1" = "fetch" ]; then
-  echo "wrapper: simulated fetch failure" >&2
+if [ "{fail}" = "fetch" ] && {{ [ "$1" = "fetch" ] || [ "$1" = "ls-remote" ]; }}; then
+  echo "wrapper: simulated recovery fetch failure" >&2
   exit 1
 fi
 if [ "{fail}" = "merge-base" ] && [ "$1" = "merge-base" ]; then
@@ -1435,8 +1435,8 @@ fn a_lost_ack_with_a_failed_recovery_fetch_is_uncertain_never_failed() {
         report["error"]
             .as_str()
             .unwrap_or("")
-            .contains("recovery fetch failed"),
-        "the error must name the failed recovery read: {report}"
+            .contains("remote base ls-remote"),
+        "the error must name the failed remote read: {report}"
     );
     // The merge actually landed despite the uncertainty — remote main is the
     // exact granted merge (the hook applied it).

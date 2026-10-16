@@ -1106,9 +1106,9 @@ fn probe_sha256_support(program: &str, probe_repo: &Path) -> bool {
 ///
 /// Every command goes through the R6 owner under one absolute deadline.
 fn recovery_fetch_base_sha(repo: &Path, base: &str, deadline: Instant) -> Result<String> {
-    // 1. Authoritative advertised tip. Exit 2 with no matching line means "not
-    // advertised" — let the parser produce that error; timeouts/spawn failures
-    // remain PushUncertain.
+    // 1. Authoritative advertised tip. Exit 2 means the base ref is not
+    // advertised (the parser names that precisely); any other non-zero exit is
+    // a transport/command failure; timeouts/spawn failures fail too.
     let remote_ref = format!("refs/heads/{base}");
     let listing = recovery_git(
         repo,
@@ -1117,6 +1117,14 @@ fn recovery_fetch_base_sha(repo: &Path, base: &str, deadline: Instant) -> Result
         false,
         deadline,
     )?;
+    if listing.status.code() != Some(2) && !listing.status.success() {
+        return Err(MergeStop::PushUncertain(format!(
+            "post-push remote base ls-remote exited {:?}: {}; push outcome unknown",
+            listing.status.code(),
+            String::from_utf8_lossy(&listing.stderr).trim()
+        ))
+        .into());
+    }
     let remote_tip = parse_ls_remote_base(&listing.stdout, base)
         .map_err(|message| MergeStop::PushUncertain(format!("{message}; push outcome unknown")))?;
     // r30 item 1 TEST-ONLY seam: park after the remote SHA was read.

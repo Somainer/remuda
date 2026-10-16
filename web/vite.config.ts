@@ -10,7 +10,14 @@ const hub = process.env.VITE_HUB_URL;
 // request. `watch: null` disables it entirely (Vite ≥ 5).
 const noWatch = process.env.VITE_NO_WATCH === "1";
 
-export default defineConfig({
+export default defineConfig(({ mode }) => ({
+  // c-unboundresume r4 item 1: compile-time gate for the e2e test handle.
+  // Literal false in every build except the dedicated `vite build --mode
+  // e2e` artifact (web/dist-e2e), so the normal bundle's installation branch
+  // is dead-code eliminated. No runtime switch exists.
+  define: {
+    __REMUDA_TEST_HOOKS__: JSON.stringify(mode === "e2e"),
+  },
   plugins: [react(), serviceWorkerPlugin()],
   server: {
     ...(hub
@@ -28,4 +35,4 @@ export default defineConfig({
     setupFiles: "./src/test/setup.ts",
     exclude: ["**/node_modules/**", "**/dist/**", "**/tests/e2e/**"],
   },
-});
+}));

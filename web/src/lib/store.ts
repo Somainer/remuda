@@ -122,6 +122,8 @@ import {
 } from "../features/session/permissions";
 import { doneFromLines, lastLines, latestScreenSnapshot } from "./screen";
 import { ConnectionMachine, type ConnectionState, LIVE_FRAME_MS } from "./connection";
+import { TEST_HOOKS_ENABLED } from "./testHooks";
+import { clearHubTestHandle, installHubTestHandle } from "./testHandle";
 import {
   newCommandId,
   openOutboxStorage,
@@ -4741,7 +4743,18 @@ class HubStore {
       if (!extLive()) return "retired";
       if (install === "obsolete") return "retired";
       this.startPoll();
-      this.installTestHandle();
+      // c-unboundresume r4 item 1: dead-code eliminated in the normal
+      // production build; present in DEV and the e2e artifact.
+      if (TEST_HOOKS_ENABLED) {
+        installHubTestHandle({
+          stopPoll: () => this.stopPoll(),
+          settlementCount: () => this.settlementCount,
+          interactionState: (id) =>
+            this.state.interactions.find((row) => row.id === id)?.state,
+          waitFollowCaughtUp: (id, timeoutMs) =>
+            this.waitForFollowCaughtUpForTest(id, timeoutMs),
+        });
+      }
       // Gate 48 item 3: the install turn drains the box with a BOUNDED lock
       // (ifAvailable): a sibling deliverer holding an instance lock never
       // blocks this turn without a deadline, and a queued login starts as soon
@@ -5007,54 +5020,6 @@ class HubStore {
     this.pollTimer = null;
   }
 
-  /**
-   * Test handle for hub e2e specs. Present in every DEV build (Vite gate); in
-   * a production bundle (playwright.security.config.ts serves web/dist) it is
-   * installed ONLY when the spec context opted in before app boot via the
-   * `remuda:test-hooks` localStorage marker (addInitScript). The marker is
-   * test-side only — app code never sets it — and a spec that needs the
-   * handle requires its presence, so a missing handle fails the spec loudly
-   * instead of letting ordinary polling impersonate machine-driven requests.
-   */
-  private testHooksEnabled(): boolean {
-    if (import.meta.env.DEV) return true;
-    try {
-      return (
-        typeof localStorage !== "undefined" && localStorage.getItem("remuda:test-hooks") === "1"
-      );
-    } catch {
-      return false;
-    }
-  }
-
-  /** Installs {@link testHooksEnabled}-gated handles (stopPoll and friends):
-   * lets a spec halt the 2 s interaction poll so a UI change can be
-   * attributed to the settlement follow frame instead of polling. */
-  private installTestHandle() {
-    if (!this.testHooksEnabled() || typeof window === "undefined") return;
-    (window as unknown as {
-      __remudaHub?: {
-        stopPoll: () => void;
-        settlementCount: () => number;
-        interactionState: (id: string) => string | undefined;
-        waitFollowCaughtUp: (id: string, timeoutMs?: number) => Promise<string>;
-      };
-    }).__remudaHub = {
-      stopPoll: () => this.stopPoll(),
-      settlementCount: () => this.settlementCount,
-      interactionState: (id: string) =>
-        this.state.interactions.find((row) => row.id === id)?.state,
-      waitFollowCaughtUp: (id: string, timeoutMs?: number) =>
-        this.waitForFollowCaughtUpForTest(id, timeoutMs),
-    };
-  }
-
-  private clearTestHandle() {
-    if (typeof window !== "undefined") {
-      delete (window as unknown as { __remudaHub?: unknown }).__remudaHub;
-    }
-  }
-
   logout() {
     const mine = this.state.session?.deviceId;
     if (mine) void api.deviceRevoke(mine).catch(() => undefined);
@@ -5062,7 +5027,7 @@ class HubStore {
     dropDeviceCookie();
     api.disconnect();
     this.stopPoll();
-    this.clearTestHandle();
+    if (TEST_HOOKS_ENABLED) clearHubTestHandle();
     this.stopWorkspaceFollow?.();
     this.stopWorkspaceFollow = null;
     this.stopSettlementFollow?.();

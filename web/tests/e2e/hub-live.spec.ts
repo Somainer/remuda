@@ -773,15 +773,12 @@ test("structured view streams assistant text and separates injected records", as
 test("the unbound session list never shows live while the Hub is unreachable (c-unboundresume)", async ({
   page,
 }) => {
-  // Explicitly enable the store test handle for THIS browser context. It is
-  // always present under the Vite dev server (import.meta.env.DEV), but the
-  // production-build run (playwright.security.config.ts serving web/dist)
-  // installs it only when this marker is set before app boot. The test then
-  // REQUIRES the handle instead of silently proceeding with list polling
-  // still on (c-unboundresume r3 item 2).
-  await page.context().addInitScript(() => {
-    localStorage.setItem("remuda:test-hooks", "1");
-  });
+  // The e2e test handle (window.__remudaHub.stopPoll) is a COMPILE-TIME part
+  // of the bundle this test runs against: present under the Vite dev server
+  // and under the dedicated e2e production artifact (web/dist-e2e via
+  // playwright.security-e2e.config.ts), absent and dead-code eliminated from
+  // the normal web/dist. The test REQUIRES it rather than silently skipping
+  // poll control (c-unboundresume r3 item 2 / r4 item 1).
   // The list's connection pill only renders in the non-empty list header, so
   // create one instance through the API CONTEXT (page.request shares the
   // device cookie but mounts nothing in the browser): the list page never
@@ -863,7 +860,7 @@ test("the unbound session list never shows live while the Hub is unreachable (c-
     const h = (window as unknown as { __remudaHub?: { stopPoll?: () => void } }).__remudaHub;
     if (typeof h?.stopPoll !== "function") {
       throw new Error(
-        "__remudaHub.stopPoll handle missing: the remuda:test-hooks marker must be enabled before app boot in BOTH hub playwright configs",
+        "__remudaHub.stopPoll handle missing: this test must run against the Vite dev server or the dedicated web/dist-e2e artifact, never the normal production bundle",
       );
     }
     h.stopPoll();

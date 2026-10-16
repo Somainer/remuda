@@ -1057,38 +1057,40 @@ fn parse_ls_remote_base(output: &[u8], base_branch: &str) -> std::result::Result
 /// operand — a recognized phrase inside a FILENAME on an unrelated error line
 /// (e.g. a bad-config path ".../unknown hash algorithm 'sha256'/config") never
 /// matches.
-fn is_unsupported_sha256_diagnostic(stderr: &str) -> bool {
-    // Exact whole-line forms (compared against each lowercased, trimmed line).
-    const WHOLE_LINES: &[&str] = &[
+fn is_unsupported_sha256_diagnostic_impl(stderr: &str) -> bool {
+    // r32 item 4: COMPLETE, case-sensitive diagnostics with the exact expected
+    // operand. Each accepted form is the full line git prints; no
+    // starts_with/contains, so a wrong operand (`bogus`, `sha1`,
+    // `sha256extra`) or trailing text never reads as unsupported-SHA-256.
+    const EXACT_LINES: &[&str] = &[
+        // Current git: the hash algorithm is unknown.
         "fatal: unknown hash algorithm 'sha256'",
+        // Current git: the backend is not compiled in.
         "fatal: attempt to use sha256 has not been compiled in",
         "fatal: sha256 repositories are not supported",
+        // Older git: the option itself is unknown (pre --object-format builds).
         "error: unknown option `object-format'",
-        "error: unknown option '--object-format=sha256'",
         "error: unknown option '--object-format'",
+        "error: unknown option '--object-format=sha256'",
+        "fatal: unknown option `--object-format'",
+        "fatal: unknown option '--object-format'",
+        "fatal: unknown option '--object-format=sha256'",
+        "error: unknown option for '--object-format'",
+        "fatal: unknown option for '--object-format'",
+        // Older git: the value is rejected. The ONLY unsupported operand is
+        // sha256 (sha1 is accepted; bogus names an algorithm, not a build that
+        // cannot do sha256).
+        "fatal: unknown value for --object-format: sha256",
+        "error: unknown value for --object-format: sha256",
     ];
-    // Prefix forms (the operand/usage text may follow on the SAME line); the
-    // prefix ends right after the option name so no filename text can precede
-    // the verdict.
-    const LINE_PREFIXES: &[&str] = &[
-        "fatal: unknown value for --object-format:",
-        "error: unknown option for --object-format",
-        "error: unknown option `--object-format",
-        "error: unknown option '--object-format",
-    ];
-    for raw_line in stderr.lines() {
-        // Match the ORIGINAL case: git's unsupported message is lowercase
-        // sha256; an uppercase "SHA256" is a different algorithm spelling and
-        // must not be treated as the unsupported-form diagnostic.
-        let line = raw_line.trim();
-        if WHOLE_LINES.contains(&line) {
-            return true;
-        }
-        if LINE_PREFIXES.iter().any(|prefix| line.starts_with(prefix)) {
-            return true;
-        }
-    }
-    false
+    stderr
+        .lines()
+        .map(str::trim_end)
+        .any(|line| EXACT_LINES.contains(&line))
+}
+
+fn is_unsupported_sha256_diagnostic(stderr: &str) -> bool {
+    is_unsupported_sha256_diagnostic_impl(stderr)
 }
 /// Run `git init --object-format=sha256` via `program`: true when created;
 /// false ONLY on a recognized unsupported-format diagnostic; spawn or other
@@ -3322,7 +3324,16 @@ mod tests {
             "error: invalid key: foo.sha256.invalid in /etc/gitconfig\n",
             "fatal: unknown hash algorithm 'bogus'\n",
             "fatal: unknown hash algorithm 'SHA256'\n",
+            // Wrong operands and trailing text (r32 item 4).
+            "fatal: unknown hash algorithm 'sha1'\n",
+            "fatal: unknown value for --object-format: bogus\n",
+            "error: unknown value for --object-format: sha1\n",
+            "fatal: unknown value for --object-format: sha256extra\n",
             "  fatal: unknown hash algorithm 'sha256'  extra\n",
+            "fatal: attempt to use sha256 has not been compiled in extra\n",
+            "fatal: unknown value for --object-format: sha256 extra\n",
+            "error: unknown option `object-format' extra\n",
+            " x error: unknown option `--object-format'\n",
             "",
         ] {
             assert!(

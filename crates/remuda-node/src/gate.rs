@@ -4483,45 +4483,44 @@ pub(crate) fn is_unsupported_sha256_diagnostic(stderr: &str) -> bool {
     unsupported_sha256_diagnostic(stderr)
 }
 
+/// r31 item 3 / r32 item 4: true ONLY when git prints one of its exact
+/// unsupported-SHA-256 diagnostic LINES (full line, exact operand).
 #[cfg(test)]
-/// r31 item 3: true ONLY when git prints one of its exact unsupported-SHA-256
-/// diagnostic LINES. Matching is per line: the line must START with the exact
-/// prefix git prints and, where the message has operands, contain the exact
-/// operand — a recognized phrase inside a FILENAME on an unrelated error line
-/// (e.g. a bad-config path ".../unknown hash algorithm 'sha256'/config") never
-/// matches.
-fn unsupported_sha256_diagnostic(stderr: &str) -> bool {
-    // Exact whole-line forms (compared against each lowercased, trimmed line).
-    const WHOLE_LINES: &[&str] = &[
+fn unsupported_sha256_diagnostic_impl(stderr: &str) -> bool {
+    // r32 item 4: COMPLETE, case-sensitive diagnostics with the exact expected
+    // operand. Each accepted form is the full line git prints; no
+    // starts_with/contains, so a wrong operand (`bogus`, `sha1`,
+    // `sha256extra`) or trailing text never reads as unsupported-SHA-256.
+    const EXACT_LINES: &[&str] = &[
+        // Current git: the hash algorithm is unknown.
         "fatal: unknown hash algorithm 'sha256'",
+        // Current git: the backend is not compiled in.
         "fatal: attempt to use sha256 has not been compiled in",
         "fatal: sha256 repositories are not supported",
+        // Older git: the option itself is unknown (pre --object-format builds).
         "error: unknown option `object-format'",
-        "error: unknown option '--object-format=sha256'",
         "error: unknown option '--object-format'",
+        "error: unknown option '--object-format=sha256'",
+        "fatal: unknown option `--object-format'",
+        "fatal: unknown option '--object-format'",
+        "fatal: unknown option '--object-format=sha256'",
+        "error: unknown option for '--object-format'",
+        "fatal: unknown option for '--object-format'",
+        // Older git: the value is rejected. The ONLY unsupported operand is
+        // sha256 (sha1 is accepted; bogus names an algorithm, not a build that
+        // cannot do sha256).
+        "fatal: unknown value for --object-format: sha256",
+        "error: unknown value for --object-format: sha256",
     ];
-    // Prefix forms (the operand/usage text may follow on the SAME line); the
-    // prefix ends right after the option name so no filename text can precede
-    // the verdict.
-    const LINE_PREFIXES: &[&str] = &[
-        "fatal: unknown value for --object-format:",
-        "error: unknown option for --object-format",
-        "error: unknown option `--object-format",
-        "error: unknown option '--object-format",
-    ];
-    for raw_line in stderr.lines() {
-        // Match the ORIGINAL case: git's unsupported message is lowercase
-        // sha256; an uppercase "SHA256" is a different algorithm spelling and
-        // must not be treated as the unsupported-form diagnostic.
-        let line = raw_line.trim();
-        if WHOLE_LINES.contains(&line) {
-            return true;
-        }
-        if LINE_PREFIXES.iter().any(|prefix| line.starts_with(prefix)) {
-            return true;
-        }
-    }
-    false
+    stderr
+        .lines()
+        .map(str::trim_end)
+        .any(|line| EXACT_LINES.contains(&line))
+}
+
+#[cfg(test)]
+fn unsupported_sha256_diagnostic(stderr: &str) -> bool {
+    unsupported_sha256_diagnostic_impl(stderr)
 }
 /// Run `git init --object-format=sha256` through `program` and classify the
 /// outcome: true when the repository is created; false ONLY on a recognized
@@ -10541,7 +10540,20 @@ head -c 1 >/dev/null || exit 4
             "error: cannot access /build/error: unknown option '--object-format=sha256'/src: No such file\n",
             "fatal: unknown hash algorithm 'bogus'\n",
             "fatal: unknown hash algorithm 'SHA256'\n",
+            // Wrong operand: sha1 is a supported algorithm, bogus is another
+            // algorithm name, sha256extra is not sha256.
+            "fatal: unknown hash algorithm 'sha1'\n",
+            "fatal: unknown value for --object-format: bogus\n",
+            "error: unknown value for --object-format: sha1\n",
+            "fatal: unknown value for --object-format: sha256extra\n",
+            // Trailing text after every accepted whole-line form.
             "  fatal: unknown hash algorithm 'sha256'  extra\n",
+            "fatal: unknown hash algorithm 'sha256' extra\n",
+            "fatal: attempt to use sha256 has not been compiled in extra\n",
+            "fatal: unknown value for --object-format: sha256 extra\n",
+            "error: unknown option `object-format' extra\n",
+            // A prefix line with the option but not at line start.
+            " x error: unknown option `--object-format'\n",
             "",
         ] {
             assert!(

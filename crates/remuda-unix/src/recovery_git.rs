@@ -195,17 +195,37 @@ mod tests {
                 .get_args()
                 .map(|a| a.to_string_lossy().into_owned())
                 .collect();
-            // The four hardening -c options precede the subcommand.
-            let sub_index = argv
-                .iter()
-                .position(|a| !a.starts_with('-') && !a.contains('=') && !matches!(a.as_str(), "c"))
-                .unwrap_or(argv.len());
-            let prefix: Vec<&str> = argv[..sub_index].iter().map(String::as_str).collect();
-            for (key, value) in h.config_pairs() {
-                let expected = format!("{key}={value}");
-                assert!(
-                    prefix.windows(2).any(|w| w[0] == "-c" && w[1] == expected),
-                    "{args:?} missing -c {expected}; prefix {prefix:?}"
+            // r32 item 6: argv is EXACTLY four "-c key=value" pairs followed by
+            // the caller's args — nothing can be dropped, reordered, or
+            // bypassed, and the hardening options precede the subcommand.
+            assert_eq!(
+                argv.len(),
+                2 * h.config_pairs().len() + args.len(),
+                "{args:?} argv has an unexpected shape: {argv:?}"
+            );
+            assert_eq!(
+                argv[2 * h.config_pairs().len()],
+                args[0],
+                "the subcommand must follow the four -c pairs"
+            );
+            for (index, (key, value)) in h.config_pairs().iter().enumerate() {
+                assert_eq!(
+                    argv[2 * index],
+                    "-c",
+                    "hardening pair {index} starts with -c"
+                );
+                assert_eq!(
+                    &argv[2 * index + 1],
+                    &format!("{key}={value}"),
+                    "hardening pair {index} has the wrong value"
+                );
+            }
+            // The remaining argv is exactly the caller's args.
+            for (offset, arg) in args.iter().enumerate() {
+                assert_eq!(
+                    argv[2 * h.config_pairs().len() + offset],
+                    *arg,
+                    "caller args must pass through unchanged"
                 );
             }
             // Fetch carries the full fetch flag set.

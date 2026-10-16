@@ -320,29 +320,29 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     tx.execute_batch("DROP INDEX IF EXISTS usage_events_turn_dedupe;")?;
     // c-usagefu r13/r16: recover scope_id and the fallback-only projection
     // fields (native turn id, native time, revision, context window) from the
-    // retained journal BEFORE the lineage collapse below. These stay
-    // UNCONDITIONAL: rows written through the legacy path while a migration
-    // stayed rolled back persist only the 14 legacy columns even when the
-    // older lineage columns already committed, so they must recover on every
-    // restart, not just on the first upgrade.
+    // retained journal BEFORE the lineage collapse below. Rows written through
+    // the legacy path while a migration stayed rolled back persist only the 14
+    // legacy columns even when the newer columns already committed, so these
+    // run on every restart; every assignment fills only missing values and the
+    // revision is raise-only (r38 item 1), so re-projection can never lower a
+    // revision a live write already established.
     backfill_scope_ids_from_journal(tx)?;
     reconstruct_fallback_projection_from_journal(tx)?;
     // c-ctxusage r9/r29: session-scope then turn-scope identity/lineage from
     // retained evidence (the scope backfill above is the same idempotent
     // update for scope ids; these also stamp session scope_id and the
-    // turn→native-session lineage).
+    // turn→native-session lineage). They prove NULL-scope rows with retained
+    // journal evidence on every migration, including rows written through the
+    // fallback path after the schema committed.
     backfill_legacy_scope_ids(tx)?;
     backfill_legacy_turn_identity(tx)?;
     // c-usagefu r14 (M1): journal-recovered turn rows that share a key but
-    // disagree on counters are two degenerate-id calls, not one re-tail —
-    // return them to the legacy NULL-scope path before the fold winner is
-    // collapsed. Unconditional for the same reason the backfills above are:
-    // they re-stamp the intentionally-cleared ids on every restart, so the
-    // clear decision must be re-applied too. The companion DELETE the merge
-    // inherited is gone: [`collapse_duplicate_turn_lineage_rows`] already
-    // keeps exactly one fold winner per LINEAGE for identical (and every
-    // other) same-lineage group, while a matching row in a DIFFERENT lineage
-    // is a retained watermark that must never be deleted (r37 item 1).
+    // disagree on counters are two degenerate-id calls from the HISTORICAL
+    // unproven producer, not one re-tail — return them to the legacy
+    // NULL-scope path before the fold winner is collapsed. Kept unconditional
+    // so rows recovered by the backfills above on any restart are classified;
+    // r38 item 2 tightens its scope to the historical producer so proven
+    // lineage recovery rows resolve through revision authority instead.
     clear_disagreeing_recovered_turn_keys(tx)?;
     // r30: identity UPDATE can merge a legacy turn with a later qualified
     // replay; collapse to the fold winner BEFORE identical-counter
@@ -785,6 +785,13 @@ fn reconstruct_fallback_projection_from_journal(conn: &Connection) -> rusqlite::
                    AND CAST(json_extract(j.payload_json, '$.payload.contextWindow') AS INTEGER) > 0
              )),
              metric_revision = CASE
+                 -- r38 item 1: raise ONLY. A durable Message keeps its original
+                 -- stored sequence across revisions while the journal record at
+                 -- that sequence carries the revision-1 frame, so re-projecting
+                 -- must never lower an established revision watermark; a stale
+                 -- replay would otherwise satisfy the >= revision accounting
+                 -- checks. Fallback rows default to revision 1 and still get
+                 -- their true (higher) journal revision back.
                  WHEN CAST((
                      SELECT json_extract(j.payload_json, '$.payload.metricRevision')
                      FROM journal j
@@ -792,7 +799,7 @@ fn reconstruct_fallback_projection_from_journal(conn: &Connection) -> rusqlite::
                        AND j.seq = usage_events.seq
                        AND json_valid(j.payload_json)
                        AND json_extract(j.payload_json, '$.kind') = 'usage'
-                 ) AS INTEGER) > 0
+                 ) AS INTEGER) > metric_revision
                  THEN CAST((
                      SELECT json_extract(j2.payload_json, '$.payload.metricRevision')
                      FROM journal j2
@@ -11078,7 +11085,124 @@ mod tests {
         );
     }
 
-    /// r37 gate fix: a wire Knowledge bucket marked `not-applicable` is a
+    /// r38 item 1: reopening the Hub must never lower an established durable
+    /// Message revision watermark. `upsert_message_row` keeps the ORIGINAL
+    /// stored sequence when it revises a message, so the retained journal at
+    /// that sequence still carries the revision-1 payload; a restart whose
+    /// fallback reconstruction re-reads it verbatim would downgrade revision 2
+    /// to 1 and let a stale replay overwrite the newer counters.
+    #[test]
+    fn reopen_never_lowers_a_durable_message_revision_then_a_stale_replay_loses() {
+        let marker = remuda_driver::adapters::codex_adapter::CODEX_DURABLE_RESPONSE_SCOPE_PREFIX;
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        create_journal_table(&conn);
+
+        // Journal retains BOTH frames at their original sequences.
+        let journal_usage = |seq: i64, revision: i64, input: i64| {
+            json!({
+                "kind": "usage",
+                "nativeAt": {"state": "known", "value": "2026-10-13T00:00:00.000Z"},
+                "payload": {
+                    "scope": "message",
+                    "scopeId": format!("{marker}0:file-M"),
+                    "mode": "snapshot",
+                    "metricRevision": revision.to_string(),
+                    "accounting": "estimated",
+                    "inputTokens": {"state": "known", "value": input.to_string()},
+                    "outputTokens": {"state": "known", "value": "0"},
+                    "cacheReadTokens": {"state": "known", "value": "0"},
+                    "cacheWriteTokens": {"state": "known", "value": "0"},
+                    "totalTokens": {"state": "known", "value": input.to_string()}
+                }
+            })
+        };
+        for (seq, rev, input) in [(1, 1, 100), (2, 2, 150)] {
+            conn.execute(
+                "INSERT INTO journal (instance_id, seq, event_id, payload_json, observed_at)
+                 VALUES ('ins_r38i1', ?1, ?2, ?3, '2026-10-13T00:00:00.000Z')",
+                params![
+                    seq,
+                    format!("je{seq}"),
+                    journal_usage(seq, rev, input).to_string()
+                ],
+            )
+            .unwrap();
+        }
+
+        // Simulate the live upsert: ONE message row kept at the ORIGINAL seq 1
+        // but carrying the revision-2 final counters (exactly what
+        // upsert_message_row leaves behind).
+        let row = UsageEventRow {
+            instance_id: "ins_r38i1".into(),
+            seq: 1,
+            profile_id: None,
+            model: None,
+            scope: "message".into(),
+            scope_id: Some(format!("{marker}0:file-M")),
+            turn_id: None,
+            native_context_window: None,
+            mode: "snapshot".into(),
+            metric_revision: 2,
+            source_session_id: None,
+            total_tokens: Some(150),
+            input_tokens: Some(150),
+            output_tokens: Some(0),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            cost_usd: None,
+            accounting: "estimated".into(),
+            observed_at: "2026-10-13T00:00:00.000Z".into(),
+            observed_at_source: "native".into(),
+        };
+        assert!(insert_usage_event(&conn, &row).unwrap());
+
+        // Reopen: the migration runs again against the retained journal.
+        migrate(&conn).unwrap();
+
+        let (revision, input): (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT metric_revision, input_tokens FROM usage_events
+                 WHERE instance_id='ins_r38i1' AND scope='message'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            revision, 2,
+            "reopen must not lower the revision watermark to 1"
+        );
+        assert_eq!(
+            input,
+            Some(150),
+            "reopen must not revert the rev-2 counters"
+        );
+
+        // A stale revision-1 replay delivered after reopen still loses to the
+        // established revision-2 authority (counters stay 150).
+        let stale = JournalRecord {
+            instance_id: "ins_r38i1".into(),
+            seq: 3,
+            event_id: "evt_stale".into(),
+            event: journal_usage(3, 1, 100),
+            observed_at: "2026-10-13T00:00:01.000Z".into(),
+        };
+        let stale_row = project_usage_event(&stale, None, None).unwrap();
+        assert!(
+            !insert_usage_event(&conn, &stale_row).unwrap(),
+            "a revision-1 replay cannot replace the established revision 2"
+        );
+        let input_after: Option<i64> = conn
+            .query_row(
+                "SELECT input_tokens FROM usage_events
+                 WHERE instance_id='ins_r38i1' AND scope='message'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(input_after, Some(150));
+    }
+
     /// STRUCTURAL ZERO ("this model/frame has no such cache tier"), not an
     /// omitted value. The merge's context basket demanded a value in EVERY
     /// bucket, so a real Claude usage frame with known input, known cache read

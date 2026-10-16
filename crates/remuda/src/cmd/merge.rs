@@ -1136,17 +1136,16 @@ fn recovery_fetch_base_sha(repo: &Path, base: &str, deadline: Instant) -> Result
     //    configured `+<sha>:refs/tags/x` cannot force-write x; --no-prune
     //    neutralises fetch.prune / remote.origin.prune; --no-tags defeats a
     //    configured tagOpt=--tags clobber.
+    // No --no-write-fetch-head: older git rejects the option (would make
+    // every recovery PushUncertain forever). FETCH_HEAD is not a ref and
+    // recovery never reads it, so writing it is harmless.
+    let mut fetch_args: Vec<&str> = vec!["fetch"];
+    fetch_args.extend_from_slice(RECOVERY_FETCH_FLAGS);
+    fetch_args.push("origin");
+    fetch_args.push(&remote_tip);
     recovery_git(
         repo,
-        &[
-            "fetch",
-            "--no-tags",
-            "--no-prune",
-            "--refmap=",
-            "--no-write-fetch-head",
-            "origin",
-            &remote_tip,
-        ],
+        &fetch_args,
         "post-push remote base object fetch",
         true,
         deadline,
@@ -1451,6 +1450,10 @@ fn gate_summary(report: &MergeReport) -> String {
 
 /// r19 item 2 / R7: per-subprocess cap so one recovery git command cannot
 /// consume the whole recovery budget.
+/// Flags the recovery object-fetch ALWAYS passes; see the Node gateway. No
+/// `--no-write-fetch-head` — older git rejects it, FETCH_HEAD is not a ref.
+const RECOVERY_FETCH_FLAGS: &[&str] = &["--no-tags", "--no-prune", "--refmap="];
+
 const RECOVERY_GIT_CAP: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// r19 item 2 / R7: ONE absolute deadline for the whole post-push recovery
@@ -2490,6 +2493,19 @@ mod tests {
     /// byte-identical across a recovery.
     fn refs_listing(repo: &Path) -> String {
         tgit_ok(repo, &["for-each-ref", "--format=%(refname) %(objectname)"])
+    }
+
+    /// r31 item 2: recovery fetch must never pass --no-write-fetch-head.
+    #[test]
+    fn recovery_fetch_flags_never_write_fetch_head() {
+        assert!(
+            !RECOVERY_FETCH_FLAGS
+                .iter()
+                .any(|flag| *flag == "--no-write-fetch-head")
+        );
+        assert!(RECOVERY_FETCH_FLAGS.contains(&"--refmap="));
+        assert!(RECOVERY_FETCH_FLAGS.contains(&"--no-prune"));
+        assert!(RECOVERY_FETCH_FLAGS.contains(&"--no-tags"));
     }
 
     /// R10: ls-remote parsing accepts exactly one well-formed line for the

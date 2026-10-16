@@ -4340,19 +4340,16 @@ fn recovery_fetch_base_sha(
     //    remote.origin.prune so no stale remote-tracking ref is deleted.
     //    --no-tags defeats a configured tagOpt=--tags clobber. A tip that moved
     //    so the SHA is no longer fetchable fails here → Unknown.
-    owned(
-        &[
-            "fetch",
-            "--no-tags",
-            "--no-prune",
-            "--refmap=",
-            "--no-write-fetch-head",
-            "origin",
-            &sha,
-        ],
-        "remote base object fetch",
-        true,
-    )?;
+    //
+    //    No --no-write-fetch-head: older git (observed on the build hosts)
+    //    rejects the option and would make every recovery Unknown forever.
+    //    FETCH_HEAD is not a ref, recovery never reads it, and writing it
+    //    cannot create or move any branch/tag; it is harmless.
+    let mut fetch_args: Vec<&str> = vec!["fetch"];
+    fetch_args.extend_from_slice(&RECOVERY_FETCH_FLAGS);
+    fetch_args.push("origin");
+    fetch_args.push(&sha);
+    owned(&fetch_args, "remote base object fetch", true)?;
     // 3. The fetched object must exist locally and peel to a commit.
     owned(
         &["cat-file", "-e", &format!("{sha}^{{commit}}")],
@@ -4535,6 +4532,13 @@ pub(crate) fn probe_sha256_support_with(program: &str, probe_repo: &Path) -> boo
 pub(crate) fn probe_sha256_support(program: &str, probe_repo: &Path) -> bool {
     probe_sha256_support_with(program, probe_repo)
 }
+
+/// Flags the recovery object-fetch ALWAYS passes. Deliberately NOT including
+/// `--no-write-fetch-head`: older git builds reject it (r31 item 2); FETCH_HEAD
+/// is not a ref and recovery never reads it. Test-visible so the exact flag
+/// set is asserted.
+#[cfg(unix)]
+pub(crate) const RECOVERY_FETCH_FLAGS: &[&str] = &["--no-tags", "--no-prune", "--refmap="];
 
 /// Per-subprocess cap so one git command cannot consume the whole probe.
 #[cfg(unix)]
@@ -9615,6 +9619,21 @@ head -c 1 >/dev/null || exit 4
     #[cfg(unix)]
     fn refs_listing(repo: &Path) -> String {
         git(repo, &["for-each-ref", "--format=%(refname) %(objectname)"])
+    }
+
+    /// r31 item 2: recovery fetch must NEVER pass --no-write-fetch-head (older
+    /// git rejects it and FETCH_HEAD is not a ref recovery reads).
+    #[cfg(unix)]
+    #[test]
+    fn recovery_fetch_flags_never_write_fetch_head() {
+        assert!(
+            !super::RECOVERY_FETCH_FLAGS
+                .iter()
+                .any(|flag| *flag == "--no-write-fetch-head")
+        );
+        assert!(super::RECOVERY_FETCH_FLAGS.contains(&"--refmap="));
+        assert!(super::RECOVERY_FETCH_FLAGS.contains(&"--no-prune"));
+        assert!(super::RECOVERY_FETCH_FLAGS.contains(&"--no-tags"));
     }
 
     /// R10: ls-remote parsing accepts exactly one well-formed line for the

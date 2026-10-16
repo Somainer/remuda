@@ -18,5 +18,15 @@ export class HubHttpError extends Error {
 }
 
 export function isUnauthorized(err: unknown): boolean {
-  return err instanceof HubHttpError && err.status === 401;
+  // instanceof first (same module realm — production path), with a
+  // structural fallback for cross-realm duplicates (e.g. vitest with
+  // vi.resetModules(): a thrown HubHttpError from a separately evaluated
+  // httpError module fails instanceof but still carries status===401).
+  if (err instanceof HubHttpError) return err.status === 401;
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    (err as { name?: unknown }).name === "HubHttpError" &&
+    (err as { status?: unknown }).status === 401
+  );
 }

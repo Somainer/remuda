@@ -1,5 +1,6 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { RestNetworkError } from "./api";
+import { HubHttpError } from "./httpError";
 import { OUTBOX_LS_KEY } from "./outbox";
 
 type Api = typeof import("./api").api;
@@ -363,13 +364,36 @@ it("r6 item 1: leaving a HELD pending route lets the list recover via a departur
   hubStore.logout();
 });
 
-it("r10 item 1 (b): after an expired-session 401 retirement BEFORE the first install, the new login's cold mount is adopted and seeds", async () => {
+it("r11 item 1 (b): a public bootstrap 401 before first install retires the identity; public login() then adopts a held-seed cold mount", async () => {
   const { api, hubStore } = await fresh();
   const A = "ins_expired_login";
   const JA = "obj_expired_login_journal";
 
-  vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
-  vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+  // The FIRST public bootstrap receives a real HubHttpError(401) at the
+  // health check, BEFORE any connection install; subsequent calls succeed.
+  let helloCalls = 0;
+  vi.spyOn(api, "hello").mockImplementation(async () => {
+    helloCalls += 1;
+    if (helloCalls === 1) throw new HubHttpError(401, "unauthorized", "unauthorized");
+    return {} as Awaited<ReturnType<Api["hello"]>>;
+  });
+  // The REAL expired session the Hub rejects: a stored device
+  // session whose cookie the Hub 401s. readSession() is the real
+  // predicate here (no hasDeviceSession mock).
+  const writeDeviceSession = (id: string) => {
+    localStorage.setItem(
+      "runtime.device-session",
+      JSON.stringify({ deviceId: id, token: `tok_${id}`, name: "dev" }),
+    );
+  };
+  writeDeviceSession("dev_expired_old");
+  // The REAL public credential transition: api.login establishes the new
+  // session; no private retirement/bootstrap substitution.
+  vi.spyOn(api, "login").mockResolvedValue({
+    deviceId: "dev_expired_login",
+    token: "tok_expired_login",
+    name: "expired-login",
+  } as Awaited<ReturnType<Api["login"]>>);
   vi.spyOn(api, "hostList").mockResolvedValue({ items: [], nextCursor: null } as Awaited<
     ReturnType<Api["hostList"]>
   >);
@@ -388,17 +412,13 @@ it("r10 item 1 (b): after an expired-session 401 retirement BEFORE the first ins
     nextCursor: null,
   });
 
-  // Outbox init is held through BOTH bootstraps (gate re-arms each time).
+  // The failed bootstrap never reaches connection installation (401 is at
+  // hello, before initConnection), but it DOES open the outbox: the gate
+  // is therefore armed only AFTER the 401, to hold the login's
+  // initialization.
   let releaseOutbox: (() => void) | null = null;
-  (
-    hubStore as unknown as {
-      setOutboxOpenGateForTest: (g: ((r: () => void) => void) | null) => void;
-    }
-  ).setOutboxOpenGateForTest((resolve) => {
-    releaseOutbox = resolve;
-  });
 
-  // Seed is held until explicitly released (never resolves before follow).
+  // Seed held until released; subscription answers live.
   let releaseSeed: (() => void) | null = null;
   vi.spyOn(api, "eventsRead").mockImplementation(
     () =>
@@ -434,49 +454,76 @@ it("r10 item 1 (b): after an expired-session 401 retirement BEFORE the first ins
     })) as Api["eventsSubscribe"],
   );
 
-  // 1) Expired session: a current-epoch 401 retires the identity
-  // BEFORE the page's first connection machine ever installed (the boot
-  // sequence that observes it throws, so no machine is created). The
-  // epoch must still advance for every token captured afterwards.
-  const storeInternal = hubStore as unknown as {
-    externalIdentityRetire: () => void;
+  // 1) Expired session: the public bootstrap observes a real
+  // HubHttpError(401) and settles with the authenticated UI cleared
+  // (it does not throw), having retired the identity.
+  // The bootstrap's own 401 retires its OWN S3 op: the public
+  // promise settles "retired" (never throws) — per the gate-48
+  // contract — while still having cleared the identity and
+  // published the unauthed UI via externalIdentityRetire.
+  const outcome = await hubStore.bootstrap();
+  expect(outcome).toBe("retired");
+  // The 401 retirement cleared the session: readSession() (the real
+  // auth predicate) now reports no session.
+  expect(api.hasDeviceSession()).toBe(false);
+  const internals = hubStore as unknown as {
+    connection: unknown;
+    identityEpoch: number;
   };
-  storeInternal.externalIdentityRetire();
-  expect((hubStore as unknown as { connection: unknown }).connection).toBeNull();
+  expect(internals.connection).toBeNull();
+  // The production 401 retirement advanced the identity epoch — the
+  // cross-identity fence the new machine installs behind.
+  expect(internals.identityEpoch).toBe(1);
 
-  // 2) Re-login bootstraps; the authenticated route renders and
-  // follow(A) starts WHILE installation is still parked.
-  const boot = hubStore.bootstrap();
+  // 2) PUBLIC login: its credential turn runs runBootstrap, which parks
+  // behind the held outbox initializer.
+  (
+    hubStore as unknown as {
+      setOutboxOpenGateForTest: (g: ((r: () => void) => void) | null) => void;
+    }
+  ).setOutboxOpenGateForTest((resolve) => {
+    releaseOutbox = resolve;
+  });
+  const loginP = hubStore.login("bootstrap", "secret", "dev");
+  await vi.waitFor(() => expect(releaseOutbox).not.toBeNull());
   await vi.waitFor(() => expect(hubStore.getSnapshot().instances.some((i) => i.id === A)).toBe(true));
-  expect(releaseOutbox).not.toBeNull();
+
+  // The authenticated session route renders and follow(A) starts while
+  // installation is still parked.
   void hubStore.follow(A);
   for (let i = 0; i < 80; i += 1) await Promise.resolve();
   expect(releaseSeed).not.toBeNull();
   expect(subscribe).not.toHaveBeenCalled();
 
   // 3) Installation finishes, THEN the seed resolves: the new identity's
-  // first machine ADOPTS the pending target (same epoch), no injected resume.
+  // first machine ADOPTS the pending target — no injected resume.
   releaseOutbox!();
   await vi.waitFor(() => expect((hubStore as unknown as { connection: unknown }).connection).not.toBeNull());
   releaseSeed!();
   for (let i = 0; i < 80; i += 1) await Promise.resolve();
 
-  await expect(boot).resolves.toBe("ready");
+  await expect(loginP).resolves.toBe("settled");
   expect(
     (hubStore as unknown as { journals: Map<string, unknown> }).journals.has(JA),
   ).toBe(true);
   expect(subscribe).toHaveBeenCalledTimes(1);
+  expect(hubStore.getSnapshot().connection).toBe("live");
 
   hubStore.logout();
 });
 
-it("r10 item 1 (c): ordinary logout/re-login cold-load mount with a held seed mounts under the new identity", async () => {
+it("r11 item 1 (c): public logout() then public login() adopts the new identity's held-seed cold mount", async () => {
   const { api, hubStore } = await fresh();
   const A = "ins_relogin_cold";
   const JA = "obj_relogin_cold_journal";
 
   vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
   vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+  vi.spyOn(api, "login").mockResolvedValue({
+    deviceId: "dev_relogin_cold",
+    token: "tok_relogin_cold",
+    name: "relogin-cold",
+  } as Awaited<ReturnType<Api["login"]>>);
   vi.spyOn(api, "hostList").mockResolvedValue({ items: [], nextCursor: null } as Awaited<
     ReturnType<Api["hostList"]>
   >);
@@ -530,13 +577,19 @@ it("r10 item 1 (c): ordinary logout/re-login cold-load mount with a held seed mo
     })) as Api["eventsSubscribe"],
   );
 
-  // First login completes normally, then ordinary logout retires the
-  // identity (its machine tears down).
+  // 1) First login completes through the full PUBLIC bootstrap.
   await hubStore.bootstrap();
-  hubStore.logout();
+  const epochAfterBoot = (hubStore as unknown as { identityEpoch: number }).identityEpoch;
+  expect(epochAfterBoot).toBe(0); // cold install did not retire anything
 
-  // The gate fired on the first bootstrap's outbox init; re-arm it
-  // for the second identity's initialization.
+  // 2) PUBLIC logout retires the identity and tears its machine down.
+  hubStore.logout();
+  expect((hubStore as unknown as { connection: unknown }).connection).toBeNull();
+  const epochAfterLogout = (hubStore as unknown as { identityEpoch: number }).identityEpoch;
+  expect(epochAfterLogout).toBe(epochAfterBoot + 1);
+
+  // Gate the RE-LOGIN's outbox initialisation (the first bootstrap ran
+  // ungated).
   let releaseOutbox2: (() => void) | null = null;
   (
     hubStore as unknown as {
@@ -546,25 +599,29 @@ it("r10 item 1 (c): ordinary logout/re-login cold-load mount with a held seed mo
     releaseOutbox2 = resolve;
   });
 
-  // Second login: follow(A) parks while its machine installs.
-  const boot = hubStore.bootstrap();
+  // 3) PUBLIC re-login: credential success, runBootstrap parks at the gate.
+  const loginP = hubStore.login("bootstrap", "secret", "dev");
+  await vi.waitFor(() => expect(releaseOutbox2).not.toBeNull());
   await vi.waitFor(() => expect(hubStore.getSnapshot().instances.some((i) => i.id === A)).toBe(true));
+
+  // The route renders and follow(A) parks while installation is held.
   void hubStore.follow(A);
   for (let i = 0; i < 80; i += 1) await Promise.resolve();
   expect(releaseSeed).not.toBeNull();
   expect(subscribe).not.toHaveBeenCalled();
 
-  await vi.waitFor(() => expect(releaseOutbox2).not.toBeNull());
+  // Install finishes, then the seed: the new identity's machine adopts.
   releaseOutbox2!();
   await vi.waitFor(() => expect((hubStore as unknown as { connection: unknown }).connection).not.toBeNull());
   releaseSeed!();
   for (let i = 0; i < 80; i += 1) await Promise.resolve();
 
-  await expect(boot).resolves.toBe("ready");
+  await expect(loginP).resolves.toBe("settled");
   expect(
     (hubStore as unknown as { journals: Map<string, unknown> }).journals.has(JA),
   ).toBe(true);
   expect(subscribe).toHaveBeenCalledTimes(1);
+  expect(hubStore.getSnapshot().connection).toBe("live");
 
   hubStore.logout();
 });

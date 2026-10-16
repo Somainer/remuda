@@ -152,6 +152,116 @@ it("unbound resume publishes live only after exactly one successful bounded prob
   hubStore.logout();
 });
 
+it("r5 item 1: a held unbound list GET cannot certify a session entered through the real follow() route; its lookup failure runs its own recovery", async () => {
+  const { api, hubStore, list } = await bootUnbound();
+  const TARGET = "ins_route_entry";
+  const JOURNAL = "obj_route_entry_journal";
+
+  // First list call (the unbound resume proof) stays held; later list calls
+  // (settlement / stale probes) answer immediately.
+  let releaseOld: (() => void) | null = null;
+  let firstHeld = false;
+  list.mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        if (firstHeld) {
+          resolve({ items: [], nextCursor: null });
+          return;
+        }
+        firstHeld = true;
+        releaseOld = () => resolve({ items: [], nextCursor: null });
+      }),
+  );
+  // The route-entry lookup fails once (its initial follow lookup) and resolves
+  // on the recovery retry.
+  let lookupCalls = 0;
+  let rejectLookup: ((e: unknown) => void) | null = null;
+  vi.spyOn(api, "instanceGet").mockImplementation(() => {
+    lookupCalls += 1;
+    if (lookupCalls === 1) {
+      return new Promise((_resolve, reject) => {
+        rejectLookup = (err) => reject(err);
+      });
+    }
+    return Promise.resolve({
+      id: TARGET,
+      journalId: JOURNAL,
+      revision: "0",
+      durableSeq: "0",
+      lifecycle: "running",
+    } as Awaited<ReturnType<Api["instanceGet"]>>);
+  });
+  vi.spyOn(api, "eventsRead").mockResolvedValue({
+    events: [],
+    durableSeq: "0",
+    windowFromSeq: null,
+    reachedAfterSeq: true,
+  });
+  const subscribe = vi.spyOn(api, "eventsSubscribe").mockImplementation(
+    (async () => ({
+      subscriptionId: "sub_route_entry",
+      journalId: JOURNAL,
+      durableSeq: "0",
+      windowFromSeq: null,
+      reachedAfterSeq: true,
+      getReadyState: () => 1,
+      snapshot: {
+        projectionVersion: "v1",
+        projectionEpoch: "epoch_route_entry",
+        asOfSeq: "0",
+        instance: {} as never,
+        runs: [],
+        commands: [],
+        pendingInteractions: [],
+        nodes: [],
+        history: { earliestRetainedSeq: "0", complete: true },
+      },
+    })) as Api["eventsSubscribe"],
+  );
+
+  // Unbound list resume, its GET held.
+  hubStore.resumeActive(null);
+  await vi.waitFor(() => expect(list).toHaveBeenCalledTimes(1));
+
+  // REAL route entry (SessionPage effect calls hubStore.follow(id)) while the
+  // old list GET is still parked and the target's lookup is pending.
+  vi.useFakeTimers();
+  const flush = async (rounds = 40) => {
+    for (let i = 0; i < rounds; i += 1) await vi.advanceTimersByTimeAsync(0);
+  };
+  const routeFollow = hubStore.follow(TARGET);
+  void routeFollow.catch(() => undefined);
+  await vi.waitFor(() => expect(lookupCalls).toBe(1));
+  await flush();
+
+  // The old list GET answers: the target was chosen synchronously at follow
+  // entry, so its generation superseded the unbound attempt — no live.
+  releaseOld!();
+  await flush();
+  for (let i = 0; i < 20 && hubStore.getSnapshot().connection === "recovering"; i += 1) {
+    await vi.advanceTimersByTimeAsync(50);
+  }
+  expect(hubStore.getSnapshot().connection).not.toBe("live");
+  expect(subscribe).not.toHaveBeenCalled();
+
+  // The lookup failure is THIS target's recovery failure: the machine settles
+  // via probe and the reconnect path retries the lookup (2nd call), then a
+  // real seed + subscribe certifies live.
+  rejectLookup!(new RestNetworkError("lookup ECONNRESET"));
+  await expect(routeFollow).rejects.toBeTruthy();
+  await flush();
+  for (let i = 0; i < 120 && subscribe.mock.calls.length === 0; i += 1) {
+    await vi.advanceTimersByTimeAsync(1_000);
+  }
+  await flush();
+  expect(lookupCalls).toBeGreaterThan(1);
+  expect(subscribe).toHaveBeenCalledTimes(1);
+  expect(hubStore.getSnapshot().connection).toBe("live");
+
+  vi.useRealTimers();
+  hubStore.logout();
+});
+
 it("r4 item 2: a held unbound list request cannot certify a NEWLY pending session; live waits for its seed+subscribe", async () => {
   const { api, hubStore, list } = await bootUnbound();
   const PENDING = "ins_pending_midresume";

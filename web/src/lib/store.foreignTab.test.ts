@@ -2519,15 +2519,15 @@ it("GATE20 item 5 (real store): offline retires the attempt, THEN its reopen soc
   }
 });
 
-it("GATE18 item 5: a duplicate seed that finds the journal mounted with a DEAD socket ends the current-binding attempt instead of stranding it on the 20 s watchdog", async () => {
+it("Ruling Y (was GATE18 item 5): a superseded attempt's late seed is fenced without a socket; the current attempt self-drives recovery instead of awaiting the watchdog", async () => {
   // follow(B) attempt 1 (unmounted seed in flight) -> navigate to mounted live
   // A (retries/retries attempt 1) -> follow(B) again before the seed returns
-  // (attempt 2) -> attempt 1's seed returns FIRST: it journals.set B, then its
-  // openFollowSocket rejects (failure dropped: stale generation). Attempt 2's
-  // seed then returns to a mounted-but-dead B: the journals.has branch used to
-  // return WITHOUT followAttemptEnd, leaving attempt 2 in recovering with no
-  // timer until the 20 s watchdog. It must end the attempt as failed so the
-  // real probe/reopen path self-drives before the watchdog.
+  // (attempt 2) -> attempt 1's seed returns AFTER B was superseded and chosen
+  // again: Ruling Y fences attempt 1's continuation entirely (no journal, no
+  // socket, no machine completion). Attempt 2 is the current owner; its first
+  // subscribe is blocked and it must settle through the normal probe path
+  // (quiet stale + probe timer) rather than sit timer-less in recovering on
+  // the 20 s watchdog.
   vi.useFakeTimers();
   const { api, hubStore } = await fresh();
   await bootLive(api, hubStore); // lists A = INSTANCE (journal JOURNAL)
@@ -2610,22 +2610,26 @@ it("GATE18 item 5: a duplicate seed that finds the journal mounted with a DEAD s
   expect(bSeedCalls).toBe(2);
   expect(store.connection.state).toBe("recovering");
 
-  // Attempt 1's seed returns: it journals.set B and its open is rejected; the
-  // failure is dropped (generation stale) and followB1 rejects.
+  // Attempt 1's seed returns: its continuation is fenced by the ownership
+  // token (gen changed when A and then attempt 2's B were chosen). It mounts
+  // nothing — no B subscribe, followB1 settles without rejecting because the
+  // stale continuation is a deliberate no-op, not a failed mount.
   seedResolvers[0]!();
-  await expect(followB1).rejects.toThrow("attempt 1 follow blocked");
+  await followB1;
   for (let i = 0; i < 10; i += 1) await Promise.resolve();
-  expect(bSubscribeCalls).toBe(1);
+  expect(bSubscribeCalls).toBe(0);
   expect(store.connection.state).toBe("recovering");
 
-  // Attempt 2's seed returns to a mounted-but-dead B.
+  // Attempt 2's seed returns and runs the FIRST real mount: its subscribe
+  // (B subscribe #1) is blocked, so followB2 rejects and the attempt settles
+  // via the probe.
   seedResolvers[1]!();
-  await followB2;
+  await expect(followB2).rejects.toThrow("attempt 1 follow blocked");
   for (let i = 0; i < 20; i += 1) await Promise.resolve();
 
-  // FIX: the attempt ended through the NORMAL failure path — quiet stale with
-  // the probe/reopen clocks armed, NOT a timer-less recovering waiting on the
-  // 20 s watchdog.
+  // The attempt ended through the NORMAL failure path — quiet stale with the
+  // probe/reopen clocks armed, NOT a timer-less recovering waiting on the 20 s
+  // watchdog.
   expect(store.connection.state).toBe("stale");
   expect(timerNames()).toContain("probe");
   expect(timerNames()).not.toContain("watchdog");

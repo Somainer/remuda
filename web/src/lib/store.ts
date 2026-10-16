@@ -870,6 +870,13 @@ const initial: HubState = {
 
 type Listener = () => void;
 
+/** Ruling Y ownership token — see HubStore.acquireTarget/ownsTarget. */
+type TargetToken = {
+  connection: ConnectionMachine | null;
+  target: Id;
+  gen: number;
+};
+
 /** Only Node-validated activity or its full Instance can change turn state. */
 function applyInstanceActivity(instances: Instance[], events: Observation[]): Instance[] {
   return instances.map((instance) => {
@@ -3237,67 +3244,69 @@ class HubStore {
   private followFrameAt = new Map<Id, number>();
 
   /**
-   * Bind the connection machine to a session. The generation bumps when the
-   * journal CHANGES, including the null→first-journal ownership hand-off and
-   * its inverse: the reconnect resume's nested follow() of the SAME journal
-   * shares the in-flight attempt, while a user navigation A → B supersedes any
-   * attempt A still owns. The null→journal case is an ownership change too
-   * (c-unboundresume r2 item 1): an unbound resume's reachability probe owns
-   * the machine until the first follow binds, and without a bump the follow's
-   * followAttemptBegin reused the unbound attempt id, so the probe's success
-   * certified live before the follow seeded/opened and the seed's later
-   * failure was dropped as a stale-attempt completion. Returns the generation
-   * the mount must report back with.
+   * Ruling Y (c-unboundresume r5) — one ownership discipline for async
+   * follow/recovery work. Ownership of the connection machine belongs to a
+   * TARGET id, chosen SYNCHRONOUSLY at route/resume entry before any await.
+   * The token captures the machine instance, the target and the binding
+   * generation; every continuation in follow()/reopenFollow()/their queued
+   * jobs revalidates it after each await and before binding, seeding,
+   * subscribing, certifying or taking over a newer generation. A stale token
+   * makes the continuation a no-op — it can never acquire fresh ownership.
    */
-  private bindConnection(instanceId: Id, journalId: Id): number {
-    const reboundAway =
-      this.connectionBoundJournal !== null && this.connectionBoundJournal !== journalId;
-    const ownershipChanged = this.connectionBoundJournal !== journalId;
-    const prevBoundTo = this.connectionBoundTo;
-    if (ownershipChanged) this.connectionBindGen += 1;
-    this.connectionBoundTo = instanceId;
-    this.connectionBoundJournal = journalId;
-    this.connection?.noteBinding(this.connectionBindGen);
-    // The machine now serves a DIFFERENT session. If the instance we just left
-    // had a delivered row whose catch-up was deferred to its (now superseded)
-    // follow, that follow will never service it — run one coalesced REST
-    // fallback for the abandoned instance so its accepted row still settles
-    // (fix-5 item 1). The global offline/recovering flag alone is not
-    // ownership; only a concrete bind-away orphans the debt.
-    if (reboundAway && prevBoundTo && prevBoundTo !== instanceId && this.reconcileOwed.has(prevBoundTo)) {
-      this.runOwedReconcile(prevBoundTo);
-    }
-    return this.connectionBindGen;
+  private targetToken(instanceId: Id): TargetToken {
+    return {
+      connection: this.connection,
+      target: instanceId,
+      gen: this.connectionBindGen,
+    };
+  }
+
+  private ownsTarget(token: TargetToken): boolean {
+    return (
+      this.connection === token.connection &&
+      this.connectionBoundTo === token.target &&
+      this.connectionBindGen === token.gen
+    );
   }
 
   /**
-   * Record a session TARGET whose journal is not known yet — its initial
-   * follow lookup has not resolved (failed before bindConnection, or has not
-   * run), so resumeActive has only the id. Entering or replacing a pending
-   * target is an OWNERSHIP transition (c-unboundresume r4 item 2): without a
-   * generation bump an unbound reachability probe still in flight stayed the
-   * current attempt, and its success certified live for a session that had
-   * neither seeded nor subscribed. Keyed on TARGET IDENTITY, even with a null
-   * journal: list (no target) → pending A, and pending A → pending B, both
-   * supersede the old attempt. The later successful follow() binds the real
-   * journal (null→journal bump) and mounts under its own attempt. Re-entering
-   * the SAME pending target changes nothing (the resume dispatch that follows
-   * may still coalesce). The abandoned-session debt condition is identical to
-   * bindConnection's: only leaving a session whose journal was known.
+   * Choose a connection target SYNCHRONOUSLY (Ruling Y). Called from
+   * follow()/resumeActive()/catchup() entry BEFORE the first await, with the
+   * journal already known or null for a pending lookup.
+   *
+   *  - new target identity (no target → A, A → B): ownership change — bump the
+   *    generation, record the target, noteBinding() (which retires any
+   *    in-flight attempt for the old owner), and service abandoned-session
+   *    debt exactly under the old condition (leaving a target whose journal
+   *    was KNOWN).
+   *  - SAME target whose journal resolved (pending null → journal): NOT an
+   *    ownership change — fill the journal, keep the generation the entry
+   *    captured, so the entry's own mount attempt stays current.
+   *  - SAME target, same journal: nothing.
    */
-  private enterPendingTarget(instanceId: Id) {
+  private acquireTarget(instanceId: Id, journalId: Id | null): TargetToken {
     const prevTarget = this.connectionBoundTo;
     const prevJournal = this.connectionBoundJournal;
-    // Re-resume of the SAME target is never an ownership change (its journal,
-    // if already bound, must not be wiped by the state lookup missing once).
-    if (prevTarget === instanceId) return;
-    this.connectionBoundTo = instanceId;
-    this.connectionBoundJournal = null;
-    this.connectionBindGen += 1;
-    this.connection?.noteBinding(this.connectionBindGen);
-    if (prevJournal !== null && prevTarget && this.reconcileOwed.has(prevTarget)) {
-      this.runOwedReconcile(prevTarget);
+    if (prevTarget !== instanceId) {
+      this.connectionBindGen += 1;
+      this.connectionBoundTo = instanceId;
+      this.connectionBoundJournal = journalId;
+      this.connection?.noteBinding(this.connectionBindGen);
+      // The machine now serves a DIFFERENT session. If the target we just
+      // left had a delivered row whose catch-up was deferred to its (now
+      // superseded) follow, that follow will never service it — run one
+      // coalesced REST fallback for the abandoned instance so its accepted
+      // row still settles (fix-5 item 1). Only a concrete bind-away from a
+      // KNOWN journal orphans the debt — a pending target never had a follow
+      // that could owe one.
+      if (prevJournal !== null && prevTarget && this.reconcileOwed.has(prevTarget)) {
+        this.runOwedReconcile(prevTarget);
+      }
+    } else if (journalId !== null && prevJournal !== journalId) {
+      // Same target, journal now known: record it without an ownership change.
+      this.connectionBoundJournal = journalId;
     }
+    return this.targetToken(instanceId);
   }
   /**
    * The follow link is genuinely live only when the socket is OPEN AND a frame
@@ -3748,13 +3757,13 @@ class HubStore {
   }
 
   /**
-   * Adopt an ALREADY-MOUNTED follow's socket after bindConnection rebound the
-   * connection machine to it (c-reconnfu gate 16 item 1). bindConnection's
-   * noteBinding retires any in-flight resume and clears the watchdog, so the
-   * machine would otherwise sit in `recovering` with NO timers (banner stuck,
-   * create refused) because the mounted branch returns before
-   * openFollowSocket. A live socket certifies live; a dead socket takes the
-   * rebind path (re-arms stale timers or a bind deadline -> beginResume).
+   * Adopt an ALREADY-MOUNTED follow's socket after acquireTarget rebound the
+   * connection machine to it (c-reconnfu gate 16 item 1). noteBinding retires
+   * any in-flight resume and clears the watchdog, so the machine would
+   * otherwise sit in `recovering` with NO timers (banner stuck, create
+   * refused) because the mounted branch returns before openFollowSocket. A
+   * live socket certifies live; a dead socket takes the rebind path (re-arms
+   * stale timers or a bind deadline -> beginResume).
    */
   private adoptMountedFollow() {
     if (this.followSocketLive()) {
@@ -3767,9 +3776,9 @@ class HubStore {
   /** Foreground trigger used by Shell/PhoneShell (replaces raw catchup). */
   resumeActive(instanceId: Id | null) {
     if (instanceId) {
-      const j = this.state.instances.find((i) => i.id === instanceId)?.journalId;
-      if (j) this.bindConnection(instanceId, j);
-      else this.enterPendingTarget(instanceId);
+      // Ruling Y: choose the target synchronously before the resume dispatch.
+      const j = this.state.instances.find((i) => i.id === instanceId)?.journalId ?? null;
+      this.acquireTarget(instanceId, j);
     }
     this.connection?.dispatch({ type: "resume" });
     if (!this.connection && instanceId) void this.catchup(instanceId);
@@ -5386,50 +5395,85 @@ class HubStore {
     if (changed) this.emit({ summaries: next });
   }
   async follow(instanceId: Id) {
-    const instance = this.state.instances.find((i) => i.id === instanceId) ?? (await api.instanceGet(instanceId));
-    // Own the connection machine through bindConnection BEFORE any other
-    // binding work (c-reconnfu gate 15 item 3): it registers this journal as
-    // the bound session, bumps the binding generation on a real bind-away, and
-    // runs the abandoned-session REST fallback when the instance we left had a
-    // deferred catch-up. Assigning the fields directly (as the old code did)
-    // stranded session A's accepted-but-unjoined row when the user navigated
-    // to an already-mounted B — the mounted-journal early return never reached
-    // openFollowSocket, so bindConnection's fallback never ran.
-    this.bindConnection(instance.id, instance.journalId);
-    const bindGen = this.connectionBindGen;
+    // Ruling Y: choose the target SYNCHRONOUSLY, before the first await, and
+    // fence every continuation with the captured ownership token. The lookup
+    // below belongs to THIS target — a held unbound list request can never
+    // certify it, and a target chosen later supersedes this whole call.
+    const cached = this.state.instances.find((i) => i.id === instanceId) ?? null;
+    const token = this.acquireTarget(instanceId, cached?.journalId ?? null);
+
+    // Already mounted (SessionPage effect re-run, or navigation to an
+    // already-mounted session): adopt THIS journal's socket so the rebound
+    // machine is not left timer-less in recovering (gate 16 item 1). No
+    // lookup/seed attempt is needed.
+    if (cached?.journalId && this.journals.has(cached.journalId)) {
+      this.adoptMountedFollow();
+      return;
+    }
+
+    // Gate 17 item 1 / Ruling Y: the mount attempt owns the LOOKUP, the seed
+    // and the first subscribe — bracketed now, before any await. A rejected
+    // initial lookup is therefore THIS target's recovery failure (the
+    // machine's probe → stale/offline → reopenFollow retries it) instead of an
+    // unbound outcome with no attempt and no recovery. Nested inside a resume
+    // for the same binding the begin shares the enclosing attempt/watchdog.
+    const bindGen = token.gen;
+    const mountAttemptId = this.connection ? this.connection.followAttemptBegin(bindGen) : null;
+    const endMountFailed = () => {
+      if (this.ownsTarget(token) && this.connection && mountAttemptId !== null) {
+        this.connection.followAttemptEnd(false, mountAttemptId, bindGen);
+      }
+    };
+
+    let instance: Instance = cached as Instance;
+    if (!instance) {
+      try {
+        instance = await api.instanceGet(instanceId);
+      } catch (err) {
+        endMountFailed();
+        throw err;
+      }
+      // Superseded while the lookup was parked: never bind/seed/mount — the
+      // newer target owns the machine (Ruling Y).
+      if (!this.ownsTarget(token)) return;
+      // Same target, journal now known: record it WITHOUT an ownership change
+      // so this entry's attempt stays the current one.
+      this.acquireTarget(instance.id, instance.journalId);
+    }
     if (!this.state.instances.some((i) => i.id === instanceId)) {
       this.emit({ instances: [instance, ...this.state.instances] });
     }
     // Fold projected effective state/catalog the single record carries.
     this.hydrateEffortEffective([instance]);
     this.hydrateModels([instance]);
-    // Already mounted (SessionPage re-render): the bind above rebound the
-    // connection machine to this active follow (and serviced any abandoned
-    // instance); adopt THIS journal's socket so the rebound machine is not
-    // left timer-less in recovering (gate 16 item 1).
+    // A duplicate mount may have won the lookup/seed race while this call was
+    // parked; adopt or settle scoped to this entry's captured generation.
     if (this.journals.has(instance.journalId)) {
-      this.adoptMountedFollow();
+      if (this.connection && mountAttemptId !== null && this.followSocketLive()) {
+        this.connection.followAttemptLive(mountAttemptId, bindGen);
+        return;
+      }
+      if (
+        this.ownsTarget(token) &&
+        this.connection &&
+        mountAttemptId !== null &&
+        !this.followSocketLive()
+      ) {
+        this.connection.followAttemptEnd(false, mountAttemptId, bindGen);
+      }
       return;
     }
     this.emit({ journalStatus: { ...this.state.journalStatus, [instanceId]: "live" } });
-    // Gate 17 item 1: an UNMOUNTED follow owns the machine while its seed and
-    // first subscribe are in flight. bindConnection's noteBinding retired the
-    // session-A attempt (and its watchdog) when we navigated here; without an
-    // attempt of our own, a seed that rejects/times out left the machine in
-    // recovering with NO timer (banner stuck, interrupt disabled, creates
-    // refused) because openFollowSocket — the only followBound caller — was
-    // never reached. Bracketing with the captured binding generation (the
-    // mount settles only while it is still current) makes a failed seed take
-    // the normal failure path: probe -> stale/offline -> retry, which reopens
-    // through reopenFollow -> follow(). Nested inside a resume for the same
-    // binding the begin shares the enclosing attempt and its watchdog.
-    const mountAttemptId = this.connection ? this.connection.followAttemptBegin(bindGen) : null;
     try {
       // Seed from ONE bounded tail window (newest rows win). The old ascending
       // 512-loop sliced the front of the tail, silently dropping everything
       // below the middle of the window on a long journal. Older rows load on
       // demand via JournalClient.loadEarlier.
       const seed = await api.eventsRead({ journalId: instance.journalId, limit: 2000 });
+      // Ruling Y: superseded while the seed read was parked — the newer target
+      // owns the machine and the duplicate-mount winner owns this journal; do
+      // not emit, create a client, subscribe or certify for the old owner.
+      if (!this.ownsTarget(token)) return;
       // Another mount may finish loading this journal while this read is pending.
       if (this.journals.has(instance.journalId)) {
         // Same adoption as the top mounted branch (gate 16 item 1), SCOPED to
@@ -5437,7 +5481,7 @@ class HubStore {
         // duplicate seed from an obsolete navigation (rapid A -> B -> A -> B)
         // must not certify the newest mount's machine. The winning mount's own
         // bracket settles the attempt when its socket is not live yet.
-        if (this.connection && mountAttemptId !== null && this.followSocketLive()) {
+        if (this.ownsTarget(token) && this.connection && mountAttemptId !== null && this.followSocketLive()) {
           this.connection.followAttemptLive(mountAttemptId, bindGen);
           return;
         }
@@ -5623,28 +5667,28 @@ class HubStore {
         history: { earliestRetainedSeq: seed.windowFromSeq ?? "1", complete: seed.reachedAfterSeq },
       });
       this.emit({ journalFloors: { ...this.state.journalFloors, [instanceId]: client.retainedFloorSeq } });
+      // Ruling Y: do not even open the socket for an owner superseded during
+      // the synchronous seed processing.
+      if (!this.ownsTarget(token)) return;
       await this.openFollowSocket(instance, client, last, {
         earliestRetainedSeq: seed.windowFromSeq ?? "1",
         complete: seed.reachedAfterSeq,
       });
-      // The seed AND the first subscribe succeeded for the CURRENT binding:
-      // certify the mount's attempt (a frame already may have). Scoped by the
-      // generation captured at bind time — a navigation that landed mid-mount
-      // makes this end a no-op.
-      if (this.connection && mountAttemptId !== null) {
+      // The seed AND the first subscribe succeeded for the CURRENT owner:
+      // certify the mount's attempt (a frame already may have). Ruling Y: a
+      // navigation that landed mid-subscribe makes this end a no-op — the
+      // socket's own frame/close handlers are journal-scoped as well.
+      if (this.ownsTarget(token) && this.connection && mountAttemptId !== null) {
         this.connection.followAttemptEnd(true, mountAttemptId, bindGen);
       }
-      // (connectionBoundTo/Journal were bound at the top of follow(), so the
-      // machine owns this session even when this first open failed offline.)
     } catch (err) {
       // Seed read or first subscribe failed: hand the failure to the machine
       // for the captured binding so the NORMAL retry path (probe -> stale/
       // offline -> reconnect reopen) owns recovery instead of leaving a
       // timer-less recovering. Rethrow: callers (and the resume chain awaiting
-      // follow()) must observe the failed mount as before.
-      if (this.connection && mountAttemptId !== null) {
-        this.connection.followAttemptEnd(false, mountAttemptId, bindGen);
-      }
+      // follow()) must observe the failed mount as before. A superseded mount's
+      // attempt was already retired by the newer target's noteBinding.
+      endMountFailed();
       throw err;
     }
   }
@@ -5786,7 +5830,7 @@ class HubStore {
   async catchup(instanceId: Id) {
     const instance = this.state.instances.find((i) => i.id === instanceId);
     if (!instance) return;
-    this.bindConnection(instanceId, instance.journalId);
+    this.acquireTarget(instanceId, instance.journalId);
     if (this.connection) {
       const client = this.journals.get(instance.journalId);
       // The 只读 banner Retry (and foreground catch-up) must heal a journal

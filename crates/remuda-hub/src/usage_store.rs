@@ -2242,9 +2242,13 @@ g_flow_messages AS (
          ),
          g_legacy_open_turns AS (
             -- A legacy (or NULL-identity) turn when NO scoped stock exists:
-            -- ordinary per-call flow.
+            -- ordinary per-call flow. Disjoint from g_proven_flow_turns: a
+            -- migration-tagged row that is lineage-QUALIFIED retained its
+            -- source_session_id through the upgrade and bills through the
+            -- proven branch alone (r37 item 2).
             SELECT t.* FROM global_winning_turns t
-            WHERE (
+            WHERE t.source_session_id IS NULL
+              AND (
                   COALESCE(t.lineage_state, '') = 'legacy'
                   OR t.scope_id IS NULL
               )
@@ -2257,8 +2261,12 @@ g_flow_messages AS (
          g_legacy_flow_turns AS (
             -- An identified pre-upgrade turn beside scoped stock bills when
             -- another per-call exists (Ruling B flow mode instance-wide).
+            -- source_session_id IS NULL keeps this disjoint from the proven
+            -- branch: a qualified retained lineage follows per-session
+            -- certification, never this instance-wide legacy path (r37 item 2).
             SELECT t.* FROM global_winning_turns t
             WHERE t.scope_id IS NOT NULL
+              AND t.source_session_id IS NULL
               AND COALESCE(t.lineage_state, '') = 'legacy'
               AND EXISTS (
                   SELECT 1 FROM global_scoped_sessions s
@@ -10365,6 +10373,176 @@ mod tests {
             )
             .unwrap();
         assert_eq!(row_count, 2, "the rejected replay added no row");
+    }
+
+    /// r37 item 2: a REAL upgrade from the pre-`lineage_state` schema tags
+    /// every retained row 'legacy', including turns that are lineage-QUALIFIED
+    /// by a retained `source_session_id`. Such a row belongs to the proven-flow
+    /// branch ALONE; it must never also match the unqualified legacy-open /
+    /// legacy-flow branches (their `UNION ALL` then counts it twice and the
+    /// flow branch stands unrelated stock down).
+    #[test]
+    fn a_migrated_lineage_qualified_turn_is_not_also_counted_as_legacy() {
+        // The c-ctxusage r28 shape: every column except the merge-introduced
+        // lineage_state (and usagefu's turn_id / native_context_window).
+        let create_r28 = "CREATE TABLE usage_events (
+            instance_id TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            profile_id TEXT,
+            model TEXT,
+            scope TEXT NOT NULL,
+            scope_id TEXT,
+            mode TEXT NOT NULL,
+            total_tokens INTEGER,
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            cache_read_tokens INTEGER,
+            cache_write_tokens INTEGER,
+            cost_usd TEXT,
+            accounting TEXT NOT NULL DEFAULT 'estimated',
+            observed_at TEXT NOT NULL,
+            observed_at_source TEXT NOT NULL DEFAULT 'ingest',
+            metric_revision INTEGER NOT NULL DEFAULT 1,
+            source_session_id TEXT,
+            PRIMARY KEY (instance_id, seq)
+         );";
+        let at = "2026-10-13T00:00:00.000Z";
+
+        // Instance A: one qualified turn, NO scoped stock — the legacy-OPEN
+        // overlap (double counted input/cost).
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(create_r28).unwrap();
+        conn.execute(
+            "INSERT INTO usage_events
+                (instance_id, seq, profile_id, model, scope, scope_id, mode,
+                 total_tokens, input_tokens, output_tokens,
+                 cache_read_tokens, cache_write_tokens, cost_usd, accounting,
+                 observed_at, observed_at_source, metric_revision,
+                 source_session_id)
+             VALUES ('ins_r37i2a', 1, 'pvp', 'm', 'turn', 'msg-1', 'snapshot',
+                 110, 100, 10, 0, 0, '1.00', 'estimated',
+                 ?1, 'native', 1, 'sess-1')",
+            params![at],
+        )
+        .unwrap();
+
+        // Instance B: a qualified turn beside an UNRELATED session's stock
+        // plus a live unqualified turn — the legacy-FLOW overlap.
+        conn.execute(
+            "INSERT INTO usage_events
+                (instance_id, seq, profile_id, model, scope, scope_id, mode,
+                 total_tokens, input_tokens, output_tokens,
+                 cache_read_tokens, cache_write_tokens, cost_usd, accounting,
+                 observed_at, observed_at_source, metric_revision,
+                 source_session_id)
+             VALUES ('ins_r37i2b', 1, 'pvp', 'm', 'turn', 'msg-1', 'snapshot',
+                 110, 100, 10, 0, 0, '1.00', 'estimated',
+                 ?1, 'native', 1, 'sess-1')",
+            params![at],
+        )
+        .unwrap();
+        // Cumulative stock for a DIFFERENT session than the turn's lineage.
+        conn.execute(
+            "INSERT INTO usage_events
+                (instance_id, seq, profile_id, model, scope, scope_id, mode,
+                 total_tokens, input_tokens, output_tokens,
+                 cache_read_tokens, cache_write_tokens, cost_usd, accounting,
+                 observed_at, observed_at_source, metric_revision,
+                 source_session_id)
+             VALUES ('ins_r37i2b', 2, 'pvp', 'm', 'session', 'sess-2',
+                 'snapshot',
+                 55, 50, 5, 0, 0, '0.50', 'estimated',
+                 ?1, 'native', 1, 'sess-2')",
+            params![at],
+        )
+        .unwrap();
+
+        // The real upgrade: retained rows are tagged, lineage retained.
+        migrate(&conn).unwrap();
+        let (state, sid): (String, Option<String>) = conn
+            .query_row(
+                "SELECT lineage_state, source_session_id FROM usage_events
+                 WHERE instance_id='ins_r37i2a'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "legacy");
+        assert_eq!(
+            sid.as_deref(),
+            Some("sess-1"),
+            "the lineage survives the tag"
+        );
+
+        // The other per-call on instance B: a LIVE unqualified turn (the live
+        // insert path leaves lineage_state NULL).
+        assert!(
+            insert_usage_event(
+                &conn,
+                &UsageEventRow {
+                    instance_id: "ins_r37i2b".into(),
+                    seq: 3,
+                    profile_id: Some("pvp".into()),
+                    model: Some("m".into()),
+                    scope: "turn".into(),
+                    scope_id: Some("msg-2".into()),
+                    turn_id: None,
+                    native_context_window: None,
+                    mode: "snapshot".into(),
+                    metric_revision: 1,
+                    source_session_id: None,
+                    total_tokens: Some(22),
+                    input_tokens: Some(20),
+                    output_tokens: Some(2),
+                    cache_read_tokens: Some(0),
+                    cache_write_tokens: Some(0),
+                    cost_usd: Some("0.20".into()),
+                    accounting: "estimated".into(),
+                    observed_at: at.into(),
+                    observed_at_source: "native".into(),
+                }
+            )
+            .unwrap()
+        );
+
+        // Instance A: the one qualified turn contributes exactly once.
+        let a = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_r37i2a",
+                kind: "claude",
+                spec_model: Some("m"),
+                effective_model: None,
+                profile_id: Some("pvp"),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(a.turns, 1, "one turn, not proven+legacy two");
+        assert_eq!(a.session_input_tokens, Some(100), "100, not 200");
+        assert_eq!(a.session_output_tokens, Some(10));
+        assert_eq!(a.cache_read_tokens, Some(0));
+        assert_eq!(a.cache_creation_tokens, Some(0));
+
+        // Instance B: qualified turn (100/10) plus the live unqualified turn
+        // (20/2) each once; the unrelated sess-2 stock stands down under the
+        // live turn's Ruling-B override, but the qualified turn must never be
+        // counted a second time through legacy-flow.
+        let b = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_r37i2b",
+                kind: "claude",
+                spec_model: Some("m"),
+                effective_model: None,
+                profile_id: Some("pvp"),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(b.turns, 2, "two turns, not a doubled qualified turn");
+        assert_eq!(b.session_input_tokens, Some(120), "100 + 20, not 220");
+        assert_eq!(b.session_output_tokens, Some(12), "10 + 2, not 22");
     }
 
     /// c-ctxusage r16 item 3 (T1'), regression 2: a qualified alpha frame at

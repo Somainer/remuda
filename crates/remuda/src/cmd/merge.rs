@@ -1131,12 +1131,18 @@ fn recovery_fetch_base_sha(repo: &Path, base: &str, deadline: Instant) -> Result
     #[cfg(test)]
     recovery_read_park(repo);
     // 2. Fetch the objects of THAT commit with an object-ID refspec and no
-    // destination: no ref writes, --no-tags defeats tagOpt=--tags.
+    //    destination. An empty --refmap ignores configured remote.origin.fetch
+    //    mappings (a destination-less CLI refspec alone does not), so a
+    //    configured `+<sha>:refs/tags/x` cannot force-write x; --no-prune
+    //    neutralises fetch.prune / remote.origin.prune; --no-tags defeats a
+    //    configured tagOpt=--tags clobber.
     recovery_git(
         repo,
         &[
             "fetch",
             "--no-tags",
+            "--no-prune",
+            "--refmap=",
             "--no-write-fetch-head",
             "origin",
             &remote_tip,
@@ -2579,6 +2585,66 @@ mod tests {
             refs_listing(&full),
             before,
             "either recovery created, updated or deleted no ref"
+        );
+        drop(keep);
+    }
+
+    /// R10 r31 item 1: configured SHA-source remote.origin.fetch mappings and
+    /// fetch.prune must not write or prune refs during the destination-less
+    /// recovery fetch (empty --refmap + --no-prune). Destination absent,
+    /// destination existing, and stale tracking ref under prune=true.
+    #[test]
+    fn configured_fetch_mappings_and_prune_write_no_refs_during_recovery() {
+        let (keep, full, base_b, merge_m, _remote_r) = divergence_fixture();
+        // Put M on remote main so recovery certifies Landed: merge the
+        // divergent R back into M, publish D.
+        tgit_ok(&full, &["fetch", "-q", "origin"]);
+        tgit_ok(&full, &["merge", "-q", "--no-ff", "-m", "D", "origin/main"]);
+        tgit_ok(&full, &["push", "-q", "origin", "main"]);
+
+        // (a) destination ABSENT
+        tgit_ok(
+            &full,
+            &[
+                "config",
+                "--add",
+                "remote.origin.fetch",
+                &format!("+{merge_m}:refs/tags/keep"),
+            ],
+        );
+        let before = refs_listing(&full);
+        push_main_cas(&full, &merge_m, &base_b).expect("M is contained in remote main: Landed");
+        assert_eq!(
+            refs_listing(&full),
+            before,
+            "absent destination must not be created"
+        );
+        assert!(
+            tgit(
+                &full,
+                &["rev-parse", "--verify", "--quiet", "refs/tags/keep"]
+            )
+            .status
+            .code()
+                != Some(0)
+        );
+
+        // (b) destination EXISTING at B
+        tgit_ok(&full, &["tag", "keep", &base_b]);
+        let before = refs_listing(&full);
+        push_main_cas(&full, &merge_m, &base_b).expect("Landed");
+        assert_eq!(refs_listing(&full), before);
+        assert_eq!(tgit_ok(&full, &["rev-parse", "refs/tags/keep"]), base_b);
+
+        // (c) fetch.prune=true with a stale tracking ref
+        tgit_ok(&full, &["config", "fetch.prune", "true"]);
+        tgit_ok(&full, &["update-ref", "refs/remotes/origin/gone", &base_b]);
+        let before = refs_listing(&full);
+        push_main_cas(&full, &merge_m, &base_b).expect("Landed");
+        assert_eq!(
+            refs_listing(&full),
+            before,
+            "stale tracking ref must survive"
         );
         drop(keep);
     }

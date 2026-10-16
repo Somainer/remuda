@@ -4332,14 +4332,20 @@ fn recovery_fetch_base_sha(
     // remote tip deterministically while a second recovery is in flight.
     #[cfg(test)]
     recovery_read_park(repo);
-    // 2. Fetch the objects of THAT commit with an explicit object-ID
-    // refspec and NO destination: git writes no ref, --no-tags defeats a
-    // configured tagOpt=--tags clobber, and FETCH_HEAD is never written. A
-    // tip that moved so the SHA is no longer fetchable fails here → Unknown.
+    // 2. Fetch the objects of THAT commit with an explicit object-ID refspec
+    //    and no destination. An empty --refmap makes git ignore ALL configured
+    //    remote.origin.fetch mappings — a destination-less command-line refspec
+    //    alone does NOT disable them (a configured `+<sha>:refs/tags/x` would
+    //    otherwise force-write x); --no-prune neutralises fetch.prune /
+    //    remote.origin.prune so no stale remote-tracking ref is deleted.
+    //    --no-tags defeats a configured tagOpt=--tags clobber. A tip that moved
+    //    so the SHA is no longer fetchable fails here → Unknown.
     owned(
         &[
             "fetch",
             "--no-tags",
+            "--no-prune",
+            "--refmap=",
             "--no-write-fetch-head",
             "origin",
             &sha,
@@ -9800,6 +9806,95 @@ head -c 1 >/dev/null || exit 4
         assert_eq!(
             second.status, "landed",
             "M is contained in release/v2 with no local ref collision: {second:?}"
+        );
+    }
+
+    /// R10 r31 item 1: a configured SHA-source remote.origin.fetch mapping
+    /// (`+<sha>:refs/tags/keep`) must NOT write its destination during a
+    /// destination-less recovery fetch — the empty --refmap ignores configured
+    /// mappings. Covered with the destination (a) absent and (b) already
+    /// pointing elsewhere; fetch.prune=true plus a stale tracking ref must also
+    /// leave the full ref listing byte-identical.
+    #[cfg(unix)]
+    #[test]
+    fn configured_fetch_mappings_and_prune_write_no_refs_during_recovery() {
+        let (_dir, _bare, lane, base_b) = recovery_branch_fixture("main", None);
+        let seed = _dir.path().join("seed");
+        // Remote main advances to M containing B.
+        std::fs::write(seed.join("m.txt"), "M\n").unwrap();
+        git(&seed, &["add", "m.txt"]);
+        git(&seed, &["commit", "-q", "-m", "M"]);
+        let merge_m = git(&seed, &["rev-parse", "main"]);
+        git(&seed, &["push", "-q", "origin", "main"]);
+
+        // (a) Destination ABSENT.
+        git(
+            &lane,
+            &[
+                "config",
+                "--add",
+                "remote.origin.fetch",
+                &format!("+{merge_m}:refs/tags/keep"),
+            ],
+        );
+        let before = refs_listing(&lane);
+        let request = remuda_protocol::GateResolveLandingParams {
+            job_id: "gjb_r31_map_absent".into(),
+            repo_path: lane.to_string_lossy().into_owned(),
+            base_branch: "main".into(),
+            merge_sha: merge_m.clone(),
+        };
+        let reply = super::resolve_landing_after_restart(&request, true);
+        assert_eq!(reply.status, "landed", "{reply:?}");
+        assert_eq!(
+            refs_listing(&lane),
+            before,
+            "an absent configured destination must not be created"
+        );
+        assert!(
+            block_git(
+                &lane,
+                &["rev-parse", "--verify", "--quiet", "refs/tags/keep"]
+            )
+            .is_err(),
+            "refs/tags/keep must not exist"
+        );
+
+        // (b) Destination EXISTING at B: must not be force-updated to M.
+        git(&lane, &["tag", "keep", &base_b]);
+        let before = refs_listing(&lane);
+        let request = remuda_protocol::GateResolveLandingParams {
+            job_id: "gjb_r31_map_existing".into(),
+            repo_path: lane.to_string_lossy().into_owned(),
+            base_branch: "main".into(),
+            merge_sha: merge_m.clone(),
+        };
+        let reply = super::resolve_landing_after_restart(&request, true);
+        assert_eq!(reply.status, "landed", "{reply:?}");
+        assert_eq!(refs_listing(&lane), before);
+        assert_eq!(
+            git(&lane, &["rev-parse", "refs/tags/keep"]),
+            base_b,
+            "the existing tag must not be force-updated"
+        );
+
+        // (c) fetch.prune=true with a stale remote-tracking ref: --no-prune
+        // keeps it.
+        git(&lane, &["config", "fetch.prune", "true"]);
+        git(&lane, &["update-ref", "refs/remotes/origin/gone", &base_b]);
+        let before = refs_listing(&lane);
+        let request = remuda_protocol::GateResolveLandingParams {
+            job_id: "gjb_r31_prune".into(),
+            repo_path: lane.to_string_lossy().into_owned(),
+            base_branch: "main".into(),
+            merge_sha: merge_m.clone(),
+        };
+        let reply = super::resolve_landing_after_restart(&request, true);
+        assert_eq!(reply.status, "landed", "{reply:?}");
+        assert_eq!(
+            refs_listing(&lane),
+            before,
+            "a stale tracking ref must survive despite fetch.prune=true"
         );
     }
 

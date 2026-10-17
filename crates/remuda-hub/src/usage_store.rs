@@ -1018,26 +1018,55 @@ fn reconstruct_fallback_projection_from_journal(conn: &Connection) -> rusqlite::
     // journal row carries the field; bare U64 scalars arrive as decimal
     // strings and are CAST to integers (guarded > 0 so garbage never zeroes a
     // stored positive value).
+    //
+    // r42 (AB1 completion): for TURN rows the journal frame's window/clock are
+    // applied only when the frame reports token baskets. A strictly-newer
+    // COST-ONLY correction is the live upsert's billing channel: the shared
+    // reconcile rule deliberately keeps the retained window and clock and
+    // advances only position/lineage/bill. Unconditional COALESCE here let a
+    // later migration fill those fields from the correction's journal record
+    // (restart != live; migration twice not idempotent). Counter frames, and
+    // Message/Session rows (whose live path COALESCEs attribution), keep the
+    // old fill-missing behaviour.
+    let journal_match = "j.instance_id = usage_events.instance_id
+                   AND j.seq = usage_events.seq
+                   AND json_valid(j.payload_json)
+                   AND json_extract(j.payload_json, '$.kind') = 'usage'";
+    // True when THIS row is a turn whose journal frame reports no additive
+    // token basket — i.e. it is the cost-only/billing channel.
+    let turn_cost_only =
+        "scope = 'turn' AND NOT EXISTS (
+                     SELECT 1 FROM journal jc
+                     WHERE jc.instance_id = usage_events.instance_id
+                       AND jc.seq = usage_events.seq
+                       AND json_valid(jc.payload_json)
+                       AND json_extract(jc.payload_json, '$.kind') = 'usage'
+                       AND (
+                           json_extract(jc.payload_json, '$.payload.inputTokens.state') IS NOT NULL
+                        OR json_extract(jc.payload_json, '$.payload.outputTokens.state') IS NOT NULL
+                        OR json_extract(jc.payload_json, '$.payload.cacheReadTokens.state') IS NOT NULL
+                        OR json_extract(jc.payload_json, '$.payload.cacheWriteTokens.state') IS NOT NULL
+                       )
+                 )";
     conn.execute(
-        "UPDATE usage_events
+        &format!(
+            "UPDATE usage_events
          SET turn_id = COALESCE(turn_id, (
                  SELECT json_extract(j.payload_json, '$.source.nativeTurnId.value')
                  FROM journal j
-                 WHERE j.instance_id = usage_events.instance_id
-                   AND j.seq = usage_events.seq
-                   AND json_valid(j.payload_json)
-                   AND json_extract(j.payload_json, '$.kind') = 'usage'
+                 WHERE {journal_match}
                    AND json_extract(j.payload_json, '$.source.nativeTurnId.value') IS NOT NULL
              )),
-             native_context_window = COALESCE(native_context_window, (
-                 SELECT CAST(json_extract(j.payload_json, '$.payload.contextWindow') AS INTEGER)
-                 FROM journal j
-                 WHERE j.instance_id = usage_events.instance_id
-                   AND j.seq = usage_events.seq
-                   AND json_valid(j.payload_json)
-                   AND json_extract(j.payload_json, '$.kind') = 'usage'
-                   AND CAST(json_extract(j.payload_json, '$.payload.contextWindow') AS INTEGER) > 0
-             )),
+             native_context_window = CASE
+                 -- Cost-only turn correction: keep the retained window.
+                 WHEN {turn_cost_only} THEN native_context_window
+                 ELSE COALESCE(native_context_window, (
+                     SELECT CAST(json_extract(j.payload_json, '$.payload.contextWindow') AS INTEGER)
+                     FROM journal j
+                     WHERE {journal_match}
+                       AND CAST(json_extract(j.payload_json, '$.payload.contextWindow') AS INTEGER) > 0
+                 ))
+             END,
              metric_revision = CASE
                  -- r38 item 1: raise ONLY. A durable Message keeps its original
                  -- stored sequence across revisions while the journal record at
@@ -1066,35 +1095,32 @@ fn reconstruct_fallback_projection_from_journal(conn: &Connection) -> rusqlite::
              END,
              observed_at = CASE
                  WHEN observed_at_source = 'native' THEN observed_at
+                 -- Cost-only turn correction: keep the retained clock.
+                 WHEN {turn_cost_only} THEN observed_at
                  ELSE COALESCE((
                      SELECT json_extract(j.payload_json, '$.nativeAt.value')
                      FROM journal j
-                     WHERE j.instance_id = usage_events.instance_id
-                       AND j.seq = usage_events.seq
-                       AND json_valid(j.payload_json)
-                       AND json_extract(j.payload_json, '$.kind') = 'usage'
+                     WHERE {journal_match}
                        AND json_extract(j.payload_json, '$.nativeAt.value') IS NOT NULL
                  ), observed_at)
              END,
              observed_at_source = CASE
                  WHEN observed_at_source = 'native' THEN 'native'
+                 WHEN {turn_cost_only} THEN observed_at_source
                  WHEN EXISTS (
                      SELECT 1 FROM journal j
-                     WHERE j.instance_id = usage_events.instance_id
-                       AND j.seq = usage_events.seq
-                       AND json_valid(j.payload_json)
-                       AND json_extract(j.payload_json, '$.kind') = 'usage'
+                     WHERE {journal_match}
                        AND json_extract(j.payload_json, '$.nativeAt.value') IS NOT NULL
                  ) THEN 'native'
                  ELSE observed_at_source
              END
          WHERE EXISTS (
              SELECT 1 FROM journal j
-             WHERE j.instance_id = usage_events.instance_id
-               AND j.seq = usage_events.seq
-               AND json_valid(j.payload_json)
-               AND json_extract(j.payload_json, '$.kind') = 'usage'
+             WHERE {journal_match}
          )",
+        journal_match = journal_match,
+        turn_cost_only = turn_cost_only,
+        ),
         [],
     )?;
     Ok(())
@@ -12603,6 +12629,7 @@ mod tests {
             let mut payload = serde_json::Map::new();
             payload.insert("scope".into(), json!("turn"));
             payload.insert("scopeId".into(), json!("msg-T"));
+            payload.insert("sourceSessionId".into(), json!("sess-S"));
             payload.insert("mode".into(), json!("snapshot"));
             payload.insert("metricRevision".into(), json!(revision));
             payload.insert("accounting".into(), json!("estimated"));
@@ -13113,6 +13140,7 @@ mod tests {
             let mut payload = serde_json::Map::new();
             payload.insert("scope".into(), json!("turn"));
             payload.insert("scopeId".into(), json!("msg-T"));
+            payload.insert("sourceSessionId".into(), json!("sess-S"));
             payload.insert("mode".into(), json!("snapshot"));
             payload.insert("metricRevision".into(), json!(revision));
             payload.insert("accounting".into(), json!("estimated"));
@@ -13255,6 +13283,294 @@ mod tests {
             assert_eq!(inst.budget_status(Some(0.02)), BudgetStatus::Stop);
             assert_eq!(supply.budget_status(Some(0.02)), BudgetStatus::Stop);
         }
+    }
+
+    /// The FULL surviving turn row (everything except rowid and the advanced
+    /// seq, which both paths set from the correction): reconciliation must be
+    /// identical live and recovered.
+    fn r42_full_turn_row(conn: &Connection, instance: &str) -> Vec<String> {
+        conn.prepare(
+            "SELECT metric_revision, profile_id, model, mode, scope_id, turn_id,
+                    scope, total_tokens, input_tokens, output_tokens,
+                    cache_read_tokens, cache_write_tokens, cost_usd, accounting,
+                    observed_at, observed_at_source, native_context_window,
+                    COALESCE(lineage_state,''), source_session_id
+             FROM usage_events
+             WHERE instance_id = ?1 AND scope = 'turn'",
+        )
+        .unwrap()
+        .query_row(params![instance], |r| {
+            (0..19)
+                .map(|i| {
+                    let v = r.get_ref(i)?;
+                    Ok::<_, rusqlite::Error>(match v {
+                        rusqlite::types::ValueRef::Null => "<NULL>".to_string(),
+                        rusqlite::types::ValueRef::Integer(i) => i.to_string(),
+                        rusqlite::types::ValueRef::Real(f) => f.to_string(),
+                        other => other.as_str().unwrap_or("<blob>").to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap()
+    }
+
+    /// r42 item 2a (AB1 completion), live -> restart: a strictly-newer
+    /// COST-ONLY correction carries a contextWindow and a native time, but
+    /// live reconciliation keeps the retained missing window and ingest clock
+    /// (the counter frame had neither). Restart reconstruction must not fill
+    /// them from the correction's journal record — restart equals live.
+    #[test]
+    fn restart_reconstruction_never_installs_a_cost_only_corrections_window_or_clock() {
+        let journal_payload = |seq: i64, revision: &str, kind: &str| {
+            let mut payload = serde_json::Map::new();
+            payload.insert("scope".into(), json!("turn"));
+            payload.insert("scopeId".into(), json!("msg-T"));
+            payload.insert("sourceSessionId".into(), json!("sess-S"));
+            payload.insert("mode".into(), json!("snapshot"));
+            payload.insert("metricRevision".into(), json!(revision));
+            payload.insert("accounting".into(), json!("estimated"));
+            if kind == "counters" {
+                payload.insert(
+                    "totalTokens".into(),
+                    json!({"state":"known","value":"500000"}),
+                );
+                payload.insert(
+                    "inputTokens".into(),
+                    json!({"state":"known","value":"500000"}),
+                );
+                payload.insert("outputTokens".into(), json!({"state":"known","value":"0"}));
+                payload.insert(
+                    "cacheReadTokens".into(),
+                    json!({"state":"known","value":"0"}),
+                );
+                payload.insert(
+                    "cacheWriteTokens".into(),
+                    json!({"state":"known","value":"0"}),
+                );
+            } else {
+                // Cost-only correction: bill, window and native time but NO
+                // token baskets.
+                payload.insert("contextWindow".into(), json!(1_000_000));
+                payload.insert(
+                    "cost".into(),
+                    json!({
+                        "state":"known",
+                        "value":{"amount":"0.03","currency":"USD"}
+                    }),
+                );
+            }
+            let mut event = serde_json::Map::new();
+            event.insert("kind".into(), json!("usage"));
+            event.insert("payload".into(), Value::Object(payload));
+            event.insert(
+                "source".into(),
+                json!({
+                    "nativeSessionId": {"state":"known","value":"sess-S"},
+                    "nativeTurnId": {"state":"known","value":"msg-T"}
+                }),
+            );
+            // Only the counter frame carries a native time — and this case
+            // deliberately gives it none, so its stored clock is ingest.
+            if seq == 2 {
+                event.insert(
+                    "nativeAt".into(),
+                    json!({"state":"known","value":"2026-10-18T00:00:01.000Z"}),
+                );
+            }
+            Value::Object(event)
+        };
+
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        create_journal_table(&conn);
+        for (seq, rev, kind, stamp) in [
+            (1i64, "1", "counters", "2026-10-18T00:00:00.000Z"),
+            (2, "2", "costonly", "2026-10-18T00:00:01.000Z"),
+        ] {
+            let event = journal_payload(seq, rev, kind);
+            let record = JournalRecord {
+                instance_id: "ins_r42i2a".into(),
+                seq,
+                event_id: format!("je{seq}"),
+                event: event.clone(),
+                observed_at: stamp.into(),
+            };
+            insert_journal_raw(&conn, &record);
+            let row = project_usage_event(&record, Some("pvp"), Some("m")).unwrap();
+            insert_usage_event(&conn, &row).unwrap();
+        }
+
+        // Live reconciliation: missing window and ingest clock are retained.
+        let before = r42_full_turn_row(&conn, "ins_r42i2a");
+        assert_eq!(before[16], "<NULL>", "live keeps the retained NULL window");
+        assert_eq!(before[15], "ingest", "live keeps the retained ingest clock");
+        assert_eq!(before[14], "2026-10-18T00:00:00.000Z");
+
+        // Restart: reconstruction runs again against the single reconciled
+        // row (whose seq now points at the correction's journal entry).
+        migrate(&conn).unwrap();
+        let after = r42_full_turn_row(&conn, "ins_r42i2a");
+        assert_eq!(
+            before, after,
+            "restart changes nothing the live reconciliation deliberately kept"
+        );
+
+        // The rollup does NOT fabricate a 1M native window.
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_r42i2a",
+                kind: "codex",
+                spec_model: Some("totally-unknown-model"),
+                effective_model: None,
+                profile_id: Some("pvp"),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        // The rollup falls back to the codex KIND window (200k) — the
+        // correction's 1M native window never leaks in.
+        assert_eq!(
+            rollup.context_window_tokens,
+            Some(200_000),
+            "no leaked native 1M window after restart"
+        );
+        assert_eq!(
+            rollup.context_used_tokens,
+            Some(500_000),
+            "the counter frame's context basket survives"
+        );
+    }
+
+    /// r42 item 2b (AB1 completion), fallback -> migration -> migration: two
+    /// legacy rows (counter frame, then a cost-only correction carrying a
+    /// window/native time) are recovered through the journal. Both migrations
+    /// must leave the retained missing window and ingest clock exactly as the
+    /// live path does — the second migration is idempotent.
+    #[test]
+    fn fallback_recovery_twice_keeps_the_retained_window_and_clock_idempotent() {
+        let build = || -> Connection {
+            let conn = Connection::open_in_memory().unwrap();
+            create_r28_usage_table_with_turn_index(&conn);
+            create_journal_table(&conn);
+            // Established fallback row: counters, no window column on r28,
+            // ingest clock t0.
+            conn.execute(
+                "INSERT INTO usage_events
+                    (instance_id, seq, profile_id, model, scope, scope_id, mode,
+                     metric_revision, source_session_id, total_tokens, input_tokens,
+                     output_tokens, cache_read_tokens, cache_write_tokens,
+                     accounting, observed_at, observed_at_source)
+                 VALUES ('ins_r42i2b', 1, 'pvp', 'm', 'turn', 'msg-T', 'snapshot',
+                     1, 'sess-S', 500000, 500000, 0, 0, 0,
+                     'estimated', '2026-10-18T00:00:00.000Z', 'ingest')",
+                [],
+            )
+            .unwrap();
+            // Cost-only fallback append at seq2 (14-column shape).
+            conn.execute(
+                "INSERT INTO usage_events
+                    (instance_id, seq, profile_id, model, scope, mode, cost_usd,
+                     accounting, observed_at)
+                 VALUES ('ins_r42i2b', 2, 'pvp', 'm', 'turn', 'snapshot', '0.03',
+                     'estimated', '2026-10-18T00:00:01.000Z')",
+                [],
+            )
+            .unwrap();
+            let journal = |seq: i64, kind: &str| {
+                let mut payload = serde_json::Map::new();
+                payload.insert("scope".into(), json!("turn"));
+                payload.insert("scopeId".into(), json!("msg-T"));
+                payload.insert("sourceSessionId".into(), json!("sess-S"));
+                payload.insert("mode".into(), json!("snapshot"));
+                payload.insert("metricRevision".into(), json!(seq.to_string()));
+                payload.insert("accounting".into(), json!("estimated"));
+                if kind == "counters" {
+                    payload.insert(
+                        "totalTokens".into(),
+                        json!({"state":"known","value":"500000"}),
+                    );
+                    payload.insert(
+                        "inputTokens".into(),
+                        json!({"state":"known","value":"500000"}),
+                    );
+                    payload.insert("outputTokens".into(), json!({"state":"known","value":"0"}));
+                    payload.insert(
+                        "cacheReadTokens".into(),
+                        json!({"state":"known","value":"0"}),
+                    );
+                    payload.insert(
+                        "cacheWriteTokens".into(),
+                        json!({"state":"known","value":"0"}),
+                    );
+                } else {
+                    payload.insert("contextWindow".into(), json!(1_000_000));
+                    payload.insert(
+                        "cost".into(),
+                        json!({
+                            "state":"known",
+                            "value":{"amount":"0.03","currency":"USD"}
+                        }),
+                    );
+                }
+                let mut event = serde_json::Map::new();
+                event.insert("kind".into(), json!("usage"));
+                event.insert("payload".into(), Value::Object(payload));
+                event.insert(
+                    "source".into(),
+                    json!({
+                        "nativeSessionId": {"state":"known","value":"sess-S"},
+                        "nativeTurnId": {"state":"known","value":"msg-T"}
+                    }),
+                );
+                if seq == 2 {
+                    event.insert(
+                        "nativeAt".into(),
+                        json!({"state":"known","value":"2026-10-18T00:00:01.000Z"}),
+                    );
+                }
+                Value::Object(event)
+            };
+            for (seq, kind, stamp) in [
+                (1i64, "counters", "2026-10-18T00:00:00.000Z"),
+                (2, "costonly", "2026-10-18T00:00:01.000Z"),
+            ] {
+                let p = journal(seq, kind);
+                conn.execute(
+                    "INSERT INTO journal (instance_id, seq, event_id, payload_json, observed_at)
+                     VALUES ('ins_r42i2b', ?1, ?2, ?3, ?4)",
+                    params![seq, format!("je{seq}"), p.to_string(), stamp],
+                )
+                .unwrap();
+            }
+            conn
+        };
+
+        let conn = build();
+        migrate(&conn).unwrap();
+        let once = r42_full_turn_row(&conn, "ins_r42i2b");
+        assert_eq!(
+            once[16], "<NULL>",
+            "first migration keeps the retained NULL window"
+        );
+        assert_eq!(once[15], "ingest", "first migration keeps the ingest clock");
+        assert_eq!(once[14], "2026-10-18T00:00:00.000Z");
+        assert_eq!(once[12], "0.03", "the correction bill survives");
+        assert_eq!(once[8], "500000", "counters carry forward");
+
+        // Second migration must be idempotent — no window/clock leak from the
+        // surviving correction's journal entry.
+        migrate(&conn).unwrap();
+        let twice = r42_full_turn_row(&conn, "ins_r42i2b");
+        assert_eq!(once, twice, "migration twice is idempotent");
+
+        let inst = aggregate_instance(&conn, "ins_r42i2b").unwrap();
+        let supply = aggregate_supply(&conn, "pvp", "m").unwrap();
+        assert!((inst.cost_usd.unwrap() - 0.03).abs() < 1e-9);
+        assert_eq!(inst.cost_usd, supply.cost_usd);
+        assert_eq!(inst.input_tokens, Some(500_000));
+        assert_eq!(inst.input_tokens, supply.input_tokens);
     }
 
     /// r37 item 3: on an upgrade from the schema that ALREADY carried

@@ -582,25 +582,149 @@ fn clear_disagreeing_recovered_turn_keys(conn: &Connection) -> rusqlite::Result<
 /// and the replay carries the native timestamp/revision the read model uses;
 /// keeping the older durable row would silently change the fold and the
 /// native-time windows.
-/// One recovered turn row participating in lineage collapse, ordered by live
-/// authority (highest revision, then seq/rowid) within its partition.
-struct CollapseTurnRow {
-    rowid: i64,
-    #[allow(dead_code)]
+/// One turn frame participating in reconciliation — either the live lineage
+/// row plus an incoming frame ([`upsert_turn_snapshot`]) or the ordered
+/// recovered rows of one lineage (migration collapse). The reconciliation rule
+/// is [`reconcile_turn_frame`] in BOTH directions: r40 AB1 leaves exactly one
+/// turn/session reconcile code path for live insert, migration, recovery and
+/// fallback.
+#[derive(Clone, Debug)]
+struct TurnFrame {
+    /// Durable row id when this frame is already persisted (the stored live
+    /// row, or a recovered row); the reconciled result targets the newest
+    /// authority frame's row id.
+    rowid: Option<i64>,
+    seq: i64,
+    profile_id: Option<String>,
+    model: Option<String>,
+    mode: String,
     revision: i64,
-    total: Option<i64>,
-    input: Option<i64>,
-    output: Option<i64>,
-    cache_read: Option<i64>,
-    cache_write: Option<i64>,
-    cost: Option<String>,
+    source_session_id: Option<String>,
+    counters: SnapshotCounters,
+    cost_usd: Option<String>,
+    accounting: String,
     observed_at: String,
     observed_at_source: String,
 }
 
+/// Reconcile an AUTHORITATIVELY-NEWER incoming frame over the retained frame,
+/// returning the frame the surviving row must hold. The CALLER guarantees
+/// authority:
+///
+/// * live insertion — a strictly higher `metric_revision` within the lineage
+///   (the stale-position gate runs before this; equal/older positions change
+///   nothing and never reach here);
+/// * migration collapse — revision DESC, then seq/rowid DESC (seq breaks ties
+///   of equal revision for imported duplicate rows, the AA1 rule).
+///
+/// Two channels, exactly the live semantics documented on
+/// [`upsert_turn_snapshot`]:
+///
+/// * a STRICTLY-NEWER COST-ONLY frame (no token basket reported) is a billing
+///   correction: it advances sequence/revision/lineage and the bill (an
+///   unreported bill keeps the stored one) but carries ALL five counters — a
+///   known total over still-incomplete baskets included — and the turn clock
+///   forward UNCHANGED, along with profile/model/mode/accounting;
+/// * a frame reporting counters merges basket gaps with [`SnapshotCounters::merged_over`],
+///   takes the bill unless it omitted one, follows the newer snapshot's clock
+///   (an ingest fallback never overwrites a retained native time), and carries
+///   profile/model/mode/accounting.
+fn reconcile_turn_frame(stored: &TurnFrame, incoming: &TurnFrame) -> TurnFrame {
+    let reports_counters = incoming
+        .counters
+        .token_baskets()
+        .iter()
+        .any(Option::is_some);
+    // Cost-only channel defaults: keep every stored attribution except the
+    // advanced position/lineage and the COALESCE bill.
+    let mut reconciled = TurnFrame {
+        rowid: incoming.rowid.or(stored.rowid),
+        seq: incoming.seq,
+        profile_id: stored.profile_id.clone(),
+        model: stored.model.clone(),
+        mode: stored.mode.clone(),
+        revision: incoming.revision,
+        source_session_id: incoming.source_session_id.clone(),
+        counters: stored.counters,
+        cost_usd: incoming
+            .cost_usd
+            .clone()
+            .or_else(|| stored.cost_usd.clone()),
+        accounting: stored.accounting.clone(),
+        observed_at: stored.observed_at.clone(),
+        observed_at_source: stored.observed_at_source.clone(),
+    };
+    if !reports_counters {
+        return reconciled;
+    }
+    // Counter channel: merge the incoming authoritative baskets over the
+    // retained gaps, take the newer attribution, move the clock under the
+    // native-trust rule.
+    reconciled.counters = incoming.counters.merged_over(&stored.counters);
+    reconciled.profile_id = incoming.profile_id.clone();
+    reconciled.model = incoming.model.clone();
+    reconciled.mode = incoming.mode.clone();
+    reconciled.accounting = incoming.accounting.clone();
+    if incoming.observed_at_source == "native" || stored.observed_at_source != "native" {
+        reconciled.observed_at = incoming.observed_at.clone();
+        reconciled.observed_at_source = incoming.observed_at_source.clone();
+    }
+    reconciled
+}
+
+/// Persist a reconciled frame onto its target row (the newest authority
+/// frame's row id), scoped by rowid — never by the nullable
+/// `(instance, scope_id)` key.
+fn persist_reconciled_turn(conn: &Connection, frame: &TurnFrame) -> rusqlite::Result<()> {
+    let rowid = frame
+        .rowid
+        .expect("a reconciled turn frame always targets a persisted row");
+    conn.execute(
+        "UPDATE usage_events SET
+            seq = ?1,
+            profile_id = ?2,
+            model = ?3,
+            mode = ?4,
+            metric_revision = ?5,
+            source_session_id = ?6,
+            total_tokens = ?7,
+            input_tokens = ?8,
+            output_tokens = ?9,
+            cache_read_tokens = ?10,
+            cache_write_tokens = ?11,
+            cost_usd = ?12,
+            accounting = ?13,
+            observed_at = ?14,
+            observed_at_source = ?15
+         WHERE rowid = ?16",
+        params![
+            frame.seq,
+            frame.profile_id,
+            frame.model,
+            frame.mode,
+            frame.revision,
+            frame.source_session_id,
+            frame.counters.total,
+            frame.counters.input,
+            frame.counters.output,
+            frame.counters.cache_read,
+            frame.counters.cache_write,
+            frame.cost_usd,
+            frame.accounting,
+            frame.observed_at,
+            frame.observed_at_source,
+            rowid,
+        ],
+    )?;
+    Ok(())
+}
+
 /// Within one turn lineage `(instance_id, scope_id, COALESCE(source_session_id,
 /// '')) reconcile duplicate recovered rows using EXACTLY the live insertion
-/// rule (r39 item 1 / AA1, c-ctxusage r16):
+/// rule (r39 item 1 / AA1; r40 AB1 — the shared
+/// [`reconcile_turn_frame`]/[`persist_reconciled_turn`] path, so a cost-only
+/// recovery carries counters and the native clock exactly like a live
+/// billing correction):
 ///
 /// * the surviving row is the strictly-highest `metric_revision`; `seq` (then
 ///   rowid) only breaks ties of EQUAL revision — a later-ingestion STALE replay
@@ -613,30 +737,39 @@ struct CollapseTurnRow {
 ///   all-known basket (U1);
 /// * an ingest clock never replaces a retained native timestamp.
 fn collapse_duplicate_turn_lineage_rows(conn: &Connection) -> rusqlite::Result<usize> {
-    let mut stmt = conn.prepare(
-        "SELECT rowid, metric_revision, total_tokens, input_tokens, output_tokens,
-                cache_read_tokens, cache_write_tokens, cost_usd,
-                observed_at, observed_at_source
-         FROM usage_events
-         WHERE scope = 'turn' AND scope_id IS NOT NULL
-         ORDER BY instance_id, scope_id, COALESCE(source_session_id, ''),
-                  metric_revision DESC, seq DESC, rowid DESC",
-    )?;
-    let ordered: Vec<CollapseTurnRow> = stmt
-        .query_map([], |r| {
-            Ok(CollapseTurnRow {
-                rowid: r.get(0)?,
-                revision: r.get(1)?,
-                total: r.get(2)?,
-                input: r.get(3)?,
-                output: r.get(4)?,
-                cache_read: r.get(5)?,
-                cache_write: r.get(6)?,
-                cost: r.get(7)?,
-                observed_at: r.get(8)?,
-                observed_at_source: r.get(9)?,
-            })
-        })?
+    let select = "SELECT rowid, seq, profile_id, model, mode, metric_revision,
+                         source_session_id, total_tokens, input_tokens, output_tokens,
+                         cache_read_tokens, cache_write_tokens, cost_usd, accounting,
+                         observed_at, observed_at_source
+                  FROM usage_events
+                  WHERE scope = 'turn' AND scope_id IS NOT NULL
+                  ORDER BY instance_id, scope_id, COALESCE(source_session_id, ''),
+                           metric_revision DESC, seq DESC, rowid DESC";
+    let map_frame = |r: &rusqlite::Row<'_>| {
+        Ok(TurnFrame {
+            rowid: Some(r.get(0)?),
+            seq: r.get(1)?,
+            profile_id: r.get(2)?,
+            model: r.get(3)?,
+            mode: r.get(4)?,
+            revision: r.get(5)?,
+            source_session_id: r.get(6)?,
+            counters: SnapshotCounters {
+                total: r.get(7)?,
+                input: r.get(8)?,
+                output: r.get(9)?,
+                cache_read: r.get(10)?,
+                cache_write: r.get(11)?,
+            },
+            cost_usd: r.get(12)?,
+            accounting: r.get(13)?,
+            observed_at: r.get(14)?,
+            observed_at_source: r.get(15)?,
+        })
+    };
+    let mut stmt = conn.prepare(select)?;
+    let ordered: Vec<TurnFrame> = stmt
+        .query_map([], map_frame)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
     let mut keys = conn.prepare(
@@ -653,7 +786,7 @@ fn collapse_duplicate_turn_lineage_rows(conn: &Connection) -> rusqlite::Result<u
 
     let mut deleted = 0usize;
     let mut cur: Option<(String, String, String)> = None;
-    let mut group: Vec<CollapseTurnRow> = Vec::new();
+    let mut group: Vec<TurnFrame> = Vec::new();
     for (row, key) in ordered.into_iter().zip(keyed) {
         if Some(&key) != cur.as_ref() {
             deleted += collapse_one_turn_lineage(conn, &mut group)?;
@@ -666,68 +799,31 @@ fn collapse_duplicate_turn_lineage_rows(conn: &Connection) -> rusqlite::Result<u
 }
 
 /// Merge one authority-ordered lineage group (winner first, losers following)
-/// into the winner row, then delete the losers. Returns the deleted count.
+/// into the winner row via the shared [`reconcile_turn_frame`] rule, then
+/// delete the losers. Returns the deleted count.
 fn collapse_one_turn_lineage(
     conn: &Connection,
-    group: &mut Vec<CollapseTurnRow>,
+    group: &mut Vec<TurnFrame>,
 ) -> rusqlite::Result<usize> {
     if group.len() <= 1 {
         group.clear();
         return Ok(0);
     }
-    let w = group.remove(0);
-    // Fill only buckets the winner did NOT report, from the first
-    // lower-authority row carrying each (group is in descending authority).
-    let pick = |w_val: Option<i64>, col: fn(&CollapseTurnRow) -> Option<i64>| {
-        w_val.or_else(|| group.iter().find_map(col))
-    };
-    let input = pick(w.input, |r| r.input);
-    let output = pick(w.output, |r| r.output);
-    let cache_read = pick(w.cache_read, |r| r.cache_read);
-    let cache_write = pick(w.cache_write, |r| r.cache_write);
-    // A winner-reported total stays authoritative; otherwise derive from the
-    // merged basket only when every basket is known (U1).
-    let baskets = [input, output, cache_read, cache_write];
-    let derived = baskets
-        .iter()
-        .all(Option::is_some)
-        .then(|| {
-            baskets
-                .iter()
-                .flatten()
-                .copied()
-                .reduce(i64::saturating_add)
-        })
-        .flatten();
-    let total = w.total.or(derived);
-    let cost = w.cost.or_else(|| group.iter().find_map(|r| r.cost.clone()));
-    // An ingest clock never replaces a retained native time.
-    let (observed_at, observed_at_source) = if w.observed_at_source == "native" {
-        (w.observed_at, w.observed_at_source)
-    } else if let Some(n) = group.iter().find(|r| r.observed_at_source == "native") {
-        (n.observed_at.clone(), n.observed_at_source.clone())
-    } else {
-        (w.observed_at, w.observed_at_source)
-    };
-    conn.execute(
-        "UPDATE usage_events
-         SET total_tokens = ?1, input_tokens = ?2, output_tokens = ?3,
-             cache_read_tokens = ?4, cache_write_tokens = ?5,
-             cost_usd = ?6, observed_at = ?7, observed_at_source = ?8
-         WHERE rowid = ?9",
-        params![
-            total,
-            input,
-            output,
-            cache_read,
-            cache_write,
-            cost,
-            observed_at,
-            observed_at_source,
-            w.rowid
-        ],
-    )?;
-    let losers: Vec<i64> = group.iter().map(|r| r.rowid).collect();
+    let all_rowids: Vec<i64> = group.iter().map(|f| f.rowid.unwrap()).collect();
+    // Fold the LOWEST-authority frame up to the winner, so each step applies
+    // the same "newer frame over retained frame" reconciliation the live path
+    // runs. The final target is the winner's own row id.
+    let mut ascending = group.drain(..).rev();
+    let mut reconciled = ascending.next().unwrap();
+    for newer in ascending {
+        reconciled = reconcile_turn_frame(&reconciled, &newer);
+    }
+    let target = reconciled.rowid.unwrap();
+    persist_reconciled_turn(conn, &reconciled)?;
+    let losers: Vec<i64> = all_rowids
+        .into_iter()
+        .filter(|rowid| *rowid != target)
+        .collect();
     let n = losers.len();
     conn.execute(
         &format!(
@@ -736,7 +832,6 @@ fn collapse_one_turn_lineage(
         ),
         rusqlite::params_from_iter(losers),
     )?;
-    group.clear();
     Ok(n)
 }
 
@@ -1649,18 +1744,6 @@ impl SnapshotCounters {
     }
 }
 
-/// The stored state a scoped upsert conflicts with.
-struct StoredSnapshot {
-    /// Durable row id the update must target, so a frame never rewrites
-    /// ANOTHER lineage's revision-replaced row (c-ctxusage r16 item 3).
-    rowid: i64,
-    counters: SnapshotCounters,
-    revision: i64,
-    cost_usd: Option<String>,
-    observed_at: String,
-    observed_at_source: String,
-}
-
 /// Turn authority gate (c-ctxusage r16 item 3, T1'): is `position` equal or
 /// older than THIS lineage's stored watermark?
 ///
@@ -1715,26 +1798,34 @@ fn upsert_turn_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Res
     // Look up ONLY the incoming lineage's own revision-replaced row. NULL is
     // matched with IS NULL; a qualified id with equality. Either way the
     // stored row's lineage IS the incoming lineage.
-    let stored: Option<StoredSnapshot> = {
+    let stored: Option<TurnFrame> = {
         let map_row = |r: &rusqlite::Row<'_>| {
-            Ok(StoredSnapshot {
-                rowid: r.get(0)?,
+            Ok(TurnFrame {
+                rowid: Some(r.get(0)?),
+                seq: r.get(1)?,
+                profile_id: r.get(2)?,
+                model: r.get(3)?,
+                mode: r.get(4)?,
+                revision: r.get(5)?,
+                source_session_id: r.get(6)?,
                 counters: SnapshotCounters {
-                    total: r.get(1)?,
-                    input: r.get(2)?,
-                    output: r.get(3)?,
-                    cache_read: r.get(4)?,
-                    cache_write: r.get(5)?,
+                    total: r.get(7)?,
+                    input: r.get(8)?,
+                    output: r.get(9)?,
+                    cache_read: r.get(10)?,
+                    cache_write: r.get(11)?,
                 },
-                revision: r.get(6)?,
-                cost_usd: r.get(7)?,
-                observed_at: r.get(8)?,
-                observed_at_source: r.get(9)?,
+                cost_usd: r.get(12)?,
+                accounting: r.get(13)?,
+                observed_at: r.get(14)?,
+                observed_at_source: r.get(15)?,
             })
         };
-        const STORED_SELECT: &str = "SELECT rowid, total_tokens, input_tokens, output_tokens,
-                    cache_read_tokens, cache_write_tokens, metric_revision,
-                    cost_usd, observed_at, observed_at_source
+        const STORED_SELECT: &str = "SELECT rowid, seq, profile_id, model, mode,
+                    metric_revision, source_session_id,
+                    total_tokens, input_tokens, output_tokens,
+                    cache_read_tokens, cache_write_tokens,
+                    cost_usd, accounting, observed_at, observed_at_source
              FROM usage_events
              WHERE instance_id = ?1 AND scope = 'turn' AND scope_id = ?2
                AND source_session_id {predicate}";
@@ -1774,98 +1865,28 @@ fn upsert_turn_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Res
         return Ok(false);
     }
 
-    let incoming = SnapshotCounters::of(row);
-    let reports_counters = incoming.token_baskets().iter().any(Option::is_some);
-
-    // STRICTLY NEWER COST-ONLY frame: a billing correction on its own
-    // channel. The bill alone is corrected (an unreported bill keeps the
-    // stored one); the watermark and ingestion seq advance so a later
-    // counter snapshot at an older position is rejected; counters it did not
-    // come with and the turn clock are kept exactly as stored. The update is
-    // scoped to THIS lineage's row id and writes the lineage explicitly
-    // (never COALESCE: an unqualified update targets the NULL row and stays
-    // NULL, and can never inherit a retained qualified id).
-    if !reports_counters {
-        // Cost-only channel: touch ONLY seq/position/lineage/bill. The stored
-        // counters, context window, accounting and clock are left exactly as
-        // they were (the earlier block comment promises exactly that); an
-        // unreported bill keeps the stored one via COALESCE. Scoped by rowid,
-        // never by the nullable (instance, scope_id) key.
-        conn.execute(
-            "UPDATE usage_events
-             SET seq = ?1,
-                 metric_revision = ?2,
-                 source_session_id = ?3,
-                 cost_usd = COALESCE(?4, cost_usd)
-             WHERE rowid = ?5",
-            params![
-                row.seq,
-                row.metric_revision,
-                row.source_session_id,
-                row.cost_usd,
-                stored.rowid,
-            ],
-        )?;
-        return Ok(true);
-    }
-
-    // STRICTLY NEWER source position: authoritative. Merge unreported incoming
-    // buckets with the retained counters (a partial frame never erases a known
-    // bucket), and an unreported cost keeps the known bill; derive the total
-    // from the merged basket when the incoming row did not report one.
-    let merged = incoming.merged_over(&stored.counters);
-    let merged_cost = row.cost_usd.clone().or_else(|| stored.cost_usd.clone());
-    // The turn clock follows the newer snapshot, except an ingest fallback
-    // never overwrites a native time (c-ctxusage r4 item 5).
-    let (observed_at, observed_at_source) =
-        if row.observed_at_source == "native" || stored.observed_at_source != "native" {
-            (row.observed_at.clone(), row.observed_at_source.clone())
-        } else {
-            (
-                stored.observed_at.clone(),
-                stored.observed_at_source.clone(),
-            )
-        };
-    // Persist unconditionally: the watermark advances EVEN when every counter
-    // and the bill are unchanged, so a later stale position is rejected against
-    // the new high-water mark (c-ctxusage r14 item 3).
-    conn.execute(
-        "UPDATE usage_events SET
-            seq = ?1,
-            profile_id = ?2,
-            model = ?3,
-            mode = ?4,
-            metric_revision = ?5,
-            source_session_id = ?6,
-            total_tokens = ?7,
-            input_tokens = ?8,
-            output_tokens = ?9,
-            cache_read_tokens = ?10,
-            cache_write_tokens = ?11,
-            cost_usd = ?12,
-            accounting = ?13,
-            observed_at = ?14,
-            observed_at_source = ?15
-         WHERE rowid = ?16",
-        params![
-            row.seq,
-            row.profile_id,
-            row.model,
-            row.mode,
-            row.metric_revision,
-            row.source_session_id,
-            merged.total,
-            merged.input,
-            merged.output,
-            merged.cache_read,
-            merged.cache_write,
-            merged_cost,
-            row.accounting,
-            observed_at,
-            observed_at_source,
-            stored.rowid,
-        ],
-    )?;
+    let incoming = TurnFrame {
+        rowid: None,
+        seq: row.seq,
+        profile_id: row.profile_id.clone(),
+        model: row.model.clone(),
+        mode: row.mode.clone(),
+        revision: row.metric_revision,
+        source_session_id: row.source_session_id.clone(),
+        counters: SnapshotCounters::of(row),
+        cost_usd: row.cost_usd.clone(),
+        accounting: row.accounting.clone(),
+        observed_at: row.observed_at.clone(),
+        observed_at_source: row.observed_at_source.clone(),
+    };
+    // One reconciliation for every frame shape: the cost-only channel carries
+    // counters/clock forward and advances only position/lineage/bill; the
+    // counter channel merges baskets and moves the clock under native trust.
+    // The update is scoped to THIS lineage's row id and writes the lineage
+    // explicitly (never COALESCE: an unqualified update targets the NULL row
+    // and stays NULL, and can never inherit a retained qualified id).
+    let reconciled = reconcile_turn_frame(&stored, &incoming);
+    persist_reconciled_turn(conn, &reconciled)?;
     Ok(true)
 }
 
@@ -11657,6 +11678,225 @@ mod tests {
             Some(150),
             "total derives from the merged known basket"
         );
+    }
+
+    /// r40 item 2 (AB1), cost-only recovery equals the live cost-only channel:
+    /// an established rev100/t0/input100/total150 frame (other buckets still
+    /// Unknown) is followed through the fallback path by a rev101 cost-only
+    /// correction at native t1. Recovery must carry EVERY counter (including a
+    /// total the incomplete merged basket cannot re-derive) and the native
+    /// clock forward, advancing only revision, sequence and bill — exactly what
+    /// the live upsert does. The test also asserts instance/supply parity on
+    /// the retained totals and bill.
+    #[test]
+    fn recovered_cost_only_correction_keeps_counters_and_clock_like_live_upsert() {
+        // --- Migration (recovery) path -------------------------------------
+        let conn = Connection::open_in_memory().unwrap();
+        create_r28_usage_table_with_turn_index(&conn);
+        create_journal_table(&conn);
+        // Established row: seq1 rev100, native t0, input100, total150, the
+        // remaining buckets Unknown.
+        conn.execute(
+            "INSERT INTO usage_events
+                (instance_id, seq, profile_id, model, scope, scope_id, mode,
+                 metric_revision, source_session_id, total_tokens, input_tokens,
+                 accounting, observed_at, observed_at_source)
+             VALUES ('ins_r40i2', 1, 'pvp', 'm', 'turn', 'msg-T', 'snapshot',
+                 100, 'sess-S', 150, 100,
+                 'estimated', '2026-10-01T00:00:00.000Z', 'native')",
+            [],
+        )
+        .unwrap();
+        // Fallback append at seq2: cost-only correction, rev101, native t1.
+        // Written through the 14-column legacy shape (no scope/sid columns).
+        conn.execute(
+            "INSERT INTO usage_events
+                (instance_id, seq, profile_id, model, scope, mode, cost_usd,
+                 accounting, observed_at)
+             VALUES ('ins_r40i2', 2, 'pvp', 'm', 'turn', 'snapshot', '0.03',
+                 'estimated', '2026-10-01T00:00:01.000Z')",
+            [],
+        )
+        .unwrap();
+        let journal = |seq: i64, revision: &str, cost: Option<&str>, stamp: &str| {
+            let cost_json = match cost {
+                Some(amount) => json!({
+                    "state": "known",
+                    "value": {"amount": amount, "currency": "USD"}
+                }),
+                None => json!({ "state": "unknown", "reason": "unpriced",
+                                 "evidenceEventIds": [] }),
+            };
+            let mut payload = serde_json::Map::new();
+            payload.insert("scope".into(), json!("turn"));
+            payload.insert("scopeId".into(), json!("msg-T"));
+            payload.insert("mode".into(), json!("snapshot"));
+            payload.insert("metricRevision".into(), json!(revision));
+            payload.insert("accounting".into(), json!("estimated"));
+            payload.insert("cost".into(), cost_json);
+            if seq == 1 {
+                payload.insert("totalTokens".into(), json!({"state":"known","value":"150"}));
+                payload.insert("inputTokens".into(), json!({"state":"known","value":"100"}));
+            }
+            json!({
+                "kind": "usage",
+                "nativeAt": {"state": "known", "value": stamp},
+                "source": {
+                    "nativeSessionId": {"state": "known", "value": "sess-S"},
+                    "nativeTurnId": {"state": "known", "value": "msg-T"}
+                },
+                "payload": Value::Object(payload)
+            })
+        };
+        let entries: [(i64, &str, Option<&str>, &str); 2] = [
+            (1, "100", None, "2026-10-01T00:00:00.000Z"),
+            (2, "101", Some("0.03"), "2026-10-01T00:00:01.000Z"),
+        ];
+        for (seq, rev, cost, stamp) in entries {
+            let payload = journal(seq, rev, cost, stamp);
+            conn.execute(
+                "INSERT INTO journal (instance_id, seq, event_id, payload_json, observed_at)
+                 VALUES ('ins_r40i2', ?1, ?2, ?3, ?4)",
+                params![seq, format!("je{seq}"), payload.to_string(), stamp],
+            )
+            .unwrap();
+        }
+
+        migrate(&conn).unwrap();
+
+        #[derive(PartialEq, Debug)]
+        struct SurvivingTurn {
+            count: i64,
+            seq: i64,
+            revision: i64,
+            scope: Option<String>,
+            sid: Option<String>,
+            total: Option<i64>,
+            input: Option<i64>,
+            output: Option<i64>,
+            cache_read: Option<i64>,
+            cache_write: Option<i64>,
+            cost: Option<String>,
+            observed_at: String,
+            observed_at_source: String,
+        }
+        let read_survivor = |conn: &Connection| -> SurvivingTurn {
+            conn.query_row(
+                "SELECT COUNT(*) OVER (), seq, metric_revision, scope_id,
+                        source_session_id, total_tokens, input_tokens, output_tokens,
+                        cache_read_tokens, cache_write_tokens, cost_usd,
+                        observed_at, observed_at_source
+                 FROM usage_events
+                 WHERE instance_id = 'ins_r40i2' AND scope = 'turn'",
+                [],
+                |r| {
+                    Ok(SurvivingTurn {
+                        count: r.get(0)?,
+                        seq: r.get(1)?,
+                        revision: r.get(2)?,
+                        scope: r.get(3)?,
+                        sid: r.get(4)?,
+                        total: r.get(5)?,
+                        input: r.get(6)?,
+                        output: r.get(7)?,
+                        cache_read: r.get(8)?,
+                        cache_write: r.get(9)?,
+                        cost: r.get(10)?,
+                        observed_at: r.get(11)?,
+                        observed_at_source: r.get(12)?,
+                    })
+                },
+            )
+            .unwrap()
+        };
+        let recovered = read_survivor(&conn);
+        assert_eq!(recovered.count, 1, "one reconciled turn row survives");
+        assert_eq!(recovered.scope.as_deref(), Some("msg-T"));
+        assert_eq!(recovered.sid.as_deref(), Some("sess-S"));
+        assert_eq!(recovered.seq, 2, "the correction advances sequence");
+        assert_eq!(recovered.revision, 101, "the correction advances revision");
+        assert_eq!(recovered.cost.as_deref(), Some("0.03"), "bill corrected");
+        assert_eq!(
+            recovered.total,
+            Some(150),
+            "a cost-only correction keeps the known total it did not re-derive"
+        );
+        assert_eq!(recovered.input, Some(100), "known counters carry forward");
+        assert_eq!(recovered.output, None, "still-Unknown buckets stay Unknown");
+        assert_eq!(recovered.cache_read, None);
+        assert_eq!(recovered.cache_write, None);
+        assert_eq!(
+            recovered.observed_at, "2026-10-01T00:00:00.000Z",
+            "a billing correction never moves the native clock"
+        );
+        assert_eq!(recovered.observed_at_source, "native");
+
+        // --- Live path ------------------------------------------------------
+        let live = Connection::open_in_memory().unwrap();
+        migrate(&live).unwrap();
+        let frame = |seq: i64,
+                     revision: i64,
+                     total: Option<i64>,
+                     input: Option<i64>,
+                     cost: Option<&str>,
+                     stamp: &str| UsageEventRow {
+            instance_id: "ins_r40i2".into(),
+            seq,
+            profile_id: Some("pvp".into()),
+            model: Some("m".into()),
+            scope: "turn".into(),
+            scope_id: Some("msg-T".into()),
+            turn_id: None,
+            native_context_window: None,
+            mode: "snapshot".into(),
+            metric_revision: revision,
+            source_session_id: Some("sess-S".into()),
+            total_tokens: total,
+            input_tokens: input,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cost_usd: cost.map(str::to_string),
+            accounting: "estimated".into(),
+            observed_at: stamp.into(),
+            observed_at_source: "native".into(),
+        };
+        assert!(
+            insert_usage_event(
+                &live,
+                &frame(
+                    1,
+                    100,
+                    Some(150),
+                    Some(100),
+                    None,
+                    "2026-10-01T00:00:00.000Z"
+                )
+            )
+            .unwrap()
+        );
+        assert!(
+            insert_usage_event(
+                &live,
+                &frame(2, 101, None, None, Some("0.03"), "2026-10-01T00:00:01.000Z")
+            )
+            .unwrap()
+        );
+        let live_survivor = read_survivor(&live);
+        assert_eq!(
+            recovered, live_survivor,
+            "recovery reconciliation must equal live reconciliation"
+        );
+
+        // --- Instance/supply parity on the recovered store ------------------
+        let inst = aggregate_instance(&conn, "ins_r40i2").unwrap();
+        let supply = aggregate_supply(&conn, "pvp", "m").unwrap();
+        assert_eq!(inst.total_tokens, supply.total_tokens);
+        assert_eq!(inst.input_tokens, supply.input_tokens);
+        assert_eq!(inst.cost_usd, supply.cost_usd);
+        assert_eq!(inst.total_tokens, Some(150));
+        assert_eq!(inst.input_tokens, Some(100));
+        assert!((inst.cost_usd.unwrap() - 0.03).abs() < 1e-9);
     }
 
     /// r37 item 3: on an upgrade from the schema that ALREADY carried

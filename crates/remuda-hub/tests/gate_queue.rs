@@ -2158,6 +2158,127 @@ async fn restart_landing_confirmed_on_remote_settles_landed() -> Result<()> {
     Ok(())
 }
 
+/// r35 item 1 (HIGH): the production Landing probe must pin the EXACT attempt
+/// generation on the REAL `gate.resolveLanding` RPC. While the owner is still
+/// registered the lane answers `unknown` and the Hub holds occupancy; once the
+/// owner has released with a verified-dead group the lane attests `absent`, the
+/// Hub requeues, and the SUCCESSOR attempt claims the same lane and is
+/// dispatched with generation 2 (no lane-busy failure). The r34 regression
+/// exercised only the Node's private liveness; this one rides the actual
+/// Hub→Node WebSocket RPC through production reconciliation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn landing_probe_pins_the_attempt_generation_and_absent_requeues_successor() -> Result<()> {
+    let ctx = Ctx::spawn_with_config(
+        1,
+        |_| {},
+        |cfg| {
+            // Expiry immediately; the periodic reconciler stays parked so only
+            // the forced seams probe deterministically.
+            cfg.gate_landing_recovery_ms = 1;
+            cfg.gate_landing_probe_interval_ms = 600_000;
+        },
+    )
+    .await?;
+    let merge_1 = "4444444444444444444444444444444444444444";
+    // Phase 1: the owner is still registered (slow finalization) → unknown.
+    *ctx.scripts[0].resolve_landing_reply.lock().unwrap() =
+        Some(json!({"jobId": "ignored", "status": "unknown"}));
+    ctx.scripts[0].script(
+        "wt/land/r35-gen-pin",
+        RunSpec {
+            // The granted land timed out: the verdict is uncertain, the socket
+            // stays up to answer read-only probes, and the run unregisters so
+            // the reconciliation RPCs are handled on the outer pump.
+            status: "landed",
+            merge_sha: Some(merge_1),
+            merge_ref: Some("refs/remuda/gate/r35-gen-pin"),
+            land_grant: true,
+            uncertain_after_grant: true,
+            ..RunSpec::default()
+        },
+    );
+    // Successor attempt: claims the lane, runs briefly, then reports a
+    // NON-lane-busy failure (terminal and deterministic for the test).
+    ctx.scripts[0].script(
+        "wt/land/r35-gen-pin",
+        RunSpec {
+            status: "failed",
+            error: Some("synthetic successor completion"),
+            reason: Some("synthetic successor completion"),
+            delay_ms: 1500,
+            ..RunSpec::default()
+        },
+    );
+    let job = ctx
+        .enqueue(json!({"branch":"wt/land/r35-gen-pin","mode":"land"}))
+        .await;
+    let id = job["id"].as_str().unwrap().to_owned();
+    ctx.wait_state(&id, &["landing"]).await;
+
+    // Forced probe while the owner is registered: the lane answers unknown.
+    let lane_host = ctx.hosts[0].clone();
+    ctx.hub.test_force_landing_reconcile(&lane_host).await;
+    for _ in 0..100 {
+        if !ctx.scripts[0].resolve_calls.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let first_probe = ctx.scripts[0].resolve_calls.lock().unwrap()[0].clone();
+    assert_eq!(
+        first_probe["generation"],
+        json!(1),
+        "the production probe must pin THIS attempt's generation: {first_probe}"
+    );
+    assert_eq!(first_probe["mergeSha"], json!(merge_1), "{first_probe}");
+    // Unknown never releases occupancy: the job stays Landing.
+    let parked = ctx.job(&id).await;
+    assert_eq!(parked["state"], json!("landing"), "{parked}");
+
+    // The owner releases the lane and the lane attests verified-dead absence.
+    *ctx.scripts[0].resolve_landing_reply.lock().unwrap() =
+        Some(json!({"jobId": "ignored", "status": "absent"}));
+    ctx.hub.test_force_landing_reconcile(&lane_host).await;
+
+    // Requeue → the scheduler claims the successor and dispatches gen 2.
+    for _ in 0..200 {
+        if ctx.scripts[0].arrivals.lock().unwrap().len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let arrivals = ctx.scripts[0].arrivals.lock().unwrap().clone();
+    assert_eq!(
+        arrivals.len(),
+        2,
+        "the successor must be dispatched: {arrivals:?}"
+    );
+    assert_eq!(arrivals[0]["generation"], json!(1), "{arrivals:?}");
+    assert_eq!(
+        arrivals[1]["generation"],
+        json!(2),
+        "the successor attempt rides generation 2: {arrivals:?}"
+    );
+    assert!(arrivals[1]["laneId"].is_string(), "{arrivals:?}");
+    assert_eq!(
+        arrivals[1]["laneId"], arrivals[0]["laneId"],
+        "the successor acquires the SAME lane the absent attempt held: {arrivals:?}"
+    );
+    let running = ctx.wait_state(&id, &["running"]).await;
+    assert_eq!(running["attempts"], json!(2), "{running}");
+    assert!(
+        running["laneId"].is_string(),
+        "the successor holds a lane: {running}"
+    );
+    let done = ctx.wait_state(&id, &["failed"]).await;
+    assert!(
+        !done["error"].as_str().unwrap_or("").contains("lane-busy")
+            && !done["reason"].as_str().unwrap_or("").contains("lane-busy"),
+        "the successor must not fail with lane-busy: {done}"
+    );
+    Ok(())
+}
+
 /// r12 item 2: the land grant is bound to the authenticated carrier SESSION the
 /// dispatch rode. Verification starts on session A; the carrier reconnects as
 /// session B before verification ends; the old run's grant on B is refused and

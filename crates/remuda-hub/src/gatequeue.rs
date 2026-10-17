@@ -4373,9 +4373,14 @@ async fn probe_landing_outcome(state: &AppState, job: &GateJob) -> LandingProbe 
         repo_path: lane.repo_path.clone(),
         base_branch: project.default_base_branch.clone(),
         merge_sha,
-        // This test helper intentionally takes the conservative path (it
-        // asserts Unknown regardless); it does not pin an attempt generation.
-        generation: None,
+        // r35 item 1: pin the EXACT attempt the Hub is reconciling. The Node's
+        // durable fence/certificate evidence is attempt-qualified by
+        // generation AND merge sha; without the generation it answers Unknown
+        // before consulting the certificate, so automatic recovery could never
+        // reach Absent and /resolve-evidence could never clear an evidence-
+        // uncertain Landing. The row's `attempts` is the dispatched generation
+        // (stamped at claim and re-checked in the settlement writer).
+        generation: Some(job.attempts),
     })
     .unwrap_or(Value::Null);
     let reply = state

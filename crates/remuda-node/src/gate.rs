@@ -1032,8 +1032,18 @@ impl GateRegistry {
     /// still stopped before exec (the child-start barrier, r15 R5). A missing
     /// leader identity or any write failure propagates so the caller refuses to
     /// release (SIGCONT) the land child until the fence is durable.
+    ///
+    /// r35 item 2: `merge_sha` is the Hub-granted merge this attempt pushes;
+    /// it is durable attempt identity and the finalizer/probe bind evidence to
+    /// it. An empty merge refuses the fence (fail closed → uncertain).
     #[cfg(unix)]
-    fn record_land_group(&self, job_id: &str, generation: u32, pgid: i32) -> std::io::Result<()> {
+    fn record_land_group(
+        &self,
+        job_id: &str,
+        generation: u32,
+        pgid: i32,
+        merge_sha: &str,
+    ) -> std::io::Result<()> {
         // r16 item 1: the injected hold/fail runs while the spawned child is
         // parked on its start barrier, before the real fence write.
         #[cfg(any(test, feature = "test-faults"))]
@@ -1041,7 +1051,14 @@ impl GateRegistry {
         let identity = sample_leader_identity(pgid).ok_or_else(|| {
             std::io::Error::other("could not read the land leader's start-time identity")
         })?;
-        write_land_fence(&self.land_fence_dir, job_id, generation, pgid, &identity)
+        write_land_fence(
+            &self.land_fence_dir,
+            job_id,
+            generation,
+            pgid,
+            &identity,
+            merge_sha,
+        )
     }
 
     /// r16 item 1 test-only: arm the one-shot land-fence persistence hold/fail.
@@ -1241,10 +1258,18 @@ impl GateRegistry {
     /// already ESRCH it writes the death certificate, otherwise it keeps the
     /// fence for the next-boot fence (Unknown). Straggler termination is the
     /// owner's job, before the reap (r18 item 3).
+    ///
+    /// r35 item 2: `generation` + `merge_sha` are THIS attempt's identity,
+    /// captured when the attempt was created. After observing ESRCH the
+    /// finalizer opens ONLY `land-<job>-g<generation>.json` and validates its
+    /// full snapshot (including the merge sha and the recorded pgid). It NEVER
+    /// discovers an attempt by scanning for the recyclable pgid, so a detached
+    /// finalizer for attempt A cannot certify attempt B after pgid reuse.
     #[cfg(unix)]
-    async fn settle_land_group(&self, job_id: &str, pgid: i32) {
+    async fn settle_land_group(&self, job_id: &str, generation: u32, merge_sha: &str, pgid: i32) {
         let dir = self.land_fence_dir.clone();
         let job_id = job_id.to_owned();
+        let merge_sha = merge_sha.to_owned();
         // r24 item 4 test-only: park the finalizer closure on entry AFTER every
         // other owner step completed, so a test can expire the absolute
         // deadline during finalization specifically.
@@ -1284,25 +1309,12 @@ impl GateRegistry {
                 );
                 return;
             }
-            // r34 item 1: fences are attempt-qualified
-            // (`land-<job>-g<gen>.json`); find THIS group's attempt fence by
-            // matching the recorded pgid. A newer attempt with a different
-            // group is left untouched; certify_dead_and_remove_fence then
-            // writes/unlinks only the matching attempt's own paths.
-            let record = match find_land_fence_record_for_pgid(&dir, &job_id, pgid) {
-                Some(record) => record,
-                // No attempt fence on disk for this exact pgid: never
-                // manufacture a certificate from the in-memory arguments.
-                None => return,
-            };
-            match certify_dead_and_remove_fence(&dir, &record, pgid) {
-                Ok(_) => {}
-                Err(error) => tracing::warn!(
-                    %error,
-                    job_id,
-                    "certifying the settled land group failed; keeping the fence"
-                ),
-            }
+            // r35 item 2 TEST-ONLY: park AFTER the ESRCH observation but BEFORE
+            // the exact-path fence lookup, so a regression can install a newer
+            // attempt B with a recycled pgid at exactly this point.
+            #[cfg(test)]
+            park_settle_after_esrch();
+            settle_fence_for_exact_attempt(&dir, &job_id, generation, &merge_sha, pgid);
         })
         .await;
     }
@@ -1322,7 +1334,12 @@ impl GateRegistry {
     ///   record, an unwitnessed crash), so a read-only probe must stay Unknown
     ///   rather than attest `absent`.
     #[cfg(unix)]
-    async fn land_push_liveness(&self, job_id: &str, generation: Option<u32>) -> LandPushLiveness {
+    async fn land_push_liveness(
+        &self,
+        job_id: &str,
+        generation: Option<u32>,
+        merge_sha: Option<&str>,
+    ) -> LandPushLiveness {
         let table = self.runs.lock().await;
         if let Some(run) = table.runs.get(job_id) {
             // r34 item 2: the OWNER is still registered (its run has not
@@ -1352,11 +1369,18 @@ impl GateRegistry {
             };
         }
         drop(table);
+        // r35 item 2: the owner is gone, so durable evidence is the only
+        // authority; hand the FULL requested identity (generation + granted
+        // merge) to the ledger reader. The live-owner arms above never return
+        // VerifiedDead, so a wrong/absent merge can only keep the answer Unknown.
         let dir = self.land_fence_dir.clone();
         let job_id = job_id.to_owned();
-        tokio::task::spawn_blocking(move || land_ledger_liveness(&dir, &job_id, generation))
-            .await
-            .unwrap_or(LandPushLiveness::Unknown)
+        let merge_sha = merge_sha.map(str::to_owned);
+        tokio::task::spawn_blocking(move || {
+            land_ledger_liveness(&dir, &job_id, generation, merge_sha.as_deref())
+        })
+        .await
+        .unwrap_or(LandPushLiveness::Unknown)
     }
 
     /// Platforms without process-group accounting can never attest death.
@@ -1365,6 +1389,7 @@ impl GateRegistry {
         &self,
         _job_id: &str,
         _generation: Option<u32>,
+        _merge_sha: Option<&str>,
     ) -> LandPushLiveness {
         LandPushLiveness::Unknown
     }
@@ -1953,9 +1978,14 @@ impl DevNode {
         // ESRCH on the group this process recorded, or a durable death
         // certificate. A missing/unreadable fence ledger with no cert is
         // Unknown, never "the push is dead".
+        //
+        // r35 item 2: bind the durable read to the FULL attempt identity the
+        // Hub probed — generation AND the granted merge sha (an empty merge is
+        // treated as no authority → Unknown).
+        let probed_merge = (!request.merge_sha.is_empty()).then_some(request.merge_sha.as_str());
         let land_group_verified_dead = matches!(
             self.gate_registry()
-                .land_push_liveness(&request.job_id, request.generation)
+                .land_push_liveness(&request.job_id, request.generation, probed_merge)
                 .await,
             LandPushLiveness::VerifiedDead
         );
@@ -2610,8 +2640,23 @@ impl DevNode {
                 // ran no git. r16 item 1 / R5: the verdict is UNCERTAIN, never
                 // a definite "failed": the grant is already held by the Hub,
                 // which reconciles the exact granted merge against the remote.
+                //
+                // r35 item 2: the fence binds the attempt's FULL identity — the
+                // Hub-granted merge sha from the passing verify is the one the
+                // grant was taken for (and the `--report` land arg pins), so it
+                // is authoritative for THIS generation.
+                let granted_merge_sha = result
+                    .merge_sha
+                    .as_deref()
+                    .filter(|sha| !sha.is_empty())
+                    .unwrap_or("");
                 if let Err(error) = barrier.release_after(|| {
-                    registry.record_land_group(&request.job_id, request.generation, pgid)
+                    registry.record_land_group(
+                        &request.job_id,
+                        request.generation,
+                        pgid,
+                        granted_merge_sha,
+                    )
                 }) {
                     use nix::sys::signal::{Signal, killpg};
                     use nix::unistd::Pid;
@@ -3268,7 +3313,15 @@ impl DevNode {
             let mut fence_finalization_expired = false;
             #[cfg(unix)]
             if let Some(pgid) = land_pgid {
-                let settle = registry.settle_land_group(&request.job_id, pgid);
+                // r35 item 2: pass THIS attempt's exact identity (captured from
+                // the passing verify/grant) so a detached finalizer opens only
+                // its own fence path; a recyclable pgid is never a lookup key.
+                let settle = registry.settle_land_group(
+                    &request.job_id,
+                    request.generation,
+                    result.merge_sha.as_deref().unwrap_or(""),
+                    pgid,
+                );
                 if tokio::time::timeout(remaining(land_deadline), settle)
                     .await
                     .is_err()
@@ -4660,22 +4713,31 @@ enum LandPushLiveness {
 /// ledger the push is provably dead ONLY when a valid death certificate for
 /// the exact job exists. Missing both, a stat/read/parse error, or a cert for a
 /// different job is Unknown.
+///
+/// r35 item 1/2: durable evidence is bound to the FULL attempt identity the
+/// Hub probed — generation AND the exact granted merge sha — so neither an
+/// attempt-greeting pin nor a merge-only match can attest death.
 #[cfg(unix)]
 fn land_ledger_liveness(
     dir: &std::path::Path,
     job_id: &str,
     generation: Option<u32>,
+    merge_sha: Option<&str>,
 ) -> LandPushLiveness {
-    // r34 item 1/2: durable evidence is read ONLY for the exact requested
-    // attempt. Without a requested generation, or when no attempt-qualified
-    // file exists for it, the answer is Unknown (never another attempt's cert).
-    let Some(generation) = generation else {
+    // Durable evidence is read ONLY for the exact requested attempt. Without a
+    // requested generation WITH its authoritative granted merge sha, or when
+    // no attempt-qualified file exists for it, the answer is Unknown (never
+    // another attempt's cert, never generic evidence).
+    let (Some(generation), Some(merge_sha)) = (generation, merge_sha) else {
         return LandPushLiveness::Unknown;
     };
+    if merge_sha.is_empty() {
+        return LandPushLiveness::Unknown;
+    }
     match std::fs::metadata(land_fence_path(dir, job_id, generation)) {
         Ok(_) => LandPushLiveness::MayPush,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            match read_land_group_dead_cert(dir, job_id, generation) {
+            match read_land_group_dead_cert(dir, job_id, generation, merge_sha) {
                 Some(_) => LandPushLiveness::VerifiedDead,
                 None => LandPushLiveness::Unknown,
             }
@@ -4705,50 +4767,6 @@ fn land_dead_cert_path(dir: &std::path::Path, job_id: &str, generation: u32) -> 
     dir.join(format!("dead-{}-g{}.json", land_slug(job_id), generation))
 }
 
-/// Find the attempt fence record for `job_id` whose recorded group is exactly
-/// `pgid`. Fence files are attempt-qualified, so finalization scans the job's
-/// `land-<slug>-g*.json` files and acts only on the matching attempt; a newer
-/// attempt with a different group is never touched. None means no usable
-/// record for this group (missing/unparseable/wrong provenance).
-#[cfg(unix)]
-fn find_land_fence_record_for_pgid(
-    dir: &std::path::Path,
-    job_id: &str,
-    pgid: i32,
-) -> Option<Value> {
-    let slug = land_slug(job_id);
-    let prefix = format!("land-{slug}-g");
-    let entries = std::fs::read_dir(dir).ok()?;
-    for entry in entries.flatten() {
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        if !name.starts_with(&prefix) || !name.ends_with(".json") {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(entry.path()) else {
-            continue;
-        };
-        let Ok(record) = serde_json::from_str::<Value>(&text) else {
-            continue;
-        };
-        if record.get("jobId").and_then(Value::as_str) != Some(job_id) {
-            continue;
-        }
-        if record.get("generation").and_then(Value::as_u64).is_none()
-            || LeaderIdentity::from_record(&record).is_none()
-            || record.get("diedAt").is_some()
-            || record.get("cause").is_some()
-        {
-            continue;
-        }
-        if record.get("pgid").and_then(Value::as_i64) == Some(i64::from(pgid)) {
-            return Some(record);
-        }
-    }
-    None
-}
-
 #[cfg(unix)]
 fn land_slug(job_id: &str) -> String {
     job_id
@@ -4775,11 +4793,11 @@ fn write_land_group_dead_cert(
     pgid: i32,
 ) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    let Some(job_id) = record.get("jobId").and_then(Value::as_str) else {
+    if record.get("pgid").and_then(Value::as_i64) != Some(i64::from(pgid)) {
         return Err(std::io::Error::other(
-            "land fence record has no jobId for the death certificate",
+            "land fence record pgid does not match the observed dead group",
         ));
-    };
+    }
     let mut cert = record.clone();
     cert["diedAt"] = json!(
         std::time::SystemTime::now()
@@ -4795,27 +4813,57 @@ fn write_land_group_dead_cert(
         .ok_or_else(|| {
             std::io::Error::other("land fence record has no generation for the death certificate")
         })?;
+    let job_id = record.get("jobId").and_then(Value::as_str).ok_or_else(|| {
+        std::io::Error::other("land fence record has no jobId for the death certificate")
+    })?;
+    write_qualified_dead_cert_bytes(dir, &cert, job_id, generation)
+}
+
+/// Atomically write an already-assembled certificate JSON to the qualified
+/// `dead-<job>-g<gen>.json` path (temp file + rename). Callers assemble the
+/// exact evidence content; this helper never synthesizes provenance.
+#[cfg(unix)]
+fn write_qualified_dead_cert_bytes(
+    dir: &std::path::Path,
+    cert: &Value,
+    job_id: &str,
+    generation: u32,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
     let path = land_dead_cert_path(dir, job_id, generation);
-    let temporary = dir.join(format!(
-        ".dead-g{generation}-{pgid}-{}.tmp",
-        std::process::id()
-    ));
+    let temporary = dir.join(format!(".dead-g{generation}-{}.tmp", std::process::id()));
     std::fs::write(&temporary, serde_json::to_vec(&cert).unwrap_or_default())?;
     std::fs::rename(&temporary, &path)?;
     Ok(())
 }
 
-/// Read and VALIDATE a death certificate for the exact job. `None` covers a
-/// missing file, any read/parse error, a job mismatch, or missing provenance
-/// (pgid + leader identity) — every one of those is Unknown, never a valid
-/// death attestation.
+/// Read and VALIDATE a death certificate for the exact requested attempt.
+/// `None` covers a missing file, any read/parse error, a job/generation/merge
+/// mismatch, or missing provenance (pgid + leader identity) — every one of
+/// those is Unknown, never a valid death attestation.
+///
+/// r35 item 2: certificates bind the granted `mergeSha`; it must equal the
+/// Hub-probed merge EXACTLY.
 #[cfg(unix)]
 fn read_land_group_dead_cert(
     dir: &std::path::Path,
     job_id: &str,
     generation: u32,
+    merge_sha: &str,
 ) -> Option<Value> {
     let text = std::fs::read_to_string(land_dead_cert_path(dir, job_id, generation)).ok()?;
+    validate_dead_cert(text, job_id, generation, merge_sha)
+}
+
+/// Validate one parsed certificate's identity against the requested attempt
+/// (see [`read_land_group_dead_cert`] for the merge-binding rules).
+#[cfg(unix)]
+fn validate_dead_cert(
+    text: String,
+    job_id: &str,
+    generation: u32,
+    merge_sha: &str,
+) -> Option<Value> {
     let cert: Value = serde_json::from_str(&text).ok()?;
     // The certificate must attest the EXACT requested attempt: job AND
     // generation, plus the required provenance (pgid + leader identity).
@@ -4828,7 +4876,11 @@ fn read_land_group_dead_cert(
         .and_then(Value::as_i64)
         .filter(|pgid| i32::try_from(*pgid).is_ok())?;
     LeaderIdentity::from_record(&cert)?;
-    Some(cert)
+    // The attested merge must match EXACTLY, and must be present on both sides.
+    match cert.get("mergeSha").and_then(Value::as_str) {
+        Some(cert_merge) if cert_merge == merge_sha && !merge_sha.is_empty() => Some(cert),
+        _ => None,
+    }
 }
 
 /// Env var telling the granted land child to read its one start-release byte
@@ -5023,11 +5075,16 @@ fn land_group_exists(pgid: i32) -> bool {
     }
 }
 
-/// Persist the granted land group fence. Every failure (missing identity,
-/// directory/temp/rename error) propagates: the caller has the land child
-/// stopped before exec and refuses to release it until this record is durable
-/// (child-start barrier, r15 R5). A missing record can never be silently
-/// skipped into an unfenced, possibly-orphaned pusher.
+/// Persist the granted land group fence. Every failure (missing identity or
+/// granted merge sha, directory/temp/rename error) propagates: the caller has
+/// the land child stopped before exec and refuses to release it until this
+/// record is durable (child-start barrier, r15 R5). A missing record can never
+/// be silently skipped into an unfenced, possibly-orphaned pusher.
+///
+/// r35 item 2: the record binds the attempt's FULL identity — generation AND
+/// the exact granted merge sha. A finalizer opens only this attempt-qualified
+/// path and the read-only probe accepts a certificate only for the exact
+/// (job, generation, merge) tuple.
 #[cfg(unix)]
 fn write_land_fence(
     dir: &std::path::Path,
@@ -5035,12 +5092,19 @@ fn write_land_fence(
     generation: u32,
     pgid: i32,
     identity: &LeaderIdentity,
+    merge_sha: &str,
 ) -> std::io::Result<()> {
+    if merge_sha.is_empty() {
+        return Err(std::io::Error::other(
+            "refusing to fence a granted land group without its exact merge sha",
+        ));
+    }
     std::fs::create_dir_all(dir)?;
     let mut record = serde_json::json!({
         "jobId": job_id,
         "generation": generation,
         "pgid": pgid,
+        "mergeSha": merge_sha,
     });
     identity.write(&mut record);
     let path = land_fence_path(dir, job_id, generation);
@@ -5078,13 +5142,15 @@ fn is_land_fence_file_name(name: &std::ffi::OsStr) -> bool {
 }
 
 /// Whether two fence/cert records describe the EXACT same granted attempt:
-/// job, generation, process group, and durable leader identity. Used to refuse
-/// certifying a LIVE REPLACEMENT group from a stale observation (r17 item 1).
+/// job, generation, granted merge sha, process group, and durable leader
+/// identity. Used to refuse certifying a LIVE REPLACEMENT group from a stale
+/// observation (r17 item 1; r35 item 2 binds the merge sha too).
 #[cfg(unix)]
 fn land_fence_snapshot_matches(a: &Value, b: &Value) -> bool {
     if a.get("jobId").and_then(Value::as_str) != b.get("jobId").and_then(Value::as_str)
         || a.get("generation").and_then(Value::as_u64)
             != b.get("generation").and_then(Value::as_u64)
+        || a.get("mergeSha").and_then(Value::as_str) != b.get("mergeSha").and_then(Value::as_str)
         || a.get("pgid").and_then(Value::as_i64) != b.get("pgid").and_then(Value::as_i64)
     {
         return false;
@@ -5144,6 +5210,49 @@ pub(crate) fn arm_certify_compare_hold(hold: std::sync::Arc<CleanupHold>) {
         .unwrap_or_else(|poison| poison.into_inner()) = Some(hold);
 }
 
+/// r35 item 2 TEST-ONLY: one-shot park inserted AFTER the finalizer observed
+/// `killpg` ESRCH but BEFORE it opens the exact-attempt fence path — the window
+/// in which a recycled pgid can belong to a newer attempt B.
+#[cfg(test)]
+static SETTLE_ESRCH_HOLD: std::sync::OnceLock<
+    std::sync::Mutex<Option<std::sync::Arc<CleanupHold>>>,
+> = std::sync::OnceLock::new();
+
+/// r35 item 2: park at the post-ESRCH/pre-lookup settle seam.
+#[cfg(test)]
+fn park_settle_after_esrch() {
+    let guard = SETTLE_ESRCH_HOLD
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let Some(hold) = guard.as_ref().cloned() else {
+        return;
+    };
+    drop(guard);
+    hold.entered
+        .store(true, std::sync::atomic::Ordering::Release);
+    let (lock, cvar) = &*hold.release;
+    let mut released = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+    while !*released {
+        let (next, timeout) = cvar
+            .wait_timeout(released, std::time::Duration::from_secs(20))
+            .unwrap_or_else(|poison| poison.into_inner());
+        released = next;
+        if timeout.timed_out() {
+            *released = true;
+        }
+    }
+}
+
+/// r35 item 2 test helper: arm the post-ESRCH settle hold (one-shot).
+#[cfg(test)]
+pub(crate) fn arm_settle_esrch_hold(hold: std::sync::Arc<CleanupHold>) {
+    *SETTLE_ESRCH_HOLD
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = Some(hold);
+}
+
 /// Authoritative group death has been observed (killpg ESRCH on the recorded
 /// pgid): persist the death certificate FROM THE OBSERVED FENCE SNAPSHOT, and
 /// only then remove the fence (r16 item 2; r17 item 1 hardening).
@@ -5166,9 +5275,15 @@ fn certify_dead_and_remove_fence(
         return Ok(false);
     };
     // The observation must be a complete live-fence snapshot, never a
-    // certificate or a record missing provenance.
+    // certificate or a record missing provenance. r35 item 2: the granted
+    // merge sha is mandatory provenance — an unqualified snapshot can never
+    // become a certificate.
     if observed.get("pgid").and_then(Value::as_i64) != Some(i64::from(observed_pgid))
         || observed.get("generation").and_then(Value::as_u64).is_none()
+        || observed
+            .get("mergeSha")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
         || LeaderIdentity::from_record(observed).is_none()
         || observed.get("diedAt").is_some()
         || observed.get("cause").is_some()
@@ -5215,6 +5330,83 @@ fn certify_dead_and_remove_fence(
             let _ = std::fs::remove_file(land_dead_cert_path(dir, job_id, generation));
             Err(error)
         }
+    }
+}
+
+/// Settle a verified-gone land group using ONLY the attempt's exact identity:
+/// open the single immutable fence path for `(job_id, generation)` and certify
+/// only when its on-disk snapshot still names THIS attempt — the same merge
+/// sha, the same pgid the caller observed ESRCH for, and a valid leader
+/// identity. There is deliberately NO directory scan: a recyclable pgid can
+/// never select another attempt's file (r35 item 2). A missing/mismatched
+/// fence keeps everything on disk (Unknown); certification errors likewise
+/// keep the fence.
+#[cfg(unix)]
+fn settle_fence_for_exact_attempt(
+    dir: &std::path::Path,
+    job_id: &str,
+    generation: u32,
+    merge_sha: &str,
+    pgid: i32,
+) {
+    if merge_sha.is_empty() {
+        tracing::warn!(
+            job_id,
+            generation,
+            "settling land group without the exact granted merge sha; refusing to certify"
+        );
+        return;
+    }
+    let fence_path = land_fence_path(dir, job_id, generation);
+    let text = match std::fs::read_to_string(&fence_path) {
+        Ok(text) => text,
+        // The exact attempt's fence is absent: never manufacture evidence and
+        // never look for another attempt via the recyclable pgid.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                job_id,
+                generation,
+                "reading the exact-attempt land fence failed; keeping the fence"
+            );
+            return;
+        }
+    };
+    let Ok(record) = serde_json::from_str::<Value>(&text) else {
+        tracing::warn!(
+            job_id,
+            generation,
+            "the exact-attempt land fence is unreadable; keeping the fence"
+        );
+        return;
+    };
+    // The on-disk record must be THIS attempt's full live snapshot. Any
+    // divergence (wrong merge, a recycled pgid, another attempt's contents at
+    // the path) refuses certification rather than touch the file.
+    if record.get("jobId").and_then(Value::as_str) != Some(job_id)
+        || record.get("generation").and_then(Value::as_u64) != Some(u64::from(generation))
+        || record.get("mergeSha").and_then(Value::as_str) != Some(merge_sha)
+        || record.get("pgid").and_then(Value::as_i64) != Some(i64::from(pgid))
+        || LeaderIdentity::from_record(&record).is_none()
+        || record.get("diedAt").is_some()
+        || record.get("cause").is_some()
+    {
+        tracing::warn!(
+            job_id,
+            generation,
+            pgid,
+            "the exact-attempt land fence does not match the observed attempt identity; refusing \
+             to certify"
+        );
+        return;
+    }
+    if let Err(error) = certify_dead_and_remove_fence(dir, &record, pgid) {
+        tracing::warn!(
+            %error,
+            job_id,
+            "certifying the settled land group failed; keeping the fence"
+        );
     }
 }
 
@@ -5277,6 +5469,11 @@ fn terminate_and_verify_group(pgid: i32, term_grace: Duration) -> bool {
 /// * leader pid ESRCH but the group still exists (orphaned members, no leader)
 ///   → Unknown → KEEP;
 /// * `kill(pid, 0)` EPERM/other → Unknown → keep.
+///
+/// r35 item 2: a leftover record binds the CURRENT attempt format — generation
+/// AND a non-empty granted `mergeSha`, with a matching qualified file name.
+/// Records missing that identity are not acted on: they stay KEPT (Unknown)
+/// rather than becoming unqualified evidence.
 #[cfg(unix)]
 fn fence_orphaned_land_groups(dir: &std::path::Path) {
     use nix::sys::signal::kill;
@@ -5320,7 +5517,35 @@ fn fence_orphaned_land_groups(dir: &std::path::Path) {
         if LeaderIdentity::from_record(&record).is_none() {
             continue;
         }
-        if record.get("jobId").and_then(Value::as_str).is_none() {
+        let Some(job_id) = record.get("jobId").and_then(Value::as_str) else {
+            continue;
+        };
+        // r35 item 2: every acted-on record must name its attempt generation
+        // AND the exact granted merge sha, in the qualified file name; a record
+        // missing that identity is KEPT (Unknown), never unqualified evidence.
+        let Some(generation) = record
+            .get("generation")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+        else {
+            tracing::warn!(
+                pgid,
+                "leftover land fence has no valid attempt generation; keeping it for operator \
+                 resolution"
+            );
+            continue;
+        };
+        let merge_sha = record.get("mergeSha").and_then(Value::as_str);
+        let file_name = path.file_name();
+        let qualified_name = file_name == land_fence_path(dir, job_id, generation).file_name();
+        if !(merge_sha.is_some_and(|sha| !sha.is_empty()) && qualified_name) {
+            tracing::warn!(
+                pgid,
+                job_id,
+                generation,
+                "leftover land fence is missing the exact attempt/merge identity; keeping it for \
+                 operator resolution"
+            );
             continue;
         }
         match kill(Pid::from_raw(pgid), None) {
@@ -5453,6 +5678,12 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    /// r35 item 2: synthetic granted merge shas for fence/certificate fixture
+    /// records (40-hex like a real sha). Fence evidence is bound to generation
+    /// AND merge, so tests pass the same value the attempt was "granted".
+    const MERGE_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const MERGE_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     /// Test-only GateAuthorizer that always authorizes and grants, so the
     /// in-module runner tests reach execute_gate without a live carrier.
@@ -6735,7 +6966,7 @@ echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\"
             fixture
                 .node
                 .gate_registry()
-                .land_push_liveness("gjb_abort_msg", Some(1))
+                .land_push_liveness("gjb_abort_msg", Some(1), result.merge_sha.as_deref())
                 .await
                 != LandPushLiveness::MayPush,
             "the aborted land group is not live afterwards"
@@ -6795,7 +7026,7 @@ echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\"
             fixture
                 .node
                 .gate_registry()
-                .land_push_liveness("gjb_survivor", Some(1))
+                .land_push_liveness("gjb_survivor", Some(1), result.merge_sha.as_deref())
                 .await,
             LandPushLiveness::VerifiedDead,
             "the land group must settle (death certificate) after pre-reap cleanup"
@@ -8716,8 +8947,14 @@ Running 8 tests across 2 projects
         let path = super::land_fence_path(dir.path(), "ghost", 1);
         std::fs::write(
             &path,
-            serde_json::json!({"jobId":"ghost","generation":1,"pgid":pgid,"startTick":42})
-                .to_string(),
+            serde_json::json!({
+                "jobId": "ghost",
+                "generation": 1,
+                "pgid": pgid,
+                "startTick": 42,
+                "mergeSha": MERGE_A,
+            })
+            .to_string(),
         )
         .unwrap();
         super::fence_orphaned_land_groups(dir.path());
@@ -8775,6 +9012,7 @@ Running 8 tests across 2 projects
                 "generation": 1,
                 "pgid": pgid,
                 "startTick": recorded,
+                "mergeSha": MERGE_A,
             })
             .to_string(),
         )
@@ -8816,7 +9054,12 @@ Running 8 tests across 2 projects
         };
         let dir = tempfile::TempDir::new().unwrap();
         let fence = dir.path();
-        let mut record = serde_json::json!({"jobId":"job-orphan-live","generation":1,"pgid":pgid});
+        let mut record = serde_json::json!({
+            "jobId": "job-orphan-live",
+            "generation": 1,
+            "pgid": pgid,
+            "mergeSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        });
         identity.write(&mut record);
         std::fs::write(
             super::land_fence_path(fence, "job-orphan-live", 1),
@@ -8842,7 +9085,13 @@ Running 8 tests across 2 projects
             "the live orphan's fence must be kept, never certified dead"
         );
         assert!(
-            super::read_land_group_dead_cert(fence, "job-orphan-live", 1).is_none(),
+            super::read_land_group_dead_cert(
+                fence,
+                "job-orphan-live",
+                1,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            )
+            .is_none(),
             "no death certificate may be written for a live group"
         );
         let _ = child.kill();
@@ -8858,7 +9107,12 @@ Running 8 tests across 2 projects
         let identity = super::sample_leader_identity(pgid).expect("identity");
         let dir = tempfile::TempDir::new().unwrap();
         let path = super::land_fence_path(dir.path(), "dead", 1);
-        let mut record = serde_json::json!({"jobId":"dead","generation":1,"pgid":pgid});
+        let mut record = serde_json::json!({
+            "jobId": "dead",
+            "generation": 1,
+            "pgid": pgid,
+            "mergeSha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        });
         identity.write(&mut record);
         std::fs::write(&path, record.to_string()).unwrap();
         let _ = child.kill();
@@ -8874,15 +9128,42 @@ Running 8 tests across 2 projects
         // the exact job, so a later ledger read attests VerifiedDead instead of
         // guessing from the missing ledger (which is Unknown on its own).
         assert!(
-            super::read_land_group_dead_cert(dir.path(), "dead", 1).is_some(),
+            super::read_land_group_dead_cert(
+                dir.path(),
+                "dead",
+                1,
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            )
+            .is_some(),
             "authoritative ESRCH at startup must leave a death certificate"
         );
         assert_eq!(
-            super::land_ledger_liveness(dir.path(), "dead", Some(1)),
+            super::land_ledger_liveness(
+                dir.path(),
+                "dead",
+                Some(1),
+                Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+            ),
             super::LandPushLiveness::VerifiedDead
         );
+        // A different merge sha never matches the certificate.
         assert_eq!(
-            super::land_ledger_liveness(dir.path(), "other-job", Some(1)),
+            super::land_ledger_liveness(
+                dir.path(),
+                "dead",
+                Some(1),
+                Some("cccccccccccccccccccccccccccccccccccccccc")
+            ),
+            super::LandPushLiveness::Unknown,
+            "the certificate is scoped to the exact granted merge"
+        );
+        assert_eq!(
+            super::land_ledger_liveness(
+                dir.path(),
+                "other-job",
+                Some(1),
+                Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+            ),
             super::LandPushLiveness::Unknown,
             "the certificate is scoped to the exact job"
         );
@@ -8927,7 +9208,12 @@ Running 8 tests across 2 projects
 
         let dir = tempfile::TempDir::new().unwrap();
         let path = super::land_fence_path(dir.path(), "orphan", 1);
-        let mut record = serde_json::json!({"jobId":"orphan","generation":1,"pgid":pgid});
+        let mut record = serde_json::json!({
+            "jobId": "orphan",
+            "generation": 1,
+            "pgid": pgid,
+            "mergeSha": MERGE_A,
+        });
         identity.write(&mut record);
         std::fs::write(&path, record.to_string()).unwrap();
         super::fence_orphaned_land_groups(dir.path());
@@ -8972,14 +9258,22 @@ Running 8 tests across 2 projects
         let live_pgid = live.id() as i32;
         // Its fence records a FOREIGN identity (a fence the live process does
         // not own), so a correct startup fence refuses to signal it.
-        super::write_land_fence(dir, job, 2, live_pgid, &super::LeaderIdentity::StartTick(1))
-            .unwrap();
+        super::write_land_fence(
+            dir,
+            job,
+            2,
+            live_pgid,
+            &super::LeaderIdentity::StartTick(1),
+            MERGE_B,
+        )
+        .unwrap();
         // The leftover attempt-1 certificate for the DEAD pgid.
         let stale = {
             let mut v = serde_json::json!({
                 "jobId": job,
                 "generation": 1,
                 "pgid": dead_pgid,
+                "mergeSha": MERGE_A,
             });
             super::LeaderIdentity::StartTick(2).write(&mut v);
             v
@@ -8998,7 +9292,8 @@ Running 8 tests across 2 projects
             "the live replacement fence must not be unlinked"
         );
         // No certificate was derived for the replacement snapshot.
-        let cert = super::read_land_group_dead_cert(dir, job, 1).expect("cert still present");
+        let cert =
+            super::read_land_group_dead_cert(dir, job, 1, MERGE_A).expect("cert still present");
         assert_eq!(cert["pgid"], json!(dead_pgid), "{cert}");
         assert_eq!(cert["generation"], json!(1), "{cert}");
 
@@ -9020,9 +9315,15 @@ Running 8 tests across 2 projects
         // The cert path is a non-empty DIRECTORY: remove_file fails with
         // IsADirectory/EISDIR, not NotFound.
         std::fs::create_dir_all(cert.join("inside")).unwrap();
-        let error =
-            super::write_land_fence(dir, job, 1, 1234, &super::LeaderIdentity::StartTick(7))
-                .expect_err("a non-NotFound cert removal error must propagate");
+        let error = super::write_land_fence(
+            dir,
+            job,
+            1,
+            1234,
+            &super::LeaderIdentity::StartTick(7),
+            MERGE_A,
+        )
+        .expect_err("a non-NotFound cert removal error must propagate");
         assert_ne!(
             error.kind(),
             std::io::ErrorKind::NotFound,
@@ -9043,11 +9344,35 @@ Running 8 tests across 2 projects
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path();
         let job = "gjb_snapshot";
-        // On disk: attempt 2 at pgid 4242.
-        super::write_land_fence(dir, job, 2, 4242, &super::LeaderIdentity::StartTick(22)).unwrap();
+        // On disk: attempt 2 at pgid 4242 …
+        super::write_land_fence(
+            dir,
+            job,
+            2,
+            4242,
+            &super::LeaderIdentity::StartTick(22),
+            MERGE_B,
+        )
+        .unwrap();
+        // … plus attempt 1's OWN qualified fence, but with a snapshot the
+        // observation no longer matches (recycled pgid/identity).
+        super::write_land_fence(
+            dir,
+            job,
+            1,
+            9999,
+            &super::LeaderIdentity::StartTick(33),
+            MERGE_A,
+        )
+        .unwrap();
         // Observed (stale): attempt 1 at a different pgid/identity.
         let observed = {
-            let mut v = serde_json::json!({"jobId": job, "generation": 1, "pgid": 4141});
+            let mut v = serde_json::json!({
+                "jobId": job,
+                "generation": 1,
+                "pgid": 4141,
+                "mergeSha": MERGE_A,
+            });
             super::LeaderIdentity::StartTick(11).write(&mut v);
             v
         };
@@ -9061,7 +9386,11 @@ Running 8 tests across 2 projects
             "the current fence stays"
         );
         assert!(
-            super::read_land_group_dead_cert(dir, job, 1).is_none(),
+            super::land_fence_path(dir, job, 1).exists(),
+            "the mismatched same-generation fence is kept too"
+        );
+        assert!(
+            super::read_land_group_dead_cert(dir, job, 1, MERGE_A).is_none(),
             "no certificate may be written for the wrong snapshot"
         );
     }
@@ -9082,10 +9411,18 @@ Running 8 tests across 2 projects
         let pgid_a = 4141;
         let pgid_b = 4242;
         // Attempt A fence (gen 1).
-        super::write_land_fence(dirp, job, 1, pgid_a, &super::LeaderIdentity::StartTick(7))
-            .unwrap();
+        super::write_land_fence(
+            dirp,
+            job,
+            1,
+            pgid_a,
+            &super::LeaderIdentity::StartTick(7),
+            MERGE_A,
+        )
+        .unwrap();
         let observed_a = serde_json::json!({
-            "jobId": job, "generation": 1, "pgid": pgid_a, "startTick": 7
+            "jobId": job, "generation": 1, "pgid": pgid_a, "startTick": 7,
+            "mergeSha": MERGE_A,
         });
 
         // Arm the post-compare park and start A's finalizer in a thread.
@@ -9107,8 +9444,15 @@ Running 8 tests across 2 projects
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         // Attempt B installs its own attempt-qualified fence while A is parked.
-        super::write_land_fence(dirp, job, 2, pgid_b, &super::LeaderIdentity::StartTick(22))
-            .unwrap();
+        super::write_land_fence(
+            dirp,
+            job,
+            2,
+            pgid_b,
+            &super::LeaderIdentity::StartTick(22),
+            MERGE_B,
+        )
+        .unwrap();
         let b_fence = super::land_fence_path(dirp, job, 2);
         let b_fence_before = std::fs::read_to_string(&b_fence).unwrap();
         assert!(b_fence_before.contains("\"generation\":2"));
@@ -9143,29 +9487,39 @@ Running 8 tests across 2 projects
             "A's gen1 cert written"
         );
 
-        // A's gen1 certificate NEVER certifies attempt B (gen 2).
+        // A's gen1 certificate NEVER certifies attempt B (gen 2) — not with
+        // B's generation and not with B's merge under A's generation.
         assert!(
-            super::read_land_group_dead_cert(dirp, job, 2).is_none(),
+            super::read_land_group_dead_cert(dirp, job, 2, MERGE_B).is_none(),
             "A's certificate must not be accepted as B's death evidence"
         );
         assert!(
-            super::read_land_group_dead_cert(dirp, job, 1).is_some(),
-            "A's certificate is valid for A's own generation"
+            super::read_land_group_dead_cert(dirp, job, 1, MERGE_B).is_none(),
+            "A's certificate must not bind a different merge"
+        );
+        assert!(
+            super::read_land_group_dead_cert(dirp, job, 1, MERGE_A).is_some(),
+            "A's certificate is valid for A's own generation and merge"
         );
         // Attempt B's ledger liveness still reads MayPush (its fence is live).
         assert_eq!(
-            super::land_ledger_liveness(dirp, job, Some(2)),
+            super::land_ledger_liveness(dirp, job, Some(2), Some(MERGE_B)),
             super::LandPushLiveness::MayPush
         );
         // Attempt A reads VerifiedDead from its own cert.
         assert_eq!(
-            super::land_ledger_liveness(dirp, job, Some(1)),
+            super::land_ledger_liveness(dirp, job, Some(1), Some(MERGE_A)),
             super::LandPushLiveness::VerifiedDead
         );
-        // A legacy unsuffixed probe (no generation pinned) stays Unknown.
+        // A legacy unsuffixed probe (no generation/merge pinned) stays Unknown.
         assert_eq!(
-            super::land_ledger_liveness(dirp, job, None),
+            super::land_ledger_liveness(dirp, job, None, None),
             super::LandPushLiveness::Unknown
+        );
+        assert_eq!(
+            super::land_ledger_liveness(dirp, job, Some(1), None),
+            super::LandPushLiveness::Unknown,
+            "a generation without the granted merge stays Unknown"
         );
     }
 
@@ -9200,34 +9554,171 @@ Running 8 tests across 2 projects
         assert!(!super::gate_test_group_exists(dead_pgid));
 
         // No run registered, no cert: Unknown.
-        assert_eq!(registry.land_push_liveness(job, Some(1)).await, Unknown);
+        assert_eq!(
+            registry
+                .land_push_liveness(job, Some(1), Some(MERGE_A))
+                .await,
+            Unknown
+        );
 
         // Owner registers a live run (gen 1) whose group is already ESRCH —
         // the slow-finalization window. Absent must be withheld: Unknown.
         registry.gate_test_insert_land_run(job, 1, dead_pgid).await;
         assert_eq!(
-            registry.land_push_liveness(job, Some(1)).await,
+            registry
+                .land_push_liveness(job, Some(1), Some(MERGE_A))
+                .await,
             Unknown,
             "a registered owner with an ESRCH group must read Unknown, never VerifiedDead"
         );
         // A probe for a DIFFERENT generation while the owner holds the job is
         // also Unknown (the registered run is gen 1).
-        assert_eq!(registry.land_push_liveness(job, Some(2)).await, Unknown);
+        assert_eq!(
+            registry
+                .land_push_liveness(job, Some(2), Some(MERGE_B))
+                .await,
+            Unknown
+        );
 
         // The finalizer finishes: attempt-qualified cert for gen 1 lands on
         // disk, then the run unregisters (owner released the lane).
         let record = serde_json::json!({
-            "jobId": job, "generation": 1, "pgid": dead_pgid, "startTick": 7
+            "jobId": job, "generation": 1, "pgid": dead_pgid, "startTick": 7,
+            "mergeSha": MERGE_A,
         });
         super::write_land_group_dead_cert(&dir, &record, dead_pgid).unwrap();
         registry.gate_test_remove_run(job).await;
         assert_eq!(
-            registry.land_push_liveness(job, Some(1)).await,
+            registry
+                .land_push_liveness(job, Some(1), Some(MERGE_A))
+                .await,
             VerifiedDead,
             "after release the durable gen1 certificate attests Absent"
         );
-        // The certificate never crosses generations.
-        assert_eq!(registry.land_push_liveness(job, Some(2)).await, Unknown);
+        // The certificate never crosses generations or merges.
+        assert_eq!(
+            registry
+                .land_push_liveness(job, Some(2), Some(MERGE_B))
+                .await,
+            Unknown
+        );
+        assert_eq!(
+            registry
+                .land_push_liveness(job, Some(1), Some(MERGE_B))
+                .await,
+            Unknown,
+            "a wrong merge must not read the gen1 certificate"
+        );
+    }
+
+    /// r35 item 2 (HIGH): a detached finalizer must never certify a NEWER
+    /// attempt after pgid reuse. Attempt A's finalizer observes ESRCH and parks
+    /// BEFORE looking up its fence; attempt B is then granted the SAME recycled
+    /// pgid (a distinct generation and distinct merge) and installs its own
+    /// fence. When A resumes it may open ONLY its own exact
+    /// `land-<job>-g1.json` path: B's live fence survives byte-identical, no
+    /// certificate is written for B, and A's certificate binds A's merge only.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_detached_finalizer_after_pgid_reuse_cannot_discover_attempt_b() {
+        let fixture = fixture(PASSING_SCRIPT);
+        let dir = fixture.node.gate_registry().land_fence_dir.clone();
+        let job = "gjb_r35_pgid_reuse";
+        // One recycled pgid that answers ESRCH for the whole group.
+        let pgid = {
+            use std::os::unix::process::CommandExt;
+            let mut child = std::process::Command::new("true")
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let pgid = i32::try_from(child.id()).unwrap();
+            child.wait().unwrap();
+            pgid
+        };
+        assert!(!super::gate_test_group_exists(pgid));
+
+        // Attempt A (gen 1) fenced the group before its finalizer detached.
+        super::write_land_fence(
+            &dir,
+            job,
+            1,
+            pgid,
+            &super::LeaderIdentity::StartTick(7),
+            MERGE_A,
+        )
+        .unwrap();
+
+        // Park A AFTER ESRCH, BEFORE the exact-path lookup.
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        super::arm_settle_esrch_hold(Arc::new(CleanupHold {
+            entered: entered.clone(),
+            release: release.clone(),
+        }));
+        // The finalizer runs detached on the runtime, modelling the production
+        // deadline-detached spawn_blocking closure.
+        let registry_a = fixture.node.inner.gate.clone();
+        let job_a = job.to_owned();
+        let handle = tokio::spawn(async move {
+            registry_a.settle_land_group(&job_a, 1, MERGE_A, pgid).await;
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !entered.load(std::sync::atomic::Ordering::Acquire) {
+            assert!(std::time::Instant::now() < deadline, "A never parked");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Attempt B is granted with the SAME recycled pgid and writes its own
+        // attempt-qualified fence (gen 2, different merge).
+        super::write_land_fence(
+            &dir,
+            job,
+            2,
+            pgid,
+            &super::LeaderIdentity::StartTick(99),
+            MERGE_B,
+        )
+        .unwrap();
+        let b_fence = super::land_fence_path(&dir, job, 2);
+        let b_fence_before = std::fs::read_to_string(&b_fence).unwrap();
+
+        // Resume A.
+        {
+            let (lock, cvar) = &*release;
+            let mut done = lock.lock().unwrap();
+            *done = true;
+            cvar.notify_all();
+        }
+        handle.await.expect("detached finalizer task panicked");
+
+        // B's live fence is untouched (byte-identical) and has NO certificate.
+        assert_eq!(
+            std::fs::read_to_string(&b_fence).unwrap(),
+            b_fence_before,
+            "B's fence must survive A's resumed finalizer untouched"
+        );
+        assert!(
+            !super::land_dead_cert_path(&dir, job, 2).is_file(),
+            "no certificate may ever be written for attempt B"
+        );
+        assert_eq!(
+            super::land_ledger_liveness(&dir, job, Some(2), Some(MERGE_B)),
+            super::LandPushLiveness::MayPush,
+            "B still shows a live fence"
+        );
+        // A certified only its own exact path.
+        assert!(
+            !super::land_fence_path(&dir, job, 1).is_file(),
+            "A's own fence is removed"
+        );
+        assert!(
+            super::read_land_group_dead_cert(&dir, job, 1, MERGE_A).is_some(),
+            "A's certificate exists for A's exact (generation, merge)"
+        );
+        assert!(
+            super::read_land_group_dead_cert(&dir, job, 1, MERGE_B).is_none(),
+            "A's certificate never binds B's merge"
+        );
     }
 
     #[test]
@@ -9241,7 +9732,7 @@ Running 8 tests across 2 projects
         std::fs::write(&blocked, b"not a directory").unwrap();
         let registry = GateRegistry::new(blocked);
         let error = registry
-            .record_land_group("job-fail", 1, std::process::id() as i32)
+            .record_land_group("job-fail", 1, std::process::id() as i32, MERGE_A)
             .expect_err("fence persistence must fail");
         assert!(
             error.to_string().contains("entity") || error.raw_os_error().is_some(),
@@ -9298,37 +9789,81 @@ Running 8 tests across 2 projects
         let _ = std::fs::remove_file(&cert);
 
         // Nothing on disk: Unknown — never a death attestation.
-        assert_eq!(registry.land_push_liveness(job, Some(1)).await, Unknown);
+        assert_eq!(
+            registry
+                .land_push_liveness(job, Some(1), Some(MERGE_A))
+                .await,
+            Unknown
+        );
+        // No merge authority: Unknown even with nothing on disk.
+        assert_eq!(
+            registry.land_push_liveness(job, Some(1), None).await,
+            Unknown
+        );
 
         // A malformed fence ledger is still a PRESENT ledger: may push.
         std::fs::write(&fence, b"not json").unwrap();
-        assert_eq!(registry.land_push_liveness(job, Some(1)).await, MayPush);
+        assert_eq!(
+            registry
+                .land_push_liveness(job, Some(1), Some(MERGE_A))
+                .await,
+            MayPush
+        );
 
         // Ledger gone, malformed cert: Unknown.
         std::fs::remove_file(&fence).unwrap();
         std::fs::write(&cert, b"not json").unwrap();
-        assert_eq!(registry.land_push_liveness(job, Some(1)).await, Unknown);
+        assert_eq!(
+            registry
+                .land_push_liveness(job, Some(1), Some(MERGE_A))
+                .await,
+            Unknown
+        );
 
         // Cert present but missing its leader identity: Unknown.
         std::fs::write(
             &cert,
-            br#"{"jobId":"gjb_liveness","generation":1,"pgid":12345}"#,
+            br#"{"jobId":"gjb_liveness","generation":1,"pgid":12345,"mergeSha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
         )
         .unwrap();
-        assert_eq!(registry.land_push_liveness(job, Some(1)).await, Unknown);
+        assert_eq!(
+            registry
+                .land_push_liveness(job, Some(1), Some(MERGE_A))
+                .await,
+            Unknown
+        );
 
         // Cert naming a different job never proves THIS job dead.
-        let foreign =
-            serde_json::json!({"jobId":"gjb_other","generation":1,"pgid":1,"startTick":7});
+        let foreign = serde_json::json!({
+            "jobId": "gjb_other", "generation": 1, "pgid": 1, "startTick": 7,
+            "mergeSha": MERGE_A,
+        });
         super::write_land_group_dead_cert(&dir, &foreign, 1).unwrap();
-        assert_eq!(registry.land_push_liveness(job, Some(1)).await, Unknown);
+        assert_eq!(
+            registry
+                .land_push_liveness(job, Some(1), Some(MERGE_A))
+                .await,
+            Unknown
+        );
 
         // A complete certificate for the exact job: VerifiedDead.
-        let own = serde_json::json!({"jobId":job,"generation":1,"pgid":12345,"startTick":42});
+        let own = serde_json::json!({
+            "jobId": job, "generation": 1, "pgid": 12345, "startTick": 42,
+            "mergeSha": MERGE_A,
+        });
         super::write_land_group_dead_cert(&dir, &own, 12345).unwrap();
         assert_eq!(
-            registry.land_push_liveness(job, Some(1)).await,
+            registry
+                .land_push_liveness(job, Some(1), Some(MERGE_A))
+                .await,
             VerifiedDead
+        );
+        // A complete certificate never binds a different merge.
+        assert_eq!(
+            registry
+                .land_push_liveness(job, Some(1), Some(MERGE_B))
+                .await,
+            Unknown
         );
     }
 
@@ -9369,9 +9904,12 @@ Running 8 tests across 2 projects
         // r34 item 1: a probe WITHOUT the attempt generation stays Unknown even
         // when an attempt-qualified certificate exists (no cross-attempt
         // evidence).
+        // r35 item 2: the certificate binds generation AND the exact granted
+        // merge sha (the real orphan commit the fixture probes).
         let dir = fixture.node.gate_registry().land_fence_dir.clone();
         let record = serde_json::json!({
-            "jobId": "gjb_deadprobe", "generation": 1, "pgid": 4242, "startTick": 99
+            "jobId": "gjb_deadprobe", "generation": 1, "pgid": 4242, "startTick": 99,
+            "mergeSha": orphan,
         });
         super::write_land_group_dead_cert(&dir, &record, 4242).unwrap();
         let reply = fixture
@@ -9922,7 +10460,8 @@ head -c 1 >/dev/null || exit 4
 
         let dir = fixture.node.gate_registry().land_fence_dir.clone();
         let record = serde_json::json!({
-            "jobId": "gjb_shallow_r7", "generation": 1, "pgid": 5353, "startTick": 7
+            "jobId": "gjb_shallow_r7", "generation": 1, "pgid": 5353, "startTick": 7,
+            "mergeSha": orphan,
         });
         super::write_land_group_dead_cert(&dir, &record, 5353).unwrap();
         let reply = fixture
@@ -11458,7 +11997,8 @@ head -c 1 >/dev/null || exit 4
         // resolver this combination certified Absent against B.
         let dir = fixture.node.gate_registry().land_fence_dir.clone();
         let record = serde_json::json!({
-            "jobId": "gjb_r30_refspec", "generation": 1, "pgid": 6127, "startTick": 11
+            "jobId": "gjb_r30_refspec", "generation": 1, "pgid": 6127, "startTick": 11,
+            "mergeSha": merge_sha,
         });
         super::write_land_group_dead_cert(&dir, &record, 6127).unwrap();
         let reply = fixture

@@ -2621,11 +2621,26 @@ g_flow_messages AS (
             -- turn sums exactly. A stock ABOVE the retained flow (partial
             -- coverage) cannot certify: Ruling B flow wins and stock stands
             -- down (r9 items 4/5).
+            --
+            -- r42 (AB2 completion): a token-LESS REPORTED carrier is the
+            -- result/cost channel only — it can never CERTIFY token coverage.
+            -- Otherwise an equal/newer-revision cost-only $0.01 bill would
+            -- hide its session's turns from the token fold and then vanish
+            -- from the token stock itself (a confident-but-incomplete sum).
+            -- Token-bearing carriers and estimated points certify unchanged.
             SELECT s.instance_id AS instance_id, s.scope_id AS sid
             FROM global_scoped_sessions s
             JOIN g_session_turn_flow f
               ON f.instance_id = s.instance_id AND f.sid = s.scope_id
             WHERE f.turn_count > 0
+              AND NOT (
+                  s.accounting = 'reported'
+                  AND s.total_tokens IS NULL
+                  AND s.input_tokens IS NULL
+                  AND s.output_tokens IS NULL
+                  AND s.cache_read_tokens IS NULL
+                  AND s.cache_write_tokens IS NULL
+              )
               AND (
                   f.max_revision < s.metric_revision
                   OR (
@@ -8946,6 +8961,161 @@ mod tests {
             BudgetStatus::Stop,
             "A's retained bill still Stops a smaller model budget"
         );
+    }
+
+    /// Helper for r42 item 1: a qualified Turn row.
+    fn r42_turn(
+        instance: &str,
+        seq: i64,
+        scope: &str,
+        sid: &str,
+        revision: i64,
+        input: i64,
+        cost: Option<&str>,
+    ) -> UsageEventRow {
+        UsageEventRow {
+            instance_id: instance.into(),
+            seq,
+            profile_id: Some("pvp_r42".into()),
+            model: Some("m-r42".into()),
+            scope: "turn".into(),
+            scope_id: Some(scope.into()),
+            turn_id: None,
+            native_context_window: None,
+            mode: "snapshot".into(),
+            metric_revision: revision,
+            source_session_id: Some(sid.into()),
+            total_tokens: Some(input),
+            input_tokens: Some(input),
+            output_tokens: Some(0),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            cost_usd: cost.map(str::to_string),
+            accounting: "estimated".into(),
+            observed_at: "2026-10-16T00:00:00.000Z".into(),
+            observed_at_source: "native".into(),
+        }
+    }
+
+    /// r42 item 1a/1b (AB2 completion): a tokenless REPORTED carrier must NOT
+    /// certify token coverage. T1 (S1, rev1, 100) + tokenless reported S1
+    /// ($0.01) at EQUAL and at NEWER revision + T2 (S2, rev1, 200, $0.02):
+    /// the carrier cannot hide T1 — totals are 300, cost is 0.03 and the
+    /// budget Stops, with instance/supply parity.
+    #[test]
+    fn a_tokenless_reported_carrier_never_certifies_turn_coverage() {
+        for carrier_revision in [1i64, 2] {
+            let label = if carrier_revision == 1 {
+                "equal"
+            } else {
+                "newer"
+            };
+            let conn = Connection::open_in_memory().unwrap();
+            migrate(&conn).unwrap();
+            assert!(
+                insert_usage_event(&conn, &r42_turn("ins_r42i1", 1, "T1", "s1", 1, 100, None))
+                    .unwrap()
+            );
+            // Tokenless reported carrier on the SAME profile/model as the
+            // turns (model-attributed bill stays model-scoped in supply).
+            let mut carrier = r40_session_row(
+                "ins_r42i1",
+                2,
+                Some("s1"),
+                carrier_revision,
+                None,
+                Some("0.01"),
+                "reported",
+            );
+            carrier.profile_id = Some("pvp_r42".into());
+            carrier.model = Some("m-r42".into());
+            assert!(
+                insert_usage_event(&conn, &carrier).unwrap(),
+                "{label}: tokenless reported carrier is accepted"
+            );
+            assert!(
+                insert_usage_event(
+                    &conn,
+                    &r42_turn("ins_r42i1", 3, "T2", "s2", 1, 200, Some("0.02"))
+                )
+                .unwrap()
+            );
+
+            let inst = aggregate_instance(&conn, "ins_r42i1").unwrap();
+            let supply = aggregate_supply(&conn, "pvp_r42", "m-r42").unwrap();
+            assert_eq!(
+                inst.input_tokens,
+                Some(300),
+                "{label}: T1's 100 + T2's 200, the tokenless carrier certifies nothing"
+            );
+            assert_eq!(inst.total_tokens, Some(300));
+            assert_eq!(inst.input_tokens, supply.input_tokens, "{label} parity");
+            assert_eq!(inst.total_tokens, supply.total_tokens);
+            assert!(
+                (inst.cost_usd.unwrap() - 0.03).abs() < 1e-9,
+                "{label}: S1 bill 0.01 + S2 estimate 0.02, got {:?}",
+                inst.cost_usd
+            );
+            assert_eq!(inst.cost_usd, supply.cost_usd);
+            assert_eq!(
+                inst.budget_status(Some(0.02)),
+                BudgetStatus::Stop,
+                "{label}"
+            );
+            assert_eq!(supply.budget_status(Some(0.02)), BudgetStatus::Stop);
+        }
+    }
+
+    /// r42 item 1c: an unpriced qualified Turn whose only "stock" is a
+    /// tokenless costless REPORTED Session must stay an uncovered Unknown
+    /// contribution — the costless carrier certifies nothing and creates no
+    /// authority key, so S1's bill can't surface as a confident $0.01.
+    #[test]
+    fn a_tokenless_costless_reported_carrier_keeps_its_unpriced_turn_unknown() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        // S1 carries the priced bill.
+        assert!(
+            insert_usage_event(
+                &conn,
+                &r40_session_row(
+                    "ins_r42i1c",
+                    1,
+                    Some("s1"),
+                    1,
+                    None,
+                    Some("0.01"),
+                    "reported"
+                )
+            )
+            .unwrap()
+        );
+        // S2: unpriced qualified Turn ...
+        assert!(
+            insert_usage_event(&conn, &r42_turn("ins_r42i1c", 2, "T2", "s2", 1, 200, None))
+                .unwrap()
+        );
+        // ... and a tokenless, costless REPORTED session carrier at the same
+        // revision (an accepted stored shape).
+        assert!(
+            insert_usage_event(
+                &conn,
+                &r40_session_row("ins_r42i1c", 3, Some("s2"), 1, None, None, "reported")
+            )
+            .unwrap()
+        );
+
+        let inst = aggregate_instance(&conn, "ins_r42i1c").unwrap();
+        let supply = aggregate_supply(&conn, "pvp_r42", "m-r42").unwrap();
+        assert_eq!(inst.input_tokens, Some(200), "the S2 turn tokens survive");
+        assert_eq!(inst.input_tokens, supply.input_tokens);
+        assert_eq!(
+            inst.cost_usd, None,
+            "S2's uncovered unpriced turn poisons past the costless carrier and S1's bill"
+        );
+        assert_eq!(inst.cost_usd, supply.cost_usd);
+        assert_eq!(inst.budget_status(Some(0.02)), BudgetStatus::Unknown);
+        assert_eq!(supply.budget_status(Some(0.02)), BudgetStatus::Unknown);
     }
 
     #[test]

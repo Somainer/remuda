@@ -3120,7 +3120,6 @@ mod tests {
     /// spawn at the owner boundary carries the full hardening set.
     #[test]
     fn every_production_cli_recovery_invocation_carries_full_hardening() {
-        use std::sync::{Arc, Mutex};
         fn assert_recorded_hardening(log: &[remuda_unix::RecordedGit]) {
             assert!(!log.is_empty(), "recovery must spawn git");
             for (index, rec) in log.iter().enumerate() {
@@ -3150,12 +3149,12 @@ mod tests {
                 }
             }
         }
-        let install = || {
-            let log: Arc<Mutex<Vec<remuda_unix::RecordedGit>>> = Arc::new(Mutex::new(Vec::new()));
-            remuda_unix::set_git_spawn_recorder(Some(log.clone()));
-            log
-        };
-
+        // r35 item 4: every phase installs the RAII RecordingGuard and consumes
+        // ONLY its own fixture repository's spawns via `for_repo` — a parallel
+        // subprocess test (an unhardened wrapper in another cwd) can neither
+        // pollute the assertions nor leak a recorder when this test panics
+        // (the guard clears the process-wide recorder on unwind). Selection is
+        // by cwd, never by hardening content (that would hide a bypass).
         let keep = tempfile::tempdir().unwrap();
         let root = keep.path();
         let origin = root.join("origin.git");
@@ -3203,12 +3202,17 @@ mod tests {
         tgit_ok(&seed, &["fetch", "-q", lane.to_str().unwrap(), &merge_m]);
         tgit_ok(&seed, &["merge", "-q", "--no-ff", "-m", "D", &merge_m]);
         tgit_ok(&seed, &["push", "-q", "origin", "main"]);
-        let remote_d = tgit_ok(&seed, &["rev-parse", "main"]);
+        // Sanity-check the remote tip is readable (its value is not asserted on
+        // below; the recovery phases probe their own ancestor facts).
+        let _remote_tip = tgit_ok(&seed, &["rev-parse", "main"]);
 
-        // (1) success
-        let log = install();
-        push_main_cas(&lane, &merge_m, &base_b).expect("Landed");
-        assert_recorded_hardening(&std::mem::take(&mut *log.lock().unwrap()));
+        // (1) success — the guard scope ends with the phase so the recorder is
+        // cleared before the next phase installs its own.
+        {
+            let guard = remuda_unix::RecordingGuard::install();
+            push_main_cas(&lane, &merge_m, &base_b).expect("Landed");
+            assert_recorded_hardening(&guard.for_repo(&lane));
+        }
 
         // (2) object-fetch failure: advance remote to E the lane lacks, swap
         // to an empty remote at the read seam.
@@ -3229,27 +3233,29 @@ mod tests {
                 empty.to_str().unwrap(),
             ],
         );
-        let log = install();
-        seam::arm(&lane, 1);
-        let repo_t = lane.clone();
-        let (merged_t, expected_t) = (merge_m.clone(), base_b.clone());
-        let result = std::thread::spawn(move || push_main_cas(&repo_t, &merged_t, &expected_t));
-        seam::wait_arrived(&lane, 0);
-        tgit_ok(
-            &lane,
-            &["remote", "set-url", "origin", empty.to_str().unwrap()],
-        );
-        seam::release(&lane, 0);
-        let error = result.join().unwrap().expect_err("uncertain");
-        seam::disarm(&lane);
-        assert!(
-            matches!(
-                error.downcast_ref::<MergeStop>(),
-                Some(MergeStop::PushUncertain(_))
-            ),
-            "{error}"
-        );
-        assert_recorded_hardening(&std::mem::take(&mut *log.lock().unwrap()));
+        {
+            let guard = remuda_unix::RecordingGuard::install();
+            seam::arm(&lane, 1);
+            let repo_t = lane.clone();
+            let (merged_t, expected_t) = (merge_m.clone(), base_b.clone());
+            let result = std::thread::spawn(move || push_main_cas(&repo_t, &merged_t, &expected_t));
+            seam::wait_arrived(&lane, 0);
+            tgit_ok(
+                &lane,
+                &["remote", "set-url", "origin", empty.to_str().unwrap()],
+            );
+            seam::release(&lane, 0);
+            let error = result.join().unwrap().expect_err("uncertain");
+            seam::disarm(&lane);
+            assert!(
+                matches!(
+                    error.downcast_ref::<MergeStop>(),
+                    Some(MergeStop::PushUncertain(_))
+                ),
+                "{error}"
+            );
+            assert_recorded_hardening(&guard.for_repo(&lane));
+        }
 
         // (3) SHALLOW / negative-ancestry path: a depth-1 clone of the remote
         // tip. The granted merge is an AVAILABLE orphan commit (present object,
@@ -3296,7 +3302,7 @@ mod tests {
                 == Some(1),
             "the orphan must genuinely not be an ancestor"
         );
-        let log = install();
+        let guard = remuda_unix::RecordingGuard::install();
         let result = push_main_cas(&shallow_lane, &orphan_merge, &remote_tip);
         let error = result
             .as_ref()
@@ -3309,7 +3315,9 @@ mod tests {
             error.to_string().contains("shallow clone"),
             "the uncertainty must come from the SHALLOW branch, not the missing-object arm: {error}"
         );
-        let recorded = std::mem::take(&mut *log.lock().unwrap());
+        // Consume only the shallow fixture repository's spawns (the guard
+        // itself clears the recorder on scope exit, including on panic).
+        let recorded = guard.for_repo(&shallow_lane);
         // The recorder observed the shallow check on the REAL recovery path.
         assert!(
             recorded.iter().any(|rec| {
@@ -3320,7 +3328,6 @@ mod tests {
         );
         assert_recorded_hardening(&recorded);
 
-        remuda_unix::set_git_spawn_recorder(None);
         drop(keep);
     }
 

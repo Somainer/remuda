@@ -350,10 +350,11 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     collapse_duplicate_turn_lineage_rows(tx)?;
     // c-usagefu: identical Message duplicates collapse to highest seq.
     consolidate_message_duplicates(tx)?;
-    consolidate_identical_scoped_rows(tx)?;
-    // r11 item 1: replay the cumulative-growth acceptance rule for imported /
-    // pre-acceptance chains before rowid order means accepted history.
-    normalise_scoped_session_chains(tx)?;
+    // r41 AB1+: reconcile every retained SESSION chain through the same
+    // cost-aware acceptance the live insert path runs — cost-inclusive stock
+    // identity (a newer reported bill survives restart), stale-point removal
+    // and reset-estimate stripping in one step.
+    reconcile_session_chains(tx)?;
     // r16 item 3 (T1'): recreate the per-LINEAGE turn unique index.
     tx.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS usage_events_turn_dedupe
@@ -605,6 +606,11 @@ struct TurnFrame {
     accounting: String,
     observed_at: String,
     observed_at_source: String,
+    /// Native per-model context window reported on the frame. r41 AB1+: the
+    /// established counter-update semantics apply — a counter-carrying frame
+    /// that reports a window updates it, an unreported one keeps the retained
+    /// value, and a cost-only correction always preserves it on both paths.
+    native_context_window: Option<i64>,
 }
 
 /// Reconcile an AUTHORITATIVELY-NEWER incoming frame over the retained frame,
@@ -653,6 +659,9 @@ fn reconcile_turn_frame(stored: &TurnFrame, incoming: &TurnFrame) -> TurnFrame {
         accounting: stored.accounting.clone(),
         observed_at: stored.observed_at.clone(),
         observed_at_source: stored.observed_at_source.clone(),
+        // A billing correction never re-reports the context window: keep the
+        // retained value (it may be a 1M window the correction omitted).
+        native_context_window: stored.native_context_window,
     };
     if !reports_counters {
         return reconciled;
@@ -665,6 +674,10 @@ fn reconcile_turn_frame(stored: &TurnFrame, incoming: &TurnFrame) -> TurnFrame {
     reconciled.model = incoming.model.clone();
     reconciled.mode = incoming.mode.clone();
     reconciled.accounting = incoming.accounting.clone();
+    // Window follows the same unreported-keeps-retained rule as the baskets.
+    reconciled.native_context_window = incoming
+        .native_context_window
+        .or(stored.native_context_window);
     if incoming.observed_at_source == "native" || stored.observed_at_source != "native" {
         reconciled.observed_at = incoming.observed_at.clone();
         reconciled.observed_at_source = incoming.observed_at_source.clone();
@@ -695,8 +708,9 @@ fn persist_reconciled_turn(conn: &Connection, frame: &TurnFrame) -> rusqlite::Re
             cost_usd = ?12,
             accounting = ?13,
             observed_at = ?14,
-            observed_at_source = ?15
-         WHERE rowid = ?16",
+            observed_at_source = ?15,
+            native_context_window = ?16
+         WHERE rowid = ?17",
         params![
             frame.seq,
             frame.profile_id,
@@ -713,6 +727,7 @@ fn persist_reconciled_turn(conn: &Connection, frame: &TurnFrame) -> rusqlite::Re
             frame.accounting,
             frame.observed_at,
             frame.observed_at_source,
+            frame.native_context_window,
             rowid,
         ],
     )?;
@@ -740,7 +755,7 @@ fn collapse_duplicate_turn_lineage_rows(conn: &Connection) -> rusqlite::Result<u
     let select = "SELECT rowid, seq, profile_id, model, mode, metric_revision,
                          source_session_id, total_tokens, input_tokens, output_tokens,
                          cache_read_tokens, cache_write_tokens, cost_usd, accounting,
-                         observed_at, observed_at_source
+                         observed_at, observed_at_source, native_context_window
                   FROM usage_events
                   WHERE scope = 'turn' AND scope_id IS NOT NULL
                   ORDER BY instance_id, scope_id, COALESCE(source_session_id, ''),
@@ -765,6 +780,7 @@ fn collapse_duplicate_turn_lineage_rows(conn: &Connection) -> rusqlite::Result<u
             accounting: r.get(13)?,
             observed_at: r.get(14)?,
             observed_at_source: r.get(15)?,
+            native_context_window: r.get(16)?,
         })
     };
     let mut stmt = conn.prepare(select)?;
@@ -835,92 +851,93 @@ fn collapse_one_turn_lineage(
     Ok(n)
 }
 
-/// Collapse rows that became exact duplicates after the retained-journal
-/// scope-id backfill: same `(instance_id, scope, scope_id)` AND identical
-/// counters in every bucket are the same cumulative point replayed at another
-/// journal seq, so keeping both would double-count a stock. Turn rows in
-/// DIFFERENT native-session lineages are never duplicates even with matching
-/// counters — each lineage keeps its own row (c-ctxusage r16 item 3). The
-/// oldest durable identity (smallest rowid) wins; its `observed_at` is
-/// retained. Runs inside [`migrate`]'s transaction (c-ctxusage r10 item 2).
-fn consolidate_identical_scoped_rows(conn: &Connection) -> rusqlite::Result<usize> {
-    conn.execute(
-        "DELETE FROM usage_events
-         WHERE scope_id IS NOT NULL
-           AND rowid NOT IN (
-               SELECT MIN(rowid)
-               FROM usage_events
-               WHERE scope_id IS NOT NULL
-               GROUP BY instance_id, scope, scope_id,
-                        CASE WHEN scope = 'turn'
-                             THEN COALESCE(source_session_id, '')
-                             ELSE '' END,
-                        COALESCE(total_tokens, -1),
-                        COALESCE(input_tokens, -1),
-                        COALESCE(output_tokens, -1),
-                        COALESCE(cache_read_tokens, -1),
-                        COALESCE(cache_write_tokens, -1)
-           )",
-        [],
-    )
-}
-
-/// Replay the cumulative-growth acceptance rule over every proven scoped
-/// session chain and drop points the rule would have rejected at insert.
+/// Reconcile EVERY retained Session chain through the SAME cost-aware
+/// acceptance rule live insertion runs (r41 AB1+):
+/// [`decide_session_point`]/[`accept_session_point`]. This replaces the two
+/// divergent recovery steps:
 ///
-/// Imported legacy rows (and rows written before the content-ordered rule
-/// existed) can land out of cumulative order: a high-water 200/20 row at a
-/// small rowid followed by a stale historical replay 100/10 at a larger one
-/// leaves raw rowid order disagreeing with the floors — current-stock
-/// selection would show 100/10 while the retained 200/20 still freezes later
-/// points. Walking each `(instance_id, scope_id)` chain in rowid order with
-/// the live [`freezes_against`] rule removes exactly those points, so rowid
-/// order is once more a true accepted-history order. Idempotent: an already
-/// normalised chain deletes nothing (c-ctxusage r11 item 1).
-fn normalise_scoped_session_chains(conn: &Connection) -> rusqlite::Result<usize> {
+/// * the old token-only duplicate consolidation grouped identical COUNTERS
+///   without cost and deleted the later row, so a restart deleted a newer
+///   reported bill ($0.01 then $0.03 collapsed to $0.01);
+/// * the old chain normalisation called [`freezes_against`] but never applied
+///   reset-cost stripping, so a recovered token growth with a decreasing
+///   driver estimate kept a price the live insert path strips to Unknown.
+///
+/// Scoped chains are keyed `(instance_id, scope_id)`; legacy NULL-scope rows
+/// form one chain per instance and never floor each other across that
+/// boundary — exactly the live floor queries. Walking each chain in rowid
+/// order (the accepted-history order) deletes points the rule freezes and
+/// UPDATEs a reset estimate to Unknown; an already-normalised chain is a
+/// no-op, so the step is idempotent and safe on every restart.
+fn reconcile_session_chains(conn: &Connection) -> rusqlite::Result<usize> {
+    struct Pending {
+        rowid: i64,
+        instance: String,
+        scope: Option<String>,
+        point: SessionStockPoint,
+    }
     let mut stmt = conn.prepare(
         "SELECT rowid, instance_id, scope_id, total_tokens, input_tokens,
                 output_tokens, cache_read_tokens, cache_write_tokens, cost_usd
          FROM usage_events
-         WHERE scope = 'session' AND scope_id IS NOT NULL
-         ORDER BY instance_id ASC, scope_id ASC, rowid ASC",
+         WHERE scope = 'session'
+         ORDER BY instance_id ASC,
+                  CASE WHEN scope_id IS NULL THEN 1 ELSE 0 END,
+                  scope_id ASC,
+                  rowid ASC",
     )?;
-    let rows = stmt.query_map([], |r| {
-        let rowid: i64 = r.get(0)?;
-        let instance_id: String = r.get(1)?;
-        let scope_id: String = r.get(2)?;
-        let point = SessionStockPoint {
-            counters: SnapshotCounters {
-                total: r.get(3)?,
-                input: r.get(4)?,
-                output: r.get(5)?,
-                cache_read: r.get(6)?,
-                cache_write: r.get(7)?,
-            },
-            cost: parse_cost(r.get::<_, Option<String>>(8)?),
-        };
-        Ok((rowid, instance_id, scope_id, point))
-    })?;
-    let mut current_key: Option<(String, String)> = None;
+    let rows: Vec<Pending> = stmt
+        .query_map([], |r| {
+            Ok(Pending {
+                rowid: r.get(0)?,
+                instance: r.get(1)?,
+                scope: r.get(2)?,
+                point: SessionStockPoint {
+                    counters: SnapshotCounters {
+                        total: r.get(3)?,
+                        input: r.get(4)?,
+                        output: r.get(5)?,
+                        cache_read: r.get(6)?,
+                        cache_write: r.get(7)?,
+                    },
+                    cost: parse_cost(r.get::<_, Option<String>>(8)?),
+                },
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+
+    let mut current_key: Option<(String, Option<String>)> = None;
     let mut accepted: Vec<SessionStockPoint> = Vec::new();
-    let mut stale_rowids: Vec<i64> = Vec::new();
-    for entry in rows {
-        let (rowid, instance_id, scope_id, point) = entry?;
-        let key = Some((instance_id, scope_id));
+    let mut removed = 0usize;
+    for row in &rows {
+        let key = Some((row.instance.clone(), row.scope.clone()));
         if key != current_key {
             current_key = key;
             accepted.clear();
         }
-        if freezes_against(&point, &accepted) {
-            stale_rowids.push(rowid);
-        } else {
-            accepted.push(point);
+        match decide_session_point(&row.point, &accepted) {
+            SessionPointDecision::Freeze => {
+                removed += conn.execute(
+                    "DELETE FROM usage_events WHERE rowid = ?1",
+                    params![row.rowid],
+                )?;
+            }
+            SessionPointDecision::Accept { strip_reset_cost } => {
+                if strip_reset_cost {
+                    // Persist the reset estimate as Unknown exactly as live.
+                    conn.execute(
+                        "UPDATE usage_events SET cost_usd = NULL WHERE rowid = ?1",
+                        params![row.rowid],
+                    )?;
+                    let mut kept = row.point;
+                    kept.cost = None;
+                    accepted.push(kept);
+                } else {
+                    accepted.push(row.point);
+                }
+            }
         }
-    }
-    drop(stmt);
-    let mut removed = 0;
-    for rowid in stale_rowids {
-        removed += conn.execute("DELETE FROM usage_events WHERE rowid = ?1", params![rowid])?;
     }
     Ok(removed)
 }
@@ -1409,26 +1426,60 @@ fn freezes_against(incoming: &SessionStockPoint, existing: &[SessionStockPoint])
     false
 }
 
-/// When a token-growing point carries a lower cost than the stored stock, the
-/// driver's running estimate has reset (unpriced turn → priced turn). Drop
-/// that point's cost rather than persist a smaller cumulative value; its
-/// token counters remain the real content. Token-LESS points keep their cost
-/// (the result channel is monotonic and is frozen on a decrease).
-fn with_reset_cost_stripped(
-    mut row: UsageEventRow,
+/// The single cost-aware acceptance decision for a cumulative Session point,
+/// shared by the LIVE insert path and migration/recovery chain reconciliation
+/// (r41 AB1+).
+enum SessionPointDecision {
+    /// The point is a stale replay / duplicate of an accepted point.
+    Freeze,
+    /// The point appends; when `strip_reset_cost` its decreasing estimate was
+    /// a driver running-total reset and must be persisted as Unknown.
+    Accept { strip_reset_cost: bool },
+}
+
+/// Decide acceptance against the retained floors using EXACTLY the live rule:
+/// [`freezes_against`] plus reset-cost detection. Recovery walks each session
+/// chain in accepted-history (rowid) order and calls this on every point, so a
+/// restarted store keeps precisely the points and stripped costs the live
+/// insert path would have produced.
+fn decide_session_point(
     incoming: &SessionStockPoint,
     floors: &[SessionStockPoint],
-) -> UsageEventRow {
+) -> SessionPointDecision {
+    if freezes_against(incoming, floors) {
+        return SessionPointDecision::Freeze;
+    }
     let tokens_grew = floors
         .iter()
         .any(|stored| incoming.tokens_grew_against(stored));
     let cost_reset = floors
         .iter()
         .any(|stored| matches!((incoming.cost, stored.cost), (Some(new), Some(old)) if new < old));
-    if tokens_grew && cost_reset {
-        row.cost_usd = None;
+    SessionPointDecision::Accept {
+        strip_reset_cost: tokens_grew && cost_reset,
     }
-    row
+}
+
+/// Live acceptance: return the row to persist (reset estimate stripped) or
+/// `None` when the point freezes.
+fn accept_session_point(
+    row: &UsageEventRow,
+    floors: &[SessionStockPoint],
+) -> Option<UsageEventRow> {
+    let incoming = SessionStockPoint::of(row);
+    match decide_session_point(&incoming, floors) {
+        SessionPointDecision::Freeze => None,
+        SessionPointDecision::Accept { strip_reset_cost } => {
+            let mut row = row.clone();
+            if strip_reset_cost {
+                // Token growth with a lower cost is a driver-priced estimate
+                // reset (unpriced turn → priced turn): keep the real token
+                // counters, persist the cost as Unknown.
+                row.cost_usd = None;
+            }
+            Some(row)
+        }
+    }
 }
 
 /// Append a new scoped cumulative-session growth point, freezing
@@ -1448,12 +1499,10 @@ fn with_reset_cost_stripped(
 /// Legacy NULL-scope rows carry no session identity and therefore never floor
 /// a scoped point (r8 item 8).
 fn insert_session_growth_point(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
-    let incoming = SessionStockPoint::of(row);
     let floors = existing_session_floors(conn, row)?;
-    if freezes_against(&incoming, &floors) {
+    let Some(row) = accept_session_point(row, &floors) else {
         return Ok(false);
-    }
-    let row = with_reset_cost_stripped(row.clone(), &incoming, &floors);
+    };
     insert_row(conn, &row)
 }
 
@@ -1461,7 +1510,6 @@ fn insert_session_growth_point(conn: &Connection, row: &UsageEventRow) -> rusqli
 /// rows only. Scoped points are the newer world and are summed separately in
 /// the rollup; legacy totals are read at all only while no scoped rows exist.
 fn insert_legacy_session_point(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
-    let incoming = SessionStockPoint::of(row);
     let mut stmt = conn.prepare(
         "SELECT total_tokens, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
                 cost_usd
@@ -1482,10 +1530,9 @@ fn insert_legacy_session_point(conn: &Connection, row: &UsageEventRow) -> rusqli
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    if freezes_against(&incoming, &existing) {
+    let Some(row) = accept_session_point(row, &existing) else {
         return Ok(false);
-    }
-    let row = with_reset_cost_stripped(row.clone(), &incoming, &existing);
+    };
     insert_row(conn, &row)
 }
 
@@ -1819,13 +1866,15 @@ fn upsert_turn_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Res
                 accounting: r.get(13)?,
                 observed_at: r.get(14)?,
                 observed_at_source: r.get(15)?,
+                native_context_window: r.get(16)?,
             })
         };
         const STORED_SELECT: &str = "SELECT rowid, seq, profile_id, model, mode,
                     metric_revision, source_session_id,
                     total_tokens, input_tokens, output_tokens,
                     cache_read_tokens, cache_write_tokens,
-                    cost_usd, accounting, observed_at, observed_at_source
+                    cost_usd, accounting, observed_at, observed_at_source,
+                    native_context_window
              FROM usage_events
              WHERE instance_id = ?1 AND scope = 'turn' AND scope_id = ?2
                AND source_session_id {predicate}";
@@ -1878,6 +1927,7 @@ fn upsert_turn_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Res
         accounting: row.accounting.clone(),
         observed_at: row.observed_at.clone(),
         observed_at_source: row.observed_at_source.clone(),
+        native_context_window: row.native_context_window,
     };
     // One reconciliation for every frame shape: the cost-only channel carries
     // counters/clock forward and advances only position/lineage/bill; the
@@ -12380,6 +12430,491 @@ mod tests {
         assert_eq!(inst.total_tokens, Some(150));
         assert_eq!(inst.input_tokens, Some(100));
         assert!((inst.cost_usd.unwrap() - 0.03).abs() < 1e-9);
+    }
+
+    /// r41 item 1 (AB1+): restart must never delete a later reported bill. Two
+    /// tokenless Reported Session points for one session ($0.01 then $0.03) are
+    /// both accepted live (cost is part of stock identity); after a second
+    /// migration the newest $0.03 must survive and the budget stays Stop.
+    #[test]
+    fn restart_keeps_the_later_reported_cumulative_bill() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        assert!(
+            insert_usage_event(
+                &conn,
+                &r40_session_row(
+                    "ins_r41i1",
+                    1,
+                    Some("s1"),
+                    1,
+                    None,
+                    Some("0.01"),
+                    "reported"
+                )
+            )
+            .unwrap()
+        );
+        assert!(
+            insert_usage_event(
+                &conn,
+                &r40_session_row(
+                    "ins_r41i1",
+                    2,
+                    Some("s1"),
+                    2,
+                    None,
+                    Some("0.03"),
+                    "reported"
+                )
+            )
+            .unwrap()
+        );
+
+        // Restart: every reconciliation step runs again.
+        migrate(&conn).unwrap();
+
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_events
+                 WHERE instance_id = 'ins_r41i1' AND scope = 'session'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 2, "both growing bills survive restart");
+        let newest: String = conn
+            .query_row(
+                "SELECT cost_usd FROM usage_events
+                 WHERE instance_id = 'ins_r41i1' AND scope = 'session'
+                 ORDER BY seq DESC, rowid DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(newest, "0.03");
+
+        let inst = aggregate_instance(&conn, "ins_r41i1").unwrap();
+        let supply = aggregate_supply(&conn, "pvp_r40", "m-r40").unwrap();
+        assert!(
+            (inst.cost_usd.unwrap() - 0.03).abs() < 1e-9,
+            "restart keeps $0.03"
+        );
+        assert_eq!(inst.cost_usd, supply.cost_usd, "instance/supply parity");
+        assert_eq!(inst.budget_status(Some(0.02)), BudgetStatus::Stop);
+        assert_eq!(supply.budget_status(Some(0.02)), BudgetStatus::Stop);
+    }
+
+    /// r41 item 2 (AB1+): recovery applies the SAME cost-aware acceptance as
+    /// live insertion for Session chains. Token growth (100 -> 200) carrying a
+    /// DECREASING estimate ($0.10 -> $0.05) strips the reset cost on BOTH
+    /// paths, leaving cost Unknown; recovered and live stores agree on the full
+    /// retained point and on instance/supply/budget answers.
+    #[test]
+    fn recovered_session_growth_with_a_decreasing_estimate_strips_cost_like_live() {
+        // --- Recovery: r28 shape + fallback append + journal evidence --------
+        let conn = Connection::open_in_memory().unwrap();
+        create_r28_usage_table_with_turn_index(&conn);
+        create_journal_table(&conn);
+        // Established scoped point: input100, estimate 0.10.
+        conn.execute(
+            "INSERT INTO usage_events
+                (instance_id, seq, profile_id, model, scope, scope_id, mode,
+                 metric_revision, source_session_id, total_tokens, input_tokens,
+                 output_tokens, cache_read_tokens, cache_write_tokens,
+                 cost_usd, accounting, observed_at, observed_at_source)
+             VALUES ('ins_r41i2', 1, 'pvp', 'm', 'session', 'sess-S', 'snapshot',
+                 1, 'sess-S', 100, 100, 0, 0, 0,
+                 '0.10', 'estimated', '2026-10-01T00:00:00.000Z', 'native')",
+            [],
+        )
+        .unwrap();
+        // Fallback append (14-column shape): input200 with the RESET estimate
+        // 0.05. Live acceptance keeps the growth and strips the cost.
+        conn.execute(
+            "INSERT INTO usage_events
+                (instance_id, seq, profile_id, model, scope, mode, total_tokens,
+                 input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                 cost_usd, accounting, observed_at)
+             VALUES ('ins_r41i2', 2, 'pvp', 'm', 'session', 'snapshot', 200,
+                 200, 0, 0, 0, '0.05',
+                 'estimated', '2026-10-01T00:00:02.000Z')",
+            [],
+        )
+        .unwrap();
+        let journal_point = |seq: i64, input: &str, cost: Option<&str>| {
+            let cost_json = match cost {
+                Some(amount) => json!({
+                    "state": "known",
+                    "value": {"amount": amount, "currency": "USD"}
+                }),
+                None => json!({ "state": "unknown", "reason": "unpriced",
+                                 "evidenceEventIds": [] }),
+            };
+            json!({
+                "kind": "usage",
+                "nativeAt": {"state": "known",
+                    "value": format!("2026-10-01T00:00:0{seq}.000Z")},
+                "source": {
+                    "nativeSessionId": {"state": "known", "value": "sess-S"}
+                },
+                "payload": {
+                    "scope": "session",
+                    "scopeId": "sess-S",
+                    "mode": "snapshot",
+                    "metricRevision": seq.to_string(),
+                    "sourceSessionId": "sess-S",
+                    "totalTokens": {"state": "known", "value": input},
+                    "inputTokens": {"state": "known", "value": input},
+                    "outputTokens": {"state": "known", "value": "0"},
+                    "cacheReadTokens": {"state": "known", "value": "0"},
+                    "cacheWriteTokens": {"state": "known", "value": "0"},
+                    "cost": cost_json,
+                    "accounting": "estimated"
+                }
+            })
+        };
+        for (seq, input, cost) in [(1i64, "100", Some("0.10")), (2, "200", Some("0.05"))] {
+            let p = journal_point(seq, input, cost);
+            let stamp = format!("2026-10-01T00:00:0{seq}.000Z");
+            conn.execute(
+                "INSERT INTO journal (instance_id, seq, event_id, payload_json, observed_at)
+                 VALUES ('ins_r41i2', ?1, ?2, ?3, ?4)",
+                params![seq, format!("je{seq}"), p.to_string(), stamp],
+            )
+            .unwrap();
+        }
+
+        migrate(&conn).unwrap();
+
+        // The newest retained point carries the growth but Unknown cost.
+        let (input, cost): (Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT input_tokens, cost_usd FROM usage_events
+                 WHERE instance_id = 'ins_r41i2' AND scope = 'session'
+                 ORDER BY seq DESC, rowid DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(input, Some(200), "token growth is retained");
+        assert_eq!(
+            cost, None,
+            "the reset estimate is stripped exactly like live"
+        );
+
+        // --- Live: project the same two observations through the live path ---
+        let live = Connection::open_in_memory().unwrap();
+        migrate(&live).unwrap();
+        for seq in [1i64, 2] {
+            let rec = JournalRecord {
+                instance_id: "ins_r41i2".into(),
+                seq,
+                event_id: format!("evt{seq}"),
+                event: serde_json::from_value(journal_point(
+                    seq,
+                    if seq == 1 { "100" } else { "200" },
+                    if seq == 1 { Some("0.10") } else { Some("0.05") },
+                ))
+                .unwrap(),
+                observed_at: format!("2026-10-01T00:00:0{seq}.000Z"),
+            };
+            let row = project_usage_event(&rec, Some("pvp"), Some("m")).unwrap();
+            insert_usage_event(&live, &row).unwrap();
+        }
+        let live_point: (Option<i64>, Option<String>) = live
+            .query_row(
+                "SELECT input_tokens, cost_usd FROM usage_events
+                 WHERE instance_id = 'ins_r41i2' AND scope = 'session'
+                 ORDER BY seq DESC, rowid DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(live_point, (input, cost), "full retained point parity");
+
+        // Aggregate / budget parity.
+        let assert_unknown = |c: &Connection, label: &str| {
+            let inst = aggregate_instance(c, "ins_r41i2").unwrap();
+            let supply = aggregate_supply(c, "pvp", "m").unwrap();
+            assert_eq!(inst.cost_usd, None, "{label}: recovered cost Unknown");
+            assert_eq!(inst.cost_usd, supply.cost_usd, "{label}: parity");
+            assert_eq!(inst.input_tokens, Some(200));
+            assert_eq!(inst.input_tokens, supply.input_tokens);
+            assert_eq!(inst.budget_status(Some(0.01)), BudgetStatus::Unknown);
+            assert_eq!(supply.budget_status(Some(0.01)), BudgetStatus::Unknown);
+        };
+        assert_unknown(&conn, "recovery");
+        assert_unknown(&live, "live");
+    }
+
+    /// r41 item 3 (AB1+): the shared Turn reconciliation carries
+    /// native_context_window with the established counter semantics — a newer
+    /// counter snapshot updates it, and a later cost-only correction keeps the
+    /// retained window on BOTH the live and recovery paths. Live and recovered
+    /// surviving rows compare equal including the window; both roll up a 1M
+    /// window and agree instance/supply/budget.
+    #[test]
+    fn turn_reconciliation_updates_and_preserves_native_context_window() {
+        let frame = |conn_inst: &str,
+                     seq: i64,
+                     revision: i64,
+                     input: Option<i64>,
+                     cost: Option<&str>,
+                     window: Option<i64>| UsageEventRow {
+            instance_id: conn_inst.into(),
+            seq,
+            profile_id: Some("pvp".into()),
+            model: Some("m".into()),
+            scope: "turn".into(),
+            scope_id: Some("msg-T".into()),
+            turn_id: None,
+            native_context_window: window,
+            mode: "snapshot".into(),
+            metric_revision: revision,
+            source_session_id: Some("sess-S".into()),
+            total_tokens: input,
+            input_tokens: input,
+            output_tokens: input.map(|_| 0),
+            cache_read_tokens: input.map(|_| 0),
+            cache_write_tokens: input.map(|_| 0),
+            cost_usd: cost.map(str::to_string),
+            accounting: "estimated".into(),
+            observed_at: format!("2026-10-01T00:00:0{seq}.000Z"),
+            observed_at_source: "native".into(),
+        };
+
+        // --- Live -------------------------------------------------------------
+        let live = Connection::open_in_memory().unwrap();
+        migrate(&live).unwrap();
+        assert!(
+            insert_usage_event(
+                &live,
+                &frame("ins_r41i3", 1, 1, Some(100), None, Some(200_000))
+            )
+            .unwrap()
+        );
+        // Newer counter snapshot reports a 1M context window.
+        assert!(
+            insert_usage_event(
+                &live,
+                &frame("ins_r41i3", 2, 2, Some(500_000), None, Some(1_000_000))
+            )
+            .unwrap()
+        );
+        let after_counters: (i64, Option<i64>) = live
+            .query_row(
+                "SELECT metric_revision, native_context_window FROM usage_events
+                 WHERE instance_id = 'ins_r41i3' AND scope = 'turn'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            after_counters,
+            (2, Some(1_000_000)),
+            "newer snapshot updates the window"
+        );
+        // A strictly-newer cost-only correction must keep window and counters.
+        assert!(
+            insert_usage_event(&live, &frame("ins_r41i3", 3, 3, None, Some("0.03"), None)).unwrap()
+        );
+        let live_survivor: (i64, i64, Option<String>, Option<i64>, Option<i64>) = live
+            .query_row(
+                "SELECT metric_revision, input_tokens, cost_usd, native_context_window,
+                        total_tokens FROM usage_events
+                 WHERE instance_id = 'ins_r41i3' AND scope = 'turn'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            live_survivor,
+            (
+                3,
+                500_000,
+                Some("0.03".into()),
+                Some(1_000_000),
+                Some(500_000)
+            ),
+            "cost-only correction keeps the retained 1M window and counters"
+        );
+
+        // --- Recovery: established 1M turn then a fallback cost-only append --
+        let conn = Connection::open_in_memory().unwrap();
+        create_r28_usage_table_with_turn_index(&conn);
+        create_journal_table(&conn);
+        conn.execute(
+            "INSERT INTO usage_events
+                (instance_id, seq, profile_id, model, scope, scope_id, mode,
+                 metric_revision, source_session_id, total_tokens, input_tokens,
+                 output_tokens, cache_read_tokens, cache_write_tokens,
+                 accounting, observed_at, observed_at_source)
+             VALUES ('ins_r41i3', 2, 'pvp', 'm', 'turn', 'msg-T', 'snapshot',
+                 2, 'sess-S', 500000, 500000, 0, 0, 0,
+                 'estimated', '2026-10-01T00:00:02.000Z', 'native')",
+            [],
+        )
+        .unwrap();
+        // The established 1M window is absent from the r28 shape and is
+        // re-projected from the journal (contextWindow) like every fallback
+        // field; the cost-only seq3 row carries no window anywhere.
+        // Fallback cost-only append at seq3 (14 columns: no window/scope).
+        conn.execute(
+            "INSERT INTO usage_events
+                (instance_id, seq, profile_id, model, scope, mode, cost_usd,
+                 accounting, observed_at)
+             VALUES ('ins_r41i3', 3, 'pvp', 'm', 'turn', 'snapshot', '0.03',
+                 'estimated', '2026-10-01T00:00:03.000Z')",
+            [],
+        )
+        .unwrap();
+        let journal_turn = |seq: i64, revision: &str, window: Option<i64>| {
+            let mut payload = serde_json::Map::new();
+            payload.insert("scope".into(), json!("turn"));
+            payload.insert("scopeId".into(), json!("msg-T"));
+            payload.insert("mode".into(), json!("snapshot"));
+            payload.insert("metricRevision".into(), json!(revision));
+            payload.insert("accounting".into(), json!("estimated"));
+            payload.insert(
+                "cost".into(),
+                json!({
+                    "state": "known",
+                    "value": {"amount": "0.03", "currency": "USD"}
+                }),
+            );
+            if seq == 2 {
+                payload.insert(
+                    "totalTokens".into(),
+                    json!({"state":"known","value":"500000"}),
+                );
+                payload.insert(
+                    "inputTokens".into(),
+                    json!({"state":"known","value":"500000"}),
+                );
+                payload.insert("outputTokens".into(), json!({"state":"known","value":"0"}));
+                payload.insert(
+                    "cacheReadTokens".into(),
+                    json!({"state":"known","value":"0"}),
+                );
+                payload.insert(
+                    "cacheWriteTokens".into(),
+                    json!({"state":"known","value":"0"}),
+                );
+            }
+            if let Some(w) = window {
+                payload.insert("contextWindow".into(), json!(w));
+            }
+            json!({
+                "kind": "usage",
+                "nativeAt": {"state": "known",
+                    "value": format!("2026-10-01T00:00:0{seq}.000Z")},
+                "source": {
+                    "nativeSessionId": {"state": "known", "value": "sess-S"},
+                    "nativeTurnId": {"state": "known", "value": "msg-T"}
+                },
+                "payload": Value::Object(payload)
+            })
+        };
+        for (seq, rev, window) in [(2i64, "2", Some(1_000_000i64)), (3, "3", None)] {
+            let p = journal_turn(seq, rev, window);
+            let stamp = format!("2026-10-01T00:00:0{seq}.000Z");
+            conn.execute(
+                "INSERT INTO journal (instance_id, seq, event_id, payload_json, observed_at)
+                 VALUES ('ins_r41i3', ?1, ?2, ?3, ?4)",
+                params![seq, format!("je{seq}"), p.to_string(), stamp],
+            )
+            .unwrap();
+        }
+        migrate(&conn).unwrap();
+
+        let recovered_survivor: (i64, i64, Option<String>, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT metric_revision, input_tokens, cost_usd, native_context_window,
+                        total_tokens FROM usage_events
+                 WHERE instance_id = 'ins_r41i3' AND scope = 'turn'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            recovered_survivor,
+            (
+                3,
+                500_000,
+                Some("0.03".into()),
+                Some(1_000_000),
+                Some(500_000)
+            ),
+            "recovery cost-only correction keeps the retained 1M window"
+        );
+        // Compare the FULL common row shape (drop seq/rowid/clock: the
+        // established frame is seq2 here vs a seq1 insert on the live path).
+        let common = |c: &Connection| {
+            c.query_row(
+                "SELECT metric_revision, source_session_id, scope_id, total_tokens,
+                        input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                        cost_usd, accounting, native_context_window
+                 FROM usage_events
+                 WHERE instance_id = 'ins_r41i3' AND scope = 'turn'",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, Option<i64>>(3)?,
+                        r.get::<_, Option<i64>>(4)?,
+                        r.get::<_, Option<i64>>(5)?,
+                        r.get::<_, Option<i64>>(6)?,
+                        r.get::<_, Option<i64>>(7)?,
+                        r.get::<_, Option<String>>(8)?,
+                        r.get::<_, String>(9)?,
+                        r.get::<_, Option<i64>>(10)?,
+                    ))
+                },
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            common(&live),
+            common(&conn),
+            "FULL recovered/live row parity"
+        );
+
+        // Rollup resolves the 1M window; 500_000 used is exactly 50%.
+        for (label, c) in [("live", &live), ("recovery", &conn)] {
+            let rollup = rollup_instance(
+                c,
+                &RollupRequest {
+                    instance_id: "ins_r41i3",
+                    kind: "claude",
+                    spec_model: Some("m"),
+                    effective_model: None,
+                    profile_id: Some("pvp"),
+                },
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                rollup.context_window_tokens,
+                Some(1_000_000),
+                "{label} window stays 1M after the cost-only correction"
+            );
+            assert_eq!(
+                rollup.context_pct,
+                Some(50),
+                "{label} percentage follows 1M"
+            );
+            assert_eq!(rollup.context_used_tokens, Some(500_000));
+            let inst = aggregate_instance(c, "ins_r41i3").unwrap();
+            let supply = aggregate_supply(c, "pvp", "m").unwrap();
+            assert!((inst.cost_usd.unwrap() - 0.03).abs() < 1e-9);
+            assert_eq!(inst.cost_usd, supply.cost_usd, "{label} cost parity");
+            assert_eq!(inst.input_tokens, supply.input_tokens);
+            assert_eq!(inst.budget_status(Some(0.02)), BudgetStatus::Stop);
+            assert_eq!(supply.budget_status(Some(0.02)), BudgetStatus::Stop);
+        }
     }
 
     /// r37 item 3: on an upgrade from the schema that ALREADY carried

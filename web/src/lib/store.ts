@@ -1237,6 +1237,30 @@ class HubStore {
    */
   private connectionBindGen = 0;
   /**
+   * Route departure DEFERRED across the React commit (c-unboundresume r12).
+   * releaseRouteTarget() schedules this instead of releasing synchronously:
+   * dev StrictMode runs a SessionPage effect's setup, cleanup and replay
+   * synchronously in ONE commit (follow(A) -> release(A) -> follow(A)), and the
+   * replay cancels the release before this microtask runs. The transient
+   * cleanup therefore never retires the original mount's generation — without
+   * the deferral the replay mounted a fresh generation, duplicated and
+   * discarded the original seed, and attached its follow socket late enough
+   * that a configure echo was absorbed into the replayed SEED as history
+   * (live=false) and never settled the pending (effort-sync D-056 gate fail).
+   */
+  private pendingRouteRelease: { instanceId: Id; epoch: number; gen: number } | null = null;
+  /**
+   * In-flight FULL follow mounts keyed by target (r12): the StrictMode replay
+   * of the SAME target in one commit joins the original mount's promise rather
+   * than issuing a duplicate lookup/seed/subscribe and bracketing a second
+   * mount attempt. Only a follow that cancelled a {@link pendingRouteRelease}
+   * for the same target joins, and only while the entry still owns the CURRENT
+   * binding (an entry left parked across a genuine departure is stale and must
+   * never be joined by a later remount); ordinary concurrent mounts are
+   * unchanged.
+   */
+  private followInFlight = new Map<Id, { work: Promise<void>; gen: number; epoch: number }>();
+  /**
    * Monotonic page-lifetime IDENTITY epoch (c-unboundresume r10). Incremented
    * exactly once per retirement/teardown of an auth identity — logout,
    * current-epoch 401 retirement, external identity change, store replacement —
@@ -1654,6 +1678,10 @@ class HubStore {
     this.owedReconcileRunning.clear();
     this.followReadyState.clear();
     this.followFrameAt.clear();
+    // r12: a deferred route departure must never fire under the next identity,
+    // and the new identity starts with no joined mounts.
+    this.pendingRouteRelease = null;
+    this.followInFlight.clear();
   }
 
   /**
@@ -3406,24 +3434,41 @@ class HubStore {
   /**
    * Route-departure transition (Ruling Y2): the active session page unmounted
    * (or a foreground resume happens off a /s/<id> route). Release ownership
-   * to "no target" SYNCHRONOUSLY so the LIST certifies via its unbound REST
-   * proof instead of recovering a departed/pending route forever (which also
-   * refused session creation while offline/recovering).
+   * to "no target" so the LIST certifies via its unbound REST proof instead of
+   * recovering a departed/pending route forever (which also refused session
+   * creation while offline/recovering).
    *
-   * A genuine departure (list / new-session page) launches a generation-scoped
-   * unbound resume — the mount watchdog was cancelled by noteBinding and
-   * nothing else would restart recovery. The resume is deferred a microtask so
-   * a navigation A → B and a StrictMode cleanup/replay (whose replacement
-   * follow() acquires a fresh generation synchronously in the same React
-   * commit) suppress it: a transient list proof must never race the new
-   * session owner.
+   * The release itself is DEFERRED a microtask (r12): dev StrictMode runs the
+   * page effect as follow(A) -> release(A) -> follow(A) synchronously in one
+   * commit; the replay re-enters follow(A) and cancels this release, so the
+   * transient cleanup never retires the original mount's generation and the
+   * replay RE-ADOPTS the in-flight mount instead of rebinding (one seed, one
+   * socket, no late attach). When the microtask runs:
+   *  - a same-target replay already cancelled the marker: keep the live mount;
+   *  - an A → B navigation owns the machine elsewhere: do nothing;
+   *  - a genuine departure remains: release synchronously and launch the
+   *    generation-scoped unbound resume (nothing else would restart recovery
+   *    once noteBinding cancelled the mount watchdog).
    */
   releaseRouteTarget(instanceId: Id) {
     if (this.connectionBoundTo !== instanceId) return;
-    const token = this.acquireTarget(null, null);
+    const release = {
+      instanceId,
+      epoch: this.identityEpoch,
+      gen: this.connectionBindGen,
+    };
+    this.pendingRouteRelease = release;
     queueMicrotask(() => {
-      if (!this.ownsTarget(token)) return; // A → B or StrictMode replay
-      this.connection?.dispatch({ type: "resume" });
+      // A same-commit follow(A) replay or a newer release superseded this one.
+      if (this.pendingRouteRelease !== release) return;
+      this.pendingRouteRelease = null;
+      // Logout / identity replacement while deferred: it already released.
+      if (this.identityEpoch !== release.epoch) return;
+      // A → B (or a same-commit replay, which clears the marker before this
+      // runs): another owner holds the machine — no transient unbound proof.
+      if (this.connectionBoundTo !== instanceId) return;
+      const token = this.acquireTarget(null, null);
+      if (this.ownsTarget(token)) this.connection?.dispatch({ type: "resume" });
     });
   }
   /**
@@ -5542,6 +5587,16 @@ class HubStore {
     // fence every continuation with the captured ownership token. The lookup
     // below belongs to THIS target — a held unbound list request can never
     // certify it, and a target chosen later supersedes this whole call.
+    //
+    // r12: a follow SYNCHRONOUSLY after releaseRouteTarget for the SAME target
+    // is React StrictMode's setup -> cleanup -> replay in one commit. Cancel
+    // the deferred departure so the original mount keeps its generation, and
+    // join the original in-flight mount instead of duplicating its lookup/
+    // seed/subscribe (the duplicated mount's discarded seed used to delay the
+    // live attach until a configure echo had already landed in the seed as
+    // history).
+    const replayed = this.pendingRouteRelease?.instanceId === instanceId;
+    if (replayed) this.pendingRouteRelease = null;
     const cached = this.state.instances.find((i) => i.id === instanceId) ?? null;
     const token = this.acquireTarget(instanceId, cached?.journalId ?? null);
 
@@ -5554,6 +5609,40 @@ class HubStore {
       return;
     }
 
+    // StrictMode replay whose ORIGINAL mount is still running AND still owns
+    // the current binding: because the departure was deferred, the original
+    // kept its generation — its promise seeds and subscribes exactly once for
+    // both effects. An entry parked across a GENUINE departure is stale (old
+    // generation/epoch) and must not be joined.
+    if (replayed) {
+      const joined = this.followInFlight.get(instanceId);
+      if (joined && joined.epoch === token.identityEpoch && joined.gen === token.gen) {
+        return joined.work;
+      }
+    }
+
+    const work = this.followMount(instanceId, cached, token);
+    const existing = this.followInFlight.get(instanceId);
+    if (
+      !existing ||
+      existing.epoch !== token.identityEpoch ||
+      existing.gen !== token.gen
+    ) {
+      this.followInFlight.set(instanceId, { work, gen: token.gen, epoch: token.identityEpoch });
+    }
+    try {
+      await work;
+    } finally {
+      if (this.followInFlight.get(instanceId)?.work === work) this.followInFlight.delete(instanceId);
+    }
+  }
+
+  /**
+   * Full follow mount: lookup (when uncached) → bounded REST seed → first
+   * subscribe. Bracketed by {@link follow}'s in-flight slot so a same-commit
+   * StrictMode replay joins it; every continuation is fenced by `token`.
+   */
+  private async followMount(instanceId: Id, cached: Instance | null, token: TargetToken) {
     // Gate 17 item 1 / Ruling Y: the mount attempt owns the LOOKUP, the seed
     // and the first subscribe — bracketed now, before any await. A rejected
     // initial lookup is therefore THIS target's recovery failure (the

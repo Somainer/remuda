@@ -2320,10 +2320,11 @@ fn fold_ctes_instance() -> &'static str {
 fn fold_ctes_supply() -> &'static str {
     static C: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     C.get_or_init(|| {
-        // Supply folds the newest bill per MODEL+session (r39 item 4).
+        // Supply folds the newest bill per MODEL+session (r39 item 4) AND the
+        // applicable legacy NULL-scope bill (r40 item 5 / AB2).
         unified_fold_ctes(
             "profile_id = ?1 AND model = ?2",
-            "global_reported_cost_by_model",
+            "global_reported_cost_supply",
         )
     })
 }
@@ -2369,7 +2370,7 @@ fn unified_fold_ctes(domain_pred: &str, reported_source: &str) -> String {
     format!(
         "global_scoped_sessions AS (
             SELECT * FROM (
-                SELECT *, ROW_NUMBER() OVER (
+                SELECT rowid AS ev_rowid, *, ROW_NUMBER() OVER (
                     PARTITION BY instance_id, scope_id ORDER BY seq DESC, rowid DESC
                 ) AS stock_rn
                 FROM usage_events
@@ -2455,9 +2456,43 @@ fn unified_fold_ctes(domain_pred: &str, reported_source: &str) -> String {
             )
             WHERE model_cost_rn = 1 AND cost_usd IS NOT NULL
          ),
+         global_reported_cost_supply AS (
+            -- r40 item 5 (AB2): the provider fold applies legacy NULL-scope
+            -- REPORTED bills EXACTLY as the instance fold does — including the
+            -- instance-global suppression once scoped evidence exists (the
+            -- legacy branch below carries the same NOT EXISTS scoped guard).
+            -- A later costless/window-only NULL-scope row therefore never
+            -- loses the established newest-KNOWN bill in supply.
+            SELECT rowid, instance_id, seq, profile_id, model, scope_id, cost_usd,
+                   total_tokens, input_tokens, output_tokens,
+                   cache_read_tokens, cache_write_tokens
+            FROM global_reported_cost_by_model
+            UNION ALL
+            SELECT rowid, instance_id, seq, profile_id, model, scope_id, cost_usd,
+                   total_tokens, input_tokens, output_tokens,
+                   cache_read_tokens, cache_write_tokens FROM (
+                SELECT rowid, instance_id, seq, profile_id, model, scope_id, cost_usd,
+                       total_tokens, input_tokens, output_tokens,
+                       cache_read_tokens, cache_write_tokens,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY instance_id
+                           ORDER BY CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END,
+                                    seq DESC, rowid DESC
+                       ) AS supply_legacy_cost_rn
+                FROM usage_events u
+                WHERE scope = 'session' AND accounting = 'reported'
+                  AND scope_id IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM usage_events s
+                      WHERE s.instance_id = u.instance_id
+                        AND s.scope = 'session' AND s.scope_id IS NOT NULL
+                  )
+            )
+            WHERE supply_legacy_cost_rn = 1 AND cost_usd IS NOT NULL
+         ),
          global_legacy_stock AS (
             SELECT * FROM (
-                SELECT *, ROW_NUMBER() OVER (
+                SELECT rowid AS ev_rowid, *, ROW_NUMBER() OVER (
                     PARTITION BY instance_id ORDER BY rowid DESC
                 ) AS legacy_rn
                 FROM usage_events
@@ -2655,10 +2690,9 @@ g_flow_messages AS (
             -- per-session coverage/certification rule instead (a covered stock
             -- still counts when another session has an uncovered proven turn).
             --
-            -- r39 (AA2): an instance with a native REPORTED cumulative bill is
-            -- removed — reported-cost authority keeps the session carrier alive
-            -- even on a result-only stream whose unqualified Turn set the
-            -- Ruling-B flag (otherwise its own bill would be suppressed).
+            -- r40 AB2: this is TOKEN-flow evidence only. Cost accounting never
+            -- removes an instance — the COST fold keys authority per
+            -- (instance, native session) in reported_cost_sessions below.
             SELECT instance_id FROM g_flow_messages
             UNION
             SELECT instance_id FROM g_unmatched_flow_turns
@@ -2666,47 +2700,35 @@ g_flow_messages AS (
             SELECT instance_id FROM g_legacy_open_turns
             UNION
             SELECT instance_id FROM g_legacy_flow_turns
-            EXCEPT
-            SELECT instance_id FROM global_reported_session_cost
          ),
          -- DOMAIN PROJECTION: the classification above is instance-global so a
          -- row stays correctly suppressed/ambiguous under every supply view;
          -- only the final projection filters by instance or profile/model.
+         --
+         -- TOKEN FOLD (AB2): the four relations below are the ONLY token
+         -- relations every consumer (instance rollup, supply aggregate,
+         -- budget) reads. Membership is the coverage/certification/Ruling-B
+         -- rule and NOTHING else — cost accounting never filters, adds or
+         -- removes a token row.
          flow_messages AS (
-            SELECT m.* FROM g_flow_messages m
-            WHERE {dm}
-              AND m.instance_id NOT IN (SELECT instance_id FROM reported_instances)
+            SELECT m.* FROM g_flow_messages m WHERE {dm}
          ),
          flow_turns AS (
-            -- AA2/AA3: flow Turns keep their TOKEN contribution even for
-            -- instances with reported-cost authority (tokens and cost are
-            -- independent); the cost CASE below excludes their cost. Ruling-B
-            -- override/stock selection is handled by the global CTEs above.
             SELECT t.* FROM g_flow_turns t WHERE {dt}
          ),
          ambiguous_turns AS (
             SELECT t.* FROM g_ambiguous_turns t WHERE {dt}
          ),
          stock_sessions AS (
-            -- Token-bearing session stock. A r39 native REPORTED carrier with
-            -- real token buckets survives the Ruling-B flow override (reported
-            -- cost authority); a token-LESS reported carrier is excluded here
-            -- (its NULL buckets would poison U1) and contributes only via
-            -- reported_session_cost / cost_only_reported.
-            SELECT g.* FROM global_scoped_sessions g
+            -- Accounting-agnostic cumulative stock (AB2): a REPORTED carrier
+            -- follows the SAME membership as an estimated one. Flow-less
+            -- sessions (no winning turn flow on the session) keep their stock
+            -- unless a Ruling B instance-wide override stands it down. A
+            -- token-less carrier is a normal member with NULL buckets (U1
+            -- surfaces Unknown tokens); it is never given a bypass.
+            SELECT g.*, g.scope_id AS sid FROM global_scoped_sessions g
             WHERE {dg}
-              AND g.accounting = 'reported'
-              AND (g.total_tokens IS NOT NULL OR g.input_tokens IS NOT NULL
-                   OR g.output_tokens IS NOT NULL OR g.cache_read_tokens IS NOT NULL
-                   OR g.cache_write_tokens IS NOT NULL)
-            UNION ALL
-            -- Flow-less sessions count their token stock unless a Ruling B
-            -- instance-wide override (message/unqualified flow) stands it down.
-            SELECT g.* FROM global_scoped_sessions g
-            WHERE {dg}
-              AND g.accounting <> 'reported'
               AND g.instance_id NOT IN (SELECT instance_id FROM override_instances)
-              AND g.instance_id NOT IN (SELECT instance_id FROM reported_instances)
               AND NOT EXISTS (
                   SELECT 1 FROM g_session_turn_flow f
                   WHERE f.instance_id = g.instance_id AND f.sid = g.scope_id
@@ -2716,19 +2738,17 @@ g_flow_messages AS (
             -- when it certifies the flow (equal/newer position), provided no
             -- instance-wide Ruling B override is active; a surviving uncovered
             -- proven turn of THIS session drops the stock via the missing
-            -- coverage match below.
-            SELECT g.* FROM global_scoped_sessions g
+            -- coverage match.
+            SELECT g.*, g.scope_id AS sid FROM global_scoped_sessions g
             WHERE {dg}
-              AND g.accounting <> 'reported'
               AND g.instance_id NOT IN (SELECT instance_id FROM override_instances)
-              AND g.instance_id NOT IN (SELECT instance_id FROM reported_instances)
               AND EXISTS (
                   SELECT 1 FROM g_fully_covered_sessions c
                   WHERE c.instance_id = g.instance_id AND c.sid = g.scope_id
               )
          ),
          legacy_stock AS (
-            SELECT l.* FROM global_legacy_stock l
+            SELECT l.*, '' AS sid FROM global_legacy_stock l
             WHERE {dl}
               AND l.instance_id NOT IN (
                   SELECT instance_id FROM global_scoped_sessions
@@ -2736,48 +2756,77 @@ g_flow_messages AS (
               AND l.instance_id NOT IN (
                   SELECT instance_id FROM override_instances
               )
-              AND l.instance_id NOT IN (SELECT instance_id FROM reported_instances)
               AND NOT EXISTS (
                   SELECT 1 FROM g_flow_turns p WHERE p.instance_id = l.instance_id
               )
          ),
+         -- COST FOLD (AB2): authority keyed by (instance_id, native_session_id)
+         -- AFTER the instance-global legacy-vs-scoped selection.
          reported_session_cost AS (
-            -- Newest reported cumulative bill per session (instance fold) or
-            -- per model+session (supply fold, r39 item 4), domain-projected.
+            -- Newest KNOWN reported cumulative bill per (instance, session)
+            -- for the instance fold, or per (model, session) PLUS the
+            -- applicable legacy NULL bill for the supply fold; the selected
+            -- source already applied the instance-global suppression once
+            -- scoped evidence exists. Domain-projected.
             SELECT g.* FROM {reported_source} g WHERE {dg}
          ),
-         reported_instances AS (
-            -- r39 item 2 (AA2): instances in THIS domain with a reported bill.
-            -- Their cost comes solely from reported_session_cost; their
-            -- unqualified flow/stock estimates must not be added (nor, for a
-            -- different instance, suppressed).
+         reported_cost_sessions AS (
+            -- The exact (instance_id, native session id) pairs a reported bill
+            -- covers — scoped bills keyed by their scope_id, a legacy NULL bill
+            -- keyed by ''. ONLY these pairs lose their estimated contribution;
+            -- another session of the same instance is untouched (AB2 item 1).
+            SELECT DISTINCT instance_id, COALESCE(scope_id, '') AS sid
+            FROM reported_session_cost
+         ),
+         reported_cost_instances AS (
+            -- Instance-level authority only for relations that carry no
+            -- session attribution (durable Messages).
             SELECT DISTINCT instance_id FROM reported_session_cost
          ),
-         -- r39 item 4 (AA3): a reported cost carrier whose SESSION frame
-         -- itself reported no tokens (a cost-only result after a model switch)
-         -- still gives the provider/model a cost row even when the Ruling-B
-         -- flow override hides the token-less stock — token presence is
-         -- independent of cost. Its token buckets are NULL so the U1 gates
-         -- surface Unknown tokens.
-         cost_only_reported AS (
-            SELECT rc.total_tokens, rc.input_tokens, rc.output_tokens,
-                   rc.cache_read_tokens, rc.cache_write_tokens, rc.cost_usd
-            FROM reported_session_cost rc
-            WHERE rc.total_tokens IS NULL
-              AND rc.input_tokens IS NULL
-              AND rc.output_tokens IS NULL
-              AND rc.cache_read_tokens IS NULL
-              AND rc.cache_write_tokens IS NULL
+         estimated_stock_cost AS (
+            -- Selected scoped/legacy stock estimates of sessions WITHOUT a
+            -- reported bill on the SAME key; NULL costs stay (they are the
+            -- sticky-Unknown poison checked in the aggregate CASE).
+            SELECT g.cost_usd AS cost_usd
+            FROM stock_sessions g
+            WHERE NOT EXISTS (
+                SELECT 1 FROM reported_cost_sessions k
+                WHERE k.instance_id = g.instance_id AND k.sid = g.sid
+            )
+            UNION ALL
+            SELECT l.cost_usd AS cost_usd
+            FROM legacy_stock l
+            WHERE NOT EXISTS (
+                SELECT 1 FROM reported_cost_sessions k
+                WHERE k.instance_id = l.instance_id AND k.sid = l.sid
+            )
          ),
-         contributions AS (
-            SELECT total_tokens, input_tokens, output_tokens,
-                   cache_read_tokens, cache_write_tokens, cost_usd
-            FROM stock_sessions
-            UNION ALL
-            SELECT total_tokens, input_tokens, output_tokens,
-                   cache_read_tokens, cache_write_tokens, cost_usd
-            FROM legacy_stock
-            UNION ALL
+         estimated_turn_cost AS (
+            -- Uncovered flow-turn estimates of a session without a reported
+            -- bill; the unpriced-turn-only guard (no session rows at all) is
+            -- applied by the poison CASE as before.
+            SELECT t.cost_usd AS cost_usd
+            FROM flow_turns t
+            WHERE NOT EXISTS (
+                SELECT 1 FROM reported_cost_sessions k
+                WHERE k.instance_id = t.instance_id
+                  AND k.sid = COALESCE(t.source_session_id, '')
+            )
+         ),
+         estimated_message_cost AS (
+            -- Durable Messages have no session attribution: excluded only
+            -- when the WHOLE instance carries a reported bill; an unpriced
+            -- Message contributes 0 (Ruling B per-call billing), never poison.
+            SELECT m.cost_usd AS cost_usd
+            FROM flow_messages m
+            WHERE m.instance_id NOT IN (
+                SELECT instance_id FROM reported_cost_instances
+            )
+         ),
+         token_events AS (
+            -- The TOKEN fold's rows (cost_usd is carried because selected
+            -- stocks/turns may be priced, but cost accounting never shapes
+            -- membership).
             SELECT total_tokens, input_tokens, output_tokens,
                    cache_read_tokens, cache_write_tokens, cost_usd
             FROM flow_turns
@@ -2788,7 +2837,32 @@ g_flow_messages AS (
             UNION ALL
             SELECT total_tokens, input_tokens, output_tokens,
                    cache_read_tokens, cache_write_tokens, cost_usd
-            FROM cost_only_reported
+            FROM stock_sessions
+            UNION ALL
+            SELECT total_tokens, input_tokens, output_tokens,
+                   cache_read_tokens, cache_write_tokens, cost_usd
+            FROM legacy_stock
+         ),
+         contributions AS (
+            -- PRESENCE (AB2 item 6): a domain/aggregate exists if it has TOKEN
+            -- evidence OR any attributable reported bill. A retained reported
+            -- bill whose frame is NOT a selected token relation (its snapshot
+            -- lost global stock selection, or a Ruling-B override hid the
+            -- carrier) still keeps the domain alive, but contributes NULL
+            -- token columns — token values come ONLY from the token relations
+            -- above, so an unselected bill's snapshot never leaks in.
+            SELECT total_tokens, input_tokens, output_tokens,
+                   cache_read_tokens, cache_write_tokens
+            FROM token_events
+            UNION ALL
+            SELECT NULL, NULL, NULL, NULL, NULL
+            FROM reported_session_cost rc
+            WHERE NOT EXISTS (
+                SELECT 1 FROM stock_sessions s WHERE s.ev_rowid = rc.rowid
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM legacy_stock l WHERE l.ev_rowid = rc.rowid
+            )
          )",
         dm = d("m"),
         dt = d("t"),
@@ -2798,170 +2872,96 @@ g_flow_messages AS (
     )
 }
 
-/// Final aggregate SELECT over a [`unified_fold_ctes`] block. The U1
-/// all-buckets-known gate applies to the TURN+STOCK relation (a turn
-/// snapshot or cumulative point is one complete accounting frame); durable
-/// per-response Message rows are summed independently with NULLs ignored
-/// (c-usagefu: codex reports per-call partial baskets, and an omitted bucket
-/// on one response is not the same as a missing Turn frame). Token buckets
-/// are therefore `U1-sum(turn/stock) + SUM(messages)`. An ambiguous turn
-/// poisons the turn/stock half only; a sticky-Unknown stock cost poisons; an
-/// unpriced TURN on a turn-only (Claude) instance poisons, while durable
-/// Message costs always sum (unpriced = 0).
+/// Final aggregate SELECT over a [`unified_fold_ctes`] block.
+///
+/// r40 AB2 — TWO INDEPENDENT FOLDS meet here:
+///
+/// * the five token columns read ONLY the TOKEN-fold relations
+///   (`flow_turns`, `stock_sessions`, `legacy_stock` as the U1-gated
+///   turn/stock half plus independently-summed durable `flow_messages`).
+///   Cost accounting never shapes these;
+/// * the cost column reads the COST-fold relations: newest reported bills per
+///   `(instance, native session)` plus the estimates of sessions WITHOUT such
+///   a bill, keyed per session — another session of a reported instance is
+///   untouched, and a legacy NULL bill keys the NULL session exactly as in the
+///   instance fold.
+///
+/// U1: a turn/stock frame half is all-known-or-NULL; durable per-response
+/// Message rows sum with NULLs ignored (codex reports per-call partial
+/// baskets). An ambiguous turn poisons the turn/stock half only; a
+/// sticky-Unknown stock cost poisons; an unpriced TURN on a turn-only
+/// (Claude) instance poisons, while durable Message costs always sum
+/// (unpriced = 0).
 fn aggregate_select_sql() -> &'static str {
-    "SELECT
-        (SELECT COALESCE(SUM(n), 0) FROM (
-            SELECT COUNT(*) AS n FROM flow_turns
-            UNION ALL SELECT COUNT(*) FROM flow_messages
-            UNION ALL SELECT COUNT(*) FROM stock_sessions
-            UNION ALL SELECT COUNT(*) FROM legacy_stock
-            UNION ALL SELECT COUNT(*) FROM cost_only_reported
-        )),
+    static C: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    C.get_or_init(|| {
+        // One U1 bucket column: ambiguous-then-unknown gate over the
+        // turn/stock half (empty half falls back to the independent Message
+        // sum: 0 with Messages, Unknown without), plus Message SUM.
+        let bucket = |bucket: &str| -> String {
+            format!(
+                "(SELECT CASE
+                     WHEN EXISTS (
+                         SELECT 1 FROM ambiguous_turns WHERE {bucket} IS NOT NULL
+                     ) THEN NULL
+                     WHEN COUNT(*) = 0
+                          AND (SELECT COUNT(*) FROM flow_messages) > 0 THEN 0
+                     WHEN COUNT(*) = 0 THEN NULL
+                     WHEN COUNT(*) = COUNT({bucket}) THEN SUM({bucket})
+                 END
+                FROM (
+                    SELECT {bucket} FROM flow_turns
+                    UNION ALL SELECT {bucket} FROM stock_sessions
+                    UNION ALL SELECT {bucket} FROM legacy_stock
+                )
+            )
+            + COALESCE((SELECT SUM({bucket}) FROM flow_messages), 0)"
+            )
+        };
+        format!(
+            "SELECT
+        (SELECT COUNT(*) FROM contributions),
         (SELECT COUNT(*) FROM ambiguous_turns),
-        (SELECT CASE
-                 WHEN EXISTS (
-                     SELECT 1 FROM ambiguous_turns WHERE total_tokens IS NOT NULL
-                 ) THEN NULL
-                 -- AA3: empty turn/stock half -> message sum when messages
-                 -- exist or no cost-only carrier; Unknown for cost-only.
-                 WHEN COUNT(*) = 0
-                      AND (SELECT COUNT(*) FROM flow_messages) > 0 THEN 0
-                 WHEN COUNT(*) = 0
-                      AND NOT EXISTS (SELECT 1 FROM cost_only_reported) THEN 0
-                 WHEN COUNT(*) = 0 THEN NULL
-                 WHEN COUNT(*) = COUNT(total_tokens) THEN SUM(total_tokens)
-             END
-            FROM (
-                SELECT total_tokens FROM flow_turns
-                UNION ALL SELECT total_tokens FROM stock_sessions
-                UNION ALL SELECT total_tokens FROM legacy_stock
-            )
-        )
-        + COALESCE((SELECT SUM(total_tokens) FROM flow_messages), 0),
-        + (SELECT CASE
-                 WHEN EXISTS (
-                     SELECT 1 FROM ambiguous_turns WHERE input_tokens IS NOT NULL
-                 ) THEN NULL
-                 -- AA3: with no turn/stock rows the value is the message
-                 -- sum (0 when there are no messages AND no cost-only
-                 -- carrier, but NULL when only a cost-only bill exists).
-                 WHEN COUNT(*) = 0
-                      AND (SELECT COUNT(*) FROM flow_messages) > 0 THEN 0
-                 WHEN COUNT(*) = 0
-                      AND NOT EXISTS (SELECT 1 FROM cost_only_reported) THEN 0
-                 WHEN COUNT(*) = 0 THEN NULL
-                 WHEN COUNT(*) = COUNT(input_tokens) THEN SUM(input_tokens)
-             END
-            FROM (
-                SELECT input_tokens FROM flow_turns
-                UNION ALL SELECT input_tokens FROM stock_sessions
-                UNION ALL SELECT input_tokens FROM legacy_stock
-            )
-        )
-        + COALESCE((SELECT SUM(input_tokens) FROM flow_messages), 0),
-        + (SELECT CASE
-                 WHEN EXISTS (
-                     SELECT 1 FROM ambiguous_turns WHERE output_tokens IS NOT NULL
-                 ) THEN NULL
-                 -- AA3: with no turn/stock rows the value is the message
-                 -- sum (0 when there are no messages AND no cost-only
-                 -- carrier, but NULL when only a cost-only bill exists).
-                 WHEN COUNT(*) = 0
-                      AND (SELECT COUNT(*) FROM flow_messages) > 0 THEN 0
-                 WHEN COUNT(*) = 0
-                      AND NOT EXISTS (SELECT 1 FROM cost_only_reported) THEN 0
-                 WHEN COUNT(*) = 0 THEN NULL
-                 WHEN COUNT(*) = COUNT(output_tokens) THEN SUM(output_tokens)
-             END
-            FROM (
-                SELECT output_tokens FROM flow_turns
-                UNION ALL SELECT output_tokens FROM stock_sessions
-                UNION ALL SELECT output_tokens FROM legacy_stock
-            )
-        )
-        + COALESCE((SELECT SUM(output_tokens) FROM flow_messages), 0),
-        + (SELECT CASE
-                 WHEN EXISTS (
-                     SELECT 1 FROM ambiguous_turns WHERE cache_read_tokens IS NOT NULL
-                 ) THEN NULL
-                 -- AA3: with no turn/stock rows the value is the message
-                 -- sum (0 when there are no messages AND no cost-only
-                 -- carrier, but NULL when only a cost-only bill exists).
-                 WHEN COUNT(*) = 0
-                      AND (SELECT COUNT(*) FROM flow_messages) > 0 THEN 0
-                 WHEN COUNT(*) = 0
-                      AND NOT EXISTS (SELECT 1 FROM cost_only_reported) THEN 0
-                 WHEN COUNT(*) = 0 THEN NULL
-                 WHEN COUNT(*) = COUNT(cache_read_tokens) THEN SUM(cache_read_tokens)
-             END
-            FROM (
-                SELECT cache_read_tokens FROM flow_turns
-                UNION ALL SELECT cache_read_tokens FROM stock_sessions
-                UNION ALL SELECT cache_read_tokens FROM legacy_stock
-            )
-        )
-        + COALESCE((SELECT SUM(cache_read_tokens) FROM flow_messages), 0),
-        + (SELECT CASE
-                 WHEN EXISTS (
-                     SELECT 1 FROM ambiguous_turns WHERE cache_write_tokens IS NOT NULL
-                 ) THEN NULL
-                 -- AA3: with no turn/stock rows the value is the message
-                 -- sum (0 when there are no messages AND no cost-only
-                 -- carrier, but NULL when only a cost-only bill exists).
-                 WHEN COUNT(*) = 0
-                      AND (SELECT COUNT(*) FROM flow_messages) > 0 THEN 0
-                 WHEN COUNT(*) = 0
-                      AND NOT EXISTS (SELECT 1 FROM cost_only_reported) THEN 0
-                 WHEN COUNT(*) = 0 THEN NULL
-                 WHEN COUNT(*) = COUNT(cache_write_tokens) THEN SUM(cache_write_tokens)
-             END
-            FROM (
-                SELECT cache_write_tokens FROM flow_turns
-                UNION ALL SELECT cache_write_tokens FROM stock_sessions
-                UNION ALL SELECT cache_write_tokens FROM legacy_stock
-            )
-        )
-        + COALESCE((SELECT SUM(cache_write_tokens) FROM flow_messages), 0),
-        -- r38 item 3 / r39 items 2-4 (AA2/AA3): cost is composed PER
-        -- ATTRIBUTABLE INSTANCE. An instance with a native REPORTED cumulative
-        -- bill contributes exactly those bills (newest KNOWN per session,
-        -- summed across its sessions) — its per-call/stock estimates are not
-        -- added and, crucially, an unrelated instance's reported bill never
-        -- suppresses another instance's estimates. Everything else bills the
-        -- existing Ruling-B/U1 estimate (sticky-Unknown stock and unpriced
-        -- turn-only poison preserved). Presence is independent of tokens: a
-        -- cost-only reported carrier keeps this column non-NULL even when its
-        -- model has zero token contributions (AA3).
+        {total},
+        {input},
+        {output},
+        {cache_read},
+        {cache_write},
+        -- r40 AB2: cost is the independent COST fold. Presence comes from
+        -- contributions (token evidence OR an attributable reported bill), so
+        -- a retained bill with zero token contributions keeps this column
+        -- non-NULL (AB2 item 6 / AA3). Bills are newest-KNOWN per
+        -- (instance, native session); estimates belong only to sessions
+        -- WITHOUT such a bill — a different session of the same instance is
+        -- never suppressed, and its Unknown cost poisons the aggregate.
         CASE
-            WHEN (SELECT COUNT(*) FROM (
-                SELECT 1 FROM flow_turns
-                UNION ALL SELECT 1 FROM flow_messages
-                UNION ALL SELECT 1 FROM stock_sessions
-                UNION ALL SELECT 1 FROM legacy_stock
-                UNION ALL SELECT 1 FROM cost_only_reported
-            )) = 0 THEN NULL
-            -- Ambiguous turn cost poisons only instances WITHOUT reported
-            -- authority (the reported bill is authoritative by definition).
+            WHEN (SELECT COUNT(*) FROM contributions) = 0 THEN NULL
+            -- An ambiguous turn's known cost poisons only when its OWN
+            -- (instance, session) key has no reported bill.
             WHEN EXISTS (
-                SELECT 1 FROM ambiguous_turns WHERE cost_usd IS NOT NULL
-                  AND instance_id NOT IN (SELECT instance_id FROM reported_instances)
+                SELECT 1 FROM ambiguous_turns a
+                WHERE a.cost_usd IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM reported_cost_sessions k
+                      WHERE k.instance_id = a.instance_id
+                        AND k.sid = COALESCE(a.source_session_id, '')
+                  )
             ) THEN NULL
-            -- Sticky-Unknown stock poisons the non-reported estimate.
+            -- Sticky-Unknown stock/legacy estimate of an uncovered session
+            -- poisons (a covered session's stock is excluded upstream).
             WHEN EXISTS (
-                SELECT 1 FROM (
-                    SELECT instance_id, cost_usd FROM stock_sessions
-                    UNION ALL
-                    SELECT instance_id, cost_usd FROM legacy_stock
-                ) est
-                WHERE est.cost_usd IS NULL
-                  AND est.instance_id NOT IN (SELECT instance_id FROM reported_instances)
+                SELECT 1 FROM estimated_stock_cost WHERE cost_usd IS NULL
             ) THEN NULL
-            -- An unpriced turn on a turn-only instance poisons only when that
-            -- instance has no reported bill.
+            -- An unpriced turn poisons only on a turn-only instance whose
+            -- session has no reported bill.
             WHEN EXISTS (
                 SELECT 1 FROM flow_turns ft
                 WHERE ft.cost_usd IS NULL
-                  AND ft.instance_id NOT IN (SELECT instance_id FROM reported_instances)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM reported_cost_sessions k
+                      WHERE k.instance_id = ft.instance_id
+                        AND k.sid = COALESCE(ft.source_session_id, '')
+                  )
                   AND NOT EXISTS (
                       SELECT 1 FROM usage_events sx
                       WHERE sx.instance_id = ft.instance_id
@@ -2973,32 +2973,30 @@ fn aggregate_select_sql() -> &'static str {
                 COALESCE((
                     SELECT SUM(CAST(cost_usd AS REAL)) FROM reported_session_cost
                 ), 0.0)
-                -- Non-reported instances: selected stock estimates.
+                -- Estimates of sessions WITHOUT a reported bill.
                 + COALESCE((
-                    SELECT SUM(CAST(cost_usd AS REAL)) FROM (
-                        SELECT cost_usd FROM stock_sessions
-                        WHERE instance_id NOT IN (SELECT instance_id FROM reported_instances)
-                        UNION ALL
-                        SELECT cost_usd FROM legacy_stock
-                        WHERE instance_id NOT IN (SELECT instance_id FROM reported_instances)
-                    )
+                    SELECT SUM(CAST(cost_usd AS REAL)) FROM estimated_stock_cost
                 ), 0.0)
-                -- Non-reported per-turn flow.
                 + COALESCE((
-                    SELECT SUM(CAST(cost_usd AS REAL)) FROM flow_turns
-                    WHERE instance_id NOT IN (SELECT instance_id FROM reported_instances)
+                    SELECT SUM(CAST(cost_usd AS REAL)) FROM estimated_turn_cost
                 ), 0.0)
                 -- Durable Message flow: an unpriced Message contributes 0
                 -- (Ruling B per-call billing, c-usagefu r10).
                 + COALESCE((
-                    SELECT SUM(CAST(cost_usd AS REAL)) FROM flow_messages
-                    WHERE instance_id NOT IN (SELECT instance_id FROM reported_instances)
+                    SELECT SUM(CAST(cost_usd AS REAL)) FROM estimated_message_cost
                 ), 0.0)
         END
      -- No FROM: every column is a scalar subquery over the fold CTEs, so the
      -- row must materialize even when `contributions` is empty (an empty
      -- aggregate SELECT over a zero-row FROM would otherwise return no rows).
-     "
+     ",
+            total = bucket("total_tokens"),
+            input = bucket("input_tokens"),
+            output = bucket("output_tokens"),
+            cache_read = bucket("cache_read_tokens"),
+            cache_write = bucket("cache_write_tokens"),
+        )
+    })
 }
 
 fn row_to_aggregate(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageAggregate> {
@@ -8242,6 +8240,377 @@ mod tests {
                 .abs()
                 < 1e-9,
             "without scoped evidence the NULL reported bill still applies"
+        );
+    }
+
+    /// Direct session stock row for the r40 AB2 regressions.
+    fn r40_session_row(
+        instance: &str,
+        seq: i64,
+        sid: Option<&str>,
+        revision: i64,
+        input: Option<i64>,
+        cost: Option<&str>,
+        accounting: &str,
+    ) -> UsageEventRow {
+        UsageEventRow {
+            instance_id: instance.into(),
+            seq,
+            profile_id: Some("pvp_r40".into()),
+            model: Some("m-r40".into()),
+            scope: "session".into(),
+            scope_id: sid.map(str::to_string),
+            turn_id: None,
+            native_context_window: None,
+            mode: "snapshot".into(),
+            metric_revision: revision,
+            source_session_id: sid.map(str::to_string),
+            total_tokens: input,
+            input_tokens: input,
+            output_tokens: input.map(|_| 0),
+            cache_read_tokens: input.map(|_| 0),
+            cache_write_tokens: input.map(|_| 0),
+            cost_usd: cost.map(str::to_string),
+            accounting: accounting.into(),
+            observed_at: "2026-10-15T00:00:00.000Z".into(),
+            observed_at_source: "native".into(),
+        }
+    }
+
+    /// r40 item 1 (AB2): reported authority is keyed by (instance, NATIVE
+    /// SESSION), not instance alone. S1 reports a tokenless $0.01 bill; S2 is
+    /// a distinct ESTIMATED session with token stock priced $0.02. The
+    /// instance and the provider folds must both answer $0.03 and Stop a
+    /// $0.02 budget; with S2's cost Unknown the aggregate is Unknown, never a
+    /// known $0.01. Instance/supply parity is asserted on identical retained
+    /// data.
+    #[test]
+    fn one_sessions_reported_bill_keeps_another_sessions_estimated_contribution() {
+        let build = |s2_cost: Option<&str>| {
+            let conn = Connection::open_in_memory().unwrap();
+            migrate(&conn).unwrap();
+            // S1: tokenless REPORTED cumulative bill.
+            assert!(
+                insert_usage_event(
+                    &conn,
+                    &r40_session_row(
+                        "ins_r40i1",
+                        1,
+                        Some("s1"),
+                        1,
+                        None,
+                        Some("0.01"),
+                        "reported"
+                    )
+                )
+                .unwrap()
+            );
+            // S2: a DIFFERENT estimated session, token stock priced 0.02.
+            assert!(
+                insert_usage_event(
+                    &conn,
+                    &r40_session_row(
+                        "ins_r40i1",
+                        2,
+                        Some("s2"),
+                        1,
+                        Some(200),
+                        s2_cost,
+                        "estimated"
+                    )
+                )
+                .unwrap()
+            );
+            conn
+        };
+
+        let conn = build(Some("0.02"));
+        let inst = aggregate_instance(&conn, "ins_r40i1").unwrap();
+        let supply = aggregate_supply(&conn, "pvp_r40", "m-r40").unwrap();
+        assert!(
+            (inst.cost_usd.unwrap() - 0.03).abs() < 1e-9,
+            "S1 reported 0.01 + S2 estimated 0.02, got {:?}",
+            inst.cost_usd
+        );
+        assert_eq!(
+            inst.cost_usd, supply.cost_usd,
+            "instance and supply folds agree on the same retained data"
+        );
+        assert_eq!(inst.total_tokens, supply.total_tokens);
+        assert_eq!(inst.input_tokens, supply.input_tokens);
+        assert_eq!(
+            inst.budget_status(Some(0.02)),
+            BudgetStatus::Stop,
+            "the 0.03 spend Stops a 0.02 budget"
+        );
+
+        // S2's price Unknown: the whole aggregate is Unknown.
+        let conn = build(None);
+        let inst = aggregate_instance(&conn, "ins_r40i1").unwrap();
+        let supply = aggregate_supply(&conn, "pvp_r40", "m-r40").unwrap();
+        assert_eq!(
+            inst.cost_usd, None,
+            "an Unknown uncovered session poisons the aggregate"
+        );
+        assert_eq!(inst.cost_usd, supply.cost_usd);
+        assert_eq!(inst.budget_status(Some(0.02)), BudgetStatus::Unknown);
+    }
+
+    /// r40 item 3 (AB2): a reported bill suppresses only the COST of its own
+    /// session — an eligible Message's tokens, turn count and rates survive.
+    #[test]
+    fn a_reported_bill_never_removes_an_eligible_messages_tokens() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        // Eligible Message M linked to turn T; NO Turn row exists, so it is
+        // live per-call flow: input100, unpriced.
+        assert!(
+            insert_usage_event(
+                &conn,
+                &UsageEventRow {
+                    instance_id: "ins_r40i3".into(),
+                    seq: 1,
+                    profile_id: Some("pvp_r40".into()),
+                    model: Some("m-r40".into()),
+                    scope: "message".into(),
+                    scope_id: Some("r1".into()),
+                    turn_id: Some("T".into()),
+                    native_context_window: None,
+                    mode: "snapshot".into(),
+                    metric_revision: 1,
+                    source_session_id: None,
+                    total_tokens: Some(100),
+                    input_tokens: Some(100),
+                    output_tokens: Some(0),
+                    cache_read_tokens: Some(0),
+                    cache_write_tokens: Some(0),
+                    cost_usd: None,
+                    accounting: "estimated".into(),
+                    observed_at: "2026-10-15T00:00:00.000Z".into(),
+                    observed_at_source: "native".into(),
+                }
+            )
+            .unwrap()
+        );
+        // Tokenless reported session bill for the same instance.
+        assert!(
+            insert_usage_event(
+                &conn,
+                &r40_session_row(
+                    "ins_r40i3",
+                    2,
+                    Some("s1"),
+                    1,
+                    None,
+                    Some("0.01"),
+                    "reported"
+                )
+            )
+            .unwrap()
+        );
+
+        let inst = aggregate_instance(&conn, "ins_r40i3").unwrap();
+        let supply = aggregate_supply(&conn, "pvp_r40", "m-r40").unwrap();
+        assert_eq!(
+            inst.input_tokens,
+            Some(100),
+            "Message tokens survive the bill"
+        );
+        assert_eq!(inst.total_tokens, Some(100));
+        assert_eq!(inst.input_tokens, supply.input_tokens);
+        assert_eq!(inst.total_tokens, supply.total_tokens);
+        assert!((inst.cost_usd.unwrap() - 0.01).abs() < 1e-9);
+        assert_eq!(inst.cost_usd, supply.cost_usd);
+        // The rollup still observes the one Message call as a turn.
+        let rollup = rollup_fold(&conn, "ins_r40i3", "codex", Some("m-r40"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(rollup.turns, 1, "the Message call stays an observed turn");
+        assert_eq!(rollup.session_input_tokens, Some(100));
+    }
+
+    /// r40 item 4 (AB2): a reported cumulative stock must never be ADDED to
+    /// newer uncovered flow. T1 rev1 input100, reported session stock rev1
+    /// input100 ($0.01), then T2 rev2 input20 — the stock cannot certify the
+    /// revision-2 flow, so both turns bill 120 and the stock's 100 is not
+    /// added (never 220). Tokens are independent of the reported cost.
+    #[test]
+    fn a_reported_stock_is_not_added_to_newer_uncovered_turn_flow() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let turn = |seq: i64, scope: &str, revision: i64, input: i64| UsageEventRow {
+            instance_id: "ins_r40i4".into(),
+            seq,
+            profile_id: Some("pvp_r40".into()),
+            model: Some("m-r40".into()),
+            scope: "turn".into(),
+            scope_id: Some(scope.into()),
+            turn_id: None,
+            native_context_window: None,
+            mode: "snapshot".into(),
+            metric_revision: revision,
+            source_session_id: Some("S".into()),
+            total_tokens: Some(input),
+            input_tokens: Some(input),
+            output_tokens: Some(0),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            cost_usd: None,
+            accounting: "estimated".into(),
+            observed_at: "2026-10-15T00:00:00.000Z".into(),
+            observed_at_source: "native".into(),
+        };
+        assert!(insert_usage_event(&conn, &turn(1, "T1", 1, 100)).unwrap());
+        assert!(
+            insert_usage_event(
+                &conn,
+                &r40_session_row(
+                    "ins_r40i4",
+                    2,
+                    Some("S"),
+                    1,
+                    Some(100),
+                    Some("0.01"),
+                    "reported"
+                )
+            )
+            .unwrap()
+        );
+        assert!(insert_usage_event(&conn, &turn(3, "T2", 2, 20)).unwrap());
+
+        let inst = aggregate_instance(&conn, "ins_r40i4").unwrap();
+        let supply = aggregate_supply(&conn, "pvp_r40", "m-r40").unwrap();
+        assert_eq!(
+            inst.input_tokens,
+            Some(120),
+            "uncovered turns 100 + 20, the older reported stock is not added"
+        );
+        assert_eq!(inst.input_tokens, supply.input_tokens);
+        assert_eq!(inst.total_tokens, supply.total_tokens);
+        assert!((inst.cost_usd.unwrap() - 0.01).abs() < 1e-9);
+        assert_eq!(inst.cost_usd, supply.cost_usd);
+        let rollup = rollup_fold(&conn, "ins_r40i4", "codex", Some("m-r40"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(rollup.session_input_tokens, Some(120));
+    }
+
+    /// r40 item 5 (AB2): a legacy-only instance's NULL-scope REPORTED bill
+    /// applies in SUPPLY exactly as in the instance fold, even after a later
+    /// costless/window-only NULL-scope frame becomes the newest legacy row.
+    #[test]
+    fn supply_keeps_a_legacy_reported_bill_after_a_later_costless_frame() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        // Newest-KNOWN legacy reported bill: 0.07, Unknown token buckets.
+        assert!(
+            insert_usage_event(
+                &conn,
+                &r40_session_row("ins_r40i5", 1, None, 1, None, Some("0.07"), "reported")
+            )
+            .unwrap()
+        );
+        // Later costless/window-only NULL-scope point (no known value moved).
+        assert!(
+            insert_usage_event(
+                &conn,
+                &r40_session_row("ins_r40i5", 2, None, 1, None, None, "reported")
+            )
+            .unwrap(),
+            "a window-only point with no known cost is accepted"
+        );
+        // The newest legacy row is the costless one; the bill must still be
+        // the newest-KNOWN 0.07.
+        let legacy_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_events
+                 WHERE instance_id = 'ins_r40i5' AND scope = 'session'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_rows, 2);
+
+        let inst = aggregate_instance(&conn, "ins_r40i5").unwrap();
+        let supply = aggregate_supply(&conn, "pvp_r40", "m-r40").unwrap();
+        assert!(
+            (inst.cost_usd.unwrap() - 0.07).abs() < 1e-9,
+            "instance keeps the newest-KNOWN legacy bill past a costless frame"
+        );
+        assert_eq!(
+            inst.cost_usd, supply.cost_usd,
+            "supply applies the same legacy bill as the instance fold"
+        );
+        assert_eq!(inst.total_tokens, supply.total_tokens);
+        assert_eq!(inst.input_tokens, supply.input_tokens);
+    }
+
+    /// r40 item 6 (AB2): aggregate PRESENCE derives from every attributable
+    /// reported bill, independent of token-frame shape. Two growing reported
+    /// snapshots of one session: A input100/$0.01 then B input200/$0.03
+    /// (B wins global token-stock selection). A's retained bill must keep it a
+    /// visible provider row with Unknown token buckets; B keeps tokens+bill.
+    #[test]
+    fn a_retained_model_bill_stays_visible_when_its_frame_lost_token_selection() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        assert!(
+            insert_usage_event(
+                &conn,
+                &UsageEventRow {
+                    ..r40_session_row(
+                        "ins_r40i6",
+                        1,
+                        Some("S"),
+                        1,
+                        Some(100),
+                        Some("0.01"),
+                        "reported"
+                    )
+                }
+            )
+            .unwrap()
+        );
+        // Model switch: the same session's later snapshot is projected under
+        // model B (the Hub projects with the instance's current model).
+        let mut switched = r40_session_row(
+            "ins_r40i6",
+            2,
+            Some("S"),
+            2,
+            Some(200),
+            Some("0.03"),
+            "reported",
+        );
+        switched.model = Some("m-r40-b".into());
+        switched.source_session_id = Some("S".into());
+        assert!(insert_usage_event(&conn, &switched).unwrap());
+
+        // B owns the selected token stock and the newest bill.
+        let inst = aggregate_instance(&conn, "ins_r40i6").unwrap();
+        let supply_b = aggregate_supply(&conn, "pvp_r40", "m-r40-b").unwrap();
+        assert_eq!(supply_b.input_tokens, Some(200));
+        assert!((supply_b.cost_usd.unwrap() - 0.03).abs() < 1e-9);
+        assert_eq!(inst.input_tokens, supply_b.input_tokens);
+        assert_eq!(inst.cost_usd, supply_b.cost_usd);
+        // A retained bill: present, priced, Unknown tokens (the gate the
+        // provider endpoint uses is events > 0 OR ambiguous).
+        let supply_a = aggregate_supply(&conn, "pvp_r40", "m-r40").unwrap();
+        assert!(supply_a.events > 0, "model A stays a visible provider row");
+        assert!(
+            (supply_a.cost_usd.unwrap() - 0.01).abs() < 1e-9,
+            "A keeps its retained 0.01 bill"
+        );
+        assert_eq!(
+            supply_a.total_tokens, None,
+            "A's snapshot is not selected token stock"
+        );
+        assert_eq!(supply_a.input_tokens, None);
+        assert_eq!(supply_a.output_tokens, None);
+        assert_eq!(
+            supply_a.budget_status(Some(0.005)),
+            BudgetStatus::Stop,
+            "A's retained bill still Stops a smaller model budget"
         );
     }
 

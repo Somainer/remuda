@@ -2802,15 +2802,27 @@ g_flow_messages AS (
             )
          ),
          estimated_turn_cost AS (
-            -- Uncovered flow-turn estimates of a session without a reported
-            -- bill; the unpriced-turn-only guard (no session rows at all) is
-            -- applied by the poison CASE as before.
+            -- Uncovered flow-turn estimates. A lineage-QUALIFIED turn is
+            -- excluded only when its OWN (instance, session) has a reported
+            -- bill; a proven other session keeps billing. An UNQUALIFIED turn
+            -- cannot be proven to be another session, so ANY reported bill of
+            -- its instance stands it down (AB2 session-keyed authority plus
+            -- the conservative unproven-flow rule).
             SELECT t.cost_usd AS cost_usd
             FROM flow_turns t
-            WHERE NOT EXISTS (
-                SELECT 1 FROM reported_cost_sessions k
-                WHERE k.instance_id = t.instance_id
-                  AND k.sid = COALESCE(t.source_session_id, '')
+            WHERE (
+                t.source_session_id IS NOT NULL
+                AND NOT EXISTS (
+                    SELECT 1 FROM reported_cost_sessions k
+                    WHERE k.instance_id = t.instance_id
+                      AND k.sid = t.source_session_id
+                )
+            )
+            OR (
+                t.source_session_id IS NULL
+                AND t.instance_id NOT IN (
+                    SELECT instance_id FROM reported_cost_instances
+                )
             )
          ),
          estimated_message_cost AS (
@@ -2936,15 +2948,13 @@ fn aggregate_select_sql() -> &'static str {
         -- never suppressed, and its Unknown cost poisons the aggregate.
         CASE
             WHEN (SELECT COUNT(*) FROM contributions) = 0 THEN NULL
-            -- An ambiguous turn's known cost poisons only when its OWN
-            -- (instance, session) key has no reported bill.
+            -- An ambiguous (always unqualified) turn's known cost poisons
+            -- only an instance WITHOUT any reported bill.
             WHEN EXISTS (
                 SELECT 1 FROM ambiguous_turns a
                 WHERE a.cost_usd IS NOT NULL
-                  AND NOT EXISTS (
-                      SELECT 1 FROM reported_cost_sessions k
-                      WHERE k.instance_id = a.instance_id
-                        AND k.sid = COALESCE(a.source_session_id, '')
+                  AND a.instance_id NOT IN (
+                      SELECT instance_id FROM reported_cost_instances
                   )
             ) THEN NULL
             -- Sticky-Unknown stock/legacy estimate of an uncovered session
@@ -2952,20 +2962,28 @@ fn aggregate_select_sql() -> &'static str {
             WHEN EXISTS (
                 SELECT 1 FROM estimated_stock_cost WHERE cost_usd IS NULL
             ) THEN NULL
-            -- An unpriced turn poisons only on a turn-only instance whose
-            -- session has no reported bill.
+            -- An unpriced turn on a turn-only instance poisons when it is not
+            -- authority-covered (qualified: same-key bill; unqualified: any
+            -- instance bill) and the instance has no session rows at all.
             WHEN EXISTS (
                 SELECT 1 FROM flow_turns ft
                 WHERE ft.cost_usd IS NULL
                   AND NOT EXISTS (
-                      SELECT 1 FROM reported_cost_sessions k
-                      WHERE k.instance_id = ft.instance_id
-                        AND k.sid = COALESCE(ft.source_session_id, '')
-                  )
-                  AND NOT EXISTS (
                       SELECT 1 FROM usage_events sx
                       WHERE sx.instance_id = ft.instance_id
                         AND sx.scope = 'session'
+                  )
+                  AND (
+                      (ft.source_session_id IS NOT NULL
+                       AND NOT EXISTS (
+                           SELECT 1 FROM reported_cost_sessions k
+                           WHERE k.instance_id = ft.instance_id
+                             AND k.sid = ft.source_session_id
+                       ))
+                   OR (ft.source_session_id IS NULL
+                       AND ft.instance_id NOT IN (
+                           SELECT instance_id FROM reported_cost_instances
+                       ))
                   )
             ) THEN NULL
             ELSE
@@ -8354,6 +8372,102 @@ mod tests {
         );
         assert_eq!(inst.cost_usd, supply.cost_usd);
         assert_eq!(inst.budget_status(Some(0.02)), BudgetStatus::Unknown);
+    }
+
+    /// r40 item 1 companion: proven-session flow vs unqualified flow under a
+    /// reported bill. A qualified turn of a DIFFERENT native session keeps its
+    /// estimate (it is provably another session); an unqualified turn cannot
+    /// be proven to belong to another session and stands down.
+    #[test]
+    fn reported_authority_splits_qualified_and_unqualified_flow_estimates() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        // S1: tokenless reported bill 0.01.
+        assert!(
+            insert_usage_event(
+                &conn,
+                &r40_session_row(
+                    "ins_r40i1b",
+                    1,
+                    Some("s1"),
+                    1,
+                    None,
+                    Some("0.01"),
+                    "reported"
+                )
+            )
+            .unwrap()
+        );
+        // A proven turn of another native session s2, priced 0.02.
+        assert!(
+            insert_usage_event(
+                &conn,
+                &UsageEventRow {
+                    instance_id: "ins_r40i1b".into(),
+                    seq: 2,
+                    profile_id: Some("pvp_r40".into()),
+                    model: Some("m-r40".into()),
+                    scope: "turn".into(),
+                    scope_id: Some("T-other".into()),
+                    turn_id: None,
+                    native_context_window: None,
+                    mode: "snapshot".into(),
+                    metric_revision: 1,
+                    source_session_id: Some("s2".into()),
+                    total_tokens: Some(200),
+                    input_tokens: Some(200),
+                    output_tokens: Some(0),
+                    cache_read_tokens: Some(0),
+                    cache_write_tokens: Some(0),
+                    cost_usd: Some("0.02".into()),
+                    accounting: "estimated".into(),
+                    observed_at: "2026-10-15T00:00:00.000Z".into(),
+                    observed_at_source: "native".into(),
+                }
+            )
+            .unwrap()
+        );
+        // An unqualified priced turn — cannot be distinguished from the
+        // reported session, so its 0.04 estimate stands down.
+        assert!(
+            insert_usage_event(
+                &conn,
+                &UsageEventRow {
+                    instance_id: "ins_r40i1b".into(),
+                    seq: 3,
+                    profile_id: Some("pvp_r40".into()),
+                    model: Some("m-r40".into()),
+                    scope: "turn".into(),
+                    scope_id: Some("T-unq".into()),
+                    turn_id: None,
+                    native_context_window: None,
+                    mode: "snapshot".into(),
+                    metric_revision: 1,
+                    source_session_id: None,
+                    total_tokens: Some(400),
+                    input_tokens: Some(400),
+                    output_tokens: Some(0),
+                    cache_read_tokens: Some(0),
+                    cache_write_tokens: Some(0),
+                    cost_usd: Some("0.04".into()),
+                    accounting: "estimated".into(),
+                    observed_at: "2026-10-15T00:00:00.000Z".into(),
+                    observed_at_source: "native".into(),
+                }
+            )
+            .unwrap()
+        );
+
+        let inst = aggregate_instance(&conn, "ins_r40i1b").unwrap();
+        let supply = aggregate_supply(&conn, "pvp_r40", "m-r40").unwrap();
+        assert!(
+            (inst.cost_usd.unwrap() - 0.03).abs() < 1e-9,
+            "reported s1 0.01 + proven-other-session turn 0.02, unqualified 0.04 stands down"
+        );
+        assert_eq!(inst.cost_usd, supply.cost_usd);
+        // Token fold is independent: both turns' tokens survive the bill.
+        assert_eq!(inst.input_tokens, Some(600));
+        assert_eq!(inst.input_tokens, supply.input_tokens);
     }
 
     /// r40 item 3 (AB2): a reported bill suppresses only the COST of its own

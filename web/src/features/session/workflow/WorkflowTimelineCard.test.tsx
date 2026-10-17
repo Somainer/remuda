@@ -256,6 +256,46 @@ describe("WorkflowTimelineCard", () => {
     expect(failedRow).toHaveAttribute("data-state", "failed");
   });
 
+  it("auto-opens a failed phase itself once the failed member streams in after the terminal run event", () => {
+    // hub_e2e streams the terminal workflow.run (with totals) BEFORE any
+    // member; the rail settles before the phase census does. The phase head
+    // is collapsed while the census shows no failure, then MUST open on its
+    // own when the failed member is projected — a test that clicked it open in
+    // that window would race the prop flip and latch it collapsed. No clicks
+    // here: the auto-expand is the contract the hub spec waits on.
+    const done14 = Array.from({ length: 14 }, (_, i) =>
+      member({ memberId: `d${i}`, label: known(`review:item-${i}`), state: "completed" }),
+    );
+    const element = (members: WorkflowMemberPayload[]) => (
+      <WorkflowTimelineCard
+        run={run({ state: "failed", totals: totalsBlock({ done: 14, failed: 1, total: 15 }) })}
+        phases={[phase("p1", "Review", "failed")]}
+        members={members}
+      />
+    );
+    const { rerender } = renderCard(element([]));
+    const phaseHead = () => screen.getByTestId("workflow-phase").querySelector("button")!;
+    expect(phaseHead()).toHaveAttribute("aria-expanded", "false");
+
+    rerender(<MemoryRouter initialEntries={["/s/inst_test"]}>{element(done14)}</MemoryRouter>);
+    expect(phaseHead()).toHaveAttribute("aria-expanded", "false");
+
+    rerender(
+      <MemoryRouter initialEntries={["/s/inst_test"]}>
+        {element([...done14, member({ memberId: "boom", label: known("review:security"), state: "failed" })])}
+      </MemoryRouter>,
+    );
+    expect(phaseHead()).toHaveAttribute("aria-expanded", "true");
+    expect(phaseHead().textContent).toContain("1 已失败");
+    // A later projection update keeps following the prop (no user toggle yet).
+    rerender(
+      <MemoryRouter initialEntries={["/s/inst_test"]}>
+        {element([...done14, member({ memberId: "boom", label: known("review:security"), state: "failed" })])}
+      </MemoryRouter>,
+    );
+    expect(phaseHead()).toHaveAttribute("aria-expanded", "true");
+  });
+
   it("shows the attempt marker as ×2", async () => {
     renderCard(
       <WorkflowTimelineCard

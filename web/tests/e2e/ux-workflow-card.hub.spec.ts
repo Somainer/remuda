@@ -210,7 +210,15 @@ test("a failed agent row is never folded", async ({ page }) => {
   // the red 1 已失败 marker next to the progress bar.
   await expect(card.getByTestId("workflow-rail-count")).toContainText("15/15");
   await expect(card.getByTestId("workflow-rail-failed")).toContainText("1 已失败");
-  await ensurePhaseOpen(page, 0);
+  // The rail totals come from the terminal workflow.run event, which the fake
+  // node appends BEFORE the member census. Wait for the phase's own census to
+  // settle (its meta shows the failed count): a phase with a failed member
+  // auto-expands per the WorkflowTimelineCard contract, so it must already be
+  // open — clicking it open while the failed member is still streaming would
+  // race the prop flip and latch the head collapsed (the gate flake).
+  const failedPhaseHead = page.locator("[data-testid='workflow-phase'] button").first();
+  await expect(failedPhaseHead).toContainText("1 已失败");
+  await expect(failedPhaseHead).toHaveAttribute("aria-expanded", "true");
   const failed = page.getByTestId("workflow-agent").filter({ hasText: "review:security" });
   await expect(failed).toBeVisible();
   await expect(failed).toHaveAttribute("data-state", "failed");

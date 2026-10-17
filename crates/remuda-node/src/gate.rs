@@ -4767,6 +4767,31 @@ fn land_dead_cert_path(dir: &std::path::Path, job_id: &str, generation: u32) -> 
     dir.join(format!("dead-{}-g{}.json", land_slug(job_id), generation))
 }
 
+/// Legacy (pre-r34) live-fence path: `land-<slug>.json`, qualified by
+/// contents only. Kept solely so startup migration can LOCATE such files;
+/// nothing else ever opens this name.
+#[cfg(unix)]
+fn legacy_land_fence_path(dir: &std::path::Path, job_id: &str) -> std::path::PathBuf {
+    dir.join(format!("land-{}.json", land_slug(job_id)))
+}
+
+/// Legacy (pre-r34) death-certificate path: `dead-<slug>.json`. Read ONLY by
+/// the explicit, generation-pinned legacy migration in
+/// [`read_land_group_dead_cert`], never as generic death evidence.
+#[cfg(unix)]
+fn legacy_land_dead_cert_path(dir: &std::path::Path, job_id: &str) -> std::path::PathBuf {
+    dir.join(format!("dead-{}.json", land_slug(job_id)))
+}
+
+/// Provenance stamped on certificates migrated from legacy (pre-r34) evidence.
+/// A migrated certificate never carries a merge sha (the legacy record had
+/// none); the missing merge is bound ONLY through the Hub's authoritative
+/// generation-pinned probe — never treated as generic death evidence.
+#[cfg(unix)]
+const LEGACY_FENCE_CERT_PROVENANCE: &str = "legacy-fence";
+#[cfg(unix)]
+const LEGACY_DEAD_CERT_PROVENANCE: &str = "legacy-cert";
+
 #[cfg(unix)]
 fn land_slug(job_id: &str) -> String {
     job_id
@@ -4838,12 +4863,18 @@ fn write_qualified_dead_cert_bytes(
 }
 
 /// Read and VALIDATE a death certificate for the exact requested attempt.
-/// `None` covers a missing file, any read/parse error, a job/generation/merge
-/// mismatch, or missing provenance (pgid + leader identity) — every one of
-/// those is Unknown, never a valid death attestation.
+/// `None` covers a missing file, any read/parse error, a job/generation
+/// mismatch, missing provenance (pgid + leader identity), or a merge mismatch —
+/// every one of those is Unknown, never a valid death attestation.
 ///
-/// r35 item 2: certificates bind the granted `mergeSha`; it must equal the
-/// Hub-probed merge EXACTLY.
+/// r35 item 2: new-style certificates carry the granted `mergeSha` and it must
+/// equal the Hub-probed merge EXACTLY. Certificates written before the merge
+/// binding (pre-r34 migrations stamped `provenance: "legacy-…"`; r34-era
+/// qualified certs are simply merge-less) carry no merge sha; such a cert is
+/// accepted ONLY under a generation-pinned probe that supplies a NON-EMPTY merge
+/// sha — the Hub's own grant record binds the missing merge. Without that
+/// authority (empty/absent merge) it is refused, so an unqualified certificate
+/// is never accepted as generic death evidence.
 #[cfg(unix)]
 fn read_land_group_dead_cert(
     dir: &std::path::Path,
@@ -4851,8 +4882,17 @@ fn read_land_group_dead_cert(
     generation: u32,
     merge_sha: &str,
 ) -> Option<Value> {
-    let text = std::fs::read_to_string(land_dead_cert_path(dir, job_id, generation)).ok()?;
-    validate_dead_cert(text, job_id, generation, merge_sha)
+    let qualified = land_dead_cert_path(dir, job_id, generation);
+    match std::fs::read_to_string(&qualified) {
+        Ok(text) => validate_dead_cert(text, job_id, generation, merge_sha),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // No qualified certificate: perform the ONE explicit legacy
+            // migration (legacy `dead-<job>.json`) under this exact
+            // generation-pinned, merge-bearing request.
+            migrate_legacy_dead_cert(dir, job_id, generation, merge_sha)
+        }
+        Err(_) => None,
+    }
 }
 
 /// Validate one parsed certificate's identity against the requested attempt
@@ -4876,11 +4916,149 @@ fn validate_dead_cert(
         .and_then(Value::as_i64)
         .filter(|pgid| i32::try_from(*pgid).is_ok())?;
     LeaderIdentity::from_record(&cert)?;
-    // The attested merge must match EXACTLY, and must be present on both sides.
     match cert.get("mergeSha").and_then(Value::as_str) {
-        Some(cert_merge) if cert_merge == merge_sha && !merge_sha.is_empty() => Some(cert),
-        _ => None,
+        // New-style evidence: the attested merge must match EXACTLY.
+        Some(cert_merge) if cert_merge == merge_sha => Some(cert),
+        Some(_) => None,
+        // Merge-less evidence (r34-era qualified certs or explicitly migrated
+        // pre-r34 records): the Hub's generation-pinned probe supplies the
+        // merge authority. Empty authority (and no merge at all) is refused —
+        // never generic death evidence.
+        None if !merge_sha.is_empty() => Some(cert),
+        None => None,
     }
+}
+
+/// Migrate a verified-dead LEGACY live fence (`land-<job>.json`) into the
+/// attempt-qualified certificate (`dead-<job>-g<gen>.json`) observed at
+/// startup. Called only after the kernel established the WHOLE group ESRCH and
+/// the record passed the same validation as a current fence (exact job,
+/// generation, pgid, leader identity). The migrated certificate gets the
+/// `legacy-fence` provenance marker and NO merge sha: the merge the old Node
+/// pushed is not recoverable from the lane record, and it must never be
+/// guessed. The certificate therefore attests death ONLY under the Hub's later
+/// generation-pinned probe carrying the authoritative granted merge sha
+/// ([`read_land_group_dead_cert`]). When a NEWER qualified certificate (or a
+/// qualified fence that is not the observed r34 source itself) already exists
+/// the migration is skipped (the newer evidence wins; the legacy file is left
+/// for the documented operator route).
+#[cfg(unix)]
+fn migrate_legacy_fence_to_cert(
+    dir: &std::path::Path,
+    source_path: &std::path::Path,
+    record: &Value,
+    job_id: &str,
+    generation: u32,
+) {
+    if land_dead_cert_path(dir, job_id, generation).exists()
+        || (land_fence_path(dir, job_id, generation).exists()
+            && land_fence_path(dir, job_id, generation) != source_path)
+    {
+        tracing::warn!(
+            job_id,
+            generation,
+            "a qualified fence/certificate already exists for this attempt; leaving the legacy \
+             fence unmigrated (operator resolution via the Hub /resolve route)"
+        );
+        return;
+    }
+    let mut cert = record.clone();
+    cert["diedAt"] = json!(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    );
+    cert["cause"] = json!("killpg-esrch");
+    cert["provenance"] = json!(LEGACY_FENCE_CERT_PROVENANCE);
+    // Defensive: never carry a merge into a legacy migration even if a stray
+    // field existed (the format checks above required its absence).
+    if let Some(object) = cert.as_object_mut() {
+        object.remove("mergeSha");
+    }
+    match write_qualified_dead_cert_bytes(dir, &cert, job_id, generation) {
+        Ok(()) => {
+            if let Err(error) = std::fs::remove_file(source_path) {
+                tracing::warn!(
+                    %error,
+                    job_id,
+                    generation,
+                    "legacy fence migrated but its source file could not be removed; it will be \
+                     skipped on the next boot"
+                );
+            }
+        }
+        Err(error) => tracing::warn!(
+            %error,
+            job_id,
+            generation,
+            "migrating the legacy land fence to a certificate failed; keeping it"
+        ),
+    }
+}
+
+/// Read, validate and migrate a legacy `dead-<job>.json` certificate to its
+/// attempt-qualified name, serving it ONLY for the exact generation-pinned,
+/// merge-bearing request. The legacy record must already carry the attempt
+/// generation (pre-r34 fences/certs did); a legacy record that cannot be bound
+/// to an exact attempt is left untouched (Unknown; the operator resolution
+/// route documented at [`fence_orphaned_land_groups`] applies).
+#[cfg(unix)]
+fn migrate_legacy_dead_cert(
+    dir: &std::path::Path,
+    job_id: &str,
+    generation: u32,
+    merge_sha: &str,
+) -> Option<Value> {
+    if merge_sha.is_empty() {
+        return None;
+    }
+    let legacy_path = legacy_land_dead_cert_path(dir, job_id);
+    let text = std::fs::read_to_string(&legacy_path).ok()?;
+    // Never migrate over a qualified file that appeared concurrently.
+    if land_fence_path(dir, job_id, generation).exists()
+        || land_dead_cert_path(dir, job_id, generation).exists()
+    {
+        return None;
+    }
+    let cert: Value = serde_json::from_str(&text).ok()?;
+    // Defense in depth: a legacy LIVE fence for the same job means a possibly
+    // in-flight group was never finalized — the certificate can never settle
+    // it (its pgid may have been reused by that live replacement). Leave both
+    // for startup/operator handling.
+    if legacy_land_fence_path(dir, job_id).exists() {
+        return None;
+    }
+    // Same validation as a qualified certificate, but the merge binding comes
+    // from the request authority and the record must prove its legacy origin by
+    // the legacy file + death fields.
+    if cert.get("jobId").and_then(Value::as_str) != Some(job_id)
+        || cert.get("generation").and_then(Value::as_u64) != Some(u64::from(generation))
+    {
+        return None;
+    }
+    cert.get("pgid")
+        .and_then(Value::as_i64)
+        .filter(|pgid| i32::try_from(*pgid).is_ok())?;
+    LeaderIdentity::from_record(&cert)?;
+    if cert.get("diedAt").is_none() || cert.get("cause").is_none() {
+        // A live-fence record misnamed with the cert prefix is not a cert.
+        return None;
+    }
+    // Persist the migration under the qualified name with the legacy marker;
+    // never stamp the request's merge into durable evidence. Best-effort: a
+    // migration I/O failure simply re-attempts on the next probe.
+    let mut migrated = cert.clone();
+    migrated["provenance"] = json!(LEGACY_DEAD_CERT_PROVENANCE);
+    if write_qualified_dead_cert_bytes(dir, &migrated, job_id, generation).is_ok() {
+        let _ = std::fs::remove_file(&legacy_path);
+    }
+    validate_dead_cert(
+        serde_json::to_string(&migrated).unwrap_or_default(),
+        job_id,
+        generation,
+        merge_sha,
+    )
 }
 
 /// Env var telling the granted land child to read its one start-release byte
@@ -5470,10 +5648,25 @@ fn terminate_and_verify_group(pgid: i32, term_grace: Duration) -> bool {
 ///   → Unknown → KEEP;
 /// * `kill(pid, 0)` EPERM/other → Unknown → keep.
 ///
-/// r35 item 2: a leftover record binds the CURRENT attempt format — generation
-/// AND a non-empty granted `mergeSha`, with a matching qualified file name.
-/// Records missing that identity are not acted on: they stay KEPT (Unknown)
-/// rather than becoming unqualified evidence.
+/// r35 item 3 (upgrade): a leftover record can be in the CURRENT
+/// attempt-qualified format (`land-<job>-g<gen>.json` with a `mergeSha`) or the
+/// LEGACY pre-r34 single-file format (`land-<job>.json`, contents-qualified, no
+/// merge sha). A dead legacy fence is migrated EXPLICITLY from its observed
+/// source path into the qualified certificate name, stamped
+/// `provenance: "legacy-fence"` and WITHOUT a merge sha; the missing merge is
+/// bound later, only through the Hub's authoritative generation-pinned probe
+/// (`gate.resolveLanding` carrying the grant's merge sha). Such a certificate
+/// is never accepted as generic death evidence (no merge authority → Unknown).
+///
+/// Explicit operator recovery route: a legacy record that cannot be bound to an
+/// exact validated attempt (missing/unparseable generation or leader identity,
+/// or a read failure) is KEPT and the Landing stays outcome-unknown. The
+/// operator then resolves it through the Hub's `POST
+/// /v1/projects/{id}/gate/jobs/{jobId}/resolve` route (Human/Bot operator,
+/// pinning the exact `expectedAttempts`/`expectedSessionEpoch`/
+/// `expectedMergeSha` tuple with a persisted rationale); unlike
+/// `/resolve-evidence`, that legacy route lets the explicit operator decision
+/// stand when the read-only probe can only answer Unknown.
 #[cfg(unix)]
 fn fence_orphaned_land_groups(dir: &std::path::Path) {
     use nix::sys::signal::kill;
@@ -5520,9 +5713,9 @@ fn fence_orphaned_land_groups(dir: &std::path::Path) {
         let Some(job_id) = record.get("jobId").and_then(Value::as_str) else {
             continue;
         };
-        // r35 item 2: every acted-on record must name its attempt generation
-        // AND the exact granted merge sha, in the qualified file name; a record
-        // missing that identity is KEPT (Unknown), never unqualified evidence.
+        // r35 item 3: every bindable record must name its attempt generation
+        // (both formats do); a record without one stays Unknown for the
+        // documented operator route.
         let Some(generation) = record
             .get("generation")
             .and_then(Value::as_u64)
@@ -5530,21 +5723,32 @@ fn fence_orphaned_land_groups(dir: &std::path::Path) {
         else {
             tracing::warn!(
                 pgid,
-                "leftover land fence has no valid attempt generation; keeping it for operator \
-                 resolution"
+                "leftover land fence has no valid attempt generation; keeping it (operator \
+                 resolution via the Hub /resolve route)"
             );
             continue;
         };
+        // r35 item 3: content decides the format. New records carry the
+        // granted merge sha; pre-r35 records never did. The observed file name
+        // must agree with the content:
+        // * qualified name + merge sha → current format;
+        // * legacy unqualified name, no merge → pre-r34 single-file format;
+        // * qualified name but NO merge → an r34-era attempt-qualified record
+        //   (the attempt-generation naming existed one round before the merge
+        //   binding); migrated like legacy evidence on ESRCH.
         let merge_sha = record.get("mergeSha").and_then(Value::as_str);
         let file_name = path.file_name();
         let qualified_name = file_name == land_fence_path(dir, job_id, generation).file_name();
-        if !(merge_sha.is_some_and(|sha| !sha.is_empty()) && qualified_name) {
+        let legacy_name = file_name == legacy_land_fence_path(dir, job_id).file_name();
+        let is_qualified = merge_sha.is_some_and(|sha| !sha.is_empty()) && qualified_name;
+        let is_merge_less_legacy = merge_sha.is_none() && (legacy_name || qualified_name);
+        if !is_qualified && !is_merge_less_legacy {
             tracing::warn!(
                 pgid,
                 job_id,
                 generation,
-                "leftover land fence is missing the exact attempt/merge identity; keeping it for \
-                 operator resolution"
+                "leftover land fence has an unbindable format/name; keeping it (operator resolution \
+                 via the Hub /resolve route)"
             );
             continue;
         }
@@ -5568,13 +5772,26 @@ fn fence_orphaned_land_groups(dir: &std::path::Path) {
                 // same-session process that joined it: only an authoritative
                 // group ESRCH settles it; anything else keeps the record.
                 if !land_group_exists(pgid) {
-                    match certify_dead_and_remove_fence(dir, &record, pgid) {
-                        Ok(true) | Ok(false) => {}
-                        Err(error) => tracing::warn!(
-                            %error,
-                            pgid,
-                            "certifying the dead land group failed; keeping the fence"
-                        ),
+                    if is_merge_less_legacy {
+                        // r35 item 3: explicit legacy migration FROM THE
+                        // OBSERVED SOURCE PATH (pre-r34 single file or an r34
+                        // qualified record written before the merge binding).
+                        // The validated attempt identity is (job, generation,
+                        // pgid, leader identity); the missing merge is NOT
+                        // reconstructed here — the migrated certificate carries
+                        // the legacy marker and no merge sha, and binds it only
+                        // when the Hub later probes with its authoritative
+                        // granted merge.
+                        migrate_legacy_fence_to_cert(dir, &path, &record, job_id, generation);
+                    } else {
+                        match certify_dead_and_remove_fence(dir, &record, pgid) {
+                            Ok(true) | Ok(false) => {}
+                            Err(error) => tracing::warn!(
+                                %error,
+                                pgid,
+                                "certifying the dead land group failed; keeping the fence"
+                            ),
+                        }
                     }
                 }
             }
@@ -9718,6 +9935,219 @@ Running 8 tests across 2 projects
         assert!(
             super::read_land_group_dead_cert(&dir, job, 1, MERGE_B).is_none(),
             "A's certificate never binds B's merge"
+        );
+    }
+
+    /// r35 item 3 (medium): a LEGACY live fence (`land-<job>.json` from a
+    /// pre-r34 Node) whose whole group is ESRCH at startup is migrated EXPLICITLY
+    /// to the attempt-qualified certificate. The migrated cert carries the
+    /// legacy provenance and NO merge sha, so it attests death ONLY under a
+    /// generation-pinned probe supplying the Hub's authoritative granted merge.
+    #[cfg(unix)]
+    #[test]
+    fn startup_migrates_a_legacy_fence_with_a_dead_group_to_a_bound_cert() {
+        let _seq = proc_lock();
+        // A guaranteed-gone group.
+        let pgid = {
+            let child = spawn_grouped("sh", &["-c", "exit 0"]);
+            let pgid = child.id() as i32;
+            reap(child);
+            pgid
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while super::land_group_exists(pgid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!super::land_group_exists(pgid));
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let fence = dir.path();
+        let job = "gjb_r35_legacy_fence";
+        let legacy = super::legacy_land_fence_path(fence, job);
+        let record = serde_json::json!({
+            "jobId": job,
+            "generation": 1,
+            "pgid": pgid,
+            "startTick": 5,
+        });
+        // Legacy records have NO merge sha.
+        assert!(record.get("mergeSha").is_none());
+        std::fs::write(&legacy, record.to_string()).unwrap();
+
+        super::fence_orphaned_land_groups(fence);
+
+        // The legacy live fence is consumed …
+        assert!(!legacy.is_file(), "the legacy fence is migrated away");
+        // … into the qualified certificate with the legacy marker and no merge.
+        let cert_path = super::land_dead_cert_path(fence, job, 1);
+        let cert_text = std::fs::read_to_string(&cert_path).expect("qualified cert written");
+        let cert: Value = serde_json::from_str(&cert_text).unwrap();
+        assert_eq!(cert["provenance"], json!("legacy-fence"), "{cert}");
+        assert!(
+            cert.get("mergeSha").is_none(),
+            "no merge is fabricated: {cert}"
+        );
+        assert_eq!(cert["pgid"], json!(pgid));
+
+        // The migrated cert is NOT generic death evidence: without a merge
+        // authority the answer is Unknown …
+        assert_eq!(
+            super::land_ledger_liveness(fence, job, Some(1), None),
+            super::LandPushLiveness::Unknown
+        );
+        assert_eq!(
+            super::land_ledger_liveness(fence, job, Some(1), Some("")),
+            super::LandPushLiveness::Unknown
+        );
+        // … but the missing merge is bound ONLY through the Hub's authoritative
+        // generation-pinned probe: the legacy record cannot verify the merge
+        // itself, so every NON-EMPTY merge the authority carries binds it (the
+        // Hub always sends its own granted merge for this generation). A
+        // new-style cert with an embedded mergeSha is matched exactly instead.
+        assert_eq!(
+            super::land_ledger_liveness(fence, job, Some(1), Some(MERGE_A)),
+            super::LandPushLiveness::VerifiedDead
+        );
+        assert_eq!(
+            super::land_ledger_liveness(fence, job, Some(1), Some(MERGE_B)),
+            super::LandPushLiveness::VerifiedDead,
+            "legacy evidence binds through the probe's authoritative merge"
+        );
+    }
+
+    /// r35 item 3 (upgrade continuity): an r34-era attempt-qualified fence
+    /// (`land-<job>-g1.json` — generation in the name but no merge sha, as the
+    /// immediately previous build wrote) with a verified-dead group is migrated
+    /// to a legacy-marked qualified certificate rather than stranded.
+    #[cfg(unix)]
+    #[test]
+    fn startup_migrates_a_merge_less_r34_qualified_fence_with_a_dead_group() {
+        let _seq = proc_lock();
+        let pgid = {
+            let child = spawn_grouped("sh", &["-c", "exit 0"]);
+            let pgid = child.id() as i32;
+            reap(child);
+            pgid
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while super::land_group_exists(pgid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!super::land_group_exists(pgid));
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let fence = dir.path();
+        let job = "gjb_r35_r34_fence";
+        // r34 wrote the generation-qualified NAME with merge-less CONTENTS.
+        let source = super::land_fence_path(fence, job, 1);
+        let record = serde_json::json!({
+            "jobId": job,
+            "generation": 1,
+            "pgid": pgid,
+            "startTick": 5,
+        });
+        std::fs::write(&source, record.to_string()).unwrap();
+
+        super::fence_orphaned_land_groups(fence);
+
+        assert!(!source.is_file(), "the r34 merge-less fence is migrated");
+        let cert_path = super::land_dead_cert_path(fence, job, 1);
+        let cert: Value =
+            serde_json::from_str(&std::fs::read_to_string(&cert_path).unwrap()).unwrap();
+        assert_eq!(cert["provenance"], json!("legacy-fence"), "{cert}");
+        assert!(cert.get("mergeSha").is_none());
+        // Binds only via the authoritative probe.
+        assert_eq!(
+            super::land_ledger_liveness(fence, job, Some(1), None),
+            super::LandPushLiveness::Unknown
+        );
+        assert_eq!(
+            super::land_ledger_liveness(fence, job, Some(1), Some(MERGE_A)),
+            super::LandPushLiveness::VerifiedDead
+        );
+    }
+
+    /// r35 item 3 (medium): a LEGACY death certificate (`dead-<job>.json`)
+    /// surviving an upgrade is migrated only when a generation-pinned,
+    /// merge-bearing probe matches the record's validated attempt identity; an
+    /// unqualified read never accepts it as generic death evidence, and a
+    /// legacy record without a bindable generation is left for the documented
+    /// operator recovery route.
+    #[cfg(unix)]
+    #[test]
+    fn a_legacy_dead_cert_binds_only_through_the_authoritative_probe() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let fence = dir.path();
+        let job = "gjb_r35_legacy_cert";
+        let legacy = super::legacy_land_dead_cert_path(fence, job);
+        let cert = serde_json::json!({
+            "jobId": job,
+            "generation": 1,
+            "pgid": 4242,
+            "startTick": 7,
+            "diedAt": 1_700_000_000_000u64,
+            "cause": "killpg-esrch",
+        });
+        std::fs::write(&legacy, cert.to_string()).unwrap();
+
+        // Generic/unqualified reads are refused (no merge authority) …
+        assert!(super::read_land_group_dead_cert(fence, job, 1, "").is_none());
+        assert_eq!(
+            super::land_ledger_liveness(fence, job, Some(1), None),
+            super::LandPushLiveness::Unknown
+        );
+        // … and the legacy file is still in place (nothing bound it yet).
+        assert!(
+            legacy.is_file(),
+            "an unbound legacy cert must be left on disk"
+        );
+
+        // The Hub's authoritative generation+merge probe migrates and accepts
+        // it once, then serves the qualified file.
+        let migrated = super::read_land_group_dead_cert(fence, job, 1, MERGE_A)
+            .expect("the generation-pinned probe binds the legacy cert");
+        assert_eq!(migrated["provenance"], json!("legacy-cert"), "{migrated}");
+        assert!(
+            migrated.get("mergeSha").is_none(),
+            "the request merge is never stamped into evidence: {migrated}"
+        );
+        assert!(
+            !legacy.is_file(),
+            "the legacy source is removed after migration"
+        );
+        assert!(super::land_dead_cert_path(fence, job, 1).is_file());
+        // Legacy evidence binds the missing merge via the probe's authority:
+        // every non-empty merge under the pinned generation verifies.
+        assert_eq!(
+            super::land_ledger_liveness(fence, job, Some(1), Some(MERGE_B)),
+            super::LandPushLiveness::VerifiedDead
+        );
+        assert_eq!(
+            super::land_ledger_liveness(fence, job, Some(1), None),
+            super::LandPushLiveness::Unknown,
+            "no merge authority stays Unknown"
+        );
+
+        // An unbindable legacy record (no attempt generation) can never be
+        // migrated: it stays Unknown and on disk for the operator route.
+        let job2 = "gjb_r35_legacy_unbound";
+        let legacy2 = super::legacy_land_dead_cert_path(fence, job2);
+        let unbound = serde_json::json!({
+            "jobId": job2,
+            "pgid": 4242,
+            "startTick": 7,
+            "diedAt": 1_700_000_000_000u64,
+            "cause": "killpg-esrch",
+        });
+        std::fs::write(&legacy2, unbound.to_string()).unwrap();
+        assert!(super::read_land_group_dead_cert(fence, job2, 1, MERGE_A).is_none());
+        assert!(
+            legacy2.is_file(),
+            "an unbindable legacy record is kept (operator resolution via the Hub /resolve route)"
+        );
+        assert_eq!(
+            super::land_ledger_liveness(fence, job2, Some(1), Some(MERGE_A)),
+            super::LandPushLiveness::Unknown
         );
     }
 

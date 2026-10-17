@@ -65,3 +65,47 @@ authorizer (a fresh process that never attached, or one whose session ended)
 refuses — missing authority is permission. Tests obtain an allow only by
 installing a test-only authorizer (`cfg(test)`/`test-faults`), unreachable
 from a production `DevNode`.
+
+## Attempt-qualified land evidence and its upgrade (r34/r35)
+
+A granted land attempt's durable evidence lives in the Node's `gate-land`
+directory and is bound to the attempt's FULL identity — job, attempt
+generation AND the exact granted merge sha:
+
+- live fence `land-<job>-g<gen>.json` (written before the held land child is
+  released);
+- death certificate `dead-<job>-g<gen>.json` (written only after the kernel
+  reported the whole group ESRCH).
+
+A finalizer opens ONLY its own attempt's immutable fence path; it never
+discovers an attempt through the recyclable process-group id, so a detached
+older finalizer cannot certify or unlink a newer attempt after pgid reuse.
+The Hub's `gate.resolveLanding` probe pins `(generation, mergeSha)` from its
+own job row (`attempts` + granted `mergeSha`); any mismatch, a missing
+authority, or absent evidence reads `unknown` — never a generic "dead".
+
+### Upgrading pre-r34 evidence and the operator route
+
+Pre-r34 Nodes wrote single files `land-<job>.json` / `dead-<job>.json` with
+no merge sha. On startup a legacy fence whose whole group is verified ESRCH is
+explicitly migrated to `dead-<job>-g<gen>.json`, stamped
+`"provenance":"legacy-fence"` and carrying NO merge; a legacy certificate is
+migrated the same way (`"legacy-cert"`) on the first generation-pinned probe.
+The missing merge is bound only through the Hub's authoritative grant data in
+the probe — an unqualified certificate is never accepted as generic death
+evidence.
+
+A legacy record that cannot be bound to an exact validated attempt (missing or
+unparseable generation/leader identity, unreadable file, ambiguous name) is
+kept on disk and the Landing remains outcome-unknown. Its explicit recovery
+route is the operator-only Hub endpoint
+
+`POST /v1/projects/{project}/gate/jobs/{jobId}/resolve`
+
+with `{"resolution":"failed"|"requeue", "expectedAttempts",
+"expectedSessionEpoch", "expectedMergeSha", "rationale"}` (Human/Bot operator;
+non-empty rationale). Unlike `/resolve-evidence`, this legacy route lets the
+explicit operator decision stand when the read-only probe can only answer
+unknown. The evidence-uncertain variant is deliberately excluded there and
+must use `/resolve-evidence`, which fails closed on anything but an
+established `landed`/`absent`.

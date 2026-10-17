@@ -222,6 +222,13 @@ impl RecordingGuard {
             .filter(|rec| rec.cwd.as_deref() == Some(repo))
             .collect()
     }
+
+    /// Test-only direct handle to the recording log. A cleanup test keeps this
+    /// handle and reads it AFTER the guard drops to prove the process-wide
+    /// recorder was really cleared (a post-drop spawn must not reach the log).
+    pub fn log_handle(&self) -> Arc<Mutex<Vec<RecordedGit>>> {
+        Arc::clone(&self.log)
+    }
 }
 
 #[cfg(any(test, feature = "test-faults"))]
@@ -359,10 +366,14 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// r34 item 4: the RAII guard records executable + cwd, filters by fixture
-    /// repository, and clears the process-wide recorder on drop (including when
-    /// the scoped assertion panics) so parallel subprocess tests cannot leak
-    /// into or pollute one another.
+    /// r34 item 4 / r35 item 5: the RAII guard records executable + cwd,
+    /// filters by fixture repository, and CLEARS the process-wide recorder on
+    /// drop — including unwinding a panicking test — so parallel subprocess
+    /// tests cannot leak into or pollute one another. r35 item 5 strengthens the
+    /// cleanup proof: the original log handle is retained across the drop and a
+    /// post-drop spawn is asserted NOT to reach it (the old test hid a missing
+    /// cleanup behind a fresh `install()`), and a separate `catch_unwind` scope
+    /// proves cleanup happens while a panic unwinds.
     #[test]
     fn recording_guard_scopes_by_cwd_and_clears_on_drop() {
         let tmp = tempfile_like_scratch();
@@ -370,7 +381,7 @@ mod tests {
         let repo_b = tmp.join("repo-b");
         std::fs::create_dir_all(&repo_a).unwrap();
         std::fs::create_dir_all(&repo_b).unwrap();
-        {
+        let kept_handle = {
             let guard = RecordingGuard::install();
             // Simulate the owner-spawn boundary (run_owned_process calls
             // record_spawn immediately before spawn): two recovery commands in
@@ -386,18 +397,76 @@ mod tests {
             assert!(only_a[0].executable.ends_with("git"));
             // take() cleared the log.
             assert!(guard.snapshot().is_empty());
-        }
-        // After the guard drops, the process-wide recorder is cleared: a later
-        // record_spawn is not captured.
+            // Record one more command, then retain a DIRECT handle so the log
+            // can be inspected after the guard itself is gone.
+            let h_a2 = RecoveryGit::new();
+            record_spawn(&h_a2.command(&repo_a, &["rev-parse", "--is-shallow-repository"]));
+            guard.log_handle()
+        };
+        // The guard has dropped. A spawn at the owner boundary must NOT be
+        // captured anywhere: the process-wide recorder is cleared, and in
+        // particular the original log the guard owned is untouched.
+        let before = kept_handle.lock().expect("kept log lock").len();
+        assert_eq!(before, 1, "the one pre-drop command is still in its log");
         let later = RecoveryGit::new();
         record_spawn(&later.command(&tmp, &["rev-parse", "--git-dir"]));
-        {
-            let guard2 = RecordingGuard::install();
-            assert!(
-                guard2.snapshot().is_empty(),
-                "the prior command leaked past guard drop"
-            );
-        }
+        let after = kept_handle.lock().expect("kept log lock").len();
+        assert_eq!(
+            before, after,
+            "a post-drop spawn must not reach the dropped guard's log (cleanup missing)"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// r35 item 5: when a test panics INSIDE the guard scope, the recorder is
+    /// still cleared as the guard unwinds — a later spawn never reaches the
+    /// panicked test's own log and a parallel test starts from a clean
+    /// recorder. The panicked scope's log handle is stashed OUTSIDE the closure
+    /// specifically so a fresh `install()` cannot mask a missing Drop cleanup
+    /// (a new guard would start empty either way).
+    #[test]
+    fn recording_guard_clears_the_recorder_while_unwinding_a_panic() {
+        let tmp = tempfile_like_scratch();
+        let repo = tmp.join("panic-repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        // Silence the deliberate panic's backtrace output.
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let mut panicked_log: Option<Arc<Mutex<Vec<RecordedGit>>>> = None;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let guard = RecordingGuard::install();
+            let h = RecoveryGit::new();
+            record_spawn(&h.command(&repo, &["rev-parse", "--git-dir"]));
+            panicked_log = Some(guard.log_handle());
+            panic!("r35 item 5 deliberate cleanup panic");
+        }));
+        std::panic::set_hook(previous_hook);
+        assert!(
+            result.is_err(),
+            "the inner scope must really panic so unwind cleanup is exercised"
+        );
+        let panicked_log = panicked_log.expect("the scope armed its log before panicking");
+        assert_eq!(
+            panicked_log.lock().expect("panic log lock").len(),
+            1,
+            "the one pre-panic command was recorded"
+        );
+        // With no unwind cleanup the process-wide recorder still targets the
+        // panicked log, so this spawn would reach it:
+        let probe = RecoveryGit::new();
+        record_spawn(&probe.command(&repo, &["rev-parse", "--is-shallow-repository"]));
+        assert_eq!(
+            panicked_log.lock().expect("panic log lock").len(),
+            1,
+            "a post-unwind spawn must not reach the panicked scope's log (Drop cleanup missing)"
+        );
+        // A freshly installed guard likewise starts empty.
+        let fresh = RecordingGuard::install();
+        assert!(
+            fresh.snapshot().is_empty(),
+            "the panicked scope leaked its recorder into a fresh guard"
+        );
+        drop(fresh);
         std::fs::remove_dir_all(&tmp).ok();
     }
 

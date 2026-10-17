@@ -486,12 +486,23 @@ export class JournalClient {
     await this.fillGap(s(from), s(floor - 1));
   }
 
-  async resumeAfterReconnect(): Promise<U64 | null> {
+  /**
+   * Re-synchronise after the follow socket reopened.
+   *
+   * @param opts.isCurrent optional OWNERSHIP predicate (Ruling Y2). Validated
+   * AFTER every await and BEFORE any status/snapshot mutation: when the caller
+   * (a store follow/reopen) has been superseded while a read was parked, the
+   * continuation settles silently as a stale attempt — it must not publish
+   * readonly-stale (or live) for an owner that is no longer this resync's.
+   */
+  async resumeAfterReconnect(opts?: { isCurrent?: () => boolean }): Promise<U64 | null> {
+    const isCurrent = opts?.isCurrent ?? (() => true);
     // Each resume gets a generation: overlapping catch-ups (send resolves
     // while one is pending, then steer/visibility starts another) must never
     // let a SLOWER read downgrade the newer one's result. A stale attempt
     // neither changes status nor throws — the newest attempt owns the outcome.
     const gen = ++this.resumeGen;
+    const stale = () => gen !== this.resumeGen || !isCurrent();
     let page;
     try {
       page = await this.read({
@@ -500,7 +511,7 @@ export class JournalClient {
         limit: 128,
       });
     } catch (err) {
-      if (gen !== this.resumeGen) return this.appliedSeq;
+      if (stale()) return this.appliedSeq;
       // A rejected resync read must never leave the client latched at
       // "reconnecting": settle at the same truthful retryable state a gap
       // budget exhaustion uses. onStatus mirrors it to the UI (只读 banner
@@ -510,7 +521,7 @@ export class JournalClient {
       this.setStatus("readonly-stale");
       throw err;
     }
-    if (gen !== this.resumeGen) return this.appliedSeq;
+    if (stale()) return this.appliedSeq;
     if (page.events.length === 0) {
       this.setStatus("live");
       return this.appliedSeq;
@@ -525,9 +536,9 @@ export class JournalClient {
       events: page.events,
       durableSeq: page.durableSeq,
     });
-    if (gen !== this.resumeGen) return this.appliedSeq;
+    if (stale()) return this.appliedSeq;
     if (result.gap) await this.fillGap(result.gap.from, result.gap.to, gen);
-    if (gen !== this.resumeGen) return this.appliedSeq;
+    if (stale()) return this.appliedSeq;
     // A fill that settled readonly-stale (descent budget exhausted,
     // divergence, or a failed fill read) means the resume did NOT make the
     // journal whole. Resolving here would let the machine publish live over

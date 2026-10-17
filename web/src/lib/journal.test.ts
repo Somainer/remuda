@@ -178,6 +178,44 @@ describe("JournalClient", () => {
     expect(statuses).not.toContain("live");
   });
 
+  it("r6 item 2: a resume read rejected after ownership is lost settles silently — no readonly-stale, no throw", async () => {
+    // Ruling Y2: the store passes an ownership predicate. The resync read is
+    // parked; the route leaves (predicate flips false); the read rejects. The
+    // stale continuation must return silently WITHOUT publishing
+    // readonly-stale — otherwise the re-mounted live journal shows 只读.
+    let rejectRead: ((err: Error) => void) | null = null;
+    const read: JournalRead = vi
+      .fn()
+      .mockImplementationOnce(
+        () =>
+          new Promise<never>((_resolve, reject) => {
+            rejectRead = reject;
+          }),
+      )
+      .mockResolvedValueOnce(page([], { durableSeq: "0" }));
+    const statuses: string[] = [];
+    const client = new JournalClient("obj_journal" as Id, read, {
+      onStatus: (status) => statuses.push(status),
+    });
+    let owned = true;
+    client.markReconnecting();
+
+    const pending = client
+      .resumeAfterReconnect({ isCurrent: () => owned })
+      .catch((err: unknown) => err);
+    rejectRead!(new Error("HTTP 502"));
+    // Ownership lost BEFORE the rejection settles.
+    owned = false;
+    const outcome = await pending;
+    expect(outcome).toBe("0"); // stale attempt resolves, does NOT throw
+    expect(client.status).toBe("reconnecting"); // no readonly-stale publication
+    expect(statuses).not.toContain("readonly-stale");
+
+    // A later resync under CURRENT ownership succeeds and restores live.
+    await client.resumeAfterReconnect({ isCurrent: () => true });
+    expect(client.status).toBe("live");
+  });
+
   it("resumes after reconnect from the last applied seq", async () => {
     const all = [obs(1), obs(2), obs(3), obs(4)];
     const read: JournalRead = vi.fn(async ({ afterSeq, limit }) => {

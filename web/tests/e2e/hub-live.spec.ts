@@ -769,3 +769,196 @@ test("structured view streams assistant text and separates injected records", as
     .poll(async () => (await page.request.get(`/v1/instances/${instanceId}`)).status())
     .toBe(404);
 });
+
+test("the unbound session list never shows live while the Hub is unreachable @e2e-handle (c-unboundresume)", async ({
+  page,
+}) => {
+  // The e2e test handle (window.__remudaHub.stopPoll) is a COMPILE-TIME part
+  // of the bundle this test runs against: present under the Vite dev server
+  // and under the dedicated e2e production artifact (web/dist-e2e via
+  // playwright.security-e2e.config.ts), absent and dead-code eliminated from
+  // the normal web/dist. The test REQUIRES it rather than silently skipping
+  // poll control (c-unboundresume r3 item 2 / r4 item 1).
+  // The list's connection pill only renders in the non-empty list header, so
+  // create one instance through the API CONTEXT (page.request shares the
+  // device cookie but mounts nothing in the browser): the list page never
+  // opens a follow socket, which is exactly the unbound state under test.
+  // The active space is a server-persisted device pref (it survives fresh
+  // contexts), so read the pressed space's [hostId, workspaceId] key from the
+  // panel rather than guessing the first workspace.
+  await login(page);
+  await page.goto("/sessions");
+  // Fail loudly when the handle is not installed (e.g. a production bundle
+  // that ignores the marker): the assertions below would otherwise mistake
+  // ordinary 2 s list polling for a scheduled reconnect probe.
+  await expect
+    .poll(
+      () =>
+        page.evaluate(
+          () =>
+            typeof (window as unknown as { __remudaHub?: { stopPoll?: unknown } }).__remudaHub
+              ?.stopPoll,
+        ),
+      { timeout: 10_000 },
+    )
+    .toBe("function");
+  const activeKey = await page
+    .locator('[data-testid="space-select"][aria-pressed="true"]')
+    .first()
+    .getAttribute("data-space-id");
+  expect(activeKey).toBeTruthy();
+  const [activeHostId, activeWorkspaceId] = JSON.parse(activeKey!) as [string, string];
+  const workspaces = (await (
+    await page.request.get(`/v1/hosts/${activeHostId}/workspaces`)
+  ).json()) as { workspaces: { workspaceId: string; root: string }[] };
+  const workspace = workspaces.workspaces.find((w) => w.workspaceId === activeWorkspaceId);
+  expect(workspace).toBeTruthy();
+  const create = await page.request.post("/v1/instances", {
+    headers: { Origin: new URL(page.url()).origin },
+    data: {
+      hostId: activeHostId,
+      workspaceId: workspace!.workspaceId,
+      cwd: workspace!.root,
+      kind: "terminal",
+      driver: "shell-pty",
+      name: "unboundresume",
+      tui: "default",
+    },
+  });
+  expect(create.ok(), await create.text()).toBe(true);
+  const instancePayload = (await create.json()) as {
+    instance: { instanceId?: string; id?: string };
+  };
+  const createdId = instancePayload.instance.instanceId ?? instancePayload.instance.id;
+  expect(createdId).toBeTruthy();
+
+  // Reload the list: the row renders the full header and NO follow upgrade is
+  // opened from the list page.
+  await page.goto("/sessions");
+  const header = page.getByTestId("session-list").locator("header");
+  // Word boundary: "offline" must not match \blive\b.
+  await expect(header).toContainText(/\blive\b/, { timeout: 20_000 });
+  await expect(page.getByTestId("session-row").filter({ hasText: "unboundresume" })).toBeVisible({
+    timeout: 20_000,
+  });
+  const followUpgrades: string[] = [];
+  page.on("websocket", (ws) => {
+    if (ws.url().includes("/v1/follow")) followUpgrades.push(ws.url());
+  });
+  await page.waitForTimeout(500);
+  expect(followUpgrades).toEqual([]);
+
+  // c-unboundresume r2 item 3: prove the FULL failure→offline→scheduled-retry
+  // sequence instead of sampling the pill twice around a fixed sleep.
+  //
+  // Stop ordinary list polling FIRST: with the 2 s refresh off and no
+  // navigation, a GET /v1/instances after the outage can only be a
+  // machine-driven reachability probe (resume / failure-settle / reconnect),
+  // which is what lets the scheduled retry be distinguished from list
+  // hydration.
+  await page.evaluate(() => {
+    const h = (window as unknown as { __remudaHub?: { stopPoll?: () => void } }).__remudaHub;
+    if (typeof h?.stopPoll !== "function") {
+      throw new Error(
+        "__remudaHub.stopPoll handle missing: this test must run against the Vite dev server or the dedicated web/dist-e2e artifact, never the normal production bundle",
+      );
+    }
+    h.stopPoll();
+  });
+
+  // Record every connection-pill transition in the page (initial state +
+  // MutationObserver deltas, with timestamps) — no between-samples live blip
+  // can pass unnoticed.
+  await page.evaluate(() => {
+    const w = window as unknown as {
+      __unboundConn?: { t: number; state: string }[];
+      __unboundProbeTimes?: number[];
+    };
+    w.__unboundConn = [];
+    const headerEl = document.querySelector('[data-testid="session-list"] > header');
+    const read = () => {
+      const m = headerEl?.textContent?.match(/recovering|offline|\bstale\b|\blive\b/);
+      return m ? m[0] : null;
+    };
+    let last = read();
+    if (last) w.__unboundConn!.push({ t: performance.now(), state: last });
+    new MutationObserver(() => {
+      const s = read();
+      if (s && s !== last) {
+        last = s;
+        w.__unboundConn!.push({ t: performance.now(), state: s });
+      }
+    }).observe(headerEl!, { childList: true, subtree: true, characterData: true });
+  });
+
+  // Hub-only outage: abort every /v1 request (REST + follow upgrades) while
+  // the browser stays online, then drive a foreground resume the way a real
+  // offline->online change does. Time-stamp every machine probe
+  // (GET /v1/instances) inside the aborting route so the scheduled reconnect
+  // retry is observable as a request issued AFTER the offline settlement.
+  await page.context().route(/\/v1\//, async (route) => {
+    if (/\/v1\/instances(?:\?|$)/.test(route.request().url())) {
+      await page.evaluate(() => {
+        const w = window as unknown as { __unboundProbeTimes?: number[] };
+        (w.__unboundProbeTimes ??= []).push(performance.now());
+      });
+    }
+    await route.abort("failed");
+  });
+  const outageStart = await page.evaluate(() => performance.now());
+  await page.evaluate(() => window.dispatchEvent(new Event("online")));
+
+  // The held resume's reachability probe fails: recovering → offline
+  // settlement, observed in that order.
+  await expect
+    .poll(
+      async () => {
+        const states = (
+          await page.evaluate((t0) => {
+            const w = window as unknown as { __unboundConn: { t: number; state: string }[] };
+            return w.__unboundConn.filter((p) => p.t >= t0).map((p) => p.state);
+          }, outageStart)
+        ).join(",");
+        return states.includes("offline") ? "offline" : states;
+      },
+      { timeout: 15_000 },
+    )
+    .toBe("offline");
+  const outageStates = await page.evaluate((t0) => {
+    const w = window as unknown as { __unboundConn: { t: number; state: string }[] };
+    return w.__unboundConn.filter((p) => p.t >= t0).map((p) => p.state);
+  }, outageStart);
+  expect(outageStates).not.toContain("live");
+  const recoveringAt = outageStates.indexOf("recovering");
+  expect(recoveringAt).toBeGreaterThanOrEqual(0);
+  expect(outageStates.indexOf("offline")).toBeGreaterThan(recoveringAt);
+
+  // A backoff-driven reconnect resume runs its OWN probe after the offline
+  // settlement (polling is stopped, so this cannot be list hydration). The
+  // Hub is still unreachable, so it must not certify live either.
+  const offlineAt = await page.evaluate(() => {
+    const w = window as unknown as { __unboundConn: { t: number; state: string }[] };
+    return w.__unboundConn.find((p) => p.state === "offline")!.t;
+  });
+  await expect
+    .poll(
+      () =>
+        page.evaluate((tOffline) => {
+          const w = window as unknown as { __unboundProbeTimes: number[] };
+          return w.__unboundProbeTimes.filter((t) => t > tOffline).length;
+        }, offlineAt),
+      { timeout: 10_000 },
+    )
+    .toBeGreaterThan(0);
+  const finalStates = await page.evaluate((t0) => {
+    const w = window as unknown as { __unboundConn: { t: number; state: string }[] };
+    return w.__unboundConn.filter((p) => p.t >= t0).map((p) => p.state);
+  }, outageStart);
+  expect(finalStates).not.toContain("live");
+  expect(finalStates.at(-1)).toMatch(/recovering|offline/);
+
+  // Lift routes and release the placement slot (the afterEach sweep also
+  // deletes every fake-node instance).
+  await page.context().unroute(/\/v1\//);
+  await page.request.delete(`/v1/instances/${createdId}?force=1`).catch(() => undefined);
+});

@@ -319,6 +319,13 @@ function SessionPageBody({
 
   useEffect(() => {
     if (instanceId && !isTtyLabFixtureId(instanceId)) void hubStore.follow(instanceId);
+    // Ruling Y2: leaving the session route releases connection ownership
+    // synchronously (cleanup also runs on A → B before B's own entry, which
+    // then supersedes the released state). Without it a failed/uncached route
+    // kept recovering forever from the list page.
+    return () => {
+      if (instanceId && !isTtyLabFixtureId(instanceId)) hubStore.releaseRouteTarget(instanceId);
+    };
   }, [instanceId]);
 
   // D-056 §6: per-model default + ultracode capability rows (best-effort).

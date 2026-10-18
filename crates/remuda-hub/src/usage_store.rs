@@ -3115,32 +3115,39 @@ g_flow_messages AS (
 /// sticky-Unknown stock cost poisons; an unpriced TURN on a turn-only
 /// (Claude) instance poisons, while durable Message costs always sum
 /// (unpriced = 0).
+/// The ONE bucket expression shared by the aggregate SELECT and
+/// [`rollup_instance`] totals (r43 AC3): U1 all-known-or-NULL over the
+/// Turn/stock accounting half, plus durable per-response Messages summed
+/// independently with NULLs ignored. An EMPTY half is NULL unless a Message
+/// contribution exists — a bill-only/cost-only Session must surface Unknown
+/// tokens, never a fabricated zero.
+fn token_bucket_expr(bucket: &str) -> String {
+    format!(
+        "(SELECT CASE
+             WHEN EXISTS (
+                 SELECT 1 FROM ambiguous_turns WHERE {bucket} IS NOT NULL
+             ) THEN NULL
+             WHEN COUNT(*) = 0
+                  AND (SELECT COUNT(*) FROM flow_messages) > 0 THEN 0
+             WHEN COUNT(*) = 0 THEN NULL
+             WHEN COUNT(*) = COUNT({bucket}) THEN SUM({bucket})
+         END
+        FROM (
+            SELECT {bucket} FROM flow_turns
+            UNION ALL SELECT {bucket} FROM stock_sessions
+            UNION ALL SELECT {bucket} FROM legacy_stock
+        )
+    )
+    + COALESCE((SELECT SUM({bucket}) FROM flow_messages), 0)"
+    )
+}
+
 fn aggregate_select_sql() -> &'static str {
     static C: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     C.get_or_init(|| {
         // One U1 bucket column: ambiguous-then-unknown gate over the
         // turn/stock half (empty half falls back to the independent Message
         // sum: 0 with Messages, Unknown without), plus Message SUM.
-        let bucket = |bucket: &str| -> String {
-            format!(
-                "(SELECT CASE
-                     WHEN EXISTS (
-                         SELECT 1 FROM ambiguous_turns WHERE {bucket} IS NOT NULL
-                     ) THEN NULL
-                     WHEN COUNT(*) = 0
-                          AND (SELECT COUNT(*) FROM flow_messages) > 0 THEN 0
-                     WHEN COUNT(*) = 0 THEN NULL
-                     WHEN COUNT(*) = COUNT({bucket}) THEN SUM({bucket})
-                 END
-                FROM (
-                    SELECT {bucket} FROM flow_turns
-                    UNION ALL SELECT {bucket} FROM stock_sessions
-                    UNION ALL SELECT {bucket} FROM legacy_stock
-                )
-            )
-            + COALESCE((SELECT SUM({bucket}) FROM flow_messages), 0)"
-            )
-        };
         format!(
             "SELECT
         (SELECT COUNT(*) FROM contributions),
@@ -3224,11 +3231,11 @@ fn aggregate_select_sql() -> &'static str {
      -- row must materialize even when `contributions` is empty (an empty
      -- aggregate SELECT over a zero-row FROM would otherwise return no rows).
      ",
-            total = bucket("total_tokens"),
-            input = bucket("input_tokens"),
-            output = bucket("output_tokens"),
-            cache_read = bucket("cache_read_tokens"),
-            cache_write = bucket("cache_write_tokens"),
+            total = token_bucket_expr("total_tokens"),
+            input = token_bucket_expr("input_tokens"),
+            output = token_bucket_expr("output_tokens"),
+            cache_read = token_bucket_expr("cache_read_tokens"),
+            cache_write = token_bucket_expr("cache_write_tokens"),
         )
     })
 }
@@ -4089,75 +4096,24 @@ pub fn rollup_instance(
                     SELECT 1 FROM usage_events
                     WHERE instance_id = ?1 AND scope = 'session'
                 ),
-                -- U1 gate over the Turn/stock accounting frames only; durable
-                -- per-response Messages sum independently (NULLs ignored).
-                (SELECT CASE
-                         WHEN EXISTS (
-                             SELECT 1 FROM ambiguous_turns
-                             WHERE input_tokens IS NOT NULL
-                         ) THEN NULL
-                         WHEN COUNT(*) = 0 THEN 0
-                         WHEN COUNT(*) = COUNT(input_tokens) THEN SUM(input_tokens)
-                     END
-                    FROM (
-                        SELECT input_tokens FROM flow_turns
-                        UNION ALL SELECT input_tokens FROM stock_sessions
-                        UNION ALL SELECT input_tokens FROM legacy_stock
-                    )
-                )
-                + COALESCE((SELECT SUM(input_tokens) FROM flow_messages), 0),
-                (SELECT CASE
-                         WHEN EXISTS (
-                             SELECT 1 FROM ambiguous_turns
-                             WHERE output_tokens IS NOT NULL
-                         ) THEN NULL
-                         WHEN COUNT(*) = 0 THEN 0
-                         WHEN COUNT(*) = COUNT(output_tokens) THEN SUM(output_tokens)
-                     END
-                    FROM (
-                        SELECT output_tokens FROM flow_turns
-                        UNION ALL SELECT output_tokens FROM stock_sessions
-                        UNION ALL SELECT output_tokens FROM legacy_stock
-                    )
-                )
-                + COALESCE((SELECT SUM(output_tokens) FROM flow_messages), 0),
-                (SELECT CASE
-                         WHEN EXISTS (
-                             SELECT 1 FROM ambiguous_turns
-                             WHERE cache_read_tokens IS NOT NULL
-                         ) THEN NULL
-                         WHEN COUNT(*) = 0 THEN 0
-                         WHEN COUNT(*) = COUNT(cache_read_tokens) THEN SUM(cache_read_tokens)
-                     END
-                    FROM (
-                        SELECT cache_read_tokens FROM flow_turns
-                        UNION ALL SELECT cache_read_tokens FROM stock_sessions
-                        UNION ALL SELECT cache_read_tokens FROM legacy_stock
-                    )
-                )
-                + COALESCE((SELECT SUM(cache_read_tokens) FROM flow_messages), 0),
-                (SELECT CASE
-                         WHEN EXISTS (
-                             SELECT 1 FROM ambiguous_turns
-                             WHERE cache_write_tokens IS NOT NULL
-                         ) THEN NULL
-                         WHEN COUNT(*) = 0 THEN 0
-                         WHEN COUNT(*) = COUNT(cache_write_tokens) THEN SUM(cache_write_tokens)
-                     END
-                    FROM (
-                        SELECT cache_write_tokens FROM flow_turns
-                        UNION ALL SELECT cache_write_tokens FROM stock_sessions
-                        UNION ALL SELECT cache_write_tokens FROM legacy_stock
-                    )
-                )
-                + COALESCE((SELECT SUM(cache_write_tokens) FROM flow_messages), 0),
+                -- r43 AC3: the aggregate's shared bucket logic — an empty
+                -- Turn/stock half is NULL unless a Message contributes, never
+                -- a fabricated zero (bill-only Session => Unknown).
+                {input},
+                {output},
+                {cache_read},
+                {cache_write},
                 (SELECT MAX(observed_at) FROM (
                     SELECT observed_at FROM flow_turns
                      WHERE observed_at_source = 'native'
                     UNION ALL
                     SELECT observed_at FROM flow_messages
                      WHERE observed_at_source = 'native'
-                 ))"
+                 ))",
+        input = token_bucket_expr("input_tokens"),
+        output = token_bucket_expr("output_tokens"),
+        cache_read = token_bucket_expr("cache_read_tokens"),
+        cache_write = token_bucket_expr("cache_write_tokens"),
     );
     let mut totals_stmt = conn.prepare_cached(&totals_sql)?;
     let totals = totals_stmt.query_row(params![instance_id], |row| {
@@ -9336,6 +9292,49 @@ mod tests {
         assert_eq!(inst.cost_usd, supply.cost_usd);
         assert_eq!(inst.budget_status(Some(0.02)), BudgetStatus::Unknown);
         assert_eq!(supply.budget_status(Some(0.02)), BudgetStatus::Unknown);
+    }
+
+    /// r43 item 3 (AC3): a bill-only tokenless reported Session has NO token
+    /// evidence — the rollup token totals must be Unknown exactly like the
+    /// aggregate, never fabricated zeros.
+    #[test]
+    fn a_bill_only_session_rolls_up_unknown_tokens_not_zero() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let mut bill = r40_session_row(
+            "ins_r43i3",
+            1,
+            Some("s1"),
+            1,
+            None,
+            Some("0.01"),
+            "reported",
+        );
+        bill.profile_id = Some("pvp_r43".into());
+        bill.model = Some("m-r43".into());
+        assert!(insert_usage_event(&conn, &bill).unwrap());
+
+        let inst = aggregate_instance(&conn, "ins_r43i3").unwrap();
+        let supply = aggregate_supply(&conn, "pvp_r43", "m-r43").unwrap();
+        assert_eq!(inst.total_tokens, None);
+        assert_eq!(inst.input_tokens, None);
+        assert_eq!(inst.output_tokens, None);
+        assert_eq!(inst.cost_usd, Some(0.01));
+
+        let rollup = rollup_fold(&conn, "ins_r43i3", "codex", Some("m-r43"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rollup.session_input_tokens, None,
+            "bill-only Session: rollup Unknown, not a fabricated zero"
+        );
+        assert_eq!(rollup.session_output_tokens, None);
+        assert_eq!(rollup.cache_read_tokens, None);
+        assert_eq!(rollup.cache_creation_tokens, None);
+        // Parity with the aggregate.
+        assert_eq!(rollup.session_input_tokens, inst.input_tokens);
+        assert_eq!(rollup.session_input_tokens, supply.input_tokens);
+        assert_eq!(inst.input_tokens, supply.input_tokens);
     }
 
     #[test]

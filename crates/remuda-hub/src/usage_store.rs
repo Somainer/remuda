@@ -288,22 +288,6 @@ fn replay_fallback_rows_from_journal(conn: &Connection) -> rusqlite::Result<usiz
     if already_replayed > 0 {
         return Ok(0);
     }
-    // AE2 (ii) exception: before anything is deleted, capture remaining
-    // physical duplicates on the two NEW unique keys. The capture removes the
-    // later physical copies so the indexes can build; the captured rows are
-    // re-fed through the SAME live upsert rule only AFTER the indexes exist
-    // (the upsert needs the unique index to hit the survivor). This runs even
-    // when no instance needs replay: a database that accumulated duplicates
-    // while an earlier migration window was rolled back must still reach a
-    // buildable current schema.
-    let mut captured_folds = fold_unjournaled_index_collisions(conn)?;
-    tx_batch_create_turn_index(conn)?;
-    tx_batch_create_message_index(conn)?;
-    captured_folds.sort_by_key(|(rowid, _)| *rowid);
-    for (_, row) in &captured_folds {
-        insert_usage_event(conn, row)?;
-    }
-
     // AE2 (i): the unit of replay is the INSTANCE. An instance participates iff
     // at least one of its physical usage rows is backed by a `kind='usage'`
     // journal frame. Frames are NEVER selected by "a physical row still
@@ -324,9 +308,9 @@ fn replay_fallback_rows_from_journal(conn: &Connection) -> rusqlite::Result<usiz
         let rows = st.query_map([], |r| r.get::<_, String>(0))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
-    if instances.is_empty() {
-        return Ok(0);
-    }
+    // The instance table may legitimately stay empty: the unjournaled fold
+    // below still has to run on databases that accumulated duplicates while an
+    // earlier migration window was rolled back.
     conn.execute_batch(
         "CREATE TEMP TABLE IF NOT EXISTS r46_replay_instances(value TEXT PRIMARY KEY);
          DELETE FROM r46_replay_instances;",
@@ -428,6 +412,27 @@ fn replay_fallback_rows_from_journal(conn: &Connection) -> rusqlite::Result<usiz
         "DELETE FROM usage_events WHERE rowid IN (SELECT value FROM r46_backed_rowids)",
         [],
     )?;
+
+    // AE2 (ii) exception: now that journal-backed rows are gone, capture the
+    // physical duplicates that remain on the two NEW unique keys — they are
+    // necessarily UNJOURNALED (backed rows in participating instances were
+    // just removed; non-participating instances never had backed rows). The
+    // survivor (MIN rowid) stays; later copies are removed so the indexes can
+    // build, then re-fed through the SAME live upsert rule after the indexes
+    // exist. Running this only AFTER the backed delete is what keeps a mixed
+    // collision group (backed survivor beside an unjournaled later revision)
+    // from folding the unjournaled revision away before the backed rows are
+    // rebuilt. The fold runs on every migration, including one with no replay.
+    let mut captured_folds = fold_unjournaled_index_collisions(conn)?;
+    tx_batch_create_turn_index(conn)?;
+    tx_batch_create_message_index(conn)?;
+    captured_folds.sort_by_key(|(rowid, _)| *rowid);
+    for (_, row) in &captured_folds {
+        insert_usage_event(conn, row)?;
+    }
+    if instances.is_empty() {
+        return Ok(0);
+    }
 
     // AE2 (i): replay EVERY usage frame of each participating instance in
     // journal order, through the exact projector + insert the live ingest path
@@ -1449,7 +1454,7 @@ fn scalar_revision(value: Option<&Value>) -> Option<i64> {
     value.as_i64()
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageAggregate {
     pub events: i64,
@@ -7127,35 +7132,97 @@ mod tests {
             native_fields_ref: None,
             context_window: window.map(U64),
         };
-        let payload_json = serde_json::to_value(payload).unwrap();
-        let mut source = serde_json::Map::new();
-        if let Some(sid) = session {
-            source.insert(
-                "nativeSessionId".into(),
-                json!({"state": "known", "value": sid}),
-            );
-        }
-        if let Some(tid) = turn {
-            source.insert(
-                "nativeTurnId".into(),
-                json!({"state": "known", "value": tid}),
-            );
-        }
-        let mut event = serde_json::Map::new();
-        event.insert("kind".into(), json!("usage"));
-        event.insert("payload".into(), payload_json);
-        if !source.is_empty() {
-            event.insert("source".into(), Value::Object(source));
-        }
-        if let Some(at) = native_at {
-            event.insert("nativeAt".into(), json!({"state": "known", "value": at}));
-        }
+        // Build the FULL typed observation envelope — schema version, event/
+        // journal/instance/host ids and complete source metadata — then
+        // serialize it. Never hand-assemble a partial envelope here.
+        use remuda_protocol::{
+            Completeness, DriverKind, EventId, HostId, InstanceId, NativeRequestKey, Observation,
+            ObservationPayload, ObservationSource, RuntimeCursor, SchemaVersion, SourceChannel,
+            SourceCursor, SourceDelivery, Timestamp,
+        };
+        let inst_branded = InstanceId::try_from(String::from(
+            Id::derive("ins", "remuda-hub-usage-tests", instance).unwrap(),
+        ))
+        .unwrap();
+        let journal_id =
+            Id::derive("obj", instance, "journal").unwrap_or_else(|_| Id::new("obj").unwrap());
+        let host_id =
+            HostId::try_from(String::from(Id::derive("hst", instance, "host").unwrap())).unwrap();
+        let event_id = EventId::try_from(String::from(
+            Id::derive(
+                "evt",
+                instance,
+                &format!("usage:{scope}:{native_key}:{seq}"),
+            )
+            .unwrap(),
+        ))
+        .unwrap();
         let stamp = native_at.unwrap_or("2026-10-20T00:00:00.000Z");
+        let observed_at = Timestamp::try_from(stamp.to_string()).unwrap();
+        let native_at_knowledge = match native_at {
+            Some(at) => Knowledge::Known {
+                value: Timestamp::try_from(at.to_string()).unwrap(),
+            },
+            None => Knowledge::Unknown {
+                reason: "not-emitted".into(),
+                evidence_event_ids: vec![],
+            },
+        };
+        let known_s = |v: &str| Knowledge::Known {
+            value: v.to_string(),
+        };
+        let unknown_s = || Knowledge::Unknown {
+            reason: "not-emitted".into(),
+            evidence_event_ids: vec![],
+        };
+        let source = ObservationSource {
+            driver_kind: DriverKind::CodexAppserver,
+            driver_version: "r46-test".into(),
+            adapter_version: "r46-test".into(),
+            channel: SourceChannel::Hook,
+            delivery: SourceDelivery::Live,
+            native_session_id: session.map(known_s).unwrap_or_else(unknown_s),
+            native_turn_id: turn.map(known_s).unwrap_or_else(unknown_s),
+            native_agent_id: unknown_s(),
+            native_item_id: unknown_s(),
+            native_event_id: unknown_s(),
+            native_request_id: NativeRequestKey::None,
+            source_cursor: SourceCursor::Runtime(Box::new(RuntimeCursor {
+                ledger_revision: U64(0),
+            })),
+        };
+        let obs = Observation {
+            schema_version: SchemaVersion,
+            event_id,
+            journal_id,
+            instance_id: inst_branded,
+            run_id: None,
+            host_id,
+            process_generation: U64(1),
+            run_generation: None,
+            seq: U64(seq as u64),
+            observed_at,
+            native_at: native_at_knowledge,
+            source,
+            completeness: Completeness::Structured,
+            raw_ref: None,
+            evidence_event_ids: vec![],
+            body: ObservationPayload::Usage(Box::new(payload)),
+        };
+        let mut event = serde_json::to_value(&obs).unwrap();
+        // Historical NULL-scope variant: serialize the FULL typed payload
+        // first (scopeId comes out as ""), then REMOVE the key — never pass an
+        // empty string, which the projector reads as a real scoped id.
+        if scope_id.is_none()
+            && let Some(payload_obj) = event.get_mut("payload").and_then(Value::as_object_mut)
+        {
+            payload_obj.remove("scopeId");
+        }
         JournalRecord {
             instance_id: instance.into(),
             seq,
-            event_id: format!("je{seq}"),
-            event: Value::Object(event),
+            event_id: String::from(obs.event_id.as_id().clone()),
+            event,
             observed_at: stamp.into(),
         }
     }
@@ -7166,7 +7233,16 @@ mod tests {
         record: JournalRecord,
     }
 
-    fn r44_property_one(seed: u64) -> bool {
+    #[derive(Clone, Copy, Default)]
+    struct R44Features {
+        any_data: bool,
+        saw_null_scope: bool,
+        saw_message_revision: bool,
+    }
+
+    fn r44_property_one(seed: u64) -> R44Features {
+        let mut saw_null_scope = false;
+        let mut saw_message_revision = false;
         let mut rng = R43Rng(seed.wrapping_add(0x9E37_79B9_7F4A_7C15));
         let profile = "pvp_prop";
         let models = ["m-a", "m-b"];
@@ -7206,11 +7282,16 @@ mod tests {
         // and the event list.
         let mut sessions: Vec<Vec<String>> = Vec::new();
         let mut lineages: Vec<Vec<(String, String, u64)>> = Vec::new();
+        // Durable Messages that may receive later REVISIONS on the same marker
+        // (the (i) failure shape: a later revision shares the earlier frame's
+        // physical row through the live Message upsert). (marker, turn, rev)
+        let mut messages: Vec<Vec<(String, Option<String>, u64)>> = Vec::new();
         let mut per_instance: Vec<Vec<R44Event>> = (0..n_instances).map(|_| Vec::new()).collect();
         for ii in 0..n_instances {
             let n_sessions = 1 + rng.below(3);
             sessions.push((0..n_sessions).map(|s| format!("sess-{ii}-{s}")).collect());
             lineages.push(Vec::new());
+            messages.push(Vec::new());
             let n_events = 6 + rng.below(14);
             let legacy_cut = if legacy_instances[ii] {
                 1 + rng.below(n_events as u64)
@@ -7465,8 +7546,11 @@ mod tests {
                             ]
                         };
                         if legacy {
-                            // Legacy NULL-scope session: no scope/session id.
-                            r44_wire_record(
+                            // Legacy NULL-scope session: the typed payload is
+                            // serialized whole and scopeId is then REMOVED (an
+                            // omission), never emitted as "". It must project
+                            // to scope_id = None.
+                            let record = r44_wire_record(
                                 &inst,
                                 seq,
                                 "session",
@@ -7479,7 +7563,20 @@ mod tests {
                                 cost_of(&mut rng).as_deref(),
                                 None,
                                 Some(stamp.as_str()),
-                            )
+                            );
+                            assert!(
+                                record.event["payload"].get("scopeId").is_none(),
+                                "seed {seed}: legacy variant OMITS scopeId, not \"\""
+                            );
+                            assert_eq!(
+                                project_usage_event(&record, Some(profile), Some(model))
+                                    .unwrap()
+                                    .scope_id,
+                                None,
+                                "seed {seed}: omitted scopeId projects to None"
+                            );
+                            saw_null_scope = true;
+                            record
                         } else {
                             r44_wire_record(
                                 &inst,
@@ -7500,35 +7597,74 @@ mod tests {
                     "message" => {
                         // Durable Message linked to an existing Turn when one
                         // exists (nativeTurnId); marker lives in scopeId.
-                        let linked = if !lineages[ii].is_empty() && rng.below(2) == 0 {
-                            Some(lineages[ii][rng.below(lineages[ii].len() as u64)].0.clone())
+                        // Half the time (once one exists) emit a later
+                        // REVISION of an earlier durable message: same marker,
+                        // strictly higher revision. On the current schema the
+                        // live upsert folds it onto the earlier physical row,
+                        // the shape the AE2 complete replay must rebuild.
+                        let revise = !messages[ii].is_empty() && rng.below(2) == 0;
+                        if revise {
+                            saw_message_revision = true;
+                            let idx = rng.below(messages[ii].len() as u64);
+                            let (marker, linked, rev) = messages[ii][idx].clone();
+                            let new_rev = rev + 1;
+                            messages[ii][idx] = (marker.clone(), linked.clone(), new_rev);
+                            let input = Basket::Known((rng.below(5) as i64) * 100);
+                            let output = Basket::Known((rng.below(5) as i64) * 100);
+                            r44_wire_record(
+                                &inst,
+                                seq,
+                                "message",
+                                Some(&marker),
+                                None,
+                                linked.as_deref(),
+                                new_rev,
+                                "estimated",
+                                [
+                                    Basket::Unknown,
+                                    input,
+                                    output,
+                                    Basket::NotApplicable,
+                                    Basket::NotApplicable,
+                                ],
+                                cost_of(&mut rng).as_deref(),
+                                None,
+                                Some(stamp.as_str()),
+                            )
                         } else {
-                            None
-                        };
-                        let marker =
-                            format!("_remuda_codex_response:v2:r{seq}-{}", rng.next_u64() % 1000);
-                        let input = Basket::Known((rng.below(5) as i64) * 100);
-                        let output = Basket::Known((rng.below(5) as i64) * 100);
-                        r44_wire_record(
-                            &inst,
-                            seq,
-                            "message",
-                            Some(&marker),
-                            None,
-                            linked.as_deref(),
-                            1,
-                            "estimated",
-                            [
-                                Basket::Unknown,
-                                input,
-                                output,
-                                Basket::NotApplicable,
-                                Basket::NotApplicable,
-                            ],
-                            cost_of(&mut rng).as_deref(),
-                            None,
-                            Some(stamp.as_str()),
-                        )
+                            let linked = if !lineages[ii].is_empty() && rng.below(2) == 0 {
+                                Some(lineages[ii][rng.below(lineages[ii].len() as u64)].0.clone())
+                            } else {
+                                None
+                            };
+                            let marker = format!(
+                                "_remuda_codex_response:v2:r{seq}-{}",
+                                rng.next_u64() % 1000
+                            );
+                            messages[ii].push((marker.clone(), linked.clone(), 1));
+                            let input = Basket::Known((rng.below(5) as i64) * 100);
+                            let output = Basket::Known((rng.below(5) as i64) * 100);
+                            r44_wire_record(
+                                &inst,
+                                seq,
+                                "message",
+                                Some(&marker),
+                                None,
+                                linked.as_deref(),
+                                1,
+                                "estimated",
+                                [
+                                    Basket::Unknown,
+                                    input,
+                                    output,
+                                    Basket::NotApplicable,
+                                    Basket::NotApplicable,
+                                ],
+                                cost_of(&mut rng).as_deref(),
+                                None,
+                                Some(stamp.as_str()),
+                            )
+                        }
                     }
                     _ => unreachable!(),
                 };
@@ -7567,13 +7703,25 @@ mod tests {
             }
         }
 
-        // Invariant (c): live == restart == second migration, FULL rows.
+        // Invariant (c): live == complete replay == second migration, FULL rows.
+        // Build a previous-release UPGRADE database by removing the one-time
+        // marker, then reopen: the migration replays EVERY usage frame of every
+        // backed instance over rows the live upserts already collapsed (later
+        // message revisions on the first seq, turn corrections advancing seq).
         let live_rows = r43_dump_rows(&conn);
-        migrate(&conn).unwrap_or_else(|e| panic!("seed {seed}: migrate1 {e}"));
+        conn.execute(
+            "DELETE FROM usage_schema_meta WHERE key = 'journal_replay_v1'",
+            [],
+        )
+        .unwrap();
+        migrate(&conn).unwrap_or_else(|e| panic!("seed {seed}: replay migrate {e}"));
         let once_rows = r43_dump_rows(&conn);
         migrate(&conn).unwrap_or_else(|e| panic!("seed {seed}: migrate2 {e}"));
         let twice_rows = r43_dump_rows(&conn);
-        assert_eq!(live_rows, once_rows, "seed {seed}: restart changed rows");
+        assert_eq!(
+            live_rows, once_rows,
+            "seed {seed}: complete replay must reproduce live rows"
+        );
         assert_eq!(
             once_rows, twice_rows,
             "seed {seed}: second migration changed rows"
@@ -7614,6 +7762,10 @@ mod tests {
         for ii in 0..n_instances {
             let inst = format!("ins_prop_{ii}");
             let agg = aggregate_instance(&conn, &inst).unwrap();
+            // AE2 (iv): the recovered aggregate equals the independent live
+            // reference's, field for field.
+            let ref_agg = aggregate_instance(&live_ref, &inst).unwrap();
+            assert_eq!(agg, ref_agg, "seed {seed} {inst} aggregate vs live");
             if agg.events > 0 || agg.token_event_rows > 0 {
                 any_data = true;
             }
@@ -7639,6 +7791,20 @@ mod tests {
                     rollup.session_output_tokens, agg.output_tokens,
                     "seed {seed} {inst} output"
                 );
+                // The recovered rollup equals the live reference rollup.
+                let ref_rollup = rollup_instance(
+                    &live_ref,
+                    &RollupRequest {
+                        instance_id: &inst,
+                        kind: "codex",
+                        spec_model: Some("m-a"),
+                        effective_model: None,
+                        profile_id: Some(profile),
+                    },
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(rollup, ref_rollup, "seed {seed} {inst} rollup vs live");
             }
             if agg.token_event_rows > 0 || agg.ambiguous_events > 0 {
                 grand_input = add(grand_input, agg.input_tokens);
@@ -7659,6 +7825,9 @@ mod tests {
         let mut supply_cost: Option<f64> = Some(0.0);
         for model in models {
             let s = aggregate_supply(&conn, profile, model).unwrap();
+            // AE2 (iv): recovered supply equals the independent live reference.
+            let ref_s = aggregate_supply(&live_ref, profile, model).unwrap();
+            assert_eq!(s, ref_s, "seed {seed} supply {model} vs live");
             if s.events == 0 {
                 continue;
             }
@@ -7679,7 +7848,11 @@ mod tests {
             (Some(a), Some(b)) => assert!((a - b).abs() < 1e-6, "seed {seed}: cost {b} vs {a}"),
             (a, b) => assert_eq!(a, b, "seed {seed}: cost Unknown parity"),
         }
-        any_data
+        R44Features {
+            any_data,
+            saw_null_scope,
+            saw_message_revision,
+        }
     }
 
     #[test]
@@ -7693,22 +7866,75 @@ mod tests {
             "default r44 run covers at least 100 seeds (~<120 s)"
         );
         let mut with_data = 0;
+        let mut null_scope_seeds = Vec::new();
+        let mut message_revision_seeds = Vec::new();
         for seed in 0..seeds {
-            if r44_property_one(seed) {
+            let f = r44_property_one(seed);
+            if f.any_data {
                 with_data += 1;
+            }
+            if f.saw_null_scope {
+                null_scope_seeds.push(seed);
+            }
+            if f.saw_message_revision {
+                message_revision_seeds.push(seed);
             }
         }
         assert!(
             with_data as u64 > seeds * 9 / 10,
             "generator produced too few populated seeds: {with_data}/{seeds}"
         );
+        assert!(
+            !null_scope_seeds.is_empty(),
+            "generator must exercise the legacy NULL-scope omission"
+        );
+        assert!(
+            !message_revision_seeds.is_empty(),
+            "generator must exercise multi-revision Message chains"
+        );
+        // Surface concrete seeds so the shapes can be pinned deterministically.
+        eprintln!(
+            "null-scope seeds (first 8): {:?}; message-revision seeds (first 8): {:?}",
+            &null_scope_seeds[..null_scope_seeds.len().min(8)],
+            &message_revision_seeds[..message_revision_seeds.len().min(8)]
+        );
     }
 
     #[test]
     fn property_invariant_fixed_seeds() {
-        for seed in [14u64, 100, 426] {
-            r44_property_one(seed);
+        // Deterministic pinned seeds. 4 and 5 each hit BOTH the legacy
+        // NULL-scope omission and a multi-revision Message chain; 12 also
+        // omits scopeId; 14/100/426 pin general shapes from earlier rounds.
+        for seed in [4u64, 5, 12, 14, 100, 426] {
+            let f = r44_property_one(seed);
+            assert!(f.any_data, "seed {seed} should produce data");
         }
+    }
+
+    #[test]
+    fn property_pinned_feature_seeds() {
+        // Concrete seeds (from a full scan) that deterministically exercise the
+        // two named shapes, asserted individually and cheaply.
+        let mut null_scope = false;
+        for seed in [4u64, 5, 12, 13] {
+            null_scope |= r44_property_one(seed).saw_null_scope;
+        }
+        assert!(
+            null_scope,
+            "a pinned seed must serialize scopeId as an OMISSION projecting to None"
+        );
+        let mut message_revision = false;
+        for seed in 0..8u64 {
+            message_revision |= r44_property_one(seed).saw_message_revision;
+        }
+        assert!(
+            message_revision,
+            "a pinned seed must contain a multi-revision Message on one physical row"
+        );
+        // Seed 4 hits both at once — the r45 high failure shape combined with
+        // the legacy NULL-scope variant.
+        let both = r44_property_one(4);
+        assert!(both.saw_null_scope && both.saw_message_revision);
     }
 
     #[test]
@@ -8668,6 +8894,90 @@ mod tests {
             r43_dump_rows(&lv),
             "second migration keeps both sides equal"
         );
+    }
+
+    #[test]
+    fn r46_e_mixed_backed_and_unjournaled_group_keeps_the_unjournaled_revision() {
+        // AE2 (i)+(ii) ordering: a durable key whose MIN(rowid) survivor is
+        // journal-backed (seq1 rev1/100) but which also carries a later
+        // UNJOURNALED revision (seq2 rev2/150). Folding BEFORE the backed
+        // delete would merge rev2 onto the backed survivor, then delete that
+        // survivor as backed and rebuild only rev1 from the journal — losing
+        // rev2. The correct order deletes the backed row first; the unjournaled
+        // rev2 row then stands alone and the replayed rev1 stale-loses to it,
+        // exactly as live would.
+        let fb = r46_upgrade_fixture();
+        let rec1 = r44_wire_record(
+            "ins_r46e",
+            1,
+            "message",
+            Some("mk1"),
+            None,
+            Some("mt1"),
+            1,
+            "estimated",
+            [
+                Basket::Unknown,
+                Basket::Known(100),
+                Basket::Known(0),
+                Basket::NotApplicable,
+                Basket::NotApplicable,
+            ],
+            Some("0.01"),
+            None,
+            Some("2026-10-20T00:00:01.000Z"),
+        );
+        // seq1 is journal-backed.
+        insert_journal_raw(&fb, &rec1);
+        insert_usage_event(
+            &fb,
+            &project_usage_event(&rec1, Some("pvp"), Some("m-a")).unwrap(),
+        )
+        .unwrap();
+        // seq2 rev2 is a later revision with NO journal frame. Drop the live
+        // invariant so the two physical rows can coexist, as they would after
+        // a rolled-back migration window.
+        fb.execute_batch("DROP INDEX IF EXISTS usage_events_message_dedupe;")
+            .unwrap();
+        let rev2 = UsageEventRow {
+            seq: 2,
+            scope_id: Some("mk1".into()),
+            turn_id: Some("mt1".into()),
+            metric_revision: 2,
+            total_tokens: Some(160),
+            input_tokens: Some(150),
+            output_tokens: Some(10),
+            cost_usd: Some("0.02".into()),
+            observed_at: "2026-10-20T00:00:02.000Z".into(),
+            ..project_usage_event(&rec1, Some("pvp"), Some("m-a")).unwrap()
+        };
+        r46_raw_insert(&fb, &rev2, None);
+
+        migrate(&fb).unwrap();
+        // The unjournaled rev2 survives: the backed delete must not fold-then-
+        // delete it, and the stale rev1 replay cannot lower it.
+        let (rev, inp, cost, n): (i64, Option<i64>, Option<String>, i64) = fb
+            .query_row(
+                "SELECT metric_revision, input_tokens, cost_usd, COUNT(*) OVER ()
+                 FROM usage_events WHERE instance_id='ins_r46e' AND scope='message'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(rev, 2, "unjournaled later revision preserved");
+        assert_eq!(inp, Some(150), "unjournaled counters preserved");
+        assert_eq!(cost.as_deref(), Some("0.02"));
+        assert_eq!(n, 1, "the group collapses to one row");
+        let agg = aggregate_instance(&fb, "ins_r46e").unwrap();
+        assert_eq!(
+            agg.input_tokens,
+            Some(150),
+            "accounting reads rev2, not rev1"
+        );
+        // Idempotent.
+        let once = r43_dump_rows(&fb);
+        migrate(&fb).unwrap();
+        assert_eq!(once, r43_dump_rows(&fb), "migrate twice == once");
     }
 
     #[test]

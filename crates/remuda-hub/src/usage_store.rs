@@ -924,7 +924,20 @@ fn reconcile_session_chains(conn: &Connection) -> rusqlite::Result<usize> {
                 )?;
             }
             SessionPointDecision::Accept { strip_reset_cost } => {
-                if strip_reset_cost {
+                // The shared live acceptance (accept_session_point) re-checks
+                // freeze after stripping: a point whose reset cost made it
+                // identical to an accepted point is frozen, never stored.
+                let stripped_freeze = strip_reset_cost && {
+                    let mut stripped = row.point;
+                    stripped.cost = None;
+                    freezes_against(&stripped, &accepted)
+                };
+                if stripped_freeze {
+                    removed += conn.execute(
+                        "DELETE FROM usage_events WHERE rowid = ?1",
+                        params![row.rowid],
+                    )?;
+                } else if strip_reset_cost {
                     // Persist the reset estimate as Unknown exactly as live.
                     conn.execute(
                         "UPDATE usage_events SET cost_usd = NULL WHERE rowid = ?1",
@@ -1024,24 +1037,39 @@ fn reconstruct_fallback_projection_from_journal(conn: &Connection) -> rusqlite::
     // whose baskets are Unknown cannot overwrite a retained window/clock on
     // restart or a second migration.
     let mut rows = conn.prepare(
-        "SELECT u.rowid, u.scope, j.instance_id, j.seq, j.payload_json, j.observed_at
+        "SELECT u.rowid, u.scope, u.turn_id, u.native_context_window,
+                u.metric_revision, u.observed_at_source,
+                j.instance_id, j.seq, j.payload_json, j.observed_at
          FROM usage_events u
          JOIN journal j
            ON j.instance_id = u.instance_id AND j.seq = u.seq
          WHERE json_valid(j.payload_json)
            AND json_extract(j.payload_json, '$.kind') = 'usage'",
     )?;
-    let projected: Vec<(i64, String, UsageEventRow)> = rows
-        .query_map([], |r| -> rusqlite::Result<(i64, String, UsageEventRow)> {
+    struct ReconstructedRow {
+        rowid: i64,
+        scope: String,
+        stored_turn_id: Option<String>,
+        stored_window: Option<i64>,
+        stored_revision: i64,
+        stored_clock_source: String,
+        frame: UsageEventRow,
+    }
+    let projected: Vec<ReconstructedRow> = rows
+        .query_map([], |r| -> rusqlite::Result<Option<ReconstructedRow>> {
             let rowid: i64 = r.get(0)?;
             let scope: String = r.get(1)?;
-            let instance: String = r.get(2)?;
-            let seq: i64 = r.get(3)?;
-            let payload: String = r.get(4)?;
-            let observed_at: String = r.get(5)?;
+            let stored_turn_id: Option<String> = r.get(2)?;
+            let stored_window: Option<i64> = r.get(3)?;
+            let stored_revision: i64 = r.get(4)?;
+            let stored_clock_source: String = r.get(5)?;
+            let instance: String = r.get(6)?;
+            let seq: i64 = r.get(7)?;
+            let payload: String = r.get(8)?;
+            let observed_at: String = r.get(9)?;
             let event: Value = serde_json::from_str(&payload).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    3,
+                    8,
                     rusqlite::types::Type::Text,
                     Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
                 )
@@ -1053,58 +1081,97 @@ fn reconstruct_fallback_projection_from_journal(conn: &Connection) -> rusqlite::
                 event,
                 observed_at,
             };
-            // profile/model do not affect basket/window/clock decoding.
-            let projected = project_usage_event(&record, None, None)
-                .ok_or_else(|| rusqlite::Error::InvalidQuery)?;
-            Ok((rowid, scope, projected))
+            Ok(
+                project_usage_event(&record, None, None).map(|frame| ReconstructedRow {
+                    rowid,
+                    scope,
+                    stored_turn_id,
+                    stored_window,
+                    stored_revision,
+                    stored_clock_source,
+                    frame,
+                }),
+            )
         })?
+        .filter_map(std::result::Result::transpose)
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(rows);
 
-    // turn_id / native window / revision / clock reconstruction. Window and
-    // clock are applied per projected row and skip cost-only turn corrections.
-    for (rowid, scope, frame) in &projected {
-        let reports_counters = SnapshotCounters::of(frame)
+    // Compute the EXACT set of rows each reconstruction assignment touches,
+    // using the decoded live-projected frame (the ONE decoder, AC1) against
+    // the stored row. On steady-state restarts every set is empty and this
+    // function becomes a single read — migrate() must stay cheap when nothing
+    // was written through the fallback path.
+    let mut turn_id_rows: Vec<i64> = Vec::new();
+    let mut revision_rows: Vec<i64> = Vec::new();
+    let mut window_rows: Vec<i64> = Vec::new();
+    let mut clock_rows: Vec<i64> = Vec::new();
+    for r in &projected {
+        let f = &r.frame;
+        if r.stored_turn_id.is_none() && f.turn_id.is_some() {
+            turn_id_rows.push(r.rowid);
+        }
+        if f.metric_revision > r.stored_revision {
+            revision_rows.push(r.rowid);
+        }
+        // Window/clock skip cost-only turn corrections (billing channel).
+        let reports_counters = SnapshotCounters::of(f)
             .token_baskets()
             .iter()
             .any(Option::is_some);
-        let turn_cost_only = scope == "turn" && !reports_counters;
-        // turn_id: attribution, always best-known.
-        conn.execute(
-            "UPDATE usage_events
-             SET turn_id = COALESCE(turn_id, (
-                     SELECT json_extract(j.payload_json, '$.source.nativeTurnId.value')
-                     FROM journal j
-                     WHERE j.instance_id = usage_events.instance_id
-                       AND j.seq = usage_events.seq
-                       AND json_valid(j.payload_json)
-                       AND json_extract(j.payload_json, '$.kind') = 'usage'
-                       AND json_extract(j.payload_json, '$.source.nativeTurnId.value') IS NOT NULL
-                 ))
-             WHERE rowid = ?1",
-            params![rowid],
-        )?;
-        // Native window: COALESCE unless this is a cost-only turn correction.
-        if !turn_cost_only {
-            conn.execute(
-                "UPDATE usage_events
-                 SET native_context_window =
-                         COALESCE(native_context_window, (
-                             SELECT CAST(json_extract(j.payload_json, '$.payload.contextWindow') AS INTEGER)
-                             FROM journal j
-                             WHERE j.instance_id = usage_events.instance_id
-                               AND j.seq = usage_events.seq
-                               AND CAST(json_extract(j.payload_json, '$.payload.contextWindow') AS INTEGER) > 0
-                         ))
-                 WHERE rowid = ?1",
-                params![rowid],
-            )?;
+        let cost_only_turn = r.scope == "turn" && !reports_counters;
+        if !cost_only_turn {
+            if r.stored_window.is_none() && f.native_context_window.is_some() {
+                window_rows.push(r.rowid);
+            }
+            if r.stored_clock_source != "native" && f.observed_at_source == "native" {
+                clock_rows.push(r.rowid);
+            }
         }
-        // Revision: raise only (unchanged r38 rule).
-        conn.execute(
-            "UPDATE usage_events
-             SET metric_revision = CASE
-                 WHEN CAST((
+    }
+    if turn_id_rows.is_empty()
+        && revision_rows.is_empty()
+        && window_rows.is_empty()
+        && clock_rows.is_empty()
+    {
+        return Ok(());
+    }
+    conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS r43_rowids(value INTEGER NOT NULL);")?;
+    let run_update = |ids: &[i64], sql: &str| -> rusqlite::Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        conn.execute_batch("DELETE FROM r43_rowids;")?;
+        {
+            let mut ins = conn.prepare("INSERT INTO r43_rowids(value) VALUES (?1)")?;
+            for rowid in ids {
+                ins.execute(params![rowid])?;
+            }
+        }
+        conn.execute(sql, [])?;
+        Ok(())
+    };
+    // turn_id attribution (best-known), including cost-only corrections.
+    run_update(
+        &turn_id_rows,
+        "UPDATE usage_events
+         SET turn_id = COALESCE(turn_id, (
+                 SELECT json_extract(j.payload_json, '$.source.nativeTurnId.value')
+                 FROM journal j
+                 WHERE j.instance_id = usage_events.instance_id
+                   AND j.seq = usage_events.seq
+                   AND json_valid(j.payload_json)
+                   AND json_extract(j.payload_json, '$.kind') = 'usage'
+                   AND json_extract(j.payload_json, '$.source.nativeTurnId.value') IS NOT NULL
+             ))
+         WHERE rowid IN (SELECT value FROM r43_rowids)",
+    )?;
+    // Revision: raise only (r38 rule), every projected row incl. corrections.
+    run_update(
+        &revision_rows,
+        "UPDATE usage_events
+         SET metric_revision = CASE
+             WHEN CAST((
                      SELECT json_extract(j.payload_json, '$.payload.metricRevision')
                      FROM journal j
                      WHERE j.instance_id = usage_events.instance_id
@@ -1112,7 +1179,7 @@ fn reconstruct_fallback_projection_from_journal(conn: &Connection) -> rusqlite::
                        AND json_valid(j.payload_json)
                        AND json_extract(j.payload_json, '$.kind') = 'usage'
                  ) AS INTEGER) > metric_revision
-                 THEN CAST((
+             THEN CAST((
                      SELECT json_extract(j2.payload_json, '$.payload.metricRevision')
                      FROM journal j2
                      WHERE j2.instance_id = usage_events.instance_id
@@ -1120,30 +1187,49 @@ fn reconstruct_fallback_projection_from_journal(conn: &Connection) -> rusqlite::
                        AND json_valid(j2.payload_json)
                        AND json_extract(j2.payload_json, '$.kind') = 'usage'
                  ) AS INTEGER)
-                 ELSE metric_revision
+             ELSE metric_revision
+         END
+         WHERE rowid IN (SELECT value FROM r43_rowids)",
+    )?;
+    // Native window (COALESCE) for counter frames only.
+    run_update(
+        &window_rows,
+        "UPDATE usage_events
+         SET native_context_window = COALESCE(native_context_window, (
+                 SELECT CAST(json_extract(j.payload_json, '$.payload.contextWindow') AS INTEGER)
+                 FROM journal j
+                 WHERE j.instance_id = usage_events.instance_id
+                   AND j.seq = usage_events.seq
+                   AND CAST(json_extract(j.payload_json, '$.payload.contextWindow') AS INTEGER) > 0
+             ))
+         WHERE rowid IN (SELECT value FROM r43_rowids)",
+    )?;
+    // Clock promotion for counter frames carrying a decoded native time only.
+    run_update(
+        &clock_rows,
+        "UPDATE usage_events
+         SET observed_at = CASE
+                 WHEN observed_at_source = 'native' THEN observed_at
+                 ELSE COALESCE((
+                     SELECT json_extract(j.payload_json, '$.nativeAt.value')
+                     FROM journal j
+                     WHERE j.instance_id = usage_events.instance_id
+                       AND j.seq = usage_events.seq
+                       AND json_extract(j.payload_json, '$.nativeAt.value') IS NOT NULL
+                 ), observed_at)
+             END,
+             observed_at_source = CASE
+                 WHEN observed_at_source = 'native' THEN 'native'
+                 WHEN EXISTS (
+                     SELECT 1 FROM journal j
+                     WHERE j.instance_id = usage_events.instance_id
+                       AND j.seq = usage_events.seq
+                       AND json_extract(j.payload_json, '$.nativeAt.value') IS NOT NULL
+                 ) THEN 'native'
+                 ELSE observed_at_source
              END
-             WHERE rowid = ?1",
-            params![rowid],
-        )?;
-        // Clock: a retained native clock always wins; a cost-only turn
-        // correction never promotes to native; otherwise best-known native.
-        if !turn_cost_only && frame.observed_at_source == "native" {
-            conn.execute(
-                "UPDATE usage_events
-                 SET observed_at = CASE
-                         WHEN observed_at_source = 'native' THEN observed_at
-                         ELSE COALESCE(?1, observed_at)
-                     END,
-                     observed_at_source = CASE
-                         WHEN observed_at_source = 'native' THEN 'native'
-                         WHEN ?1 IS NOT NULL THEN 'native'
-                         ELSE observed_at_source
-                     END
-                 WHERE rowid = ?2",
-                params![frame.observed_at, rowid],
-            )?;
-        }
-    }
+         WHERE rowid IN (SELECT value FROM r43_rowids)",
+    )?;
     Ok(())
 }
 
@@ -1523,6 +1609,15 @@ fn accept_session_point(
                 // reset (unpriced turn → priced turn): keep the real token
                 // counters, persist the cost as Unknown.
                 row.cost_usd = None;
+                // r43 AC4 (restart == live): stripping can make the point
+                // content-identical to an already-accepted one (a bucket that
+                // merely went Unknown->0 while the stale cost disappears).
+                // Migration freezes such a point, so live must freeze it too
+                // instead of appending a duplicate restart would later delete.
+                let stripped = SessionStockPoint::of(&row);
+                if freezes_against(&stripped, floors) {
+                    return None;
+                }
             }
             Some(row)
         }
@@ -2168,6 +2263,12 @@ pub struct UsageAggregate {
     /// real zero (a migrated instance with no spend yet), which leaves this
     /// false.
     pub unavailable: bool,
+    /// Number of rows in the domain's TOKEN fold (flow turns, certified stocks,
+    /// eligible durable Messages). Zero means the domain exists only through
+    /// cost authority/presence (a bill-only session): its `None` token columns
+    /// are ABSENCE, not an U1-Unknown. r43 AC4 uses this to compose
+    /// instance/supply grand token sums; read callers can ignore it.
+    pub token_event_rows: i64,
 }
 
 impl UsageAggregate {
@@ -2552,14 +2653,11 @@ fn unified_fold_ctes(domain_pred: &str, reported_source: &str) -> String {
             WHERE legacy_cost_rn = 1 AND cost_usd IS NOT NULL
          ),
          global_reported_cost_by_model AS (
-            -- r39 item 4 (AA3 provider attribution): the SAME session can
-            -- report cumulative snapshots against different models across a
-            -- /model switch. The instance fold (global_reported_session_cost)
-            -- takes the newest per session; the PROVIDER fold needs the newest
-            -- snapshot per (model, session) so an earlier model keeps its
-            -- reported bill instead of being hidden by the switched model.
-            -- Scoped only: a legacy NULL bill is instance-keyed and already in
-            -- the main relation.
+            -- Newest KNOWN reported frame per (instance, profile, model,
+            -- session). Used for PRESENCE only after r43 AC4: a model keeps a
+            -- provider row after a /model switch, but superseded cumulative
+            -- bills are never re-summed (the cross-model newest bill below is
+            -- the single amount).
             SELECT rowid, instance_id, seq, profile_id, model, scope_id, cost_usd,
                    total_tokens, input_tokens, output_tokens,
                    cache_read_tokens, cache_write_tokens FROM (
@@ -2576,39 +2674,27 @@ fn unified_fold_ctes(domain_pred: &str, reported_source: &str) -> String {
             )
             WHERE model_cost_rn = 1 AND cost_usd IS NOT NULL
          ),
+         global_reported_presence_supply AS (
+            -- r43 AC4: superseded per-model reported frames keep the model
+            -- VISIBLE (AA3 presence) but contribute neither cost nor tokens —
+            -- the cumulative bill is counted once, on the newest cross-model
+            -- bill's model.
+            SELECT m.* FROM global_reported_cost_by_model m
+            WHERE NOT EXISTS (
+                SELECT 1 FROM global_reported_session_cost c
+                WHERE c.rowid = m.rowid
+            )
+         ),
          global_reported_cost_supply AS (
-            -- r40 item 5 (AB2): the provider fold applies legacy NULL-scope
-            -- REPORTED bills EXACTLY as the instance fold does — including the
-            -- instance-global suppression once scoped evidence exists (the
-            -- legacy branch below carries the same NOT EXISTS scoped guard).
-            -- A later costless/window-only NULL-scope row therefore never
-            -- loses the established newest-KNOWN bill in supply.
+            -- r43 AC4: supply AMOUNTS come from the SAME cross-model newest-
+            -- bill relation the instance fold uses (including its legacy
+            -- branch), attributed to the newest bill's model. Summing the
+            -- per-model supplies therefore equals the instance aggregate; a
+            -- newer cumulative bill on B no longer double-bills A.
             SELECT rowid, instance_id, seq, profile_id, model, scope_id, cost_usd,
                    total_tokens, input_tokens, output_tokens,
                    cache_read_tokens, cache_write_tokens
-            FROM global_reported_cost_by_model
-            UNION ALL
-            SELECT rowid, instance_id, seq, profile_id, model, scope_id, cost_usd,
-                   total_tokens, input_tokens, output_tokens,
-                   cache_read_tokens, cache_write_tokens FROM (
-                SELECT rowid, instance_id, seq, profile_id, model, scope_id, cost_usd,
-                       total_tokens, input_tokens, output_tokens,
-                       cache_read_tokens, cache_write_tokens,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY instance_id
-                           ORDER BY CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END,
-                                    seq DESC, rowid DESC
-                       ) AS supply_legacy_cost_rn
-                FROM usage_events u
-                WHERE scope = 'session' AND accounting = 'reported'
-                  AND scope_id IS NULL
-                  AND NOT EXISTS (
-                      SELECT 1 FROM usage_events s
-                      WHERE s.instance_id = u.instance_id
-                        AND s.scope = 'session' AND s.scope_id IS NOT NULL
-                  )
-            )
-            WHERE supply_legacy_cost_rn = 1 AND cost_usd IS NOT NULL
+            FROM global_reported_session_cost
          ),
          global_reported_cost_sessions AS (
             -- r41 AB2+: reported-authority keys computed GLOBALLY per
@@ -3086,11 +3172,18 @@ g_flow_messages AS (
             WHERE e.total_tokens IS NULL AND e.input_tokens IS NULL
               AND e.output_tokens IS NULL AND e.cache_read_tokens IS NULL
               AND e.cache_write_tokens IS NULL
+            UNION ALL
+            -- Superseded per-model reported frames keep the model VISIBLE
+            -- (r43 AC4 presence) with zero amount/tokens.
+            SELECT NULL, NULL, NULL, NULL, NULL
+            FROM global_reported_presence_supply p
+            WHERE {dp}
          )",
         dm = d("m"),
         dt = d("t"),
         dg = d("g"),
         dl = d("l"),
+        dp = d("p"),
         reported_source = reported_source,
     )
 }
@@ -3226,7 +3319,9 @@ fn aggregate_select_sql() -> &'static str {
                 + COALESCE((
                     SELECT SUM(CAST(cost_usd AS REAL)) FROM estimated_message_cost
                 ), 0.0)
-        END
+        END,
+        -- r43 AC4: token-evidence row count (presence-only bill => 0).
+        {token_rows}
      -- No FROM: every column is a scalar subquery over the fold CTEs, so the
      -- row must materialize even when `contributions` is empty (an empty
      -- aggregate SELECT over a zero-row FROM would otherwise return no rows).
@@ -3236,6 +3331,7 @@ fn aggregate_select_sql() -> &'static str {
             output = token_bucket_expr("output_tokens"),
             cache_read = token_bucket_expr("cache_read_tokens"),
             cache_write = token_bucket_expr("cache_write_tokens"),
+            token_rows = "(SELECT COUNT(*) FROM token_events)",
         )
     })
 }
@@ -3253,6 +3349,7 @@ fn row_to_aggregate(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageAggregate>
         output_tokens: row.get(4)?,
         cost_usd: row.get(7)?,
         unavailable: false,
+        token_event_rows: row.get::<_, Option<i64>>(8)?.unwrap_or(0),
     })
 }
 
@@ -3311,6 +3408,11 @@ pub fn aggregate_supply(
             output_tokens: if total_rows == 0 { None } else { row.get(4)? },
             cost_usd: if total_rows == 0 { None } else { row.get(7)? },
             unavailable: false,
+            token_event_rows: if total_rows == 0 {
+                0
+            } else {
+                row.get::<_, Option<i64>>(8)?.unwrap_or(0)
+            },
         })
     })
 }
@@ -9024,13 +9126,16 @@ mod tests {
         assert!((supply_b.cost_usd.unwrap() - 0.03).abs() < 1e-9);
         assert_eq!(inst.input_tokens, supply_b.input_tokens);
         assert_eq!(inst.cost_usd, supply_b.cost_usd);
-        // A retained bill: present, priced, Unknown tokens (the gate the
-        // provider endpoint uses is events > 0 OR ambiguous).
+        // A stays VISIBLE after the /model switch (AA3 provider presence),
+        // but r43 AC4 bills the cumulative session meter ONCE: the newer B
+        // bill supersedes A's 0.01, so supply(A) contributes presence with a
+        // known zero amount — summing supplies equals the instance aggregate.
         let supply_a = aggregate_supply(&conn, "pvp_r40", "m-r40").unwrap();
         assert!(supply_a.events > 0, "model A stays a visible provider row");
-        assert!(
-            (supply_a.cost_usd.unwrap() - 0.01).abs() < 1e-9,
-            "A keeps its retained 0.01 bill"
+        assert_eq!(
+            supply_a.cost_usd,
+            Some(0.0),
+            "A's superseded cumulative bill is not re-summed"
         );
         assert_eq!(
             supply_a.total_tokens, None,
@@ -9040,8 +9145,8 @@ mod tests {
         assert_eq!(supply_a.output_tokens, None);
         assert_eq!(
             supply_a.budget_status(Some(0.005)),
-            BudgetStatus::Stop,
-            "A's retained bill still Stops a smaller model budget"
+            BudgetStatus::Ok,
+            "the cumulative bill lives on B; A's budget is not stopped twice"
         );
     }
 

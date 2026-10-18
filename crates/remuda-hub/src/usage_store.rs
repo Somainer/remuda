@@ -2466,6 +2466,11 @@ fn unified_fold_ctes(domain_pred: &str, reported_source: &str) -> String {
     let turn_covered = turn_fully_covered_sql("t.instance_id", "t.scope_id");
     format!(
         "global_scoped_sessions AS (
+            -- COMPLETE scoped-session relation (newest point per
+            -- instance/scope_id): used for existence checks (legacy/scoped
+            -- selection, ambiguity) and as the backbone for cost authority.
+            -- It deliberately includes tokenless reported carriers — cost
+            -- presence must not depend on tokens (AB2+).
             SELECT * FROM (
                 SELECT rowid AS ev_rowid, *, ROW_NUMBER() OVER (
                     PARTITION BY instance_id, scope_id ORDER BY seq DESC, rowid DESC
@@ -2474,6 +2479,24 @@ fn unified_fold_ctes(domain_pred: &str, reported_source: &str) -> String {
                 WHERE scope = 'session' AND scope_id IS NOT NULL
             )
             WHERE stock_rn = 1
+         ),
+         global_token_stock_sessions AS (
+            -- r43 AC2 (ONE stock selection): the TOKEN relation ranks ONLY
+            -- token-bearing points, so a later tokenless reported (or
+            -- window-only) carrier can never displace an earlier stock's
+            -- tokens by winning the ranking and then being filtered out.
+            -- Cost authority/presence keep using the complete relation above.
+            SELECT * FROM (
+                SELECT rowid AS ev_rowid, *, ROW_NUMBER() OVER (
+                    PARTITION BY instance_id, scope_id ORDER BY seq DESC, rowid DESC
+                ) AS token_stock_rn
+                FROM usage_events
+                WHERE scope = 'session' AND scope_id IS NOT NULL
+                  AND (total_tokens IS NOT NULL OR input_tokens IS NOT NULL
+                       OR output_tokens IS NOT NULL OR cache_read_tokens IS NOT NULL
+                       OR cache_write_tokens IS NOT NULL)
+            )
+            WHERE token_stock_rn = 1
          ),
          global_reported_session_cost AS (
             -- r38 item 3 / r39 items 2-4 (AA2): a result-frame Session carrier
@@ -2604,6 +2627,8 @@ fn unified_fold_ctes(domain_pred: &str, reported_source: &str) -> String {
             SELECT DISTINCT instance_id FROM global_reported_session_cost
          ),
          global_legacy_stock AS (
+            -- COMPLETE newest legacy NULL-scope session point per instance
+            -- (existence / legacy-scoped cost selection).
             SELECT * FROM (
                 SELECT rowid AS ev_rowid, *, ROW_NUMBER() OVER (
                     PARTITION BY instance_id ORDER BY rowid DESC
@@ -2612,6 +2637,51 @@ fn unified_fold_ctes(domain_pred: &str, reported_source: &str) -> String {
                 WHERE scope = 'session' AND scope_id IS NULL
             )
             WHERE legacy_rn = 1
+         ),
+         global_token_legacy_stock AS (
+            -- r43 AC2: the TOKEN legacy relation ranks only token-bearing
+            -- legacy points (same pre-ranking exclusion as scoped token
+            -- stock).
+            SELECT * FROM (
+                SELECT rowid AS ev_rowid, *, ROW_NUMBER() OVER (
+                    PARTITION BY instance_id ORDER BY rowid DESC
+                ) AS token_legacy_rn
+                FROM usage_events
+                WHERE scope = 'session' AND scope_id IS NULL
+                  AND (total_tokens IS NOT NULL OR input_tokens IS NOT NULL
+                       OR output_tokens IS NOT NULL OR cache_read_tokens IS NOT NULL
+                       OR cache_write_tokens IS NOT NULL)
+            )
+            WHERE token_legacy_rn = 1
+         ),
+         global_estimated_session_points AS (
+            -- r43 AC2: the COMPLETE cost relation for ESTIMATED cumulative
+            -- stocks — newest ESTIMATED point per (instance, session)
+            -- INCLUDING tokenless/window-only points (the stock-only
+            -- Ruling-B bill). Independent of token ranking: a later tokenless
+            -- reported carrier never removes an estimate, and a tokenless
+            -- successor never masks an earlier Unknown estimate.
+            SELECT * FROM (
+                SELECT rowid AS ev_rowid, *, ROW_NUMBER() OVER (
+                    PARTITION BY instance_id, scope_id ORDER BY seq DESC, rowid DESC
+                ) AS est_rn
+                FROM usage_events
+                WHERE scope = 'session' AND scope_id IS NOT NULL
+                  AND accounting <> 'reported'
+            )
+            WHERE est_rn = 1
+         ),
+         global_estimated_legacy_points AS (
+            -- Same complete estimated relation for legacy NULL-scope points.
+            SELECT * FROM (
+                SELECT rowid AS ev_rowid, *, ROW_NUMBER() OVER (
+                    PARTITION BY instance_id ORDER BY rowid DESC
+                ) AS est_legacy_rn
+                FROM usage_events
+                WHERE scope = 'session' AND scope_id IS NULL
+                  AND accounting <> 'reported'
+            )
+            WHERE est_legacy_rn = 1
          ),
          global_winning_turns AS (
             -- rowid is projected explicitly: the rate-window query correlates
@@ -2669,25 +2739,16 @@ g_flow_messages AS (
             -- coverage) cannot certify: Ruling B flow wins and stock stands
             -- down (r9 items 4/5).
             --
-            -- r42 (AB2 completion): a token-LESS REPORTED carrier is the
-            -- result/cost channel only — it can never CERTIFY token coverage.
-            -- Otherwise an equal/newer-revision cost-only $0.01 bill would
-            -- hide its session's turns from the token fold and then vanish
-            -- from the token stock itself (a confident-but-incomplete sum).
-            -- Token-bearing carriers and estimated points certify unchanged.
+            -- r43 AC2 (ONE stock selection): coverage certification reads the
+            -- token-only ranking, so ANY tokenless point (reported cost-only
+            -- carrier or window-only estimated point) is excluded before
+            -- certification rather than filtered out afterward. A tokenless
+            -- point can never hide its session's turn flow.
             SELECT s.instance_id AS instance_id, s.scope_id AS sid
-            FROM global_scoped_sessions s
+            FROM global_token_stock_sessions s
             JOIN g_session_turn_flow f
               ON f.instance_id = s.instance_id AND f.sid = s.scope_id
             WHERE f.turn_count > 0
-              AND NOT (
-                  s.accounting = 'reported'
-                  AND s.total_tokens IS NULL
-                  AND s.input_tokens IS NULL
-                  AND s.output_tokens IS NULL
-                  AND s.cache_read_tokens IS NULL
-                  AND s.cache_write_tokens IS NULL
-              )
               AND (
                   f.max_revision < s.metric_revision
                   OR (
@@ -2849,22 +2910,15 @@ g_flow_messages AS (
             SELECT t.* FROM g_ambiguous_turns t WHERE {dt}
          ),
          stock_sessions AS (
-            -- Accounting-agnostic cumulative stock membership (AB2), but the
-            -- TOKEN half contains only frames that carry token evidence: a
-            -- token-LESS REPORTED carrier is the result channel (cost only) —
-            -- it stays in the COST fold/presence and never poisons another
-            -- session's or turn's known buckets with its NULLs (r41 AB2+).
-            -- Flow-less sessions (no winning turn flow on the session) keep
-            -- their stock unless a Ruling B instance-wide override stands it
-            -- down.
-            SELECT g.*, g.scope_id AS sid FROM global_scoped_sessions g
+            -- TOKEN stock (r43 AC2): the token-only ranked relation, so
+            -- membership is accounting-agnostic and tokenless points of ANY
+            -- kind never enter — they cannot displace earlier token stock.
+            -- Cost authority/presence use the complete Session relations
+            -- instead. Flow-less sessions (no winning turn flow on the
+            -- session) keep their stock unless a Ruling B instance-wide
+            -- override stands it down.
+            SELECT g.*, g.scope_id AS sid FROM global_token_stock_sessions g
             WHERE {dg}
-              AND (
-                  g.accounting <> 'reported'
-                  OR g.total_tokens IS NOT NULL OR g.input_tokens IS NOT NULL
-                  OR g.output_tokens IS NOT NULL OR g.cache_read_tokens IS NOT NULL
-                  OR g.cache_write_tokens IS NOT NULL
-              )
               AND g.instance_id NOT IN (SELECT instance_id FROM override_instances)
               AND NOT EXISTS (
                   SELECT 1 FROM g_session_turn_flow f
@@ -2876,14 +2930,8 @@ g_flow_messages AS (
             -- instance-wide Ruling B override is active; a surviving uncovered
             -- proven turn of THIS session drops the stock via the missing
             -- coverage match.
-            SELECT g.*, g.scope_id AS sid FROM global_scoped_sessions g
+            SELECT g.*, g.scope_id AS sid FROM global_token_stock_sessions g
             WHERE {dg}
-              AND (
-                  g.accounting <> 'reported'
-                  OR g.total_tokens IS NOT NULL OR g.input_tokens IS NOT NULL
-                  OR g.output_tokens IS NOT NULL OR g.cache_read_tokens IS NOT NULL
-                  OR g.cache_write_tokens IS NOT NULL
-              )
               AND g.instance_id NOT IN (SELECT instance_id FROM override_instances)
               AND EXISTS (
                   SELECT 1 FROM g_fully_covered_sessions c
@@ -2891,7 +2939,9 @@ g_flow_messages AS (
               )
          ),
          legacy_stock AS (
-            SELECT l.*, '' AS sid FROM global_legacy_stock l
+            -- TOKEN legacy stock from the token-only legacy ranking; the
+            -- legacy/scoped existence guard still uses the COMPLETE relation.
+            SELECT l.*, '' AS sid FROM global_token_legacy_stock l
             WHERE {dl}
               AND l.instance_id NOT IN (
                   SELECT instance_id FROM global_scoped_sessions
@@ -2915,23 +2965,46 @@ g_flow_messages AS (
             -- (those are global_reported_cost_sessions, r41 AB2+).
             SELECT g.* FROM {reported_source} g WHERE {dg}
          ),
-         estimated_stock_cost AS (
-            -- Selected scoped/legacy stock estimates of sessions WITHOUT a
-            -- reported bill on the SAME GLOBAL key; NULL costs stay (they are
-            -- the sticky-Unknown poison checked in the aggregate CASE).
-            SELECT g.cost_usd AS cost_usd
-            FROM stock_sessions g
-            WHERE NOT EXISTS (
-                SELECT 1 FROM global_reported_cost_sessions k
-                WHERE k.instance_id = g.instance_id AND k.sid = g.sid
-            )
+         estimated_stock_rows AS (
+            -- Projected ESTIMATED stock points that actually stand as the
+            -- session's stock estimate (no Ruling-B override; flow-less or
+            -- coverage-certified, matching the token stock membership) and
+            -- whose session has no reported authority key. Complete wrt
+            -- tokens: tokenless estimated bills stay here (stock-only case).
+            SELECT g.* FROM global_estimated_session_points g
+            WHERE {dg}
+              AND g.instance_id NOT IN (SELECT instance_id FROM override_instances)
+              AND NOT EXISTS (
+                  SELECT 1 FROM global_reported_cost_sessions k
+                  WHERE k.instance_id = g.instance_id AND k.sid = g.scope_id
+              )
+              AND (
+                  NOT EXISTS (
+                      SELECT 1 FROM g_session_turn_flow f
+                      WHERE f.instance_id = g.instance_id AND f.sid = g.scope_id
+                  )
+                  OR EXISTS (
+                      SELECT 1 FROM g_fully_covered_sessions c
+                      WHERE c.instance_id = g.instance_id AND c.sid = g.scope_id
+                  )
+              )
             UNION ALL
-            SELECT l.cost_usd AS cost_usd
-            FROM legacy_stock l
-            WHERE NOT EXISTS (
-                SELECT 1 FROM global_reported_cost_sessions k
-                WHERE k.instance_id = l.instance_id AND k.sid = l.sid
-            )
+            SELECT l.* FROM global_estimated_legacy_points l
+            WHERE {dl}
+              AND l.instance_id NOT IN (SELECT instance_id FROM global_scoped_sessions)
+              AND l.instance_id NOT IN (SELECT instance_id FROM override_instances)
+              AND NOT EXISTS (
+                  SELECT 1 FROM g_flow_turns p WHERE p.instance_id = l.instance_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM global_reported_cost_sessions k
+                  WHERE k.instance_id = l.instance_id AND k.sid = ''
+              )
+         ),
+         estimated_stock_cost AS (
+            -- Selected scoped/legacy stock ESTIMATES (NULL stays: the
+            -- sticky-Unknown poison), independent of token membership.
+            SELECT cost_usd AS cost_usd FROM estimated_stock_rows
          ),
          estimated_turn_cost AS (
             -- Uncovered flow-turn estimates, excluded by the GLOBAL authority
@@ -2988,13 +3061,12 @@ g_flow_messages AS (
             FROM legacy_stock
          ),
          contributions AS (
-            -- PRESENCE (AB2 item 6): a domain/aggregate exists if it has TOKEN
-            -- evidence OR any attributable reported bill. A retained reported
-            -- bill whose frame is NOT a selected token relation (its snapshot
-            -- lost global stock selection, or a Ruling-B override hid the
-            -- carrier) still keeps the domain alive, but contributes NULL
-            -- token columns — token values come ONLY from the token relations
-            -- above, so an unselected bill's snapshot never leaks in.
+            -- PRESENCE (AB2 item 6 / r43 AC2): a domain/aggregate exists if
+            -- it has TOKEN evidence, an attributable reported bill, OR a
+            -- selected estimated stock (a stock-only tokenless cumulative
+            -- bill is real spend evidence). The non-token branches contribute
+            -- NULL token columns — token values come ONLY from token_events,
+            -- so an unselected snapshot never leaks in.
             SELECT total_tokens, input_tokens, output_tokens,
                    cache_read_tokens, cache_write_tokens
             FROM token_events
@@ -3007,6 +3079,13 @@ g_flow_messages AS (
             AND NOT EXISTS (
                 SELECT 1 FROM legacy_stock l WHERE l.ev_rowid = rc.rowid
             )
+            UNION ALL
+            -- Tokenless estimated stock points keep the domain alive.
+            SELECT NULL, NULL, NULL, NULL, NULL
+            FROM estimated_stock_rows e
+            WHERE e.total_tokens IS NULL AND e.input_tokens IS NULL
+              AND e.output_tokens IS NULL AND e.cache_read_tokens IS NULL
+              AND e.cache_write_tokens IS NULL
          )",
         dm = d("m"),
         dt = d("t"),
@@ -9159,6 +9238,100 @@ mod tests {
         assert_eq!(
             inst.cost_usd, None,
             "S2's uncovered unpriced turn poisons past the costless carrier and S1's bill"
+        );
+        assert_eq!(inst.cost_usd, supply.cost_usd);
+        assert_eq!(inst.budget_status(Some(0.02)), BudgetStatus::Unknown);
+        assert_eq!(supply.budget_status(Some(0.02)), BudgetStatus::Unknown);
+    }
+
+    /// r43 item 2a (AC2), stock-only: a later tokenless reported carrier must
+    /// be excluded BEFORE ranking token stocks, so an earlier token-bearing
+    /// stock of the same session survives. S1 est100 -> tokenless reported
+    /// $0.01; S2 est200/$0.02 => 300 tokens, $0.03.
+    #[test]
+    fn a_tokenless_reported_carrier_does_not_displace_earlier_token_stock() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let mut s1_est =
+            r40_session_row("ins_r43i2a", 1, Some("s1"), 1, Some(100), None, "estimated");
+        s1_est.profile_id = Some("pvp_r43".into());
+        s1_est.model = Some("m-r43".into());
+        assert!(insert_usage_event(&conn, &s1_est).unwrap());
+        let mut s1_bill = r40_session_row(
+            "ins_r43i2a",
+            2,
+            Some("s1"),
+            2,
+            None,
+            Some("0.01"),
+            "reported",
+        );
+        s1_bill.profile_id = Some("pvp_r43".into());
+        s1_bill.model = Some("m-r43".into());
+        assert!(insert_usage_event(&conn, &s1_bill).unwrap());
+        let mut s2 = r40_session_row(
+            "ins_r43i2a",
+            3,
+            Some("s2"),
+            1,
+            Some(200),
+            Some("0.02"),
+            "estimated",
+        );
+        s2.profile_id = Some("pvp_r43".into());
+        s2.model = Some("m-r43".into());
+        assert!(insert_usage_event(&conn, &s2).unwrap());
+
+        let inst = aggregate_instance(&conn, "ins_r43i2a").unwrap();
+        let supply = aggregate_supply(&conn, "pvp_r43", "m-r43").unwrap();
+        assert_eq!(
+            inst.input_tokens,
+            Some(300),
+            "S1's 100 survives its tokenless bill"
+        );
+        assert_eq!(inst.total_tokens, Some(300));
+        assert_eq!(inst.input_tokens, supply.input_tokens);
+        assert_eq!(inst.total_tokens, supply.total_tokens);
+        assert!(
+            (inst.cost_usd.unwrap() - 0.03).abs() < 1e-9,
+            "bill 0.01 + est 0.02"
+        );
+        assert_eq!(inst.cost_usd, supply.cost_usd);
+        assert_eq!(inst.budget_status(Some(0.02)), BudgetStatus::Stop);
+        assert_eq!(supply.budget_status(Some(0.02)), BudgetStatus::Stop);
+    }
+
+    /// r43 item 2b (AC2), stock-only Unknown: S1 tokenless reported $0.01;
+    /// S2 estimated 200/Unknown cost; then an S2 tokenless costless reported
+    /// carrier. The costless successor must not remove S2's Unknown stock
+    /// cost: aggregate None, budget Unknown (never $0.01/Ok).
+    #[test]
+    fn a_tokenless_costless_stock_successor_keeps_the_earlier_unknown_cost() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let row =
+            |seq: i64, sid: &str, input: Option<i64>, cost: Option<&str>, accounting: &str| {
+                let mut r =
+                    r40_session_row("ins_r43i2b", seq, Some(sid), seq, input, cost, accounting);
+                r.profile_id = Some("pvp_r43".into());
+                r.model = Some("m-r43".into());
+                r
+            };
+        assert!(insert_usage_event(&conn, &row(1, "s1", None, Some("0.01"), "reported")).unwrap());
+        assert!(insert_usage_event(&conn, &row(2, "s2", Some(200), None, "estimated")).unwrap());
+        assert!(insert_usage_event(&conn, &row(3, "s2", None, None, "reported")).unwrap());
+
+        let inst = aggregate_instance(&conn, "ins_r43i2b").unwrap();
+        let supply = aggregate_supply(&conn, "pvp_r43", "m-r43").unwrap();
+        assert_eq!(
+            inst.input_tokens,
+            Some(200),
+            "S2's 200-token stock survives"
+        );
+        assert_eq!(inst.input_tokens, supply.input_tokens);
+        assert_eq!(
+            inst.cost_usd, None,
+            "S2's uncovered Unknown cost is preserved"
         );
         assert_eq!(inst.cost_usd, supply.cost_usd);
         assert_eq!(inst.budget_status(Some(0.02)), BudgetStatus::Unknown);

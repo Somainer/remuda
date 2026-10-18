@@ -986,3 +986,116 @@ it("r4 item 3: the debt fallback trigger applies evidence only and leaves permis
   const evs = hubStore.getSnapshot().events[INSTANCE] ?? [];
   expect(evs.some((e) => e.kind === "permission" && e.eventId === "evt_perm_A_r4")).toBe(false);
 });
+
+it("r4 item 4: the debt scan cursor advances through a full unrelated page to the owed command at 257", async () => {
+  // AD3 item 4: filtering a full unrelated page must not stall the scan. A
+  // separate debt cursor advances through every inspected page. Real API
+  // adapter over a fetch stub: frontier 128, unrelated 129-256, owed at 257.
+  const { api, hubStore } = await fresh();
+
+  const sentCommandIdRef = { value: "" };
+  const seedRows = Array.from({ length: 128 }, (_, i) => ({
+    seq: i + 1,
+    eventId: `evt_seed_${i + 1}`,
+    kind: "raw_tty",
+    payload: { text: `filler ${i + 1}` },
+  }));
+  const unrelatedRows = Array.from({ length: 128 }, (_, i) => ({
+    seq: i + 129,
+    eventId: `evt_noise_${i + 129}`,
+    kind: "raw_tty",
+    payload: { text: `unrelated ${i + 129}` },
+  }));
+  const all = [...seedRows, ...unrelatedRows, {
+    seq: 257,
+    eventId: "evt_user_257",
+    kind: "message",
+    payload: { role: "user" },
+  }];
+
+  // The unrelated 129-256 burst and the owed 257 only become durable AFTER the
+  // drain's empty resync (the command journals late, like the real race).
+  let appended = false;
+  // Hub window semantics: newest 2000 in (afterSeq, beforeSeq], ascending.
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input), "http://hub.test");
+      const after = Number(url.searchParams.get("afterSeq") ?? "0");
+      const beforeRaw = url.searchParams.get("beforeSeq");
+      const before = beforeRaw === null ? null : Number(beforeRaw);
+      const visible = appended ? all : seedRows;
+      const resolved = visible.map((r) =>
+        r.seq === 257
+          ? { ...r, payload: { role: "user", commandId: sentCommandIdRef.value } }
+          : r,
+      );
+      const page = resolved
+        .filter((r) => r.seq > after && (before === null || r.seq <= before))
+        .sort((a, b) => b.seq - a.seq)
+        .slice(-2000)
+        .reverse();
+      if (after >= 128 && !appended && page.length === 0) appended = true;
+      const fromSeq = page[0]?.seq ?? null;
+      return new Response(
+        JSON.stringify({
+          instanceId: INSTANCE,
+          durableSeq: appended ? "257" : "128",
+          fromSeq: fromSeq === null ? null : String(fromSeq),
+          reachedAfterSeq: fromSeq === null || fromSeq === after + 1,
+          events: page,
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }),
+  );
+
+  vi.spyOn(api, "instanceGet").mockResolvedValue({ id: INSTANCE, journalId: JOURNAL } as never);
+  vi.spyOn(api, "instanceList").mockResolvedValue({
+    items: [{ id: INSTANCE, journalId: JOURNAL, revision: "1", durableSeq: "128", lifecycle: "running" } as never],
+    nextCursor: null,
+  });
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+  vi.spyOn(api, "eventsSubscribe").mockResolvedValue({
+    subscriptionId: "sub_debt_257",
+    journalId: JOURNAL,
+    durableSeq: "128",
+    windowFromSeq: "1",
+    reachedAfterSeq: true,
+    getReadyState: () => 1,
+    snapshot: {
+      projectionVersion: "v1",
+      projectionEpoch: "epoch_debt_257",
+      asOfSeq: "128",
+      instance: {} as never,
+      runs: [],
+      commands: [],
+      pendingInteractions: [],
+      nodes: [],
+      history: { earliestRetainedSeq: "1", complete: true },
+    },
+  });
+  let sentCommandId = "";
+  vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+    sentCommandId = _args[4] as string;
+    sentCommandIdRef.value = sentCommandId;
+    return Promise.resolve(commandResult(sentCommandId, "accepted"));
+  });
+  await hubStore.refresh();
+  await hubStore.follow(INSTANCE);
+  await vi.waitFor(() => expect(hubStore.getSnapshot().events[INSTANCE]).toHaveLength(128));
+  await hubStore.send(INSTANCE, "owed at 257");
+  const bubble = () => hubStore.getSnapshot().bubbles.find((b) => b.commandId === sentCommandId)!;
+  await vi.waitFor(() => expect(bubble().outboxState).toBe("sent"));
+
+  await vi.waitFor(
+    () => {
+      expect(bubble().state).toBe("settled");
+      expect(bubble().outboxState).toBe("done");
+    },
+    { timeout: 6_000 },
+);
+  // Only the owed node entered store state — the unrelated 128 did not.
+  expect(hubStore.getSnapshot().events[INSTANCE]).toHaveLength(129);
+});

@@ -1351,8 +1351,24 @@ class HubStore {
    * `firstAt` bounds the whole chase with a wall deadline even while no
    * journal client is mounted (those passes do not spend attempts). At most
    * ONE timer is armed per instance.
+   *
+   * Ruling AD3 item 4: `scanAfter` is the debt reader's OWN forward cursor,
+   * advanced through every inspected page (including full unrelated pages),
+   * independent of the store's folded events / live dedupe. `overlapBelow`
+   * anchors the separate bounded lookback for an entry just below the
+   * frontier the live stream passed by.
    */
-  private owedTail = new Map<Id, { attempts: number; firstAt: number; storageRetries: number; timer: ReturnType<typeof setTimeout> | null }>();
+  private owedTail = new Map<
+    Id,
+    {
+      attempts: number;
+      firstAt: number;
+      storageRetries: number;
+      scanAfter: number;
+      overlapBelow: number;
+      timer: ReturnType<typeof setTimeout> | null;
+    }
+  >();
   private owedTailRunning = new Set<Id>();
   /**
    * Ruling AD r2 item 3: command ids whose durable terminal ("unknown")
@@ -3969,12 +3985,40 @@ class HubStore {
     this.scheduleOwedTail(instanceId);
   }
 
+  /** Highest journal seq folded into this instance's live state (scan anchor). */
+  private owedFrontier(instanceId: Id): number {
+    return (this.state.events[instanceId] ?? []).reduce(
+      (max, ev) => Math.max(max, Number(ev.seq) || 0),
+      0,
+    );
+  }
+
+  private newOwedTail(instanceId: Id): {
+    attempts: number;
+    firstAt: number;
+    storageRetries: number;
+    scanAfter: number;
+    overlapBelow: number;
+    timer: ReturnType<typeof setTimeout> | null;
+  } {
+    // The debt begins when a drained row's resync raced the node append, so
+    // the owed entry can sit AT the current frontier; the forward scan starts
+    // there and the bounded overlap covers just below it.
+    const frontier = this.owedFrontier(instanceId);
+    return {
+      attempts: 0,
+      firstAt: Date.now(),
+      storageRetries: 0,
+      scanAfter: frontier,
+      overlapBelow: frontier,
+      timer: null,
+    };
+  }
+
   /** Arm ONE bounded tail re-read pass with doubling backoff. */
   private scheduleOwedTail(instanceId: Id, delayOverride?: number) {
     if (!this.reconcileOwed.has(instanceId)) return;
-    const tail =
-      this.owedTail.get(instanceId) ??
-      { attempts: 0, firstAt: Date.now(), storageRetries: 0, timer: null as ReturnType<typeof setTimeout> | null };
+    const tail = this.owedTail.get(instanceId) ?? this.newOwedTail(instanceId);
     if (tail.timer !== null) return;
     const delay =
       delayOverride ??
@@ -4062,12 +4106,7 @@ class HubStore {
     // instance tail record exists and pin the exact object captured.
     let tail = this.owedTail.get(instanceId);
     if (!tail) {
-      tail = {
-        attempts: 0,
-        firstAt: Date.now(),
-        storageRetries: 0,
-        timer: null,
-      };
+      tail = this.newOwedTail(instanceId);
       this.owedTail.set(instanceId, tail);
     }
     const capturedTail = tail;
@@ -4110,20 +4149,16 @@ class HubStore {
         if (!stillOurs()) return;
         let answered = false;
         if (instance) {
-          // Ruling AD r2 item 2 — a FORWARD read plus a bounded OVERLAP read.
-          // The old single window was anchored `overlap` rows BELOW the
-          // frontier and the adapter slices to `limit`: with >=limit loaded
-          // rows it returned the SAME oldest window forever, so a command
-          // journaled just past the frontier was never seen. The forward
-          // read (afterSeq = highest loaded) makes monotonic progress; the
-          // small descending overlap covers an entry the same turn's frames
-          // passed by. Both are bounded Hub windows and fold by command id.
-          const known = this.state.events[instanceId] ?? [];
-          const highest = known.reduce((max, ev) => Math.max(max, Number(ev.seq) || 0), 0);
+          // Ruling AD3: the FORWARD scan uses the debt reader's OWN cursor
+          // (tail.scanAfter), advanced through EVERY inspected page even when
+          // it carries only unrelated events — otherwise a full unrelated page
+          // (the adapter slices to `limit`) would be reread forever and never
+          // reach a command journaled farther out. The bounded OVERLAP scan is
+          // separate, anchored at the frontier captured when the debt began.
           try {
             const forward = await api.eventsRead({
               journalId: instance.journalId,
-              afterSeq: String(highest),
+              afterSeq: String(tail.scanAfter),
               limit: OWED_TAIL_WINDOW,
             });
             // Retired WHILE a read was parked (held-response regression):
@@ -4131,13 +4166,17 @@ class HubStore {
             if (!stillOurs()) return;
             answered = true;
             tail.attempts += 1;
+            const forwardHigh = forward.events.reduce(
+              (max, ev) => Math.max(max, Number(ev.seq) || 0),
+              tail.scanAfter,
+            );
+            tail.scanAfter = forwardHigh;
             this.applySettlementEvidence(instanceId, forward.events);
             if (this.reconcileOwed.has(instanceId) && this.owedCommandLacksEvidence(instanceId)) {
-              const overlapAfter = String(Math.max(0, highest - OWED_TAIL_OVERLAP));
               const overlap = await api.eventsRead({
                 journalId: instance.journalId,
-                afterSeq: overlapAfter,
-                beforeSeq: String(highest),
+                afterSeq: String(Math.max(0, tail.overlapBelow - OWED_TAIL_OVERLAP)),
+                beforeSeq: String(tail.overlapBelow),
                 limit: OWED_TAIL_OVERLAP,
               });
               if (!stillOurs()) return;

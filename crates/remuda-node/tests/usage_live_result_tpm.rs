@@ -355,22 +355,26 @@ fn a_cost_only_result_after_a_model_switch_still_bills_the_new_model() {
         put(obs, "model-b");
     }
 
-    // Model A owns the token-bearing Turn and its 0.01 snapshot.
+    // Model A owns the token-bearing Turn. r43 AC4 bills the cumulative
+    // session meter ONCE across a /model switch: the newer B bill supersedes
+    // A's 0.01, so A stays a visible provider row but contributes a known
+    // zero amount (summing supplies equals the instance aggregate).
     let supply_a = aggregate_supply(&conn, "pvp_switch", "model-a").unwrap();
     assert_eq!(
         supply_a.input_tokens,
         Some(100),
         "A keeps its token contribution"
     );
-    assert!(supply_a.events >= 1);
-    assert!(
-        (supply_a.cost_usd.unwrap_or(-1.0) - 0.01).abs() < 1e-9,
-        "A carries its reported 0.01 snapshot, got {:?}",
+    assert!(supply_a.events >= 1, "A stays a visible provider row");
+    assert_eq!(
+        supply_a.cost_usd,
+        Some(0.0),
+        "A's superseded cumulative 0.01 is not re-summed, got {:?}",
         supply_a.cost_usd
     );
 
-    // Model B has only the cost-only carrier: a visible row, bill present,
-    // every token bucket Unknown.
+    // Model B has only the cost-only carrier: a visible row carrying the one
+    // cumulative bill, every token bucket Unknown.
     let supply_b = aggregate_supply(&conn, "pvp_switch", "model-b").unwrap();
     assert!(
         supply_b.events >= 1,
@@ -392,6 +396,13 @@ fn a_cost_only_result_after_a_model_switch_still_bills_the_new_model() {
         "Stop",
         "the 0.03 B bill Stops a 0.02 model budget"
     );
+    assert_eq!(
+        format!("{:?}", supply_a.budget_status(Some(0.02))),
+        "Ok",
+        "the cumulative bill lives on B; A is not stopped twice"
+    );
+    // Grand per-model supply equals the instance aggregate (r43 AC4).
+    let total_supply_cost = supply_a.cost_usd.unwrap_or(0.0) + supply_b.cost_usd.unwrap_or(0.0);
 
     // The instance bill is the latest cumulative reported value.
     let agg = aggregate_instance(&conn, "ins_model_switch").unwrap();
@@ -399,6 +410,11 @@ fn a_cost_only_result_after_a_model_switch_still_bills_the_new_model() {
         (agg.cost_usd.unwrap_or(-1.0) - 0.03).abs() < 1e-9,
         "instance bills the newest cumulative 0.03, got {:?}",
         agg.cost_usd
+    );
+    assert!(
+        (total_supply_cost - agg.cost_usd.unwrap()).abs() < 1e-9,
+        "sum of per-model supplies ({total_supply_cost}) == instance ({})",
+        agg.cost_usd.unwrap()
     );
 }
 

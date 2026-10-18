@@ -125,6 +125,7 @@ async function liveBatch(api: Api) {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
   for (const store of liveStores.splice(0)) store.logout();
   localStorage.removeItem(OUTBOX_LS_KEY);
 });
@@ -342,4 +343,117 @@ it("a debt read released after logout and a new login folds nothing into the suc
     hubStore as unknown as { outbox: { get: (id: string) => { state: string } | undefined } | null }
   ).outbox?.get(commandId);
   expect(successorRow?.state).not.toBe("done");
+});
+
+it("the debt tail makes FORWARD progress through the real adapter with 128 loaded rows and the command at 129", async () => {
+  // r2 item 2: afterSeq "0" + limit 128 returns the same oldest 128 rows
+  // forever (the real adapter slices to limit, api.ts eventsRead); a command
+  // journaled at seq 129 must be reached by a FORWARD read, not by re-reading
+  // the overlap window. Drives the REAL api.eventsRead adapter via fetch.
+  const { api, hubStore } = await fresh();
+
+  let commandId = "";
+  const rows = Array.from({ length: 128 }, (_, i) => ({
+    seq: i + 1,
+    eventId: `evt_seed_${i + 1}`,
+    kind: "raw_tty",
+    payload: { text: `filler ${i + 1}` },
+  }));
+  let appended = false;
+
+  // Emulate the Hub: newest up to 2000 rows in (afterSeq, beforeSeq],
+  // ascending order with fromSeq/reachedAfterSeq metadata.
+  const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+    const url = new URL(String(input), "http://hub.test");
+    const after = Number(url.searchParams.get("afterSeq") ?? "0");
+    const beforeRaw = url.searchParams.get("beforeSeq");
+    const before = beforeRaw === null ? null : Number(beforeRaw);
+    const userRow129 = {
+      seq: 129,
+      eventId: "evt_user_129",
+      kind: "message",
+      payload: { role: "user", commandId },
+    };
+    const visible = appended ? [...rows, userRow129] : rows;
+    const page = visible
+      .filter((r) => r.seq > after && (before === null || r.seq <= before))
+      .sort((a, b) => b.seq - a.seq)
+      .slice(-2000)
+      .reverse();
+    // The drain's empty resume (afterSeq=128) races the node append: the
+    // command lands at seq 129 immediately AFTER that empty response.
+    if (after >= 128 && !appended && page.length === 0) appended = true;
+    const fromSeq = page[0]?.seq ?? null;
+    return new Response(
+      JSON.stringify({
+        instanceId: INSTANCE,
+        durableSeq: String(appended ? 129 : 128),
+        fromSeq: fromSeq === null ? null : String(fromSeq),
+        reachedAfterSeq: fromSeq === null || fromSeq === after + 1,
+        events: page,
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+  });
+  vi.stubGlobal("fetch", fetchMock);
+
+  // Everything except eventsRead is still mocked; eventsRead runs for real
+  // through rest()/coerceObservationList.
+  vi.spyOn(api, "instanceGet").mockResolvedValue({
+    id: INSTANCE,
+    journalId: JOURNAL,
+  } as Awaited<ReturnType<Api["instanceGet"]>>);
+  vi.spyOn(api, "instanceList").mockResolvedValue({
+    items: [
+      { id: INSTANCE, journalId: JOURNAL, revision: "1", durableSeq: "128", lifecycle: "running" } as Awaited<
+        ReturnType<Api["instanceList"]>
+      >["items"][number],
+    ],
+    nextCursor: null,
+  });
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as Awaited<ReturnType<Api["interactionList"]>>);
+  vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+  vi.spyOn(api, "eventsSubscribe").mockResolvedValue({
+    subscriptionId: "sub_outbox_debt_realread",
+    journalId: JOURNAL,
+    durableSeq: "128",
+    windowFromSeq: "1",
+    reachedAfterSeq: true,
+    getReadyState: () => 1,
+    snapshot: {
+      projectionVersion: "v1",
+      projectionEpoch: "epoch_outbox_debt_realread",
+      asOfSeq: "128",
+      instance: {} as never,
+      runs: [],
+      commands: [],
+      pendingInteractions: [],
+      nodes: [],
+      history: { earliestRetainedSeq: "1", complete: true },
+    },
+  });
+  vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+    commandId = _args[4] as string;
+    return Promise.resolve(commandResult(commandId, "accepted"));
+  });
+
+  await hubStore.refresh();
+  await hubStore.follow(INSTANCE);
+  // Seed folded 128 rows through the REAL adapter.
+  await vi.waitFor(() => expect(hubStore.getSnapshot().events[INSTANCE]).toHaveLength(128));
+
+  await hubStore.send(INSTANCE, "the one at 129");
+  const bubble = () => hubStore.getSnapshot().bubbles.find((b) => b.commandId === commandId)!;
+  await vi.waitFor(() => expect(bubble().outboxState).toBe("sent"));
+
+  // The forward tail read must reach seq 129 and settle the bubble (the old
+  // fixed overlap window never got past row 128).
+  await vi.waitFor(
+    () => {
+      expect(bubble().state).toBe("settled");
+      expect(bubble().outboxState).toBe("done");
+    },
+    { timeout: 6_000 },
+  );
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
 });

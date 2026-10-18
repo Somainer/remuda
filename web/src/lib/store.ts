@@ -152,7 +152,16 @@ const OWED_TAIL_BASE_BACKOFF_MS = 300;
 const OWED_TAIL_MAX_BACKOFF_MS = 2_000;
 const OWED_TAIL_MAX_ATTEMPTS = 12;
 const OWED_TAIL_DEADLINE_MS = 45_000;
+/** Limit for the FORWARD debt read (rows strictly above the loaded frontier). */
 const OWED_TAIL_WINDOW = 128;
+/**
+ * Bounded lookback for the separate OVERLAP read (r2 item 2). The missed
+ * entry can sit just BELOW the loaded frontier (the same turn's frames
+ * advanced past it). It stays small: contiguity/gap-fill means an entry much
+ * farther back could not have been skipped, and the forward read owns the
+ * frontier.
+ */
+const OWED_TAIL_OVERLAP = 64;
 const OWED_UNCONFIRMED_REASON = "journal confirmation deadline";
 /** Bounded backoff for Hub-held (Node offline) same-id re-POSTs. */
 const HELD_RETRY_BASE_MS = 2_000;
@@ -4058,26 +4067,39 @@ class HubStore {
         if (!stillOurs()) return;
         let answered = false;
         if (instance) {
-          // Direct REST read — deliberately NOT the mounted JournalClient's
-          // resume read: binding/socket-open latency after an offline reload
-          // must not stall evidence, and the fold is by command id so it does
-          // not need cursor contiguity. Anchor below the highest seq already
-          // loaded (the owed entry can sit under the live cursor).
+          // Ruling AD r2 item 2 — a FORWARD read plus a bounded OVERLAP read.
+          // The old single window was anchored `overlap` rows BELOW the
+          // frontier and the adapter slices to `limit`: with >=limit loaded
+          // rows it returned the SAME oldest window forever, so a command
+          // journaled just past the frontier was never seen. The forward
+          // read (afterSeq = highest loaded) makes monotonic progress; the
+          // small descending overlap covers an entry the same turn's frames
+          // passed by. Both are bounded Hub windows and fold by command id.
           const known = this.state.events[instanceId] ?? [];
           const highest = known.reduce((max, ev) => Math.max(max, Number(ev.seq) || 0), 0);
-          const afterSeq = String(Math.max(0, highest - OWED_TAIL_WINDOW));
           try {
-            const page = await api.eventsRead({
+            const forward = await api.eventsRead({
               journalId: instance.journalId,
-              afterSeq,
+              afterSeq: String(highest),
               limit: OWED_TAIL_WINDOW,
             });
-            // Retired WHILE the read was parked (held-response regression):
+            // Retired WHILE a read was parked (held-response regression):
             // never fold the old identity's events into the successor store.
             if (!stillOurs()) return;
             answered = true;
             tail.attempts += 1;
-            this.foldDebtWindow(instanceId, page.events);
+            this.foldDebtWindow(instanceId, forward.events);
+            if (this.reconcileOwed.has(instanceId) && this.owedCommandLacksEvidence(instanceId)) {
+              const overlapAfter = String(Math.max(0, highest - OWED_TAIL_OVERLAP));
+              const overlap = await api.eventsRead({
+                journalId: instance.journalId,
+                afterSeq: overlapAfter,
+                beforeSeq: String(highest),
+                limit: OWED_TAIL_OVERLAP,
+              });
+              if (!stillOurs()) return;
+              this.foldDebtWindow(instanceId, overlap.events);
+            }
           } catch {
             if (!stillOurs()) return;
             /* rejected read: keep the debt and retry at the base cadence */

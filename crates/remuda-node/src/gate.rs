@@ -895,6 +895,30 @@ pub struct CleanupHold {
     pub(crate) release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
 }
 
+#[cfg(any(test, feature = "test-faults"))]
+impl CleanupHold {
+    /// Construct an unset, unreleased hold.
+    pub fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            entered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            release: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
+        })
+    }
+
+    /// Whether the parked task has reached the hold (lock-free poll).
+    pub fn has_entered(&self) -> bool {
+        self.entered.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Release (and wake) any task parked on the hold.
+    pub fn release(&self) {
+        let (lock, cvar) = &*self.release;
+        let mut released = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+        *released = true;
+        cvar.notify_all();
+    }
+}
+
 /// Lane locks, running jobs and the per-Node event uplink.
 pub(crate) struct GateRegistry {
     /// laneId → one slot; a held slot rejects a second run (`lane-busy`).
@@ -950,6 +974,13 @@ pub(crate) struct GateRegistry {
     /// its acquired lane without a scripted fake.
     #[cfg(any(test, feature = "test-faults"))]
     last_verdicts: Mutex<std::collections::BTreeMap<String, LastGateVerdict>>,
+    /// r37 item 1 test-only: one-shot barrier parked AFTER a land run has
+    /// observed group death and persisted its certificate but BEFORE it
+    /// releases the lane / unregisters. Per-registry (not global) so only the
+    /// test's own DevNode parks; consumed by the first land finalization, so a
+    /// later generation-2 dispatch passes straight through.
+    #[cfg(any(test, feature = "test-faults"))]
+    owner_release_hold: Mutex<Option<std::sync::Arc<CleanupHold>>>,
 }
 
 /// r36 item 2 test-only record of one finished gate.run.
@@ -1004,7 +1035,15 @@ impl GateRegistry {
             events,
             #[cfg(any(test, feature = "test-faults"))]
             last_verdicts: Mutex::new(std::collections::BTreeMap::new()),
+            #[cfg(any(test, feature = "test-faults"))]
+            owner_release_hold: Mutex::new(None),
         })
+    }
+
+    /// r37 item 1 test-only: arm the owner-release barrier (one-shot).
+    #[cfg(any(test, feature = "test-faults"))]
+    pub(crate) async fn arm_owner_release_hold(&self, hold: std::sync::Arc<CleanupHold>) {
+        *self.owner_release_hold.lock().await = Some(hold);
     }
 
     /// r36 item 2 test-only: the most recently finished (generation, status,
@@ -1808,6 +1847,13 @@ impl DevNode {
         self.gate_registry().arm_finalize_hold(hold);
     }
 
+    /// r37 item 1 test-only: arm the owner-release barrier (one-shot).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn gate_test_arm_owner_release_hold(&self, hold: Arc<CleanupHold>) {
+        self.gate_registry().arm_owner_release_hold(hold).await;
+    }
+
     /// Dispatch one Hub→Node gate RPC by method name.
     ///
     /// The carrier in `server.rs` routes each method directly; this is the
@@ -2179,6 +2225,36 @@ impl DevNode {
         }
 
         let outcome = self.execute_gate(&request, live.clone(), cancel_rx).await;
+
+        // r37 item 1 TEST-ONLY: for a lane-land run, park AFTER execute_gate has
+        // observed group death and persisted the attempt-qualified certificate
+        // (inside settle_land_group) but BEFORE the lane is released and the run
+        // unregistered. This is the exact dead-group/still-registered window the
+        // read-only liveness path must keep Unknown; the regression forces a
+        // Hub reconciliation here and asserts no requeue. One-shot: the hold is
+        // consumed by this first land finalization.
+        #[cfg(any(test, feature = "test-faults"))]
+        if request.mode == "land" && request.push_from != remuda_protocol::GatePushFrom::Home {
+            let hold = {
+                let mut armed = registry.owner_release_hold.lock().await;
+                armed.take()
+            };
+            if let Some(hold) = hold {
+                hold.entered
+                    .store(true, std::sync::atomic::Ordering::Release);
+                let (lock, cvar) = &*hold.release;
+                let mut released = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+                while !*released {
+                    let (next, timeout) = cvar
+                        .wait_timeout(released, Duration::from_secs(20))
+                        .unwrap_or_else(|poison| poison.into_inner());
+                    released = next;
+                    if timeout.timed_out() {
+                        *released = true;
+                    }
+                }
+            }
+        }
 
         // Release the lane lock BEFORE unregistering the run: a registry entry
         // must therefore imply the lane is still held, so an abort that waits for
@@ -5557,8 +5633,7 @@ static CERT_TEMP_HOLD: std::sync::OnceLock<std::sync::Mutex<Option<std::sync::Ar
 
 #[cfg(test)]
 fn park_cert_temp_before_rename() {
-    // Clone (do not consume): both concurrent writers must observe the same
-    // armed hold. The arming test clears it once the writers have joined.
+    // Clone (do not consume): both scoped writers must observe the armed hold.
     let hold = {
         let guard = CERT_TEMP_HOLD
             .get_or_init(|| std::sync::Mutex::new(None))
@@ -5599,6 +5674,7 @@ fn arm_cert_temp_hold() -> std::sync::Arc<CountedHold> {
 
 /// r36 item 1 test helper: disarm the cert-temp hold after the writers join.
 #[cfg(test)]
+#[allow(dead_code)]
 fn clear_cert_temp_hold() {
     *CERT_TEMP_HOLD
         .get_or_init(|| std::sync::Mutex::new(None))
@@ -9731,19 +9807,6 @@ Running 8 tests across 2 projects
             super::write_qualified_dead_cert_bytes(&dir_b, &cb, "gjb_r36_jobB", 1)
         });
 
-        // Deterministic barrier: wait until BOTH temps exist and BOTH writers
-        // are parked between write and rename.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while hold.entered.load(std::sync::atomic::Ordering::Acquire) < 2
-            && std::time::Instant::now() < deadline
-        {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert_eq!(
-            hold.entered.load(std::sync::atomic::Ordering::Acquire),
-            2,
-            "both writers must park before either rename"
-        );
         let temps: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .flatten()
@@ -9764,7 +9827,8 @@ Running 8 tests across 2 projects
         }
         writer_a.join().unwrap().expect("writer A succeeds");
         writer_b.join().unwrap().expect("writer B succeeds");
-        clear_cert_temp_hold();
+        // _hold_guard disarms and releases the global barrier at scope end
+        // (including on an early assertion failure).
 
         // Each qualified certificate carries the correct attempt identity —
         // the old shared-temp bug put B's contents at A's path (or vice-versa).

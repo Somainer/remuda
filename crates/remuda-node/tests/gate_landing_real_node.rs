@@ -281,6 +281,12 @@ async fn landing_absence_routes_through_the_real_node_to_a_generation2_acquisiti
     // Hold attempt-1's land child BEFORE dispatch: it parks in the script's
     // hold loop with the owner registered and the group live.
     std::fs::write(root.join("r36-hold-land"), b"hold").unwrap();
+    // r37 item 1: arm the per-registry owner-release barrier (one-shot). The
+    // generation-1 finalizer parks here AFTER the group is dead and the
+    // certificate is persisted, but while it still holds the lane/registration.
+    let release_hold = remuda_node::CleanupHold::new();
+    node.gate_test_arm_owner_release_hold(release_hold.clone())
+        .await;
     let (status, enqueued) = http(
         addr,
         "POST",
@@ -334,22 +340,30 @@ async fn landing_absence_routes_through_the_real_node_to_a_generation2_acquisiti
         "a repeated probe against the registered owner must not requeue: {still_landing_2}"
     );
 
-    // (2) Release the child: signal death, no verdict. The production owner
-    // certifies the ESRCH group and unregisters; the Hub keeps the row Landing
-    // (uncertain), now backed by a durable death certificate.
+    // (2) Release the child: it dies by signal. The production owner certifies
+    // the ESRCH group and parks on the owner-release barrier BEFORE releasing
+    // the lane/unregistering — the exact dead-but-still-owned window.
     std::fs::remove_file(root.join("r36-hold-land")).unwrap();
-    let deadline = tokio::time::Instant::now() + TIMEOUT;
-    loop {
-        if node.gate_test_live_run_state(&job_id).await.is_none() {
-            break;
-        }
+    let hold_deadline = tokio::time::Instant::now() + TIMEOUT;
+    while !release_hold.has_entered() {
         assert!(
-            tokio::time::Instant::now() < deadline,
-            "the generation-1 owner never unregistered"
+            tokio::time::Instant::now() < hold_deadline,
+            "the generation-1 finalizer never reached the owner-release barrier"
         );
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    // The production finalizer left a death certificate and removed the fence.
+
+    // r37 item 1: INSIDE the release window — the group is dead and the
+    // certificate is already durable, yet the owner is still registered and
+    // holds the lane. Verify all three facts before probing.
+    let pgid = node
+        .gate_test_live_land_pgid(&job_id)
+        .await
+        .expect("the registered owner still records its land group");
+    assert!(
+        !remuda_node::gate_test_group_exists(pgid),
+        "the land group must be ESRCH-dead inside the release window"
+    );
     let fence_dir = root.join("gate-land");
     let cert_deadline = tokio::time::Instant::now() + TIMEOUT;
     loop {
@@ -357,20 +371,62 @@ async fn landing_absence_routes_through_the_real_node_to_a_generation2_acquisiti
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|name| name.starts_with("dead-"))
+            .filter(|name| name.starts_with("dead-") && name.ends_with(".json"))
             .collect();
         if !certs.is_empty() {
             break;
         }
         assert!(
             tokio::time::Instant::now() < cert_deadline,
-            "no death certificate after the owner finalized: {certs:?}"
+            "no death certificate before the release window probe: {certs:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        node.gate_test_live_run_state(&job_id).await.map(|(g, _)| g),
+        Some(1),
+        "the generation-1 owner is still registered inside the release window"
+    );
+
+    // The decisive owner-release assertion: even with the group dead and the
+    // certificate durable, a registered owner still holding the lane forces the
+    // production read-only probe to Unknown — the Hub must NOT requeue. The old
+    // defect (VerifiedDead while registered) makes this probe Absent and the
+    // job jump to queued/attempt 2.
+    hub.test_force_landing_reconcile(&host_id).await;
+    let held = get_job(&hub, &job_id).await;
+    assert_eq!(
+        held["state"],
+        json!("landing"),
+        "dead group + registered owner must keep the probe Unknown: {held}"
+    );
+    assert_eq!(
+        held["attempts"],
+        json!(1),
+        "the owner-release window must not requeue: {held}"
+    );
+    assert_eq!(
+        node.gate_test_live_run_state(&job_id).await.map(|(g, _)| g),
+        Some(1),
+        "the owner is still registered after the in-window probe"
+    );
+
+    // Now let the owner actually release the lane and unregister.
+    release_hold.release();
+    let unregister_deadline = tokio::time::Instant::now() + TIMEOUT;
+    loop {
+        if node.gate_test_live_run_state(&job_id).await.is_none() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < unregister_deadline,
+            "the generation-1 owner never unregistered after release"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // (3) The next production probe attests Absent → Hub requeues → gen 2 is
-    // dispatched and the production lane accepts it (no lane-busy).
+    // (3) The next production probe now attests Absent → Hub requeues → gen 2
+    // is dispatched and the production lane accepts it (no lane-busy).
     hub.test_force_landing_reconcile(&host_id).await;
 
     // Wait for the PRODUCTION Node to finish generation 2. Its gate.run is the

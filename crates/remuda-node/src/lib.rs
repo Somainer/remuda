@@ -131,6 +131,10 @@ pub use signal::{
 // Hook-channel silence diagnostics live in remuda-signal next to the socket
 // they probe; re-exported here as the Node-owned surface the instance badge
 // reads.
+/// Test-only cleanup/owner-release hold for blocking land-owner paths.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-faults"))]
+pub use gate::CleanupHold;
 /// Test implementability of the pre-run Hub-authority fence.
 #[doc(hidden)]
 pub use gate::GateAuthorizer;

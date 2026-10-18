@@ -1014,67 +1014,96 @@ fn reconstruct_fallback_projection_from_journal(conn: &Connection) -> rusqlite::
     if journal_exists == 0 {
         return Ok(());
     }
-    // The correlated subqueries return NULL unless a valid kind='usage'
-    // journal row carries the field; bare U64 scalars arrive as decimal
-    // strings and are CAST to integers (guarded > 0 so garbage never zeroes a
-    // stored positive value).
-    //
-    // r42 (AB1 completion): for TURN rows the journal frame's window/clock are
-    // applied only when the frame reports token baskets. A strictly-newer
-    // COST-ONLY correction is the live upsert's billing channel: the shared
-    // reconcile rule deliberately keeps the retained window and clock and
-    // advances only position/lineage/bill. Unconditional COALESCE here let a
-    // later migration fill those fields from the correction's journal record
-    // (restart != live; migration twice not idempotent). Counter frames, and
-    // Message/Session rows (whose live path COALESCEs attribution), keep the
-    // old fill-missing behaviour.
-    let journal_match = "j.instance_id = usage_events.instance_id
-                   AND j.seq = usage_events.seq
-                   AND json_valid(j.payload_json)
-                   AND json_extract(j.payload_json, '$.kind') = 'usage'";
-    // True when THIS row is a turn whose journal frame reports no additive
-    // token basket — i.e. it is the cost-only/billing channel.
-    let turn_cost_only =
-        "scope = 'turn' AND NOT EXISTS (
-                     SELECT 1 FROM journal jc
-                     WHERE jc.instance_id = usage_events.instance_id
-                       AND jc.seq = usage_events.seq
-                       AND json_valid(jc.payload_json)
-                       AND json_extract(jc.payload_json, '$.kind') = 'usage'
-                       AND (
-                           json_extract(jc.payload_json, '$.payload.inputTokens.state') IS NOT NULL
-                        OR json_extract(jc.payload_json, '$.payload.outputTokens.state') IS NOT NULL
-                        OR json_extract(jc.payload_json, '$.payload.cacheReadTokens.state') IS NOT NULL
-                        OR json_extract(jc.payload_json, '$.payload.cacheWriteTokens.state') IS NOT NULL
-                       )
-                 )";
-    conn.execute(
-        &format!(
+    // r43 AC1 (ONE decoder): window/clock reconstruction membership is decided
+    // by decoding the journal payload with the SAME live projector
+    // ([`project_usage_event`]) + [`SnapshotCounters::token_baskets`] the live
+    // upsert uses, never by re-checking JSON `.state` keys. A Known value or a
+    // structural NotApplicable (decoded to a Some(0) additive basket) is
+    // counter evidence; an explicit Knowledge::Unknown and an absent field
+    // decode to None and do NOT count — so a cost-only billing correction
+    // whose baskets are Unknown cannot overwrite a retained window/clock on
+    // restart or a second migration.
+    let mut rows = conn.prepare(
+        "SELECT u.rowid, u.scope, j.instance_id, j.seq, j.payload_json, j.observed_at
+         FROM usage_events u
+         JOIN journal j
+           ON j.instance_id = u.instance_id AND j.seq = u.seq
+         WHERE json_valid(j.payload_json)
+           AND json_extract(j.payload_json, '$.kind') = 'usage'",
+    )?;
+    let projected: Vec<(i64, String, UsageEventRow)> = rows
+        .query_map([], |r| -> rusqlite::Result<(i64, String, UsageEventRow)> {
+            let rowid: i64 = r.get(0)?;
+            let scope: String = r.get(1)?;
+            let instance: String = r.get(2)?;
+            let seq: i64 = r.get(3)?;
+            let payload: String = r.get(4)?;
+            let observed_at: String = r.get(5)?;
+            let event: Value = serde_json::from_str(&payload).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+                )
+            })?;
+            let record = JournalRecord {
+                instance_id: instance,
+                seq,
+                event_id: String::new(),
+                event,
+                observed_at,
+            };
+            // profile/model do not affect basket/window/clock decoding.
+            let projected = project_usage_event(&record, None, None)
+                .ok_or_else(|| rusqlite::Error::InvalidQuery)?;
+            Ok((rowid, scope, projected))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(rows);
+
+    // turn_id / native window / revision / clock reconstruction. Window and
+    // clock are applied per projected row and skip cost-only turn corrections.
+    for (rowid, scope, frame) in &projected {
+        let reports_counters = SnapshotCounters::of(frame)
+            .token_baskets()
+            .iter()
+            .any(Option::is_some);
+        let turn_cost_only = scope == "turn" && !reports_counters;
+        // turn_id: attribution, always best-known.
+        conn.execute(
             "UPDATE usage_events
-         SET turn_id = COALESCE(turn_id, (
-                 SELECT json_extract(j.payload_json, '$.source.nativeTurnId.value')
-                 FROM journal j
-                 WHERE {journal_match}
-                   AND json_extract(j.payload_json, '$.source.nativeTurnId.value') IS NOT NULL
-             )),
-             native_context_window = CASE
-                 -- Cost-only turn correction: keep the retained window.
-                 WHEN {turn_cost_only} THEN native_context_window
-                 ELSE COALESCE(native_context_window, (
-                     SELECT CAST(json_extract(j.payload_json, '$.payload.contextWindow') AS INTEGER)
+             SET turn_id = COALESCE(turn_id, (
+                     SELECT json_extract(j.payload_json, '$.source.nativeTurnId.value')
                      FROM journal j
-                     WHERE {journal_match}
-                       AND CAST(json_extract(j.payload_json, '$.payload.contextWindow') AS INTEGER) > 0
+                     WHERE j.instance_id = usage_events.instance_id
+                       AND j.seq = usage_events.seq
+                       AND json_valid(j.payload_json)
+                       AND json_extract(j.payload_json, '$.kind') = 'usage'
+                       AND json_extract(j.payload_json, '$.source.nativeTurnId.value') IS NOT NULL
                  ))
-             END,
-             metric_revision = CASE
-                 -- r38 item 1: raise ONLY. A durable Message keeps its original
-                 -- stored sequence across revisions while the journal record at
-                 -- that sequence carries the revision-1 frame, so re-projecting
-                 -- must never lower an established revision watermark; a stale
-                 -- replay would otherwise satisfy the >= revision accounting
-                 -- checks. Fallback rows default to revision 1 and still get
-                 -- their true (higher) journal revision back.
+             WHERE rowid = ?1",
+            params![rowid],
+        )?;
+        // Native window: COALESCE unless this is a cost-only turn correction.
+        if !turn_cost_only {
+            conn.execute(
+                "UPDATE usage_events
+                 SET native_context_window =
+                         COALESCE(native_context_window, (
+                             SELECT CAST(json_extract(j.payload_json, '$.payload.contextWindow') AS INTEGER)
+                             FROM journal j
+                             WHERE j.instance_id = usage_events.instance_id
+                               AND j.seq = usage_events.seq
+                               AND CAST(json_extract(j.payload_json, '$.payload.contextWindow') AS INTEGER) > 0
+                         ))
+                 WHERE rowid = ?1",
+                params![rowid],
+            )?;
+        }
+        // Revision: raise only (unchanged r38 rule).
+        conn.execute(
+            "UPDATE usage_events
+             SET metric_revision = CASE
                  WHEN CAST((
                      SELECT json_extract(j.payload_json, '$.payload.metricRevision')
                      FROM journal j
@@ -1092,37 +1121,29 @@ fn reconstruct_fallback_projection_from_journal(conn: &Connection) -> rusqlite::
                        AND json_extract(j2.payload_json, '$.kind') = 'usage'
                  ) AS INTEGER)
                  ELSE metric_revision
-             END,
-             observed_at = CASE
-                 WHEN observed_at_source = 'native' THEN observed_at
-                 -- Cost-only turn correction: keep the retained clock.
-                 WHEN {turn_cost_only} THEN observed_at
-                 ELSE COALESCE((
-                     SELECT json_extract(j.payload_json, '$.nativeAt.value')
-                     FROM journal j
-                     WHERE {journal_match}
-                       AND json_extract(j.payload_json, '$.nativeAt.value') IS NOT NULL
-                 ), observed_at)
-             END,
-             observed_at_source = CASE
-                 WHEN observed_at_source = 'native' THEN 'native'
-                 WHEN {turn_cost_only} THEN observed_at_source
-                 WHEN EXISTS (
-                     SELECT 1 FROM journal j
-                     WHERE {journal_match}
-                       AND json_extract(j.payload_json, '$.nativeAt.value') IS NOT NULL
-                 ) THEN 'native'
-                 ELSE observed_at_source
              END
-         WHERE EXISTS (
-             SELECT 1 FROM journal j
-             WHERE {journal_match}
-         )",
-        journal_match = journal_match,
-        turn_cost_only = turn_cost_only,
-        ),
-        [],
-    )?;
+             WHERE rowid = ?1",
+            params![rowid],
+        )?;
+        // Clock: a retained native clock always wins; a cost-only turn
+        // correction never promotes to native; otherwise best-known native.
+        if !turn_cost_only && frame.observed_at_source == "native" {
+            conn.execute(
+                "UPDATE usage_events
+                 SET observed_at = CASE
+                         WHEN observed_at_source = 'native' THEN observed_at
+                         ELSE COALESCE(?1, observed_at)
+                     END,
+                     observed_at_source = CASE
+                         WHEN observed_at_source = 'native' THEN 'native'
+                         WHEN ?1 IS NOT NULL THEN 'native'
+                         ELSE observed_at_source
+                     END
+                 WHERE rowid = ?2",
+                params![frame.observed_at, rowid],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -13571,6 +13592,194 @@ mod tests {
         assert_eq!(inst.cost_usd, supply.cost_usd);
         assert_eq!(inst.input_tokens, Some(500_000));
         assert_eq!(inst.input_tokens, supply.input_tokens);
+    }
+
+    /// Build a real protocol `usage` JournalRecord whose payload is a
+    /// SERIALIZED [`remuda_protocol::observation::UsagePayload`] (r43 AC1: the
+    /// reconstruction guard must decode baskets the same way the live
+    /// projector does, so explicit Knowledge::Unknown must read as "no
+    /// counter evidence").
+    fn r43_real_usage_journal(
+        instance: &str,
+        seq: i64,
+        revision: u64,
+        counter: bool,
+        cost: Option<&str>,
+        window: Option<u64>,
+        native_at: Option<&str>,
+    ) -> JournalRecord {
+        use remuda_protocol::{
+            Accounting, Cost, Id, InputAccounting, Knowledge, U64, UsageMode, UsagePayload,
+            UsageScope,
+        };
+        let unknown = || Knowledge::Unknown {
+            reason: "unpriced".into(),
+            evidence_event_ids: vec![],
+        };
+        let known_u64 = |v: u64| Knowledge::Known { value: U64(v) };
+        // A counter frame reports Known 500000/0/0/0; a billing correction
+        // serialises every additive basket as explicit Unknown.
+        let (input, output, cache_read, cache_write, total) = if counter {
+            (
+                known_u64(500_000),
+                known_u64(0),
+                known_u64(0),
+                known_u64(0),
+                known_u64(500_000),
+            )
+        } else {
+            (unknown(), unknown(), unknown(), unknown(), unknown())
+        };
+        let cost: Knowledge<Cost> = match cost {
+            Some(amount) => Knowledge::Known {
+                value: Cost {
+                    amount: amount.into(),
+                    currency: "USD".into(),
+                },
+            },
+            None => Knowledge::Unknown {
+                reason: "unpriced".into(),
+                evidence_event_ids: vec![],
+            },
+        };
+        let payload = UsagePayload {
+            usage_id: Id::new("obj").unwrap(),
+            scope: UsageScope::Turn,
+            scope_id: "msg-T".into(),
+            mode: UsageMode::Snapshot,
+            metric_revision: U64(revision),
+            source_session_id: Some("sess-S".into()),
+            input_tokens: input,
+            input_accounting: InputAccounting::Uncached,
+            output_tokens: output,
+            reasoning_tokens: unknown(),
+            cache_read_tokens: cache_read,
+            cache_write_tokens: cache_write,
+            total_tokens: total,
+            cost,
+            accounting: Accounting::Estimated,
+            native_fields_ref: None,
+            context_window: window.map(U64),
+        };
+        let mut event = serde_json::Map::new();
+        event.insert("kind".into(), json!("usage"));
+        event.insert("payload".into(), serde_json::to_value(payload).unwrap());
+        event.insert(
+            "source".into(),
+            json!({
+                "nativeSessionId": {"state":"known","value":"sess-S"},
+                "nativeTurnId": {"state":"known","value":"msg-T"}
+            }),
+        );
+        if let Some(at) = native_at {
+            event.insert("nativeAt".into(), json!({"state":"known","value":at}));
+        }
+        let stamp = native_at.unwrap_or("2026-10-19T00:00:00.000Z");
+        JournalRecord {
+            instance_id: instance.into(),
+            seq,
+            event_id: format!("je{seq}"),
+            event: Value::Object(event),
+            observed_at: stamp.into(),
+        }
+    }
+
+    /// r43 item 1 (AC1), live -> restart with REAL Unknown baskets: a
+    /// strictly-newer cost-only correction serializes every additive basket
+    /// as Knowledge::Unknown and carries a 1M window/native time. The live
+    /// decoder sees no counter evidence and preserves the retained NULL
+    /// window/ingest clock; restart reconstruction must decode identically.
+    #[test]
+    fn restart_with_real_unknown_baskets_keeps_the_retained_window_and_clock() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        create_journal_table(&conn);
+        let counter = r43_real_usage_journal("ins_r43i1", 1, 1, true, None, None, None);
+        let correction = r43_real_usage_journal(
+            "ins_r43i1",
+            2,
+            2,
+            false,
+            Some("0.03"),
+            Some(1_000_000),
+            Some("2026-10-19T00:00:01.000Z"),
+        );
+        for record in [&counter, &correction] {
+            insert_journal_raw(&conn, record);
+            let row = project_usage_event(record, Some("pvp"), Some("m")).unwrap();
+            insert_usage_event(&conn, &row).unwrap();
+        }
+
+        // Live reconciliation: Unknown baskets == no counters -> retained
+        // NULL window and ingest clock survive.
+        let live = r42_full_turn_row(&conn, "ins_r43i1");
+        assert_eq!(live[16], "<NULL>", "live keeps the retained NULL window");
+        assert_eq!(live[15], "ingest");
+        assert_eq!(live[12], "0.03");
+
+        // Restart must not let the correction's Unknown baskets count.
+        migrate(&conn).unwrap();
+        assert_eq!(
+            r42_full_turn_row(&conn, "ins_r43i1"),
+            live,
+            "restart == live with explicit Knowledge::Unknown baskets"
+        );
+    }
+
+    /// r43 item 1b (AC1), fallback -> migration -> migration with REAL
+    /// Unknown baskets: idempotence of the shared-decode reconstruction.
+    #[test]
+    fn fallback_twice_with_real_unknown_baskets_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_r28_usage_table_with_turn_index(&conn);
+        create_journal_table(&conn);
+        // Established fallback counter row: no window, ingest clock.
+        conn.execute(
+            "INSERT INTO usage_events
+                (instance_id, seq, profile_id, model, scope, scope_id, mode,
+                 metric_revision, source_session_id, total_tokens, input_tokens,
+                 output_tokens, cache_read_tokens, cache_write_tokens,
+                 accounting, observed_at, observed_at_source)
+             VALUES ('ins_r43i1b', 1, 'pvp', 'm', 'turn', 'msg-T', 'snapshot',
+                 1, 'sess-S', 500000, 500000, 0, 0, 0,
+                 'estimated', '2026-10-19T00:00:00.000Z', 'ingest')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO usage_events
+                (instance_id, seq, profile_id, model, scope, mode, cost_usd,
+                 accounting, observed_at)
+             VALUES ('ins_r43i1b', 2, 'pvp', 'm', 'turn', 'snapshot', '0.03',
+                 'estimated', '2026-10-19T00:00:01.000Z')",
+            [],
+        )
+        .unwrap();
+        for record in [
+            r43_real_usage_journal("ins_r43i1b", 1, 1, true, None, None, None),
+            r43_real_usage_journal(
+                "ins_r43i1b",
+                2,
+                2,
+                false,
+                Some("0.03"),
+                Some(1_000_000),
+                Some("2026-10-19T00:00:01.000Z"),
+            ),
+        ] {
+            insert_journal_raw(&conn, &record);
+        }
+
+        migrate(&conn).unwrap();
+        let once = r42_full_turn_row(&conn, "ins_r43i1b");
+        assert_eq!(once[16], "<NULL>", "first migration keeps NULL window");
+        assert_eq!(once[15], "ingest");
+        migrate(&conn).unwrap();
+        assert_eq!(
+            r42_full_turn_row(&conn, "ins_r43i1b"),
+            once,
+            "second migration with Unknown baskets is idempotent"
+        );
     }
 
     /// r37 item 3: on an upgrade from the schema that ALREADY carried

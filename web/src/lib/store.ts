@@ -148,9 +148,9 @@ const RECONCILE_GET_INTERVAL_MS = 1_000;
  * deadline — after it, owed rows move to the existing not-confirmed state
  * (outbox "unknown" -> 状态待确认), never an eternal accepted bubble.
  */
-const OWED_TAIL_BASE_BACKOFF_MS = 500;
-const OWED_TAIL_MAX_BACKOFF_MS = 3_000;
-const OWED_TAIL_MAX_ATTEMPTS = 10;
+const OWED_TAIL_BASE_BACKOFF_MS = 300;
+const OWED_TAIL_MAX_BACKOFF_MS = 2_000;
+const OWED_TAIL_MAX_ATTEMPTS = 12;
 const OWED_TAIL_DEADLINE_MS = 45_000;
 const OWED_TAIL_WINDOW = 128;
 const OWED_UNCONFIRMED_REASON = "journal confirmation deadline";
@@ -4007,17 +4007,19 @@ class HubStore {
   /**
    * Ruling AD: one pass of the bounded debt-driven tail re-read. Runs on the
    * instance's journal chain (serialized with the drain/reopen reads) and
-   * folds anything it reads through {@link foldDebtWindow} — a fold the
-   * JournalClient's cursor/generation rules could otherwise suppress. A read
-   * that observes the owed command's entry retires the row to done and
-   * clears the debt; an empty read schedules the next backed-off pass.
+   * reads the journal DIRECTLY over REST, folding what it finds through
+   * {@link foldDebtWindow} by command id — neither the mounted
+   * JournalClient's binding/socket-open latency nor its cursor/generation
+   * rules can suppress the owed entry this way. A read that observes the
+   * owed command's entry retires the row to done and clears the debt; an
+   * empty answered read schedules the next backed-off pass.
    *
    * A REJECTED read spends NO attempt (the route storm right after unblock
-   * can lose a read or two): only answered reads count against the attempt
-   * cap, while the wall deadline bounds the chase regardless. With no
-   * journal client mounted the pass waits WITHOUT spending an attempt (the
-   * mount fold re-checks). At the cap or deadline the owed rows move to the
-   * existing not-confirmed state (outbox "unknown" -> 状态待确认).
+   * can lose a read or two, and an unresolved instance GET retries at the
+   * base cadence): only answered reads count against the attempt cap,
+   * while the wall deadline bounds the chase regardless. At the cap or
+   * deadline the owed rows move to the existing not-confirmed state
+   * (outbox "unknown" -> 状态待确认).
    */
   private runOwedTailPass(instanceId: Id) {
     if (this.owedTailRunning.has(instanceId)) return;
@@ -4040,14 +4042,27 @@ class HubStore {
         const instance =
           this.state.instances.find((i) => i.id === instanceId) ??
           (await api.instanceGet(instanceId).catch(() => null));
-        const client = instance ? this.journals.get(instance.journalId) : undefined;
         let answered = false;
-        if (client) {
-          const page = await client.readDebtWindow(OWED_TAIL_WINDOW);
-          if (page !== null) {
+        if (instance) {
+          // Direct REST read — deliberately NOT the mounted JournalClient's
+          // resume read: binding/socket-open latency after an offline reload
+          // must not stall evidence, and the fold is by command id so it does
+          // not need cursor contiguity. Anchor below the highest seq already
+          // loaded (the owed entry can sit under the live cursor).
+          const known = this.state.events[instanceId] ?? [];
+          const highest = known.reduce((max, ev) => Math.max(max, Number(ev.seq) || 0), 0);
+          const afterSeq = String(Math.max(0, highest - OWED_TAIL_WINDOW));
+          try {
+            const page = await api.eventsRead({
+              journalId: instance.journalId,
+              afterSeq,
+              limit: OWED_TAIL_WINDOW,
+            });
             answered = true;
             tail.attempts += 1;
-            this.foldDebtWindow(instanceId, page);
+            this.foldDebtWindow(instanceId, page.events);
+          } catch {
+            /* rejected read: keep the debt and retry at the base cadence */
           }
         }
         if (!this.reconcileOwed.has(instanceId)) return;
@@ -4055,9 +4070,10 @@ class HubStore {
           this.clearOwed(instanceId);
           return;
         }
-        // No client mounted: re-check on the base cadence without spending
-        // the read budget; a lost read keeps the same cadence too. A
-        // successful-but-empty read backs off by attempt.
+        // An unanswered read (no instance resolution, or a rejected/404
+        // read in the unblock storm) retries at the base cadence without
+        // spending the read budget; a successful-but-empty read backs off
+        // by attempt. The wall deadline bounds both paths.
         this.scheduleOwedTail(instanceId, answered ? undefined : OWED_TAIL_BASE_BACKOFF_MS);
       } finally {
         this.owedTailRunning.delete(instanceId);

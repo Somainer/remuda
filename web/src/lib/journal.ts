@@ -487,40 +487,6 @@ export class JournalClient {
   }
 
   /**
-   * Ruling AD (outboxdebt): a durable tail READ driven by catch-up DEBT.
-   *
-   * This is deliberately NOT {@link JournalClient.resumeAfterReconnect}:
-   *  - it never discards a page because live frames advanced the resume
-   *    generation while the read was parked (a live batch legitimately
-   *    supersedes a reconnect RESYNC, but a drained command's evidence must
-   *    not be thrown away — the event can sit BELOW the cursor the live
-   *    stream advanced to);
-   *  - it never changes the connection/status (a debt read certifies
-   *    nothing either way);
-   *  - it reads a bounded window STARTING BELOW the applied cursor, because
-   *    the missed command can already have been passed over by the cursor;
-   *  - a rejected read returns null (the caller keeps the debt and backs
-   *    off) instead of settling readonly-stale.
-   *
-   * The caller folds the returned observations itself (by command id), so
-   * ordering relative to the live cursor is irrelevant to settlement.
-   */
-  async readDebtWindow(limit = 128): Promise<Observation[] | null> {
-    const after = String(Math.max(0, this.applied - limit));
-    try {
-      const page = await this.read({
-        journalId: this.journalId,
-        afterSeq: after,
-        limit,
-      });
-      this.durableSeq = Math.max(this.durableSeq, n(page.durableSeq));
-      return page.events;
-    } catch {
-      return null;
-    }
-  }
-
-  /**
    * Re-synchronise after the follow socket reopened.
    *
    * @param opts.isCurrent optional OWNERSHIP predicate (Ruling Y2). Validated

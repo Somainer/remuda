@@ -588,3 +588,67 @@ it("a historical configure lifecycle recovered by the debt fold never overwrites
   fold(INSTANCE, [configureLifecycle(1, "evt_cfg_A_bad", "model-degraded:model-A:not-found")]);
   expect(pending()?.id).toBe("model-B");
 });
+
+it("r3 item 1: the FIRST post-drain resync held across logout and a real successor login applies nothing", async () => {
+  // The drain's inline JournalClient.resumeAfterReconnect must carry an
+  // ownership predicate. Without it (default always-true), a resync response
+  // parked across logout is applied AFTER a real successor login, restoring
+  // the retired identity's events and flipping the successor outbox row done.
+  const { api, hubStore } = await fresh();
+  await mountFollow(api, hubStore);
+  vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+  vi.spyOn(api, "hostList").mockResolvedValue({ items: [], nextCursor: null } as Awaited<
+    ReturnType<Api["hostList"]>
+  >);
+  vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as Awaited<ReturnType<Api["deviceList"]>>);
+  vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as Awaited<ReturnType<Api["passkeyList"]>>);
+  vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+  vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+  vi.spyOn(api, "login").mockResolvedValue({
+    deviceId: "dev_successor",
+    token: "tok_successor",
+    name: "successor",
+  } as Awaited<ReturnType<Api["login"]>>);
+  vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+    const commandId = _args[4] as string;
+    return Promise.resolve(commandResult(commandId, "accepted"));
+  });
+
+  // Seed reads (no afterSeq) resolve empty; every RESYNC read (afterSeq set)
+  // parks until released — the held FIRST post-drain resync.
+  const commandIdRef = { value: "" };
+  let releaseHeld: (() => void) | null = null;
+  const held = new Promise<JournalPage>((resolve) => {
+    releaseHeld = () => resolve(userMessagePage(commandIdRef.value));
+  });
+  vi.mocked(api.eventsRead).mockImplementation(((args: { afterSeq?: string }) =>
+    args.afterSeq ? held : Promise.resolve(EMPTY_PAGE)) as Api["eventsRead"]);
+
+  await hubStore.send(INSTANCE, "across a real re-login");
+  const bubble = () => hubStore.getSnapshot().bubbles[0]!;
+  await vi.waitFor(() => expect(bubble().outboxState).toBe("sent"));
+  commandIdRef.value = bubble().commandId!;
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(true);
+
+  // Logout (epoch bump, outbox/machine disposed, events wiped)…
+  hubStore.logout();
+  expect(hubStore.getSnapshot().events[INSTANCE]).toBeUndefined();
+  // …then a REAL public login establishing the successor identity (its
+  // bootstrap lists no instances, so it never follows INSTANCE itself).
+  vi.mocked(api.instanceList).mockResolvedValue({ items: [], nextCursor: null });
+  await expect(hubStore.login("bootstrap", "secret", "dev")).resolves.toBe("settled");
+  const successorRow = () =>
+    (
+      hubStore as unknown as { outbox: { get: (id: string) => OutboxRecord | undefined } | null }
+    ).outbox?.get(commandIdRef.value);
+  expect(successorRow()?.state).toBe("sent");
+
+  // Release the retired identity's parked resync carrying the old command.
+  releaseHeld!();
+  for (let i = 0; i < 50; i += 1) await Promise.resolve();
+
+  // Nothing leaked into the successor store…
+  expect(hubStore.getSnapshot().events[INSTANCE]).toBeUndefined();
+  // …and its durable row was never flipped done by the stale application.
+  expect(successorRow()?.state).toBe("sent");
+});

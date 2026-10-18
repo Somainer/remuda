@@ -4063,20 +4063,15 @@ class HubStore {
   private runOwedTailPass(instanceId: Id) {
     if (this.owedTailRunning.has(instanceId)) return;
     this.owedTailRunning.add(instanceId);
+    // r3 item 1: capture the issuing identity epoch, exact Outbox and this
+    // pass's tail record BEFORE the job is queued, so a stale job can be
+    // rejected before any mutation.
+    const epoch = this.identityEpoch;
+    const box = this.outbox;
+    const tail = this.owedTail.get(instanceId);
+    const stillOurs = () =>
+      this.identityEpoch === epoch && this.outbox === box && this.owedTail.get(instanceId) === tail;
     void this.chainReconcile(instanceId, async () => {
-      // Ruling AD r2 item 1: capture the issuing identity epoch, the exact
-      // Outbox and this pass's tail record BEFORE the first await. A logout
-      // or identity succession while a read is parked disposes the box and
-      // clears the debt; the stale response must then be dropped whole —
-      // no fold, no transition, no clear — rather than repopulate the
-      // successor store with the previous identity's journal.
-      const epoch = this.identityEpoch;
-      const box = this.outbox;
-      const tail = this.owedTail.get(instanceId);
-      const stillOurs = () =>
-        this.identityEpoch === epoch &&
-        this.outbox === box &&
-        this.owedTail.get(instanceId) === tail;
       try {
         if (!box || !tail || !this.reconcileOwed.has(instanceId)) return;
         if (!this.owedCommandLacksEvidence(instanceId)) {
@@ -4239,15 +4234,15 @@ class HubStore {
     // (gate 6 item 4a).
     if (this.owedReconcileRunning.has(instanceId)) return;
     this.owedReconcileRunning.add(instanceId);
+    // r3 item 1: capture ownership BEFORE queueing; the nested
+    // resumeAfterReconnect receives it as isCurrent so a read parked across
+    // logout is dropped inside the JournalClient before it can apply.
+    const epoch = this.identityEpoch;
+    const box = this.outbox;
+    const stillOurs = () => this.identityEpoch === epoch && this.outbox === box;
     void this.chainReconcile(instanceId, async () => {
-      // r2 item 1: same identity/lifetime ownership as the tail pass — a
-      // response parked across logout must never fold the old identity's
-      // journal into the successor store.
-      const epoch = this.identityEpoch;
-      const box = this.outbox;
-      const stillOurs = () => this.identityEpoch === epoch && this.outbox === box;
       try {
-        if (!this.reconcileOwed.has(instanceId)) return;
+        if (!box || !this.reconcileOwed.has(instanceId)) return;
         const instance =
           this.state.instances.find((i) => i.id === instanceId) ??
           (await api.instanceGet(instanceId).catch(() => null));
@@ -4260,7 +4255,7 @@ class HubStore {
           return;
         }
         try {
-          await client.resumeAfterReconnect();
+          await client.resumeAfterReconnect({ isCurrent: stillOurs });
         } catch {
           /* bounded REST catch-up failed: keep the debt; arm/keep its tail */
           if (stillOurs()) this.reevaluateOwedDebt(instanceId);
@@ -4584,13 +4579,13 @@ class HubStore {
       if (!box.pendingFor(instanceId).length) {
         const drainJournalId =
           this.state.instances.find((i) => i.id === instanceId)?.journalId ?? null;
+        // r3 item 1: capture the issuing epoch/box BEFORE queueing; the
+        // nested resumeAfterReconnect receives it as isCurrent, so a read
+        // parked across logout is dropped inside the JournalClient before it
+        // can apply the retired identity's events.
+        const drainEpoch = this.identityEpoch;
+        const drainStillOurs = () => this.identityEpoch === drainEpoch && this.outbox === box;
         await this.chainReconcile(instanceId, async () => {
-          // r2 item 1: the resync below can park across an auth retirement.
-          // Capture the issuing epoch/box and revalidate after the await
-          // before folding or arming debt, so a stale drain continuation can
-          // never publish the retired identity's journal into the successor.
-          const drainEpoch = this.identityEpoch;
-          const drainStillOurs = () => this.identityEpoch === drainEpoch && this.outbox === box;
           // Ruling AD: record PER-COMMAND catch-up debt for every accepted
           // (Hub-accepted, journal-unconfirmed) "sent" row of this instance
           // BEFORE any read. An empty resync certifies live but proves nothing
@@ -4616,7 +4611,7 @@ class HubStore {
           if (!this.followOwnsCatchupNow(instanceId, drainJournalId)) {
             const client = drainJournalId ? this.journals.get(drainJournalId) : undefined;
             try {
-              await client?.resumeAfterReconnect();
+              await client?.resumeAfterReconnect({ isCurrent: drainStillOurs });
             } catch {
               // A rejected catch-up leaves the recorded debt in place; the
               // re-check below arms its bounded tail.

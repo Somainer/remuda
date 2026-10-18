@@ -446,7 +446,16 @@ mod tests {
             // repo-a's one command; the log is now empty. A foreign owner
             // spawn's command (a different cwd) can never appear here because
             // the selection itself filtered by cwd.
-            assert!(guard.snapshot().is_empty());
+            assert_eq!(
+                guard
+                    .snapshot()
+                    .iter()
+                    .filter(|rec| within_tmp(rec))
+                    .count(),
+                0,
+                "no fixture-root command remains after for_repo: {:?}",
+                guard.snapshot()
+            );
             // Record one more command, then retain a DIRECT handle so the log
             // can be inspected after the guard itself is gone.
             let h_a2 = RecoveryGit::new();

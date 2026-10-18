@@ -915,3 +915,74 @@ it("r4 item 2: a queued stale drain job retired at entry neither recreates debt 
   // …and the successor's restored row is untouched.
   expect(successorRow()?.state).toBe("sent");
 });
+
+it("r4 item 3: the debt fallback trigger applies evidence only and leaves permission request B pending", async () => {
+  // The ACTUAL fallback path is runOwedReconcile (resume failure / failed
+  // reopen / bind-away / watchdog). On 87712402 it drives the mounted
+  // JournalClient.resumeAfterReconnect, whose onEvents runs the permission
+  // reducer on an OLD readback for A and clears request B. AD3: it must be a
+  // self-contained evidence-only REST read.
+  const { api, hubStore } = await fresh();
+  await mountFollow(api, hubStore);
+  vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+    const commandId = _args[4] as string;
+    return Promise.resolve(commandResult(commandId, "accepted"));
+  });
+
+  // Permission request B is live-pending; seed an older effective observation.
+  const h = hubStore as unknown as {
+    state: {
+      permissionPending: Record<string, { mode: string; queued: boolean } | undefined>;
+      permissionEffective: Record<string, { mode: string; source: string; observedAt: string }>;
+    };
+  };
+  h.state.permissionEffective[INSTANCE] = { mode: "default", source: "remuda", observedAt: "2026-10-18T00:00:00Z" };
+  h.state.permissionPending[INSTANCE] = { mode: "plan", queued: true };
+
+  await hubStore.send(INSTANCE, "owed when permission B pending");
+  const bubble = () => hubStore.getSnapshot().bubbles[0]!;
+  await vi.waitFor(() => expect(bubble().outboxState).toBe("sent"));
+  const commandId = bubble().commandId!;
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(true);
+
+  // The fallback's read returns an OLD permission effective readback for A
+  // (newer than the seeded effective) AND the owed command entry.
+  vi.mocked(api.eventsRead).mockResolvedValue({
+    events: [
+      {
+        eventId: "evt_perm_A_r4",
+        instanceId: INSTANCE,
+        journalId: JOURNAL,
+        seq: "1",
+        kind: "permission",
+        observedAt: "2026-10-18T00:09:00Z",
+        source: { channel: "runtime" },
+        payload: { effective: { mode: "default", source: "remuda", observedAt: "2026-10-18T00:09:00Z" } },
+      } as unknown as Observation,
+      {
+        kind: "message",
+        eventId: "evt_user_fallback",
+        journalId: JOURNAL,
+        instanceId: INSTANCE,
+        seq: "2",
+        completeness: "structured",
+        payload: { role: "user", commandId },
+      } as unknown as Observation,
+    ],
+    durableSeq: "2",
+    windowFromSeq: "1",
+    reachedAfterSeq: true,
+  });
+
+  // Fire the actual fallback handler.
+  (hubStore as unknown as { runOwedReconcile: (id: string) => void }).runOwedReconcile(INSTANCE);
+  for (let i = 0; i < 80; i += 1) await Promise.resolve();
+
+  // Owed command settled durably…
+  expect(bubble().outboxState).toBe("done");
+  // …but A's old permission readback never settled B.
+  expect(h.state.permissionPending[INSTANCE]?.mode).toBe("plan");
+  // And the page never entered the live journal-client state.
+  const evs = hubStore.getSnapshot().events[INSTANCE] ?? [];
+  expect(evs.some((e) => e.kind === "permission" && e.eventId === "evt_perm_A_r4")).toBe(false);
+});

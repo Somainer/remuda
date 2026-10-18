@@ -1341,11 +1341,10 @@ class HubStore {
   /**
    * Instances with an owed REST fallback currently running. Several triggers
    * can fire for one instance while its bounded read is in flight (rebind,
-   * failed reopen, watchdog — and N drained rows); they must collapse into the
-   * ONE coalesced read the doc comment on runOwedReconcile promises instead of
-   * queueing N reads behind each other (c-reconnfu gate 6 item 4a).
+   * failed reopen, watchdog — and N drained rows); they collapse into the
+   * ONE coalesced self-contained evidence pass (owedTailRunning in
+   * runOwedTailPass).
    */
-  private owedReconcileRunning = new Set<Id>();
   /**
    * Ruling AD: bounded debt-driven tail re-read state per instance. `attempts`
    * counts actual journal reads the driver issued while evidence was missing;
@@ -1734,7 +1733,6 @@ class HubStore {
     // directly and again through externalIdentityRetire — so no counter
     // lives here.
     this.reconcileOwed.clear();
-    this.owedReconcileRunning.clear();
     // Ruling AD: retire every bounded tail re-read timer with the binding.
     for (const tail of this.owedTail.values()) {
       if (tail.timer) clearTimeout(tail.timer);
@@ -4058,19 +4056,30 @@ class HubStore {
     // rejected before any mutation.
     const epoch = this.identityEpoch;
     const box = this.outbox;
-    const tail = this.owedTail.get(instanceId);
-    // r4 item 2: also pin the EXACT debt record — a stale job must not act on
-    // debt a retired drain recreated or a successor re-recorded.
     const debt = this.reconcileOwed.get(instanceId);
+    // Immediate fallback triggers (resume failure / bind-away / watchdog) run
+    // a pass without a previously armed timer, so lazily ensure the per-
+    // instance tail record exists and pin the exact object captured.
+    let tail = this.owedTail.get(instanceId);
+    if (!tail) {
+      tail = {
+        attempts: 0,
+        firstAt: Date.now(),
+        storageRetries: 0,
+        timer: null,
+      };
+      this.owedTail.set(instanceId, tail);
+    }
+    const capturedTail = tail;
     const stillOurs = () =>
       this.identityEpoch === epoch &&
       this.outbox === box &&
-      this.owedTail.get(instanceId) === tail &&
+      this.owedTail.get(instanceId) === capturedTail &&
       this.reconcileOwed.get(instanceId) === debt;
     void this.chainReconcile(instanceId, async () => {
       // Entry gate: a queued callback that survived logout is dropped before
       // any mutation.
-      if (!box || !tail || !debt || this.reconcileOwed.get(instanceId) !== debt) return;
+      if (!box || !debt || this.reconcileOwed.get(instanceId) !== debt) return;
       try {
         if (!this.owedCommandLacksEvidence(instanceId)) {
           this.clearOwed(instanceId);
@@ -4223,59 +4232,18 @@ class HubStore {
   /**
    * Honour a post-delivery catch-up for an instance that NO follow currently
    * owns (the binding moved to another session) or whose owning attempt just
-   * failed/timed out. One bounded REST resume per instance on its own journal
-   * chain; never drives the global connection machine (it is bound elsewhere
-   * or the follow was just judged dead). Idempotent — safe to call when a
-   * follow later takes over.
+   * failed/timed out — the trigger fired by resume failures, failed follow
+   * reopens, bind-away and the watchdog.
    *
-   * Ruling AD: even a WHOLE, successful read deletes nothing by itself — the
-   * per-command evidence check ({@link reevaluateOwedDebt}) decides; an empty
-   * read keeps the debt and arms the bounded tail. A read rejection /
-   * readonly-stale settlement likewise keeps it so the next failure,
-   * watchdog, rebind or navigation trigger retries instead of leaving the
-   * accepted row stuck at 已受理 (c-reconnfu gate 6 item 2).
+   * Ruling AD3 (self-contained): this NEVER drives the mounted
+   * JournalClient — a resync there would apply the whole page (permission/
+   * model reducers, live dedupe) and its nested gap fill escapes identity
+   * retirement. It simply runs the SAME ownership-fenced, evidence-only
+   * bounded REST tail pass; coalescing is shared via {@link owedTailRunning}.
    */
   private runOwedReconcile(instanceId: Id) {
     if (!this.reconcileOwed.has(instanceId)) return;
-    // Coalesce: N drained rows / several failure triggers for one instance
-    // must collapse into ONE bounded read, not N jobs queued on the chain
-    // (gate 6 item 4a).
-    if (this.owedReconcileRunning.has(instanceId)) return;
-    this.owedReconcileRunning.add(instanceId);
-    // r3 item 1: capture ownership BEFORE queueing; the nested
-    // resumeAfterReconnect receives it as isCurrent so a read parked across
-    // logout is dropped inside the JournalClient before it can apply.
-    const epoch = this.identityEpoch;
-    const box = this.outbox;
-    const stillOurs = () => this.identityEpoch === epoch && this.outbox === box;
-    void this.chainReconcile(instanceId, async () => {
-      try {
-        if (!box || !this.reconcileOwed.has(instanceId)) return;
-        const instance =
-          this.state.instances.find((i) => i.id === instanceId) ??
-          (await api.instanceGet(instanceId).catch(() => null));
-        if (!stillOurs()) return;
-        const client = instance ? this.journals.get(instance.journalId) : undefined;
-        if (!client) {
-          // Nothing mounted to fold; the bounded tail driver waits for the
-          // mount instead of dropping the debt.
-          if (stillOurs()) this.reevaluateOwedDebt(instanceId);
-          return;
-        }
-        try {
-          await client.resumeAfterReconnect({ isCurrent: stillOurs });
-        } catch {
-          /* bounded REST catch-up failed: keep the debt; arm/keep its tail */
-          if (stillOurs()) this.reevaluateOwedDebt(instanceId);
-          return;
-        }
-        if (!stillOurs()) return;
-        this.settleFromJournal(instanceId, this.state.events[instanceId] ?? []);
-        this.reevaluateOwedDebt(instanceId);
-      } finally {
-        if (this.identityEpoch === epoch) this.owedReconcileRunning.delete(instanceId);
-      }
-    });
+    this.runOwedTailPass(instanceId);
   }
 
   /** Reopen the follow socket for an already-mounted instance and resync. */

@@ -2841,6 +2841,11 @@ it("GATE16 item 4c: an accepted delivery stamped during offline recovery is caug
 
 it("GATE15 item 3: navigating away from mounted A (deferred REST catch-up owed) to mounted B runs A's catch-up via the real follow() path", async () => {
   const { api, hubStore } = await fresh();
+  // A has a durable SENT row awaiting its journal join (not deliverable, so it
+  // is never re-POSTed); the test stamps per-command debt for it (AD3: the
+  // self-contained evidence read only runs while an owed command lacks
+  // journal evidence).
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([row({ commandId: "cmd_bindaway", state: "sent" })]));
   await bootLive(api, hubStore); // mounts A = INSTANCE (journal JOURNAL)
 
   const JOURNAL_B = "obj_journal_b";
@@ -2876,13 +2881,14 @@ it("GATE15 item 3: navigating away from mounted A (deferred REST catch-up owed) 
   await hubStore.follow(INSTANCE_B);
   await hubStore.follow(INSTANCE);
 
-  // A owes a deferred catch-up: its accepted response arrived during
-  // reconnect backoff and was stamped via recordOwed rather than read inline.
+  // A owes a deferred catch-up for its sent row: its accepted response
+  // arrived during reconnect backoff and was stamped via recordOwed rather
+  // than read inline.
   const storeInternal = hubStore as unknown as {
-    recordOwed: (id: string) => void;
+    recordOwed: (id: string, commandIds?: Iterable<string>) => void;
     reconcileOwed: Map<string, unknown>;
   };
-  storeInternal.recordOwed(INSTANCE);
+  storeInternal.recordOwed(INSTANCE, ["cmd_bindaway"]);
   expect(storeInternal.reconcileOwed.has(INSTANCE)).toBe(true);
 
   // Navigate to the already-mounted B (as SessionPage does). With the fix
@@ -2892,9 +2898,20 @@ it("GATE15 item 3: navigating away from mounted A (deferred REST catch-up owed) 
   vi.mocked(api.eventsRead).mockImplementation(async (args) => {
     journalReadsAfterNav.push(args.journalId);
     return {
-      events: [],
+      // The self-contained evidence read settles the owed command.
+      events:
+        args.journalId === JOURNAL
+          ? [
+              {
+                seq: "1",
+                eventId: "evt_bindaway_1",
+                kind: "message",
+                payload: { role: "user", commandId: "cmd_bindaway" },
+              },
+            ]
+          : [],
       windowFromSeq: "1",
-      durableSeq: "0",
+      durableSeq: args.journalId === JOURNAL ? "1" : "0",
       reachedAfterSeq: true,
     } as Awaited<ReturnType<Api["eventsRead"]>>;
   });

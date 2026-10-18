@@ -6922,14 +6922,6 @@ mod tests {
         Unknown,
     }
     impl Basket {
-        fn wire(self) -> Value {
-            match self {
-                Basket::Known(v) => json!({"state": "known", "value": v}),
-                Basket::NotApplicable => json!({"state": "not-applicable"}),
-                Basket::Unknown => json!({"state": "unknown", "reason": "unreported",
-                                          "evidenceEventIds": []}),
-            }
-        }
         fn decoded(self) -> Option<i64> {
             match self {
                 Basket::Known(v) => Some(v),
@@ -6939,9 +6931,6 @@ mod tests {
         }
     }
 
-    /// Build ONE REAL protocol usage observation (serialized exactly like an
-    /// on-the-wire Observation: kind/payload/source/nativeAt). The stored row
-    /// is derived ONLY through project_usage_event + the live insert path.
     #[allow(clippy::too_many_arguments)]
     fn r44_wire_record(
         instance: &str,
@@ -6957,40 +6946,74 @@ mod tests {
         window: Option<u64>,
         native_at: Option<&str>,
     ) -> JournalRecord {
-        let [total, input, output, cache_read, cache_write] = baskets;
-        let cost_json = match cost {
-            Some(amount) => json!({"state": "known",
-                "value": {"amount": amount, "currency": "USD"}}),
-            None => json!({"state": "unknown", "reason": "unpriced",
-                            "evidenceEventIds": []}),
+        use remuda_protocol::{
+            Accounting, Cost, Id, InputAccounting, Knowledge, U64, UsageMode, UsagePayload,
+            UsageScope,
         };
-        let mut payload = serde_json::Map::new();
-        payload.insert("usageId".into(), json!("obj"));
-        payload.insert("scope".into(), json!(scope));
-        // A genuine NULL-scope legacy point OMITS the identity entirely.
-        if let Some(id) = scope_id {
-            payload.insert("scopeId".into(), json!(id));
-        }
-        payload.insert("mode".into(), json!("snapshot"));
-        payload.insert("metricRevision".into(), json!(revision.to_string()));
-        if let Some(sid) = session {
-            payload.insert("sourceSessionId".into(), json!(sid));
-        }
-        payload.insert("inputTokens".into(), input.wire());
-        payload.insert("inputAccounting".into(), json!("uncached"));
-        payload.insert("outputTokens".into(), output.wire());
-        payload.insert(
-            "reasoningTokens".into(),
-            json!({"state": "unknown", "reason": "unreported", "evidenceEventIds": []}),
-        );
-        payload.insert("cacheReadTokens".into(), cache_read.wire());
-        payload.insert("cacheWriteTokens".into(), cache_write.wire());
-        payload.insert("totalTokens".into(), total.wire());
-        payload.insert("cost".into(), cost_json);
-        payload.insert("accounting".into(), json!(accounting));
-        if let Some(w) = window {
-            payload.insert("contextWindow".into(), json!(w));
-        }
+        let k = |b: Basket| -> Knowledge<U64> {
+            match b {
+                Basket::Known(v) => Knowledge::Known {
+                    value: U64(v as u64),
+                },
+                Basket::NotApplicable => Knowledge::NotApplicable,
+                Basket::Unknown => Knowledge::Unknown {
+                    reason: "unreported".into(),
+                    evidence_event_ids: vec![],
+                },
+            }
+        };
+        let [total, input, output, cache_read, cache_write] = baskets;
+        let cost_knowledge: Knowledge<Cost> = match cost {
+            Some(amount) => Knowledge::Known {
+                value: Cost {
+                    amount: amount.into(),
+                    currency: "USD".into(),
+                },
+            },
+            None => Knowledge::Unknown {
+                reason: "unpriced".into(),
+                evidence_event_ids: vec![],
+            },
+        };
+        let scope_enum = match scope {
+            "message" => UsageScope::Message,
+            "session" => UsageScope::Session,
+            _ => UsageScope::Turn,
+        };
+        let native_key = scope_id.unwrap_or("legacy");
+        let usage_id = Id::derive(
+            "obj",
+            instance,
+            &format!("usage:{scope}:{native_key}:{seq}"),
+        )
+        .unwrap_or_else(|_| Id::new("obj").unwrap());
+        let payload = UsagePayload {
+            usage_id,
+            scope: scope_enum,
+            scope_id: scope_id.unwrap_or("").to_string(),
+            mode: UsageMode::Snapshot,
+            metric_revision: U64(revision),
+            source_session_id: session.map(str::to_string),
+            input_tokens: k(input),
+            input_accounting: InputAccounting::Uncached,
+            output_tokens: k(output),
+            reasoning_tokens: Knowledge::Unknown {
+                reason: "unreported".into(),
+                evidence_event_ids: vec![],
+            },
+            cache_read_tokens: k(cache_read),
+            cache_write_tokens: k(cache_write),
+            total_tokens: k(total),
+            cost: cost_knowledge,
+            accounting: if accounting == "reported" {
+                Accounting::Reported
+            } else {
+                Accounting::Estimated
+            },
+            native_fields_ref: None,
+            context_window: window.map(U64),
+        };
+        let payload_json = serde_json::to_value(payload).unwrap();
         let mut source = serde_json::Map::new();
         if let Some(sid) = session {
             source.insert(
@@ -7006,7 +7029,7 @@ mod tests {
         }
         let mut event = serde_json::Map::new();
         event.insert("kind".into(), json!("usage"));
-        event.insert("payload".into(), Value::Object(payload));
+        event.insert("payload".into(), payload_json);
         if !source.is_empty() {
             event.insert("source".into(), Value::Object(source));
         }
@@ -7023,16 +7046,12 @@ mod tests {
         }
     }
 
-    /// A generated observation with its projected model and legacy flag.
     struct R44Event {
         model: &'static str,
         legacy: bool,
         record: JournalRecord,
     }
 
-    /// Build one REAL seeded sequence of protocol observations across 1-3
-    /// instances (one database so supply pooling is exercised) and assert the
-    /// r44 invariants. Returns true when any instance has data.
     fn r44_property_one(seed: u64) -> bool {
         let mut rng = R43Rng(seed.wrapping_add(0x9E37_79B9_7F4A_7C15));
         let profile = "pvp_prop";
@@ -7068,12 +7087,11 @@ mod tests {
             migrate(&conn).unwrap();
         }
         create_journal_table(&conn);
-        conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS r43_rowids(value INTEGER NOT NULL);")
-            .unwrap();
 
-        // Per instance: sessions, accepted turn lineages and the event list.
+        // Per instance: sessions, accepted turn lineages (scope, sid, revision)
+        // and the event list.
         let mut sessions: Vec<Vec<String>> = Vec::new();
-        let mut lineages: Vec<Vec<(String, u64)>> = Vec::new();
+        let mut lineages: Vec<Vec<(String, String, u64)>> = Vec::new();
         let mut per_instance: Vec<Vec<R44Event>> = (0..n_instances).map(|_| Vec::new()).collect();
         for ii in 0..n_instances {
             let n_sessions = 1 + rng.below(3);
@@ -7094,6 +7112,7 @@ mod tests {
                 let kind = *rng.pick(&[
                     "turn",
                     "turn_first_tokenless",
+                    "turn_revise",
                     "turn_correct",
                     "session",
                     "message",
@@ -7142,7 +7161,7 @@ mod tests {
                         } else {
                             None
                         };
-                        lineages[ii].push((scope.clone(), revision));
+                        lineages[ii].push((scope.clone(), sid.clone(), revision));
                         r44_wire_record(
                             &inst,
                             seq,
@@ -7158,6 +7177,98 @@ mod tests {
                             native,
                         )
                     }
+                    "turn_revise" => {
+                        if lineages[ii].is_empty() {
+                            // Nothing to revise: fall back to a fresh turn.
+                            let sid = sessions[ii][rng.below(sessions[ii].len() as u64)].clone();
+                            let scope = format!("turn-{seq}");
+                            let input = draw_basket(&mut rng);
+                            let output = draw_basket(&mut rng);
+                            let cr = draw_basket(&mut rng);
+                            let cw = draw_basket(&mut rng);
+                            let total = match (
+                                input.decoded(),
+                                output.decoded(),
+                                cr.decoded(),
+                                cw.decoded(),
+                            ) {
+                                (Some(a), Some(o), Some(r), Some(w)) if rng.below(2) == 0 => {
+                                    Basket::Known(a + o + r + w)
+                                }
+                                _ => Basket::Unknown,
+                            };
+                            let revision = 1 + rng.below(3) as u64;
+                            lineages[ii].push((scope.clone(), sid.clone(), revision));
+                            r44_wire_record(
+                                &inst,
+                                seq,
+                                "turn",
+                                Some(&scope),
+                                Some(&sid),
+                                Some(&scope),
+                                revision,
+                                "estimated",
+                                [total, input, output, cr, cw],
+                                cost_of(&mut rng).as_deref(),
+                                if rng.below(4) == 0 {
+                                    Some(200_000)
+                                } else {
+                                    None
+                                },
+                                if rng.below(2) == 0 {
+                                    Some(stamp.as_str())
+                                } else {
+                                    None
+                                },
+                            )
+                        } else {
+                            // COUNTER-BEARING revision of an EXISTING lineage:
+                            // same scope/sid, strictly higher revision, real
+                            // baskets; window/nativeAt usually omitted so the
+                            // revision must retain the first frame's metadata.
+                            let idx = rng.below(lineages[ii].len() as u64);
+                            let (scope, sid, rev) = lineages[ii][idx].clone();
+                            let input = draw_basket(&mut rng);
+                            let output = draw_basket(&mut rng);
+                            let cr = draw_basket(&mut rng);
+                            let cw = draw_basket(&mut rng);
+                            let total = match (
+                                input.decoded(),
+                                output.decoded(),
+                                cr.decoded(),
+                                cw.decoded(),
+                            ) {
+                                (Some(a), Some(o), Some(r), Some(w)) if rng.below(2) == 0 => {
+                                    Basket::Known(a + o + r + w)
+                                }
+                                _ => Basket::Unknown,
+                            };
+                            let new_rev = rev + 1;
+                            lineages[ii][idx] = (scope.clone(), sid.clone(), new_rev);
+                            r44_wire_record(
+                                &inst,
+                                seq,
+                                "turn",
+                                Some(&scope),
+                                Some(&sid),
+                                Some(&scope),
+                                new_rev,
+                                "estimated",
+                                [total, input, output, cr, cw],
+                                cost_of(&mut rng).as_deref(),
+                                if rng.below(5) == 0 {
+                                    Some(200_000)
+                                } else {
+                                    None
+                                },
+                                if rng.below(5) == 0 {
+                                    Some(stamp.as_str())
+                                } else {
+                                    None
+                                },
+                            )
+                        }
+                    }
                     "turn_correct" => {
                         if lineages[ii].is_empty() {
                             // No lineage yet: emit an ordinary turn instead.
@@ -7165,7 +7276,7 @@ mod tests {
                             let scope = format!("turn-{seq}");
                             let input = draw_basket(&mut rng);
                             let revision = 1 + rng.below(3) as u64;
-                            lineages[ii].push((scope.clone(), revision));
+                            lineages[ii].push((scope.clone(), sid.clone(), revision));
                             r44_wire_record(
                                 &inst,
                                 seq,
@@ -7191,8 +7302,8 @@ mod tests {
                             // additive basket explicitly Unknown. It may carry
                             // window/native time which must be suppressed.
                             let idx = rng.below(lineages[ii].len() as u64);
-                            let (scope, rev) = lineages[ii][idx].clone();
-                            let sid = sessions[ii][rng.below(sessions[ii].len() as u64)].clone();
+                            // A correction stays in the SAME proven lineage.
+                            let (scope, sid, rev) = lineages[ii][idx].clone();
                             let correction_rev = rev + 1 + rng.below(2) as u64;
                             let window = if rng.below(2) == 0 {
                                 Some(1_000_000)
@@ -7204,7 +7315,7 @@ mod tests {
                             } else {
                                 None
                             };
-                            lineages[ii][idx] = (scope.clone(), correction_rev);
+                            lineages[ii][idx] = (scope.clone(), sid.clone(), correction_rev);
                             r44_wire_record(
                                 &inst,
                                 seq,
@@ -7354,6 +7465,29 @@ mod tests {
             "seed {seed}: second migration changed rows"
         );
 
+        // Invariant (c, independent): fallback recovery equals an INDEPENDENT
+        // live reference — a fresh current-schema database that ingests the
+        // SAME journal records through the live path in journal order. This is
+        // Ruling AE (recovery IS replay): the recovered state is not compared
+        // against a snapshot taken after a migration, but against live ingest
+        // derived independently.
+        let live_ref = Connection::open_in_memory().unwrap();
+        migrate(&live_ref).unwrap();
+        create_journal_table(&live_ref);
+        for events in per_instance.iter() {
+            for ev in events.iter() {
+                insert_journal_raw(&live_ref, &ev.record);
+                let row = project_usage_event(&ev.record, Some(profile), Some(ev.model))
+                    .expect("real usage payload projects");
+                insert_usage_event(&live_ref, &row).unwrap();
+            }
+        }
+        assert_eq!(
+            r43_dump_rows(&live_ref),
+            twice_rows,
+            "seed {seed}: fallback recovery equals independent live reference"
+        );
+
         // Grand instance totals over every instance.
         let mut grand_input: Option<i64> = Some(0);
         let mut grand_output: Option<i64> = Some(0);
@@ -7434,16 +7568,6 @@ mod tests {
         any_data
     }
 
-    /// AC4 (mandatory): deterministic seeded random sequences satisfy
-    /// (a) grand instance aggregates == grand per-model supply aggregates for
-    /// tokens and cost (Unknown iff any side is Unknown),
-    /// (b) rollup tokens == aggregate tokens,
-    /// (c) live == restart == second-restart full-row identity.
-    ///
-    /// Seed count defaults to 100 (~2 min on a contended dev box) and is
-    /// overridable via `CTXUSAGE_PROPERTY_SEEDS` for a longer manual run (e.g.
-    /// 500). The violating seeds found while building this (14, 100, 426) each
-    /// have their own fixed regression.
     #[test]
     fn property_fold_invariants_hold_across_random_sequences() {
         let seeds: u64 = std::env::var("CTXUSAGE_PROPERTY_SEEDS")

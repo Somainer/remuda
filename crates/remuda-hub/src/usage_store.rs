@@ -231,22 +231,18 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     // historical duplicate that the old index forbade.
     tx.execute_batch("DROP INDEX IF EXISTS usage_events_scope_dedupe;")?;
     tx.execute_batch("DROP INDEX IF EXISTS usage_events_turn_dedupe;")?;
-    // Ruling AE (recovery IS replay): drop every journal-backed row written
-    // under the fallback/legacy schema and rebuild it from its retained
-    // observation through the SAME live ingest path, in journal order. This
-    // replaces the former backfill/reconstruct + recovery-only turn/message
-    // collapse chain: the live revision watermarks and stock acceptance now
-    // decide recovery exactly as they did at arrival. Rows without a journal
-    // record are kept untouched. The live upsert/growth paths dedupe on the
-    // current schema, so no recovery-only collapse is needed.
+    // Ruling AE2 (recovery IS replay, complete and undecorated): for every
+    // instance that owns at least one journal-backed usage row, delete ALL of
+    // that instance's journal-backed rows and replay EVERY usage frame of its
+    // journal in (seq, rowid) order through the live ingest path. Rows without
+    // journal backing are never deleted or tagged; the only touch they receive
+    // is the live-rule fold required to build the new unique indexes.
     replay_fallback_rows_from_journal(tx)?;
     set_meta_marker(conn, MARKER_JOURNAL_REPLAY)?;
-    // r41 AB1+: reconcile every retained SESSION chain through the same
-    // cost-aware acceptance the live insert path runs — cost-inclusive stock
-    // identity (a newer reported bill survives restart), stale-point removal
-    // and reset-estimate stripping in one step.
-    reconcile_session_chains(tx)?;
-    // r16 item 3 (T1'): recreate the per-LINEAGE turn unique index.
+    // r16 item 3 (T1'): recreate the per-LINEAGE turn unique index. When the
+    // replay helper ran against a database with a journal table it already
+    // created both live invariants; on a journal-less database these are the
+    // authoritative creates.
     tx.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS usage_events_turn_dedupe
              ON usage_events(
@@ -283,10 +279,7 @@ fn replay_fallback_rows_from_journal(conn: &Connection) -> rusqlite::Result<usiz
     if journal_exists == 0 {
         return Ok(0);
     }
-    // The one-time AE replay has already committed on this database: fallback
-    // rows cannot be written after a successful migration, so replaying would
-    // only delete/rebuild already-live rows (and could drop a stock the live
-    // acceptance rule now freezes as an identical replay).
+    // The one-time AE replay has already committed on this database.
     let already_replayed: i64 = conn.query_row(
         "SELECT COUNT(*) FROM usage_schema_meta WHERE key = ?1 AND value = 'applied'",
         [MARKER_JOURNAL_REPLAY],
@@ -295,167 +288,357 @@ fn replay_fallback_rows_from_journal(conn: &Connection) -> rusqlite::Result<usiz
     if already_replayed > 0 {
         return Ok(0);
     }
-    // The set of physical usage rows that have a matching journal observation,
-    // captured BEFORE any delete (a live upsert can collapse two fallback rows
-    // onto one durable key). Join on the fallback PK (instance_id, seq) — the
-    // journal is the durable per-instance append log and always carries both.
-    let backed: Vec<i64> = {
+    // AE2 (ii) exception: before anything is deleted, capture remaining
+    // physical duplicates on the two NEW unique keys. The capture removes the
+    // later physical copies so the indexes can build; the captured rows are
+    // re-fed through the SAME live upsert rule only AFTER the indexes exist
+    // (the upsert needs the unique index to hit the survivor). This runs even
+    // when no instance needs replay: a database that accumulated duplicates
+    // while an earlier migration window was rolled back must still reach a
+    // buildable current schema.
+    let mut captured_folds = fold_unjournaled_index_collisions(conn)?;
+    tx_batch_create_turn_index(conn)?;
+    tx_batch_create_message_index(conn)?;
+    captured_folds.sort_by_key(|(rowid, _)| *rowid);
+    for (_, row) in &captured_folds {
+        insert_usage_event(conn, row)?;
+    }
+
+    // AE2 (i): the unit of replay is the INSTANCE. An instance participates iff
+    // at least one of its physical usage rows is backed by a `kind='usage'`
+    // journal frame. Frames are NEVER selected by "a physical row still
+    // represents this seq": the live Message upsert keeps the FIRST seq while a
+    // revision lands at a later seq, and the live Turn upsert ADVANCES seq to a
+    // correction's seq — so surviving physical seqs are exactly not the set of
+    // frames to replay.
+    let instances: Vec<String> = {
         let mut st = conn.prepare(
-            "SELECT u.rowid
-             FROM usage_events u
-             JOIN journal j
-               ON j.instance_id = u.instance_id AND j.seq = u.seq
+            "SELECT DISTINCT j.instance_id
+             FROM journal j
+             JOIN usage_events u
+               ON u.instance_id = j.instance_id AND u.seq = j.seq
              WHERE json_valid(j.payload_json)
                AND json_extract(j.payload_json, '$.kind') = 'usage'
-             ORDER BY u.instance_id, u.seq, u.rowid",
+             ORDER BY j.instance_id",
         )?;
-        let rows = st.query_map([], |r| r.get::<_, i64>(0))?;
+        let rows = st.query_map([], |r| r.get::<_, String>(0))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
-    if backed.is_empty() {
+    if instances.is_empty() {
         return Ok(0);
     }
-    // The journal observations to replay, in journal order. Projected later
-    // (profile/model come from the live store's own columns when present).
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS r46_replay_instances(value TEXT PRIMARY KEY);
+         DELETE FROM r46_replay_instances;",
+    )?;
+    {
+        let mut ins = conn.prepare("INSERT INTO r46_replay_instances(value) VALUES (?1)")?;
+        for instance in &instances {
+            ins.execute(params![instance])?;
+        }
+    }
+
+    // Profile/model attribution is durable per-frame provider attribution that
+    // the wire payload does not carry. Resolve it from the backed physical
+    // rows BEFORE they are deleted, at three granularities:
+    //  * exact (instance, seq): a physical row sat at this seq;
+    //  * durable key (scope/scope_id/lineage): the surviving row of a collapsed
+    //    lineage carries the final attribution earlier frames folded onto;
+    //  * instance: deterministic first-backed-row fallback.
+    #[derive(Clone, Default)]
+    struct Attribution {
+        profile_id: Option<String>,
+        model: Option<String>,
+    }
+    let mut exact_attr: std::collections::HashMap<(String, i64), Attribution> =
+        std::collections::HashMap::new();
+    let mut key_attr: std::collections::HashMap<
+        (String, String, String, String),
+        (i64, Attribution),
+    > = std::collections::HashMap::new();
+    let mut inst_attr: std::collections::HashMap<String, (i64, Attribution)> =
+        std::collections::HashMap::new();
+    {
+        let mut st = conn.prepare(
+            "SELECT j.instance_id, j.seq, u.scope,
+                    COALESCE(u.scope_id, ''), COALESCE(u.source_session_id, ''),
+                    u.profile_id, u.model
+             FROM usage_events u
+             JOIN journal j ON j.instance_id = u.instance_id AND j.seq = u.seq
+             WHERE json_valid(j.payload_json)
+               AND json_extract(j.payload_json, '$.kind') = 'usage'
+               AND j.instance_id IN (SELECT value FROM r46_replay_instances)
+             ORDER BY j.instance_id, j.seq, u.rowid",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<String>>(6)?,
+            ))
+        })?;
+        for row in rows {
+            let (instance, seq, scope, scope_id, sid, profile_id, model) = row?;
+            let attr = Attribution { profile_id, model };
+            exact_attr
+                .entry((instance.clone(), seq))
+                .or_insert_with(|| attr.clone());
+            // Key attribution prefers the HIGHEST surviving seq: the live Turn
+            // upsert advances seq onto the surviving row, while the Message
+            // upsert keeps a single survivor at the first seq (message
+            // attribution never changes under fold, so either row agrees).
+            let key = (instance.clone(), scope, scope_id, sid);
+            match key_attr.get(&key) {
+                Some((kept_seq, _)) if *kept_seq >= seq => {}
+                _ => {
+                    key_attr.insert(key, (seq, attr.clone()));
+                }
+            }
+            match inst_attr.get(&instance) {
+                Some((kept_seq, _)) if *kept_seq <= seq => {}
+                _ => {
+                    inst_attr.insert(instance, (seq, attr));
+                }
+            }
+        }
+    }
+
+    // AE2 (i): delete ALL journal-backed usage rows of the participating
+    // instances — every kind (Session/Turn/Message). The journal is untouched,
+    // so a failure inside this transaction rolls every delete back.
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS r46_backed_rowids(value INTEGER NOT NULL);
+         DELETE FROM r46_backed_rowids;",
+    )?;
+    conn.execute(
+        "INSERT INTO r46_backed_rowids(value)
+         SELECT u.rowid
+         FROM usage_events u
+         JOIN journal j ON j.instance_id = u.instance_id AND j.seq = u.seq
+         WHERE json_valid(j.payload_json)
+           AND json_extract(j.payload_json, '$.kind') = 'usage'
+           AND j.instance_id IN (SELECT value FROM r46_replay_instances)",
+        [],
+    )?;
+    conn.execute(
+        "DELETE FROM usage_events WHERE rowid IN (SELECT value FROM r46_backed_rowids)",
+        [],
+    )?;
+
+    // AE2 (i): replay EVERY usage frame of each participating instance in
+    // journal order, through the exact projector + insert the live ingest path
+    // uses.
     let records: Vec<JournalRecord> = {
         let mut st = conn.prepare(
-            "SELECT j.instance_id, j.seq, j.event_id, j.payload_json, j.observed_at,
-                    (SELECT e.profile_id FROM usage_events e
-                       JOIN journal jj ON jj.instance_id = e.instance_id AND jj.seq = e.seq
-                      WHERE jj.rowid = j.rowid LIMIT 1) AS profile_id,
-                    (SELECT e.model FROM usage_events e
-                       JOIN journal jj ON jj.instance_id = e.instance_id AND jj.seq = e.seq
-                      WHERE jj.rowid = j.rowid LIMIT 1) AS model
+            "SELECT j.instance_id, j.seq, j.event_id, j.payload_json, j.observed_at
              FROM journal j
              WHERE json_valid(j.payload_json)
                AND json_extract(j.payload_json, '$.kind') = 'usage'
-               AND EXISTS (
-                   SELECT 1 FROM usage_events u
-                    WHERE u.instance_id = j.instance_id AND u.seq = j.seq
-               )
+               AND j.instance_id IN (SELECT value FROM r46_replay_instances)
              ORDER BY j.instance_id, j.seq, j.rowid",
         )?;
         let rows = st.query_map([], |r| -> rusqlite::Result<JournalRecord> {
-            let instance: String = r.get(0)?;
-            let seq: i64 = r.get(1)?;
-            let event_id: String = r.get(2)?;
             let payload: String = r.get(3)?;
-            let observed_at: String = r.get(4)?;
-            let profile: Option<String> = r.get(5)?;
-            let model: Option<String> = r.get(6)?;
-            let mut event: Value = serde_json::from_str(&payload).map_err(|e| {
+            let event = serde_json::from_str(&payload).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
                     3,
                     rusqlite::types::Type::Text,
                     Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
                 )
             })?;
-            // The fallback row's profile/model are durable attribution not
-            // present in the wire payload; re-project with them so the live
-            // rebuild keeps the original provider/model.
-            let event_mut = event.as_object_mut().ok_or_else(|| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    3,
-                    rusqlite::types::Type::Text,
-                    Box::new(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "journal usage event is not a JSON object",
-                    )),
-                )
-            })?;
-            let _ = (profile, model, event_mut);
             Ok(JournalRecord {
-                instance_id: instance,
-                seq,
-                event_id,
+                instance_id: r.get(0)?,
+                seq: r.get(1)?,
+                event_id: r.get(2)?,
                 event,
-                observed_at,
+                observed_at: r.get(4)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
-    // Project each record against the profile/model its fallback row carried.
-    // Resolve those per (instance, seq) from the pre-delete rows.
-    let attribution: Vec<(String, i64, Option<String>, Option<String>)> = {
-        let mut st = conn.prepare(
-            "SELECT DISTINCT u.instance_id, j.seq, u.profile_id, u.model
-             FROM usage_events u
-             JOIN journal j ON j.instance_id = u.instance_id AND j.seq = u.seq
-             WHERE json_valid(j.payload_json)
-               AND json_extract(j.payload_json, '$.kind') = 'usage'
-             ORDER BY u.instance_id, j.seq",
-        )?;
-        let rows = st.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get(2)?,
-                r.get(3)?,
-            ))
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    let lookup_attr = |record: &JournalRecord, row: &UsageEventRow| -> Option<&Attribution> {
+        exact_attr
+            .get(&(record.instance_id.clone(), record.seq))
+            .or_else(|| {
+                key_attr
+                    .get(&(
+                        record.instance_id.clone(),
+                        row.scope.clone(),
+                        row.scope_id.clone().unwrap_or_default(),
+                        row.source_session_id.clone().unwrap_or_default(),
+                    ))
+                    .map(|(_, a)| a)
+            })
+            .or_else(|| inst_attr.get(&record.instance_id).map(|(_, a)| a))
     };
-    // Drop the physical fallback rows. The journal is untouched, so a failure
-    // inside this transaction rolls the delete back and nothing is lost.
-    conn.execute_batch(
-        "CREATE TEMP TABLE IF NOT EXISTS r45_backed_rowids(value INTEGER NOT NULL);
-         DELETE FROM r45_backed_rowids;",
-    )?;
-    {
-        let mut ins = conn.prepare("INSERT INTO r45_backed_rowids(value) VALUES (?1)")?;
-        for rowid in &backed {
-            ins.execute(params![rowid])?;
-        }
-    }
-    conn.execute(
-        "DELETE FROM usage_events WHERE rowid IN (SELECT value FROM r45_backed_rowids)",
-        [],
-    )?;
-    // The live durable-Message upsert (insert_row -> upsert_message_row)
-    // dedupes replayed responses by (instance, scope, scope_id) through a
-    // UNIQUE partial index. The old recovery-only consolidation used to create
-    // it; under AE the index is a live invariant, so (re)create it here after
-    // the fallback rows are gone. First collapse any UN-backed duplicate
-    // durable messages (no journal to authoritatively replay) to the earliest
-    // row so the unique index can be built.
-    conn.execute(
-        "DELETE FROM usage_events
-         WHERE scope = 'message' AND scope_id IS NOT NULL
-           AND rowid NOT IN (
-               SELECT MIN(rowid) FROM usage_events
-               WHERE scope = 'message' AND scope_id IS NOT NULL
-               GROUP BY instance_id, scope, scope_id)",
-        [],
-    )?;
-    tx_batch_create_message_index(conn)?;
-    // Replay through the live ingest path in journal order.
     let mut rebuilt = 0usize;
     for record in &records {
-        let (_, _, profile, model) = attribution
-            .iter()
-            .find(|(inst, seq, _, _)| inst == &record.instance_id && *seq == record.seq)
-            .cloned()
-            .unwrap_or_else(|| (record.instance_id.clone(), record.seq, None, None));
-        let Some(row) = project_usage_event(record, profile.as_deref(), model.as_deref()) else {
+        // Project once to learn the durable key the live path folds on, then
+        // resolve attribution the surviving physical row carried.
+        let Some(pre) = project_usage_event(record, None, None) else {
+            continue;
+        };
+        let default_attr = Attribution::default();
+        let attr = lookup_attr(record, &pre).unwrap_or(&default_attr);
+        let Some(row) =
+            project_usage_event(record, attr.profile_id.as_deref(), attr.model.as_deref())
+        else {
             continue;
         };
         insert_usage_event(conn, &row)?;
         rebuilt += 1;
     }
-    // AE provenance: these rows were replayed from observations that arrived
-    // while the schema migration was rolled back, so they carry the same
-    // `legacy` lineage_state the deleted fallback rows had. The live read fold
-    // relies on the tag to keep an unprovable historical turn conservative
-    // (ambiguous) next to a scoped stock; replaying through the live ingest
-    // path changes HOW the row is built, not its origin classification. A
-    // post-upgrade live row is never selected here (the one-time replay marker
-    // only runs while fallback rows can exist), so this never tags live data.
+    // AE2 (iii): no lineage tag and no other recovery marking. Replayed rows
+    // are live rows, column for column.
+    Ok(rebuilt)
+}
+
+/// Create the per-lineage Turn unique index (live invariant).
+fn tx_batch_create_turn_index(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS usage_events_turn_dedupe
+             ON usage_events(
+                 instance_id, scope, scope_id,
+                 COALESCE(source_session_id, '')
+             )
+             WHERE scope = 'turn' AND scope_id IS NOT NULL;",
+    )
+}
+
+/// Physical rows that collide on a unique index the current live schema needs,
+/// among rows the replay does not rebuild (rows without a journal frame at
+/// their seq). The SURVIVOR (MIN rowid per collision group) stays in place;
+/// every later physical row is captured and removed, then returned so the
+/// caller can create the unique indexes and re-feed the captures through the
+/// live upsert rule — higher revision wins, omitted metadata retained, never a
+/// discard-to-MIN(rowid) sweep.
+fn fold_unjournaled_index_collisions(
+    conn: &Connection,
+) -> rusqlite::Result<Vec<(i64, UsageEventRow)>> {
+    // Collision key for each live unique index, with the row-value predicate
+    // that selects physical rows belonging to a duplicated group.
+    struct Fold {
+        scope: &'static str,
+        // SQL listing the grouping key after WHERE scope=? — the SELECT returns
+        // full rows ordered by key,rowid; the bound parameter is the scope.
+        predicate: &'static str,
+    }
+    let folds = [
+        Fold {
+            scope: "message",
+            // Collision on (instance_id, scope, scope_id).
+            predicate: "(instance_id, scope, scope_id) IN (
+                SELECT instance_id, scope, scope_id FROM usage_events
+                 WHERE scope = 'message' AND scope_id IS NOT NULL
+                 GROUP BY instance_id, scope, scope_id
+                HAVING COUNT(*) > 1)",
+        },
+        Fold {
+            scope: "turn",
+            // Collision on the per-lineage key the turn index enforces.
+            predicate: "(instance_id, scope, scope_id,
+                               COALESCE(source_session_id, '')) IN (
+                SELECT instance_id, scope, scope_id,
+                       COALESCE(source_session_id, '')
+                  FROM usage_events
+                 WHERE scope = 'turn' AND scope_id IS NOT NULL
+                 GROUP BY instance_id, scope, scope_id,
+                          COALESCE(source_session_id, '')
+                HAVING COUNT(*) > 1)",
+        },
+    ];
+
+    // Survivors (MIN rowid per collision group) stay; every later captured row
+    // is removed and later re-fed through the live upsert.
+    let mut captured: Vec<(i64, UsageEventRow)> = Vec::new();
+    for fold in &folds {
+        let sql = format!(
+            "SELECT rowid, instance_id, seq, profile_id, model, scope, scope_id, turn_id,
+                    metric_revision, source_session_id, mode,
+                    total_tokens, input_tokens, output_tokens,
+                    cache_read_tokens, cache_write_tokens, cost_usd, accounting,
+                    observed_at, observed_at_source, native_context_window
+             FROM usage_events
+             WHERE scope = ?1 AND scope_id IS NOT NULL
+               AND {predicate}
+             ORDER BY instance_id, scope, scope_id,
+                      COALESCE(source_session_id, ''), rowid",
+            predicate = fold.predicate
+        );
+        let mut st = conn.prepare(&sql)?;
+        let rows = st.query_map(params![fold.scope], |r| {
+            let rowid: i64 = r.get(0)?;
+            let row = UsageEventRow {
+                instance_id: r.get(1)?,
+                seq: r.get(2)?,
+                profile_id: r.get(3)?,
+                model: r.get(4)?,
+                scope: r.get(5)?,
+                scope_id: r.get(6)?,
+                turn_id: r.get(7)?,
+                metric_revision: r.get(8)?,
+                source_session_id: r.get(9)?,
+                mode: r.get(10)?,
+                total_tokens: r.get(11)?,
+                input_tokens: r.get(12)?,
+                output_tokens: r.get(13)?,
+                cache_read_tokens: r.get(14)?,
+                cache_write_tokens: r.get(15)?,
+                cost_usd: r.get(16)?,
+                accounting: r.get(17)?,
+                observed_at: r.get(18)?,
+                observed_at_source: r.get(19)?,
+                native_context_window: r.get(20)?,
+            };
+            Ok((rowid, row))
+        })?;
+        let mut group_key: Option<(String, String, String)> = None;
+        for item in rows {
+            let (rowid, row) = item?;
+            // Within the ordered stream, only the FIRST row of each collision
+            // group is its survivor (MIN rowid). Turn groups additionally
+            // distinguish the lineage column; it is constant inside the
+            // ORDER BY partition, so (instance, scope, scope_id) plus a
+            // lineage change detection below is sufficient.
+            let key = (
+                row.instance_id.clone(),
+                row.scope_id.clone().unwrap_or_default(),
+                row.source_session_id.clone().unwrap_or_default(),
+            );
+            let is_new_group = group_key.as_ref() != Some(&key);
+            if is_new_group {
+                group_key = Some(key);
+            } else {
+                captured.push((rowid, row));
+            }
+        }
+    }
+    if captured.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Remove the captured physical copies so the unique indexes can build.
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS r46_fold_rowids(value INTEGER PRIMARY KEY);
+         DELETE FROM r46_fold_rowids;",
+    )?;
+    {
+        let mut ins = conn.prepare("INSERT INTO r46_fold_rowids(value) VALUES (?1)")?;
+        for (rowid, _) in &captured {
+            ins.execute(params![rowid])?;
+        }
+    }
     conn.execute(
-        "UPDATE usage_events SET lineage_state = 'legacy'
-         WHERE lineage_state IS NULL OR lineage_state = ''",
+        "DELETE FROM usage_events WHERE rowid IN (SELECT value FROM r46_fold_rowids)",
         [],
     )?;
-    Ok(rebuilt)
+    // Returned in per-group rowid order; the caller creates the unique indexes
+    // and then re-feeds these in global rowid order, so INSERT OR IGNORE hits
+    // the survivor and the live revision/metadata rule folds the content.
+    Ok(captured)
 }
 
 #[derive(Clone, Debug)]
@@ -569,92 +752,6 @@ fn persist_reconciled_turn(conn: &Connection, frame: &TurnFrame) -> rusqlite::Re
         ],
     )?;
     Ok(())
-}
-
-fn reconcile_session_chains(conn: &Connection) -> rusqlite::Result<usize> {
-    struct Pending {
-        rowid: i64,
-        instance: String,
-        scope: Option<String>,
-        point: SessionStockPoint,
-    }
-    let mut stmt = conn.prepare(
-        "SELECT rowid, instance_id, scope_id, total_tokens, input_tokens,
-                output_tokens, cache_read_tokens, cache_write_tokens, cost_usd
-         FROM usage_events
-         WHERE scope = 'session'
-         ORDER BY instance_id ASC,
-                  CASE WHEN scope_id IS NULL THEN 1 ELSE 0 END,
-                  scope_id ASC,
-                  rowid ASC",
-    )?;
-    let rows: Vec<Pending> = stmt
-        .query_map([], |r| {
-            Ok(Pending {
-                rowid: r.get(0)?,
-                instance: r.get(1)?,
-                scope: r.get(2)?,
-                point: SessionStockPoint {
-                    counters: SnapshotCounters {
-                        total: r.get(3)?,
-                        input: r.get(4)?,
-                        output: r.get(5)?,
-                        cache_read: r.get(6)?,
-                        cache_write: r.get(7)?,
-                    },
-                    cost: parse_cost(r.get::<_, Option<String>>(8)?),
-                },
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    drop(stmt);
-
-    let mut current_key: Option<(String, Option<String>)> = None;
-    let mut accepted: Vec<SessionStockPoint> = Vec::new();
-    let mut removed = 0usize;
-    for row in &rows {
-        let key = Some((row.instance.clone(), row.scope.clone()));
-        if key != current_key {
-            current_key = key;
-            accepted.clear();
-        }
-        match decide_session_point(&row.point, &accepted) {
-            SessionPointDecision::Freeze => {
-                removed += conn.execute(
-                    "DELETE FROM usage_events WHERE rowid = ?1",
-                    params![row.rowid],
-                )?;
-            }
-            SessionPointDecision::Accept { strip_reset_cost } => {
-                // The shared live acceptance (accept_session_point) re-checks
-                // freeze after stripping: a point whose reset cost made it
-                // identical to an accepted point is frozen, never stored.
-                let stripped_freeze = strip_reset_cost && {
-                    let mut stripped = row.point;
-                    stripped.cost = None;
-                    freezes_against(&stripped, &accepted)
-                };
-                if stripped_freeze {
-                    removed += conn.execute(
-                        "DELETE FROM usage_events WHERE rowid = ?1",
-                        params![row.rowid],
-                    )?;
-                } else if strip_reset_cost {
-                    // Persist the reset estimate as Unknown exactly as live.
-                    conn.execute(
-                        "UPDATE usage_events SET cost_usd = NULL WHERE rowid = ?1",
-                        params![row.rowid],
-                    )?;
-                    let mut kept = row.point;
-                    kept.cost = None;
-                    accepted.push(kept);
-                } else {
-                    accepted.push(row.point);
-                }
-            }
-        }
-    }
-    Ok(removed)
 }
 
 pub fn insert_usage_event(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
@@ -6897,24 +6994,23 @@ mod tests {
         }
     }
 
-    /// Canonical FULL-row fingerprint of every usage column EXCEPT
-    /// lineage_state: that tag is provenance metadata ('legacy' for rows
-    /// recovered from fallback vs NULL for rows ingested live) and is allowed
-    /// to differ between a fallback-recovered database and its independent live
-    /// reference; everything else must be identical.
+    /// Canonical FULL-row fingerprint of EVERY usage column, including
+    /// lineage_state. AE2: replayed rows are live rows column for column, so a
+    /// recovered database must match its independent live reference on all 21
+    /// columns.
     fn r43_dump_rows(conn: &Connection) -> Vec<Vec<Option<String>>> {
         conn.prepare(
             "SELECT instance_id, seq, profile_id, model, scope, scope_id, turn_id,
                     mode, total_tokens, input_tokens, output_tokens,
                     cache_read_tokens, cache_write_tokens, cost_usd, accounting,
                     observed_at, observed_at_source, metric_revision,
-                    source_session_id, native_context_window
+                    source_session_id, native_context_window, lineage_state
              FROM usage_events
-             ORDER BY 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20",
+             ORDER BY 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21",
         )
         .unwrap()
         .query_map([], |r| {
-            (0..20)
+            (0..21)
                 .map(|i| {
                     Ok(match r.get_ref(i)? {
                         rusqlite::types::ValueRef::Null => None,
@@ -6931,22 +7027,6 @@ mod tests {
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap()
-    }
-
-    /// All replayed rows in a recovered database carry the `legacy` provenance
-    /// tag; a fully-live reference carries none. The content fingerprint
-    /// (r43_dump_rows) otherwise matches exactly.
-    fn r45_all_lineage_states(conn: &Connection, instance: &str) -> Vec<String> {
-        let mut st = conn
-            .prepare(
-                "SELECT COALESCE(lineage_state, '') FROM usage_events
-                 WHERE instance_id = ?1 ORDER BY seq, rowid",
-            )
-            .unwrap();
-        st.query_map(params![instance], |r| r.get::<_, String>(0))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect()
     }
 
     #[derive(Clone, Copy)]
@@ -7521,32 +7601,6 @@ mod tests {
             twice_rows,
             "seed {seed}: fallback recovery equals independent live reference"
         );
-        // Provenance: any row that began under the fallback schema is replayed
-        // and stays lineage_state='legacy'; a fully-live database tags nothing.
-        // (Content matches via r43_dump_rows; only this tag may differ.)
-        if any_legacy {
-            let mut legacy_count = 0usize;
-            let mut live_tagged = 0usize;
-            for ii in 0..n_instances {
-                let inst = format!("ins_prop_{ii}");
-                legacy_count += r45_all_lineage_states(&conn, &inst)
-                    .iter()
-                    .filter(|s| s.as_str() == "legacy")
-                    .count();
-                live_tagged += r45_all_lineage_states(&live_ref, &inst)
-                    .iter()
-                    .filter(|s| s.as_str() == "legacy")
-                    .count();
-            }
-            assert!(
-                legacy_count > 0,
-                "seed {seed}: replayed fallback rows tagged legacy"
-            );
-            assert_eq!(
-                live_tagged, 0,
-                "seed {seed}: the live reference is never tagged"
-            );
-        }
 
         // Grand instance totals over every instance.
         let mut grand_input: Option<i64> = Some(0);
@@ -7818,17 +7872,6 @@ mod tests {
             r43_dump_rows(&lv),
             "fallback replay equals independent live ingest"
         );
-        assert_eq!(
-            r45_all_lineage_states(&fb, "ins_ae_a"),
-            vec!["legacy".to_string()],
-            "replayed row keeps fallback provenance"
-        );
-        assert!(
-            r45_all_lineage_states(&lv, "ins_ae_a")
-                .iter()
-                .all(|s| s.is_empty()),
-            "the live reference is not legacy-tagged"
-        );
         let req = RollupRequest {
             instance_id: "ins_ae_a",
             kind: "codex",
@@ -7875,10 +7918,6 @@ mod tests {
             r43_dump_rows(&fb),
             r43_dump_rows(&lv),
             "envelope-only identity replays equal to live"
-        );
-        assert_eq!(
-            r45_all_lineage_states(&fb, "ins_ae_b"),
-            vec!["legacy".to_string()]
         );
         let sid: Option<String> = fb
             .query_row(
@@ -7933,10 +7972,6 @@ mod tests {
             r43_dump_rows(&fb),
             r43_dump_rows(&lv),
             "stale-revision replay matches live rejection"
-        );
-        assert_eq!(
-            r45_all_lineage_states(&fb, "ins_ae_c"),
-            vec!["legacy".to_string()]
         );
         let (n, rev, window, source): (i64, i64, Option<i64>, String) = fb
             .query_row(
@@ -8029,12 +8064,6 @@ mod tests {
             r43_dump_rows(&lv),
             "fallback -> live counter -> migrate equals fully-live reference"
         );
-        // The single recovered survivor stays legacy-tagged; the live
-        // post-migration counter frame is merged onto it by the live upsert.
-        assert_eq!(
-            r45_all_lineage_states(&fb, "ins_ae_d"),
-            vec!["legacy".to_string()]
-        );
         let (window, total): (Option<i64>, Option<i64>) = fb
             .query_row(
                 "SELECT native_context_window, total_tokens
@@ -8049,6 +8078,596 @@ mod tests {
             "counter frame retains first window"
         );
         assert_eq!(total, Some(500_000), "counter frame contributes counters");
+    }
+
+    // ---- r46 AE2: complete, undecorated instance replay --------------------
+
+    /// An UPGRADE fixture: a previous-release database that already carries the
+    /// full current schema (and the live invariant indexes) but NOT the
+    /// one-time `journal_replay_v1` marker, so the reopen migration replays.
+    fn r46_upgrade_fixture() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        create_journal_table(&conn);
+        conn.execute(
+            "DELETE FROM usage_schema_meta WHERE key = 'journal_replay_v1'",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    /// Independent live reference: a fresh current-schema database ingesting
+    /// the same journal frames through the live path in journal order.
+    fn r46_live_reference(records: &[JournalRecord]) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        create_journal_table(&conn);
+        for r in records {
+            insert_journal_raw(&conn, r);
+            let row = project_usage_event(r, Some("pvp"), Some("m-a")).unwrap();
+            insert_usage_event(&conn, &row).unwrap();
+        }
+        conn
+    }
+
+    /// Instance aggregate, per-model supply and rollup must agree column-for-
+    /// column with the independent live reference.
+    fn r46_assert_accounting_equal(fb: &Connection, lv: &Connection, inst: &str) {
+        let a = aggregate_instance(fb, inst).unwrap();
+        let b = aggregate_instance(lv, inst).unwrap();
+        assert_eq!(a.events, b.events, "{inst} events");
+        assert_eq!(a.ambiguous_events, b.ambiguous_events, "{inst} ambiguous");
+        assert_eq!(a.ambiguous, b.ambiguous, "{inst} ambiguous flag");
+        assert_eq!(a.total_tokens, b.total_tokens, "{inst} total");
+        assert_eq!(a.input_tokens, b.input_tokens, "{inst} input");
+        assert_eq!(a.output_tokens, b.output_tokens, "{inst} output");
+        assert_eq!(a.token_event_rows, b.token_event_rows, "{inst} rows");
+        assert_eq!(a.unavailable, b.unavailable, "{inst} unavailable");
+        match (a.cost_usd, b.cost_usd) {
+            (Some(x), Some(y)) => assert!((x - y).abs() < 1e-9, "{inst} cost {x} vs {y}"),
+            (x, y) => assert_eq!(x, y, "{inst} cost Unknown parity"),
+        }
+        let model = "m-a";
+        let sa = aggregate_supply(fb, "pvp", model).unwrap();
+        let sb = aggregate_supply(lv, "pvp", model).unwrap();
+        assert_eq!(sa.events, sb.events, "{inst} supply events");
+        assert_eq!(
+            sa.ambiguous_events, sb.ambiguous_events,
+            "{inst} supply ambiguous"
+        );
+        assert_eq!(sa.total_tokens, sb.total_tokens, "{inst} supply total");
+        assert_eq!(sa.input_tokens, sb.input_tokens, "{inst} supply input");
+        assert_eq!(sa.output_tokens, sb.output_tokens, "{inst} supply output");
+        assert_eq!(sa.cost_usd, sb.cost_usd, "{inst} supply cost");
+        let req = RollupRequest {
+            instance_id: inst,
+            kind: "codex",
+            spec_model: Some("m-a"),
+            effective_model: None,
+            profile_id: Some("pvp"),
+        };
+        assert_eq!(
+            rollup_instance(fb, &req).unwrap(),
+            rollup_instance(lv, &req).unwrap(),
+            "{inst} rollup"
+        );
+    }
+
+    #[test]
+    fn r46_a_upgrade_message_revision_chain_replays_the_full_journal() {
+        // The r45 high: the live Message upsert keeps the FIRST seq while rev2
+        // arrives at seq2, so selecting frames by surviving physical seq rolled
+        // rev2 back to rev1.
+        let rec1 = r44_wire_record(
+            "ins_r46a",
+            1,
+            "message",
+            Some("mk:file-X"),
+            None,
+            Some("mt1"),
+            1,
+            "estimated",
+            [
+                Basket::Unknown,
+                Basket::Known(100),
+                Basket::Known(0),
+                Basket::NotApplicable,
+                Basket::NotApplicable,
+            ],
+            Some("0.01"),
+            None,
+            Some("2026-10-20T00:00:01.000Z"),
+        );
+        let rec2 = r44_wire_record(
+            "ins_r46a",
+            2,
+            "message",
+            Some("mk:file-X"),
+            None,
+            Some("mt1"),
+            2,
+            "estimated",
+            [
+                Basket::Unknown,
+                Basket::Known(150),
+                Basket::Known(10),
+                Basket::NotApplicable,
+                Basket::NotApplicable,
+            ],
+            Some("0.02"),
+            None,
+            Some("2026-10-20T00:00:02.000Z"),
+        );
+        let fb = r46_upgrade_fixture();
+        for r in [&rec1, &rec2] {
+            insert_journal_raw(&fb, r);
+            let row = project_usage_event(r, Some("pvp"), Some("m-a")).unwrap();
+            insert_usage_event(&fb, &row).unwrap();
+        }
+        // The live upsert collapsed both frames onto one seq-1 physical row.
+        let n_before: i64 = fb
+            .query_row(
+                "SELECT COUNT(*) FROM usage_events
+                 WHERE instance_id='ins_r46a' AND scope='message'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n_before, 1);
+        migrate(&fb).unwrap();
+        let (rev, inp, cost): (i64, Option<i64>, Option<String>) = fb
+            .query_row(
+                "SELECT metric_revision, input_tokens, cost_usd FROM usage_events
+                 WHERE instance_id='ins_r46a' AND scope='message'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(rev, 2, "accepted revision 2 survives replay");
+        assert_eq!(inp, Some(150), "accepted counters survive replay");
+        assert_eq!(cost.as_deref(), Some("0.02"), "corrected bill survives");
+        let lv = r46_live_reference(&[rec1, rec2]);
+        assert_eq!(
+            r43_dump_rows(&fb),
+            r43_dump_rows(&lv),
+            "full rows equal the independent live reference"
+        );
+        r46_assert_accounting_equal(&fb, &lv, "ins_r46a");
+        let once = r43_dump_rows(&fb);
+        migrate(&fb).unwrap();
+        assert_eq!(once, r43_dump_rows(&fb), "migrate twice == once");
+    }
+
+    #[test]
+    fn r46_b_upgrade_turn_final_tokenless_correction() {
+        // Complementary Turn failure: the live Turn upsert ADVANCES seq onto
+        // the tokenless correction's seq; replaying only that seq loses the
+        // counters/window/native time of the first counter frame.
+        let rec1 = r44_wire_record(
+            "ins_r46b",
+            1,
+            "turn",
+            Some("t1"),
+            Some("sess-S"),
+            Some("t1"),
+            1,
+            "estimated",
+            [
+                Basket::Known(110),
+                Basket::Known(100),
+                Basket::Known(10),
+                Basket::Known(0),
+                Basket::Known(0),
+            ],
+            Some("0.01"),
+            Some(1_000_000),
+            Some("2026-10-20T00:00:01.000Z"),
+        );
+        let rec2 = r44_wire_record(
+            "ins_r46b",
+            2,
+            "turn",
+            Some("t1"),
+            Some("sess-S"),
+            Some("t1"),
+            2,
+            "estimated",
+            [Basket::Unknown; 5],
+            Some("0.02"),
+            None,
+            None,
+        );
+        let fb = r46_upgrade_fixture();
+        for r in [&rec1, &rec2] {
+            insert_journal_raw(&fb, r);
+            let row = project_usage_event(r, Some("pvp"), Some("m-a")).unwrap();
+            insert_usage_event(&fb, &row).unwrap();
+        }
+        let (phys_seq,): (i64,) = fb
+            .query_row(
+                "SELECT seq FROM usage_events
+                 WHERE instance_id='ins_r46b' AND scope='turn'",
+                [],
+                |r| Ok((r.get(0)?,)),
+            )
+            .unwrap();
+        assert_eq!(phys_seq, 2, "the live turn upsert advanced seq to 2");
+        migrate(&fb).unwrap();
+        struct TurnAfter {
+            revision: i64,
+            seq: Option<i64>,
+            total: Option<i64>,
+            input: Option<i64>,
+            output: Option<i64>,
+            window: Option<i64>,
+            at_source: String,
+        }
+        let row: TurnAfter = fb
+            .query_row(
+                "SELECT metric_revision, seq, total_tokens, input_tokens, output_tokens,
+                        native_context_window, observed_at_source
+                 FROM usage_events WHERE instance_id='ins_r46b' AND scope='turn'",
+                [],
+                |r| {
+                    Ok(TurnAfter {
+                        revision: r.get(0)?,
+                        seq: r.get(1)?,
+                        total: r.get(2)?,
+                        input: r.get(3)?,
+                        output: r.get(4)?,
+                        window: r.get(5)?,
+                        at_source: r.get(6)?,
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!(row.revision, 2);
+        assert_eq!(
+            row.seq,
+            Some(2),
+            "surviving row stays at the correction seq"
+        );
+        assert_eq!(row.total, Some(110), "first-frame counters retained");
+        assert_eq!(row.input, Some(100));
+        assert_eq!(row.output, Some(10));
+        assert_eq!(row.window, Some(1_000_000), "first-frame window retained");
+        let lv = r46_live_reference(&[rec1.clone(), rec2.clone()]);
+        let cost: Option<String> = fb
+            .query_row(
+                "SELECT cost_usd FROM usage_events
+                 WHERE instance_id='ins_r46b' AND scope='turn'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cost.as_deref(), Some("0.02"), "the correction bill wins");
+        assert_eq!(row.at_source, "native", "first-frame native clock retained");
+        assert_eq!(
+            r43_dump_rows(&fb),
+            r43_dump_rows(&lv),
+            "full rows equal the independent live reference"
+        );
+        r46_assert_accounting_equal(&fb, &lv, "ins_r46b");
+        let once = r43_dump_rows(&fb);
+        migrate(&fb).unwrap();
+        assert_eq!(once, r43_dump_rows(&fb), "migrate twice == once");
+    }
+
+    #[test]
+    fn r46_c_unmatched_identified_turn_beside_scoped_session_bills_like_live() {
+        // Defect 2: an identified Turn with known counters and no proven source
+        // session, next to a scoped Session, is valid unmatched LIVE flow and
+        // must never be reclassified into ambiguous/Unknown by a replay tag.
+        let turn = r44_wire_record(
+            "ins_r46c",
+            1,
+            "turn",
+            Some("t1"),
+            None,
+            Some("t1"),
+            1,
+            "estimated",
+            [
+                Basket::Known(110),
+                Basket::Known(100),
+                Basket::Known(10),
+                Basket::Known(0),
+                Basket::Known(0),
+            ],
+            Some("0.01"),
+            None,
+            Some("2026-10-20T00:00:01.000Z"),
+        );
+        let session = r44_wire_record(
+            "ins_r46c",
+            2,
+            "session",
+            Some("s1"),
+            Some("s1"),
+            None,
+            1,
+            "estimated",
+            [
+                Basket::Known(280),
+                Basket::Known(250),
+                Basket::Known(30),
+                Basket::NotApplicable,
+                Basket::NotApplicable,
+            ],
+            Some("3.00"),
+            None,
+            Some("2026-10-20T00:00:02.000Z"),
+        );
+        // Upgrade the r28 fallback shape (journal frames + 14-column rows).
+        let (fb, lv) = r45_fallback_vs_live(&[turn, session], "pvp", "m-a");
+        let agg = aggregate_instance(&fb, "ins_r46c").unwrap();
+        assert_eq!(agg.ambiguous_events, 0, "the live turn is not ambiguous");
+        assert_eq!(agg.input_tokens, Some(100), "the unmatched live turn bills");
+        assert_eq!(agg.cost_usd, Some(0.01), "no Unknown is introduced");
+        assert_eq!(
+            r43_dump_rows(&fb),
+            r43_dump_rows(&lv),
+            "every column incl lineage_state equals live"
+        );
+        r46_assert_accounting_equal(&fb, &lv, "ins_r46c");
+    }
+
+    /// Raw insert of a usage row in the current-schema column set, bypassing
+    /// the unique indexes (used to simulate rows accumulated while an earlier
+    /// migration window was rolled back).
+    fn r46_raw_insert(conn: &Connection, row: &UsageEventRow, lineage: Option<&str>) {
+        conn.execute(
+            "INSERT INTO usage_events
+                (instance_id, seq, profile_id, model, scope, scope_id, turn_id, mode,
+                 metric_revision, source_session_id, total_tokens, input_tokens,
+                 output_tokens, cache_read_tokens, cache_write_tokens, cost_usd,
+                 accounting, observed_at, observed_at_source, native_context_window,
+                 lineage_state)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+            params![
+                row.instance_id,
+                row.seq,
+                row.profile_id,
+                row.model,
+                row.scope,
+                row.scope_id,
+                row.turn_id,
+                row.mode,
+                row.metric_revision,
+                row.source_session_id,
+                row.total_tokens,
+                row.input_tokens,
+                row.output_tokens,
+                row.cache_read_tokens,
+                row.cache_write_tokens,
+                row.cost_usd,
+                row.accounting,
+                row.observed_at,
+                row.observed_at_source,
+                row.native_context_window,
+                lineage,
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn r46_d_unjournaled_duplicates_fold_by_the_live_rule_else_unchanged() {
+        // Defect 3: two unjournaled duplicate rows colliding on a new unique
+        // key are folded in rowid order through the live upsert rule (higher
+        // revision wins, omitted metadata retained) — never deleted by a
+        // keep-MIN(rowid) sweep. Every other unjournaled row is byte-identical.
+        let mk1_seq1 = UsageEventRow {
+            instance_id: "ins_r46d".into(),
+            seq: 1,
+            profile_id: Some("pvp".into()),
+            model: Some("m-a".into()),
+            scope: "message".into(),
+            scope_id: Some("mk1".into()),
+            turn_id: None,
+            metric_revision: 1,
+            source_session_id: None,
+            mode: "snapshot".into(),
+            total_tokens: Some(100),
+            input_tokens: Some(100),
+            output_tokens: Some(0),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            cost_usd: Some("0.01".into()),
+            accounting: "estimated".into(),
+            observed_at: "2026-10-20T00:00:01.000Z".into(),
+            observed_at_source: "native".into(),
+            native_context_window: None,
+        };
+        let mut mk1_seq2 = mk1_seq1.clone();
+        mk1_seq2.seq = 2;
+        mk1_seq2.metric_revision = 2;
+        mk1_seq2.total_tokens = Some(150);
+        mk1_seq2.input_tokens = Some(150);
+        mk1_seq2.output_tokens = Some(10);
+        mk1_seq2.cost_usd = Some("0.02".into());
+        mk1_seq2.observed_at = "2026-10-20T00:00:02.000Z".into();
+        let t1_seq10 = UsageEventRow {
+            seq: 10,
+            scope: "turn".into(),
+            scope_id: Some("t1".into()),
+            metric_revision: 1,
+            total_tokens: Some(100),
+            input_tokens: Some(90),
+            output_tokens: Some(10),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            cost_usd: Some("1.00".into()),
+            observed_at: "2026-10-20T00:00:03.000Z".into(),
+            ..mk1_seq1.clone()
+        };
+        let mut t1_seq11 = t1_seq10.clone();
+        t1_seq11.seq = 11;
+        t1_seq11.metric_revision = 2;
+        t1_seq11.total_tokens = Some(120);
+        t1_seq11.input_tokens = Some(110);
+        let mut mk2 = mk1_seq1.clone();
+        mk2.seq = 20;
+        mk2.scope_id = Some("mk2".into());
+        mk2.total_tokens = Some(7);
+        mk2.input_tokens = Some(7);
+        mk2.cost_usd = None;
+        mk2.observed_at = "2026-10-20T00:00:04.000Z".into();
+        let sp1 = UsageEventRow {
+            seq: 21,
+            scope: "session".into(),
+            scope_id: Some("sp1".into()),
+            metric_revision: 1,
+            source_session_id: Some("sp1".into()),
+            mode: "snapshot".into(),
+            total_tokens: Some(300),
+            input_tokens: Some(300),
+            output_tokens: Some(0),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            cost_usd: None,
+            accounting: "reported".into(),
+            observed_at: "2026-10-20T00:00:05.000Z".into(),
+            observed_at_source: "native".into(),
+            native_context_window: None,
+            ..mk1_seq1.clone()
+        };
+
+        let fb = r46_upgrade_fixture();
+        // An unrelated journal-backed instance so replay has real work.
+        let other = r44_wire_record(
+            "ins_r46o",
+            1,
+            "session",
+            Some("so1"),
+            Some("so1"),
+            None,
+            1,
+            "estimated",
+            [
+                Basket::Known(11),
+                Basket::Known(11),
+                Basket::NotApplicable,
+                Basket::NotApplicable,
+                Basket::NotApplicable,
+            ],
+            None,
+            None,
+            Some("2026-10-20T00:00:00.000Z"),
+        );
+        insert_journal_raw(&fb, &other);
+        insert_usage_event(
+            &fb,
+            &project_usage_event(&other, Some("pvp"), Some("m-a")).unwrap(),
+        )
+        .unwrap();
+        // Rolled-back migration window: the new unique indexes were dropped and
+        // physical duplicates accumulated.
+        fb.execute_batch(
+            "DROP INDEX IF EXISTS usage_events_message_dedupe;
+             DROP INDEX IF EXISTS usage_events_turn_dedupe;",
+        )
+        .unwrap();
+        let unjournaled = [&mk1_seq1, &mk1_seq2, &t1_seq10, &t1_seq11, &mk2, &sp1];
+        for r in &unjournaled {
+            r46_raw_insert(&fb, r, None);
+        }
+        let before = r43_dump_rows(&fb);
+        migrate(&fb).unwrap();
+
+        // One physical survivor per folded key, folded by the live rule.
+        let (mseq, mrev, minp, mcost): (i64, i64, Option<i64>, Option<String>) = fb
+            .query_row(
+                "SELECT seq, metric_revision, input_tokens, cost_usd FROM usage_events
+                 WHERE instance_id='ins_r46d' AND scope='message' AND scope_id='mk1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(mseq, 1, "message survivor keeps the earliest physical seq");
+        assert_eq!(mrev, 2, "higher revision wins");
+        assert_eq!(minp, Some(150), "rev2 counters folded, not discarded");
+        assert_eq!(mcost.as_deref(), Some("0.02"));
+        let (tseq, trev, tinp): (i64, i64, Option<i64>) = fb
+            .query_row(
+                "SELECT seq, metric_revision, input_tokens FROM usage_events
+                 WHERE instance_id='ins_r46d' AND scope='turn' AND scope_id='t1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(tseq, 11, "the live turn fold advances seq");
+        assert_eq!(trev, 2);
+        assert_eq!(tinp, Some(110));
+        let dupes: i64 = fb
+            .query_row(
+                "SELECT COUNT(*) FROM (
+                    SELECT 1 FROM usage_events
+                     WHERE instance_id='ins_r46d' AND scope_id IS NOT NULL
+                     GROUP BY scope, scope_id, COALESCE(source_session_id,'')
+                    HAVING COUNT(*) > 1)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dupes, 0);
+
+        // Preservation: every unjournaled row OUTSIDE the two collision groups
+        // is byte-identical after migration (all 21 columns). The groups'
+        // survivors change by design (the captured rev2 folds onto them); the
+        // folded end state is verified against the independent live reference
+        // below.
+        let after_once = r43_dump_rows(&fb);
+        let fold_touched = [
+            ("message", "1"),
+            ("message", "2"),
+            ("turn", "10"),
+            ("turn", "11"),
+        ];
+        for row in &before {
+            let in_fold_group = row[0].as_deref() == Some("ins_r46d")
+                && fold_touched.iter().any(|(scope, seq)| {
+                    row[4].as_deref() == Some(*scope) && row[1].as_deref() == Some(*seq)
+                });
+            if !in_fold_group && row[0].as_deref() != Some("ins_r46o") {
+                assert!(
+                    after_once.contains(row),
+                    "unjournaled row preserved column-for-column: {row:?}"
+                );
+            }
+        }
+
+        // Independent live expectation: feed the same rows through the live
+        // upsert in rowid order on a current-schema database.
+        let lv = Connection::open_in_memory().unwrap();
+        migrate(&lv).unwrap();
+        create_journal_table(&lv);
+        insert_journal_raw(&lv, &other);
+        insert_usage_event(
+            &lv,
+            &project_usage_event(&other, Some("pvp"), Some("m-a")).unwrap(),
+        )
+        .unwrap();
+        for r in &unjournaled {
+            insert_usage_event(&lv, r).unwrap();
+        }
+        migrate(&lv).unwrap();
+        assert_eq!(
+            r43_dump_rows(&fb),
+            r43_dump_rows(&lv),
+            "folded+preserved state equals the live upsert expectation"
+        );
+
+        // (e) migrate twice == once.
+        migrate(&fb).unwrap();
+        assert_eq!(after_once, r43_dump_rows(&fb), "migrate twice == once");
+        migrate(&lv).unwrap();
+        assert_eq!(
+            r43_dump_rows(&fb),
+            r43_dump_rows(&lv),
+            "second migration keeps both sides equal"
+        );
     }
 
     #[test]
@@ -12644,6 +13263,14 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
         create_journal_table(&conn);
+        // r46: construct a PREVIOUS-RELEASE current-schema upgrade fixture —
+        // the replay marker must NOT already be installed, or the reopen below
+        // skips replay and this test proves nothing.
+        conn.execute(
+            "DELETE FROM usage_schema_meta WHERE key = 'journal_replay_v1'",
+            [],
+        )
+        .unwrap();
 
         // Journal retains BOTH frames at their original sequences.
         let journal_usage = |_seq: i64, revision: i64, input: i64| {

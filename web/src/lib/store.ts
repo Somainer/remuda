@@ -3043,8 +3043,13 @@ class HubStore {
     return true;
   }
 
-  /** Fold one `instance.configure` permission lifecycle. */
-  private notePermissionLifecycle(instanceId: Id, observation: Observation) {
+  /**
+   * Fold one `instance.configure` permission lifecycle. `live=false` for
+   * replayed/recovered history (r2 item 4): an old permission lifecycle for
+   * a prior walk must never set/clear a CURRENT pending request — history
+   * hydrates observed state through notePermissionObservation only.
+   */
+  private notePermissionLifecycle(instanceId: Id, observation: Observation, live = true) {
     const payload = observation.payload as
       | { type?: string; nativeName?: string; status?: unknown }
       | undefined;
@@ -3056,7 +3061,7 @@ class HubStore {
           ? (payload.status as { value: unknown }).value
           : undefined;
     const parsed = permissionLifecycleStatus(value);
-    if (!parsed) return;
+    if (!parsed || !live) return;
     const pending = { ...this.state.permissionPending };
     if (parsed.kind === "queued") {
       pending[instanceId] = { mode: parsed.mode, queued: true, at: Date.now() };
@@ -3994,9 +3999,15 @@ class HubStore {
    * contiguity: the owed entry can sit just BELOW the cursor the live
    * stream advanced past (the live frames of the same turn), and the
    * JournalClient's resume read drops such a page when a live batch bumps
-   * its resume generation. Merge by seq, run the same live reducers, and
-   * settle matching bubbles/outbox rows. Screens are deliberately left to
-   * the screen paths so a late debt fold can never roll a newer screen.
+   * its resume generation.
+   *
+   * r2 item 4: every entry recovered here is HISTORICAL (read from durable
+   * storage behind a live cursor), so the request lifecycle reducers run
+   * with live=false — the same semantics as mount/seed replay. An old
+   * model-queued/degraded (or permission) lifecycle for a prior request
+   * must never overwrite or clear a CURRENT pending request; those
+   * reducers hydrate effective state only on replayed history. Screens are
+   * left to the screen paths so a late fold can never roll a newer screen.
    */
   private foldDebtWindow(instanceId: Id, events: Observation[]) {
     const current = this.state.events[instanceId] ?? [];
@@ -4008,12 +4019,13 @@ class HubStore {
         if (nextInstances.some((row, index) => row !== this.state.instances[index])) {
           this.emit({ instances: nextInstances });
         }
-        this.noteEffortObservation(instanceId, event, true);
-        this.noteEffortLifecycle(instanceId, event, true);
-        this.noteModelObservation(instanceId, event, true);
-        this.noteModelLifecycle(instanceId, event, true);
+        // Historical semantics: hydrate, never settle a live request.
+        this.noteEffortObservation(instanceId, event, false);
+        this.noteEffortLifecycle(instanceId, event, false);
+        this.noteModelObservation(instanceId, event, false);
+        this.noteModelLifecycle(instanceId, event, false);
         this.notePermissionObservation(instanceId, event);
-        this.notePermissionLifecycle(instanceId, event);
+        this.notePermissionLifecycle(instanceId, event, false);
       }
       const next = current.concat(fresh).sort((a, b) => Number(a.seq) - Number(b.seq));
       const phrase = liveSummary(next);
@@ -6175,7 +6187,7 @@ class HubStore {
         this.noteModelObservation(instanceId, event, false);
         this.noteModelLifecycle(instanceId, event, false);
         this.notePermissionObservation(instanceId, event);
-        this.notePermissionLifecycle(instanceId, event);
+        this.notePermissionLifecycle(instanceId, event, false);
       }
       const read: JournalRead = async (args) => {
         if (args.journalId === mockJournalIds.journalGap && args.afterSeq && Number(args.afterSeq) > 0) {
@@ -6279,7 +6291,7 @@ class HubStore {
             this.noteModelObservation(instanceId, event, false);
             this.noteModelLifecycle(instanceId, event, false);
             this.notePermissionObservation(instanceId, event);
-            this.notePermissionLifecycle(instanceId, event);
+            this.notePermissionLifecycle(instanceId, event, false);
           }
           this.emit({
             instances: applyInstanceActivity(this.state.instances, fresh),

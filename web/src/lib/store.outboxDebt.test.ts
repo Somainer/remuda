@@ -535,3 +535,56 @@ it("a storage-aborted terminal write keeps the debt, shows 状态待确认 in me
     vi.useRealTimers();
   }
 });
+
+it("a historical configure lifecycle recovered by the debt fold never overwrites the current pending request", async () => {
+  // r2 item 4: foldDebtWindow is a RECOVERY read — entries below the live
+  // cursor get historical semantics (live=false). An old queued/degraded
+  // lifecycle for request A must not replace or clear request B pending.
+  const { api, hubStore } = await fresh();
+  await mountFollow(api, hubStore);
+
+  const configureLifecycle = (seq: number, eventId: string, status: string): Observation =>
+    ({
+      eventId,
+      instanceId: INSTANCE,
+      journalId: JOURNAL,
+      seq: String(seq),
+      kind: "lifecycle",
+      observedAt: `2026-10-18T00:0${seq}:00Z`,
+      source: { channel: "runtime" },
+      payload: {
+        type: "native",
+        nativeName: "instance.configure",
+        nativeId: { state: "not-applicable" },
+        status: { state: "known", value: status },
+        relatedIds: {},
+      },
+    }) as unknown as Observation;
+
+  // Request B is live-pending now (inject through the store's live reducer
+  // directly; the mock JournalClient would gap-rule a seq-2 batch).
+  const live = (
+    hubStore as unknown as { noteModelLifecycle: (id: string, ev: Observation) => void }
+  ).noteModelLifecycle.bind(hubStore) as (id: string, ev: Observation) => void;
+  live(INSTANCE, configureLifecycle(2, "evt_cfg_B", "model-queued:model-B"));
+  const pending = () =>
+    (
+      hubStore as unknown as {
+        state: { modelPending: Record<string, { id: string; queued: boolean } | undefined> };
+      }
+    ).state.modelPending[INSTANCE];
+  expect(pending()?.id).toBe("model-B");
+
+  const fold = (
+    hubStore as unknown as { foldDebtWindow: (id: string, events: Observation[]) => void }
+  ).foldDebtWindow.bind(hubStore) as (id: string, events: Observation[]) => void;
+
+  // The debt tail recovers an OLD queued lifecycle for request A (a gap
+  // below the cursor, seq 1). It must hydrate history, not replace B.
+  fold(INSTANCE, [configureLifecycle(1, "evt_cfg_A_old", "model-queued:model-A")]);
+  expect(pending()?.id).toBe("model-B");
+
+  // An old DEGRADED lifecycle for A must not clear B or toast/revert either.
+  fold(INSTANCE, [configureLifecycle(1, "evt_cfg_A_bad", "model-degraded:model-A:not-found")]);
+  expect(pending()?.id).toBe("model-B");
+});

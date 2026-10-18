@@ -116,6 +116,13 @@ function debtOf(hubStore: Store): Map<string, unknown> {
   return (hubStore as unknown as { reconcileOwed: Map<string, unknown> }).reconcileOwed;
 }
 
+/** The live-batch injector the follow subscription mock captured. */
+async function liveBatch(api: Api) {
+  const subscribe = vi.mocked(api.eventsSubscribe);
+  await vi.waitFor(() => expect(subscribe.mock.calls.length).toBeGreaterThan(0));
+  return subscribe.mock.calls[0]?.[2] as (batch: Record<string, unknown>) => void;
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
   for (const store of liveStores.splice(0)) store.logout();
@@ -220,4 +227,63 @@ it("bounded tail re-read exhaustion moves the accepted bubble to the existing çŠ
   } finally {
     vi.useRealTimers();
   }
+});
+
+it("a debt read BELOW the live cursor folds the missed command entry and settles the bubble", async () => {
+  // The e2e shape: the same turn's assistant frames advance the journal
+  // client's applied cursor past the missed user entry, and a normal
+  // resumeAfterReconnect read (generation-gated, cursor-anchored) can never
+  // fold it. The debt tail reads a window BELOW the cursor and folds by
+  // command id.
+  const { api, hubStore } = await fresh();
+  await mountFollow(api, hubStore);
+  vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+    const commandId = _args[4] as string;
+    return Promise.resolve(commandResult(commandId, "accepted"));
+  });
+
+  await hubStore.send(INSTANCE, "missed below cursor");
+  const bubble = () => hubStore.getSnapshot().bubbles[0]!;
+  await vi.waitFor(() => expect(bubble().outboxState).toBe("sent"));
+  const commandId = bubble().commandId!;
+
+  // The turn continues live: an assistant frame at seq 1 advances the
+  // client cursor (it is not the owed user message).
+  const onBatch = await liveBatch(api);
+  onBatch({
+    subscriptionId: "sub_outbox_debt",
+    journalId: JOURNAL,
+    fromSeq: "1",
+    toSeq: "1",
+    durableSeq: "1",
+    events: [
+      {
+        kind: "message",
+        eventId: "evt_assistant_1",
+        journalId: JOURNAL,
+        instanceId: INSTANCE,
+        seq: "1",
+        completeness: "structured",
+        payload: { role: "assistant", text: "working" },
+      } as unknown as Observation,
+    ],
+  });
+
+  // From now on the durable read sees the missed user entry; the debt read
+  // starts BELOW the applied cursor (afterSeq 0), so it still finds it.
+  vi.mocked(api.eventsRead).mockResolvedValue(userMessagePage(commandId));
+
+  await vi.waitFor(
+    () => {
+      const b = hubStore.getSnapshot().bubbles.find((x) => x.commandId === commandId)!;
+      expect(b.state).toBe("settled");
+      expect(b.outboxState).toBe("done");
+    },
+    { timeout: 5_000 },
+  );
+  const folded = hubStore
+    .getSnapshot()
+    .events[INSTANCE]?.some((e) => (e.payload as { commandId?: string }).commandId === commandId);
+  expect(folded).toBe(true);
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
 });

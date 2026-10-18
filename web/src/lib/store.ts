@@ -149,9 +149,10 @@ const RECONCILE_GET_INTERVAL_MS = 1_000;
  * (outbox "unknown" -> 状态待确认), never an eternal accepted bubble.
  */
 const OWED_TAIL_BASE_BACKOFF_MS = 500;
-const OWED_TAIL_MAX_BACKOFF_MS = 4_000;
-const OWED_TAIL_MAX_ATTEMPTS = 8;
-const OWED_TAIL_DEADLINE_MS = 30_000;
+const OWED_TAIL_MAX_BACKOFF_MS = 3_000;
+const OWED_TAIL_MAX_ATTEMPTS = 10;
+const OWED_TAIL_DEADLINE_MS = 45_000;
+const OWED_TAIL_WINDOW = 128;
 const OWED_UNCONFIRMED_REASON = "journal confirmation deadline";
 /** Bounded backoff for Hub-held (Node offline) same-id re-POSTs. */
 const HELD_RETRY_BASE_MS = 2_000;
@@ -3961,15 +3962,62 @@ class HubStore {
   }
 
   /**
+   * Ruling AD: fold a debt-driven durable tail window directly, by command
+   * id. Unlike the live onEvents path this does not rely on cursor
+   * contiguity: the owed entry can sit just BELOW the cursor the live
+   * stream advanced past (the live frames of the same turn), and the
+   * JournalClient's resume read drops such a page when a live batch bumps
+   * its resume generation. Merge by seq, run the same live reducers, and
+   * settle matching bubbles/outbox rows. Screens are deliberately left to
+   * the screen paths so a late debt fold can never roll a newer screen.
+   */
+  private foldDebtWindow(instanceId: Id, events: Observation[]) {
+    const current = this.state.events[instanceId] ?? [];
+    const seenIds = new Set(current.map((e) => e.eventId));
+    const fresh = events.filter((e) => !seenIds.has(e.eventId));
+    if (fresh.length) {
+      for (const event of fresh) {
+        const nextInstances = applyInstanceActivity(this.state.instances, [event]);
+        if (nextInstances.some((row, index) => row !== this.state.instances[index])) {
+          this.emit({ instances: nextInstances });
+        }
+        this.noteEffortObservation(instanceId, event, true);
+        this.noteEffortLifecycle(instanceId, event, true);
+        this.noteModelObservation(instanceId, event, true);
+        this.noteModelLifecycle(instanceId, event, true);
+        this.notePermissionObservation(instanceId, event);
+        this.notePermissionLifecycle(instanceId, event);
+      }
+      const next = current.concat(fresh).sort((a, b) => Number(a.seq) - Number(b.seq));
+      const phrase = liveSummary(next);
+      const summaries = { ...this.state.summaries };
+      if (phrase) summaries[instanceId] = phrase;
+      else delete summaries[instanceId];
+      this.emit({
+        instances: applyInstanceActivity(this.state.instances, fresh),
+        events: { ...this.state.events, [instanceId]: next },
+        summaries,
+      });
+    }
+    // settleFromJournal folds against the merged state (it reads
+    // this.state.events) and retires matching rows to done.
+    this.settleFromJournal(instanceId, this.state.events[instanceId] ?? events);
+  }
+
+  /**
    * Ruling AD: one pass of the bounded debt-driven tail re-read. Runs on the
    * instance's journal chain (serialized with the drain/reopen reads) and
-   * folds anything it reads through the normal journal listener. A read that
-   * observes the owed command's entry retires the row to done and clears the
-   * debt; an empty read schedules the next backed-off pass. With no journal
-   * client mounted the pass waits WITHOUT spending an attempt (the mount fold
-   * re-checks), but the wall deadline still bounds it. At the attempt cap or
-   * deadline the owed rows move to the existing not-confirmed state
-   * (outbox "unknown" -> 状态待确认): the accepted bubble never strands.
+   * folds anything it reads through {@link foldDebtWindow} — a fold the
+   * JournalClient's cursor/generation rules could otherwise suppress. A read
+   * that observes the owed command's entry retires the row to done and
+   * clears the debt; an empty read schedules the next backed-off pass.
+   *
+   * A REJECTED read spends NO attempt (the route storm right after unblock
+   * can lose a read or two): only answered reads count against the attempt
+   * cap, while the wall deadline bounds the chase regardless. With no
+   * journal client mounted the pass waits WITHOUT spending an attempt (the
+   * mount fold re-checks). At the cap or deadline the owed rows move to the
+   * existing not-confirmed state (outbox "unknown" -> 状态待确认).
    */
   private runOwedTailPass(instanceId: Id) {
     if (this.owedTailRunning.has(instanceId)) return;
@@ -3993,23 +4041,24 @@ class HubStore {
           this.state.instances.find((i) => i.id === instanceId) ??
           (await api.instanceGet(instanceId).catch(() => null));
         const client = instance ? this.journals.get(instance.journalId) : undefined;
+        let answered = false;
         if (client) {
-          tail.attempts += 1;
-          try {
-            await client.resumeAfterReconnect();
-          } catch {
-            /* rejected/stale bounded read: the next pass retries */
+          const page = await client.readDebtWindow(OWED_TAIL_WINDOW);
+          if (page !== null) {
+            answered = true;
+            tail.attempts += 1;
+            this.foldDebtWindow(instanceId, page);
           }
-          this.settleFromJournal(instanceId, this.state.events[instanceId] ?? []);
         }
         if (!this.reconcileOwed.has(instanceId)) return;
         if (!this.owedCommandLacksEvidence(instanceId)) {
           this.clearOwed(instanceId);
           return;
         }
-        // No mounted client: re-check soon but do not spend the read budget;
-        // the deadline still ends the chase.
-        this.scheduleOwedTail(instanceId, client ? undefined : OWED_TAIL_BASE_BACKOFF_MS);
+        // No client mounted: re-check on the base cadence without spending
+        // the read budget; a lost read keeps the same cadence too. A
+        // successful-but-empty read backs off by attempt.
+        this.scheduleOwedTail(instanceId, answered ? undefined : OWED_TAIL_BASE_BACKOFF_MS);
       } finally {
         this.owedTailRunning.delete(instanceId);
       }

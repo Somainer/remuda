@@ -1104,8 +1104,47 @@ fn reconstruct_fallback_projection_from_journal(conn: &Connection) -> rusqlite::
     // was written through the fallback path.
     let mut turn_id_rows: Vec<i64> = Vec::new();
     let mut revision_rows: Vec<i64> = Vec::new();
-    let mut window_rows: Vec<i64> = Vec::new();
-    let mut clock_rows: Vec<i64> = Vec::new();
+    // Non-turn (Message/Session) counter frames fill window/clock best-known.
+    let mut other_window_rows: Vec<i64> = Vec::new();
+    let mut other_clock_rows: Vec<i64> = Vec::new();
+    // Turn rows whose OWN frame may carry recoverable window/clock: a COUNTER
+    // frame, OR the lineage's FIRST frame (even tokenless — r44 item 2: an
+    // initial accepted frame recovers its window/clock/provenance; only a
+    // later billing CORRECTION against retained state is suppressed, per the
+    // shared live reconcile rule). "First" is read from the FULL journal
+    // lineage (a live upsert writes the latest correction's seq onto the
+    // surviving physical row, so its joined journal record alone would lie).
+    let mut turn_meta_rows: Vec<i64> = Vec::new();
+    // First (minimum seq) journal frame per turn lineage key from the journal.
+    let mut first_journal_seq: std::collections::HashMap<(String, String, String), i64> =
+        std::collections::HashMap::new();
+    {
+        let mut jst = conn.prepare(
+            "SELECT j.instance_id,
+                    json_extract(j.payload_json, '$.payload.scopeId'),
+                    COALESCE(json_extract(j.payload_json, '$.source.nativeSessionId.value'), ''),
+                    MIN(j.seq)
+             FROM journal j
+             WHERE json_valid(j.payload_json)
+               AND json_extract(j.payload_json, '$.kind') = 'usage'
+               AND json_extract(j.payload_json, '$.payload.scope') = 'turn'
+               AND json_type(j.payload_json, '$.payload.scopeId') = 'text'
+               AND length(json_extract(j.payload_json, '$.payload.scopeId')) > 0
+             GROUP BY 1, 2, 3",
+        )?;
+        let rows = jst.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (inst, scope_id, sid, seq) = row?;
+            first_journal_seq.insert((inst, scope_id, sid), seq);
+        }
+    }
     for r in &projected {
         let f = &r.frame;
         if r.stored_turn_id.is_none() && f.turn_id.is_some() {
@@ -1114,25 +1153,45 @@ fn reconstruct_fallback_projection_from_journal(conn: &Connection) -> rusqlite::
         if f.metric_revision > r.stored_revision {
             revision_rows.push(r.rowid);
         }
-        // Window/clock skip cost-only turn corrections (billing channel).
         let reports_counters = SnapshotCounters::of(f)
             .token_baskets()
             .iter()
             .any(Option::is_some);
-        let cost_only_turn = r.scope == "turn" && !reports_counters;
-        if !cost_only_turn {
-            if r.stored_window.is_none() && f.native_context_window.is_some() {
-                window_rows.push(r.rowid);
+        if r.scope != "turn" {
+            if reports_counters {
+                if r.stored_window.is_none() && f.native_context_window.is_some() {
+                    other_window_rows.push(r.rowid);
+                }
+                if r.stored_clock_source != "native" && f.observed_at_source == "native" {
+                    other_clock_rows.push(r.rowid);
+                }
             }
-            if r.stored_clock_source != "native" && f.observed_at_source == "native" {
-                clock_rows.push(r.rowid);
+            continue;
+        }
+        // Turn frame: recover its own metadata iff it is a counter frame or the
+        // lineage's first journal frame.
+        let sid = f.source_session_id.clone().unwrap_or_default();
+        let scope_id = match f.scope_id.as_deref() {
+            Some(id) => id,
+            None => continue,
+        };
+        let is_first = first_journal_seq
+            .get(&(f.instance_id.clone(), scope_id.to_string(), sid))
+            .is_some_and(|first| *first == f.seq);
+        if reports_counters || is_first {
+            // One membership; window/clock COALESCE are idempotent guards.
+            let needs_window = r.stored_window.is_none() && f.native_context_window.is_some();
+            let needs_clock = r.stored_clock_source != "native" && f.observed_at_source == "native";
+            if needs_window || needs_clock {
+                turn_meta_rows.push(r.rowid);
             }
         }
     }
     if turn_id_rows.is_empty()
         && revision_rows.is_empty()
-        && window_rows.is_empty()
-        && clock_rows.is_empty()
+        && other_window_rows.is_empty()
+        && other_clock_rows.is_empty()
+        && turn_meta_rows.is_empty()
     {
         return Ok(());
     }
@@ -1191,10 +1250,8 @@ fn reconstruct_fallback_projection_from_journal(conn: &Connection) -> rusqlite::
          END
          WHERE rowid IN (SELECT value FROM r43_rowids)",
     )?;
-    // Native window (COALESCE) for counter frames only.
-    run_update(
-        &window_rows,
-        "UPDATE usage_events
+    // Window (COALESCE) for active turn frames and non-turn counter frames.
+    let window_sql = "UPDATE usage_events
          SET native_context_window = COALESCE(native_context_window, (
                  SELECT CAST(json_extract(j.payload_json, '$.payload.contextWindow') AS INTEGER)
                  FROM journal j
@@ -1202,12 +1259,11 @@ fn reconstruct_fallback_projection_from_journal(conn: &Connection) -> rusqlite::
                    AND j.seq = usage_events.seq
                    AND CAST(json_extract(j.payload_json, '$.payload.contextWindow') AS INTEGER) > 0
              ))
-         WHERE rowid IN (SELECT value FROM r43_rowids)",
-    )?;
-    // Clock promotion for counter frames carrying a decoded native time only.
-    run_update(
-        &clock_rows,
-        "UPDATE usage_events
+         WHERE rowid IN (SELECT value FROM r43_rowids)";
+    run_update(&other_window_rows, window_sql)?;
+    run_update(&turn_meta_rows, window_sql)?;
+    // Clock promotion for the same active frames carrying a decoded native time.
+    let clock_sql = "UPDATE usage_events
          SET observed_at = CASE
                  WHEN observed_at_source = 'native' THEN observed_at
                  ELSE COALESCE((
@@ -1228,8 +1284,10 @@ fn reconstruct_fallback_projection_from_journal(conn: &Connection) -> rusqlite::
                  ) THEN 'native'
                  ELSE observed_at_source
              END
-         WHERE rowid IN (SELECT value FROM r43_rowids)",
-    )?;
+         WHERE rowid IN (SELECT value FROM r43_rowids)";
+    run_update(&other_clock_rows, clock_sql)?;
+    // Active turn frames receive clock with the same membership.
+    run_update(&turn_meta_rows, clock_sql)?;
     Ok(())
 }
 
@@ -10055,6 +10113,38 @@ mod tests {
     /// overridable via `CTXUSAGE_PROPERTY_SEEDS` for a longer manual run (e.g.
     /// 500). The violating seeds found while building this (14, 100, 426) each
     /// have their own fixed regression.
+    #[test]
+    fn property_fold_invariants_hold_across_random_sequences() {
+        let seeds: u64 = std::env::var("CTXUSAGE_PROPERTY_SEEDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100);
+        assert!(
+            seeds >= 100,
+            "default r44 run covers at least 100 seeds (~<120 s)"
+        );
+        let mut with_data = 0;
+        for seed in 0..seeds {
+            if r44_property_one(seed) {
+                with_data += 1;
+            }
+        }
+        assert!(
+            with_data as u64 > seeds * 9 / 10,
+            "generator produced too few populated seeds: {with_data}/{seeds}"
+        );
+    }
+
+    /// Fixed regressions: exact seeds that violated invariants before the
+    /// r43/r44 fixes. Pinned so a regression pinpoints the broken rule even
+    /// when the broad run uses a smaller seed count.
+    #[test]
+    fn property_invariant_fixed_seeds() {
+        for seed in [14u64, 100, 426] {
+            r44_property_one(seed);
+        }
+    }
+
     /// r44 item 1: a REPORTED token stock with Unknown cost must stay Unknown
     /// (never collapse to a known $0), alone and next to another session's bill.
     #[test]
@@ -10124,36 +10214,52 @@ mod tests {
         assert_eq!(agg.budget_status(Some(0.01)), BudgetStatus::Unknown);
     }
 
+    /// r44 item 2: a lineage's FIRST tokenless Turn (bill + 1M window + native
+    /// time) written through the fallback path must recover its window/clock/
+    /// provenance on migration — it is an initial accepted frame, not a
+    /// billing correction against retained state.
     #[test]
-    fn property_fold_invariants_hold_across_random_sequences() {
-        let seeds: u64 = std::env::var("CTXUSAGE_PROPERTY_SEEDS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(100);
-        assert!(
-            seeds >= 100,
-            "default r44 run covers at least 100 seeds (~<120 s)"
+    fn r44_first_tokenless_turn_recovers_metadata_from_fallback() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_r28_usage_table_with_turn_index(&conn);
+        create_journal_table(&conn);
+        // First frame: tokenless (all baskets Unknown), $0.03 bill, 1M window,
+        // native time. Written via the 14-column fallback path.
+        let first = r44_wire_record(
+            "i",
+            1,
+            "turn",
+            Some("msg-T"),
+            Some("sess-S"),
+            Some("msg-T"),
+            1,
+            "estimated",
+            [Basket::Unknown; 5],
+            Some("0.03"),
+            Some(1_000_000),
+            Some("2026-10-20T00:00:00.000Z"),
         );
-        let mut with_data = 0;
-        for seed in 0..seeds {
-            if r44_property_one(seed) {
-                with_data += 1;
-            }
-        }
-        assert!(
-            with_data as u64 > seeds * 9 / 10,
-            "generator produced too few populated seeds: {with_data}/{seeds}"
-        );
-    }
-
-    /// Fixed regressions: exact seeds that violated invariants before the
-    /// r43/r44 fixes. Pinned so a regression pinpoints the broken rule even
-    /// when the broad run uses a smaller seed count.
-    #[test]
-    fn property_invariant_fixed_seeds() {
-        for seed in [14u64, 100, 426] {
-            r44_property_one(seed);
-        }
+        insert_journal_raw(&conn, &first);
+        let row = project_usage_event(&first, Some("p"), Some("m")).unwrap();
+        // The fallback row stores only 14 columns: no scope/window/clock.
+        insert_usage_event(&conn, &row).unwrap();
+        // A later counter revision with no metadata (revision 2) — migration
+        // must not let the first frame's metadata be lost or wrongly applied.
+        migrate(&conn).unwrap();
+        let once = r42_full_turn_row(&conn, "i");
+        // columns: rev, profile, model, mode, scope_id, turn_id, scope, total,
+        // input, output, cr, cw, cost, accounting, at, at_source, window,
+        // lineage, sid
+        assert_eq!(once[4], "msg-T", "scope id recovered");
+        assert_eq!(once[18], "sess-S", "provenance recovered");
+        assert_eq!(once[16], "1000000", "first frame window recovered");
+        assert_eq!(once[15], "native", "first frame native clock recovered");
+        assert_eq!(once[14], "2026-10-20T00:00:00.000Z");
+        assert_eq!(once[12], "0.03");
+        // A second migration changes nothing.
+        migrate(&conn).unwrap();
+        let twice = r42_full_turn_row(&conn, "i");
+        assert_eq!(once, twice, "idempotent recovery");
     }
 
     #[test]

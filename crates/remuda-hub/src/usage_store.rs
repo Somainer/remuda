@@ -9442,6 +9442,397 @@ mod tests {
         assert_eq!(inst.input_tokens, supply.input_tokens);
     }
 
+    /// Deterministic LCG for the AC4 property test (no extra crate).
+    struct R43Rng(u64);
+    impl R43Rng {
+        fn next_u64(&mut self) -> u64 {
+            // MMIX constants.
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 33
+        }
+        fn below(&mut self, n: u64) -> usize {
+            (self.next_u64() % n) as usize
+        }
+        fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
+            &items[self.below(items.len() as u64)]
+        }
+    }
+
+    /// Dump EVERY usage row (minus rowid, which collapse/update legitimately
+    /// retargets) in total column order — the canonical restart-state
+    /// fingerprint for invariant (c).
+    fn r43_dump_rows(conn: &Connection) -> Vec<Vec<Option<String>>> {
+        conn.prepare(
+            "SELECT instance_id, seq, profile_id, model, scope, scope_id, turn_id,
+                    mode, total_tokens, input_tokens, output_tokens,
+                    cache_read_tokens, cache_write_tokens, cost_usd, accounting,
+                    observed_at, observed_at_source, metric_revision,
+                    source_session_id, native_context_window, lineage_state
+             FROM usage_events
+             ORDER BY 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21",
+        )
+        .unwrap()
+        .query_map([], |r| {
+            (0..21)
+                .map(|i| {
+                    Ok(match r.get_ref(i)? {
+                        rusqlite::types::ValueRef::Null => None,
+                        rusqlite::types::ValueRef::Integer(v) => Some(v.to_string()),
+                        rusqlite::types::ValueRef::Real(v) => Some(v.to_string()),
+                        rusqlite::types::ValueRef::Text(v) => {
+                            Some(String::from_utf8_lossy(v).into_owned())
+                        }
+                        rusqlite::types::ValueRef::Blob(v) => Some(format!("<blob {}>", v.len())),
+                    })
+                })
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+    }
+
+    /// Build one random accepted-observation sequence and assert the AC4
+    /// invariants for seed `seed`. Returns true when at least one instance has
+    /// data (skips the all-empty corner).
+    fn r43_property_one(conn: &Connection, seed: u64) -> bool {
+        // Steady-state DB reused across seeds: live inserts carry no legacy
+        // lineage tag and the fold's prepared statements stay cached (the 40 KB
+        // fold would otherwise be re-planned for every seed's fresh in-memory
+        // connection). Clear rows, journal and the reconstruction scratch set
+        // before each sequence.
+        conn.execute_batch(
+            "DELETE FROM usage_events;
+             DELETE FROM journal;
+             DELETE FROM r43_rowids;",
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM sqlite_sequence WHERE name = 'usage_events'",
+            [],
+        )
+        .unwrap_or_default();
+        let mut rng = R43Rng(seed.wrapping_add(0x9E37_79B9_7F4A_7C15));
+
+        let n_instances = 1 + rng.below(3);
+        let profile = "pvp_prop";
+        let models = ["m-a", "m-b"];
+        let pick_model = |rng: &mut R43Rng| {
+            let n = 1 + rng.below(2);
+            *rng.pick(&models[..n])
+        };
+        // Per instance: sessions and live turn lineage state (scope, rev).
+        let mut sessions: Vec<Vec<String>> = Vec::new();
+        let mut last_turns: Vec<Vec<(String, i64)>> = Vec::new();
+        for i in 0..n_instances {
+            let n_sessions = 1 + rng.below(3);
+            sessions.push((0..n_sessions).map(|s| format!("sess-{i}-{s}")).collect());
+            last_turns.push(Vec::new());
+        }
+        let n_events = 6 + rng.below(15);
+        let mut seq_per_inst = vec![0i64; n_instances];
+        for _ in 0..n_events {
+            let ii = rng.below(n_instances as u64);
+            let inst = format!("ins_prop_{ii}");
+            seq_per_inst[ii] += 1;
+            let seq = seq_per_inst[ii];
+            let model = pick_model(&mut rng);
+            let stamp = format!("2026-10-20T00:00:{:02}.000Z", seq % 60);
+            let kind = *rng.pick(&["turn", "turn_correct", "session", "message"]);
+            let mut row = UsageEventRow {
+                instance_id: inst.clone(),
+                seq,
+                profile_id: Some(profile.into()),
+                model: Some(model.into()),
+                scope: "turn".into(),
+                scope_id: None,
+                turn_id: None,
+                native_context_window: if rng.below(4) == 0 {
+                    Some(200_000)
+                } else {
+                    None
+                },
+                mode: "snapshot".into(),
+                metric_revision: 1,
+                source_session_id: None,
+                total_tokens: None,
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                cost_usd: None,
+                accounting: "estimated".into(),
+                observed_at: stamp.clone(),
+                observed_at_source: "native".into(),
+            };
+            // Known value / structural zero / Unknown (None).
+            let draw_basket = |rng: &mut R43Rng| -> Option<i64> {
+                match rng.below(3) {
+                    0 => Some(100 * (1 + rng.below(5)) as i64),
+                    1 => Some(0),
+                    _ => None,
+                }
+            };
+            match kind {
+                "turn" | "turn_correct" => {
+                    let sid = rng.pick(&sessions[ii]).clone();
+                    let (scope, revision) = if kind == "turn_correct"
+                        && !last_turns[ii].is_empty()
+                        && rng.below(2) == 0
+                    {
+                        // Strictly newer correction of a prior turn lineage.
+                        let idx = rng.below(last_turns[ii].len() as u64);
+                        let (scope, rev) = last_turns[ii][idx].clone();
+                        (scope, rev + 1)
+                    } else {
+                        (format!("turn-{seq}"), 1 + rng.below(3) as i64)
+                    };
+                    let cost_only = kind == "turn_correct" && rng.below(2) == 0;
+                    row.scope_id = Some(scope.clone());
+                    row.source_session_id = Some(sid);
+                    row.metric_revision = revision;
+                    if cost_only {
+                        // Billing channel: every additive basket Unknown.
+                        row.total_tokens = None;
+                        row.input_tokens = None;
+                        row.output_tokens = None;
+                        row.cache_read_tokens = None;
+                        row.cache_write_tokens = None;
+                    } else {
+                        let input = draw_basket(&mut rng);
+                        row.input_tokens = input;
+                        row.output_tokens = draw_basket(&mut rng);
+                        row.cache_read_tokens = draw_basket(&mut rng);
+                        row.cache_write_tokens = draw_basket(&mut rng);
+                        row.total_tokens = match (
+                            input,
+                            row.output_tokens,
+                            row.cache_read_tokens,
+                            row.cache_write_tokens,
+                        ) {
+                            (Some(a), Some(o), Some(r), Some(w)) => Some(a + o + r + w),
+                            _ => None,
+                        };
+                        last_turns[ii].push((scope, revision));
+                    }
+                    if rng.below(3) > 0 {
+                        row.cost_usd = Some(format!("{:.2}", 0.01 * (1 + rng.below(50)) as f64));
+                    }
+                }
+                "session" => {
+                    let sid = rng.pick(&sessions[ii]).clone();
+                    let tokenless = rng.below(2) == 0;
+                    let reported = rng.below(2) == 0;
+                    row.scope = "session".into();
+                    row.scope_id = Some(sid.clone());
+                    row.source_session_id = Some(sid);
+                    row.metric_revision = 1 + rng.below(3) as i64;
+                    row.accounting = if reported { "reported" } else { "estimated" }.into();
+                    if !tokenless {
+                        let input = draw_basket(&mut rng);
+                        row.input_tokens = input;
+                        row.output_tokens = Some(0);
+                        row.cache_read_tokens = Some(0);
+                        row.cache_write_tokens = Some(0);
+                        row.total_tokens = input;
+                    }
+                    if rng.below(4) > 0 {
+                        row.cost_usd = Some(format!("{:.2}", 0.01 * (1 + rng.below(50)) as f64));
+                    }
+                }
+                "message" => {
+                    let scope = format!(
+                        "_remuda_codex_response:v2:r{seq}-{x}",
+                        x = rng.next_u64() % 1000
+                    );
+                    row.scope = "message".into();
+                    row.scope_id = Some(scope);
+                    row.turn_id = if rng.below(2) == 0 {
+                        Some(format!("turn-{seq}"))
+                    } else {
+                        None
+                    };
+                    let input = draw_basket(&mut rng).or(Some(0));
+                    row.input_tokens = input;
+                    row.output_tokens = draw_basket(&mut rng).or(Some(0));
+                    row.cache_read_tokens = Some(0);
+                    row.cache_write_tokens = Some(0);
+                    row.total_tokens = Some(input.unwrap() + row.output_tokens.unwrap_or(0));
+                    if rng.below(2) == 0 {
+                        row.cost_usd = Some(format!("{:.2}", 0.01 * (1 + rng.below(20)) as f64));
+                    }
+                }
+                _ => unreachable!(),
+            }
+            // Production order: journal first, then insert the (already
+            // projected) row — the shapes are hand-built in projected form.
+            let event = json!({ "kind": "usage" });
+            let record = JournalRecord {
+                instance_id: inst.clone(),
+                seq,
+                event_id: format!("je{seq}"),
+                event,
+                observed_at: stamp,
+            };
+            insert_journal_raw(conn, &record);
+            let _ = insert_usage_event(conn, &row).unwrap();
+        }
+
+        // (c) live == restart == second restart, full rows minus rowid.
+        let live_rows = r43_dump_rows(conn);
+        migrate(conn).unwrap_or_else(|e| panic!("seed {seed}: migrate1 {e}"));
+        let once_rows = r43_dump_rows(conn);
+        migrate(conn).unwrap_or_else(|e| panic!("seed {seed}: migrate2 {e}"));
+        let twice_rows = r43_dump_rows(conn);
+        assert_eq!(live_rows, once_rows, "seed {seed}: restart changed rows");
+        assert_eq!(
+            once_rows, twice_rows,
+            "seed {seed}: second migration changed rows"
+        );
+
+        let mut any_data = false;
+        // Grand totals over every instance — supply aggregates pool instances,
+        // so invariant (a) is sum(instances) == sum(per-model supplies).
+        let mut grand_input: Option<i64> = Some(0);
+        let mut grand_total: Option<i64> = Some(0);
+        let mut grand_cost: Option<f64> = Some(0.0);
+        for ii in 0..n_instances {
+            let inst = format!("ins_prop_{ii}");
+            let agg = aggregate_instance(conn, &inst).unwrap();
+            if agg.events > 0 {
+                any_data = true;
+            }
+            if agg.events == 0 {
+                continue;
+            }
+            // (b) rollup tokens == aggregate tokens.
+            let rollup = rollup_instance(
+                conn,
+                &RollupRequest {
+                    instance_id: &inst,
+                    kind: "codex",
+                    spec_model: Some("m-a"),
+                    effective_model: None,
+                    profile_id: Some(profile),
+                },
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                rollup.session_input_tokens, agg.input_tokens,
+                "seed {seed} {inst} input"
+            );
+            assert_eq!(
+                rollup.session_output_tokens, agg.output_tokens,
+                "seed {seed} {inst} output"
+            );
+
+            let has_tokens = agg.token_event_rows > 0 || agg.ambiguous_events > 0;
+            let add = |acc: Option<i64>, v: Option<i64>| match (acc, v) {
+                (Some(a), Some(b)) => Some(a + b),
+                _ => None,
+            };
+            if has_tokens {
+                grand_input = add(grand_input, agg.input_tokens);
+                grand_total = add(grand_total, agg.total_tokens);
+            }
+            grand_cost = match (grand_cost, agg.cost_usd) {
+                (Some(a), Some(b)) => Some(a + b),
+                _ => None,
+            };
+        }
+
+        // (a) grand instance totals == grand per-model supply totals; Unknown
+        // iff any present side is Unknown. A model whose domain has only
+        // presence rows (a superseded cumulative bill after a /model switch)
+        // owns NO token evidence: its NULL token columns are absence in the
+        // token partition, not Unknown, so it is skipped for token summing
+        // (its cost is still a known zero). The fold's own token_events CTE is
+        // the authority on whether the domain carries token evidence.
+        let mut supply_input: Option<i64> = Some(0);
+        let mut supply_total: Option<i64> = Some(0);
+        let mut supply_cost: Option<f64> = Some(0.0);
+        for model in models {
+            let s = aggregate_supply(conn, profile, model).unwrap();
+            if s.events == 0 {
+                continue;
+            }
+            let has_tokens = s.token_event_rows > 0 || s.ambiguous_events > 0;
+            let add = |acc: Option<i64>, v: Option<i64>| match (acc, v) {
+                (Some(a), Some(b)) => Some(a + b),
+                _ => None,
+            };
+            if has_tokens {
+                supply_input = add(supply_input, s.input_tokens);
+                supply_total = add(supply_total, s.total_tokens);
+            }
+            supply_cost = match (supply_cost, s.cost_usd) {
+                (Some(a), Some(b)) => Some(a + b),
+                _ => None,
+            };
+        }
+        assert_eq!(grand_total, supply_total, "seed {seed}: total grand sum");
+        match (grand_cost, supply_cost) {
+            (Some(a), Some(b)) => assert!((a - b).abs() < 1e-6, "seed {seed}: cost {b} vs {a}"),
+            (a, b) => assert_eq!(a, b, "seed {seed}: cost Unknown parity"),
+        }
+        any_data
+    }
+
+    /// AC4 (mandatory): deterministic seeded random sequences satisfy
+    /// (a) grand instance aggregates == grand per-model supply aggregates for
+    /// tokens and cost (Unknown iff any side is Unknown),
+    /// (b) rollup tokens == aggregate tokens,
+    /// (c) live == restart == second-restart full-row identity.
+    ///
+    /// Seed count defaults to 100 (~2 min on a contended dev box) and is
+    /// overridable via `CTXUSAGE_PROPERTY_SEEDS` for a longer manual run (e.g.
+    /// 500). The violating seeds found while building this (14, 100, 426) each
+    /// have their own fixed regression.
+    #[test]
+    fn property_fold_invariants_hold_across_random_sequences() {
+        let seeds: u64 = std::env::var("CTXUSAGE_PROPERTY_SEEDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100);
+        assert!(seeds >= 100, "default AC4 run covers at least 100 seeds");
+        // One migrated steady-state connection reused across seeds so the
+        // fold's prepared-statement cache survives (runtime budget).
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        create_journal_table(&conn);
+        conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS r43_rowids(value INTEGER NOT NULL);")
+            .unwrap();
+        let mut with_data = 0;
+        for seed in 0..seeds {
+            if r43_property_one(&conn, seed) {
+                with_data += 1;
+            }
+        }
+        assert!(
+            with_data as u64 > seeds * 9 / 10,
+            "generator produced too few populated seeds: {with_data}/{seeds}"
+        );
+    }
+
+    /// AC4 fixed regressions: the exact seeds that violated an invariant
+    /// before the r43 fixes. Kept as named tests so a regression pinpoints the
+    /// broken rule even if the broad run uses a smaller seed count.
+    #[test]
+    fn property_invariant_fixed_seeds_14_100_426() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        create_journal_table(&conn);
+        conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS r43_rowids(value INTEGER NOT NULL);")
+            .unwrap();
+        for seed in [14u64, 100, 426] {
+            r43_property_one(&conn, seed);
+        }
+    }
+
     #[test]
     fn priced_flow_cost_is_billed_alongside_an_unmatched_historical_turn_ignoring_stock() {
         // c-usagefu r10 item 6 (Ruling B): COST follows the exact eligible-flow

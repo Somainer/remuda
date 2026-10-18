@@ -1009,7 +1009,14 @@ impl GateRegistry {
     /// normal boot — this is one directory read.
     pub(crate) fn open(land_fence_dir: std::path::PathBuf) -> Arc<Self> {
         #[cfg(unix)]
-        fence_orphaned_land_groups(&land_fence_dir);
+        {
+            // r37 item 4: this Node now exclusively owns the ledger dir and no
+            // certificate writer has started yet — reclaim crash-abandoned
+            // certificate temps BEFORE the orphan-fence scan and before serving
+            // any run.
+            reclaim_abandoned_cert_temps(&land_fence_dir);
+            fence_orphaned_land_groups(&land_fence_dir);
+        }
         Self::new(land_fence_dir)
     }
 
@@ -5047,6 +5054,42 @@ fn write_qualified_dead_cert_bytes(
     Err(std::io::Error::other(
         "could not allocate a unique certificate temp file",
     ))
+}
+
+/// A certificate temp file (one that never completed its rename into a
+/// qualified `dead-<job>-g<gen>.json`). Both the current unique-name scheme
+/// (`.dead-<slug>-g<gen>.<pid>-<nanos>-<seq>.tmp`) and the older per-pid/pgid
+/// scheme are matched: a hidden `.dead-` prefix and a `.tmp` suffix.
+#[cfg(unix)]
+fn is_abandoned_cert_temp(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy();
+    name.starts_with(".dead-") && name.ends_with(".tmp")
+}
+
+/// r37 item 4: remove crash-abandoned certificate temporary files from the
+/// ledger directory. This runs ONLY at Node startup (`GateRegistry::open`),
+/// when this process has exclusive ownership of the ledger and before any
+/// certificate writer (or the orphan-fence scan) starts, so it can never race
+/// a live rename or delete a temp a concurrent writer still owns. The files
+/// are never read as evidence (readers open only qualified names); this just
+/// bounds their cross-restart accumulation.
+#[cfg(unix)]
+fn reclaim_abandoned_cert_temps(dir: &std::path::Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        if !is_abandoned_cert_temp(&entry.file_name()) {
+            continue;
+        }
+        // Best-effort: a file we cannot remove (permissions, vanished) is left
+        // for the next boot; it is still ignored by every evidence read.
+        if std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 /// Read and VALIDATE a death certificate for the exact requested attempt.
@@ -9856,6 +9899,83 @@ Running 8 tests across 2 projects
             .filter(|name| name.starts_with(".dead-") && name.ends_with(".tmp"))
             .collect();
         assert!(leftovers.is_empty(), "temp files leaked: {leftovers:?}");
+    }
+
+    /// r37 item 4: crash-abandoned certificate temp files are reclaimed at
+    /// startup under exclusive ledger ownership, while real certificates and
+    /// live fences are kept and the temp was never readable as evidence.
+    #[test]
+    fn startup_reclaims_abandoned_certificate_temps_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let job = "gjb_r37_tmpjob";
+
+        // Two abandoned temps: the current unique scheme and the older
+        // per-pid/pgid scheme (a Node crashed after sync, before rename).
+        let tmp_new = dir.join(format!(
+            ".dead-{}-g1.{}-{:09x}-1.tmp",
+            job,
+            std::process::id(),
+            123u32
+        ));
+        let tmp_old = dir.join(".dead-g1-999-4242.tmp");
+        std::fs::write(&tmp_new, b"{\"jobId\":\"crashed\"}").unwrap();
+        std::fs::write(&tmp_old, b"{\"jobId\":\"crashed-old\"}").unwrap();
+
+        // A real qualified certificate and a live fence must survive.
+        let mut record = serde_json::json!({
+            "jobId": job,
+            "generation": 1,
+            "pgid": 4001,
+            "mergeSha": MERGE_A,
+        });
+        super::LeaderIdentity::StartTick(7).write(&mut record);
+        super::write_land_group_dead_cert(dir, &record, 4001).unwrap();
+        super::write_land_fence(
+            dir,
+            "gjb_r37_live",
+            1,
+            5001,
+            &super::LeaderIdentity::StartTick(8),
+            MERGE_B,
+        )
+        .unwrap();
+
+        // An unrelated dotfile / non-temp must not be touched.
+        let unrelated = dir.join(".keep");
+        std::fs::write(&unrelated, b"x").unwrap();
+
+        // The decisive startup path: opening a GateRegistry (exclusive ledger
+        // ownership, before any writer starts) reclaims the leftovers.
+        let _registry = super::GateRegistry::open(dir.to_path_buf());
+        assert!(!tmp_new.exists(), "new-scheme temp removed on startup");
+        assert!(!tmp_old.exists(), "old-scheme temp removed on startup");
+        assert!(unrelated.exists(), "unrelated dotfile kept");
+
+        // The direct helper reports the count on a second call (idempotent:
+        // nothing remains to remove).
+        assert_eq!(
+            super::reclaim_abandoned_cert_temps(dir),
+            0,
+            "startup already reclaimed the leftovers"
+        );
+
+        // The real certificate is intact and readable; the abandoned temp was
+        // never evidence for any job (no temp-prefixed cert reader exists).
+        assert!(
+            super::read_land_group_dead_cert(dir, job, 1, MERGE_A).is_some(),
+            "real certificate preserved"
+        );
+        assert_eq!(
+            super::land_ledger_liveness(dir, "crashed", Some(1), Some(MERGE_A)),
+            super::LandPushLiveness::Unknown,
+            "an abandoned temp never attests death"
+        );
+        assert_eq!(
+            super::land_ledger_liveness(dir, job, Some(1), Some(MERGE_A)),
+            super::LandPushLiveness::VerifiedDead,
+            "the qualified certificate still attests death"
+        );
     }
 
     /// r17 item 1: `certify_dead_and_remove_fence` refuses when the fence on

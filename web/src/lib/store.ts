@@ -4472,7 +4472,9 @@ class HubStore {
             .unresolved()
             .filter((r) => r.instanceId === instanceId && r.state === "sent")
             .map((r) => r.commandId);
-          this.recordOwed(instanceId, owedCommands);
+          // Only stamp debt when there is a Hub-accepted row still missing
+          // journal evidence (merge with any debt a prior drain recorded).
+          if (owedCommands.length) this.recordOwed(instanceId, owedCommands);
           // Decide ownership WHEN THIS JOB RUNS, not when the drain enqueued
           // it: a live→recovering flip while we waited behind an earlier slow
           // catch-up must be observed here (fix-5 item 2). If THIS instance's

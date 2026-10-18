@@ -5191,7 +5191,7 @@ class HubStore {
         // observed by a seed/debt read after an earlier exhaustion) is STILL
         // promoted to durable done — like live settlement — so an offline
         // reload cannot resurrect it as 状态待确认.
-        if (commandId && rec && rec.state !== "done" && rec.state !== "rejected" && rec.state !== "unknown") {
+        if (commandId && rec && rec.state !== "done" && rec.state !== "rejected") {
           // Journal evidence always retires the durable row, independent of
           // which epoch issued it; progress itself is gated inside the helper.
           void this.outbox.patch(commandId, { state: "done", serverState: "journal-settled" });

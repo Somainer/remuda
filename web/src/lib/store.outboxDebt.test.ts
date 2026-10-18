@@ -73,12 +73,12 @@ function userMessagePage(commandId: string): JournalPage {
   };
 }
 
-async function mountFollow(api: Api, hubStore: Store) {
+async function mountFollow(api: Api, hubStore: Store, seedPage: JournalPage = EMPTY_PAGE) {
   vi.spyOn(api, "instanceGet").mockResolvedValue({
     id: INSTANCE,
     journalId: JOURNAL,
   } as Awaited<ReturnType<Api["instanceGet"]>>);
-  vi.spyOn(api, "eventsRead").mockResolvedValue(EMPTY_PAGE);
+  vi.spyOn(api, "eventsRead").mockResolvedValue(seedPage);
   vi.spyOn(api, "instanceList").mockResolvedValue({
     items: [
       { id: INSTANCE, journalId: JOURNAL, revision: "1", durableSeq: "0", lifecycle: "running" } as Awaited<
@@ -777,4 +777,76 @@ it("r3 item 1: the FIRST post-drain resync held across logout and a real success
   expect(hubStore.getSnapshot().events[INSTANCE]).toBeUndefined();
   // …and its durable row was never flipped done by the stale application.
   expect(successorRow()?.state).toBe("sent");
+});
+
+it("r3 item 4: a journal-confirmed unknown row is promoted to durable done and stays settled across a reload", async () => {
+  // Exhaust -> unknown committed -> command journals later -> a fresh store
+  // (offline reload reconstruction) whose mount seed observes it must settle
+  // the restored bubble durably, not resurrect it as 状态待确认.
+  vi.useFakeTimers();
+  try {
+    const { api, hubStore } = await fresh();
+    await mountFollow(api, hubStore);
+    vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+      const commandId = _args[4] as string;
+      return Promise.resolve(commandResult(commandId, "accepted"));
+    });
+
+    await hubStore.send(INSTANCE, "late confirmation");
+    for (let i = 0; i < 30; i += 1) await vi.advanceTimersByTimeAsync(0);
+    const bubble = () => hubStore.getSnapshot().bubbles[0]!;
+    for (let i = 0; i < 30 && bubble().outboxState !== "sent"; i += 1) {
+      await vi.advanceTimersByTimeAsync(0);
+    }
+    expect(bubble().outboxState).toBe("sent");
+    const commandId = bubble().commandId!;
+
+    // Run the read deadline with every read empty -> exhaustion commits unknown.
+    for (let t = 0; t < 46_000; t += 250) await vi.advanceTimersByTimeAsync(250);
+    const rowOf = (s: Store) =>
+      (s as unknown as { outbox: { get: (id: string) => OutboxRecord | undefined } }).outbox?.get(commandId);
+    expect(rowOf(hubStore)?.state).toBe("unknown");
+
+    // The command journals later; a FRESH store reconstructs the outbox
+    // (localStorage backend survives module reset) and mounts with a seed
+    // carrying the confirmation — exactly an offline reload.
+    const second = await fresh();
+    const secondInternals = second.hubStore as unknown as {
+      ensureOutboxForTest: () => Promise<unknown>;
+      initConnection: (offline: boolean, epoch: number) => Promise<string>;
+      extEpoch: number;
+    };
+    await secondInternals.ensureOutboxForTest();
+    // Real offline-reload reconstruction: installs a machine AND restores the
+    // durable rows as optimistic bubbles.
+    await secondInternals.initConnection(true, secondInternals.extEpoch);
+    await mountFollow(second.api, second.hubStore, {
+      events: [
+        {
+          kind: "message",
+          eventId: "evt_late_user",
+          journalId: JOURNAL,
+          instanceId: INSTANCE,
+          seq: "1",
+          completeness: "structured",
+          payload: { role: "user", commandId },
+        } as unknown as Observation,
+      ],
+      durableSeq: "1",
+      windowFromSeq: "1",
+      reachedAfterSeq: true,
+    });
+    for (let i = 0; i < 200; i += 1) await vi.advanceTimersByTimeAsync(0);
+    const si = second.hubStore as unknown as { journals: Map<string, unknown>; connectionState: string; state: { events: Record<string, unknown[]> } };
+    console.log("ZZ durable row:", rowOf(second.hubStore)?.state, "events:", second.hubStore.getSnapshot().events[INSTANCE]?.length, "journals:", si.journals.size, "conn:", si.connectionState, "bubble:", JSON.stringify(second.hubStore.getSnapshot().bubbles.find((b) => b.commandId === commandId)?.state));
+
+    const restored = () =>
+      second.hubStore.getSnapshot().bubbles.find((b) => b.commandId === commandId)!;
+    expect(restored().state).toBe("settled");
+    expect(restored().outboxState).toBe("done");
+    expect(rowOf(second.hubStore)?.state).toBe("done");
+    second.hubStore.logout();
+  } finally {
+    vi.useRealTimers();
+  }
 });

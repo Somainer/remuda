@@ -850,3 +850,68 @@ it("r3 item 4: a journal-confirmed unknown row is promoted to durable done and s
     vi.useRealTimers();
   }
 });
+
+it("r4 item 2: a queued stale drain job retired at entry neither recreates debt nor touches the successor row", async () => {
+  // Distinct from the held-READ regression: here the drain job is QUEUED on
+  // the per-instance chain behind a blocker when logout happens. Chained
+  // promises survive logout (only timers are torn down), so the retired drain
+  // callback must reject itself at ENTRY before recording debt or settling.
+  const { api, hubStore } = await fresh();
+  await mountFollow(api, hubStore);
+  vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+  vi.spyOn(api, "hostList").mockResolvedValue({ items: [], nextCursor: null } as Awaited<
+    ReturnType<Api["hostList"]>
+  >);
+  vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as Awaited<ReturnType<Api["deviceList"]>>);
+  vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as Awaited<ReturnType<Api["passkeyList"]>>);
+  vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+  vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+  vi.spyOn(api, "login").mockResolvedValue({
+    deviceId: "dev_successor_r4",
+    token: "tok_successor_r4",
+    name: "successor",
+  } as Awaited<ReturnType<Api["login"]>>);
+  vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+    const commandId = _args[4] as string;
+    return Promise.resolve(commandResult(commandId, "accepted"));
+  });
+  // Resync reads answer empty immediately — the serialization that parks the
+  // drain callback comes from the chain blocker below, not a held request.
+  vi.mocked(api.eventsRead).mockResolvedValue(EMPTY_PAGE);
+
+  // Hold the instance's journal chain BEFORE the send so the post-drain job
+  // queues but never runs.
+  let releaseBlock: (() => void) | null = null;
+  (
+    hubStore as unknown as { chainReconcile: (id: string, job: () => Promise<unknown>) => Promise<unknown> }
+  ).chainReconcile(INSTANCE, () => new Promise<void>((resolve) => (releaseBlock = resolve)));
+
+  await hubStore.send(INSTANCE, "queued behind a blocker");
+  const bubble = () => hubStore.getSnapshot().bubbles[0]!;
+  await vi.waitFor(() => expect(bubble().outboxState).toBe("sent"));
+  const commandId = bubble().commandId!;
+  // The drain recorded its debt as part of delivery; clear it to model the
+  // retired state the queued job must not resurrect.
+  (hubStore as unknown as { reconcileOwed: Map<string, unknown> }).reconcileOwed.delete(INSTANCE);
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+
+  // Retire WHILE the drain callback is still queued, then a real successor
+  // login restores the persisted sent row under a new Outbox.
+  hubStore.logout();
+  vi.mocked(api.instanceList).mockResolvedValue({ items: [], nextCursor: null });
+  await expect(hubStore.login("bootstrap", "secret", "dev")).resolves.toBe("settled");
+  const successorRow = () =>
+    (
+      hubStore as unknown as { outbox: { get: (id: string) => OutboxRecord | undefined } | null }
+    ).outbox?.get(commandId);
+  expect(successorRow()?.state).toBe("sent");
+
+  // Release the blocker: the retired drain callback now enters.
+  releaseBlock!();
+  for (let i = 0; i < 80; i += 1) await Promise.resolve();
+
+  // It rejected itself at entry: no debt resurrected…
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+  // …and the successor's restored row is untouched.
+  expect(successorRow()?.state).toBe("sent");
+});

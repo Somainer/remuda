@@ -4059,11 +4059,19 @@ class HubStore {
     const epoch = this.identityEpoch;
     const box = this.outbox;
     const tail = this.owedTail.get(instanceId);
+    // r4 item 2: also pin the EXACT debt record — a stale job must not act on
+    // debt a retired drain recreated or a successor re-recorded.
+    const debt = this.reconcileOwed.get(instanceId);
     const stillOurs = () =>
-      this.identityEpoch === epoch && this.outbox === box && this.owedTail.get(instanceId) === tail;
+      this.identityEpoch === epoch &&
+      this.outbox === box &&
+      this.owedTail.get(instanceId) === tail &&
+      this.reconcileOwed.get(instanceId) === debt;
     void this.chainReconcile(instanceId, async () => {
+      // Entry gate: a queued callback that survived logout is dropped before
+      // any mutation.
+      if (!box || !tail || !debt || this.reconcileOwed.get(instanceId) !== debt) return;
       try {
-        if (!box || !tail || !this.reconcileOwed.has(instanceId)) return;
         if (!this.owedCommandLacksEvidence(instanceId)) {
           this.clearOwed(instanceId);
           return;
@@ -4072,7 +4080,7 @@ class HubStore {
           tail.attempts >= OWED_TAIL_MAX_ATTEMPTS ||
           Date.now() - tail.firstAt >= OWED_TAIL_DEADLINE_MS;
         if (exhausted) {
-          const committed = await this.exhaustOwedDebt(instanceId, stillOurs);
+          const committed = await this.exhaustOwedDebt(instanceId, debt, box, stillOurs);
           if (!stillOurs()) return;
           if (committed) return;
           // r2 item 3: a terminal write failed to persist. Retain the debt
@@ -4169,20 +4177,30 @@ class HubStore {
    * was otherwise still present after a null patch). Never leaves "accepted"
    * forever, never drops the row.
    */
-  private async exhaustOwedDebt(instanceId: Id, stillOurs: () => boolean): Promise<boolean> {
-    const debt = this.reconcileOwed.get(instanceId);
-    if (!debt) return true;
+  private async exhaustOwedDebt(
+    instanceId: Id,
+    debt: { commands: Set<Id> },
+    box: Outbox,
+    stillOurs: () => boolean,
+  ): Promise<boolean> {
+    if (this.reconcileOwed.get(instanceId) !== debt || this.outbox !== box) return true;
     let allCommitted = true;
     for (const commandId of debt.commands) {
-      const rec = this.outbox?.get(commandId);
+      // r4 item 2: fence EVERY terminal write with the exact captured
+      // Outbox + debt ownership BEFORE the patch, never only after its await.
+      if (!stillOurs()) return true;
+      const rec = box.get(commandId);
       if (!rec || rec.state === "done" || rec.state === "rejected" || rec.state === "unknown") continue;
       // Present not-confirmed from memory BEFORE the write so even an aborting
       // transaction never strands an accepted bubble.
       this.owedPresentedUnknown.add(commandId);
       this.syncBubbleFromOutbox(commandId);
-      const written = await this.safePatch(commandId, { state: "unknown", lastError: OWED_UNCONFIRMED_REASON });
-      // r2 item 1: a retirement parked behind the patch await ends the job
-      // without touching the successor's state or debt.
+      const written = await this.safePatchOn(box, commandId, {
+        state: "unknown",
+        lastError: OWED_UNCONFIRMED_REASON,
+      });
+      // A retirement parked behind the patch await ends without touching the
+      // successor's state or debt.
       if (!stillOurs()) return true;
       if (written) {
         this.owedPresentedUnknown.delete(commandId);
@@ -4191,14 +4209,14 @@ class HubStore {
       // null means the row vanished (another tab retracted it — fine) or the
       // storage transaction aborted (the durable row is still there — the
       // obligation survives).
-      const stillThere = this.outbox?.get(commandId);
+      const stillThere = box.get(commandId);
       if (!stillThere) {
         this.owedPresentedUnknown.delete(commandId);
         continue;
       }
       allCommitted = false;
     }
-    if (allCommitted) this.clearOwed(instanceId);
+    if (allCommitted && stillOurs()) this.clearOwed(instanceId);
     return allCommitted;
   }
 
@@ -4576,6 +4594,11 @@ class HubStore {
         const drainEpoch = this.identityEpoch;
         const drainStillOurs = () => this.identityEpoch === drainEpoch && this.outbox === box;
         await this.chainReconcile(instanceId, async () => {
+          // r4 item 2: this callback may have been QUEUED before an auth
+          // retirement (chained promises outlive logout — only timers are
+          // torn down). Reject the retired job at ENTRY, before recording
+          // debt, reading or settling anything.
+          if (this.identityEpoch !== drainEpoch || this.outbox !== box) return;
           // Ruling AD: record PER-COMMAND catch-up debt for every accepted
           // (Hub-accepted, journal-unconfirmed) "sent" row of this instance
           // BEFORE any read. An empty resync certifies live but proves nothing
@@ -4853,6 +4876,26 @@ class HubStore {
       return null;
     } finally {
       this.syncBubbleFromOutbox(commandId);
+    }
+  }
+
+  /**
+   * r4 item 2: patch a SPECIFIC captured Outbox (not the possibly-replaced
+   * current one), so a retired debt job can never write a terminal transition
+   * onto a successor identity's box. The in-memory presentation is refreshed
+   * only when that box is still current.
+   */
+  private async safePatchOn(
+    box: Outbox,
+    commandId: Id,
+    patch: Partial<OutboxRecord>,
+  ): Promise<OutboxRecord | null> {
+    try {
+      return await box.patch(commandId, patch);
+    } catch {
+      return null;
+    } finally {
+      if (this.outbox === box) this.syncBubbleFromOutbox(commandId);
     }
   }
 

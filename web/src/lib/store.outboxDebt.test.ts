@@ -837,8 +837,6 @@ it("r3 item 4: a journal-confirmed unknown row is promoted to durable done and s
       reachedAfterSeq: true,
     });
     for (let i = 0; i < 200; i += 1) await vi.advanceTimersByTimeAsync(0);
-    const si = second.hubStore as unknown as { journals: Map<string, unknown>; connectionState: string; state: { events: Record<string, unknown[]> } };
-    console.log("ZZ durable row:", rowOf(second.hubStore)?.state, "events:", second.hubStore.getSnapshot().events[INSTANCE]?.length, "journals:", si.journals.size, "conn:", si.connectionState, "bubble:", JSON.stringify(second.hubStore.getSnapshot().bubbles.find((b) => b.commandId === commandId)?.state));
 
     const restored = () =>
       second.hubStore.getSnapshot().bubbles.find((b) => b.commandId === commandId)!;

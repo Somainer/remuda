@@ -162,6 +162,13 @@ const OWED_TAIL_WINDOW = 128;
  * frontier.
  */
 const OWED_TAIL_OVERLAP = 64;
+/**
+ * Bounded extra retries for a terminal ("unknown") exhaustion write whose
+ * durable transaction ABORTED (r2 item 3). The obligation is retained
+ * across them and the bubble presents not-confirmed from memory meanwhile.
+ */
+const OWED_TAIL_STORAGE_RETRIES = 3;
+const OWED_TAIL_STORAGE_RETRY_MS = 1_000;
 const OWED_UNCONFIRMED_REASON = "journal confirmation deadline";
 /** Bounded backoff for Hub-held (Node offline) same-id re-POSTs. */
 const HELD_RETRY_BASE_MS = 2_000;
@@ -1346,8 +1353,16 @@ class HubStore {
    * journal client is mounted (those passes do not spend attempts). At most
    * ONE timer is armed per instance.
    */
-  private owedTail = new Map<Id, { attempts: number; firstAt: number; timer: ReturnType<typeof setTimeout> | null }>();
+  private owedTail = new Map<Id, { attempts: number; firstAt: number; storageRetries: number; timer: ReturnType<typeof setTimeout> | null }>();
   private owedTailRunning = new Set<Id>();
+  /**
+   * Ruling AD r2 item 3: command ids whose durable terminal ("unknown")
+   * exhaustion write FAILED to commit. The durable row stays non-terminal,
+   * but the bubble must already present the existing not-confirmed state
+   * (状态待确认) from memory while the bounded storage retry runs — never an
+   * eternal accepted bubble.
+   */
+  private owedPresentedUnknown = new Set<Id>();
   private outboxInit: Promise<"ok" | "obsolete" | "unavailable"> | null = null;
   /**
    * Auth-identity generation (c-reconnfu gate 33 item 2; kept under S3).
@@ -1726,6 +1741,7 @@ class HubStore {
     }
     this.owedTail.clear();
     this.owedTailRunning.clear();
+    this.owedPresentedUnknown.clear();
     this.followReadyState.clear();
     this.followFrameAt.clear();
     // r12: a deferred route departure must never fire under the next identity,
@@ -3932,6 +3948,8 @@ class HubStore {
 
   /** Delete the debt AND retire its bounded tail driver. */
   private clearOwed(instanceId: Id) {
+    const debt = this.reconcileOwed.get(instanceId);
+    if (debt) for (const commandId of debt.commands) this.owedPresentedUnknown.delete(commandId);
     this.reconcileOwed.delete(instanceId);
     const tail = this.owedTail.get(instanceId);
     if (tail?.timer) clearTimeout(tail.timer);
@@ -3958,7 +3976,7 @@ class HubStore {
     if (!this.reconcileOwed.has(instanceId)) return;
     const tail =
       this.owedTail.get(instanceId) ??
-      { attempts: 0, firstAt: Date.now(), timer: null as ReturnType<typeof setTimeout> | null };
+      { attempts: 0, firstAt: Date.now(), storageRetries: 0, timer: null as ReturnType<typeof setTimeout> | null };
     if (tail.timer !== null) return;
     const delay =
       delayOverride ??
@@ -4057,7 +4075,18 @@ class HubStore {
           tail.attempts >= OWED_TAIL_MAX_ATTEMPTS ||
           Date.now() - tail.firstAt >= OWED_TAIL_DEADLINE_MS;
         if (exhausted) {
-          await this.exhaustOwedDebt(instanceId, stillOurs);
+          const committed = await this.exhaustOwedDebt(instanceId, stillOurs);
+          if (!stillOurs()) return;
+          if (committed) return;
+          // r2 item 3: a terminal write failed to persist. Retain the debt
+          // and run a BOUNDED storage retry; the bubble already presents
+          // not-confirmed from memory. After the bounded retries the
+          // obligation is still retained (no eternal timer), so later
+          // evidence, a trigger or a reload can finish it.
+          tail.storageRetries += 1;
+          if (tail.storageRetries <= OWED_TAIL_STORAGE_RETRIES) {
+            this.scheduleOwedTail(instanceId, OWED_TAIL_STORAGE_RETRY_MS);
+          }
           return;
         }
         const instance =
@@ -4130,20 +4159,50 @@ class HubStore {
    * reconciling-GET deadline uses — 状态待确认 with its refresh action — then
    * retire the debt. Never leaves "accepted" forever, never drops the row.
    */
-  private async exhaustOwedDebt(instanceId: Id, stillOurs: () => boolean) {
+  /**
+   * Ruling AD exhaustion: the bounded tail never observed journal evidence.
+   * Move each still-outstanding owed row to the product's EXISTING
+   * not-confirmed state (outbox "unknown"), the same terminal projection the
+   * reconciling-GET deadline uses — 状态待确认 with its refresh action.
+   *
+   * r2 item 3: the terminal transition must COMMIT before the obligation is
+   * retired. A storage abort leaves the durable row non-terminal; the bubble
+   * presents not-confirmed from memory and the caller runs a bounded storage
+   * retry. Returns false when ANY terminal write failed to commit (or the row
+   * was otherwise still present after a null patch). Never leaves "accepted"
+   * forever, never drops the row.
+   */
+  private async exhaustOwedDebt(instanceId: Id, stillOurs: () => boolean): Promise<boolean> {
     const debt = this.reconcileOwed.get(instanceId);
-    if (debt) {
-      for (const commandId of debt.commands) {
-        const rec = this.outbox?.get(commandId);
-        if (rec && rec.state !== "done" && rec.state !== "rejected" && rec.state !== "unknown") {
-          await this.safePatch(commandId, { state: "unknown", lastError: OWED_UNCONFIRMED_REASON });
-          // r2 item 1: a retirement parked behind the patch await ends the
-          // job without touching the successor's state or debt.
-          if (!stillOurs()) return;
-        }
+    if (!debt) return true;
+    let allCommitted = true;
+    for (const commandId of debt.commands) {
+      const rec = this.outbox?.get(commandId);
+      if (!rec || rec.state === "done" || rec.state === "rejected" || rec.state === "unknown") continue;
+      // Present not-confirmed from memory BEFORE the write so even an aborting
+      // transaction never strands an accepted bubble.
+      this.owedPresentedUnknown.add(commandId);
+      this.syncBubbleFromOutbox(commandId);
+      const written = await this.safePatch(commandId, { state: "unknown", lastError: OWED_UNCONFIRMED_REASON });
+      // r2 item 1: a retirement parked behind the patch await ends the job
+      // without touching the successor's state or debt.
+      if (!stillOurs()) return true;
+      if (written) {
+        this.owedPresentedUnknown.delete(commandId);
+        continue;
       }
+      // null means the row vanished (another tab retracted it — fine) or the
+      // storage transaction aborted (the durable row is still there — the
+      // obligation survives).
+      const stillThere = this.outbox?.get(commandId);
+      if (!stillThere) {
+        this.owedPresentedUnknown.delete(commandId);
+        continue;
+      }
+      allCommitted = false;
     }
-    if (stillOurs()) this.clearOwed(instanceId);
+    if (allCommitted) this.clearOwed(instanceId);
+    return allCommitted;
   }
 
   /**
@@ -5065,6 +5124,7 @@ class HubStore {
     const attachments = live?.attachments?.length
       ? live.attachments
       : ((r.attachments ?? []) as BubbleAttachment[]);
+    const presentedUnknown = this.owedPresentedUnknown.has(r.commandId) && r.state !== "done" && r.state !== "rejected";
     return {
       clientRequestId: r.clientRequestId,
       instanceId: r.instanceId,
@@ -5075,14 +5135,16 @@ class HubStore {
       state:
         r.state === "done"
           ? "settled"
-          : r.state === "rejected" || r.state === "unknown"
+          : r.state === "rejected" || r.state === "unknown" || presentedUnknown
             ? "unknown"
             : // pending/inflight = queued; "sent"/"held" already reached the
               // Hub and render as an accepted (delivered, not 待确认) row.
               r.state === "pending" || r.state === "inflight"
               ? "queued"
               : "accepted",
-      outboxState: r.state,
+      // r2 item 3: a terminal exhaustion write that failed to commit still
+      // presents the existing not-confirmed state from memory.
+      outboxState: presentedUnknown ? "unknown" : r.state,
       // The rejection reason rides along on the rejected row so 未送达 can
       // show the Node/Hub's own neutral explanation inline.
       ...(r.state === "rejected" && r.lastError ? { outboxError: r.lastError } : {}),
@@ -5094,7 +5156,14 @@ class HubStore {
 
   private syncBubbleFromOutbox(commandId: Id) {
     const rec = this.outbox?.get(commandId);
-    if (!rec) return;
+    if (!rec) {
+      this.owedPresentedUnknown.delete(commandId);
+      return;
+    }
+    // A terminal durable row supersedes the in-memory not-confirmed marker.
+    if (rec.state === "done" || rec.state === "rejected" || rec.state === "unknown") {
+      this.owedPresentedUnknown.delete(commandId);
+    }
     const next = this.bubbleFromOutbox(rec);
     this.emit({
       bubbles: this.state.bubbles.map((b) => (b.clientRequestId === rec.clientRequestId ? next : b)),

@@ -1,7 +1,7 @@
 import { afterEach, expect, it, vi } from "vitest";
 import type { CommandResult } from "../types/command";
 import type { Observation } from "../types/observation";
-import { OUTBOX_LS_KEY } from "./outbox";
+import { OUTBOX_LS_KEY, type OutboxRecord } from "./outbox";
 
 /**
  * Ruling AD (outboxdebt r1): catch-up debt for a drained (sent-while-offline)
@@ -456,4 +456,82 @@ it("the debt tail makes FORWARD progress through the real adapter with 128 loade
     { timeout: 6_000 },
   );
   expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+});
+
+it("a storage-aborted terminal write keeps the debt, shows 状态待确认 in memory and retries to not-confirmed", async () => {
+  // r2 item 3: if the IndexedDB transaction writing "unknown" aborts,
+  // deleting the debt/timer would strand the accepted bubble forever. The
+  // obligation survives, the in-memory presentation is already
+  // not-confirmed, and a bounded storage retry commits it.
+  vi.useFakeTimers();
+  try {
+    const { api, hubStore } = await fresh();
+    await mountFollow(api, hubStore);
+    vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+      const commandId = _args[4] as string;
+      return Promise.resolve(commandResult(commandId, "accepted"));
+    });
+
+    await hubStore.send(INSTANCE, "storage aborts once");
+    for (let i = 0; i < 30; i += 1) await vi.advanceTimersByTimeAsync(0);
+    const bubble = () => hubStore.getSnapshot().bubbles[0]!;
+    for (let i = 0; i < 30 && bubble().outboxState !== "sent"; i += 1) {
+      await vi.advanceTimersByTimeAsync(0);
+    }
+    expect(bubble().outboxState).toBe("sent");
+    const commandId = bubble().commandId!;
+    expect(debtOf(hubStore).has(INSTANCE)).toBe(true);
+
+    // The terminal-state ("unknown") IndexedDB transaction aborts ONCE.
+    const outbox0 = (
+      hubStore as unknown as { outbox: { storage: { mergeUnlessDone: (id: string, p: unknown) => Promise<unknown> } } }
+    ).outbox;
+    const storage = outbox0.storage;
+    const realMerge = storage.mergeUnlessDone.bind(storage);
+    let aborted = false;
+    storage.mergeUnlessDone = vi.fn(async (id: string, patch: unknown) => {
+      if ((patch as { state?: string }).state === "unknown" && !aborted) {
+        aborted = true;
+        throw new Error("IDB_TRANSACTION_ABORTED");
+      }
+      return realMerge(id, patch);
+    });
+
+    // Run the read deadline (every read answered empty) until the FIRST
+    // terminal write aborts at exhaustion.
+    for (let t = 0; t < 60_000 && !aborted; t += 100) {
+      await vi.advanceTimersByTimeAsync(100);
+      for (let i = 0; i < 5; i += 1) await vi.advanceTimersByTimeAsync(0);
+    }
+    for (let i = 0; i < 30; i += 1) await vi.advanceTimersByTimeAsync(0);
+
+    // The abort happened…
+    expect(aborted).toBe(true);
+    // …the durable row is STILL "sent" (commit failed)…
+    const rowState = () =>
+      (hubStore as unknown as { outbox: { get: (id: string) => OutboxRecord | undefined } }).outbox.get(commandId)?.state;
+    expect(rowState()).toBe("sent");
+    // …but the obligation survived and the bubble already presents
+    // not-confirmed (never a permanent accepted).
+    expect(debtOf(hubStore).has(INSTANCE)).toBe(true);
+    expect(bubble().outboxState).toBe("unknown");
+    const { projectCommandStatus } = await import("./commandStatus");
+    expect(projectCommandStatus({ hasServerCommandId: true, outboxState: "unknown" }).label).toBe("状态待确认");
+
+    // The bounded storage retry fires and commits "unknown".
+    await vi.advanceTimersByTimeAsync(1_100);
+    for (let i = 0; i < 20; i += 1) await vi.advanceTimersByTimeAsync(0);
+    expect(rowState()).toBe("unknown");
+    expect(bubble().outboxState).toBe("unknown");
+    expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+
+    // No further tail work after the committed transition.
+    const reads = vi.mocked(api.eventsRead).mock.calls.length;
+    for (let t = 0; t < 10_000; t += 500) await vi.advanceTimersByTimeAsync(500);
+    expect(vi.mocked(api.eventsRead).mock.calls.length).toBe(reads);
+
+    hubStore.logout();
+  } finally {
+    vi.useRealTimers();
+  }
 });

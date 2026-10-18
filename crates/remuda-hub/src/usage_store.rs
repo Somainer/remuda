@@ -442,6 +442,19 @@ fn replay_fallback_rows_from_journal(conn: &Connection) -> rusqlite::Result<usiz
         insert_usage_event(conn, &row)?;
         rebuilt += 1;
     }
+    // AE provenance: these rows were replayed from observations that arrived
+    // while the schema migration was rolled back, so they carry the same
+    // `legacy` lineage_state the deleted fallback rows had. The live read fold
+    // relies on the tag to keep an unprovable historical turn conservative
+    // (ambiguous) next to a scoped stock; replaying through the live ingest
+    // path changes HOW the row is built, not its origin classification. A
+    // post-upgrade live row is never selected here (the one-time replay marker
+    // only runs while fallback rows can exist), so this never tags live data.
+    conn.execute(
+        "UPDATE usage_events SET lineage_state = 'legacy'
+         WHERE lineage_state IS NULL OR lineage_state = ''",
+        [],
+    )?;
     Ok(rebuilt)
 }
 
@@ -6884,19 +6897,24 @@ mod tests {
         }
     }
 
+    /// Canonical FULL-row fingerprint of every usage column EXCEPT
+    /// lineage_state: that tag is provenance metadata ('legacy' for rows
+    /// recovered from fallback vs NULL for rows ingested live) and is allowed
+    /// to differ between a fallback-recovered database and its independent live
+    /// reference; everything else must be identical.
     fn r43_dump_rows(conn: &Connection) -> Vec<Vec<Option<String>>> {
         conn.prepare(
             "SELECT instance_id, seq, profile_id, model, scope, scope_id, turn_id,
                     mode, total_tokens, input_tokens, output_tokens,
                     cache_read_tokens, cache_write_tokens, cost_usd, accounting,
                     observed_at, observed_at_source, metric_revision,
-                    source_session_id, native_context_window, lineage_state
+                    source_session_id, native_context_window
              FROM usage_events
-             ORDER BY 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21",
+             ORDER BY 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20",
         )
         .unwrap()
         .query_map([], |r| {
-            (0..21)
+            (0..20)
                 .map(|i| {
                     Ok(match r.get_ref(i)? {
                         rusqlite::types::ValueRef::Null => None,
@@ -6913,6 +6931,22 @@ mod tests {
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap()
+    }
+
+    /// All replayed rows in a recovered database carry the `legacy` provenance
+    /// tag; a fully-live reference carries none. The content fingerprint
+    /// (r43_dump_rows) otherwise matches exactly.
+    fn r45_all_lineage_states(conn: &Connection, instance: &str) -> Vec<String> {
+        let mut st = conn
+            .prepare(
+                "SELECT COALESCE(lineage_state, '') FROM usage_events
+                 WHERE instance_id = ?1 ORDER BY seq, rowid",
+            )
+            .unwrap();
+        st.query_map(params![instance], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
     }
 
     #[derive(Clone, Copy)]
@@ -7487,6 +7521,32 @@ mod tests {
             twice_rows,
             "seed {seed}: fallback recovery equals independent live reference"
         );
+        // Provenance: any row that began under the fallback schema is replayed
+        // and stays lineage_state='legacy'; a fully-live database tags nothing.
+        // (Content matches via r43_dump_rows; only this tag may differ.)
+        if any_legacy {
+            let mut legacy_count = 0usize;
+            let mut live_tagged = 0usize;
+            for ii in 0..n_instances {
+                let inst = format!("ins_prop_{ii}");
+                legacy_count += r45_all_lineage_states(&conn, &inst)
+                    .iter()
+                    .filter(|s| s.as_str() == "legacy")
+                    .count();
+                live_tagged += r45_all_lineage_states(&live_ref, &inst)
+                    .iter()
+                    .filter(|s| s.as_str() == "legacy")
+                    .count();
+            }
+            assert!(
+                legacy_count > 0,
+                "seed {seed}: replayed fallback rows tagged legacy"
+            );
+            assert_eq!(
+                live_tagged, 0,
+                "seed {seed}: the live reference is never tagged"
+            );
+        }
 
         // Grand instance totals over every instance.
         let mut grand_input: Option<i64> = Some(0);
@@ -7758,6 +7818,17 @@ mod tests {
             r43_dump_rows(&lv),
             "fallback replay equals independent live ingest"
         );
+        assert_eq!(
+            r45_all_lineage_states(&fb, "ins_ae_a"),
+            vec!["legacy".to_string()],
+            "replayed row keeps fallback provenance"
+        );
+        assert!(
+            r45_all_lineage_states(&lv, "ins_ae_a")
+                .iter()
+                .all(|s| s.is_empty()),
+            "the live reference is not legacy-tagged"
+        );
         let req = RollupRequest {
             instance_id: "ins_ae_a",
             kind: "codex",
@@ -7804,6 +7875,10 @@ mod tests {
             r43_dump_rows(&fb),
             r43_dump_rows(&lv),
             "envelope-only identity replays equal to live"
+        );
+        assert_eq!(
+            r45_all_lineage_states(&fb, "ins_ae_b"),
+            vec!["legacy".to_string()]
         );
         let sid: Option<String> = fb
             .query_row(
@@ -7858,6 +7933,10 @@ mod tests {
             r43_dump_rows(&fb),
             r43_dump_rows(&lv),
             "stale-revision replay matches live rejection"
+        );
+        assert_eq!(
+            r45_all_lineage_states(&fb, "ins_ae_c"),
+            vec!["legacy".to_string()]
         );
         let (n, rev, window, source): (i64, i64, Option<i64>, String) = fb
             .query_row(
@@ -7949,6 +8028,12 @@ mod tests {
             r43_dump_rows(&fb),
             r43_dump_rows(&lv),
             "fallback -> live counter -> migrate equals fully-live reference"
+        );
+        // The single recovered survivor stays legacy-tagged; the live
+        // post-migration counter frame is merged onto it by the live upsert.
+        assert_eq!(
+            r45_all_lineage_states(&fb, "ins_ae_d"),
+            vec!["legacy".to_string()]
         );
         let (window, total): (Option<i64>, Option<i64>) = fb
             .query_row(

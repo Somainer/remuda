@@ -1161,12 +1161,34 @@ async fn ambiguous_only_model_survives_upgrade_and_shows_on_provider_usage() -> 
             PRIMARY KEY (instance_id, seq)
         );",
     )?;
+    // Ruling AE (recovery IS replay): the retained journal event must carry
+    // the FULL observation so migration can rebuild the row through the live
+    // ingest path — the same full event the production fallback writer appends
+    // (250 input / 30 output / 0 caches / $3 estimated), plus the proven
+    // session identity. Deliberately no turn evidence, so model A's turn stays
+    // unprovable (ambiguous).
     let stock_event = serde_json::json!({
         "kind": "usage",
+        "nativeAt": { "state": "known", "value": "2020-01-01T00:00:05.000Z" },
         "payload": {
+            "usageId": "obj_stock_b",
             "scope": "session",
             "scopeId": "sess-b-scoped",
-            "mode": "snapshot"
+            "mode": "snapshot",
+            "metricRevision": "1",
+            "sourceSessionId": "sess-b-scoped",
+            "inputTokens": { "state": "known", "value": "250" },
+            "inputAccounting": "uncached",
+            "outputTokens": { "state": "known", "value": "30" },
+            "reasoningTokens": { "state": "unknown", "reason": "unreported",
+                                  "evidenceEventIds": [] },
+            "cacheReadTokens": { "state": "known", "value": "0" },
+            "cacheWriteTokens": { "state": "known", "value": "0" },
+            "totalTokens": { "state": "known", "value": "280" },
+            "cost": { "state": "known",
+                       "value": { "amount": "3.00", "currency": "USD" } },
+            "accounting": "estimated",
+            "nativeFieldsRef": null
         },
         "source": {
             "nativeSessionId": { "state": "known", "value": "sess-b-scoped" },

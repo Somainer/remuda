@@ -3092,6 +3092,29 @@ g_flow_messages AS (
             -- sticky-Unknown poison), independent of token membership.
             SELECT cost_usd AS cost_usd FROM estimated_stock_rows
          ),
+         unknown_reported_stock AS (
+            -- r44 item 1: a REPORTED token-bearing stock whose cumulative
+            -- bill is Unknown keeps cost Unknown — it must NOT fall through
+            -- to the ELSE $0. Only a session WITHOUT a newer KNOWN reported
+            -- bill poisons; a known bill elsewhere in the same session is the
+            -- authority and covers it. Based on the standing TOKEN stock
+            -- relations so it matches exactly the token evidence that surfaces.
+            SELECT 1 AS hit FROM stock_sessions g
+            WHERE g.accounting = 'reported'
+              AND g.cost_usd IS NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM global_reported_cost_sessions k
+                  WHERE k.instance_id = g.instance_id AND k.sid = g.scope_id
+              )
+            UNION ALL
+            SELECT 1 FROM legacy_stock l
+            WHERE l.accounting = 'reported'
+              AND l.cost_usd IS NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM global_reported_cost_sessions k
+                  WHERE k.instance_id = l.instance_id AND k.sid = ''
+              )
+         ),
          estimated_turn_cost AS (
             -- Uncovered flow-turn estimates, excluded by the GLOBAL authority
             -- keys. A lineage-QUALIFIED turn is excluded only when its OWN
@@ -3272,6 +3295,11 @@ fn aggregate_select_sql() -> &'static str {
             -- poisons (a covered session's stock is excluded upstream).
             WHEN EXISTS (
                 SELECT 1 FROM estimated_stock_cost WHERE cost_usd IS NULL
+            ) THEN NULL
+            -- r44 item 1: a REPORTED token stock with an Unknown cumulative
+            -- cost (and no newer known bill in its session) poisons too.
+            WHEN EXISTS (
+                SELECT 1 FROM unknown_reported_stock
             ) THEN NULL
             -- Unknown is preserved over the selected estimated contribution
             -- of EVERY uncovered native session (r41 AB2+):
@@ -10027,6 +10055,75 @@ mod tests {
     /// overridable via `CTXUSAGE_PROPERTY_SEEDS` for a longer manual run (e.g.
     /// 500). The violating seeds found while building this (14, 100, 426) each
     /// have their own fixed regression.
+    /// r44 item 1: a REPORTED token stock with Unknown cost must stay Unknown
+    /// (never collapse to a known $0), alone and next to another session's bill.
+    #[test]
+    fn r44_reported_token_stock_with_unknown_cost_stays_unknown() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        create_journal_table(&conn);
+        // Session s0: token-bearing reported stock, no bill (Unknown cost).
+        let r0 = r44_wire_record(
+            "i",
+            1,
+            "session",
+            Some("s0"),
+            Some("s0"),
+            None,
+            1,
+            "reported",
+            [
+                Basket::Known(100),
+                Basket::Known(100),
+                Basket::NotApplicable,
+                Basket::NotApplicable,
+                Basket::NotApplicable,
+            ],
+            None,
+            None,
+            Some("2026-10-20T00:00:01.000Z"),
+        );
+        insert_journal_raw(&conn, &r0);
+        let row = project_usage_event(&r0, Some("p"), Some("m")).unwrap();
+        insert_usage_event(&conn, &row).unwrap();
+
+        let agg = aggregate_instance(&conn, "i").unwrap();
+        assert_eq!(agg.input_tokens, Some(100));
+        assert_eq!(
+            agg.cost_usd, None,
+            "reported Unknown-cost stock is Unknown, not $0"
+        );
+        assert_eq!(agg.budget_status(Some(0.01)), BudgetStatus::Unknown);
+        let sup = aggregate_supply(&conn, "p", "m").unwrap();
+        assert_eq!(sup.cost_usd, None, "supply Unknown too");
+        assert_eq!(sup.budget_status(Some(0.01)), BudgetStatus::Unknown);
+
+        // Add a different session with a real $0.01 bill: aggregate stays Unknown.
+        let r1 = r44_wire_record(
+            "i",
+            2,
+            "session",
+            Some("s1"),
+            Some("s1"),
+            None,
+            1,
+            "reported",
+            [Basket::Unknown; 5],
+            Some("0.01"),
+            None,
+            Some("2026-10-20T00:00:02.000Z"),
+        );
+        insert_journal_raw(&conn, &r1);
+        let row = project_usage_event(&r1, Some("p"), Some("m")).unwrap();
+        insert_usage_event(&conn, &row).unwrap();
+        let agg = aggregate_instance(&conn, "i").unwrap();
+        assert_eq!(
+            agg.cost_usd, None,
+            "one Unknown-cost stock poisons the $0.01 bill"
+        );
+        assert_eq!(agg.budget_status(Some(0.01)), BudgetStatus::Unknown);
+    }
+
     #[test]
     fn property_fold_invariants_hold_across_random_sequences() {
         let seeds: u64 = std::env::var("CTXUSAGE_PROPERTY_SEEDS")

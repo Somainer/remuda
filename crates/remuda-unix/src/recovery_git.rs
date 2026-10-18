@@ -473,11 +473,11 @@ mod tests {
             "the one pre-drop repo-a command is still in its log"
         );
         let later = RecoveryGit::new();
-        record_spawn(&later.command(&tmp, &["rev-parse", "--git-dir"]));
+        record_spawn(&later.command(&repo_a, &["rev-parse", "--git-dir"]));
         assert_eq!(
             count_in(&kept_handle, &in_repo_a),
             1,
-            "a post-drop spawn must not reach the dropped guard's repo-a log (cleanup missing)"
+            "a post-drop repo-a spawn must not reach the dropped guard's log (cleanup missing)"
         );
 
         // A fresh guard installs onto a clean recorder (the scope-1 cleanup

@@ -536,13 +536,29 @@ it("a storage-aborted terminal write keeps the debt, shows 状态待确认 in me
   }
 });
 
-it("a historical configure lifecycle recovered by the debt fold never overwrites the current pending request", async () => {
-  // r2 item 4: foldDebtWindow is a RECOVERY read — entries below the live
-  // cursor get historical semantics (live=false). An old queued/degraded
-  // lifecycle for request A must not replace or clear request B pending.
+it("r3 item 2: a model-B degraded verdict in a debt read is left for the live callback to apply", async () => {
+  // AD2: a debt forward read is EVIDENCE-ONLY. A current request's
+  // model-degraded verdict riding the same page must NOT be applied (or have
+  // its id consumed) by the debt path — only the owed user message settles;
+  // the SAME event arriving on the live callback then shows B's refusal.
   const { api, hubStore } = await fresh();
   await mountFollow(api, hubStore);
+  vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+    const commandId = _args[4] as string;
+    return Promise.resolve(commandResult(commandId, "accepted"));
+  });
 
+  // Optimistic in-flight model request B.
+  const h = hubStore as unknown as {
+    state: {
+      modelPending: Record<string, { id: string; queued: boolean } | undefined>;
+      models: Record<string, string | undefined>;
+    };
+  };
+  h.state.models[INSTANCE] = "model-B";
+  const noteModel = (
+    hubStore as unknown as { noteModelLifecycle: (id: string, ev: Observation) => void }
+  ).noteModelLifecycle.bind(hubStore) as (id: string, ev: Observation) => void;
   const configureLifecycle = (seq: number, eventId: string, status: string): Observation =>
     ({
       eventId,
@@ -560,33 +576,143 @@ it("a historical configure lifecycle recovered by the debt fold never overwrites
         relatedIds: {},
       },
     }) as unknown as Observation;
-
-  // Request B is live-pending now (inject through the store's live reducer
-  // directly; the mock JournalClient would gap-rule a seq-2 batch).
-  const live = (
-    hubStore as unknown as { noteModelLifecycle: (id: string, ev: Observation) => void }
-  ).noteModelLifecycle.bind(hubStore) as (id: string, ev: Observation) => void;
-  live(INSTANCE, configureLifecycle(2, "evt_cfg_B", "model-queued:model-B"));
-  const pending = () =>
-    (
-      hubStore as unknown as {
-        state: { modelPending: Record<string, { id: string; queued: boolean } | undefined> };
-      }
-    ).state.modelPending[INSTANCE];
+  noteModel(INSTANCE, configureLifecycle(1, "evt_cfg_B", "model-queued:model-B"));
+  const pending = () => h.state.modelPending[INSTANCE];
   expect(pending()?.id).toBe("model-B");
 
-  const fold = (
-    hubStore as unknown as { foldDebtWindow: (id: string, events: Observation[]) => void }
-  ).foldDebtWindow.bind(hubStore) as (id: string, events: Observation[]) => void;
+  const degradedB = configureLifecycle(2, "evt_cfg_B_bad", "model-degraded:model-B:not-found");
 
-  // The debt tail recovers an OLD queued lifecycle for request A (a gap
-  // below the cursor, seq 1). It must hydrate history, not replace B.
-  fold(INSTANCE, [configureLifecycle(1, "evt_cfg_A_old", "model-queued:model-A")]);
-  expect(pending()?.id).toBe("model-B");
+  await hubStore.send(INSTANCE, "owed while B pending");
+  const bubble = () => hubStore.getSnapshot().bubbles[0]!;
+  await vi.waitFor(() => expect(bubble().outboxState).toBe("sent"));
+  const commandId = bubble().commandId!;
 
-  // An old DEGRADED lifecycle for A must not clear B or toast/revert either.
-  fold(INSTANCE, [configureLifecycle(1, "evt_cfg_A_bad", "model-degraded:model-A:not-found")]);
+  // The forward debt read returns BOTH the owed command entry and B's
+  // verdict. Only settlement evidence is applied.
+  vi.mocked(api.eventsRead).mockResolvedValue({
+    events: [
+      degradedB,
+      {
+        kind: "message",
+        eventId: "evt_user_owed",
+        journalId: JOURNAL,
+        instanceId: INSTANCE,
+        seq: "3",
+        completeness: "structured",
+        payload: { role: "user", commandId },
+      } as unknown as Observation,
+    ],
+    durableSeq: "3",
+    windowFromSeq: "1",
+    reachedAfterSeq: true,
+  });
+  // Drive the bounded debt tail read directly (its earlier drain resync
+  // already consumed the empty seed/resync pages).
+  (
+    hubStore as unknown as { runOwedTailPass: (id: string) => void }
+  ).runOwedTailPass(INSTANCE);
+  for (let i = 0; i < 50; i += 1) await Promise.resolve();
+  // The debt read neither applied nor consumed B's verdict: B stays pending
+  // and the optimistic selection is untouched.
+  expect(bubble().state).toBe("settled");
+  expect(bubble().outboxState).toBe("done");
   expect(pending()?.id).toBe("model-B");
+  expect(h.state.models[INSTANCE]).toBe("model-B");
+
+  // Now the SAME verdict arrives through the live callback (contiguously
+  // after a seq-1 assistant frame): it applies and shows the refusal —
+  // pending cleared, picker reverted.
+  const onBatch = await liveBatch(api);
+  onBatch({
+    subscriptionId: "sub_outbox_debt",
+    journalId: JOURNAL,
+    fromSeq: "1",
+    toSeq: "1",
+    durableSeq: "1",
+    events: [
+      {
+        kind: "message",
+        eventId: "evt_assistant_1",
+        journalId: JOURNAL,
+        instanceId: INSTANCE,
+        seq: "1",
+        completeness: "structured",
+        payload: { role: "assistant", text: "working" },
+      } as unknown as Observation,
+    ],
+  });
+  onBatch({
+    subscriptionId: "sub_outbox_debt",
+    journalId: JOURNAL,
+    fromSeq: "2",
+    toSeq: "2",
+    durableSeq: "2",
+    events: [degradedB],
+  });
+  expect(pending()).toBeUndefined();
+  expect(h.state.models[INSTANCE]).toBeUndefined();
+});
+
+it("r3 item 3: an old permission readback for A recovered by a debt read leaves request B pending", async () => {
+  // AD2: a debt read ignores every non-settlement event. An older permission
+  // readback for request A in the page must never settle request B.
+  const { api, hubStore } = await fresh();
+  await mountFollow(api, hubStore);
+  vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+    const commandId = _args[4] as string;
+    return Promise.resolve(commandResult(commandId, "accepted"));
+  });
+
+  const h = hubStore as unknown as {
+    state: { permissionPending: Record<string, { mode: string; queued: boolean } | undefined> };
+  };
+  h.state.permissionPending[INSTANCE] = { mode: "plan", queued: true };
+
+  // A's OLD effective-permission readback (kind "permission"), timestamped
+  // after any last loaded effective — the shape notePermissionObservation
+  // uses to settle a pending walk.
+  const oldPermissionA = {
+    eventId: "evt_perm_A_old",
+    instanceId: INSTANCE,
+    journalId: JOURNAL,
+    seq: "1",
+    kind: "permission",
+    observedAt: "2026-10-18T00:09:00Z",
+    source: { channel: "runtime" },
+    payload: {
+      effective: { mode: "default", source: "remuda", observedAt: "2026-10-18T00:09:00Z" },
+    },
+  } as unknown as Observation;
+
+  await hubStore.send(INSTANCE, "owed while permission B pending");
+  const bubble = () => hubStore.getSnapshot().bubbles[0]!;
+  await vi.waitFor(() => expect(bubble().outboxState).toBe("sent"));
+  const commandId = bubble().commandId!;
+
+  vi.mocked(api.eventsRead).mockResolvedValue({
+    events: [
+      oldPermissionA,
+      {
+        kind: "message",
+        eventId: "evt_user_owed_perm",
+        journalId: JOURNAL,
+        instanceId: INSTANCE,
+        seq: "2",
+        completeness: "structured",
+        payload: { role: "user", commandId },
+      } as unknown as Observation,
+    ],
+    durableSeq: "2",
+    windowFromSeq: "1",
+    reachedAfterSeq: true,
+  });
+  (
+    hubStore as unknown as { runOwedTailPass: (id: string) => void }
+  ).runOwedTailPass(INSTANCE);
+  for (let i = 0; i < 50; i += 1) await Promise.resolve();
+  expect(bubble().outboxState).toBe("done");
+  // A's old permission readback never settled B.
+  expect(h.state.permissionPending[INSTANCE]?.mode).toBe("plan");
 });
 
 it("r3 item 1: the FIRST post-drain resync held across logout and a real successor login applies nothing", async () => {

@@ -3043,13 +3043,8 @@ class HubStore {
     return true;
   }
 
-  /**
-   * Fold one `instance.configure` permission lifecycle. `live=false` for
-   * replayed/recovered history (r2 item 4): an old permission lifecycle for
-   * a prior walk must never set/clear a CURRENT pending request — history
-   * hydrates observed state through notePermissionObservation only.
-   */
-  private notePermissionLifecycle(instanceId: Id, observation: Observation, live = true) {
+  /** Fold one `instance.configure` permission lifecycle. */
+  private notePermissionLifecycle(instanceId: Id, observation: Observation) {
     const payload = observation.payload as
       | { type?: string; nativeName?: string; status?: unknown }
       | undefined;
@@ -3061,7 +3056,7 @@ class HubStore {
           ? (payload.status as { value: unknown }).value
           : undefined;
     const parsed = permissionLifecycleStatus(value);
-    if (!parsed || !live) return;
+    if (!parsed) return;
     const pending = { ...this.state.permissionPending };
     if (parsed.kind === "queued") {
       pending[instanceId] = { mode: parsed.mode, queued: true, at: Date.now() };
@@ -3994,60 +3989,55 @@ class HubStore {
   }
 
   /**
-   * Ruling AD: fold a debt-driven durable tail window directly, by command
-   * id. Unlike the live onEvents path this does not rely on cursor
-   * contiguity: the owed entry can sit just BELOW the cursor the live
-   * stream advanced past (the live frames of the same turn), and the
-   * JournalClient's resume read drops such a page when a live batch bumps
-   * its resume generation.
-   *
-   * r2 item 4: every entry recovered here is HISTORICAL (read from durable
-   * storage behind a live cursor), so the request lifecycle reducers run
-   * with live=false — the same semantics as mount/seed replay. An old
-   * model-queued/degraded (or permission) lifecycle for a prior request
-   * must never overwrite or clear a CURRENT pending request; those
-   * reducers hydrate effective state only on replayed history. Screens are
-   * left to the screen paths so a late fold can never roll a newer screen.
+   * Ruling AD2 — apply SETTLEMENT EVIDENCE ONLY. A debt tail/overlap read is
+   * not a journal fold: it scans the returned page exclusively for user
+   * messages carrying one of THIS instance's owed command ids. Each matched
+   * entry is:
+   *  - appended to state.events as the authoritative transcript node (merge
+   *    by seq) so the optimistic bubble joins its real row;
+   *  - settled (bubble -> settled, durable row -> done, including a row that
+   *    had earlier reached the "unknown" not-confirmed state);
+   * Nothing else in the page is touched — no model/permission/effort or other
+   * reducer runs, no activity/screen/summary projection, and the event ids
+   * are NOT recorded in the live JournalClient dedupe path, so a current
+   * request's verdict sitting in the same page still arrives intact through
+   * the live socket callback.
    */
-  private foldDebtWindow(instanceId: Id, events: Observation[]) {
+  private applySettlementEvidence(instanceId: Id, events: Observation[]) {
+    const debt = this.reconcileOwed.get(instanceId);
+    if (!debt) return;
+    const owed = debt.commands;
     const current = this.state.events[instanceId] ?? [];
     const seenIds = new Set(current.map((e) => e.eventId));
-    const fresh = events.filter((e) => !seenIds.has(e.eventId));
-    if (fresh.length) {
-      for (const event of fresh) {
-        const nextInstances = applyInstanceActivity(this.state.instances, [event]);
-        if (nextInstances.some((row, index) => row !== this.state.instances[index])) {
-          this.emit({ instances: nextInstances });
-        }
-        // Historical semantics: hydrate, never settle a live request.
-        this.noteEffortObservation(instanceId, event, false);
-        this.noteEffortLifecycle(instanceId, event, false);
-        this.noteModelObservation(instanceId, event, false);
-        this.noteModelLifecycle(instanceId, event, false);
-        this.notePermissionObservation(instanceId, event);
-        this.notePermissionLifecycle(instanceId, event, false);
-      }
-      const next = current.concat(fresh).sort((a, b) => Number(a.seq) - Number(b.seq));
-      const phrase = liveSummary(next);
-      const summaries = { ...this.state.summaries };
-      if (phrase) summaries[instanceId] = phrase;
-      else delete summaries[instanceId];
-      this.emit({
-        instances: applyInstanceActivity(this.state.instances, fresh),
-        events: { ...this.state.events, [instanceId]: next },
-        summaries,
-      });
+    const matched: Observation[] = [];
+    for (const ev of events) {
+      if (ev.kind !== "message") continue;
+      const commandId = (ev.payload as { commandId?: Id }).commandId;
+      if (!commandId || !owed.has(commandId) || seenIds.has(ev.eventId)) continue;
+      seenIds.add(ev.eventId);
+      matched.push(ev);
     }
-    // settleFromJournal folds against the merged state (it reads
-    // this.state.events) and retires matching rows to done.
-    this.settleFromJournal(instanceId, this.state.events[instanceId] ?? events);
+    if (matched.length) {
+      const next = current.concat(matched).sort((a, b) => Number(a.seq) - Number(b.seq));
+      this.emit({
+        events: { ...this.state.events, [instanceId]: next },
+        bubbles: settleBubbles(this.state.bubbles, instanceId, next),
+      });
+      // Settlement-only durable retirement (no acceptance side effects beyond
+      // the single progress helper; settleFromJournal patches including a
+      // previously "unknown" row — r3 item 4).
+      this.settleFromJournal(instanceId, matched);
+    }
+    // Evidence (including evidence already present in state.events) clears
+    // each owed command; anything still missing keeps the bounded tail.
+    this.reevaluateOwedDebt(instanceId);
   }
 
   /**
-   * Ruling AD: one pass of the bounded debt-driven tail re-read. Runs on the
+   * Ruling AD2: one pass of the bounded debt-driven tail re-read. Runs on the
    * instance's journal chain (serialized with the drain/reopen reads) and
-   * reads the journal DIRECTLY over REST, folding what it finds through
-   * {@link foldDebtWindow} by command id — neither the mounted
+   * reads the journal DIRECTLY over REST, applying SETTLEMENT EVIDENCE ONLY
+   * via {@link applySettlementEvidence} — neither the mounted
    * JournalClient's binding/socket-open latency nor its cursor/generation
    * rules can suppress the owed entry this way. A read that observes the
    * owed command's entry retires the row to done and clears the debt; an
@@ -4124,7 +4114,7 @@ class HubStore {
             if (!stillOurs()) return;
             answered = true;
             tail.attempts += 1;
-            this.foldDebtWindow(instanceId, forward.events);
+            this.applySettlementEvidence(instanceId, forward.events);
             if (this.reconcileOwed.has(instanceId) && this.owedCommandLacksEvidence(instanceId)) {
               const overlapAfter = String(Math.max(0, highest - OWED_TAIL_OVERLAP));
               const overlap = await api.eventsRead({
@@ -4134,7 +4124,7 @@ class HubStore {
                 limit: OWED_TAIL_OVERLAP,
               });
               if (!stillOurs()) return;
-              this.foldDebtWindow(instanceId, overlap.events);
+              this.applySettlementEvidence(instanceId, overlap.events);
             }
           } catch {
             if (!stillOurs()) return;
@@ -5196,6 +5186,11 @@ class HubStore {
         if (ev.kind !== "message") continue;
         const commandId = (ev.payload as { commandId?: Id }).commandId;
         const rec = commandId ? this.outbox.get(commandId) : null;
+        // r3 item 4: a journal-confirmed row that had already reached the
+        // not-confirmed "unknown" state (late historical confirmation, e.g.
+        // observed by a seed/debt read after an earlier exhaustion) is STILL
+        // promoted to durable done — like live settlement — so an offline
+        // reload cannot resurrect it as 状态待确认.
         if (commandId && rec && rec.state !== "done" && rec.state !== "rejected" && rec.state !== "unknown") {
           // Journal evidence always retires the durable row, independent of
           // which epoch issued it; progress itself is gated inside the helper.
@@ -6182,7 +6177,7 @@ class HubStore {
         this.noteModelObservation(instanceId, event, false);
         this.noteModelLifecycle(instanceId, event, false);
         this.notePermissionObservation(instanceId, event);
-        this.notePermissionLifecycle(instanceId, event, false);
+        this.notePermissionLifecycle(instanceId, event);
       }
       const read: JournalRead = async (args) => {
         if (args.journalId === mockJournalIds.journalGap && args.afterSeq && Number(args.afterSeq) > 0) {
@@ -6286,7 +6281,7 @@ class HubStore {
             this.noteModelObservation(instanceId, event, false);
             this.noteModelLifecycle(instanceId, event, false);
             this.notePermissionObservation(instanceId, event);
-            this.notePermissionLifecycle(instanceId, event, false);
+            this.notePermissionLifecycle(instanceId, event);
           }
           this.emit({
             instances: applyInstanceActivity(this.state.instances, fresh),

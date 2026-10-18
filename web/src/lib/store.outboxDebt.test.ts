@@ -287,3 +287,59 @@ it("a debt read BELOW the live cursor folds the missed command entry and settles
   expect(folded).toBe(true);
   expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
 });
+
+it("a debt read released after logout and a new login folds nothing into the successor store", async () => {
+  // Ruling AD r2 item 1: identity/lifetime ownership. A tail read parked
+  // across an auth retirement must be dropped WHOLE when it resolves — no
+  // journal fold, no outbox transition on the successor identity.
+  const { api, hubStore } = await fresh();
+  await mountFollow(api, hubStore);
+  vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+    const commandId = _args[4] as string;
+    return Promise.resolve(commandResult(commandId, "accepted"));
+  });
+
+  // Seed reads (no afterSeq) and the drain's own resume read (1st afterSeq)
+  // resolve empty; every LATER afterSeq read (the debt tail) parks until
+  // released — simulating the response arriving after logout.
+  let afterSeqCalls = 0;
+  let heldCommandId = "";
+  let releaseHeld: (() => void) = () => undefined;
+  const held = new Promise<JournalPage>((resolve) => {
+    releaseHeld = () => resolve(userMessagePage(heldCommandId));
+  });
+  const read = vi.mocked(api.eventsRead);
+  read.mockImplementation(((args: { afterSeq?: string }) => {
+    if (!args.afterSeq) return Promise.resolve(EMPTY_PAGE);
+    afterSeqCalls += 1;
+    return afterSeqCalls <= 1 ? Promise.resolve(EMPTY_PAGE) : held;
+  }) as Api["eventsRead"]);
+
+  await hubStore.send(INSTANCE, "across an auth retirement");
+  const bubble = () => hubStore.getSnapshot().bubbles[0]!;
+  await vi.waitFor(() => expect(bubble().outboxState).toBe("sent"));
+  const commandId = bubble().commandId!;
+
+  // Debt recorded and its tail read parked (call #2).
+  await vi.waitFor(() => expect(afterSeqCalls).toBeGreaterThanOrEqual(2), { timeout: 5_000 });
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(true);
+
+  // Logout (epoch bump + outbox disposal), then a NEW login (new box,
+  // same successor identity, restored durable row).
+  hubStore.logout();
+  await (hubStore as unknown as { ensureOutboxForTest: () => Promise<unknown> }).ensureOutboxForTest();
+  expect(hubStore.getSnapshot().events[INSTANCE]).toBeUndefined();
+
+  // Release the OLD identity's response carrying the old journal entry.
+  heldCommandId = commandId;
+  releaseHeld();
+  for (let i = 0; i < 50; i += 1) await Promise.resolve();
+
+  // Nothing of the old identity folded into the successor store…
+  expect(hubStore.getSnapshot().events[INSTANCE]).toBeUndefined();
+  // …and the successor's durable row was never flipped done by the stale fold.
+  const successorRow = (
+    hubStore as unknown as { outbox: { get: (id: string) => { state: string } | undefined } | null }
+  ).outbox?.get(commandId);
+  expect(successorRow?.state).not.toBe("done");
+});

@@ -4025,9 +4025,21 @@ class HubStore {
     if (this.owedTailRunning.has(instanceId)) return;
     this.owedTailRunning.add(instanceId);
     void this.chainReconcile(instanceId, async () => {
+      // Ruling AD r2 item 1: capture the issuing identity epoch, the exact
+      // Outbox and this pass's tail record BEFORE the first await. A logout
+      // or identity succession while a read is parked disposes the box and
+      // clears the debt; the stale response must then be dropped whole —
+      // no fold, no transition, no clear — rather than repopulate the
+      // successor store with the previous identity's journal.
+      const epoch = this.identityEpoch;
+      const box = this.outbox;
+      const tail = this.owedTail.get(instanceId);
+      const stillOurs = () =>
+        this.identityEpoch === epoch &&
+        this.outbox === box &&
+        this.owedTail.get(instanceId) === tail;
       try {
-        const tail = this.owedTail.get(instanceId);
-        if (!tail || !this.reconcileOwed.has(instanceId)) return;
+        if (!box || !tail || !this.reconcileOwed.has(instanceId)) return;
         if (!this.owedCommandLacksEvidence(instanceId)) {
           this.clearOwed(instanceId);
           return;
@@ -4036,12 +4048,14 @@ class HubStore {
           tail.attempts >= OWED_TAIL_MAX_ATTEMPTS ||
           Date.now() - tail.firstAt >= OWED_TAIL_DEADLINE_MS;
         if (exhausted) {
-          await this.exhaustOwedDebt(instanceId);
+          await this.exhaustOwedDebt(instanceId, stillOurs);
           return;
         }
         const instance =
           this.state.instances.find((i) => i.id === instanceId) ??
           (await api.instanceGet(instanceId).catch(() => null));
+        // Retired WHILE the instance lookup was parked: drop its result.
+        if (!stillOurs()) return;
         let answered = false;
         if (instance) {
           // Direct REST read — deliberately NOT the mounted JournalClient's
@@ -4058,14 +4072,18 @@ class HubStore {
               afterSeq,
               limit: OWED_TAIL_WINDOW,
             });
+            // Retired WHILE the read was parked (held-response regression):
+            // never fold the old identity's events into the successor store.
+            if (!stillOurs()) return;
             answered = true;
             tail.attempts += 1;
             this.foldDebtWindow(instanceId, page.events);
           } catch {
+            if (!stillOurs()) return;
             /* rejected read: keep the debt and retry at the base cadence */
           }
         }
-        if (!this.reconcileOwed.has(instanceId)) return;
+        if (!stillOurs() || !this.reconcileOwed.has(instanceId)) return;
         if (!this.owedCommandLacksEvidence(instanceId)) {
           this.clearOwed(instanceId);
           return;
@@ -4076,7 +4094,9 @@ class HubStore {
         // by attempt. The wall deadline bounds both paths.
         this.scheduleOwedTail(instanceId, answered ? undefined : OWED_TAIL_BASE_BACKOFF_MS);
       } finally {
-        this.owedTailRunning.delete(instanceId);
+        // Only the owning identity's job clears its running marker; a
+        // retired job leaves the successor's (fresh) marker untouched.
+        if (this.identityEpoch === epoch) this.owedTailRunning.delete(instanceId);
       }
     });
   }
@@ -4088,17 +4108,20 @@ class HubStore {
    * reconciling-GET deadline uses — 状态待确认 with its refresh action — then
    * retire the debt. Never leaves "accepted" forever, never drops the row.
    */
-  private async exhaustOwedDebt(instanceId: Id) {
+  private async exhaustOwedDebt(instanceId: Id, stillOurs: () => boolean) {
     const debt = this.reconcileOwed.get(instanceId);
     if (debt) {
       for (const commandId of debt.commands) {
         const rec = this.outbox?.get(commandId);
         if (rec && rec.state !== "done" && rec.state !== "rejected" && rec.state !== "unknown") {
           await this.safePatch(commandId, { state: "unknown", lastError: OWED_UNCONFIRMED_REASON });
+          // r2 item 1: a retirement parked behind the patch await ends the
+          // job without touching the successor's state or debt.
+          if (!stillOurs()) return;
         }
       }
     }
-    this.clearOwed(instanceId);
+    if (stillOurs()) this.clearOwed(instanceId);
   }
 
   /**
@@ -4124,29 +4147,37 @@ class HubStore {
     if (this.owedReconcileRunning.has(instanceId)) return;
     this.owedReconcileRunning.add(instanceId);
     void this.chainReconcile(instanceId, async () => {
+      // r2 item 1: same identity/lifetime ownership as the tail pass — a
+      // response parked across logout must never fold the old identity's
+      // journal into the successor store.
+      const epoch = this.identityEpoch;
+      const box = this.outbox;
+      const stillOurs = () => this.identityEpoch === epoch && this.outbox === box;
       try {
         if (!this.reconcileOwed.has(instanceId)) return;
         const instance =
           this.state.instances.find((i) => i.id === instanceId) ??
           (await api.instanceGet(instanceId).catch(() => null));
+        if (!stillOurs()) return;
         const client = instance ? this.journals.get(instance.journalId) : undefined;
         if (!client) {
           // Nothing mounted to fold; the bounded tail driver waits for the
           // mount instead of dropping the debt.
-          this.reevaluateOwedDebt(instanceId);
+          if (stillOurs()) this.reevaluateOwedDebt(instanceId);
           return;
         }
         try {
           await client.resumeAfterReconnect();
         } catch {
           /* bounded REST catch-up failed: keep the debt; arm/keep its tail */
-          this.reevaluateOwedDebt(instanceId);
+          if (stillOurs()) this.reevaluateOwedDebt(instanceId);
           return;
         }
+        if (!stillOurs()) return;
         this.settleFromJournal(instanceId, this.state.events[instanceId] ?? []);
         this.reevaluateOwedDebt(instanceId);
       } finally {
-        this.owedReconcileRunning.delete(instanceId);
+        if (this.identityEpoch === epoch) this.owedReconcileRunning.delete(instanceId);
       }
     });
   }
@@ -4461,6 +4492,12 @@ class HubStore {
         const drainJournalId =
           this.state.instances.find((i) => i.id === instanceId)?.journalId ?? null;
         await this.chainReconcile(instanceId, async () => {
+          // r2 item 1: the resync below can park across an auth retirement.
+          // Capture the issuing epoch/box and revalidate after the await
+          // before folding or arming debt, so a stale drain continuation can
+          // never publish the retired identity's journal into the successor.
+          const drainEpoch = this.identityEpoch;
+          const drainStillOurs = () => this.identityEpoch === drainEpoch && this.outbox === box;
           // Ruling AD: record PER-COMMAND catch-up debt for every accepted
           // (Hub-accepted, journal-unconfirmed) "sent" row of this instance
           // BEFORE any read. An empty resync certifies live but proves nothing
@@ -4492,6 +4529,7 @@ class HubStore {
               // re-check below arms its bounded tail.
             }
           }
+          if (!drainStillOurs()) return;
           this.settleFromJournal(instanceId, this.state.events[instanceId] ?? []);
           // Evidence clears each owed command; anything still unobserved is
           // chased by the bounded tail (or lands at 状态待确认 on deadline).

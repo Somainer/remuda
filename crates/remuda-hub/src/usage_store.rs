@@ -9495,248 +9495,489 @@ mod tests {
         .unwrap()
     }
 
-    /// Build one random accepted-observation sequence and assert the AC4
-    /// invariants for seed `seed`. Returns true when at least one instance has
-    /// data (skips the all-empty corner).
-    fn r43_property_one(conn: &Connection, seed: u64) -> bool {
-        // Steady-state DB reused across seeds: live inserts carry no legacy
-        // lineage tag and the fold's prepared statements stay cached (the 40 KB
-        // fold would otherwise be re-planned for every seed's fresh in-memory
-        // connection). Clear rows, journal and the reconstruction scratch set
-        // before each sequence.
-        conn.execute_batch(
-            "DELETE FROM usage_events;
-             DELETE FROM journal;
-             DELETE FROM r43_rowids;",
-        )
-        .unwrap();
-        conn.execute(
-            "DELETE FROM sqlite_sequence WHERE name = 'usage_events'",
-            [],
-        )
-        .unwrap_or_default();
-        let mut rng = R43Rng(seed.wrapping_add(0x9E37_79B9_7F4A_7C15));
+    /// A token basket the r44 property generator reports on the wire.
+    #[derive(Clone, Copy)]
+    enum Basket {
+        Known(i64),
+        /// Structural zero (Knowledge::NotApplicable) — decodes to Some(0).
+        NotApplicable,
+        /// Explicit Knowledge::Unknown — decodes to None.
+        Unknown,
+    }
+    impl Basket {
+        fn wire(self) -> Value {
+            match self {
+                Basket::Known(v) => json!({"state": "known", "value": v}),
+                Basket::NotApplicable => json!({"state": "not-applicable"}),
+                Basket::Unknown => json!({"state": "unknown", "reason": "unreported",
+                                          "evidenceEventIds": []}),
+            }
+        }
+        fn decoded(self) -> Option<i64> {
+            match self {
+                Basket::Known(v) => Some(v),
+                Basket::NotApplicable => Some(0),
+                Basket::Unknown => None,
+            }
+        }
+    }
 
-        let n_instances = 1 + rng.below(3);
+    /// Build ONE REAL protocol usage observation (serialized exactly like an
+    /// on-the-wire Observation: kind/payload/source/nativeAt). The stored row
+    /// is derived ONLY through project_usage_event + the live insert path.
+    #[allow(clippy::too_many_arguments)]
+    fn r44_wire_record(
+        instance: &str,
+        seq: i64,
+        scope: &str,
+        scope_id: Option<&str>,
+        session: Option<&str>,
+        turn: Option<&str>,
+        revision: u64,
+        accounting: &str,
+        baskets: [Basket; 5], // total, input, output, cacheRead, cacheWrite
+        cost: Option<&str>,   // None -> Knowledge::Unknown
+        window: Option<u64>,
+        native_at: Option<&str>,
+    ) -> JournalRecord {
+        let [total, input, output, cache_read, cache_write] = baskets;
+        let cost_json = match cost {
+            Some(amount) => json!({"state": "known",
+                "value": {"amount": amount, "currency": "USD"}}),
+            None => json!({"state": "unknown", "reason": "unpriced",
+                            "evidenceEventIds": []}),
+        };
+        let mut payload = serde_json::Map::new();
+        payload.insert("usageId".into(), json!("obj"));
+        payload.insert("scope".into(), json!(scope));
+        // A genuine NULL-scope legacy point OMITS the identity entirely.
+        if let Some(id) = scope_id {
+            payload.insert("scopeId".into(), json!(id));
+        }
+        payload.insert("mode".into(), json!("snapshot"));
+        payload.insert("metricRevision".into(), json!(revision.to_string()));
+        if let Some(sid) = session {
+            payload.insert("sourceSessionId".into(), json!(sid));
+        }
+        payload.insert("inputTokens".into(), input.wire());
+        payload.insert("inputAccounting".into(), json!("uncached"));
+        payload.insert("outputTokens".into(), output.wire());
+        payload.insert(
+            "reasoningTokens".into(),
+            json!({"state": "unknown", "reason": "unreported", "evidenceEventIds": []}),
+        );
+        payload.insert("cacheReadTokens".into(), cache_read.wire());
+        payload.insert("cacheWriteTokens".into(), cache_write.wire());
+        payload.insert("totalTokens".into(), total.wire());
+        payload.insert("cost".into(), cost_json);
+        payload.insert("accounting".into(), json!(accounting));
+        if let Some(w) = window {
+            payload.insert("contextWindow".into(), json!(w));
+        }
+        let mut source = serde_json::Map::new();
+        if let Some(sid) = session {
+            source.insert(
+                "nativeSessionId".into(),
+                json!({"state": "known", "value": sid}),
+            );
+        }
+        if let Some(tid) = turn {
+            source.insert(
+                "nativeTurnId".into(),
+                json!({"state": "known", "value": tid}),
+            );
+        }
+        let mut event = serde_json::Map::new();
+        event.insert("kind".into(), json!("usage"));
+        event.insert("payload".into(), Value::Object(payload));
+        if !source.is_empty() {
+            event.insert("source".into(), Value::Object(source));
+        }
+        if let Some(at) = native_at {
+            event.insert("nativeAt".into(), json!({"state": "known", "value": at}));
+        }
+        let stamp = native_at.unwrap_or("2026-10-20T00:00:00.000Z");
+        JournalRecord {
+            instance_id: instance.into(),
+            seq,
+            event_id: format!("je{seq}"),
+            event: Value::Object(event),
+            observed_at: stamp.into(),
+        }
+    }
+
+    /// A generated observation with its projected model and legacy flag.
+    struct R44Event {
+        model: &'static str,
+        legacy: bool,
+        record: JournalRecord,
+    }
+
+    /// Build one REAL seeded sequence of protocol observations across 1-3
+    /// instances (one database so supply pooling is exercised) and assert the
+    /// r44 invariants. Returns true when any instance has data.
+    fn r44_property_one(seed: u64) -> bool {
+        let mut rng = R43Rng(seed.wrapping_add(0x9E37_79B9_7F4A_7C15));
         let profile = "pvp_prop";
         let models = ["m-a", "m-b"];
-        let pick_model = |rng: &mut R43Rng| {
-            let n = 1 + rng.below(2);
-            *rng.pick(&models[..n])
-        };
-        // Per instance: sessions and live turn lineage state (scope, rev).
-        let mut sessions: Vec<Vec<String>> = Vec::new();
-        let mut last_turns: Vec<Vec<(String, i64)>> = Vec::new();
-        for i in 0..n_instances {
-            let n_sessions = 1 + rng.below(3);
-            sessions.push((0..n_sessions).map(|s| format!("sess-{i}-{s}")).collect());
-            last_turns.push(Vec::new());
-        }
-        let n_events = 6 + rng.below(15);
-        let mut seq_per_inst = vec![0i64; n_instances];
-        for _ in 0..n_events {
-            let ii = rng.below(n_instances as u64);
-            let inst = format!("ins_prop_{ii}");
-            seq_per_inst[ii] += 1;
-            let seq = seq_per_inst[ii];
-            let model = pick_model(&mut rng);
-            let stamp = format!("2026-10-20T00:00:{:02}.000Z", seq % 60);
-            let kind = *rng.pick(&["turn", "turn_correct", "session", "message"]);
-            let mut row = UsageEventRow {
-                instance_id: inst.clone(),
-                seq,
-                profile_id: Some(profile.into()),
-                model: Some(model.into()),
-                scope: "turn".into(),
-                scope_id: None,
-                turn_id: None,
-                native_context_window: if rng.below(4) == 0 {
-                    Some(200_000)
-                } else {
-                    None
-                },
-                mode: "snapshot".into(),
-                metric_revision: 1,
-                source_session_id: None,
-                total_tokens: None,
-                input_tokens: None,
-                output_tokens: None,
-                cache_read_tokens: None,
-                cache_write_tokens: None,
-                cost_usd: None,
-                accounting: "estimated".into(),
-                observed_at: stamp.clone(),
-                observed_at_source: "native".into(),
-            };
-            // Known value / structural zero / Unknown (None).
-            let draw_basket = |rng: &mut R43Rng| -> Option<i64> {
-                match rng.below(3) {
-                    0 => Some(100 * (1 + rng.below(5)) as i64),
-                    1 => Some(0),
-                    _ => None,
-                }
-            };
-            match kind {
-                "turn" | "turn_correct" => {
-                    let sid = rng.pick(&sessions[ii]).clone();
-                    let (scope, revision) = if kind == "turn_correct"
-                        && !last_turns[ii].is_empty()
-                        && rng.below(2) == 0
-                    {
-                        // Strictly newer correction of a prior turn lineage.
-                        let idx = rng.below(last_turns[ii].len() as u64);
-                        let (scope, rev) = last_turns[ii][idx].clone();
-                        (scope, rev + 1)
-                    } else {
-                        (format!("turn-{seq}"), 1 + rng.below(3) as i64)
-                    };
-                    let cost_only = kind == "turn_correct" && rng.below(2) == 0;
-                    row.scope_id = Some(scope.clone());
-                    row.source_session_id = Some(sid);
-                    row.metric_revision = revision;
-                    if cost_only {
-                        // Billing channel: every additive basket Unknown.
-                        row.total_tokens = None;
-                        row.input_tokens = None;
-                        row.output_tokens = None;
-                        row.cache_read_tokens = None;
-                        row.cache_write_tokens = None;
-                    } else {
-                        let input = draw_basket(&mut rng);
-                        row.input_tokens = input;
-                        row.output_tokens = draw_basket(&mut rng);
-                        row.cache_read_tokens = draw_basket(&mut rng);
-                        row.cache_write_tokens = draw_basket(&mut rng);
-                        row.total_tokens = match (
-                            input,
-                            row.output_tokens,
-                            row.cache_read_tokens,
-                            row.cache_write_tokens,
-                        ) {
-                            (Some(a), Some(o), Some(r), Some(w)) => Some(a + o + r + w),
-                            _ => None,
-                        };
-                        last_turns[ii].push((scope, revision));
-                    }
-                    if rng.below(3) > 0 {
-                        row.cost_usd = Some(format!("{:.2}", 0.01 * (1 + rng.below(50)) as f64));
-                    }
-                }
-                "session" => {
-                    let sid = rng.pick(&sessions[ii]).clone();
-                    let tokenless = rng.below(2) == 0;
-                    let reported = rng.below(2) == 0;
-                    row.scope = "session".into();
-                    row.scope_id = Some(sid.clone());
-                    row.source_session_id = Some(sid);
-                    row.metric_revision = 1 + rng.below(3) as i64;
-                    row.accounting = if reported { "reported" } else { "estimated" }.into();
-                    if !tokenless {
-                        let input = draw_basket(&mut rng);
-                        row.input_tokens = input;
-                        row.output_tokens = Some(0);
-                        row.cache_read_tokens = Some(0);
-                        row.cache_write_tokens = Some(0);
-                        row.total_tokens = input;
-                    }
-                    if rng.below(4) > 0 {
-                        row.cost_usd = Some(format!("{:.2}", 0.01 * (1 + rng.below(50)) as f64));
-                    }
-                }
-                "message" => {
-                    let scope = format!(
-                        "_remuda_codex_response:v2:r{seq}-{x}",
-                        x = rng.next_u64() % 1000
-                    );
-                    row.scope = "message".into();
-                    row.scope_id = Some(scope);
-                    row.turn_id = if rng.below(2) == 0 {
-                        Some(format!("turn-{seq}"))
-                    } else {
-                        None
-                    };
-                    let input = draw_basket(&mut rng).or(Some(0));
-                    row.input_tokens = input;
-                    row.output_tokens = draw_basket(&mut rng).or(Some(0));
-                    row.cache_read_tokens = Some(0);
-                    row.cache_write_tokens = Some(0);
-                    row.total_tokens = Some(input.unwrap() + row.output_tokens.unwrap_or(0));
-                    if rng.below(2) == 0 {
-                        row.cost_usd = Some(format!("{:.2}", 0.01 * (1 + rng.below(20)) as f64));
-                    }
-                }
-                _ => unreachable!(),
+        let draw_basket = |rng: &mut R43Rng| -> Basket {
+            match rng.below(3) {
+                0 => Basket::Known(100 * (1 + rng.below(5)) as i64),
+                1 => Basket::NotApplicable,
+                _ => Basket::Unknown,
             }
-            // Production order: journal first, then insert the (already
-            // projected) row — the shapes are hand-built in projected form.
-            let event = json!({ "kind": "usage" });
-            let record = JournalRecord {
-                instance_id: inst.clone(),
-                seq,
-                event_id: format!("je{seq}"),
-                event,
-                observed_at: stamp,
+        };
+        let cost_of = |rng: &mut R43Rng| -> Option<String> {
+            if rng.below(4) > 0 {
+                Some(format!("{:.2}", 0.01 * (1 + rng.below(50)) as f64))
+            } else {
+                None
+            }
+        };
+
+        // The seed DB starts on the r28 FALLBACK shape when any instance
+        // begins legacy; its first events are written through the 14-column
+        // path (NULL scope) and recovered when the schema is upgraded.
+        let n_instances = 1 + rng.below(3);
+        let begin_legacy = rng.below(3) == 0;
+        let legacy_instances: Vec<bool> = (0..n_instances)
+            .map(|_| begin_legacy && rng.below(2) == 0)
+            .collect();
+        let any_legacy = legacy_instances.iter().any(|x| *x);
+        let conn = Connection::open_in_memory().unwrap();
+        if any_legacy {
+            create_r28_usage_table_with_turn_index(&conn);
+        } else {
+            migrate(&conn).unwrap();
+        }
+        create_journal_table(&conn);
+        conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS r43_rowids(value INTEGER NOT NULL);")
+            .unwrap();
+
+        // Per instance: sessions, accepted turn lineages and the event list.
+        let mut sessions: Vec<Vec<String>> = Vec::new();
+        let mut lineages: Vec<Vec<(String, u64)>> = Vec::new();
+        let mut per_instance: Vec<Vec<R44Event>> = (0..n_instances).map(|_| Vec::new()).collect();
+        for ii in 0..n_instances {
+            let n_sessions = 1 + rng.below(3);
+            sessions.push((0..n_sessions).map(|s| format!("sess-{ii}-{s}")).collect());
+            lineages.push(Vec::new());
+            let n_events = 6 + rng.below(14);
+            let legacy_cut = if legacy_instances[ii] {
+                1 + rng.below(n_events as u64)
+            } else {
+                0
             };
-            insert_journal_raw(conn, &record);
-            let _ = insert_usage_event(conn, &row).unwrap();
+            for ei in 0..n_events {
+                let seq = ei as i64 + 1;
+                let model = models[rng.below(models.len() as u64)];
+                let inst = format!("ins_prop_{ii}");
+                let stamp = format!("2026-10-20T00:00:{:02}.000Z", seq % 60);
+                let legacy = legacy_instances[ii] && ei < legacy_cut;
+                let kind = *rng.pick(&[
+                    "turn",
+                    "turn_first_tokenless",
+                    "turn_correct",
+                    "session",
+                    "message",
+                ]);
+                let record = match kind {
+                    "turn" | "turn_first_tokenless" => {
+                        let sid = sessions[ii][rng.below(sessions[ii].len() as u64)].clone();
+                        let scope = format!("turn-{seq}");
+                        let revision = 1 + rng.below(3) as u64;
+                        let first_tokenless = kind == "turn_first_tokenless";
+                        let baskets = if first_tokenless {
+                            // FIRST frame, no baskets: bill + window + native
+                            // time. Recovery must read it as an initial frame
+                            // (recover metadata), never a cost-only correction.
+                            [Basket::Unknown; 5]
+                        } else {
+                            let input = draw_basket(&mut rng);
+                            let output = draw_basket(&mut rng);
+                            let cr = draw_basket(&mut rng);
+                            let cw = draw_basket(&mut rng);
+                            let total = match (
+                                input.decoded(),
+                                output.decoded(),
+                                cr.decoded(),
+                                cw.decoded(),
+                            ) {
+                                (Some(a), Some(o), Some(r), Some(w)) if rng.below(2) == 0 => {
+                                    Basket::Known(a + o + r + w)
+                                }
+                                _ => Basket::Unknown,
+                            };
+                            [total, input, output, cr, cw]
+                        };
+                        let window = if first_tokenless || rng.below(4) == 0 {
+                            Some(200_000)
+                        } else {
+                            None
+                        };
+                        let cost = if first_tokenless || rng.below(3) > 0 {
+                            cost_of(&mut rng)
+                        } else {
+                            None
+                        };
+                        let native = if first_tokenless || rng.below(2) == 0 {
+                            Some(stamp.as_str())
+                        } else {
+                            None
+                        };
+                        lineages[ii].push((scope.clone(), revision));
+                        r44_wire_record(
+                            &inst,
+                            seq,
+                            "turn",
+                            Some(&scope),
+                            Some(&sid),
+                            Some(&scope),
+                            revision,
+                            "estimated",
+                            baskets,
+                            cost.as_deref(),
+                            window,
+                            native,
+                        )
+                    }
+                    "turn_correct" => {
+                        if lineages[ii].is_empty() {
+                            // No lineage yet: emit an ordinary turn instead.
+                            let sid = sessions[ii][rng.below(sessions[ii].len() as u64)].clone();
+                            let scope = format!("turn-{seq}");
+                            let input = draw_basket(&mut rng);
+                            let revision = 1 + rng.below(3) as u64;
+                            lineages[ii].push((scope.clone(), revision));
+                            r44_wire_record(
+                                &inst,
+                                seq,
+                                "turn",
+                                Some(&scope),
+                                Some(&sid),
+                                Some(&scope),
+                                revision,
+                                "estimated",
+                                [
+                                    Basket::Unknown,
+                                    input,
+                                    Basket::NotApplicable,
+                                    Basket::Unknown,
+                                    Basket::Unknown,
+                                ],
+                                cost_of(&mut rng).as_deref(),
+                                None,
+                                None,
+                            )
+                        } else {
+                            // Strictly-newer cost-only correction: every
+                            // additive basket explicitly Unknown. It may carry
+                            // window/native time which must be suppressed.
+                            let idx = rng.below(lineages[ii].len() as u64);
+                            let (scope, rev) = lineages[ii][idx].clone();
+                            let sid = sessions[ii][rng.below(sessions[ii].len() as u64)].clone();
+                            let correction_rev = rev + 1 + rng.below(2) as u64;
+                            let window = if rng.below(2) == 0 {
+                                Some(1_000_000)
+                            } else {
+                                None
+                            };
+                            let native = if rng.below(2) == 0 {
+                                Some(stamp.as_str())
+                            } else {
+                                None
+                            };
+                            lineages[ii][idx] = (scope.clone(), correction_rev);
+                            r44_wire_record(
+                                &inst,
+                                seq,
+                                "turn",
+                                Some(&scope),
+                                Some(&sid),
+                                Some(&scope),
+                                correction_rev,
+                                "estimated",
+                                [Basket::Unknown; 5],
+                                cost_of(&mut rng).as_deref(),
+                                window,
+                                native,
+                            )
+                        }
+                    }
+                    "session" => {
+                        let sid = sessions[ii][rng.below(sessions[ii].len() as u64)].clone();
+                        let reported = rng.below(2) == 0;
+                        let accounting = if reported { "reported" } else { "estimated" };
+                        let tokenless = rng.below(2) == 0;
+                        let revision = 1 + rng.below(3) as u64;
+                        let baskets = if tokenless {
+                            [Basket::Unknown; 5]
+                        } else {
+                            let input = draw_basket(&mut rng);
+                            [
+                                input,
+                                input,
+                                Basket::NotApplicable,
+                                Basket::NotApplicable,
+                                Basket::NotApplicable,
+                            ]
+                        };
+                        if legacy {
+                            // Legacy NULL-scope session: no scope/session id.
+                            r44_wire_record(
+                                &inst,
+                                seq,
+                                "session",
+                                None,
+                                None,
+                                None,
+                                revision,
+                                accounting,
+                                baskets,
+                                cost_of(&mut rng).as_deref(),
+                                None,
+                                Some(stamp.as_str()),
+                            )
+                        } else {
+                            r44_wire_record(
+                                &inst,
+                                seq,
+                                "session",
+                                Some(&sid),
+                                Some(&sid),
+                                None,
+                                revision,
+                                accounting,
+                                baskets,
+                                cost_of(&mut rng).as_deref(),
+                                None,
+                                Some(stamp.as_str()),
+                            )
+                        }
+                    }
+                    "message" => {
+                        // Durable Message linked to an existing Turn when one
+                        // exists (nativeTurnId); marker lives in scopeId.
+                        let linked = if !lineages[ii].is_empty() && rng.below(2) == 0 {
+                            Some(lineages[ii][rng.below(lineages[ii].len() as u64)].0.clone())
+                        } else {
+                            None
+                        };
+                        let marker =
+                            format!("_remuda_codex_response:v2:r{seq}-{}", rng.next_u64() % 1000);
+                        let input = Basket::Known((rng.below(5) as i64) * 100);
+                        let output = Basket::Known((rng.below(5) as i64) * 100);
+                        r44_wire_record(
+                            &inst,
+                            seq,
+                            "message",
+                            Some(&marker),
+                            None,
+                            linked.as_deref(),
+                            1,
+                            "estimated",
+                            [
+                                Basket::Unknown,
+                                input,
+                                output,
+                                Basket::NotApplicable,
+                                Basket::NotApplicable,
+                            ],
+                            cost_of(&mut rng).as_deref(),
+                            None,
+                            Some(stamp.as_str()),
+                        )
+                    }
+                    _ => unreachable!(),
+                };
+                per_instance[ii].push(R44Event {
+                    model,
+                    legacy,
+                    record,
+                });
+            }
         }
 
-        // (c) live == restart == second restart, full rows minus rowid.
-        let live_rows = r43_dump_rows(conn);
-        migrate(conn).unwrap_or_else(|e| panic!("seed {seed}: migrate1 {e}"));
-        let once_rows = r43_dump_rows(conn);
-        migrate(conn).unwrap_or_else(|e| panic!("seed {seed}: migrate2 {e}"));
-        let twice_rows = r43_dump_rows(conn);
+        // ---- Production ingest ---------------------------------------------
+        // 1) every legacy event (NULL-scope fallback path) in per-instance
+        //    order, journaled first; 2) schema upgrade; 3) every scoped event
+        //    through project_usage_event + the live insert path.
+        for events in per_instance.iter() {
+            for ev in events.iter().filter(|e| e.legacy) {
+                insert_journal_raw(&conn, &ev.record);
+                let row = project_usage_event(&ev.record, Some(profile), Some(ev.model))
+                    .expect("real usage payload projects");
+                let _ = insert_usage_event(&conn, &row).unwrap();
+            }
+        }
+        if any_legacy {
+            migrate(&conn).unwrap();
+        }
+        let mut any_data = false;
+        for events in per_instance.iter() {
+            for ev in events.iter().filter(|e| !e.legacy) {
+                insert_journal_raw(&conn, &ev.record);
+                let row = project_usage_event(&ev.record, Some(profile), Some(ev.model))
+                    .expect("real usage payload projects");
+                if insert_usage_event(&conn, &row).unwrap() {
+                    any_data = true;
+                }
+            }
+        }
+
+        // Invariant (c): live == restart == second migration, FULL rows.
+        let live_rows = r43_dump_rows(&conn);
+        migrate(&conn).unwrap_or_else(|e| panic!("seed {seed}: migrate1 {e}"));
+        let once_rows = r43_dump_rows(&conn);
+        migrate(&conn).unwrap_or_else(|e| panic!("seed {seed}: migrate2 {e}"));
+        let twice_rows = r43_dump_rows(&conn);
         assert_eq!(live_rows, once_rows, "seed {seed}: restart changed rows");
         assert_eq!(
             once_rows, twice_rows,
             "seed {seed}: second migration changed rows"
         );
 
-        let mut any_data = false;
-        // Grand totals over every instance — supply aggregates pool instances,
-        // so invariant (a) is sum(instances) == sum(per-model supplies).
+        // Grand instance totals over every instance.
         let mut grand_input: Option<i64> = Some(0);
+        let mut grand_output: Option<i64> = Some(0);
         let mut grand_total: Option<i64> = Some(0);
         let mut grand_cost: Option<f64> = Some(0.0);
+        let add = |acc: Option<i64>, v: Option<i64>| match (acc, v) {
+            (Some(a), Some(b)) => Some(a + b),
+            _ => None,
+        };
         for ii in 0..n_instances {
             let inst = format!("ins_prop_{ii}");
-            let agg = aggregate_instance(conn, &inst).unwrap();
-            if agg.events > 0 {
+            let agg = aggregate_instance(&conn, &inst).unwrap();
+            if agg.events > 0 || agg.token_event_rows > 0 {
                 any_data = true;
             }
-            if agg.events == 0 {
-                continue;
+            // Invariant (b): rollup tokens == aggregate tokens.
+            if agg.events > 0 || agg.token_event_rows > 0 || agg.cost_usd.is_some() {
+                let rollup = rollup_instance(
+                    &conn,
+                    &RollupRequest {
+                        instance_id: &inst,
+                        kind: "codex",
+                        spec_model: Some("m-a"),
+                        effective_model: None,
+                        profile_id: Some(profile),
+                    },
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(
+                    rollup.session_input_tokens, agg.input_tokens,
+                    "seed {seed} {inst} input"
+                );
+                assert_eq!(
+                    rollup.session_output_tokens, agg.output_tokens,
+                    "seed {seed} {inst} output"
+                );
             }
-            // (b) rollup tokens == aggregate tokens.
-            let rollup = rollup_instance(
-                conn,
-                &RollupRequest {
-                    instance_id: &inst,
-                    kind: "codex",
-                    spec_model: Some("m-a"),
-                    effective_model: None,
-                    profile_id: Some(profile),
-                },
-            )
-            .unwrap()
-            .unwrap();
-            assert_eq!(
-                rollup.session_input_tokens, agg.input_tokens,
-                "seed {seed} {inst} input"
-            );
-            assert_eq!(
-                rollup.session_output_tokens, agg.output_tokens,
-                "seed {seed} {inst} output"
-            );
-
-            let has_tokens = agg.token_event_rows > 0 || agg.ambiguous_events > 0;
-            let add = |acc: Option<i64>, v: Option<i64>| match (acc, v) {
-                (Some(a), Some(b)) => Some(a + b),
-                _ => None,
-            };
-            if has_tokens {
+            if agg.token_event_rows > 0 || agg.ambiguous_events > 0 {
                 grand_input = add(grand_input, agg.input_tokens);
+                grand_output = add(grand_output, agg.output_tokens);
                 grand_total = add(grand_total, agg.total_tokens);
             }
             grand_cost = match (grand_cost, agg.cost_usd) {
@@ -9745,28 +9986,20 @@ mod tests {
             };
         }
 
-        // (a) grand instance totals == grand per-model supply totals; Unknown
-        // iff any present side is Unknown. A model whose domain has only
-        // presence rows (a superseded cumulative bill after a /model switch)
-        // owns NO token evidence: its NULL token columns are absence in the
-        // token partition, not Unknown, so it is skipped for token summing
-        // (its cost is still a known zero). The fold's own token_events CTE is
-        // the authority on whether the domain carries token evidence.
+        // Invariant (a): grand per-model supply == grand instance totals;
+        // Unknown iff any present side is Unknown.
         let mut supply_input: Option<i64> = Some(0);
+        let mut supply_output: Option<i64> = Some(0);
         let mut supply_total: Option<i64> = Some(0);
         let mut supply_cost: Option<f64> = Some(0.0);
         for model in models {
-            let s = aggregate_supply(conn, profile, model).unwrap();
+            let s = aggregate_supply(&conn, profile, model).unwrap();
             if s.events == 0 {
                 continue;
             }
-            let has_tokens = s.token_event_rows > 0 || s.ambiguous_events > 0;
-            let add = |acc: Option<i64>, v: Option<i64>| match (acc, v) {
-                (Some(a), Some(b)) => Some(a + b),
-                _ => None,
-            };
-            if has_tokens {
+            if s.token_event_rows > 0 || s.ambiguous_events > 0 {
                 supply_input = add(supply_input, s.input_tokens);
+                supply_output = add(supply_output, s.output_tokens);
                 supply_total = add(supply_total, s.total_tokens);
             }
             supply_cost = match (supply_cost, s.cost_usd) {
@@ -9774,6 +10007,8 @@ mod tests {
                 _ => None,
             };
         }
+        assert_eq!(grand_input, supply_input, "seed {seed}: input grand sum");
+        assert_eq!(grand_output, supply_output, "seed {seed}: output grand sum");
         assert_eq!(grand_total, supply_total, "seed {seed}: total grand sum");
         match (grand_cost, supply_cost) {
             (Some(a), Some(b)) => assert!((a - b).abs() < 1e-6, "seed {seed}: cost {b} vs {a}"),
@@ -9798,17 +10033,13 @@ mod tests {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(100);
-        assert!(seeds >= 100, "default AC4 run covers at least 100 seeds");
-        // One migrated steady-state connection reused across seeds so the
-        // fold's prepared-statement cache survives (runtime budget).
-        let conn = Connection::open_in_memory().unwrap();
-        migrate(&conn).unwrap();
-        create_journal_table(&conn);
-        conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS r43_rowids(value INTEGER NOT NULL);")
-            .unwrap();
+        assert!(
+            seeds >= 100,
+            "default r44 run covers at least 100 seeds (~<120 s)"
+        );
         let mut with_data = 0;
         for seed in 0..seeds {
-            if r43_property_one(&conn, seed) {
+            if r44_property_one(seed) {
                 with_data += 1;
             }
         }
@@ -9818,18 +10049,13 @@ mod tests {
         );
     }
 
-    /// AC4 fixed regressions: the exact seeds that violated an invariant
-    /// before the r43 fixes. Kept as named tests so a regression pinpoints the
-    /// broken rule even if the broad run uses a smaller seed count.
+    /// Fixed regressions: exact seeds that violated invariants before the
+    /// r43/r44 fixes. Pinned so a regression pinpoints the broken rule even
+    /// when the broad run uses a smaller seed count.
     #[test]
-    fn property_invariant_fixed_seeds_14_100_426() {
-        let conn = Connection::open_in_memory().unwrap();
-        migrate(&conn).unwrap();
-        create_journal_table(&conn);
-        conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS r43_rowids(value INTEGER NOT NULL);")
-            .unwrap();
+    fn property_invariant_fixed_seeds() {
         for seed in [14u64, 100, 426] {
-            r43_property_one(&conn, seed);
+            r44_property_one(seed);
         }
     }
 

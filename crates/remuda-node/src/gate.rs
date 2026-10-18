@@ -5044,7 +5044,7 @@ fn write_qualified_dead_cert_bytes(
         // rename, so a regression can run a second writer to the exact
         // interleave where a shared temp name would swap certificate contents.
         #[cfg(test)]
-        park_cert_temp_before_rename();
+        park_cert_temp_before_rename(dir, job_id);
         if let Err(error) = std::fs::rename(&temporary, &path) {
             let _ = std::fs::remove_file(&temporary);
             return Err(error);
@@ -5661,13 +5661,27 @@ pub(crate) fn arm_settle_esrch_hold(hold: std::sync::Arc<CleanupHold>) {
         .unwrap_or_else(|poison| poison.into_inner()) = Some(hold);
 }
 
-/// r36 item 1 TEST-ONLY: like CleanupHold but counts how many certificate
-/// writers have parked, so a two-writer regression can wait until BOTH have
-/// written their temp before letting either rename.
+/// r36 item 1 / r37 item 2 TEST-ONLY: like CleanupHold but counts how many
+/// certificate writers have parked, so a two-writer regression can wait until
+/// BOTH have written their temp before letting either rename. r37 item 2
+/// scopes it to the regression's own ledger directory and intended job pair so
+/// an unrelated test's certificate write never counts as an arrival.
 #[cfg(test)]
 struct CountedHold {
     entered: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     release: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    dir: std::path::PathBuf,
+    jobs: Vec<String>,
+}
+
+#[cfg(test)]
+impl CountedHold {
+    /// Only a write into THIS scoped ledger dir for one of the intended jobs
+    /// parks; every other cert writer (sharing the process-global static)
+    /// passes straight through and never touches `entered`.
+    fn matches(&self, dir: &std::path::Path, job_id: &str) -> bool {
+        dir == self.dir && self.jobs.iter().any(|job| job == job_id)
+    }
 }
 
 #[cfg(test)]
@@ -5675,14 +5689,17 @@ static CERT_TEMP_HOLD: std::sync::OnceLock<std::sync::Mutex<Option<std::sync::Ar
     std::sync::OnceLock::new();
 
 #[cfg(test)]
-fn park_cert_temp_before_rename() {
+fn park_cert_temp_before_rename(dir: &std::path::Path, job_id: &str) {
     // Clone (do not consume): both scoped writers must observe the armed hold.
     let hold = {
         let guard = CERT_TEMP_HOLD
             .get_or_init(|| std::sync::Mutex::new(None))
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        guard.as_ref().cloned()
+        guard
+            .as_ref()
+            .filter(|hold| hold.matches(dir, job_id))
+            .cloned()
     };
     let Some(hold) = hold else {
         return;
@@ -5703,16 +5720,41 @@ fn park_cert_temp_before_rename() {
 }
 
 #[cfg(test)]
-fn arm_cert_temp_hold() -> std::sync::Arc<CountedHold> {
+fn arm_cert_temp_hold(dir: std::path::PathBuf, jobs: Vec<String>) -> std::sync::Arc<CountedHold> {
     let hold = std::sync::Arc::new(CountedHold {
         entered: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         release: std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
+        dir,
+        jobs,
     });
     *CERT_TEMP_HOLD
         .get_or_init(|| std::sync::Mutex::new(None))
         .lock()
         .unwrap_or_else(|poison| poison.into_inner()) = Some(hold.clone());
     hold
+}
+
+/// r37 item 2 TEST-ONLY: RAII scope guard for the cert-temp barrier. Dropping
+/// it disarms the process-global hold and releases every parked writer, so an
+/// assertion failure or normal completion can never leave another test's
+/// certificate writer blocked or the static left armed.
+#[cfg(test)]
+struct CertTempHoldGuard {
+    hold: std::sync::Arc<CountedHold>,
+}
+
+#[cfg(test)]
+impl Drop for CertTempHoldGuard {
+    fn drop(&mut self) {
+        *CERT_TEMP_HOLD
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = None;
+        let (lock, cvar) = &*self.hold.release;
+        let mut released = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+        *released = true;
+        cvar.notify_all();
+    }
 }
 
 /// r36 item 1 test helper: disarm the cert-temp hold after the writers join.
@@ -9838,7 +9880,13 @@ Running 8 tests across 2 projects
         let cert_a = cert("gjb_r36_jobA", 4141, MERGE_A);
         let cert_b = cert("gjb_r36_jobB", 4242, MERGE_B);
 
-        let hold = arm_cert_temp_hold();
+        // r37 item 2: the barrier is scoped to THIS unique ledger dir and the
+        // two intended jobs, so an unrelated parallel test's certificate write
+        // cannot count as an arrival; the RAII guard disarms/releases even on
+        // assertion failure.
+        let jobs = vec!["gjb_r36_jobA".to_owned(), "gjb_r36_jobB".to_owned()];
+        let hold = arm_cert_temp_hold(dir.clone(), jobs);
+        let _hold_guard = CertTempHoldGuard { hold: hold.clone() };
         let dir_a = dir.clone();
         let ca = cert_a.clone();
         let writer_a = std::thread::spawn(move || {
@@ -9850,6 +9898,44 @@ Running 8 tests across 2 projects
             super::write_qualified_dead_cert_bytes(&dir_b, &cb, "gjb_r36_jobB", 1)
         });
 
+        // r37 item 2: a FOREIGN writer (different ledger dir AND job) must pass
+        // the scoped barrier without parking: it completes on its own while A/B
+        // are held and never increments the barrier's arrival count.
+        let foreign_dir = tempfile::TempDir::new().unwrap();
+        let foreign_cert = cert("gjb_r36_foreign", 4343, MERGE_A);
+        let fdir = foreign_dir.path().to_path_buf();
+        let writer_foreign = std::thread::spawn(move || {
+            super::write_qualified_dead_cert_bytes(&fdir, &foreign_cert, "gjb_r36_foreign", 1)
+        });
+
+        // Deterministic barrier: wait until BOTH scoped temps exist and BOTH
+        // scoped writers are parked between write and rename.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while hold.entered.load(std::sync::atomic::Ordering::Acquire) < 2
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            hold.entered.load(std::sync::atomic::Ordering::Acquire),
+            2,
+            "both scoped writers must park before either rename"
+        );
+        // The foreign writer did NOT park: it finished (its qualified cert
+        // exists) while A/B are still held, and the arrival count is exactly 2.
+        writer_foreign
+            .join()
+            .unwrap()
+            .expect("foreign writer completes without parking");
+        assert!(
+            super::land_dead_cert_path(foreign_dir.path(), "gjb_r36_foreign", 1).exists(),
+            "the foreign write completed independently while A/B were parked"
+        );
+        assert_eq!(
+            hold.entered.load(std::sync::atomic::Ordering::Acquire),
+            2,
+            "a foreign-dir write must not count as a barrier arrival"
+        );
         let temps: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .flatten()

@@ -945,6 +945,25 @@ pub(crate) struct GateRegistry {
     /// still land, so a read-only landing probe reports `unknown`.
     land_fence_dir: std::path::PathBuf,
     events: tokio::sync::broadcast::Sender<GateEventParams>,
+    /// r36 item 2 test-only: the most recently finished run of one job, so a
+    /// real-Node integration test can observe the production land verdict and
+    /// its acquired lane without a scripted fake.
+    #[cfg(any(test, feature = "test-faults"))]
+    last_verdicts: Mutex<std::collections::BTreeMap<String, LastGateVerdict>>,
+}
+
+/// r36 item 2 test-only record of one finished gate.run.
+#[cfg(any(test, feature = "test-faults"))]
+#[derive(Clone)]
+pub struct LastGateVerdict {
+    /// Dispatch generation that produced the verdict.
+    pub generation: u32,
+    /// Lane slot the dispatch acquired.
+    pub lane_id: String,
+    /// Final production verdict status.
+    pub status: String,
+    /// Verdict error/reason, if any.
+    pub error: Option<String>,
 }
 
 impl GateRegistry {
@@ -983,7 +1002,17 @@ impl GateRegistry {
             land_drain_seams: std::sync::Mutex::new(LandDrainSeams::default()),
             land_fence_dir,
             events,
+            #[cfg(any(test, feature = "test-faults"))]
+            last_verdicts: Mutex::new(std::collections::BTreeMap::new()),
         })
+    }
+
+    /// r36 item 2 test-only: the most recently finished (generation, status,
+    /// error) for a job — the production classification a real-Node
+    /// integration test asserts on.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn gate_test_last_verdict(&self, job_id: &str) -> Option<LastGateVerdict> {
+        self.last_verdicts.lock().await.get(job_id).cloned()
     }
 
     /// Test-only: override the consumed merge/land CLI.
@@ -1664,6 +1693,13 @@ impl DevNode {
         self.gate_registry().gate_test_live_land_pgid(job_id).await
     }
 
+    /// r36 item 2 test-only: last production gate verdict for a job.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn gate_test_last_verdict(&self, job_id: &str) -> Option<LastGateVerdict> {
+        self.gate_registry().gate_test_last_verdict(job_id).await
+    }
+
     /// Test-only: install a Hub-authority hook directly (drives the pre-run
     /// gate.authorize check without a live carrier).
     #[doc(hidden)]
@@ -2152,6 +2188,22 @@ impl DevNode {
         {
             let mut table = registry.runs.lock().await;
             table.runs.remove(&request.job_id);
+        }
+        // r36 item 2 test-only: retain the last finished verdict (with the
+        // acquired lane) so a real-Node regression can observe the PRODUCTION
+        // classification and lane acquisition, not a fake's canned reply.
+        #[cfg(any(test, feature = "test-faults"))]
+        {
+            let mut last = registry.last_verdicts.lock().await;
+            last.insert(
+                request.job_id.clone(),
+                LastGateVerdict {
+                    generation: request.generation,
+                    lane_id: request.lane_id.clone(),
+                    status: outcome.status.clone(),
+                    error: outcome.error.clone(),
+                },
+            );
         }
 
         // The finished event is authoritative even if the RPC reply is lost.

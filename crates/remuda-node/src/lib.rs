@@ -141,6 +141,11 @@ pub use gate::GateRunHold;
 /// Land-grant answer type used by the durable daemon authorizer and tests.
 #[doc(hidden)]
 pub use gate::LandGrantAnswer as GateLandGrantAnswer;
+/// r36 item 2 test-only record of one finished gate.run (production verdict +
+/// acquired lane) for real-Node Landing regressions.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-faults"))]
+pub use gate::LastGateVerdict;
 /// Test-only: pids still alive in a process group (r13 item 5 kill/reap test).
 #[doc(hidden)]
 #[cfg(any(test, feature = "test-faults"))]

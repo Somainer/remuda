@@ -383,6 +383,50 @@ mod tests {
         std::fs::create_dir_all(&repo_b).unwrap();
         std::fs::create_dir_all(&repo_panic).unwrap();
 
+        // r37 item 3: every assertion filters to THIS test's fixture tree. A
+        // parallel owner test (run_owned_process records every spawn) uses its
+        // own temp working directory, so its commands never appear under the
+        // fixture root and can no longer inflate a count or break an empty
+        // assertion. The retained post-drop log handles are still inspected
+        // AFTER the guard drops (the actual cleanup proof).
+        //
+        // The fixture-root predicate is applied to BOTH synthetic records and
+        // the live log, so a regression that drops the cwd scoping fails here
+        // deterministically (a synthetic foreign-cwd record must be excluded).
+        let within_tmp =
+            |rec: &RecordedGit| rec.cwd.as_deref().is_some_and(|cwd| cwd.starts_with(&tmp));
+        let foreign_cwd = std::env::temp_dir().join("some-other-owner-test-cwd");
+        let foreign_rec = RecordedGit {
+            executable: "git".into(),
+            cwd: Some(foreign_cwd.clone()),
+            args: vec!["rev-parse".into()],
+            env: vec![],
+        };
+        assert!(
+            !within_tmp(&foreign_rec),
+            "a foreign-cwd owner spawn must be excluded by the fixture filter (got {foreign_cwd:?})"
+        );
+        assert!(
+            within_tmp(&RecordedGit {
+                executable: "git".into(),
+                cwd: Some(repo_a.clone()),
+                args: vec![],
+                env: vec![],
+            }),
+            "a fixture-cwd record must match the filter"
+        );
+        let count_in = |log: &Arc<Mutex<Vec<RecordedGit>>>, pred: &dyn Fn(&RecordedGit) -> bool| {
+            log.lock()
+                .expect("record log lock")
+                .iter()
+                .filter(|rec| pred(rec))
+                .count()
+        };
+        let in_repo_a =
+            |rec: &RecordedGit| within_tmp(rec) && rec.cwd.as_deref() == Some(repo_a.as_path());
+        let in_repo_panic =
+            |rec: &RecordedGit| within_tmp(rec) && rec.cwd.as_deref() == Some(repo_panic.as_path());
+
         // ── scope 1: a normally-dropped guard ──────────────────────────────
         let kept_handle = {
             let guard = RecordingGuard::install();
@@ -398,7 +442,10 @@ mod tests {
             assert_eq!(only_a.len(), 1, "only repo-a's command, got {only_a:?}");
             assert_eq!(only_a[0].cwd.as_deref(), Some(repo_a.as_path()));
             assert!(only_a[0].executable.ends_with("git"));
-            // take() cleared the log.
+            // for_repo() consumes (takes) the whole log and returned exactly
+            // repo-a's one command; the log is now empty. A foreign owner
+            // spawn's command (a different cwd) can never appear here because
+            // the selection itself filtered by cwd.
             assert!(guard.snapshot().is_empty());
             // Record one more command, then retain a DIRECT handle so the log
             // can be inspected after the guard itself is gone.
@@ -409,21 +456,34 @@ mod tests {
         // The guard has dropped. A spawn at the owner boundary must NOT reach
         // the original log the guard owned (proves Drop really cleared the
         // process-wide recorder; a fresh install() would hide a missing Drop).
-        let before = kept_handle.lock().expect("kept log lock").len();
-        assert_eq!(before, 1, "the one pre-drop command is still in its log");
+        // Filtered to repo-a so a foreign owner test's spawn (another cwd) is
+        // irrelevant.
+        assert_eq!(
+            count_in(&kept_handle, &in_repo_a),
+            1,
+            "the one pre-drop repo-a command is still in its log"
+        );
         let later = RecoveryGit::new();
         record_spawn(&later.command(&tmp, &["rev-parse", "--git-dir"]));
-        let after = kept_handle.lock().expect("kept log lock").len();
         assert_eq!(
-            before, after,
-            "a post-drop spawn must not reach the dropped guard's log (cleanup missing)"
+            count_in(&kept_handle, &in_repo_a),
+            1,
+            "a post-drop spawn must not reach the dropped guard's repo-a log (cleanup missing)"
         );
 
         // A fresh guard installs onto a clean recorder (the scope-1 cleanup
-        // actually ran; scope 2 starts from a known-empty state).
+        // actually ran; scope 2 starts from a known-empty fixture state).
         {
             let guard = RecordingGuard::install();
-            assert!(guard.snapshot().is_empty(), "scope 1 leaked its recorder");
+            assert_eq!(
+                guard
+                    .snapshot()
+                    .iter()
+                    .filter(|rec| within_tmp(rec))
+                    .count(),
+                0,
+                "scope 1 leaked its recorder into the fixture cwd"
+            );
         }
         // The throwaway guard above clears itself immediately.
         let probe = RecoveryGit::new();
@@ -447,32 +507,42 @@ mod tests {
         );
         let panicked_log = panicked_log.expect("the scope armed its log before panicking");
         assert_eq!(
-            panicked_log.lock().expect("panic log lock").len(),
+            count_in(&panicked_log, &in_repo_panic),
             1,
-            "the one pre-panic command was recorded"
+            "the one pre-panic repo-panic command was recorded"
         );
         // With no unwind cleanup the process-wide recorder still targets the
-        // panicked log, so this spawn would reach it:
+        // panicked log, so this fixture spawn would reach it:
         let probe = RecoveryGit::new();
         record_spawn(&probe.command(&repo_panic, &["rev-parse", "--is-shallow-repository"]));
         assert_eq!(
-            panicked_log.lock().expect("panic log lock").len(),
+            count_in(&panicked_log, &in_repo_panic),
             1,
-            "a post-unwind spawn must not reach the panicked scope's log (Drop cleanup missing)"
+            "a post-unwind spawn must not reach the panicked scope's repo-panic log (Drop cleanup missing)"
         );
         // A freshly installed guard likewise starts empty (and its own
         // post-drop probe is captured nowhere).
         let fresh = RecordingGuard::install();
-        assert!(
-            fresh.snapshot().is_empty(),
+        assert_eq!(
+            fresh
+                .snapshot()
+                .iter()
+                .filter(|rec| within_tmp(rec))
+                .count(),
+            0,
             "the panicked scope leaked its recorder into a fresh guard"
         );
         drop(fresh);
         let h = RecoveryGit::new();
         record_spawn(&h.command(&repo_panic, &["rev-parse", "--git-dir"]));
         let fresh2 = RecordingGuard::install();
-        assert!(
-            fresh2.snapshot().is_empty(),
+        assert_eq!(
+            fresh2
+                .snapshot()
+                .iter()
+                .filter(|rec| within_tmp(rec))
+                .count(),
+            0,
             "post-drop spawns are never recorded"
         );
         std::fs::remove_dir_all(&tmp).ok();

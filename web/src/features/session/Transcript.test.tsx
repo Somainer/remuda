@@ -633,6 +633,151 @@ describe("Transcript search (batch E)", () => {
     localStorage.clear();
   });
 
+  it("persists a follow edge synchronously, before the anchor-save debounce can fire", () => {
+    // mainflakes session-virtual:158: a full-document navigation inside the
+    // 250 ms persist debounce destroys the page before the timer (and the
+    // passive unmount flush) runs, so the next visit restores the stale follow
+    // value. The follow/unfollow EDGE therefore writes storage immediately on
+    // the scroll event that crosses the pin threshold — no timer involved.
+    vi.useFakeTimers();
+    try {
+      const COUNT = 60;
+      const events = buildLongObservations({
+        instanceId: "ins_edge" as Id,
+        journalId: "obj_edge" as Id,
+        hostId: "hst_1" as Id,
+        count: COUNT,
+      });
+      localStorage.clear();
+      // Last visit left the reader scrolled up (follow=false). The anchor id
+      // only has to parse; the restore effect leaves it when the id is absent.
+      localStorage.setItem(
+        "runtime.reading.v1.ins_edge",
+        JSON.stringify({ anchorId: "obj_long_m_1", offset: 0, ratio: 0, avgRow: 96, follow: false }),
+      );
+      stubLayout(COUNT);
+      renderRouted(events, "/s/ins_edge", false);
+      const scroller = screen.getByTestId("transcript-scroller") as HTMLElement;
+
+      const readFollow = () =>
+        (JSON.parse(localStorage.getItem("runtime.reading.v1.ins_edge") ?? "{}") as { follow?: boolean }).follow;
+      expect(readFollow()).toBe(false);
+
+      // Reader re-pins to the tail. Geometry: 60 rows * 96 - 720 viewport.
+      (scroller as HTMLElement & { scrollTop: number }).scrollTop = COUNT * 96 - 720;
+      fireEvent.scroll(scroller);
+
+      // Synchronous: true WITHOUT advancing the 250 ms debounce timer.
+      expect(readFollow()).toBe(true);
+
+      // And scrolling back up flips it back at once.
+      (scroller as HTMLElement & { scrollTop: number }).scrollTop = 0;
+      fireEvent.scroll(scroller);
+      expect(readFollow()).toBe(false);
+    } finally {
+      vi.useRealTimers();
+      localStorage.clear();
+    }
+  });
+
+  it("keeps follow pinned when the pin write's own coalesced scroll event lands after content grows", async () => {
+    // mainflakes session-virtual:158: on re-entry the follow-pin layout effect
+    // writes scrollTop while the content is still laid out SHORT (the wrapping
+    // rows grow to their real height only afterwards). The write clamps near
+    // the top; its coalesced scroll event is delivered after the growth, and
+    // onScroll recomputing pin state against the NEW geometry flips follow off
+    // permanently (every later re-pin effect then early-returns). An own write
+    // echo must keep the follow state the writer intended.
+    localStorage.clear();
+    const VIEW = 427;
+    let sh = 459; // first layout: tail clamps to 459-427 = 32
+    const isScroller = (el: unknown) =>
+      el instanceof HTMLElement && el.dataset?.testid === "transcript-scroller";
+    vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(
+      function (this: HTMLElement) {
+        return isScroller(this) ? VIEW : 0;
+      },
+    );
+    vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockImplementation(
+      function (this: HTMLElement) {
+        return isScroller(this) ? sh : 0;
+      },
+    );
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockReturnValue({
+      height: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, x: 0, y: 0, toJSON() {},
+    } as DOMRect);
+    vi.stubGlobal("ResizeObserver", class { observe() {} unobserve() {} disconnect() {} });
+
+    // Clamped scrollTop; the write's scroll event fires on the NEXT animation
+    // frame, like a real browser's coalesced delivery under load.
+    const tops = new WeakMap<HTMLElement, number>();
+    const queued = new Set<HTMLElement>();
+    const protoScrollTop = Object.getOwnPropertyDescriptor(
+      Element.prototype,
+      "scrollTop",
+    )!;
+    Object.defineProperty(HTMLElement.prototype, "scrollTop", {
+      configurable: true,
+      get(this: HTMLElement) {
+        return isScroller(this) ? (tops.get(this) ?? 0) : protoScrollTop.get!.call(this);
+      },
+      set(this: HTMLElement, v: number) {
+        if (!isScroller(this)) {
+          protoScrollTop.set!.call(this, v);
+          return;
+        }
+        const clamped = Math.max(0, Math.min(v, Math.max(0, sh - VIEW)));
+        tops.set(this, clamped);
+        if (!queued.has(this)) {
+          queued.add(this);
+          requestAnimationFrame(() => {
+            queued.delete(this);
+            fireEvent.scroll(this);
+          });
+        }
+      },
+    });
+
+    const element = (evs: Observation[]) => (
+      <MemoryRouter initialEntries={["/s/ins_echo"]}>
+        <Routes>
+          <Route path="/s/:instanceId" element={<Transcript events={evs} compact={false} />} />
+        </Routes>
+      </MemoryRouter>
+    );
+    const utils = render(element(buildLongObservations({
+      instanceId: "ins_echo" as Id,
+      journalId: "obj_echo" as Id,
+      hostId: "hst_1" as Id,
+      count: 1,
+    })));
+    const scroller = screen.getByTestId("transcript-scroller") as HTMLElement;
+    // The follow pin was written against the short first layout and clamped.
+    expect((scroller as HTMLElement & { scrollTop: number }).scrollTop).toBe(32);
+
+    // Content grows BEFORE the write's coalesced event is delivered.
+    sh = 2511;
+    await act(async () => {
+      await new Promise((resolve) =>
+        requestAnimationFrame(() => requestAnimationFrame(resolve)),
+      );
+    });
+
+    // More nodes stream in: the structural re-pin effect must still be armed.
+    utils.rerender(element(buildLongObservations({
+      instanceId: "ins_echo" as Id,
+      journalId: "obj_echo" as Id,
+      hostId: "hst_1" as Id,
+      count: 10,
+    })));
+    expect((scroller as HTMLElement & { scrollTop: number }).scrollTop).toBe(2511 - VIEW);
+    utils.unmount();
+    // Remove the scroller accessor installed on HTMLElement so it cannot
+    // shadow jsdom's native Element.prototype scrollTop for later tests.
+    delete (HTMLElement.prototype as unknown as Record<string, unknown>).scrollTop;
+    localStorage.clear();
+  });
+
   it("keeps a failed tool visible inline and immune to collapse-all", async () => {
     const user = userEvent.setup();
     // User prompt, one failed tool, then the assistant turn ends: compaction

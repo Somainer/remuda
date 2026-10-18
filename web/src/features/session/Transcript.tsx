@@ -348,6 +348,13 @@ function TranscriptInner({
   const restoredRef = useRef(false);
   // Follow state restores from the last visit; a brand-new session pins.
   const pinRef = useRef(saved ? saved.follow : true);
+  // The follow value last written to reading storage. A follow/unfollow EDGE
+  // is persisted synchronously (not via the 250ms anchor debounce): a full
+  // document navigation inside the debounce window destroys the page before
+  // the flip lands, so the next visit restores the stale follow state
+  // (mainflakes session-virtual:158). Seeded from the saved value so a
+  // re-entry's restore echo does not count as an edge.
+  const lastFollowRef = useRef(saved ? saved.follow : true);
   // True while a saved-position / load-earlier restore is in flight: freezes
   // the unmeasured-row estimate so the rows above the anchor keep their saved
   // contribution. Declared with the other per-instance refs so the route
@@ -362,8 +369,10 @@ function TranscriptInner({
    * event — a reader gesture, j/k navigation, a search hit, 跳到最新 — is an
    * intentional jump that cancels the restore instead of being swallowed.
    * The seq lets a later write's rAF invalidate only its own record.
+   * `follow` is the pin state the writer intended, honored by the delayed
+   * echo instead of recomputing against post-write geometry.
    */
-  const restoreEchoRef = useRef<{ top: number; seq: number; inputSeq: number } | null>(null);
+  const restoreEchoRef = useRef<{ top: number; seq: number; inputSeq: number; follow: boolean } | null>(null);
   const restoreEchoSeqRef = useRef(0);
   /**
    * Bumped on every genuine reader gesture (wheel/touch/scroll key/scrollbar
@@ -504,6 +513,7 @@ function TranscriptInner({
     setInstanceEpoch(instanceId);
     restoredRef.current = false;
     pinRef.current = saved ? saved.follow : true;
+    lastFollowRef.current = saved ? saved.follow : true;
     scrollTopRef.current = 0;
     pendingScroll.current = null;
     prependAnchorRef.current = null;
@@ -607,7 +617,15 @@ function TranscriptInner({
     if (!el || el.scrollTop === before) return;
     const seq = restoreEchoSeqRef.current + 1;
     restoreEchoSeqRef.current = seq;
-    restoreEchoRef.current = { top: el.scrollTop, seq, inputSeq: readerInputSeqRef.current };
+    // Capture the follow state the WRITE intended. A follow-pin write can be
+    // issued while the content is still laid out short (rows that wrap to
+    // their real height only after first layout): the write clamps near the
+    // top, and the content grows before this event is delivered. Recomputing
+    // pin state from that stale top against the new height would flip follow
+    // off and silence every later re-pin effect — the returning reader is
+    // stranded at the top (mainflakes session-virtual:158). The echo restores
+    // the writer's intent instead of the geometry observed at event time.
+    restoreEchoRef.current = { top: el.scrollTop, seq, inputSeq: readerInputSeqRef.current, follow: pinRef.current };
     reflowOwnScrollRef.current = true;
     requestAnimationFrame(() => {
       if (restoreEchoRef.current?.seq === seq) {
@@ -1633,6 +1651,7 @@ function TranscriptInner({
     const index = Math.min(indexAtOffset(list.length, sizesHold.current, top, est), list.length - 1);
     const anchorId = list[index]?.id;
     if (!anchorId) return;
+    lastFollowRef.current = pinRef.current;
     writePosition(instanceId, {
       anchorId,
       offset: Math.max(0, top - (offsets[index] ?? 0)),
@@ -1949,7 +1968,23 @@ function TranscriptInner({
           const el = event.currentTarget;
           setScrollTop(el.scrollTop);
           scrollTopRef.current = el.scrollTop;
-          pinRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 64;
+          // Classify the event FIRST (see armOwnScrollEcho): an own re-pin
+          // write's coalesced echo can reach us after the content grew, when
+          // recomputing from geometry would wrongly flip the writer's follow
+          // state. Keep the intent the write recorded; genuine reader input
+          // recomputes from the current geometry.
+          const echo = restoreEchoRef.current;
+          restoreEchoRef.current = null;
+          const ownEcho =
+            echo !== null &&
+            echo.inputSeq === readerInputSeqRef.current &&
+            Math.abs(el.scrollTop - echo.top) <= 2;
+          pinRef.current = ownEcho ? echo!.follow : el.scrollHeight - el.scrollTop - el.clientHeight < 64;
+          // Persist a follow/unfollow edge immediately: unlike the debounced
+          // anchor save, this must survive a navigation that lands inside the
+          // 250 ms debounce window (a full-document load tears the page down
+          // before the timer or the passive unmount flush runs).
+          if (pinRef.current !== lastFollowRef.current) flushPosition(el.scrollTop);
           // The reflow anchor re-anchors only until the reader moves. A reflow
           // compensator / restore-correction write dispatches the event marked
           // with its own latch (armed together with the load-restore echo);
@@ -1976,12 +2011,6 @@ function TranscriptInner({
           //     gutter pointerdown) can coalesce a scroll with a correction
           //     write's echo; if it lands far from the echo target it is the
           //     reader, not our math.
-          const echo = restoreEchoRef.current;
-          restoreEchoRef.current = null;
-          const ownEcho =
-            echo !== null &&
-            echo.inputSeq === readerInputSeqRef.current &&
-            Math.abs(el.scrollTop - echo.top) <= 2;
           if (!ownEcho) {
             // Genuine reader scroll: re-arm growth anchoring immediately.
             rearmGrowthHold();

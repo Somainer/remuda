@@ -2253,7 +2253,7 @@ impl DevNode {
                 let mut released = lock.lock().unwrap_or_else(|poison| poison.into_inner());
                 while !*released {
                     let (next, timeout) = cvar
-                        .wait_timeout(released, Duration::from_secs(20))
+                        .wait_timeout(released, OWNER_RELEASE_HOLD_WATCHDOG)
                         .unwrap_or_else(|poison| poison.into_inner());
                     released = next;
                     if timeout.timed_out() {
@@ -4794,6 +4794,14 @@ const RECOVERY_GIT_CAP: Duration = Duration::from_secs(10);
 /// `gate.resolveLanding` RPC timeout (R7/R6 — one deadline for the probe).
 #[cfg(unix)]
 const LANDING_PROBE_DEADLINE: Duration = Duration::from_secs(25);
+
+/// r38 item 4 TEST-ONLY: watchdog for the owner-release barrier. It must
+/// outlast the complete interval in which the regression parks the owner —
+/// the 25 s read-only probe deadline plus the test's forced reconcile/poll
+/// window — so a slow probe can never auto-release the owner and break the
+/// still-registered assertion. The barrier is normally released explicitly.
+#[cfg(any(test, feature = "test-faults"))]
+const OWNER_RELEASE_HOLD_WATCHDOG: Duration = Duration::from_secs(120);
 
 /// Run a git command through THE OWNER CONTRACT helper in `remuda-unix`
 /// (own group, non-reaping exit observation, survivor cleanup while the leader

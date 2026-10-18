@@ -2802,7 +2802,34 @@ it("GATE16 item 4c: an accepted delivery stamped during offline recovery is caug
 
   // Navigate to the already-mounted B. bindConnection bind-away services A's
   // abandoned debt via a bounded journal catch-up (eventsRead on A's journal).
-  eventsReadSpy.mockClear();
+  // Ruling AD (outboxdebt): an EMPTY catch-up no longer clears the debt — the
+  // Node has now journaled A's command, so A's read serves the entry; only
+  // observing it discharges the debt.
+  eventsReadSpy.mockImplementation(
+    async (args) =>
+      (args.journalId === JOURNAL
+        ? {
+            events: [
+              {
+                kind: "message",
+                eventId: "evt_owed_real",
+                journalId: JOURNAL,
+                instanceId: INSTANCE,
+                seq: "1",
+                payload: { role: "user", commandId: "cmd_owed_real" },
+              },
+            ],
+            windowFromSeq: "1",
+            durableSeq: "1",
+            reachedAfterSeq: true,
+          }
+        : {
+            events: [],
+            windowFromSeq: "1",
+            durableSeq: "0",
+            reachedAfterSeq: true,
+          }) as Awaited<ReturnType<Api["eventsRead"]>>,
+  );
   await hubStore.follow(INSTANCE_B);
   await vi.waitFor(
     () => expect(eventsReadSpy.mock.calls.some((c) => c[0].journalId === JOURNAL)).toBe(true),

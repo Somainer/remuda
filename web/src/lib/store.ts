@@ -4397,14 +4397,15 @@ class HubStore {
           this.state.instances.find((i) => i.id === instanceId)?.journalId ?? null;
         await this.chainReconcile(instanceId, async () => {
           // Ruling AD: record PER-COMMAND catch-up debt for every accepted
-          // (Hub-reached, journal-unconfirmed) row of this instance BEFORE
-          // any read. An empty resync certifies live but proves nothing
-          // about these commands; it must not delete the debt. (Held/queued
-          // rows never reached the Node and are not owed here; rejected rows
-          // are terminal.)
+          // (Hub-accepted, journal-unconfirmed) "sent" row of this instance
+          // BEFORE any read. An empty resync certifies live but proves nothing
+          // about these commands; it must not delete the debt. Held/queued
+          // rows never reached the Node (their own re-POST owns them),
+          // "reconciling" rows are converged by their bounded command-GET
+          // loop, and rejected rows are terminal — none are owed here.
           const owedCommands = box
             .unresolved()
-            .filter((r) => r.instanceId === instanceId && (r.state === "sent" || r.state === "reconciling"))
+            .filter((r) => r.instanceId === instanceId && r.state === "sent")
             .map((r) => r.commandId);
           this.recordOwed(instanceId, owedCommands);
           // Decide ownership WHEN THIS JOB RUNS, not when the drain enqueued

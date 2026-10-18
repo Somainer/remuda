@@ -4844,9 +4844,37 @@ fn write_land_group_dead_cert(
     write_qualified_dead_cert_bytes(dir, &cert, job_id, generation)
 }
 
+/// Per-process sequence used so every certificate write gets a distinct temp
+/// file even within the same nanosecond (r36 item 1).
+#[cfg(unix)]
+static CERT_TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One unique, single-use temporary-file name for a certificate write.
+#[cfg(unix)]
+fn cert_temp_name(dir: &std::path::Path, job_id: &str, generation: u32) -> std::path::PathBuf {
+    let seq = CERT_TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    dir.join(format!(
+        ".dead-{}-g{}.{}-{:09x}-{:x}.tmp",
+        land_slug(job_id),
+        generation,
+        std::process::id(),
+        nanos,
+        seq
+    ))
+}
+
 /// Atomically write an already-assembled certificate JSON to the qualified
-/// `dead-<job>-g<gen>.json` path (temp file + rename). Callers assemble the
-/// exact evidence content; this helper never synthesizes provenance.
+/// `dead-<job>-g<gen>.json` path. Each invocation creates its OWN exclusive
+/// temp file (O_EXCL/`create_new`, name includes job + generation + a unique
+/// nonce) and renames only that file; two concurrent finalizers for different
+/// jobs/generations can never exchange certificate contents through a shared
+/// temp name (r36 item 1). A failed create/write/rename removes only this
+/// invocation's temp — never the destination or the live fence — and the
+/// caller's `?` leaves the fence in place.
 #[cfg(unix)]
 fn write_qualified_dead_cert_bytes(
     dir: &std::path::Path,
@@ -4854,12 +4882,43 @@ fn write_qualified_dead_cert_bytes(
     job_id: &str,
     generation: u32,
 ) -> std::io::Result<()> {
+    use std::io::Write;
     std::fs::create_dir_all(dir)?;
     let path = land_dead_cert_path(dir, job_id, generation);
-    let temporary = dir.join(format!(".dead-g{generation}-{}.tmp", std::process::id()));
-    std::fs::write(&temporary, serde_json::to_vec(&cert).unwrap_or_default())?;
-    std::fs::rename(&temporary, &path)?;
-    Ok(())
+    let bytes = serde_json::to_vec(&cert).unwrap_or_default();
+    // Residual name collisions (only possible across processes) retry.
+    for _ in 0..8 {
+        let temporary = cert_temp_name(dir, job_id, generation);
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+        let written = file.write_all(&bytes).and_then(|_| file.sync_all());
+        if let Err(error) = written {
+            drop(file);
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error);
+        }
+        drop(file);
+        // r36 item 1 TEST-ONLY: park with the temp fully written but before the
+        // rename, so a regression can run a second writer to the exact
+        // interleave where a shared temp name would swap certificate contents.
+        #[cfg(test)]
+        park_cert_temp_before_rename();
+        if let Err(error) = std::fs::rename(&temporary, &path) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error);
+        }
+        return Ok(());
+    }
+    Err(std::io::Error::other(
+        "could not allocate a unique certificate temp file",
+    ))
 }
 
 /// Read and VALIDATE a death certificate for the exact requested attempt.
@@ -5429,6 +5488,70 @@ pub(crate) fn arm_settle_esrch_hold(hold: std::sync::Arc<CleanupHold>) {
         .get_or_init(|| std::sync::Mutex::new(None))
         .lock()
         .unwrap_or_else(|poison| poison.into_inner()) = Some(hold);
+}
+
+/// r36 item 1 TEST-ONLY: like CleanupHold but counts how many certificate
+/// writers have parked, so a two-writer regression can wait until BOTH have
+/// written their temp before letting either rename.
+#[cfg(test)]
+struct CountedHold {
+    entered: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    release: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+
+#[cfg(test)]
+static CERT_TEMP_HOLD: std::sync::OnceLock<std::sync::Mutex<Option<std::sync::Arc<CountedHold>>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn park_cert_temp_before_rename() {
+    // Clone (do not consume): both concurrent writers must observe the same
+    // armed hold. The arming test clears it once the writers have joined.
+    let hold = {
+        let guard = CERT_TEMP_HOLD
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        guard.as_ref().cloned()
+    };
+    let Some(hold) = hold else {
+        return;
+    };
+    hold.entered
+        .fetch_add(1, std::sync::atomic::Ordering::Release);
+    let (lock, cvar) = &*hold.release;
+    let mut released = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+    while !*released {
+        let (next, timeout) = cvar
+            .wait_timeout(released, std::time::Duration::from_secs(20))
+            .unwrap_or_else(|poison| poison.into_inner());
+        released = next;
+        if timeout.timed_out() {
+            *released = true;
+        }
+    }
+}
+
+#[cfg(test)]
+fn arm_cert_temp_hold() -> std::sync::Arc<CountedHold> {
+    let hold = std::sync::Arc::new(CountedHold {
+        entered: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        release: std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
+    });
+    *CERT_TEMP_HOLD
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = Some(hold.clone());
+    hold
+}
+
+/// r36 item 1 test helper: disarm the cert-temp hold after the writers join.
+#[cfg(test)]
+fn clear_cert_temp_hold() {
+    *CERT_TEMP_HOLD
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = None;
 }
 
 /// Authoritative group death has been observed (killpg ESRCH on the recorded
@@ -9516,6 +9639,107 @@ Running 8 tests across 2 projects
 
         let _ = live.kill();
         reap(live);
+    }
+
+    /// r36 item 1: two finalizers writing certificates CONCURRENTLY (different
+    /// jobs, same Node) park with their temp fully written, then both rename.
+    /// Each certificate must land under its own qualified path with ITS OWN
+    /// identity; a shared temp name let the later write's contents reach the
+    /// earlier job's certificate and fail the later rename, leaving one
+    /// attempt with invalid evidence and its fence removed.
+    #[test]
+    fn concurrent_certificate_writes_never_share_a_temp_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+
+        let cert = |job: &'static str, pgid: i32, merge: &'static str| {
+            let mut v = serde_json::json!({
+                "jobId": job,
+                "generation": 1,
+                "pgid": pgid,
+                "mergeSha": merge,
+                "diedAt": 1_700_000_000_000u64,
+                "cause": "killpg-esrch",
+            });
+            super::LeaderIdentity::StartTick(pgid as u64).write(&mut v);
+            v
+        };
+        let cert_a = cert("gjb_r36_jobA", 4141, MERGE_A);
+        let cert_b = cert("gjb_r36_jobB", 4242, MERGE_B);
+
+        let hold = arm_cert_temp_hold();
+        let dir_a = dir.clone();
+        let ca = cert_a.clone();
+        let writer_a = std::thread::spawn(move || {
+            super::write_qualified_dead_cert_bytes(&dir_a, &ca, "gjb_r36_jobA", 1)
+        });
+        let dir_b = dir.clone();
+        let cb = cert_b.clone();
+        let writer_b = std::thread::spawn(move || {
+            super::write_qualified_dead_cert_bytes(&dir_b, &cb, "gjb_r36_jobB", 1)
+        });
+
+        // Deterministic barrier: wait until BOTH temps exist and BOTH writers
+        // are parked between write and rename.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while hold.entered.load(std::sync::atomic::Ordering::Acquire) < 2
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            hold.entered.load(std::sync::atomic::Ordering::Acquire),
+            2,
+            "both writers must park before either rename"
+        );
+        let temps: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".dead-") && name.ends_with(".tmp"))
+            .collect();
+        assert_eq!(
+            temps.len(),
+            2,
+            "each writer must own a distinct temp file, found {temps:?}"
+        );
+        // Release both writers.
+        {
+            let (lock, cvar) = &*hold.release;
+            let mut released = lock.lock().unwrap();
+            *released = true;
+            cvar.notify_all();
+        }
+        writer_a.join().unwrap().expect("writer A succeeds");
+        writer_b.join().unwrap().expect("writer B succeeds");
+        clear_cert_temp_hold();
+
+        // Each qualified certificate carries the correct attempt identity —
+        // the old shared-temp bug put B's contents at A's path (or vice-versa).
+        let got_a = super::read_land_group_dead_cert(&dir, "gjb_r36_jobA", 1, MERGE_A)
+            .expect("A's certificate must be its own identity");
+        let got_b = super::read_land_group_dead_cert(&dir, "gjb_r36_jobB", 1, MERGE_B)
+            .expect("B's certificate must be its own identity");
+        assert_eq!(got_a["pgid"], json!(4141), "{got_a}");
+        assert_eq!(got_a["jobId"], json!("gjb_r36_jobA"), "{got_a}");
+        assert_eq!(got_b["pgid"], json!(4242), "{got_b}");
+        assert_eq!(got_b["jobId"], json!("gjb_r36_jobB"), "{got_b}");
+        assert_eq!(
+            super::land_ledger_liveness(&dir, "gjb_r36_jobA", Some(1), Some(MERGE_A)),
+            super::LandPushLiveness::VerifiedDead
+        );
+        assert_eq!(
+            super::land_ledger_liveness(&dir, "gjb_r36_jobB", Some(1), Some(MERGE_B)),
+            super::LandPushLiveness::VerifiedDead
+        );
+        // No temp files leak after successful writes.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".dead-") && name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files leaked: {leftovers:?}");
     }
 
     /// r17 item 1: `certify_dead_and_remove_fence` refuses when the fence on

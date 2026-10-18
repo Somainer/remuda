@@ -1010,12 +1010,10 @@ impl GateRegistry {
     pub(crate) fn open(land_fence_dir: std::path::PathBuf) -> Arc<Self> {
         #[cfg(unix)]
         {
-            // r37 item 4: this Node now exclusively owns the ledger dir and no
-            // certificate writer has started yet — reclaim crash-abandoned
-            // certificate temps BEFORE the orphan-fence scan and before serving
-            // any run.
-            reclaim_abandoned_cert_temps(&land_fence_dir);
-            fence_orphaned_land_groups(&land_fence_dir);
+            // r37 item 4 / r38 item 1: reclaim abandoned cert temps and scan
+            // orphaned fences under an exclusive ledger flock, skipping when a
+            // detached writer from a previous process still holds the ledger.
+            reconcile_ledger_at_startup(&land_fence_dir);
         }
         Self::new(land_fence_dir)
     }
@@ -2240,6 +2238,12 @@ impl DevNode {
         // read-only liveness path must keep Unknown; the regression forces a
         // Hub reconciliation here and asserts no requeue. One-shot: the hold is
         // consumed by this first land finalization.
+        //
+        // r38 item 4: this watchdog is longer than the ENTIRE permitted window
+        // the regression holds the owner (the read-only probe deadline plus the
+        // test's assertion/polling interval), so a slow in-window reconciliation
+        // can never auto-release the owner and invalidate the
+        // still-registered assertion. Explicit release remains the normal path.
         #[cfg(any(test, feature = "test-faults"))]
         if request.mode == "land" && request.push_from != remuda_protocol::GatePushFrom::Home {
             let hold = {
@@ -5010,14 +5014,59 @@ fn cert_temp_name(dir: &std::path::Path, job_id: &str, generation: u32) -> std::
     ))
 }
 
+/// r38 item 1: ledger-scoped advisory lock guarding certificate writes against
+/// startup reclamation. Every live/detached certificate writer holds a SHARED
+/// flock on this file for its whole create→sync→rename; startup reconciliation
+/// takes an EXCLUSIVE non-blocking flock and skips reclamation entirely if a
+/// writer (possibly a detached finalizer from a previous process) still holds a
+/// shared lock. flock conflicts across distinct open file descriptions even in
+/// the same process, which is what makes the in-process regression faithful.
+#[cfg(unix)]
+fn ledger_lock_path(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join(".gate-ledger.lock")
+}
+
+/// Open the ledger advisory-lock file WITHOUT creating the ledger directory
+/// (startup path): a Node that has never written a fence owns no ledger, so
+/// there is nothing to reclaim/scan and we must not leave state behind under a
+/// caller's workspace root.
+#[cfg(unix)]
+fn open_ledger_lock_file_existing(dir: &std::path::Path) -> Option<std::fs::File> {
+    if !dir.is_dir() {
+        return None;
+    }
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(false)
+        .truncate(false)
+        .open(ledger_lock_path(dir))
+        .ok()
+}
+
+/// Open (creating dir + file if absent) the ledger advisory-lock file. Used by
+/// runtime certificate writers, which are the first to actually touch the
+/// ledger.
+#[cfg(unix)]
+fn open_ledger_lock_file(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::create_dir_all(dir)?;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(ledger_lock_path(dir))
+}
+
 /// Atomically write an already-assembled certificate JSON to the qualified
-/// `dead-<job>-g<gen>.json` path. Each invocation creates its OWN exclusive
+/// `dead-<job>-g<gen>.json` path, holding the ledger SHARED flock for the whole
+/// create→sync→rename (r38 item 1) so startup reclamation can never unlink an
+/// in-flight writer's temp. Each invocation also creates its OWN exclusive
 /// temp file (O_EXCL/`create_new`, name includes job + generation + a unique
-/// nonce) and renames only that file; two concurrent finalizers for different
-/// jobs/generations can never exchange certificate contents through a shared
-/// temp name (r36 item 1). A failed create/write/rename removes only this
-/// invocation's temp — never the destination or the live fence — and the
-/// caller's `?` leaves the fence in place.
+/// nonce) and renames only that file (r36 item 1). A failed
+/// create/write/rename removes only this invocation's temp — never the
+/// destination or the live fence — and the caller's `?` leaves the fence in
+/// place.
 #[cfg(unix)]
 fn write_qualified_dead_cert_bytes(
     dir: &std::path::Path,
@@ -5025,8 +5074,29 @@ fn write_qualified_dead_cert_bytes(
     job_id: &str,
     generation: u32,
 ) -> std::io::Result<()> {
+    use nix::fcntl::{Flock, FlockArg};
+    let lock_file = open_ledger_lock_file(dir)?;
+    // Blocking SHARED lock: startup is the only EXCLUSIVE holder and skips
+    // reclamation rather than blocking, so a writer waits only in the rare
+    // case startup is actively scanning (which never writes a writer's temp).
+    // The guard is held to the end of the function, covering create→rename.
+    let _ledger_guard = Flock::lock(lock_file, FlockArg::LockShared)
+        .map_err(|(_file, error)| std::io::Error::other(format!("ledger shared flock: {error}")))?;
+    write_qualified_dead_cert_bytes_locked(dir, cert, job_id, generation)
+}
+
+/// Certificate write body that assumes the ledger flock is already held. Used
+/// by the public writer (holds SHARED) and by startup migration (holds
+/// EXCLUSIVE), so the two never try to acquire conflicting flocks on two file
+/// descriptions in the same startup pass.
+#[cfg(unix)]
+fn write_qualified_dead_cert_bytes_locked(
+    dir: &std::path::Path,
+    cert: &Value,
+    job_id: &str,
+    generation: u32,
+) -> std::io::Result<()> {
     use std::io::Write;
-    std::fs::create_dir_all(dir)?;
     let path = land_dead_cert_path(dir, job_id, generation);
     let bytes = serde_json::to_vec(&cert).unwrap_or_default();
     // Residual name collisions (only possible across processes) retry.
@@ -5074,13 +5144,83 @@ fn is_abandoned_cert_temp(name: &std::ffi::OsStr) -> bool {
     name.starts_with(".dead-") && name.ends_with(".tmp")
 }
 
-/// r37 item 4: remove crash-abandoned certificate temporary files from the
-/// ledger directory. This runs ONLY at Node startup (`GateRegistry::open`),
-/// when this process has exclusive ownership of the ledger and before any
-/// certificate writer (or the orphan-fence scan) starts, so it can never race
-/// a live rename or delete a temp a concurrent writer still owns. The files
-/// are never read as evidence (readers open only qualified names); this just
-/// bounds their cross-restart accumulation.
+/// r37 item 4 / r38 item 1: startup ledger reconciliation.
+///
+/// Reclaims crash-abandoned certificate temps and scans orphaned fences ONLY
+/// while holding the ledger EXCLUSIVE advisory flock. The lock is acquired
+/// non-blockingly: if any certificate writer still holds a SHARED lock — a
+/// detached finalizer that survived its deadline, including one outliving a
+/// Node shutdown/reopen of the same data dir — this returns without touching
+/// the ledger (the wait is retried on the next start). That is what prevents
+/// startup from unlinking a temp a still-running writer is about to rename.
+/// Runtime certificate writers take SHARED locks and never conflict with each
+/// other.
+#[cfg(unix)]
+fn reconcile_ledger_at_startup(dir: &std::path::Path) {
+    use nix::fcntl::{Flock, FlockArg};
+    // No-create open first: a fresh Node whose ledger DIRECTORY was never
+    // created has nothing to reconcile and must not leave state under the
+    // caller's workspace root. If the dir exists (this Node or a prior build
+    // wrote fences there) the lock file may just be older than the locking
+    // change, so create it then.
+    let lock_file = match open_ledger_lock_file_existing(dir) {
+        Some(file) => file,
+        None if dir.is_dir() => match open_ledger_lock_file(dir) {
+            Ok(file) => file,
+            Err(error) => {
+                tracing::warn!(?dir, %error, "could not create the land ledger lock; skipping startup fence reconciliation");
+                return;
+            }
+        },
+        None => return,
+    };
+    let exclusive = Flock::lock(lock_file, FlockArg::LockExclusiveNonblock);
+    match exclusive {
+        Ok(exclusive_guard) => {
+            // EXCLUSIVE for reclamation: this is the only step that unlinks
+            // writer temps, so no writer may be active.
+            reclaim_abandoned_cert_temps(dir);
+            // The orphan-fence scan certifies dead fences and itself invokes
+            // certificate writers (each a SHARED flock on its OWN open fd).
+            // Holding EXCLUSIVE here across those would self-deadlock (flock is
+            // per open-file-description, and a process can't hold EX on one fd
+            // and SH on another of the same file). Temp reclamation is already
+            // finished, so release EXCLUSIVE and hold a SHARED guard for the
+            // scan: it composes with the nested writer SHARED locks and still
+            // excludes a second EXCLUSIVE startup from interleaving.
+            drop(exclusive_guard);
+            // Reopen the ledger lock for the SHARED scan phase.
+            let Some(scan_file) = open_ledger_lock_file_existing(dir) else {
+                return;
+            };
+            match Flock::lock(scan_file, FlockArg::LockShared) {
+                Ok(scan_guard) => {
+                    fence_orphaned_land_groups(dir);
+                    drop(scan_guard);
+                }
+                Err((_file, error)) => {
+                    tracing::warn!(?dir, %error, "could not take the shared ledger lock for the orphan-fence scan");
+                }
+            }
+        }
+        Err((_file, nix::errno::Errno::EWOULDBLOCK)) => {
+            tracing::warn!(
+                ?dir,
+                "land ledger is locked by a still-active certificate writer; \
+                 skipping startup fence reclamation (retried on the next start)"
+            );
+        }
+        Err((_file, error)) => {
+            tracing::warn!(?dir, %error, "land ledger exclusive flock failed; skipping startup fence reconciliation");
+        }
+    }
+}
+
+/// Remove crash-abandoned certificate temporary files from the ledger
+/// directory. Caller MUST hold the ledger EXCLUSIVE flock
+/// ([`reconcile_ledger_at_startup`]); the lock is what proves no writer still
+/// owns a temp. The files are never read as evidence (readers open only
+/// qualified names); this bounds their cross-restart accumulation.
 #[cfg(unix)]
 fn reclaim_abandoned_cert_temps(dir: &std::path::Path) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -5214,7 +5354,7 @@ fn migrate_legacy_fence_to_cert(
     if let Some(object) = cert.as_object_mut() {
         object.remove("mergeSha");
     }
-    match write_qualified_dead_cert_bytes(dir, &cert, job_id, generation) {
+    match write_qualified_dead_cert_bytes_locked(dir, &cert, job_id, generation) {
         Ok(()) => {
             if let Err(error) = std::fs::remove_file(source_path) {
                 tracing::warn!(
@@ -5288,7 +5428,7 @@ fn migrate_legacy_dead_cert(
     // migration I/O failure simply re-attempts on the next probe.
     let mut migrated = cert.clone();
     migrated["provenance"] = json!(LEGACY_DEAD_CERT_PROVENANCE);
-    if write_qualified_dead_cert_bytes(dir, &migrated, job_id, generation).is_ok() {
+    if write_qualified_dead_cert_bytes_locked(dir, &migrated, job_id, generation).is_ok() {
         let _ = std::fs::remove_file(&legacy_path);
     }
     validate_dead_cert(
@@ -10069,6 +10209,126 @@ Running 8 tests across 2 projects
             super::land_ledger_liveness(dir, job, Some(1), Some(MERGE_A)),
             super::LandPushLiveness::VerifiedDead,
             "the qualified certificate still attests death"
+        );
+    }
+
+    /// r38 item 1: a certificate writer that is still alive (a detached
+    /// finalizer parked before rename) holds the ledger SHARED flock; startup
+    /// reclamation must NOT take EXCLUSIVE ownership and must NOT unlink its
+    /// temp. Once the writer finishes and installs its certificate, the next
+    /// startup pass acquires EXCLUSIVE and reclaims unrelated crash leftovers.
+    #[test]
+    fn startup_does_not_reclaim_an_active_writers_cert_temp() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        std::fs::create_dir_all(&dir).unwrap();
+        let job = "gjb_r38_active";
+
+        let mut record = serde_json::json!({
+            "jobId": job,
+            "generation": 1,
+            "pgid": 6001,
+            "mergeSha": MERGE_A,
+            "diedAt": 1_700_000_000_000u64,
+            "cause": "killpg-esrch",
+        });
+        super::LeaderIdentity::StartTick(11).write(&mut record);
+
+        // A crash-leftover temp a PREVIOUS process abandoned (must be reclaimed
+        // only once no writer is active).
+        let leftover = dir.join(format!(
+            ".dead-{}-g1.{}-{:09x}-9.tmp",
+            job,
+            std::process::id(),
+            456u32
+        ));
+        std::fs::write(&leftover, b"{\"jobId\":\"crashed\"}").unwrap();
+
+        // Park the writer after its temp is written (it is holding the ledger
+        // SHARED flock the whole time).
+        let hold = arm_cert_temp_hold(dir.clone(), vec![job.to_owned()]);
+        let _hold_guard = CertTempHoldGuard { hold: hold.clone() };
+        let writer_dir = dir.clone();
+        let writer_record = record.clone();
+        let writer = std::thread::spawn(move || {
+            super::write_qualified_dead_cert_bytes(&writer_dir, &writer_record, job, 1)
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while hold.entered.load(std::sync::atomic::Ordering::Acquire) < 1
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            hold.entered.load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "the writer must park while holding the shared ledger flock"
+        );
+
+        // Simulated restart while the detached writer is still active. Startup
+        // tries the EXCLUSIVE non-blocking flock, is refused, and must skip
+        // reconciliation entirely.
+        let _registry = super::GateRegistry::open(dir.clone());
+
+        // Both the active writer's own temp AND the old leftover survive: the
+        // active temp would otherwise be unlinked under its pending rename.
+        let active_temps: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".dead-") && name.ends_with(".tmp"))
+            .collect();
+        assert!(
+            active_temps
+                .iter()
+                .any(|name| name != &leftover.file_name().unwrap().to_string_lossy()),
+            "the active writer's temp must remain: {active_temps:?}"
+        );
+        assert!(
+            leftover.exists(),
+            "the leftover is kept while a writer is active"
+        );
+        // No certificate was installed for the crashed leftover.
+        assert_eq!(
+            super::land_ledger_liveness(&dir, "crashed", Some(1), Some(MERGE_A)),
+            super::LandPushLiveness::Unknown
+        );
+
+        // Let the writer finish: its rename installs the qualified certificate.
+        {
+            let (lock, cvar) = &*hold.release;
+            let mut released = lock.lock().unwrap();
+            *released = true;
+            cvar.notify_all();
+        }
+        writer
+            .join()
+            .unwrap()
+            .expect("active writer renames successfully");
+        assert!(
+            super::read_land_group_dead_cert(&dir, job, 1, MERGE_A).is_some(),
+            "the active writer's certificate is installed"
+        );
+
+        // Next restart: no writer holds the ledger, EXCLUSIVE is acquired and
+        // the leftover is reclaimed; the freshly installed certificate stays.
+        let _registry2 = super::GateRegistry::open(dir.clone());
+        assert!(
+            !leftover.exists(),
+            "the leftover is reclaimed once the ledger is free"
+        );
+        let temps_left: usize = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                n.starts_with(".dead-") && n.ends_with(".tmp")
+            })
+            .count();
+        assert_eq!(temps_left, 0, "no temp files remain after reclamation");
+        assert!(
+            super::read_land_group_dead_cert(&dir, job, 1, MERGE_A).is_some(),
+            "the installed certificate survives reclamation"
         );
     }
 

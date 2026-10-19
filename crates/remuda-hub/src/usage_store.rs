@@ -620,15 +620,13 @@ fn fold_unjournaled_index_collisions(
     let folds = [
         Fold {
             scope: "message",
-            // AE3-only commit state: message grouping still carries the lineage
-            // qualifier (the r47 fold-key fix removes it in the next commit).
+            // Message key is (instance_id, scope, scope_id) — source_session_id
+            // is deliberately NOT part of the key.
             non_survivor: "u.rowid > (
                 SELECT MIN(g.rowid) FROM usage_events g
                  WHERE g.instance_id = u.instance_id
                    AND g.scope = u.scope
                    AND g.scope_id = u.scope_id
-                   AND COALESCE(g.source_session_id, '') =
-                       COALESCE(u.source_session_id, '')
             )",
         },
         Fold {
@@ -9153,6 +9151,86 @@ mod tests {
         let once = r43_dump_rows(&fb);
         migrate(&fb).unwrap();
         assert_eq!(once, r43_dump_rows(&fb), "migrate twice == once");
+    }
+
+    #[test]
+    fn r47_fold_message_collision_ignores_source_session_id() {
+        // AE3 item 2 (codex r46 medium-2): the Message unique key is
+        // (instance, scope, scope_id) — source_session_id is NOT part of it.
+        // Two unjournaled Messages with the same durable key but different
+        // source sessions (rev1/A, rev2/B) must fold to ONE rev2 row; grouping
+        // that kept a survivor per session would leave a collision and abort
+        // the whole migration at CREATE UNIQUE INDEX.
+        let base = UsageEventRow {
+            instance_id: "ins_r47fold".into(),
+            seq: 1,
+            profile_id: Some("pvp".into()),
+            model: Some("m-a".into()),
+            scope: "message".into(),
+            scope_id: Some("mk1".into()),
+            turn_id: None,
+            metric_revision: 1,
+            source_session_id: Some("sess-A".into()),
+            mode: "snapshot".into(),
+            total_tokens: Some(100),
+            input_tokens: Some(100),
+            output_tokens: Some(0),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            cost_usd: Some("0.01".into()),
+            accounting: "estimated".into(),
+            observed_at: "2026-10-20T00:00:01.000Z".into(),
+            observed_at_source: "native".into(),
+            native_context_window: None,
+        };
+        let mut rev2 = base.clone();
+        rev2.seq = 2;
+        rev2.metric_revision = 2;
+        rev2.source_session_id = Some("sess-B".into());
+        rev2.total_tokens = Some(160);
+        rev2.input_tokens = Some(150);
+        rev2.output_tokens = Some(10);
+        rev2.cost_usd = Some("0.02".into());
+        rev2.observed_at = "2026-10-20T00:00:02.000Z".into();
+
+        // Column-present marker-absent DB; drop the message index so both
+        // physical rows can coexist (rolled-back window). No journal rows, so
+        // neither is backed — the fold is the only thing that touches them.
+        let conn = r46_upgrade_fixture();
+        conn.execute_batch("DROP INDEX IF EXISTS usage_events_message_dedupe;")
+            .unwrap();
+        r46_raw_insert(&conn, &base, None);
+        r46_raw_insert(&conn, &rev2, None);
+        migrate(&conn).unwrap(); // must commit, not fail on the unique index
+
+        let (n, rev, inp, cost): (i64, i64, Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(metric_revision), MAX(input_tokens),
+                        COALESCE(MAX(cost_usd), NULL)
+                 FROM usage_events
+                 WHERE instance_id='ins_r47fold' AND scope='message'
+                   AND scope_id='mk1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "the two sessions collapse onto the one message key");
+        assert_eq!(rev, 2, "higher revision wins");
+        assert_eq!(inp, Some(150), "rev2 counters are folded, not discarded");
+        assert_eq!(cost.as_deref(), Some("0.02"));
+        // The message index exists and is unique.
+        let idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='index' AND name='usage_events_message_dedupe'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1);
+        let once = r43_dump_rows(&conn);
+        migrate(&conn).unwrap();
+        assert_eq!(once, r43_dump_rows(&conn), "migrate twice == once");
     }
 
     /// Raw insert into a PRE-lineage schema (all current columns except

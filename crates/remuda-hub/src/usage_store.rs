@@ -9391,9 +9391,11 @@ mod tests {
     }
 
     #[test]
-    fn r48_turn_live_rev1_then_replayed_legacy_rev2_becomes_legacy() {
-        // A pre-cutover (legacy) frame can carry a higher revision for a key
-        // whose current row is live; accepting it makes the row legacy.
+    fn r48_turn_upsert_live_rev1_then_legacy_rev2_becomes_legacy() {
+        // UNIT TEST of the upsert (the migration/replay path is covered by the
+        // r49_replay_* tests). A pre-cutover-era (legacy) frame can carry a
+        // higher revision for a key whose current row is live; accepting it
+        // makes the row legacy. Era is supplied directly to the upsert.
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
         create_journal_table(&conn);
@@ -9401,6 +9403,10 @@ mod tests {
         insert_usage_event(&conn, &rev1).unwrap();
         r48_add_scoped_session(&conn, "ins_r48ll");
         assert_eq!(r48_turn_era(&conn, "ins_r48ll"), None);
+        let live_billing = aggregate_instance(&conn, "ins_r48ll").unwrap();
+        assert_eq!(live_billing.ambiguous_events, 0);
+        assert_eq!(live_billing.input_tokens, Some(100));
+        assert_eq!(live_billing.cost_usd, Some(0.01));
 
         let (_, rev2) = r48_turn("ins_r48ll", 2, 2, 110, "0.02");
         let accepted = insert_usage_event_era(&conn, &rev2, IngestEra::Legacy).unwrap();
@@ -9410,23 +9416,34 @@ mod tests {
             Some("legacy"),
             "row era follows the accepted pre-cutover rev2"
         );
+        // Concrete conservative billing beside scoped stock.
         let agg = aggregate_instance(&conn, "ins_r48ll").unwrap();
         assert_eq!(
             agg.ambiguous_events, 1,
             "now a legacy turn beside stock -> ambiguous"
         );
         assert_eq!(agg.input_tokens, None, "conservative Unknown");
-        assert_eq!(agg.cost_usd, None);
+        assert_eq!(agg.output_tokens, None);
+        assert_eq!(agg.cost_usd, None, "the bill is Unknown, not 0.02");
     }
 
     #[test]
-    fn r48_turn_lower_live_revision_rejected_keeps_legacy_era() {
-        // A lower live revision must not overwrite a stored legacy rev2.
+    fn r48_turn_lower_live_revision_rejected_keeps_legacy_era_and_billing() {
+        // A lower live revision must not overwrite a stored legacy rev2. The
+        // scoped Session makes the surviving legacy turn take the conservative
+        // Unknown path; the rejected live rev1 must not change that billing.
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
         create_journal_table(&conn);
         let (_, rev2) = r48_turn("ins_r48rj", 2, 2, 110, "0.02");
         insert_usage_event_era(&conn, &rev2, IngestEra::Legacy).unwrap();
+        r48_add_scoped_session(&conn, "ins_r48rj");
+        // Before the rejected frame: legacy rev2 beside stock is Unknown.
+        let before = aggregate_instance(&conn, "ins_r48rj").unwrap();
+        assert_eq!(before.ambiguous_events, 1);
+        assert_eq!(before.input_tokens, None);
+        assert_eq!(before.cost_usd, None);
+
         let (_, rev1) = r48_turn("ins_r48rj", 1, 1, 100, "0.01");
         let accepted = insert_usage_event(&conn, &rev1).unwrap();
         assert!(!accepted, "the lower revision is rejected");
@@ -9444,17 +9461,26 @@ mod tests {
             )
             .unwrap();
         assert_eq!((rev, inp), (2, Some(110)), "rev2 content stays");
+        // Billing is unchanged: still conservative Unknown.
+        let after = aggregate_instance(&conn, "ins_r48rj").unwrap();
+        assert_eq!(after.ambiguous_events, 1, "still ambiguous after rejection");
+        assert_eq!(
+            after.input_tokens, None,
+            "still Unknown, no live rev1 counters"
+        );
+        assert_eq!(after.cost_usd, None, "still Unknown, no live rev1 bill");
     }
 
-    /// Build a durable Message row at a given seq/revision/counters.
-    fn r48_message(
+    /// Build a durable Message journal record + projected row at a given
+    /// seq/revision/counters (used by the replay-driven fixtures).
+    fn r48_message_rec(
         inst: &str,
         seq: i64,
         rev: i64,
         input: i64,
         cost: &str,
         sid: Option<&str>,
-    ) -> UsageEventRow {
+    ) -> (JournalRecord, UsageEventRow) {
         let rec = r44_wire_record(
             inst,
             seq,
@@ -9475,7 +9501,20 @@ mod tests {
             None,
             Some("2026-10-20T00:00:01.000Z"),
         );
-        project_usage_event(&rec, Some("pvp"), Some("m-a")).unwrap()
+        let row = project_usage_event(&rec, Some("pvp"), Some("m-a")).unwrap();
+        (rec, row)
+    }
+
+    /// Build a durable Message row at a given seq/revision/counters.
+    fn r48_message(
+        inst: &str,
+        seq: i64,
+        rev: i64,
+        input: i64,
+        cost: &str,
+        sid: Option<&str>,
+    ) -> UsageEventRow {
+        r48_message_rec(inst, seq, rev, input, cost, sid).1
     }
 
     fn r48_message_era(conn: &Connection, inst: &str) -> Option<String> {
@@ -9490,10 +9529,20 @@ mod tests {
 
     #[test]
     fn r48_message_accepted_revision_carries_its_era_rejected_keeps_stored() {
-        // legacy rev1 -> live rev2 accepted => NULL; counters follow rev2.
+        // UNIT TEST of the message upsert (replay is covered by r49_replay_*).
+        // Durable Messages always bill Ruling B per-call flow regardless of
+        // era, so each transition must leave CONCRETE counters/cost; era only
+        // changes provenance, never the charge.
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
         create_journal_table(&conn);
+        let assert_bill = |inp: Option<i64>, cost: Option<f64>| {
+            let a = aggregate_instance(&conn, "ins_m1").unwrap();
+            assert_eq!(a.input_tokens, inp, "message input tokens");
+            assert_eq!(a.cost_usd, cost, "message cost");
+        };
+
+        // legacy rev1: concrete 100 / 0.01.
         insert_usage_event_era(
             &conn,
             &r48_message("ins_m1", 1, 1, 100, "0.01", None),
@@ -9501,10 +9550,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r48_message_era(&conn, "ins_m1").as_deref(), Some("legacy"));
+        assert_bill(Some(100), Some(0.01));
+
+        // live rev2 accepted => NULL era; counters/cost follow rev2.
         assert!(
             insert_usage_event(&conn, &r48_message("ins_m1", 2, 2, 150, "0.02", None)).unwrap()
         );
         assert_eq!(r48_message_era(&conn, "ins_m1"), None, "live rev2 era wins");
+        assert_bill(Some(150), Some(0.02));
         let inp: Option<i64> = conn
             .query_row(
                 "SELECT input_tokens FROM usage_events
@@ -9515,7 +9568,7 @@ mod tests {
             .unwrap();
         assert_eq!(inp, Some(150));
 
-        // live rev2 -> legacy rev3 accepted => legacy.
+        // legacy rev3 accepted => legacy era; still concrete 160 / 0.03.
         assert!(
             insert_usage_event_era(
                 &conn,
@@ -9525,74 +9578,324 @@ mod tests {
             .unwrap()
         );
         assert_eq!(r48_message_era(&conn, "ins_m1").as_deref(), Some("legacy"));
+        assert_bill(Some(160), Some(0.03));
 
-        // lower live rev1 rejected => stays legacy.
+        // lower live rev1 rejected => era stays legacy AND bill stays rev3.
         assert!(
             !insert_usage_event(&conn, &r48_message("ins_m1", 1, 1, 100, "0.01", None)).unwrap()
         );
         assert_eq!(r48_message_era(&conn, "ins_m1").as_deref(), Some("legacy"));
+        assert_bill(Some(160), Some(0.03));
+    }
+
+    /// One physical row of a mixed-era message fold group.
+    struct R48FoldRow<'a> {
+        era: Option<&'a str>,
+        rev: i64,
+        input: i64,
+        cost: &'a str,
     }
 
     /// Two physical unjournaled message rows on one key, dropped index, then a
-    /// real migrate folds them. The captured (later-rowid) row carries
-    /// `captured_era` at revision `captured_rev`; returns the post-fold era.
-    fn r48_fold_eras(
-        survivor_era: Option<&str>,
-        captured_era: Option<&str>,
-        captured_rev: i64,
-    ) -> Option<String> {
+    /// real migrate folds them. Returns the post-migrate connection so the
+    /// caller asserts era AND concrete billing.
+    fn r48_fold_connection(
+        inst: &str,
+        survivor: R48FoldRow<'_>,
+        captured: R48FoldRow<'_>,
+    ) -> Connection {
         let conn = r46_upgrade_fixture();
         conn.execute_batch("DROP INDEX IF EXISTS usage_events_message_dedupe;")
             .unwrap();
-        let mut s1 = r48_message("ins_r48foldera", 1, 1, 100, "0.01", Some("sA"));
+        let mut s1 = r48_message(
+            inst,
+            1,
+            survivor.rev,
+            survivor.input,
+            survivor.cost,
+            Some("sA"),
+        );
         s1.source_session_id = Some("sA".into());
-        let mut s2 = r48_message("ins_r48foldera", 2, captured_rev, 150, "0.02", Some("sB"));
+        let mut s2 = r48_message(
+            inst,
+            2,
+            captured.rev,
+            captured.input,
+            captured.cost,
+            Some("sB"),
+        );
         s2.source_session_id = Some("sB".into());
-        r46_raw_insert(&conn, &s1, survivor_era);
-        r46_raw_insert(&conn, &s2, captured_era);
+        r46_raw_insert(&conn, &s1, survivor.era);
+        r46_raw_insert(&conn, &s2, captured.era);
         migrate(&conn).unwrap();
-        r48_message_era(&conn, "ins_r48foldera")
+        conn
+    }
+
+    fn r48_assert_message_bill(
+        conn: &Connection,
+        inst: &str,
+        input: Option<i64>,
+        cost: Option<f64>,
+    ) {
+        let a = aggregate_instance(conn, inst).unwrap();
+        assert_eq!(a.input_tokens, input, "{inst} folded message input");
+        assert_eq!(a.cost_usd, cost, "{inst} folded message cost");
     }
 
     #[test]
-    fn r48_mixed_era_fold_takes_winning_revisions_era() {
-        // Captured legacy rev2 is higher -> accepted -> legacy.
+    fn r48_mixed_era_fold_takes_winning_revisions_era_and_billing() {
+        // Captured legacy rev2 is higher -> accepted -> era legacy; winning
+        // counters/cost are rev2's 150 / 0.02 (Messages always bill flow).
+        let conn = r48_fold_connection(
+            "ins_r48foldLeg",
+            R48FoldRow {
+                era: None,
+                rev: 1,
+                input: 100,
+                cost: "0.01",
+            },
+            R48FoldRow {
+                era: Some("legacy"),
+                rev: 2,
+                input: 150,
+                cost: "0.02",
+            },
+        );
         assert_eq!(
-            r48_fold_eras(None, Some("legacy"), 2).as_deref(),
+            r48_message_era(&conn, "ins_r48foldLeg").as_deref(),
             Some("legacy"),
             "legacy revision wins the fold"
         );
-        // Captured live rev2 is higher -> accepted -> NULL.
+        r48_assert_message_bill(&conn, "ins_r48foldLeg", Some(150), Some(0.02));
+
+        // Captured live rev2 is higher -> accepted -> era NULL; same winning
+        // counters/cost.
+        let conn = r48_fold_connection(
+            "ins_r48foldLive",
+            R48FoldRow {
+                era: Some("legacy"),
+                rev: 1,
+                input: 100,
+                cost: "0.01",
+            },
+            R48FoldRow {
+                era: None,
+                rev: 2,
+                input: 150,
+                cost: "0.02",
+            },
+        );
         assert_eq!(
-            r48_fold_eras(Some("legacy"), None, 2),
+            r48_message_era(&conn, "ins_r48foldLive"),
             None,
             "live revision wins the fold"
         );
-        // Captured live rev1 is LOWER than survivor legacy rev2 -> rejected,
-        // survivor era (legacy) is retained.
-        let conn = r46_upgrade_fixture();
-        conn.execute_batch("DROP INDEX IF EXISTS usage_events_message_dedupe;")
-            .unwrap();
-        let mut survivor = r48_message("ins_r48fe", 1, 2, 150, "0.02", Some("sA"));
-        survivor.source_session_id = Some("sA".into());
-        let mut lower = r48_message("ins_r48fe", 2, 1, 100, "0.01", Some("sB"));
-        lower.source_session_id = Some("sB".into());
-        r46_raw_insert(&conn, &survivor, Some("legacy"));
-        r46_raw_insert(&conn, &lower, None);
-        migrate(&conn).unwrap();
-        let era: Option<String> = conn
-            .query_row(
-                "SELECT lineage_state FROM usage_events
-                 WHERE instance_id='ins_r48fe' AND scope='message'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
+        r48_assert_message_bill(&conn, "ins_r48foldLive", Some(150), Some(0.02));
+
+        // Captured live rev1 is LOWER than survivor legacy rev2 -> rejected;
+        // survivor era (legacy) AND survivor counters/cost (150 / 0.02) kept.
+        let conn = r48_fold_connection(
+            "ins_r48fe",
+            R48FoldRow {
+                era: Some("legacy"),
+                rev: 2,
+                input: 150,
+                cost: "0.02",
+            },
+            R48FoldRow {
+                era: None,
+                rev: 1,
+                input: 100,
+                cost: "0.01",
+            },
+        );
         assert_eq!(
-            era.as_deref(),
+            r48_message_era(&conn, "ins_r48fe").as_deref(),
             Some("legacy"),
             "rejected captured rev keeps survivor era"
         );
+        r48_assert_message_bill(&conn, "ins_r48fe", Some(150), Some(0.02));
+    }
+
+    // ===== r49: replay-driven (migration) era transitions =====
+    //
+    // Unlike the r48 upsert unit tests, these drive the era through the REAL
+    // migration/replay: a recorded cutover_seq decides each frame's era, and a
+    // pre/post-cutover higher revision is applied to an existing row by replay.
+
+    /// Current-schema, marker-absent DB with both unique indexes dropped (so a
+    /// key can have two physical rows) and an explicit recorded cutover.
+    fn r49_replay_fixture(inst: &str, cutover_seq: i64) -> Connection {
+        let conn = r46_upgrade_fixture();
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS usage_events_message_dedupe;
+             DROP INDEX IF EXISTS usage_events_turn_dedupe;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO usage_instance_era(instance_id, cutover_seq)
+             VALUES (?1, ?2)",
+            params![inst, cutover_seq],
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn r49_replay_turn_precutover_higher_rev_on_live_row_becomes_legacy() {
+        // cutover=3. An existing LIVE unjournaled turn at seq4/rev1 (NULL),
+        // plus a real PRE-CUTOVER journal frame at seq1 carrying rev2. Replay
+        // (seq1 <= 3 -> legacy) accepts rev2 over the live row: the stored row
+        // becomes legacy and beside scoped stock takes conservative Unknown.
+        let inst = "ins_r49tpre";
+        let conn = r49_replay_fixture(inst, 3);
+        let (pre_rec, pre_row) = r48_turn(inst, 1, 2, 110, "0.02");
+        let (_, live_row) = r48_turn(inst, 4, 1, 100, "0.01");
+        // Physical seq1 is backed by the journal frame; seq4 is unjournaled.
+        insert_journal_raw(&conn, &pre_rec);
+        r46_raw_insert(&conn, &pre_row, Some("legacy"));
+        r46_raw_insert(&conn, &live_row, None);
+        r48_add_scoped_session(&conn, inst);
+        migrate(&conn).unwrap();
+
+        assert_eq!(
+            r48_turn_era(&conn, inst).as_deref(),
+            Some("legacy"),
+            "replayed pre-cutover rev2 flips the existing live row to legacy"
+        );
+        let (rev, inp): (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT metric_revision, input_tokens FROM usage_events
+                 WHERE instance_id = ?1 AND scope='turn' AND scope_id='t1'",
+                params![inst],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (rev, inp),
+            (2, Some(110)),
+            "pre-cutover rev2 content authoritative"
+        );
+        let agg = aggregate_instance(&conn, inst).unwrap();
+        assert_eq!(
+            agg.ambiguous_events, 1,
+            "legacy turn beside stock is ambiguous"
+        );
+        assert_eq!(agg.input_tokens, None, "conservative Unknown, not 110");
+        assert_eq!(agg.cost_usd, None, "conservative Unknown, not 0.02");
+        // Idempotent.
+        let once = r43_dump_rows(&conn);
+        migrate(&conn).unwrap();
+        assert_eq!(once, r43_dump_rows(&conn));
+    }
+
+    #[test]
+    fn r49_replay_turn_postcutover_higher_rev_on_legacy_row_becomes_live() {
+        // cutover=3. An existing legacy turn rev1 (journal seq1) and a real
+        // POST-CUTOVER journal frame seq4 carrying rev2. Replay makes the row
+        // live (NULL); beside scoped stock it bills Ruling B flow 110 / 0.02.
+        let inst = "ins_r49tpost";
+        let conn = r49_replay_fixture(inst, 3);
+        let (legacy_rec, legacy_row) = r48_turn(inst, 1, 1, 100, "0.01");
+        let (live_rec, _) = r48_turn(inst, 4, 2, 110, "0.02");
+        insert_journal_raw(&conn, &legacy_rec);
+        insert_journal_raw(&conn, &live_rec);
+        r46_raw_insert(&conn, &legacy_row, Some("legacy"));
+        r48_add_scoped_session(&conn, inst);
+        migrate(&conn).unwrap();
+
+        assert_eq!(
+            r48_turn_era(&conn, inst),
+            None,
+            "post-cutover rev2 flips the legacy row to live"
+        );
+        let (rev, inp): (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT metric_revision, input_tokens FROM usage_events
+                 WHERE instance_id = ?1 AND scope='turn' AND scope_id='t1'",
+                params![inst],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((rev, inp), (2, Some(110)));
+        let agg = aggregate_instance(&conn, inst).unwrap();
+        assert_eq!(agg.ambiguous_events, 0, "live turn is not ambiguous");
+        assert_eq!(
+            agg.input_tokens,
+            Some(110),
+            "Ruling B flow bills rev2 counters"
+        );
+        assert_eq!(agg.cost_usd, Some(0.02), "Ruling B flow bills rev2 cost");
+        let once = r43_dump_rows(&conn);
+        migrate(&conn).unwrap();
+        assert_eq!(once, r43_dump_rows(&conn));
+    }
+
+    #[test]
+    fn r49_replay_message_precutover_higher_rev_on_live_row_becomes_legacy() {
+        // cutover=3. Existing LIVE unjournaled message seq4/rev1; a real
+        // pre-cutover journal frame seq1/rev2. Replay accepts rev2 as legacy.
+        // Messages always bill flow, so counters/cost stay concrete.
+        let inst = "ins_r49mpre";
+        let conn = r49_replay_fixture(inst, 3);
+        let (pre_rec, pre_row) = r48_message_rec(inst, 1, 2, 150, "0.02", None);
+        let live_row = r48_message(inst, 4, 1, 100, "0.01", None);
+        insert_journal_raw(&conn, &pre_rec);
+        r46_raw_insert(&conn, &pre_row, Some("legacy"));
+        r46_raw_insert(&conn, &live_row, None);
+        migrate(&conn).unwrap();
+
+        assert_eq!(
+            r48_message_era(&conn, inst).as_deref(),
+            Some("legacy"),
+            "replayed pre-cutover rev2 makes the message legacy"
+        );
+        let (rev, inp): (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT metric_revision, input_tokens FROM usage_events
+                 WHERE instance_id = ?1 AND scope='message' AND scope_id='mk1'",
+                params![inst],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((rev, inp), (2, Some(150)));
+        r48_assert_message_bill(&conn, inst, Some(150), Some(0.02));
+        let once = r43_dump_rows(&conn);
+        migrate(&conn).unwrap();
+        assert_eq!(once, r43_dump_rows(&conn));
+    }
+
+    #[test]
+    fn r49_replay_message_postcutover_higher_rev_on_legacy_row_becomes_live() {
+        // cutover=3. Existing legacy message rev1 (journal seq1); post-cutover
+        // journal frame seq4 rev2. Replay makes it live (NULL); concrete bill.
+        let inst = "ins_r49mpost";
+        let conn = r49_replay_fixture(inst, 3);
+        let (legacy_rec, legacy_row) = r48_message_rec(inst, 1, 1, 100, "0.01", None);
+        let (live_rec, _) = r48_message_rec(inst, 4, 2, 150, "0.02", None);
+        insert_journal_raw(&conn, &legacy_rec);
+        insert_journal_raw(&conn, &live_rec);
+        r46_raw_insert(&conn, &legacy_row, Some("legacy"));
+        migrate(&conn).unwrap();
+
+        assert_eq!(
+            r48_message_era(&conn, inst),
+            None,
+            "post-cutover rev2 makes it live"
+        );
+        let (rev, inp): (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT metric_revision, input_tokens FROM usage_events
+                 WHERE instance_id = ?1 AND scope='message' AND scope_id='mk1'",
+                params![inst],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((rev, inp), (2, Some(150)));
+        r48_assert_message_bill(&conn, inst, Some(150), Some(0.02));
+        let once = r43_dump_rows(&conn);
+        migrate(&conn).unwrap();
+        assert_eq!(once, r43_dump_rows(&conn));
     }
 
     #[test]

@@ -228,7 +228,20 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
         if journal_exists > 0 {
             conn.execute(
                 "INSERT OR IGNORE INTO usage_instance_era(instance_id, cutover_seq)
-                 SELECT instance_id, MAX(seq) FROM journal GROUP BY instance_id",
+                 SELECT inst.instance_id, COALESCE(MAX(j.seq), 0)
+                 FROM (
+                     SELECT DISTINCT instance_id FROM usage_events
+                     UNION
+                     SELECT DISTINCT instance_id FROM journal
+                 ) inst
+                 LEFT JOIN journal j ON j.instance_id = inst.instance_id
+                 GROUP BY inst.instance_id",
+                [],
+            )?;
+        } else {
+            conn.execute(
+                "INSERT OR IGNORE INTO usage_instance_era(instance_id, cutover_seq)
+                 SELECT DISTINCT instance_id, 0 FROM usage_events",
                 [],
             )?;
         }
@@ -293,7 +306,29 @@ fn tx_batch_create_message_index(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+/// AE3(c): initialize any MISSING per-instance cutover metadata for a database
+/// that already has the lineage column (unreleased intermediate branch build).
+/// This is independent of the one-time replay marker and of journal replay
+/// running at all, so it must be reached even when the replay guard or the
+/// missing-journal table would otherwise return early. Instances upgraded by
+/// case (a) already have a row, which INSERT OR IGNORE preserves.
+fn ensure_intermediate_era_metadata(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO usage_instance_era(instance_id, cutover_seq)
+         SELECT u.instance_id,
+                COALESCE(MAX(CASE WHEN u.lineage_state = 'legacy' THEN u.seq END), 0)
+         FROM usage_events u
+         GROUP BY u.instance_id",
+        [],
+    )?;
+    Ok(())
+}
+
 fn replay_fallback_rows_from_journal(conn: &Connection) -> rusqlite::Result<usize> {
+    // AE3(c) first: fill cutover metadata for column-present intermediate
+    // databases regardless of whether replay runs or the completion marker is
+    // already applied. (Reads only usage_events, so it precedes both guards.)
+    ensure_intermediate_era_metadata(conn)?;
     // A database without a journal table (unit migrations, a fresh store that
     // never appended observations) has nothing to replay from.
     let journal_exists: i64 = conn.query_row(
@@ -414,20 +449,6 @@ fn replay_fallback_rows_from_journal(conn: &Connection) -> rusqlite::Result<usiz
             }
         }
     }
-
-    // AE3(c): the column already exists on databases built by an unreleased
-    // intermediate branch, so no cutover was recorded at its introduction.
-    // Derive the per-instance cutover from the pre-cutover rows that survive
-    // tagged 'legacy': cutover_seq = MAX(seq) among them, or 0 when the
-    // instance has none (all its rows are post-cutover live).
-    conn.execute(
-        "INSERT OR IGNORE INTO usage_instance_era(instance_id, cutover_seq)
-         SELECT u.instance_id,
-                COALESCE(MAX(CASE WHEN u.lineage_state = 'legacy' THEN u.seq END), 0)
-         FROM usage_events u
-         GROUP BY u.instance_id",
-        [],
-    )?;
 
     // AE2 (i): delete ALL journal-backed usage rows of the participating
     // instances — every kind (Session/Turn/Message) — backed by PHYSICAL
@@ -9572,6 +9593,98 @@ mod tests {
             Some("legacy"),
             "rejected captured rev keeps survivor era"
         );
+    }
+
+    #[test]
+    fn r48_item2_column_intro_unjournaled_instance_without_journal_gets_cutover_0() {
+        // Item 2: introduce lineage_state with an unjournaled usage row at
+        // seq 10 in an instance that has NO journal frames. The cutover must be
+        // explicitly recorded as 0 (not derived from the usage seq) and the row
+        // is still legacy.
+        let conn = Connection::open_in_memory().unwrap();
+        // Pre-lineage current-schema-minus-lineage database.
+        migrate(&conn).unwrap();
+        create_journal_table(&conn);
+        conn.execute_batch(
+            "ALTER TABLE usage_events DROP COLUMN lineage_state;
+             DELETE FROM usage_schema_meta;
+             DELETE FROM usage_instance_era;",
+        )
+        .unwrap();
+        let mut row = r48_message("ins_r48nojourn", 10, 1, 100, "0.01", None);
+        row.instance_id = "ins_r48nojourn".into();
+        row.seq = 10;
+        r47_raw_insert_no_lineage(&conn, &row); // deliberately NOT journaled
+
+        migrate(&conn).unwrap();
+        let cutover: i64 = conn
+            .query_row(
+                "SELECT cutover_seq FROM usage_instance_era WHERE instance_id='ins_r48nojourn'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            cutover, 0,
+            "instance with no journal frames records boundary 0"
+        );
+        assert_eq!(
+            r48_message_era(&conn, "ins_r48nojourn").as_deref(),
+            Some("legacy"),
+            "the row is still legacy (existed at cutover)"
+        );
+    }
+
+    #[test]
+    fn r48_item3_marker_applied_without_era_metadata_still_initializes() {
+        // Item 3: lineage_state present and journal_replay_v1 already applied,
+        // but usage_instance_era is empty. Migrate must still derive cutovers
+        // (case c) before the completion guard returns.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        create_journal_table(&conn);
+        // A legacy row (intermediate build) and a live row in different
+        // instances, then clear the era metadata and keep the replay marker.
+        let legacy = r48_message("ins_r48mlegacy", 3, 1, 100, "0.01", None);
+        let live = r48_message("ins_r48mlive", 7, 1, 100, "0.01", None);
+        r46_raw_insert(&conn, &legacy, Some("legacy"));
+        r46_raw_insert(&conn, &live, None);
+        conn.execute("DELETE FROM usage_instance_era", []).unwrap();
+        let marker: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_schema_meta WHERE key='journal_replay_v1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker, 1, "fixture keeps the applied replay marker");
+
+        migrate(&conn).unwrap();
+        let legacy_cut: i64 = conn
+            .query_row(
+                "SELECT cutover_seq FROM usage_instance_era WHERE instance_id='ins_r48mlegacy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let live_cut: i64 = conn
+            .query_row(
+                "SELECT cutover_seq FROM usage_instance_era WHERE instance_id='ins_r48mlive'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_cut, 3, "legacy row's seq is the derived boundary");
+        assert_eq!(live_cut, 0, "all-live instance derives boundary 0");
+        // Rows keep their era.
+        assert_eq!(
+            r48_message_era(&conn, "ins_r48mlegacy").as_deref(),
+            Some("legacy")
+        );
+        assert_eq!(r48_message_era(&conn, "ins_r48mlive"), None);
+        let once = r43_dump_rows(&conn);
+        migrate(&conn).unwrap();
+        assert_eq!(once, r43_dump_rows(&conn), "migrate twice == once");
     }
 
     /// Raw insert into a PRE-lineage schema (all current columns except

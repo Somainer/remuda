@@ -191,21 +191,43 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     )?;
     // c-usagefu (c): native per-model context window reported on the payload.
     crate::store::ensure_column(conn, "usage_events", "native_context_window", "INTEGER")?;
-    // c-ctxusage × c-usagefu merge: provenance tag separating rows that
-    // already existed at this migration (pre-upgrade producers, including
-    // rows written while an earlier migration window was rolled back and
-    // recovered from the journal below) from rows projected LIVE after the
-    // upgrade. The fold treats an unprovable LEGACY turn next to scoped stock
-    // as conservative Unknown (c-ctxusage r29 ambiguity), while a live turn
-    // the current codex adapter projected follows Ruling B flow billing even
-    // beside stock; the two shapes are otherwise identical, so without the
-    // tag the two rulings cannot be distinguished. Existing rows are tagged
-    // only on the migration that INTRODUCES the column: on a later restart the
-    // column already exists and post-upgrade live rows (NULL) stay live.
+    // c-ctxusage × c-usagefu merge, Ruling AE3: lineage_state is PRODUCER-ERA
+    // provenance, not a recovery marker. Pre-upgrade producers and the current
+    // codex adapter emit identically shaped turns with different billing
+    // semantics (r29 conservative ambiguity vs Ruling B flow); the producer era
+    // is the only discriminator. The era boundary per instance is the cutover:
+    // the migration that INTRODUCES this column. Every row that exists at the
+    // cutover is 'legacy' — including rows with no journal frame, since they too
+    // were produced by the old era. The cutover seq is MAX(journal.seq) at the
+    // cutover moment; replay ingests a frame with seq <= cutover as legacy and
+    // any later frame as live, via an explicit per-frame provenance input —
+    // never a post-hoc blanket UPDATE. A later restart sees the column already
+    // present and post-upgrade live rows (NULL) stay live.
     let tag_legacy_rows = !crate::store::column_exists(conn, "usage_events", "lineage_state")?;
     crate::store::ensure_column(conn, "usage_events", "lineage_state", "TEXT")?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS usage_instance_era (
+            instance_id TEXT PRIMARY KEY,
+            cutover_seq INTEGER NOT NULL
+         );",
+    )?;
     if tag_legacy_rows {
         conn.execute("UPDATE usage_events SET lineage_state = 'legacy'", [])?;
+        // Record the per-instance cutover from the journal of record. A
+        // database without a journal table has no replayable era boundary.
+        let journal_exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'journal'",
+            [],
+            |row| row.get(0),
+        )?;
+        if journal_exists > 0 {
+            conn.execute(
+                "INSERT OR IGNORE INTO usage_instance_era(instance_id, cutover_seq)
+                 SELECT instance_id, MAX(seq) FROM journal GROUP BY instance_id",
+                [],
+            )?;
+        }
     }
     conn.execute_batch(META_DDL)?;
     // c-ctxusage r10/r29-r31 + c-usagefu r13-r16 identity recovery: the whole
@@ -288,21 +310,21 @@ fn replay_fallback_rows_from_journal(conn: &Connection) -> rusqlite::Result<usiz
     if already_replayed > 0 {
         return Ok(0);
     }
-    // AE2 (i): the unit of replay is the INSTANCE. An instance participates iff
-    // at least one of its physical usage rows is backed by a `kind='usage'`
-    // journal frame. Frames are NEVER selected by "a physical row still
-    // represents this seq": the live Message upsert keeps the FIRST seq while a
-    // revision lands at a later seq, and the live Turn upsert ADVANCES seq to a
-    // correction's seq — so surviving physical seqs are exactly not the set of
-    // frames to replay.
+    // AE2 (i)/AE3: the unit of replay is the INSTANCE. An instance participates
+    // iff at least one of its physical usage rows is backed by a journal frame
+    // at the SAME (instance, seq). Backing is physical EXISTENCE in the
+    // journal, regardless of the frame kind (a usage_events row's seq always
+    // mirrors the usage frame that produced it). Frames are NEVER selected by
+    // "a physical row still represents this seq": the live Message upsert keeps
+    // the FIRST seq while a revision lands at a later seq, and the live Turn
+    // upsert ADVANCES seq to a correction's seq — so surviving physical seqs are
+    // exactly not the set of frames to replay.
     let instances: Vec<String> = {
         let mut st = conn.prepare(
             "SELECT DISTINCT j.instance_id
              FROM journal j
              JOIN usage_events u
                ON u.instance_id = j.instance_id AND u.seq = j.seq
-             WHERE json_valid(j.payload_json)
-               AND json_extract(j.payload_json, '$.kind') = 'usage'
              ORDER BY j.instance_id",
         )?;
         let rows = st.query_map([], |r| r.get::<_, String>(0))?;
@@ -349,9 +371,7 @@ fn replay_fallback_rows_from_journal(conn: &Connection) -> rusqlite::Result<usiz
                     u.profile_id, u.model
              FROM usage_events u
              JOIN journal j ON j.instance_id = u.instance_id AND j.seq = u.seq
-             WHERE json_valid(j.payload_json)
-               AND json_extract(j.payload_json, '$.kind') = 'usage'
-               AND j.instance_id IN (SELECT value FROM r46_replay_instances)
+             WHERE j.instance_id IN (SELECT value FROM r46_replay_instances)
              ORDER BY j.instance_id, j.seq, u.rowid",
         )?;
         let rows = st.query_map([], |r| {
@@ -391,9 +411,26 @@ fn replay_fallback_rows_from_journal(conn: &Connection) -> rusqlite::Result<usiz
         }
     }
 
+    // AE3(c): the column already exists on databases built by an unreleased
+    // intermediate branch, so no cutover was recorded at its introduction.
+    // Derive the per-instance cutover from the pre-cutover rows that survive
+    // tagged 'legacy': cutover_seq = MAX(seq) among them, or 0 when the
+    // instance has none (all its rows are post-cutover live). Post-cutover NULL
+    // rows do NOT move the boundary. This is the "blanket update reaches live
+    // rows" case from r45: those rows must keep their NULL era.
+    conn.execute(
+        "INSERT OR IGNORE INTO usage_instance_era(instance_id, cutover_seq)
+         SELECT u.instance_id,
+                COALESCE(MAX(CASE WHEN u.lineage_state = 'legacy' THEN u.seq END), 0)
+         FROM usage_events u
+         GROUP BY u.instance_id",
+        [],
+    )?;
+
     // AE2 (i): delete ALL journal-backed usage rows of the participating
-    // instances — every kind (Session/Turn/Message). The journal is untouched,
-    // so a failure inside this transaction rolls every delete back.
+    // instances — every kind (Session/Turn/Message) — backed by PHYSICAL
+    // (instance, seq) existence in the journal. The journal is untouched, so a
+    // failure inside this transaction rolls every delete back.
     conn.execute_batch(
         "CREATE TEMP TABLE IF NOT EXISTS r46_backed_rowids(value INTEGER NOT NULL);
          DELETE FROM r46_backed_rowids;",
@@ -403,9 +440,7 @@ fn replay_fallback_rows_from_journal(conn: &Connection) -> rusqlite::Result<usiz
          SELECT u.rowid
          FROM usage_events u
          JOIN journal j ON j.instance_id = u.instance_id AND j.seq = u.seq
-         WHERE json_valid(j.payload_json)
-           AND json_extract(j.payload_json, '$.kind') = 'usage'
-           AND j.instance_id IN (SELECT value FROM r46_replay_instances)",
+         WHERE j.instance_id IN (SELECT value FROM r46_replay_instances)",
         [],
     )?;
     conn.execute(
@@ -424,11 +459,17 @@ fn replay_fallback_rows_from_journal(conn: &Connection) -> rusqlite::Result<usiz
     // from folding the unjournaled revision away before the backed rows are
     // rebuilt. The fold runs on every migration, including one with no replay.
     let mut captured_folds = fold_unjournaled_index_collisions(conn)?;
+    // AE3 medium-2 regression gate: after folding, no exact-key collision may
+    // remain or the unique-index create would fail (test builds only).
+    #[cfg(test)]
+    assert_no_index_collisions(conn);
     tx_batch_create_turn_index(conn)?;
     tx_batch_create_message_index(conn)?;
-    captured_folds.sort_by_key(|(rowid, _)| *rowid);
-    for (_, row) in &captured_folds {
-        insert_usage_event(conn, row)?;
+    captured_folds.sort_by_key(|(rowid, _, _)| *rowid);
+    for (_, row, era) in &captured_folds {
+        // Re-feed with the captured row's OWN producer era — folding preserves
+        // provenance, never reclassifies it.
+        insert_usage_event_era(conn, row, *era)?;
     }
     if instances.is_empty() {
         return Ok(0);
@@ -480,6 +521,20 @@ fn replay_fallback_rows_from_journal(conn: &Connection) -> rusqlite::Result<usiz
             })
             .or_else(|| inst_attr.get(&record.instance_id).map(|(_, a)| a))
     };
+    // AE3(b): per-instance producer-era boundary. A frame with seq <= the
+    // cutover seq is ingested with legacy provenance; a later frame is live.
+    let mut cutover: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    {
+        let mut st = conn.prepare(
+            "SELECT instance_id, cutover_seq FROM usage_instance_era
+             WHERE instance_id IN (SELECT value FROM r46_replay_instances)",
+        )?;
+        let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        for row in rows {
+            let (instance, seq) = row?;
+            cutover.insert(instance, seq);
+        }
+    }
     let mut rebuilt = 0usize;
     for record in &records {
         // Project once to learn the durable key the live path folds on, then
@@ -494,11 +549,17 @@ fn replay_fallback_rows_from_journal(conn: &Connection) -> rusqlite::Result<usiz
         else {
             continue;
         };
-        insert_usage_event(conn, &row)?;
+        // The frame carries its producer era explicitly — no post-hoc tag.
+        let era = if record.seq <= *cutover.get(&record.instance_id).unwrap_or(&0) {
+            IngestEra::Legacy
+        } else {
+            IngestEra::Live
+        };
+        insert_usage_event_era(conn, &row, era)?;
         rebuilt += 1;
     }
-    // AE2 (iii): no lineage tag and no other recovery marking. Replayed rows
-    // are live rows, column for column.
+    // AE3: replayed rows carry per-frame producer era, column for column with
+    // live ingest — no blanket recovery marking.
     Ok(rebuilt)
 }
 
@@ -514,69 +575,100 @@ fn tx_batch_create_turn_index(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+/// Test-only gate run between the unjournaled fold and the unique-index
+/// creates: each live unique key must already be collision-free.
+#[cfg(test)]
+fn assert_no_index_collisions(conn: &Connection) {
+    let dupes: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM (
+                SELECT 1 FROM usage_events
+                 WHERE scope_id IS NOT NULL AND scope IN ('message', 'turn')
+                 GROUP BY scope, instance_id, scope_id,
+                          CASE WHEN scope = 'turn'
+                               THEN COALESCE(source_session_id, '')
+                               ELSE '' END
+                HAVING COUNT(*) > 1)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        dupes, 0,
+        "a unique-key collision remains after the unjournaled fold"
+    );
+}
+
 /// Physical rows that collide on a unique index the current live schema needs,
 /// among rows the replay does not rebuild (rows without a journal frame at
-/// their seq). The SURVIVOR (MIN rowid per collision group) stays in place;
+/// their seq). The SURVIVOR (MIN rowid per the EXACT index key) stays in place;
 /// every later physical row is captured and removed, then returned so the
 /// caller can create the unique indexes and re-feed the captures through the
 /// live upsert rule — higher revision wins, omitted metadata retained, never a
-/// discard-to-MIN(rowid) sweep.
+/// discard-to-MIN(rowid) sweep. Grouping matches each index's key columns
+/// exactly: the Message index ignores source_session_id; the Turn index keeps
+/// the lineage qualifier.
 fn fold_unjournaled_index_collisions(
     conn: &Connection,
-) -> rusqlite::Result<Vec<(i64, UsageEventRow)>> {
-    // Collision key for each live unique index, with the row-value predicate
-    // that selects physical rows belonging to a duplicated group.
+) -> rusqlite::Result<Vec<(i64, UsageEventRow, IngestEra)>> {
     struct Fold {
         scope: &'static str,
-        // SQL listing the grouping key after WHERE scope=? — the SELECT returns
-        // full rows ordered by key,rowid; the bound parameter is the scope.
-        predicate: &'static str,
+        // Correlated predicate: true for rows that are NOT the MIN(rowid)
+        // survivor of their own exact unique-key group (outer row is `u`).
+        non_survivor: &'static str,
     }
     let folds = [
         Fold {
             scope: "message",
-            // Collision on (instance_id, scope, scope_id).
-            predicate: "(instance_id, scope, scope_id) IN (
-                SELECT instance_id, scope, scope_id FROM usage_events
-                 WHERE scope = 'message' AND scope_id IS NOT NULL
-                 GROUP BY instance_id, scope, scope_id
-                HAVING COUNT(*) > 1)",
+            // AE3-only commit state: message grouping still carries the lineage
+            // qualifier (the r47 fold-key fix removes it in the next commit).
+            non_survivor: "u.rowid > (
+                SELECT MIN(g.rowid) FROM usage_events g
+                 WHERE g.instance_id = u.instance_id
+                   AND g.scope = u.scope
+                   AND g.scope_id = u.scope_id
+                   AND COALESCE(g.source_session_id, '') =
+                       COALESCE(u.source_session_id, '')
+            )",
         },
         Fold {
             scope: "turn",
-            // Collision on the per-lineage key the turn index enforces.
-            predicate: "(instance_id, scope, scope_id,
-                               COALESCE(source_session_id, '')) IN (
-                SELECT instance_id, scope, scope_id,
-                       COALESCE(source_session_id, '')
-                  FROM usage_events
-                 WHERE scope = 'turn' AND scope_id IS NOT NULL
-                 GROUP BY instance_id, scope, scope_id,
-                          COALESCE(source_session_id, '')
-                HAVING COUNT(*) > 1)",
+            // Turn key additionally carries the lineage qualifier.
+            non_survivor: "u.rowid > (
+                SELECT MIN(g.rowid) FROM usage_events g
+                 WHERE g.instance_id = u.instance_id
+                   AND g.scope = u.scope
+                   AND g.scope_id = u.scope_id
+                   AND COALESCE(g.source_session_id, '') =
+                       COALESCE(u.source_session_id, '')
+            )",
         },
     ];
 
-    // Survivors (MIN rowid per collision group) stay; every later captured row
-    // is removed and later re-fed through the live upsert.
-    let mut captured: Vec<(i64, UsageEventRow)> = Vec::new();
+    let mut captured: Vec<(i64, UsageEventRow, IngestEra)> = Vec::new();
     for fold in &folds {
         let sql = format!(
             "SELECT rowid, instance_id, seq, profile_id, model, scope, scope_id, turn_id,
                     metric_revision, source_session_id, mode,
                     total_tokens, input_tokens, output_tokens,
                     cache_read_tokens, cache_write_tokens, cost_usd, accounting,
-                    observed_at, observed_at_source, native_context_window
-             FROM usage_events
-             WHERE scope = ?1 AND scope_id IS NOT NULL
-               AND {predicate}
-             ORDER BY instance_id, scope, scope_id,
-                      COALESCE(source_session_id, ''), rowid",
-            predicate = fold.predicate
+                    observed_at, observed_at_source, native_context_window,
+                    lineage_state
+             FROM usage_events u
+             WHERE u.scope = ?1 AND u.scope_id IS NOT NULL
+               AND {non_survivor}
+             ORDER BY u.rowid",
+            non_survivor = fold.non_survivor
         );
         let mut st = conn.prepare(&sql)?;
         let rows = st.query_map(params![fold.scope], |r| {
             let rowid: i64 = r.get(0)?;
+            let lineage: Option<String> = r.get(21)?;
+            let era = if lineage.as_deref() == Some("legacy") {
+                IngestEra::Legacy
+            } else {
+                IngestEra::Live
+            };
             let row = UsageEventRow {
                 instance_id: r.get(1)?,
                 seq: r.get(2)?,
@@ -599,27 +691,10 @@ fn fold_unjournaled_index_collisions(
                 observed_at_source: r.get(19)?,
                 native_context_window: r.get(20)?,
             };
-            Ok((rowid, row))
+            Ok((rowid, row, era))
         })?;
-        let mut group_key: Option<(String, String, String)> = None;
         for item in rows {
-            let (rowid, row) = item?;
-            // Within the ordered stream, only the FIRST row of each collision
-            // group is its survivor (MIN rowid). Turn groups additionally
-            // distinguish the lineage column; it is constant inside the
-            // ORDER BY partition, so (instance, scope, scope_id) plus a
-            // lineage change detection below is sufficient.
-            let key = (
-                row.instance_id.clone(),
-                row.scope_id.clone().unwrap_or_default(),
-                row.source_session_id.clone().unwrap_or_default(),
-            );
-            let is_new_group = group_key.as_ref() != Some(&key);
-            if is_new_group {
-                group_key = Some(key);
-            } else {
-                captured.push((rowid, row));
-            }
+            captured.push(item?);
         }
     }
     if captured.is_empty() {
@@ -632,7 +707,7 @@ fn fold_unjournaled_index_collisions(
     )?;
     {
         let mut ins = conn.prepare("INSERT INTO r46_fold_rowids(value) VALUES (?1)")?;
-        for (rowid, _) in &captured {
+        for (rowid, _, _) in &captured {
             ins.execute(params![rowid])?;
         }
     }
@@ -640,9 +715,9 @@ fn fold_unjournaled_index_collisions(
         "DELETE FROM usage_events WHERE rowid IN (SELECT value FROM r46_fold_rowids)",
         [],
     )?;
-    // Returned in per-group rowid order; the caller creates the unique indexes
-    // and then re-feeds these in global rowid order, so INSERT OR IGNORE hits
-    // the survivor and the live revision/metadata rule folds the content.
+    // Already in global rowid order (ORDER BY u.rowid per scope); the caller
+    // creates the unique indexes and re-feeds these so INSERT OR IGNORE hits
+    // the exact-key survivor and the live revision/metadata rule folds content.
     Ok(captured)
 }
 
@@ -759,7 +834,42 @@ fn persist_reconciled_turn(conn: &Connection, frame: &TurnFrame) -> rusqlite::Re
     Ok(())
 }
 
+/// Producer era of an ingested frame (Ruling AE3). `lineage_state` records
+/// which producer era emitted a frame: a pre-cutover producer's turn takes the
+/// r29 conservative-ambiguity billing rule; a post-cutover live frame takes
+/// Ruling B flow. The value is carried explicitly per frame through the insert
+/// path — it is never applied by a blanket post-hoc UPDATE.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IngestEra {
+    /// Emitted after the lineage cutover: lineage_state stays NULL.
+    Live,
+    /// Emitted by a pre-cutover producer (seq <= the instance cutover seq):
+    /// lineage_state = 'legacy'.
+    Legacy,
+}
+
+impl IngestEra {
+    fn lineage_value(self) -> Option<&'static str> {
+        match self {
+            IngestEra::Live => None,
+            IngestEra::Legacy => Some("legacy"),
+        }
+    }
+}
+
+/// Live ingestion entry point: post-cutover frames always carry the live era.
 pub fn insert_usage_event(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
+    insert_usage_event_era(conn, row, IngestEra::Live)
+}
+
+/// Insert a frame with an explicit producer-era provenance (AE3). Journal
+/// replay uses this to give a pre-cutover frame its `legacy` lineage and a
+/// post-cutover frame the live NULL, column for column with live ingest.
+pub fn insert_usage_event_era(
+    conn: &Connection,
+    row: &UsageEventRow,
+    era: IngestEra,
+) -> rusqlite::Result<bool> {
     // c-usagefu r15 item 1: on a database whose usage migration never
     // committed (the legacy origin/main shape), record the event through
     // main's plain insert path so usage keeps landing durably — a later
@@ -769,11 +879,10 @@ pub fn insert_usage_event(conn: &Connection, row: &UsageEventRow) -> rusqlite::R
         return insert_legacy_row(conn, row);
     }
     match (row.scope.as_str(), row.scope_id.as_deref()) {
-        ("turn", Some(_)) => upsert_turn_snapshot(conn, row),
-        ("session", Some(_)) => insert_session_growth_point(conn, row),
-        ("session", None) => insert_legacy_session_point(conn, row),
-        (_, None) => insert_row(conn, row),
-        _ => insert_row(conn, row),
+        ("turn", Some(_)) => upsert_turn_snapshot(conn, row, era),
+        ("session", Some(_)) => insert_session_growth_point(conn, row, era),
+        ("session", None) => insert_legacy_session_point(conn, row, era),
+        _ => insert_row(conn, row, era),
     }
 }
 
@@ -938,15 +1047,23 @@ fn accept_session_point(
     }
 }
 
-fn insert_session_growth_point(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
+fn insert_session_growth_point(
+    conn: &Connection,
+    row: &UsageEventRow,
+    era: IngestEra,
+) -> rusqlite::Result<bool> {
     let floors = existing_session_floors(conn, row)?;
     let Some(row) = accept_session_point(row, &floors) else {
         return Ok(false);
     };
-    insert_row(conn, &row)
+    insert_row(conn, &row, era)
 }
 
-fn insert_legacy_session_point(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
+fn insert_legacy_session_point(
+    conn: &Connection,
+    row: &UsageEventRow,
+    era: IngestEra,
+) -> rusqlite::Result<bool> {
     let mut stmt = conn.prepare(
         "SELECT total_tokens, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
                 cost_usd
@@ -970,20 +1087,20 @@ fn insert_legacy_session_point(conn: &Connection, row: &UsageEventRow) -> rusqli
     let Some(row) = accept_session_point(row, &existing) else {
         return Ok(false);
     };
-    insert_row(conn, &row)
+    insert_row(conn, &row, era)
 }
 
-fn insert_row(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
+fn insert_row(conn: &Connection, row: &UsageEventRow, era: IngestEra) -> rusqlite::Result<bool> {
     if row.scope == "message" && row.scope_id.is_some() {
-        return upsert_message_row(conn, row);
+        return upsert_message_row(conn, row, era);
     }
     let inserted = conn.execute(
         "INSERT OR IGNORE INTO usage_events
             (instance_id, seq, profile_id, model, scope, scope_id, turn_id, mode,
              metric_revision, source_session_id, total_tokens, input_tokens, output_tokens,
              cache_read_tokens, cache_write_tokens, cost_usd, accounting,
-             observed_at, observed_at_source, native_context_window)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+             observed_at, observed_at_source, native_context_window, lineage_state)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
         params![
             row.instance_id,
             row.seq,
@@ -1005,20 +1122,25 @@ fn insert_row(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> 
             row.observed_at,
             row.observed_at_source,
             row.native_context_window,
+            era.lineage_value(),
         ],
     )?;
     Ok(inserted > 0)
 }
 
-fn upsert_message_row(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
+fn upsert_message_row(
+    conn: &Connection,
+    row: &UsageEventRow,
+    era: IngestEra,
+) -> rusqlite::Result<bool> {
     let inserted = conn.execute(
         "INSERT OR IGNORE INTO usage_events
             (instance_id, seq, profile_id, model, scope, scope_id, turn_id, mode,
              metric_revision, total_tokens, input_tokens, output_tokens,
              cache_read_tokens, cache_write_tokens, cost_usd, accounting,
-             observed_at, observed_at_source, native_context_window)
+             observed_at, observed_at_source, native_context_window, lineage_state)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                 ?15, ?16, ?17, ?18, ?19)",
+                 ?15, ?16, ?17, ?18, ?19, ?20)",
         params![
             row.instance_id,
             row.seq,
@@ -1039,6 +1161,7 @@ fn upsert_message_row(conn: &Connection, row: &UsageEventRow) -> rusqlite::Resul
             row.observed_at,
             row.observed_at_source,
             row.native_context_window,
+            era.lineage_value(),
         ],
     )?;
     if inserted > 0 {
@@ -1195,7 +1318,11 @@ fn turn_position_is_stale(incoming_position: i64, stored_revision: i64) -> bool 
     incoming_position <= stored_revision
 }
 
-fn upsert_turn_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
+fn upsert_turn_snapshot(
+    conn: &Connection,
+    row: &UsageEventRow,
+    era: IngestEra,
+) -> rusqlite::Result<bool> {
     // Look up ONLY the incoming lineage's own revision-replaced row. NULL is
     // matched with IS NULL; a qualified id with equality. Either way the
     // stored row's lineage IS the incoming lineage.
@@ -1253,8 +1380,9 @@ fn upsert_turn_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Res
 
     let Some(stored) = stored else {
         // First frame of this lineage for the scope id: its own row, leaving
-        // every other lineage's row and watermark untouched.
-        return insert_row(conn, row);
+        // every other lineage's row and watermark untouched. The row carries
+        // THIS frame's producer era.
+        return insert_row(conn, row, era);
     };
 
     // The authority gate runs BEFORE any field branch — including the
@@ -4083,7 +4211,7 @@ mod tests {
                     observed_at: "2026-09-15T00:00:00.000Z".into(),
                 };
                 let row = project_usage_event(&rec, Some("pvp_codex"), Some("gpt-5.4")).unwrap();
-                insert_row(conn, &row).expect("codex usage row projects");
+                insert_row(conn, &row, IngestEra::Live).expect("codex usage row projects");
                 *seq += 1;
             }
         };
@@ -4958,7 +5086,7 @@ mod tests {
                     observed_at: "2030-01-01T00:00:00.000Z".into(), // far future ingest
                 };
                 let row = project_usage_event(&rec, None, None).unwrap();
-                insert_row(&conn, &row).unwrap();
+                insert_row(&conn, &row, IngestEra::Live).unwrap();
             }
         }
 
@@ -5027,7 +5155,7 @@ mod tests {
             observed_at: "2030-01-01T00:00:00Z".into(),
         };
         let first_row = project_usage_event(&first, None, None).unwrap();
-        assert!(insert_row(&conn, &first_row).unwrap());
+        assert!(insert_row(&conn, &first_row, IngestEra::Live).unwrap());
         let (turn, source): (Option<String>, String) = conn
             .query_row(
                 "SELECT turn_id, observed_at_source FROM usage_events WHERE scope_id='r1'",
@@ -5059,7 +5187,7 @@ mod tests {
             observed_at: "2030-01-01T00:00:00Z".into(),
         };
         let second_row = project_usage_event(&second, None, None).unwrap();
-        let changed = insert_row(&conn, &second_row).expect("upsert succeeds");
+        let changed = insert_row(&conn, &second_row, IngestEra::Live).expect("upsert succeeds");
         assert!(changed, "the better-attributed replay updated the row");
 
         let count: i64 = conn
@@ -5384,18 +5512,18 @@ mod tests {
         };
 
         // First adapter: two message responses (r1=100 out, r2=200 out).
-        let first = insert_row(&conn, &message_row(1, "r1", 100)).unwrap();
+        let first = insert_row(&conn, &message_row(1, "r1", 100), IngestEra::Live).unwrap();
         assert!(first, "first r1 inserted");
-        assert!(insert_row(&conn, &message_row(2, "r2", 200)).unwrap());
+        assert!(insert_row(&conn, &message_row(2, "r2", 200), IngestEra::Live).unwrap());
 
         // Second adapter replays the same rollout (different journal seqs but
         // identical response ids): both must be ignored.
         assert!(
-            !insert_row(&conn, &message_row(3, "r1", 100)).unwrap(),
+            !insert_row(&conn, &message_row(3, "r1", 100), IngestEra::Live).unwrap(),
             "replayed r1 is deduped by response id"
         );
         assert!(
-            !insert_row(&conn, &message_row(4, "r2", 200)).unwrap(),
+            !insert_row(&conn, &message_row(4, "r2", 200), IngestEra::Live).unwrap(),
             "replayed r2 is deduped by response id"
         );
 
@@ -5475,11 +5603,13 @@ mod tests {
                 &t1,
                 Some("t1"),
             ),
+            IngestEra::Live,
         )
         .unwrap();
         insert_row(
             &conn,
             &project(2, "session", "s1", 1, 40, 10, 100, 5, "0.10", &t1, None),
+            IngestEra::Live,
         )
         .unwrap();
         // Turn 2: additive Message (60/20, cache 150/7) and the Session point
@@ -5499,11 +5629,13 @@ mod tests {
                 &t2,
                 Some("t2"),
             ),
+            IngestEra::Live,
         )
         .unwrap();
         insert_row(
             &conn,
             &project(4, "session", "s1", 2, 100, 30, 250, 12, "0.30", &t2, None),
+            IngestEra::Live,
         )
         .unwrap();
 
@@ -5572,8 +5704,8 @@ mod tests {
             };
             project_usage_event(&rec, Some("pvp_up"), Some("gpt-5.4")).unwrap()
         };
-        insert_row(&conn, &project(1, "message", "r1")).unwrap();
-        insert_row(&conn, &project(2, "turn", "t1")).unwrap();
+        insert_row(&conn, &project(1, "message", "r1"), IngestEra::Live).unwrap();
+        insert_row(&conn, &project(2, "turn", "t1"), IngestEra::Live).unwrap();
 
         assert_eq!(
             aggregate_instance(&conn, "ins_up").unwrap().output_tokens,
@@ -5653,18 +5785,34 @@ mod tests {
         insert_row(
             &conn,
             &project(seq, "message", "r1", Some("t1"), Some("0.10")),
+            IngestEra::Live,
         )
         .unwrap();
         seq += 1;
-        insert_row(&conn, &project(seq, "turn", "t1", Some("t1"), Some("0.10"))).unwrap();
+        insert_row(
+            &conn,
+            &project(seq, "turn", "t1", Some("t1"), Some("0.10")),
+            IngestEra::Live,
+        )
+        .unwrap();
         seq += 1;
         // Session cumulative point priced $0.10.
         insert_usage_event(&conn, &s1(seq, 1, Some("0.10"))).unwrap();
         seq += 1;
         // Turn 2 unpriced: Message + Turn both unknown cost; session NULL.
-        insert_row(&conn, &project(seq, "message", "r2", Some("t2"), None)).unwrap();
+        insert_row(
+            &conn,
+            &project(seq, "message", "r2", Some("t2"), None),
+            IngestEra::Live,
+        )
+        .unwrap();
         seq += 1;
-        insert_row(&conn, &project(seq, "turn", "t2", Some("t2"), None)).unwrap();
+        insert_row(
+            &conn,
+            &project(seq, "turn", "t2", Some("t2"), None),
+            IngestEra::Live,
+        )
+        .unwrap();
         seq += 1;
         insert_usage_event(&conn, &s1(seq, 2, None)).unwrap();
         seq += 1;
@@ -5672,10 +5820,16 @@ mod tests {
         insert_row(
             &conn,
             &project(seq, "message", "r3", Some("t3"), Some("0.20")),
+            IngestEra::Live,
         )
         .unwrap();
         seq += 1;
-        insert_row(&conn, &project(seq, "turn", "t3", Some("t3"), Some("0.20"))).unwrap();
+        insert_row(
+            &conn,
+            &project(seq, "turn", "t3", Some("t3"), Some("0.20")),
+            IngestEra::Live,
+        )
+        .unwrap();
         seq += 1;
         insert_usage_event(&conn, &s1(seq, 3, None)).unwrap();
 
@@ -7730,9 +7884,10 @@ mod tests {
         // Invariant (c, independent): fallback recovery equals an INDEPENDENT
         // live reference — a fresh current-schema database that ingests the
         // SAME journal records through the live path in journal order. This is
-        // Ruling AE (recovery IS replay): the recovered state is not compared
-        // against a snapshot taken after a migration, but against live ingest
-        // derived independently.
+        // Ruling AE (recovery IS replay); AE3(d) adds producer era: a frame the
+        // seed DB produced before the cutover (ev.legacy) is ingested into the
+        // reference with legacy provenance, every later frame as live — exactly
+        // the era the forced replay assigns by seq <= cutover.
         let live_ref = Connection::open_in_memory().unwrap();
         migrate(&live_ref).unwrap();
         create_journal_table(&live_ref);
@@ -7741,13 +7896,18 @@ mod tests {
                 insert_journal_raw(&live_ref, &ev.record);
                 let row = project_usage_event(&ev.record, Some(profile), Some(ev.model))
                     .expect("real usage payload projects");
-                insert_usage_event(&live_ref, &row).unwrap();
+                let era = if ev.legacy {
+                    IngestEra::Legacy
+                } else {
+                    IngestEra::Live
+                };
+                insert_usage_event_era(&live_ref, &row, era).unwrap();
             }
         }
         assert_eq!(
             r43_dump_rows(&live_ref),
             twice_rows,
-            "seed {seed}: fallback recovery equals independent live reference"
+            "seed {seed}: fallback recovery equals independent era-aware reference"
         );
 
         // Grand instance totals over every instance.
@@ -8068,10 +8228,14 @@ mod tests {
         let lv = Connection::open_in_memory().unwrap();
         migrate(&lv).unwrap();
         create_journal_table(&lv);
+        // AE3(d): every frame here is a PRE-CUTOVER producer frame (the cutover
+        // on `fb` is MAX(journal seq) when lineage_state is introduced), so the
+        // independent reference ingests them with legacy provenance — the same
+        // era `fb` rebuilds — rather than post-cutover live.
         for r in records {
             insert_journal_raw(&lv, r);
             let row = project_usage_event(r, Some(profile), Some(model)).unwrap();
-            insert_usage_event(&lv, &row).unwrap();
+            insert_usage_event_era(&lv, &row, IngestEra::Legacy).unwrap();
         }
         (fb, lv)
     }
@@ -8273,22 +8437,25 @@ mod tests {
         .unwrap();
         migrate(&fb).unwrap();
 
-        // Independent fully-live reference: same two records on a current DB.
+        // Independent era-aware reference: frame1 is a pre-cutover producer
+        // frame (legacy); the post-upgrade counter frame2 is live. The upsert
+        // merges frame2 onto frame1's row, whose lineage is sticky legacy.
         let lv = Connection::open_in_memory().unwrap();
         migrate(&lv).unwrap();
         create_journal_table(&lv);
-        for r in [&first, &counter] {
+        for (r, era) in [(&first, IngestEra::Legacy), (&counter, IngestEra::Live)] {
             insert_journal_raw(&lv, r);
-            insert_usage_event(
+            insert_usage_event_era(
                 &lv,
                 &project_usage_event(r, Some("pvp"), Some("m-a")).unwrap(),
+                era,
             )
             .unwrap();
         }
         assert_eq!(
             r43_dump_rows(&fb),
             r43_dump_rows(&lv),
-            "fallback -> live counter -> migrate equals fully-live reference"
+            "fallback -> live counter -> migrate equals era-aware reference"
         );
         let (window, total): (Option<i64>, Option<i64>) = fb
             .query_row(
@@ -8581,12 +8748,18 @@ mod tests {
     }
 
     #[test]
-    fn r46_c_unmatched_identified_turn_beside_scoped_session_bills_like_live() {
-        // Defect 2: an identified Turn with known counters and no proven source
-        // session, next to a scoped Session, is valid unmatched LIVE flow and
-        // must never be reclassified into ambiguous/Unknown by a replay tag.
+    fn r47_i_pre_cutover_unmatched_turn_beside_scoped_session_is_conservative_unknown() {
+        // Ruling AE3, codex r46 medium-1: lineage_state is PRODUCER-ERA
+        // provenance, not a recovery tag. Upgrading a schema WITHOUT the
+        // lineage column, an identified Turn (known counters, no proven source
+        // session) next to a scoped Session is a PRE-CUTOVER producer frame. It
+        // ends 'legacy' even though it is unjournaled (the column-introduction
+        // rule tags every row that exists at the cutover), and the documented
+        // r29 conservative rule classifies it as ambiguous -> Unknown. The
+        // current codex adapter emits the same shape but is post-cutover live;
+        // producer era is the only discriminator.
         let turn = r44_wire_record(
-            "ins_r46c",
+            "ins_r47i",
             1,
             "turn",
             Some("t1"),
@@ -8606,7 +8779,7 @@ mod tests {
             Some("2026-10-20T00:00:01.000Z"),
         );
         let session = r44_wire_record(
-            "ins_r46c",
+            "ins_r47i",
             2,
             "session",
             Some("s1"),
@@ -8625,18 +8798,397 @@ mod tests {
             None,
             Some("2026-10-20T00:00:02.000Z"),
         );
-        // Upgrade the r28 fallback shape (journal frames + 14-column rows).
-        let (fb, lv) = r45_fallback_vs_live(&[turn, session], "pvp", "m-a");
-        let agg = aggregate_instance(&fb, "ins_r46c").unwrap();
-        assert_eq!(agg.ambiguous_events, 0, "the live turn is not ambiguous");
-        assert_eq!(agg.input_tokens, Some(100), "the unmatched live turn bills");
-        assert_eq!(agg.cost_usd, Some(0.01), "no Unknown is introduced");
+        // Pre-lineage schema: every current column EXCEPT lineage_state. Build
+        // a current DB then drop the column and the era/marker state, so the
+        // reopen migration re-introduces it and applies the cutover rule.
+        let fb = Connection::open_in_memory().unwrap();
+        migrate(&fb).unwrap();
+        create_journal_table(&fb);
+        fb.execute_batch(
+            "ALTER TABLE usage_events DROP COLUMN lineage_state;
+             DELETE FROM usage_schema_meta;
+             DELETE FROM usage_instance_era;",
+        )
+        .unwrap();
+        // The identified Turn is UNJOURNALED but retains its scope columns.
+        let turn_row = project_usage_event(&turn, Some("pvp"), Some("m-a")).unwrap();
+        r47_raw_insert_no_lineage(&fb, &turn_row);
+        // The scoped Session IS journal-backed: replay rebuilds it scoped.
+        insert_journal_raw(&fb, &session);
+        let session_row = project_usage_event(&session, Some("pvp"), Some("m-a")).unwrap();
+        r47_raw_insert_no_lineage(&fb, &session_row);
+        migrate(&fb).unwrap();
+
+        // Both rows carry the producer-era tag.
+        let states: Vec<String> = fb
+            .prepare(
+                "SELECT COALESCE(lineage_state,'') FROM usage_events
+                 WHERE instance_id='ins_r47i' ORDER BY seq",
+            )
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(states, vec!["legacy".to_string(), "legacy".to_string()]);
+
+        // Conservative accounting: the unproven legacy turn beside scoped
+        // stock is ambiguous and poisons to Unknown.
+        let agg = aggregate_instance(&fb, "ins_r47i").unwrap();
+        assert_eq!(agg.ambiguous_events, 1, "the pre-cutover turn is ambiguous");
+        assert!(agg.ambiguous);
         assert_eq!(
-            r43_dump_rows(&fb),
-            r43_dump_rows(&lv),
-            "every column incl lineage_state equals live"
+            agg.input_tokens, None,
+            "known counters are conservative Unknown"
         );
-        r46_assert_accounting_equal(&fb, &lv, "ins_r46c");
+        assert_eq!(agg.cost_usd, None, "the bill is Unknown, not $0.01");
+        let supply = aggregate_supply(&fb, "pvp", "m-a").unwrap();
+        assert_eq!(supply.ambiguous_events, 1);
+        assert_eq!(supply.cost_usd, None);
+
+        // Idempotent.
+        let once = r43_dump_rows(&fb);
+        migrate(&fb).unwrap();
+        assert_eq!(once, r43_dump_rows(&fb), "migrate twice == once");
+    }
+
+    #[test]
+    fn r47_post_cutover_unmatched_turn_beside_scoped_session_bills_ruling_b_flow() {
+        // AE3 counterpart: the SAME shape produced AFTER the cutover (column
+        // present, live ingest) is live (NULL) and bills as unmatched Ruling B
+        // flow with no ambiguity — the discriminator is producer era.
+        let turn = r44_wire_record(
+            "ins_r47live",
+            1,
+            "turn",
+            Some("t1"),
+            None,
+            Some("t1"),
+            1,
+            "estimated",
+            [
+                Basket::Known(110),
+                Basket::Known(100),
+                Basket::Known(10),
+                Basket::Known(0),
+                Basket::Known(0),
+            ],
+            Some("0.01"),
+            None,
+            Some("2026-10-20T00:00:01.000Z"),
+        );
+        let session = r44_wire_record(
+            "ins_r47live",
+            2,
+            "session",
+            Some("s1"),
+            Some("s1"),
+            None,
+            1,
+            "estimated",
+            [
+                Basket::Known(280),
+                Basket::Known(250),
+                Basket::Known(30),
+                Basket::NotApplicable,
+                Basket::NotApplicable,
+            ],
+            Some("3.00"),
+            None,
+            Some("2026-10-20T00:00:02.000Z"),
+        );
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        create_journal_table(&conn);
+        for r in [&turn, &session] {
+            insert_journal_raw(&conn, r);
+            let row = project_usage_event(r, Some("pvp"), Some("m-a")).unwrap();
+            insert_usage_event(&conn, &row).unwrap();
+        }
+        let states: Vec<Option<String>> = conn
+            .prepare(
+                "SELECT lineage_state FROM usage_events
+                 WHERE instance_id='ins_r47live' ORDER BY seq",
+            )
+            .unwrap()
+            .query_map([], |r| r.get::<_, Option<String>>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(states, vec![None, None], "post-cutover rows stay live/NULL");
+        let agg = aggregate_instance(&conn, "ins_r47live").unwrap();
+        assert_eq!(
+            agg.ambiguous_events, 0,
+            "a live identified turn is not ambiguous"
+        );
+        assert_eq!(agg.input_tokens, Some(100), "the unmatched live turn bills");
+        assert_eq!(agg.cost_usd, Some(0.01));
+    }
+
+    /// Build one identified turn + one scoped session UsageEventRow pair.
+    fn r47_turn_and_session(
+        inst: &str,
+        tseq: i64,
+        sseq: i64,
+    ) -> (UsageEventRow, JournalRecord, JournalRecord) {
+        let turn = r44_wire_record(
+            inst,
+            tseq,
+            "turn",
+            Some("t1"),
+            None,
+            Some("t1"),
+            1,
+            "estimated",
+            [
+                Basket::Known(110),
+                Basket::Known(100),
+                Basket::Known(10),
+                Basket::Known(0),
+                Basket::Known(0),
+            ],
+            Some("0.01"),
+            None,
+            Some("2026-10-20T00:00:01.000Z"),
+        );
+        let session = r44_wire_record(
+            inst,
+            sseq,
+            "session",
+            Some("s1"),
+            Some("s1"),
+            None,
+            1,
+            "estimated",
+            [
+                Basket::Known(280),
+                Basket::Known(250),
+                Basket::Known(30),
+                Basket::NotApplicable,
+                Basket::NotApplicable,
+            ],
+            Some("3.00"),
+            None,
+            Some("2026-10-20T00:00:02.000Z"),
+        );
+        let turn_row = project_usage_event(&turn, Some("pvp"), Some("m-a")).unwrap();
+        (turn_row, turn, session)
+    }
+
+    #[test]
+    fn r47_ii_column_present_marker_absent_keeps_live_rows_null_and_billing() {
+        // AE3(c): the column already exists (unreleased intermediate branch
+        // build) but no cutover was recorded. Instance A holds legacy-tagged
+        // rows; instance B holds post-cutover NULL rows. Reopen must derive the
+        // cutover PER INSTANCE (A: MAX seq among legacy; B: 0), replay with the
+        // right era, and never blanket-retag B's live rows. This is codex r45's
+        // "blanket update reaches live rows" case.
+        let (a_turn_row, a_turn, a_session) = r47_turn_and_session("ins_r47A", 1, 2);
+        let (b_turn_row, b_turn, b_session) = r47_turn_and_session("ins_r47B", 1, 2);
+        let a_session_row = project_usage_event(&a_session, Some("pvp"), Some("m-a")).unwrap();
+        let b_session_row = project_usage_event(&b_session, Some("pvp"), Some("m-a")).unwrap();
+
+        let conn = r46_upgrade_fixture(); // column present, replay marker removed
+        // Instance A: rows explicitly tagged legacy (pre-cutover producer).
+        r46_raw_insert(&conn, &a_turn_row, Some("legacy"));
+        r46_raw_insert(&conn, &a_session_row, Some("legacy"));
+        // Instance B: post-cutover live rows, lineage NULL.
+        r46_raw_insert(&conn, &b_turn_row, None);
+        r46_raw_insert(&conn, &b_session_row, None);
+        // Journal every frame so replay rebuilds them.
+        for r in [&a_turn, &a_session, &b_turn, &b_session] {
+            insert_journal_raw(&conn, r);
+        }
+        migrate(&conn).unwrap();
+
+        // A stays legacy (conservative Unknown beside scoped stock).
+        let a_states: Vec<String> = conn
+            .prepare(
+                "SELECT COALESCE(lineage_state,'') FROM usage_events
+                 WHERE instance_id='ins_r47A' ORDER BY scope",
+            )
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(a_states.iter().all(|s| s == "legacy"), "A: {a_states:?}");
+        let a = aggregate_instance(&conn, "ins_r47A").unwrap();
+        assert_eq!(a.ambiguous_events, 1, "A's legacy turn stays ambiguous");
+        assert_eq!(a.input_tokens, None, "A stays conservative Unknown");
+
+        // B stays live NULL and bills Ruling B flow.
+        let b_states: Vec<Option<String>> = conn
+            .prepare(
+                "SELECT lineage_state FROM usage_events
+                 WHERE instance_id='ins_r47B' ORDER BY scope",
+            )
+            .unwrap()
+            .query_map([], |r| r.get::<_, Option<String>>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            b_states.iter().all(std::option::Option::is_none),
+            "B: {b_states:?}"
+        );
+        let b = aggregate_instance(&conn, "ins_r47B").unwrap();
+        assert_eq!(b.ambiguous_events, 0, "B's live turn is not ambiguous");
+        assert_eq!(
+            b.input_tokens,
+            Some(100),
+            "B's live turn bills Ruling B flow"
+        );
+        assert_eq!(b.cost_usd, Some(0.01));
+
+        // Idempotent.
+        let once = r43_dump_rows(&conn);
+        migrate(&conn).unwrap();
+        assert_eq!(once, r43_dump_rows(&conn), "migrate twice == once");
+    }
+
+    #[test]
+    fn r47_iii_one_instance_pre_and_post_cutover_frames_get_per_row_era() {
+        // AE3(b): one instance straddles the cutover. seq1 is a pre-cutover
+        // turn (legacy); a post-upgrade seq2 frame is live. Forced replay must
+        // assign each its era, equal to an independent era-aware reference.
+        let first = r44_wire_record(
+            "ins_r47iii",
+            1,
+            "turn",
+            Some("t1"),
+            None,
+            Some("t1"),
+            1,
+            "estimated",
+            [
+                Basket::Known(110),
+                Basket::Known(100),
+                Basket::Known(10),
+                Basket::Known(0),
+                Basket::Known(0),
+            ],
+            Some("0.01"),
+            None,
+            Some("2026-10-20T00:00:01.000Z"),
+        );
+        // Fallback first frame under a pre-lineage schema.
+        let fb = Connection::open_in_memory().unwrap();
+        create_r28_usage_table_with_turn_index(&fb);
+        create_journal_table(&fb);
+        insert_journal_raw(&fb, &first);
+        insert_usage_event(
+            &fb,
+            &project_usage_event(&first, Some("pvp"), Some("m-a")).unwrap(),
+        )
+        .unwrap();
+        migrate(&fb).unwrap(); // column introduced; cutover = MAX(seq) = 1.
+
+        // Post-cutover seq2 frame, a live identified turn (distinct scope).
+        let second = r44_wire_record(
+            "ins_r47iii",
+            2,
+            "turn",
+            Some("t2"),
+            None,
+            Some("t2"),
+            1,
+            "estimated",
+            [
+                Basket::Known(220),
+                Basket::Known(200),
+                Basket::Known(20),
+                Basket::Known(0),
+                Basket::Known(0),
+            ],
+            Some("0.02"),
+            None,
+            Some("2026-10-20T00:00:03.000Z"),
+        );
+        insert_journal_raw(&fb, &second);
+        insert_usage_event(
+            &fb,
+            &project_usage_event(&second, Some("pvp"), Some("m-a")).unwrap(),
+        )
+        .unwrap();
+        // Force the complete replay over the collapsed/era-mixed rows.
+        fb.execute(
+            "DELETE FROM usage_schema_meta WHERE key = 'journal_replay_v1'",
+            [],
+        )
+        .unwrap();
+        migrate(&fb).unwrap();
+
+        let eras: Vec<(Option<i64>, Option<String>)> = fb
+            .prepare(
+                "SELECT seq, lineage_state FROM usage_events
+                 WHERE instance_id='ins_r47iii' AND scope='turn' ORDER BY seq",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            eras,
+            vec![(Some(1), Some("legacy".into())), (Some(2), None)],
+            "seq1 pre-cutover is legacy; seq2 post-cutover is live"
+        );
+
+        // Independent era-aware reference.
+        let lv = Connection::open_in_memory().unwrap();
+        migrate(&lv).unwrap();
+        create_journal_table(&lv);
+        for (r, era) in [(&first, IngestEra::Legacy), (&second, IngestEra::Live)] {
+            insert_journal_raw(&lv, r);
+            insert_usage_event_era(
+                &lv,
+                &project_usage_event(r, Some("pvp"), Some("m-a")).unwrap(),
+                era,
+            )
+            .unwrap();
+        }
+        assert_eq!(r43_dump_rows(&fb), r43_dump_rows(&lv));
+        r46_assert_accounting_equal(&fb, &lv, "ins_r47iii");
+        let once = r43_dump_rows(&fb);
+        migrate(&fb).unwrap();
+        assert_eq!(once, r43_dump_rows(&fb), "migrate twice == once");
+    }
+
+    /// Raw insert into a PRE-lineage schema (all current columns except
+    /// lineage_state), bypassing the live upsert path.
+    fn r47_raw_insert_no_lineage(conn: &Connection, row: &UsageEventRow) {
+        conn.execute(
+            "INSERT INTO usage_events
+                (instance_id, seq, profile_id, model, scope, scope_id, turn_id, mode,
+                 metric_revision, source_session_id, total_tokens, input_tokens,
+                 output_tokens, cache_read_tokens, cache_write_tokens, cost_usd,
+                 accounting, observed_at, observed_at_source, native_context_window)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+            params![
+                row.instance_id,
+                row.seq,
+                row.profile_id,
+                row.model,
+                row.scope,
+                row.scope_id,
+                row.turn_id,
+                row.mode,
+                row.metric_revision,
+                row.source_session_id,
+                row.total_tokens,
+                row.input_tokens,
+                row.output_tokens,
+                row.cache_read_tokens,
+                row.cache_write_tokens,
+                row.cost_usd,
+                row.accounting,
+                row.observed_at,
+                row.observed_at_source,
+                row.native_context_window,
+            ],
+        )
+        .unwrap();
     }
 
     /// Raw insert of a usage row in the current-schema column set, bypassing
@@ -9033,12 +9585,14 @@ mod tests {
         insert_row(
             &conn,
             &project(1, "turn", "t1", Some("t1"), 100, Some("0.10")),
+            IngestEra::Live,
         )
         .unwrap();
         // New Message r2 for a turn with NO Turn row (eligible flow).
         insert_row(
             &conn,
             &project(2, "message", "resp2", Some("t2"), 50, Some("0.05")),
+            IngestEra::Live,
         )
         .unwrap();
         // A priced cumulative Session snapshot that accompanies r2.

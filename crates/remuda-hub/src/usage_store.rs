@@ -213,8 +213,12 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     )?;
     if tag_legacy_rows {
         conn.execute("UPDATE usage_events SET lineage_state = 'legacy'", [])?;
-        // Record the per-instance cutover from the journal of record. A
-        // database without a journal table has no replayable era boundary.
+        // AE3(a): record the cutover for the UNION of every instance present
+        // in usage_events or the journal. The boundary is the journal MAX(seq)
+        // at the cutover moment; an instance with usage rows but no journal
+        // frames (or no journal table at all) gets an explicit boundary of 0.
+        // Case-(c) derivation below never overrides these rows (INSERT OR
+        // IGNORE), so column-introduction upgrades keep their true boundary.
         let journal_exists: i64 = conn.query_row(
             "SELECT COUNT(*) FROM sqlite_master
              WHERE type = 'table' AND name = 'journal'",
@@ -415,9 +419,7 @@ fn replay_fallback_rows_from_journal(conn: &Connection) -> rusqlite::Result<usiz
     // intermediate branch, so no cutover was recorded at its introduction.
     // Derive the per-instance cutover from the pre-cutover rows that survive
     // tagged 'legacy': cutover_seq = MAX(seq) among them, or 0 when the
-    // instance has none (all its rows are post-cutover live). Post-cutover NULL
-    // rows do NOT move the boundary. This is the "blanket update reaches live
-    // rows" case from r45: those rows must keep their NULL era.
+    // instance has none (all its rows are post-cutover live).
     conn.execute(
         "INSERT OR IGNORE INTO usage_instance_era(instance_id, cutover_seq)
          SELECT u.instance_id,
@@ -734,6 +736,10 @@ struct TurnFrame {
     observed_at: String,
     observed_at_source: String,
     native_context_window: Option<i64>,
+    // Producer era of THIS frame. A persisted row takes the era of whatever
+    // authoritative frame is currently accepted (AE3 clarification): a higher
+    // accepted revision overwrites it; a rejected revision leaves it stored.
+    era: IngestEra,
 }
 
 fn reconcile_turn_frame(stored: &TurnFrame, incoming: &TurnFrame) -> TurnFrame {
@@ -763,6 +769,10 @@ fn reconcile_turn_frame(stored: &TurnFrame, incoming: &TurnFrame) -> TurnFrame {
         // A billing correction never re-reports the context window: keep the
         // retained value (it may be a 1M window the correction omitted).
         native_context_window: stored.native_context_window,
+        // The authoritative revision is the incoming one, so its producer era
+        // becomes the row's provenance (an accepted higher revision only; a
+        // rejected/equal frame never reaches this reconcile).
+        era: incoming.era,
     };
     if !reports_counters {
         return reconciled;
@@ -807,8 +817,9 @@ fn persist_reconciled_turn(conn: &Connection, frame: &TurnFrame) -> rusqlite::Re
             accounting = ?13,
             observed_at = ?14,
             observed_at_source = ?15,
-            native_context_window = ?16
-         WHERE rowid = ?17",
+            native_context_window = ?16,
+            lineage_state = ?17
+         WHERE rowid = ?18",
         params![
             frame.seq,
             frame.profile_id,
@@ -826,6 +837,7 @@ fn persist_reconciled_turn(conn: &Connection, frame: &TurnFrame) -> rusqlite::Re
             frame.observed_at,
             frame.observed_at_source,
             frame.native_context_window,
+            frame.era.lineage_value(),
             rowid,
         ],
     )?;
@@ -1201,7 +1213,13 @@ fn upsert_message_row(
                  ELSE observed_at END,
              observed_at_source = CASE
                  WHEN observed_at_source = 'native' THEN 'native'
-                 ELSE ?11 END
+                 ELSE ?11 END,
+             lineage_state = CASE
+                 -- AE3: a strictly higher accepted revision carries the
+                 -- incoming frame's era; an equal/lower (rejected) revision
+                 -- and an equal-position metadata fill leave provenance stored.
+                 WHEN ?12 > metric_revision THEN ?14
+                 ELSE lineage_state END
          WHERE instance_id = ?1 AND scope = 'message' AND scope_id = ?2
            AND (
                 metric_revision < ?12
@@ -1230,6 +1248,7 @@ fn upsert_message_row(
             row.observed_at_source, // ?11
             row.metric_revision,    // ?12
             row.accounting,         // ?13
+            era.lineage_value(),    // ?14
         ],
     )?;
     Ok(updated > 0)
@@ -1346,6 +1365,10 @@ fn upsert_turn_snapshot(
                 observed_at: r.get(14)?,
                 observed_at_source: r.get(15)?,
                 native_context_window: r.get(16)?,
+                era: match r.get::<_, Option<String>>(17)? {
+                    Some(v) if v == "legacy" => IngestEra::Legacy,
+                    _ => IngestEra::Live,
+                },
             })
         };
         const STORED_SELECT: &str = "SELECT rowid, seq, profile_id, model, mode,
@@ -1353,7 +1376,7 @@ fn upsert_turn_snapshot(
                     total_tokens, input_tokens, output_tokens,
                     cache_read_tokens, cache_write_tokens,
                     cost_usd, accounting, observed_at, observed_at_source,
-                    native_context_window
+                    native_context_window, lineage_state
              FROM usage_events
              WHERE instance_id = ?1 AND scope = 'turn' AND scope_id = ?2
                AND source_session_id {predicate}";
@@ -1408,6 +1431,7 @@ fn upsert_turn_snapshot(
         observed_at: row.observed_at.clone(),
         observed_at_source: row.observed_at_source.clone(),
         native_context_window: row.native_context_window,
+        era,
     };
     // One reconciliation for every frame shape: the cost-only channel carries
     // counters/clock forward and advances only position/lineage/bill; the
@@ -8436,8 +8460,9 @@ mod tests {
         migrate(&fb).unwrap();
 
         // Independent era-aware reference: frame1 is a pre-cutover producer
-        // frame (legacy); the post-upgrade counter frame2 is live. The upsert
-        // merges frame2 onto frame1's row, whose lineage is sticky legacy.
+        // frame (legacy); the post-upgrade counter frame2 is a higher revision
+        // and is live, so accepting it moves the merged row's era to live
+        // (AE3: provenance follows the accepted authoritative frame).
         let lv = Connection::open_in_memory().unwrap();
         migrate(&lv).unwrap();
         create_journal_table(&lv);
@@ -9231,6 +9256,322 @@ mod tests {
         let once = r43_dump_rows(&conn);
         migrate(&conn).unwrap();
         assert_eq!(once, r43_dump_rows(&conn), "migrate twice == once");
+    }
+
+    // ===== r48: era follows the accepted authoritative frame =====
+
+    /// Build an identified Turn row (scope_id t1, NO proven source session) for
+    /// the given revision/counters/cost, plus a scoped Session row beside it.
+    fn r48_turn(
+        inst: &str,
+        seq: i64,
+        rev: i64,
+        input: i64,
+        cost: &str,
+    ) -> (JournalRecord, UsageEventRow) {
+        let rec = r44_wire_record(
+            inst,
+            seq,
+            "turn",
+            Some("t1"),
+            None,
+            Some("t1"),
+            rev as u64,
+            "estimated",
+            [
+                Basket::Known(input + 10),
+                Basket::Known(input),
+                Basket::Known(10),
+                Basket::Known(0),
+                Basket::Known(0),
+            ],
+            Some(cost),
+            None,
+            Some("2026-10-20T00:00:01.000Z"),
+        );
+        let row = project_usage_event(&rec, Some("pvp"), Some("m-a")).unwrap();
+        (rec, row)
+    }
+
+    /// Add the scoped Session that makes a legacy unproven turn ambiguous but
+    /// lets a live unproven turn bill Ruling B flow.
+    fn r48_add_scoped_session(conn: &Connection, inst: &str) {
+        let rec = r44_wire_record(
+            inst,
+            9,
+            "session",
+            Some("s1"),
+            Some("s1"),
+            None,
+            1,
+            "estimated",
+            [
+                Basket::Known(500),
+                Basket::Known(500),
+                Basket::NotApplicable,
+                Basket::NotApplicable,
+                Basket::NotApplicable,
+            ],
+            Some("9.00"),
+            None,
+            Some("2026-10-20T00:00:09.000Z"),
+        );
+        insert_usage_event(
+            conn,
+            &project_usage_event(&rec, Some("pvp"), Some("m-a")).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn r48_turn_era(conn: &Connection, inst: &str) -> Option<String> {
+        conn.query_row(
+            "SELECT lineage_state FROM usage_events
+             WHERE instance_id = ?1 AND scope='turn' AND scope_id='t1'",
+            params![inst],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn r48_turn_legacy_rev1_accepted_live_rev2_becomes_live_and_bills_flow() {
+        // AE3 clarification: a higher accepted revision carries ITS era.
+        // Legacy rev1 turn beside scoped stock is ambiguous; once a live rev2
+        // is accepted for the same key the row goes NULL and bills Ruling B.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        create_journal_table(&conn);
+        let (_, rev1) = r48_turn("ins_r48tl", 1, 1, 100, "0.01");
+        insert_usage_event_era(&conn, &rev1, IngestEra::Legacy).unwrap();
+        r48_add_scoped_session(&conn, "ins_r48tl");
+        assert_eq!(r48_turn_era(&conn, "ins_r48tl").as_deref(), Some("legacy"));
+        let before = aggregate_instance(&conn, "ins_r48tl").unwrap();
+        assert_eq!(before.ambiguous_events, 1, "legacy rev1 is ambiguous");
+
+        let (_, rev2) = r48_turn("ins_r48tl", 2, 2, 110, "0.02");
+        let accepted = insert_usage_event(&conn, &rev2).unwrap(); // live
+        assert!(accepted, "the higher live revision is accepted");
+        assert_eq!(
+            r48_turn_era(&conn, "ins_r48tl"),
+            None,
+            "row era follows live rev2"
+        );
+        let after = aggregate_instance(&conn, "ins_r48tl").unwrap();
+        assert_eq!(
+            after.ambiguous_events, 0,
+            "live turn is no longer ambiguous"
+        );
+        assert_eq!(
+            after.input_tokens,
+            Some(110),
+            "live rev2 bills Ruling B flow"
+        );
+        assert_eq!(after.cost_usd, Some(0.02));
+    }
+
+    #[test]
+    fn r48_turn_live_rev1_then_replayed_legacy_rev2_becomes_legacy() {
+        // A pre-cutover (legacy) frame can carry a higher revision for a key
+        // whose current row is live; accepting it makes the row legacy.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        create_journal_table(&conn);
+        let (_, rev1) = r48_turn("ins_r48ll", 1, 1, 100, "0.01");
+        insert_usage_event(&conn, &rev1).unwrap();
+        r48_add_scoped_session(&conn, "ins_r48ll");
+        assert_eq!(r48_turn_era(&conn, "ins_r48ll"), None);
+
+        let (_, rev2) = r48_turn("ins_r48ll", 2, 2, 110, "0.02");
+        let accepted = insert_usage_event_era(&conn, &rev2, IngestEra::Legacy).unwrap();
+        assert!(accepted);
+        assert_eq!(
+            r48_turn_era(&conn, "ins_r48ll").as_deref(),
+            Some("legacy"),
+            "row era follows the accepted pre-cutover rev2"
+        );
+        let agg = aggregate_instance(&conn, "ins_r48ll").unwrap();
+        assert_eq!(
+            agg.ambiguous_events, 1,
+            "now a legacy turn beside stock -> ambiguous"
+        );
+        assert_eq!(agg.input_tokens, None, "conservative Unknown");
+        assert_eq!(agg.cost_usd, None);
+    }
+
+    #[test]
+    fn r48_turn_lower_live_revision_rejected_keeps_legacy_era() {
+        // A lower live revision must not overwrite a stored legacy rev2.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        create_journal_table(&conn);
+        let (_, rev2) = r48_turn("ins_r48rj", 2, 2, 110, "0.02");
+        insert_usage_event_era(&conn, &rev2, IngestEra::Legacy).unwrap();
+        let (_, rev1) = r48_turn("ins_r48rj", 1, 1, 100, "0.01");
+        let accepted = insert_usage_event(&conn, &rev1).unwrap();
+        assert!(!accepted, "the lower revision is rejected");
+        assert_eq!(
+            r48_turn_era(&conn, "ins_r48rj").as_deref(),
+            Some("legacy"),
+            "rejected revision leaves stored provenance untouched"
+        );
+        let (rev, inp): (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT metric_revision, input_tokens FROM usage_events
+                 WHERE instance_id='ins_r48rj' AND scope='turn' AND scope_id='t1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((rev, inp), (2, Some(110)), "rev2 content stays");
+    }
+
+    /// Build a durable Message row at a given seq/revision/counters.
+    fn r48_message(
+        inst: &str,
+        seq: i64,
+        rev: i64,
+        input: i64,
+        cost: &str,
+        sid: Option<&str>,
+    ) -> UsageEventRow {
+        let rec = r44_wire_record(
+            inst,
+            seq,
+            "message",
+            Some("mk1"),
+            sid,
+            Some("t1"),
+            rev as u64,
+            "estimated",
+            [
+                Basket::Unknown,
+                Basket::Known(input),
+                Basket::Known(5),
+                Basket::NotApplicable,
+                Basket::NotApplicable,
+            ],
+            Some(cost),
+            None,
+            Some("2026-10-20T00:00:01.000Z"),
+        );
+        project_usage_event(&rec, Some("pvp"), Some("m-a")).unwrap()
+    }
+
+    fn r48_message_era(conn: &Connection, inst: &str) -> Option<String> {
+        conn.query_row(
+            "SELECT lineage_state FROM usage_events
+             WHERE instance_id = ?1 AND scope='message' AND scope_id='mk1'",
+            params![inst],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn r48_message_accepted_revision_carries_its_era_rejected_keeps_stored() {
+        // legacy rev1 -> live rev2 accepted => NULL; counters follow rev2.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        create_journal_table(&conn);
+        insert_usage_event_era(
+            &conn,
+            &r48_message("ins_m1", 1, 1, 100, "0.01", None),
+            IngestEra::Legacy,
+        )
+        .unwrap();
+        assert_eq!(r48_message_era(&conn, "ins_m1").as_deref(), Some("legacy"));
+        assert!(
+            insert_usage_event(&conn, &r48_message("ins_m1", 2, 2, 150, "0.02", None)).unwrap()
+        );
+        assert_eq!(r48_message_era(&conn, "ins_m1"), None, "live rev2 era wins");
+        let inp: Option<i64> = conn
+            .query_row(
+                "SELECT input_tokens FROM usage_events
+                 WHERE instance_id='ins_m1' AND scope='message'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(inp, Some(150));
+
+        // live rev2 -> legacy rev3 accepted => legacy.
+        assert!(
+            insert_usage_event_era(
+                &conn,
+                &r48_message("ins_m1", 3, 3, 160, "0.03", None),
+                IngestEra::Legacy
+            )
+            .unwrap()
+        );
+        assert_eq!(r48_message_era(&conn, "ins_m1").as_deref(), Some("legacy"));
+
+        // lower live rev1 rejected => stays legacy.
+        assert!(
+            !insert_usage_event(&conn, &r48_message("ins_m1", 1, 1, 100, "0.01", None)).unwrap()
+        );
+        assert_eq!(r48_message_era(&conn, "ins_m1").as_deref(), Some("legacy"));
+    }
+
+    /// Two physical unjournaled message rows on one key, dropped index, then a
+    /// real migrate folds them. The captured (later-rowid) row carries
+    /// `captured_era` at revision `captured_rev`; returns the post-fold era.
+    fn r48_fold_eras(
+        survivor_era: Option<&str>,
+        captured_era: Option<&str>,
+        captured_rev: i64,
+    ) -> Option<String> {
+        let conn = r46_upgrade_fixture();
+        conn.execute_batch("DROP INDEX IF EXISTS usage_events_message_dedupe;")
+            .unwrap();
+        let mut s1 = r48_message("ins_r48foldera", 1, 1, 100, "0.01", Some("sA"));
+        s1.source_session_id = Some("sA".into());
+        let mut s2 = r48_message("ins_r48foldera", 2, captured_rev, 150, "0.02", Some("sB"));
+        s2.source_session_id = Some("sB".into());
+        r46_raw_insert(&conn, &s1, survivor_era);
+        r46_raw_insert(&conn, &s2, captured_era);
+        migrate(&conn).unwrap();
+        r48_message_era(&conn, "ins_r48foldera")
+    }
+
+    #[test]
+    fn r48_mixed_era_fold_takes_winning_revisions_era() {
+        // Captured legacy rev2 is higher -> accepted -> legacy.
+        assert_eq!(
+            r48_fold_eras(None, Some("legacy"), 2).as_deref(),
+            Some("legacy"),
+            "legacy revision wins the fold"
+        );
+        // Captured live rev2 is higher -> accepted -> NULL.
+        assert_eq!(
+            r48_fold_eras(Some("legacy"), None, 2),
+            None,
+            "live revision wins the fold"
+        );
+        // Captured live rev1 is LOWER than survivor legacy rev2 -> rejected,
+        // survivor era (legacy) is retained.
+        let conn = r46_upgrade_fixture();
+        conn.execute_batch("DROP INDEX IF EXISTS usage_events_message_dedupe;")
+            .unwrap();
+        let mut survivor = r48_message("ins_r48fe", 1, 2, 150, "0.02", Some("sA"));
+        survivor.source_session_id = Some("sA".into());
+        let mut lower = r48_message("ins_r48fe", 2, 1, 100, "0.01", Some("sB"));
+        lower.source_session_id = Some("sB".into());
+        r46_raw_insert(&conn, &survivor, Some("legacy"));
+        r46_raw_insert(&conn, &lower, None);
+        migrate(&conn).unwrap();
+        let era: Option<String> = conn
+            .query_row(
+                "SELECT lineage_state FROM usage_events
+                 WHERE instance_id='ins_r48fe' AND scope='message'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            era.as_deref(),
+            Some("legacy"),
+            "rejected captured rev keeps survivor era"
+        );
     }
 
     /// Raw insert into a PRE-lineage schema (all current columns except

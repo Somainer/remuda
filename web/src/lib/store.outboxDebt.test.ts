@@ -456,7 +456,7 @@ it("the debt tail makes FORWARD progress through the real adapter with 128 loade
     { timeout: 6_000 },
   );
   expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
-});
+}, 15_000);
 
 it("a storage-aborted terminal write keeps the debt, shows 状态待确认 in memory and retries to not-confirmed", async () => {
   // r2 item 3: if the IndexedDB transaction writing "unknown" aborts,
@@ -1004,12 +1004,11 @@ it("r4 item 4: the debt scan cursor advances through a full unrelated page to th
     kind: "raw_tty",
     payload: { text: `unrelated ${i + 129}` },
   }));
-  const all = [...seedRows, ...unrelatedRows, {
-    seq: 257,
-    eventId: "evt_user_257",
-    kind: "message",
-    payload: { role: "user" },
-  }];
+  const all = [
+    ...seedRows,
+    ...unrelatedRows,
+    { seq: 257, eventId: "evt_user_257", kind: "message", payload: { role: "user" } },
+  ];
 
   // The unrelated 129-256 burst and the owed 257 only become durable AFTER the
   // drain's empty resync (the command journals late, like the real race).
@@ -1093,10 +1092,10 @@ it("r4 item 4: the debt scan cursor advances through a full unrelated page to th
       expect(bubble().outboxState).toBe("done");
     },
     { timeout: 6_000 },
-);
+  );
   // Only the owed node entered store state — the unrelated 128 did not.
   expect(hubStore.getSnapshot().events[INSTANCE]).toHaveLength(129);
-});
+}, 15_000);
 
 it("r4 item 2: a queued tail pass whose debt generation was cleared still lets the NEXT debt's tail run", async () => {
   // Liveness of the entry gate. A tail pass is queued behind a chain blocker

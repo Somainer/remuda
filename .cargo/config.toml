@@ -3,3 +3,13 @@ debug = "line-tables-only"
 
 [profile.test]
 debug = "line-tables-only"
+
+# Compile the bundled SQLite without its global memory accounting. With the
+# default (SQLITE_DEFAULT_MEMSTATUS=1) every sqlite3_malloc/sqlite3_free runs
+# under ONE process-wide mutex, so concurrent connections serialize on
+# statement planning: the parallel remuda-hub lib suite spent ~97% of its CPU
+# in the kernel and timed out wall-clock rate windows. Nothing reads
+# sqlite3_status memory counters or sets a heap limit; this is one of SQLite's
+# recommended compile-time options.
+[env]
+LIBSQLITE3_FLAGS = "-DSQLITE_DEFAULT_MEMSTATUS=0"

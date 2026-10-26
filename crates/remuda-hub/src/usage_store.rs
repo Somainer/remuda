@@ -1819,8 +1819,16 @@ fn unified_fold_ctes(domain_pred: &str, reported_source: &str) -> String {
     };
     let message_eligible = eligible_flow_predicate("m");
     let turn_covered = turn_fully_covered_sql("t.instance_id", "t.scope_id");
+    // Every CTE referenced more than once is AS MATERIALIZED. An unhinted
+    // multi-use CTE is still eligible for query flattening, so SQLite inlines
+    // and re-generates it — with everything it depends on — at EVERY
+    // reference: the aggregate compiled to ~97k VDBE ops and ~40 MiB of
+    // planner memory per prepare, which collapsed under a parallel test run
+    // (c-ctxusage r5 gate). MATERIALIZED is an evaluation fence only (each
+    // relation is computed once per statement); single-use CTEs stay unhinted
+    // so their one reference can still be flattened and pushed down into.
     format!(
-        "global_scoped_sessions AS (
+        "global_scoped_sessions AS MATERIALIZED (
             -- COMPLETE scoped-session relation (newest point per
             -- instance/scope_id): used for existence checks (legacy/scoped
             -- selection, ambiguity) and as the backbone for cost authority.
@@ -1835,7 +1843,7 @@ fn unified_fold_ctes(domain_pred: &str, reported_source: &str) -> String {
             )
             WHERE stock_rn = 1
          ),
-         global_token_stock_sessions AS (
+         global_token_stock_sessions AS MATERIALIZED (
             -- r43 AC2 (ONE stock selection): the TOKEN relation ranks ONLY
             -- token-bearing points, so a later tokenless reported (or
             -- window-only) carrier can never displace an earlier stock's
@@ -1853,7 +1861,7 @@ fn unified_fold_ctes(domain_pred: &str, reported_source: &str) -> String {
             )
             WHERE token_stock_rn = 1
          ),
-         global_reported_session_cost AS (
+         global_reported_session_cost AS MATERIALIZED (
             -- r38 item 3 / r39 items 2-4 (AA2): a result-frame Session carrier
             -- reports the native CUMULATIVE bill for one native session. The
             -- bill is the newest KNOWN reported value per (instance, session),
@@ -1950,7 +1958,7 @@ fn unified_fold_ctes(domain_pred: &str, reported_source: &str) -> String {
                    cache_read_tokens, cache_write_tokens
             FROM global_reported_session_cost
          ),
-         global_reported_cost_sessions AS (
+         global_reported_cost_sessions AS MATERIALIZED (
             -- r41 AB2+: reported-authority keys computed GLOBALLY per
             -- (instance_id, native session) AFTER the instance-global
             -- legacy/scoped selection and BEFORE any provider/model
@@ -1963,7 +1971,7 @@ fn unified_fold_ctes(domain_pred: &str, reported_source: &str) -> String {
             SELECT DISTINCT instance_id, COALESCE(scope_id, '') AS sid
             FROM global_reported_session_cost
          ),
-         global_reported_cost_instances AS (
+         global_reported_cost_instances AS MATERIALIZED (
             SELECT DISTINCT instance_id FROM global_reported_session_cost
          ),
          global_legacy_stock AS (
@@ -2023,7 +2031,7 @@ fn unified_fold_ctes(domain_pred: &str, reported_source: &str) -> String {
             )
             WHERE est_legacy_rn = 1
          ),
-         global_winning_turns AS (
+         global_winning_turns AS MATERIALIZED (
             -- rowid is projected explicitly: the rate-window query correlates
             -- winning rows against g_ambiguous_turns BY rowid (NULL scope_ids
             -- cannot be joined by value), and a UNION ALL result exposes
@@ -2041,7 +2049,7 @@ fn unified_fold_ctes(domain_pred: &str, reported_source: &str) -> String {
             FROM usage_events u
             WHERE u.scope = 'turn' AND u.scope_id IS NULL
          ),
-g_flow_messages AS (
+g_flow_messages AS MATERIALIZED (
             -- `eligible_flow_predicate` covers BOTH scopes (it is main's
             -- outer-relation predicate); restrict it to Messages here because
             -- winning Turns go through the lineage CTEs below. Computed
@@ -2049,7 +2057,7 @@ g_flow_messages AS (
             SELECT m.* FROM usage_events m
             WHERE m.scope = 'message' AND ({message_eligible})
          ),
-         g_session_turn_flow AS (
+         g_session_turn_flow AS MATERIALIZED (
             -- Per-native-session sums of the winning TURN rows (all of them:
             -- a stock can only be certified against the complete retained
             -- turn flow, including rows the durable Messages represent).
@@ -2071,7 +2079,7 @@ g_flow_messages AS (
             WHERE t.source_session_id IS NOT NULL
             GROUP BY t.instance_id, t.source_session_id
          ),
-         g_fully_covered_sessions AS (
+         g_fully_covered_sessions AS MATERIALIZED (
             -- The latest cumulative stock certifies its turn flow: a strictly
             -- NEWER position is authoritative whatever the retained sums; at
             -- an equal position every bucket the stock reports must match the
@@ -2123,7 +2131,7 @@ g_flow_messages AS (
               )
               AND NOT ({turn_covered})
          ),
-         g_unmatched_flow_turns AS (
+         g_unmatched_flow_turns AS MATERIALIZED (
             -- Live per-call flow for an identified turn with no proven session
             -- lineage (Ruling B): bills alongside Messages and makes stock
             -- stand down. Pre-upgrade 'legacy' rows take the conservative
@@ -2134,7 +2142,7 @@ g_flow_messages AS (
               AND COALESCE(t.lineage_state, '') <> 'legacy'
               AND NOT ({turn_covered})
          ),
-         g_legacy_open_turns AS (
+         g_legacy_open_turns AS MATERIALIZED (
             -- A legacy (or NULL-identity) turn when NO scoped stock exists:
             -- ordinary per-call flow. Disjoint from g_proven_flow_turns: a
             -- migration-tagged row that is lineage-QUALIFIED retained its
@@ -2152,7 +2160,7 @@ g_flow_messages AS (
               )
               AND NOT ({turn_covered})
          ),
-         g_legacy_flow_turns AS (
+         g_legacy_flow_turns AS MATERIALIZED (
             -- An identified pre-upgrade turn beside scoped stock bills when
             -- another per-call exists (Ruling B flow mode instance-wide).
             -- source_session_id IS NULL keeps this disjoint from the proven
@@ -2206,13 +2214,13 @@ g_flow_messages AS (
                   )
               )
          ),
-         g_flow_turns AS (
+         g_flow_turns AS MATERIALIZED (
             SELECT * FROM g_proven_flow_turns
             UNION ALL SELECT * FROM g_unmatched_flow_turns
             UNION ALL SELECT * FROM g_legacy_open_turns
             UNION ALL SELECT * FROM g_legacy_flow_turns
          ),
-         override_instances AS (
+         override_instances AS MATERIALIZED (
             -- Instance-wide Ruling B stock-stand-down: triggered by durable
             -- Messages or by a surviving UNQUALIFIED live/legacy turn flow.
             -- Lineage-PROVEN turns are deliberately NOT here: they follow the
@@ -2240,16 +2248,16 @@ g_flow_messages AS (
          -- budget) reads. Membership is the coverage/certification/Ruling-B
          -- rule and NOTHING else — cost accounting never filters, adds or
          -- removes a token row.
-         flow_messages AS (
+         flow_messages AS MATERIALIZED (
             SELECT m.* FROM g_flow_messages m WHERE {dm}
          ),
-         flow_turns AS (
+         flow_turns AS MATERIALIZED (
             SELECT t.* FROM g_flow_turns t WHERE {dt}
          ),
-         ambiguous_turns AS (
+         ambiguous_turns AS MATERIALIZED (
             SELECT t.* FROM g_ambiguous_turns t WHERE {dt}
          ),
-         stock_sessions AS (
+         stock_sessions AS MATERIALIZED (
             -- TOKEN stock (r43 AC2): the token-only ranked relation, so
             -- membership is accounting-agnostic and tokenless points of ANY
             -- kind never enter — they cannot displace earlier token stock.
@@ -2278,7 +2286,7 @@ g_flow_messages AS (
                   WHERE c.instance_id = g.instance_id AND c.sid = g.scope_id
               )
          ),
-         legacy_stock AS (
+         legacy_stock AS MATERIALIZED (
             -- TOKEN legacy stock from the token-only legacy ranking; the
             -- legacy/scoped existence guard still uses the COMPLETE relation.
             SELECT l.*, '' AS sid FROM global_token_legacy_stock l
@@ -2295,7 +2303,7 @@ g_flow_messages AS (
          ),
          -- COST FOLD (AB2): authority keyed by (instance_id, native_session_id)
          -- AFTER the instance-global legacy-vs-scoped selection.
-         reported_session_cost AS (
+         reported_session_cost AS MATERIALIZED (
             -- Newest KNOWN reported cumulative bill per (instance, session)
             -- for the instance fold, or per (model, session) PLUS the
             -- applicable legacy NULL bill for the supply fold; the selected
@@ -2305,7 +2313,7 @@ g_flow_messages AS (
             -- (those are global_reported_cost_sessions, r41 AB2+).
             SELECT g.* FROM {reported_source} g WHERE {dg}
          ),
-         estimated_stock_rows AS (
+         estimated_stock_rows AS MATERIALIZED (
             -- Projected ESTIMATED stock points that actually stand as the
             -- session's stock estimate (no Ruling-B override; flow-less or
             -- coverage-certified, matching the token stock membership) and
@@ -2341,7 +2349,7 @@ g_flow_messages AS (
                   WHERE k.instance_id = l.instance_id AND k.sid = ''
               )
          ),
-         estimated_stock_cost AS (
+         estimated_stock_cost AS MATERIALIZED (
             -- Selected scoped/legacy stock ESTIMATES (NULL stays: the
             -- sticky-Unknown poison), independent of token membership.
             SELECT cost_usd AS cost_usd FROM estimated_stock_rows
@@ -2465,37 +2473,75 @@ g_flow_messages AS (
     )
 }
 
+const TOKEN_BUCKETS: [&str; 5] = [
+    "total_tokens",
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+];
+
+/// FROM clause of one-row summaries that [`token_bucket_expr`] reads: the
+/// turn/stock half (`tb`), the Message half (`mb`) and the ambiguous turns
+/// (`ab`), each fold relation referenced ONCE for all buckets. SQLite copies a
+/// CTE's whole dependency graph into every reference, so per-bucket scalar
+/// subqueries made the planner cost scale with buckets x relations. An
+/// aggregate without GROUP BY yields exactly one row, so the cross join is
+/// always one row — also when every relation is empty.
+fn token_bucket_summaries_sql() -> String {
+    let columns = TOKEN_BUCKETS.join(", ");
+    let known_and_sum = TOKEN_BUCKETS
+        .iter()
+        .map(|b| format!("COUNT({b}) AS k_{b}, SUM({b}) AS s_{b}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sum = TOKEN_BUCKETS
+        .iter()
+        .map(|b| format!("SUM({b}) AS s_{b}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let known = TOKEN_BUCKETS
+        .iter()
+        .map(|b| format!("COUNT({b}) AS k_{b}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "(SELECT COUNT(*) AS n, {known_and_sum} FROM (
+             SELECT {columns} FROM flow_turns
+             UNION ALL SELECT {columns} FROM stock_sessions
+             UNION ALL SELECT {columns} FROM legacy_stock
+         )) AS tb,
+         (SELECT COUNT(*) AS n, {sum} FROM flow_messages) AS mb,
+         (SELECT COUNT(*) AS n, {known} FROM ambiguous_turns) AS ab"
+    )
+}
+
+/// One U1 bucket over [`token_bucket_summaries_sql`]: an ambiguous turn
+/// knowing the bucket poisons it; an empty turn/stock half falls back to the
+/// independent Message sum (0 with Messages, Unknown without); a half with
+/// any NULL bucket is Unknown; plus the Message SUM.
 fn token_bucket_expr(bucket: &str) -> String {
     format!(
-        "(SELECT CASE
-             WHEN EXISTS (
-                 SELECT 1 FROM ambiguous_turns WHERE {bucket} IS NOT NULL
-             ) THEN NULL
-             WHEN COUNT(*) = 0
-                  AND (SELECT COUNT(*) FROM flow_messages) > 0 THEN 0
-             WHEN COUNT(*) = 0 THEN NULL
-             WHEN COUNT(*) = COUNT({bucket}) THEN SUM({bucket})
+        "(CASE
+             WHEN ab.k_{bucket} > 0 THEN NULL
+             WHEN tb.n = 0 AND mb.n > 0 THEN 0
+             WHEN tb.n = 0 THEN NULL
+             WHEN tb.n = tb.k_{bucket} THEN tb.s_{bucket}
          END
-        FROM (
-            SELECT {bucket} FROM flow_turns
-            UNION ALL SELECT {bucket} FROM stock_sessions
-            UNION ALL SELECT {bucket} FROM legacy_stock
-        )
-    )
-    + COALESCE((SELECT SUM({bucket}) FROM flow_messages), 0)"
+         + COALESCE(mb.s_{bucket}, 0))"
     )
 }
 
 fn aggregate_select_sql() -> &'static str {
     static C: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     C.get_or_init(|| {
-        // One U1 bucket column: ambiguous-then-unknown gate over the
-        // turn/stock half (empty half falls back to the independent Message
-        // sum: 0 with Messages, Unknown without), plus Message SUM.
+        // One U1 bucket column per token bucket ([`token_bucket_expr`]) over
+        // the one-row summaries; `cb` counts `contributions` once for both the
+        // event column and the cost presence gate.
         format!(
             "SELECT
-        (SELECT COUNT(*) FROM contributions),
-        (SELECT COUNT(*) FROM ambiguous_turns),
+        cb.n,
+        ab.n,
         {total},
         {input},
         {output},
@@ -2509,7 +2555,7 @@ fn aggregate_select_sql() -> &'static str {
         -- WITHOUT such a bill — a different session of the same instance is
         -- never suppressed, and its Unknown cost poisons the aggregate.
         CASE
-            WHEN (SELECT COUNT(*) FROM contributions) = 0 THEN NULL
+            WHEN cb.n = 0 THEN NULL
             -- An ambiguous (always unqualified) turn's known cost poisons
             -- only an instance WITHOUT any reported bill.
             WHEN EXISTS (
@@ -2576,18 +2622,20 @@ fn aggregate_select_sql() -> &'static str {
                     SELECT SUM(CAST(cost_usd AS REAL)) FROM estimated_message_cost
                 ), 0.0)
         END,
-        -- r43 AC4: token-evidence row count (presence-only bill => 0).
-        {token_rows}
-     -- No FROM: every column is a scalar subquery over the fold CTEs, so the
-     -- row must materialize even when `contributions` is empty (an empty
-     -- aggregate SELECT over a zero-row FROM would otherwise return no rows).
+        -- r43 AC4: token-evidence row count (presence-only bill => 0):
+        -- `token_events` is exactly the turn/stock half plus the Messages.
+        tb.n + mb.n
+     -- Every FROM term is an aggregate without GROUP BY (exactly one row), so
+     -- the row materializes even when `contributions` is empty.
+     FROM (SELECT COUNT(*) AS n FROM contributions) AS cb,
+          {summaries}
      ",
             total = token_bucket_expr("total_tokens"),
             input = token_bucket_expr("input_tokens"),
             output = token_bucket_expr("output_tokens"),
             cache_read = token_bucket_expr("cache_read_tokens"),
             cache_write = token_bucket_expr("cache_write_tokens"),
-            token_rows = "(SELECT COUNT(*) FROM token_events)",
+            summaries = token_bucket_summaries_sql(),
         )
     })
 }
@@ -2635,23 +2683,17 @@ pub fn aggregate_supply(
         return Ok(UsageAggregate::unavailable());
     }
     let ctes = fold_ctes_supply();
-    // Count surviving rows in THIS domain first: a zero-row fold is "model
-    // absent from the data", not "model spent zero", so its token/cost
-    // columns must surface as NULL rather than the empty-fold zero defaults.
-    let count_sql = format!("WITH {ctes} SELECT COUNT(*) FROM contributions");
-    let total_rows: i64 = {
-        let mut stmt = conn.prepare_cached(&count_sql)?;
-        stmt.query_row(params![profile_id, model], |row| row.get(0))?
-    };
     let sql = format!("WITH {ctes} {select}", select = aggregate_select_sql());
     let mut stmt = conn.prepare_cached(&sql)?;
     stmt.query_row(params![profile_id, model], |row| {
+        // Column 0 counts the surviving rows in THIS domain: a zero-row fold
+        // is "model absent from the data", not "model spent zero", so its
+        // token/cost columns must surface as NULL rather than the empty-fold
+        // zero defaults. Read from the same statement (and snapshot) instead
+        // of planning the fold graph a second time.
+        let total_rows = row.get::<_, Option<i64>>(0)?.unwrap_or(0);
         Ok(UsageAggregate {
-            events: if total_rows == 0 {
-                0
-            } else {
-                row.get::<_, Option<i64>>(0)?.unwrap_or(0)
-            },
+            events: total_rows,
             ambiguous_events: row.get(1)?,
             ambiguous: row.get::<_, i64>(1)? != 0,
             total_tokens: if total_rows == 0 { None } else { row.get(2)? },
@@ -3275,11 +3317,13 @@ pub fn rollup_instance(
                     UNION ALL
                     SELECT observed_at FROM flow_messages
                      WHERE observed_at_source = 'native'
-                 ))",
+                 ))
+             FROM {summaries}",
         input = token_bucket_expr("input_tokens"),
         output = token_bucket_expr("output_tokens"),
         cache_read = token_bucket_expr("cache_read_tokens"),
         cache_write = token_bucket_expr("cache_write_tokens"),
+        summaries = token_bucket_summaries_sql(),
     );
     let mut totals_stmt = conn.prepare_cached(&totals_sql)?;
     let totals = totals_stmt.query_row(params![instance_id], |row| {
@@ -5768,6 +5812,60 @@ mod tests {
             rollup.tpm_out_60s,
             Some(100),
             "rate window also reads one stream"
+        );
+    }
+
+    #[test]
+    fn fold_aggregates_compile_each_relation_once() {
+        // c-ctxusage r5 gate: SQLite flattens an unhinted multi-use CTE into
+        // every reference, and per-bucket scalar subqueries re-referenced the
+        // fold relations ~40 times, so the aggregate compiled to ~97k VDBE ops
+        // (~40 MiB of planner memory per prepare). Under the parallel lib run
+        // that stretched the rate-window tests past their 60 s window. Guard
+        // the compiled program size — deterministic for the bundled SQLite —
+        // rather than any wall-clock budget.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let select = aggregate_select_sql();
+        for (name, ctes) in [
+            ("instance", fold_ctes_instance()),
+            ("supply", fold_ctes_supply()),
+        ] {
+            let mut explain = conn
+                .prepare(&format!("EXPLAIN WITH {ctes} {select}"))
+                .unwrap();
+            let params = vec!["x"; explain.parameter_count()];
+            let ops = explain
+                .query_map(rusqlite::params_from_iter(params), |_| Ok(()))
+                .unwrap()
+                .count();
+            assert!(
+                ops < 20_000,
+                "{name} aggregate compiled to {ops} VDBE ops; a multi-use fold \
+                 CTE lost AS MATERIALIZED or a relation is referenced per bucket"
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_sqlite_is_built_without_the_global_memstatus_mutex() {
+        // c-ctxusage r5 gate: with SQLite's default memory accounting every
+        // sqlite3_malloc/free takes ONE process-wide mutex, so fold planning
+        // on concurrent connections serialized (a 0.2 s fold flow took ~90 s
+        // at 64 threads). .cargo/config.toml builds the bundled SQLite with
+        // SQLITE_DEFAULT_MEMSTATUS=0; fail loudly if that flag stops applying.
+        let conn = Connection::open_in_memory().unwrap();
+        let options: Vec<String> = conn
+            .prepare("PRAGMA compile_options")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            options.iter().any(|o| o == "DEFAULT_MEMSTATUS=0"),
+            "bundled SQLite must be compiled with SQLITE_DEFAULT_MEMSTATUS=0 \
+             (LIBSQLITE3_FLAGS in .cargo/config.toml); got {options:?}"
         );
     }
 

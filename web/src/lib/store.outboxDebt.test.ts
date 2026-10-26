@@ -1428,3 +1428,117 @@ it("r5 item 1: a byte-capped page short of the cursor is descended before the cu
   expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
   expect(hubStore.getSnapshot().events[INSTANCE]).toHaveLength(129);
 }, 15_000);
+
+it("r5 item 2: a debt whose tail was rejected during a failed credential login settles once the Outbox is re-installed", async () => {
+  // Ordinary credential succession disposes the Outbox WITHOUT bumping the
+  // identity epoch; the tail pass that fires in that null window is rejected
+  // and (rightly) does not loop. When the failed login restores the Outbox
+  // under the same identity, nothing else arrives — no journal traffic, live
+  // batch or drain — so the install itself must re-arm the owed tail.
+  const { api, hubStore } = await fresh();
+  await mountFollow(api, hubStore);
+  vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+    const commandId = _args[4] as string;
+    return Promise.resolve(commandResult(commandId, "accepted"));
+  });
+  let refuseLogin: ((err: Error) => void) | null = null;
+  vi.spyOn(api, "login").mockImplementation(
+    () => new Promise<never>((_resolve, reject) => (refuseLogin = reject)),
+  );
+  const h = hubStore as unknown as {
+    owedTail: Map<string, { timer: ReturnType<typeof setTimeout> | null }>;
+    owedTailRunning: Set<string>;
+    outbox: unknown;
+  };
+
+  await hubStore.send(INSTANCE, "owed across a failed login");
+  const bubble = () => hubStore.getSnapshot().bubbles[0]!;
+  await vi.waitFor(() => expect(bubble().outboxState).toBe("sent"));
+  await vi.waitFor(() => expect(h.owedTail.get(INSTANCE)?.timer).not.toBeNull());
+  const commandId = bubble().commandId!;
+
+  // The credential turn disposes the Outbox and parks on the request…
+  const login = hubStore.login("bootstrap", "secret", "dev").catch((err: unknown) => err);
+  await vi.waitFor(() => expect(h.outbox).toBeNull());
+  // …while the armed tail fires and is rejected without re-arming.
+  await vi.waitFor(
+    () => {
+      expect(h.owedTail.get(INSTANCE)?.timer).toBeNull();
+      expect(h.owedTailRunning.has(INSTANCE)).toBe(false);
+    },
+    { timeout: 3_000 },
+  );
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(true);
+
+  // The command's journal entry is durable now, but only a tail read can see it.
+  vi.mocked(api.eventsRead).mockResolvedValue(userMessagePage(commandId));
+  refuseLogin!(new Error("credential refused"));
+  expect(await login).toBeInstanceOf(Error);
+  await vi.waitFor(() => expect(h.outbox).not.toBeNull());
+
+  await vi.waitFor(
+    () => {
+      expect(bubble().state).toBe("settled");
+      expect(bubble().outboxState).toBe("done");
+    },
+    { timeout: 4_000 },
+  );
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+}, 15_000);
+
+it("r5 item 2: journal evidence folded while the Outbox is disposed retires the durable row once it is re-installed", async () => {
+  // The live entry for the owed command arrives in the credential turn's
+  // null-Outbox window: the fold cannot patch the durable row, so it must not
+  // discharge the debt either. The re-installed Outbox re-checks the debt
+  // against the evidence folded so far and retires the row to done.
+  const { api, hubStore } = await fresh();
+  await mountFollow(api, hubStore);
+  vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+    const commandId = _args[4] as string;
+    return Promise.resolve(commandResult(commandId, "accepted"));
+  });
+  let refuseLogin: ((err: Error) => void) | null = null;
+  vi.spyOn(api, "login").mockImplementation(
+    () => new Promise<never>((_resolve, reject) => (refuseLogin = reject)),
+  );
+  const h = hubStore as unknown as { outbox: { get: (id: string) => OutboxRecord | undefined } | null };
+
+  await hubStore.send(INSTANCE, "owed, confirmed during the gap");
+  const bubble = () => hubStore.getSnapshot().bubbles[0]!;
+  await vi.waitFor(() => expect(bubble().outboxState).toBe("sent"));
+  await vi.waitFor(() => expect(debtOf(hubStore).has(INSTANCE)).toBe(true));
+  const commandId = bubble().commandId!;
+
+  const login = hubStore.login("bootstrap", "secret", "dev").catch((err: unknown) => err);
+  await vi.waitFor(() => expect(h.outbox).toBeNull());
+  const onBatch = await liveBatch(api);
+  onBatch({
+    subscriptionId: "sub_outbox_debt",
+    journalId: JOURNAL,
+    fromSeq: "1",
+    toSeq: "1",
+    durableSeq: "1",
+    events: [
+      {
+        kind: "message",
+        eventId: "evt_user_gap_live",
+        journalId: JOURNAL,
+        instanceId: INSTANCE,
+        seq: "1",
+        completeness: "structured",
+        payload: { role: "user", commandId },
+      } as unknown as Observation,
+    ],
+  });
+  // No box to retire the row in: the debt is kept, not discharged.
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(true);
+
+  refuseLogin!(new Error("credential refused"));
+  expect(await login).toBeInstanceOf(Error);
+  await vi.waitFor(() => expect(h.outbox).not.toBeNull());
+  await vi.waitFor(() => {
+    expect(h.outbox?.get(commandId)?.state).toBe("done");
+    expect(bubble().outboxState).toBe("done");
+  });
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+}, 15_000);

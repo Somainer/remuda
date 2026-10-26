@@ -1360,7 +1360,7 @@ class HubStore {
    */
   private reconcileOwed = new Map<
     Id,
-    { bindGen: number; attemptId: number | null; commands: Set<Id> }
+    { bindGen: number; attemptId: number | null; epoch: number; commands: Set<Id> }
   >();
   /**
    * Ruling AD: bounded debt-driven tail re-read state per instance. `attempts`
@@ -1932,8 +1932,10 @@ class HubStore {
         // Gate 48 item 3: this initializer runs INSIDE the auth turn's
         // install — bound its lock so a sibling-held instance lock cannot park
         // the turn (or poison the flushChain the turn drain joins).
-        if (!obsolete() && this.outbox === box)
+        if (!obsolete() && this.outbox === box) {
           void this.flushAllOutbox(new Set(), false, true);
+          this.resumeOwedDebts();
+        }
         return "ok";
       } catch {
         if (obsolete()) return "obsolete";
@@ -3945,7 +3947,12 @@ class HubStore {
   private recordOwed(instanceId: Id, commandIds?: Iterable<Id>) {
     const ref = this.connection?.attemptRef() ?? null;
     const existing = this.reconcileOwed.get(instanceId);
-    const debt = existing ?? { bindGen: 0, attemptId: null, commands: new Set<Id>() };
+    const debt = existing ?? {
+      bindGen: 0,
+      attemptId: null,
+      epoch: this.identityEpoch,
+      commands: new Set<Id>(),
+    };
     if (commandIds) for (const commandId of commandIds) debt.commands.add(commandId);
     debt.bindGen = this.connectionBindGen;
     debt.attemptId = ref?.attemptId ?? existing?.attemptId ?? null;
@@ -3996,14 +4003,41 @@ class HubStore {
    * evidence folded SO FAR. Called after EVERY journal observation (live
    * batch, catch-up/resync fold, mount seed): evidence clears the debt;
    * missing evidence arms (once) the bounded debt-driven tail re-read.
+   *
+   * r5 item 2: while ordinary credential succession has the Outbox disposed
+   * (null, same identity epoch) nothing can be proven or retired — a fold
+   * then could not patch the durable row — so the debt is left untouched;
+   * installing the next Outbox re-checks it ({@link resumeOwedDebts}).
    */
   private reevaluateOwedDebt(instanceId: Id) {
-    if (!this.reconcileOwed.has(instanceId)) return;
+    if (!this.reconcileOwed.has(instanceId) || !this.outbox) return;
     if (!this.owedCommandLacksEvidence(instanceId)) {
       this.clearOwed(instanceId);
       return;
     }
     this.scheduleOwedTail(instanceId);
+  }
+
+  /**
+   * r5 item 2: an Outbox was installed. Ordinary credential succession
+   * disposes the box WITHOUT bumping the identity epoch (a failed login then
+   * restores it), so the current identity's debts survive while their tail
+   * passes are rejected in the null window — by design without re-arming.
+   * Re-check each of them now: evidence folded while no box was installed
+   * retires the durable row, and anything still unobserved gets its bounded
+   * tail re-armed. Debts of another identity epoch are never touched (every
+   * retirement clears the map; the epoch check is defence in depth).
+   */
+  private resumeOwedDebts() {
+    for (const [instanceId, debt] of this.reconcileOwed) {
+      if (debt.epoch !== this.identityEpoch) continue;
+      this.settleFromJournal(instanceId, this.state.events[instanceId] ?? []);
+      if (this.owedCommandLacksEvidence(instanceId)) {
+        this.scheduleOwedTail(instanceId, OWED_TAIL_BASE_BACKOFF_MS);
+      } else {
+        this.clearOwed(instanceId);
+      }
+    }
   }
 
   /** Highest journal seq folded into this instance's live state (scan anchor). */
@@ -4177,20 +4211,21 @@ class HubStore {
       this.outbox === box &&
       this.owedTail.get(instanceId) === capturedTail &&
       this.reconcileOwed.get(instanceId) === debt;
+    // Every ownership check inside the job goes through `owns`, which also
+    // records that this pass LOST ownership — see the `finally` re-arm.
+    let lostOwnership = false;
+    const owns = () => {
+      if (stillOurs()) return true;
+      lostOwnership = true;
+      return false;
+    };
     void this.chainReconcile(instanceId, async () => {
       try {
         // Entry gate: a queued callback that survived logout (or whose debt
         // generation was cleared while it waited) is dropped before any
-        // mutation. It still releases the running marker in `finally`, and a
-        // same-identity rejection re-arms the CURRENT debt's tail: that
-        // debt's own timer may have fired while this pass held the marker
-        // and been coalesced away, which would otherwise strand it forever.
-        // No re-arm while the Outbox is mid-succession (null): a fresh pass
-        // would only reject again, so the next drain or trigger restarts it.
-        if (!box || !debt || !stillOurs()) {
-          if (this.identityEpoch === epoch && this.outbox) {
-            this.scheduleOwedTail(instanceId, OWED_TAIL_BASE_BACKOFF_MS);
-          }
+        // mutation.
+        if (!box || !debt || !owns()) {
+          lostOwnership = true;
           return;
         }
         if (!this.owedCommandLacksEvidence(instanceId)) {
@@ -4201,8 +4236,8 @@ class HubStore {
           tail.attempts >= OWED_TAIL_MAX_ATTEMPTS ||
           Date.now() - tail.firstAt >= OWED_TAIL_DEADLINE_MS;
         if (exhausted) {
-          const committed = await this.exhaustOwedDebt(instanceId, debt, box, stillOurs);
-          if (!stillOurs()) return;
+          const committed = await this.exhaustOwedDebt(instanceId, debt, box, owns);
+          if (!owns()) return;
           if (committed) return;
           // r2 item 3: a terminal write failed to persist. Retain the debt
           // and run a BOUNDED storage retry; the bubble already presents
@@ -4219,7 +4254,7 @@ class HubStore {
           this.state.instances.find((i) => i.id === instanceId) ??
           (await api.instanceGet(instanceId).catch(() => null));
         // Retired WHILE the instance lookup was parked: drop its result.
-        if (!stillOurs()) return;
+        if (!owns()) return;
         let answered = false;
         if (instance) {
           // Ruling AD3: the FORWARD scan uses the debt reader's OWN cursor
@@ -4237,7 +4272,7 @@ class HubStore {
               tail.scanAfter,
               tail.scanBound ?? tail.scanAfter + OWED_TAIL_WINDOW,
               OWED_TAIL_WINDOW,
-              stillOurs,
+              owns,
             );
             // Retired WHILE a read was parked (held-response regression):
             // never fold the old identity's events into the successor store.
@@ -4257,17 +4292,17 @@ class HubStore {
                 Math.max(0, tail.overlapBelow - OWED_TAIL_OVERLAP),
                 tail.overlapBound ?? tail.overlapBelow,
                 OWED_TAIL_OVERLAP,
-                stillOurs,
+                owns,
               );
               if (!overlap) return;
               tail.overlapBound = overlap.uninspectedBelow;
             }
           } catch {
-            if (!stillOurs()) return;
+            if (!owns()) return;
             /* rejected read: keep the debt and retry at the base cadence */
           }
         }
-        if (!stillOurs() || !this.reconcileOwed.has(instanceId)) return;
+        if (!owns() || !this.reconcileOwed.has(instanceId)) return;
         if (!this.owedCommandLacksEvidence(instanceId)) {
           this.clearOwed(instanceId);
           return;
@@ -4280,7 +4315,16 @@ class HubStore {
       } finally {
         // Only the owning identity's job clears its running marker; a
         // retired job leaves the successor's (fresh) marker untouched.
-        if (this.identityEpoch === epoch) this.owedTailRunning.delete(instanceId);
+        if (this.identityEpoch === epoch) {
+          this.owedTailRunning.delete(instanceId);
+          // A same-identity pass that lost ownership (its debt generation was
+          // cleared, or the Outbox was replaced while it was queued or parked)
+          // re-arms the CURRENT debt's tail: that debt's own timer may have
+          // fired while this pass held the marker and been coalesced away.
+          // Never while the Outbox is null — a fresh pass would only reject
+          // again; installing the next Outbox re-arms (resumeOwedDebts).
+          if (lostOwnership && this.outbox) this.scheduleOwedTail(instanceId, OWED_TAIL_BASE_BACKOFF_MS);
+        }
       }
     });
   }

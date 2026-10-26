@@ -5867,8 +5867,24 @@ fn park_cert_temp_before_rename(dir: &std::path::Path, job_id: &str) {
     }
 }
 
+/// r39 item 2: serializes every test that uses the single-process
+/// CERT_TEMP_HOLD slot, from arming through writer completion (the guard is
+/// kept alive until after the writer threads join). The two barrier tests
+/// would otherwise overwrite each other's slot when run in the same binary.
 #[cfg(test)]
-fn arm_cert_temp_hold(dir: std::path::PathBuf, jobs: Vec<String>) -> std::sync::Arc<CountedHold> {
+static CERT_BARRIER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Arm the cert-temp barrier AND acquire the process-wide test serialization
+/// lock. The returned [`CertTempHoldGuard`] disarms the slot, releases parked
+/// writers and frees the serialization lock on drop — hold it until after the
+/// spawned writers have joined.
+#[cfg(test)]
+fn arm_cert_temp_hold(dir: std::path::PathBuf, jobs: Vec<String>) -> CertTempHoldGuard {
+    // Acquire the serialization lock BEFORE touching the shared slot so two
+    // barrier tests can never arm concurrently.
+    let serial = CERT_BARRIER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let hold = std::sync::Arc::new(CountedHold {
         entered: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         release: std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
@@ -5879,16 +5895,38 @@ fn arm_cert_temp_hold(dir: std::path::PathBuf, jobs: Vec<String>) -> std::sync::
         .get_or_init(|| std::sync::Mutex::new(None))
         .lock()
         .unwrap_or_else(|poison| poison.into_inner()) = Some(hold.clone());
-    hold
+    CertTempHoldGuard {
+        hold,
+        _serial: serial,
+    }
 }
 
-/// r37 item 2 TEST-ONLY: RAII scope guard for the cert-temp barrier. Dropping
-/// it disarms the process-global hold and releases every parked writer, so an
-/// assertion failure or normal completion can never leave another test's
-/// certificate writer blocked or the static left armed.
+/// r37 item 2 / r39 item 2 TEST-ONLY: RAII scope guard for the cert-temp
+/// barrier. Dropping it disarms the process-global hold, releases every parked
+/// writer and frees the cross-test serialization lock, so an assertion failure
+/// or normal completion can never leave another test's writer blocked, the
+/// static armed, or the slot occupied.
 #[cfg(test)]
 struct CertTempHoldGuard {
     hold: std::sync::Arc<CountedHold>,
+    /// Held to the end of the test; serializes all CERT_TEMP_HOLD users.
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl CertTempHoldGuard {
+    /// Number of scoped writers parked at the barrier.
+    fn entered(&self) -> usize {
+        self.hold.entered.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Release (and wake) every writer parked on this barrier.
+    fn release(&self) {
+        let (lock, cvar) = &*self.hold.release;
+        let mut released = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+        *released = true;
+        cvar.notify_all();
+    }
 }
 
 #[cfg(test)]
@@ -5898,21 +5936,8 @@ impl Drop for CertTempHoldGuard {
             .get_or_init(|| std::sync::Mutex::new(None))
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = None;
-        let (lock, cvar) = &*self.hold.release;
-        let mut released = lock.lock().unwrap_or_else(|poison| poison.into_inner());
-        *released = true;
-        cvar.notify_all();
+        self.release();
     }
-}
-
-/// r36 item 1 test helper: disarm the cert-temp hold after the writers join.
-#[cfg(test)]
-#[allow(dead_code)]
-fn clear_cert_temp_hold() {
-    *CERT_TEMP_HOLD
-        .get_or_init(|| std::sync::Mutex::new(None))
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner()) = None;
 }
 
 /// Authoritative group death has been observed (killpg ESRCH on the recorded
@@ -10031,10 +10056,10 @@ Running 8 tests across 2 projects
         // r37 item 2: the barrier is scoped to THIS unique ledger dir and the
         // two intended jobs, so an unrelated parallel test's certificate write
         // cannot count as an arrival; the RAII guard disarms/releases even on
-        // assertion failure.
+        // assertion failure. r39 item 2: arming also takes the cross-test
+        // serialization lock, held through the writer joins.
         let jobs = vec!["gjb_r36_jobA".to_owned(), "gjb_r36_jobB".to_owned()];
         let hold = arm_cert_temp_hold(dir.clone(), jobs);
-        let _hold_guard = CertTempHoldGuard { hold: hold.clone() };
         let dir_a = dir.clone();
         let ca = cert_a.clone();
         let writer_a = std::thread::spawn(move || {
@@ -10059,13 +10084,11 @@ Running 8 tests across 2 projects
         // Deterministic barrier: wait until BOTH scoped temps exist and BOTH
         // scoped writers are parked between write and rename.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while hold.entered.load(std::sync::atomic::Ordering::Acquire) < 2
-            && std::time::Instant::now() < deadline
-        {
+        while hold.entered() < 2 && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(
-            hold.entered.load(std::sync::atomic::Ordering::Acquire),
+            hold.entered(),
             2,
             "both scoped writers must park before either rename"
         );
@@ -10080,7 +10103,7 @@ Running 8 tests across 2 projects
             "the foreign write completed independently while A/B were parked"
         );
         assert_eq!(
-            hold.entered.load(std::sync::atomic::Ordering::Acquire),
+            hold.entered(),
             2,
             "a foreign-dir write must not count as a barrier arrival"
         );
@@ -10096,16 +10119,11 @@ Running 8 tests across 2 projects
             "each writer must own a distinct temp file, found {temps:?}"
         );
         // Release both writers.
-        {
-            let (lock, cvar) = &*hold.release;
-            let mut released = lock.lock().unwrap();
-            *released = true;
-            cvar.notify_all();
-        }
+        hold.release();
         writer_a.join().unwrap().expect("writer A succeeds");
         writer_b.join().unwrap().expect("writer B succeeds");
-        // _hold_guard disarms and releases the global barrier at scope end
-        // (including on an early assertion failure).
+        // `hold` drops here: disarms the global barrier and releases the
+        // cross-test serialization lock (also on an early assertion failure).
 
         // Each qualified certificate carries the correct attempt identity —
         // the old shared-temp bug put B's contents at A's path (or vice-versa).
@@ -10133,6 +10151,86 @@ Running 8 tests across 2 projects
             .filter(|name| name.starts_with(".dead-") && name.ends_with(".tmp"))
             .collect();
         assert!(leftovers.is_empty(), "temp files leaked: {leftovers:?}");
+    }
+
+    /// r39 item 2: arming the cert-temp barrier takes a process-wide
+    /// serialization lock held until the returned guard drops, so the two
+    /// barrier tests can never occupy the single CERT_TEMP_HOLD slot at once.
+    /// A second arming from another thread blocks while the first guard lives.
+    #[test]
+    fn cert_temp_hold_arming_is_serialized_across_tests() {
+        let d1 = tempfile::TempDir::new().unwrap();
+        let d2 = tempfile::TempDir::new().unwrap();
+
+        // A latch telling the first guard holder when to release.
+        struct Gate {
+            acquired: std::sync::atomic::AtomicBool,
+            release: std::sync::Mutex<bool>,
+            cvar: std::sync::Condvar,
+        }
+        let gate = std::sync::Arc::new(Gate {
+            acquired: std::sync::atomic::AtomicBool::new(false),
+            release: std::sync::Mutex::new(false),
+            cvar: std::sync::Condvar::new(),
+        });
+
+        // First test arms and holds until signalled.
+        let g = gate.clone();
+        let first = std::thread::spawn(move || {
+            let _guard = arm_cert_temp_hold(d1.path().to_path_buf(), vec!["gjb_first".to_owned()]);
+            g.acquired.store(true, std::sync::atomic::Ordering::Release);
+            let mut released = g.release.lock().unwrap();
+            while !*released {
+                released = g.cvar.wait(released).unwrap();
+            }
+        });
+        // Wait until the first guard is held.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !gate.acquired.load(std::sync::atomic::Ordering::Acquire)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(gate.acquired.load(std::sync::atomic::Ordering::Acquire));
+
+        // A second arming must BLOCK while the first guard is alive.
+        let second_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let second_acquired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ss = second_started.clone();
+        let sa = second_acquired.clone();
+        let d2p = d2.path().to_path_buf();
+        let second = std::thread::spawn(move || {
+            ss.store(true, std::sync::atomic::Ordering::Release);
+            let _guard = arm_cert_temp_hold(d2p, vec!["gjb_second".to_owned()]);
+            sa.store(true, std::sync::atomic::Ordering::Release);
+            // keep it held briefly so the test can observe completion
+            std::thread::sleep(Duration::from_millis(100));
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !second_started.load(std::sync::atomic::Ordering::Acquire)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Give the second thread a clear chance to arm if it were NOT serialized.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !second_acquired.load(std::sync::atomic::Ordering::Acquire),
+            "a second cert-temp arming must block while the first guard is held"
+        );
+
+        // Release the first guard; the second now arms.
+        {
+            let mut released = gate.release.lock().unwrap();
+            *released = true;
+            gate.cvar.notify_all();
+        }
+        first.join().unwrap();
+        second.join().unwrap();
+        assert!(
+            second_acquired.load(std::sync::atomic::Ordering::Acquire),
+            "the second arming proceeds once the first guard drops"
+        );
     }
 
     /// r37 item 4: crash-abandoned certificate temp files are reclaimed at
@@ -10245,22 +10343,20 @@ Running 8 tests across 2 projects
         std::fs::write(&leftover, b"{\"jobId\":\"crashed\"}").unwrap();
 
         // Park the writer after its temp is written (it is holding the ledger
-        // SHARED flock the whole time).
+        // SHARED flock the whole time). r39 item 2: arming also serializes
+        // against the other cert-barrier test for the whole parked window.
         let hold = arm_cert_temp_hold(dir.clone(), vec![job.to_owned()]);
-        let _hold_guard = CertTempHoldGuard { hold: hold.clone() };
         let writer_dir = dir.clone();
         let writer_record = record.clone();
         let writer = std::thread::spawn(move || {
             super::write_qualified_dead_cert_bytes(&writer_dir, &writer_record, job, 1)
         });
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while hold.entered.load(std::sync::atomic::Ordering::Acquire) < 1
-            && std::time::Instant::now() < deadline
-        {
+        while hold.entered() < 1 && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(
-            hold.entered.load(std::sync::atomic::Ordering::Acquire),
+            hold.entered(),
             1,
             "the writer must park while holding the shared ledger flock"
         );
@@ -10295,12 +10391,7 @@ Running 8 tests across 2 projects
         );
 
         // Let the writer finish: its rename installs the qualified certificate.
-        {
-            let (lock, cvar) = &*hold.release;
-            let mut released = lock.lock().unwrap();
-            *released = true;
-            cvar.notify_all();
-        }
+        hold.release();
         writer
             .join()
             .unwrap()

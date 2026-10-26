@@ -423,6 +423,15 @@ pub struct InstanceCommandRequest {
     /// Native effort index for `instance.configure`.
     #[serde(default)]
     pub effort_index: Option<u32>,
+    /// D-056 orthogonal ultracode flag for `instance.configure`.
+    #[serde(default)]
+    pub effort_ultracode: Option<bool>,
+    /// c-effortread r9 item 6: explicit axis intent (`"flag"` | `"tier"`).
+    #[serde(default)]
+    pub effort_axis: Option<String>,
+    /// c-effortread r10: per-request id minted by the web for one switch.
+    #[serde(default)]
+    pub effort_request_id: Option<String>,
     /// Native permission-mode word for `instance.configure`.
     #[serde(default)]
     pub permission_mode: Option<String>,
@@ -446,6 +455,22 @@ impl InstanceCommandRequest {
                 .get("index")
                 .and_then(serde_json::Value::as_u64)
                 .map(|n| n as u32);
+            // D-056: the orthogonal flag rides with the level; the driver picks
+            // the exact in-session word from the reported Claude version.
+            self.effort_ultracode = effort.get("ultracode").and_then(serde_json::Value::as_bool);
+            // c-effortread r9 item 6: the explicit axis the client intends.
+            self.effort_axis = effort
+                .get("axis")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| matches!(*value, "flag" | "tier"))
+                .map(str::to_owned);
+            // c-effortread r10: the per-request id echoed on lifecycle edges.
+            self.effort_request_id = effort
+                .get("requestId")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
         }
         self.permission_mode = params
             .get("permissionMode")
@@ -490,5 +515,92 @@ mod tests {
             assert_eq!(request.effort_name.as_deref(), Some(name));
             assert_eq!(request.effort_index, Some(index));
         }
+    }
+
+    #[test]
+    fn configure_forwards_the_orthogonal_ultracode_boolean() {
+        // D-056: the flag rides with the level all the way to the driver,
+        // which picks the in-session word from the reported binary version.
+        let request: InstanceCommandRequest =
+            serde_json::from_value(json!({ "operation": "instance.configure" })).unwrap();
+        let request = request.with_configure(&json!({
+            "effort": { "name": "xhigh", "ultracode": true, "index": 3, "kind": "claude" }
+        }));
+        assert_eq!(request.effort_name.as_deref(), Some("xhigh"));
+        assert_eq!(request.effort_ultracode, Some(true));
+
+        let request: InstanceCommandRequest =
+            serde_json::from_value(json!({ "operation": "instance.configure" })).unwrap();
+        let request = request.with_configure(&json!({
+            "effort": { "name": "max", "ultracode": false, "index": 4, "kind": "claude" }
+        }));
+        assert_eq!(request.effort_name.as_deref(), Some("max"));
+        assert_eq!(request.effort_ultracode, Some(false));
+
+        // An omitted flag stays None (codex/grok level-only configure).
+        let request: InstanceCommandRequest =
+            serde_json::from_value(json!({ "operation": "instance.configure" })).unwrap();
+        let request =
+            request.with_configure(&json!({ "effort": { "name": "high", "kind": "grok" } }));
+        assert_eq!(request.effort_ultracode, None);
+    }
+
+    #[test]
+    fn configure_forwards_the_effort_per_request_id() {
+        // c-effortread r10: the web's per-request id rides effort.requestId
+        // through the Hub command payload to the driver, which echoes it.
+        let request: InstanceCommandRequest =
+            serde_json::from_value(json!({ "operation": "instance.configure" })).unwrap();
+        let request = request.with_configure(&json!({
+            "effort": { "name": "max", "ultracode": true, "index": 4, "kind": "claude",
+                         "axis": "flag", "requestId": "effreq-abc" }
+        }));
+        assert_eq!(request.effort_request_id.as_deref(), Some("effreq-abc"));
+        assert_eq!(request.effort_axis.as_deref(), Some("flag"));
+
+        // Whitespace/empty is dropped; a non-string is ignored.
+        let request: InstanceCommandRequest =
+            serde_json::from_value(json!({ "operation": "instance.configure" })).unwrap();
+        let request = request.with_configure(&json!({
+            "effort": { "name": "max", "kind": "claude", "requestId": "   " }
+        }));
+        assert_eq!(request.effort_request_id, None);
+        let request: InstanceCommandRequest =
+            serde_json::from_value(json!({ "operation": "instance.configure" })).unwrap();
+        let request = request.with_configure(&json!({
+            "effort": { "name": "max", "kind": "claude", "requestId": 42 }
+        }));
+        assert_eq!(request.effort_request_id, None);
+    }
+
+    #[test]
+    fn configure_maps_a_missing_or_invalid_ultracode_boolean_to_none_with_the_flag_axis() {
+        // c-effortread r12 item 4: a FLAG-axis configure whose boolean is
+        // absent OR carries a non-boolean JSON value reaches the driver as
+        // `effort_ultracode = None` WITH `effort_axis = Some("flag")`, so the
+        // driver's pre-dispatch gate refuses it on every build instead of
+        // reading None as false and typing `ultracode off` / a plain level.
+        for value in [
+            json!({ "name": "high", "axis": "flag" }),
+            json!({ "name": "high", "axis": "flag", "ultracode": "on" }),
+            json!({ "name": "high", "axis": "flag", "ultracode": 1 }),
+            json!({ "name": "high", "axis": "flag", "ultracode": null }),
+        ] {
+            let request: InstanceCommandRequest =
+                serde_json::from_value(json!({ "operation": "instance.configure" })).unwrap();
+            let request = request.with_configure(&json!({ "effort": value }));
+            assert_eq!(request.effort_axis.as_deref(), Some("flag"), "{value}");
+            assert_eq!(request.effort_ultracode, None, "{value}");
+            assert_eq!(request.effort_name.as_deref(), Some("high"), "{value}");
+        }
+        // A genuine boolean is preserved alongside the axis (sanity: the gate
+        // must not refuse well-formed toggles before the build dispatch).
+        let request: InstanceCommandRequest =
+            serde_json::from_value(json!({ "operation": "instance.configure" })).unwrap();
+        let request = request.with_configure(&json!({
+            "effort": { "name": "high", "axis": "flag", "ultracode": false }
+        }));
+        assert_eq!(request.effort_axis.as_deref(), Some("flag"));
+        assert_eq!(request.effort_ultracode, Some(false));
     }
 }

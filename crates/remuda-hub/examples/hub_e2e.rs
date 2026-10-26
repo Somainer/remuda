@@ -11,10 +11,21 @@ use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::{Mutex, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+// c-acceptrace round 3: the fake Node's instance.send acceptance sequence
+// (durable journal.append, matching-ack wait, accepted-command reply) and the
+// append-ack machinery are shared with the tests/accept_reply.rs regression so
+// the test guards the exact arm the harness runs.
+#[path = "../tests/support/mod.rs"]
+mod fake_node;
+use fake_node::{
+    AckBarrier, FrameQueue, NodeWs, accept_instance_send, append_command_user, append_user_message,
+    durable_command_append, send_command_result_reply, send_rpc_ok, wait_frame_ack,
+};
 
 const BOOTSTRAP: &str = "e2e-bootstrap-token";
 const LISTEN: &str = "127.0.0.1:18787";
@@ -489,10 +500,41 @@ fn bulk_catalog() -> String {
 /// taller than the viewport. Returns the JSON payload fragment and the id
 /// vector (also remembered per instance for listed/typed attribution).
 fn fake_launch_catalog(prompt: Option<&str>) -> (Value, Vec<String>) {
+    // Each trigger is a DISTINCT substring — check the more specific ones
+    // first ("-spelling" before "-same" etc.) so a prompt never matches the
+    // wrong branch.
     let models: Vec<String> = if prompt.is_some_and(|text| text.contains("tall-catalog")) {
         std::iter::once("e2e/auto".to_owned())
             .chain((0..80).map(|i| format!("e2e/m-{i:02}")))
             .collect()
+    } else if prompt.is_some_and(|text| text.contains("auto-vendor-spelling")) {
+        // The cross-spelling case: /auto vs /auto_model across vendors.
+        vec![
+            "vendor-a/auto".to_owned(),
+            "vendor-b/auto_model".to_owned(),
+            "e2e/fast".to_owned(),
+        ]
+    } else if prompt.is_some_and(|text| text.contains("auto-vendor-same")) {
+        // Two CONCRETE vendor models whose final segment is the provider's own
+        // automatic choice. They are distinct full ids and never merge with
+        // each other or with the bare-auto alias.
+        vec![
+            "vendor-a/auto".to_owned(),
+            "vendor-b/auto".to_owned(),
+            "e2e/fast".to_owned(),
+        ]
+    } else if prompt.is_some_and(|text| text.contains("auto-vendor-append")) {
+        // Catalog lists ONLY vendor-a/auto: a read-back of vendor-b/auto must
+        // append that unlisted running id as its own row.
+        vec!["vendor-a/auto".to_owned(), "e2e/fast".to_owned()]
+    } else if prompt.is_some_and(|text| text.contains("shared-tail-collision")) {
+        // Two DISTINCT full ids sharing one final segment: the driver matches
+        // models verbatim, so the web picker renders/selects them by full id.
+        vec![
+            "vendor-a/shared".to_owned(),
+            "vendor-b/shared".to_owned(),
+            "e2e/fast".to_owned(),
+        ]
     } else {
         vec![
             "e2e/auto".to_owned(),
@@ -650,9 +692,13 @@ fn node_hello_frame(host_id: &HostId, workspaces: &Value, epoch: u64, live: &[St
                 "maxInstances": 8,
                 // Inventory only: this harness never launches herdr.
                 "herdr": { "version": "e2e-fake" },
+                // Report the current decoupled build: the effort-sync suite
+                // drives the orthogonal switch (flag on at any tier without
+                // moving the slider) and the live version gate derives from
+                // this inventory when the instance carries no own snapshot.
                 "cli": [{
                     "kind": "claude",
-                    "version": "2.1.268",
+                    "version": "2.1.289",
                     "absolutePath": "/usr/bin/claude",
                     "authState": "logged_in"
                 }, {
@@ -932,6 +978,14 @@ async fn fake_node(
     // Scripted terminal answers: a spawned timer sends (instance, iid, answers)
     // back into this loop so journal appends stay single-writer.
     let (close_tx, mut close_rx) = tokio::sync::mpsc::channel::<(String, String, Value)>(8);
+    // c-reconnfu round 5: `__gate_journal__` parks its mirrored append
+    // OFF the shared RPC read loop. A spawned task polls the test-controlled
+    // release file and, only when it appears, sends the append work back
+    // through this channel so journal frames keep a single writer. On the 60 s
+    // poll timeout it sends NOTHING (no append), so a failed spec can never
+    // stall this loop (instance.close/purge and later specs must answer).
+    let (journal_gate_tx, mut journal_gate_rx) =
+        tokio::sync::mpsc::channel::<(String, Option<String>, String)>(8);
     // Scripted terminal answers awaiting their first `interaction.list`, keyed
     // by interaction id -> instance id. See the `ask-question-terminal` arm.
     let terminal_pending: Arc<Mutex<HashMap<String, String>>> =
@@ -958,6 +1012,50 @@ async fn fake_node(
             biased;
             Some(frame) = requeue_rx.recv() => {
                 frame_queue.push_back(frame);
+            }
+            // c-reconnfu round 5: a __gate_journal__ append whose release
+            // gate the spec just opened. Runs on the read loop (single
+            // writer) after the parked poller task observed the gate file.
+            // c-reconnfu round 6: once the append has been journaled it
+            // writes the per-command ACK file the spec's teardown waits
+            // on, so no fixed sleep decides whether the parked append
+            // landed before instance deletion.
+            Some((gate_instance, gate_command, gate_prompt)) = journal_gate_rx.recv() => {
+                let gate_cid = gate_command.clone().unwrap_or_default();
+                // c-reconnfu gate-19 merge: the parked append runs the SAME
+                // shared durable append/ack path as accept_instance_send
+                // (strict j{seq} ack validation) — never a second append
+                // helper. The acceptance RPC (real typed CommandResult) was
+                // already answered when the send first arrived.
+                let (gate_seq, _gate_ack) = durable_command_append(
+                    &mut ws,
+                    &mut frame_queue,
+                    &gate_instance,
+                    append_n,
+                    &gate_prompt,
+                    gate_command.as_deref(),
+                    None,
+                    &AckBarrier::Immediate,
+                )
+                .await?;
+                append_n = gate_seq;
+                append_n = append_journal(
+                    &mut ws,
+                    &gate_instance,
+                    append_n,
+                    "assistant",
+                    &format!("echo: {gate_prompt}"),
+                )
+                .await?;
+                append_n =
+                    append_native_status(&mut ws, &gate_instance, append_n, "idle").await?;
+                // Every append drained its ack frame, so the Hub has the
+                // user observation; tell the spec it is safe to delete.
+                let ack = std::env::temp_dir().join(format!(
+                    "remuda-e2e-journal-ack-{}-{gate_cid}",
+                    addr.port()
+                ));
+                let _ = std::fs::write(&ack, "journaled\n");
             }
             Some((closed_instance, closed_iid, terminal_answers)) = close_rx.recv() => {
                 let Some(card) = pending.lock().await.remove(&closed_iid) else {
@@ -1246,7 +1344,11 @@ async fn fake_node(
                         .await?;
                         // §9.1 model-sync: the driver's launch snapshot carries the
                         // gateway-discovered catalog and the launch model so the
-                        // picker shows the real list immediately.
+                        // picker shows the real list immediately. The effective id
+                        // is the requested id VERBATIM — production passes the
+                        // model through unchanged (launch/user.rs merges it as-is;
+                        // there is no passthrough/auto → gateway-id resolution in
+                        // the driver), so the fake invents none.
                         let launch_model = spec
                             .get("modelId")
                             .or_else(|| spec.get("model"))
@@ -1276,6 +1378,12 @@ async fn fake_node(
                             }),
                         )
                         .await?;
+                        // A freshly launched claude-pty is at its prompt: the
+                        // real driver reports Turn agent_status idle, which is
+                        // what the composer reads to send an Enter prompt
+                        // immediately (busy/blocked would queue it as held).
+                        append_n =
+                            append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
                         send_rpc_ok(&mut ws, id, create_result(spec, &instance_id)).await?;
                         continue;
                     }
@@ -1369,18 +1477,19 @@ async fn fake_node(
                         .await?;
                         continue;
                     }
-                    // c-ghostbadge round 2: a GENUINELY live hook approval
-                    // with a short known deadline. The card is journaled
-                    // durably AND held in the live broker, so badge and
-                    // inbox both show 1/1 while the agent is blocked. The
-                    // spec then ends the instance through a REAL node
-                    // restart (instance.send sentinel `GHOSTNODE_RESTART`):
-                    // the new epoch omits the instance, the Hub's
-                    // reconcile_reported_instances settles it exited, the
-                    // new process serves no interaction.list for it, and
-                    // once the deadline crosses the shared projection drops
-                    // the durable pending row to expired — 0/0 with no
-                    // reload. Nothing here is pre-ended.
+                    // c-ghostbadge round 2 / c-cardsettle r9: a GENUINELY
+                    // live hook approval with a short KNOWN deadline. The
+                    // card is journaled durably AND held in the live broker,
+                    // so badge and inbox both show 1/1 while the agent is
+                    // blocked. The spec then ends the instance through a
+                    // REAL node restart (instance.send sentinel
+                    // `GHOSTNODE_RESTART`): the new epoch omits the instance,
+                    // the Hub's reconcile_reported_instances settles it
+                    // exited AND invalidates the card in the SAME
+                    // transaction regardless of its still-open deadline (r9
+                    // item 1; the Hub has no deadline sweeper), and the
+                    // settlement control frame flips badge/inbox 0/0 in
+                    // place with no reload.
                     if prompt.contains("ghostbadge-live") {
                         let iid = InteractionId::new();
                         // Long enough that the e2e's create -> restart ->
@@ -1647,7 +1756,7 @@ async fn fake_node(
                     // same way, after one usage observation so its home row has
                     // a known 50% context ring (100k of the 200k Claude window).
                     if prompt.contains("mhome-blocked") {
-                        if let Some(usage) = scripted_usage("usage:40000,500,60000,0") {
+                        if let Some(usage) = scripted_usage("usage:40000,500,60000,0", append_n) {
                             append_n = append_event(
                                 &mut ws,
                                 &mut frame_queue,
@@ -1684,6 +1793,8 @@ async fn fake_node(
                     // carrier (claude-pty emits in its own branch above; shell-pty
                     // and print land here).
                     if kind == "claude" {
+                        // Verbatim effective id (no invented resolution; see the
+                        // claude-pty create arm above).
                         let launch_model = spec
                             .get("modelId")
                             .or_else(|| spec.get("model"))
@@ -1750,36 +1861,90 @@ async fn fake_node(
                         .await?;
                         continue;
                     }
-                    // c-hubfakeack determinism regression (`__ackbarrier__:hold`
-                    // followed by `__ackbarrier__:next`): the hold command parks
-                    // its append-ack wait until a FURTHER Hub RPC is buffered,
-                    // forcing the swallowed-frame race structurally; both reply
-                    // `accepted:true` so the Hub marks the row accepted from the
-                    // RPC reply itself (not via later journal reconcile).
-                    if prompt.starts_with("__ackbarrier__:") {
-                        if prompt.contains(":hold") {
-                            append_n = append_command_user_barrier(
-                                &mut ws,
-                                &mut frame_queue,
-                                addr.port(),
-                                tracked_ack_reply.clone(),
-                                &instance_id,
-                                append_n,
-                                prompt,
-                                command_id,
-                            )
-                            .await?;
-                        } else {
-                            append_n = append_command_user(
-                                &mut ws,
-                                &mut frame_queue,
-                                &instance_id,
-                                append_n,
-                                prompt,
-                                command_id,
-                            )
-                            .await?;
+                    // c-reconnfu: `__gate_journal__` answers the send with the
+                    // REAL typed CommandResult immediately (the shared
+                    // send_command_result_reply builder — never a hand-built
+                    // {accepted:true} envelope) and parks the mirrored durable
+                    // appends OFF this read loop; a spawned task polls the
+                    // spec-controlled release/cancel file (no socket IO) and,
+                    // on release, sends the append work back via
+                    // journal_gate_tx (single writer), where the SAME shared
+                    // durable_command_append/ack path journals it.
+                    if prompt == "__gate_journal__" {
+                        if let Some(cid) = command_id {
+                            send_command_result_reply(&mut ws, id, cid, &instance_id).await?;
+                            let tmp = std::env::temp_dir();
+                            let gate = tmp
+                                .join(format!("remuda-e2e-journal-release-{}-{cid}", addr.port()));
+                            let cancel = tmp
+                                .join(format!("remuda-e2e-journal-cancel-{}-{cid}", addr.port()));
+                            let ack =
+                                tmp.join(format!("remuda-e2e-journal-ack-{}-{cid}", addr.port()));
+                            let gate_tx = journal_gate_tx.clone();
+                            let gate_instance = instance_id.clone();
+                            let gate_prompt = prompt.to_string();
+                            let gate_cid = cid.to_string();
+                            tokio::spawn(async move {
+                                let step = Duration::from_millis(100);
+                                let max = Duration::from_secs(60);
+                                let mut waited = Duration::ZERO;
+                                let mut decision: Option<bool> = None;
+                                while waited < max {
+                                    if cancel.exists() {
+                                        let _ = std::fs::remove_file(&cancel);
+                                        decision = Some(false);
+                                        break;
+                                    }
+                                    if gate.exists() {
+                                        let _ = std::fs::remove_file(&gate);
+                                        decision = Some(true);
+                                        break;
+                                    }
+                                    tokio::time::sleep(step).await;
+                                    waited += step;
+                                }
+                                match decision {
+                                    Some(true) => {
+                                        let _ = gate_tx
+                                            .send((gate_instance, Some(gate_cid), gate_prompt))
+                                            .await;
+                                    }
+                                    Some(false) => {
+                                        let _ = std::fs::write(&ack, "cancelled\n");
+                                    }
+                                    None => {}
+                                }
+                            });
                         }
+                        continue;
+                    }
+                    // c-reconnfu: `__hold_journal__:<ms>` answers the send
+                    // with the REAL typed CommandResult first (so the Hub row
+                    // is accepted and the bubble can leave the in-flight
+                    // label), then WITHHOLDS the mirrored durable user
+                    // observation for the scripted delay — the deterministic
+                    // lost-response replay window — before journaling through
+                    // the SAME shared durable append/ack path and completing
+                    // the turn.
+                    if let Some(ms) = prompt
+                        .strip_prefix("__hold_journal__:")
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        let hold_cid = command_id.context("instance.send requires commandId")?;
+                        send_command_result_reply(&mut ws, id, hold_cid, &instance_id).await?;
+                        tokio::time::sleep(Duration::from_millis(ms)).await;
+                        let (hold_seq, _hold_ack) = durable_command_append(
+                            &mut ws,
+                            &mut frame_queue,
+                            &instance_id,
+                            append_n,
+                            prompt,
+                            Some(hold_cid),
+                            None,
+                            &AckBarrier::Immediate,
+                        )
+                        .await?;
+                        append_n = hold_seq;
                         append_n = append_journal(
                             &mut ws,
                             &instance_id,
@@ -1790,18 +1955,48 @@ async fn fake_node(
                         .await?;
                         append_n =
                             append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
-                        send_rpc_ok(
+                        continue;
+                    }
+                    // c-hubfakeack determinism regression (`__ackbarrier__:hold`
+                    // followed by `__ackbarrier__:next`): the hold command parks
+                    // its append-ack wait until a FURTHER Hub RPC is buffered,
+                    // forcing the swallowed-frame race structurally. BOTH
+                    // variants run the SAME accept_instance_send contract as
+                    // the normal arm (durable append → strict ack → real typed
+                    // CommandResult); hold only adds the deterministic
+                    // intervening-RPC barrier INSIDE that shared operation.
+                    if prompt.starts_with("__ackbarrier__:") {
+                        let barrier = if prompt.contains(":hold") {
+                            AckBarrier::InterveningRpc {
+                                port: addr.port(),
+                                tracked: tracked_ack_reply.clone(),
+                            }
+                        } else {
+                            AckBarrier::Immediate
+                        };
+                        let accepted = accept_instance_send(
                             &mut ws,
+                            &mut frame_queue,
                             id,
-                            json!({
-                                "accepted": true,
-                                "command": {
-                                    "state": "accepted",
-                                    "commandId": command_id.unwrap_or(""),
-                                }
-                            }),
+                            &instance_id,
+                            append_n,
+                            prompt,
+                            command_id.context("instance.send requires commandId")?,
+                            None,
+                            &barrier,
                         )
                         .await?;
+                        append_n = accepted.append_seq;
+                        append_n = append_journal(
+                            &mut ws,
+                            &instance_id,
+                            append_n,
+                            "assistant",
+                            &format!("echo: {prompt}"),
+                        )
+                        .await?;
+                        append_n =
+                            append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
                         continue;
                     }
                     // c-journalpage bounded-window seeding hook:
@@ -1898,7 +2093,7 @@ async fn fake_node(
                     // prompt appends one full protocol usage observation (each
                     // position `-` = the channel was not reported, exercising the
                     // Hub rollup's unknown-not-zero rule), then ends the turn.
-                    if let Some(usage) = scripted_usage(prompt) {
+                    if let Some(mut usage) = scripted_usage(prompt, append_n) {
                         send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
                         append_n = append_command_user(
                             &mut ws,
@@ -1909,15 +2104,32 @@ async fn fake_node(
                             command_id,
                         )
                         .await?;
-                        append_n = append_event(
-                            &mut ws,
-                            &mut frame_queue,
-                            &instance_id,
-                            append_n,
-                            "usage",
-                            usage,
-                        )
-                        .await?;
+                        // c-ctxusage r5 item 7: the Hub projection reads
+                        // nativeAt at the EVENT level (event.nativeAt), not
+                        // inside payload. Lift it so the sentinel is a live
+                        // observation that enters the rate window.
+                        let native_at =
+                            usage.as_object_mut().and_then(|obj| obj.remove("nativeAt"));
+                        if let Some(native_at) = native_at {
+                            append_n = append_full_event(
+                                &mut ws,
+                                &mut frame_queue,
+                                &instance_id,
+                                append_n,
+                                json!({ "kind": "usage", "payload": usage, "nativeAt": native_at }),
+                            )
+                            .await?;
+                        } else {
+                            append_n = append_event(
+                                &mut ws,
+                                &mut frame_queue,
+                                &instance_id,
+                                append_n,
+                                "usage",
+                                usage,
+                            )
+                            .await?;
+                        }
                         append_n = append_journal(
                             &mut ws,
                             &instance_id,
@@ -2091,15 +2303,30 @@ async fn fake_node(
                     // C2: the journal user node for a composer send carries the
                     // exact commandId the HTTP response returned, so the web folds
                     // optimistic bubble and transcript node into one.
-                    append_n = append_command_user(
+                    //
+                    // ONE shared acceptance contract (tests/support/mod.rs),
+                    // identical to the one accept_reply drives: durably append
+                    // the user message, await its MATCHING ack (an RPC error is
+                    // fatal), and answer the send with the REAL typed
+                    // CommandResult — all before the fake turn journals its
+                    // output, exactly as DevNode accepts at enqueue time and the
+                    // worker runs afterwards. The previous hand-written
+                    // `{ok:true}` / `{accepted:true,command:{…}}` envelopes are
+                    // gone; reverting the shared builder or the ack wait
+                    // reddens the accept_reply regression.
+                    let accepted = accept_instance_send(
                         &mut ws,
                         &mut frame_queue,
+                        id,
                         &instance_id,
                         append_n,
                         prompt,
-                        command_id,
+                        command_id.context("instance.send requires commandId")?,
+                        None,
+                        &AckBarrier::Immediate,
                     )
                     .await?;
+                    append_n = accepted.append_seq;
                     // D-027: echo the attachment metadata the Hub resolved, so the
                     // e2e can prove staging reached the Node without a real agent.
                     // 2026-09-15: also echo the [Image #n] manifest (index +
@@ -2220,7 +2447,9 @@ async fn fake_node(
                         };
                     append_n =
                         append_native_status(&mut ws, &instance_id, append_n, next_status).await?;
-                    send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                    // The acceptance RPC was already sent by accept_instance_send
+                    // above (durable user append → real CommandResult), before
+                    // the turn output streamed — matching DevNode enqueue/accept.
                 }
                 "instance.cancel" => {
                     // §5.3: the turn ends but the instance keeps running.
@@ -2245,6 +2474,7 @@ async fn fake_node(
                                 &instance_id,
                                 append_n,
                                 &format!("model-queued:{mid}"),
+                                None,
                             )
                             .await?;
                         } else if let Some(mid) = requested.strip_prefix("__notfound__:") {
@@ -2254,6 +2484,7 @@ async fn fake_node(
                                 &instance_id,
                                 append_n,
                                 &format!("model-degraded:{mid}:not-found"),
+                                None,
                             )
                             .await?;
                         } else {
@@ -2324,6 +2555,17 @@ async fn fake_node(
                     if let Some(effort) = params.get("effort")
                         && let Some(requested) = effort.get("name").and_then(Value::as_str)
                     {
+                        let effort_request_id = effort
+                            .get("requestId")
+                            .and_then(Value::as_str)
+                            .filter(|id| !id.is_empty());
+                        // D-056: the wire is a native level word plus an
+                        // orthogonal ultracode boolean. Test-only sentinels
+                        // (the UI sends real words, never these):
+                        //   "__queued__:<word>"              → queued lifecycle
+                        //   "__degrade__:<word>:<reason>"    → degraded lifecycle
+                        //   "__ultra_refuse_model__"         → switch refused (model)
+                        //   "__ultra_refuse_workflows__"     → switch refused (workflows)
                         if let Some(word) = requested.strip_prefix("__queued__:") {
                             append_n = append_configure_status(
                                 &mut ws,
@@ -2331,53 +2573,94 @@ async fn fake_node(
                                 &instance_id,
                                 append_n,
                                 &format!("effort-queued:{word}"),
+                                effort_request_id,
                             )
                             .await?;
-                        } else if let Some(word) = requested.strip_prefix("__degrade__:") {
+                        } else if let Some(rest) = requested.strip_prefix("__degrade__:") {
                             append_n = append_configure_status(
                                 &mut ws,
                                 &mut frame_queue,
                                 &instance_id,
                                 append_n,
-                                &format!("effort-degraded:{word}:dialog-kept"),
+                                &format!("effort-degraded:{rest}"),
+                                effort_request_id,
+                            )
+                            .await?;
+                        } else if requested == "__ultra_refuse_model__"
+                            || requested == "__ultra_refuse_workflows__"
+                        {
+                            let reason = if requested == "__ultra_refuse_model__" {
+                                "ultracode:ultracode-unavailable-for-model"
+                            } else {
+                                "ultracode:ultracode-workflows-disabled"
+                            };
+                            append_n = append_configure_status(
+                                &mut ws,
+                                &mut frame_queue,
+                                &instance_id,
+                                append_n,
+                                &format!("effort-degraded:{reason}"),
+                                effort_request_id,
                             )
                             .await?;
                         } else {
-                            // Keep the Claude mismatch fixture; Codex must echo
-                            // both max and ultra unchanged through the Hub.
-                            let clamped = requested == "max"
-                                && instance_kinds.get(&instance_id).map(String::as_str)
-                                    == Some("claude");
-                            let ultra = requested == "ultracode";
-                            // ultracode reads back as tier xhigh on Claude; a
-                            // clamped max reads back xhigh too.
-                            let tier = if clamped || ultra { "xhigh" } else { requested };
+                            let want_ultra = effort
+                                .get("ultracode")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false)
+                                || requested == "ultracode";
+                            // "__clamp__" opts into the clamp explicitly; a
+                            // plain Claude max with the switch OFF also clamps
+                            // (the 2.1.289 case-g model without xhigh), but
+                            // max WITH ultracode on stays on max (D-056).
+                            let clamp_word = requested == "__clamp__"
+                                || requested == "ultracode"
+                                || (requested == "max"
+                                    && instance_kinds.get(&instance_id).map(String::as_str)
+                                        == Some("claude")
+                                    && !want_ultra);
+                            let tier = if clamp_word { "xhigh" } else { requested };
                             let observed_at = monotonic_effort_observed_at();
-                            let event = json!({
-                                "kind": "effort",
-                                "completeness": "structured",
-                                "payload": {
-                                    "requested": {"name": requested,
-                                        "ultracode": effort.get("ultracode").and_then(Value::as_bool).unwrap_or(false)},
-                                    "effective": {
-                                        // Measured 2.1.272: ultracode carries the
-                                        // workflow flag; a plain level accept
-                                        // positively clears it; an unrelated clamp
-                                        // leaves the flag unknown.
-                                        "name": tier,
-                                        "ultracode": if ultra {
-                                            serde_json::Value::Bool(true)
-                                        } else if clamped {
-                                            serde_json::Value::Null
-                                        } else {
-                                            serde_json::Value::Bool(false)
+                            // The flag is its OWN axis. On is positively
+                            // confirmed at the requested level; a plain level
+                            // request reports positive off; the opt-in clamp
+                            // leaves the flag unconfirmed (null).
+                            let flag: serde_json::Value = if want_ultra {
+                                serde_json::Value::Bool(true)
+                            } else if clamp_word {
+                                serde_json::Value::Null
+                            } else {
+                                serde_json::Value::Bool(false)
+                            };
+                            let event = {
+                                // c-effortread r11: a real driver stamps the
+                                // verdict observation with the configure's own
+                                // request id, so the web settles (and accepts a
+                                // clamped/opposite outcome) on that echo instead
+                                // of the stricter id-less legacy fallback.
+                                let request_id = effort
+                                    .get("requestId")
+                                    .and_then(Value::as_str)
+                                    .filter(|id| !id.is_empty());
+                                let mut event = json!({
+                                    "kind": "effort",
+                                    "completeness": "structured",
+                                    "payload": {
+                                        "requested": {"name": requested, "ultracode": want_ultra},
+                                        "effective": {
+                                            "name": tier,
+                                            "ultracode": flag,
+                                            "source": "remuda",
+                                            "observedAt": observed_at
                                         },
-                                        "source": "remuda",
-                                        "observedAt": observed_at
-                                    },
-                                    "raw": tier
+                                        "raw": tier
+                                    }
+                                });
+                                if let Some(id) = request_id {
+                                    event["payload"]["requestId"] = json!(id);
                                 }
-                            });
+                                event
+                            };
                             append_n = append_event(
                                 &mut ws,
                                 &mut frame_queue,
@@ -2403,6 +2686,7 @@ async fn fake_node(
                                 &instance_id,
                                 append_n,
                                 &format!("permission-queued:{word}"),
+                                None,
                             )
                             .await?;
                         } else if let Some(word) = requested.strip_prefix("__degrade__:") {
@@ -2412,6 +2696,7 @@ async fn fake_node(
                                 &instance_id,
                                 append_n,
                                 &format!("permission-degraded:{word}:no-status-line"),
+                                None,
                             )
                             .await?;
                         } else {
@@ -2946,232 +3231,12 @@ async fn fake_node(
     Ok(())
 }
 
-/// Total time one journal append may take to be acknowledged. This is an
-/// ABSOLUTE budget: it must not reset per received frame, or a steady trickle
-/// of unrelated frames (interaction.list polls every ~2 s, pipelined RPCs)
-/// would let a missing ack park the Node in the append handler forever and
-/// grow the stash without bound.
-const FRAME_ACK_TIMEOUT: Duration = Duration::from_secs(5);
-/// Bound on frames stashed behind one ack wait. Hitting it is a LOUD harness
-/// failure, never an unbounded queue.
-const PENDING_FRAME_QUEUE_CAP: usize = 4096;
 /// c-hubfakeack determinism barrier: how long the marked send waits for the
 /// NEXT interaction.list RPC to already be on the wire while its own append
 /// ack is outstanding. The spec issues that GET itself, so the frame is
 /// present within milliseconds. This is deliberately WELL BELOW the Hub's
 /// 5 s command-accept budget (DEFAULT_COMMAND_ACCEPT_TIMEOUT_MS): a missed RPC
 /// fails loudly in the Node before the Hub gives up and returns reconciling.
-const ACK_BARRIER_TIMEOUT: Duration = Duration::from_millis(2_000);
-/// Test-only negative control: HUB_E2E_ACK_DISCARD=1 makes the barrier RECORD
-/// the intervening interaction.list (and its marker) but DROP the frame,
-/// reproducing the old swallowed-frame bug while keeping the new markers. The
-/// reply marker must then never appear, proving the test has real power.
-fn ack_discard_enabled() -> bool {
-    std::env::var("HUB_E2E_ACK_DISCARD").as_deref() == Ok("1")
-}
-
-/// Classify a frame against the wanted append-ack id.
-///
-/// - `Some(Ok(()))`  — a matching SUCCESS response (object `result`, no error)
-/// - `Some(Err(_))`  — a matching response carrying an `error`, or no result
-///   object (a rejected/failed append must never be hidden as success)
-/// - `None`          — not the wanted response (a Hub RPC or a stale ack)
-fn classify_ack_frame(value: &Value, want: &str) -> Option<Result<()>> {
-    if value.get("method").is_some() {
-        return None;
-    }
-    if value.get("id").and_then(Value::as_str) != Some(want) {
-        return None;
-    }
-    if let Some(error) = value.get("error") {
-        return Some(Err(anyhow!("append ack {want} was an RPC error: {error}")));
-    }
-    if !value.get("result").is_some_and(Value::is_object) {
-        return Some(Err(anyhow!(
-            "append ack {want} carried no result object: {value}"
-        )));
-    }
-    Some(Ok(()))
-}
-
-/// Read frames until the Hub acknowledges the journal append with id `want`.
-///
-/// Uses ONE absolute deadline (`FRAME_ACK_TIMEOUT` from the first call),
-/// blocking only for the time remaining each iteration. Before blocking it
-/// scans `queue` for an already-buffered matching ack (the determinism
-/// barrier and nested appends can stash the ack ahead of unrelated RPCs).
-///
-/// Every other frame — a stale fire-and-forget append ack or an unrelated Hub
-/// RPC like the web poll's interaction.list — is stashed in `queue` for the
-/// main loop to process, so waiting on durability can never swallow an RPC.
-/// A missing ack, an `error` ack, or an over-capacity queue is a loud error
-/// that the spawn supervisor turns into a non-zero harness exit.
-async fn wait_frame_ack(ws: &mut NodeWs, queue: &mut FrameQueue, want: &str) -> Result<()> {
-    let deadline = Instant::now() + FRAME_ACK_TIMEOUT;
-    loop {
-        // 1. Already-buffered match (the ack may be queued ahead of RPCs).
-        if let Some(pos) = queue.iter().position(|frame| {
-            serde_json::from_str::<Value>(frame)
-                .map(|v| classify_ack_frame(&v, want).is_some())
-                .unwrap_or(false)
-        }) {
-            let frame = queue.remove(pos).context("frame queue position vanished")?;
-            let value: Value = serde_json::from_str(&frame)?;
-            classify_ack_frame(&value, want).expect("frame just matched")?;
-            return Ok(());
-        }
-        // 2. Block for the REMAINING time only — the deadline never extends.
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            anyhow::bail!(
-                "timed out after {} ms waiting for append ack {want} ({} frame(s) queued)",
-                FRAME_ACK_TIMEOUT.as_millis(),
-                queue.len()
-            );
-        }
-        let frame = match tokio::time::timeout(remaining, ws.next()).await {
-            Ok(Some(Ok(Message::Text(text)))) => text,
-            Ok(_) => anyhow::bail!("hub connection closed waiting for append ack {want}"),
-            Err(_) => {
-                anyhow::bail!(
-                    "timed out after {} ms waiting for append ack {want} ({} frame(s) queued)",
-                    FRAME_ACK_TIMEOUT.as_millis(),
-                    queue.len()
-                )
-            }
-        };
-        let value: Value = serde_json::from_str(&frame)?;
-        match classify_ack_frame(&value, want) {
-            Some(Ok(())) => return Ok(()),
-            Some(Err(reason)) => return Err(reason),
-            None => {
-                if queue.len() >= PENDING_FRAME_QUEUE_CAP {
-                    anyhow::bail!(
-                        "pending frame queue overflow (>{PENDING_FRAME_QUEUE_CAP}) waiting for append ack {want}"
-                    );
-                }
-                queue.push_back(frame.to_string());
-            }
-        }
-    }
-}
-
-/// c-hubfakeack determinism barrier (test-only): do not let an append ack
-/// complete until a FURTHER Hub→Node RPC has actually arrived on the socket
-/// and been stashed. This makes the "RPC buffered behind an outstanding ack"
-/// race structural instead of relying on scheduler timing: the marked send
-/// parks here, and the Hub (which pipelines instance.send over independent
-/// in-flight slots) forwards the next command into this wait. Every frame —
-/// including an ack that arrives early — is queued; the caller then runs the
-/// normal [`wait_frame_ack`], which resolves from the queue. Writes a marker
-/// file (counting intervening RPCs) so the Playwright spec can prove the
-/// intervening RPC really was queued, not merely that two sends succeeded.
-///
-/// If no further RPC arrives within the barrier window the Node is mis-wired
-/// or the Hub serialised — a loud error rather than a silent pass.
-/// The interaction.list frame the ack barrier is waiting for, if `frame` is
-/// one: returns its parsed JSON-RPC id.
-fn interaction_list_id(frame: &str) -> Option<Value> {
-    let value: Value = serde_json::from_str(frame).ok()?;
-    if value.get("method").and_then(Value::as_str) == Some("interaction.list") {
-        value.get("id").cloned()
-    } else {
-        None
-    }
-}
-
-/// Park behind the append ack `want` until an `interaction.list` RPC is
-/// buffered (the spec issues that GET itself). Records the RPC's id in
-/// `tracked` and writes the QUEUE marker (`<id> interaction.list`) the moment
-/// the frame arrives. Under HUB_E2E_ACK_DISCARD=1 the frame is recorded but
-/// then DROPPED (negative control): the interaction.list arm can never answer
-/// it, so the separate REPLY marker never appears even though the queue marker
-/// does — exactly the gap this regression must catch.
-async fn ensure_intervening_rpc(
-    ws: &mut NodeWs,
-    queue: &mut FrameQueue,
-    want: &str,
-    port: u16,
-    tracked: std::sync::Arc<tokio::sync::Mutex<Option<Value>>>,
-) -> Result<()> {
-    let queue_marker = std::env::temp_dir().join(format!("remuda-e2e-ackqueue-{port}"));
-    let record = |rpc_id: &Value| {
-        let body = format!("{rpc_id} interaction.list");
-        std::fs::write(&queue_marker, body)
-            .with_context(|| format!("write ack queue marker {}", queue_marker.display()))
-    };
-
-    // 1. Already buffered ahead of the wait; remember its QUEUE POSITION so the
-    // discard negative control can remove THAT entry (removing only a clone
-    // would leave the original queued, answered, and wrongly reply-marked).
-    let mut found: Option<(Value, String, Option<usize>)> = queue
-        .iter()
-        .position(|f| interaction_list_id(f).is_some())
-        .map(|pos| {
-            let frame = &queue[pos];
-            (
-                interaction_list_id(frame).expect("just matched"),
-                frame.clone(),
-                Some(pos),
-            )
-        });
-
-    let deadline = Instant::now() + ACK_BARRIER_TIMEOUT;
-    while found.is_none() {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            anyhow::bail!(
-                "ack barrier: no interaction.list arrived behind append ack {want} within {} ms",
-                ACK_BARRIER_TIMEOUT.as_millis()
-            );
-        }
-        match tokio::time::timeout(remaining, ws.next()).await {
-            Ok(Some(Ok(Message::Text(text)))) => {
-                let text = text.to_string();
-                if interaction_list_id(&text).is_some() {
-                    // A frame just read: not in the queue yet (position None).
-                    let id = interaction_list_id(&text).expect("matched above");
-                    found = Some((id, text, None));
-                } else if queue.len() < PENDING_FRAME_QUEUE_CAP {
-                    // A journal ack or other RPC: stash for the dispatch loop.
-                    queue.push_back(text);
-                } else {
-                    anyhow::bail!("pending frame queue overflow in ack barrier for {want}");
-                }
-            }
-            Ok(_) => anyhow::bail!("hub connection closed during ack barrier for {want}"),
-            Err(_) => {
-                anyhow::bail!(
-                    "ack barrier: no interaction.list arrived behind append ack {want} within {} ms",
-                    ACK_BARRIER_TIMEOUT.as_millis()
-                )
-            }
-        }
-    }
-
-    let (rpc_id, frame, queued_pos) = found.expect("an interaction.list was observed");
-    record(&rpc_id)?;
-    *tracked.lock().await = Some(rpc_id);
-    if ack_discard_enabled() {
-        // NEGATIVE CONTROL: record + marker written, then REMOVE the frame for
-        // real. If it was already queued, drop the entry at its captured
-        // position; otherwise simply do not enqueue the freshly read frame.
-        if let Some(pos) = queued_pos {
-            if pos < queue.len() && queue[pos] == frame {
-                queue.remove(pos);
-            } else if let Some(eq) = queue.iter().position(|f| f == &frame) {
-                queue.remove(eq);
-            }
-        }
-        tracing::warn!("HUB_E2E_ACK_DISCARD=1: dropped queued interaction.list behind {want}");
-    } else if queued_pos.is_none() && queue.len() < PENDING_FRAME_QUEUE_CAP {
-        // Normal mode, freshly read frame: enqueue it, preserving order.
-        queue.push_back(frame);
-    }
-    // Normal mode with queued_pos = Some: the frame is already in the queue at
-    // its original position; leave it there (do not move it to the back).
-    Ok(())
-}
 /// Journal the entity lifecycle a terminal-answered question settles with:
 /// state `resolved`, actor human with no device, answer carried verbatim.
 async fn append_terminal_resolution(
@@ -3560,31 +3625,6 @@ impl TtyFake {
         (!line.is_empty()).then_some(line)
     }
 }
-
-async fn send_rpc_ok(
-    ws: &mut tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
-    id: Value,
-    result: Value,
-) -> Result<()> {
-    ws.send(Message::Text(
-        json!({ "jsonrpc": "2.0", "id": id, "result": result })
-            .to_string()
-            .into(),
-    ))
-    .await?;
-    Ok(())
-}
-
-type NodeWs =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
-
-/// c-hubfakeack: frames stashed while an append waits for its own ack. Every
-/// journal.append waits on its JSON-RPC id; a Hub RPC (instance.send,
-/// interaction.list, tty.screen, …) that arrives meanwhile is pushed here so
-/// the main dispatch loop answers it — never swallowed by the ack wait.
-type FrameQueue = std::collections::VecDeque<String>;
 
 // ── t-bind fake worktree layer (HUB_E2E_TASK_BIND=1 only) ──────────────────
 //
@@ -4312,120 +4352,6 @@ async fn append_uo6b_epoch_live(
         }),
     )
     .await
-}
-
-/// One full-shape user message observation. A composer/command send carries
-/// `command_id` (C2 correlation); a natively typed prompt omits it.
-/// Send one command/user journal message frame and return its `j{seq}` id;
-/// does NOT wait for the append ack (callers drive [`wait_frame_ack`],
-/// possibly behind the determinism barrier).
-async fn send_user_message_frame(
-    ws: &mut NodeWs,
-    instance_id: &str,
-    n: u64,
-    text: &str,
-    command_id: Option<&str>,
-    node: &str,
-) -> Result<u64> {
-    let seq = n + 1;
-    let mut payload = json!({
-        "nodeId": node,
-        "messageId": node,
-        "revision": "1",
-        "operation": "open",
-        "role": "user",
-        "phase": "input",
-        "blocks": [{ "type": "text", "text": text }],
-        "targetBlock": null,
-        "parentToolCallId": null,
-        "nativeOrigin": { "state": "known", "value": "ui" },
-        "origin": "human",
-        "status": "complete",
-    });
-    if let Some(command_id) = command_id {
-        payload["commandId"] = json!(command_id);
-    }
-    ws.send(Message::Text(
-        json!({
-            "jsonrpc": "2.0",
-            "id": format!("j{seq}"),
-            "method": "journal.append",
-            "params": {
-                "instanceId": instance_id,
-                "event": {
-                    "kind": "message",
-                    "completeness": "structured",
-                    "payload": payload,
-                }
-            }
-        })
-        .to_string()
-        .into(),
-    ))
-    .await?;
-    Ok(seq)
-}
-
-async fn append_user_message(
-    ws: &mut NodeWs,
-    queue: &mut FrameQueue,
-    instance_id: &str,
-    n: u64,
-    text: &str,
-    command_id: Option<&str>,
-    node: &str,
-) -> Result<u64> {
-    let seq = send_user_message_frame(ws, instance_id, n, text, command_id, node).await?;
-    wait_frame_ack(ws, queue, &format!("j{seq}")).await?;
-    Ok(seq)
-}
-
-/// c-hubfakeack barrier command: append the user frame, then force a FURTHER
-/// Hub RPC to be buffered behind this append's outstanding ack before
-/// matching it. Proves the queue-and-drain path under a guaranteed race and
-/// that the ack itself is an explicit success (wait_frame_ack rejects an
-/// `error` ack). The marker file reports how many intervening RPCs were
-/// stashed.
-#[allow(clippy::too_many_arguments)]
-async fn append_command_user_barrier(
-    ws: &mut NodeWs,
-    queue: &mut FrameQueue,
-    port: u16,
-    tracked: std::sync::Arc<tokio::sync::Mutex<Option<Value>>>,
-    instance_id: &str,
-    n: u64,
-    text: &str,
-    command_id: Option<&str>,
-) -> Result<u64> {
-    let node = command_id
-        .map(|id| {
-            id.strip_prefix("cmd_")
-                .map_or_else(|| format!("obj_node_{n}"), |uuid| format!("obj_{uuid}"))
-        })
-        .unwrap_or_else(|| format!("obj_legacy_{n}"));
-    let seq = send_user_message_frame(ws, instance_id, n, text, command_id, &node).await?;
-    let want = format!("j{seq}");
-    ensure_intervening_rpc(ws, queue, &want, port, tracked).await?;
-    wait_frame_ack(ws, queue, &want).await?;
-    Ok(seq)
-}
-
-/// A command-delivered prompt: its user node carries the delivering commandId.
-async fn append_command_user(
-    ws: &mut NodeWs,
-    queue: &mut FrameQueue,
-    instance_id: &str,
-    n: u64,
-    text: &str,
-    command_id: Option<&str>,
-) -> Result<u64> {
-    let node = command_id
-        .map(|id| {
-            id.strip_prefix("cmd_")
-                .map_or_else(|| format!("obj_node_{n}"), |uuid| format!("obj_{uuid}"))
-        })
-        .unwrap_or_else(|| format!("obj_legacy_{n}"));
-    append_user_message(ws, queue, instance_id, n, text, command_id, &node).await
 }
 
 /// A prompt typed natively into the PTY: human origin, no commandId, its own
@@ -5178,8 +5104,23 @@ async fn append_configure_status(
     instance_id: &str,
     n: u64,
     status: &str,
+    effort_request_id: Option<&str>,
 ) -> Result<u64> {
     let seq = n + 1;
+    let mut event = json!({
+        "kind": "lifecycle",
+        "payload": {
+            "type": "native",
+            "nativeName": "instance.configure",
+            "status": status
+        }
+    });
+    // c-effortread r11: the fake driver echoes the configure's request id on
+    // lifecycle edges, exactly like the real driver; the web binds queued/
+    // degraded edges to that request rather than the id-less legacy matcher.
+    if let Some(id) = effort_request_id.filter(|id| !id.is_empty()) {
+        event["payload"]["relatedIds"] = json!({ "effortRequestId": id });
+    }
     ws.send(Message::Text(
         json!({
             "jsonrpc": "2.0",
@@ -5187,14 +5128,7 @@ async fn append_configure_status(
             "method": "journal.append",
             "params": {
                 "instanceId": instance_id,
-                "event": {
-                    "kind": "lifecycle",
-                    "payload": {
-                        "type": "native",
-                        "nativeName": "instance.configure",
-                        "status": status
-                    }
-                }
+                "event": event
             }
         })
         .to_string()
@@ -5291,7 +5225,13 @@ fn wf_timestamp(offset_ms: i128) -> Value {
 /// `usage:<input>,<output>,<cacheRead>,<cacheWrite>`; each field is a
 /// non-negative integer or `-` for a channel the harness never reported.
 /// Returns the full protocol UsagePayload the driver would have appended.
-fn scripted_usage(prompt: &str) -> Option<Value> {
+///
+/// `turn` is a per-turn discriminator for `scopeId`: every real assistant
+/// message has a distinct message id, so distinct scripted turns must not
+/// share a scope id (the Hub durably dedupes on
+/// `(instance_id, scope, scope_id)` and would otherwise fold later turns into
+/// the first).
+fn scripted_usage(prompt: &str, turn: u64) -> Option<Value> {
     let body = prompt.strip_prefix("usage:")?;
     let parts: Vec<Option<u64>> = body
         .split(',')
@@ -5320,7 +5260,7 @@ fn scripted_usage(prompt: &str) -> Option<Value> {
     Some(json!({
         "usageId": "obj_e2e_usage",
         "scope": "turn",
-        "scopeId": "obj_e2e_run",
+        "scopeId": format!("obj_e2e_run_{turn}"),
         "mode": "snapshot",
         "metricRevision": "1",
         "inputTokens": knowledge(input),
@@ -5332,6 +5272,16 @@ fn scripted_usage(prompt: &str) -> Option<Value> {
         "totalTokens": knowledge(total),
         "cost": { "state": "unknown", "reason": "unpriced", "evidenceEventIds": [] },
         "accounting": "estimated",
+        // The fake session's model id is not in the Hub's static catalog and
+        // the e2e profile has no declared window, so the rollup would use the
+        // approximate kind-fallback. A real driver reports the per-model
+        // window on usage observations (c-usagefu (c)); mirror that (a bare
+        // protocol U64 scalar, like to_usage_payload encodes it) so the
+        // ux-usage chip shows an EXACT percentage (200k window → 17%).
+        "contextWindow": "200000",
+        // c-ctxusage r5 item 7: the sentinel's usage is a live observation, so
+        // it carries a current nativeAt and enters the rate window.
+        "nativeAt": { "state": "known", "value": monotonic_effort_observed_at() },
         "nativeFieldsRef": null
     }))
 }

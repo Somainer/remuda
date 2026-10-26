@@ -53,6 +53,8 @@ pub mod keys;
 pub mod launch;
 pub mod lifecycle;
 mod promotion;
+#[cfg(test)]
+mod resume_gap_test;
 pub mod send;
 
 pub use launch::{AgentLaunch, CARRIER_ENV, Target, native_carrier_enabled};
@@ -143,6 +145,10 @@ pub struct ShellPtyOptions {
     pub extra_env: std::collections::BTreeMap<String, String>,
     /// Authenticated instance context, injected only after environment filtering.
     pub agent_mcp: Option<crate::agent_mcp::AgentMcpContext>,
+    /// Identity of the Node that built this driver (c-usagefu r18 items 2/3).
+    /// `None` for drivers constructed outside a composed Node (unit tests,
+    /// embedded use): their retained blocks live in the detached bag.
+    pub node_epoch: Option<crate::adapters::codex_discovery::NodeEpoch>,
     /// Initial columns.
     pub cols: u16,
     /// Initial rows.
@@ -225,6 +231,14 @@ pub struct ShellPtyOptions {
     /// `None` only for a driver built outside a Node (tests,
     /// [`ShellPtyDriver::spawn`]), which mints one.
     pub instance_id: Option<InstanceId>,
+    /// Fault injection: make `spawn_at` fail at the post-spawn adapter-setup
+    /// decision — AFTER the child spawned and the switch workers started — so a
+    /// test can drive the real launch path into its failure cleanup (reap the
+    /// child, abort workers, clear `inner`) instead of calling the cleanup
+    /// primitive directly. Only compiled under the test/fake-harness build;
+    /// absent from release code.
+    #[cfg(any(test, feature = "test-stub"))]
+    pub fail_after_spawn: bool,
 }
 
 /// What the driver needs to stand up this instance's hook path.
@@ -260,6 +274,9 @@ impl ShellPtyOptions {
             auto_trust_workspace: false,
             agent: None,
             instance_id: None,
+            node_epoch: None,
+            #[cfg(any(test, feature = "test-stub"))]
+            fail_after_spawn: false,
         }
     }
 
@@ -459,7 +476,20 @@ pub struct ShellPtyDriver {
     /// Deterministic transcript binding for the current promotion epoch.
     bindings: promotion::BindingHandle,
     /// Promotion poller, stopped on close.
+    #[cfg(any(test, feature = "test-stub"))]
+    poller: Mutex<Option<promotion::PollerTask>>,
+    #[cfg(not(any(test, feature = "test-stub")))]
     poller: Mutex<Option<JoinHandle<()>>>,
+    /// Cooperative-shutdown signal for the promotion poller and the channel its
+    /// `finish()` completes on (c-ctxusage r5 item 6): close waits for the last
+    /// hydrator finalise instead of aborting mid-pump.
+    poller_shutdown: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
+    poller_finalised: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    /// Serializes overlapping `close()` calls (c-usagefu r18 item 1): the first
+    /// close owns the whole teardown; a concurrent close waits for it and then
+    /// finds no state. Held across the ladder (seconds), never across a
+    /// blocking std guard.
+    close_lock: Mutex<()>,
     /// Exit waiter (§5.5), stopped on close.
     waiter: Mutex<Option<JoinHandle<()>>>,
     /// Process table behind detection; a fixture in tests.
@@ -470,6 +500,25 @@ pub struct ShellPtyDriver {
     /// File-tail signal adapters (codex rollout, grok ACP files). Dropped on
     /// close, which stops their poll tasks (D-028 P6).
     adapters: Mutex<Option<crate::adapters::supervisor::AdapterHandle>>,
+    /// c-usagefu r10 item 1; r11 items 2/3 (Ruling A2): the OWNER guard of the
+    /// codex instance-lifetime cohort for a driver-launched (native/resumed)
+    /// codex, held for the whole run independent of whether its file adapter
+    /// binds (the adapter holds a non-closing witness). The interval is closed
+    /// explicitly in close() only after the stop ladder confirms the process
+    /// is gone (or transferred on resume adoption), so aborting adapters never
+    /// ends it early. None for shells, grok and promoted attaches (the
+    /// promotion poller owns the promoted unknown-boundary cohort).
+    codex_lifetime: Mutex<Option<crate::adapters::codex_discovery::LifetimeGuard>>,
+    /// c-usagefu r12 item 1 (Ruling A2'): OWNER guards of every promoted-codex
+    /// census interval the promotion poller registers, owned by the
+    /// DRIVER/SESSION rather than by the poller or foreground detection. The
+    /// poller only pushes; a demotion never closes. The driver drains the vec
+    /// in close() and closes every interval only after the stop ladder
+    /// confirms the process group terminated (or retains them with Drop-close
+    /// suppressed for the Node's lifetime on a stop-incomplete verdict,
+    /// c-usagefu r17 Ruling W0).
+    promoted_codex_lifetimes:
+        Arc<std::sync::Mutex<Vec<crate::adapters::codex_discovery::LifetimeGuard>>>,
     /// Recipe from the last start, reused by [`Driver::close`] to journal what
     /// it stopped and by the Node to audit what was launched.
     recipe: std::sync::Mutex<Option<LaunchRecipe>>,
@@ -503,13 +552,87 @@ pub struct ShellPtyDriver {
     interrupt_pid: Arc<AtomicI32>,
     interrupt_screen_markers: Arc<std::sync::Mutex<promotion::InterruptBaseline>>,
     seq: Arc<AtomicU64>,
+    /// c-usagefu r17 W0 test seam: when set, close() substitutes this ladder
+    /// outcome (a stop-incomplete naming a survivor the regression controls)
+    /// for the real one AFTER the real ladder has run — its signals and group
+    /// scan are never skipped. Gated `test-stub` so Node integration tests
+    /// (remuda-node pulls the driver in with that feature) can drive the real
+    /// DevNode close/recompose path deterministically.
+    #[cfg(any(test, feature = "test-stub"))]
+    test_stop_outcome: std::sync::Mutex<Option<StopOutcome>>,
 }
+
+/// Master endpoint plus its dup'd writer, carried only between spawn and the
+/// [`PtyState`] so a launch failure in that window can hang the slave up.
+type PtyEndpoints = (Box<dyn MasterPty + Send>, Option<Box<dyn io::Write + Send>>);
 
 impl ShellPtyDriver {
     /// Build an unstarted driver.
     #[must_use]
     pub fn new(options: ShellPtyOptions) -> Self {
         Self::with_process_table(options, Arc::new(SystemProcessTable))
+    }
+
+    /// c-usagefu r17 W0 test seam (Node integration tests via `test-stub`):
+    /// force the next close's ladder verdict. The real ladder still runs; only
+    /// its verdict is substituted.
+    #[cfg(any(test, feature = "test-stub"))]
+    pub fn test_force_stop_outcome(&self, outcome: lifecycle::StopOutcome) {
+        *self
+            .test_stop_outcome
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outcome);
+    }
+
+    /// c-usagefu r18 items 2/3 test seam: the spawned child's process group.
+    #[cfg(any(test, feature = "test-stub"))]
+    pub fn test_pgid(&self) -> Option<i32> {
+        self.inner.try_lock().ok().and_then(|guard| {
+            guard
+                .as_ref()
+                .map(|state| state.pgid.load(Ordering::SeqCst))
+        })
+    }
+
+    /// c-usagefu r21 item 3 test seam: this driver's poller finalization gate
+    /// (per-spawn, per-invocation acknowledgement).
+    #[cfg(any(test, feature = "test-stub"))]
+    #[cfg(any(test, feature = "test-stub"))]
+    #[cfg(test)]
+    pub(crate) async fn test_poller_gate(&self) -> Option<Arc<promotion::FinalisePublishGate>> {
+        self.poller
+            .lock()
+            .await
+            .as_ref()
+            .map(promotion::PollerTask::gate)
+    }
+
+    /// c-usagefu r19 item 1 test seam: whether the live codex file adapter has
+    /// bound a session yet.
+    #[cfg(any(test, feature = "test-stub"))]
+    pub fn test_codex_bound(&self) -> bool {
+        if let Ok(handle) = self.adapters.try_lock()
+            && let Some(handle) = handle.as_ref()
+        {
+            return handle.is_bound();
+        }
+        false
+    }
+
+    /// c-usagefu r20 item 5 test seam: clone the run's event sender so a test
+    /// can deliberately FILL the bounded channel and stall finalization
+    /// publication.
+    #[cfg(any(test, feature = "test-stub"))]
+    pub async fn test_events_sender(&self) -> Option<mpsc::Sender<remuda_protocol::Observation>> {
+        self.events_tx.lock().await.clone()
+    }
+
+    /// c-usagefu r20 item 5 test seam: a stamped throwaway observation used to
+    /// fill the run channel in cancellation tests.
+    #[cfg(any(test, feature = "test-stub"))]
+    pub async fn test_filler_observation(&self) -> Option<remuda_protocol::Observation> {
+        let ctx = self.promote_ctx.lock().await.clone()?;
+        Some(promotion::test_filler_observation(&ctx))
     }
 
     /// Build a driver whose promotion detection reads `table` instead of the
@@ -523,11 +646,18 @@ impl ShellPtyDriver {
             status: Arc::new(std::sync::Mutex::new(None)),
             bindings: promotion::BindingHandle::empty(),
             poller: Mutex::new(None),
+            poller_shutdown: Mutex::new(None),
+            poller_finalised: Mutex::new(None),
+            close_lock: Mutex::new(()),
+            #[cfg(any(test, feature = "test-stub"))]
+            test_stop_outcome: std::sync::Mutex::new(None),
             waiter: Mutex::new(None),
             table,
             fallbacks: crate::hook_answer::FallbackLedger::new(),
             hooks: Mutex::new(None),
             adapters: Mutex::new(None),
+            codex_lifetime: Mutex::new(None),
+            promoted_codex_lifetimes: Arc::new(std::sync::Mutex::new(Vec::new())),
             recipe: std::sync::Mutex::new(None),
             exited: Arc::new(std::sync::Mutex::new(None)),
             effort_bridge: Mutex::new(Arc::new(crate::effort::EffortBridge::new())),
@@ -833,11 +963,34 @@ impl ShellPtyDriver {
 
     /// §9.1: queue `/effort <level>` for the composer, ready-ladder gated, and
     /// wait for transcript read-back while the composer is idle.
-    async fn switch_effort(&self, level: &str) -> DriverResult<DriverAck> {
-        let Some(request) = crate::effort::EffortRequest::from_level(level) else {
+    async fn switch_effort(
+        &self,
+        level: &str,
+        ultracode: Option<bool>,
+        axis: Option<remuda_protocol::EffortAxis>,
+        request_id: Option<String>,
+    ) -> DriverResult<DriverAck> {
+        // The promoted-shell carrier does not hold the agent's reported binary
+        // version, so the version-gated ultracode axis fails closed here (the
+        // Herdr `claude_pty` carrier is the version-aware one and types
+        // `ultracode` / `ultracode on|off` itself). Plain level switches work.
+        // c-effortread r12 item 4: the explicit axis is threaded all the way
+        // here (send() used to drop it). ANY explicit flag operation — on,
+        // off, or one whose boolean is missing/non-boolean (None) — is refused
+        // rather than silently typing a plain `/effort <level>` for it.
+        if axis == Some(remuda_protocol::EffortAxis::Flag) || ultracode == Some(true) {
+            return Err(DriverError::CapabilityUnsupported(
+                "ultracode cannot be switched from a promoted-shell carrier; \
+                 use the managed Claude session"
+                    .to_owned(),
+            ));
+        }
+        let Some(request) = crate::effort::EffortRequest::from_level(level)
+            .map(|request| request.with_request_id(request_id.as_deref()))
+        else {
             return Err(DriverError::CapabilityUnsupported(format!(
                 "claude /effort does not accept {level:?} in-session; \
-                 valid: low, medium, high, xhigh, max, ultracode"
+                 valid: low, medium, high, xhigh, max, ultracode, ultracode on, ultracode off"
             )));
         };
         let state = self.state().await?;
@@ -863,6 +1016,7 @@ impl ShellPtyDriver {
             events,
             seq: Arc::clone(&self.seq),
             ctx,
+            bindings: self.bindings.clone(),
         });
         let ready = io.is_idle().await;
         if ready {
@@ -878,9 +1032,10 @@ impl ShellPtyDriver {
         } else {
             // The agent is working (or the screen is not provably idle). Hold
             // for the next idle and let the worker journal the terminal state.
-            io.journal(
+            io.journal_effort(
                 crate::effort::SwitchOutcome::Queued.journal_status(request.command_word(), ""),
                 remuda_protocol::Severity::Info,
+                request.request_id.clone(),
             )
             .await;
             queue.enqueue(request, None);
@@ -919,6 +1074,7 @@ impl ShellPtyDriver {
             events,
             seq: Arc::clone(&self.seq),
             ctx,
+            bindings: self.bindings.clone(),
         });
         if io.is_idle().await {
             let (done, rx_outcome) = tokio::sync::oneshot::channel();
@@ -929,9 +1085,10 @@ impl ShellPtyDriver {
                 // Never claim applied without a terminal outcome.
             }
         } else {
-            io.journal(
+            io.journal_effort(
                 crate::model::ModelSwitchOutcome::Queued.journal_status(&request.id, ""),
                 remuda_protocol::Severity::Info,
+                None,
             )
             .await;
             queue.enqueue(request, None);
@@ -1051,7 +1208,66 @@ impl ShellPtyDriver {
                 pty_err(io::Error::other(format!("materialize panicked: {error}")))
             })??
         };
+        // D-056 (r4 items 1 & 3), r5 item 7: build the resume mode BEFORE the
+        // child spawns against the ONE config dir the child actually receives
+        // (child_env_layers), and put that same dir on the promotion ctx so the
+        // hydrator discovers transcripts in exactly the directory the child
+        // writes to. build_command reassembles the same deterministic layers.
+        let launch_cwd = spec
+            .as_ref()
+            .map(|s| std::path::PathBuf::from(&s.cwd))
+            .unwrap_or_else(|| self.options.cwd.clone());
+        let child_env = child_env_layers(&self.options, &recipe)?;
+        let config_dir = child_env.claude_config_dir(&self.options);
+        let mut hook_ctx = hook_ctx;
+        hook_ctx.claude_home = config_dir.clone();
         let cmd = build_command(&self.options, cwd, &recipe, hooks.as_ref())?;
+        // c-usagefu r10 item 1 (Ruling A): register the codex agent's live
+        // interval in its cwd at the agent.start boundary, BEFORE the child
+        // is spawned and independent of the file adapter/hook binding. A
+        // same-cwd generic launch doing prompt-only discovery needs a complete
+        // census that includes THIS native instance; the driver holds one
+        // cohort clone for the whole run and hands another to the adapter.
+        //
+        // c-usagefu r15 item 4 (Ruling L1): this hook-confirmed path is a
+        // production registration too, so the boundary is sampled INSIDE the
+        // LAUNCH_REGISTRATION critical section together with the lifetime
+        // insert (register_confirmed_launch), never on a free-standing clock
+        // before the call — a launch blocked on the lock must decide from the
+        // instant it actually registered. No discovery window opens here: the
+        // hook supplies session identity and with_instance_key must not open
+        // one against the attached lifetime witness.
+        let (native_lifetime, launch_floor) =
+            if self.options.target.agent_kind() == Some(AgentKind::Codex) {
+                let (guard, boundary) = crate::adapters::codex_discovery::register_confirmed_launch(
+                    std::path::Path::new(cwd),
+                    hook_ctx.instance_id.as_id().as_str(),
+                    self.options
+                        .node_epoch
+                        .as_ref()
+                        .map(crate::adapters::codex_discovery::NodeEpoch::id),
+                );
+                (Some(guard), boundary)
+            } else {
+                (None, time::OffsetDateTime::now_utc())
+            };
+        let pre_resume_mode: Option<crate::claude_transcript::ResumeMode> =
+            match &self.options.target {
+                Target::Agent {
+                    resume: Some(session_id),
+                    ..
+                } => Some(
+                    match crate::claude_transcript::ResumeBoundary::for_resume(
+                        &config_dir,
+                        &launch_cwd,
+                        session_id,
+                    ) {
+                        Some(boundary) => crate::claude_transcript::ResumeMode::Boundary(boundary),
+                        None => crate::claude_transcript::ResumeMode::Unverified,
+                    },
+                ),
+                _ => None,
+            };
         let child = pair.slave.spawn_command(cmd).map_err(pty_err)?;
         drop(pair.slave);
         // `portable-pty` calls `setsid()` before `exec`, so the child leads its
@@ -1059,8 +1275,22 @@ impl ShellPtyDriver {
         let pgid = child.process_id().and_then(|pid| i32::try_from(pid).ok());
         let killer = child.clone_killer();
         let master = pair.master;
-        let writer = master.take_writer().map_err(pty_err)?;
-        let reader = master.try_clone_reader().map_err(pty_err)?;
+        // Each of the next steps can fail; the spawned child must be killed and
+        // reaped on any of those errors rather than orphaned.
+        let writer = match master.take_writer() {
+            Ok(writer) => writer,
+            Err(error) => {
+                Self::abort_failed_launch(child, pgid, Some((master, None))).await;
+                return Err(pty_err(error));
+            }
+        };
+        let reader = match master.try_clone_reader() {
+            Ok(reader) => reader,
+            Err(error) => {
+                Self::abort_failed_launch(child, pgid, Some((master, Some(writer)))).await;
+                return Err(pty_err(error));
+            }
+        };
         let (output, _) = broadcast::channel(64);
         let emulator = self.options.emulator.then(|| {
             tracing::info!(
@@ -1088,7 +1318,7 @@ impl ShellPtyDriver {
         });
         let pump = Arc::clone(&state);
         let (eof_tx, eof_rx) = tokio::sync::oneshot::channel();
-        std::thread::Builder::new()
+        if let Err(error) = std::thread::Builder::new()
             .name("remuda-shell-pty".into())
             .spawn(move || {
                 read_pty(pump, reader);
@@ -1096,7 +1326,14 @@ impl ShellPtyDriver {
                 // closed at both ends. It frequently beats `wait()`.
                 let _ = eof_tx.send(());
             })
-            .map_err(DriverError::Io)?;
+        {
+            // The reader never started: run the stop ladder so the spawned
+            // child is killed and reaped, not orphaned.
+            if let Err(stop_error) = self.stop_tree(&state).await {
+                tracing::warn!(%stop_error, "cleanup after failed launch failed");
+            }
+            return Err(DriverError::Io(error));
+        }
         *self.inner.lock().await = Some(Arc::clone(&state));
         *self.hooks.lock().await = hooks.clone();
         *self.events_tx.lock().await = Some(tx.clone());
@@ -1105,16 +1342,14 @@ impl ShellPtyDriver {
         // adopts the previous bridge afterwards when a switch was in flight.
         let effort_bridge = Arc::new(crate::effort::EffortBridge::new());
         if let Some(effort) = spec.and_then(|spec| spec.effort) {
-            effort_bridge.note_launch_request(crate::effort::EffortRequest {
-                name: effort.name,
-                ultracode: effort.ultracode,
-            });
+            effort_bridge.note_launch_request(crate::effort::EffortRequest::from_selection(effort));
         }
         let effort_io: Arc<dyn crate::effort::EffortSwitchIo> = Arc::new(ShellEffortIo {
             state: Arc::clone(&state),
             events: tx.clone(),
             seq: Arc::clone(&self.seq),
             ctx: hook_ctx.clone(),
+            bindings: self.bindings.clone(),
         });
         // A fresh run needs a fresh queue: stop the previous worker and close
         // its queue before swapping.
@@ -1145,17 +1380,13 @@ impl ShellPtyDriver {
                     .parent()
                     .map(std::path::Path::to_path_buf)
             });
-        let catalog_env: Vec<(String, String)> =
-            agent_env(&self.options.target, &recipe, self.options.pin_native_home)
-                .into_iter()
-                .chain(
-                    self.options
-                        .extra_env
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone())),
-                )
-                .filter(|(key, _)| !crate::child_env::is_denied(key))
-                .collect();
+        // r6 item 2 / r7 item 4(b): the catalog/settings refresh must read the
+        // SAME env and config dir the child receives (the pin overrides
+        // extra_env). Reuse the env layers built BEFORE the child spawned
+        // (line above): recomputing them here was a second fallible call
+        // AFTER spawn whose `?` returned straight through spawn_at, skipping
+        // the launch-failure teardown and orphaning the child.
+        let catalog_env: Vec<(String, String)> = child_env.entries.clone();
         let model_catalog = crate::model_discovery::resolve_catalog(
             Some(std::path::Path::new(&recipe.native_home)),
             host_config_dir.as_deref(),
@@ -1171,7 +1402,7 @@ impl ShellPtyDriver {
         // is missing the promotion-time answer may be the host fallback.
         // Re-resolve when the session's own cache lands and re-stamp the
         // catalog so the picker never freezes on the fallback list.
-        {
+        let mut catalog_refresh_task: Option<JoinHandle<()>> = {
             let bridge = Arc::clone(&model_bridge);
             let events = tx.clone();
             let seq = Arc::clone(&self.seq);
@@ -1182,7 +1413,9 @@ impl ShellPtyDriver {
             let host_dir = host_config_dir.clone();
             let current = launch_model.clone();
             let env = catalog_env.clone();
-            tokio::spawn(async move {
+            // The one-shot catalog-refresh task; aborted on a post-spawn
+            // launch failure, otherwise detached to run once after launch.
+            Some(tokio::spawn(async move {
                 let payload = crate::model_discovery::scoped_refresh_payload(
                     std::path::PathBuf::from(native_home),
                     host_dir,
@@ -1206,13 +1439,14 @@ impl ShellPtyDriver {
                 {
                     tracing::debug!(%error, "model catalog refresh: event channel closed");
                 }
-            });
-        }
+            }))
+        };
         let model_io: Arc<dyn crate::model::SwitchIo> = Arc::new(ShellEffortIo {
             state: Arc::clone(&state),
             events: tx.clone(),
             seq: Arc::clone(&self.seq),
             ctx: hook_ctx.clone(),
+            bindings: self.bindings.clone(),
         });
         if let Some(worker) = self.model_worker.lock().await.take() {
             worker.abort();
@@ -1270,9 +1504,111 @@ impl ShellPtyDriver {
         // GROK_HOME), follow the child pid, and emit on the instance's one
         // ordered observation channel. Hook-confirmed session identity wins
         // over file discovery (Hook > File) via the adapter confirm path.
-        if let Some(handle) = self.spawn_adapters(&hooks, &recipe, &hook_ctx, &tx, pgid, cwd)? {
-            *self.adapters.lock().await = Some(handle);
+        // The DRIVER keeps the cohort OWNER registered before the child was
+        // spawned; the file adapter receives a non-closing WITNESS. The owner
+        // is closed explicitly in close() only AFTER the stop ladder confirms
+        // the process is gone (Ruling A2), so tearing the adapter down before
+        // the ladder — or a witness dropping at any point — can never close
+        // the interval early (c-usagefu r11 item 3).
+        let adapter_lifetime = native_lifetime.as_ref().map(|guard| guard.witness());
+        if let Some(guard) = native_lifetime {
+            *self.codex_lifetime.lock().await = Some(guard);
         }
+        // c-usagefu r15 item 3: a `codex resume <id>` continues the session's
+        // EXISTING rollout (whose session_meta predates the resume floor); the
+        // tail adapter binds it by id rather than by timestamp.
+        let resume_session_id = match &self.options.target {
+            Target::Agent {
+                resume: Some(session_id),
+                ..
+            } => Some(session_id.clone()),
+            _ => None,
+        };
+        // Fault injection (test/fake-harness only): fail the post-spawn
+        // adapter-setup step so the real launch path runs its failure cleanup.
+        #[cfg(any(test, feature = "test-stub"))]
+        let adapter_setup: DriverResult<
+            Option<crate::adapters::supervisor::AdapterHandle>,
+        > = if self.options.fail_after_spawn {
+            Err(DriverError::Io(io::Error::other(
+                "injected post-spawn adapter-setup failure",
+            )))
+        } else {
+            self.spawn_adapters(
+                &hooks,
+                &recipe,
+                &hook_ctx,
+                &tx,
+                pgid,
+                cwd,
+                adapter_lifetime,
+                launch_floor,
+                resume_session_id,
+            )
+        };
+        #[cfg(not(any(test, feature = "test-stub")))]
+        let adapter_setup = self.spawn_adapters(
+            &hooks,
+            &recipe,
+            &hook_ctx,
+            &tx,
+            pgid,
+            cwd,
+            adapter_lifetime,
+            launch_floor,
+            resume_session_id,
+        );
+        match adapter_setup {
+            Ok(Some(handle)) => *self.adapters.lock().await = Some(handle),
+            Ok(None) => {}
+            Err(error) => {
+                // The child is already running: kill and reap it so an adapter
+                // setup failure does not orphan the launched agent.
+                if let Err(stop_error) = self.stop_tree(&state).await {
+                    tracing::warn!(%stop_error, "cleanup after failed launch failed");
+                }
+                // Tear down every coordination task this launch started and
+                // clear `inner`, exactly as a successful stop does: a failed
+                // launch must not leave detached effort/model/permission
+                // workers (or the one-shot catalog refresh) holding stale
+                // bridges, nor leave a dead PtyState that a later resume could
+                // adopt. The poller never started at this point.
+                self.effort_queue.lock().await.close();
+                if let Some(worker) = self.effort_worker.lock().await.take() {
+                    worker.abort();
+                }
+                self.model_queue.lock().await.close();
+                if let Some(worker) = self.model_worker.lock().await.take() {
+                    worker.abort();
+                }
+                self.permission_queue.lock().await.close();
+                if let Some(worker) = self.permission_worker.lock().await.take() {
+                    worker.abort();
+                }
+                if let Some(task) = catalog_refresh_task.take() {
+                    task.abort();
+                }
+                self.events_tx.lock().await.take();
+                self.interrupt_pid.store(0, Ordering::SeqCst);
+                // Item 8: release the hook server/socket and anything parked
+                // on it, and drop the transcript claim — exactly what close()
+                // does. Without this the per-instance socket stayed bound
+                // (retire_parked held its agents' turns and the socket file
+                // remained), so the retry after this failed launch could not
+                // bind and inherited a stale epoch.
+                if let Some(hooks) = self.hooks.lock().await.as_ref() {
+                    hooks.retire_parked();
+                }
+                self.hooks.lock().await.take();
+                self.bindings.demobilize();
+                *self.inner.lock().await = None;
+                return Err(error);
+            }
+        }
+        // On a successful launch the one-shot catalog refresh outlives this
+        // function and must keep running detached; dropping its JoinHandle
+        // (without abort) does exactly that.
+        drop(catalog_refresh_task);
         if self.options.promote {
             // Built before `hooks` moves into the poller: the silence probe
             // needs the live session's *real* socket path. Under a long data
@@ -1285,6 +1621,13 @@ impl ShellPtyDriver {
                     socket: session.socket_path.clone(),
                 })
             });
+            // c-ctxusage r5 item 6: cooperative poller shutdown.
+            let (poller_tx, poller_rx) = tokio::sync::watch::channel(false);
+            let (finalised_tx, finalised_rx) = tokio::sync::oneshot::channel();
+            *self.poller_shutdown.lock().await = Some(poller_tx);
+            *self.poller_finalised.lock().await = Some(finalised_rx);
+            // The pre-spawn resume boundary (None for a login shell, which
+            // bounds a hand-typed resume per detected process instead).
             *self.poller.lock().await = Some(promotion::spawn(
                 Arc::clone(&state),
                 hook_ctx.clone(),
@@ -1297,6 +1640,11 @@ impl ShellPtyDriver {
                 self.options.auto_trust_workspace,
                 Arc::clone(&self.interrupt_pid),
                 Arc::clone(&self.interrupt_screen_markers),
+                Arc::clone(&self.promoted_codex_lifetimes),
+                self.options
+                    .node_epoch
+                    .as_ref()
+                    .map(crate::adapters::codex_discovery::NodeEpoch::id),
                 tx.clone(),
                 Arc::clone(&self.seq),
                 Some(Arc::clone(&effort_bridge)),
@@ -1308,6 +1656,7 @@ impl ShellPtyDriver {
                 }),
                 Some(Arc::clone(&permission_bridge)),
                 launch_permission,
+                pre_resume_mode,
                 // c-wfdrill2 B: the pinned path this launch exec'd, so
                 // detection does not depend on the executable's basename
                 // being one the agent table has heard of. Only for an agent
@@ -1320,6 +1669,8 @@ impl ShellPtyDriver {
                 // socket the poller probes when a quiet hook tier goes silent
                 // (captured above before `hooks` moved into the poller).
                 silence_paths,
+                poller_rx,
+                finalised_tx,
             ));
             // A login shell has no agent at spawn; once promotion identifies a
             // hand-typed codex/grok, start its file adapter against the native
@@ -1372,6 +1723,7 @@ impl ShellPtyDriver {
     /// wrote, so it only exists when the hook path is live — without hooks
     /// there is no per-session shadow home, and reading the user's real
     /// `~/.codex` from a launched session would cross the §4.2 boundary.
+    #[allow(clippy::too_many_arguments)] // launch wiring passes hooks/recipe/ctx/events/pid/cwd/lifetime.
     fn spawn_adapters(
         &self,
         hooks: &Option<Arc<crate::launch::HookSession>>,
@@ -1380,6 +1732,16 @@ impl ShellPtyDriver {
         events: &mpsc::Sender<remuda_protocol::Observation>,
         pid: Option<i32>,
         cwd: &str,
+        lifetime: Option<crate::adapters::codex_discovery::LifetimeGuard>,
+        // c-usagefu r14 item 5: the agent.start boundary the census lifetime
+        // was registered at (the resume time for a continued run). The tail
+        // adapter uses it as its discovery floor, so a gap rollout created
+        // before the resume is refused by the real discovery path.
+        launch_floor: time::OffsetDateTime,
+        // c-usagefu r15 item 3: native session id of an explicit
+        // `codex resume <id>`; the adapter binds that existing rollout by id
+        // even though its session_meta timestamp predates the resume floor.
+        resume_session_id: Option<String>,
     ) -> DriverResult<Option<crate::adapters::supervisor::AdapterHandle>> {
         let Some(hooks) = hooks else {
             return Ok(None);
@@ -1394,6 +1756,12 @@ impl ShellPtyDriver {
             home: shadow.home.clone(),
             cwd: PathBuf::from(cwd),
             pid: pid.filter(|pid| *pid > 0).map(|pid| pid as u32),
+            // Discovery floor for a shadow-home launch: a SessionStart hook
+            // still wins (tier 1), but without one the REAL cwd/floor/prompt
+            // path decides instead of the newest session_index guess — the
+            // floor is what refuses a pre-resume gap rollout (r14 item 5).
+            launched_at: Some(launch_floor),
+            resume_session_id,
         };
         let stamp = crate::adapters::supervisor::stamp_ctx(
             ctx.instance_id.clone(),
@@ -1414,6 +1782,22 @@ impl ShellPtyDriver {
                 .filter(|model| !model.is_empty()),
             hooks: Some(Arc::clone(hooks)),
             agent_pid: pid,
+            // c-usagefu r7 item 3: claim under the STABLE Remuda instance id,
+            // not a fresh UUID — close/resume re-spawns this adapter and must
+            // reclaim the rollout the previous spawn owned.
+            instance_key: Some(ctx.instance_id.as_id().as_str().to_owned()),
+            // Native-carrier launch relies on the stable instance key
+            // (tier a/c); process-tree probing is not wired for the pty
+            // carrier here (the shell_pty native path is hook-confirmed).
+            ownership: None,
+            agent_pid_roots: None,
+            // r10 item 1: native/resumed launch joins the cwd census with its
+            // known agent.start floor; the driver's cohort clone keeps the
+            // interval open independent of this adapter's binding.
+            lifetime,
+            // Hook-confirmed launch: no prompt-only discovery, hence no
+            // pending window (r12 item 2 applies to generic-pty launches).
+            window: None,
         };
         crate::adapters::supervisor::spawn_file_adapters(kind, adapter_ctx)
     }
@@ -1443,6 +1827,10 @@ impl ShellPtyDriver {
         let task = tokio::spawn(async move {
             let mut current: Option<remuda_protocol::AgentKind> = None;
             let mut handle: Option<crate::adapters::supervisor::AdapterHandle> = None;
+            // The promoted-codex cwd census is owned by the promotion POLLER,
+            // which registers the unknown-boundary interval BEFORE it publishes
+            // the detection this watch reads (c-usagefu r11 item 2, Ruling A2).
+            // The watch only spawns/ab-spawns the file adapter.
             let mut tick = tokio::time::interval(PROMOTE_POLL);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -1479,6 +1867,19 @@ impl ShellPtyDriver {
                         fallback_model: None,
                         hooks: None,
                         agent_pid: Some(found.pid),
+                        // Promoted attaches are per-process: no driver launch
+                        // identity (r7 item 2 gives them a unique lifecycle
+                        // owner); resume of a DRIVER launch goes through the
+                        // native-carrier spawn above with the stable key.
+                        instance_key: None,
+                        ownership: None,
+                        agent_pid_roots: None,
+                        // Census presence is owned by the promotion poller,
+                        // which registers before it publishes the detection;
+                        // the promoted adapter binds by hook/name index only.
+                        lifetime: None,
+                        // Promoted attach: no launch-floor discovery window.
+                        window: None,
                     };
                     match crate::adapters::supervisor::spawn_file_adapters(kind, adapter_ctx) {
                         Ok(Some(started)) => handle = Some(started),
@@ -1490,7 +1891,7 @@ impl ShellPtyDriver {
                 }
             }
         });
-        crate::adapters::supervisor::AdapterHandle { tasks: vec![task] }
+        crate::adapters::supervisor::AdapterHandle::from_tasks(vec![task])
     }
 
     /// Run the stop ladder against this PTY's process group (§5.3).
@@ -1560,6 +1961,22 @@ impl ShellPtyDriver {
             reaper,
         )
         .await?;
+        // Test seam: override ONLY the ladder verdict (simulating a member the
+        // ladder could not kill). The real signals and group scan all run;
+        // nothing substitutes them.
+        #[cfg(any(test, feature = "test-stub"))]
+        let outcome = {
+            let mut outcome = outcome;
+            if let Some(forced) = self
+                .test_stop_outcome
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                outcome = forced;
+            }
+            outcome
+        };
         // The leader can be classified dead while the kernel has not made it
         // reapable yet: on macOS a SIGKILLed session leader sits in `E`
         // (exiting) before it becomes a zombie. `stop_group` correctly reports
@@ -1602,6 +2019,82 @@ impl ShellPtyDriver {
         Ok(outcome)
     }
 
+    /// Tear down a child whose launch failed BEFORE its [`PtyState`] existed
+    /// (writer/reader setup failed). A launch error after spawn must never
+    /// orphan the child, so this runs the same close-first stop ladder as
+    /// [`Self::stop_tree`], then makes one bounded attempt to reap the leader.
+    async fn abort_failed_launch(
+        mut child: Box<dyn portable_pty::Child + Send + Sync>,
+        pgid: Option<i32>,
+        mut pty: Option<PtyEndpoints>,
+    ) {
+        let mut close = move || {
+            if let Some((master, writer)) = pty.take() {
+                // Close the writer first, then the master box: the slave's
+                // last endpoint going is what delivers SIGHUP.
+                drop(writer);
+                drop(master);
+            }
+        };
+        let reaped = match pgid {
+            Some(pgid) if pgid > 0 => {
+                let mut reaped = false;
+                let ladder = {
+                    let mut reap = || {
+                        if reaped {
+                            return true;
+                        }
+                        match child.try_wait() {
+                            Ok(Some(_status)) => {
+                                reaped = true;
+                                true
+                            }
+                            Ok(None) => false,
+                            Err(error) => {
+                                tracing::debug!(%error, "failed-launch pty child reap failed");
+                                true
+                            }
+                        }
+                    };
+                    lifecycle::stop_group(pgid, &mut close, &mut reap).await
+                };
+                if let Err(error) = ladder {
+                    tracing::warn!(%error, pgid, "failed-launch stop ladder errored");
+                }
+                reaped
+            }
+            _ => {
+                // No process group (or no pid): hang up, then kill the direct
+                // child and mark it for one bounded reap below.
+                close();
+                if let Err(error) = child.kill() {
+                    tracing::debug!(%error, "failed-launch direct child kill failed");
+                }
+                false
+            }
+        };
+        if !reaped {
+            // Same bounded transition-to-zombie wait as the regular stop path.
+            let deadline = tokio::time::Instant::now() + REAP_EXITING_GRACE;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) | Err(_) => break,
+                    Ok(None) if tokio::time::Instant::now() < deadline => {
+                        tokio::time::sleep(lifecycle::EXIT_REAP_POLL).await;
+                    }
+                    Ok(None) => {
+                        tracing::error!(
+                            pgid,
+                            "reap-incomplete after a failed launch: the process group is dead \
+                             but the leader has not become reapable; it stays a child of this Node"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     /// Shared body of [`Driver::resume`] and [`Driver::start_resumed`].
     ///
     /// `spec` is `Some` for the cross-instance case (D-026), where the new
@@ -1634,6 +2127,10 @@ impl ShellPtyDriver {
             },
             Arc::clone(&self.table),
         );
+        // c-usagefu r12 item 1: the resumed run's poller registers promoted
+        // codex intervals into the SAME driver-owned slot, so every cohort of
+        // this session closes in one place after the final stop ladder.
+        resumed.promoted_codex_lifetimes = Arc::clone(&self.promoted_codex_lifetimes);
         // The adopted poller/bus must update the same control handles that
         // callers retain on `self`, including native cancel confirmation.
         resumed.promoted = Arc::clone(&self.promoted);
@@ -1651,8 +2148,23 @@ impl ShellPtyDriver {
         // operations have to reach the process that was just started.
         *self.inner.lock().await = resumed.inner.lock().await.take();
         *self.hooks.lock().await = resumed.hooks.lock().await.take();
-        *self.poller.lock().await = resumed.poller.lock().await.take();
+        *self.poller.lock().await = {
+            // Transfer the resumed driver's gate-bearing task whole (the gate
+            // is per-driver; test builds read it through the same field).
+            resumed.poller.lock().await.take()
+        };
+        *self.poller_shutdown.lock().await = resumed.poller_shutdown.lock().await.take();
+        *self.poller_finalised.lock().await = resumed.poller_finalised.lock().await.take();
         *self.waiter.lock().await = resumed.waiter.lock().await.take();
+        // c-usagefu r8 item 2: adopt the resumed driver's file-tail adapter
+        // handle (its process is the live one; the previous driver's tails
+        // followed a dead pid). Production single-point of the move:
+        // supervisor::adopt_resumed_handle.
+        crate::adapters::supervisor::adopt_resumed_handle(&self.adapters, &resumed.adapters).await;
+        // c-usagefu r10 item 1: adopt the resumed run's live codex census
+        // cohort. The previous run's guard is superseded by a newer epoch, so
+        // dropping it here does not record a close for the continued session.
+        *self.codex_lifetime.lock().await = resumed.codex_lifetime.lock().await.take();
         // §9.1: adopt the resumed run's switch coordination. Its worker and
         // mapper share a bridge, and its event sender is the live one. When a
         // switch was mid-flight at resume, adopt the resumed bridge so the
@@ -1973,6 +2485,100 @@ fn provider_source_lifecycle(
             affects_completion: false,
         })),
     )))
+}
+
+/// c-usagefu r18 item 1 deterministic test gate for overlapping closes. With
+/// the permit held, the winning close parks immediately AFTER claiming
+/// teardown ownership and the observation sender and BEFORE the
+/// poller/ladder teardown. Free permit (production and normal tests) is a
+/// pass-through.
+/// Set by a close AFTER it claimed teardown ownership + sender; it then waits
+/// on [`TEST_CLOSE_OWNERSHIP_PARK`] for the test to release it.
+#[cfg(test)]
+static TEST_CLOSE_OWNERSHIP_PARKED: std::sync::LazyLock<std::sync::atomic::AtomicBool> =
+    std::sync::LazyLock::new(|| std::sync::atomic::AtomicBool::new(false));
+/// Whether a test has armed the gate. Disarmed by default, so every close in
+/// normal tests and other test binaries passes the seam without touching it.
+#[cfg(test)]
+static TEST_CLOSE_OWNERSHIP_ARMED: std::sync::LazyLock<std::sync::atomic::AtomicBool> =
+    std::sync::LazyLock::new(|| std::sync::atomic::AtomicBool::new(false));
+/// Latch used while armed: false parks the winning close until the test opens
+/// it; a late second close after the release (value already true) passes.
+#[cfg(test)]
+static TEST_CLOSE_OWNERSHIP_PARK: std::sync::LazyLock<tokio::sync::watch::Sender<bool>> =
+    std::sync::LazyLock::new(|| tokio::sync::watch::channel(true).0);
+
+#[cfg(test)]
+async fn park_after_close_ownership_claim() {
+    if !TEST_CLOSE_OWNERSHIP_ARMED.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let mut rx = TEST_CLOSE_OWNERSHIP_PARK.subscribe();
+    TEST_CLOSE_OWNERSHIP_PARKED.store(true, std::sync::atomic::Ordering::SeqCst);
+    if *rx.borrow() {
+        return;
+    }
+    let _ = rx.changed().await;
+}
+
+#[cfg(not(test))]
+async fn park_after_close_ownership_claim() {}
+
+/// Test seam: arm the gate (clear the arrival flag, close the latch).
+#[cfg(test)]
+pub(crate) fn test_reset_close_ownership_park() {
+    TEST_CLOSE_OWNERSHIP_PARKED.store(false, std::sync::atomic::Ordering::SeqCst);
+    TEST_CLOSE_OWNERSHIP_ARMED.store(true, std::sync::atomic::Ordering::SeqCst);
+    TEST_CLOSE_OWNERSHIP_PARK.send_replace(false);
+}
+
+/// Test seam: the winning close has reached the gate (ownership + sender
+/// claimed) and is waiting for release.
+#[cfg(test)]
+pub(crate) fn test_close_ownership_park_winner_arrived() -> bool {
+    TEST_CLOSE_OWNERSHIP_PARKED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Test seam: open the latch so every parked (or later-arriving) close passes.
+#[cfg(test)]
+pub(crate) fn test_release_close_ownership_park() {
+    TEST_CLOSE_OWNERSHIP_PARK.send_replace(true);
+}
+
+/// c-usagefu r17 Ruling W0: the operator-facing Diagnostic/Warning emitted
+/// once when a close's stop ladder cannot confirm the process group is gone.
+/// Its census intervals then stay open for the rest of the Node lifetime, so
+/// new sessions in that directory are not auto-attributed until the restart;
+/// this observation is the operator's only signal why. It names both the
+/// instance and the directory.
+pub(crate) fn stop_incomplete_warning_message() -> &'static str {
+    "stop incomplete — new sessions in this directory will not be auto-attributed until the Node \
+     restarts"
+}
+
+fn stop_incomplete_warning_payload(
+    instance: &str,
+    cwd: &str,
+) -> remuda_protocol::ObservationPayload {
+    let mut related = std::collections::BTreeMap::new();
+    related.insert("instance".to_owned(), instance.to_owned());
+    related.insert("cwd".to_owned(), cwd.to_owned());
+    remuda_protocol::ObservationPayload::Lifecycle(Box::new(
+        remuda_protocol::LifecyclePayload::Native(Box::new(remuda_protocol::NativeLifecycle {
+            topic: remuda_protocol::LifecycleTopic::Diagnostic,
+            native_name: "stop-incomplete".to_owned(),
+            native_id: remuda_protocol::Knowledge::Known {
+                value: instance.to_owned(),
+            },
+            status: remuda_protocol::Knowledge::Known {
+                value: stop_incomplete_warning_message().to_owned(),
+            },
+            related_ids: related,
+            data_ref: None,
+            severity: remuda_protocol::Severity::Warning,
+            affects_completion: false,
+        })),
+    ))
 }
 
 /// Write the standalone settings overlay (hooks-off path) when no hook
@@ -2380,7 +2986,14 @@ impl Driver for ShellPtyDriver {
             && !level.is_empty()
             && switch.model_id.is_empty()
         {
-            return self.switch_effort(level).await;
+            return self
+                .switch_effort(
+                    level,
+                    switch.effort_ultracode,
+                    switch.effort_axis,
+                    switch.effort_request_id.clone(),
+                )
+                .await;
         }
         // §9.1: a model switch is `/model <id>` proven by the verdict.
         if self.session_kind() == Some(AgentKind::Claude)
@@ -2443,6 +3056,22 @@ impl Driver for ShellPtyDriver {
         // half a second per prompt.
         state.await_quiescence().await;
         state.write_bytes(&submit).await?;
+        // c-usagefu r14 item 5: record the dispatched prompt for the codex
+        // file adapter the same way generic-pty does. A shadow-home codex
+        // launch's discovery is then provable through the REAL resume floor
+        // plus prompt evidence (the hook channel only confirms a session the
+        // codex child reports; without dispatched prompt evidence the adapter
+        // had to guess the newest session_index entry). Codex only and keyed
+        // by the stable instance id, so close/resume keeps the evidence.
+        if self.session_kind() == Some(AgentKind::Codex)
+            && let Some(instance_id) = &self.options.instance_id
+        {
+            crate::adapters::codex_discovery::record_input(
+                &self.options.cwd,
+                instance_id.as_id().as_str(),
+                &text,
+            );
+        }
         Ok(DriverAck::transport_written())
     }
 
@@ -2645,6 +3274,14 @@ impl Driver for ShellPtyDriver {
     /// not, that is journaled as `stop-incomplete`; §5.3 step 4 forbids
     /// reporting `exited` over a process tree that is still there.
     async fn close(&self) -> DriverResult<DriverAck> {
+        // c-usagefu r18 item 1: serialize overlapping closes. The winner runs
+        // the whole teardown; a concurrent close waits here and then leaves
+        // immediately (its teardown ownership claim finds nothing). Without
+        // this, one close could take the observation sender and be descheduled
+        // while a second close won the teardown ownership below — the loser of
+        // the ownership race would then hold the only sender and the winner's
+        // stop-incomplete operator warning could never be emitted.
+        let _close_guard = self.close_lock.lock().await;
         // §9.1: stop the effort switch before the PTY it types into goes away.
         self.effort_queue.lock().await.close();
         if let Some(worker) = self.effort_worker.lock().await.take() {
@@ -2659,9 +3296,54 @@ impl Driver for ShellPtyDriver {
         if let Some(worker) = self.permission_worker.lock().await.take() {
             worker.abort();
         }
-        self.events_tx.lock().await.take();
+        // c-ctxusage r4 item 2: cooperative poller shutdown. Signal closure
+        // first, then give the poller one window to read the final append and
+        // publish its last turn via `finish()` (an assistant record with usage
+        // and no stop_reason would otherwise never reach usage_events). The
+        // poller holds its own events sender clone, so finalised observations
+        // still reach the RunHandle while it winds down.
+        if let Some(inner) = self.inner.lock().await.as_ref() {
+            inner.closed.store(true, Ordering::SeqCst);
+        }
+        // Wake the poller's select so a close between ticks is observed
+        // immediately, then await its finalise.
+        if let Some(shutdown) = self.poller_shutdown.lock().await.take() {
+            let _ = shutdown.send(true);
+        }
         if let Some(poller) = self.poller.lock().await.take() {
-            poller.abort();
+            // c-ctxusage r5 item 6: the poller may be mid first-bind pump over a
+            // large transcript. It finalises the hydrator AFTER its current pump
+            // returns and signals once that is done; wait for that signal rather
+            // than aborting on a fixed 2 s deadline while `finish()` is running.
+            // 15 s only bounds a genuinely wedged pump; on timeout the abort is
+            // covered by the FinaliseGuard's synchronous best-effort finish.
+            const PROMOTER_FINALISE_TIMEOUT: std::time::Duration =
+                std::time::Duration::from_secs(15);
+            let finalised = self.poller_finalised.lock().await.take();
+            #[cfg(test)]
+            let mut poller = poller.into_handle();
+            #[cfg(not(test))]
+            let mut poller = poller;
+            let finished = if let Some(finalised) = finalised {
+                tokio::pin!(finalised);
+                tokio::time::timeout(PROMOTER_FINALISE_TIMEOUT, async {
+                    // The finalise signal wins; task completion covers the
+                    // no-hydrator / already-finished paths.
+                    tokio::select! {
+                        _ = &mut finalised => true,
+                        _ = &mut poller => true,
+                    }
+                })
+                .await
+                .is_ok()
+            } else {
+                tokio::time::timeout(PROMOTER_FINALISE_TIMEOUT, &mut poller)
+                    .await
+                    .is_ok()
+            };
+            if !finished {
+                poller.abort();
+            }
         }
         if let Ok(mut slot) = self.promoted.lock() {
             *slot = None;
@@ -2684,12 +3366,39 @@ impl Driver for ShellPtyDriver {
         if let Some(handle) = self.adapters.lock().await.take() {
             handle.abort();
         }
+        // The codex census interval is NOT released here. close() is only
+        // beginning: the agent process is still live until the stop ladder
+        // below confirms it is gone, and Ruling A2 (c-usagefu r11 item 3)
+        // requires the interval to stay LIVE through this whole window so a
+        // rollout created during close is still attributed under the census.
+        // The file adapter held only a non-closing witness, so aborting it
+        // above changes nothing. The owner is taken and closed after the
+        // ladder. A resume adopted a newer cohort before this point, so the
+        // owner's epoch check protects a continued session regardless.
         self.interrupt_pid.store(0, Ordering::SeqCst);
         // Drop any transcript claim so a respawn starts a fresh epoch.
         self.bindings.demobilize();
-        let Some(state) = self.inner.lock().await.take() else {
-            return Ok(DriverAck::not_dispatched());
+        // Claim teardown ownership AND the run's observation channel in ONE
+        // critical section (c-usagefu r18 item 1). The sender is needed only
+        // after the ladder (the stop-incomplete warning), but taking it here
+        // with the inner state guarantees the close that owns the teardown is
+        // also the only close that ever held the sender — a concurrent closer
+        // is already parked on `close_lock`, so the winner cannot end up
+        // senderless. A second close after completion finds no state and leaves.
+        let close_events;
+        let close_ctx;
+        let claimed = {
+            let Some(state) = self.inner.lock().await.take() else {
+                return Ok(DriverAck::not_dispatched());
+            };
+            close_events = self.events_tx.lock().await.take();
+            close_ctx = self.promote_ctx.lock().await.clone();
+            state
         };
+        let state = claimed;
+        // c-usagefu r18 item 1 test gate (no-op in production): park with
+        // teardown ownership and the sender already claimed.
+        park_after_close_ownership_claim().await;
         // Set before the ladder runs so the exit waiter reads this exit as the
         // ladder working rather than as an unexplained crash.
         state.closed.store(true, Ordering::SeqCst);
@@ -2697,8 +3406,10 @@ impl Driver for ShellPtyDriver {
         if let Some(waiter) = self.waiter.lock().await.take() {
             waiter.abort();
         }
-        match outcome {
+        let mut group_gone = false;
+        match &outcome {
             Ok(outcome) if outcome.group_gone => {
+                group_gone = true;
                 tracing::info!(
                     rung = outcome.rung.label(),
                     pgid = outcome.pgid,
@@ -2707,14 +3418,108 @@ impl Driver for ShellPtyDriver {
             }
             Ok(outcome) => {
                 // §5.3 step 4: say so rather than claiming a clean stop.
+                // The survivor may be a group member that outlived SIGKILL or
+                // a setsid descendant that escaped the group kill (r14 item 4).
                 tracing::error!(
                     rung = outcome.rung.label(),
                     pgid = outcome.pgid,
                     survivors = ?outcome.survivors,
-                    "stop-incomplete: the process group outlived SIGKILL"
+                    "stop-incomplete: survivor processes outlived the stop ladder"
                 );
             }
             Err(error) => tracing::error!(%error, "pty stop ladder failed"),
+        }
+        // Ruling A2/A2': close the census intervals only AFTER the process has
+        // actually stopped — a record the agent writes while this teardown was
+        // in flight must find a live census. This covers BOTH the
+        // driver-launched cohort and every promoted-codex interval the poller
+        // handed the session (r12 item 1: a demotion never closes one).
+        //
+        // c-usagefu r17 COORDINATOR RULING W0 (replaces the r13–r16 watcher /
+        // registry / process-identity machinery): when the ladder CANNOT
+        // confirm the group is gone, the owner guards are suppressed and
+        // retained for the rest of this Node's lifetime — the intervals stay
+        // OPEN and same-cwd prompt-only discovery keeps refusing, exactly as
+        // while the agent was live. Nothing probes the survivor or closes the
+        // intervals later on this Node; Node shutdown drops the guards without
+        // recording a close. The one operator-visible consequence is the
+        // lifecycle/Warning below. A confirmed group exit closes every interval
+        // here, exactly as before.
+        let mut unconfirmed = Vec::new();
+        if let Some(lifetime) = self.codex_lifetime.lock().await.take() {
+            if group_gone {
+                lifetime.close_interval();
+            } else {
+                unconfirmed.push(lifetime);
+            }
+        }
+        let promoted_guards = self
+            .promoted_codex_lifetimes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+            .collect::<Vec<_>>();
+        for lifetime in promoted_guards {
+            if group_gone {
+                lifetime.close_interval();
+            } else {
+                unconfirmed.push(lifetime);
+            }
+        }
+        if !group_gone && !unconfirmed.is_empty() {
+            // c-usagefu r18 Ruling W0': an incomplete close while the owning
+            // Node is shutting down needs only this tracing warn! — its block
+            // ends with this Node (the epoch retirement drops the intervals
+            // below) and the pumps/workers are already stopped, so the operator
+            // observation is neither required nor worth reordering shutdown
+            // for. A LIVE Node's incomplete close additionally emits the
+            // lifecycle/Warning observation below.
+            let node_shutting_down = self
+                .options
+                .node_epoch
+                .as_ref()
+                .is_some_and(crate::adapters::codex_discovery::NodeEpoch::is_shutting_down);
+            let cwd = unconfirmed
+                .first()
+                .map(|guard| guard.cwd().display().to_string())
+                .unwrap_or_else(|| "<unknown>".to_owned());
+            let instance = close_ctx
+                .as_ref()
+                .map(|ctx| ctx.instance_id.as_id().to_string())
+                .or_else(|| {
+                    self.options
+                        .instance_id
+                        .as_ref()
+                        .map(|id| id.as_id().to_string())
+                })
+                .unwrap_or_else(|| "<unknown>".to_owned());
+            tracing::warn!(
+                instance = %instance,
+                cwd = %cwd,
+                node_shutting_down,
+                "stop-incomplete: the census interval stays open until the Node restarts"
+            );
+            crate::adapters::codex_discovery::retain_unconfirmed_guards(unconfirmed);
+            // Live Node only: surface the condition to the operator exactly
+            // once (close runs once per instance) via a Diagnostic/Warning
+            // lifecycle naming the instance and cwd. Best-effort — the run
+            // channel may already be gone during teardown; the retained
+            // intervals are what enforce the conservative behaviour, not this
+            // emission.
+            if !node_shutting_down
+                && let (Some(events), Some(ctx)) = (close_events.as_ref(), close_ctx.as_ref())
+                && let Err(error) = promotion::emit_payload(
+                    events,
+                    &self.seq,
+                    ctx,
+                    remuda_protocol::SourceChannel::Runtime,
+                    remuda_protocol::Completeness::Structured,
+                    stop_incomplete_warning_payload(&instance, &cwd),
+                )
+                .await
+            {
+                tracing::debug!(%error, "stop-incomplete warning not journaled");
+            }
         }
         Ok(DriverAck::not_dispatched())
     }
@@ -2755,10 +3560,109 @@ impl Driver for ShellPtyDriver {
         }
         self.start_resumed_inner(Some(spec), session_id).await
     }
+
+    #[cfg(any(test, feature = "test-stub"))]
+    fn test_force_stop_outcome(&self, outcome: lifecycle::StopOutcome) {
+        ShellPtyDriver::test_force_stop_outcome(self, outcome);
+    }
+
+    #[cfg(any(test, feature = "test-stub"))]
+    fn test_pgid(&self) -> Option<i32> {
+        ShellPtyDriver::test_pgid(self)
+    }
+
+    #[cfg(any(test, feature = "test-stub"))]
+    fn test_codex_bound(&self) -> bool {
+        ShellPtyDriver::test_codex_bound(self)
+    }
 }
 
 fn pty_err(err: impl std::fmt::Display) -> DriverError {
     DriverError::Io(io::Error::other(err.to_string()))
+}
+
+/// Assemble the child env in its exact application order and track which keys
+/// are set. r5/r6: the env map is built ONCE so the launch command, the
+/// pre-spawn resume-boundary snapshot and the promotion hydrator all derive the
+/// SAME `CLAUDE_CONFIG_DIR`.
+///
+/// Layers in order: base allowlist → TERM/COLORTERM → per-launch extra_env
+/// (deny-list filtered) → native-home pin / recipe allowlist → MCP env.
+///
+/// For a PINNED Claude agent the pin is authoritative and overrides an
+/// extra_env `CLAUDE_CONFIG_DIR` (with the empty securestorage override the
+/// login keychain needs, r6 item 2); for an UNPINNED launch nothing is
+/// injected and the child writes under its own `$HOME/.claude` (r6 item 1),
+/// which is exactly where the snapshot/hydrator look.
+fn child_env_layers(options: &ShellPtyOptions, recipe: &LaunchRecipe) -> DriverResult<ChildEnv> {
+    let mut map = std::collections::BTreeMap::new();
+    for (key, value) in crate::child_env::base_env() {
+        map.insert(key, value);
+    }
+    map.insert("TERM".to_owned(), "xterm-256color".to_owned());
+    map.insert("COLORTERM".to_owned(), "truecolor".to_owned());
+    for (key, value) in &options.extra_env {
+        if !crate::child_env::is_denied(key) {
+            map.insert(key.clone(), value.clone());
+        }
+    }
+    // The native-home pin is applied AFTER extra_env and wins for a pinned
+    // Claude agent (r6 item 2); agent_env overwrites any earlier
+    // CLAUDE_CONFIG_DIR and supplies the securestorage override.
+    for (key, value) in agent_env(&options.target, recipe, options.pin_native_home) {
+        if crate::child_env::is_denied(&key) {
+            tracing::warn!(%key, "recipe env entry is on the deny list; not forwarding");
+            continue;
+        }
+        map.insert(key, value);
+    }
+    if let Some(context) = &options.agent_mcp {
+        for (key, value) in context.environment()? {
+            map.insert(key, value);
+        }
+    }
+    Ok(ChildEnv {
+        entries: map.into_iter().collect(),
+    })
+}
+
+struct ChildEnv {
+    entries: Vec<(String, String)>,
+}
+
+impl ChildEnv {
+    /// The single effective `CLAUDE_CONFIG_DIR` the child actually uses, so
+    /// the boundary snapshot and PromoteCtx open the directory the child
+    /// writes to. Resolution: the assembled child env's CLAUDE_CONFIG_DIR
+    /// (the pinned native home or an explicit override) → an explicit
+    /// `options.claude_home` → the CHILD's HOME from the SAME assembled map
+    /// joined with `.claude` (Claude's default) → the ambient fallback. The
+    /// parent driver process environment is never read directly: an
+    /// unpinned, env_clear'd child inherits neither the driver's
+    /// CLAUDE_CONFIG_DIR (r6 item 1).
+    fn claude_config_dir(&self, options: &ShellPtyOptions) -> PathBuf {
+        self.entries
+            .iter()
+            .find_map(|(key, value)| {
+                (key == "CLAUDE_CONFIG_DIR" && !value.is_empty()).then(|| PathBuf::from(value))
+            })
+            .or_else(|| options.claude_home.clone())
+            .or_else(|| {
+                self.entries
+                    .iter()
+                    .find_map(|(key, value)| {
+                        (key == "HOME" && !value.is_empty()).then(|| PathBuf::from(value))
+                    })
+                    .map(|home| home.join(".claude"))
+            })
+            .unwrap_or_else(default_claude_home)
+    }
+
+    fn apply(&self, cmd: &mut CommandBuilder) {
+        for (key, value) in &self.entries {
+            cmd.env(key, value);
+        }
+    }
 }
 
 fn build_command(
@@ -2791,43 +3695,18 @@ fn build_command(
     };
     cmd.cwd(cwd);
     cmd.env_clear();
-    let base = crate::child_env::base_env();
-    for (key, value) in &base {
-        cmd.env(key, value);
-    }
-    cmd.env("TERM", "xterm-256color");
-    cmd.env("COLORTERM", "truecolor");
-    for (key, value) in &options.extra_env {
-        if !crate::child_env::is_denied(key) {
-            cmd.env(key, value);
-        }
-    }
-    // §5.1 step 1 / §9.1: an inherited `CLAUDE_CODE_EFFORT_LEVEL` outranks the
-    // in-session `/effort` command, so a value leaking in from the operator's
-    // shell would pin the effort for the whole session and make the UI's
-    // "effective" readout a lie. `child_env` denies it, and this loop honours
-    // that; the assertion is that nothing below re-adds it.
-    for (key, value) in agent_env(&options.target, recipe, options.pin_native_home) {
-        if crate::child_env::is_denied(&key) {
-            tracing::warn!(%key, "recipe env entry is on the deny list; not forwarding");
-            continue;
-        }
-        cmd.env(key, value);
-    }
-    if let Some(context) = &options.agent_mcp {
-        for (key, value) in context.environment()? {
-            cmd.env(key, value);
-        }
-    }
+    // r5 item 7: the SAME env map the boundary snapshot and hydrator use.
+    let child_env = child_env_layers(options, recipe)?;
+    child_env.apply(&mut cmd);
     // Last, and deliberately past the allowlist: the shim PATH and the hook
     // credential are values the *driver computed*, not values it inherited
     // (D-028 §4.2). The inherit allowlist exists to keep the Node's own
     // credentials and any `LD_PRELOAD`/proxy/CA injection out of a process the
     // model can read; it is not the channel for something we minted ourselves.
     if let Some(session) = hooks {
-        let inherited = base
-            .get("PATH")
-            .cloned()
+        let inherited = crate::child_env::base_env()
+            .into_iter()
+            .find_map(|(key, value)| (key == "PATH").then_some(value))
             .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
         for (key, value) in session.child_env(&inherited) {
             cmd.env(key, value);
@@ -2883,10 +3762,15 @@ fn agent_env(
             _ => None,
         })
         .collect::<Vec<_>>();
+    // r6 item 2: for a PINNED Claude agent the managed native home is
+    // authoritative — it overrides any extra_env CLAUDE_CONFIG_DIR (the
+    // materializer guarantees the child, the boundary snapshot and the
+    // catalog/settings all use recipe.native_home), and the empty
+    // securestorage override keeps the macOS keychain namespace the
+    // operator logged into.
     if pin_native_home
         && target.agent_kind() == Some(AgentKind::Claude)
         && !recipe.native_home.is_empty()
-        && !entries.iter().any(|(name, _)| name == "CLAUDE_CONFIG_DIR")
     {
         entries.push(("CLAUDE_CONFIG_DIR".into(), recipe.native_home.clone()));
         // Keep the *credentials* where the operator logged in, while the
@@ -2913,7 +3797,6 @@ fn agent_env(
     }
     entries
 }
-
 fn read_pty(state: Arc<PtyState>, mut reader: Box<dyn Read + Send>) {
     let mut buf = [0_u8; 4096];
     loop {
@@ -3172,6 +4055,9 @@ struct ShellEffortIo {
     events: mpsc::Sender<remuda_protocol::Observation>,
     seq: Arc<AtomicU64>,
     ctx: promotion::PromoteCtx,
+    /// Current deterministic transcript binding, for the c-effortread r15
+    /// item 4 submission floor (EOF captured immediately before typing).
+    bindings: promotion::BindingHandle,
 }
 
 #[async_trait]
@@ -3203,8 +4089,40 @@ impl crate::effort::EffortSwitchIo for ShellEffortIo {
         Ok(self.state.screen_grid().text())
     }
 
-    async fn journal(&self, status: String, severity: remuda_protocol::Severity) {
-        let payload = promotion::effort_lifecycle(&status, severity);
+    async fn submission_floor(&self) -> crate::effort::SubmissionProvenance {
+        use crate::effort::SubmissionProvenance;
+        // The hydrator follows the same binding; stat the bound transcript's
+        // current EOF so the switch's own slash (appended starting AT this
+        // offset) attributes to the switch while an older unread slash cannot
+        // (c-effortread r15 item 4, r16 item 1). No binding or a failed stat is
+        // explicit provenance loss (r16 item 3): attribute nothing rather than
+        // falling back to word-only matching.
+        let Some(binding) = self.bindings.binding() else {
+            return SubmissionProvenance::Unavailable;
+        };
+        match std::fs::metadata(binding.path) {
+            Ok(metadata) => SubmissionProvenance::Floor(metadata.len()),
+            Err(_) => SubmissionProvenance::Unavailable,
+        }
+    }
+
+    async fn journal_effort(
+        &self,
+        status: String,
+        severity: remuda_protocol::Severity,
+        request_id: Option<String>,
+    ) {
+        // c-effortread r10: echo the configure's per-request id so the web
+        // binds the lifecycle edge to the exact in-flight switch.
+        let related_ids = request_id
+            .map(|id| {
+                std::collections::BTreeMap::from([(
+                    remuda_protocol::EFFORT_REQUEST_ID_KEY.to_owned(),
+                    id,
+                )])
+            })
+            .unwrap_or_default();
+        let payload = promotion::effort_lifecycle(&status, severity, related_ids);
         if promotion::emit_payload(
             &self.events,
             &self.seq,
@@ -3303,6 +4221,603 @@ mod tests {
             Ok(())
         }
     }
+
+    /// r5/r6 items 1+2+7: launch env, boundary snapshot and hydrator derive
+    /// ONE `CLAUDE_CONFIG_DIR` from the env the child actually receives.
+    ///
+    /// - pin=true: the managed native home is authoritative even with an
+    ///   extra_env CLAUDE_CONFIG_DIR, and CLAUDE_SECURESTORAGE_CONFIG_DIR is
+    ///   forced empty (macOS keychain namespace);
+    /// - pin=false + override: the override survives;
+    /// - pin=false with no override: the child's own $HOME/.claude from the
+    ///   ASSEMBLED env map — never the parent driver process's
+    ///   CLAUDE_CONFIG_DIR.
+    #[test]
+    fn child_env_derives_one_config_dir_for_pinned_and_unpinned_launches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let native_home = tmp.path().join("native-home");
+        let custom = tmp.path().join("custom");
+        let child_home = tmp.path().join("child-home");
+        let recipe = LaunchRecipe {
+            native_home: native_home.to_string_lossy().into_owned(),
+            ..shell_recipe(
+                &ShellPtyOptions::login(tmp.path().to_path_buf()),
+                &tmp.path().to_string_lossy(),
+            )
+            .expect("recipe")
+        };
+        let claude_target = Target::Agent {
+            kind: AgentKind::Claude,
+            resume: None,
+        };
+        let value_of = |entries: &[(String, String)], key: &str| {
+            entries
+                .iter()
+                .find_map(|(name, value)| (name == key).then(|| value.clone()))
+        };
+        let with_child_home = |mut options: ShellPtyOptions| {
+            options
+                .extra_env
+                .insert("HOME".to_owned(), child_home.to_string_lossy().into_owned());
+            options
+        };
+
+        // pin=true, no override: native_home + empty securestorage.
+        let pinned = with_child_home(ShellPtyOptions {
+            target: claude_target.clone(),
+            pin_native_home: true,
+            ..ShellPtyOptions::login(tmp.path().to_path_buf())
+        });
+        let env = child_env_layers(&pinned, &recipe).expect("env");
+        assert_eq!(env.claude_config_dir(&pinned), native_home);
+        assert_eq!(
+            value_of(&env.entries, "CLAUDE_CONFIG_DIR"),
+            Some(native_home.to_string_lossy().into_owned())
+        );
+        assert_eq!(
+            value_of(&env.entries, "CLAUDE_SECURESTORAGE_CONFIG_DIR"),
+            Some(String::new())
+        );
+
+        // pin=true WITH an extra_env CLAUDE_CONFIG_DIR: the PIN wins
+        // (r6 item 2), securestorage is still forced, and the dir appears
+        // once.
+        let mut pinned_custom = pinned.clone();
+        pinned_custom.extra_env.insert(
+            "CLAUDE_CONFIG_DIR".into(),
+            custom.to_string_lossy().into_owned(),
+        );
+        let env = child_env_layers(&pinned_custom, &recipe).expect("env");
+        assert_eq!(env.claude_config_dir(&pinned_custom), native_home);
+        assert_eq!(
+            value_of(&env.entries, "CLAUDE_CONFIG_DIR"),
+            Some(native_home.to_string_lossy().into_owned()),
+            "the managed pin overrides an extra_env dir"
+        );
+        assert_eq!(
+            value_of(&env.entries, "CLAUDE_SECURESTORAGE_CONFIG_DIR"),
+            Some(String::new())
+        );
+        assert_eq!(
+            env.entries
+                .iter()
+                .filter(|(name, _)| name == "CLAUDE_CONFIG_DIR")
+                .count(),
+            1,
+            "the dir appears exactly once"
+        );
+
+        // pin=false + explicit override: the custom dir survives (no pin is
+        // injected).
+        let unpinned_custom = with_child_home(ShellPtyOptions {
+            target: claude_target.clone(),
+            pin_native_home: false,
+            ..ShellPtyOptions::login(tmp.path().to_path_buf())
+        });
+        let mut unpinned_custom = unpinned_custom;
+        unpinned_custom.extra_env.insert(
+            "CLAUDE_CONFIG_DIR".into(),
+            custom.to_string_lossy().into_owned(),
+        );
+        let env = child_env_layers(&unpinned_custom, &recipe).expect("env");
+        assert_eq!(env.claude_config_dir(&unpinned_custom), custom);
+        assert!(
+            value_of(&env.entries, "CLAUDE_SECURESTORAGE_CONFIG_DIR").is_none(),
+            "no pin, no managed securestorage override"
+        );
+
+        // pin=false and no override: the child writes to its OWN
+        // $HOME/.claude resolved from the ASSEMBLED env map (r6 item 1).
+        // CLAUDE_CONFIG_DIR is not on the child_env inherit allowlist, so a
+        // value exported by the parent driver can never enter the map or the
+        // resolution — no parent-process env lookup is needed.
+        let unpinned = with_child_home(ShellPtyOptions {
+            target: claude_target,
+            pin_native_home: false,
+            claude_home: None,
+            ..ShellPtyOptions::login(tmp.path().to_path_buf())
+        });
+        let env = child_env_layers(&unpinned, &recipe).expect("env");
+        assert!(
+            value_of(&env.entries, "CLAUDE_CONFIG_DIR").is_none(),
+            "an unpinned launch invents no config-dir env"
+        );
+        assert_eq!(
+            env.claude_config_dir(&unpinned),
+            child_home.join(".claude"),
+            "the unpinned child's own HOME/.claude, never the parent config dir"
+        );
+    }
+
+    /// r7 item 3 (r6 item 1 end to end): with a PARENT driver-process
+    /// CLAUDE_CONFIG_DIR that differs from the child's $HOME/.claude, a real
+    /// agent launch must make the child's EFFECTIVE command-env config dir,
+    /// the resume boundary's directory and PromoteCtx.claude_home ALL THE
+    /// SAME — for both native-home pin values. The parent value never appears.
+    ///
+    /// The workspace forbids unsafe code (edition-2024 `env::set_var`), so the
+    /// driver process's parent env is set by RE-EXECUTING this test binary
+    /// with CLAUDE_CONFIG_DIR on the child Command (same convention as
+    /// remuda config/remuda-signal env tests).
+    #[test]
+    fn item3_one_config_dir_command_env_boundary_promote_ctx_both_pins() {
+        if std::env::var_os(R7_CONFIG_CHILD_MARKER).is_some() {
+            return;
+        }
+        for pin in ["true", "false"] {
+            let parent_dir = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "shell_pty::tests::item3_config_dir_child_body",
+                    "--nocapture",
+                ])
+                .env(R7_CONFIG_CHILD_MARKER, pin)
+                .env("CLAUDE_CONFIG_DIR", parent_dir.path())
+                .output()
+                .expect("spawn child");
+            assert!(
+                output.status.success(),
+                "pin={pin} child failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    /// Child body for [`item3_one_config_dir_command_env_boundary_promote_ctx_both_pins`].
+    #[tokio::test]
+    async fn item3_config_dir_child_body() {
+        let pin_native_home = match std::env::var(R7_CONFIG_CHILD_MARKER).as_deref() {
+            Ok("true") => true,
+            Ok("false") => false,
+            _ => return,
+        };
+        let parent_home = std::env::var_os("CLAUDE_CONFIG_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("the parent CLAUDE_CONFIG_DIR is set by the re-exec");
+        let dir = tempfile::tempdir().unwrap();
+        let child_home = dir.path().join("child-home");
+        let native_home = dir.path().join("managed-native-home");
+        std::fs::create_dir_all(&child_home).unwrap();
+        std::fs::create_dir_all(&native_home).unwrap();
+        let env_dump = dir.path().join("env.txt");
+        // The stub answers probes, then dumps its REAL environment and sleeps
+        // as the live child.
+        let claude_bin = remuda_testing::install_executable(
+            dir.path(),
+            "claude",
+            format!(
+                "#!/bin/sh\ncase \"$1\" in --version) echo '2.1.289'; exit 0;; esac\n\
+                 env > {dump}\nexec sleep 30\n",
+                dump = env_dump.display(),
+            ),
+        );
+
+        let mut spec: InstanceSpec =
+            serde_json::from_str(include_str!("../tests/fixtures/instance-spec.json")).unwrap();
+        spec.driver = DriverKind::ShellPty;
+        spec.kind = AgentKind::Claude;
+        spec.cwd = dir.path().to_string_lossy().into_owned();
+        spec.effort = None;
+        let mut options = ShellPtyOptions::agent(
+            dir.path().to_path_buf(),
+            AgentKind::Claude,
+            AgentLaunch {
+                profile: Box::new(crate::profile::ProviderProfile {
+                    id: spec.provider_profile.id.clone(),
+                    kind: ProviderKind::Anthropic,
+                    base_url: String::new(),
+                    delegation: Delegation::None,
+                    secret_ref: None,
+                    models: vec!["claude".into()],
+                    health: crate::profile::ProviderHealth::Healthy,
+                }),
+                launch_dir: dir.path().join("launch"),
+                native_home: native_home.clone(),
+                binary: Some(claude_bin),
+                origin: crate::materializer::LaunchOrigin::Human,
+                native_home_managed: pin_native_home,
+                settings_overlay: None,
+            },
+        );
+        options.pin_native_home = pin_native_home;
+        // Deliberately NO options.claude_home: resolution must come from the
+        // assembled child env, and the parent driver env must not leak in.
+        options.claude_home = None;
+        options
+            .extra_env
+            .insert("HOME".to_owned(), child_home.to_string_lossy().into_owned());
+
+        let driver = ShellPtyDriver::new(options);
+        driver
+            .spawn_at(&spec.cwd, Some(&spec))
+            .await
+            .expect("real agent launch");
+        let dump = async {
+            for _ in 0..100 {
+                if let Ok(text) = std::fs::read_to_string(&env_dump)
+                    && text.contains("HOME=")
+                {
+                    return text;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            panic!("child env dump never appeared at {}", env_dump.display());
+        }
+        .await;
+        let env: std::collections::BTreeMap<String, String> = dump
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect();
+        let ctx = driver
+            .promote_ctx
+            .lock()
+            .await
+            .clone()
+            .expect("promote ctx set on spawn");
+        Driver::close(&driver).await.expect("clean close");
+
+        // 1. The child's effective config dir: its CLAUDE_CONFIG_DIR, or its
+        //    own $HOME/.claude — never the parent driver's value.
+        let child_env_dir = env
+            .get("CLAUDE_CONFIG_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| child_home.join(".claude"));
+        assert_ne!(
+            child_env_dir, parent_home,
+            "pin={pin_native_home}: the parent CLAUDE_CONFIG_DIR must not reach the child"
+        );
+        if pin_native_home {
+            assert_eq!(
+                env.get("CLAUDE_CONFIG_DIR").map(std::path::Path::new),
+                Some(native_home.as_path()),
+                "pin={pin_native_home}: the managed native home is pinned"
+            );
+            assert_eq!(
+                env.get("CLAUDE_SECURESTORAGE_CONFIG_DIR")
+                    .map(String::as_str),
+                Some(""),
+                "pin={pin_native_home}: the macOS keychain namespace is forced"
+            );
+        } else {
+            assert!(
+                !env.contains_key("CLAUDE_CONFIG_DIR"),
+                "pin={pin_native_home}: no dir is invented; the child default applies"
+            );
+            assert_eq!(child_env_dir, child_home.join(".claude"));
+        }
+        // 2. PromoteCtx resolves the SAME directory the child uses.
+        assert_eq!(
+            ctx.claude_home, child_env_dir,
+            "pin={pin_native_home}: PromoteCtx.claude_home must be the child env dir"
+        );
+        // 3. The pre-spawn resume boundary for any session lands under exactly
+        //    that directory (same cwd slug rule the hydrator uses).
+        let session_id = "dddddddd-2222-4333-8444-eeeeeeeeeeee";
+        let cwd = std::path::PathBuf::from(&spec.cwd);
+        let session_path = crate::claude_transcript::ResumeBoundary::session_path(
+            &ctx.claude_home,
+            &cwd,
+            session_id,
+        );
+        assert!(
+            session_path.starts_with(&ctx.claude_home),
+            "pin={pin_native_home}: boundary {session_path:?} must live under {:?}",
+            ctx.claude_home
+        );
+        std::fs::create_dir_all(session_path.parent().unwrap()).unwrap();
+        std::fs::write(&session_path, "").unwrap();
+        let boundary = crate::claude_transcript::ResumeBoundary::for_resume(
+            &ctx.claude_home,
+            &cwd,
+            session_id,
+        );
+        assert!(
+            boundary.is_some(),
+            "pin={pin_native_home}: a resume snapshot resolves through the one config dir"
+        );
+    }
+
+    /// c-effortread r9 item 9a: the REAL driver, launching the fake-harness
+    /// `claude` with `--resume <id>`, must snapshot the pre-spawn resume
+    /// boundary through the CHILD config dir for BOTH native-home pin values,
+    /// under a PARENT driver CLAUDE_CONFIG_DIR that names a different dir.
+    /// Pre-anchor history never publishes; an effort record appended after
+    /// spawn publishes. Goes red if spawn_at resolves the boundary through the
+    /// parent dir (the decoy xhigh history leaks).
+    #[test]
+    fn r9_item9a_real_resume_spawn_uses_child_config_dir_for_both_pins() {
+        if std::env::var_os(R7_CONFIG_CHILD_MARKER).is_some() {
+            return;
+        }
+        for pin in ["true", "false"] {
+            let parent_dir = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "shell_pty::tests::r9_item9a_real_resume_child_body",
+                    "--nocapture",
+                ])
+                .env(R7_CONFIG_CHILD_MARKER, pin)
+                .env("CLAUDE_CONFIG_DIR", parent_dir.path())
+                .output()
+                .expect("spawn child");
+            assert!(
+                output.status.success(),
+                "pin={pin} child failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    /// Child body for [`r9_item9a_real_resume_spawn_uses_child_config_dir_for_both_pins`].
+    #[tokio::test]
+    async fn r9_item9a_real_resume_child_body() {
+        use remuda_testing::fake_harness::artifacts::{SessionMeta, claude_assistant_block};
+        use remuda_testing::fake_harness::clock::FakeClock;
+        use remuda_testing::fake_harness::script::UsageSpec;
+
+        let pin_native_home = match std::env::var(R7_CONFIG_CHILD_MARKER).as_deref() {
+            Ok("true") => true,
+            Ok("false") => false,
+            _ => return,
+        };
+        let parent_home = std::env::var_os("CLAUDE_CONFIG_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("the parent CLAUDE_CONFIG_DIR is set by the re-exec");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let workspace = std::fs::canonicalize(&workspace).unwrap();
+        let child_home = root.join("child-home");
+        let native_home = root.join("managed-native-home");
+        std::fs::create_dir_all(&child_home).unwrap();
+        std::fs::create_dir_all(&native_home).unwrap();
+        let instance_dir = root.join("instance");
+
+        // Install the deterministic fake-harness as the child `claude`.
+        let install = root.join("opt/bin");
+        std::fs::create_dir_all(&install).unwrap();
+        let harness = remuda_testing::ensure_workspace_bin("fake-harness");
+        let claude_bin = install.join("claude");
+        std::fs::copy(&harness, &claude_bin).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&claude_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Locate the real relay binary the hook overlay invokes.
+        let deps_dir = std::env::current_exe().unwrap();
+        let deps_dir = deps_dir.parent().unwrap();
+        let relay_binary = [deps_dir.join("remuda"), deps_dir.join("../remuda")]
+            .into_iter()
+            .find(|candidate| candidate.is_file())
+            .unwrap_or_else(|| remuda_testing::workspace_root().join("target/debug/remuda"));
+
+        let session_id = "aaaaaaaa-r9a0-4333-8444-aaaaaaaaaaaa";
+        let child_config = if pin_native_home {
+            native_home.clone()
+        } else {
+            child_home.join(".claude")
+        };
+        let meta = SessionMeta {
+            session_id: session_id.to_owned(),
+            cwd: workspace.clone(),
+            model: "claude".into(),
+            version: "2.1.270".into(),
+        };
+        let session_path = crate::claude_transcript::ResumeBoundary::session_path(
+            &child_config,
+            &workspace,
+            session_id,
+        );
+        std::fs::create_dir_all(session_path.parent().unwrap()).unwrap();
+        let history_clock = FakeClock::new(1_700_000_000_000);
+        let history = serde_json::to_string(&claude_assistant_block(
+            &meta,
+            &history_clock,
+            "msg-history",
+            0,
+            serde_json::json!({"type": "text", "text": "HISTORY-PRE-ANCHOR-MARKER"}),
+            "end_turn",
+            &UsageSpec::default(),
+            Some("high"),
+        ))
+        .unwrap();
+        std::fs::write(&session_path, history + "\n").unwrap();
+
+        // The parent driver CLAUDE_CONFIG_DIR carries a same-id DECOY
+        // transcript. If spawn_at wrongly resolves the boundary through it,
+        // this xhigh read-back leaks as current.
+        let parent_path = crate::claude_transcript::ResumeBoundary::session_path(
+            &parent_home,
+            &workspace,
+            session_id,
+        );
+        std::fs::create_dir_all(parent_path.parent().unwrap()).unwrap();
+        let decoy = serde_json::to_string(&claude_assistant_block(
+            &meta,
+            &history_clock,
+            "msg-parent",
+            0,
+            serde_json::json!({"type": "text", "text": "PARENT-DECOY-MARKER"}),
+            "end_turn",
+            &UsageSpec::default(),
+            Some("xhigh"),
+        ))
+        .unwrap();
+        std::fs::write(&parent_path, decoy + "\n").unwrap();
+
+        let mut spec: InstanceSpec =
+            serde_json::from_str(include_str!("../tests/fixtures/instance-spec.json")).unwrap();
+        spec.driver = DriverKind::ShellPty;
+        spec.kind = AgentKind::Claude;
+        spec.cwd = workspace.to_string_lossy().into_owned();
+        spec.effort = None;
+
+        let launch = ShellPtyOptions::agent(
+            workspace.clone(),
+            AgentKind::Claude,
+            AgentLaunch {
+                profile: Box::new(crate::profile::ProviderProfile {
+                    id: spec.provider_profile.id.clone(),
+                    kind: ProviderKind::Anthropic,
+                    base_url: String::new(),
+                    delegation: Delegation::None,
+                    secret_ref: None,
+                    models: vec!["claude".into()],
+                    health: crate::profile::ProviderHealth::Healthy,
+                }),
+                launch_dir: instance_dir.join("launch"),
+                native_home: native_home.clone(),
+                binary: Some(claude_bin),
+                origin: crate::materializer::LaunchOrigin::Human,
+                native_home_managed: pin_native_home,
+                settings_overlay: None,
+            },
+        );
+        let mut options = launch.resuming(session_id);
+        options.pin_native_home = pin_native_home;
+        // Deliberately no options.claude_home: the child env resolves it.
+        options.claude_home = None;
+        options
+            .extra_env
+            .insert("HOME".to_owned(), child_home.to_string_lossy().into_owned());
+        options
+            .extra_env
+            .insert("FAKE_HARNESS_DIALECT_VERSION".into(), "modern".into());
+        options.hooks = Some(HookConfig {
+            instance_dir: instance_dir.clone(),
+            relay_binary,
+            tui: crate::launch::TuiMode::Default,
+        });
+
+        let driver = ShellPtyDriver::new(options);
+        let mut events = driver
+            .start(spec)
+            .await
+            .expect("real resume launch")
+            .into_events();
+
+        // The boundary was snapped at spawn: the pre-anchor history must not
+        // publish while promotion binds and starts pumping.
+        let settle = std::time::Duration::from_secs(6);
+        let early = r9a_collect(&mut events, settle).await;
+        assert!(
+            !r9a_blob_contains(&early, "HISTORY-PRE-ANCHOR-MARKER"),
+            "pin={pin_native_home}: pre-anchor history must never hydrate as current"
+        );
+        assert!(
+            !r9a_blob_contains(&early, "PARENT-DECOY-MARKER"),
+            "pin={pin_native_home}: the parent CLAUDE_CONFIG_DIR transcript must never be read"
+        );
+        assert!(
+            !r9a_effort_names(&early).contains(&Some(remuda_protocol::EffortName::High)),
+            "pin={pin_native_home}: the pre-anchor high read-back must not publish"
+        );
+        assert!(
+            !r9a_effort_names(&early).contains(&Some(remuda_protocol::EffortName::Xhigh)),
+            "pin={pin_native_home}: the parent-decoy xhigh read-back must not publish"
+        );
+
+        // After spawn the agent appends a NEW effort record past the boundary.
+        let post_clock = FakeClock::new(1_700_000_100_000);
+        let post = serde_json::to_string(&claude_assistant_block(
+            &meta,
+            &post_clock,
+            "msg-post-anchor",
+            0,
+            serde_json::json!({"type": "text", "text": "POST-ANCHOR-MAX-MARKER"}),
+            "end_turn",
+            &UsageSpec::default(),
+            Some("max"),
+        ))
+        .unwrap();
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&session_path)
+            .unwrap();
+        writeln!(file, "{post}").unwrap();
+        drop(file);
+
+        let later = r9a_collect(&mut events, std::time::Duration::from_secs(20)).await;
+        assert!(
+            r9a_effort_names(&later).contains(&Some(remuda_protocol::EffortName::Max)),
+            "pin={pin_native_home}: the post-spawn max verdict publishes past the resume boundary"
+        );
+        assert!(
+            r9a_blob_contains(&later, "POST-ANCHOR-MAX-MARKER"),
+            "pin={pin_native_home}: post-anchor conversation hydrates"
+        );
+        // Even after pumping the post-boundary record, neither history source
+        // has leaked.
+        let all: Vec<remuda_protocol::Observation> = early.into_iter().chain(later).collect();
+        assert!(!r9a_blob_contains(&all, "HISTORY-PRE-ANCHOR-MARKER"));
+        assert!(!r9a_blob_contains(&all, "PARENT-DECOY-MARKER"));
+
+        Driver::close(&driver).await.expect("clean close");
+    }
+
+    async fn r9a_collect(
+        events: &mut mpsc::Receiver<remuda_protocol::Observation>,
+        dur: std::time::Duration,
+    ) -> Vec<remuda_protocol::Observation> {
+        let mut out = Vec::new();
+        let until = std::time::Instant::now() + dur;
+        while std::time::Instant::now() < until {
+            // Stop early once the budget is over or a max edge has landed
+            // (callers that need the full budget pass a fresh receiver).
+            if let Ok(Some(observation)) =
+                tokio::time::timeout(std::time::Duration::from_millis(200), events.recv()).await
+            {
+                out.push(observation);
+            }
+        }
+        out
+    }
+
+    fn r9a_blob_contains(observations: &[remuda_protocol::Observation], needle: &str) -> bool {
+        observations.iter().any(|observation| {
+            serde_json::to_string(&observation.body).is_ok_and(|body| body.contains(needle))
+        })
+    }
+
+    fn r9a_effort_names(
+        observations: &[remuda_protocol::Observation],
+    ) -> Vec<Option<remuda_protocol::EffortName>> {
+        observations
+            .iter()
+            .filter_map(|observation| match &observation.body {
+                remuda_protocol::ObservationPayload::Effort(payload) => {
+                    Some(payload.effective.name)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    const R7_CONFIG_CHILD_MARKER: &str = "REMUDA_TEST_R7_CONFIG_CHILD";
 
     /// c-wfdrill2 C. `promote_ctx` minted `InstanceId::new()`, so every id the
     /// driver derived — hook tool nodes through `remuda_signal`, the
@@ -4129,6 +5644,8 @@ mod tests {
             pid: 42,
             session_id: None,
             hydrates_transcript: true,
+            resume: false,
+            session_id_from_hook: false,
         });
         let hooks = driver.hooks.lock().await.clone().unwrap();
         assert!(
@@ -4247,8 +5764,1330 @@ mod tests {
         Driver::close(&driver).await.unwrap();
     }
 
-    /// A driver whose PTY runs an inert process, carrying `kind` as its
-    /// session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_promoted_codex_registers_its_census_interval_before_publishing_detection() {
+        // c-usagefu r11 item 2 (Ruling A2), tightened by r12 item 1 (A2'):
+        // the promotion poller registers the promoted codex's unknown-boundary
+        // lifetime BEFORE it publishes the detection into the `promoted` slot,
+        // and the OWNER guard is handed to the driver. The r10 shape
+        // registered it one file-adapter-watch tick (~800 ms) later, leaving a
+        // window in which a same-cwd generic launch saw a promoted codex
+        // invisible to the census.
+        //
+        // Deterministic phase control on a two-worker runtime: the fake table
+        // blocks EVERY poller sample on a per-call ticket the test releases on
+        // a wall-clock schedule, while the watch keeps its own 800 ms grid. The
+        // poller's promote sample is released at 1100 ms (the watch's 800 ms
+        // tick has already read None; its next tick is at 1600 ms), so a
+        // registration performed by the watch cannot exist at the publish
+        // instant. The demote sample is released at 1900 ms (watch next runs
+        // at 2400 ms): under A2' demotion must NOT close the interval — it
+        // stays live until the driver's stop ladder runs at test end.
+        struct GatedTable {
+            ticket: std::sync::Mutex<u64>,
+            released_until: Arc<AtomicU64>,
+            cv: Arc<std::sync::Condvar>,
+            lock: Arc<std::sync::Mutex<()>>,
+            codex: Arc<AtomicBool>,
+        }
+        impl crate::promote::ProcessTable for GatedTable {
+            fn process_group(&self, pgid: i32) -> Vec<crate::promote::ProcessRow> {
+                if pgid > 0 {
+                    let mine = {
+                        let mut ticket = self
+                            .ticket
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        *ticket += 1;
+                        *ticket
+                    };
+                    let mut guard = self
+                        .lock
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    while self.released_until.load(Ordering::SeqCst) < mine {
+                        guard = self
+                            .cv
+                            .wait(guard)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    }
+                    if self.codex.load(Ordering::SeqCst) {
+                        return vec![crate::promote::ProcessRow {
+                            pid: pgid,
+                            args: "codex".into(),
+                        }];
+                    }
+                }
+                Vec::new()
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        let released_until = Arc::new(AtomicU64::new(0));
+        let codex = Arc::new(AtomicBool::new(false));
+        let table = Arc::new(GatedTable {
+            ticket: std::sync::Mutex::new(0),
+            released_until: Arc::clone(&released_until),
+            cv: Arc::new(std::sync::Condvar::new()),
+            lock: Arc::new(std::sync::Mutex::new(())),
+            codex: Arc::clone(&codex),
+        });
+        // Ticket releases after spawn: t=0 sample immediately; the promote
+        // sample at ~1100 ms (between watch ticks 800/1600); the demote sample
+        // at ~1900 ms (between 1600/2400); everything thereafter is open so
+        // driver shutdown never blocks in a sample.
+        let cv = Arc::clone(&table.cv);
+        let lock = Arc::clone(&table.lock);
+        let releaser = {
+            let released_until = Arc::clone(&released_until);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                released_until.store(1, Ordering::SeqCst);
+                cv.notify_all();
+                std::thread::sleep(std::time::Duration::from_millis(1080));
+                released_until.store(2, Ordering::SeqCst);
+                cv.notify_all();
+                std::thread::sleep(std::time::Duration::from_millis(800));
+                released_until.store(3, Ordering::SeqCst);
+                cv.notify_all();
+                std::thread::sleep(std::time::Duration::from_millis(700));
+                released_until.store(u64::MAX, Ordering::SeqCst);
+                let _guard = lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                cv.notify_all();
+            })
+        };
+
+        let mut options = ShellPtyOptions::login(cwd.clone());
+        options.args = vec!["/bin/sh".into(), "-c".into(), "sleep 60".into()];
+        options.promote = true;
+        let driver = ShellPtyDriver::with_process_table(
+            options,
+            table as Arc<dyn crate::promote::ProcessTable>,
+        );
+        let _events = driver.spawn().await.unwrap().into_events();
+        let pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
+        assert!(pgid > 0, "the test shell owns a foreground process group");
+        let owner = format!("promoted-codex-{pgid}");
+        let census_present = || crate::adapters::codex_discovery::census_contains(&cwd, &owner);
+        assert!(!census_present(), "nothing registered before a detection");
+
+        // Arm codex before the poller's 800 ms sample (released at 1100).
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        codex.store(true, Ordering::SeqCst);
+        for _ in 0..3000 {
+            if driver
+                .promoted
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|found| found.kind == AgentKind::Codex)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(
+            driver
+                .promoted
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|found| found.kind == AgentKind::Codex),
+            "the codex detection was published"
+        );
+        assert!(
+            census_present(),
+            "registered at the publish instant, not at the watch's next 800 ms tick"
+        );
+
+        // Demote before the poller's 1600 ms sample (released at 1900).
+        codex.store(false, Ordering::SeqCst);
+        for _ in 0..3000 {
+            if driver.promoted.lock().unwrap().is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(
+            driver.promoted.lock().unwrap().is_none(),
+            "demotion published"
+        );
+        // r12 item 1 (Ruling A2'): demotion only forgets the pid — the poller
+        // no longer closes the interval. Ownership is the driver/session's and
+        // the interval stays LIVE until the stop ladder confirms the process
+        // terminated. Give any (now incorrect) poller-side close a generous
+        // window to show itself: the interval must remain live throughout.
+        for _ in 0..100 {
+            assert!(
+                crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, &owner),
+                "a demotion must NOT close the promoted interval (r12 A2')"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(
+            census_present(),
+            "and it stays registered for a competing same-cwd discovery"
+        );
+
+        releaser.join().unwrap();
+        Driver::close(&driver).await.unwrap();
+        assert!(
+            !crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, &owner),
+            "the driver closes the promoted interval only after the stop ladder"
+        );
+        assert!(
+            census_present(),
+            "closed-but-retained for pending discovery decisions"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_promoted_codex_rollout_after_a_demotion_is_never_attributed_to_a_competitor() {
+        // c-usagefu r12 item 1 (Ruling A2'): a promoted codex leaves the
+        // foreground (demotion) while its process is still alive in the PTY.
+        // r11 CLOSED the census interval on demotion, so a competing
+        // driver-launched codex that dispatched the same prompt afterwards
+        // became the sole live instance over [its launch, rollout creation]
+        // and bound a rollout the promoted session actually owned — even one
+        // created while close was stopping the promoted process. The promoted
+        // lifetime is now owned by the DRIVER/SESSION: a demotion leaves it
+        // LIVE and it closes only after the stop ladder confirms termination.
+        //
+        // The competitor runs the REAL production discovery path
+        // (CodexAdapter::discover over an actual rollout fixture), never a
+        // test-only census helper.
+        struct Item1Table {
+            codex: Arc<AtomicBool>,
+        }
+        impl crate::promote::ProcessTable for Item1Table {
+            fn process_group(&self, pgid: i32) -> Vec<crate::promote::ProcessRow> {
+                if pgid > 0 && self.codex.load(Ordering::SeqCst) {
+                    vec![crate::promote::ProcessRow {
+                        pid: pgid,
+                        args: "codex".into(),
+                    }]
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        let codex = Arc::new(AtomicBool::new(false));
+        let table = Arc::new(Item1Table {
+            codex: Arc::clone(&codex),
+        });
+        let mut options = ShellPtyOptions::login(cwd.clone());
+        options.args = vec!["/bin/sh".into(), "-c".into(), "sleep 60".into()];
+        options.promote = true;
+        let driver = ShellPtyDriver::with_process_table(
+            options,
+            table as Arc<dyn crate::promote::ProcessTable>,
+        );
+        let _events = driver.spawn().await.unwrap().into_events();
+        let pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
+        let owner = format!("promoted-codex-{pgid}");
+
+        codex.store(true, Ordering::SeqCst);
+        for _ in 0..3000 {
+            if driver
+                .promoted
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|found| found.kind == AgentKind::Codex)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(crate::adapters::codex_discovery::census_contains(
+            &cwd, &owner
+        ));
+
+        // The codex leaves the foreground — but its sleep-60 process is still
+        // running in the PTY group.
+        codex.store(false, Ordering::SeqCst);
+        for _ in 0..3000 {
+            if driver.promoted.lock().unwrap().is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(driver.promoted.lock().unwrap().is_none(), "demoted");
+        assert!(
+            crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, &owner),
+            "r12 A2': demotion does NOT close the promoted lifetime"
+        );
+
+        // A competing driver-launched codex starts in the same cwd AFTER the
+        // demotion, dispatches a prompt, and a rollout carrying that prompt is
+        // created in its CODEX_HOME (the lazily-written real fixture layout).
+        let competitor_home = tempfile::tempdir().unwrap();
+        let floor = time::OffsetDateTime::now_utc();
+        let mut competitor = crate::adapters::CodexAdapter::new(crate::adapters::AdapterHome {
+            home: competitor_home.path().to_path_buf(),
+            cwd: cwd.clone(),
+            pid: None,
+            launched_at: Some(floor),
+            resume_session_id: None,
+        })
+        .with_instance_key(Some("r12-item1-competitor".to_owned()));
+        let prompt = "competitor prompt that must not win";
+        crate::adapters::codex_discovery::record_input(&cwd, "r12-item1-competitor", prompt);
+        let started = time::OffsetDateTime::now_utc();
+        let date_dir = format!(
+            "{:04}/{:02}/{:02}",
+            started.year(),
+            u8::from(started.month()),
+            started.day()
+        );
+        let month_dir = competitor_home.path().join("sessions").join(date_dir);
+        std::fs::create_dir_all(&month_dir).unwrap();
+        let started_rfc = started
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        std::fs::write(
+            month_dir.join("rollout-r12competitor.jsonl"),
+            format!(
+                "{{\"timestamp\":\"{started_rfc}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"r12competitor\",\"session_id\":\"r12competitor\",\"cwd\":\"{}\",\"timestamp\":\"{started_rfc}\"}}}}\n\
+                 {{\"timestamp\":\"{started_rfc}\",\"ordinal\":1,\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"id\":\"m_user\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{prompt}\"}}],\"internal_chat_message_metadata_passthrough\":{{\"content_item_kinds\":[\"user.text\"]}}}}}}\n",
+                cwd.display()
+            ),
+        )
+        .unwrap();
+
+        // Production discovery (the public poll entry point runs discover):
+        // the promoted session's LIVE unknown-boundary interval overlaps
+        // [competitor launch, creation], so prompt-only attribution is
+        // refused and the rejection is permanently remembered.
+        use crate::adapters::FileSignalAdapter as _;
+        let observed = competitor.poll().unwrap();
+        assert!(observed.is_empty(), "a refused candidate emits nothing");
+        assert!(competitor.binding().is_none());
+
+        // The driver now closes: the stop ladder kills the still-running
+        // process and only then closes the promoted interval. Close is
+        // deterministic here (plain sleep), so bound it loosely.
+        Driver::close(&driver).await.unwrap();
+        assert!(
+            !crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, &owner),
+            "closed after confirmed termination"
+        );
+        assert!(
+            crate::adapters::codex_discovery::census_contains(&cwd, &owner),
+            "the closed interval is retained while the competitor decision is pending"
+        );
+        let observed = competitor.poll().unwrap();
+        assert!(observed.is_empty(), "still refused after close");
+        assert!(competitor.binding().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_fresh_rollout_created_while_the_stop_ladder_runs_is_refused_before_closure() {
+        // c-usagefu r13 item 4: the r12 promoted-close regression built and
+        // rejected its rollout BEFORE close() even started. The live window
+        // that actually matters is WHILE THE REAL STOP LADDER IS RUNNING with
+        // the promoted process still alive: a rollout freshly created there and
+        // a competitor's FIRST discovery in that window must be refused, and
+        // only after termination is confirmed does the promoted interval close.
+        //
+        // Moving the lifetime close to the START of close() makes this test
+        // bind: the competitor's launch floor is sampled inside close (after
+        // the early close), so the already-closed unknown-boundary interval no
+        // longer overlaps its [launch, creation] window and it becomes the sole
+        // live instance.
+        use crate::adapters::FileSignalAdapter as _;
+        struct Item4Table {
+            codex: Arc<AtomicBool>,
+        }
+        impl crate::promote::ProcessTable for Item4Table {
+            fn process_group(&self, pgid: i32) -> Vec<crate::promote::ProcessRow> {
+                if pgid > 0 && self.codex.load(Ordering::SeqCst) {
+                    vec![crate::promote::ProcessRow {
+                        pid: pgid,
+                        args: "codex".into(),
+                    }]
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        let codex = Arc::new(AtomicBool::new(true));
+        let table = Arc::new(Item4Table {
+            codex: Arc::clone(&codex),
+        });
+        // Ignores SIGINT/SIGHUP like every agent TUI: the group stays alive
+        // through the interrupt and hangup graces (~4 s window) and is reaped
+        // only by SIGKILL.
+        let mut options = ShellPtyOptions::login(cwd.clone());
+        options.args = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "trap '' INT HUP TERM; exec sleep 60".into(),
+        ];
+        options.promote = true;
+        let driver = ShellPtyDriver::with_process_table(
+            options,
+            table as Arc<dyn crate::promote::ProcessTable>,
+        );
+        let _events = driver.spawn().await.unwrap().into_events();
+        let pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
+        let owner = format!("promoted-codex-{pgid}");
+
+        for _ in 0..3000 {
+            if driver
+                .promoted
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|found| found.kind == AgentKind::Codex)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(crate::adapters::codex_discovery::census_contains(
+            &cwd, &owner
+        ));
+
+        // close() runs concurrently with this test future (borrowed, not
+        // 'static): the promoted process is genuinely alive throughout the
+        // ladder graces. The gate future finishes its in-flight discovery while
+        // close keeps advancing, and join waits for termination to complete.
+        let (close_result, mut competitor) = tokio::join!(Driver::close(&driver), async {
+            // Gate on being INSIDE close teardown (the promoted slot is
+            // cleared before the ladder) while the process group is still
+            // live.
+            let gate_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let in_teardown = driver.promoted.lock().unwrap().is_none();
+                let alive = lifecycle::group_has_live_member(pgid);
+                if in_teardown && alive {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < gate_deadline,
+                    "never observed close teardown while the group was alive"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(
+                crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, &owner),
+                "the promoted interval is LIVE while the ladder is running"
+            );
+
+            // The competitor launches NOW — floor strictly inside close —
+            // and a FRESH rollout carrying its prompt is created in the
+            // same window.
+            let competitor_home = tempfile::tempdir().unwrap();
+            let floor = time::OffsetDateTime::now_utc();
+            let competitor_owner = "r13-item4-competitor";
+            let mut competitor = crate::adapters::CodexAdapter::new(crate::adapters::AdapterHome {
+                home: competitor_home.path().to_path_buf(),
+                cwd: cwd.clone(),
+                pid: None,
+                launched_at: Some(floor),
+                resume_session_id: None,
+            })
+            .with_instance_key(Some(competitor_owner.to_owned()));
+            let prompt = "r13 item 4 rollout born during close";
+            crate::adapters::codex_discovery::record_input(&cwd, competitor_owner, prompt);
+            let started = time::OffsetDateTime::now_utc();
+            assert!(
+                started >= floor,
+                "the rollout is created after the competitor launch"
+            );
+            let date_dir = format!(
+                "{:04}/{:02}/{:02}",
+                started.year(),
+                u8::from(started.month()),
+                started.day()
+            );
+            let month_dir = competitor_home.path().join("sessions").join(date_dir);
+            std::fs::create_dir_all(&month_dir).unwrap();
+            let started_rfc = started
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap();
+            std::fs::write(
+                    month_dir.join("rollout-r13item4.jsonl"),
+                    format!(
+                        "{{\"timestamp\":\"{started_rfc}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"r13item4\",\"session_id\":\"r13item4\",\"cwd\":\"{}\",\"timestamp\":\"{started_rfc}\"}}}}\n\
+                         {{\"timestamp\":\"{started_rfc}\",\"ordinal\":1,\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"id\":\"m_user\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{prompt}\"}}],\"internal_chat_message_metadata_passthrough\":{{\"content_item_kinds\":[\"user.text\"]}}}}}}\n",
+                        cwd.display()
+                    ),
+                )
+                .unwrap();
+
+            // FIRST discovery, still while the process is alive in the
+            // ladder: the LIVE unknown-boundary interval overlaps the
+            // competitor's whole window — refused, and the rejection
+            // sticks.
+            assert!(
+                lifecycle::group_has_live_member(pgid),
+                "rollout + first discovery genuinely precede termination"
+            );
+            let observed = competitor.poll().unwrap();
+            assert!(
+                observed.is_empty(),
+                "a rollout born while the promoted process is alive is refused"
+            );
+            assert!(
+                competitor.binding().is_none(),
+                "the competitor must not bind a rollout the live promoted instance owns"
+            );
+            competitor
+        });
+        close_result.unwrap();
+
+        // Termination finished inside join: the interval closed only AFTER it,
+        // and stays retained while the competitor decision window is open.
+        assert!(
+            !crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, &owner),
+            "closed only after the stop ladder confirmed termination"
+        );
+        assert!(
+            crate::adapters::codex_discovery::census_contains(&cwd, &owner),
+            "retained for the still-open competitor decision"
+        );
+        // A1: the in-window refusal is permanent; the cleaner census after
+        // close does not reverse it.
+        let observed = competitor.poll().unwrap();
+        assert!(observed.is_empty(), "still refused after confirmed closure");
+        assert!(competitor.binding().is_none());
+    }
+
+    #[tokio::test]
+    async fn the_codex_census_interval_stays_live_until_the_process_has_stopped() {
+        // c-usagefu r11 item 3 (Ruling A2): the lifetime interval closes only
+        // AFTER the agent process has stopped, not when close() begins. r10
+        // dropped the driver's guard BEFORE the stop ladder even ran (while the
+        // aborted adapter's clone also went away), so a rollout the agent
+        // created during teardown found a closed census and a later same-cwd
+        // launch could become its owner.
+        //
+        // The child ignores SIGINT and SIGHUP (ignored dispositions survive
+        // the exec); on this box the group still answers throughout the 2 s
+        // interrupt grace and dies during the later hangup grace (~3.5 s into
+        // the ladder, when the master closes). A 2.5 s observation window sits
+        // fully inside that: it proves the interval is LIVE throughout close,
+        // including after a witness clone drops mid-ladder. The old code
+        // dropped the guard before the first rung, failing the first sample.
+        // After close returns (group gone) the interval is closed-but-retained.
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        let owner = "native-codex-close-order";
+        let mut options = ShellPtyOptions::login(cwd.clone());
+        options.args = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "trap '' INT HUP TERM; exec sleep 60".into(),
+        ];
+        let driver = ShellPtyDriver::new(options);
+        let _run = driver.spawn().await.expect("spawns");
+
+        // Exactly what a Target::Agent Codex spawn does: the driver slot owns
+        // the cohort; the adapter side is a non-closing witness.
+        let lifetime = crate::adapters::codex_discovery::begin_lifetime(
+            &cwd,
+            owner,
+            Some(time::OffsetDateTime::now_utc()),
+        );
+        let witness = lifetime.witness();
+        let mut witness = Some(witness);
+        *driver.codex_lifetime.lock().await = Some(lifetime);
+
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let closer = tokio::spawn(async move {
+            let ok = Driver::close(&driver).await.is_ok();
+            let _ = done_tx.send(());
+            ok
+        });
+
+        for tick in 0..250u32 {
+            assert!(
+                crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, owner),
+                "the census must stay LIVE while close is stopping the process (tick {tick})"
+            );
+            // The adapter witness vanishes ~1 s into the ladder (it was
+            // aborted before the ladder started); the owner keeps it live.
+            if tick == 100 {
+                witness.take();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        done_rx.await.unwrap();
+        assert!(closer.await.unwrap(), "close completes on the killed group");
+        assert!(
+            !crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, owner),
+            "closed only once the process group is actually gone"
+        );
+        assert!(
+            crate::adapters::codex_discovery::census_contains(&cwd, owner),
+            "the closed interval is retained for pending discovery decisions"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stop_incomplete_teardown_keeps_the_census_open_for_the_node_lifetime() {
+        // c-usagefu r17 COORDINATOR RULING W0 (replaces the r13–r16 watcher /
+        // registry / process-identity machinery): when the stop ladder cannot
+        // CONFIRM the group is gone, the codex census intervals stay OPEN for
+        // the rest of this Node's lifetime — no watcher, no registry, no
+        // survivor probing. The operator is told exactly once through a
+        // lifecycle/Warning naming the instance and cwd, a later same-cwd
+        // prompt-only discovery keeps REFUSING even after the survivor exits,
+        // and Node shutdown drops the retained guards without recording a
+        // close.
+        use crate::adapters::FileSignalAdapter as _;
+        use std::os::unix::process::CommandExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        let canonical_cwd = std::fs::canonicalize(&cwd).unwrap().display().to_string();
+
+        // The survivor: a REAL process in its OWN group, the identity a
+        // stop-incomplete verdict names. The forced verdict only substitutes
+        // the ladder's conclusion; the real ladder still runs. The test kills
+        // the survivor after close.
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exec sleep 60"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let survivor_pid = i32::try_from(child.id()).unwrap();
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        assert!(
+            lifecycle::group_has_live_member(survivor_pid),
+            "the external survivor is live in its own process group"
+        );
+
+        let mut options = ShellPtyOptions::login(cwd.clone());
+        options.args = vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()];
+        let driver = ShellPtyDriver::new(options);
+        let mut events = driver.spawn().await.expect("spawns").into_events();
+
+        // The driver-owned (native launch) cohort AND a promoted (unknown
+        // boundary) cohort, exactly as production registers them. c-usagefu r18
+        // item 3: they carry this test's Node epoch so the epoch-scoped
+        // shutdown seam below retires them.
+        let epoch = crate::adapters::codex_discovery::NodeEpoch::mint();
+        let native_owner = "r17-w0-native";
+        let promoted_owner = "r17-w0-promoted";
+        *driver.codex_lifetime.lock().await =
+            Some(crate::adapters::codex_discovery::begin_lifetime_for_epoch(
+                &cwd,
+                native_owner,
+                Some(time::OffsetDateTime::now_utc()),
+                Some(epoch.id()),
+            ));
+        driver.promoted_codex_lifetimes.lock().unwrap().push(
+            crate::adapters::codex_discovery::begin_lifetime_for_epoch(
+                &cwd,
+                promoted_owner,
+                None,
+                Some(epoch.id()),
+            ),
+        );
+
+        // Force the stop-incomplete verdict AFTER the real ladder, naming the
+        // genuinely live external survivor.
+        *driver.test_stop_outcome.lock().unwrap() = Some(lifecycle::StopOutcome {
+            rung: lifecycle::StopRung::Kill,
+            group_gone: false,
+            pgid: Some(survivor_pid),
+            survivors: vec![survivor_pid],
+        });
+        Driver::close(&driver).await.unwrap();
+
+        // The operator warning: exactly one Diagnostic/Warning lifecycle,
+        // naming the instance and the cwd and carrying the W0 message.
+        let mut stop_warnings = Vec::new();
+        while let Ok(observation) = events.try_recv() {
+            if let remuda_protocol::ObservationPayload::Lifecycle(payload) = &observation.body
+                && let remuda_protocol::LifecyclePayload::Native(native) = &**payload
+                && native.topic == remuda_protocol::LifecycleTopic::Diagnostic
+                && native.severity == remuda_protocol::Severity::Warning
+                && native.native_name == "stop-incomplete"
+            {
+                stop_warnings.push(native.clone());
+            }
+        }
+        assert_eq!(
+            stop_warnings.len(),
+            1,
+            "the stop-incomplete warning is emitted exactly once"
+        );
+        let warning = &stop_warnings[0];
+        let instance = warning
+            .related_ids
+            .get("instance")
+            .expect("names the instance");
+        assert!(!instance.is_empty(), "the named instance is not empty");
+        assert_eq!(
+            warning.related_ids.get("cwd").map(String::as_str),
+            Some(canonical_cwd.as_str()),
+            "the warning names the census cwd"
+        );
+        assert_eq!(
+            warning.native_id,
+            remuda_protocol::Knowledge::Known {
+                value: instance.clone()
+            },
+            "the native id is the named instance"
+        );
+        assert_eq!(
+            warning.status,
+            remuda_protocol::Knowledge::Known {
+                value: super::stop_incomplete_warning_message().to_owned()
+            }
+        );
+
+        // Both intervals are LIVE immediately after the incomplete close.
+        for owner in [native_owner, promoted_owner] {
+            assert!(
+                crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, owner),
+                "{owner}: the interval stays live after a stop-incomplete close"
+            );
+        }
+
+        // The survivor exits later — nothing is watching, so both intervals
+        // stay LIVE.
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(survivor_pid),
+            Some(nix::sys::signal::Signal::SIGKILL),
+        )
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while lifecycle::group_has_live_member(survivor_pid) {
+            assert!(tokio::time::Instant::now() < deadline, "the survivor exits");
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        for owner in [native_owner, promoted_owner] {
+            assert!(
+                crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, owner),
+                "{owner}: a survivor exit after close never closes the interval (W0)"
+            );
+        }
+
+        // A LATER same-cwd, prompt-only launch is refused through the REAL
+        // discovery path and the rejection sticks (Ruling A1): the live
+        // intervals overlap its whole decision window.
+        let next_home = tempfile::tempdir().unwrap();
+        let floor = time::OffsetDateTime::now_utc();
+        let next_owner = "r17-w0-competitor";
+        let mut next = crate::adapters::CodexAdapter::new(crate::adapters::AdapterHome {
+            home: next_home.path().to_path_buf(),
+            cwd: cwd.clone(),
+            pid: None,
+            launched_at: Some(floor),
+            resume_session_id: None,
+        })
+        .with_instance_key(Some(next_owner.to_owned()));
+        let prompt = "r17 W0 later launch prompt";
+        crate::adapters::codex_discovery::record_input(&cwd, next_owner, prompt);
+        let started = floor;
+        let date_dir = format!(
+            "{:04}/{:02}/{:02}",
+            started.year(),
+            u8::from(started.month()),
+            started.day()
+        );
+        let month_dir = next_home.path().join("sessions").join(date_dir);
+        std::fs::create_dir_all(&month_dir).unwrap();
+        let started_rfc = started
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        std::fs::write(
+            month_dir.join("rollout-r17w0.jsonl"),
+            format!(
+                "{{\"timestamp\":\"{started_rfc}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"r17w0\",\"session_id\":\"r17w0\",\"cwd\":\"{}\",\"timestamp\":\"{started_rfc}\"}}}}\n\
+                 {{\"timestamp\":\"{started_rfc}\",\"ordinal\":1,\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"id\":\"m_user\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{prompt}\"}}],\"internal_chat_message_metadata_passthrough\":{{\"content_item_kinds\":[\"user.text\"]}}}}}}\n",
+                cwd.display()
+            ),
+        )
+        .unwrap();
+        for attempt in 0..2 {
+            let observed = next.poll().unwrap();
+            assert!(
+                observed.is_empty(),
+                "same-cwd prompt-only discovery refuses while a stop-incomplete interval is live \
+                 (attempt {attempt})"
+            );
+            assert!(
+                next.binding().is_none(),
+                "no bind after refusal (attempt {attempt})"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        drop(next);
+
+        // Node shutdown (the exact seam DevNode::shutdown calls, c-usagefu r18
+        // item 3): the retained guards drop WITHOUT a recorded close and their
+        // still-open census SEGMENTS are retired (removed, not closed), so a
+        // fresh Node epoch can attribute in this cwd again.
+        crate::adapters::codex_discovery::shutdown_unconfirmed_guards(Some(&epoch));
+        for owner in [native_owner, promoted_owner] {
+            assert!(
+                !crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, owner),
+                "{owner}: this Node's shutdown retires its block without recording a close"
+            );
+        }
+        crate::adapters::codex_discovery::forget_lifetime(&cwd, next_owner);
+    }
+
+    /// Collect every observation of one body type from the receiver (drains
+    /// without blocking).
+    fn drain_observations<T>(
+        events: &mut mpsc::Receiver<remuda_protocol::Observation>,
+        mut select: impl FnMut(&remuda_protocol::ObservationPayload) -> Option<T>,
+    ) -> Vec<T> {
+        let mut out = Vec::new();
+        while let Ok(observation) = events.try_recv() {
+            if let Some(value) = select(&observation.body) {
+                out.push(value);
+            }
+        }
+        out
+    }
+
+    fn stop_incomplete_warnings(
+        events: &mut mpsc::Receiver<remuda_protocol::Observation>,
+    ) -> Vec<remuda_protocol::NativeLifecycle> {
+        drain_observations(events, |body| match body {
+            remuda_protocol::ObservationPayload::Lifecycle(payload) => match &**payload {
+                remuda_protocol::LifecyclePayload::Native(native)
+                    if native.topic == remuda_protocol::LifecycleTopic::Diagnostic
+                        && native.severity == remuda_protocol::Severity::Warning
+                        && native.native_name == "stop-incomplete" =>
+                {
+                    Some((**native).clone())
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+    }
+
+    /// c-usagefu r18 Ruling W0': an incomplete close performed as part of the
+    /// owning Node's shutdown emits only a tracing warn! — no operator
+    /// lifecycle/Warning observation — because the block ends with that Node.
+    /// A live Node's incomplete close still emits the observation (covered by
+    /// the r17 W0 test).
+    #[tokio::test]
+    async fn a_shutdown_incomplete_close_emits_no_lifecycle_warning() {
+        use std::os::unix::process::CommandExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exec sleep 60"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let survivor_pid = i32::try_from(child.id()).unwrap();
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+
+        let epoch = crate::adapters::codex_discovery::NodeEpoch::mint();
+        epoch.begin_shutdown();
+        let mut options = ShellPtyOptions::login(cwd.clone());
+        options.args = vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()];
+        options.node_epoch = Some(epoch.clone());
+        let driver = ShellPtyDriver::new(options);
+        let mut events = driver.spawn().await.unwrap().into_events();
+        *driver.test_stop_outcome.lock().unwrap() = Some(lifecycle::StopOutcome {
+            rung: lifecycle::StopRung::Kill,
+            group_gone: false,
+            pgid: Some(survivor_pid),
+            survivors: vec![survivor_pid],
+        });
+        *driver.codex_lifetime.lock().await =
+            Some(crate::adapters::codex_discovery::begin_lifetime_for_epoch(
+                &cwd,
+                "r18-item2-owner",
+                Some(time::OffsetDateTime::now_utc()),
+                driver
+                    .options
+                    .node_epoch
+                    .as_ref()
+                    .map(crate::adapters::codex_discovery::NodeEpoch::id),
+            ));
+        Driver::close(&driver).await.unwrap();
+
+        // Draining every observation is the assertion: a stop-incomplete
+        // lifecycle/Warning here fails the test above. The channel may carry
+        // unrelated observations (or be empty); only the warning is gated.
+        while let Ok(observation) = events.try_recv() {
+            if let remuda_protocol::ObservationPayload::Lifecycle(payload) = &observation.body
+                && let remuda_protocol::LifecyclePayload::Native(native) = &**payload
+                && native.topic == remuda_protocol::LifecycleTopic::Diagnostic
+                && native.severity == remuda_protocol::Severity::Warning
+                && native.native_name == "stop-incomplete"
+            {
+                panic!("a shutdown incomplete close must not emit the lifecycle warning");
+            }
+        }
+
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(survivor_pid),
+            Some(nix::sys::signal::Signal::SIGKILL),
+        )
+        .unwrap();
+        crate::adapters::codex_discovery::shutdown_unconfirmed_guards(Some(&epoch));
+    }
+
+    #[tokio::test]
+    async fn overlapping_closes_winner_emits_the_single_stop_incomplete_warning() {
+        // c-usagefu r18 item 1: two overlapping close() calls on one driver.
+        // The close that wins teardown ownership must also be the one holding
+        // the observation sender; otherwise — as before — close A takes the
+        // sender and parks in the poller-finalise wait, close B wins the
+        // teardown, runs the incomplete stop and has NO sender: the operator
+        // warning is silently lost. The close lock serializes the two, so
+        // exactly one warning is ever emitted, by the winner.
+        use std::os::unix::process::CommandExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+
+        // External survivor named by the forced verdict.
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exec sleep 60"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let survivor_pid = i32::try_from(child.id()).unwrap();
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+
+        let args = Arc::new(std::sync::Mutex::new("claude".to_owned()));
+        let driver = Arc::new(r7_login_driver(&cwd, &dir.path().join("home"), args));
+        let mut events = driver.spawn().await.expect("spawn").into_events();
+        // Let the promotion poller reach its select before arming the gate.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        *driver.test_stop_outcome.lock().unwrap() = Some(lifecycle::StopOutcome {
+            rung: lifecycle::StopRung::Kill,
+            group_gone: false,
+            pgid: Some(survivor_pid),
+            survivors: vec![survivor_pid],
+        });
+        // The owner guard a codex launch registers (the table here is a
+        // promoted claude login; the guard is what makes the warning fire).
+        *driver.codex_lifetime.lock().await =
+            Some(crate::adapters::codex_discovery::begin_lifetime(
+                &cwd,
+                "r18-item1-owner",
+                Some(time::OffsetDateTime::now_utc()),
+            ));
+
+        // Arm the deterministic gate: the winning close parks immediately
+        // after claiming teardown ownership and the sender, so B's overlap is
+        // driven while the teardown is still in flight.
+        test_reset_close_ownership_park();
+
+        let driver_a = Arc::clone(&driver);
+        let driver_b = Arc::clone(&driver);
+        let closer_a = tokio::spawn(async move { Driver::close(&*driver_a).await });
+
+        // Wait until A has claimed ownership and the sender.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+        while !test_close_ownership_park_winner_arrived() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "A parks at the ownership gate"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            driver.events_tx.lock().await.is_none(),
+            "A has taken the observation sender before B starts"
+        );
+
+        // B starts while A is parked. Under the fix it waits on close_lock;
+        // without the fix it overtakes through the poller teardown, wins the
+        // (later) ownership claim and has NO sender.
+        let closer_b = tokio::spawn(async move { Driver::close(&*driver_b).await });
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        // Release A; both closes then settle (A completes the teardown; B
+        // finds no state).
+        test_release_close_ownership_park();
+        closer_a.await.unwrap().unwrap();
+        closer_b.await.unwrap().unwrap();
+
+        let warnings = stop_incomplete_warnings(&mut events);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "exactly one stop-incomplete warning is emitted, by the winning close"
+        );
+
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(survivor_pid),
+            Some(nix::sys::signal::Signal::SIGKILL),
+        )
+        .unwrap();
+        crate::adapters::codex_discovery::shutdown_unconfirmed_guards(None);
+    }
+
+    /// c-usagefu r18 item 5 helper: a promoted login driver whose real poller
+    /// has bound the transcript and is buffering one open-turn usage record
+    /// (counters present, stop_reason null) that no poll has published.
+    async fn driver_with_buffered_open_turn(
+        dir: &Path,
+    ) -> (
+        ShellPtyDriver,
+        mpsc::Receiver<remuda_protocol::Observation>,
+        PathBuf,
+        &'static str,
+    ) {
+        let home = dir.join("claude-home");
+        let cwd = dir.to_path_buf();
+        let slug = crate::claude_transcript::project_dir(&home, &cwd);
+        std::fs::create_dir_all(&slug).unwrap();
+        let session: &'static str = "01234567-89ab-cdef-0123-456789abcdef";
+        let args = Arc::new(std::sync::Mutex::new(format!(
+            "claude --session-id {session}"
+        )));
+        let driver = r7_login_driver(&cwd, &home, args);
+        let mut events = driver.spawn().await.expect("spawn").into_events();
+        let pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
+        let hooks = driver.hooks.lock().await.clone().expect("hook session");
+
+        // Hook binds before the transcript exists (Fresh), then the prompt and
+        // one open assistant turn land.
+        let path = slug.join(format!("{session}.jsonl"));
+        r7_send_session_start(&hooks, pgid, session, &path).await;
+        std::fs::write(
+            &path,
+            format!(
+                "{}{}",
+                r7_user(session, "open-prompt", "working now"),
+                r7_record(
+                    session,
+                    serde_json::json!({
+                        "type": "assistant",
+                        "uuid": "open-assistant",
+                        "timestamp": "2026-10-14T00:00:00.000Z",
+                        "isSidechain": false,
+                        "message": {
+                            "type": "message",
+                            "role": "assistant",
+                            "id": "msg_open_turn",
+                            "model": "claude-opus-5-5",
+                            "content": [{"type": "text", "text": "working on it"}],
+                            "stop_reason": null,
+                            "usage": {
+                                "input_tokens": 5,
+                                "cache_read_input_tokens": 6000,
+                                "cache_creation_input_tokens": 9,
+                                "output_tokens": 13
+                            }
+                        }
+                    })
+                )
+            ),
+        )
+        .unwrap();
+        // Bind + at least two pumps: conversation hydrates, the open usage
+        // stays buffered.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if drain_observations(&mut events, |body| {
+                matches!(body, remuda_protocol::ObservationPayload::Message(_)).then_some(())
+            })
+            .is_empty()
+            {
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            } else {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            drain_observations(&mut events, |body| {
+                matches!(body, remuda_protocol::ObservationPayload::Usage(_)).then_some(())
+            })
+            .is_empty(),
+            "the open turn usage is buffered in the live hydrator"
+        );
+        (driver, events, cwd, session)
+    }
+
+    fn buffered_usage_payloads(
+        events: &mut mpsc::Receiver<remuda_protocol::Observation>,
+    ) -> Vec<remuda_protocol::UsagePayload> {
+        drain_observations(events, |body| match body {
+            remuda_protocol::ObservationPayload::Usage(payload) => Some((**payload).clone()),
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn an_aborted_poller_publishes_the_live_hydrators_buffered_usage_exactly_once() {
+        // c-usagefu r18 item 5: close's finalise deadline aborts a wedged
+        // poller. Before the fix the abort guard was constructed with
+        // hydrator: None and only received the hydrator on the NORMAL disarm
+        // path, so the abort dropped the live mapper and its buffered usage.
+        // The guard now owns the live hydrator for the whole loop; its Drop
+        // runs finish_sync into a channel with free capacity.
+        let dir = tempfile::tempdir().unwrap();
+        let (driver, mut events, _cwd, _session) = driver_with_buffered_open_turn(dir.path()).await;
+
+        let park = promotion::test_acquire_final_finalise_park().await;
+        // Signal exactly what close signals before waiting on the poller: the
+        // closed bit and the cooperative watch. The poller breaks its loop and
+        // parks at the gate before its final finalise.
+        driver
+            .state()
+            .await
+            .unwrap()
+            .closed
+            .store(true, Ordering::SeqCst);
+        if let Some(shutdown) = driver.poller_shutdown.lock().await.take() {
+            let _ = shutdown.send(true);
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+        while !promotion::test_final_finalise_park_held() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the poller parks at the gate"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Channel has free capacity: drain anything queued.
+        let _ = drain_observations(&mut events, |body| Some(body.clone())).len();
+
+        // Deterministic abort, exactly like close's deadline path.
+        let poller = driver
+            .poller
+            .lock()
+            .await
+            .take()
+            .expect("the real poller handle")
+            .into_handle();
+        poller.abort();
+        let _ = poller.await;
+        drop(park);
+
+        // The guard's Drop finish_sync delivered the buffered usage.
+        let payloads = buffered_usage_payloads(&mut events);
+        assert_eq!(payloads.len(), 1, "buffered usage survives the abort once");
+        let known = |value: &remuda_protocol::Knowledge<remuda_protocol::U64>| match value {
+            remuda_protocol::Knowledge::Known { value } => value.0,
+            other => panic!("expected Known counter, got {other:?}"),
+        };
+        assert_eq!(known(&payloads[0].input_tokens), 5);
+        assert_eq!(known(&payloads[0].cache_read_tokens), 6_000);
+        assert_eq!(known(&payloads[0].cache_write_tokens), 9);
+        assert_eq!(known(&payloads[0].output_tokens), 13);
+
+        // The real close afterwards (poller already gone) publishes nothing
+        // more: the aborted hydrator owned the only copy.
+        Driver::close(&driver).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            buffered_usage_payloads(&mut events).is_empty(),
+            "no second usage publication after the abort finalise"
+        );
+        crate::adapters::codex_discovery::shutdown_unconfirmed_guards(None);
+    }
+
+    /// c-usagefu r20 item 5 shared harness: fill the bounded run channel so the
+    /// next awaited publication parks, then free exactly one slot on demand.
+    /// Dummy observations are tagged so the test can ignore them when reading.
+    async fn fill_event_channel(
+        sender: &mpsc::Sender<remuda_protocol::Observation>,
+        filler: &remuda_protocol::Observation,
+    ) {
+        while sender.capacity() > 0 {
+            sender
+                .send(filler.clone())
+                .await
+                .expect("fill the run channel");
+        }
+    }
+
+    /// True iff an observation is the buffered open turn's usage payload.
+    fn is_open_turn_usage(observation: &remuda_protocol::Observation) -> bool {
+        match &observation.body {
+            remuda_protocol::ObservationPayload::Usage(payload) => {
+                payload.output_tokens == remuda_protocol::Knowledge::Known { value: U64(13) }
+            }
+            _ => false,
+        }
+    }
+
+    /// Shared helper for the r21 cancellation regressions: drive the poller to
+    /// release into a pending reserve(), abort, free one slot and join. Returns
+    /// the observations delivered after the abort.
+    #[allow(clippy::too_many_lines)]
+    async fn abort_at_pending_reservation(
+        driver: &ShellPtyDriver,
+        events: &mut mpsc::Receiver<remuda_protocol::Observation>,
+        rebind: Option<(&crate::launch::HookSession, i32, &std::path::Path)>,
+    ) -> Vec<remuda_protocol::Observation> {
+        let sender = driver.test_events_sender().await.expect("run sender");
+        let filler = driver.test_filler_observation().await.expect("filler");
+        // Per-driver, per-invocation permit (c-usagefu r21 item 3).
+        let gate = driver.test_poller_gate().await.expect("poller gate");
+        let mut permit = gate.permit().await;
+
+        if let Some((hooks, pgid, second)) = rebind {
+            std::fs::write(second, b"{}").unwrap();
+            r7_send_session_start(hooks, pgid, "r20-second-session", second).await;
+        } else {
+            driver
+                .state()
+                .await
+                .unwrap()
+                .closed
+                .store(true, Ordering::SeqCst);
+            if let Some(shutdown) = driver.poller_shutdown.lock().await.take() {
+                let _ = shutdown.send(true);
+            }
+        }
+        // Wait for THIS poller's invocation to reach the gate after
+        // production (no sleep: acknowledgement is per-spawn).
+        permit.wait_entered().await;
+        // Fill the bounded channel while publication is still gated off.
+        fill_event_channel(&sender, &filler).await;
+        // Release the poller toward reserve() on the FULL channel.
+        permit.release_to_pending_reserve().await;
+        // c-usagefu r22 item 1: on a current-thread runtime the barrier's last
+        // participant returns before the poller resumes. Wait for the ack from
+        // polling the ACTUAL reservation future (a poll returned Pending) so
+        // the abort below cannot land while the poller is still before
+        // reserve() — which let pop-before-reserve regressions pass.
+        permit.wait_reserve_pending().await;
+
+        // Abort while full, then free exactly ONE slot and join.
+        // current_thread: the poller is parked on reserve(); abort schedules a
+        // cancellation poll; freeing the slot wakes it. The two compete, but
+        // both converge to exactly-once: the woken send delivers and Drop sees
+        // an empty queue, OR the cancellation drops the future first and Drop
+        // try_sends the queued observation into the freed slot. The assertion
+        // is exactly one either way; reverting reserve-before-pop leaves
+        // NOTHING in the queue for Drop and the woken future is cancelled.
+        let handle = driver
+            .poller
+            .lock()
+            .await
+            .take()
+            .expect("the real poller handle")
+            .into_handle();
+        handle.abort();
+        // Free one slot SYNCHRONOUSLY (try_recv releases the semaphore permit
+        // and wakes the queued sender without polling the runtime), then yield
+        // the current-thread runtime exactly ONCE: either the queued send
+        // completes (observation delivered, queue empty) or the cancel poll
+        // runs (future dropped, guard try_sends) — both exactly-once. Multiple
+        // yields would let the woken send race the cancel poll; one yield is
+        // sufficient because the cancel is already scheduled.
+        let freed = events.try_recv().expect("one filler drains synchronously");
+        let _ = freed;
+        tokio::task::yield_now().await;
+        let _ = handle.await;
+
+        let mut delivered = Vec::new();
+        while let Ok(Some(observation)) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), events.recv()).await
+        {
+            if is_open_turn_usage(&observation) {
+                delivered.push(observation);
+            }
+        }
+        delivered
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_abort_during_a_full_channel_finalize_delivers_usage_exactly_once() {
+        // c-usagefu r21 item 3 — CLOSE path, per-spawn acknowledgement: abort
+        // lands on THIS invocation's pending reservation; the buffered open
+        // turn is delivered exactly once.
+        let dir = tempfile::tempdir().unwrap();
+        let (driver, mut events, _cwd, _session) = driver_with_buffered_open_turn(dir.path()).await;
+
+        let delivered = abort_at_pending_reservation(&driver, &mut events, None).await;
+        assert_eq!(
+            delivered.len(),
+            1,
+            "buffered usage survives abort during a full-channel finalize, once"
+        );
+
+        Driver::close(&driver).await.unwrap();
+        assert!(
+            buffered_usage_payloads(&mut events).is_empty(),
+            "no second usage publication"
+        );
+        crate::adapters::codex_discovery::shutdown_unconfirmed_guards(None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_abort_during_a_full_channel_rebind_delivers_usage_exactly_once() {
+        // c-usagefu r21 item 3 — REBIND path: a second authenticated
+        // SessionStart finalizes the old hydrator; the per-spawn gate proves
+        // THIS invocation parked (no other poller can satisfy it); abort at its
+        // pending reservation delivers the old turn once.
+        let dir = tempfile::tempdir().unwrap();
+        let (driver, mut events, _cwd, _session) = driver_with_buffered_open_turn(dir.path()).await;
+        let pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
+        let hooks = driver.hooks.lock().await.clone().expect("hook session");
+        let home = dir.path().join("claude-home");
+        let slug = crate::claude_transcript::project_dir(&home, dir.path());
+        std::fs::create_dir_all(&slug).unwrap();
+        let second = slug.join("r20-second-session.jsonl");
+
+        let delivered =
+            abort_at_pending_reservation(&driver, &mut events, Some((&hooks, pgid, &second))).await;
+        assert_eq!(
+            delivered.len(),
+            1,
+            "the rebound hydrator's buffered usage survives abort, once"
+        );
+        Driver::close(&driver).await.unwrap();
+        assert!(
+            buffered_usage_payloads(&mut events).is_empty(),
+            "no second usage publication after the abort rebind"
+        );
+        crate::adapters::codex_discovery::shutdown_unconfirmed_guards(None);
+    }
+
+    #[tokio::test]
+    async fn a_normal_close_with_guard_owned_hydrator_publishes_buffered_usage_once() {
+        // c-usagefu r18 item 5 normal-path half: with the guard owning the
+        // hydrator, the cooperative close finalises it and marks the guard
+        // done, so the Drop finish_sync never re-emits the same group.
+        let dir = tempfile::tempdir().unwrap();
+        let (driver, mut events, _cwd, _session) = driver_with_buffered_open_turn(dir.path()).await;
+
+        Driver::close(&driver).await.unwrap();
+        // Give any (incorrect) second publication time to land.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let payloads = buffered_usage_payloads(&mut events);
+        assert_eq!(
+            payloads.len(),
+            1,
+            "normal close publishes the open usage once"
+        );
+    }
+
     ///
     /// Promoted rather than launched: §1.0 makes the two the same session to
     /// everything below the spawn, and the promoted shape needs no materializer
@@ -4266,6 +7105,8 @@ mod tests {
                 pid: 1,
                 session_id: None,
                 hydrates_transcript: true,
+                resume: false,
+                session_id_from_hook: false,
             });
         }
         driver
@@ -4336,6 +7177,8 @@ mod tests {
             pid: 1,
             session_id: None,
             hydrates_transcript: true,
+            resume: false,
+            session_id_from_hook: false,
         });
         *driver.status.lock().unwrap() = Some(ScreenStatus::Idle);
 
@@ -4421,5 +7264,819 @@ mod tests {
             "'/data/it'\\''s.png'",
             "an embedded quote must not end the quoting"
         );
+    }
+
+    /// A post-spawn launch failure driven through the REAL spawn path (not the
+    /// cleanup primitive): the switch workers and catalog task are aborted,
+    /// `inner` is cleared, and the driver stays reusable — c-r3 replaced r2's
+    /// direct `abort_failed_launch` call. Child reaping on the real path is
+    /// asserted by `a_real_codex_ultra_launch_*` via the live state's pgid
+    /// (the failure path tears the child down before it can name itself, so a
+    /// pid-file assertion there races the immediate cleanup).
+    #[tokio::test]
+    async fn a_post_spawn_failure_through_spawn_clears_inner_and_workers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut options = ShellPtyOptions::login(tmp.path().to_path_buf());
+        options.args = vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()];
+        options.fail_after_spawn = true;
+        let mut driver = ShellPtyDriver::new(options);
+        // The real launch spawns the child, then fails at adapter setup.
+        let err = driver.spawn().await.expect_err("injected launch must fail");
+        assert!(matches!(err, DriverError::Io(_)), "got {err:?}");
+
+        // Item 5: a failed launch leaves no live state and no detached
+        // coordination tasks.
+        assert!(driver.inner.lock().await.is_none(), "inner cleared");
+        assert!(driver.effort_worker.lock().await.is_none());
+        assert!(driver.model_worker.lock().await.is_none());
+        assert!(driver.permission_worker.lock().await.is_none());
+        assert!(driver.events_tx.lock().await.is_none());
+
+        // The same driver can launch again (a failed resume must not poison the
+        // driver for the retry), and that launch reaps cleanly.
+        driver.options.fail_after_spawn = false;
+        let pgid = {
+            let handle = driver.spawn().await.expect("relaunches after failure");
+            let state = driver.state().await.expect("live state on relaunch");
+            let pgid = state.pgid.load(Ordering::SeqCst);
+            assert!(lifecycle::group_alive(pgid), "the relaunched child runs");
+            drop(handle);
+            pgid
+        };
+        driver.close().await.expect("clean close");
+        for _ in 0..100 {
+            if !lifecycle::group_alive(pgid) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            !lifecycle::group_alive(pgid),
+            "close reaps the relaunched child"
+        );
+    }
+
+    /// Item 8: a post-spawn adapter-setup failure with hooks ON must release
+    /// the hook server/socket, retire parked hooks, and drop the transcript
+    /// claim — otherwise the retry cannot bind the per-instance socket. The
+    /// retry through the REAL spawn path reuses the same instance dir.
+    #[tokio::test]
+    async fn a_post_spawn_failure_with_hooks_releases_the_socket_and_retries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let instance_dir = tmp.path().join("instance");
+        let mut options = ShellPtyOptions::login(tmp.path().to_path_buf());
+        options.args = vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()];
+        options.hooks = Some(HookConfig {
+            instance_dir: instance_dir.clone(),
+            relay_binary: PathBuf::from("/nonexistent/remuda"),
+            tui: crate::launch::TuiMode::Fullscreen,
+        });
+        options.fail_after_spawn = true;
+        let mut driver = ShellPtyDriver::new(options);
+        let err = driver.spawn().await.expect_err("injected launch must fail");
+        assert!(matches!(err, DriverError::Io(_)), "got {err:?}");
+
+        assert!(driver.hook_session().await.is_none(), "hooks taken");
+        assert!(
+            !instance_dir.join("hook.sock").exists(),
+            "the failed launch unbound the hook socket"
+        );
+
+        // The same driver retries in the SAME instance dir: the socket must be
+        // free to bind again (before item 8 the stale server held it). The hook
+        // session reports only after the child's first SessionStart, so the
+        // bound socket file is the assertion here.
+        driver.options.fail_after_spawn = false;
+        driver.spawn().await.expect("the retry launches");
+        assert!(
+            instance_dir.join("hook.sock").exists(),
+            "the retry rebound the hook socket"
+        );
+        driver.close().await.expect("clean close");
+        assert!(
+            !instance_dir.join("hook.sock").exists(),
+            "close unbind after the retry"
+        );
+    }
+
+    // r3 item 4: a Codex carrier launched with the `ultra` level through the
+    // REAL shell-pty spawn path (real materialize → real child, not a unit call
+    // to EffortRequest::from_selection) must not panic and must reap on close.
+    #[tokio::test]
+    async fn a_real_codex_ultra_launch_spawns_and_reaps_without_panic() {
+        use remuda_testing::install_executable;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Stub codex: answers the version probe, otherwise sleeps long enough to
+        // be observed as a live group leader before close reaps it.
+        let codex_bin = install_executable(
+            dir.path(),
+            "codex",
+            "#!/bin/sh\ncase \"$1\" in --version) echo 'codex-cli 0.154.0'; exit 0;; esac\nexec sleep 30\n",
+        );
+        let mut spec: InstanceSpec =
+            serde_json::from_str(include_str!("../tests/fixtures/instance-spec.json")).unwrap();
+        spec.driver = DriverKind::ShellPty;
+        spec.kind = AgentKind::Codex;
+        spec.cwd = dir.path().to_string_lossy().into_owned();
+        spec.effort = Some(remuda_protocol::EffortSelection {
+            name: remuda_protocol::EffortName::Ultra,
+            ultracode: false,
+        });
+
+        let mut options = ShellPtyOptions::agent(
+            dir.path().to_path_buf(),
+            AgentKind::Codex,
+            AgentLaunch {
+                profile: Box::new(crate::profile::ProviderProfile {
+                    id: spec.provider_profile.id.clone(),
+                    kind: ProviderKind::OpenaiResponses,
+                    base_url: String::new(),
+                    delegation: Delegation::None,
+                    secret_ref: None,
+                    models: vec!["gpt".into()],
+                    health: crate::profile::ProviderHealth::Healthy,
+                }),
+                launch_dir: dir.path().join("launch"),
+                native_home: dir.path().join("native-home"),
+                binary: Some(codex_bin),
+                origin: crate::materializer::LaunchOrigin::Human,
+                native_home_managed: false,
+                settings_overlay: None,
+            },
+        );
+        options.pin_native_home = false;
+        options.promote = false; // keep the test focused on spawn, not detection
+
+        let driver = ShellPtyDriver::new(options);
+        // The r2 bug panicked inside the spawn task after the child started; the
+        // real path returns a handle and the effort bridge accepts `ultra`.
+        let handle = driver
+            .spawn_at(&spec.cwd, Some(&spec))
+            .await
+            .expect("codex ultra launch succeeds through the real spawn path");
+        assert!(driver.inner.lock().await.is_some(), "the run is live");
+        // The child really is the live process group the real spawn created.
+        let pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
+        assert!(
+            pgid > 0 && lifecycle::group_alive(pgid),
+            "the stub child runs"
+        );
+        drop(handle);
+        driver.close().await.expect("clean close reaps the stub");
+        assert!(driver.inner.lock().await.is_none(), "close clears inner");
+        for _ in 0..100 {
+            if !lifecycle::group_alive(pgid) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            !lifecycle::group_alive(pgid),
+            "close reaped the spawned child"
+        );
+    }
+
+    /// Test table that reports one foreground `claude` row for whatever pgid the
+    /// live driver's child leads, so the real promotion poller detects it.
+    struct ClaudeTable;
+
+    impl crate::promote::ProcessTable for ClaudeTable {
+        fn process_group(&self, pgid: i32) -> Vec<crate::promote::ProcessRow> {
+            if pgid <= 0 {
+                return Vec::new();
+            }
+            vec![crate::promote::ProcessRow {
+                pid: pgid,
+                args: "claude".to_owned(),
+            }]
+        }
+    }
+
+    // c-r3 items 3/4: the promotion pump driven through the live driver's REAL
+    // event channel. A hand-started claude (a login shell whose foreground is a
+    // `claude` per the fixture process table) binds its transcript through the
+    // deterministic pid-file channel, and an assistant effort record appended
+    // after the bind is published on the run's mpsc channel with the
+    // deterministic journal/live event id.
+    #[tokio::test]
+    async fn the_promotion_pump_publishes_effort_through_the_live_channel() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("claude-home");
+        let cwd = dir.path().to_path_buf();
+        let session_id = "01234567-89ab-cdef-0123-456789abcdef";
+        let transcript =
+            crate::claude_transcript::project_dir(&home, &cwd).join(format!("{session_id}.jsonl"));
+
+        let mut options = ShellPtyOptions::login(cwd.clone());
+        options.args = vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()];
+        options.promote = true;
+        options.claude_home = Some(home.clone());
+        let driver = ShellPtyDriver::with_process_table(
+            options,
+            Arc::new(ClaudeTable) as Arc<dyn crate::promote::ProcessTable>,
+        );
+        let mut events = driver.spawn().await.expect("spawn").into_events();
+        // The fixture reports the child leader itself as the foreground claude.
+        let pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
+        assert!(pgid > 0);
+
+        // Deterministic channel B: the pid file names the session and cwd.
+        let sessions = home.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join(format!("{pgid}.json")),
+            serde_json::json!({ "sessionId": session_id, "cwd": cwd.to_string_lossy() })
+                .to_string(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        // One turn must already exist so the content-cwd check has something;
+        // the effort record follows after the hydrator binds.
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"user\",\"uuid\":\"u0\",\"sessionId\":".to_owned()
+                + &serde_json::to_string(session_id).unwrap()
+                + ",\"version\":\"2.1.289\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}\n",
+        )
+        .unwrap();
+
+        // Give the poller (PROMOTE_POLL) a few ticks to detect the foreground
+        // claude and bind the transcript through the pid file.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let mut high_record = serde_json::to_vec(&json!({
+            "type": "assistant",
+            "uuid": "msg-prom",
+            "sessionId": session_id,
+            "version": "2.1.289",
+            "message": {
+                "id": "msg-prom",
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "text", "text": "ok"}],
+            },
+            "effort": "high",
+            "perTurnEffort": null,
+        }))
+        .unwrap();
+        high_record.push(b'\n');
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap()
+            .write_all(&high_record)
+            .unwrap();
+
+        // Drain until the effort edge is published on the real channel. The
+        // promoted-shell driver minted its own instance scope in promote_ctx, so
+        // derive the expected id from an observation's instance_id.
+        let mut scope: Option<String> = None;
+        let mut effort_id: Option<remuda_protocol::EventId> = None;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(Some(obs)) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), events.recv()).await
+            {
+                scope.get_or_insert_with(|| obs.instance_id.as_id().to_string());
+                if let remuda_protocol::ObservationPayload::Effort(_) = &obs.body {
+                    effort_id = Some(obs.event_id);
+                    break;
+                }
+            }
+        }
+        Driver::close(&driver).await.unwrap();
+        let scope = scope.expect("saw at least one scoped observation");
+        let expected =
+            remuda_protocol::effort_event_id(&scope, "msg-prom", remuda_protocol::EffortName::High);
+        assert_eq!(
+            effort_id,
+            Some(expected),
+            "the promotion pump published the journal-derived effort id on its real channel"
+        );
+    }
+
+    // ----- c-effortread r7 item 1: sticky boundary by the BOUND session -----
+
+    /// One fixture table: the live pgid is always a `claude` whose args the
+    /// test swaps between polls (the process argv never changes on an
+    /// in-TUI /resume, so the test deliberately keeps it on the OLD flag).
+    #[derive(Clone)]
+    struct ScriptedClaudeTable {
+        args: Arc<std::sync::Mutex<String>>,
+    }
+
+    impl crate::promote::ProcessTable for ScriptedClaudeTable {
+        fn process_group(&self, pgid: i32) -> Vec<crate::promote::ProcessRow> {
+            if pgid <= 0 {
+                return Vec::new();
+            }
+            vec![crate::promote::ProcessRow {
+                pid: pgid,
+                args: self.args.lock().unwrap().clone(),
+            }]
+        }
+    }
+
+    const R7_S1: &str = "cccccccc-3333-4333-8333-cccccccccccc";
+    const R7_X: &str = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+    const R7_Y: &str = "dddddddd-4444-4444-8444-dddddddddddd";
+    const R7_Z: &str = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
+
+    fn r7_record(session: &str, mut record: serde_json::Value) -> String {
+        record
+            .as_object_mut()
+            .unwrap()
+            .insert("sessionId".into(), serde_json::json!(session));
+        record
+            .as_object_mut()
+            .unwrap()
+            .insert("version".into(), serde_json::json!("2.1.289"));
+        let mut line = record.to_string();
+        line.push('\n');
+        line
+    }
+
+    fn r7_user(session: &str, uuid: &str, text: &str) -> String {
+        r7_record(
+            session,
+            serde_json::json!({
+                "type": "user",
+                "uuid": uuid,
+                "message": {"role": "user", "content": text},
+            }),
+        )
+    }
+
+    fn r7_slash(session: &str, uuid: &str, args: &str) -> String {
+        r7_record(
+            session,
+            serde_json::json!({
+                "type": "user",
+                "uuid": uuid,
+                "message": {
+                    "role": "user",
+                    "content": format!(
+                        "<command-name>/effort</command-name>\n\
+                         <command-message>effort</command-message>\n\
+                         <command-args>{args}</command-args>"
+                    ),
+                },
+            }),
+        )
+    }
+
+    fn r7_verdict(session: &str, uuid: &str, text: &str) -> String {
+        r7_user(
+            session,
+            uuid,
+            &format!("<local-command-stdout>{text}</local-command-stdout>"),
+        )
+    }
+
+    fn r7_assistant(session: &str, uuid: &str, effort: Option<&str>) -> String {
+        let mut record = serde_json::json!({
+            "type": "assistant",
+            "uuid": uuid,
+            "message": {
+                "id": uuid,
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "text", "text": format!("reply {uuid}")}],
+                "stop_reason": "end_turn",
+            },
+            "perTurnEffort": null,
+        });
+        if let Some(level) = effort {
+            record
+                .as_object_mut()
+                .unwrap()
+                .insert("effort".into(), serde_json::json!(level));
+        }
+        r7_record(session, record)
+    }
+
+    fn r7_effort_names(
+        observations: &[remuda_protocol::Observation],
+    ) -> Vec<Option<remuda_protocol::EffortName>> {
+        observations
+            .iter()
+            .filter_map(|observation| match &observation.body {
+                remuda_protocol::ObservationPayload::Effort(payload) => {
+                    Some(payload.effective.name)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn r7_conversation_has(observations: &[remuda_protocol::Observation], needle: &str) -> bool {
+        observations.iter().any(|observation| {
+            matches!(
+                observation.body,
+                remuda_protocol::ObservationPayload::Message(_)
+                    | remuda_protocol::ObservationPayload::Thought(_)
+                    | remuda_protocol::ObservationPayload::ToolCall(_)
+                    | remuda_protocol::ObservationPayload::ToolResult(_)
+            ) && serde_json::to_string(&observation.body).is_ok_and(|body| body.contains(needle))
+        })
+    }
+
+    async fn r7_collect(
+        events: &mut mpsc::Receiver<remuda_protocol::Observation>,
+        dur: std::time::Duration,
+    ) -> Vec<remuda_protocol::Observation> {
+        let mut out = Vec::new();
+        let until = std::time::Instant::now() + dur;
+        while std::time::Instant::now() < until {
+            if let Ok(Some(observation)) =
+                tokio::time::timeout(std::time::Duration::from_millis(200), events.recv()).await
+            {
+                out.push(observation);
+            }
+        }
+        out
+    }
+
+    async fn r7_send_session_start(
+        hooks: &crate::launch::HookSession,
+        pid: i32,
+        session_id: &str,
+        path: &std::path::Path,
+    ) {
+        let reply = remuda_signal::send_event(
+            &hooks.socket_path,
+            &remuda_signal::HookEnvelope {
+                credential: hooks.child_env("")["REMUDA_HOOK_CREDENTIAL"].clone(),
+                event: "SessionStart".into(),
+                ppid: pid,
+                payload: serde_json::json!({
+                    "session_id": session_id,
+                    "transcript_path": path.to_string_lossy(),
+                }),
+            },
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(reply.to_hook_json(), serde_json::json!({}));
+    }
+
+    fn r7_login_driver(
+        dir: &std::path::Path,
+        home: &std::path::Path,
+        args: Arc<std::sync::Mutex<String>>,
+    ) -> ShellPtyDriver {
+        let mut options = ShellPtyOptions::login(dir.to_path_buf());
+        options.args = vec!["/bin/sh".into(), "-c".into(), "exec sleep 60".into()];
+        options.promote = true;
+        options.claude_home = Some(home.to_path_buf());
+        options.hooks = Some(HookConfig {
+            instance_dir: dir.join("instance"),
+            relay_binary: std::path::PathBuf::from("/nonexistent/remuda"),
+            tui: crate::launch::TuiMode::Fullscreen,
+        });
+        ShellPtyDriver::with_process_table(
+            options,
+            Arc::new(ScriptedClaudeTable { args }) as Arc<dyn crate::promote::ProcessTable>,
+        )
+    }
+
+    /// r7 item 1: a fresh launch argv keeps `--session-id S1` after the user
+    /// runs `/resume Y` in the TUI. The poller must bound Y from Y's OWN
+    /// SessionStart snapshot (unverified EOF anchor): Y's history (a high
+    /// read-back plus a max slash/verdict) neither publishes an effort edge
+    /// nor settles an armed switch, while conversation appended afterwards
+    /// still hydrates.
+    #[tokio::test]
+    async fn item1_resume_after_launch_uses_the_bound_session_not_the_argv_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("claude-home");
+        let cwd = dir.path().to_path_buf();
+        let slug = crate::claude_transcript::project_dir(&home, &cwd);
+        std::fs::create_dir_all(&slug).unwrap();
+        let args = Arc::new(std::sync::Mutex::new(format!(
+            "claude --session-id {R7_S1}"
+        )));
+        let driver = r7_login_driver(dir.path(), &home, Arc::clone(&args));
+        let mut events = driver.spawn().await.expect("spawn").into_events();
+        let pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
+        assert!(pgid > 0);
+        let hooks = driver.hooks.lock().await.clone().expect("hook session");
+
+        // First tick promotes. S1's authenticated SessionStart fires at TUI
+        // boot, BEFORE the first prompt lazily creates the transcript, so the
+        // sticky entry for S1 is measured while the file is absent.
+        let s1_path = slug.join(format!("{R7_S1}.jsonl"));
+        r7_send_session_start(&hooks, pgid, R7_S1, &s1_path).await;
+        r7_collect(&mut events, std::time::Duration::from_millis(1000)).await;
+        // The prompt then creates S1.jsonl; the next poll binds it Fresh.
+        std::fs::write(&s1_path, r7_user(R7_S1, "s1-prompt", "first prompt")).unwrap();
+        r7_collect(&mut events, std::time::Duration::from_millis(1600)).await;
+
+        // Arm before the rebind: Y's replayed verdict must never settle it.
+        let bridge = driver.effort_bridge.lock().await.clone();
+        let generation = bridge.arm(crate::effort::EffortRequest::from_level("max").expect("max"));
+
+        // In-TUI /resume Y; argv still says S1. Y carries history with a
+        // high read-back and the exact max slash+verdict that WOULD settle
+        // the armed switch were Y tailed from byte 0 as current.
+        let y_history = format!(
+            "{}{}{}",
+            r7_assistant(R7_Y, "y-old-assistant", Some("high")),
+            r7_slash(R7_Y, "y-old-slash", "max"),
+            r7_verdict(R7_Y, "y-old-verdict", "Set effort level to max"),
+        );
+        let y_path = slug.join(format!("{R7_Y}.jsonl"));
+        std::fs::write(&y_path, y_history).unwrap();
+        r7_send_session_start(&hooks, pgid, R7_Y, &y_path).await;
+        let rebound = r7_collect(&mut events, std::time::Duration::from_millis(2400)).await;
+        assert!(
+            r7_effort_names(&rebound).is_empty(),
+            "Y history must not publish an effort edge: {rebound:?}"
+        );
+        assert!(bridge.has_pending());
+        assert!(
+            bridge
+                .wait(generation, std::time::Duration::from_millis(300))
+                .await
+                .is_none(),
+            "the replayed verdict must not resolve Applied"
+        );
+
+        // Bytes appended AFTER Y's anchor hydrate as conversation only.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&y_path)
+            .unwrap()
+            .write_all(r7_user(R7_Y, "y-new-prompt", "after the resume").as_bytes())
+            .unwrap();
+        let after = r7_collect(&mut events, std::time::Duration::from_millis(1800)).await;
+        assert!(
+            r7_effort_names(&after).is_empty(),
+            "the gate never opens for Y this epoch: {after:?}"
+        );
+        assert!(r7_conversation_has(&after, "after the resume"));
+        assert!(bridge.has_pending());
+
+        Driver::close(&driver).await.unwrap();
+    }
+
+    /// c-usagefu r17 item 2: an authenticated native-session rebind in the
+    /// SAME foreground pid (an in-TUI `/clear` reports a new SessionStart)
+    /// must finalize and publish the OLD hydrator's buffered group before
+    /// discarding it. The open turn's usage is emitted only by
+    /// mapper.finish(); `hydrator = None` dropped it silently, so every token
+    /// of the pre-/clear turn never reached the Hub.
+    #[tokio::test]
+    async fn a_native_session_rebind_publishes_the_old_hydrators_buffered_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("claude-home");
+        let cwd = dir.path().to_path_buf();
+        let slug = crate::claude_transcript::project_dir(&home, &cwd);
+        std::fs::create_dir_all(&slug).unwrap();
+        let args = Arc::new(std::sync::Mutex::new(format!(
+            "claude --session-id {R7_S1}"
+        )));
+        let driver = r7_login_driver(dir.path(), &home, Arc::clone(&args));
+        let mut events = driver.spawn().await.expect("spawn").into_events();
+        let pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
+        assert!(pgid > 0);
+        let hooks = driver.hooks.lock().await.clone().expect("hook session");
+
+        // S1 reports at boot, before its transcript exists (measured Fresh).
+        let s1_path = slug.join(format!("{R7_S1}.jsonl"));
+        r7_send_session_start(&hooks, pgid, R7_S1, &s1_path).await;
+        r7_collect(&mut events, std::time::Duration::from_millis(1000)).await;
+
+        // The prompt and one assistant turn land: real counters but NO
+        // stop_reason, so the usage stays buffered in the hydrator across
+        // ordinary poll flushes (published only by finish()).
+        let open_turn = r7_record(
+            R7_S1,
+            serde_json::json!({
+                "type": "assistant",
+                "uuid": "s1-open-assistant",
+                "timestamp": "2026-10-14T00:00:00.000Z",
+                "isSidechain": false,
+                "message": {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": "msg_s1_open",
+                    "model": "claude-opus-5-5",
+                    "content": [{"type": "text", "text": "working on it"}],
+                    "stop_reason": null,
+                    "usage": {
+                        "input_tokens": 3,
+                        "cache_read_input_tokens": 4000,
+                        "cache_creation_input_tokens": 7,
+                        "output_tokens": 11
+                    }
+                }
+            }),
+        );
+        std::fs::write(
+            &s1_path,
+            format!("{}{open_turn}", r7_user(R7_S1, "s1-prompt", "first prompt")),
+        )
+        .unwrap();
+        // Bind + at least one poll: the conversation hydrates, the buffered
+        // usage does NOT publish yet.
+        let before_rebind = r7_collect(&mut events, std::time::Duration::from_millis(1800)).await;
+        assert!(
+            !before_rebind
+                .iter()
+                .any(|o| matches!(o.body, remuda_protocol::ObservationPayload::Usage(_))),
+            "the open turn's usage stays buffered across poll flushes"
+        );
+
+        // /clear in the same pid: a second authenticated SessionStart names
+        // the new session S2, whose transcript already holds history (sized
+        // from the authenticated report; that history is gated, not current).
+        let s2_path = slug.join(format!("{R7_Z}.jsonl"));
+        std::fs::write(&s2_path, r7_user(R7_Z, "s2-history", "old cleared turn")).unwrap();
+        r7_send_session_start(&hooks, pgid, R7_Z, &s2_path).await;
+        let rebound = r7_collect(&mut events, std::time::Duration::from_millis(2600)).await;
+
+        // The OLD session's buffered usage is finalised as part of the rebind,
+        // before the new hydrator opens — the counters are the open turn's.
+        let buffered: Vec<_> = rebound
+            .iter()
+            .filter_map(|o| match &o.body {
+                remuda_protocol::ObservationPayload::Usage(payload) => Some(payload),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            buffered.len(),
+            1,
+            "the rebind publishes the old hydrator's buffered usage exactly once"
+        );
+        let known = |value: &remuda_protocol::Knowledge<remuda_protocol::U64>| match value {
+            remuda_protocol::Knowledge::Known { value } => value.0,
+            other => panic!("expected Known counter, got {other:?}"),
+        };
+        assert_eq!(known(&buffered[0].input_tokens), 3);
+        assert_eq!(known(&buffered[0].cache_read_tokens), 4_000);
+        assert_eq!(known(&buffered[0].cache_write_tokens), 7);
+        assert_eq!(known(&buffered[0].output_tokens), 11);
+        // The gated history never hydrates as conversation.
+        assert!(!r7_conversation_has(&rebound, "old cleared turn"));
+
+        // After the rebind, S2 continues in its OWN hydrator: bytes appended
+        // past the anchor hydrate as current conversation.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&s2_path)
+            .unwrap()
+            .write_all(r7_user(R7_Z, "s2-prompt", "after clear").as_bytes())
+            .unwrap();
+        let after = r7_collect(&mut events, std::time::Duration::from_millis(1800)).await;
+        assert!(
+            r7_conversation_has(&after, "after clear"),
+            "the rebound session continues in a fresh hydrator"
+        );
+
+        Driver::close(&driver).await.unwrap();
+    }
+
+    /// r7 item 1, lazy-create arm: the user /resume's BEFORE ever sending a
+    /// prompt, so the launch session S1 never gets a transcript and no
+    /// binding exists when Y's authenticated SessionStart arrives. The
+    /// argv channel would keep looking for the (still absent) S1 file; the
+    /// hook report must bind Y directly and its history must stay gated.
+    #[tokio::test]
+    async fn item1_resume_before_any_binding_binds_the_reported_session_directly() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("claude-home");
+        let cwd = dir.path().to_path_buf();
+        let slug = crate::claude_transcript::project_dir(&home, &cwd);
+        std::fs::create_dir_all(&slug).unwrap();
+        let args = Arc::new(std::sync::Mutex::new(format!(
+            "claude --session-id {R7_S1}"
+        )));
+        let driver = r7_login_driver(dir.path(), &home, Arc::clone(&args));
+        let mut events = driver.spawn().await.expect("spawn").into_events();
+        let pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
+        assert!(pgid > 0);
+        let hooks = driver.hooks.lock().await.clone().expect("hook session");
+
+        // S1 reports at boot but its file is never created (no prompt).
+        let s1_path = slug.join(format!("{R7_S1}.jsonl"));
+        r7_send_session_start(&hooks, pgid, R7_S1, &s1_path).await;
+        r7_collect(&mut events, std::time::Duration::from_millis(1000)).await;
+        // Still no binding: the /resume target Y reports with history.
+        let bridge = driver.effort_bridge.lock().await.clone();
+        let generation = bridge.arm(crate::effort::EffortRequest::from_level("max").expect("max"));
+        let y_path = slug.join(format!("{R7_Y}.jsonl"));
+        std::fs::write(
+            &y_path,
+            format!(
+                "{}{}{}",
+                r7_assistant(R7_Y, "y-old-assistant", Some("high")),
+                r7_slash(R7_Y, "y-old-slash", "max"),
+                r7_verdict(R7_Y, "y-old-verdict", "Set effort level to max"),
+            ),
+        )
+        .unwrap();
+        r7_send_session_start(&hooks, pgid, R7_Y, &y_path).await;
+        let rebound = r7_collect(&mut events, std::time::Duration::from_millis(2400)).await;
+        assert!(
+            r7_effort_names(&rebound).is_empty(),
+            "Y binds directly but its history stays gated: {rebound:?}"
+        );
+        assert!(
+            bridge
+                .wait(generation, std::time::Duration::from_millis(300))
+                .await
+                .is_none(),
+            "the replayed verdict must not resolve Applied"
+        );
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&y_path)
+            .unwrap()
+            .write_all(r7_user(R7_Y, "y-new-prompt", "late resume prompt").as_bytes())
+            .unwrap();
+        let after = r7_collect(&mut events, std::time::Duration::from_millis(1800)).await;
+        assert!(r7_effort_names(&after).is_empty(), "{after:?}");
+        assert!(r7_conversation_has(&after, "late resume prompt"));
+
+        Driver::close(&driver).await.unwrap();
+    }
+
+    /// r7 item 1(b): `claude --resume X` (hand-typed; the poller only has the
+    /// argv) followed by `/clear` to Z. X stays an unverified resume, and Z
+    /// is Fresh from its own absent-file SessionStart: once Z's transcript
+    /// appears its records are current, the effort edge publishes and an
+    /// armed switch settles — X history never leaks.
+    #[tokio::test]
+    async fn item1_resume_then_clear_binds_z_fresh_and_reads_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("claude-home");
+        let cwd = dir.path().to_path_buf();
+        let slug = crate::claude_transcript::project_dir(&home, &cwd);
+        std::fs::create_dir_all(&slug).unwrap();
+        let args = Arc::new(std::sync::Mutex::new(format!("claude --resume {R7_X}")));
+        let driver = r7_login_driver(dir.path(), &home, Arc::clone(&args));
+        let mut events = driver.spawn().await.expect("spawn").into_events();
+        let pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
+        assert!(pgid > 0);
+        let hooks = driver.hooks.lock().await.clone().expect("hook session");
+
+        let x_history = format!(
+            "{}{}{}",
+            r7_assistant(R7_X, "x-old-assistant", Some("high")),
+            r7_slash(R7_X, "x-old-slash", "max"),
+            r7_verdict(R7_X, "x-old-verdict", "Set effort level to max"),
+        );
+        let x_path = slug.join(format!("{R7_X}.jsonl"));
+        std::fs::write(&x_path, x_history).unwrap();
+        r7_send_session_start(&hooks, pgid, R7_X, &x_path).await;
+        let x_phase = r7_collect(&mut events, std::time::Duration::from_millis(1800)).await;
+        assert!(
+            r7_effort_names(&x_phase).is_empty(),
+            "X is an unverified resume: no history edge: {x_phase:?}"
+        );
+
+        let bridge = driver.effort_bridge.lock().await.clone();
+        let generation = bridge.arm(crate::effort::EffortRequest::from_level("max").expect("max"));
+
+        // /clear: the SessionStart arrives while Z's file is still absent
+        // (lazy creation). The sticky mode is Fresh at that instant.
+        let z_path = slug.join(format!("{R7_Z}.jsonl"));
+        r7_send_session_start(&hooks, pgid, R7_Z, &z_path).await;
+        r7_collect(&mut events, std::time::Duration::from_millis(1200)).await;
+        // Z then appears with its own first turn: the slash settles its own
+        // switch and the assistant's max read-back publishes.
+        std::fs::write(
+            &z_path,
+            format!(
+                "{}{}{}",
+                r7_slash(R7_Z, "z-slash", "max"),
+                r7_verdict(R7_Z, "z-verdict", "Set effort level to max"),
+                r7_assistant(R7_Z, "z-assistant", Some("max")),
+            ),
+        )
+        .unwrap();
+        let z_phase = r7_collect(&mut events, std::time::Duration::from_millis(3000)).await;
+        let names = r7_effort_names(&z_phase);
+        assert!(
+            names.contains(&Some(remuda_protocol::EffortName::Max)),
+            "Z is Fresh: its max read-back must publish: {names:?}"
+        );
+        assert!(
+            !names.contains(&Some(remuda_protocol::EffortName::High)),
+            "X's high history must never publish: {names:?}"
+        );
+        assert!(
+            bridge
+                .wait(generation, std::time::Duration::from_secs(2))
+                .await
+                .is_some(),
+            "Z's own verdict settles the armed switch Applied"
+        );
+
+        Driver::close(&driver).await.unwrap();
     }
 }

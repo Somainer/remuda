@@ -56,6 +56,35 @@ pub fn usage_from_transcript_record(record: &Value) -> Option<UsageEvent> {
     ))
 }
 
+/// Extract usage from one `message.usage` object (already lifted off the
+/// transcript record), keyed by the message/request ids.
+///
+/// Used when a message group is assembled from multiple block records: the
+/// group keeps the last block's usage and the message id, without the full
+/// record envelope.
+#[must_use]
+pub fn usage_from_message_usage(
+    message_id: Option<&str>,
+    request_id: Option<&str>,
+    model: Option<&str>,
+    usage: &Value,
+) -> Option<UsageEvent> {
+    if !usage.is_object() {
+        return None;
+    }
+    let tokens = counters_from_anthropic_usage(usage);
+    let reasoning = usage["output_tokens_details"]["thinking_tokens"].as_u64();
+    Some(UsageEvent::new(
+        UsageSource::ClaudeTranscript,
+        request_id.map(str::to_owned),
+        message_id.map(str::to_owned),
+        model.map(str::to_owned),
+        tokens,
+        reasoning,
+        None,
+    ))
+}
+
 /// Parse and extract from one raw transcript JSONL line. Unparseable/blank
 /// lines and records without usage yield `None`.
 #[must_use]

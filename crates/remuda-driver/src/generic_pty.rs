@@ -30,7 +30,7 @@ use remuda_protocol::{
     RunId, Severity, SourceChannel, U64,
 };
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -89,6 +89,23 @@ pub struct GenericPtyOptions {
     pub liveness_timeout_ms: u64,
     /// Optional screen regex; emits a lifecycle event when a line matches.
     pub line_matcher: Option<String>,
+    /// Hub-issued instance id, set by the Node for launched instances. Used to
+    /// stamp the file-tail adapter observations for codex/grok (c-usagefu (d));
+    /// absent in standalone tests, which mint a fresh id.
+    pub instance_id: Option<InstanceId>,
+    /// Explicit home the codex/grok file-tail adapter tails.
+    ///
+    /// Production always leaves this `None`: the driver then resolves the
+    /// operator's real home from the ambient `CODEX_HOME`/`GROK_HOME` (else
+    /// `$HOME/.codex`/`$HOME/.grok`) — the same environment the herdr pane's
+    /// harness process resolves, since the driver runs in the Node process.
+    /// The pane itself is never pinned to this home (r2 item 1). Tests set it
+    /// because the workspace forbids process-env mutation; it must name a home
+    /// the operator's harness actually writes to.
+    pub file_adapter_home: Option<PathBuf>,
+    /// Census epoch of the Node that built this driver (c-usagefu r18 item 3);
+    /// None outside a composed Node.
+    pub node_epoch: Option<crate::adapters::codex_discovery::NodeEpoch>,
 }
 
 impl GenericPtyOptions {
@@ -114,6 +131,9 @@ impl GenericPtyOptions {
             agent_start_timeout_ms: 120_000,
             liveness_timeout_ms: 60_000,
             line_matcher: Some("^DONE".into()),
+            instance_id: None,
+            file_adapter_home: None,
+            node_epoch: None,
         }
     }
 }
@@ -132,6 +152,18 @@ struct PtyLive {
     interactions: Arc<PtyInteractions>,
     interaction_task: JoinHandle<()>,
     matcher_task: Option<JoinHandle<()>>,
+    /// codex/grok file-tail adapters (c-usagefu (d)); aborted on close.
+    adapter_handle: Option<crate::adapters::supervisor::AdapterHandle>,
+    /// r8 item 1: task refreshing the pane's live agent pid roots for the
+    /// process-tree ownership probe; aborted on close.
+    pid_task: Option<JoinHandle<()>>,
+    /// Per-launch identity shared with the codex file adapter's discovery
+    /// (c-usagefu r6 item 1).
+    instance_key: String,
+    /// r9 item 1: clone of the codex instance lifetime registered before
+    /// launch. Dropped with the live driver slot to close the interval; the
+    /// file adapter holds its own clone. None for non-codex launches.
+    _lifetime: Option<crate::adapters::codex_discovery::LifetimeGuard>,
     closed: bool,
     failed: Arc<AtomicBool>,
 }
@@ -299,16 +331,7 @@ impl GenericPtyDriver {
             .await
             .map_err(map_herdr)?;
         let client = bind_client(&server, &self.options)?;
-        let mut env = HashMap::new();
-        // Only pin CLAUDE_CONFIG_DIR when the native home actually holds a
-        // login. An isolated dir without one makes Claude 2.1 report "Not
-        // logged in" even when the host user is authenticated. The test is
-        // credential evidence, not the presence of `.claude.json`: claude-pty
-        // seeds that file with onboarding flags and no credentials, and a
-        // config dir the two drivers share must not be mistaken for a login.
-        if crate::claude_onboarding::has_login_material(std::path::Path::new(&recipe.native_home)) {
-            env.insert("CLAUDE_CONFIG_DIR".into(), recipe.native_home.clone());
-        }
+        let mut env = pane_home_env(std::path::Path::new(&recipe.native_home));
         // D-045: driver-computed capability handshakes, attached only when
         // granted; they pass the REMUDA_ deny prefix that guards caller env.
         for entry in recipe
@@ -362,6 +385,60 @@ impl GenericPtyDriver {
         self.resources
             .record(&client, &session_name, &created, &pane_id)
             .await?;
+        // Discovery floor captured at the agent.start boundary, BEFORE the
+        // RPC returns and before wait_agent_settled (up to 60 s): codex
+        // 0.154 writes session_meta lazily on the first turn, so a floor
+        // sampled after settling could post-date the session's own timestamp
+        // and the adapter would never bind (c-usagefu r4 item 2).
+        //
+        // c-usagefu r9 item 1: the per-launch instance key is minted HERE and
+        // — for codex — its lifetime is registered in the discovery registry
+        // BEFORE the child is spawned. An instance that launches/closes in
+        // the gap before the file adapter exists must still be on record, or
+        // a later same-cwd launch can become "sole" for a rollout the closed
+        // instance created. A launch failure drops the guard and records the
+        // close; success hands one clone to the adapter and keeps one here.
+        let instance_key = uuid::Uuid::new_v4().to_string();
+        // c-usagefu r12 item 2 (Ruling A2'): for a codex launch the pending
+        // DISCOVERY window is opened TOGETHER with the lifetime and BEFORE the
+        // agent process starts — not when the file adapter is constructed.
+        // Generic-pty waits out agent settlement (up to 60 s) before it can
+        // build the adapter; opening the window only there let another
+        // instance's window release during that gap be treated as the cwd's
+        // LAST window, pruning the closed lifetime segments (and clearing the
+        // prompt evidence) this registered-but-not-yet-adapted launch's later
+        // discovery decision still needs. The window is handed to the adapter
+        // below; a launch failure drops both it and the lifetime here.
+        //
+        // c-usagefu r14 item 2 (Ruling L1): for codex the launch boundary is
+        // sampled INSIDE the registration critical section and returned on the
+        // bundle — the value handed to the adapter below. Other harnesses do
+        // not register, so their floor is sampled here at the same decision
+        // point.
+        let lifetime;
+        let mut pending_window;
+        let launched_at;
+        if preset.id.eq_ignore_ascii_case("codex") {
+            // The lifetime AND the pending-discovery window are one bundle
+            // registered BEFORE the process starts (r12 item 2, Ruling A2');
+            // the bundle's boundary was sampled inside the LAUNCH_REGISTRATION
+            // critical section (r14 item 2, Ruling L1).
+            let pending = crate::adapters::codex_discovery::register_pending_launch(
+                std::path::Path::new(&recipe.cwd),
+                &instance_key,
+                self.options
+                    .node_epoch
+                    .as_ref()
+                    .map(crate::adapters::codex_discovery::NodeEpoch::id),
+            );
+            launched_at = pending.launched_at;
+            lifetime = Some(pending.lifetime);
+            pending_window = Some(pending.window);
+        } else {
+            launched_at = time::OffsetDateTime::now_utc();
+            lifetime = None;
+            pending_window = None;
+        }
         let started = crate::pty_interaction::start_agent(
             &client,
             AgentStartParams {
@@ -490,6 +567,41 @@ impl GenericPtyDriver {
             .insert("agentName".into(), agent_name.clone());
         ack.native_ids
             .insert("herdrKind".into(), preset.herdr_kind.into());
+        // c-usagefu (d): tail the codex/grok session files from the pinned
+        // native home so generic-pty dispatch gets usage/live observations the
+        // way shell-pty launches do.
+        // The per-launch instance key was minted before the agent launch
+        // (r9 item 1, above).
+        // r8 item 1 tier b: process-tree ownership of the rollout file. The
+        // pid roots are refreshed from the pane's foreground agent process
+        // list while the pane is live; the codex adapter's /proc probe
+        // attributes a file held open anywhere in those trees.
+        let ownership_probe = crate::adapters::codex_ownership::platform_probe();
+        let agent_pid_roots: Arc<std::sync::Mutex<Vec<u32>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid_task = if ownership_probe.is_some() {
+            Some(spawn_agent_pid_refresh(
+                client.clone(),
+                pane_id.clone(),
+                preset.binary,
+                recipe.argv.clone(),
+                Arc::clone(&agent_pid_roots),
+            ))
+        } else {
+            None
+        };
+        let adapter_handle = self.spawn_file_tail_adapters(
+            &spec,
+            &recipe,
+            &ctx,
+            &tx,
+            launched_at,
+            &instance_key,
+            ownership_probe,
+            Arc::clone(&agent_pid_roots),
+            lifetime.clone(),
+            pending_window.take(),
+        );
         *self.inner.lock().await = Some(PtyLive {
             ctx,
             client,
@@ -502,6 +614,10 @@ impl GenericPtyDriver {
             interactions,
             interaction_task,
             matcher_task,
+            adapter_handle,
+            instance_key,
+            _lifetime: lifetime,
+            pid_task,
             closed: false,
             failed,
         });
@@ -509,6 +625,139 @@ impl GenericPtyDriver {
         info!(kind = preset.id, "generic-pty agent.start dispatched");
         Ok(RunHandle::new(recipe, ack, rx))
     }
+
+    /// Start the file-tail adapters for a codex/grok generic-pty launch
+    /// (c-usagefu (d)). Before this the only spawn sites were the shell-pty
+    /// carrier, while Hub dispatch forces every non-claude harness onto
+    /// generic-pty — so Grok/Codex sessions never produced structured usage.
+    ///
+    /// The pane is deliberately NOT handed a pinned `CODEX_HOME`/`GROK_HOME`
+    /// (r2 item 1: the per-instance home is empty and would lose the
+    /// operator's login), so the harness reads and writes its REAL home — the
+    /// same environment resolution the promoted-hand-typed path uses
+    /// (`CODEX_HOME`/`GROK_HOME`, else `$HOME/.codex`/`$HOME/.grok`). The
+    /// adapter tails that real home, which is shared with every other project
+    /// the operator runs, so binding must be proven rather than guessed:
+    /// grok matches its pid/cwd registry and rejects ambiguity (the herdr pane
+    /// reports no child pid); codex (r3 item 1) binds only a UNIQUE rollout
+    /// whose cwd is this launch cwd and whose session started at/after THIS
+    /// launch — a same-cwd collision fails closed, and the `session_index`
+    /// "newest renamed thread anywhere" guess is never used. A bound rollout
+    /// must additionally carry a first prompt THIS driver dispatched (r5
+    /// item 5), and a tail that cannot start yet (the lazily-created 0.154
+    /// rollout has not registered) keeps retrying, cheaply via mtime pruning,
+    /// until the adapter binds or the instance closes. Failure
+    /// to spawn degrades silently, like the promoted-adapter watch — losing
+    /// the file channel never fails the launch.
+    /// r8 item 1 process-tree evidence passed to the codex file adapter.
+    #[allow(clippy::too_many_arguments)] // launch wiring already passes spec/recipe/ctx/events/key.
+    fn spawn_file_tail_adapters(
+        &self,
+        spec: &InstanceSpec,
+        recipe: &LaunchRecipe,
+        ctx: &crate::claude_pty::ObsCtx,
+        events: &mpsc::Sender<Observation>,
+        launched_at: time::OffsetDateTime,
+        instance_key: &str,
+        ownership_probe: Option<Arc<dyn crate::adapters::codex_ownership::RolloutOwnership>>,
+        agent_pid_roots: Arc<std::sync::Mutex<Vec<u32>>>,
+        lifetime: Option<crate::adapters::codex_discovery::LifetimeGuard>,
+        // r12 item 2: the pending-discovery window opened before the process
+        // started; handed to the codex adapter instead of a late one.
+        window: Option<crate::adapters::codex_discovery::DiscoveryWindow>,
+    ) -> Option<crate::adapters::supervisor::AdapterHandle> {
+        let kind = match spec.kind {
+            AgentKind::Codex | AgentKind::Grok => spec.kind,
+            _ => return None,
+        };
+        // `launched_at` is sampled at the agent.start boundary by the caller.
+        // The Node and the herdr daemon share the operator's login
+        // environment, so resolving the harness home from this process gives
+        // the same home the pane's harness process resolves. Tests inject the
+        // home explicitly (`file_adapter_home`) because the workspace forbids
+        // process-env mutation.
+        let home_path = self.options.file_adapter_home.clone().or_else(|| {
+            crate::adapters::supervisor::promoted_home(kind, PathBuf::from(&recipe.cwd), None)
+                .map(|adapter_home| adapter_home.home)
+        })?;
+        let home = crate::adapters::AdapterHome {
+            home: home_path,
+            cwd: PathBuf::from(&recipe.cwd),
+            pid: None,
+            launched_at: Some(launched_at),
+            // Generic-pty resume is not wired through the native rollout id;
+            // discovery stays on the anonymous cwd + timestamp floor.
+            resume_session_id: None,
+        };
+        let stamp = crate::adapters::supervisor::stamp_ctx(
+            self.options.instance_id.clone().unwrap_or_default(),
+            spec.host.clone(),
+            ctx.journal_id.clone(),
+            ctx.run_id.clone(),
+            format!("{kind:?}-pending"),
+        );
+        let adapter_ctx = crate::adapters::supervisor::AdapterCtx {
+            stamp,
+            seq: Arc::clone(&self.seq),
+            events: events.clone(),
+            home,
+            fallback_model: Some(recipe.provider.model_requested.clone())
+                .filter(|model| !model.is_empty()),
+            hooks: None,
+            agent_pid: None,
+            instance_key: Some(instance_key.to_owned()),
+            ownership: ownership_probe,
+            agent_pid_roots: Some(agent_pid_roots),
+            lifetime,
+            window,
+        };
+        match crate::adapters::supervisor::spawn_file_adapters(kind, adapter_ctx) {
+            Ok(Some(handle)) => Some(handle),
+            Ok(None) => None,
+            Err(error) => {
+                tracing::debug!(%error, ?kind, "generic-pty file adapter failed to start");
+                None
+            }
+        }
+    }
+}
+
+/// r8 item 1: poll the pane's foreground process list and record the live
+/// agent pid roots (codex CLI + any agent-looking descendant foreground
+/// process) into `roots`. Stops when the pane disappears / the RPC fails.
+fn spawn_agent_pid_refresh(
+    client: Client,
+    pane_id: String,
+    binary: &'static str,
+    argv: Vec<String>,
+    roots: Arc<std::sync::Mutex<Vec<u32>>>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_millis(500));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            let pids = match client.pane_process_info(Some(pane_id.clone())).await {
+                Ok(info) => info
+                    .process_info
+                    .map(|proc| {
+                        proc.foreground_processes
+                            .iter()
+                            .filter(|p| process_looks_like_agent(p, binary, &argv))
+                            .map(|p| p.pid)
+                            .collect::<Vec<u32>>()
+                    })
+                    .unwrap_or_default(),
+                Err(_) => {
+                    // Pane gone / daemon unavailable: stop refreshing.
+                    break;
+                }
+            };
+            if let Ok(mut guard) = roots.lock() {
+                *guard = pids;
+            }
+        }
+    })
 }
 
 #[async_trait]
@@ -577,6 +826,18 @@ impl Driver for GenericPtyDriver {
         prompt_when_ready(&client, &agent_name, &text).await?;
         let inner = self.inner.lock().await;
         let live = inner.as_ref().ok_or(DriverError::ControlUnavailable)?;
+        // Record the sent prompt for the codex file adapter: discovery may
+        // bind only a rollout whose first user message is an input THIS
+        // driver dispatched to THIS instance (c-usagefu r5 item 5). Codex
+        // only: prompts sent to a grok/claude pane must never authorize a
+        // codex bind, and the registry is per-instance (r6 item 1).
+        if live.preset_id.eq_ignore_ascii_case("codex") {
+            crate::adapters::codex_discovery::record_input(
+                &std::path::PathBuf::from(&live.recipe.cwd),
+                &live.instance_key,
+                &text,
+            );
+        }
         // D-027: grok has no remote image input at all — not a flag, not a
         // content block, not a path its tooling will open as an image. The
         // prompt still carries the path, but say plainly that this agent will
@@ -688,7 +949,12 @@ impl Driver for GenericPtyDriver {
         }
         live.closed = true;
         live.interaction_task.abort();
+        // Dropping the handle aborts the codex/grok file-tail tasks.
+        live.adapter_handle.take();
         if let Some(task) = live.status_task.take() {
+            task.abort();
+        }
+        if let Some(task) = live.pid_task.take() {
             task.abort();
         }
         if let Some(task) = live.matcher_task.take() {
@@ -734,12 +1000,14 @@ fn spawn_status_pump(
                 }
                 failed.store(true, Ordering::SeqCst);
                 let _ = interactions.close().await;
-                let payload = failure_lifecycle(
-                    "exit",
-                    &ctx.session_id,
-                    &pane_id,
-                    "pane exited; agent process is gone",
-                );
+                // c-cardsettle-fu r1 item 3: a generic-PTY pane exit carries
+                // its real diagnostic in the event data (exit code / signal /
+                // last stderr line); persist THAT rather than the literal
+                // "failed", which told the operator nothing about the death.
+                // The generic string remains only the fallback when the
+                // carrier supplied no usable detail.
+                let diagnostic = pane_exit_diagnostic(&event.data);
+                let payload = failure_lifecycle("exit", &ctx.session_id, &pane_id, &diagnostic);
                 if emit_on(
                     &tx,
                     &seq,
@@ -986,7 +1254,136 @@ async fn emit_startup_failure(
     .await
 }
 
-fn failure_lifecycle(
+/// Build the human-facing diagnostic for a generic-PTY `pane.exited` event
+/// (c-cardsettle-fu r1 item 3). Prefers the real evidence the carrier
+/// reports — a signal, an exit code, or the last stderr line — over the
+/// uninformative literal "failed". Returns the generic fallback only when
+/// none of those fields is present. Field names are checked across the
+/// snake_case and camelCase shapes the herdr wire uses.
+/// Build the human-facing diagnostic for a pane-exit event; pub so the Node
+/// integration tests can construct observations with the exact production
+/// helpers instead of hand-stamping fields.
+pub fn pane_exit_diagnostic(data: &serde_json::Value) -> String {
+    const FALLBACK: &str = "pane exited; agent process is gone";
+    let str_field = |names: &[&str]| -> Option<String> {
+        names
+            .iter()
+            .find_map(|name| data.get(*name))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    let num_field = |names: &[&str]| -> Option<i64> {
+        names
+            .iter()
+            .find_map(|name| data.get(*name))
+            .and_then(serde_json::Value::as_i64)
+    };
+
+    // c-cardsettle-fu2 r4 item 1: the diagnostic carries ONLY structured
+    // evidence — a signal name/number or an exit code — never child text. A
+    // pane event's lastStderr is the agent process's own stderr and can
+    // contain anything (Authorization headers, tokens, URLs with
+    // passwords); a heuristic redactor cannot enumerate every leak shape, so
+    // the stderr field is not rendered at all. The same string is journaled,
+    // projected to instances.last_error on both Node and Hub, and shown in
+    // the session end bar, so its vocabulary is fixed here.
+    if let Some(text) = pane_signal_diagnostic(
+        str_field(&["signalName", "signal_name", "signal"]),
+        num_field(&["signal", "signalNumber", "signal_number"]),
+    ) {
+        return text;
+    }
+
+    // An exit code: prefer the explicit field, also accept an object
+    // `{code: …}`/`exit_status` shape.
+    if let Some(code) = num_field(&[
+        "exitCode",
+        "exit_code",
+        "code",
+        "exitStatus",
+        "exit_status",
+        "status",
+    ])
+    .filter(|code| *code != 0)
+    {
+        return format!("agent process exited with code {code}");
+    }
+
+    FALLBACK.to_owned()
+}
+
+/// Build the structured `killed by signal` diagnostic from a signal NAME
+/// string and/or NUMBER carried by the pane event (both optional), using
+/// the PLATFORM's own signal definitions (`nix`) — the same source
+/// shell_pty's `signal_name` uses — never a baked-in table: numbers mean
+/// different signals on macOS vs Linux (10 is BUS there, USR1 here; 30 is
+/// USR1 there, PWR here).
+///
+/// Number resolution:
+/// - `129..=192` decodes the shell `128+N` encoding and is signal evidence
+///   only when the platform recognizes `N`;
+/// - `1..=127` is taken as a direct signal number and must be recognized;
+/// - anything else (0, 128, >=193, negatives) is not a signal.
+///
+/// A numeric field the platform does NOT recognize (0, 72, 200, …) is not
+/// signal evidence at all — the caller falls through to the exit-code field
+/// and then the fixed fallback, so `{"signal":200,"exitCode":42}` reports
+/// the exit code instead of inventing "signal 72".
+///
+/// Name resolution (only when no numeric field is present): uppercase
+/// FIRST, then prepend `SIG` when missing ("usr1" → "SIGUSR1"); the
+/// resolved signal renders as its name without the prefix plus its
+/// platform number. An unrecognized name contributes nothing.
+#[cfg(unix)]
+fn pane_signal_diagnostic(name: Option<String>, number: Option<i64>) -> Option<String> {
+    use nix::sys::signal::Signal;
+    use std::str::FromStr;
+
+    /// Render exactly "agent process killed by signal NAME (N)".
+    fn render(signal: Signal) -> String {
+        let name = signal
+            .as_str()
+            .strip_prefix("SIG")
+            .unwrap_or(signal.as_str());
+        format!("agent process killed by signal {name} ({})", signal as i32)
+    }
+
+    if let Some(raw) = number {
+        let candidate: Option<i32> = match raw {
+            129..=192 => i32::try_from(raw - 128).ok(),
+            1..=127 => i32::try_from(raw).ok(),
+            _ => None,
+        };
+        // Present-but-unrecognized numeric signal vetoes the whole signal
+        // branch, including a name carried alongside it.
+        let signal = Signal::try_from(candidate?).ok()?;
+        return Some(render(signal));
+    }
+    if let Some(raw) = name {
+        let upper = raw.trim().to_ascii_uppercase();
+        let prefixed = if upper.starts_with("SIG") {
+            upper
+        } else {
+            format!("SIG{upper}")
+        };
+        let signal = Signal::from_str(&prefixed).ok()?;
+        return Some(render(signal));
+    }
+    None
+}
+
+/// Non-Unix builds carry no signal vocabulary; signal fields are ignored and
+/// the caller renders the exit code or fixed fallback.
+#[cfg(not(unix))]
+fn pane_signal_diagnostic(_name: Option<String>, _number: Option<i64>) -> Option<String> {
+    None
+}
+
+/// Test/integration-visible builder for the pane-exit lifecycle payload;
+/// production callers use the private wrapper inside the status pump.
+pub fn failure_lifecycle(
     native_name: &str,
     agent_name: &str,
     pane_id: &str,
@@ -1005,6 +1402,11 @@ fn failure_lifecycle(
             related_ids: BTreeMap::from([
                 ("paneId".into(), pane_id.into()),
                 ("lastError".into(), reason.into()),
+                // c-cardsettle-fu2 r1 item 2: the node's native_exit reads
+                // related_ids["reason"] first; without this the stored
+                // instance failure collapsed to "failed" even though
+                // status/lastError carried the real diagnostic.
+                ("reason".into(), reason.into()),
             ]),
             data_ref: None,
             severity: Severity::Error,
@@ -1275,6 +1677,37 @@ fn pin_source(source: &BinarySource) -> DriverResult<BinaryPin> {
     }
 }
 
+/// The home-directory variables the generic-pty pane is pinned to.
+///
+/// Claude's `CLAUDE_CONFIG_DIR` is pinned only when the registered native home
+/// actually holds a login. An isolated dir without one makes Claude 2.1 report
+/// "Not logged in" even when the host user is authenticated. The test is
+/// credential evidence, not the presence of `.claude.json`: claude-pty seeds
+/// that file with onboarding flags and no credentials, and a config dir the
+/// two drivers share must not be mistaken for a login.
+///
+/// c-usagefu r2 item 1: this map deliberately NEVER contains `CODEX_HOME` /
+/// `GROK_HOME`. The Node-registered native home for a generic-pty launch is an
+/// empty per-instance directory it only `mkdir -p`s. Pinning either name would
+/// point the harness at a home without the operator's `auth.json` /
+/// `config.toml` — a login screen and lost provider config on every
+/// Hub-dispatched codex/grok worker (and, with `REMUDA_CLAUDE_CONFIG_DIR`
+/// set, every instance would share one dir). The herdr pane inherits the
+/// daemon's environment, so the harness resolves its real home the same way a
+/// hand-typed command would; the file-tail adapter reads that same real home
+/// (`spawn_file_tail_adapters`). See the materializer invariant: a partial
+/// shadow home would lose the operator's login.
+fn pane_home_env(native_home: &Path) -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    if crate::claude_onboarding::has_login_material(native_home) {
+        env.insert(
+            "CLAUDE_CONFIG_DIR".into(),
+            native_home.to_string_lossy().into_owned(),
+        );
+    }
+    env
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1295,5 +1728,238 @@ mod tests {
         ));
         assert!(!looks_like_shell_prompt("❯ \n"));
         assert!(!looks_like_shell_prompt("OK\n❯ \n"));
+    }
+
+    /// c-usagefu r2 item 1: the Node-registered native home on a generic-pty
+    /// launch is an empty per-instance directory. The pane env must never pin
+    /// `CODEX_HOME`/`GROK_HOME` at it — that would take the operator's
+    /// `~/.codex`/`~/.grok` login material away — and an empty Claude home is
+    /// not pinned either (the host user keeps their own login).
+    #[test]
+    fn pane_env_for_an_empty_home_pins_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = pane_home_env(dir.path());
+        assert!(
+            env.is_empty(),
+            "empty per-instance home must not pin any config dir: {env:?}"
+        );
+        assert!(!env.contains_key("CODEX_HOME"));
+        assert!(!env.contains_key("GROK_HOME"));
+        assert!(!env.contains_key("CLAUDE_CONFIG_DIR"));
+    }
+
+    /// c-usagefu r2 item 1: even when the registered home carries a real Claude
+    /// login (the only condition that pins `CLAUDE_CONFIG_DIR`), the
+    /// codex/grok home names are still absent. Nothing the driver computes may
+    /// ever point them at a home without login material.
+    #[test]
+    fn pane_env_pins_claude_only_never_codex_or_grok() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".credentials.json"),
+            "{\"accessToken\":\"fixture\"}",
+        )
+        .unwrap();
+        let env = pane_home_env(dir.path());
+        assert_eq!(
+            env.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+            Some(dir.path().to_string_lossy().as_ref())
+        );
+        assert!(
+            !env.contains_key("CODEX_HOME"),
+            "pinning CODEX_HOME at the per-instance home loses the operator's login: {env:?}"
+        );
+        assert!(
+            !env.contains_key("GROK_HOME"),
+            "pinning GROK_HOME at the per-instance home loses the operator's login: {env:?}"
+        );
+    }
+
+    /// c-cardsettle-fu r1 item 3 / r4-r5 item 1: the stored PaneExited
+    /// diagnostic carries ONLY structured evidence — exit code, a signal
+    /// resolved through the PLATFORM's own definitions, or the fixed
+    /// fallback. Child stderr is never rendered.
+    #[test]
+    fn pane_exit_diagnostic_names_the_real_exit_code() {
+        let diag = |data: serde_json::Value| pane_exit_diagnostic(&data);
+        assert_eq!(
+            diag(serde_json::json!({ "pane_id": "p1", "exitCode": 42 })),
+            "agent process exited with code 42"
+        );
+        assert_eq!(
+            diag(serde_json::json!({ "pane_id": "p1", "exit_code": 7 })),
+            "agent process exited with code 7"
+        );
+        // A bare code 0 adds no failure diagnostic; fall through.
+        assert_eq!(
+            diag(serde_json::json!({ "pane_id": "p1", "exitCode": 0 })),
+            "pane exited; agent process is gone"
+        );
+        // Nothing usable: generic fallback, never the literal "failed".
+        assert_eq!(
+            diag(serde_json::json!({ "pane_id": "p1" })),
+            "pane exited; agent process is gone"
+        );
+        // 137 standing alone is an EXIT CODE, never silently decoded as a
+        // signal.
+        assert_eq!(
+            diag(serde_json::json!({ "pane_id": "p1", "exitCode": 137 })),
+            "agent process exited with code 137"
+        );
+        // Numeric fields the platform does not recognize as signals (0, 200)
+        // are NOT signal evidence: the exit code still renders.
+        assert_eq!(
+            diag(serde_json::json!({ "pane_id": "p1", "signal": 0, "exitCode": 42 })),
+            "agent process exited with code 42"
+        );
+        assert_eq!(
+            diag(serde_json::json!({ "pane_id": "p1", "signal": 200, "exitCode": 42 })),
+            "agent process exited with code 42"
+        );
+        // …and with no exit code they collapse to the fallback.
+        assert_eq!(
+            diag(serde_json::json!({ "pane_id": "p1", "signal": 200 })),
+            "pane exited; agent process is gone"
+        );
+    }
+
+    /// Signal cases resolved with the platform's own nix definitions. Numbers
+    /// are computed from nix (never hard-coded): BUS is 7 on Linux but 10 on
+    /// macOS, USR1 is 10 on Linux but 30 on macOS, so a baked-in table named
+    /// them wrong for the owner's macOS gate.
+    #[cfg(unix)]
+    #[test]
+    fn pane_exit_signal_resolved_from_platform_definitions() {
+        use nix::sys::signal::Signal;
+        use std::str::FromStr;
+
+        let diag = |data: serde_json::Value| pane_exit_diagnostic(&data);
+        let expected = |signal: Signal| {
+            format!(
+                "agent process killed by signal {} ({})",
+                signal.as_str().strip_prefix("SIG").unwrap(),
+                signal as i32
+            )
+        };
+
+        for signal in [Signal::SIGBUS, Signal::SIGUSR1, Signal::SIGKILL] {
+            let num = i64::from(signal as i32);
+            // Direct number.
+            assert_eq!(
+                diag(serde_json::json!({ "signal": num })),
+                expected(signal),
+                "numeric {num} must resolve via nix on THIS platform"
+            );
+            // Shell 128+N encoding.
+            assert_eq!(
+                diag(serde_json::json!({ "signal": 128 + num })),
+                expected(signal),
+                "128+{num} must decode via nix on THIS platform"
+            );
+        }
+
+        // Name-only shapes: SIG-prefixed, bare lowercase, and the literal
+        // reviewer example.
+        assert_eq!(
+            diag(serde_json::json!({ "signalName": "SIGBUS" })),
+            expected(Signal::from_str("SIGBUS").unwrap())
+        );
+        assert_eq!(
+            diag(serde_json::json!({ "signalName": "usr1" })),
+            expected(Signal::SIGUSR1)
+        );
+        assert_eq!(
+            diag(serde_json::json!({ "signal_name": "sigkill" })),
+            expected(Signal::SIGKILL)
+        );
+
+        // A 128+N whose N the platform does not recognize is not a signal.
+        assert_eq!(
+            diag(serde_json::json!({ "signal": 128 + 72, "exitCode": 42 })),
+            "agent process exited with code 42"
+        );
+        // An unrecognized name alongside a good exit code falls through.
+        assert_eq!(
+            diag(serde_json::json!({ "signalName": "SIGBOGUS", "exitCode": 42 })),
+            "agent process exited with code 42"
+        );
+    }
+
+    /// c-cardsettle-fu2 r4 item 1: stderr text — including every credential
+    /// shape the heuristic redactor used to miss (a decoy word before the
+    /// real key, standalone Bearer, JSON password, `--token x`, a URL whose
+    /// long username was swallowed, truncation, escaped quotes, ':' inside
+    /// values) — is not a leak the diagnostic can carry any more: a
+    /// lastStderr-only pane exit ALWAYS persists the fixed fallback and no
+    /// fragment of the stderr survives.
+    #[test]
+    fn pane_exit_never_carries_stderr_text() {
+        // (stderr line, fragments that WOULD leak under the old redactor).
+        let cases: [(&str, &[&str]); 5] = [
+            // Decoy key before the real one; standalone Bearer; JSON pair.
+            (
+                r#"the keyboard broke: Authorization decoy, Bearer abc123xyz {"password":"hunter2-secret"}"#,
+                &["abc123xyz", "hunter2-secret"],
+            ),
+            // Space-separated --token (no '=' or ':' after the key).
+            (
+                "fatal auth --token secretvalue-9931 retry gave up",
+                &["secretvalue-9931"],
+            ),
+            // URL whose long username runs into the bare-token rule and the
+            // password sits after the ':'.
+            (
+                "GET https://abcdefghijklmnopqrstuvwxyz0123456789-long:hunter2pw@git.example.com/x failed",
+                &["hunter2pw"],
+            ),
+            // Escaped quotes and ':' inside an otherwise credential-looking
+            // value.
+            (
+                r#"Authorization: Bearer \"tok-live-AA:BB:CC\" end of line"#,
+                &["tok-live-AA:BB:CC", "Bearer"],
+            ),
+            // Oversized line: a redactor truncating before redacting left the
+            // head intact.
+            (
+                &format!("password=head-secret-{} tail", "Z".repeat(500)),
+                &["head-secret"],
+            ),
+        ];
+        for (line, fragments) in cases {
+            let data = serde_json::json!({ "pane_id": "p1", "lastStderr": line });
+            let diag = pane_exit_diagnostic(&data);
+            assert_eq!(
+                diag, "pane exited; agent process is gone",
+                "stderr must collapse to the fixed fallback, got: {diag}"
+            );
+            for fragment in fragments {
+                assert!(
+                    line.contains(fragment),
+                    "test sanity: {fragment:?} is actually carried by the stderr"
+                );
+                assert!(
+                    !diag.contains(fragment),
+                    "stderr fragment {fragment:?} must never reach the diagnostic: {diag}"
+                );
+            }
+        }
+        // last_stderr alias and a stderr accompanied by code 0 alike fall
+        // back; code 0 is not failure evidence and the text is dropped.
+        assert_eq!(
+            pane_exit_diagnostic(&serde_json::json!({
+                "last_stderr": "Authorization: Bearer zzz",
+                "exitCode": 0
+            })),
+            "pane exited; agent process is gone"
+        );
+        // Arbitrary message/error/detail objects were never accepted and
+        // still are not.
+        assert_eq!(
+            pane_exit_diagnostic(&serde_json::json!({
+                "message": "Bearer x",
+                "error": { "detail": "password=y" }
+            })),
+            "pane exited; agent process is gone"
+        );
     }
 }

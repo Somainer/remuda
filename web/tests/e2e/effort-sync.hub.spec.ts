@@ -38,6 +38,15 @@ async function createSession(page: Page, prompt: string, kind = "claude"): Promi
   expect(hostId).toBeTruthy();
   await hostPicker.selectOption(hostId!);
   await page.getByTestId(`new-session-kind-${kind}`).click();
+  // c-effortui r5 item 3: effort switch tests require the Herdr claude-pty
+  // carrier — shell-pty cannot type version-gated ultracode words and the
+  // switch is intentionally locked for it. The fake node reports both; the
+  // New Session default is the native shell-pty, so open advanced and select
+  // claude-pty.
+  if (kind === "claude") {
+    await page.getByTestId("new-session-advanced").click();
+    await page.getByTestId("new-session-driver-claude-pty").click();
+  }
   await expect(page.getByTestId("new-session-workspace").locator("option")).not.toHaveCount(0, {
     timeout: 20_000,
   });
@@ -119,6 +128,41 @@ for (const width of [390, 1440]) {
   });
 }
 
+// D-056 evidence renders: five-stop slider with the orthogonal Ultracode
+// switch at phone (390px, options sheet) and desktop (1440px, anchored
+// popover). Captured only with REMUDA_EVIDENCE=1; self-skips otherwise.
+// (The owner's WebKit-iPhone real-keyboard pass is separate; these are the
+// committed chromium renders of both surfaces.)
+for (const width of [390, 1440] as const) {
+  test.describe(`D-056 switch evidence ${width}px`, { tag: ["@evidence"] }, () => {
+    test.skip(process.env.REMUDA_EVIDENCE !== "1", "set REMUDA_EVIDENCE=1 for evidence renders");
+
+    test("five stops + ultracode switch render under the pill", async ({ page }) => {
+      await page.setViewportSize({ width, height: 900 });
+      const instanceId = await createSession(page, `effort switch evidence ${width}`);
+      await clearApprovals(page, instanceId);
+      await page.getByTestId("model-effort-chip").click();
+      await expect(page.getByTestId("effort-slider")).toBeVisible();
+      await expect(page.getByTestId("effort-slider")).toHaveAttribute(
+        "data-tiers",
+        "low,medium,high,xhigh,max",
+      );
+      await expect(page.getByTestId("effort-ultracode-switch")).toBeVisible();
+      // The narrow (390px) layout renders the same card at viewport width;
+      // the phone options-sheet surface is exercised by the mobile/WebKit
+      // project in the non-hub config. Both widths are captured here.
+      await mkdir(evidenceDir, { recursive: true });
+      // Switch ON to capture the ember state on the switch row.
+      await page.getByTestId("effort-ultracode-switch").click();
+      await expect(page.getByTestId("effort-ultracode-switch")).toHaveAttribute("aria-checked", "true");
+      await page.screenshot({
+        path: path.join(evidenceDir, `effort-toggle-1-${width}.png`),
+        animations: "disabled",
+      });
+    });
+  });
+}
+
 // Clean up with `page.request`, which carries the login session cookie. The
 // standalone Playwright `request` fixture is unauthenticated: deleting with
 // it 401s (previously swallowed by .catch), leaving the fake node's 8
@@ -137,6 +181,16 @@ async function clearApprovals(page: Page, instanceId: string) {
   // Node→Hub uplink can lag create, and answering a not-yet-persisted request
   // would be resurrected when its late journal event lands.
   await page.evaluate(async (id) => {
+    // The fake Node's claude-pty create arm (hub_e2e) raises NO create-time
+    // approval — it early-continues after the ready/model launch frames — so
+    // there is nothing to clear and the card wait must not burn its full
+    // deadline (c-effortread r9 gate: the dead wait added ~10 s per spec and
+    // starved the later terminal /effort read-back past its 15 s timeout).
+    // The default shell-pty arm is the one that parks a pending approval.
+    const detail = await (
+      await fetch(`/v1/instances/${id}`, { credentials: "include" })
+    ).json();
+    if (detail?.driver === "claude-pty") return;
     const listPending = async () => {
       const body = await (await fetch("/v1/interactions", { credentials: "include" })).json();
       return (body.items ?? []).filter(
@@ -175,224 +229,287 @@ async function clearApprovals(page: Page, instanceId: string) {
   }, instanceId);
 }
 
-/** Open the effort popover and move the slider to `stop` via keyboard. */
-async function moveSlider(page: Page, key: "ArrowRight" | "ArrowLeft" | "Home" | "End") {
+/** Open the effort popover (idempotent: a no-op if already open). */
+async function openPopover(page: Page) {
+  if (await page.getByTestId("effort-slider").isVisible().catch(() => false)) return;
   await page.getByTestId("model-effort-chip").click();
-  await page.getByTestId("effort-slider").focus();
-  await page.keyboard.press(key);
-  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("effort-slider")).toBeVisible();
 }
 
-test("slider change reaches the fake node; transcript read-back drives the effective chip", async ({
-  page,
-}) => {
+/** Close the effort popover if it is open. */
+async function closePopover(page: Page) {
+  if (await page.getByTestId("effort-slider").isVisible().catch(() => false)) {
+    await page.keyboard.press("Escape");
+  }
+}
+
+/** Move the slider via keyboard; leaves the popover closed. */
+async function moveSlider(page: Page, key: "ArrowRight" | "ArrowLeft" | "Home" | "End") {
+  await openPopover(page);
+  const slider = page.getByTestId("effort-slider");
+  await slider.focus();
+  await page.keyboard.press(key);
+  await closePopover(page);
+}
+
+/** Pick a native tier row in the popover list; leaves the popover closed. */
+async function pickTier(page: Page, stop: string) {
+  await openPopover(page);
+  await page.getByTestId("effort-open-list").click();
+  await page.getByTestId(`effort-tier-${stop}`).click();
+  await closePopover(page);
+}
+
+/** Flip the D-056 ultracode switch to the desired state; leaves popover open
+ *  so subsequent assertions can read the slider/switch. */
+async function setSwitch(page: Page, on: boolean) {
+  await openPopover(page);
+  const sw = page.getByTestId("effort-ultracode-switch");
+  await expect(sw).toBeEnabled();
+  if ((await sw.getAttribute("aria-checked")) !== (on ? "true" : "false")) {
+    await sw.click();
+  }
+}
+
+/** Post a configure with a sentinel effort the UI slider never offers. */
+async function postEffortConfigure(
+  page: Page,
+  instanceId: string,
+  effort: Record<string, unknown>,
+) {
+  await page.evaluate(
+    async ({ id, effort }) => {
+      // The fake node's answer to an instance.configure is a native lifecycle
+      // over the follow socket (the queued/degraded sentinels emit NO effort
+      // observation). Lifecycle frames in the bounded REST seed are history and
+      // are deliberately never applied, so wait until THIS instance's follow
+      // socket has caught up past its snapshot before posting — otherwise the
+      // configure can land inside the follow-attach window and be absorbed
+      // into the seed as replay (c-effortread r9).
+      await (window as unknown as { __remudaHub?: { waitFollowCaughtUp: (id: string) => Promise<string> } })
+        .__remudaHub?.waitFollowCaughtUp(id);
+      const res = await fetch(`/v1/instances/${id}/commands`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ operation: "instance.configure", payload: { effort } }),
+      });
+      if (!res.ok) throw new Error(`configure ${res.status}`);
+    },
+    { id: instanceId, effort },
+  );
+}
+
+test("a level switch reaches the fake node and the read-back drives the chip", async ({ page }) => {
   const instanceId = await createSession(page, "effort round trip");
   await clearApprovals(page, instanceId);
 
-  // Before any assistant record reports a level, the chip is a greyed `?`.
-  await expect(page.getByTestId("model-effort-chip-label")).toHaveText("?", {
-    timeout: 10_000,
-  });
-  await expect(page.getByTestId("model-effort-chip")).toHaveAttribute(
-    "data-effort-effective",
-    "unknown",
-  );
+  await expect(page.getByTestId("model-effort-chip-label")).toHaveText("?", { timeout: 10_000 });
+  await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-effort-effective", "unknown");
 
-  // high (index 2) → xhigh (index 3). hubStore.setEffort posts the configure;
-  // the fake node reports xhigh back — agreement, no mismatch.
-  await moveSlider(page, "ArrowRight");
-  await expect(page.getByTestId("model-effort-chip-label")).toHaveText("xhigh", {
-    timeout: 15_000,
-  });
-  await expect(page.getByTestId("model-effort-chip")).toHaveAttribute(
-    "data-effort-source",
-    "remuda",
+  // high (index 2) → xhigh (index 3); the wire carries the native word plus
+  // an explicit boolean, never the legacy alias.
+  const xhighRequest = page.waitForRequest(
+    (r) =>
+      r.method() === "POST"
+      && r.url().endsWith(`/v1/instances/${instanceId}/commands`)
+      && r.postDataJSON()?.payload?.effort?.name === "xhigh"
+      && r.postDataJSON()?.payload?.effort?.ultracode === false,
   );
+  await moveSlider(page, "ArrowRight");
+  await xhighRequest;
+  await expect(page.getByTestId("model-effort-chip-label")).toHaveText("xhigh", { timeout: 15_000 });
+  await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-effort-source", "remuda");
   await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-effort-mismatch", "0");
-  expect(await page.getByTestId("model-effort-mismatch").count()).toBe(0);
+});
 
-  // xhigh → max. The fake agent environment clamps the effective level to
-  // xhigh: the chip shows the observed level and the mismatch line.
-  await moveSlider(page, "ArrowRight");
-  await expect(page.getByTestId("model-effort-chip-label")).toHaveText("xhigh", {
-    timeout: 15_000,
-  });
+test("plain max clamps to xhigh while max+ultracode stays on max (D-056)", async ({ page }) => {
+  const instanceId = await createSession(page, "effort clamp vs switch");
+  await clearApprovals(page, instanceId);
+  // LEVEL to max with the switch OFF: the fake model lacks xhigh, so it
+  // clamps to xhigh and the mismatch line renders.
+  await moveSlider(page, "End");
+  await expect(page.getByTestId("model-effort-chip-label")).toHaveText("xhigh", { timeout: 15_000 });
   const mismatch = page.getByTestId("model-effort-mismatch");
   await expect(mismatch).toBeVisible();
   expect(await mismatch.textContent()).toContain("请求 max");
   expect(await mismatch.textContent()).toContain("实际 xhigh");
-});
 
-test("ultracode read-back names the chip ultracode; a terminal /effort moves the slider without configure", async ({
-  page,
-}) => {
-  const instanceId = await createSession(page, "effort terminal sync");
-  await clearApprovals(page, instanceId);
-  await expect(page.getByTestId("model-effort-chip-label")).toHaveText("?");
-
-  // Count every instance.configure command so the terminal-side fold below
-  // can be proven not to ping-pong a configure back into the PTY.
-  let configureCalls = 0;
-  await page.route("**/v1/instances/*/commands", async (route) => {
-    const request = route.request();
-    if (request.method() === "POST") {
-      const body = request.postDataJSON() as { operation?: string } | null;
-      if (body?.operation === "instance.configure") configureCalls += 1;
-    }
-    await route.continue();
-  });
-
-  // low → med → high → xhigh → max → ultracode (End from default).
-  await moveSlider(page, "End");
-  await expect(page.getByTestId("model-effort-chip-label")).toHaveText("ultracode", {
-    timeout: 15_000,
-  });
-  await expect(page.getByTestId("model-effort-chip")).toHaveAttribute(
-    "data-effort-effective",
-    "ultracode",
+  // Now turn the SWITCH on at max: D-056 keeps the level at max even when the
+  // model would otherwise clamp — the read-back is {max, ultracode:on}.
+  const onRequest = page.waitForRequest(
+    (r) =>
+      r.postDataJSON()?.payload?.effort?.name === "max"
+      && r.postDataJSON()?.payload?.effort?.ultracode === true,
   );
-  await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-ember", "1");
-  const configuresAfterSlider = configureCalls;
-  expect(configuresAfterSlider).toBeGreaterThanOrEqual(1);
-
-  // Terminal side: a send carrying the sentinel the fake node maps to a
-  // hand-typed `/effort low` slash observation.
-  const composer = page.getByTestId("composer-input");
-  await composer.fill("/effort:low");
-  await page.keyboard.press("Enter");
-  await expect(page.getByTestId("model-effort-chip-label")).toHaveText("low", { timeout: 15_000 });
-  await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-effort-source", "slash");
-  // Give any (incorrect) configure a moment to happen, then prove none did.
-  await page.waitForTimeout(800);
-  expect(configureCalls).toBe(configuresAfterSlider);
+  await setSwitch(page, true);
+  await onRequest;
+  await expect(page.getByTestId("model-effort-chip-label")).toHaveText("max", { timeout: 15_000 });
+  await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-ultracode-effective", "on");
 });
 
-test("three consecutive switches including ultracode each settle the chip (c-effort3)", async ({
-  page,
-}) => {
-  // Regression for the second-switch failure: after the first switch to
-  // ultracode read back, the next plain-tier switch used to end with
-  // 未收到回读 and the chip returned to "?". Every switch in any order must
-  // settle from its own read-back.
-  const instanceId = await createSession(page, "effort multi switch");
+test("the orthogonal switch turns ultracode on at the current tier without moving the slider", async ({ page }) => {
+  const instanceId = await createSession(page, "effort decoupled switch");
   await clearApprovals(page, instanceId);
   await expect(page.getByTestId("model-effort-chip-label")).toHaveText("?");
 
+  // LEVEL to xhigh first (a tier the fake echoes unclamped).
+  await pickTier(page, "xhigh");
+  await expect(page.getByTestId("model-effort-chip-label")).toHaveText("xhigh", { timeout: 15_000 });
+
+  // Then the SWITCH on: {name:"xhigh",ultracode:true}; the slider stays put.
+  const onRequest = page.waitForRequest(
+    (r) =>
+      r.method() === "POST"
+      && r.url().endsWith(`/v1/instances/${instanceId}/commands`)
+      && r.postDataJSON()?.payload?.effort?.name === "xhigh"
+      && r.postDataJSON()?.payload?.effort?.ultracode === true,
+  );
+  await setSwitch(page, true);
+  await onRequest;
+  await expect(page.getByTestId("model-effort-chip-label")).toHaveText("xhigh", { timeout: 15_000 });
+  await expect(page.getByTestId("model-effort-ultracode")).toHaveText(/ultracode/);
+  await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-ultracode-effective", "on");
+  await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-ember", "1");
+  await openPopover(page);
+  await expect(page.getByTestId("effort-slider")).toHaveAttribute("data-name", "xhigh");
+  await expect(page.getByTestId("effort-ultracode-switch")).toHaveAttribute("aria-checked", "true");
+  await page.keyboard.press("Escape");
+
+  // A terminal-side /effort moves the axes locally and posts no configure.
   let configureCalls = 0;
   await page.route("**/v1/instances/*/commands", async (route) => {
-    const request = route.request();
-    if (
-      request.method() === "POST"
-      && (request.postDataJSON() as { operation?: string } | null)?.operation
-        === "instance.configure"
-    ) {
+    if (route.request().method() === "POST" && route.request().postDataJSON()?.operation === "instance.configure") {
       configureCalls += 1;
     }
     await route.continue();
   });
+  await page.getByTestId("composer-input").fill("/effort:low");
+  await page.keyboard.press("Enter");
+  await expect(page.getByTestId("model-effort-chip-label")).toHaveText("low", { timeout: 15_000 });
+  await page.waitForTimeout(800);
+  expect(configureCalls).toBe(0);
+});
 
-  // Pick one stop from the popover list, wait for its configure wire call, and
-  // assert the chip settles on the read-back label (no "?", no mismatch).
-  const pick = async (
-    stop: string,
-    expectedLabel: string,
-    expectedEffective: string,
-  ) => {
-    const configure = page.waitForRequest(
-      (r) =>
-        r.method() === "POST"
-        && r.url().endsWith(`/v1/instances/${instanceId}/commands`)
-        && r.postDataJSON()?.operation === "instance.configure"
-        && r.postDataJSON()?.payload?.effort?.name === stop,
-    );
-    await page.getByTestId("model-effort-chip").click();
-    await page.getByTestId("effort-open-list").click();
-    await page.getByTestId(`effort-tier-${stop}`).click();
-    await configure;
-    await expect(page.getByTestId("model-effort-chip-label")).toHaveText(expectedLabel, {
-      timeout: 15_000,
-    });
-    await expect(page.getByTestId("model-effort-chip")).toHaveAttribute(
-      "data-effort-effective",
-      expectedEffective,
-    );
-    await expect(page.getByTestId("model-effort-chip")).toHaveAttribute(
-      "data-effort-source",
-      "remuda",
-    );
-    await expect(page.getByTestId("model-effort-chip")).toHaveAttribute(
-      "data-effort-mismatch",
-      "0",
-    );
-    await expect(page.getByTestId("model-effort-pending")).toHaveCount(0);
-    // Selecting a row does not close the list; reset the popover for the next
-    // pick (matches the codex-tiers spec).
-    await page.keyboard.press("Escape");
-  };
+test("three consecutive switches (flag on, level, flag off/on) each settle", async ({ page }) => {
+  const instanceId = await createSession(page, "effort multi switch");
+  await clearApprovals(page, instanceId);
+  await expect(page.getByTestId("model-effort-chip-label")).toHaveText("?");
 
-  // First switch to ultracode, then a plain tier, then ultracode again — the
-  // exact order from the owner's report — and finish on max.
-  await pick("ultracode", "ultracode", "ultracode");
-  await pick("high", "high", "high");
-  await pick("ultracode", "ultracode", "ultracode");
-
-  // Claude max is the existing clamp fixture (reads back xhigh with an unknown
-  // flag); the chip must still settle rather than show "?" / no-read-back.
-  const maxConfigure = configureCalls;
-  await page.getByTestId("model-effort-chip").click();
-  await page.getByTestId("effort-open-list").click();
-  const maxRequest = page.waitForRequest(
+  // 1) Flag ON at the current level (high); the slider does not move.
+  let req = page.waitForRequest(
     (r) =>
-      r.method() === "POST"
-      && r.url().endsWith(`/v1/instances/${instanceId}/commands`)
-      && r.postDataJSON()?.operation === "instance.configure"
-      && r.postDataJSON()?.payload?.effort?.name === "max",
+      r.url().endsWith(`/v1/instances/${instanceId}/commands`)
+      && r.postDataJSON()?.payload?.effort?.name === "high"
+      && r.postDataJSON()?.payload?.effort?.ultracode === true,
   );
-  await page.getByTestId("effort-tier-max").click();
-  await maxRequest;
-  await expect(page.getByTestId("model-effort-chip-label")).not.toHaveText("?", {
+  await setSwitch(page, true);
+  await req;
+  await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-ultracode-effective", "on", {
+    timeout: 15_000,
+  });
+
+  // 2) LEVEL to xhigh keeps the flag on (it rides along at any tier).
+  req = page.waitForRequest(
+    (r) =>
+      r.url().endsWith(`/v1/instances/${instanceId}/commands`)
+      && r.postDataJSON()?.payload?.effort?.name === "xhigh"
+      && r.postDataJSON()?.payload?.effort?.ultracode === true,
+  );
+  await pickTier(page, "xhigh");
+  await req;
+  await expect(page.getByTestId("model-effort-chip-label")).toHaveText("xhigh", { timeout: 15_000 });
+  await expect(page.getByTestId("model-effort-ultracode")).toHaveText(/ultracode/);
+
+  // 3) Flag OFF then ON — each settles from its own read-back.
+  await setSwitch(page, false);
+  await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-ultracode-effective", "off", {
+    timeout: 15_000,
+  });
+  await setSwitch(page, true);
+  await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-ultracode-effective", "on", {
     timeout: 15_000,
   });
   await expect(page.getByTestId("model-effort-pending")).toHaveCount(0);
-  expect(configureCalls).toBeGreaterThan(maxConfigure);
 });
 
-test("a queued push-down shows 排队中; a rejected one reverts the chip", async ({ page }) => {
+// The sentinel configure words (__queued__ / __degrade__ / __ultra_refuse…)
+// are understood ONLY by the in-process fake Node in
+// crates/remuda-hub/examples/hub_e2e.rs. Those tests gate on the harness knob
+// at COLLECTION time rather than probing the trigger with a sentinel POST
+// (a probe against a real Node types garbage into a live session). The gate
+// runs the in-process hub with HUB_E2E_FAKE_NODE=1; a default full-suite run
+// skips them, exactly like HUB_E2E_API_ROUTE for the api-route suite.
+test.describe("fake-node sentinel configure outcomes", () => {
+  test.skip(
+    process.env.HUB_E2E_FAKE_NODE !== "1",
+    "set HUB_E2E_FAKE_NODE=1 for the in-process hub_e2e fake Node",
+  );
+
+test("a model refusal disables only the switch, never ends the session", async ({ page }) => {
+  const instanceId = await createSession(page, "effort switch refusals");
+  await clearApprovals(page, instanceId);
+  await postEffortConfigure(page, instanceId, {
+    name: "__ultra_refuse_model__",
+    ultracode: true,
+    index: 2,
+  });
+  await openPopover(page);
+  const row = page.getByTestId("effort-ultracode");
+  await expect(row).toHaveAttribute("data-disabled", "1", { timeout: 10_000 });
+  await expect(row).toHaveAttribute("data-reason", "ultracode-unavailable-for-model");
+  await expect(page.getByTestId("effort-ultracode-switch")).toBeDisabled();
+  await expect(page.getByTestId("effort-ultracode-reason")).toContainText(/ultracode/i);
+  // The tier axis stays usable (a refused switch is a configure outcome only).
+  await expect(page.getByTestId("effort-slider")).not.toHaveAttribute("aria-disabled", "true");
+  await page.keyboard.press("Escape");
+});
+
+test("a queued level shows 排队中; a same-id degraded verdict clears the indicator", async ({ page }) => {
   const instanceId = await createSession(page, "effort queue and reject");
   await clearApprovals(page, instanceId);
   await expect(page.getByTestId("model-effort-chip-label")).toHaveText("?");
 
-  // Post the sentinel command directly (the UI slider never offers these
-  // words): the fake node answers with only an effort-queued lifecycle.
-  await page.evaluate(async (id) => {
-    const res = await fetch(`/v1/instances/${id}/commands`, {
-      method: "POST",
-      credentials: "include",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        operation: "instance.configure",
-        payload: { effort: { name: "__queued__:xhigh", index: 3 } },
-      }),
-    });
-    if (!res.ok) throw new Error(`queued configure ${res.status}`);
-  }, instanceId);
+  // c-effortread r12 item 2: the request id is the ONLY thing that can clear
+  // a pending. The composer always mints one; queue and the later degraded
+  // verdict here carry the SAME id (one request that queues then is dismissed).
+  await postEffortConfigure(page, instanceId, {
+    name: "__queued__:xhigh",
+    ultracode: false,
+    index: 3,
+    requestId: "e2e-queue-degrade",
+  });
   await expect(page.getByTestId("model-effort-pending")).toHaveText("排队中", { timeout: 10_000 });
-  await expect(page.getByTestId("model-effort-chip")).toHaveAttribute(
-    "data-effort-pending",
-    "queued",
-  );
+  await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-effort-pending", "queued");
 
-  // A degraded verdict (Esc on the native dialog) reverts and clears pending.
-  await page.evaluate(async (id) => {
-    await fetch(`/v1/instances/${id}/commands`, {
-      method: "POST",
-      credentials: "include",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        operation: "instance.configure",
-        payload: { effort: { name: "__degrade__:max", index: 4 } },
-      }),
-    });
-  }, instanceId);
+  await postEffortConfigure(page, instanceId, {
+    name: "__degrade__:xhigh:dialog-kept",
+    ultracode: false,
+    index: 3,
+    requestId: "e2e-queue-degrade",
+  });
   await expect(page.getByTestId("model-effort-pending")).toHaveCount(0, { timeout: 10_000 });
+});
+
+test("an id-less degraded verdict with no matching id leaves the queued indicator pending", async ({ page }) => {
+  const instanceId = await createSession(page, "effort idless degrade");
+  await clearApprovals(page, instanceId);
+  await expect(page.getByTestId("model-effort-chip-label")).toHaveText("?");
+
+  // Older driver (no request ids): the queued lifecycle synthesises an
+  // observer pending; a later id-less degraded verdict — even word-matching —
+  // cannot name the request, so it must neither clear nor roll it back. The
+  // request stays pending for its bounded reconciliation instead.
+  await postEffortConfigure(page, instanceId, { name: "__queued__:max", ultracode: false, index: 4 });
+  await expect(page.getByTestId("model-effort-pending")).toHaveText("排队中", { timeout: 10_000 });
+
+  await postEffortConfigure(page, instanceId, {
+    name: "__degrade__:max:dialog-kept",
+    ultracode: false,
+    index: 4,
+  });
+  await expect(page.getByTestId("model-effort-pending")).toHaveCount(1, { timeout: 10_000 });
+  await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-effort-pending", "queued");
+});
+
 });

@@ -455,6 +455,74 @@ hello 在单 writer 前排成一串，尾延迟 ≈ N × 单 hello 串行时间�
   判定在客户端常量里）。
 * 后台 tab：定时器被节流时以 socket close/error 与重新可见时的首帧时间为准；
   从后台回前台立即按最近帧年龄判一次态，不等下一拍。
+* **stale 的总时长有界（c-reconnfu gate 8/9）**：从进入**一次** quiet stale
+  episode 起算 **30 s**（`STALE_TO_OFFLINE_MS`）的硬截止在该 episode 内携带——
+  同一 episode 里周期性 probe 与安静重开 follow 的重定器不重置它；但离开 stale
+  （frame 回 live、真断线进 offline/recovering、或截止到点转 disconnected）即
+  丢弃，下一次再进 stale 重新获得完整 30 s。截止到点即使每轮 probe 都成功、
+  follow 升级始终被阻塞，也必须转 `disconnected`（loud offline，横幅出现、
+  重连时钟接管）。REST 可达只决定「不谎报 live」，不允许让无 follow 的 stale
+  无限延续，也不允许把上一 episode 的截止带进新 episode（gate 9：那会让
+  REST 已恢复的链路上线即离线、亚秒级重连风暴）。一次真实 frame 重新认证 live
+  后该截止清零。
+* **无 follow 的 resume/probe 必须自证可达（c-unboundresume，2026-10）**：在会话列表/新会话页没有 follow socket，
+  没有任何 frame 可以认证 live——resume 动作只有在**一次有界 REST GET 确实应答之后**才允许解析成功并发布 live。
+  该 GET 复用既有的 `rest()` 读截止（半开转发拖死时按 10 s 读超时拒绝）并以 bootstrap 类操作走 S3
+  「一次一个认证操作」队列，绝不另开并行认证路径（排队中的登录先发完、探测再用新会话发请求）。网络错误/读超时
+  → resume 拒绝，经既有的失败 settle probe 判定后发布 offline 并交给 reconnect 退避时钟，绝不在吞掉错误的情况下
+  发布 live；无 follow 的 settle/quiet probe 同样必须发真实请求，不得无偿返回 true（旧实现因此在 Hub 不可达时
+  把列表页静置于 quiet stale、退避被解除）。当前 epoch 的 401 走与 bootstrap 401 相同的登出/退役路径。
+  bound follow 行为不变（socket+追帧成功才是 live）；列表页的数据水合由 2 s 轮询负责，resume 不再尾随第二次
+  refresh——可达性证明恰好是一次探测。
+
+### 5.2.1 定时器归属表（c-reconnfu gate 10 item 0；gate 11 items 1/6/7、gate 12 item 8、gate 13 item 5、gate 14 item 4 校订）
+
+客户端状态机的每个命名定时器只有一个 owner；`setTimer(name, ms, fn)` 在写入
+新 handle 前总是先 `clearTimer(name)`，所以旧 job 绝不会在后来的状态 episode 里
+开火（孤儿 timer 会让上一 episode 的截止在新 episode 误触发，`dispose()` 也
+cancel 不到已被替换的 handle）。
+
+六个命名定时器是 `stale`、`probe`、`offline`、`bind`、`watchdog`、`reconnect`；
+注意两个容易混淆的名字（gate 11 item 7 校订）：**`stale` 定时器是 15 s 帧看门
+狗**（`armFrameWatchdog` 安装，fire 只做 live→stale），它在进入 stale 状态后
+不再存在；**`watchdog` 定时器是 20 s resume 看门狗**（只在 recovering /
+quiet-reopen 在飞时安装）。此外 `staleDeadlineAt` 不是定时器，是一次 quiet
+stale episode 的 30 s 墙钟截止，由 `offline` 定时器兑现；**`reconnect` 由
+`scheduleReconnect` 安装**（`setStateOffline` 与每次 `goOfflineAndSchedule` 调
+用），不是 `offline` 定时器自己（gate 12 item 8 校订）。
+
+| 状态 | `stale`（15 s 帧看门狗） | probe（15 s REST 探测） | offline（episode 30 s 截止） | bind（15 s 首帧） | watchdog（20 s resume） | reconnect（backoff） | staleDeadlineAt |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| **live** | arm：`startLive` 经 `armFrameWatchdog`（**`bootstrapLive` 不 arm**——列表/新会话页无 follow，由 `followBound` 的 bind 接管）；每个 `frame`/`followRebindLive` 重臂；fire：live→stale 并 `armStaleProbeTimers`；clear：frame 重臂、离开 live（close/offline/进 recovering）、`dispose` | — | — | arm：`followBound` 首次绑定（非 rebind、state 为 live/stale、无在飞 attempt）；fire：frame-live→重臂帧看门狗；wasLive（含 stale）→stale+probe；否则 `beginResume`；clear：`armFrameWatchdog`/settle 回 stale 时显式 clear/`setTimer`/`dispose` | —（无在飞 resume attempt） | —（在线不排程） | 0 |
+| **stale** | —（帧看门狗已在 live→stale 时 fire；stale 内由 probe/offline 接管） | arm：`armStaleProbeTimers`，fire 时**同时 capture `latestBindGen` 与 `resumeAttemptId`**（gate 11 item 6），两者都匹配才 dispatch；ok→`quietReopen`，fail→`goOfflineAndSchedule`；clear：`setTimer` 自身、quiet arm、任何离开 stale | arm：`armStaleProbeTimers`（值=staleDeadlineAt−now）；fire：**调用** `goOfflineAndSchedule`（后者再经 `scheduleReconnect` 安装 reconnect）；clear：同 probe | —：rebind 遇 `resumeInFlight` 直接 return（仅 isFollowLive 时 armFrameWatchdog）；rebind 在 stale 且无 attempt → 重臂 probe/offline（不 arm bind）；非 rebind 在飞 attempt → **跳过**（gate 11 item 1 恢复）；attempt settle 回 stale 时 clear 既有 `bind` | 仅 quiet-reopen 在飞时（见下一行）；其 fire 落回 stale | —（quiet stale 不排自主重连） | arm：首次进 stale（`setState` 离开 stale 即清零）；由 `offline` 定时器兑现 |
+| **quiet-reopen-in-stale** | — | clear：`armResumeAttemptQuiet` 清除；attempt settle（未 frame）回 stale 后由 `armStaleProbeTimers` 按**沿用**的 deadline 重臂 | **不清**：同一 stale episode 的 offline 截止继续有效（gate 10 item 4）；fire 时退休在飞 quiet attempt（不带 `resumeRetiredOffline`，其迟到 completion 被 id 丢弃） | —：resumeInFlight=true，rebind 与**非 rebind** 的 `followBound` 都跳过 bind（gate 11 item 1） | arm：`armResumeAttemptQuiet`（arm 时重置 `closedDuringResume`，gate 11 item 2）；fire：未 frame→回 stale（re-arm probe/offline），frame-live→live；clear：completion/绑定变更/`setTimer` | — | 沿用当前 episode |
+| **recovering** | — | —（失败结算用一次性 `settleResumeFailureViaProbe`，capture gen+attemptId，不走 probe 定时器） | **—（recovering 不持有 offline 定时器：`armResumeAttempt` 已 clear）**；settle probe 不可达时调 `goOfflineAndSchedule` **转到 offline**，由 offline 行的 reconnect 接管 | —：非 rebind 且 state=offline 的 `followBound` 立即 `beginResume`（无延迟 bind）；resume 在飞的非 rebind bind 由 gate 11 item 1 跳过 | arm：`armResumeAttempt`（`beginResume`/`followAttemptBegin`，arm 时重置 `closedDuringResume`，gate 11 item 2）；fire：frame-live→live+帧看门狗，state=stale→quiet 重臂，否则 REST 可达→stale、不可达→offline；clear：resumeAttempt 完成（latch 在此被消费，gate 11 item 2）、`noteBinding`  supersede、`setTimer` | **—（进入 recovering 时被 `armResumeAttempt` clear；只有转回 offline 后才由 `scheduleReconnect` 安装）** | 0（setState 离开 stale 清零） |
+| **offline** | — | — | —（`goOffline` 已 clear；offline 自身不持有 episode 截止） | 非 rebind `followBound` 且 state=offline → 立即 `beginResume`（不 arm 延迟 bind） | arm：`beginResume`/`resume`/`online` 事件→`armResumeAttempt`（安装后即转入 recovering） | arm：**`scheduleReconnect`**（由 `setStateOffline` 与每次 `goOfflineAndSchedule` 调用）；fire：frame-live 则认证 live，否则 `beginResume`；clear：resume 启动、frame 认证 | 0 |
+
+`dispose()` clear 全部六个命名定时器。Outbox 自己另有按 commandId 跟踪的租约到期
+wakeup：它记住租约快照、租约续约（含已经过期的替换租约）时 adopt 并 re-arm、墙钟
+回退不误 reclaim、行送达/删除/refresh 显示终态时 cancel、dispose 的 abort signal
+让在飞 reclaim 事务提交前回滚（gate 13 items 1–3，outbox 交付语义见 §5.4 的
+D-055）。
+
+两条退休路径对「在飞 attempt 的迟到 completion」的处置相反（gate 14 item 4
+校订）：
+
+* **浏览器 `offline` 事件** → `retireInFlightForOffline`：clear
+  bind/stale/probe/offline/watchdog，`resumeInFlight=false` 但把
+  `resumeRetiredOffline` **置 true**。完成入口的守卫是
+  `(!resumeInFlight && !resumeRetiredOffline) || attemptId !== resumeAttemptId`：
+  A 被退休后其 **id 仍 current**，所以 A 的 same-id completion（成功或失败）
+  **仍然被接受**，直到某个更新的 attempt 把 `resumeAttemptId` 顶掉——之后该
+  completion 才因 attemptId 不匹配被丢弃。flag 的另一作用是让随后的 `online`
+  事件（或前台 resume）立即启动新 attempt；浏览器 `offline` 不动 `reconnect`
+  定时器。
+* **episode 截止 fire**（`offline` 定时器 → `goOffline`）→ `goOffline` 把
+  `resumeInFlight=false`、`resumeRetiredOffline=false`（**清掉**）后退休在飞的
+  quiet attempt。此时 same-id completion 到达，两个资格标志都为 false，被
+  **retired-state 守卫**直接拒绝（不是因为 attempt id 不匹配——id 恰好相同）；
+  恢复只由随后 `goOfflineAndSchedule` → `scheduleReconnect` 的 reconnect 时钟
+  接管。
 
 ### 5.3 最高优先级规则：绝不把旧数据当新数据
 
@@ -492,6 +560,63 @@ hello 在单 writer 前排成一串，尾延迟 ≈ N × 单 hello 串行时间�
   （`alerts.rs:172-181`，D-049 (5)）：live/stale/disconnected 都**不**改
   badge，不用通知条数或连接状态冒充审批数，Badging API 不可用就什么都不做。
 * 连接状态只存在于 §5.2 的界面状态条，不进入推送载荷。
+
+### 5.6 SW 离线恢复后同源 WebSocket 被 LNA 扣下的真正条件：SW 脚本由 DevTools 合成响应交付（c-reconnfu item 8/round2 实测，2026-09-28～29）
+
+* 背景：手机端 PWA 由 service worker 离线缓存兜底——整页在断网时由 SW
+  恢复，恢复后连接机自动重连 follow WebSocket（D-055）。担心的是 Chromium
+  的 Private/Local Network Access 检查会不会给「SW 离线恢复、客户端地址
+  空间未知」的页面永久扣下到 Hub 的 WebSocket（即使网络已恢复）。
+* 第一轮（2026-09-28，Chrome 151，无任何 PNA/LNA 关闭开关）在三种 origin
+  形态（`127.0.0.1` loopback HTTP、`172.18.0.1` 私网 HTTP、私网
+  HTTPS+受信证书）上实测「注册 SW→在线同源 WS 成功→setOffline→断网下
+  整页 reload 由 SW 恢复→恢复网络→同源 WS」均 `OPEN`，断网期间只有
+  `ERR_INTERNET_DISCONNECTED`，从未出现
+  `ERR_BLOCKED_BY_LOCAL_NETWORK_ACCESS_CHECKS`——但当时给出的解释
+  （「Vite harness 跨源、经 :58889→:58880 代理一跳被 PNA 扣下，生产同源
+  没有这一跳」）**不成立**：浏览器侧请求在两种形态下都是同源的
+  （`api.ts:711/721` DEV 返回空 base，WS 连 `location.host`；Vite
+  `vite.config.ts:19` 在服务端代转发），「跨源」解释不了为何被拦。
+* 第二轮（2026-09-29，Playwright 1.63 自带 Chromium 1243，探针与原始
+  证据在 `scratch/pna-exp/`）用控制变量法定位了真正差异——**SW 脚本
+  本身的交付方式**，与 Vite/代理跳、离线、SW 缓存全部无关：
+  * 同一台普通同源 HTTP server 服务页面+SW+WS，离线恢复后 WS：
+    服务器真实响应交付 `/sw.js` → `OPEN`；
+  * 仅把 `/sw.js` 改成 Playwright
+    `context.route(...).fulfill(...)` 合成响应交付（连
+    `route.fetch()` 后原样 `fulfill({response})`、或补齐与服务器逐字
+    相同的响应头也一样）→
+    `ERR_BLOCKED_BY_LOCAL_NETWORK_ACCESS_CHECKS`，而且**不需要任何
+    离线/恢复过程**：注册后直接连 WS 即被拦，取消路由拦截后已注册的
+    worker 仍然带毒；
+  * 同样的 Vite 代理拓扑（页面 :8097，WS upgrade 经其 proxy 到
+    :8099），SW 脚本改由 Vite 从真实 socket 服务 → 离线恢复后 WS
+    `OPEN`（断网期间只有 `ERR_INTERNET_DISCONNECTED`），直接证伪
+    「代理跳被扣」；
+  * 受控页的同源普通 HTTP fetch 始终 200（请求走 SW fetch handler），
+    只有**绕过 SW 的 WebSocket**（SW 不处理 WS）被拦；unregister 该
+    SW 后新页面 WS 立即 `OPEN`——污染附着在「由合成脚本响应创建的 SW
+    注册」上，随注册消失。
+  * 机制（证据支持的精确表述）：经 DevTools Fetch 域 pause/fulfill 合成
+    的 SW 脚本响应没有真实网络对端地址，Chromium 给该 worker 记录的
+    响应地址空间为未知；受控页面发起的、不经过 SW 的 WebSocket 在 LNA
+    检查中按该未知空间的客户端评估，访问 loopback 即被本地网络访问检查
+    扣下。
+* 对生产的结论：**生产 Hub 同源形态不会命中这一拦截**，因为 SW 脚本由
+  Hub 自己的真实 socket（与 PWA 壳、`/v1/follow` 同源；
+  `lib.rs:841` 的 `static_fallback` → `web::static_handler`）服务，
+    worker 带有真实地址空间；被证实的触发条件（脚本响应由调试器合成）
+    在没有 CDP/Playwright 拦截的生产中不存在。边界：该结论只覆盖这一条
+    触发路径与已测形态；若未来改成「PWA 与 Hub 不同源 / 经独立网关
+    转发 WS / SW 脚本由中间层注入」需要重测。
+* e2e 处置：唯一需要豁免的是用 `route.fulfill` 注入测试 SW 的那个用例。
+  豁免是**文件级** `test.use({ launchOptions: { args: [...] } })`
+  （Playwright 不接受 describe 内的 launchOptions：会强制新建 worker），
+  写在 `offline-outbox.hub.spec.ts` 文件顶部，只作用于该 spec，
+  **不**进 `playwright.hub.config.ts`（该文件必须与 origin/main 逐字节
+  一致）。
+* 若未来出现真实部署形态下 online 后 upgrade 仍被 LNA 扣下，最小恢复是
+  检测到 online 后做一次有守卫的 reload（当前无此代码，因为同源不需要）。
 
 ---
 

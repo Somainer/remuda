@@ -59,15 +59,23 @@ anyhow.workspace = true
 # with the feature without pulling it into the production lib.
 remuda-hub = { path = ".", features = ["test-faults"] }
 base64 = "0.22"
+# D-057 OA6 ma-sdk-state r3: the claude-sdk state tests replay the real
+# recorded fixtures through the driver's stdout mapper (test-stub only) and
+# fold the serialized observations via journal.append.
+remuda-driver = { workspace = true, features = ["test-stub"] }
 ece = { version = "2.2", default-features = false, features = ["backend-openssl"] }
 # Software ES256 authenticator for the passkey ceremony tests (D-029).
 openssl = "0.10"
 # utimensat/TimeSpec: tests backdate an access-code file's mtime to exercise
-# the round-3 "file newer than stamp" re-stamp rule. Features unify with the
-# normal-dep entry; no new crate is pulled.
-nix = { version = "0.28", default-features = false, features = ["fs", "time"] }
-# The offline Anthropic-Messages gateway the api-routing relay e2e runs against.
+# the round-3 "file newer than stamp" re-stamp rule. SO_RCVBUF on a follower's
+# unread socket lets the r7 settlement-order test deterministically force
+# writer backpressure. Features unify with the normal-dep entry; no new crate
+# is pulled.
+nix = { version = "0.28", default-features = false, features = ["fs", "time", "net", "socket"] }
 remuda-journal.workspace = true
+# tests/support/mod.rs (shared with the hub_e2e example) serializes a real
+# typed CommandResult for the accept_reply acceptance-envelope regression.
+remuda-protocol.workspace = true
 remuda-testing.workspace = true
 serde_cbor_2 = "0.13"
 sha2.workspace = true

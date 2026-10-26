@@ -6097,6 +6097,7 @@ async fn mark_forward_intent_rechecks_the_stamp_on_the_row() {
             "instance.send".into(),
             json!({}),
             None,
+            None,
             Some(initiator.clone()),
             Some(launch_device.clone()),
         )
@@ -6104,7 +6105,8 @@ async fn mark_forward_intent_rechecks_the_stamp_on_the_row() {
         .unwrap();
     assert!(created);
     store
-        .mark_forward_intent(held.command_id.clone())
+        // No hello has adopted this host's link: its durable generation is 0.
+        .mark_forward_intent(held.command_id.clone(), 0)
         .await
         .unwrap();
 
@@ -6131,6 +6133,7 @@ async fn mark_forward_intent_rechecks_the_stamp_on_the_row() {
             "instance.send".into(),
             json!({}),
             None,
+            None,
             Some(initiator),
             Some(second_device.clone()),
         )
@@ -6142,7 +6145,7 @@ async fn mark_forward_intent_rechecks_the_stamp_on_the_row() {
     // second row, then the second row's intent claim is refused Fenced.
     store.test_delete_device(second_device).await.unwrap();
     let err = store
-        .mark_forward_intent(second.command_id.clone())
+        .mark_forward_intent(second.command_id.clone(), 0)
         .await
         .unwrap_err();
     assert!(
@@ -6160,6 +6163,7 @@ async fn mark_forward_intent_rechecks_the_stamp_on_the_row() {
             instance.host_id,
             "instance.close".into(),
             json!({}),
+            None,
             None,
             // Successor initiator: same lineage, NEXT generation is what F
             // would write; use the current row's live generation here since

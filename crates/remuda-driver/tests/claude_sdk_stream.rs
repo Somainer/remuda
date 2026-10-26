@@ -5,8 +5,8 @@
 //! The properties under test are `print-replacement.md` §1.7 and §2.5 plus
 //! D-028a item 3: one message node across every delta, `Partial` completeness
 //! while a block is open and `Structured` once the final block closes it,
-//! thought / tool_call / tool_result ordering, and usage from the terminal
-//! `result`.
+//! thought / tool_call / tool_result ordering, and per-call usage from the
+//! model stream (cost from the terminal `result`).
 
 use remuda_driver::StdoutMapper;
 use remuda_protocol::{
@@ -265,28 +265,57 @@ fn session_identity_comes_from_system_init() {
     }
 }
 
-/// Usage rides the terminal `result` (§2.5, `usage_from_result`); the usage page
-/// regresses if this stops arriving on the new carrier (§2.8).
+/// c-usagefu r2 item 3: the SDK carrier takes per-call tokens from the
+/// assistant `message.usage` / `message_delta` stream (the provisional
+/// assistant frame revised to the final delta), NOT a cumulative Session stock
+/// summed from `result.usage`. The result still contributes the reported cost.
+/// The usage page regresses if either channel stops arriving.
 #[test]
-fn usage_comes_from_the_terminal_result() {
+fn usage_tokens_ride_per_call_frames_and_cost_rides_the_result() {
     let (_mapper, obs) = partial_then_final();
-    let usage = obs
+
+    // Per-call Turn usage: provisional output 3 on the assistant frame, revised
+    // to the final 7 on message_delta; input 11 is constant.
+    let turn: Vec<&remuda_protocol::UsagePayload> = obs
         .iter()
-        .find_map(|o| match &o.body {
-            ObservationPayload::Usage(p) => Some(p.as_ref()),
+        .filter_map(|o| match &o.body {
+            ObservationPayload::Usage(p) if p.scope == remuda_protocol::UsageScope::Turn => {
+                Some(p.as_ref())
+            }
             _ => None,
         })
-        .expect("usage observation");
-    assert_eq!(usage.input_tokens, Knowledge::Known { value: U64(11) });
-    assert_eq!(usage.output_tokens, Knowledge::Known { value: U64(7) });
-    assert_eq!(usage.total_tokens, Knowledge::Known { value: U64(18) });
-    match &usage.cost {
+        .collect();
+    assert_eq!(turn.len(), 2, "provisional rev 1 + final rev 2");
+    assert_eq!(turn[0].output_tokens, Knowledge::Known { value: U64(3) });
+    let final_turn = turn[1];
+    assert_eq!(final_turn.input_tokens, Knowledge::Known { value: U64(11) });
+    assert_eq!(final_turn.output_tokens, Knowledge::Known { value: U64(7) });
+    assert_eq!(final_turn.total_tokens, Knowledge::Known { value: U64(18) });
+
+    // The result Session snapshot carries cost but NO token stock.
+    let session = obs
+        .iter()
+        .find_map(|o| match &o.body {
+            ObservationPayload::Usage(p) if p.scope == remuda_protocol::UsageScope::Session => {
+                Some(p.as_ref())
+            }
+            _ => None,
+        })
+        .expect("result session usage");
+    assert!(
+        matches!(session.input_tokens, Knowledge::Unknown { .. }),
+        "result.usage must not become a cumulative session stock: {:?}",
+        session.input_tokens
+    );
+    assert!(matches!(session.output_tokens, Knowledge::Unknown { .. }));
+    match &session.cost {
         Knowledge::Known { value } => assert_eq!(value.currency, "USD"),
         other => panic!("expected a reported cost, got {other:?}"),
     }
 
-    // The turn lifecycle precedes its usage, and a terminal result affects
-    // completion (`map_result`).
+    // The per-call tokens are known while the model is still streaming, so the
+    // Turn usage precedes the terminal turn_done; the cost-bearing Session
+    // snapshot follows its result (which flips completion).
     let turn_done = obs
         .iter()
         .position(|o| match &o.body {
@@ -303,8 +332,32 @@ fn usage_comes_from_the_terminal_result() {
             _ => false,
         })
         .expect("terminal turn_done");
-    let usage_at = first_index(&obs, "usage");
-    assert!(turn_done < usage_at, "usage must follow its result");
+    let turn_usage_at = obs
+        .iter()
+        .position(|o| {
+            matches!(
+                &o.body,
+                ObservationPayload::Usage(p) if p.scope == remuda_protocol::UsageScope::Turn
+            )
+        })
+        .expect("per-call turn usage");
+    let session_usage_at = obs
+        .iter()
+        .position(|o| {
+            matches!(
+                &o.body,
+                ObservationPayload::Usage(p) if p.scope == remuda_protocol::UsageScope::Session
+            )
+        })
+        .expect("result session usage");
+    assert!(
+        turn_usage_at < turn_done,
+        "per-call tokens ride the model message, before the terminal result"
+    );
+    assert!(
+        turn_done < session_usage_at,
+        "the cost-bearing result usage must follow its result"
+    );
 }
 
 /// The recorded print fixture still assembles on the sdk carrier: the two
@@ -328,5 +381,231 @@ fn the_recorded_print_stream_still_assembles_on_sdk() {
     assert!(
         obs.iter().any(|o| o.completeness == Completeness::Partial),
         "sdk must report Partial on this fixture's deltas"
+    );
+}
+
+/// Collect the native `turn/result` lifecycles emitted by replaying `source`.
+fn result_natives(source: &str, driver: DriverKind) -> Vec<remuda_protocol::NativeLifecycle> {
+    let (_mapper, obs) = replay(source, driver);
+    obs.into_iter()
+        .filter_map(|o| match o.body {
+            ObservationPayload::Lifecycle(p) => match *p {
+                LifecyclePayload::Native(n) if n.native_name == "result" => Some(*n),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+fn settles_root_turn(n: &remuda_protocol::NativeLifecycle) -> bool {
+    n.related_ids.get("settledRootTurn").map(String::as_str) == Some("true")
+}
+
+/// D-057 OA6 r2 item 1: the driver stamps `settledRootTurn` on the result that
+/// ends the ROOT turn, independent of `affectsCompletion` (the one-shot print
+/// heuristic). The single-turn `ok` session's FIRST result (index 0, queued
+/// omitted, affectsCompletion=false) settles the root turn — the live sdk case
+/// that previously stayed "working" forever.
+#[test]
+fn first_result_of_a_single_turn_session_settles_the_root() {
+    let ok = result_natives(
+        include_str!("../../remuda-testing/fixtures/scripts/ok.jsonl"),
+        DriverKind::ClaudeSdk,
+    );
+    assert_eq!(ok.len(), 1);
+    assert!(
+        settles_root_turn(&ok[0]),
+        "the first (only) result must carry settledRootTurn"
+    );
+    assert!(
+        !ok[0].affects_completion,
+        "index 0 still has the print heuristic false; settlement is separate"
+    );
+
+    // The shared print-carrier mapper makes the same decision.
+    let ok_print = result_natives(
+        include_str!("../../remuda-testing/fixtures/scripts/ok.jsonl"),
+        DriverKind::ClaudePrint,
+    );
+    assert!(settles_root_turn(&ok_print[0]));
+}
+
+/// In a multi-turn session each turn's result ends that turn (the next turn is
+/// already driven by its own turn_started), so both twoturn results settle —
+/// including index 0.
+#[test]
+fn every_result_of_a_multi_turn_session_settles_its_turn() {
+    let two = result_natives(
+        include_str!("../../remuda-testing/fixtures/scripts/twoturn.jsonl"),
+        DriverKind::ClaudeSdk,
+    );
+    assert_eq!(two.len(), 2);
+    assert!(settles_root_turn(&two[0]), "turn 1 settles");
+    assert!(settles_root_turn(&two[1]), "turn 2 settles");
+}
+
+/// A background Workflow emits an intermediate result (index 0) while the
+/// workflow is open — that one does NOT settle the root; the final result
+/// (index 1) does. This is the one shape `result_index` still gates.
+#[test]
+fn a_workflow_intermediate_result_does_not_settle_until_its_final() {
+    // Drive the workflow script (system/task_started local_workflow ->
+    // result 0 -> result 1) through the mapper.
+    let wf = result_natives(
+        include_str!("../../remuda-testing/fixtures/scripts/workflow.jsonl"),
+        DriverKind::ClaudeSdk,
+    );
+    assert_eq!(wf.len(), 2);
+    assert!(
+        !settles_root_turn(&wf[0]),
+        "the workflow's index-0 result is intermediate"
+    );
+    assert!(
+        settles_root_turn(&wf[1]),
+        "the workflow's final result settles"
+    );
+}
+
+fn result_lines(source: &str, driver: DriverKind) -> Vec<remuda_protocol::NativeLifecycle> {
+    result_natives(source, driver)
+}
+
+/// r3 item 2: the REAL stopped-workflow capture. The workflow's terminal
+/// task_notification (status=stopped, after a task_updated killed patch)
+/// arrives BEFORE the only result, which carries the process-global
+/// result_index 0 and queued 0. The terminal notification — not the index —
+/// is what closes the workflow, so that single result settles the root turn.
+/// Pre-r3 the counter-based bookkeeping kept the root "working" forever.
+#[test]
+fn the_stopped_workflow_canary_settles_on_its_terminal_notification() {
+    let results = result_lines(
+        include_str!("../../remuda-testing/fixtures/claude/claude-workflow-canary-1.jsonl"),
+        DriverKind::ClaudeSdk,
+    );
+    assert_eq!(results.len(), 1, "the canary has exactly one result");
+    assert!(
+        settles_root_turn(&results[0]),
+        "the post-notification result (index 0) settles the root turn"
+    );
+}
+
+/// r3 item 3: with TWO workflows owned by one turn, closing the first one
+/// does not settle: an intervening result stays intermediate until the SECOND
+/// workflow's terminal notification; only the last result settles.
+#[test]
+fn two_open_workflows_settle_only_after_both_terminate() {
+    let results = result_lines(
+        include_str!("../../remuda-testing/fixtures/scripts/workflow-two.jsonl"),
+        DriverKind::ClaudeSdk,
+    );
+    assert_eq!(results.len(), 3);
+    assert!(!settles_root_turn(&results[0]), "both workflows open");
+    assert!(
+        !settles_root_turn(&results[1]),
+        "A terminated but B still open: the first close must not settle"
+    );
+    assert!(settles_root_turn(&results[2]), "both terminated");
+}
+
+/// r3 item 1: result_index is process-global and grows across turns, so a
+/// workflow intermediate in a LATER root turn can carry a NONZERO index. The
+/// index must not settle it; the owning turn's open workflow does.
+#[test]
+fn a_later_turn_workflow_intermediate_with_nonzero_index_does_not_settle() {
+    let results = result_lines(
+        include_str!("../../remuda-testing/fixtures/scripts/workflow-later-turn.jsonl"),
+        DriverKind::ClaudeSdk,
+    );
+    assert_eq!(results.len(), 3);
+    // Turn 1 (index 0) settles normally.
+    assert!(settles_root_turn(&results[0]));
+    // Turn 2's workflow intermediate has index 1 (nonzero) but must NOT settle.
+    assert!(
+        !settles_root_turn(&results[1]),
+        "a nonzero result_index is not evidence of settlement while the workflow is open"
+    );
+    // After the terminal notification (status=stopped), index 2 settles.
+    assert!(settles_root_turn(&results[2]));
+}
+
+// NOTE ma-sdk-state r5 item 1: the former hand-mapped
+// `an_older_buffered_result_cannot_settle_a_newer_outstanding_input` lived
+// here and drove `StdoutMapper` directly, so it could not exercise the
+// publication ordering that actually prevents an older buffered result from
+// settling a newer turn. It was replaced by a test through the REAL
+// publication task:
+// `an_older_buffered_result_cannot_settle_a_newer_outstanding_input_through_the_publication_task`
+// in tests/claude_sdk_process.rs.
+
+/// ma-sdk-state r6 item 5: turn A completes while a newer turn B is still
+/// outstanding (A's result is deferred and carries no settledRootTurn); when
+/// B's write later fails on the live child and B is rolled back, the rollback
+/// EMITS the settle it blocked (a `result` lifecycle with settledRootTurn +
+/// deferredSettle), so the root idles instead of staying working until another
+/// turn arrives.
+#[test]
+fn a_failed_newer_write_releases_the_older_turn_deferred_settle() {
+    let result_a = serde_json::json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "result": "A done",
+        "stop_reason": "end_turn",
+        "session_id": SESSION,
+        "result_index": 0
+    });
+    let mut mapper = StdoutMapper::new(DriverKind::ClaudeSdk, SESSION);
+    // Two sends in flight: A in front, B outstanding.
+    mapper.begin_turn();
+    mapper.begin_turn();
+
+    // A's result maps while B is open: deferred, no settle.
+    let obs_a = mapper.map(result_a).expect("map A result");
+    let result_a = obs_a
+        .iter()
+        .find_map(|o| match &o.body {
+            ObservationPayload::Lifecycle(p) => match p.as_ref() {
+                LifecyclePayload::Native(n) if n.native_name == "result" => Some(n),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("A result lifecycle");
+    assert!(
+        !result_a.related_ids.contains_key("settledRootTurn"),
+        "A is deferred behind B: no settledRootTurn"
+    );
+
+    // B's write fails on a live child: rolling B back releases A's settle.
+    let settle = mapper
+        .cancel_turn()
+        .expect("cancel is infallible")
+        .expect("the rollback emits the deferred settle");
+    let native = match &settle.body {
+        ObservationPayload::Lifecycle(p) => match p.as_ref() {
+            LifecyclePayload::Native(n) => n,
+            _ => panic!("deferred settle must be a native lifecycle"),
+        },
+        _ => panic!("deferred settle must be a lifecycle"),
+    };
+    assert_eq!(native.native_name, "result");
+    assert_eq!(
+        native
+            .related_ids
+            .get("settledRootTurn")
+            .map(String::as_str),
+        Some("true"),
+        "the released settle idles the root"
+    );
+    assert_eq!(
+        native.related_ids.get("deferredSettle").map(String::as_str),
+        Some("true")
+    );
+
+    // Rolling back again releases nothing.
+    assert!(
+        mapper.cancel_turn().expect("second cancel").is_none(),
+        "the deferred settle is one-shot"
     );
 }

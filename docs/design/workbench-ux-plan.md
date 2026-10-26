@@ -45,8 +45,8 @@
 | 文档行 | 投影自的现有字段 |
 |---|---|
 | 在队列，尚未发送 | `Command.state==="queued"` 且 `Command.dispatch ∈ {not-dispatched, intent-durable}`（`web/src/types/command.ts`）；本地态 `LocalBubble.state==="queued"`（`lib/store.ts:527`） |
-| 已受理 / 会话已创建 | `Command.state==="accepted"`；创建看 `Instance.lifecycle ∈ {requested, preparing, starting}`；**不得**据此显示任务成功 |
-| 已发送，等待确认 | `Command.dispatch==="transport-written"` 且 `Command.resolution==="clear"`；交互侧 `Interaction.delivery==="written"`（`types/interaction.ts:85`） |
+| 已受理 / 会话已创建 | `Command.state==="accepted"`；创建看 `Instance.lifecycle ∈ {requested, preparing, starting}`；**不得**据此显示任务成功。D-055 outbox 同文：outbox 行 `sent`（明确受理应答在手）或 `done`（journal 确认执行）的乐观气泡也投影本格（`commandStatus.ts`），journal 行随后替换气泡 |
+| 已发送，等待确认 | `Command.dispatch==="transport-written"` 且 `Command.resolution==="clear"`；交互侧 `Interaction.delivery==="written"`（`types/interaction.ts:85`）。D-055 outbox 同文：outbox 行 `inflight`（POST 已发、应答未到）或 `reconciling`（已转发、有界 GET 确认中）投影本格；拿到明确受理应答（行收敛为 `sent`）后升「已受理」。乐观气泡链：等待发送 → 已发送，等待确认 → 已受理 → journal 行替换 |
 | 状态待确认 | `Command.resolution ∈ {unknown, reconciling}`；`Instance.connectivity ∈ {disconnected, reconciling}`；`Instance.lifecycle ∈ {unknown, reconciling}`；`Instance.lastError==="node-epoch-changed"`（已被 `SessionPage.tsx:85`、`SessionList.tsx:18` 读取）；`Interaction.delivery==="unknown"` |
 | 需要你回答 / 需要批准 | `projectInteraction()==="pending"`（`lib/interactionStatus.ts:33`）+ `InteractionKind ∈ {approval, question, plan-review, elicitation}` |
 | 回答已提交但原生未清除 | `Interaction.state==="answer-committed"` 且尚无 `InteractionResolutionReason==="native-cleared"`；UI 取 `projectInteraction` 的 `settled` / `superseded` |

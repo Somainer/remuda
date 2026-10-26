@@ -720,6 +720,13 @@ pub struct UsagePayload {
     /// `native_fields_ref`; protocol §5.5.
     #[serde(deserialize_with = "crate::scalar::required_option")]
     pub native_fields_ref: Option<Id>,
+    /// `context_window`; protocol §5.5. Native per-model context window in
+    /// tokens (e.g. stream-json `result.modelUsage.<model>.contextWindow`),
+    /// when the harness reports one. Additive optional field: absent on
+    /// adapters that do not know it; the Hub then resolves a window from the
+    /// effective model / provider profile / static catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<U64>,
 }
 
 /// BlobLocator; `protocol.md` §5.5.
@@ -924,6 +931,13 @@ pub struct EffortPayload {
     /// known on the observing side.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested: Option<EffortSelection>,
+    /// Per-request id of the in-session switch THIS edge's `requested` echo
+    /// belongs to (c-effortread r10, items 1–4). The driver mints nothing: it
+    /// echoes the id the configure carried (web → Hub → Node → driver). An
+    /// older driver/journal omits it; consumers then fall back to the
+    /// newer-than-baseline-and-queue axis/value rule.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "requestId")]
+    pub request_id: Option<String>,
     /// The level actually observed in the assistant transcript record.
     pub effective: EffortEffective,
     /// Native spelling read off the record (`effort` / `perTurnEffort`), kept

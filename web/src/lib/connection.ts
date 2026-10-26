@@ -4,15 +4,16 @@
  *
  * States (hub-resilience §5.2, client names):
  *  - live: follow socket open and a frame received within LIVE_FRAME_MS.
- *  - stale: socket open but silent past LIVE_FRAME_MS, or one REST probe
- *    timeout. No banner; the top dot only.
+ *  - stale: socket open but silent past LIVE_FRAME_MS, one REST probe
+ *    timeout, OR a resume whose follow could not open while REST stayed
+ *    reachable. No banner; the top dot only; REST drives delivery.
  *  - offline: socket closed, navigator offline, or a reconnect attempt
- *    failed. Banner; writes go to the outbox.
+ *    failed with REST also unreachable. Banner; writes go to the outbox.
  *  - recovering: a reconnect is open and its seq catch-up / outbox flush is
  *    running. A watchdog guarantees it can never stay here.
  *
- * The machine never lies: a failed catch-up ends in offline, never a forced
- * "live" (the bug this replaces). Every state has an exit.
+ * The machine never lies: a failed catch-up ends in stale/offline, never a
+ * forced "live" (the bug this replaces). Every state has an exit.
  */
 
 export type ConnectionState = "live" | "stale" | "offline" | "recovering";
@@ -51,14 +52,39 @@ export type MachineDeps = {
   /** Lightweight REST probe used while the socket looks silently stale. */
   probe: () => Promise<boolean>;
   /**
+   * Called exactly once when an in-flight resume attempt is closed while still
+   * bound to the CURRENT generation: `why: "ok"` on success, `"failed"` when the
+   * resume action rejected, `"watchdog"` when the 20 s watchdog gave up on a
+   * hung resume. The store uses it to settle post-delivery debt the attempt
+   * owed: a failed/hung follow must not leave an accepted row at 已受理 while
+   * REST works. Never called for a superseded (stale generation) attempt — the
+   * bind-away path owns that instance's debt.
+   */
+  onAttemptFinish?: (info: { gen: number; attemptId: number; why: "ok" | "failed" | "watchdog" }) => void;
+  /**
    * Whether the follow link is genuinely usable RIGHT NOW: the socket is OPEN
    * AND a frame was received within LIVE_FRAME_MS. Foreground/online resume
    * from a cached "live" trusts the link only when this is true; an OPEN but
    * silent, or a closed, socket forces reopen.
    */
   isFollowLive: () => boolean;
+  /**
+   * Whether follow recovery is OWED for the current binding: a mounted follow
+   * OR a pending session target whose first journal lookup has not resolved
+   * yet (store: boundTo set, boundJournal null). False only on the session
+   * list / new-session page with no session target, where no follow socket
+   * exists or is expected. A quiet stale probe that succeeds while unowned
+   * certifies the link itself — there is no follow to reopen, and running the
+   * resume action would issue a SECOND GET whose tail could cross the carried
+   * stale deadline and publish a false offline (c-unboundresume r2 item 2).
+   * A pending target must instead keep quiet-reopening until its real
+   * seed/subscribe completes (r3 item 1).
+   */
+  isFollowBound: () => boolean;
   schedule?: Scheduler;
   cancel?: ScheduleCancel;
+  /** Injectable clock (tests with fake timers pass their clock's now()). */
+  now?: () => number;
   random?: () => number;
   log?: (msg: string) => void;
   onState?: (state: ConnectionState, detail?: { pendingCount?: number }) => void;
@@ -68,16 +94,49 @@ type TimerName = "stale" | "offline" | "reconnect" | "watchdog" | "probe" | "bin
 
 export class ConnectionMachine {
   state: ConnectionState = "offline";
+  /**
+   * c-reconnfu gate 41 S2 — PERMANENT disposal. Once dispose() returns the
+   * machine is retired forever: it never dispatches, publishes state or
+   * schedules another timer, and every pending attempt/probe continuation is
+   * invalidated. A disposed machine is replaced (never reused) by the store;
+   * without this flag a REST probe/resume parked across a logout could resolve
+   * afterwards and overwrite the replacement machine's published state.
+   */
+  private disposed = false;
   /** Consecutive failed/ongoing attempts; reset on any real recovery. */
   private attempt = 0;
   private timers = new Map<TimerName, unknown>();
   private resumeInFlight = false;
+  /**
+   * Set by the browser `offline` arm while a resume is in flight: the attempt
+   * bookkeeping is retired so an `online` resume is not coalesced away, yet
+   * the attempt's own rejection still owns the failure settlement (gate 8).
+   */
+  private resumeRetiredOffline = false;
+  /**
+   * Set when the follow socket closes/errors WHILE a resume attempt owns it.
+   * The close itself does not force a state change (the attempt settles), but
+   * a subsequent frame must not certify live over a DEAD socket, and the
+   * attempt's failure arm treats the link as a real loss. Cleared on the next
+   * socket open (gate 8: snapshot frame → live, then socket closed, then REST
+   * catch-up failed used to keep false 已连接 for up to 40 s).
+   */
+  private closedDuringResume = false;
   /**
    * Monotonic id of the current resume attempt. A completion (or watchdog)
    * from a timed-out attempt carries a stale id and is ignored: the watchdog
    * fires attempt A, B starts, A resolves late — A must never consume B.
    */
   private resumeAttemptId = 0;
+  /**
+   * Binding generation of the CURRENT session binding and of the attempt in
+   * flight. The store bumps {@link latestBindGen} whenever it binds the
+   * machine to a DIFFERENT journal (navigation A → B): an attempt armed for
+   * an older generation is superseded — its late completion must never
+   * certify/fail the newly bound session.
+   */
+  private latestBindGen = 0;
+  private resumeBindGen = 0;
   private readonly schedule: Scheduler;
   private readonly cancel: ScheduleCancel;
   private readonly random: () => number;
@@ -106,8 +165,18 @@ export class ConnectionMachine {
   }
 
   private setState(next: ConnectionState, detail?: { pendingCount?: number }) {
+    // Gate 41 S2: a permanently disposed machine never publishes again, even
+    // if a late probe/resume continuation reaches here.
+    if (this.disposed) return;
     if (next === this.state) return;
     this.state = next;
+    // Gate 9 item 1: the stale-entry deadline must not survive stale itself.
+    // Clearing it ONLY on live leaked it across offline/recovering: a
+    // REST-proven link that cycled stale→offline→recovering→stale computed
+    // offlineMs=0, went immediately offline and storm-reconnected. It is a
+    // bound on ONE quiet-stale episode, seeded on entry, discarded the moment
+    // the machine leaves stale.
+    if (next !== "stale") this.staleDeadlineAt = 0;
     this.deps.onState?.(next, detail);
   }
 
@@ -121,8 +190,23 @@ export class ConnectionMachine {
     for (const n of names) this.clearTimer(n);
   }
 
+  /**
+   * Arm/replace ONE named timer. Gate 10 item 2: always cancel the previous
+   * handle first — replacing it directly (the old code) leaves the orphan job
+   * live: a later clearTimers/dispose cancels only the NEW handle and the
+   * orphan fires inside a later state episode.
+   */
+  private setTimer(name: TimerName, ms: number, fn: () => void) {
+    // Gate 41 S2: a disposed machine schedules nothing — late arming attempts
+    // (a reopen/probe continuation racing disposal) must die here.
+    if (this.disposed) return;
+    this.clearTimer(name);
+    this.timers.set(name, this.schedule(fn, ms));
+  }
+
   /** Start with an optimistic live assumption (bootstrap just succeeded). */
   startLive() {
+    if (this.disposed) return;
     this.attempt = 0;
     this.armFrameWatchdog();
     this.setState("live");
@@ -137,6 +221,24 @@ export class ConnectionMachine {
    * frozen transcript can never sit behind 已连接.
    */
   bootstrapLive() {
+    if (this.disposed) return;
+    this.attempt = 0;
+    this.clearTimers("stale", "offline", "probe", "reconnect", "watchdog", "bind");
+    this.setState("live");
+  }
+
+  /**
+   * Certify live for an UNBOUND binding whose quiet stale probe just
+   * succeeded (c-unboundresume r2 item 2): the one bounded GET that answered
+   * IS the reachability proof, so no resume action (and no second GET) may
+   * follow. Leaving stale discards the carried episode deadline via setState,
+   * and NO frame watchdog is armed — exactly like {@link bootstrapLive}, the
+   * unbound list/new-session page has no socket whose silence could be
+   * watched (foreground/online/focus resumes and the next mount own
+   * revalidation). Only callable while stale; callers re-check state.
+   */
+  private certifyUnboundLive() {
+    if (this.disposed || this.state !== "stale") return;
     this.attempt = 0;
     this.clearTimers("stale", "offline", "probe", "reconnect", "watchdog", "bind");
     this.setState("live");
@@ -148,45 +250,82 @@ export class ConnectionMachine {
    * dispatches {frame} and takes over via armFrameWatchdog; silence means the
    * open socket is not actually carrying data — live degrades to stale (probe
    * then reopen), recovering retries the resume.
+   *
+   * `rebind` is set when the store rebounds to an ALREADY-MOUNTED session
+   * (navigation back, or a racing mount the user returns to). Such a call must
+   * judge the EXISTING socket by the frame/probe deadline alone: the machine
+   * may currently sit in a PREVIOUS mount's recovering state, and inheriting
+   * it via `wasLive === false` would immediately beginResume() and open a
+   * second socket for a session that still has a working one. A genuinely dead
+   * socket is still reopened later — the stale-state probe path certifies REST
+   * reachability and only then resumes.
    */
-  followBound() {
+  followBound(opts: { rebind?: boolean } = {}) {
     this.clearTimer("bind");
-    if (this.state === "offline") {
+    if (!opts.rebind && this.state === "offline") {
       this.beginResume();
       return;
     }
-    const wasLive = this.state === "live";
-    this.timers.set(
-      "bind",
-      this.schedule(() => {
-        this.timers.delete("bind");
-        // A frame landed just in time and already proved the link.
-        if (this.state === "live" && this.deps.isFollowLive()) {
-          this.armFrameWatchdog();
-          return;
-        }
-        if (wasLive) {
-          // OPEN but silent: stale, then the same probe/offline dance the
-          // frame watchdog runs (REST reachable triggers reopen+catch-up).
-          this.setState("stale");
-          this.timers.set(
-            "probe",
-            this.schedule(() => {
-              if (this.state !== "stale") return;
-              void this.deps.probe().then((ok) => this.dispatch({ type: "probe", ok }));
-            }, REST_PROBE_MS),
-          );
-          this.timers.set(
-            "offline",
-            this.schedule(() => {
-              if (this.state === "stale") this.goOfflineAndSchedule();
-            }, STALE_TO_OFFLINE_MS),
-          );
-        } else {
-          this.beginResume();
-        }
-      }, LIVE_FRAME_MS),
-    );
+    // gate 8 items 3 & 5, gate 9 item 2:
+    //  - a rebind from LOUD OFFLINE has no REST proof: do nothing (never
+    //    enter stale and hide the banner; the offline reconnect path owns
+    //    recovery).
+    //  - a rebind while quiet stale, with NO in-flight attempt, must RE-ARM
+    //    the stale timers: a navigation into a mounted session can happen
+    //    after noteBinding retired the previous quiet attempt and cleared the
+    //    watchdog (bind was the only timer and the rebind early-return used to
+    //    strand stale with zero timers forever).
+    //  - a rebind while a resume/quiet reopen is still in flight owns nothing
+    //    new: the attempt settles (frame → live, reject → stale re-arms).
+    if (opts.rebind && (this.state === "offline" || this.resumeInFlight)) {
+      if (this.deps.isFollowLive()) this.armFrameWatchdog();
+      return;
+    }
+    // gate 9 item 3: from quiet stale a bind deadline certifies via the SAME
+    // quiet probe path (treat stale as wasLive), never beginResume — the
+    // upgrade refusal / snapshot timeout must not produce a loud recovering
+    // cycle.
+    // gate 10 item 5 (gate9 item 2): a rebind after noteBinding retired a
+    // real quiet reopen finds stale with zero timers — re-arm so it is not
+    // frozen.
+    if (opts.rebind && this.state === "stale") {
+      this.armStaleProbeTimers();
+      return;
+    }
+    // gate 11 item 1 (gate 9 item 3 restored — gate 10 deleted this arm): the
+    // REAL reopen path (openFollowSocket → followBound() with NO rebind) arrives
+    // while THIS attempt's resume is in flight; the socket opening is the
+    // attempt's own. Arming `bind` here would leave a competing deadline that
+    // fires into the settled attempt: when a blocked upgrade later settles
+    // quiet stale at ~10 s, the 15 s bind fires beginResume (wasLive was
+    // captured false for recovering) and flashes the recovering banner on
+    // every cycle. The resume watchdog already owns this attempt; a
+    // frame-certified follow takes the frame watchdog.
+    if (!opts.rebind && this.resumeInFlight) {
+      if (this.deps.isFollowLive()) this.armFrameWatchdog();
+      return;
+    }
+    // gate 9 item 3: from quiet stale a bind deadline certifies via the SAME
+    // quiet probe path (treat stale as wasLive), never beginResume — the
+    // upgrade refusal / snapshot timeout must not produce a loud recovering
+    // cycle.
+    const wasLive = this.state === "live" || this.state === "stale";
+    this.setTimer("bind", LIVE_FRAME_MS, () => {
+      this.timers.delete("bind");
+      // A frame landed just in time and already proved the link.
+      if (this.state === "live" && this.deps.isFollowLive()) {
+        this.armFrameWatchdog();
+        return;
+      }
+      if (wasLive) {
+        // OPEN but silent: stale, then the same probe/offline dance the
+        // frame watchdog runs (REST reachable triggers reopen+catch-up).
+        this.setState("stale");
+        this.armStaleProbeTimers();
+      } else {
+        this.beginResume();
+      }
+    });
   }
 
   /**
@@ -195,6 +334,8 @@ export class ConnectionMachine {
    * watchdog off the machine's own retry/probe rhythm.
    */
   setStateOffline() {
+    // Gate 41 S2: no re-arm on a retired machine.
+    if (this.disposed) return;
     this.attempt = 0;
     this.clearTimers("stale", "offline", "probe", "reconnect", "watchdog");
     this.setState("offline");
@@ -202,20 +343,55 @@ export class ConnectionMachine {
   }
 
   dispatch(event: ConnectionEvent) {
+    // Gate 41 S2: a permanently disposed machine ignores EVERY event — events
+    // queued by a parked socket/probe across logout must not touch state after
+    // the store has replaced this machine.
+    if (this.disposed) return;
     switch (event.type) {
       case "frame":
         // A frame proves the link: live, backoff reset, watchdog re-armed.
+        // (A frame from a socket that closes later in the same resume is not
+        // enough to clear closedDuringResume — only a fresh socket open does.)
         this.attempt = 0;
         if (this.state !== "live") this.setState("live");
         this.armFrameWatchdog();
         return;
       case "open":
+        // A fresh socket clears any latched close from its predecessor.
+        this.closedDuringResume = false;
         // The socket alone is not "live" until its snapshot/frame arrives; an
         // open while offline starts the recovering catch-up.
         if (this.state === "offline") this.beginResume();
         return;
       case "close":
       case "error":
+        // A resume attempt in flight OWNS the decision for this failure:
+        // `openFollowSocket`'s socket fails to open and rejects the resume
+        // action, whose completion settles via the REST probe. Letting the
+        // socket's own close/error force offline here raced that decision
+        // (offline in tens of ms, before the probe could answer) and stormed
+        // offline↔recovering on every blocked follow upgrade under load
+        // (c-reconnfu gate 7). Latch the close so the attempt's failure arm
+        // cannot certify live over a dead socket, and so a late frame cannot
+        // either (gate 8). The resume watchdog (20 s) guarantees an exit.
+        if (this.resumeInFlight) {
+          this.closedDuringResume = true;
+          return;
+        }
+        if (this.resumeRetiredOffline) {
+          // c-reconnfu gate 20 item 5: the browser `offline` event retired
+          // this attempt WHILE its REST catch-up was still pending, but the
+          // socket it opened can genuinely CLOSE before that read resolves
+          // (offline → close ordering — gate 19 item 5 covered close →
+          // offline). Preserve the close information for the retired attempt
+          // too: without this latch its later SUCCESSFUL completion certified
+          // live over the dead link. The completion takes the same dead-link
+          // settlement as an in-flight close (probe-verified stale / offline).
+          // State already is "offline" and the reconnect clock is armed, so
+          // do not re-run goOfflineAndSchedule here.
+          this.closedDuringResume = true;
+          return;
+        }
         this.goOfflineAndSchedule();
         return;
       case "online":
@@ -233,33 +409,127 @@ export class ConnectionMachine {
         return;
       }
       case "offline":
-        this.goOffline();
+        // Browser offline: clear timers and retire with the flag so the next
+        // online event can override with a new attempt (item 1 gate 8). The
+        // episode deadline (goOffline, called by the timer) retires without
+        // the flag (gate 10 item 4) so a late quiet-reopen rejection is
+        // ignored and the reconnect clock alone owns recovery.
+        this.clearTimers("bind", "stale", "offline", "probe", "watchdog");
+        this.retireInFlightForOffline();
+        if (this.state !== "offline") this.setState("offline");
         return;
       case "probe":
         if (this.state !== "stale") return;
         if (event.ok) {
           // REST reachable is NOT proof the follow stream works: a live
-          // transcript needs the socket. Reopen + catch up (which certifies
-          // live on success) instead of optimistically setting live.
+          // transcript needs the socket. Reopen + catch up — but QUIETLY while
+          // already in stale (REST proven): stay banner-less, success certifies
+          // live on the first frame, a blocked upgrade stays stale (c-reconnfu
+          // gate 7: a loud recovering blip on every periodic reopen kept the
+          // banner mounted under load).
           this.attempt = 0;
-          this.beginResume();
+          this.quietReopen();
         } else {
           this.goOfflineAndSchedule();
         }
         return;
       case "resumeAttempt": {
+        // Gate 17 item 4: reject a completion whose BINDING GENERATION differs
+        // BEFORE touching any state. The retired-offline acceptance below used
+        // to let an attempt for a navigated-away session through: its close
+        // latch then overrode the NEW binding's healthy live socket (state was
+        // flipped to recovering before the gen check at the end ran). A
+        // same-binding offline retirement (resumeBindGen === latestBindGen) is
+        // still accepted — gate 8's offline→online chain depends on it.
+        if (this.resumeBindGen !== this.latestBindGen) {
+          return;
+        }
         // Accept a completion only for the CURRENT attempt. A late resolution
         // from an attempt the watchdog already timed out (B is now running)
-        // must not certify live nor consume B's outcome.
-        if (!this.resumeInFlight || event.attemptId !== this.resumeAttemptId) return;
+        // must not certify live nor consume B's outcome. The browser
+        // `offline` arm (gate 8) retires resumeInFlight but marks the attempt
+        // current for its rejection via resumeRetiredOffline.
+        if (
+          (!this.resumeInFlight && !this.resumeRetiredOffline) ||
+          event.attemptId !== this.resumeAttemptId
+        ) {
+          return;
+        }
+        const gen = this.resumeBindGen;
+        const closed = this.closedDuringResume;
         this.resumeInFlight = false;
+        this.resumeRetiredOffline = false;
+        // Gate 11 item 2 (gate 9 item 4 restored — gate 10 deleted the
+        // consume): the latch belongs to THIS completion. A close latched by
+        // attempt A must not still be latched when a later attempt's own
+        // frame-certified follow rejects a trailing read — every new arm also
+        // resets (loud: armResumeAttempt; quiet: armResumeAttemptQuiet).
+        this.closedDuringResume = false;
         this.clearTimer("watchdog");
-        if (event.ok) {
+        if (event.ok && !closed) {
+          // Successful resume with no latched close: certify live. This is
+          // explicit about the NO-BOUND-FOLLOW bootstrap case too — a resume
+          // on the session list/new-session page opens no follow socket (the
+          // store's resumeConnection has no bound instance), so nothing can
+          // latch a close for that attempt; closed is necessarily false and
+          // the REST-success resume correctly reports live there.
           this.attempt = 0;
           this.setState("live");
           this.armFrameWatchdog();
+        } else if (event.ok) {
+          // Gate 19 item 5: the follow socket this attempt opened genuinely
+          // CLOSED while resumeAfterReconnect's REST catch-up was still
+          // pending (closed latched by the real close event). The catch-up
+          // then succeeding certifies the bounded READ — journal caught up —
+          // NOT a live link: that socket is dead and its frame stream is
+          // gone. Certifying live here reported 已连接 on a frozen transcript
+          // with no recovery running. Take the SAME dead-link settlement/
+          // recovery path a failed resume uses: REST reachable settles quiet
+          // stale and quietly reopens (a real new follow certifies), REST
+          // down goes loud offline with the reconnect clock.
+          if (this.state === "live") this.setState("recovering");
+          this.settleResumeFailureViaProbe(true);
+        } else if (!closed && this.deps.isFollowLive()) {
+          // The resume ACTION rejected (a resume-side REST catch-up read
+          // timed out under load), but the follow socket it opened is still
+          // OPEN and proven live by its own frames. Frames are healing the
+          // journal and the socket's frame watchdog/close remain the real
+          // failure detectors — forcing offline here would tear down the
+          // working follow, reopen a replacement, and storm
+          // offline↔recovering (c-reconnfu gate 7). Gate 8: the latch also
+          // covers the race where the socket closed after its last frame —
+          // a dead follow must never certify live over a failed REST read.
+          this.attempt = 0;
+          this.setState("live");
+          this.armFrameWatchdog();
+        } else if (this.state === "stale" && !closed) {
+          // This was a QUIET reopen out of a REST-proven stale state (see
+          // quietReopen): REST already answered, so the failed follow re-open
+          // stays quiet stale and the stale probe/offline timers keep
+          // ticking — no loud recovering/offline banner blip. Clear the bind
+          // deadline the real openFollowSocket path armed (gate 9 item 3):
+          // leaving it would beginResume 15 s later and flash recovering even
+          // though the attempt already settled to stale.
+          this.clearTimer("bind");
+          this.attempt = 0;
+          this.armStaleProbeTimers();
         } else {
-          this.goOfflineAndSchedule();
+          // Recovering, OR a frame-certified live whose socket has since
+          // latched closed (gate 8 item 2): leave the loud recovery state to
+          // the REST probe, which settles stale/offline. Drop the latched
+          // "live" label first so the settle probe is allowed to act.
+          if (closed && this.state === "live") this.setState("recovering");
+          this.settleResumeFailureViaProbe(closed);
+        }
+        // Bind match is defence in depth: noteBinding retires a superseded
+        // attempt before its completion can arrive, so only a current-binding
+        // finish is reported.
+        if (gen === this.latestBindGen) {
+          this.deps.onAttemptFinish?.({
+            gen,
+            attemptId: event.attemptId,
+            why: event.ok ? "ok" : "failed",
+          });
         }
         return;
       }
@@ -271,38 +541,174 @@ export class ConnectionMachine {
    * resume immediately on return.
    */
   setVisibility(visible: boolean) {
+    if (this.disposed) return;
     if (visible) this.dispatch({ type: "resume" });
     else if (this.state === "offline") this.clearTimer("reconnect");
   }
 
   private armFrameWatchdog() {
     this.clearTimers("bind", "stale", "offline", "probe", "reconnect");
-    this.timers.set(
-      "stale",
-      this.schedule(() => {
-        if (this.state !== "live") return;
-        this.setState("stale");
-        // One REST probe decides whether the socket is silently dead.
-        this.timers.set(
-          "probe",
-          this.schedule(() => {
-            if (this.state !== "stale") return;
-            void this.deps.probe().then((ok) => this.dispatch({ type: "probe", ok }));
-          }, REST_PROBE_MS),
-        );
-        // No frame for another window: offline regardless of the probe.
-        this.timers.set(
-          "offline",
-          this.schedule(() => {
-            if (this.state === "stale") this.goOfflineAndSchedule();
-          }, STALE_TO_OFFLINE_MS),
-        );
-      }, LIVE_FRAME_MS),
-    );
+    this.setTimer("stale", LIVE_FRAME_MS, () => {
+      if (this.state !== "live") return;
+      this.setState("stale");
+      // One REST probe decides whether the socket is silently dead.
+      this.armStaleProbeTimers();
+    });
+  }
+
+  /**
+   * Wall-clock deadline after which quiet stale MUST become loud offline.
+   * Gate 8 item 8: quiet reopens re-arm the probe/offline timers from zero on
+   * every cycle while follow upgrades stay blocked; without a single deadline
+   * carried across cycles a Hub that dies right after a good probe kept the
+   * banner-less state indefinitely (or 40–70 s), contradicting
+   * hub-resilience §5.2. 0 = no deadline in force (a fresh live→stale frame
+   * expiry sets one).
+   */
+  private staleDeadlineAt = 0;
+
+  /**
+   * The quiet-state retry timers: probe REST, reopening the follow when it
+   * answers, and giving up to loud offline after a window without a probe.
+   * The offline deadline is the EARLIER of the fixed STALE_TO_OFFLINE window
+   * and any deadline carried from an earlier stale cycle (quiet reopens), so
+   * total quiet-stale time is bounded even with repeated blocked upgrades.
+   */
+  /**
+   * The quiet-state retry timers: probe REST, reopening the follow when it
+   * answers, and giving up to loud offline at the end of ONE stale episode.
+   *
+   * Gate 9: the 30 s deadline is carried across re-arms DURING the same stale
+   * episode (probe cycles and quiet reopens call this without leaving stale)
+   * but re-seeded whenever the machine has actually left stale and returned —
+   * setState cleared it then, so a missing value here means a fresh entry.
+   */
+  private armStaleProbeTimers() {
+    // Gate 9 item 1: seed only while IN stale. The quiet-reopen watchdog
+    // (state recovering) must not manufacture a deadline that then fires at
+    // 0 when the failed reopen lands back in stale.
+    if (this.state !== "stale") return;
+    const now = this.clockNow();
+    if (!this.staleDeadlineAt) {
+      this.staleDeadlineAt = now + STALE_TO_OFFLINE_MS;
+    }
+    const offlineMs = Math.max(0, this.staleDeadlineAt - now);
+    this.setTimer("probe", REST_PROBE_MS, () => {
+      if (this.state !== "stale") return;
+      // Gate 10 item 3: capture the binding the probe answers FOR. A late
+      // probe (the user navigated to a framed session B while it was in
+      // flight) must not demote B.
+      // Gate 11 item 6: capture the RESUME ATTEMPT too, and require BOTH to
+      // match. Same binding is not enough: a stale probe P in flight before a
+      // foreground resume fails after it — the failed attempt settles quiet
+      // stale via its own settle probe Q, and P answering false afterwards
+      // must not take Q's stale offline (attempt id moved on).
+      // c-unboundresume r2 item 2: capture whether a follow was BOUND when the
+      // probe started. An unbound ok certifies the list-page link itself —
+      // quietReopen's resume would run proveHubReachable a SECOND time, and on
+      // a slow Hub that second GET straddles the carried episode deadline and
+      // publishes offline despite two successful reads.
+      const gen = this.latestBindGen;
+      const probeAttemptId = this.resumeAttemptId;
+      const bound = this.deps.isFollowBound();
+      void this.deps.probe().then((ok) => {
+        // Gate 41 S2: the probe was parked across dispose; drop its answer.
+        if (this.disposed) return;
+        if (gen !== this.latestBindGen) return;
+        if (probeAttemptId !== this.resumeAttemptId) return;
+        if (this.state !== "stale") return;
+        if (ok && !bound) {
+          this.certifyUnboundLive();
+        } else {
+          this.dispatch({ type: "probe", ok });
+        }
+      });
+    });
+    this.setTimer("offline", offlineMs, () => {
+      if (this.state === "stale") this.goOfflineAndSchedule();
+    });
+  }
+
+  private clockNow(): number {
+    return this.deps.now ? this.deps.now() : Date.now();
+  }
+
+  /**
+   * Decide the aftermath of a resume that could not open the follow socket.
+   * Restores stay in `recovering` (banner) only for the probe's own duration;
+   * a frame-live link is never touched; otherwise REST reachable settles quiet
+   * at stale (whether we are currently recovering OR offline — an `offline`
+   * browser event can land while the resume is in flight, and dropping that
+   * case left the link loud-offline with nothing scheduled once the resume
+   * rejected, c-reconnfu gate 8) and unreachable stays loud offline with the
+   * reconnect clock armed.
+   */
+  private settleResumeFailureViaProbe(closed: boolean = false) {
+    // Gate 10 item 3: capture the binding AND the attempt this settlement
+    // answers for. If the user navigates to a framed session B (store rebinds
+    // → noteBinding bumps the generation) before the probe resolves, the
+    // result — ok or not-ok — must not demote B's healthy socket.
+    const gen = this.latestBindGen;
+    const attemptId = this.resumeAttemptId;
+    void this.deps
+      .probe()
+      .then((ok) => {
+        // Gate 41 S2: parked across dispose — never settle from the dead
+        // machine (its goOffline would publish over the replacement).
+        if (this.disposed) return;
+        if (gen !== this.latestBindGen) return;
+        if (attemptId !== this.resumeAttemptId) return;
+        // A newer attempt owns the state.
+        if (this.resumeInFlight) return;
+        // A genuinely frame-live follow owns itself — but NOT when the live
+        // label has no frame backing (isFollowLive false): a resume failure on
+        // an unframed socket that nevertheless sits labelled live (an earlier
+        // snapshot that was revoked) must settle via the probe rather than
+        // hold a false 已连接 (gate 8 item 6 / gate 9 item 4).
+        if (!closed && this.deps.isFollowLive()) return;
+        // An unframed live (or a latched-closed live) leaves the label for the
+        // probe decision; framed-open without a latch stays live above.
+        if (this.state === "live") this.setState("recovering");
+        if (ok) {
+          this.attempt = 0;
+          this.setState("stale");
+          this.armStaleProbeTimers();
+        } else {
+          this.goOfflineAndSchedule();
+        }
+      })
+      .catch(() => {
+        // Gate 41 S2: same retirement for a parked probe rejection.
+        if (this.disposed) return;
+        if (!this.resumeInFlight && !this.deps.isFollowLive() && this.state !== "live") {
+          this.goOfflineAndSchedule();
+        }
+      });
+  }
+
+  /**
+   * Retire the current resume attempt for a BROWSER `offline` event (distinct
+   * from the episode-deadline retirement in goOffline): the flag is kept so a
+   * following `online` event starts a new attempt while the old rejection is
+   * still dropped.
+   */
+  private retireInFlightForOffline() {
+    if (!this.resumeInFlight) return;
+    this.resumeInFlight = false;
+    this.resumeRetiredOffline = true;
   }
 
   private goOffline() {
     this.clearTimers("bind", "stale", "offline", "probe", "watchdog");
+    // Gate 10 item 4: when the EPISODE deadline fires while a quiet resume is
+    // in flight, retire it WITHOUT the offline-event flag so its late
+    // rejection is IGNORED (id mismatch): the reconnect clock alone owns
+    // recovery. The browser `offline` event keeps the flag so an online event
+    // can override with a new attempt.
+    if (this.resumeInFlight) {
+      this.resumeInFlight = false;
+      this.resumeRetiredOffline = false;
+    }
     if (this.state !== "offline") this.setState("offline");
   }
 
@@ -316,42 +722,283 @@ export class ConnectionMachine {
     const n = this.attempt;
     const delay = this.backoffDelay(n);
     this.deps.log?.(`reconnect attempt ${n + 1} in ${delay} ms`);
-    this.timers.set(
-      "reconnect",
-      this.schedule(() => {
-        this.timers.delete("reconnect");
-        this.beginResume();
-      }, delay),
-    );
+    this.setTimer("reconnect", delay, () => {
+      this.timers.delete("reconnect");
+      // AUTONOMOUS retry only: a manual resume/online explicitly demands a
+      // reopen and is dispatched through beginResume directly. The backoff,
+      // by contrast, must never replace a follow that re-certified live
+      // (open + a frame within LIVE_FRAME_MS) while the clock was waiting —
+      // doing so closed the working socket and stormed offline↔recovering
+      // on a restored page (c-reconnfu gate 7). Certify under the frame
+      // watchdog instead; a genuinely dead link is reopened by the frame
+      // watchdog's stale/probe path as usual.
+      if (this.deps.isFollowLive()) {
+        this.attempt = 0;
+        this.setState("live");
+        this.armFrameWatchdog();
+        return;
+      }
+      this.beginResume();
+    });
+  }
+
+  /**
+   * Reopen the follow WITHOUT leaving quiet `stale`: REST is already proven by
+   * the probe that triggered this, so the UI must not show recovering/offline.
+   * A frame certifies live (the resume action resolves ok); a blocked/dead
+   * upgrade rejects and the failure arm keeps stale. The 20 s watchdog still
+   * bounds the attempt.
+   */
+  private quietReopen() {
+    if (this.disposed || this.resumeInFlight) return;
+    const attemptId = this.armResumeAttemptQuiet(this.latestBindGen);
+    void this.deps
+      .resume()
+      .then(() => {
+        if (this.disposed) return;
+        this.dispatch({ type: "resumeAttempt", ok: true, attemptId });
+      })
+      .catch(() => {
+        if (this.disposed) return;
+        this.dispatch({ type: "resumeAttempt", ok: false, attemptId });
+      });
+  }
+
+  /** beginResume variant that keeps a REST-proven stale state banner-less. */
+  private armResumeAttemptQuiet(gen: number): number {
+    // Gate 9 item 5: keep the stale-entry `offline` deadline armed across the
+    // quiet reopen (real bound ≈ 15 s probe + read + 20 s watchdog; dropping
+    // it left quiet stale unbounded when upgrades stayed blocked). Only the
+    // stale/probe/reconnect timers are replaced; the watchdog bounds THIS
+    // attempt, and on settle armStaleProbeTimers re-arms everything using the
+    // carried deadline.
+    this.clearTimers("stale", "probe", "reconnect");
+    // NOTE: no setState("recovering") — stay in quiet stale.
+    // Gate 11 item 2 (gate 9 item 4 restored): EVERY new attempt arm — loud
+    // AND quiet — starts with a clean latch. A may have been retired by its
+    // watchdog without a completion consuming its close latch; the quiet
+    // reopen's own frame-certified follow must not reject into A's dead-socket
+    // settlement.
+    this.closedDuringResume = false;
+    this.resumeInFlight = true;
+    this.resumeBindGen = gen;
+    const attemptId = ++this.resumeAttemptId;
+    this.setTimer("watchdog", RECOVERING_WATCHDOG_MS, () => {
+      if (
+        !this.resumeInFlight ||
+        this.resumeAttemptId !== attemptId ||
+        this.resumeBindGen !== this.latestBindGen
+      ) {
+        return;
+      }
+      this.resumeInFlight = false;
+      this.attempt = 0;
+      this.armStaleProbeTimers();
+      this.deps.onAttemptFinish?.({ gen, attemptId, why: "watchdog" });
+    });
+    return attemptId;
   }
 
   private beginResume() {
-    if (this.resumeInFlight) return;
-    this.clearTimers("stale", "offline", "probe", "reconnect");
+    // Coalesce only an attempt for the CURRENT binding: one armed for a mount
+    // the user navigated away from is superseded and replaced wholesale.
+    if (this.disposed) return;
+    if (this.resumeInFlight && this.resumeBindGen === this.latestBindGen) return;
+    const attemptId = this.armResumeAttempt();
+    void this.deps
+      .resume()
+      .then(() => {
+        if (this.disposed) return;
+        this.dispatch({ type: "resumeAttempt", ok: true, attemptId });
+      })
+      .catch(() => {
+        if (this.disposed) return;
+        this.dispatch({ type: "resumeAttempt", ok: false, attemptId });
+      });
+  }
+
+  /**
+   * Store hook: report the generation of the current session binding. The
+   * store bumps it on every bind to a DIFFERENT journal (navigation A → B).
+   * Once advanced, an attempt armed for an older generation is superseded.
+   *
+   * The supersession is RETIRED here, not merely remembered: an attempt for
+   * the journal the user left keeps its 20 s watchdog armed, and a frame on
+   * the session returned to flips state to live without clearing that
+   * watchdog (`armFrameWatchdog` owns only the frame timers). Without the
+   * retire, the stale watchdog later fires and takes the RETURNED session
+   * offline, reopening a second socket. The store's bind-away handler is the
+   * other half — it settles the abandoned instance's own debt over REST.
+   */
+  noteBinding(gen: number) {
+    if (this.disposed) return;
+    if (gen === this.latestBindGen) return;
+    this.latestBindGen = gen;
+    // Gate 17 item 4: a binding change invalidates the OLD attempt's
+    // retired-offline bookkeeping AND its close latch. A browser `offline`
+    // event while A's attempt was dying left resumeRetiredOffline set with
+    // resumeInFlight=false; after navigating to mounted B (adopted live) A's
+    // delayed rejection then PASSED the acceptance guard, and its stale close
+    // latch flipped B's healthy-socket state to recovering. The gen guard in
+    // the resumeAttempt arm drops the completion; clearing the latch here keeps
+    // every other path (frame/settle) clean as well.
+    this.resumeRetiredOffline = false;
+    this.closedDuringResume = false;
+    if (this.resumeInFlight && this.resumeBindGen !== gen) {
+      this.resumeInFlight = false;
+      this.clearTimer("watchdog");
+    }
+  }
+
+  /**
+   * Identity of the resume attempt currently owning the link for the BOUND
+   * binding, or null when none (idle live, or a just-superseded attempt). The
+   * store stamps post-delivery catch-up debt with it so a later failure can
+   * tell whether THIS attempt owed the row.
+   */
+  attemptRef(): { gen: number; attemptId: number } | null {
+    if (this.disposed) return null;
+    if (!this.resumeInFlight || this.resumeBindGen !== this.latestBindGen) return null;
+    return { gen: this.resumeBindGen, attemptId: this.resumeAttemptId };
+  }
+
+  /**
+   * The store rebound to an ALREADY-MOUNTED session whose socket is OPEN and
+   * fresh: certify the link against the new binding immediately, closing the
+   * attempt a superseded mount still owned (its watchdog becomes a no-op).
+   */
+  followRebindLive() {
+    if (this.disposed) return;
+    this.resumeInFlight = false;
+    this.attempt = 0;
+    this.clearTimers("watchdog", "reconnect");
+    this.setState("live");
+    this.armFrameWatchdog();
+  }
+
+  /**
+   * Live hand-off from a mount whose SEED LOST to an already-mounted journal,
+   * scoped to the mount's captured binding generation and attempt id. Certifies
+   * only when the call still names the CURRENT binding AND its exact in-flight
+   * attempt: a deferred duplicate seed from an obsolete navigation (rapid
+   * A → B → A → B) must not retire the newest mount's attempt and watchdog
+   * (whose later failure would then be ignored, leaving a false live).
+   */
+  followAttemptLive(attemptId: number, gen: number) {
+    if (this.disposed) return;
+    if (gen !== this.latestBindGen) return;
+    if (!this.resumeInFlight || this.resumeAttemptId !== attemptId) return;
+    this.followRebindLive();
+  }
+
+  /**
+   * Arm the recovering slot + watchdog WITHOUT running the resume action. The
+   * INITIAL follow mount (REST journal seed + first subscribe) runs outside
+   * resume() but must not leave the machine claiming live with no timer while
+   * its seed read is pending: the caller reports the outcome with
+   * {@link followAttemptEnd} exactly as resume() would.
+   *
+   * Returns the attempt id to report back with. When a resume ALREADY owns the
+   * slot for the SAME binding (the reconnect resume retried the mount through
+   * follow()), its watchdog covers the mount and its id is returned — the
+   * nested mount's completion then certifies/fails the enclosing attempt,
+   * never arms a second, competing watchdog. An in-flight attempt for an
+   * OLDER binding (the user navigated A → B mid-seed) is replaced: B gets a
+   * fresh attempt and A's later end is ignored.
+   */
+  followAttemptBegin(gen: number = this.latestBindGen): number {
+    if (this.disposed) return this.resumeAttemptId;
+    if (this.resumeInFlight && gen === this.resumeBindGen) return this.resumeAttemptId;
+    return this.armResumeAttempt(gen);
+  }
+
+  /**
+   * Report an externally-driven follow mount (see followAttemptBegin). A
+   * completion for a superseded binding is dropped — a late A success must not
+   * certify B, a late A failure must not take B offline.
+   */
+  followAttemptEnd(ok: boolean, attemptId: number, gen: number = this.latestBindGen) {
+    if (this.disposed) return;
+    if (gen !== this.latestBindGen) return;
+    this.dispatch({ type: "resumeAttempt", ok, attemptId });
+  }
+
+  private armResumeAttempt(gen: number = this.latestBindGen): number {
+    this.clearTimers("stale", "offline", "probe", "reconnect", "watchdog");
+    this.resumeRetiredOffline = false;
+    // Gate 9 item 4: every NEW attempt starts with a clean latch. A close
+    // latched by a previous attempt must not poison later healthy resumes.
+    this.closedDuringResume = false;
     this.setState("recovering");
     this.resumeInFlight = true;
+    this.resumeBindGen = gen;
     const attemptId = ++this.resumeAttemptId;
     // The resume can never strand us in recovering: the watchdog forces the
     // attempt closed, and the promise also reports success/failure. Both carry
     // this id, so once a later attempt owns the slot the stale attempt's
     // watchdog and completion are ignored.
-    this.timers.set(
-      "watchdog",
-      this.schedule(() => {
-        if (!this.resumeInFlight || this.resumeAttemptId !== attemptId) return;
+    this.setTimer("watchdog", RECOVERING_WATCHDOG_MS, () => {
+      // The bind-generation guard is independent of the attempt-id guard:
+      // noteBinding retires a superseded attempt, but a late re-entry must
+      // never drive the CURRENT session offline from an attempt bound to a
+      // journal the user already left.
+      if (
+        !this.resumeInFlight ||
+        this.resumeAttemptId !== attemptId ||
+        this.resumeBindGen !== this.latestBindGen
+      ) {
+        return;
+      }
+      // A socket already certified live by frames owes no offline
+      // transition: the resume action outlived its watchdog but the follow
+      // demonstrably works — arm the frame watchdog and stay live instead of
+      // replacing the socket (the same offline↔recovering storm as the
+      // resumeAttempt failure arm; c-reconnfu gate 7). The exactly-once
+      // onAttemptFinish contract still applies: gate 8 item 7 — the store's
+      // owed-catch-up fallback keys off this callback.
+      if (this.deps.isFollowLive()) {
         this.resumeInFlight = false;
-        this.attempt += 1;
-        this.goOfflineAndSchedule();
-      }, RECOVERING_WATCHDOG_MS),
-    );
+        this.attempt = 0;
+        this.setState("live");
+        this.armFrameWatchdog();
+        this.deps.onAttemptFinish?.({ gen, attemptId, why: "watchdog" });
+        return;
+      }
+      this.resumeInFlight = false;
+      this.attempt += 1;
+      if (this.state === "stale") {
+        // Quiet reopen watchdog: REST was proven; stay quiet stale.
+        this.attempt = 0;
+        this.armStaleProbeTimers();
+      } else {
+        // Same REST-reachable-but-follow-blocked decision as a rejected
+        // resume action: settle quiet at stale (no banner, no storm) when
+        // REST works.
+        this.settleResumeFailureViaProbe();
+      }
+      this.deps.onAttemptFinish?.({ gen, attemptId, why: "watchdog" });
+    });
     this.attempt += 1;
-    void this.deps
-      .resume()
-      .then(() => this.dispatch({ type: "resumeAttempt", ok: true, attemptId }))
-      .catch(() => this.dispatch({ type: "resumeAttempt", ok: false, attemptId }));
+    return attemptId;
   }
 
+  /**
+   * Gate 41 S2 — PERMANENTLY retire this machine. Idempotent.
+   *
+   * Cancels every timer, invalidates the in-flight resume attempt AND bumps
+   * the attempt id (so a parked resume/probe completion carrying the old id is
+   * dropped even where a continuation checks attempt identity directly), and
+   * flips the disposed flag that gates dispatch/publication/scheduling: a
+   * pending REST probe resolving afterwards can no longer publish offline or
+   * arm a reconnect that competes with the replacement machine.
+   */
   dispose() {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.resumeInFlight = false;
+    this.resumeRetiredOffline = false;
+    this.closedDuringResume = false;
+    this.resumeAttemptId += 1;
     for (const h of this.timers.values()) this.cancel(h);
     this.timers.clear();
   }

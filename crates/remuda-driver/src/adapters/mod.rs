@@ -21,6 +21,8 @@
 //! [grok-signals-1](../../../docs/design/evidence/grok-signals-1.md).
 
 pub mod codex_adapter;
+pub mod codex_discovery;
+pub(crate) mod codex_ownership;
 pub mod grok_adapter;
 pub mod grok_live;
 pub mod grok_terminal;
@@ -63,6 +65,11 @@ pub struct AdapterObservation {
     pub turn_id: Option<String>,
     /// Native item/request id for the envelope, when applicable.
     pub item_id: Option<String>,
+    /// Native source timestamp of the record (c-ctxusage r5 item 7): rollout
+    /// usage rows carry their own event time, so a byte-0 replay must not look
+    /// like current throughput. Absent for adapters whose file format gives no
+    /// time.
+    pub native_at: Option<Timestamp>,
 }
 
 impl AdapterObservation {
@@ -75,6 +82,7 @@ impl AdapterObservation {
             payload,
             turn_id: None,
             item_id: None,
+            native_at: None,
         }
     }
 
@@ -87,6 +95,7 @@ impl AdapterObservation {
             payload,
             turn_id: None,
             item_id: None,
+            native_at: None,
         }
     }
 
@@ -94,6 +103,13 @@ impl AdapterObservation {
     #[must_use]
     pub fn with_turn(mut self, turn_id: impl Into<String>) -> Self {
         self.turn_id = Some(turn_id.into());
+        self
+    }
+
+    /// Attach the native source timestamp to the envelope.
+    #[must_use]
+    pub fn with_native_at(mut self, native_at: Option<Timestamp>) -> Self {
+        self.native_at = native_at;
         self
     }
 }
@@ -108,6 +124,22 @@ pub struct AdapterHome {
     /// Agent process pid when known (launch child, or promoted foreground
     /// leader). Grok's `active_sessions.json` matches on it.
     pub pid: Option<u32>,
+    /// When THIS driver launched the agent (generic-pty dispatch: no hooks, no
+    /// child pid), the wall-clock floor for file discovery. A native session
+    /// may bind only if its `session_meta.timestamp` is at/after it and its
+    /// cwd matches — without the floor, an unconfirmed adapter could bind an
+    /// older, unrelated session sharing the operator's real harness home
+    /// (c-usagefu r3 item 1). `None` for a promoted/foreign-launched process,
+    /// whose session legitimately predates our attachment.
+    pub launched_at: Option<time::OffsetDateTime>,
+    /// The native session id an explicit `codex resume <id>` continues
+    /// (c-usagefu r15 item 3). A real resume APPENDS to the existing rollout,
+    /// whose `session_meta.timestamp` is the ORIGINAL start and therefore
+    /// predates [`Self::launched_at`]; discovery binds that rollout BY ID
+    /// (cwd still verified) and never falls through to timestamp/cwd guessing,
+    /// which could bind a different pre-floor file. `None` for an ordinary
+    /// launch, where the timestamp floor remains the discovery rule.
+    pub resume_session_id: Option<String>,
 }
 
 /// A session the adapter should follow.
@@ -171,9 +203,14 @@ pub fn stamp(ctx: &StampCtx, seq: u64, observed: &AdapterObservation) -> Option<
         run_generation: Some(U64(1)),
         seq: U64(seq),
         observed_at,
-        native_at: Knowledge::Unknown {
-            reason: "file-tail-has-no-envelope-time".into(),
-            evidence_event_ids: Vec::new(),
+        native_at: match &observed.native_at {
+            Some(value) => Knowledge::Known {
+                value: value.clone(),
+            },
+            None => Knowledge::Unknown {
+                reason: "file-tail-has-no-envelope-time".into(),
+                evidence_event_ids: Vec::new(),
+            },
         },
         source: ObservationSource {
             driver_kind: remuda_protocol::DriverKind::ShellPty,
@@ -484,6 +521,34 @@ fn now_ts() -> Option<Timestamp> {
         minute,
         second,
         now.millisecond(),
+    ))
+    .ok()
+}
+
+/// Parse a native file-tail timestamp (RFC3339, any sub-second precision or
+/// offset) into the protocol millisecond-UTC `Timestamp` (c-ctxusage r5
+/// item 7). `None` when the source gave no time or it does not parse — the
+/// observation then stays `native_at: Unknown` and is treated as an ingest
+/// fallback rather than historical evidence.
+pub fn native_timestamp(raw: Option<&str>) -> Option<Timestamp> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let parsed =
+        time::OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339).ok()?;
+    let utc = parsed.to_offset(time::UtcOffset::UTC);
+    let date = utc.date();
+    let (hour, minute, second) = utc.time().as_hms();
+    Timestamp::try_from(format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        date.year(),
+        u8::from(date.month()),
+        date.day(),
+        hour,
+        minute,
+        second,
+        utc.millisecond(),
     ))
     .ok()
 }

@@ -10,13 +10,12 @@ use futures::FutureExt;
 use remuda_protocol::{
     Acceptance, AcceptanceScope, Activity, ActorRef, ActorType, AgentKind, ClaudeRef, Command,
     CommandAuthority, CommandId, CommandOperation, CommandOrigin, CommandResult, CommandState,
-    CommandTarget, Completeness, Connectivity, Digest as WireDigest, DispatchState, DriverKind,
+    CommandTarget, Completeness, Connectivity, Digest as WireDigest, DispatchState,
     EntityLifecycle, EntityMeta, ExpectedState, Host, HostId, HostState, HostTransport,
     HostTransportMode, Id, Instance, InstanceId, InstanceLifecycle, JournalEvent, Knowledge,
     LifecycleEntity, LifecyclePayload, MessagePhase, MessageRole, NativeRef, NodeReceipt,
     ObservationPayload, Ownership, Page, PathStyle, Platform, ProcessRef, ResolutionState,
-    Settlement, SettlementOutcome, SourceChannel, U64, Workspace, WorkspaceId, WorkspaceState,
-    WritePolicy,
+    Settlement, SettlementOutcome, U64, Workspace, WorkspaceId, WorkspaceState, WritePolicy,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -110,6 +109,10 @@ pub(crate) struct DevNodeInner {
     /// Root for materialized attachments. Set by `compose` from the Node data
     /// dir; `None` on an in-memory Node, where attachments are refused.
     pub(crate) attachment_root: std::sync::RwLock<Option<std::path::PathBuf>>,
+    /// Identity used to scope this Node's stop-incomplete census blocks
+    /// (c-usagefu r18 items 2/3). Minted per composed Node, handed to the
+    /// driver factories, and retired on shutdown.
+    pub(crate) census_epoch: remuda_driver::NodeEpoch,
     queue_capacity: usize,
     host: Host,
     workspace: Workspace,
@@ -135,6 +138,22 @@ pub(crate) struct DevNodeInner {
 #[derive(Clone)]
 pub struct DevNode {
     pub(crate) inner: Arc<DevNodeInner>,
+}
+
+impl DevNode {
+    /// This Node's census epoch (c-usagefu r18 items 2/3): drivers built by
+    /// the Node register their codex census intervals under it, and shutdown
+    /// retires only its own retained blocks.
+    #[must_use]
+    pub fn census_epoch(&self) -> remuda_driver::NodeEpoch {
+        self.inner.census_epoch.clone()
+    }
+
+    /// Test seam (c-usagefu r19 item 1): the live instance-local driver.
+    #[cfg(feature = "test-stub")]
+    pub async fn test_instance_driver(&self, id: &InstanceId) -> Option<Arc<dyn Driver>> {
+        self.inner.instance_drivers.read().await.get(id).cloned()
+    }
 }
 
 /// Last-clone teardown.
@@ -205,6 +224,12 @@ impl DevNode {
     }
 
     /// Build a Node around supplied parts and a persisted Host identity.
+    ///
+    /// The Node adopts the registry's census epoch — the same epoch every
+    /// driver built from that registry carries (c-usagefu r19 item 1). One
+    /// registry backs at most one Node: adopting the same registry (or a clone
+    /// of it) twice is rejected so two Nodes can never share shutdown/retire
+    /// ownership (c-usagefu r20 item 3).
     pub fn with_parts_on_host(
         config: &crate::DevServerConfig,
         store: Arc<dyn LocalStore>,
@@ -216,6 +241,11 @@ impl DevNode {
                 "instance queue capacity must be positive".to_owned(),
             ));
         }
+        // Reserve before ANY Node state exists; the reservation rolls back on
+        // the `?` paths below and commits only when the completed Node is
+        // returned (c-usagefu r21 item 4).
+        let adoption = drivers.claim_adoption()?;
+        let census_epoch = drivers.census_epoch();
         let host = fixture_host(host_id.clone())?;
         let workspace_registry = crate::workspace::WorkspaceRegistry::open(config, host_id)?;
         let workspace = workspace_registry
@@ -226,7 +256,7 @@ impl DevNode {
                 NodeError::InvalidConfig("initial workspace registry is empty".into())
             })?;
         let interactions = InteractionRuntime::spawn(Arc::clone(&store))?;
-        Ok(Self {
+        let node = Self {
             inner: Arc::new(DevNodeInner {
                 store,
                 drivers,
@@ -257,10 +287,13 @@ impl DevNode {
                 ),
                 api_relay: crate::api_relay::ApiRelayState::new(),
                 diagnostics: std::sync::RwLock::new(crate::DoctorContext::default()),
+                census_epoch,
                 #[cfg(test)]
                 create_reservation_barrier: tokio::sync::RwLock::new(None),
             }),
-        })
+        };
+        adoption.commit();
+        Ok(node)
     }
 
     /// Install the create reservation test barrier (c-dirpicker round 4
@@ -462,6 +495,7 @@ impl DevNode {
                     finish_instance_operation(
                         self.inner.store.as_ref(),
                         instance_id,
+                        driver.kind(),
                         &DriverRequest::Close,
                     )?;
                 }
@@ -1839,10 +1873,15 @@ async fn pump_one_observation(
     // only for a kind with a file-tail adapter (codex/grok); the
     // registry is the single lookup rather than another per-kind branch.
     //
-    // c-cardsettle r5 item 4: finally, a ROOT result/StopFailure turn
-    // failure frees the composer (idle) regardless of channel — print/SDK
-    // events arrive on Stdout/Transcript, which neither the Hook nor the
-    // File fold sees.
+    // Finally, the print/sdk engine's own turn events (ma-sdk-state r3):
+    // turn/turn_started sets working; a settled turn/result idles exactly
+    // like a successful turn end even when the result is a turn failure
+    // (c-cardsettle r5 item 4) — never failing the instance. The
+    // cardsettle r5-item-4 fallback (an UNSETTLED root result/error still
+    // frees the composer) must run AFTER the explicit engine decision: the
+    // merge with ma-sdk-state had dropped it, which let a mapper-bypassed
+    // failed result stick the root at working (the Hub derive keeps both
+    // arms; Node and Hub must agree).
     let activity = hook_activity
         .or_else(|| match store.get_instance(instance_id) {
             Ok(instance) if crate::adapter_registry::has_file_adapter(instance.kind) => {
@@ -1850,6 +1889,7 @@ async fn pump_one_observation(
             }
             _ => None,
         })
+        .or_else(|| crate::signal::engine_turn_activity(&observation))
         .or_else(|| root_turn_failure_activity(&observation));
     if let Some(activity) = activity
         && let Err(error) = store.set_instance_state(
@@ -1894,12 +1934,43 @@ async fn pump_one_observation(
             }
         }
         Err(error) => {
-            tracing::error!(%error, instance_id = %instance_id.as_id(), "native observation commit failed");
-            record_task_exit(
-                store.as_ref(),
-                instance_id,
-                "native-observation-commit-failed",
-            );
+            // c-cardsettle r7 item 7 (OA6): the Node's OWN store failing to
+            // commit an observation is not evidence the child ended. End the
+            // instance only when the driver reports the child actually gone;
+            // otherwise keep it (and its cards) alive and append a best-effort
+            // error observation so the failure is visible once the store
+            // recovers. The pump keeps running, so the driver's later real
+            // exit still settles the instance normally.
+            if driver.process_gone().await {
+                tracing::error!(%error, instance_id = %instance_id.as_id(), "native observation commit failed with the child gone");
+                record_task_exit(
+                    store.as_ref(),
+                    instance_id,
+                    "native-observation-commit-failed",
+                );
+            } else {
+                tracing::error!(%error, instance_id = %instance_id.as_id(), "native observation commit failed; child alive, keeping the instance live");
+                let diagnostic = DriverEmission::NativeLifecycle {
+                    name: "observation-commit-failed".to_owned(),
+                    status: format!("rejected: {error}"),
+                    severity: remuda_protocol::Severity::Warning,
+                };
+                match diagnostic.into_payload() {
+                    Ok(payload) => {
+                        if let Err(diag_error) = store.append_observation(
+                            instance_id,
+                            None,
+                            Completeness::Structured,
+                            payload,
+                        ) {
+                            tracing::warn!(%diag_error, "commit-failure diagnostic also not journaled; instance stays live");
+                        }
+                    }
+                    Err(payload_error) => {
+                        tracing::warn!(%payload_error, "commit-failure diagnostic could not be built; instance stays live");
+                    }
+                }
+            }
         }
     }
 }
@@ -2308,7 +2379,7 @@ async fn execute_queued(
                 )?;
                 interactions.ingest(&observation).await?;
             }
-            finish_instance_operation(store.as_ref(), instance_id, &queued.request)?;
+            finish_instance_operation(store.as_ref(), instance_id, driver.kind(), &queued.request)?;
             settle_command(
                 &mut command,
                 SettlementOutcome::Completed,
@@ -2343,7 +2414,18 @@ async fn execute_queued(
             // cannot do) must not mark the instance itself failed.
             let is_control = matches!(queued.request, DriverRequest::Configure { .. });
             if !pty_queue::is_pty(driver.kind()) && !is_control {
-                record_task_exit(store.as_ref(), instance_id, &error.to_string());
+                // c-cardsettle r7 item 7 (OA6): a rejected command is not a
+                // process end. End the instance only when the driver itself
+                // reports the child gone (e.g. stdin closed against an exited
+                // process); with the child alive the diagnostic appended above
+                // is the whole record, the instance keeps running and its
+                // pending cards stay pending — the driver's own real exit
+                // observation settles them through the normal pump path.
+                if driver.process_gone().await {
+                    record_task_exit(store.as_ref(), instance_id, &error.to_string());
+                } else {
+                    tracing::warn!(%error, instance_id = %instance_id.as_id(), "command rejected while the child is alive; instance stays live");
+                }
             }
             settle_command(
                 &mut command,
@@ -2371,6 +2453,7 @@ fn notify_carrier(
 fn finish_instance_operation(
     store: &dyn LocalStore,
     instance_id: &InstanceId,
+    kind: remuda_protocol::DriverKind,
     request: &DriverRequest,
 ) -> Result<(), NodeError> {
     match request {
@@ -2394,13 +2477,22 @@ fn finish_instance_operation(
         | DriverRequest::Cancel
         | DriverRequest::SendKeys { .. }
         | DriverRequest::Configure { .. } => {
-            store.set_instance_state(
-                instance_id,
-                None,
-                Some(Knowledge::Known {
-                    value: Activity::Idle,
-                }),
-            )?;
+            // ma-sdk-state r4 item 2: on the structured print/sdk carriers a
+            // transport acknowledgement is not turn evidence. The
+            // turn_started observation sets working and the SETTLED result (or
+            // process end) idles; stamping idle here overwrote a working that
+            // the pump applied from turn_started, and any successful control
+            // during a turn did the same. PTY carriers have no native turn
+            // lifecycle, so the ack stays their idle signal.
+            if !crate::signal::structured_engine_turn_carrier(kind) {
+                store.set_instance_state(
+                    instance_id,
+                    None,
+                    Some(Knowledge::Known {
+                        value: Activity::Idle,
+                    }),
+                )?;
+            }
         }
         DriverRequest::RespondInteraction { .. } => {}
     }
@@ -2698,13 +2790,26 @@ fn native_exit(observation: &remuda_protocol::Observation) -> Option<NativeExit>
         ProcessEndKind::Exited => "exited",
         ProcessEndKind::Failed => "failed",
     };
+    // c-cardsettle-fu2 r1 item 2: pick the REAL diagnostic in order —
+    // related_ids["reason"] (what generic_pty's failure_lifecycle stamps),
+    // then related_ids["lastError"], then a non-empty prose status; fall back
+    // to the literal state ("failed") only when none carries detail.
+    let status_value = match &native.status {
+        Knowledge::Known { value } if !value.trim().is_empty() => Some(value.as_str()),
+        _ => None,
+    };
+    let reason = native
+        .related_ids
+        .get("reason")
+        .or_else(|| native.related_ids.get("lastError"))
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .or(status_value)
+        .unwrap_or(state)
+        .to_owned();
     Some(NativeExit {
         state: state.to_string(),
-        reason: native
-            .related_ids
-            .get("reason")
-            .cloned()
-            .unwrap_or_else(|| state.to_string()),
+        reason,
     })
 }
 
@@ -2771,6 +2876,13 @@ fn record_native_exit(store: &dyn LocalStore, instance_id: &InstanceId, exit: &N
 /// `process_end` evidence is terminal. Subagent scope, configure and
 /// diagnostic topics return None (own scope). Mirrors the Hub's
 /// `root_turn_failed` derivation so Node local state and the Hub agree.
+///
+/// Runs in the observation pump AFTER
+/// `signal::engine_turn_activity`: that fold handles turn_started and the
+/// explicit `settledRootTurn` decision, while this is the r5-item-4 fallback
+/// for an UNSETTLED result/error (older journals and mapper-bypassed tests).
+/// In the live mapper output a root error already carries the settled flag,
+/// so the two arms agree on the real stream.
 fn root_turn_failure_activity(observation: &remuda_protocol::Observation) -> Option<Activity> {
     let ObservationPayload::Lifecycle(payload) = &observation.body else {
         return None;
@@ -2787,8 +2899,8 @@ fn root_turn_failure_activity(observation: &remuda_protocol::Observation) -> Opt
     // foreground session, so this channel-agnostic fallback must NOT invent
     // attribution for it. Print/SDK children own the Stdout/Transcript
     // channels outright — those are exactly the events this exists for.
-    if observation.source.channel == SourceChannel::Hook
-        && observation.source.driver_kind == DriverKind::ShellPty
+    if observation.source.channel == remuda_protocol::SourceChannel::Hook
+        && observation.source.driver_kind == remuda_protocol::DriverKind::ShellPty
     {
         return None;
     }
@@ -2796,8 +2908,23 @@ fn root_turn_failure_activity(observation: &remuda_protocol::Observation) -> Opt
         .related_ids
         .get("outcome")
         .is_some_and(|outcome| outcome.eq_ignore_ascii_case("failed"));
+    // ma-sdk-state r5 item 2: `affects_completion` is the one-shot PRINT
+    // process-completion heuristic the mapper derives from the process-global
+    // result_index (index>0 && queued==0). That index is meaningless on the
+    // long-lived sdk child — an is_error result with index 1 while a workflow
+    // is open would otherwise idle here — and it is redundant for print too:
+    // claude-sdk/claude-print results always carry the explicit
+    // `settledRootTurn` decision, which `engine_turn_activity` handles before
+    // this fallback. So honor the index heuristic only for OTHER sources
+    // (legacy journals / mapper-bypassed shapes).
+    let index_heuristic_source = !matches!(
+        observation.source.driver_kind,
+        remuda_protocol::DriverKind::ClaudeSdk | remuda_protocol::DriverKind::ClaudePrint
+    );
     let result_error = native.native_name == "result"
-        && matches!(&native.status, remuda_protocol::Knowledge::Known { value } if value == "error");
+        && matches!(&native.status, remuda_protocol::Knowledge::Known { value } if value == "error")
+        && native.affects_completion
+        && index_heuristic_source;
     let stop_failure = native.native_name == "StopFailure" && outcome_failed;
     (result_error || stop_failure).then_some(Activity::Idle)
 }
@@ -2873,6 +3000,9 @@ fn command_parts(
                 model: request.model.clone(),
                 effort: request.effort_name.clone(),
                 effort_index: request.effort_index,
+                effort_ultracode: request.effort_ultracode,
+                effort_axis: request.effort_axis.clone(),
+                effort_request_id: request.effort_request_id.clone(),
                 permission_mode: request.permission_mode.clone(),
             },
             false,
@@ -3519,6 +3649,52 @@ mod tests {
             observation
         };
 
+        // Wait until the pump DURABLY commits an observation matching a
+        // native id/status: a sleep could race the pump and assert before (or
+        // long after) the frames landed. r7 item 6 replaces the 120 ms sleep
+        // with this committed-seq readiness marker.
+        let wait_committed =
+            |native_id: &'static str,
+             status: &'static str|
+             -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+                let store = Arc::clone(&store) as Arc<dyn LocalStore>;
+                let id = id.clone();
+                let status = status.to_string();
+                Box::pin(async move {
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        loop {
+                            let committed = store.get_instance(&id).is_ok_and(|instance| {
+                                store
+                                    .read_events(&instance.journal_id, None, 256)
+                                    .is_ok_and(|page| {
+                                        page.events.iter().any(|event| match event {
+                                            JournalEvent::Instance(observation) => {
+                                                matches!(&observation.body,
+                                                    ObservationPayload::Lifecycle(payload)
+                                                        if matches!(payload.as_ref(),
+                                                            LifecyclePayload::Native(native)
+                                                                if matches!(&native.native_id,
+                                                                    Knowledge::Known { value }
+                                                                        if value == native_id)
+                                                                    && matches!(&native.status,
+                                                                        Knowledge::Known { value }
+                                                                            if value == &status)))
+                                            }
+                                            _ => false,
+                                        })
+                                    })
+                            });
+                            if committed {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(2)).await;
+                        }
+                    })
+                    .await
+                    .expect("the observation pump commits the frame in time");
+                })
+            };
+
         // 1) The print/SDK init frame (stdout channel).
         tx.send(frame(
             SourceChannel::Stdout,
@@ -3530,6 +3706,17 @@ mod tests {
         ))
         .await
         .unwrap();
+        wait_committed("sess-1", "started").await;
+        // The init frame alone leaves the instance live.
+        let after_init = store.get_instance(&id).unwrap();
+        assert!(
+            !matches!(
+                after_init.lifecycle,
+                InstanceLifecycle::Failed | InstanceLifecycle::Exited
+            ),
+            "the print/SDK init frame never ends the session: {:?}",
+            after_init.lifecycle
+        );
         // 2) The Claude PTY ready frame with each live agent status.
         for status in ["idle", "working", "blocked", "done", "unknown"] {
             tx.send(frame(
@@ -3554,8 +3741,11 @@ mod tests {
         ))
         .await
         .unwrap();
+        wait_committed("pane-8", "working").await;
 
-        tokio::time::sleep(Duration::from_millis(120)).await;
+        // Lifecycle AND activity asserted only once every startup frame is
+        // durable: still live, with a concrete known activity the folds
+        // produced — never failed/unknown.
         let live = store.get_instance(&id).unwrap();
         assert!(
             !matches!(
@@ -3565,22 +3755,35 @@ mod tests {
             "startup frames must never end the session: {:?}",
             live.lifecycle
         );
+        assert!(
+            matches!(live.activity, Knowledge::Known { .. }),
+            "startup frames leave a concrete live activity: {:?}",
+            live.activity
+        );
 
         // 3b) A failed first TURN (the print mapper's exact result-error
         // frame on stdout): composer idles but the process stays alive — it
-        // must accept the next prompt rather than being marked ended.
+        // must accept the next prompt rather than being marked ended. The
+        // final result carries the explicit settledRootTurn decision (r5 item
+        // 2: the index heuristic alone no longer idles print/sdk).
         tx.send(native_lifecycle_full(
             remuda_protocol::LifecycleTopic::Turn,
             "result",
             "sess-1",
-            &[("resultIndex", "1"), ("numTurns", "1")],
+            &[
+                ("resultIndex", "1"),
+                ("numTurns", "1"),
+                ("settledRootTurn", "true"),
+            ],
             remuda_protocol::Severity::Error,
             true,
             "error",
         ))
         .await
         .unwrap();
-        tokio::time::sleep(Duration::from_millis(120)).await;
+        // The failed result commits BEFORE the lifecycle assertion, and ends
+        // the TURN (activity idle) without touching the process lifecycle.
+        wait_committed("sess-1", "error").await;
         let after_turn = store.get_instance(&id).unwrap();
         assert!(
             !matches!(
@@ -3589,6 +3792,13 @@ mod tests {
             ),
             "a failed result is turn-level, not a process end: {:?}",
             after_turn.lifecycle
+        );
+        assert_eq!(
+            after_turn.activity,
+            Knowledge::Known {
+                value: Activity::Idle
+            },
+            "a failed root turn frees the composer (idle)"
         );
 
         // 4) The REAL print driver exit: name=session, status=exited.
@@ -3709,14 +3919,20 @@ mod tests {
         assert!(native_exit(&obs).is_none());
     }
 
-    /// c-cardsettle r5 item 4: the channel-agnostic root turn-failure edge
-    /// frees the composer for print/SDK Runtime/Stdout channels, but does NOT
-    /// attribute an UNBOUND shell-pty hook (the promoted-hook fold verifies
-    /// ownership itself); subagent/configure stay own-scope.
+    /// c-cardsettle r5 item 4 / ma-sdk-state r5 item 2: the channel-agnostic
+    /// root turn-failure edge frees the composer, but for claude-print/sdk a
+    /// result error must be attributed ONLY by the explicit settledRootTurn
+    /// decision (engine_turn_activity), never by the process-global index
+    /// heuristic. An UNSETTLED print/sdk result error therefore returns None
+    /// here; the index heuristic still idles OTHER (legacy) sources, and an
+    /// unbound shell-pty hook as well as subagent/configure stay own-scope.
     #[test]
     fn root_turn_failure_activity_is_scoped_like_the_hub_projection() {
         use remuda_protocol::{DriverKind, SourceChannel};
-        // Root result error on the print/SDK (Runtime) channel → idle.
+        // A print/SDK result error carrying ONLY the index heuristic (no
+        // settledRootTurn — e.g. an is_error result with index 1 while a
+        // workflow is open) must NOT idle: those carriers always settle via the
+        // explicit flag, which engine_turn_activity handles.
         let runtime_result = native_lifecycle_full(
             remuda_protocol::LifecycleTopic::Turn,
             "result",
@@ -3726,8 +3942,22 @@ mod tests {
             true,
             "error",
         );
+        assert_eq!(root_turn_failure_activity(&runtime_result), None);
+
+        // The SAME observation from a legacy/non-structured source still idles
+        // through the index heuristic (older journals / other carriers).
+        let mut legacy_result = native_lifecycle_full(
+            remuda_protocol::LifecycleTopic::Turn,
+            "result",
+            "sess-1",
+            &[("resultIndex", "1"), ("numTurns", "1")],
+            remuda_protocol::Severity::Error,
+            true,
+            "error",
+        );
+        legacy_result.source.driver_kind = DriverKind::ClaudePty;
         assert_eq!(
-            root_turn_failure_activity(&runtime_result),
+            root_turn_failure_activity(&legacy_result),
             Some(Activity::Idle)
         );
 
@@ -3783,6 +4013,55 @@ mod tests {
             "turn_done",
         );
         assert_eq!(root_turn_failure_activity(&turn_done), None);
+    }
+
+    /// ma-sdk-state r5 item 2: on the long-lived sdk child an is_error result
+    /// can carry the process-global result_index 1 (and the print-derived
+    /// affects_completion) WHILE A WORKFLOW IS STILL OPEN. The mapper therefore
+    /// omits settledRootTurn. Neither the engine fold nor the failure fallback
+    /// may idle the turn — the row must stay working until the workflow's own
+    /// terminal notification settles it.
+    #[test]
+    fn an_sdk_result_error_while_a_workflow_is_open_never_idles() {
+        use remuda_protocol::DriverKind;
+        // index 1 + no queued field is exactly what made the print heuristic
+        // stamp affects_completion=true; the open workflow is represented by
+        // the absence of settledRootTurn.
+        let mut open_workflow_error = native_lifecycle_full(
+            remuda_protocol::LifecycleTopic::Turn,
+            "result",
+            "sess-1",
+            &[("resultIndex", "1")],
+            remuda_protocol::Severity::Error,
+            true,
+            "error",
+        );
+        open_workflow_error.source.driver_kind = DriverKind::ClaudeSdk;
+        assert_eq!(
+            crate::signal::engine_turn_activity(&open_workflow_error),
+            None,
+            "the engine fold idles only on settledRootTurn"
+        );
+        assert_eq!(
+            root_turn_failure_activity(&open_workflow_error),
+            None,
+            "the index heuristic must not idle an open-workflow sdk result"
+        );
+
+        // Once the workflow closes, the real mapper settles the turn and the
+        // same result carries the flag → idle.
+        let mut settled_error = open_workflow_error.clone();
+        if let remuda_protocol::ObservationPayload::Lifecycle(payload) = &mut settled_error.body
+            && let remuda_protocol::LifecyclePayload::Native(native) = payload.as_mut()
+        {
+            native
+                .related_ids
+                .insert("settledRootTurn".to_owned(), "true".to_owned());
+        }
+        assert_eq!(
+            crate::signal::engine_turn_activity(&settled_error),
+            Some(Activity::Idle)
+        );
     }
 
     /// c-cardsettle r3 item 8: any hook/turn/session observation carrying a
@@ -4234,14 +4513,21 @@ mod tests {
             row.lifecycle
         );
 
-        // r4 item 2: a failed turn (topic=turn result error, even the final
-        // result) does NOT end a LIVE child — the child accepts another
-        // prompt and cards stay pending until a real topic=session exit.
+        // r4 item 2 / r5 item 2: a failed turn (topic=turn result error, even
+        // the final result) does NOT end a LIVE child — the child accepts
+        // another prompt and cards stay pending until a real topic=session
+        // exit. The FINAL print result settles via the explicit settledRootTurn
+        // decision (NOT the process-global index heuristic), so the observation
+        // carries the flag the real mapper emits.
         tx.send(native_lifecycle_full(
             remuda_protocol::LifecycleTopic::Turn,
             "result",
             "not-applicable",
-            &[("resultIndex", "1"), ("outcome", "failed")],
+            &[
+                ("resultIndex", "1"),
+                ("outcome", "failed"),
+                ("settledRootTurn", "true"),
+            ],
             remuda_protocol::Severity::Error,
             true,
             "error",
@@ -4294,16 +4580,191 @@ mod tests {
         pump.await.unwrap();
     }
 
-    /// c-cardsettle r5 item 3 — the owner replay driven through the REAL Node
-    /// pump: a shell-pty hook StopFailure for a workflow subagent (agentId +
-    /// agentType, outcome=failed, remudaActivity=idle, NO
-    /// agentTranscriptPath, StopFailure before SubagentStart) must (a) leave
-    /// the root instance exactly as it was — no failed/exited lifecycle and
-    /// no idle — while (b) journaling a workflow.member Failed for THAT
-    /// agent, resolved from agentId via its on-disk transcript.
+    /// ma-sdk-state r4 item 2: on a structured print/sdk carrier a command's
+    /// TRANSPORT acknowledgement is not turn evidence. The command completion
+    /// is held until the turn_started observation has already applied
+    /// working; the ack must leave the working state alone, and only the
+    /// settled result idles. A PTY carrier keeps the old ack-idles behaviour.
     #[tokio::test]
-    async fn owner_subagent_stopfailure_pump_keeps_root_and_fails_the_member() {
-        use remuda_protocol::{DriverKind, Knowledge, ObservationPayload, SourceChannel};
+    async fn structured_carrier_command_ack_keeps_turn_working_until_result() {
+        use remuda_protocol::{Activity, DriverKind, InputOrigin, PromptMode};
+
+        async fn wait_activity(
+            store: &Arc<dyn LocalStore>,
+            id: &InstanceId,
+            want: Activity,
+        ) -> Instance {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                let row = store.get_instance(id).unwrap();
+                if let remuda_protocol::Knowledge::Known { value } = &row.activity
+                    && *value == want
+                {
+                    return row;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    panic!("activity never reached {want:?}: {row:?}");
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+
+        let send = DriverRequest::Send {
+            prompt: "do the thing".to_owned(),
+            attachments: Vec::new(),
+            origin: InputOrigin::Human,
+            mode: PromptMode::NewTurn,
+        };
+
+        // ── Structured sdk carrier ──────────────────────────────────────────
+        let store: Arc<dyn LocalStore> = Arc::new(MemoryStore::new(64));
+        let instance = fixture_instance(
+            InstanceId::new(),
+            HostId::new(),
+            WorkspaceId::new(),
+            DriverKind::ClaudeSdk,
+        )
+        .unwrap();
+        let id = instance.meta.id.clone();
+        store.insert_instance(instance).unwrap();
+        let interactions = InteractionRuntime::spawn(Arc::clone(&store)).unwrap();
+        let (tx, rx) = mpsc::channel(16);
+        let pump = spawn_observation_pump(
+            Arc::clone(&store),
+            interactions,
+            id.clone(),
+            rx,
+            Arc::new(FakeDriver::default()),
+            Arc::new(crate::prompt_correlation::PromptCorrelator::default()),
+        );
+
+        // Hold the command completion until the start observation is applied.
+        let mut started = native_lifecycle_full(
+            remuda_protocol::LifecycleTopic::Turn,
+            "turn_started",
+            "sess-item2",
+            &[("nativeClientMessageId", "msg-item2")],
+            remuda_protocol::Severity::Info,
+            false,
+            "working",
+        );
+        started.source.driver_kind = DriverKind::ClaudeSdk;
+        tx.send(started).await.unwrap();
+        wait_activity(&store, &id, Activity::Working).await;
+
+        // The write ack lands AFTER the start: the Send ack must not idle.
+        finish_instance_operation(store.as_ref(), &id, DriverKind::ClaudeSdk, &send).unwrap();
+        let row = store.get_instance(&id).unwrap();
+        assert_eq!(
+            row.activity,
+            remuda_protocol::Knowledge::Known {
+                value: Activity::Working
+            },
+            "the send ack must not overwrite the turn_started working state"
+        );
+        // Any other successful control ack during the turn is just as inert.
+        finish_instance_operation(
+            store.as_ref(),
+            &id,
+            DriverKind::ClaudeSdk,
+            &DriverRequest::Cancel,
+        )
+        .unwrap();
+        finish_instance_operation(
+            store.as_ref(),
+            &id,
+            DriverKind::ClaudeSdk,
+            &DriverRequest::Configure {
+                model: Some("haiku".to_owned()),
+                effort: None,
+                effort_index: None,
+                effort_ultracode: None,
+                effort_axis: None,
+                effort_request_id: None,
+                permission_mode: None,
+            },
+        )
+        .unwrap();
+        let row = store.get_instance(&id).unwrap();
+        assert_eq!(
+            row.activity,
+            remuda_protocol::Knowledge::Known {
+                value: Activity::Working
+            },
+            "cancel/configure acks keep the native turn state"
+        );
+
+        // Only the settled result ends the turn.
+        let mut result = native_lifecycle_full(
+            remuda_protocol::LifecycleTopic::Turn,
+            "result",
+            "sess-item2",
+            &[
+                ("resultIndex", "0"),
+                ("queuedTurnCount", "0"),
+                ("settledRootTurn", "true"),
+            ],
+            remuda_protocol::Severity::Info,
+            false,
+            "turn_done",
+        );
+        result.source.driver_kind = DriverKind::ClaudeSdk;
+        tx.send(result).await.unwrap();
+        let row = wait_activity(&store, &id, Activity::Idle).await;
+        assert_eq!(
+            row.lifecycle,
+            InstanceLifecycle::Ready,
+            "a turn result idles without ending the sdk process"
+        );
+        drop(tx);
+        pump.await.unwrap();
+
+        // ── PTY carrier keeps the ack-idles behaviour ───────────────────────
+        let pty: Arc<dyn LocalStore> = Arc::new(MemoryStore::new(64));
+        let pty_instance = fixture_instance(
+            InstanceId::new(),
+            HostId::new(),
+            WorkspaceId::new(),
+            DriverKind::ShellPty,
+        )
+        .unwrap();
+        let pty_id = pty_instance.meta.id.clone();
+        pty.insert_instance(pty_instance).unwrap();
+        pty.set_instance_state(
+            &pty_id,
+            None,
+            Some(remuda_protocol::Knowledge::Known {
+                value: Activity::Working,
+            }),
+        )
+        .unwrap();
+        finish_instance_operation(pty.as_ref(), &pty_id, DriverKind::ShellPty, &send).unwrap();
+        assert_eq!(
+            pty.get_instance(&pty_id).unwrap().activity,
+            remuda_protocol::Knowledge::Known {
+                value: Activity::Idle
+            },
+            "a PTY carrier has no native turn lifecycle: its ack still idles"
+        );
+    }
+
+    /// c-cardsettle r7 item 5 (was r5 item 3, strengthened): the owner's
+    /// recorded RAW hook is mapped through the REAL `map_event` mapper and
+    /// driven through the REAL Node pump — not a hand-built observation — with
+    /// the root explicitly seeded WORKING (the old fixture defaulted to Idle,
+    /// so an idle-stamping regression compared Idle to Idle and passed).
+    ///
+    /// 1. Root stays Working (lifecycle and activity literally unchanged)
+    ///    after the subagent StopFailure carrying the recorded
+    ///    remudaActivity=idle.
+    /// 2. The workflow member is journaled Failed.
+    /// 3. The Node's COMMITTED output is then fed into the HUB projection:
+    ///    the pending approval stays pending and the member row is failed
+    ///    there too.
+    #[tokio::test]
+    async fn owner_subagent_stopfailure_pump_keeps_working_root_fails_member_and_hub_keeps_card() {
+        use remuda_protocol::{DriverKind, ObservationPayload, SourceChannel};
+        use remuda_signal::{HookEvent, map_event};
 
         // On-disk session tree the tailer resolves runs from.
         let tmp = tempfile::TempDir::new().unwrap();
@@ -4325,8 +4786,18 @@ mod tests {
         )
         .unwrap();
         let id = instance.meta.id.clone();
+        let journal_id = instance.journal_id.clone();
         store.insert_instance(instance).unwrap();
-        let instance = store.get_instance(&id).unwrap();
+        // Explicitly WORKING root — this is what made the old test vacuous.
+        store
+            .set_instance_state(
+                &id,
+                None,
+                Some(remuda_protocol::Knowledge::Known {
+                    value: Activity::Working,
+                }),
+            )
+            .unwrap();
         let interactions = InteractionRuntime::spawn(Arc::clone(&store)).unwrap();
         let (tx, rx) = mpsc::channel(16);
         let pump = spawn_observation_pump(
@@ -4338,63 +4809,115 @@ mod tests {
             Arc::new(crate::prompt_correlation::PromptCorrelator::default()),
         );
 
-        // A shell-pty HOOK observation (the mapped shape the hook shim commits).
-        let hook = |topic: remuda_protocol::LifecycleTopic,
-                    name: &str,
-                    related: &[(&str, &str)],
-                    status: &str,
-                    severity: remuda_protocol::Severity| {
-            let mut observation = native_lifecycle_full(
-                topic,
-                name,
-                "not-applicable",
-                related,
-                severity,
-                false,
-                status,
-            );
+        const PPID: i32 = 4242;
+        let transcript = enc.join("sid.jsonl").to_string_lossy().into_owned();
+
+        /// Map a recorded raw hook through the REAL mapper, then stamp the
+        /// envelope the production bus stamps (Hook / shell-pty).
+        fn map_raw_hook(name: &str, payload: serde_json::Value) -> remuda_protocol::Observation {
+            let mapped = map_event(&HookEvent {
+                name: name.into(),
+                ppid: PPID,
+                payload,
+            });
+            let mut observation = remuda_protocol::Observation {
+                schema_version: remuda_protocol::SchemaVersion,
+                event_id: remuda_protocol::EventId::new(),
+                journal_id: Id::new("obj").unwrap(),
+                instance_id: InstanceId::new(),
+                run_id: None,
+                host_id: HostId::new(),
+                process_generation: U64(1),
+                run_generation: None,
+                seq: U64(1),
+                observed_at: timestamp_now().unwrap(),
+                native_at: unknown("test"),
+                source: crate::driver::runtime_source(
+                    &fixture_instance(
+                        InstanceId::new(),
+                        HostId::new(),
+                        WorkspaceId::new(),
+                        DriverKind::ShellPty,
+                    )
+                    .unwrap(),
+                    U64(1),
+                ),
+                completeness: mapped.completeness,
+                raw_ref: None,
+                evidence_event_ids: Vec::new(),
+                body: mapped.payload,
+            };
             observation.source.channel = SourceChannel::Hook;
             observation.source.driver_kind = DriverKind::ShellPty;
             observation
-        };
+        }
 
-        // SessionStart binds the session directory.
-        tx.send(hook(
-            remuda_protocol::LifecycleTopic::Session,
+        /// Merge a live-fold tag into a mapped native observation.
+        fn tag(
+            observation: &mut remuda_protocol::Observation,
+            key: &'static str,
+            value: &'static str,
+        ) {
+            let ObservationPayload::Lifecycle(payload) = &mut observation.body else {
+                panic!("the mapper produced a lifecycle payload");
+            };
+            let remuda_protocol::LifecyclePayload::Native(native) = payload.as_mut() else {
+                panic!("a native lifecycle payload");
+            };
+            native.related_ids.insert(key.into(), value.into());
+        }
+
+        // SessionStart arrives first; with no foreground reading yet it is
+        // held PENDING (the honest "unverified binding" rule).
+        let mut session_start = map_raw_hook(
             "SessionStart",
-            &[(
-                "transcriptPath",
-                enc.join("sid.jsonl").to_string_lossy().as_ref(),
-            )],
-            "observed",
+            serde_json::json!({
+                "session_id": "sid",
+                "transcript_path": transcript,
+            }),
+        );
+        tag(&mut session_start, "remudaActivity", "working");
+        tx.send(session_start).await.unwrap();
+
+        // The promotion poll then identifies the foreground pid: the pending
+        // SessionStart binds to it (the real production order). Without this,
+        // owns_hook is false and the subagent activity guard is never
+        // exercised.
+        let mut promoted = native_lifecycle_full(
+            remuda_protocol::LifecycleTopic::Session,
+            "agent_promoted",
+            "not-applicable",
+            &[("kind", "claude"), ("pid", "4242")],
             remuda_protocol::Severity::Info,
-        ))
-        .await
-        .unwrap();
-        // The owner's first event: subagent StopFailure, remudaActivity=idle.
-        let before = store.get_instance(&id).unwrap();
-        let before_lifecycle = before.lifecycle;
-        let before_activity = before.activity.clone();
-        tx.send(hook(
-            remuda_protocol::LifecycleTopic::Turn,
+            false,
+            "observed",
+        );
+        promoted.source.channel = SourceChannel::Runtime;
+        promoted.source.driver_kind = DriverKind::ShellPty;
+        tx.send(promoted).await.unwrap();
+
+        // The owner's first event: subagent StopFailure. Raw payload fields
+        // are the harness's snake_case wire keys; the live fold's turn-ended
+        // phase and the (old-shim) remudaActivity=idle tag are merged onto the
+        // raw observation exactly like the recorded event.
+        let mut stop_failure = map_raw_hook(
             "StopFailure",
-            &[
-                ("agentId", "agent0sub0agent000"),
-                ("agentType", "workflow-subagent"),
-                ("outcome", "failed"),
-                ("phase", "turn-ended"),
-                ("remudaActivity", "idle"),
-            ],
-            "idle",
-            remuda_protocol::Severity::Warning,
-        ))
-        .await
-        .unwrap();
+            serde_json::json!({
+                "session_id": "sid",
+                "transcript_path": transcript,
+                "agent_id": "agent0sub0agent000",
+                "agent_type": "workflow-subagent",
+                "outcome": "failed",
+            }),
+        );
+        tag(&mut stop_failure, "phase", "turn-ended");
+        tag(&mut stop_failure, "remudaActivity", "idle");
+        tx.send(stop_failure).await.unwrap();
 
         // Poll until the member-failed observation lands (or time out).
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                let page = store.read_events(&instance.journal_id, None, 256).unwrap();
+                let page = store.read_events(&journal_id, None, 256).unwrap();
                 let failed = page.events.iter().any(|event| {
                     let remuda_protocol::JournalEvent::Instance(event) = event else {
                         return false;
@@ -4402,7 +4925,7 @@ mod tests {
                     matches!(&event.body,
                         ObservationPayload::WorkflowMember(member)
                             if matches!(&member.native_agent_id,
-                                Knowledge::Known { value }
+                                remuda_protocol::Knowledge::Known { value }
                                     if value == "agent0sub0agent000")
                                 && member.state == remuda_protocol::WorkflowState::Failed)
                 });
@@ -4415,20 +4938,143 @@ mod tests {
         .await
         .expect("the failed workflow member is journaled");
 
-        // The root turn is unchanged: lifecycle and activity equal what they
-        // were BEFORE the subagent StopFailure (no end, no idle).
+        // The root turn is unchanged: lifecycle still Ready and, decisively,
+        // activity still WORKING — a subagent remudaActivity=idle cannot idle
+        // a working root (the pre-r7 fixture asserted Idle against Idle).
         let root = store.get_instance(&id).unwrap();
         assert_eq!(
-            root.lifecycle, before_lifecycle,
+            root.lifecycle,
+            InstanceLifecycle::Ready,
             "a subagent StopFailure never ends the root"
         );
         assert_eq!(
-            root.activity, before_activity,
-            "the subagent's remudaActivity=idle never moves the root activity"
+            root.activity,
+            remuda_protocol::Knowledge::Known {
+                value: Activity::Working
+            },
+            "the subagent's remudaActivity=idle never moves a WORKING root"
+        );
+
+        // Collect the Node's COMMITTED output (every observation the pump
+        // actually journaled, including the synthesized member-failed).
+        let committed: Vec<remuda_protocol::Observation> = store
+            .read_events(&journal_id, None, 256)
+            .unwrap()
+            .events
+            .into_iter()
+            .filter_map(|event| match event {
+                remuda_protocol::JournalEvent::Instance(observation) => Some(*observation),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            committed.iter().any(|o| matches!(&o.body,
+                ObservationPayload::WorkflowMember(m)
+                    if m.state == remuda_protocol::WorkflowState::Failed)),
+            "the committed output carries the failed member"
         );
 
         drop(tx);
         pump.await.unwrap();
+
+        // ── Hub projection half ────────────────────────────────────────────
+        // Feed the Node's committed output (the exact uplink conversion:
+        // serde_json::to_value(JournalEvent::Instance)) into a real Hub Store
+        // with a running, card-holding instance.
+        let hub_dir = tempfile::tempdir().unwrap();
+        let hub_store =
+            remuda_hub::store_test_support::Store::open(hub_dir.path()).expect("hub store");
+        let hub_host = remuda_protocol::HostId::new().as_id().to_string();
+        let hub_instance = remuda_protocol::InstanceId::new().as_id().to_string();
+        hub_store
+            .ensure_instance(hub_host.clone(), hub_instance.clone())
+            .await
+            .unwrap();
+        let hub_append = |event: serde_json::Value| {
+            let hub_store = &hub_store;
+            let host = hub_host.clone();
+            let instance = hub_instance.clone();
+            async move {
+                hub_store
+                    .append_journal(host, instance, None, event)
+                    .await
+                    .expect("hub append")
+            }
+        };
+        hub_append(serde_json::json!({"kind":"lifecycle","payload":{
+            "type":"entity","entityType":"instance","state":"ready"}}))
+        .await;
+        hub_append(serde_json::json!({"kind":"lifecycle","payload":{
+            "type":"native","topic":"turn","nativeName":"agent_status",
+            "status":{"state":"known","value":"working"}}}))
+        .await;
+        let hub_card = format!("int_{}", uuid::Uuid::now_v7());
+        hub_append(
+            serde_json::json!({"kind":"interaction.requested","payload":{
+            "interactionKind":"approval",
+            "interaction":{
+                "id": hub_card, "kind":"approval", "state":"pending",
+                "blocking": true, "answerable": true,
+                "resolution": {"state":"unknown"},
+                "request": {"kind":"approval","title":"Bash","description":"x","options":[]}}}}),
+        )
+        .await;
+
+        // Re-stamp each Node observation onto the Hub instance and append in
+        // journal order, exactly as the WSS uplink serializes it.
+        for mut observation in committed {
+            observation.instance_id =
+                remuda_protocol::InstanceId::try_from(hub_instance.clone()).unwrap();
+            let value = serde_json::to_value(remuda_protocol::JournalEvent::Instance(Box::new(
+                observation,
+            )))
+            .expect("node journal event serializes to hub wire JSON");
+            hub_append(value).await;
+        }
+
+        let hub_row = hub_store
+            .get_instance(hub_instance.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            hub_row.lifecycle, "running",
+            "the hub projection keeps the root running"
+        );
+        assert_ne!(
+            hub_row.activity, "idle",
+            "the subagent StopFailure never idles the working root at the hub either"
+        );
+        let pending = hub_store
+            .list_interactions(None, Some(hub_instance.clone()), None, true)
+            .await
+            .unwrap();
+        assert!(
+            pending.iter().any(|r| r.interaction_id == hub_card),
+            "the pending approval is still pending after the subagent failure"
+        );
+        // The member row is failed in the Hub journal projection (the wire
+        // shape the uplink serializes: kind=workflow.member, state=failed,
+        // nativeAgentId carrying the owner's subagent id).
+        let hub_page = hub_store
+            .read_journal(hub_instance.clone(), 0, None)
+            .await
+            .unwrap();
+        let member_failed = hub_page.events.iter().any(|record| {
+            let event = &record.event;
+            event.get("kind").and_then(|v| v.as_str()) == Some("workflow.member")
+                && event.pointer("/payload/state").and_then(|v| v.as_str()) == Some("failed")
+                && event
+                    .pointer("/payload/nativeAgentId/value")
+                    .and_then(|v| v.as_str())
+                    == Some("agent0sub0agent000")
+        });
+        assert!(
+            member_failed,
+            "the hub projection records the workflow member failed: {}",
+            serde_json::to_value(&hub_page.events).unwrap_or_default()
+        );
+        hub_store.close().await;
     }
 
     #[tokio::test]
@@ -5115,7 +5761,7 @@ mod tests {
                 "instanceId": created.instance.meta.id,
                 "origin": "human",
                 "model": "opus",
-                "effort": { "index": 3, "name": "ultracode", "kind": "claude" }
+                "effort": { "index": 3, "name": "xhigh", "ultracode": true, "kind": "claude" }
             }),
         )
         .await
@@ -5177,7 +5823,13 @@ mod tests {
                     native.native_name == "instance.configure"
                         && native.status
                             == Knowledge::Known {
-                                value: "applied model=opus effort=ultracode index=3 permission=-"
+                                // D-056: the orthogonal boolean reaches the
+                                // driver alongside the level (xhigh), never as
+                                // the legacy "ultracode" level name.
+                                // c-effortread r9 item 6: the explicit axis
+                                // reaches the driver too; this legacy request
+                                // omits it ("-").
+                                value: "applied model=opus effort=xhigh index=3 ultracode=true axis=- permission=-"
                                     .into(),
                             }
                 });
@@ -5498,12 +6150,53 @@ mod tests {
             assert!(!gate.settled);
         }
     }
+
+    /// c-cardsettle-fu2 r1 item 2 fallback chain: without a reason field,
+    /// lastError is used; with neither, a non-empty prose status is used; only
+    /// a completely empty diagnostic falls back to "failed".
+    #[test]
+    fn native_exit_reason_falls_through_last_error_status() {
+        let mk = |related: &[(&str, &str)], status: &str| {
+            native_lifecycle_full(
+                remuda_protocol::LifecycleTopic::Session,
+                "exit",
+                "agent-02",
+                related,
+                remuda_protocol::Severity::Error,
+                true,
+                status,
+            )
+        };
+        // lastError used when reason absent.
+        let exit = native_exit(&mk(
+            &[
+                ("paneId", "p"),
+                ("lastError", "agent process killed by signal 9"),
+            ],
+            "pane exited",
+        ))
+        .unwrap();
+        assert_eq!(exit.reason, "agent process killed by signal 9");
+
+        // Non-empty prose status used when neither related field present.
+        let exit = native_exit(&mk(&[("paneId", "p")], "boom in stderr")).unwrap();
+        assert_eq!(exit.reason, "boom in stderr");
+
+        // Empty everything falls back to "failed".
+        let exit = native_exit(&mk(&[("paneId", "p")], "")).unwrap();
+        assert_eq!(exit.reason, "failed");
+    }
 }
 
 #[cfg(test)]
 mod api_relay_launch_test {
     use super::*;
     use crate::{FakeDriver, MemoryStore};
+    // Test-only DriverKind references left without the top-level import after
+    // the ma-sdk-state origin/main merge (24a8bbdd): production code now
+    // qualifies DriverKind in full, while every other cfg(test) site imports
+    // it locally; this sibling test module needs it at its top.
+    use remuda_protocol::DriverKind;
 
     fn node() -> DevNode {
         let config = crate::DevServerConfig::loopback(0)
@@ -5892,6 +6585,740 @@ mod api_relay_launch_test {
             node.store().get_instance(&instance_id).ok().is_none(),
             "a refused launch creates no instance record"
         );
+    }
+
+    /// c-cardsettle r7 item 7 (OA6) tests: the two Node sites that used to end an
+    /// instance on non-process-end evidence — a failed native-observation commit
+    /// (the Node's own store failing) and a rejected non-PTY command (control /
+    /// API error while the child may be alive). A scripted non-PTY driver keeps an
+    /// event channel (driven through the REAL observation pump) and knobs for
+    /// command failure and the driver's own child-gone report.
+    #[cfg(test)]
+    mod oa6_store_and_rejection_tests {
+        use super::*;
+        use crate::{
+            DriverEmission, DriverError, DriverFuture, DriverLaunch, DriverRegistry, DriverRequest,
+            MemoryStore,
+        };
+        use remuda_protocol::{
+            Activity, DriverKind, Knowledge, LifecyclePayload, LifecycleTopic, MessagePhase,
+            MessageRole, NativeLifecycle, Observation, ObservationPayload, Severity, SourceChannel,
+        };
+        use serde_json::json;
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+
+        /// Local copy of the shared test builder (this module is a sibling of
+        /// `runtime::tests`, which keeps that helper private).
+        fn native(
+            topic: LifecycleTopic,
+            name: &str,
+            native_id: &str,
+            severity: Severity,
+            affects_completion: bool,
+            status: &str,
+        ) -> Observation {
+            Observation {
+                schema_version: remuda_protocol::SchemaVersion,
+                event_id: remuda_protocol::EventId::new(),
+                journal_id: Id::new("obj").expect("journal id"),
+                instance_id: InstanceId::new(),
+                run_id: None,
+                host_id: HostId::new(),
+                process_generation: U64(1),
+                run_generation: None,
+                seq: U64(1),
+                observed_at: timestamp_now().expect("now"),
+                native_at: unknown("test"),
+                source: crate::driver::runtime_source(
+                    &fixture_instance(
+                        InstanceId::new(),
+                        HostId::new(),
+                        WorkspaceId::new(),
+                        DriverKind::ClaudePrint,
+                    )
+                    .expect("fixture instance"),
+                    U64(1),
+                ),
+                completeness: Completeness::Structured,
+                raw_ref: None,
+                evidence_event_ids: Vec::new(),
+                body: ObservationPayload::Lifecycle(Box::new(LifecyclePayload::Native(Box::new(
+                    NativeLifecycle {
+                        topic,
+                        native_name: name.to_owned(),
+                        native_id: Knowledge::Known {
+                            value: native_id.to_owned(),
+                        },
+                        status: Knowledge::Known {
+                            value: status.to_owned(),
+                        },
+                        related_ids: std::collections::BTreeMap::new(),
+                        data_ref: None,
+                        severity,
+                        affects_completion,
+                    },
+                )))),
+            }
+        }
+
+        /// Test-side controls for the one instance-local scripted driver.
+        #[derive(Clone)]
+        struct ScriptHandle {
+            tx: Arc<Mutex<Option<mpsc::Sender<Observation>>>>,
+            /// Next N `Send` commands fail with a control error (child alive).
+            reject_sends: Arc<AtomicUsize>,
+            /// What the driver reports from `process_gone`.
+            gone: Arc<AtomicBool>,
+            /// Every prompt the execute path actually accepted.
+            sent: Arc<Mutex<Vec<String>>>,
+        }
+
+        struct ScriptPrintDriver {
+            instance: Instance,
+            handle: ScriptHandle,
+        }
+
+        impl Driver for ScriptPrintDriver {
+            fn kind(&self) -> DriverKind {
+                DriverKind::ClaudePrint
+            }
+
+            fn start(&self) -> crate::DriverStartFuture<'_> {
+                // The real production pump consumes this channel: observations
+                // sent here go through spawn_observation_pump exactly like the
+                // print driver's stdout reader.
+                Box::pin(async move {
+                    let (tx, rx) = mpsc::channel(32);
+                    *self.handle.tx.lock().unwrap() = Some(tx);
+                    Ok(Some(rx))
+                })
+            }
+
+            fn process_gone(&self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+                let gone = self.handle.gone.clone();
+                Box::pin(async move { gone.load(Ordering::SeqCst) })
+            }
+
+            fn execute(&self, request: DriverRequest) -> DriverFuture<'_> {
+                Box::pin(async move {
+                    match request {
+                        DriverRequest::Send { prompt, .. } => {
+                            if self
+                                .handle
+                                .reject_sends
+                                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                                    if n > 0 { Some(n - 1) } else { None }
+                                })
+                                .is_ok()
+                            {
+                                // A control/API rejection: the child is still alive.
+                                return Err(DriverError::Failed(
+                                    "scripted control rejection".into(),
+                                ));
+                            }
+                            let mut emissions = Vec::new();
+                            if prompt.contains("can_use_tool") {
+                                let interaction =
+                                    crate::interactions::fake_can_use_tool(&self.instance)
+                                        .map_err(|error| DriverError::Failed(error.to_string()))?;
+                                emissions.push(DriverEmission::InteractionRequested {
+                                    interaction: Box::new(interaction),
+                                });
+                            }
+                            self.handle.sent.lock().unwrap().push(prompt);
+                            emissions.push(DriverEmission::Message {
+                                role: MessageRole::Assistant,
+                                phase: MessagePhase::Final,
+                                text: "PONG".into(),
+                            });
+                            Ok(emissions)
+                        }
+                        // Close always works so teardown never errors.
+                        DriverRequest::Close => Ok(Vec::new()),
+                        other => {
+                            // No other request type is used by these tests.
+                            Err(DriverError::Failed(format!(
+                                "scripted driver does not handle {other:?}"
+                            )))
+                        }
+                    }
+                })
+            }
+        }
+
+        struct ScriptPrintFactory {
+            handle: ScriptHandle,
+        }
+
+        impl crate::DriverFactory for ScriptPrintFactory {
+            fn kind(&self) -> DriverKind {
+                DriverKind::ClaudePrint
+            }
+
+            fn build(&self, launch: DriverLaunch) -> Result<Arc<dyn Driver>, DriverError> {
+                Ok(Arc::new(ScriptPrintDriver {
+                    instance: launch.instance,
+                    handle: self.handle.clone(),
+                }))
+            }
+        }
+
+        fn new_handle() -> ScriptHandle {
+            ScriptHandle {
+                tx: Arc::new(Mutex::new(None)),
+                reject_sends: Arc::new(AtomicUsize::new(0)),
+                gone: Arc::new(AtomicBool::new(false)),
+                sent: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn scripted_node() -> (DevNode, Arc<MemoryStore>, tempfile::TempDir, ScriptHandle) {
+            let config = crate::DevServerConfig::loopback(0)
+                .with_workspace_roots(remuda_testing::test_workspace_roots!());
+            let handle = new_handle();
+            let registry = DriverRegistry::default();
+            registry
+                .register_factory(Arc::new(ScriptPrintFactory {
+                    handle: handle.clone(),
+                }))
+                .expect("register scripted print factory");
+            // DURABLE store: pending cards live in the EntityDb, so the test can
+            // assert the card survives (and is not retired) via the same rows the
+            // hello inventory lists.
+            let data = tempfile::tempdir().expect("data dir");
+            let store =
+                Arc::new(MemoryStore::open_journaled(data.path(), 64).expect("durable store"));
+            let node = DevNode::with_parts(&config, store.clone() as Arc<dyn LocalStore>, registry)
+                .expect("compose node");
+            (node, store, data, handle)
+        }
+
+        async fn wait_for(deadline_ms: u64, mut predicate: impl FnMut() -> bool) {
+            tokio::time::timeout(Duration::from_millis(deadline_ms), async {
+                while !predicate() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("condition in time");
+        }
+
+        async fn create_ready(node: &DevNode) -> Instance {
+            let created = node
+                .create_instance(
+                    serde_json::from_value(json!({
+                        "kind": "claude",
+                        "driver": "claude-print",
+                        "model": "fake",
+                        "prompt": "first",
+                    }))
+                    .expect("request"),
+                )
+                .await
+                .expect("create");
+            let id = created.instance.meta.id.clone();
+            wait_for(3000, || {
+                node.get_instance(&id)
+                    .is_ok_and(|instance| matches!(instance.lifecycle, InstanceLifecycle::Ready))
+            })
+            .await;
+            wait_for(3000, || {
+                node.get_command(&created.command.command_id)
+                    .is_ok_and(|command| matches!(command.state, CommandState::Settled))
+            })
+            .await;
+            node.get_instance(&id).expect("instance")
+        }
+
+        async fn send(node: &DevNode, id: &InstanceId, prompt: &str) -> Command {
+            node.submit_command(
+                id,
+                serde_json::from_value(json!({ "operation": "send", "prompt": prompt }))
+                    .expect("request"),
+            )
+            .await
+            .expect("submit")
+            .command
+        }
+
+        /// Send a native observation over the driver's REAL pump channel.
+        fn pump_native(
+            handle: &ScriptHandle,
+            topic: LifecycleTopic,
+            name: &str,
+            status: &str,
+            severity: Severity,
+            channel: SourceChannel,
+            kind: DriverKind,
+        ) {
+            let mut observation = native(topic, name, "sess-r7", severity, false, status);
+            observation.source.channel = channel;
+            observation.source.driver_kind = kind;
+            handle
+                .tx
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("driver started its observation stream")
+                .try_send(observation)
+                .expect("pump channel accepts the observation");
+        }
+
+        fn events_named(node: &DevNode, instance: &Instance, name: &str) -> bool {
+            node.read_journal(&instance.journal_id, None, 256)
+                .expect("journal")
+                .events
+                .iter()
+                .any(|event| match event {
+                    JournalEvent::Instance(observation) => matches!(&observation.body,
+                    ObservationPayload::Lifecycle(payload)
+                        if matches!(payload.as_ref(),
+                            remuda_protocol::LifecyclePayload::Native(native)
+                                if native.native_name == name)),
+                    _ => false,
+                })
+        }
+
+        /// Site 1: the Node's own store rejects an observation commit while the
+        /// child is alive. The instance stays live, its pending card stays
+        /// pending, and the driver's later REAL exit still ends the instance.
+        #[tokio::test]
+        async fn observation_commit_failure_keeps_the_live_instance_and_its_card() {
+            let (node, store, _data, handle) = scripted_node();
+
+            let instance = create_ready(&node).await;
+            let id = instance.meta.id.clone();
+
+            // A pending approval card reaches the broker through the command path.
+            let request = send(&node, &id, "please can_use_tool now").await;
+            assert!(
+                matches!(
+                    request.state,
+                    CommandState::Accepted | CommandState::Settled
+                ),
+                "the card-producing send reached the driver: {:?}",
+                request.state
+            );
+            wait_for(3000, || {
+                store
+                    .pending_interactions()
+                    .is_ok_and(|rows| rows.len() == 1)
+            })
+            .await;
+
+            // The Node's own store now fails the next driver observation commit.
+            store.fail_next_driver_observations(2);
+            pump_native(
+                &handle,
+                LifecycleTopic::Diagnostic,
+                "r7-commit-probe",
+                "ok",
+                Severity::Info,
+                SourceChannel::Stdout,
+                DriverKind::ClaudePrint,
+            );
+
+            // The fallback ERROR OBSERVATION (not a task exit) is journaled.
+            wait_for(3000, || {
+                events_named(&node, &instance, "observation-commit-failed")
+            })
+            .await;
+
+            // The failure happened and the instance is still live — not failed,
+            // not exited, no task-exit last_error, and its card still pending.
+            let after = node.get_instance(&id).expect("instance");
+            assert!(
+                matches!(after.lifecycle, InstanceLifecycle::Ready),
+                "a Node store failure never ends the child: {:?}",
+                after.lifecycle
+            );
+            assert!(after.last_error.is_none(), "no task-exit last_error");
+            assert_eq!(store.pending_interactions().unwrap().len(), 1);
+
+            // The driver's OWN real exit (the exact print session/exited shape)
+            // still ends the instance through the normal pump path; the entity
+            // event the Hub settles cards from is journaled.
+            pump_native(
+                &handle,
+                LifecycleTopic::Session,
+                "session",
+                "exited",
+                Severity::Info,
+                SourceChannel::Stdout,
+                DriverKind::ClaudePrint,
+            );
+            wait_for(3000, || {
+                node.get_instance(&id)
+                    .is_ok_and(|instance| matches!(instance.lifecycle, InstanceLifecycle::Exited))
+            })
+            .await;
+
+            node.shutdown().await.expect("shutdown");
+        }
+
+        /// Site 2: a rejected non-PTY command while the child is alive rejects the
+        /// command only — the instance stays live and its card stays pending. A
+        /// rejection the driver pairs with a confirmed child-gone DOES end it; and
+        /// an alive instance still ends on the driver's own real exit.
+        #[tokio::test]
+        async fn command_rejection_keeps_the_live_instance_until_the_child_is_gone() {
+            let (node, store, _data, handle) = scripted_node();
+            let instance = create_ready(&node).await;
+            let id = instance.meta.id.clone();
+
+            let request = send(&node, &id, "please can_use_tool now").await;
+            assert!(
+                matches!(
+                    request.state,
+                    CommandState::Accepted | CommandState::Settled
+                ),
+                "the card-producing send reached the driver: {:?}",
+                request.state
+            );
+            wait_for(3000, || {
+                store
+                    .pending_interactions()
+                    .is_ok_and(|rows| rows.len() == 1)
+            })
+            .await;
+            // Working root turn so a wrong idle/failed stamp would be visible.
+            store
+                .set_instance_state(
+                    &id,
+                    None,
+                    Some(Knowledge::Known {
+                        value: Activity::Working,
+                    }),
+                )
+                .expect("seed working");
+
+            // The next send is rejected while the driver reports the child ALIVE.
+            handle.reject_sends.store(1, Ordering::SeqCst);
+            let rejected = send(&node, &id, "retry after the error").await;
+            // The worker settles asynchronously; wait for the rejected outcome.
+            wait_for(3000, || {
+                node.get_command(&rejected.command_id)
+                    .is_ok_and(|command| matches!(command.state, CommandState::Settled))
+            })
+            .await;
+            let rejected = node.get_command(&rejected.command_id).expect("command");
+            assert_eq!(
+                rejected.state,
+                CommandState::Settled,
+                "a rejected command still settles its ledger row"
+            );
+            assert!(
+                matches!(&rejected.settlement,
+                Knowledge::Known { value } if value.outcome == SettlementOutcome::Rejected),
+                "the settlement records the rejection: {:?}",
+                rejected.settlement
+            );
+
+            // Give the worker a tick; the instance must not have ended.
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let after = node.get_instance(&id).expect("instance");
+            assert!(
+                matches!(after.lifecycle, InstanceLifecycle::Ready),
+                "a command rejection with the child alive never ends the instance: {:?}",
+                after.lifecycle
+            );
+            assert_eq!(
+                after.activity,
+                Knowledge::Known {
+                    value: Activity::Working
+                },
+                "a rejection does not touch activity"
+            );
+            assert!(after.last_error.is_none(), "no task-exit last_error");
+            assert_eq!(store.pending_interactions().unwrap().len(), 1);
+            // The rejection diagnostic is recorded.
+            assert!(events_named(&node, &instance, "fake-driver-error"));
+
+            // The driver's real exit still settles it.
+            pump_native(
+                &handle,
+                LifecycleTopic::Session,
+                "session",
+                "exited",
+                Severity::Info,
+                SourceChannel::Stdout,
+                DriverKind::ClaudePrint,
+            );
+            wait_for(3000, || {
+                node.get_instance(&id)
+                    .is_ok_and(|instance| matches!(instance.lifecycle, InstanceLifecycle::Exited))
+            })
+            .await;
+            node.shutdown().await.expect("shutdown");
+
+            // A rejection the driver pairs with a confirmed child-gone DOES end
+            // the instance (the guard still honors real process-end evidence).
+            let (node2, _store2, _data2, handle2) = scripted_node();
+            let instance2 = create_ready(&node2).await;
+            let id2 = instance2.meta.id.clone();
+            handle2.gone.store(true, Ordering::SeqCst);
+            handle2.reject_sends.store(1, Ordering::SeqCst);
+            let _ = send(&node2, &id2, "send right as the child exits").await;
+            wait_for(3000, || {
+                node2
+                    .get_instance(&id2)
+                    .is_ok_and(|instance| matches!(instance.lifecycle, InstanceLifecycle::Failed))
+            })
+            .await;
+            node2.shutdown().await.expect("shutdown");
+        }
+    }
+
+    /// c-cardsettle-fu2 r4 item 1: a generic-PTY pane exit built through the
+    /// DRIVER's failure_lifecycle + pane_exit_diagnostic flows through the
+    /// REAL observation pump into the Node store AND the Hub projection.
+    ///
+    /// Covers all three diagnostic shapes:
+    /// - exit code 42 → "agent process exited with code 42";
+    /// - signal 9 → "agent process killed by signal KILL (9)";
+    /// - a pane carrying ONLY lastStderr full of credential-looking text →
+    ///   the fixed fallback, and NO substring of that stderr appears in the
+    ///   committed journal observation or in the serialized Hub row (the leak
+    ///   CLASS is removed: the redactor is gone and stderr is never rendered).
+    #[tokio::test]
+    async fn generic_pty_structured_exit_flows_through_pump_to_node_and_hub() {
+        use remuda_driver::generic_pty::{failure_lifecycle, pane_exit_diagnostic};
+
+        struct ExitCase {
+            name: &'static str,
+            data: serde_json::Value,
+            expected: String,
+            /// Fragments carried by the event's stderr that must appear
+            /// NOWHERE persisted (journal payload or Hub row). Empty for the
+            /// structured cases.
+            leak_fragments: &'static [&'static str],
+        }
+        let stderr = "Authorization decoy Bearer abc123xyz-leak \
+--token secretvalue-9931-leak {\"password\":\"hunter2-secret-leak\"} \
+escaped \\\"Authorization: Bearer tok-live-AA:BB:CC\\\" end";
+        let mut cases: Vec<ExitCase> = vec![
+            ExitCase {
+                name: "stderr-only",
+                data: serde_json::json!({ "lastStderr": stderr }),
+                expected: "pane exited; agent process is gone".to_owned(),
+                leak_fragments: &[
+                    "abc123xyz-leak",
+                    "secretvalue-9931-leak",
+                    "hunter2-secret-leak",
+                    "tok-live-AA:BB:CC",
+                    "Bearer",
+                    "password",
+                ],
+            },
+            ExitCase {
+                name: "exit-code-42",
+                data: serde_json::json!({ "exitCode": 42 }),
+                expected: "agent process exited with code 42".to_owned(),
+                leak_fragments: &[],
+            },
+            // r5 item 1: a numeric signal the platform does not recognize is
+            // not signal evidence — the exit code alongside it renders.
+            ExitCase {
+                name: "signal-200-falls-through-to-code",
+                data: serde_json::json!({ "signal": 200, "exitCode": 42 }),
+                expected: "agent process exited with code 42".to_owned(),
+                leak_fragments: &[],
+            },
+        ];
+        // r5 item 1: the signal number/name are derived from the PLATFORM's
+        // nix definitions (9/KILL on both Linux and macOS, but BUS/USR1
+        // differ) — never a hard-coded number.
+        #[cfg(unix)]
+        {
+            use nix::sys::signal::Signal;
+            let kill = Signal::SIGKILL;
+            cases.push(ExitCase {
+                name: "signal-kill",
+                data: serde_json::json!({ "signal": i64::from(kill as i32) }),
+                expected: format!(
+                    "agent process killed by signal {} ({})",
+                    kill.as_str().strip_prefix("SIG").unwrap(),
+                    kill as i32
+                ),
+                leak_fragments: &[],
+            });
+        }
+
+        for case in cases {
+            // Build the observation exactly the way the generic_pty status
+            // pump does when a pane exits.
+            let diagnostic = pane_exit_diagnostic(&case.data);
+            assert_eq!(
+                diagnostic, case.expected,
+                "[{}] diagnostic must be the fixed structured text",
+                case.name
+            );
+            let payload: remuda_protocol::Observation = remuda_protocol::Observation {
+                schema_version: remuda_protocol::SchemaVersion,
+                event_id: remuda_protocol::EventId::new(),
+                journal_id: Id::new("obj").expect("journal id"),
+                instance_id: InstanceId::new(),
+                run_id: None,
+                host_id: HostId::new(),
+                process_generation: U64(1),
+                run_generation: None,
+                seq: U64(1),
+                observed_at: timestamp_now().expect("now"),
+                native_at: unknown("test"),
+                source: crate::driver::runtime_source(
+                    &fixture_instance(
+                        InstanceId::new(),
+                        HostId::new(),
+                        WorkspaceId::new(),
+                        DriverKind::ShellPty,
+                    )
+                    .expect("fixture"),
+                    U64(1),
+                ),
+                completeness: Completeness::ScreenDerived,
+                raw_ref: None,
+                evidence_event_ids: Vec::new(),
+                body: failure_lifecycle("exit", "agent-x", "pane-x", &diagnostic),
+            };
+            let instance_id = payload.instance_id.clone();
+
+            // The DRIVER's producer contract: failure_lifecycle must stamp the
+            // diagnostic into related_ids["reason"] (the field the Node's
+            // classifier reads first), and that stamp itself must carry none
+            // of the stderr fragments.
+            let ObservationPayload::Lifecycle(box_lc) = &payload.body else {
+                panic!("[{}] expected a lifecycle payload", case.name);
+            };
+            let LifecyclePayload::Native(native) = box_lc.as_ref() else {
+                panic!("[{}] expected a native lifecycle", case.name);
+            };
+            assert_eq!(
+                native.related_ids.get("reason").map(String::as_str),
+                Some(case.expected.as_str()),
+                "[{}] failure_lifecycle must stamp related_ids.reason",
+                case.name
+            );
+            let stamped_wire =
+                serde_json::to_string(&native.related_ids).expect("related ids serialize");
+            for fragment in case.leak_fragments {
+                assert!(
+                    !stamped_wire.contains(fragment),
+                    "[{}] stamped related_ids leak {fragment}: {stamped_wire}",
+                    case.name
+                );
+            }
+
+            // ── Node side: seed a live row, deliver through the REAL pump. ──
+            let store: Arc<dyn LocalStore> = Arc::new(MemoryStore::new(64));
+            store
+                .insert_instance(
+                    fixture_instance(
+                        instance_id.clone(),
+                        HostId::new(),
+                        WorkspaceId::new(),
+                        DriverKind::ShellPty,
+                    )
+                    .expect("fixture"),
+                )
+                .expect("seed");
+            let interactions = InteractionRuntime::spawn(Arc::clone(&store)).unwrap();
+            let (tx, rx) = mpsc::channel(16);
+            let pump = spawn_observation_pump(
+                Arc::clone(&store),
+                interactions,
+                instance_id.clone(),
+                rx,
+                Arc::new(FakeDriver::default()),
+                Arc::new(crate::prompt_correlation::PromptCorrelator::default()),
+            );
+            tx.send(payload).await.expect("send pane-exit observation");
+            drop(tx);
+            pump.await.unwrap();
+
+            // Node-stored failure carries exactly the structured text.
+            let node_row = store.get_instance(&instance_id).expect("node instance");
+            assert_eq!(node_row.lifecycle, InstanceLifecycle::Failed);
+            assert_eq!(
+                node_row.last_error.as_deref(),
+                Some(case.expected.as_str()),
+                "[{}] the Node store must persist the structured text",
+                case.name
+            );
+
+            // Re-read the observation from the Node journal (what the uplink
+            // would send); it must carry no stderr fragment either.
+            let committed = store
+                .read_events(
+                    &store.get_instance(&instance_id).unwrap().journal_id,
+                    None,
+                    64,
+                )
+                .expect("node events")
+                .events;
+            assert!(!committed.is_empty(), "the pump committed the observation");
+            let mut journal_wire = String::new();
+
+            // ── Hub side: replay the committed observations through a real
+            // Hub Store, mirroring the uplink conversion. ──
+            let hub_dir = tempfile::tempdir().unwrap();
+            let hub_store =
+                remuda_hub::store_test_support::Store::open(hub_dir.path()).expect("hub store");
+            let hub_host = HostId::new().as_id().to_string();
+            let hub_instance = instance_id.clone().as_id().to_string();
+            hub_store
+                .ensure_instance(hub_host.clone(), hub_instance.clone())
+                .await
+                .unwrap();
+            for event in committed {
+                journal_wire.push_str(&serde_json::to_string(&event).expect("event wire"));
+                // Only the Instance variant carries a pump observation; the
+                // uplink converts it to hub journal wire JSON.
+                let remuda_protocol::JournalEvent::Instance(observation) = event else {
+                    continue;
+                };
+                let mut value = serde_json::to_value(*observation).expect("observation wire json");
+                value["instance_id"] = serde_json::json!(hub_instance);
+                hub_store
+                    .append_journal(hub_host.clone(), hub_instance.clone(), None, value)
+                    .await
+                    .expect("hub append");
+            }
+            for fragment in case.leak_fragments {
+                assert!(
+                    !journal_wire.contains(fragment),
+                    "[{}] the Node journal leaks stderr fragment {fragment}",
+                    case.name
+                );
+            }
+
+            let hub_row = hub_store
+                .get_instance(hub_instance.clone())
+                .await
+                .unwrap()
+                .expect("hub row");
+            assert_eq!(hub_row.lifecycle, "failed");
+            assert_eq!(
+                hub_row.last_error.as_deref(),
+                Some(case.expected.as_str()),
+                "[{}] the Hub projection must persist the structured text",
+                case.name
+            );
+            // Assert on the SERIALIZED ROW: no stderr substring survives into
+            // any projected field.
+            let row_wire = serde_json::to_string(&hub_row).expect("hub row serializes");
+            for fragment in case.leak_fragments {
+                assert!(
+                    !row_wire.contains(fragment),
+                    "[{}] the serialized Hub row leaks stderr fragment {fragment}: {row_wire}",
+                    case.name
+                );
+            }
+            hub_store.close().await;
+        }
     }
 }
 

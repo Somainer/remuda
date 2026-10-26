@@ -50,8 +50,13 @@ export function LoginPage({ mode }: { mode?: "bootstrap" | "pair" }) {
           controller.signal,
         );
       })
-      .then(() => {
-        if (!cancelled && hubStore.stateAuthed()) navigate(destination(), { replace: true });
+      .then((outcome) => {
+        // Gate 50 item 3: a retired credential turn is not success — never
+        // navigate into the gated tree (AuthGate would bounce straight back
+        // and a /pair submission would lose its route and form).
+        if (!cancelled && outcome === "settled" && hubStore.stateAuthed()) {
+          navigate(destination(), { replace: true });
+        }
       })
       .catch(() => {
         // Conditional mediation is an opportunistic autofill hint. It rejects
@@ -84,7 +89,11 @@ export function LoginPage({ mode }: { mode?: "bootstrap" | "pair" }) {
     setError(null);
     void hubStore
       .passkeyLogin("required", deviceName.trim() || undefined, controller.signal)
-      .then(() => navigate(destination(), { replace: true }))
+      .then((outcome) => {
+        // Gate 50 item 3: no success navigation for a retired turn — the
+        // passkey form stays mounted on its current route.
+        if (outcome === "settled" && hubStore.stateAuthed()) navigate(destination(), { replace: true });
+      })
       .catch((err: unknown) => {
         if (!controller.signal.aborted) setError(passkeyErrorText(err));
       })
@@ -99,7 +108,12 @@ export function LoginPage({ mode }: { mode?: "bootstrap" | "pair" }) {
     setError(null);
     void hubStore
       .login(tab, secret, deviceName.trim() || (tab === "pair" ? "phone" : "device"))
-      .then(() => navigate(destination(), { replace: true }))
+      .then((outcome) => {
+        // Gate 50 item 3: navigate only on a settled, currently authenticated
+        // turn. A retired bootstrap/pair resolution (logout/peer/401 during
+        // the turn) keeps the form and — under /pair — the pairing route.
+        if (outcome === "settled" && hubStore.stateAuthed()) navigate(destination(), { replace: true });
+      })
       .catch((err: unknown) => setError(err instanceof Error ? err.message : "登录失败"))
       .finally(() => setBusy(false));
   };

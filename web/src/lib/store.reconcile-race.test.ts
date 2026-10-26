@@ -917,3 +917,119 @@ it("a cancelled beforeunload prompt unlatches outbox delivery via the scheduled 
   await hubStore.send(INSTANCE, "after cancel");
   await vi.waitFor(() => expect(send).toHaveBeenCalled());
 });
+
+it("item 7: a list-poll screen read waits behind the ordered reconciliation carrying the unseen higher-seq screen", async () => {
+  const { api, hubStore } = await fresh();
+  const deferred = <T,>() => {
+    let resolve!: (v: T | PromiseLike<T>) => void;
+    const promise = new Promise<T>((r) => {
+      resolve = r;
+    });
+    return { promise, resolve };
+  };
+
+  const seq1: Observation = {
+    kind: "message",
+    eventId: "evt_race7_1",
+    journalId: JOURNAL,
+    instanceId: INSTANCE,
+    seq: "1",
+    completeness: "structured",
+    payload: { role: "assistant", text: "working" },
+  } as unknown as Observation;
+  const seq2: Observation = {
+    kind: "raw_tty",
+    eventId: "evt_race7_2",
+    journalId: JOURNAL,
+    instanceId: INSTANCE,
+    seq: "2",
+    payload: { text: "FRESH SCREEN AT SEQ 2" },
+  } as unknown as Observation;
+
+  // The ordered reconciliation's resume read (afterSeq 1) is held pending;
+  // it carries the unseen seq-2 screen.
+  const resumePage = deferred<Awaited<ReturnType<Api["eventsRead"]>>>();
+  let resumeStarted = false;
+  vi.spyOn(api, "instanceGet").mockResolvedValue({
+    id: INSTANCE,
+    journalId: JOURNAL,
+  } as Awaited<ReturnType<Api["instanceGet"]>>);
+  vi.spyOn(api, "eventsRead").mockImplementation(
+    (async (args?: { afterSeq?: string }) => {
+      if (args?.afterSeq === "1") {
+        if (!resumeStarted) {
+          resumeStarted = true;
+          return resumePage.promise;
+        }
+      }
+      return {
+        events: [seq1],
+        durableSeq: "1",
+        windowFromSeq: "1",
+        reachedAfterSeq: true,
+      };
+    }) as Api["eventsRead"],
+  );
+  vi.spyOn(api, "eventsSubscribe").mockResolvedValue({
+    subscriptionId: "sub_race7",
+    journalId: JOURNAL,
+    durableSeq: "1",
+    windowFromSeq: "1",
+    reachedAfterSeq: true,
+    getReadyState: () => 1,
+    snapshot: {
+      projectionVersion: "v1",
+      projectionEpoch: "epoch_race7",
+      asOfSeq: "1",
+      instance: {} as never,
+      runs: [],
+      commands: [],
+      pendingInteractions: [],
+      nodes: [],
+      history: { earliestRetainedSeq: "1", complete: true },
+    },
+  });
+  vi.spyOn(api, "instanceList").mockResolvedValue({
+    items: [{ id: INSTANCE, journalId: JOURNAL, revision: "1", durableSeq: "1", lifecycle: "running" } as never],
+    nextCursor: null,
+  });
+  vi.spyOn(api, "interactionList").mockResolvedValue([]);
+  await hubStore.refresh();
+  await hubStore.follow(INSTANCE);
+
+  const internal = hubStore as unknown as {
+    journals: Map<string, { resumeAfterReconnect: () => Promise<unknown> }>;
+    chainReconcile: (id: string, job: () => Promise<unknown>) => Promise<unknown>;
+  };
+  const client = internal.journals.get(JOURNAL)!;
+
+  // Queue a reconciliation carrying the unseen seq-2 screen...
+  const job = internal.chainReconcile(INSTANCE, () => client.resumeAfterReconnect());
+  // ...then the 2.5 s list-poll fan-out. Its RPC must queue BEHIND the job.
+  let journalScreenCommittedBeforeRpc = false;
+  const screenRead = vi.spyOn(api, "screenRead").mockImplementation(async () => {
+    journalScreenCommittedBeforeRpc =
+      hubStore.getSnapshot().screens[INSTANCE]?.journalSeq === "2";
+    return { lines: ["CURRENT BUFFER AFTER CATCHUP"] };
+  });
+  hubStore.refreshScreens([INSTANCE]);
+  await new Promise((r) => setTimeout(r, 10));
+  expect(screenRead).not.toHaveBeenCalled();
+
+  // The catch-up lands with the unseen higher-seq screen.
+  resumePage.resolve({
+    events: [seq2],
+    durableSeq: "2",
+    windowFromSeq: "1",
+    reachedAfterSeq: true,
+  });
+  await job;
+
+  // Only now may the list RPC read, and it commits the current buffer on the
+  // seq-2 basis (never an old basis-1 buffer over the seq-2 screen).
+  await vi.waitFor(() => expect(screenRead).toHaveBeenCalled());
+  expect(journalScreenCommittedBeforeRpc).toBe(true);
+  const screen = hubStore.getSnapshot().screens[INSTANCE];
+  expect(screen?.lines).toEqual(["CURRENT BUFFER AFTER CATCHUP"]);
+  expect(screen?.journalSeq).toBe("2");
+});

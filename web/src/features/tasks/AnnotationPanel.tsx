@@ -155,10 +155,19 @@ export function useAnnotationDrafts(instanceId: string | null | undefined): Anno
 export function AnnotationBadge({
   instanceId,
   readonly = false,
+  floating = false,
 }: {
   instanceId: string;
   /** Archived-task sessions and terminal segments offer no entry point. */
   readonly?: boolean;
+  /**
+   * Render as the bordered chip that floats over the transcript edge
+   * (annotationBar) instead of the quiet in-flow 批注行 (badgeRow). The two
+   * placements need distinct styles: the in-flow chip is transparent and
+   * borderless; the floating one needs its own surface so it does not collide
+   * with transcript text or swallow stray clicks.
+   */
+  floating?: boolean;
 }) {
   const { openPanel, panel, closePanel } = useAnnotationsContext();
   const drafts = useAnnotationDrafts(instanceId);
@@ -166,26 +175,31 @@ export function AnnotationBadge({
   if (count === 0) return null;
 
   const open = panel?.instanceId === instanceId;
-  // Read-only (archived) sessions may still OPEN the panel to review or
-  // remove drafts created before the read-only state resolved; the badge is
-  // only inert when there is nothing to open.
+  // The quiet in-flow 批注行 (ui-spec §2.2 item 5) renders a borderless 24px
+  // control; the over-transcript floating dock renders the same button with
+  // the bordered .floatBadge chip surface.
   return (
-    <button
-      type="button"
-      className={css.badge}
-      data-testid="annotation-badge"
-      data-active={open ? "1" : "0"}
-      data-readonly={readonly ? "1" : "0"}
-      aria-expanded={open}
-      title={readonly ? "只读预览：仅可查看或撤回已有批注" : "查看随下一次发送投递的批注"}
-      onClick={() => (open ? closePanel() : openPanel(instanceId, "card"))}
+    <div
+      className={floating ? css.floatBadgeRow : css.badgeRow}
+      data-testid={floating ? "annotation-badge-float" : "annotation-badge-row"}
     >
-      <span aria-hidden="true">批注</span>
-      <span className={css.badgeCount} data-testid="annotation-badge-count">
-        {count}
-      </span>
-      <span>本次发送带 {count} 条批注</span>
-    </button>
+      <button
+        type="button"
+        className={floating ? css.floatBadge : css.badge}
+        data-testid="annotation-badge"
+        data-active={open ? "1" : "0"}
+        data-readonly={readonly ? "1" : "0"}
+        aria-expanded={open}
+        title={readonly ? "只读预览：仅可查看或撤回已有批注" : "查看随下一次发送投递的批注"}
+        onClick={() => (open ? closePanel() : openPanel(instanceId, "card"))}
+      >
+        本次发送带{" "}
+        <span className={css.badgeCount} data-testid="annotation-badge-count">
+          {count}
+        </span>{" "}
+        条批注
+      </button>
+    </div>
   );
 }
 
@@ -430,7 +444,14 @@ export function useSessionTask(
           (instanceTaskId ? items.find((t) => t.id === instanceTaskId) : undefined) ??
           items.find((t) => t.placement?.instanceId === instanceId) ??
           null;
-        setTask(match);
+        // Each poll decodes a fresh object; keep the current one when the
+        // ledger row is unchanged so an idle session page does not re-render
+        // every 15 s.
+        setTask((current) =>
+          current === match || (current && match && JSON.stringify(current) === JSON.stringify(match))
+            ? current
+            : match,
+        );
       } catch {
         /* Keep the last known task; the rail stays usable without it. */
       }

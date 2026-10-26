@@ -594,6 +594,7 @@ pub async fn spawn_on_host(
             request.operation.to_owned(),
             payload,
             request.idempotency_key,
+            None,
             request.initiator,
             request.initiator_device_id,
         )

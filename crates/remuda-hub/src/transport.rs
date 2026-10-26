@@ -454,7 +454,15 @@ impl NodeTransport for StdioTransport {
 }
 
 struct NodeSlot {
+    /// Registry session generation: bumped on every `insert`, used to retire a
+    /// stale WS session in `remove_generation`.
     generation: u64,
+    /// c-dirpicker r11 item 2: the durable per-host link generation the
+    /// adopting `node.hello` stamped in the hosts table when it registered
+    /// this transport. A forwarding attempt pins this value together with the
+    /// transport, so the generation it stamps on the command is the link the
+    /// prepare/commit actually ride.
+    link_generation: i64,
     link: Arc<dyn NodeTransport>,
 }
 
@@ -471,6 +479,37 @@ pub(crate) struct InsertedSession {
     /// guard) instead of re-querying the map, so an old socket tearing down
     /// after the hello cannot change the answer (r16 item 6).
     pub(crate) displaced_live: bool,
+}
+
+/// A live (transport, durable link generation) pair pinned at the start of one
+/// forwarding attempt. The stamp, prepare and commit all go through THIS
+/// handle: with a half-open previous link still registered when the new
+/// hello's bump lands, pinning each separately could send a prepare on one
+/// link stamped for the other (r11 item 2).
+#[derive(Clone)]
+pub struct PinnedNodeCall {
+    #[allow(dead_code)] // retained so the pin is self-describing in debuggers
+    session_generation: u64,
+    /// The host link generation to stamp on commands forwarded on this pin.
+    link_generation: i64,
+    link: Arc<dyn NodeTransport>,
+}
+
+impl PinnedNodeCall {
+    /// The durable link generation this pin carries.
+    pub fn link_generation(&self) -> i64 {
+        self.link_generation
+    }
+
+    /// Send one JSON-RPC call on the pinned transport.
+    pub async fn call(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Option<Value>, HubError> {
+        self.link.call(method, params, timeout).await
+    }
 }
 
 /// Connected Node transports, keyed by host id.
@@ -595,16 +634,10 @@ impl ConnectedNodes {
         params: Value,
         timeout: Duration,
     ) -> Result<Option<Value>, HubError> {
-        let Some(link) = self
-            .inner
-            .lock()
-            .await
-            .get(host_id)
-            .map(|slot| slot.link.clone())
-        else {
-            return Ok(None);
-        };
-        link.call(method, params, timeout).await
+        match self.pin(host_id).await {
+            Some(pin) => pin.call(method, params, timeout).await,
+            None => Ok(None),
+        }
     }
 
     /// Send a notification (no `id`, no pending slot) to a connected Node.
@@ -615,26 +648,51 @@ impl ConnectedNodes {
         method: &str,
         params: Value,
     ) -> Result<bool, HubError> {
-        let Some(link) = self
-            .inner
+        let Some(pin) = self.pin(host_id).await else {
+            return Ok(false);
+        };
+        pin.link.notify(method, params).await
+    }
+
+    /// Pin the host's CURRENT (transport, durable link generation) atomically
+    /// under the registry lock. A forwarding attempt uses the returned handle
+    /// for every frame so a reconnect between frames cannot move one of them
+    /// onto a different link. `None` = no live session.
+    pub async fn pin(&self, host_id: &str) -> Option<PinnedNodeCall> {
+        self.inner
             .lock()
             .await
             .get(host_id)
-            .map(|slot| slot.link.clone())
-        else {
-            return Ok(false);
-        };
-        link.notify(method, params).await
+            .map(|slot| PinnedNodeCall {
+                session_generation: slot.generation,
+                link_generation: slot.link_generation,
+                link: slot.link.clone(),
+            })
     }
 
     /// Record a live session. Mints a fresh, never-reused session identity
     /// (process-wide monotonic) and reports whether it superseded a still-live
     /// session for the same host. The returned generation retires only this
     /// session in [`Self::remove_generation`].
+    ///
+    /// Test seam: no real hello bumped a durable link generation for a
+    /// directly mounted scripted transport, so the slot carries 0.
     pub(crate) async fn insert(
         &self,
         host_id: String,
         link: Arc<dyn NodeTransport>,
+    ) -> InsertedSession {
+        self.insert_with_generation(host_id, link, 0).await
+    }
+
+    /// Record a live session together with the durable per-host link generation
+    /// the adopting hello just stamped (c-dirpicker r11 item 2). Session
+    /// identity and takeover reporting are as in [`Self::insert`].
+    pub(crate) async fn insert_with_generation(
+        &self,
+        host_id: String,
+        link: Arc<dyn NodeTransport>,
+        link_generation: i64,
     ) -> InsertedSession {
         // Exclusive with every in-flight Landing authority decision for this
         // host (r15 item 3): a writer that passed its current-session pre-check
@@ -644,7 +702,7 @@ impl ConnectedNodes {
         // holds the guard, notify test waiters BEFORE awaiting.
         if let Ok(guard) = lock.try_write() {
             let _authority = guard;
-            return self.insert_locked(host_id, link).await;
+            return self.insert_locked(host_id, link, link_generation).await;
         }
         #[cfg(any(test, feature = "test-faults"))]
         {
@@ -652,7 +710,7 @@ impl ConnectedNodes {
             notify.notify_waiters();
         }
         let _authority = lock.write_owned().await;
-        self.insert_locked(host_id, link).await
+        self.insert_locked(host_id, link, link_generation).await
     }
 
     /// Register the new session with the authority guard already held.
@@ -660,6 +718,7 @@ impl ConnectedNodes {
         &self,
         host_id: String,
         link: Arc<dyn NodeTransport>,
+        link_generation: i64,
     ) -> InsertedSession {
         let mut inner = self.inner.lock().await;
         let counter = self.next_session.fetch_add(1, AtomicOrdering::Relaxed) + 1;
@@ -671,7 +730,14 @@ impl ConnectedNodes {
         // so post-hello Landing handling does not rebind A's grants to B; a
         // registration into an empty slot (genuine reconnect) leaves it clear.
         let displaced_live = inner.contains_key(&host_id);
-        inner.insert(host_id.clone(), NodeSlot { generation, link });
+        inner.insert(
+            host_id.clone(),
+            NodeSlot {
+                generation,
+                link_generation,
+                link,
+            },
+        );
         if displaced_live {
             // Keyed by the NEW (takeover) generation; only that session's
             // guarded removal clears it (r16 item 6).

@@ -211,6 +211,11 @@ pub struct MemoryStore {
     entities: Option<EntityDb>,
     /// See [`LocalStore::journal_bytes_read`].
     journal_bytes_read: std::sync::atomic::AtomicU64,
+    /// c-cardsettle r7 item 7 (test only): fail the next N
+    /// `append_driver_observation` calls with a store IO error, simulating a
+    /// transient Node-side commit failure while the child is alive.
+    #[cfg(test)]
+    fail_next_driver_observations: std::sync::atomic::AtomicUsize,
 }
 
 /// Owns the journal writer job channel and closes it on drop. Not `Clone`: a
@@ -439,7 +444,18 @@ impl MemoryStore {
             durable: None,
             entities: None,
             journal_bytes_read: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            fail_next_driver_observations: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// c-cardsettle r7 item 7 (test only): arm the next `count` driver
+    /// observation commits to fail — simulating the Node's own store
+    /// rejecting writes while the managed child is still alive.
+    #[cfg(test)]
+    pub fn fail_next_driver_observations(&self, count: usize) {
+        self.fail_next_driver_observations
+            .store(count, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Open a durable store under `data_dir` (`node.sqlite` + remuda-journal).
@@ -500,6 +516,8 @@ impl MemoryStore {
             durable: Some(durable),
             entities: Some(entities),
             journal_bytes_read: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            fail_next_driver_observations: std::sync::atomic::AtomicUsize::new(0),
         };
         for instance in store.list_instances()? {
             if matches!(instance.lifecycle, InstanceLifecycle::Ready) {
@@ -1004,6 +1022,21 @@ impl LocalStore for MemoryStore {
         instance_id: &InstanceId,
         mut observation: Observation,
     ) -> Result<Observation, NodeError> {
+        // r7 item 7 test seam: fail BEFORE taking the write lock, so the
+        // rejected commit mutates nothing and the next observation commits
+        // normally.
+        #[cfg(test)]
+        if self
+            .fail_next_driver_observations
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            self.fail_next_driver_observations
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(NodeError::Driver(
+                "injected observation-commit IO failure".into(),
+            ));
+        }
         let (event, sender, persisted) = {
             let mut state = self.state.write().map_err(|_| NodeError::StorePoisoned)?;
             let record = state

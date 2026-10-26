@@ -75,6 +75,10 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
                         model: None,
                         effort_name: None,
                         effort_index: None,
+                        effort_ultracode: None,
+                        effort_axis: None,
+
+                        effort_request_id: None,
                         permission_mode: None,
                     }
                     .with_configure(&params),
@@ -102,6 +106,10 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
                         model: None,
                         effort_name: None,
                         effort_index: None,
+                        effort_ultracode: None,
+                        effort_axis: None,
+
+                        effort_request_id: None,
                         permission_mode: None,
                     },
                 )
@@ -134,6 +142,10 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
                         model: None,
                         effort_name: None,
                         effort_index: None,
+                        effort_ultracode: None,
+                        effort_axis: None,
+
+                        effort_request_id: None,
                         permission_mode: None,
                     },
                 )
@@ -164,6 +176,10 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
                         model: None,
                         effort_name: None,
                         effort_index: None,
+                        effort_ultracode: None,
+                        effort_axis: None,
+
+                        effort_request_id: None,
                         permission_mode: None,
                     },
                 )

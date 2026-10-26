@@ -1402,6 +1402,9 @@ async fn instance_usage_http(
         "outputTokens": agg.output_tokens,
         "estimatedUsd": agg.cost_usd,
         "estimated": true,
+        // c-usagefu r16 item 7: on the rolled-back usage shape the numbers are
+        // placeholders, not evidence; the client renders Unknown, never $0.00.
+        "unavailable": agg.unavailable,
     })))
 }
 
@@ -1422,6 +1425,10 @@ async fn catalog_http(
                 "contextWindow": row.context_window,
                 "maxOutputTokens": row.max_output_tokens,
                 "effortLevels": row.effort_levels,
+                // D-056 §6 per-model default + ultracode toggle capability;
+                // null/default when the catalog does not know the model.
+                "defaultEffort": row.default_effort,
+                "ultracodeCapable": row.ultracode_capable,
                 "supports": {
                     "toolChoiceAny": row.supports.tool_choice_any,
                     "structuredOutput": row.supports.structured_output,

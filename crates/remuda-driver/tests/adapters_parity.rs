@@ -526,6 +526,8 @@ fn run_and_adapt_scenario(kind: AgentKind, scenario: &str, prompt: &str) -> Pari
                 home: home.clone(),
                 cwd: cwd.clone(),
                 pid: None,
+                launched_at: None,
+                resume_session_id: None,
             });
             let rollout = remuda_driver::codex_rollout::locate_rollout_in(&home, &session)
                 .expect("codex rollout written by the fake harness");
@@ -542,6 +544,8 @@ fn run_and_adapt_scenario(kind: AgentKind, scenario: &str, prompt: &str) -> Pari
                 home: home.clone(),
                 cwd: cwd.clone(),
                 pid: None,
+                launched_at: None,
+                resume_session_id: None,
             });
             // The fake empties active_sessions.json on shutdown, so bind the
             // known session directory directly (as a SessionStart hook resolves

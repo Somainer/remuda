@@ -57,8 +57,10 @@ remuda-node = { workspace = true, features = ["test-faults"] }
 remuda-protocol.workspace = true
 remuda-signal.workspace = true
 remuda-testing.workspace = true
+rusqlite.workspace = true
 serde_json.workspace = true
 tempfile = "3"
+time.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "net", "process", "test-util"] }
 tokio-tungstenite.workspace = true
 toml = "0.8"

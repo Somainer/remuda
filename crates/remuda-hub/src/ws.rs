@@ -52,10 +52,149 @@ pub struct SettlementNotice {
     pub state: String,
     /// Resolution reason ("generation-ended").
     pub reason: String,
-    /// Durable `updated_at` of the terminal row; followers advance their
-    /// delivery cursor on every notice so a multi-page lag drain skips no row
-    /// (c-cardsettle r6 item 2).
-    pub updated_at: String,
+    /// Per-Hub monotonic settlement seq (c-cardsettle r9 item 3); followers
+    /// advance their delivery cursor on every notice so a multi-page lag
+    /// drain skips no row regardless of timestamps or id ordering.
+    pub seq: i64,
+}
+
+/// Test-only park seam for a follower's settlement pump (c-cardsettle r11
+/// item 1). Production builds contain no seam: every call site and the
+/// [`AppState`](crate::AppState) field are gated behind
+/// `cfg(any(test, feature = "test-faults"))`.
+///
+/// Unlike shrinking the client socket SO_RCVBUF (which the Hub's ~16 KiB
+/// send buffer defeats: batch A can sit in the kernel buffer with the pump
+/// already at A's END), this parks the PUMP itself deterministically after
+/// it processes the live notice whose seq is `after_seq`, so the follower's
+/// durable delivery cursor provably sits mid-batch before the next batch
+/// is published.
+#[cfg(any(test, feature = "test-faults"))]
+#[derive(Default, Clone)]
+pub(crate) struct FollowParks {
+    slot: Arc<tokio::sync::Mutex<Option<FollowParkSlot>>>,
+}
+
+#[cfg(any(test, feature = "test-faults"))]
+struct FollowParkSlot {
+    /// Park once the pump processes a notice with exactly this seq.
+    after_seq: i64,
+    /// The pump sends back the seq it parked at (the test asserts it equals
+    /// the armed K).
+    reached: tokio::sync::oneshot::Sender<i64>,
+    /// The pump waits on this until the test releases it.
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(any(test, feature = "test-faults"))]
+impl FollowParks {
+    /// Arm a one-shot park at `after_seq`. Returns `(reached, release)`:
+    /// `reached` resolves with the seq the pump parked at; sending on
+    /// `release` lets the pump continue.
+    pub(crate) async fn arm(
+        &self,
+        after_seq: i64,
+    ) -> (
+        tokio::sync::oneshot::Receiver<i64>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.slot.lock().await = Some(FollowParkSlot {
+            after_seq,
+            reached: reached_tx,
+            release: release_rx,
+        });
+        (reached_rx, release_tx)
+    }
+
+    /// If the pump just processed the armed seq, report it and park until
+    /// released. One-shot: the slot is removed on entry. A dropped release
+    /// sender (test aborted) closes the channel and the pump proceeds.
+    pub(crate) async fn park_if_reached(&self, seq: i64) {
+        let slot = self.slot.lock().await.take();
+        if let Some(slot) = slot {
+            if slot.after_seq == seq {
+                let _ = slot.reached.send(seq);
+                let _ = slot.release.await;
+            } else {
+                // Not this notice: re-arm so a later notice in the same pump
+                // can still hit the park point.
+                *self.slot.lock().await = Some(slot);
+            }
+        }
+    }
+}
+
+/// Test-only park seam for an irreversible HTTP operation (c-cardsettle-fu
+/// r1 item 2). Lets a test prove the operation runs in a DETACHED task that
+/// survives the handler future being cancelled on client disconnect: arm,
+/// start the request, wait until the operation parks, abort the request
+/// future (RST), then release — a detached task completes, an inline handler
+/// does not.
+///
+/// c-cardsettle-fu2 r1 item 4: a second slot parks AFTER the delete DB job
+/// commits, so a test can RST in the window where the deletion is durable
+/// but publication/cleanup have not run yet (the fu1 seam parked before ANY
+/// DB work, which did not match the requested post-enqueue window).
+#[cfg(any(test, feature = "test-faults"))]
+#[derive(Default, Clone)]
+pub(crate) struct OperationParks {
+    /// One-shot post-delete park KEYED BY INSTANCE ID. Background settle
+    /// activity (node hello sweeps, other requests) also calls
+    /// publish_settlement; a global slot would be consumed by the first such
+    /// unrelated settlement. Keying ensures only the delete of the armed
+    /// instance parks.
+    post_delete_slot: Arc<tokio::sync::Mutex<Option<(String, OperationParkSlot)>>>,
+}
+
+#[cfg(any(test, feature = "test-faults"))]
+struct OperationParkSlot {
+    reached: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(any(test, feature = "test-faults"))]
+impl OperationParks {
+    /// Arm the post-delete park for `instance_id`. Fires once that exact
+    /// instance's delete transaction commits (c-cardsettle-fu2 r1 item 4).
+    pub(crate) async fn arm_post_delete(
+        &self,
+        instance_id: &str,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.post_delete_slot.lock().await = Some((
+            instance_id.to_owned(),
+            OperationParkSlot {
+                reached: reached_tx,
+                release: release_rx,
+            },
+        ));
+        (reached_rx, release_tx)
+    }
+
+    /// Park after the delete job committed if a park is armed FOR THIS
+    /// instance; unrelated settlements (background sweeps etc.) pass straight
+    /// through without consuming the slot.
+    pub(crate) async fn park_after_delete_if_armed(&self, instance_id: &str) {
+        let mut guard = self.post_delete_slot.lock().await;
+        let matches = guard
+            .as_ref()
+            .is_some_and(|(armed_id, _)| armed_id == instance_id);
+        if !matches {
+            return;
+        }
+        let Some((_, slot)) = guard.take() else {
+            return;
+        };
+        drop(guard);
+        let _ = slot.reached.send(());
+        let _ = slot.release.await;
+    }
 }
 
 /// Live event for `/v1/follow`.
@@ -476,16 +615,16 @@ pub(crate) fn spawn_egress_reinstall(state: &AppState, host_id: String) {
 /// Post-`node.hello` reconciliation that EVERY carrier must run once the new
 /// transport is registered and the hello reply is queued: the D-048 B.2
 /// egress re-push and the c-dirpicker unregister-abort sweep (r7 item 1,
-/// r8 item 1, r9 item 1).
+/// r8 item 1, r9 item 1, r10 item 1).
 ///
 /// Both run in spawned tasks: they share the session's bounded outbound
 /// FIFO, which the session task itself drains, so awaiting them inline
 /// would fill the FIFO ahead of the reply (parking the hello behind ~32
 /// routed instances) and the sweep's RPC would deadlock the read loop on
-/// its own reply. The timestamp captured here is the reconnect instant:
-/// the sweep (see [`crate::workspaces::abort_unsettled_unregisters_on_reconnect`])
-/// must not abort DELETEs accepted on THIS new link, so only commands
-/// created before it are touched.
+/// its own reply. The sweep decides which intents to abort by the durable
+/// link generation the hello just bumped (see
+/// [`crate::workspaces::abort_unsettled_unregisters_on_reconnect`]), not by
+/// the clock, so no reconnect instant is plumbed here.
 /// `generation` and `displaced_live` are the values captured AT HELLO (not
 /// re-queried later), so a stale older socket that tears down after this hello
 /// cannot change the Landing-rebind decision (r16 item 6).
@@ -496,11 +635,7 @@ pub(crate) fn spawn_post_hello_tasks(
     displaced_live: bool,
 ) {
     spawn_egress_reinstall(state, host_id.clone());
-    crate::workspaces::spawn_unregister_abort_sweep(
-        state,
-        host_id.clone(),
-        crate::config::now_rfc3339(),
-    );
+    crate::workspaces::spawn_unregister_abort_sweep(state, host_id.clone());
     // r13 item 1: now that this carrier is registered, immediately reconcile
     // (read-only, forced) any Landing row pinned to this host against the exact
     // granted merge — covering a Hub restart where the push reached origin
@@ -637,19 +772,35 @@ pub(crate) async fn handle_node_method(
             // call_node found no link (or blocked on a stale slot) and the
             // Node never received the abort, so the unbinding mark wedged.
             if params["daemon"] == true {
-                let settlement = state
-                    .store
-                    .reconcile_daemon_instances(
+                state
+                    .publish_settlement_unit(state.store.reconcile_daemon_instances(
                         host.host_id.clone(),
                         params["instances"].as_array().cloned().unwrap_or_default(),
-                    )
+                    ))
                     .await?;
-                state.broadcast_settlement(&settlement);
             }
             reconcile_lost_instances(state, &host.host_id, &params).await?;
+            // c-dirpicker r10 item 1: adopt the new link generation BEFORE the
+            // transport is registered. Commands can only be forwarded once
+            // the registry slot below exists, so every DELETE issued on this
+            // new link stamps the new generation and the post-hello sweep
+            // attributes it to the live link; unregister intents the dead
+            // previous link left behind carry the old value and are aborted.
+            // Durable and monotonic, so hub restarts and backward wall-clock
+            // steps neither reuse nor move a generation.
+            //
+            // r11 item 2: the bumped value is stored IN the registry slot
+            // together with the transport. `ConnectedNodes::pin` hands the pair
+            // out atomically, so a forwarding attempt stamps and rides the very
+            // same link even while a half-open previous session is still
+            // registered during this hello window.
+            let link_generation = state
+                .store
+                .bump_host_link_generation(host.host_id.clone())
+                .await?;
             let inserted = state
                 .nodes
-                .insert(
+                .insert_with_generation(
                     host.host_id.clone(),
                     Arc::new(
                         WssTransport::new(out_tx.clone(), pending.clone()).with_kind(
@@ -657,6 +808,7 @@ pub(crate) async fn handle_node_method(
                                 .unwrap_or(TransportKind::OutboundWss),
                         ),
                     ),
+                    link_generation,
                 )
                 .await;
             *session_generation = Some(inserted.generation);
@@ -772,23 +924,42 @@ pub(crate) async fn handle_node_method(
             // cannot smuggle one long transaction past the count cap
             // (hub-store-1).
             for range in crate::store::journal_append_chunks(&events) {
-                let appended_chunk = state
-                    .store
-                    .append_journal_batch(
-                        host_id.clone(),
-                        instance_id.clone(),
-                        next_seq,
-                        events[range].to_vec(),
-                    )
-                    .await
-                    .map_err(map_host_store)?;
+                // r8 item 4 / r9 item 4(c): the publication lock covers ONLY
+                // the settling commit and the settlement-bus sends, so a
+                // concurrent delete/sweep can never publish before a journal
+                // exit that committed earlier. It must NOT wrap the loop
+                // below — the journal-bus publish and the alerts/usage/supply
+                // observers await on unrelated resources; holding a global
+                // lock across them serialised every journal ingest on the
+                // Hub. Guards drop at the block's end, before those runs.
+                let appended_chunk = {
+                    let _settlement_order = state.settlement_publish_lock().await;
+                    let chunk = state
+                        .store
+                        .append_journal_batch(
+                            host_id.clone(),
+                            instance_id.clone(),
+                            next_seq,
+                            events[range].to_vec(),
+                        )
+                        .await
+                        .map_err(map_host_store)?;
+                    for appended in &chunk {
+                        // c-cardsettle: cards a terminal transaction
+                        // invalidated commit with the append; tell followers
+                        // immediately (a seq-less settlement control frame).
+                        // Broadcast even for REPLAYED rows: a request replayed
+                        // by a Node after the hello reconcile ended its owner
+                        // is invalidated during replay (r7 item 1), and that
+                        // notice has no other publication path (no fresh
+                        // journal event follows it).
+                        state.broadcast_settlement(&appended.settlement);
+                    }
+                    chunk
+                };
                 for appended in appended_chunk {
                     if !appended.replayed {
                         publish_journal(&state.bus, &appended.record);
-                        // c-cardsettle: cards this terminal journal event
-                        // invalidated commit with the append; tell followers
-                        // immediately (a seq-less settlement control frame).
-                        state.broadcast_settlement(&appended.settlement);
                         crate::alerts::observe(state, &appended.record);
                         crate::usage_store::observe_journal(state, &appended.record).await;
                         crate::supply::observe_journal_text(state, &appended.record).await;
@@ -1265,6 +1436,14 @@ async fn reconcile_lost_instances(
         .record_node_epoch(host_id.to_string(), epoch)
         .await?;
     if !changed {
+        // c-cardsettle r8 item 2 (OA6): a SAME-epoch hello means the SAME Node
+        // process reconnected after a contact loss — not a restart. The host
+        // sweep may have marked still-running rows exited/host-lost while the
+        // link was down. Revive the rows this inventory reports LIVE BEFORE
+        // anything else (journal catch-up / card dispatch): host loss is
+        // contact loss, never process end, and a new approval from the revived
+        // process must stay pending and answerable.
+        revive_live_inventory(state, host_id, params).await?;
         return Ok(());
     }
     let Some(reported) = params.get("instances").and_then(Value::as_array) else {
@@ -1293,18 +1472,39 @@ async fn reconcile_lost_instances(
                 .map(str::to_string)
         })
         .collect();
-    let (lost, settlement) = state
-        .store
-        .reconcile_reported_instances(
-            host_id.to_string(),
-            reported,
-            NODE_EPOCH_CHANGED.to_string(),
-            true,
-        )
+    let (lost, legacy_exited) = state
+        .publish_settlement(async {
+            state
+                .store
+                .reconcile_reported_instances(
+                    host_id.to_string(),
+                    reported,
+                    NODE_EPOCH_CHANGED.to_string(),
+                    true,
+                )
+                .await
+                .map(|outcome| ((outcome.lost, outcome.legacy_exited), outcome.settlement))
+        })
         .await?;
-    // c-cardsettle: announce the invalidated cards the same transaction
-    // produced, so an open inbox/session drops them without waiting a poll.
-    state.broadcast_settlement(&settlement);
+    for legacy_id in &legacy_exited {
+        tracing::info!(
+            %host_id,
+            instance_id = %legacy_id,
+            "new epoch re-swept a legacy host-lost row on an upgraded database; \
+             settled its cards without a new diagnostic"
+        );
+    }
+    // c-cardsettle r10 item 1 (OA6): a NEW Node epoch that LISTS a swept,
+    // still-pending instance as live is liveness evidence from the new
+    // process itself (a herdr-adopted chapter is normally listed starting or
+    // ready). Revive such rows BEFORE the lost side effects run — they were
+    // excluded from `lost` by the inventory, but the rank-held row is still
+    // the sweep's exited/host-lost shape until revived here. Cards the
+    // chapter still owns stay pending and answerable.
+    revive_live_inventory(state, host_id, params).await?;
+    // r10 item 4(c): legacy already-exited rows on upgraded databases only
+    // had their cards settled (the settlement above covered them); they are
+    // old news and get no diagnostic/egress/worker side effects.
     for instance_id in lost {
         tracing::warn!(
             %host_id,
@@ -1325,6 +1525,84 @@ async fn reconcile_lost_instances(
             "node epoch changed; instance lost",
         )
         .await;
+    }
+    Ok(())
+}
+
+/// Extract the instances a hello inventory reports as LIVE as
+/// `(id, hub_lifecycle, activity)` triples, the input to
+/// [`Store::revive_host_lost_instances`].
+///
+/// c-cardsettle r10 item 1 (OA6): a same- or new-epoch inventory that still
+/// holds a chapter is liveness evidence even when its lifecycle is not the
+/// Node's narrow ready/running pair — a herdr-adopted instance is listed
+/// `starting`, a draining chapter `closing`, and an older Node omits the key
+/// entirely (`unknown`). Each maps onto the closest LIVE Hub lifecycle; only
+/// confessed terminal entries (`exited`/`failed`/`closed`/`requested`) are
+/// excluded.
+fn live_inventory_entries(params: &Value) -> Vec<(String, String, String)> {
+    params
+        .get("instances")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| !entry_is_terminal(item))
+        .filter_map(|item| {
+            let id = item
+                .get("id")
+                .or_else(|| item.get("instanceId"))
+                .and_then(Value::as_str)?
+                .to_string();
+            // Only rows the Node claims are live revive a host-lost row.
+            let reported = item.get("lifecycle").and_then(Value::as_str).unwrap_or("");
+            let lifecycle = match reported {
+                "ready" | "running" | "reconciling" | "" | "unknown" => "running",
+                "starting" | "preparing" => "starting",
+                "closing" => "closing",
+                // "closed" is a real end; "requested" is an unacked Hub
+                // create the Node does not hold; anything unrecognised is
+                // not liveness evidence.
+                _ => return None,
+            };
+            let activity = match item
+                .get("activity")
+                .and_then(Value::as_str)
+                .or_else(|| item.pointer("/activity/value").and_then(Value::as_str))
+            {
+                Some("waiting-interaction") => "blocked",
+                Some(value @ ("idle" | "working" | "blocked" | "draining")) => value,
+                _ => "idle",
+            };
+            Some((id, lifecycle.to_string(), activity.to_string()))
+        })
+        .collect()
+}
+
+/// Reconnect: revive host-lost rows the reconnecting or restarted Node still
+/// reports live (c-cardsettle r8 item 2; r10 item 1 runs this on BOTH epoch
+/// branches). Runs on daemon and plain runtime hellos — the daemon inventory
+/// overlay (`reconcile_daemon_instances`) already rewrites the rows it names,
+/// and the host-lost predicate revival here is idempotent for those and the
+/// only revival path for a non-daemon runtime link.
+async fn revive_live_inventory(
+    state: &AppState,
+    host_id: &str,
+    params: &Value,
+) -> Result<(), HubError> {
+    let live = live_inventory_entries(params);
+    if live.is_empty() {
+        return Ok(());
+    }
+    let revived = state
+        .store
+        .revive_host_lost_instances(host_id.to_string(), &live)
+        .await?;
+    for instance_id in revived {
+        tracing::info!(
+            %host_id,
+            %instance_id,
+            "a reconnect inventory reports a host-lost instance live; revived without settling cards"
+        );
     }
     Ok(())
 }
@@ -1611,11 +1889,37 @@ enum FollowMsg {
 /// per-instance follower). Notices are sent before the trailing gap frame, so
 /// the client pins all of them before reconciling. A query error or a dead
 /// writer returns Err and the caller closes the follower (never a bare gap).
+///
+/// r9 item 3 PUBLICATION-ORDER INVARIANT: the live broadcast path publishes
+/// settlements in the order of the per-Hub monotonic `settlement_events.seq`
+/// assigned inside each settling transaction (within one sweep the settle
+/// SELECT orders rows by id so seqs ascend; across sweeps AUTOINCREMENT is a
+/// total order even in the same millisecond). That ordering is what lets the
+/// max-seq cursor and this strictly-forward `seq > cursor` recovery coexist:
+/// a dropped low-seq row of an earlier batch always sits behind the cursor
+/// and is recovered on the next drain. Keep both paths seq-ascending.
 async fn drain_settlement_lag(
     store: &crate::store::Store,
     instance_ids: &[String],
     cursor: &mut Option<String>,
     out_tx: &mpsc::Sender<FollowMsg>,
+) -> Result<(), ()> {
+    // A lag drain always closes with the single gap frame.
+    drain_settlement_pages(store, instance_ids, cursor, out_tx, true).await
+}
+
+/// Page every settlement strictly after `cursor` through `out_tx`, advancing
+/// the cursor past EVERY row (including rows filtered out for a per-instance
+/// follower), in ascending monotonic seq order. `trailing_gap` sends the
+/// single settlement-backpressure gap after the pages — true for a Lagged
+/// recovery, FALSE for the startup catch-up (the follower is not lagging, it
+/// is closing the subscribe window).
+async fn drain_settlement_pages(
+    store: &crate::store::Store,
+    instance_ids: &[String],
+    cursor: &mut Option<String>,
+    out_tx: &mpsc::Sender<FollowMsg>,
+    trailing_gap: bool,
 ) -> Result<(), ()> {
     loop {
         let page = store
@@ -1625,7 +1929,7 @@ async fn drain_settlement_lag(
                 tracing::error!(%error, "settlement lag recovery query failed; closing follower");
             })?;
         let short = page.len() < crate::store::SETTLEMENT_LAG_PAGE as usize;
-        for (sid, iid, reason, updated_at) in page {
+        for (sid, iid, reason, seq_token) in page {
             if instance_ids.is_empty() || instance_ids.iter().any(|id| id == &sid) {
                 let frame = json!({
                     "type": "settlement",
@@ -1637,19 +1941,24 @@ async fn drain_settlement_lag(
                 .to_string();
                 out_tx.send(FollowMsg::Text(frame)).await.map_err(|_| ())?;
             }
-            // Cursor advances past EVERY paged row, sent or filtered.
+            // Cursor advances past EVERY paged row, sent or filtered. The
+            // token is the monotonic settlement_events.seq (r9 item 3); it
+            // was issued by the store, so it parses.
+            let seq = seq_token.parse::<i64>().map_err(|_| ())?;
             *cursor = Some(crate::store::Store::settlement_max_cursor(
                 cursor.as_deref(),
-                &updated_at,
-                &iid,
+                seq,
             ));
         }
         if short {
             break;
         }
     }
-    let gap = json!({ "type": "gap", "reason": "settlement-backpressure" }).to_string();
-    out_tx.send(FollowMsg::Text(gap)).await.map_err(|_| ())
+    if trailing_gap {
+        let gap = json!({ "type": "gap", "reason": "settlement-backpressure" }).to_string();
+        out_tx.send(FollowMsg::Text(gap)).await.map_err(|_| ())?;
+    }
+    Ok(())
 }
 
 async fn follow_session(
@@ -1663,12 +1972,25 @@ async fn follow_session(
     let (out_tx, mut out_rx) = mpsc::channel::<FollowMsg>(cap);
     let (mut sink, mut stream) = socket.split();
     let mut rx = state.bus.subscribe();
+    // c-cardsettle r9 item 4(a): read the durable seed BEFORE taking the
+    // settlement-bus subscription. The old order (subscribe, then read) still
+    // had a skip window: more than one ring of settlements committed between
+    // the read and the pump's first recv makes the brand-new receiver return
+    // Lagged with none of those notices consumed, and a drain seeded at the
+    // post-commit max then excludes them (`seq > cursor`). With the seed read
+    // FIRST, everything <= seed is covered by the initial list + connect
+    // replay; the pump's startup catch-up (no gap) drains every settlement
+    // committed AFTER the read, overlapping bus deliveries which the client
+    // de-dupes by interaction id. No settlement can fall in between.
+    let mut settlement_cursor: Option<String> = match state.store.max_settlement_cursor().await {
+        Ok(cursor) => cursor,
+        Err(error) => {
+            tracing::error!(%error, "could not seed the settlement lag cursor; closing follower");
+            return;
+        }
+    };
     // c-cardsettle: separate receiver on the dedicated settlement bus.
     let mut settlement_rx = state.settlement_bus.subscribe();
-    // c-cardsettle r5 item 6: this follower's durable delivery cursor — the
-    // updated_at of the newest settlement row already recovered to it. Lag
-    // pages strictly forward from it, bounded by SETTLEMENT_LAG_PAGE.
-    let mut settlement_cursor: Option<String> = None;
     let mut instance_ids: Vec<String> = filter.into_iter().collect();
     for id in &instance_ids {
         state.followers.watch(device_id.clone(), id.clone()).await;
@@ -1717,6 +2039,24 @@ async fn follow_session(
                     return;
                 }
             }
+        }
+        // c-cardsettle r9 item 4(a): startup catch-up. Drain every settlement
+        // committed AFTER the pre-subscribe seed with NO trailing gap; rows at
+        // or before the seed are already covered by the list + connect replay.
+        // This closes the seed/subscribe window — a settlement committed in it
+        // is delivered here even if the brand-new receiver Lagged before its
+        // first recv (the bus copies overlap and are de-duped client-side).
+        if drain_settlement_pages(
+            &state.store,
+            &instance_ids,
+            &mut settlement_cursor,
+            &out_tx,
+            false,
+        )
+        .await
+        .is_err()
+        {
+            return;
         }
         loop {
             tokio::select! {
@@ -1832,11 +2172,25 @@ async fn follow_session(
                             // row the bus passes — including rows filtered out
                             // for this follower — so a later lag drain never
                             // re-scans or skips past it.
+                            //
+                            // r9 item 3: the key is the monotonic
+                            // settlement_events.seq assigned in the settling
+                            // transaction, not a (updated_at, id) composite,
+                            // so same-millisecond cross-settle publication can
+                            // never skip a row a follower missed. Lag recovery
+                            // pages strictly forward from this cursor; see
+                            // drain_settlement_lag.
                             settlement_cursor = Some(crate::store::Store::settlement_max_cursor(
                                 settlement_cursor.as_deref(),
-                                &notice.updated_at,
-                                &notice.interaction_id,
+                                notice.seq,
                             ));
+                            // c-cardsettle r11 item 1: deterministic test
+                            // park AFTER the live notice advanced the cursor
+                            // (no-op unless armed; outside the per-instance
+                            // filter so the seq contract holds for any
+                            // follower).
+                            #[cfg(any(test, feature = "test-faults"))]
+                            state.follow_parks.park_if_reached(notice.seq).await;
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => {
                             // c-cardsettle r4 item 6 / r6 item 2: drain every
@@ -2300,8 +2654,9 @@ mod tests {
     use crate::store::{SETTLEMENT_LAG_PAGE, Store};
     use rusqlite::params;
 
-    /// Insert `count` invalidated interactions with ascending synthetic
-    /// timestamps, optionally one 2-hours-old lost row and one pending row.
+    /// Insert `count` rows into the settlement_events log, optionally one
+    /// 2-hours-old lost row and one still-pending interaction (which has NO
+    /// log entry and must never drain).
     async fn seed_backlog(
         store: &Store,
         count: u32,
@@ -2309,23 +2664,21 @@ mod tests {
         with_pending: bool,
     ) -> Vec<String> {
         store
-            .run_named("r6_seed_settlement_backlog", move |conn| {
+            .run_named("r9_seed_settlement_backlog", move |conn| {
                 let mut ids = Vec::new();
                 {
                     let mut stmt = conn.prepare(
-                        "INSERT INTO interactions
-                            (id, instance_id, host_id, kind, state, blocking,
-                             payload_json, created_at, updated_at)
-                         VALUES (?1, 'ins_lag', 'hst_lag', 'approval', 'invalidated', 0,
-                                 '{}', ?2, ?2)",
+                        "INSERT INTO settlement_events
+                            (interaction_id, instance_id, state, reason, created_at)
+                         VALUES (?1, 'ins_lag', 'invalidated', 'generation-ended', ?2)",
                     )?;
                     if with_aged_lost {
                         stmt.execute(params!["int_lag_AGED", "2026-09-01T00:00:00.000Z"])?;
                     }
                     for n in 0..count {
                         let id = format!("int_lag_{n:05}");
-                        // Proper RFC3339 stamps; the backlog stays under 10
-                        // minutes and sorts in seed order.
+                        // Proper RFC3339 stamps; the backlog stays in the
+                        // present window. Seq, not the stamp, orders the drain.
                         let stamp = format!("2026-10-07T12:{:02}:{:02}.000Z", n / 60, n % 60);
                         stmt.execute(params![id, stamp])?;
                         ids.push(format!("int_lag_{n:05}"));
@@ -2430,6 +2783,197 @@ mod tests {
         assert!(cursor.is_some(), "the cursor advanced past the tail");
     }
 
+    /// c-cardsettle r9 item 3: cross-`settle` publication ORDER. A follower
+    /// that has already drained part of a FIRST settlement batch (its cursor
+    /// ends MID the settlement log) must not be able to permanently skip rows
+    /// of a SECOND settle whose notices overrun the broadcast ring.
+    /// Concretely:
+    ///   1. settle A (5 rows); the follower receives 3 live, cursor mid-A.
+    ///   2. settle B (70 rows > the 64-notice ring) with NO live delivery
+    ///      (its out channel is dropped, as a backpressured socket behaves).
+    ///   3. resume draining from the mid-A cursor: all remaining A rows AND all
+    ///      B rows must be recovered, in ascending settlement seq order, each
+    ///      once, before the gap.
+    ///
+    /// The per-Hub AUTOINCREMENT seq assigned in the settling transaction is a
+    /// total order even when the two settles share a millisecond and their
+    /// interaction ids interleave, so a strictly-forward seq cursor can never
+    /// skip a row of the earlier batch.
+    ///
+    /// c-cardsettle r10 item 5 SCOPE NOTE: the "cursor mid-A" here is built
+    /// DIRECTLY from invalidated_interactions_after(None) and handed to
+    /// drain_settlement_lag — the live follower never received the first
+    /// three rows, so this test proves ONLY the durable seq ordering/drain
+    /// path, not production backpressure (it does not make the r9 commit's
+    /// "delivers part of a batch" claim true). The end-to-end assertion — a
+    /// REAL follow_session whose cursor advances mid-batch through the live
+    /// settlement bus before the block — lives in
+    /// tests/cardsettle.rs::follower_blocked_mid_batch_recovers_a_larger_later_batch_in_order.
+    #[tokio::test]
+    async fn settlement_cursor_mid_first_batch_recovers_a_later_overring_sweep() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let store = Store::open(dir.path()).expect("store");
+        let host = format!("hst_{}", uuid::Uuid::now_v7());
+        store
+            .run_named("r8_enroll_host", {
+                let host = host.clone();
+                move |conn| {
+                    let now = crate::config::now_rfc3339();
+                    conn.execute(
+                        "INSERT INTO hosts (id, label, token_hash, state, last_seen_at,
+                            node_version, cli_json, capabilities_json, created_at, transport,
+                            labels_json, max_instances, hostname)
+                         VALUES (?1, ?1, 'x', 'online', ?2, '0.1.0-test', '[]', '{}', ?2,
+                                 'outbound-wss', '[]', 8, 'r8-order')",
+                        rusqlite::params![host, now],
+                    )?;
+                    Ok(())
+                }
+            })
+            .await
+            .expect("enroll");
+
+        // Seed one live instance per settle with pending cards, through the
+        // same public APIs the node socket handler uses.
+        let seed = |n: u32, cards: u32| {
+            let store = store.clone();
+            let host = host.clone();
+            async move {
+                let instance_id = format!("ins_r8order_{n}");
+                store
+                    .ensure_instance(host.clone(), instance_id.clone())
+                    .await
+                    .expect("ensure instance");
+                store
+                    .append_journal(
+                        host.clone(),
+                        instance_id.clone(),
+                        None,
+                        json!({
+                            "kind": "lifecycle",
+                            "payload": {
+                                "type": "entity", "entityType": "instance", "state": "ready"
+                            }
+                        }),
+                    )
+                    .await
+                    .expect("ready entity");
+                let mut ids = Vec::new();
+                for c in 0..cards {
+                    let id = format!("int_r8order_{n}_{c:05}");
+                    store
+                        .append_journal(
+                            host.clone(),
+                            instance_id.clone(),
+                            None,
+                            json!({
+                                "kind": "interaction.requested",
+                                "payload": {
+                                    "interactionKind": "approval",
+                                    "interaction": {
+                                        "id": id,
+                                        "kind": "approval",
+                                        "state": "pending",
+                                        "blocking": true,
+                                        "answerable": true,
+                                        "carrier": "harness-hook",
+                                        "deadline": { "state": "unknown" },
+                                        "resolution": { "state": "unknown" },
+                                        "request": {
+                                            "kind": "approval",
+                                            "title": "Bash",
+                                            "description": "r8 order",
+                                            "options": []
+                                        }
+                                    }
+                                }
+                            }),
+                        )
+                        .await
+                        .expect("approval request");
+                    ids.push(id);
+                }
+                (instance_id, ids)
+            }
+        };
+        // Batch A settles FIRST, then B. The seqs are what order publication
+        // (A's five before B's seventy) even though B is the bigger sweep and
+        // both settle at the wall clock's same millisecond.
+        let (inst_a, mut cards_a) = seed(2, 5).await;
+        let (inst_b, cards_b) = seed(1, 70).await;
+
+        // Settle A, then B; B never publishes live to this follower.
+        store
+            .settle_instance_exited(inst_a.clone(), "r9-order-a".into())
+            .await
+            .expect("settle A");
+        store
+            .settle_instance_exited(inst_b.clone(), "r9-order-b".into())
+            .await
+            .expect("settle B");
+
+        // PART 1: the follower received the first three A rows live, so its
+        // durable cursor is the seq token on the third row.
+        let page = store
+            .invalidated_interactions_after(None)
+            .await
+            .expect("page");
+        let first_three: Vec<String> = page
+            .iter()
+            .take(3)
+            .map(|(_, id, _, _)| id.clone())
+            .collect();
+        let mid_cursor = page
+            .iter()
+            .find(|(_, id, _, _)| id == &first_three[2])
+            .expect("third row present")
+            .3
+            .clone();
+
+        // PART 2: fresh drain from the MID cursor recovers the rest in order.
+        // Concurrently receive: the batch exceeds the channel capacity, so the
+        // drain task must run while this test reads (mirrors the real pump).
+        let mut cursor = Some(mid_cursor);
+        let (tx, mut rx) = mpsc::channel::<FollowMsg>(16);
+        let drainer =
+            tokio::spawn(async move { drain_settlement_lag(&store, &[], &mut cursor, &tx).await });
+        let mut recovered = Vec::new();
+        let mut gaps = 0;
+        while let Some(FollowMsg::Text(text)) = rx.recv().await {
+            let frame: Value = serde_json::from_str(&text).expect("json");
+            match frame["type"].as_str() {
+                Some("settlement") => {
+                    recovered.push(frame["interactionId"].as_str().unwrap().to_string())
+                }
+                Some("gap") => gaps += 1,
+                other => panic!("unexpected frame {other:?}"),
+            }
+        }
+        drainer.await.expect("drain task").expect("drain ok");
+
+        // Expect A's remaining two followed by all 70 B rows, total order.
+        cards_a.sort();
+        let mut expected: Vec<String> = first_three.to_vec();
+        expected.extend(recovered.iter().cloned());
+        let mut want = Vec::new();
+        want.append(&mut cards_a.clone());
+        let mut cards_b = cards_b;
+        cards_b.sort();
+        want.append(&mut cards_b);
+        assert_eq!(
+            expected, want,
+            "mid-cursor drain completes both batches in order"
+        );
+        assert_eq!(gaps, 1, "one gap closes the drain");
+        // No duplicates across the two drain phases.
+        let mut unique = expected.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), want.len(), "no row delivered twice");
+        let _ = inst_a;
+        let _ = inst_b;
+    }
+
     /// r6 item 2: a per-instance follower advances its cursor past rows
     /// filtered out for it, so those rows are neither sent nor re-scanned on a
     /// follow-up drain.
@@ -2438,23 +2982,22 @@ mod tests {
         let dir = tempfile::tempdir().expect("tmp");
         let store = Store::open(dir.path()).expect("store");
         store
-            .run_named("r6_seed_two_instances", |conn| {
+            .run_named("r9_seed_two_instances", |conn| {
                 conn.execute(
-                    "INSERT INTO interactions
-                        (id, instance_id, host_id, kind, state, blocking,
-                         payload_json, created_at, updated_at)
+                    "INSERT INTO settlement_events
+                        (interaction_id, instance_id, state, reason, created_at)
                      VALUES
-                        ('int_OWNED', 'ins_owned', 'hst', 'approval', 'invalidated', 0,
-                         '{}', '2026-10-07T12:00:01.000Z', '2026-10-07T12:00:01.000Z'),
-                        ('int_OTHER', 'ins_other', 'hst', 'approval', 'invalidated', 0,
-                         '{}', '2026-10-07T12:00:02.000Z', '2026-10-07T12:00:02.000Z')",
+                        ('int_OWNED', 'ins_owned', 'invalidated',
+                         'generation-ended', '2026-10-07T12:00:01.000Z'),
+                        ('int_OTHER', 'ins_other', 'invalidated',
+                         'generation-ended', '2026-10-07T12:00:02.000Z')",
                     [],
                 )?;
                 Ok(())
             })
             .await
             .expect("seed");
-        let (tx, mut rx) = mpsc::channel::<FollowMsg>(8);
+        let (tx, rx) = mpsc::channel::<FollowMsg>(8);
         let filter = vec!["ins_owned".to_string()];
         let mut cursor: Option<String> = None;
         drain_settlement_lag(&store, &filter, &mut cursor, &tx)
@@ -2463,6 +3006,7 @@ mod tests {
         drop(tx);
         let mut ids = Vec::new();
         let mut gaps = 0;
+        let mut rx = rx;
         while let Some(FollowMsg::Text(text)) = rx.recv().await {
             let frame: Value = serde_json::from_str(&text).unwrap();
             match frame["type"].as_str() {

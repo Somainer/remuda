@@ -5,6 +5,7 @@ import {
   MAX_BACKOFF_MS,
   RECOVERING_WATCHDOG_MS,
   STALE_TO_OFFLINE_MS,
+  REST_PROBE_MS,
 } from "./connection";
 
 function fakeTimers() {
@@ -36,6 +37,8 @@ function fakeTimers() {
       }
       now = deadline;
     },
+    /** Pending scheduled jobs (the machine must leave ZERO after dispose). */
+    pendingCount: () => jobs.size,
   };
 }
 
@@ -43,18 +46,25 @@ function setup() {
   const clock = fakeTimers();
   const resume = vi.fn(() => Promise.resolve());
   const probe = vi.fn(() => Promise.resolve(true));
-  const isFollowLive = vi.fn(() => true);
+  const isFollowLive = vi.fn(() => false);
+  // Whether a follow is BOUND to the current binding (false = unbound list /
+  // new-session page).
+  const isFollowBound = vi.fn(() => true);
   const onState = vi.fn();
+  const onAttemptFinish = vi.fn();
   const machine = new ConnectionMachine({
     resume,
     probe,
     isFollowLive,
+    isFollowBound,
     schedule: clock.schedule,
     cancel: clock.cancel,
+    now: clock.now,
     random: () => 0.5,
     onState,
+    onAttemptFinish,
   });
-  return { clock, resume, probe, onState, machine, isFollowLive };
+  return { clock, resume, probe, isFollowBound, onState, onAttemptFinish, machine, isFollowLive };
 }
 
 describe("ConnectionMachine", () => {
@@ -81,7 +91,8 @@ describe("ConnectionMachine", () => {
   });
 
   it("goes offline after the stale window and reconnects on the backoff", async () => {
-    const { clock, machine } = setupTracked();
+    const { clock, machine, isFollowLive } = setupTracked();
+    isFollowLive.mockReturnValue(false);
     machine.startLive();
     clock.advance(LIVE_FRAME_MS + STALE_TO_OFFLINE_MS);
     expect(machine.state).toBe("offline");
@@ -123,29 +134,861 @@ describe("ConnectionMachine", () => {
     expect(resume).toHaveBeenCalledTimes(1);
   });
 
-  it("a failed resume returns to offline, never stays recovering; next success heals", async () => {
-    const { machine } = setupTracked();
+  it("GATE8: a resume rejected after offline→online is settled and a resume runs again", async () => {
+    // Chain from review: recovering (resume in flight) → browser offline
+    // (retired the attempt) → online before it settles → the online event
+    // must start a NEW resume instead of being swallowed; the stale attempt's
+    // later rejection is dropped (the newer attempt owns the slot). Before
+    // gate 8 the online resume was coalesced away and the link sat loud
+    // offline with nothing scheduled.
+    const { machine, resume } = setupTracked();
+    resume // hold both attempts until the test settles them
+      .mockImplementationOnce(() => new Promise<void>(() => {}))
+      .mockImplementationOnce(() => new Promise<void>(() => {}));
+    machine.startLive();
+    machine.dispatch({ type: "close" });
+    machine.dispatch({ type: "resume" }); // attempt 1 in flight
+    expect(resume).toHaveBeenCalledTimes(1);
+    machine.dispatch({ type: "offline" }); // browser offline while attempt 1 runs
+    machine.dispatch({ type: "online" }); // online before attempt 1 settles
+    expect(resume).toHaveBeenCalledTimes(2); // NEW resume started (the fix)
+
+    // The stale attempt-1 rejection is ignored while attempt 2 owns recovery.
+    machine.dispatch({ type: "resumeAttempt", ok: false, attemptId: 1 });
+    await Promise.resolve();
+    expect(machine.state).toBe("recovering");
+
+    // Attempt 2 succeeds → live (the phone recovered without foreground I/O).
+    machine.dispatch({ type: "resumeAttempt", ok: true, attemptId: 2 });
+    expect(machine.state).toBe("live");
+  });
+
+  it("GATE8: the same chain with REST down keeps a loud offline reconnect clock after both attempts fail", async () => {
+    const { machine, probe, resume } = setupTracked();
+    probe.mockResolvedValue(false);
+    resume
+      .mockImplementationOnce(() => new Promise<void>(() => {}))
+      .mockImplementationOnce(() => new Promise<void>(() => {}));
+    machine.startLive();
+    machine.dispatch({ type: "close" });
+    machine.dispatch({ type: "resume" }); // attempt 1
+    machine.dispatch({ type: "offline" });
+    machine.dispatch({ type: "online" }); // attempt 2 (new resume started)
+    machine.dispatch({ type: "resumeAttempt", ok: false, attemptId: 1 }); // stale: dropped
+    await Promise.resolve();
+    expect(machine.state).toBe("recovering");
+    // Attempt 2 fails with REST unreachable → loud offline + scheduled retry.
+    machine.dispatch({ type: "resumeAttempt", ok: false, attemptId: 2 });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(machine.state).toBe("offline");
+  });
+
+  it("GATE9 item 4: the close latch is consumed once and a later framed follow survives a read timeout", async () => {
+    // Attempt 1: socket closes mid-resume; its failure settles off-live.
+    const { machine, isFollowLive, resume } = setupTracked();
+    isFollowLive.mockReturnValue(true);
+    machine.startLive();
+    machine.dispatch({ type: "close" });
+    machine.dispatch({ type: "resume" });
+    machine.dispatch({ type: "close" }); // latched
+    machine.dispatch({ type: "resumeAttempt", ok: false, attemptId: 1 });
+    await vi.waitFor(() => expect(machine.state).not.toBe("live"));
+
+    // Attempt 2 must REALLY start (assert resume call count), with a fresh
+    // frame; its REST catch-up read times out but the consumed latch means
+    // the gate-7 "framed follow survives a resume-read failure" rule applies.
+    const callsBeforeAttempt2 = resume.mock.calls.length;
+    // Attempt 2 starts while no fresh frame is in yet (isFollowLive false);
+    // its OWN frame then certifies it (set true below).
+    isFollowLive.mockReturnValue(false);
+    machine.dispatch({ type: "resume" });
+    await Promise.resolve();
+    expect(resume.mock.calls.length).toBe(callsBeforeAttempt2 + 1);
+    // Attempt 2's own follow frame arrives: isFollowLive now true (the latch
+    // must NOT still be set from attempt 1 — item 4 reset in armResumeAttempt).
+    isFollowLive.mockReturnValue(true);
+    // isFollowLive stays TRUE from attempt 1 onward (the frame at t=189
+    // proves the socket is healthy; the old code never reset isFollowLive —
+    // the latch is the only thing distinguishing attempt 1's closed socket
+    // from attempt 2's healthy one).
+    machine.dispatch({ type: "resumeAttempt", ok: false, attemptId: 2 });
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    await vi.waitFor(() => expect(machine.state).toBe("live"));
+  });
+
+  it("GATE9 item 2: a socket that closed during a resume cannot certify live after a REST failure (no false 已连接)", async () => {
+    // subscribe snapshot dispatched a frame (live) DURING the resume, then the
+    // socket closed and the resume-side REST catch-up failed. Old gate-7 logic
+    // kept false live until frame-watchdog+probe+timeout (~40 s). The close
+    // latch must make the failure arm settle like a dead link.
+    const { machine, isFollowLive } = setupTracked();
+    // Frame-certified at reject time (open+fresh timestamp), as in the race;
+    // the latch overrides it.
+    isFollowLive.mockReturnValue(true);
     machine.startLive();
     machine.dispatch({ type: "close" });
     machine.dispatch({ type: "resume" });
     expect(machine.state).toBe("recovering");
+    machine.dispatch({ type: "frame" }); // snapshot frame → live
+    expect(machine.state).toBe("live");
+    machine.dispatch({ type: "close" }); // socket dies while attempt owns it
+    expect(machine.state).toBe("live"); // close alone doesn't flip state
+
+    // REST catch-up fails: the latch forces a real-loss settlement, never
+    // staying live.
     machine.dispatch({ type: "resumeAttempt", ok: false, attemptId: 1 });
-    expect(machine.state).toBe("offline");
+    await vi.waitFor(() => expect(machine.state).not.toBe("live"));
+  });
+
+  it("GATE7: a follow close/error while a resume is in flight does not force offline (the resume settles)", async () => {
+    const { machine, isFollowLive } = setupTracked();
+    isFollowLive.mockReturnValue(false);
+    machine.startLive();
+    machine.dispatch({ type: "close" });
+    machine.dispatch({ type: "resume" });
+    expect(machine.state).toBe("recovering");
+    // The follow fails to open: its socket error/close arrive, but the resume
+    // attempt owns the outcome — no immediate offline storm.
+    machine.dispatch({ type: "error" });
+    machine.dispatch({ type: "close" });
+    expect(machine.state).toBe("recovering");
+    // Resume action rejects; probe (default true) settles quiet stale.
+    machine.dispatch({ type: "resumeAttempt", ok: false, attemptId: 1 });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(machine.state).toBe("stale");
+  });
+
+  it("c-unboundresume r2 item 2: one successful UNBOUND stale probe certifies live — no quiet resume and no episode-deadline offline", async () => {
+    // Review scenario (unbound list page, slow-but-reachable Hub):
+    //  t=15 frame-silence deadline → stale; the REST probe starts (GET #1)
+    //  t=24 GET #1 answers ok. The old code ran quietReopen → the unbound
+    //       resume issued GET #2; both 9 s reads were inside their own 10 s
+    //       deadlines, yet the episode deadline carried from t=0 fired at t=30
+    //       and published offline while GET #2 was still running.
+    // Fix: with NO bound follow the successful probe certifies its
+    // still-current binding itself — resume() is never called (no second GET)
+    // and the live certification discards the stale episode deadline.
+    const { clock, machine, resume, probe, isFollowBound, onState } = setupTracked();
+    isFollowBound.mockReturnValue(false); // unbound: session list page
+    let resolveProbe: ((ok: boolean) => void) | null = null;
+    probe.mockImplementation(() => new Promise<boolean>((resolve) => void (resolveProbe = resolve)));
+    // GET #2 (the old quiet resume's own reachability read) stays parked past
+    // the carried episode deadline, exactly like the review's t=24→33 read.
+    resume.mockImplementation(() => new Promise<void>(() => {}));
+
+    machine.startLive();
+    clock.advance(LIVE_FRAME_MS); // t=15: stale, probe timer armed
+    expect(machine.state).toBe("stale");
+    clock.advance(REST_PROBE_MS); // t=30: GET #1 in flight (held)
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(resume).not.toHaveBeenCalled();
+
+    // GET #1 answers ok 9 s later (still inside the carried 30 s episode
+    // deadline, as in the review timeline).
+    clock.advance(9_000);
+    const offlineEvents: string[] = [];
+    onState.mockImplementation((s: string) => {
+      if (s === "offline") offlineEvents.push(s);
+    });
+    resolveProbe!(true);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // The probe itself certifies the unbound binding live: no resume GET.
+    expect(machine.state).toBe("live");
+    expect(resume).not.toHaveBeenCalled();
+    expect(probe).toHaveBeenCalledTimes(1);
+
+    // Past the stale episode's 30 s deadline the certification must hold:
+    // the deadline was discarded on live, so no offline/reconnect fires.
+    clock.advance(60_000);
+    expect(machine.state).toBe("live");
+    expect(offlineEvents).toEqual([]);
+    expect(resume).not.toHaveBeenCalled();
+  });
+
+  it("GATE7: a blocked follow upgrade during a quiet stale reopen keeps the machine quiet stale", async () => {
+    const { clock, machine, resume } = setupTracked();
+    resume.mockReturnValue(new Promise<void>(() => {})); // blocked upgrade: never resolves
+    machine.startLive();
+    clock.advance(LIVE_FRAME_MS); // stale
+    clock.advance(REST_PROBE_MS); // probe ok → quiet reopen (stays stale)
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(machine.state).toBe("stale");
+    expect(resume).toHaveBeenCalledTimes(1);
+    // Follow upgrade blocked: failure keeps stale (never recovering/offline).
+    machine.dispatch({ type: "resumeAttempt", ok: false, attemptId: 1 });
+    expect(machine.state).toBe("stale");
+  });
+
+  it("GATE7: a failed resume with REST reachable settles quiet at stale; a later success heals", async () => {
+    const { machine, isFollowLive } = setupTracked();
+    isFollowLive.mockReturnValue(false);
+    machine.startLive();
+    machine.dispatch({ type: "close" });
+    machine.dispatch({ type: "resume" });
+    expect(machine.state).toBe("recovering");
+    // probe() resolves true by default: follow blocked but REST works → stale.
+    machine.dispatch({ type: "resumeAttempt", ok: false, attemptId: 1 });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(machine.state).toBe("stale");
     machine.dispatch({ type: "resume" });
     machine.dispatch({ type: "resumeAttempt", ok: true, attemptId: 2 });
     expect(machine.state).toBe("live");
   });
 
-  it("the recovering watchdog forces offline if resume hangs", () => {
+  it("a failed resume with REST unreachable returns to loud offline", async () => {
+    const { machine, isFollowLive, probe } = setupTracked();
+    isFollowLive.mockReturnValue(false);
+    probe.mockResolvedValue(false);
+    machine.startLive();
+    machine.dispatch({ type: "close" });
+    machine.dispatch({ type: "resume" });
+    machine.dispatch({ type: "resumeAttempt", ok: false, attemptId: 1 });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(machine.state).toBe("offline");
+  });
+
+  it("GATE7: a failed resume ACTION stays live when its follow socket is already frame-certified", async () => {
+    // The resume-side REST catch-up read can reject/timeout under load after
+    // the follow it opened started streaming frames. Forcing offline there
+    // tears down a working follow and storms offline↔recovering (the restored
+    // page's banner then never cleared). Frames + the frame watchdog own this
+    // link; the failed read must not take it down.
+    const { machine, resume, isFollowLive } = setupTracked();
+    isFollowLive.mockReturnValue(true); // follow already streaming frames
+    resume.mockRejectedValueOnce(new Error("resume read failed"));
+    machine.startLive();
+    machine.dispatch({ type: "close" });
+    machine.dispatch({ type: "resume" });
+    expect(machine.state).toBe("recovering");
+    // the
+    // rejection settles as live once the microtask runs.
+    await vi.waitFor(() => expect(machine.state).toBe("live"));
+    // The rejected attempt schedules nothing against the certified link.
+    const calls = resume.mock.calls.length;
+    // (clock isn't advanced; no timers in the live state but the frame
+    // watchdog, which is silent here.)
+    expect(calls).toBe(1);
+  });
+
+  it("GATE10 item 3: the REAL followBound() (no rebind) arms no bind timer during an in-flight reopen and never flashes recovering", async () => {
+    // Real store path: openFollowSocket → followBound() with NO rebind flag,
+    // while resumeConnection's resume() is in flight. The resume HANGS past
+    // LIVE_FRAME_MS (snapshot timeout 10 s can exceed it); with the old code
+    // followBound armed a 15 s bind timer that fires beginResume after the
+    // resume later rejects and settles quiet stale → loud recovering flash on
+    // every blocked-upgrade cycle.
+    const { clock, machine, resume, onState } = setupTracked();
+    let rejectResume: ((e: Error) => void) | null = null;
+    resume.mockImplementation(() => {
+      machine.followBound(); // store binds before awaiting the socket
+      return new Promise<void>((_res, rej) => void (rejectResume = rej));
+    });
+    machine.startLive();
+    clock.advance(LIVE_FRAME_MS); // t=15 silent → stale
+    const recoveringEvents: string[] = [];
+    onState.mockImplementation((s: string) => {
+      if (s === "recovering") recoveringEvents.push(s);
+    });
+
+    // Probe fires at t=30 → quiet reopen: resume hangs, followBound must NOT
+    // arm a competing bind timer (it sees resumeInFlight=true and returns).
+    clock.advance(REST_PROBE_MS);
+    await Promise.resolve();
+    expect(resume).toHaveBeenCalledTimes(1);
+    expect(machine.state).toBe("stale"); // quiet reopen stays stale
+    // Gate 11 item 8c: assert BY TIMER NAME — no `bind` during the in-flight
+    // resume (the watchdog/episode deadline own this window).
+    const timerNames = () =>
+      [...(machine as unknown as { timers: Map<string, unknown> }).timers.keys()];
+    expect(timerNames()).not.toContain("bind");
+    expect(timerNames()).toContain("offline");
+
+    // t=45: with the fix NOTHING happens (no bind timer). The old code's bind
+    // timer would fire here and begin a (coalesced) resume; more importantly
+    // when the resume later rejects to stale, that timer stays armed and
+    // beginResume flashes recovering.
+    // t=44 still inside the episode deadline: nothing fired.
+    clock.advance(LIVE_FRAME_MS - 1);
+    expect(machine.state).toBe("stale");
+    expect(resume).toHaveBeenCalledTimes(1);
+    expect(recoveringEvents).toEqual([]);
+    // t=45: the episode deadline fires loud offline (the quiet resume is
+    // retired WITHOUT the offline flag — gate 10 item 4).
+    clock.advance(1);
+    expect(machine.state).toBe("offline");
+
+    // The quiet resume rejects AFTER the deadline: dropped, no state bounce.
+    rejectResume!(new Error("FOLLOW_SNAPSHOT_TIMEOUT"));
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(machine.state).toBe("offline");
+    expect(recoveringEvents).toEqual([]);
+  });
+
+  it("GATE11 item 1: a recovering resume's non-rebind followBound() arms NO bind timer and the quiet stale settlement never flashes recovering", async () => {
+    // Timeline (§5.2.1 recovering row → bind cell "—（非 rebind 且
+    // resumeInFlight 时 followBound 跳过）"):
+    // t=0  recovering resume starts; store.openFollowSocket binds via
+    //      followBound() with NO rebind while the attempt is in flight.
+    // t=10 the subscribe snapshot times out → resume rejects → settle probe
+    //      ok → quiet stale at ~10.1.
+    // t=15 the competing `bind` deadline the OLD code armed would fire
+    //      beginResume (wasLive captured recovering=false) → recovering flash.
+    const { clock, machine, resume, onState } = setupTracked();
+    let rejectResume: ((e: Error) => void) | null = null;
+    resume.mockImplementation(() => {
+      machine.followBound(); // openFollowSocket binds before awaiting subscribe
+      return new Promise<void>((_resolve, reject) => void (rejectResume = reject));
+    });
+    const timerNames = () =>
+      [...(machine as unknown as { timers: Map<string, unknown> }).timers.keys()];
+    machine.startLive();
+    machine.dispatch({ type: "close" });
+    machine.dispatch({ type: "resume" }); // attempt 1 in flight, t=0
+    expect(machine.state).toBe("recovering");
+    // The in-flight NON-rebind bind must skip arming `bind` (assert BY NAME).
+    expect(timerNames()).not.toContain("bind");
+
+    // Snapshot timeout at t=10, REST settlement probe ok → quiet stale.
+    clock.advance(10_000);
+    rejectResume!(new Error("FOLLOW_SNAPSHOT_TIMEOUT"));
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(machine.state).toBe("stale");
+    // The stale arm of the settled resume owns no `bind` either.
+    expect(timerNames()).not.toContain("bind");
+
+    // t=15: no recovering banner from a ghost bind deadline.
+    const recoveringAfterSettle: string[] = [];
+    onState.mockImplementation((s: string) => {
+      if (s === "recovering") recoveringAfterSettle.push(s);
+    });
+    clock.advance(5_000);
+    expect(machine.state).toBe("stale");
+    expect(recoveringAfterSettle).toEqual([]);
+    expect(resume).toHaveBeenCalledTimes(1);
+  });
+
+  it("GATE11 item 6: a stale probe answering for an OLD attempt id cannot take the newer ACTIVE quiet attempt offline", async () => {
+    // Same binding, no navigation:
+    //  t=30 stale probe P starts (no attempt in flight; captures attempt id 0)
+    //  t=31 a LATER stale cycle answers ok -> quietReopen starts attempt 1; its
+    //       resume is DEFERRED, so the attempt is PROVABLY active (state stays
+    //       stale, resumeInFlight=true, attemptRef id 1)
+    //  t=35 P answers FALSE. P's generation matches, so the gen-only gate
+    //       accepted it and goOfflineAndSchedule flipped the link offline
+    //       while attempt 1 was still genuinely in flight — even though
+    //       attempt 1 owns the decision. The probe must capture
+    //       resumeAttemptId too and require BOTH to match.
+    const { clock, machine, probe, resume, onState } = setupTracked();
+    const pResolvers: ((ok: boolean) => void)[] = [];
+    let resumeCalls = 0;
+    let rejectQuiet: ((e: Error) => void) | null = null;
+    probe.mockImplementation(
+      () => new Promise<boolean>((resolve) => pResolvers.push(resolve)),
+    );
+    resume.mockImplementation(() => {
+      resumeCalls += 1;
+      // The quiet attempt's resume stays pending (active) until released.
+      return new Promise<void>((_resolve, reject) => {
+        if (resumeCalls === 1) rejectQuiet = reject;
+      });
+    });
+    machine.startLive();
+    clock.advance(LIVE_FRAME_MS); // t=15 stale
+    clock.advance(REST_PROBE_MS); // t=30: stale probe P in flight (id 0)
+    expect(pResolvers).toHaveLength(1);
+
+    // t=31: a later stale cycle answers ok DIRECTLY: quietReopen attempt 1
+    // starts and stays active (deferred resume); state remains quiet stale.
+    machine.dispatch({ type: "probe", ok: true });
+    await Promise.resolve();
+    expect(resume).toHaveBeenCalledTimes(1);
+    expect(machine.state).toBe("stale");
+    expect((machine as unknown as { resumeInFlight: boolean }).resumeInFlight).toBe(true);
+    expect(machine.attemptRef()).toEqual({ gen: 0, attemptId: 1 });
+
+    // t=35: the stale P answers false while attempt 1 is ACTIVE: dropped (id
+    // 0 != 1) — no offline banner, attempt still owns the link.
+    const offlineEvents: string[] = [];
+    onState.mockImplementation((s: string) => {
+      if (s === "offline") offlineEvents.push(s);
+    });
+    pResolvers[0]!(false);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(machine.state).toBe("stale");
+    expect((machine as unknown as { resumeInFlight: boolean }).resumeInFlight).toBe(true);
+    expect(offlineEvents).toEqual([]);
+
+    // The quiet attempt later rejects: a quiet failure merely re-arms the
+    // stale probe/offline timers, state stays quiet stale; P never changed
+    // anything and no offline transition ever happened.
+    rejectQuiet!(new Error("snapshot timeout"));
+    for (let i = 0; i < 4; i += 1) await Promise.resolve();
+    expect(machine.state).toBe("stale");
+    expect(offlineEvents).toEqual([]);
+  });
+
+  it("GATE11 item 2: the close latch is CONSUMED by attempt A's completion; quiet attempt B's own frame survives B's rejection", async () => {
+    // §5.2.1 recovering row -> watchdog cell: EVERY attempt arm starts with a
+    // clean latch and a completion consumes it. A (loud) closes while active
+    // and settles quiet stale via the REST probe; B is the later QUIET reopen
+    // (deferred resume), certifies its OWN link with a frame, then its promise
+    // rejects — the gate-7 framed-follow rule must keep B live. Gate 10 deleted
+    // the consume, so A's latch poisoned B into recovering+settle-probe.
+    const { clock, machine, resume, probe, isFollowLive } = setupTracked();
+    isFollowLive.mockReturnValue(false);
+    let rejectB: ((e: Error) => void) | null = null;
+    resume
+      .mockImplementationOnce(() => new Promise<void>(() => {})) // A hangs
+      .mockImplementationOnce(
+        () => new Promise<void>((_resolve, reject) => void (rejectB = reject)),
+      );
+    machine.startLive();
+    machine.dispatch({ type: "close" });
+    machine.dispatch({ type: "resume" }); // attempt A (loud) in flight
+    machine.dispatch({ type: "close" }); // socket dies mid-A: latch set
+    // A settles (REST reachable): quiet stale; its completion CONSUMES latch.
+    machine.dispatch({ type: "resumeAttempt", ok: false, attemptId: 1 });
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(machine.state).toBe("stale");
+    expect(probe).toHaveBeenCalledTimes(1);
+
+    // Quiet reopen B starts from the stale probe (deferred resume).
+    clock.advance(REST_PROBE_MS);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(resume).toHaveBeenCalledTimes(2);
+    expect(machine.state).toBe("stale");
+    // The stale cycle fired one more probe to trigger B; B's failure must not
+    // schedule any settlement probe of its own.
+    const probesAtBArm = probe.mock.calls.length;
+    expect(probesAtBArm).toBe(2);
+
+    // B's own follow frames: it is genuinely live.
+    isFollowLive.mockReturnValue(true);
+    machine.dispatch({ type: "frame" });
+    expect(machine.state).toBe("live");
+    // B's promise rejects (a trailing REST read timeout): stays live.
+    rejectB!(new Error("resume-side read timed out"));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(machine.state).toBe("live");
+    // No extra settle probe from B: its failure never left live.
+    expect(probe).toHaveBeenCalledTimes(probesAtBArm);
+  });
+
+  it("GATE11 item 2: the latch is reset by the QUIET arm when A was retired by its watchdog without a completion", async () => {
+    // A's watchdog (not its promise completion) settles it quiet stale, so no
+    // completion ever consumed A's close latch. The quiet reopen arm
+    // (armResumeAttemptQuiet) must reset the latch itself; otherwise B's
+    // frame-certified follow is poisoned by A's dead socket.
+    const { clock, machine, resume, isFollowLive } = setupTracked();
+    isFollowLive.mockReturnValue(false);
+    let rejectB: ((e: Error) => void) | null = null;
+    resume
+      .mockImplementationOnce(() => new Promise<void>(() => {})) // A hangs; watchdog retires it
+      .mockImplementationOnce(
+        () => new Promise<void>((_resolve, reject) => void (rejectB = reject)),
+      );
+    machine.startLive();
+    machine.dispatch({ type: "close" });
+    machine.dispatch({ type: "resume" }); // A
+    machine.dispatch({ type: "close" }); // A's socket dead: latch set
+    expect(machine.state).toBe("recovering");
+    // Watchdog gives up on A; REST probe ok settles quiet stale.
+    clock.advance(RECOVERING_WATCHDOG_MS);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(machine.state).toBe("stale");
+
+    // Quiet reopen B; its resume is deferred.
+    clock.advance(REST_PROBE_MS);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(resume).toHaveBeenCalledTimes(2);
+
+    // B frames, then rejects: must stay live (latch was reset at B's arm).
+    isFollowLive.mockReturnValue(true);
+    machine.dispatch({ type: "frame" });
+    expect(machine.state).toBe("live");
+    rejectB!(new Error("read timed out"));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(machine.state).toBe("live");
+  });
+
+  it("GATE11 item 2: a completion CONSUMES the latch immediately even with no later attempt armed (white-box field contract)", async () => {
+    // Every read of the latch is a later attempt's completion, and every arm
+    // resets — so the consume-at-completion is unobservable through state in
+    // the happy ordering, but the field MUST be false the instant A's own
+    // completion returns (the latch is A's, not ambient state): a late
+    // close/open frame sequence before the next arm must not inherit it.
+    const { machine, isFollowLive } = setupTracked();
+    isFollowLive.mockReturnValue(false);
+    machine.startLive();
+    machine.dispatch({ type: "close" });
+    machine.dispatch({ type: "resume" }); // A
+    machine.dispatch({ type: "close" }); // latched
+    expect((machine as unknown as { closedDuringResume: boolean }).closedDuringResume).toBe(true);
+    // A settles (REST reachable) to quiet stale: completion consumes.
+    machine.dispatch({ type: "resumeAttempt", ok: false, attemptId: 1 });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect((machine as unknown as { closedDuringResume: boolean }).closedDuringResume).toBe(false);
+
+    // The successful arm stays clean too.
+    machine.dispatch({ type: "resume" }); // B (loud)
+    machine.dispatch({ type: "resumeAttempt", ok: true, attemptId: 2 });
+    expect((machine as unknown as { closedDuringResume: boolean }).closedDuringResume).toBe(false);
+  });
+
+  it("GATE11 item 8b: a rebind after a retired quiet reopen arms a NEW probe that STARTS the attempt before the inherited offline deadline", async () => {
+    // gate 10's version only asserted the carried offline deadline fired; that
+    // passes without the rebind-stale re-arm (armStaleProbeTimers) because the
+    // quiet arm deliberately keeps the offline timer. Here the NEW probe is
+    // required to fire and start a real quiet attempt strictly before the
+    // inherited deadline; without the re-arm the rebind arms `bind` instead,
+    // whose follow-up probe lands AFTER the deadline and never starts.
+    const { clock, machine, resume } = setupTracked();
+    const timerNames = () =>
+      [...(machine as unknown as { timers: Map<string, unknown> }).timers.keys()];
+    resume.mockImplementation(() => new Promise<void>(() => {})); // blocked upgrades
+    machine.startLive();
+    clock.advance(LIVE_FRAME_MS); // t=15 stale: probe t=30, offline deadline t=45
+    await Promise.resolve(); // drain frame-watchdog settle
+
+    // The REST probe answers a moment early (t=29): quiet reopen attempt A
+    // starts and clears the stale/probe/reconnect timers, offline carried.
+    clock.advance(STALE_TO_OFFLINE_MS - REST_PROBE_MS - 1_000);
+    await Promise.resolve(); // drain (probe timer not yet due)
+    machine.dispatch({ type: "probe", ok: true });
+    await Promise.resolve(); // quietReopen -> resume call
+    expect(resume).toHaveBeenCalledTimes(1);
+    // Navigate away: noteBinding retires A (watchdog cleared). Only the
+    // carried offline deadline remains.
+    machine.noteBinding(1);
+    // Navigate back into the mounted stale session: rebind must re-arm the
+    // STALE timers — probe at t=44, inherited offline at t=45.
+    machine.followBound({ rebind: true });
+    expect(timerNames()).toContain("probe");
+    expect(timerNames()).not.toContain("bind");
+
+    // t=44: the NEW probe fires; its ok answer starts quiet attempt B BEFORE
+    // the inherited deadline.
+    clock.advance(REST_PROBE_MS);
+    await Promise.resolve(); // probe promise
+    await Promise.resolve(); // continuation -> dispatch -> quietReopen B
+    expect(resume).toHaveBeenCalledTimes(2);
+    expect(machine.attemptRef()).not.toBeNull(); // B genuinely in flight
+    expect(machine.state).toBe("stale");
+
+    // t=45: the inherited deadline still owns the loud transition (gate 10
+    // item 4 retires B without the offline flag).
+    clock.advance(1_000);
+    await Promise.resolve(); // drain goOfflineAndSchedule/scheduleReconnect
+    expect(machine.state).toBe("offline");
+  });
+
+  it("GATE9 item 1: the stale deadline does not leak across stale→offline→recovering→stale (no sub-second resume storm)", async () => {
+    // Exact review sequence: live → stale (D armed) → probe fails → offline
+    // (Hub really gone) → Hub back with REST ok but follow upgrades refused
+    // → reconnect → recovering → resume rejects → settle probe ok → stale.
+    // Before gate 9 the carried D was already in the past, so the stale entry
+    // fired at 0 ms and reconnected on a 0–500 ms jitter forever.
+    const { clock, machine, probe, resume } = setupTracked();
+    resume.mockReturnValue(new Promise<void>(() => {})); // upgrades refused
+    machine.startLive();
+    clock.advance(LIVE_FRAME_MS); // stale, D = 30 s
+    await Promise.resolve(); // drain frame-watchdog settle
+    expect(machine.state).toBe("stale");
+
+    // Probe fails (REST down): loud offline, D must clear. The probe timer
+    // delivers the false answer itself — mock before the advance and drain its
+    // continuation instead of dispatching by hand.
+    probe.mockResolvedValue(false);
+    clock.advance(REST_PROBE_MS);
+    await Promise.resolve(); // probe promise
+    await Promise.resolve(); // continuation -> dispatch probe false
+    expect(machine.state).toBe("offline");
+
+    // Hub back: online → recovering; resume rejects (upgrades still blocked);
+    // settle probe now succeeds → quiet stale with a FRESH 30 s deadline.
+    probe.mockResolvedValue(true);
+    machine.dispatch({ type: "online" }); // attempt 1
+    expect(machine.state).toBe("recovering");
+    // The resume (upgrades refused) is a hanging promise; reject it so the
+    // settle probe continuation actually runs, then drain it fully.
+    expect(resume).toHaveBeenCalledTimes(1);
+    machine.dispatch({ type: "resumeAttempt", ok: false, attemptId: 1 });
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(machine.state).toBe("stale");
+
+    // No sub-second reconnect storm. Inside the FRESH 30 s window the only
+    // legitimate activity is a probe-driven QUIET reopen: it starts and stays
+    // in quiet stale until the episode deadline retires it — a loud reconnect
+    // clock must never appear inside the window.
+    const timerNames = () =>
+      [...(machine as unknown as { timers: Map<string, unknown> }).timers.keys()];
+    const callsAtStale = resume.mock.calls.length;
+    expect(callsAtStale).toBe(1); // the one loud online resume
+
+    // The fresh stale probe starts exactly one quiet attempt.
+    clock.advance(REST_PROBE_MS);
+    await Promise.resolve(); // probe promise
+    await Promise.resolve(); // probe continuation -> dispatch -> quietReopen
+    expect(resume.mock.calls.length).toBe(callsAtStale + 1);
+    expect(machine.attemptRef()).not.toBeNull(); // quiet attempt STARTED
+    expect(machine.state).toBe("stale");
+    expect(timerNames()).not.toContain("reconnect"); // no loud clock
+
+    // One ms before the fresh bound the quiet attempt is still the only owner
+    // — retired by nothing, no reconnect scheduled early.
+    clock.advance(STALE_TO_OFFLINE_MS - REST_PROBE_MS - 1);
+    await Promise.resolve(); // drain any fired continuations
+    expect(machine.state).toBe("stale");
+    expect(machine.attemptRef()).not.toBeNull();
+    expect(timerNames()).not.toContain("reconnect");
+    expect(resume.mock.calls.length).toBe(callsAtStale + 1);
+
+    // At the bound: RETIREMENT via the episode deadline (gate 10 item 4 — no
+    // offline flag), loud offline; the autonomous reconnect is scheduled only
+    // AFTER this point.
+    clock.advance(1);
+    await Promise.resolve(); // goOfflineAndSchedule schedules reconnect async-safe
+    expect(machine.state).toBe("offline");
+    expect(machine.attemptRef()).toBeNull();
+    expect(timerNames()).toContain("reconnect");
+    expect(resume.mock.calls.length).toBe(callsAtStale + 1);
+  });
+
+  it("GATE10 item 4: episode-deadline offline during a quiet resume ignores the late rejection (reconnect owns recovery)", async () => {
+    // Timeline: stale (deadline t=45) → probe ok at t=30 → quiet reopen with
+    // a resume that rejects at t=45.1 → deadline fires at t=45 while the
+    // resume is still in flight. The rejection must NOT bounce offline back
+    // to quiet stale (which let the queued reconnect flash recovering twice).
+    const { clock, machine, resume, onState } = setupTracked();
+    let rejectResume: ((e: Error) => void) | null = null;
+    resume.mockImplementation(
+      () => new Promise<void>((_resolve, reject) => void (rejectResume = reject)),
+    );
+    machine.startLive();
+    clock.advance(LIVE_FRAME_MS); // t=15 stale, deadline t=45
+
+    // One probe cycle (t=30): quiet reopen starts, resume hangs.
+    clock.advance(REST_PROBE_MS);
+    await Promise.resolve();
+    expect(resume).toHaveBeenCalledTimes(1);
+    expect(machine.state).toBe("stale");
+
+    // t=45: the episode deadline fires loud offline and schedules a reconnect.
+    clock.advance(STALE_TO_OFFLINE_MS - REST_PROBE_MS);
+    expect(machine.state).toBe("offline");
+
+    // The quiet resume rejects AFTER the deadline: it must be ignored (no
+    // quiet-stale bounce, exactly one reconnect-driven resume follows).
+    const callsAtDeadline = resume.mock.calls.length;
+    rejectResume!(new Error("snapshot timeout"));
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(machine.state).toBe("offline");
+    // No second resume was triggered by the late rejection itself.
+    expect(resume.mock.calls.length).toBe(callsAtDeadline);
+    // The machine never published a recovering bounce from the rejection.
+    expect(
+      onState.mock.calls.map((c) => c[0] as string).filter((s) => s === "recovering").length,
+    ).toBe(0);
+  });
+
+  it("GATE10 item 3: A's deferred settle probe resolving after navigation to framed B never demotes B (ok and not-ok)", async () => {
+    for (const probeOk of [true, false]) {
+      const { machine, probe } = setupTracked();
+      let resolveProbe: ((ok: boolean) => void) | null = null;
+      probe.mockImplementation(
+        () => new Promise<boolean>(res => void (resolveProbe = res)),
+      );
+      machine.startLive();
+      // A's follow fails mid-resume → settle probe starts and hangs.
+      machine.dispatch({ type: "close" });
+      machine.dispatch({ type: "resume" });
+      machine.dispatch({ type: "resumeAttempt", ok: false, attemptId: 1 });
+      await Promise.resolve();
+      expect(resolveProbe).not.toBeNull();
+
+      // User navigates to B: a fresh binding with a framed healthy socket.
+      machine.noteBinding(2);
+      machine.dispatch({ type: "frame" });
+      expect(machine.state).toBe("live");
+
+      // A's probe now resolves (both outcomes): B must stay live.
+      resolveProbe!(probeOk);
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(machine.state).toBe("live");
+    }
+  });
+
+  it("GATE10 item 2: re-arming a timer cancels the OLD handle (no orphan fires in a later episode)", () => {
+    // stale at t=0 arms an offline deadline at t=30. A rebind re-arms stale at
+    // t=20 (new deadline t=50). A frame at t=25 returns to live and clears the
+    // replacement; a fresh stale at t=40 gets a deadline t=70. With the OLD
+    // code (timers.set without cancelling) the orphan t=30 deadline fires
+    // inside the live episode at t=30 and wrongly takes it offline.
     const { clock, machine } = setupTracked();
+    machine.startLive();
+    clock.advance(LIVE_FRAME_MS); // t=15 stale, deadline t=45
+    expect(machine.state).toBe("stale");
+    // Re-arm (a rebind re-arms the stale timers) at a later point: the first
+    // offline handle is replaced.
+    clock.advance(5_000); // t=20
+    machine.followBound({ rebind: true }); // re-arms stale timers (no resume in flight here)
+    // Frame certifies live and clears the replacement deadline.
+    machine.dispatch({ type: "frame" }); // t=20 live
+    expect(machine.state).toBe("live");
+    // Fresh stale at t=35 → deadline t=65.
+    clock.advance(LIVE_FRAME_MS); // t=35 stale
+    expect(machine.state).toBe("stale");
+    // t=45: the ORIGINAL orphan deadline would fire here. It must not.
+    clock.advance(10_000);
+    expect(machine.state).toBe("stale");
+    // The fresh episode's own deadline at t=65 still fires.
+    clock.advance(STALE_TO_OFFLINE_MS - 10_000);
+    expect(machine.state).toBe("offline");
+  });
+
+  it("GATE11 item 8a: dispose leaves ZERO scheduler jobs after real arms and handle replacements", () => {
+    // Exercise genuine jobs and REPLACED handles (a cancel implementation that
+    // drops only the last handle would leave the replaced jobs scheduled),
+    // then dispose and assert the scheduler itself has no pending job.
+    const { clock, machine, resume } = setupTracked();
+    machine.startLive(); // frame-watchdog job
+    machine.dispatch({ type: "frame" }); // replaces the frame job
+    clock.advance(LIVE_FRAME_MS); // fires frame job; stale arms probe+offline
+    machine.followBound({ rebind: true }); // stale re-arm REPLACES probe+offline
+    machine.dispatch({ type: "close" }); // clears them; goOfflineAndSchedule arms reconnect
+    expect(clock.pendingCount()).toBe(1);
+
+    machine.dispose();
+    expect(clock.pendingCount()).toBe(0);
+
+    // Nothing fires afterwards: no state change, no resume.
+    clock.advance(600_000);
+    expect(machine.state).toBe("offline");
+    expect(resume).not.toHaveBeenCalled();
+  });
+
+  it("GATE8/10 item 8+5: quiet stale bound is enforced during a REAL quiet reopen", async () => {
+    // Drain the probe().then continuation so quietReopen actually runs
+    // (resume invoked), then advance to the ORIGINAL deadline: the quiet
+    // resume keeps the offline timer armed (gate 10 item 5), so the bound is
+    // enforced even while the reopen is in flight.
+    const { clock, machine, resume } = setupTracked();
+    resume.mockReturnValue(new Promise<void>(() => {})); // blocked upgrade
+    machine.startLive();
+    clock.advance(LIVE_FRAME_MS); // t=15 stale, deadline t=45
+    clock.advance(REST_PROBE_MS); // t=30 probe ok
+    await Promise.resolve(); // drain probe().then → quietReopen + resume called
+    expect(resume).toHaveBeenCalledTimes(1);
+    expect(machine.state).toBe("stale");
+    // t=45: the carried offline deadline fires despite the in-flight reopen.
+    clock.advance(STALE_TO_OFFLINE_MS - REST_PROBE_MS);
+    expect(machine.state).toBe("offline");
+  });
+
+  it("GATE8 item 8: a good frame/live resets the stale deadline", () => {
+    const { clock, machine } = setupTracked();
+    machine.startLive();
+    clock.advance(LIVE_FRAME_MS); // stale, deadline armed
+    machine.dispatch({ type: "frame" }); // back to live, deadline cleared
+    clock.advance(LIVE_FRAME_MS); // stale again — fresh deadline, not the old
+    expect(machine.state).toBe("stale");
+    // Old deadline (15 s into this stale window) must not fire early.
+    clock.advance(STALE_TO_OFFLINE_MS - 1);
+    expect(machine.state).toBe("stale");
+    clock.advance(1);
+    expect(machine.state).toBe("offline");
+  });
+
+  it("GATE7+8 item 7: the recovering watchdog certifies live AND reports why=watchdog exactly once", () => {
+    const { clock, machine, resume, isFollowLive, onAttemptFinish } = setupTracked();
+    isFollowLive.mockReturnValue(true); // follow open + freshly framed
+    resume.mockReturnValue(new Promise<void>(() => {})); // hangs
+    machine.startLive();
+    machine.dispatch({ type: "close" });
+    machine.dispatch({ type: "resume" });
+    expect(machine.state).toBe("recovering");
+    // stay live under the frame watchdog rather
+    // than going offline and scheduling a socket replacement.
+    clock.advance(RECOVERING_WATCHDOG_MS);
+    expect(machine.state).toBe("live");
+    // Gate 8 item 7: the early live return must still honour the
+    // exactly-once onAttemptFinish contract (store's owed-catch-up fallback).
+    expect(onAttemptFinish).toHaveBeenCalledTimes(1);
+    expect(onAttemptFinish).toHaveBeenCalledWith(
+      expect.objectContaining({ why: "watchdog" }),
+    );
+    const callsAtCertify = resume.mock.calls.length;
+    clock.advance(MAX_BACKOFF_MS + 1_000);
+    expect(resume.mock.calls.length).toBe(callsAtCertify);
+    expect(onAttemptFinish).toHaveBeenCalledTimes(1);
+  });
+
+  it("GATE7: a scheduled reconnect tick never replaces a frame-certified follow", () => {
+    const { clock, machine, resume, isFollowLive } = setupTracked();
+    isFollowLive.mockReturnValue(true); // follow re-certified before the tick
+    machine.startLive();
+    machine.dispatch({ type: "close" });
+    expect(machine.state).toBe("offline");
+    clock.advance(250); // attempt-0 full-jitter delay with random()=0.5
+    expect(machine.state).toBe("live");
+    expect(resume).not.toHaveBeenCalled();
+    clock.advance(MAX_BACKOFF_MS + 1_000);
+    expect(resume).not.toHaveBeenCalled();
+  });
+
+  it("GATE7: the recovering watchdog with REST reachable settles quiet stale; a dead Hub stays offline", async () => {
+    const { clock, machine, isFollowLive, probe } = setupTracked();
+    isFollowLive.mockReturnValue(false);
     machine.startLive();
     machine.dispatch({ type: "close" });
     machine.dispatch({ type: "resume" });
     expect(machine.state).toBe("recovering");
     clock.advance(RECOVERING_WATCHDOG_MS);
-    expect(machine.state).toBe("offline");
+    // probe() resolves true by default: REST reachable → quiet stale.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(machine.state).toBe("stale");
     // A late response after the watchdog must not resurrect the attempt.
     machine.dispatch({ type: "resumeAttempt", ok: true, attemptId: 1 });
+    expect(machine.state).toBe("stale");
+
+    // REST gone too → loud offline.
+    probe.mockResolvedValue(false);
+    machine.dispatch({ type: "close" });
+    machine.dispatch({ type: "resume" });
+    clock.advance(RECOVERING_WATCHDOG_MS);
+    await Promise.resolve();
+    await Promise.resolve();
     expect(machine.state).toBe("offline");
   });
 
@@ -154,7 +997,9 @@ describe("ConnectionMachine", () => {
     // while B is still pending, then B fails. A's completion must be dropped
     // (it is not the current attempt) and B's failure must land offline —
     // never a false live certified by the dead attempt A.
-    const { clock, machine, resume } = setupTracked();
+    const { clock, machine, resume, isFollowLive, probe } = setupTracked();
+    isFollowLive.mockReturnValue(false);
+    probe.mockResolvedValue(false); // genuinely unreachable: failures land offline
     let resolveA: () => void = () => {};
     let rejectB: (err: Error) => void = () => {};
     resume
@@ -176,8 +1021,10 @@ describe("ConnectionMachine", () => {
     clock.advance(250);
     expect(machine.state).toBe("recovering");
     expect(resume).toHaveBeenCalledTimes(1);
-    // A hangs past the watchdog: offline, reconnect scheduled.
+    // A hangs past the watchdog; REST is down too → offline (probe settles).
     clock.advance(RECOVERING_WATCHDOG_MS);
+    await Promise.resolve();
+    await Promise.resolve();
     expect(machine.state).toBe("offline");
     // Watchdog bumped the attempt to 2: backoff is 1000 ms (cap 2_000 * 0.5).
     clock.advance(1_000);
@@ -193,9 +1040,7 @@ describe("ConnectionMachine", () => {
 
     // B then fails: the machine goes offline, never live.
     rejectB(new Error("follow reopen failed"));
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(machine.state).toBe("offline");
+    await vi.waitFor(() => expect(machine.state).toBe("offline"));
   });
 
   it("hiding the page cancels the offline reconnect clock", () => {
@@ -208,7 +1053,7 @@ describe("ConnectionMachine", () => {
     expect(machine.state).toBe("offline");
   });
 
-  it("a successful REST probe triggers reopen+catch-up, never a false live", async () => {
+  it("GATE7: a successful REST probe QUIETLY reopens the follow while staying stale, never a false live", async () => {
     const { clock, machine, probe, resume } = setupTracked();
     machine.startLive();
     clock.advance(LIVE_FRAME_MS);
@@ -216,15 +1061,18 @@ describe("ConnectionMachine", () => {
     clock.advance(15_000);
     expect(probe).toHaveBeenCalledTimes(1);
     await Promise.resolve();
-    // REST reachable is not live: it forces a resume (socket reopen+catch-up),
-    // which certifies live only on success.
-    expect(machine.state).toBe("recovering");
+    // REST reachable is not live: a follow reopen runs (resume invoked) but the
+    // machine stays QUIET stale while it tries — no recovering banner. Success
+    // certifies live via the resume result/frame, failure returns to stale.
+    expect(machine.state).toBe("stale");
     expect(resume).toHaveBeenCalledTimes(1);
+    machine.dispatch({ type: "resumeAttempt", ok: true, attemptId: 1 });
+    expect(machine.state).toBe("live");
   });
 
   it("backoff is full-jitter within the doubling 30 s cap", () => {
     const withRandom = (r: number) =>
-      new ConnectionMachine({ resume: async () => {}, probe: async () => true, isFollowLive: () => true, random: () => r }).backoffDelay(10);
+      new ConnectionMachine({ resume: async () => {}, probe: async () => true, isFollowLive: () => true, isFollowBound: () => true, random: () => r }).backoffDelay(10);
     expect(withRandom(0)).toBe(0);
     expect(withRandom(1)).toBe(MAX_BACKOFF_MS);
   });
@@ -246,7 +1094,8 @@ describe("ConnectionMachine", () => {
   });
 
   it("foreground from cached live with an OPEN socket is a no-op (no churn)", () => {
-    const { machine, resume } = setupTracked();
+    const { machine, resume, isFollowLive } = setupTracked();
+    isFollowLive.mockReturnValue(true); // open + fresh frame
     machine.startLive();
     machine.dispatch({ type: "resume" });
     expect(machine.state).toBe("live");
@@ -300,4 +1149,339 @@ describe("ConnectionMachine", () => {
     clock.advance(1);
     expect(machine.state).toBe("stale");
   });
+
+  it("GATE7: an initial journal seed failure with REST reachable settles stale and the probe retries the follow", async () => {
+    const { clock, machine, resume, isFollowLive } = setupTracked();
+    isFollowLive.mockReturnValue(false);
+    machine.bootstrapLive();
+    const id = machine.followAttemptBegin();
+    expect(machine.state).toBe("recovering");
+
+    // The seed fails but REST answers: quiet stale (no loud offline banner),
+    // not a false live.
+    machine.followAttemptEnd(false, id);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(machine.state).toBe("stale");
+    // The stale probe (15 s) reopens the follow (probe resolves async).
+    clock.advance(REST_PROBE_MS);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(resume).toHaveBeenCalledTimes(1);
+  });
+
+  it("followAttempt: success certifies live and clears the watchdog", () => {
+    const { clock, machine } = setupTracked();
+    machine.bootstrapLive();
+    const id = machine.followAttemptBegin();
+    expect(machine.state).toBe("recovering");
+    machine.followAttemptEnd(true, id);
+    expect(machine.state).toBe("live");
+    // Past the watchdog window: the (cleared) external-attempt watchdog never
+    // fires; with no further frame the ordinary frame watchdog drives stale.
+    clock.advance(RECOVERING_WATCHDOG_MS);
+    expect(machine.state).toBe("stale");
+  });
+
+  it("GATE7: a hung seed watchdog with REST reachable settles stale; a late completion stays stale", async () => {
+    const { clock, machine, isFollowLive } = setupTracked();
+    isFollowLive.mockReturnValue(false);
+    machine.bootstrapLive();
+    const id = machine.followAttemptBegin();
+    clock.advance(RECOVERING_WATCHDOG_MS);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(machine.state).toBe("stale");
+    // A late seed completion must not certify live.
+    machine.followAttemptEnd(true, id);
+    expect(machine.state).toBe("stale");
+  });
+
+  it("followAttempt: nested in a resume shares its slot and id, never double-watchdogs", () => {
+    const { clock, machine, resume } = setupTracked();
+    machine.startLive();
+    machine.dispatch({ type: "close" });
+    machine.dispatch({ type: "resume" });
+    expect(machine.state).toBe("recovering");
+    const nestedId = machine.followAttemptBegin();
+    // Same slot: the nested mount reports the enclosing attempt's outcome.
+    machine.followAttemptEnd(true, nestedId);
+    expect(machine.state).toBe("live");
+    // No second resume from a competing watchdog during the recovery window.
+    clock.advance(RECOVERING_WATCHDOG_MS - 1);
+    expect(resume).toHaveBeenCalledTimes(1);
+  });
+
+  it("binding gen: a superseded mount's late success never certifies the new binding live", () => {
+    const { machine } = setupTracked();
+    machine.bootstrapLive();
+    // Mount A starts its seed attempt under generation 1.
+    const idA = machine.followAttemptBegin(1);
+    expect(machine.state).toBe("recovering");
+    // Navigate to B: generation 2, B starts its own attempt.
+    machine.noteBinding(2);
+    const idB = machine.followAttemptBegin(2);
+    expect(idB).not.toBe(idA);
+    // A's seed/subscribe succeeds late — ignored, the machine must not claim
+    // live with no certified B socket.
+    machine.followAttemptEnd(true, idA, 1);
+    expect(machine.state).toBe("recovering");
+    // B's own success certifies.
+    machine.followAttemptEnd(true, idB, 2);
+    expect(machine.state).toBe("live");
+  });
+
+  it("binding gen: a superseded mount's late failure never takes the new binding offline", () => {
+    const { clock, machine } = setupTracked();
+    machine.bootstrapLive();
+    const idA = machine.followAttemptBegin(1);
+    machine.noteBinding(2);
+    const idB = machine.followAttemptBegin(2);
+    machine.followAttemptEnd(true, idB, 2);
+    expect(machine.state).toBe("live");
+    // A fails after B certified — B stays live.
+    machine.followAttemptEnd(false, idA, 1);
+    expect(machine.state).toBe("live");
+    clock.advance(1);
+    expect(machine.state).toBe("live");
+  });
+
+  it("followRebindLive: an already-mounted live rebind certifies and retires a superseded attempt", () => {
+    const { clock, machine } = setupTracked();
+    machine.bootstrapLive();
+    machine.followAttemptBegin(1);
+    expect(machine.state).toBe("recovering");
+    // Navigate to an already-mounted session whose socket is OPEN+fresh.
+    machine.noteBinding(2);
+    machine.followRebindLive();
+    expect(machine.state).toBe("live");
+    // The superseded attempt's watchdog is retired: at its deadline nothing
+    // happens (B stays live; the frame watchdog then drives quiet stale).
+    clock.advance(RECOVERING_WATCHDOG_MS);
+    expect(machine.state).not.toBe("offline");
+  });
+
+  it("binding gen: a resume for a superseded binding starts a fresh attempt and reruns resume", () => {
+    const { machine, resume } = setupTracked();
+    machine.bootstrapLive();
+    machine.followAttemptBegin(1);
+    expect(resume).toHaveBeenCalledTimes(0);
+    machine.noteBinding(2);
+    // The non-live mounted rebind kicks the machine like a foreground resume.
+    machine.dispatch({ type: "resume" });
+    expect(resume).toHaveBeenCalledTimes(1);
+    // The old attempt's late failure cannot close B's attempt.
+    machine.followAttemptEnd(false, 1, 1);
+    expect(machine.state).toBe("recovering");
+  });
+
+  it("gate6 item1: returning to a mounted A retires B's watchdog; a frame on A never leads offline or a reopen", () => {
+    const { clock, machine, resume, onState } = setupTracked();
+    machine.bootstrapLive();
+    // B's journal seed is in flight under gen 1: recovering + 20 s watchdog.
+    machine.noteBinding(1);
+    const idB = machine.followAttemptBegin(1);
+    expect(machine.state).toBe("recovering");
+    expect(machine.attemptRef()).toEqual({ gen: 1, attemptId: idB });
+    // >5 s later the user returns to already-mounted A (gen 2): noteBinding
+    // retires B's attempt immediately.
+    clock.advance(6_000);
+    machine.noteBinding(2);
+    expect(machine.attemptRef()).toBeNull();
+    // A's socket is OPEN but not freshly framed: the rebind takes the
+    // frame/probe deadline rather than inheriting recovering -> beginResume.
+    machine.followBound({ rebind: true });
+    expect(resume).toHaveBeenCalledTimes(0);
+    // A frame lands on A 1 s after the rebind.
+    clock.advance(1_000);
+    machine.dispatch({ type: "frame" });
+    // t=20 s: B's old watchdog deadline passes (retired — a no-op). Keep A
+    // framed (as a live socket would) and run past A's frame window.
+    clock.advance(13_000);
+    machine.dispatch({ type: "frame" });
+    expect(machine.state).toBe("live");
+    clock.advance(8_000);
+    expect(machine.state).toBe("live");
+    expect(resume).toHaveBeenCalledTimes(0);
+    expect(onState.mock.calls.map((call) => call[0])).not.toContain("offline");
+  });
+
+  it("GATE8 item 5: a rebind from unproven offline is a no-op (never stale, no resume)", () => {
+    const { clock, machine, resume } = setupTracked();
+    machine.bootstrapLive();
+    machine.dispatch({ type: "offline" });
+    expect(machine.state).toBe("offline");
+    machine.followBound({ rebind: true });
+    expect(resume).toHaveBeenCalledTimes(0);
+    clock.advance(LIVE_FRAME_MS);
+    expect(machine.state).toBe("offline");
+    expect(resume).toHaveBeenCalledTimes(0);
+  });
+
+  it("GATE8 item 3: a rebind mid quiet-reopen never arms a loud second resume", async () => {
+    const { clock, machine, resume } = setupTracked();
+    resume.mockReturnValue(new Promise<void>(() => {})); // blocked upgrades
+    machine.startLive();
+    clock.advance(LIVE_FRAME_MS); // stale
+    clock.advance(REST_PROBE_MS); // probe ok → quiet reopen scheduled
+    // The quiet reopen invokes resume on a microtask.
+    await Promise.resolve();
+    expect(resume).toHaveBeenCalledTimes(1);
+    expect(machine.state).toBe("stale");
+    // A second mount rebinds while the reopen is in flight; the bind deadline
+    // must not start a loud beginResume.
+    machine.followBound({ rebind: true });
+    // Advance less than the carried 30 s stale bound: still quiet stale and no
+    // second resume (gate 9 item 5 keeps the offline deadline alive, so the
+    // bound fires at 30 s — advancing only 14 s here stays inside it).
+    clock.advance(14_000);
+    expect(resume).toHaveBeenCalledTimes(1);
+    expect(machine.state).toBe("stale");
+  });
+
+  it("gate6 item1: a non-rebind followBound from offline resumes immediately", () => {
+    const { machine, resume } = setupTracked();
+    machine.bootstrapLive();
+    machine.dispatch({ type: "offline" });
+    machine.followBound();
+    expect(machine.state).toBe("recovering");
+    expect(resume).toHaveBeenCalledTimes(1);
+  });
+
+  it("gate6 item2: onAttemptFinish reports ok/failed with the attempt ref", () => {
+    const { machine, onAttemptFinish } = setupTracked();
+    machine.bootstrapLive();
+    machine.noteBinding(3);
+    const id = machine.followAttemptBegin(3);
+    machine.followAttemptEnd(true, id, 3);
+    expect(onAttemptFinish).toHaveBeenCalledWith({ gen: 3, attemptId: id, why: "ok" });
+
+    const id2 = machine.followAttemptBegin(3);
+    machine.followAttemptEnd(false, id2, 3);
+    expect(onAttemptFinish).toHaveBeenCalledWith({ gen: 3, attemptId: id2, why: "failed" });
+  });
+
+  it("gate6 item2: the watchdog reports why=watchdog for a hung current-binding attempt (settles stale when REST answers)", async () => {
+    const { clock, machine, onAttemptFinish } = setupTracked();
+    machine.bootstrapLive();
+    machine.noteBinding(1);
+    const id = machine.followAttemptBegin(1);
+    clock.advance(RECOVERING_WATCHDOG_MS);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(machine.state).toBe("stale");
+    expect(onAttemptFinish).toHaveBeenCalledWith({ gen: 1, attemptId: id, why: "watchdog" });
+  });
+
+  it("gate6 item2: a superseded attempt's watchdog fires no finish callback", () => {
+    const { clock, machine, onAttemptFinish } = setupTracked();
+    machine.bootstrapLive();
+    machine.noteBinding(1);
+    const idA = machine.followAttemptBegin(1);
+    machine.noteBinding(2);
+    clock.advance(RECOVERING_WATCHDOG_MS);
+    expect(onAttemptFinish).not.toHaveBeenCalled();
+    // A late completion for the retired attempt is also silent.
+    machine.followAttemptEnd(false, idA, 1);
+    expect(onAttemptFinish).not.toHaveBeenCalled();
+  });
+
+  it("GATE17 item 4: an offline-retired attempt's delayed rejection and close latch never cross a binding onto mounted live B", async () => {
+    // The gate-17 regression: A's resume socket closes mid-attempt
+    // (closedDuringResume latched), a browser offline event retires the
+    // attempt with resumeRetiredOffline (resumeInFlight=false), the user
+    // navigates to mounted B adopted live, and A's delayed catch-up rejects —
+    // the stale completion passed the acceptance guard and its latch flipped
+    // B to recovering. The binding change must retire ALL of A's bookkeeping
+    // and its completion must be dropped before any state mutation.
+    const { machine, resume, probe, isFollowLive, onAttemptFinish, onState } = setupTracked();
+    machine.bootstrapLive();
+    machine.noteBinding(1);
+
+    // A's resume stays pending; its follow socket closes while A owns it.
+    let rejectA!: (err: Error) => void;
+    resume.mockImplementationOnce(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectA = reject;
+        }),
+    );
+    machine.dispatch({ type: "resume" });
+    expect(machine.state).toBe("recovering");
+    machine.dispatch({ type: "close" });
+    // Browser offline: the attempt is retired WITH the offline flag.
+    machine.dispatch({ type: "offline" });
+    expect(machine.state).toBe("offline");
+
+    // Navigate to mounted B: the store binds gen 2 then adopts B's live
+    // socket (adoptMountedFollow -> followRebindLive).
+    machine.noteBinding(2);
+    isFollowLive.mockReturnValue(true);
+    machine.followRebindLive();
+    expect(machine.state).toBe("live");
+    const statesAfterAdopt = onState.mock.calls.length;
+
+    // A's delayed catch-up rejects. B must stay live: no recovery transition,
+    // no settlement probe (which could demote B later), no finish callback.
+    rejectA(new Error("A catch-up lost the race"));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(machine.state).toBe("live");
+    expect(onState.mock.calls.slice(statesAfterAdopt).map((c) => c[0])).toEqual([]);
+    expect(probe).not.toHaveBeenCalled();
+    expect(onAttemptFinish).not.toHaveBeenCalled();
+  });
+
+  // Gate-19 item 6: the same-binding "rejection is CONSUMED — settlement,
+  // explicit online after the retry deadline, then a real resume/subscribe"
+  // case used to be a setupTracked machine unit test with mocked
+  // resume/probe/liveness; it now lives as a REAL-store regression in
+  // store.foreignTab.test.ts ("GATE19 item 6b (real store)…"), driving the
+  // store's actual reopenFollow/openFollowSocket/resumeAfterReconnect path.
+it("gate41 S2: dispose permanently retires a machine — a pending probe resolving false afterwards never publishes or schedules", async () => {
+  const { clock, machine, probe, onState, resume, isFollowLive } = setupTracked();
+  // Drive into stale with a REST probe already pending (frame silence).
+  isFollowLive.mockReturnValue(false);
+  machine.startLive();
+  clock.advance(LIVE_FRAME_MS);
+  expect(machine.state).toBe("stale");
+  const pendingProbe = Promise.resolve(false);
+  probe.mockReturnValueOnce(pendingProbe);
+  clock.advance(REST_PROBE_MS); // arms the probe, now in flight
+  expect(probe).toHaveBeenCalled();
+
+  // A NEW owner installs a replacement machine and is happily live.
+  const replacement = setup();
+  replacement.machine.startLive();
+
+  // The old machine is disposed WHILE its probe is still in flight.
+  machine.dispose();
+  expect(clock.pendingCount()).toBe(0); // every timer cancelled
+  await pendingProbe;
+  await Promise.resolve();
+  await Promise.resolve();
+
+  // The dead machine never published offline, never armed a reconnect.
+  expect(machine.state).toBe("stale");
+  const oldStates = onState.mock.calls.map((c) => c[0]);
+  expect(oldStates).not.toContain("offline");
+  expect(oldStates).not.toContain("recovering");
+  expect(resume).not.toHaveBeenCalled();
+  expect(clock.pendingCount()).toBe(0); // probe(false) scheduled nothing
+
+  // It is permanently inert to every entry point.
+  machine.dispatch({ type: "frame" });
+  machine.startLive();
+  machine.setStateOffline();
+  machine.noteBinding(99);
+  expect(machine.state).toBe("stale");
+  expect(clock.pendingCount()).toBe(0);
+  // Idempotent.
+  machine.dispose();
+
+  // The replacement machine keeps running unaffected.
+  expect(replacement.machine.state).toBe("live");
+  replacement.clock.advance(LIVE_FRAME_MS);
+  expect(replacement.machine.state).toBe("stale"); // still functional
+});
 });

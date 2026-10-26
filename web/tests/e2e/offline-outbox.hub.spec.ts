@@ -1,5 +1,5 @@
 import { expect, request as apiRequest, test, type APIRequestContext, type Browser, type Page } from "@playwright/test";
-import { readdir, readFile, rm } from "node:fs/promises";
+import { readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { login } from "./hub-auth";
@@ -25,6 +25,119 @@ import { login } from "./hub-auth";
 test.describe.configure({ mode: "serial" });
 
 const created: string[] = [];
+
+/**
+ * Test-controlled journal release (c-reconnfu rounds 4–6): the fake
+ * node's `__gate_journal__` fixture accepts the POST immediately but
+ * parks its mirrored journal observation OFF the node RPC loop until
+ * the spec creates the release file — replacing the autonomous 8 s
+ * sleep of `__hold_journal__` with a deterministic handshake.
+ *
+ * Handshake (files in os.tmpdir(), scoped by hub port + commandId
+ * so parallel hubs never cross):
+ *   ...-release-<port>-<cid>  spec writes → node appends, then writes
+ *   ...-cancel-<port>-<cid>   spec writes → node ACKs without appending
+ *   ...-ack-<port>-<cid>      node writes once the parked append is
+ *                              journaled ("journaled") or the gate is
+ *                              cancelled ("cancelled").
+ * Registration is kept until the node ACKs, so a failure immediately
+ * after release still has a provable teardown — no fixed sleeps.
+ *
+ * The port is derived from the SAME effective Hub URL
+ * playwright.hub.config.ts resolves (VITE_HUB_URL wins, then
+ * HUB_E2E_LISTEN, then the 58880 default).
+ */
+const effectiveHubUrl =
+  process.env.VITE_HUB_URL ?? `http://${process.env.HUB_E2E_LISTEN ?? "127.0.0.1:58880"}`;
+const hubPort = new URL(effectiveHubUrl).port;
+const journalReleasePrefix = `remuda-e2e-journal-release-${hubPort}-`;
+const journalCancelPrefix = `remuda-e2e-journal-cancel-${hubPort}-`;
+const journalAckPrefix = `remuda-e2e-journal-ack-${hubPort}-`;
+
+/** Stays registered until the node writes the ACK file. */
+const pendingJournalGates = new Set<string>();
+function journalReleasePath(commandId: string): string {
+  return path.join(os.tmpdir(), `${journalReleasePrefix}${commandId}`);
+}
+function journalCancelPath(commandId: string): string {
+  return path.join(os.tmpdir(), `${journalCancelPrefix}${commandId}`);
+}
+function journalAckPath(commandId: string): string {
+  return path.join(os.tmpdir(), `${journalAckPrefix}${commandId}`);
+}
+/** Register the gate the moment its commandId is known. */
+function registerJournalGate(commandId: string): void {
+  pendingJournalGates.add(commandId);
+}
+async function journalGateFileExists(file: string): Promise<boolean> {
+  // access/stat adds an import; readdir is already used by the sweep.
+  const entries = await readdir(os.tmpdir()).catch(() => [] as string[]);
+  return entries.includes(path.basename(file));
+}
+/**
+ * Bounded wait for the node's ACK. The node's poller ticks every
+ * 100 ms and the append round-trip is local, so this is generous
+ * without resorting to a blind sleep.
+ */
+async function awaitJournalAck(commandId: string, timeoutMs = 20_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await journalGateFileExists(journalAckPath(commandId))) return true;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return journalGateFileExists(journalAckPath(commandId));
+}
+/** Spec-driven happy-path release; registration is kept until ACK. */
+async function releaseJournal(commandId: string): Promise<void> {
+  await writeFile(journalReleasePath(commandId), "release\n");
+}
+/**
+ * Release EVERY gate still registered when the test body ends —
+ * including a body that failed before calling releaseJournal(), or one
+ * that released and failed before the node ACKed. Each gate is
+ * released (if not already), then awaited with a bounded poll on the
+ * node's ACK file: the parked append must land BEFORE instances are
+ * * deleted. On timeout the gate is cancelled and teardown fails
+ * loudly (a swallowed stall would leak a 60 s poller into later
+ * specs). All gate files are swept afterwards.
+ */
+async function teardownJournalGates(): Promise<void> {
+  const stuck: string[] = [];
+  for (const commandId of pendingJournalGates) {
+    let acked = await journalGateFileExists(journalAckPath(commandId));
+    if (!acked) {
+      // Release unless the node already observed a release (happy path
+      // that crashed before ACK); either way, then wait for ACK.
+      await writeFile(journalReleasePath(commandId), "teardown-release\n").catch(() => undefined);
+      acked = await awaitJournalAck(commandId);
+      if (!acked) {
+        // Tell the poller to ACK without appending so it cannot
+        // linger; still report the stall as a test failure.
+        await writeFile(journalCancelPath(commandId), "teardown-cancel\n").catch(() => undefined);
+        await awaitJournalAck(commandId, 2_000);
+        stuck.push(commandId);
+      }
+    }
+  }
+  pendingJournalGates.clear();
+  await sweepJournalGateFiles();
+  if (stuck.length > 0) {
+    throw new Error(`journal gate never ACKed by the fake node: ${stuck.join(", ")}`);
+  }
+}
+async function sweepJournalGateFiles(): Promise<void> {
+  const entries = await readdir(os.tmpdir()).catch(() => [] as string[]);
+  await Promise.all(
+    entries
+      .filter(
+        (entry) =>
+          entry.startsWith(journalReleasePrefix) ||
+          entry.startsWith(journalCancelPrefix) ||
+          entry.startsWith(journalAckPrefix),
+      )
+      .map((entry) => rm(path.join(os.tmpdir(), entry), { force: true }).catch(() => undefined)),
+  );
+}
 
 async function clearApprovals(page: Page, instanceId: string) {
   // The fake node raises a launch approval on create; answer it via the API so
@@ -157,6 +270,28 @@ async function sendMessage(page: Page, text: string) {
   else await send.click();
 }
 
+/**
+ * Read the instance.send commandId from the Hub command record
+ * (independent APIRequestContext), polling until it is committed. Use this
+ * for ungated sends whose optimistic bubble may already have been
+ * journal-replaced before an attribute read (c-reconnfu r6 item 2).
+ */
+async function pollForCommandId(
+  api: APIRequestContext,
+  instanceId: string,
+  timeoutMs = 15_000,
+): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const id = (await hubCommands(api, instanceId)).find(
+      (c) => c.operation === "instance.send",
+    )?.id;
+    if (id) return id;
+    if (Date.now() >= deadline) throw new Error("no instance.send command recorded");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
 const V1 = /\/v1\//;
 
 /**
@@ -182,8 +317,30 @@ async function keepHubBlockedByRoutes(context: import('@playwright/test').Browse
   await context.setOffline(false);
 }
 
-async function unblockHub(context: import('@playwright/test').BrowserContext) {
+/**
+ * Restore Hub reachability after a FULL browser outage (blockHub set the
+ * browser offline, so the real recovery also fires window `online`). Unroutes
+ * /v1 and lifts emulation, then synthesises the `online` event the browser
+ * would fire on a genuine offline->online transition — that drives resume ->
+ * live -> outbox flush immediately rather than waiting the reconnect backoff.
+ */
+async function unblockHubAfterBrowserOffline(page: import('@playwright/test').Page) {
+  const context = page.context();
   await context.setOffline(false);
+  await context.unroute(V1);
+  await page.evaluate(() => window.dispatchEvent(new Event("online")));
+}
+
+/**
+ * Restore Hub reachability for a HUB-ONLY outage: the browser stayed online
+ * the whole time (the document had to keep loading during the offline reload),
+ * so there is NO window `online` event to synthesise — emitting one would
+ * reset the connection backoff and hide the real reconnect path. Recovery is
+ * routes-only; the app must reconnect on its own bounded backoff
+ * (connection MAX_BACKOFF_MS = 30 s), which is why callers wait long enough
+ * to cover one max-backoff interval plus resume/flush.
+ */
+async function unblockHubRoutesOnly(context: import('@playwright/test').BrowserContext) {
   await context.unroute(V1);
 }
 
@@ -249,10 +406,14 @@ async function deleteCreatedInstances(browser: Browser) {
 // run, and again in afterAll as a safety net when an afterEach could not run
 // its own cleanup (it only ever sees ids left behind).
 test.afterEach(async ({ browser }) => {
+  // Release gates a failed test body left pending BEFORE deleting
+  // instances (the parked node append must not stall close/purge).
+  await teardownJournalGates();
   await deleteCreatedInstances(browser);
 });
 
 test.afterAll(async ({ browser }) => {
+  await sweepJournalGateFiles();
   await deleteCreatedInstances(browser);
 });
 
@@ -307,7 +468,7 @@ test("offline sends are queued and delivered exactly once after reconnect", asyn
   ).length;
   expect(seedSends).toBe(0);
 
-  await unblockHub(page.context());
+  await unblockHubAfterBrowserOffline(page);
   await expect(banner).toHaveCount(0, { timeout: 20_000 });
 
   // Exactly one Hub command row per id …
@@ -360,11 +521,14 @@ test("an offline-queued message survives a reload while the Hub is still off and
   // And nothing reached the Hub yet (independent read, 200 required).
   expect((await hubCommands(api, instanceId)).filter((c) => c.operation === "instance.send")).toHaveLength(0);
 
-  // Reconnect: the restored row delivers exactly once under the same id.
-  await unblockHub(page.context());
-  await expect(page.getByTestId("journal-banner")).toHaveCount(0, { timeout: 20_000 });
+  // Reconnect by ROUTES ALONE (Hub-only outage; the browser never went
+  // offline, so no synthetic "online" event). The app reconnects on its
+  // bounded backoff (connection MAX_BACKOFF_MS = 30 s); wait long enough to
+  // cover one max-backoff interval plus resume/flush rather than racing it.
+  await unblockHubRoutesOnly(page.context());
+  await expect(page.getByTestId("journal-banner")).toHaveCount(0, { timeout: 45_000 });
   await expect
-    .poll(() => hubJournalMessageCount(api, instanceId, commandId!), { timeout: 30_000 })
+    .poll(() => hubJournalMessageCount(api, instanceId, commandId!), { timeout: 45_000 })
     .toBe(1);
   await expect
     .poll(
@@ -372,7 +536,7 @@ test("an offline-queued message survives a reload while the Hub is still off and
         (await hubCommands(api, instanceId)).filter(
           (c) => c.operation === "instance.send" && c.id === commandId,
         ).length,
-      { timeout: 30_000 },
+      { timeout: 45_000 },
     )
     .toBe(1);
   await expectDelivered(page, commandId);
@@ -420,8 +584,15 @@ test("a committed POST whose browser response is lost retries with replayed:true
     route.request().method() === "GET" ? route.abort("failed") : route.continue(),
   );
 
-  await sendMessage(page, "lost response message");
+  await sendMessage(page, "__hold_journal__:8000");
   const bubble = page.locator('[data-testid="optimistic-bubble"]').first();
+  // The fake node acks the first POST but WITHHOLDS its mirrored journal user
+  // observation for 8 s (__hold_journal__): without the hold the journal
+  // confirmation retires the row to done first (the terminal-done guarantee
+  // then correctly skips the replay), so the lost-response retry could never
+  // be observed. The hold makes the re-POST and its replayed:true answer the
+  // deterministic path; the journal replacement is asserted afterwards (the
+  // withheld append lands well inside the 30 s poll).
   await expect(bubble).toBeVisible();
   const commandId = await bubble.getAttribute("data-command-id");
   expect(commandId).toBeTruthy();
@@ -446,11 +617,346 @@ test("a committed POST whose browser response is lost retries with replayed:true
       { timeout: 30_000 },
     )
     .toBe(1);
-  // … and one journal message for the id (executed exactly once).
-  await expect.poll(() => hubJournalMessageCount(api, instanceId, commandId!)).toBe(1);
+  // … and one journal message for the id (executed exactly once). The fake
+  // node withholds it behind the __hold_journal__ delay, so allow for that.
+  await expect
+    .poll(() => hubJournalMessageCount(api, instanceId, commandId!), { timeout: 30_000 })
+    .toBe(1);
   await expectDelivered(page, commandId);
 });
 
+test("an online send labels the row 等待发送 then 已发送，等待确认/已受理 as it delivers", async ({ page }) => {
+  const instanceId = await createSession(page, "label progression seed");
+  await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
+  const api = await hubApi(page);
+
+  // Hold this instance's single-deliverer Web Lock from inside the page: with
+  // no flush possible the queued bubble must sit at its honest online label
+  // (等待发送 — NOT 待发送（离线）, the link is live the whole time).
+  await page.evaluate((iid) => {
+    const w = window as unknown as {
+      __releaseLock?: () => void;
+    };
+    const lock = new Promise<void>((resolve) => {
+      w.__releaseLock = resolve;
+    });
+    void navigator.locks.request(`remuda-outbox-${iid}`, () => lock);
+  }, instanceId);
+
+  // Once the flush acquires the lock it reaches the POST; park that so the
+  // in-flight label is observable too.
+  const commandsPattern = /\/v1\/instances\/[^/]+\/commands$/;
+  let releasePost: (() => void) | null = null;
+  const postGate = new Promise<void>((resolve) => {
+    releasePost = resolve;
+  });
+  await page.context().route(commandsPattern, async (route) => {
+    if (route.request().method() !== "POST") return route.continue();
+    await postGate;
+    const res = await route.fetch();
+    return route.fulfill({ response: res });
+  });
+
+  await sendMessage(page, "__gate_journal__");
+  const bubble = page.locator('[data-testid="optimistic-bubble"]').first();
+  await expect(bubble).toBeVisible();
+  const commandId = await bubble.getAttribute("data-command-id");
+  expect(commandId).toBeTruthy();
+  // Drop any stale gate from a crashed earlier worker, then register
+  // THIS commandId the moment it is known so a failure below still
+  // releases the gate in afterEach.
+  await rm(journalReleasePath(commandId!), { force: true });
+  registerJournalGate(commandId!);
+
+  // Queued behind the lock, link live: 等待发送, never the offline wording.
+  await expect(bubble).toContainText("等待发送");
+  await expect(bubble).not.toContainText("离线");
+
+  // Release the lock: the flush takes it and the parked POST shows the row
+  // is in flight with NO answer yet — 已发送，等待确认， never 状态待确认.
+  await page.evaluate(() => (window as unknown as { __releaseLock?: () => void }).__releaseLock?.());
+  await expect(bubble).toContainText("已发送，等待确认", { timeout: 15_000 });
+  await expect(bubble).not.toContainText("已受理");
+  await expect(bubble).not.toContainText("状态待确认");
+
+  // Release the POST. The fake node accepts it immediately but withholds
+  // the mirrored journal user observation on the TEST-CONTROLLED gate
+  // (__gate_journal__, hub_e2e.rs): once the browser has processed the
+  // accepted response the STILL-VISIBLE bubble must carry the distinct
+  // accepted/delivered label 已受理 — unlike inflight's
+  // 已发送，等待确认 — and exactly one Hub command row is committed.
+  releasePost?.();
+  await expect(bubble).toContainText("已受理", { timeout: 15_000 });
+  await expect(bubble).not.toContainText("已发送，等待确认");
+  await expect(bubble).toBeVisible();
+  await expect
+    .poll(
+      async () =>
+        (await hubCommands(api, instanceId)).filter(
+          (c) => c.operation === "instance.send" && c.id === commandId,
+        ).length,
+      { timeout: 15_000 },
+    )
+    .toBe(1);
+
+  // The journal is still gated by the test (no autonomous sleep to race):
+  // the observation has not joined and the chip stays on screen.
+  await expect
+    .poll(() => hubJournalMessageCount(api, instanceId, commandId!), { timeout: 2_000 })
+    .toBe(0);
+
+  // Release the journal and WAIT FOR THE NODE ACK (append journaled),
+  // then assert the observation joined exactly once and the bubble was
+  // replaced by the authoritative transcript row.
+  await releaseJournal(commandId!);
+  expect(await awaitJournalAck(commandId!)).toBe(true);
+  pendingJournalGates.delete(commandId!);
+  await expect
+    .poll(() => hubJournalMessageCount(api, instanceId, commandId!), { timeout: 30_000 })
+    .toBe(1);
+  await expectDelivered(page, commandId);
+});
+
+test("a Hub-accepted send shows its delivered label on the still-visible bubble until the journal join", async ({ page }) => {
+  const instanceId = await createSession(page, "label hold seed");
+  await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
+  const api = await hubApi(page);
+
+  // The fake node accepts the POST immediately but withholds its mirrored
+  // journal user observation until the TEST-CONTROLLED gate file appears
+  // (__gate_journal__, hub_e2e.rs — no autonomous sleep to race): the
+  // accepted/delivered phase is asserted on the STILL-VISIBLE bubble, then
+  // the spec releases the journal and asserts the replacement itself.
+  await sendMessage(page, "__gate_journal__");
+  const bubble = page.locator('[data-testid="optimistic-bubble"]').first();
+  await expect(bubble).toBeVisible();
+  const commandId = await bubble.getAttribute("data-command-id");
+  expect(commandId).toBeTruthy();
+  // Drop any stale gate from a crashed earlier worker, then register
+  // THIS commandId the moment it is known: an assertion failing below
+  // still releases the gate in afterEach.
+  await rm(journalReleasePath(commandId!), { force: true });
+  registerJournalGate(commandId!);
+
+  // The POST landed with a CLEAR answer and the Hub committed the command
+  // (the outbox row settles to "sent"), while the journal confirmation is
+  // held back. The still-visible bubble shows the accepted/delivered label
+  // 已受理 — DISTINCT from inflight's 已发送，等待确认 — never 状态待确认.
+  await expect(bubble).toContainText("已受理", { timeout: 15_000 });
+  await expect(bubble).not.toContainText("已发送，等待确认");
+  await expect(bubble).not.toContainText("状态待确认");
+  await expect
+    .poll(
+      async () =>
+        (await hubCommands(api, instanceId)).filter(
+          (c) => c.operation === "instance.send" && c.id === commandId,
+        ).length,
+      { timeout: 15_000 },
+    )
+    .toBe(1);
+  // The optimistic chip is still on screen: the journal confirmation is gated
+  // by this test, so the authoritative (non-bubble) transcript row cannot
+  // have replaced it yet (give the node a moment: it appends within 100 ms
+  // of the release file appearing, and no release has happened).
+  await expect(bubble).toBeVisible();
+  await expect
+    .poll(() => hubJournalMessageCount(api, instanceId, commandId!), { timeout: 2_000 })
+    .toBe(0);
+
+  // Only NOW release the journal, wait for the node ACK (append
+  // journaled), then assert the observation joined exactly once and
+  // the bubble was replaced by the transcript row.
+  await releaseJournal(commandId!);
+  expect(await awaitJournalAck(commandId!)).toBe(true);
+  pendingJournalGates.delete(commandId!);
+  await expect
+    .poll(() => hubJournalMessageCount(api, instanceId, commandId!), { timeout: 30_000 })
+    .toBe(1);
+  await expectDelivered(page, commandId);
+});
+
+test("a parked journal gate never blocks the node RPC loop and teardown ACKs a released-but-unacked gate", async ({ page }) => {
+  // c-reconnfu round 5/6 regression. The fake node parks the
+  // __gate_journal__ append OFF its shared RPC read loop and
+  // handshakes with an ACK file once it is journaled, so:
+  //   1. while A is parked, a normal send on a DIFFERENT instance B
+  //      is still answered and journaled immediately (the parked A must
+  //      not stall the single fake-node read loop / later RPCs);
+  //   2. a body that releases A but FAILS IMMEDIATELY (before the node
+  //      ACK lands) still has a provable teardown: registration is
+  //      kept until the node ACKs, teardown awaits it (bounded, no
+  //      fixed sleep), and the append lands before instance deletion.
+  const instanceA = await createSession(page, "gate parked A");
+  await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
+
+  // A parks its journal; register it and do NOT await anything here.
+  await sendMessage(page, "__gate_journal__");
+  const bubbleA = page.locator('[data-testid="optimistic-bubble"]').first();
+  const commandA = await bubbleA.getAttribute("data-command-id");
+  expect(commandA).toBeTruthy();
+  await rm(journalReleasePath(commandA!), { force: true });
+  await rm(journalAckPath(commandA!), { force: true });
+  registerJournalGate(commandA!);
+  expect(pendingJournalGates.has(commandA!)).toBe(true);
+  await expect(bubbleA).toContainText("已受理", { timeout: 15_000 });
+
+  // B is an independent instance; an ordinary send must flow through
+  // the node RPC loop RIGHT NOW despite A being parked. Read B's
+  // commandId from the Hub command record (c-reconnfu r6 item 2): the
+  // ungated bubble may already have been journal-replaced before we
+  // read its attribute.
+  const instanceB = await createSession(page, "gate normal B");
+  await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
+  const apiB = await hubApi(page);
+  await sendMessage(page, "unblocked normal B");
+  // B is ungated, so its optimistic bubble may already have been
+  // journal-replaced: read the commandId from the Hub command
+  // record (c-reconnfu r6 item 2), never the bubble attribute.
+  const commandB = await pollForCommandId(apiB, instanceB, 15_000);
+  // B's node observation joins promptly (well inside one 60 s gate
+  // timeout): the parked A did not block B's RPC + journal append.
+  await expect
+    .poll(() => hubJournalMessageCount(apiB, instanceB, commandB), { timeout: 15_000 })
+    .toBe(1);
+  await expectDelivered(page, commandB);
+
+  // Simulate a body failure IMMEDIATELY AFTER release: trigger the
+  // release but do NOT wait for the node ACK, then run teardown.
+  // The registration is still present; teardown must await the node's
+  // bounded ACK instead of assuming a fixed sleep.
+  expect(pendingJournalGates.has(commandA!)).toBe(true);
+  await releaseJournal(commandA!);
+  await teardownJournalGates();
+  expect(pendingJournalGates.has(commandA!)).toBe(false);
+  // The node wrote the ACK and A's parked append landed exactly once.
+  expect(await journalGateFileExists(journalAckPath(commandA!))).toBe(false); // swept
+  const apiA = await hubApi(page);
+  expect(await hubJournalMessageCount(apiA, instanceA, commandA!)).toBe(1);
+});
+
+/**
+ * Test-only service worker: network-first with an offline cache fallback for
+ * every same-origin GET EXCEPT the Hub API (/v1), which must always reach the
+ * network so an offline bootstrap fails honestly. Registered explicitly from
+ * the test (the app registers its SW only in PROD builds) so a FULL emulated
+ * offline navigation — context.setOffline(true) still in effect across the
+ * reload — can serve the dev-server shell from the cache.
+ */
+const OFFLINE_SHELL_SW = `
+const CACHE = "e2e-offline-shell-v1";
+self.addEventListener("install", () => self.skipWaiting());
+self.addEventListener("activate", (event) => event.waitUntil(self.clients.claim()));
+self.addEventListener("fetch", (event) => {
+  const req = event.request;
+  if (req.method !== "GET") return;
+  const url = new URL(req.url);
+  if (url.origin !== self.location.origin) return;
+  if (url.pathname.startsWith("/v1/")) return;
+  event.respondWith((async () => {
+    const cache = await caches.open(CACHE);
+    try {
+      const res = await fetch(req);
+      if (res && res.ok && res.type === "basic") {
+        cache.put(req, res.clone()).catch(() => {});
+      }
+      return res;
+    } catch (err) {
+      const hit = await cache.match(req, { ignoreSearch: true });
+      if (hit) return hit;
+      throw err;
+    }
+  })());
+});
+`;
+
+// The full-offline-SW-restore test needs the loopback PNA/LNA exemption (see the
+// describe below and docs/design/hub-resilience.md §5.6). Playwright only
+// accepts launchOptions at file scope (a describe-level use forces a new
+// worker), so this disables the checks for THIS SPEC FILE only — not the hub
+// config and not the rest of the suite.
+test.use({
+  launchOptions: {
+    args: [
+      "--disable-features=BlockInsecurePrivateNetworkRequests,PrivateNetworkAccessChecks,PrivateNetworkAccessForNavigations,PrivateNetworkAccessForWorkers,PrivateNetworkAccessForWebRTC,BlockInsecureLocalNetworkRequests,LocalNetworkAccessChecks,LocalNetworkAccessChecksForNavigation,LocalNetworkAccessChecksForWebRTC,LocalNetworkAccessChecksForWorkers,LocalNetworkAccessChecksWarningOnly",
+    ],
+  },
+});
+
+test.describe("full offline SW restore (PNA/LNA loopback exemption for this harness case)", () => {
+  test("an offline-queued message survives a reload with the browser context STILL offline and sends once after", async ({ page }) => {
+    const instanceId = await createSession(page, "full offline reload seed");
+    await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
+    const api = await hubApi(page);
+
+    // Install the offline-shell worker and let it take control.
+    await page.context().route("**/e2e-offline-sw.js", (route) =>
+      route.fulfill({ contentType: "application/javascript; charset=utf-8", body: OFFLINE_SHELL_SW }),
+    );
+    await page.evaluate(async () => {
+      await navigator.serviceWorker.register("/e2e-offline-sw.js", { updateViaCache: "none" });
+      await navigator.serviceWorker.ready;
+      if (!navigator.serviceWorker.controller) {
+        await new Promise((resolve) =>
+          navigator.serviceWorker.addEventListener("controllerchange", resolve, { once: true }),
+        );
+      }
+    });
+
+    // One more ONLINE navigation so the controlled page primes the shell cache.
+    await page.goto(page.url());
+    await expect(page.getByTestId("session-page")).toBeVisible({ timeout: 20_000 });
+    await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
+
+    // Go fully offline at the BROWSER CONTEXT level (not a Hub-only route): the
+    // next reload happens with emulation still in effect. The cached shell must
+    // boot while every Hub call and the follow upgrade genuinely fail.
+    await page.context().setOffline(true);
+    await expect(page.getByTestId("journal-banner")).toHaveAttribute("data-state", "offline");
+
+    await sendMessage(page, "offline across a full offline reload");
+    const queued = page.locator('[data-testid="optimistic-bubble"]');
+    await expect(queued).toHaveCount(1);
+    const commandId = await queued.getAttribute("data-command-id");
+    expect(commandId).toBeTruthy();
+    await expect(queued.first()).toContainText("待发送（离线）");
+    // The independent API client is outside the browser context: nothing sent.
+    expect((await hubCommands(api, instanceId)).filter((c) => c.operation === "instance.send")).toHaveLength(0);
+
+    // Reload WHILE context offline: the service worker serves the document and
+    // the whole module shell; the restored app boots from durable state.
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await expect(page.getByTestId("session-page")).toBeVisible({ timeout: 20_000 });
+    const restored = page.locator(`[data-testid="optimistic-bubble"][data-command-id="${commandId}"]`);
+    await expect(restored).toBeVisible();
+    await expect(restored).toContainText("offline across a full offline reload");
+    await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
+    await expect(restored).toContainText("待发送（离线）");
+    // Still nothing at the Hub through the offline reload.
+    expect((await hubCommands(api, instanceId)).filter((c) => c.operation === "instance.send")).toHaveLength(0);
+
+    // Lift emulation: with this test's loopback-PNA exemption the restored
+    // page can reopen its follow socket; the online event plus a foreground
+    // resume kick the machine out of its offline backoff.
+    await page.context().setOffline(false);
+    await page.evaluate(() => {
+      window.dispatchEvent(new Event("online"));
+      window.dispatchEvent(new Event("focus"));
+    });
+    await expect
+      .poll(
+        async () =>
+          (await hubCommands(api, instanceId)).filter(
+            (c) => c.operation === "instance.send" && c.id === commandId,
+          ).length,
+        { timeout: 60_000 },
+      )
+      .toBe(1);
+    await expect.poll(() => hubJournalMessageCount(api, instanceId, commandId!), { timeout: 30_000 }).toBe(1);
+    // The link banner clears after the brief 已恢复 notice (1.5 s).
+    await expect(page.getByTestId("journal-banner")).toHaveCount(0, { timeout: 20_000 });
+    await expectDelivered(page, commandId);
+  });
+});
 /**
  * c-hubfakeack round 3: DETERMINISTIC proof that a Hub->Node RPC buffered
  * behind an outstanding journal.append ack is QUEUED AND ANSWERED, not merely

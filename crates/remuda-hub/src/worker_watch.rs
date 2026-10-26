@@ -884,6 +884,7 @@ async fn deliver_note_file(
             "instance.send".into(),
             payload,
             None,
+            None,
             initiator,
             initiator_device_id,
         )
@@ -971,6 +972,7 @@ async fn write_keys(
                 "source": "coordinator",
             }),
             None,
+            None,
             initiator,
             initiator_device_id,
         )
@@ -1010,7 +1012,9 @@ enum ModelVerdict {
 fn read_model_verdict(lines: &[String], requested: &str) -> Option<ModelVerdict> {
     for line in lines.iter().rev().take(12) {
         match remuda_protocol::parse_model_stdout(line) {
-            remuda_protocol::ModelStdout::Accepted(observed) => {
+            remuda_protocol::ModelStdout::Accepted {
+                model: observed, ..
+            } => {
                 let id = observed.id;
                 let same = id == requested
                     || id.ends_with(&format!("/{requested}"))
@@ -1339,6 +1343,7 @@ async fn resume_worker(
             worker.host_id.as_id().to_string(),
             "instance.send".into(),
             payload,
+            None,
             None,
             resume_initiator.clone(),
             resume_device_id.clone(),
@@ -1708,6 +1713,7 @@ async fn stop_worker(
                 worker.host_id.as_id().to_string(),
                 "instance.close".into(),
                 json!({ "instanceId": instance_id.as_id() }),
+                None,
                 None,
                 stop_initiator,
                 stop_device_id,

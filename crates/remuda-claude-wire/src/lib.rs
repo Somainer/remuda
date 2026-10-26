@@ -13,5 +13,12 @@ pub use codec::{
     write_line,
 };
 pub use error::Error;
-pub use process::{ClaudeProcess, SettingSources, SettingsArg, SpawnMode, SpawnSpec};
+pub use process::{
+    ClaudeProcess, ProcessWriter, SettingSources, SettingsArg, SpawnMode, SpawnSpec,
+};
+/// Test-stub writer gate (ma-sdk-state r9 item 3).
+#[cfg(feature = "test-stub")]
+pub mod write_gate {
+    pub use crate::process::write_gate::WriteGate;
+}
 pub use types::*;

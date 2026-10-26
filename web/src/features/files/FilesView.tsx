@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   fetchChanges,
   fetchEntryDiff,
@@ -58,19 +58,33 @@ export function FilesView({ hostId, workspaceId, hostLabel, taskFilter, onBack }
   const [staged, setStaged] = useState(false);
   const [detail, setDetail] = useState<EntryDetailState>({ kind: "idle" });
   const [detailLoading, setDetailLoading] = useState(false);
+  // Generation of the most recently STARTED load. The mount effect runs twice
+  // under dev StrictMode (two concurrent fetchChanges), and under load the
+  // first request's response can land AFTER the second's and after the reader
+  // opened a detail: applying it would replace the view model and silently
+  // clear contentChanged (and an even later start would reset the open
+  // detail), which is the ux-files:175 flake. Only the newest load applies.
+  const loadGenRef = useRef(0);
   // The project space is the unchanged axis; the task space is its projection.
   // Default stays on the project space so an open file view is byte-similar.
   const [space, setSpace] = useState<"project" | "task">("project");
   const taskActive = taskFilter != null && space === "task";
 
   const load = useCallback(async () => {
+    const gen = loadGenRef.current + 1;
+    loadGenRef.current = gen;
     setView((current) => ({ phase: "loading", status: current.status, contentChanged: false }));
     setActivePath(null);
     setDetail({ kind: "idle" });
     try {
       const status = await fetchChanges(hostId, workspaceId);
+      // A newer load (the StrictMode twin, or a manual refresh) supersedes
+      // this response: drop it instead of clobbering the newer view model and
+      // any detail the reader has since opened.
+      if (gen !== loadGenRef.current) return;
       setView(projectStatus(status));
     } catch (error) {
+      if (gen !== loadGenRef.current) return;
       setView(phaseFromError(error));
     }
   }, [hostId, workspaceId]);

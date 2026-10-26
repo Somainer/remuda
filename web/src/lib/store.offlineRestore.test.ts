@@ -48,9 +48,20 @@ it("an offline reload restores the full instance projection (capabilities/native
   vi.spyOn(api, "hello").mockRejectedValue(new Error("network off"));
   vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
   vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+  // The background drain is exercised by the outbox delivery suites; here it
+  // is stubbed so the assertion is about the OFFLINE RESTORE (projection +
+  // honest machine state), not about how many microtask hops the install's
+  // fire-and-forget flush had reached (an internal queueing detail that the
+  // S3 auth-queue race legitimately shifts by one continuation).
+  vi.spyOn(hubStore, "flushAllOutbox").mockImplementation(() => undefined as never);
   const send = vi.spyOn(api, "instanceSend");
 
   await hubStore.bootstrap();
+  // Give the (now stubbed) flush and any queued continuations room.
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
 
   const state = hubStore.getSnapshot();
   // Honest link state with the network still off: offline or recovering,

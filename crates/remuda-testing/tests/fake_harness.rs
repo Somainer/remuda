@@ -89,8 +89,8 @@ fn claude_artifacts_parse_with_the_transcript_mapper() {
 
     // The production tail sees the same whole lines.
     let mut tail = TranscriptTail::new(path.clone());
-    let lines = tail.poll().expect("poll");
-    assert_eq!(lines.len(), records.len());
+    let read = tail.poll().expect("poll");
+    assert_eq!(read.lines.len(), records.len());
 }
 
 #[test]
@@ -842,6 +842,8 @@ fn p6_codex_adapter_lifecycle_messages_tools_and_usage_from_a_live_fake() {
         home: h.home().to_path_buf(),
         cwd: h.home().to_path_buf(),
         pid: Some(h.pid()),
+        launched_at: None,
+        resume_session_id: None,
     });
     let observed = adapter.poll().expect("adapter poll");
     assert!(
@@ -902,6 +904,8 @@ fn p6_codex_adapter_records_an_interrupted_turn_from_a_live_fake() {
         home: h.home().to_path_buf(),
         cwd: h.home().to_path_buf(),
         pid: Some(h.pid()),
+        launched_at: None,
+        resume_session_id: None,
     });
     let observed = adapter.poll().expect("poll");
     assert!(
@@ -930,6 +934,8 @@ fn p6_grok_adapter_chunks_turns_and_tools_from_a_live_fake() {
         home: h.home().to_path_buf(),
         cwd: h.home().to_path_buf(),
         pid: Some(h.pid()),
+        launched_at: None,
+        resume_session_id: None,
     });
     let deadline = std::time::Instant::now() + WAIT;
     let mut observed = Vec::new();

@@ -178,6 +178,44 @@ describe("JournalClient", () => {
     expect(statuses).not.toContain("live");
   });
 
+  it("r6 item 2: a resume read rejected after ownership is lost settles silently — no readonly-stale, no throw", async () => {
+    // Ruling Y2: the store passes an ownership predicate. The resync read is
+    // parked; the route leaves (predicate flips false); the read rejects. The
+    // stale continuation must return silently WITHOUT publishing
+    // readonly-stale — otherwise the re-mounted live journal shows 只读.
+    let rejectRead: ((err: Error) => void) | null = null;
+    const read: JournalRead = vi
+      .fn()
+      .mockImplementationOnce(
+        () =>
+          new Promise<never>((_resolve, reject) => {
+            rejectRead = reject;
+          }),
+      )
+      .mockResolvedValueOnce(page([], { durableSeq: "0" }));
+    const statuses: string[] = [];
+    const client = new JournalClient("obj_journal" as Id, read, {
+      onStatus: (status) => statuses.push(status),
+    });
+    let owned = true;
+    client.markReconnecting();
+
+    const pending = client
+      .resumeAfterReconnect({ isCurrent: () => owned })
+      .catch((err: unknown) => err);
+    rejectRead!(new Error("HTTP 502"));
+    // Ownership lost BEFORE the rejection settles.
+    owned = false;
+    const outcome = await pending;
+    expect(outcome).toBe("0"); // stale attempt resolves, does NOT throw
+    expect(client.status).toBe("reconnecting"); // no readonly-stale publication
+    expect(statuses).not.toContain("readonly-stale");
+
+    // A later resync under CURRENT ownership succeeds and restores live.
+    await client.resumeAfterReconnect({ isCurrent: () => true });
+    expect(client.status).toBe("live");
+  });
+
   it("resumes after reconnect from the last applied seq", async () => {
     const all = [obs(1), obs(2), obs(3), obs(4)];
     const read: JournalRead = vi.fn(async ({ afterSeq, limit }) => {
@@ -363,14 +401,15 @@ describe("JournalClient", () => {
       onPrepend: (events) => prepended.push(events.map((e) => Number(e.seq))),
     });
     // Late attach: the snapshot is a partial tail window.
+    client.noteHistory(Array.from({ length: 2_000 }, (_, i) => obs(3001 + i)));
     client.applySnapshot({
       ...snapshot(5_000),
       history: { earliestRetainedSeq: "3001", complete: false },
     });
     expect(client.retainedFloorSeq).toBe("3001");
 
-    const floor = await client.loadEarlier();
-    expect(floor).toBe("1001");
+    const result = await client.loadEarlier();
+    expect(result).toEqual({ prepended: true, end: false, floor: "1001" });
     expect(calls).toHaveLength(1);
     expect(calls[0]).toMatchObject({ afterSeq: "0", beforeSeq: "3000" });
     expect(prepended).toHaveLength(1);
@@ -378,12 +417,84 @@ describe("JournalClient", () => {
     expect(prepended[0]?.at(-1)).toBe(3000);
 
     // A later partial snapshot with a higher floor must not move the loaded
-    // floor back up.
+    // floor back up (it only re-anchors the descending cursor).
     client.applySnapshot({
       ...snapshot(5_000),
       history: { earliestRetainedSeq: "3001", complete: false },
     });
     expect(client.retainedFloorSeq).toBe("1001");
+  });
+
+  it("duplicate pages after a reconnect re-anchor keep descending to held history", async () => {
+    // Real bounded Hub: newest `window` rows of (afterSeq, beforeSeq]. Every
+    // response is one such window, so a duplicate page (rows already held) is
+    // only possible when a snapshot re-anchored the paging cursor ABOVE them.
+    const { read, calls } = windowedRead(10_000, 2_000);
+    const prepended: number[][] = [];
+    const client = new JournalClient("obj_journal" as Id, read, {
+      onPrepend: (events) => prepended.push(events.map((e) => Number(e.seq))),
+    });
+    // Late attach to a bounded tail window 3001..5000: the seed READ delivers
+    // the rows (noteHistory), the snapshot carries the window floor.
+    client.noteHistory(Array.from({ length: 2_000 }, (_, i) => obs(3001 + i)));
+    client.applySnapshot({
+      ...snapshot(5_000),
+      history: { earliestRetainedSeq: "3001", complete: false },
+    });
+    // Live frames extend the applied cursor to 8000 while connected.
+    const live = Array.from({ length: 3_000 }, (_, i) => obs(5001 + i));
+    client.applyBatch({
+      subscriptionId: "sub",
+      journalId: "obj_journal" as Id,
+      fromSeq: "5001",
+      toSeq: "8000",
+      events: live,
+      durableSeq: "8000",
+    });
+
+    // Reconnect delivers a bounded resync snapshot whose window floor (8001)
+    // is ABOVE manually-loadable history the client has not paged yet.
+    client.applySnapshot({
+      ...snapshot(10_000),
+      history: { earliestRetainedSeq: "8001", complete: false },
+    });
+    expect(client.retainedFloorSeq).toBe("3001");
+
+    // Click 1 pages below the snapshot window: 6001..8000, every row already
+    // held. No prepend, NOT the end, the retained floor/button stay, and the
+    // cursor descended.
+    await expect(client.loadEarlier()).resolves.toEqual({
+      prepended: false,
+      end: false,
+      floor: "3001",
+    });
+    expect(prepended).toHaveLength(0);
+    expect(calls.at(-1)?.beforeSeq).toBe("8000");
+
+    // Click 2 walks down through another fully-held window.
+    await expect(client.loadEarlier()).resolves.toMatchObject({ prepended: false, end: false });
+    expect(calls.at(-1)?.beforeSeq).toBe("6000");
+
+    // Click 3 crosses into unseen rows: 2001..3000 arrive (3001..4000 were
+    // already held); the retained floor moves, the end is not reached.
+    const r3 = await client.loadEarlier();
+    expect(calls.at(-1)?.beforeSeq).toBe("4000");
+    expect(r3).toMatchObject({ prepended: true, end: false });
+    expect(prepended).toHaveLength(1);
+    expect(prepended[0]?.[0]).toBe(2001);
+    expect(prepended[0]?.at(-1)).toBe(3000);
+    expect(client.retainedFloorSeq).toBe("2001");
+
+    // Click 4 reaches the authoritative end at seq 1.
+    const r4 = await client.loadEarlier();
+    expect(r4).toMatchObject({ prepended: true, end: true });
+    expect(prepended[1]?.[0]).toBe(1);
+    expect(prepended[1]?.at(-1)).toBe(2000);
+    expect(client.retainedFloorSeq).toBe("1");
+
+    // The end short-circuits further reads.
+    expect((await client.loadEarlier()).end).toBe(true);
+    expect(calls).toHaveLength(4);
   });
 });
 

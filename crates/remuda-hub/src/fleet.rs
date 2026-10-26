@@ -217,6 +217,7 @@ async fn broadcast(
                 body.operation.clone(),
                 payload,
                 key,
+                None,
                 broadcast_initiator.clone(),
                 broadcast_device_id.clone(),
             )
@@ -477,6 +478,7 @@ async fn fleet_commands(
                 host_id.clone(),
                 body.operation.clone(),
                 payload,
+                None,
                 None,
                 // Agent callers are refused at the top of this handler.
                 None,

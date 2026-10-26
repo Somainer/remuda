@@ -144,6 +144,187 @@ pub fn group_alive(pgid: i32) -> bool {
     }
 }
 
+/// What the host can establish about one child process BEFORE its parent
+/// reaps it (ma-sdk-state r14 item 4; r15 item 2).
+///
+/// The distinction between "missing" and "unknown" is load-bearing: an
+/// unreadable `/proc` on Linux must never be read as death (the r13 test
+/// helper mapped every read error to "gone", which is always true on macOS
+/// where `/proc` does not exist), and signal 0 alone must never be read as
+/// liveness on macOS — it succeeds for an unreaped zombie, which the pre-close
+/// SIGKILL proofs must be able to see (r15 item 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildDisposition {
+    /// No such process: it exited and has already been reaped (or the pid is
+    /// stale). Signal 0 returns `ESRCH` (Linux also: `/proc/<pid>` is ENOENT).
+    Gone,
+    /// Dead but not yet reaped by its parent: Linux `/proc` state `Z`/`X`/`x`;
+    /// a non-Linux unix `ps` row in state `Z`/`E`/`?Es`.
+    Zombie,
+    /// Still running.
+    Alive,
+    /// The information is unavailable (unreadable `/proc` for a reason other
+    /// than ENOENT, `EPERM` from signal 0, or a `ps` table that does not show
+    /// the pid). Callers that need proof of death keep waiting rather than
+    /// treating this as gone.
+    Unknown,
+}
+
+/// Classify one direct child from its Linux `/proc/<pid>/stat` contents and a
+/// signal-0 probe result.
+///
+/// EVERY `/proc` read failure — INCLUDING `NotFound` — falls through to the
+/// signal-0 probe. ENOENT normally means the pid was reaped, but inside a
+/// chroot or mount namespace `/proc/<pid>` is absent while the child is very
+/// much alive, so the read result alone is never death:
+/// [`ChildDisposition::Gone`] requires a confirming `ESRCH`, while existence
+/// (`Ok`) or `EPERM` under an unreadable `/proc` is
+/// [`ChildDisposition::Unknown`] (r15 item 3).
+#[cfg(target_os = "linux")]
+pub(crate) fn classify_linux_child(
+    stat: std::io::Result<String>,
+    signal0: Result<(), nix::errno::Errno>,
+) -> ChildDisposition {
+    match stat {
+        Ok(text) => classify_linux_stat(&text),
+        Err(_) => match signal0 {
+            // The process exists (or /proc itself is hidden from this
+            // namespace) but /proc would not say in what state: unavailable
+            // information, not evidence of death.
+            Ok(()) | Err(nix::errno::Errno::EPERM) => ChildDisposition::Unknown,
+            // ENOENT plus a confirming ESRCH is the normal reaped/gone case.
+            Err(nix::errno::Errno::ESRCH) => ChildDisposition::Gone,
+            Err(_) => ChildDisposition::Unknown,
+        },
+    }
+}
+
+/// Parse the state letter out of a `/proc/<pid>/stat` line ("<comm>) <state> …";
+/// comm can contain spaces/parens, so split at the LAST ')'. An unparseable
+/// line is [`ChildDisposition::Unknown`] rather than a guess.
+#[cfg(target_os = "linux")]
+fn classify_linux_stat(stat: &str) -> ChildDisposition {
+    match stat
+        .rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+    {
+        Some("Z") | Some("X") | Some("x") => ChildDisposition::Zombie,
+        Some(_) => ChildDisposition::Alive,
+        None => ChildDisposition::Unknown,
+    }
+}
+
+/// Classify a child on a unix WITHOUT `/proc` (macOS, *BSD) from a signal-0
+/// probe result and the child's `ps` state row, if `ps` showed one
+/// (ma-sdk-state r15 item 2).
+///
+/// Signal 0 alone is NOT liveness evidence on these platforms: `kill(pid, 0)`
+/// succeeds for an unreaped zombie exactly as for a running process, which is
+/// what made the old arm answer `Alive` for a SIGKILLed child and drove the
+/// pre-close death proofs into their full timeout and panic. The rules are:
+///
+/// * signal 0 `ESRCH` (whatever `ps` saw) → [`ChildDisposition::Gone`];
+/// * signal 0 `Ok` plus a `ps` row with a dead-state letter (`Z`, `E`,
+///   `?Es`, … — [`state_is_dead`]) → [`ChildDisposition::Zombie`];
+/// * signal 0 `Ok` plus a live row → [`ChildDisposition::Alive`];
+/// * signal 0 `Ok` with NO row (the `ps` invocation failed or the table does
+///   not show the pid) → [`ChildDisposition::Unknown`]: existence without a
+///   state is unavailable information, never liveness;
+/// * signal 0 `EPERM`/any other error → [`ChildDisposition::Unknown`].
+#[cfg(any(test, all(unix, not(target_os = "linux"))))]
+pub(crate) fn classify_ps_child(
+    signal0: Result<(), nix::errno::Errno>,
+    ps_state: Option<&str>,
+) -> ChildDisposition {
+    match signal0 {
+        Err(nix::errno::Errno::ESRCH) => ChildDisposition::Gone,
+        Ok(()) => match ps_state {
+            Some(state) if state_is_dead(state) => ChildDisposition::Zombie,
+            Some(_) => ChildDisposition::Alive,
+            None => ChildDisposition::Unknown,
+        },
+        // EPERM: the pid exists but we may not signal it — ps rows for it
+        // cannot be trusted to establish liveness under the same restriction,
+        // and every other signal error is equally inconclusive.
+        Err(_) => ChildDisposition::Unknown,
+    }
+}
+
+/// Read one pid's state letter from `ps -o pid=,stat= -p <pid>` output.
+/// Split out from the invocation so the macOS classification has a
+/// host-independent unit test with injected output.
+#[cfg(any(test, all(unix, not(target_os = "linux"))))]
+pub(crate) fn parse_ps_pid_state(bytes: &[u8], wanted: i32) -> Option<String> {
+    for line in String::from_utf8_lossy(bytes).lines() {
+        let mut parts = line.split_whitespace();
+        let Some(pid) = parts.next().and_then(|value| value.parse::<i32>().ok()) else {
+            continue;
+        };
+        let state = parts.next().unwrap_or("");
+        if pid == wanted {
+            return Some(state.to_owned());
+        }
+    }
+    None
+}
+
+/// Establish one child's disposition (ma-sdk-state r14 item 4; r15 items 2/3).
+///
+/// * **Linux**: `/proc/<pid>/stat` distinguishes a live child from an
+///   unreaped zombie — exactly the state a SIGKILLed child sits in before its
+///   parent's `wait()`. Any read failure, INCLUDING ENOENT (a chroot or mount
+///   namespace can hide all of `/proc` while the child lives), is confirmed
+///   against signal 0: gone needs a matching `ESRCH`.
+/// * **macOS/other unix**: there is no `/proc`; signal 0 asks the kernel
+///   whether the pid exists and `ps` supplies the state signal 0 cannot:
+///   `ESRCH` is gone/reaped, a dead-state row (`Z`/`E`/`?Es`) is an unreaped
+///   zombie, a live row is alive, and anything less conclusive is unknown.
+///   Callers requiring gone/zombie evidence keep waiting.
+#[must_use]
+pub fn child_disposition(pid: i32) -> ChildDisposition {
+    if pid <= 0 {
+        return ChildDisposition::Unknown;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"));
+        let signal0 = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None);
+        classify_linux_child(stat, signal0)
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        let signal0 = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None);
+        // `ps` can add nothing on a confirming ESRCH; for every other answer
+        // the state row is what separates a zombie from a live process.
+        let ps_state = if matches!(signal0, Err(nix::errno::Errno::ESRCH)) {
+            None
+        } else {
+            ps_child_state(pid)
+        };
+        classify_ps_child(signal0, ps_state.as_deref())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        ChildDisposition::Unknown
+    }
+}
+
+/// Invoke `ps` for one pid's state row on a non-Linux unix (ma-sdk-state
+/// r15 item 2). Returns `None` when `ps` cannot be run, fails, or shows no
+/// row — all indistinguishable cases the classifier reads as unknown.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn ps_child_state(pid: i32) -> Option<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "pid=,stat=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_ps_pid_state(&output.stdout, pid)
+}
+
 /// Whether a single process (by pid, not group) is still running.
 ///
 /// Like [`group_alive`], this asks the kernel with signal 0 rather than parsing
@@ -169,6 +350,351 @@ pub fn process_alive(pid: i32) -> bool {
         let _ = pid;
         false
     }
+}
+
+/// Wait (event-driven, no poll/sleep) for a process the caller did NOT fork
+/// to exit, then confirm the disposition reads [`ChildDisposition::Gone`] or
+/// [`ChildDisposition::Zombie`] (ma-sdk-state r15 item 2).
+///
+/// The pre-close SIGKILL proofs watch the DRIVER's direct child, so
+/// `waitpid(2)` returns `ECHILD` and a `/proc`-state poll with a sleep was the
+/// only option; the kernel instead offers a termination event:
+///
+/// * **Linux**: `pidfd_open(2)` + `poll(2)` (`POLLIN` on exit, kernel ≥5.3).
+///   The fd becomes readable at the zombie transition for a non-child too.
+/// * **macOS/BSD**: a `kqueue` `EVFILT_PROC`/`NOTE_EXIT` registration.
+///
+/// Returns `false` on timeout, on an unsupported host (`pidfd_open` absent),
+/// or when the final classifier read is still inconclusive — the caller's
+/// named bound is the terminator either way. Blocking work runs off the async
+/// worker threads.
+#[cfg(any(test, feature = "test-stub"))]
+pub async fn wait_child_exit(pid: i32, timeout: Duration) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    let join = tokio::task::spawn_blocking(move || wait_child_exit_blocking(pid, timeout, None));
+    join.await.unwrap_or_default()
+}
+
+/// What one bounded event wait ended on (ma-sdk-state r16 item 2). The
+/// `Fired` payload carries the parsed event for the platform waiter (the
+/// Linux arm carries nothing; the macOS arm carries its [`KqueueEventRead`]).
+#[cfg(all(any(test, feature = "test-stub"), unix))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterruptibleEventWait<T> {
+    /// The termination event fired.
+    Fired(T),
+    /// The single bound elapsed without an event.
+    TimedOut,
+}
+
+/// Test-only probe for the REAL interruptible event wait (ma-sdk-state r17
+/// item 2; r18 item 3): the ONE instant from which the waiter derives its
+/// deadline (sampled where the deadline is computed and stamped into the
+/// probe unchanged — the test clocks `completion - started` against the
+/// bound) and the number of EINTR restarts the wait ACTUALLY performed (a
+/// signal that was merely caught without interrupting the parked syscall
+/// must not count).
+#[cfg(all(any(test, feature = "test-stub"), unix))]
+#[derive(Default)]
+struct EintrWaitProbe {
+    /// The single `started` instant the deadline is `started + timeout`
+    /// from; stamped with exactly that instant (never a second sample).
+    deadline_anchor: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Incremented on every EINTR restart against that same deadline.
+    eintr_retries: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(all(any(test, feature = "test-stub"), unix))]
+impl EintrWaitProbe {
+    fn note_wait_started(&self, started: std::time::Instant) {
+        *self.deadline_anchor.lock().expect("eintr probe anchor") = Some(started);
+    }
+
+    fn note_eintr_retry(&self) {
+        self.eintr_retries
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    // Read accessors: deadline_anchor is read by both the all-unix r19 item 2
+    // scripted-clock anchor-identity test and the Linux x86_64 real-syscall
+    // test, so it compiles on every unix test build; eintr_retries is read
+    // ONLY by the Linux x86_64 real-syscall test and must carry that gate or
+    // macOS clippy reports it never used (ma-sdk-state r20).
+    #[cfg(all(test, unix))]
+    fn deadline_anchor(&self) -> Option<std::time::Instant> {
+        *self.deadline_anchor.lock().expect("eintr probe anchor")
+    }
+
+    #[cfg(all(test, unix, target_os = "linux", target_arch = "x86_64"))]
+    fn eintr_retries(&self) -> usize {
+        self.eintr_retries
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// Drive an interruptible bounded event wait against ONE monotonic deadline
+/// (ma-sdk-state r16 item 2).
+///
+/// `wait_once` performs ONE blocking wait and receives the time REMAINING at the
+/// deadline on every call — never the original timeout. `EINTR` restarts the
+/// wait with that remainder (so a signal interrupting a parked `poll(2)` /
+/// `kevent(2)` fails the waiter neither early nor after a freshly renewed full
+/// timeout); any other error propagates immediately, and a deadline already
+/// consumed ends the wait as [`InterruptibleEventWait::TimedOut`]. The event
+/// source is level-triggered on Linux (a pidfd stays readable), so restarting
+/// the wait loses no event.
+#[cfg(all(any(test, feature = "test-stub"), unix))]
+fn wait_with_eintr_retry<T>(
+    timeout: Duration,
+    probe: Option<&EintrWaitProbe>,
+    wait_once: impl FnMut(Duration) -> std::io::Result<InterruptibleEventWait<T>>,
+) -> std::io::Result<InterruptibleEventWait<T>> {
+    wait_with_eintr_retry_clocked(timeout, probe, &mut std::time::Instant::now, wait_once)
+}
+
+/// Clock-seamed core of [`wait_with_eintr_retry`] (ma-sdk-state r19 item 2):
+/// the real waiter passes `Instant::now`; the deterministic anchor-identity
+/// regression passes a scripted clock so it can prove — without sleeps or
+/// timing tolerance — that the probe stamps the SAME instant the deadline is
+/// derived from.
+#[cfg(all(any(test, feature = "test-stub"), unix))]
+fn wait_with_eintr_retry_clocked<T>(
+    timeout: Duration,
+    probe: Option<&EintrWaitProbe>,
+    now: &mut impl FnMut() -> std::time::Instant,
+    mut wait_once: impl FnMut(Duration) -> std::io::Result<InterruptibleEventWait<T>>,
+) -> std::io::Result<InterruptibleEventWait<T>> {
+    // ma-sdk-state r18 item 3: sample ONE started instant; the deadline is
+    // derived from it and the probe stamps EXACTLY that instant, so the
+    // test's `completion - started` is measured against the same clock the
+    // retry loop uses (previously the deadline used one Instant::now() sample
+    // and the probe stamped a later one).
+    let started = now();
+    let deadline = started + timeout;
+    if let Some(probe) = probe {
+        probe.note_wait_started(started);
+    }
+    loop {
+        let remaining = deadline.saturating_duration_since(now());
+        if remaining == Duration::ZERO {
+            return Ok(InterruptibleEventWait::TimedOut);
+        }
+        match wait_once(remaining) {
+            Ok(outcome) => return Ok(outcome),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                // r17 item 2: acknowledge the ACTUAL restart of the real wait
+                // (the injected unit tests pass no probe).
+                if let Some(probe) = probe {
+                    probe.note_eintr_retry();
+                }
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// What one `kevent(2)` wait on the macOS/BSD arm ended on (ma-sdk-state
+/// r16 item 4), expressed without nix types so the decision below is
+/// unit-testable on EVERY unix target — the kqueue arm itself builds only off
+/// Linux and the coordinator runs it on a Mac.
+#[cfg(any(test, all(unix, not(target_os = "linux"))))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KqueueWaitOutcome {
+    /// The eventlist entry fired with NOTE_EXIT (no EV_ERROR).
+    NoteExit,
+    /// The returned entry carried EV_ERROR: the changelist registration
+    /// FAILED — this is NOT an exit (its payload is the errno, e.g. ESRCH for
+    /// a process that died in the registration window, EPERM when the pid is
+    /// not watchable). The old arm read every `Ok(1)` as an exit.
+    ChangeError(i32),
+    /// `kevent` returned 0: the bound elapsed with no event.
+    BoundElapsed,
+    /// The `kevent` syscall itself failed with an error other than EINTR
+    /// (EINTR never reaches here — the retry helper owns it).
+    WaitFailed,
+}
+
+/// The pre-arm move of the macOS child-exit wait (ma-sdk-state r16 item 4).
+#[cfg(any(test, all(unix, not(target_os = "linux"))))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KqueuePreArm {
+    /// The disposition already reads Gone or Zombie: no kqueue is needed.
+    /// This is the defect fix: EVFILT_PROC/NOTE_EXIT is edge-triggered and
+    /// never replays a death that happened BEFORE registration, so an
+    /// already-exited unreaped zombie used to wait out the full bound.
+    AlreadyConfirmed,
+    /// Register NOTE_EXIT and wait: the child is Alive, or the disposition is
+    /// Unknown (a `ps` hiccup, EPERM), in which case kqueue is the last
+    /// available event source.
+    RegisterAndWait,
+}
+
+/// Decide the pre-arm move from an injected/real disposition (r16 item 4).
+#[cfg(any(test, all(unix, not(target_os = "linux"))))]
+fn kqueue_pre_arm_move(disposition: ChildDisposition) -> KqueuePreArm {
+    match disposition {
+        ChildDisposition::Gone | ChildDisposition::Zombie => KqueuePreArm::AlreadyConfirmed,
+        ChildDisposition::Alive | ChildDisposition::Unknown => KqueuePreArm::RegisterAndWait,
+    }
+}
+
+/// The terminal decision of the macOS child-exit wait (ma-sdk-state r16 item
+/// 4): NEITHER a changelist EV_ERROR nor a timeout is itself evidence of an
+/// exit, and even a delivered NOTE_EXIT keeps the r15 item-2 discipline of a
+/// confirming classifier read — the wait is satisfied only when a FRESH
+/// disposition independently reads Gone or Zombie.
+///
+/// `event` therefore never sways the verdict (every outcome is confirmed the
+/// same way), but threading the PARSED event through the caller is the fix
+/// shape: the wait closure must distinguish a changelist EV_ERROR from a real
+/// NOTE_EXIT instead of treating every `Ok(1)` as an exit. The injected tests
+/// pin the full event×disposition table.
+#[cfg(any(test, all(unix, not(target_os = "linux"))))]
+fn kqueue_exit_confirmed(event: KqueueWaitOutcome, disposition: ChildDisposition) -> bool {
+    match (event, disposition) {
+        // A fresh Gone/Zombie classifier read confirms the wait however it
+        // ended — a registration EV_ERROR, an elapsed bound, or a failed
+        // syscall — matching the "re-check on timeout or error" contract.
+        (_, ChildDisposition::Gone | ChildDisposition::Zombie) => true,
+        // A delivered NOTE_EXIT paired with an inconclusive disposition, a
+        // changelist EV_ERROR (never an exit), an elapsed bound, or a failed
+        // wait can none of them confirm death on their own.
+        (
+            KqueueWaitOutcome::NoteExit
+            | KqueueWaitOutcome::ChangeError(_)
+            | KqueueWaitOutcome::BoundElapsed
+            | KqueueWaitOutcome::WaitFailed,
+            _,
+        ) => false,
+    }
+}
+
+#[cfg(all(any(test, feature = "test-stub"), unix, target_os = "linux"))]
+fn wait_child_exit_blocking(pid: i32, timeout: Duration, probe: Option<&EintrWaitProbe>) -> bool {
+    // A pidfd is a pollable fd that becomes readable when the process EXITS
+    // (the zombie transition included), even when it is not ours to reap, so
+    // the wait parks in the kernel instead of polling /proc on a timer.
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    use rustix::process::{Pid, PidfdFlags, pidfd_open};
+
+    let Some(target) = Pid::from_raw(pid) else {
+        return false;
+    };
+    let fd = match pidfd_open(target, PidfdFlags::empty()) {
+        Ok(fd) => fd,
+        // ESRCH: it is already gone. Anything else (ENOSYS on a pre-5.3
+        // kernel, EPERM) has no event source here: one classifier read rather
+        // than a sleep, and a live/unknown answer fails the bound honestly.
+        Err(rustix::io::Errno::SRCH) => {
+            return matches!(
+                child_disposition(pid),
+                ChildDisposition::Gone | ChildDisposition::Zombie
+            );
+        }
+        Err(_) => return false,
+    };
+    let mut fds = [PollFd::new(&fd, PollFlags::IN)];
+    // One monotonic deadline across EINTR restarts (r16 item 2): each poll gets
+    // only the time remaining, so a signal storm can neither fail the wait
+    // early nor renew the bound.
+    let waited = wait_with_eintr_retry(timeout, probe, |remaining| {
+        let Some(timespec) = Timespec::try_from(remaining).ok() else {
+            return Ok(InterruptibleEventWait::TimedOut);
+        };
+        match poll(&mut fds, Some(&timespec)) {
+            Ok(1) => Ok(InterruptibleEventWait::Fired(())),
+            Ok(_) => Ok(InterruptibleEventWait::TimedOut),
+            Err(rustix::io::Errno::INTR) => Err(std::io::Error::from(rustix::io::Errno::INTR)),
+            Err(other) => Err(std::io::Error::from(other)),
+        }
+    });
+    matches!(waited, Ok(InterruptibleEventWait::Fired(())))
+        && matches!(
+            child_disposition(pid),
+            ChildDisposition::Gone | ChildDisposition::Zombie
+        )
+}
+
+#[cfg(all(any(test, feature = "test-stub"), unix, not(target_os = "linux")))]
+fn wait_child_exit_blocking(pid: i32, timeout: Duration, probe: Option<&EintrWaitProbe>) -> bool {
+    // The macOS/BSD equivalent of the pidfd wait: an EVFILT_PROC/NOTE_EXIT
+    // registration delivers when the watched process exits. nix's safe
+    // kqueue wrapper is used because the workspace forbids `unsafe`; same-uid
+    // processes (our own test children) are watchable though not reaped by us.
+    use nix::sys::event::{EventFilter, EventFlag, FilterFlag, KEvent, Kqueue};
+
+    // ma-sdk-state r16 item 4: classify BEFORE arming. The pre-close SIGKILL
+    // proofs call this on a child that has ALREADY exited and is an unreaped
+    // zombie, and EVFILT_PROC/NOTE_EXIT is edge-triggered — it never replays a
+    // death that happened before the EV_ADD landed, so the old arm parked for
+    // its whole bound and panicked the proofs. Gone/Zombie is success without
+    // a syscall (the Linux pidfd arm needs no equivalent: pidfd readiness is
+    // level-triggered).
+    if kqueue_pre_arm_move(child_disposition(pid)) == KqueuePreArm::AlreadyConfirmed {
+        return true;
+    }
+
+    let Ok(kq) = Kqueue::new() else {
+        // No event source: a fresh classifier read is the only evidence left.
+        return matches!(
+            child_disposition(pid),
+            ChildDisposition::Gone | ChildDisposition::Zombie
+        );
+    };
+    let change = KEvent::new(
+        pid as nix::libc::uintptr_t,
+        EventFilter::EVFILT_PROC,
+        EventFlag::EV_ADD | EventFlag::EV_ENABLE,
+        FilterFlag::NOTE_EXIT,
+        0,
+        0,
+    );
+    let mut events = [KEvent::new(
+        0,
+        EventFilter::EVFILT_PROC,
+        EventFlag::empty(),
+        FilterFlag::empty(),
+        0,
+        0,
+    )];
+    // EINTR retries against the ONE monotonic deadline with the remaining
+    // time (r16 item 2). On Ok(1) the returned entry is PARSED: a changelist
+    // EV_ERROR (errno in data) is a failed registration, NOT a NOTE_EXIT
+    // (r16 item 4 — the old arm treated every Ok(1) as an exit).
+    let waited = wait_with_eintr_retry::<KqueueWaitOutcome>(timeout, probe, |remaining| {
+        let deadline = Some(nix::libc::timespec {
+            tv_sec: remaining.as_secs() as nix::libc::time_t,
+            tv_nsec: remaining.subsec_nanos() as nix::libc::c_long,
+        });
+        match kq.kevent(&[change], &mut events, deadline) {
+            Ok(0) => Ok(InterruptibleEventWait::TimedOut),
+            Ok(1) => {
+                let entry = &events[0];
+                let outcome = if entry.flags().contains(EventFlag::EV_ERROR) {
+                    KqueueWaitOutcome::ChangeError(entry.data() as i32)
+                } else {
+                    KqueueWaitOutcome::NoteExit
+                };
+                Ok(InterruptibleEventWait::Fired(outcome))
+            }
+            // eventlist has exactly one slot; the kernel cannot report more.
+            Ok(_) => Ok(InterruptibleEventWait::TimedOut),
+            Err(nix::errno::Errno::EINTR) => Err(std::io::Error::from(nix::errno::Errno::EINTR)),
+            Err(_) => Ok(InterruptibleEventWait::Fired(KqueueWaitOutcome::WaitFailed)),
+        }
+    });
+    // Terminal read (r16 item 4): re-classify on EVERY outcome — a delivered
+    // NOTE_EXIT, a changelist EV_ERROR, an elapsed bound, or a failed wait —
+    // and confirm only Gone/Zombie.
+    let event = match waited {
+        Ok(InterruptibleEventWait::Fired(event)) => event,
+        Ok(InterruptibleEventWait::TimedOut) => KqueueWaitOutcome::BoundElapsed,
+        Err(_) => KqueueWaitOutcome::WaitFailed,
+    };
+    kqueue_exit_confirmed(event, child_disposition(pid))
 }
 
 /// One member of a process group as read from the host process table.
@@ -1010,5 +1536,631 @@ mod tests {
         assert!(outcome.group_gone, "a zombie is not an outlived group");
         assert!(outcome.survivors.is_empty());
         assert_eq!(outcome.rung, StopRung::AlreadyGone);
+    }
+
+    /// r15 item 2: the event-driven child-exit wait parks for the kernel
+    /// termination event and reads a SIGKILLed (still unreaped) child as
+    /// gone/zombie, while a bound against a LIVE process returns false without
+    /// a panic. The killed child is this test's own (the integration tests
+    /// cover the non-child driver-child case); the pidfd/kqueue event fires at
+    /// the zombie transition either way.
+    #[cfg(all(unix, target_os = "linux"))]
+    #[test]
+    fn the_event_wait_notices_a_sigkilled_child_and_times_out_a_live_one() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            // A live child: the bound must elapse and answer false.
+            let mut live = std::process::Command::new("/bin/sh")
+                .args(["-c", "exec sleep 30"])
+                .spawn()
+                .expect("spawn");
+            let live_pid = i32::try_from(live.id()).expect("pid");
+            let start = std::time::Instant::now();
+            assert!(
+                !wait_child_exit(live_pid, Duration::from_millis(200)).await,
+                "a live child does not satisfy the exit wait"
+            );
+            assert!(start.elapsed() >= Duration::from_millis(180));
+
+            // SIGKILL it, leave it unreaped: the kernel event (pidfd readable)
+            // must fire while it is still a zombie.
+            nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(live_pid),
+                Some(nix::sys::signal::Signal::SIGKILL),
+            )
+            .expect("kill");
+            assert!(
+                wait_child_exit(live_pid, Duration::from_secs(5)).await,
+                "the SIGKILLed child is seen gone/zombie from the exit event"
+            );
+            let _ = live.wait();
+        });
+    }
+
+    /// r16 item 2 (injectable): three injected EINTR answers restart the wait
+    /// with the shrinking remaining time and the fourth fires — the bound is one
+    /// monotonic deadline, not four retries with the full timeout.
+    #[cfg(unix)]
+    #[test]
+    fn eintr_restarts_the_exit_wait_with_the_remaining_time_until_it_fires() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const TIMEOUT: Duration = Duration::from_secs(60); // never elapses
+
+        let calls = AtomicUsize::new(0);
+        let outcome = wait_with_eintr_retry(TIMEOUT, None, |remaining| {
+            let n = calls.fetch_add(1, Ordering::AcqRel);
+            assert!(
+                remaining <= TIMEOUT,
+                "every attempt gets the remaining time at the single deadline"
+            );
+            if n > 0 {
+                assert!(remaining < TIMEOUT, "a retry gets a strictly shorter bound");
+            }
+            match n {
+                0..=2 => Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+                _ => Ok(InterruptibleEventWait::Fired(())),
+            }
+        })
+        .expect("the wait itself never returns an error");
+        assert_eq!(outcome, InterruptibleEventWait::Fired(()));
+        assert_eq!(calls.load(Ordering::Acquire), 4);
+    }
+
+    /// r16 item 2 (injectable): uninterrupted EINTR answers keep restarting
+    /// until the one deadline elapses — without sleeping the caller — and then
+    /// answer TimedOut.
+    #[cfg(unix)]
+    #[test]
+    fn eintr_retries_until_the_single_deadline_elapses() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const BOUND: Duration = Duration::from_millis(20);
+
+        let calls = AtomicUsize::new(0);
+        let start = std::time::Instant::now();
+        let outcome = wait_with_eintr_retry::<()>(BOUND, None, |_| {
+            calls.fetch_add(1, Ordering::AcqRel);
+            Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+        })
+        .expect("the wait itself never returns an error");
+        assert_eq!(outcome, InterruptibleEventWait::TimedOut);
+        assert!(
+            start.elapsed() >= BOUND,
+            "the retries continue until the bound elapses, not failing at the first EINTR"
+        );
+        assert!(
+            calls.load(Ordering::Acquire) > 1,
+            "a continuously interrupting wait retries against the same deadline"
+        );
+    }
+
+    /// ma-sdk-state r19 item 2 (injectable, deterministic, no sleeps): the
+    /// probe's deadline anchor is the EXACT instant the deadline is derived
+    /// from, passed through unchanged — not a second clock sample the probe
+    /// reads itself. The fb3c7aca implementation let the probe stamp a fresh
+    /// `Instant::now()` a few dozen nanoseconds after the deadline's own
+    /// sample; that gap is invisible to the real-ppoll timing proof because
+    /// the interrupted syscall returns one to two milliseconds AFTER the
+    /// deadline (verified: the old implementation passes the timing proof
+    /// 20/20). A scripted clock settles the identity EXACTLY: the first
+    /// sample is `t0`, the second — the loop's remaining calculation — is
+    /// `t0 + SHIFT`; the fixed waiter samples once, hands that instant to
+    /// the probe, and its closure sees `WAIT - SHIFT`, while the old probe
+    /// stamped its own real-clock instant and fails the anchor equality by
+    /// name.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_anchor_is_the_exact_started_instant_the_deadline_derives_from() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        const WAIT: Duration = Duration::from_millis(400);
+        const SHIFT: Duration = Duration::from_millis(10);
+
+        let t0 = std::time::Instant::now();
+        // Scripted clock: call 0 (the deadline's started instant) returns t0;
+        // call 1 (the loop's first remaining calculation) returns t0+SHIFT;
+        // every later call returns t0.
+        let calls = AtomicUsize::new(0);
+        let mut now = || {
+            let n = calls.fetch_add(1, AtomicOrdering::AcqRel);
+            match n {
+                0 => t0,
+                1 => t0 + SHIFT,
+                _ => t0,
+            }
+        };
+
+        let probe = EintrWaitProbe::default();
+        let mut first_remaining = None;
+        let outcome = wait_with_eintr_retry_clocked(WAIT, Some(&probe), &mut now, |remaining| {
+            if first_remaining.is_none() {
+                first_remaining = Some(remaining);
+            }
+            Ok(InterruptibleEventWait::Fired(()))
+        })
+        .expect("the wait itself never returns an error");
+        assert_eq!(outcome, InterruptibleEventWait::Fired(()));
+        // The anchor is the SAME instant the deadline derived from. The old
+        // probe stamped a fresh std::time::Instant::now() and fails this
+        // exact equality with the defect named.
+        assert_eq!(
+            probe.deadline_anchor(),
+            Some(t0),
+            "the probe must stamp the exact started instant the deadline is derived from"
+        );
+        // The loop's remaining time derives from the SECOND scripted sample
+        // (t0+SHIFT): this pins the clock wiring — the started sample and the
+        // remaining sample are distinct calls and neither is duplicated.
+        assert_eq!(
+            first_remaining,
+            Some(WAIT - SHIFT),
+            "the first wait receives the remaining time against the one started instant"
+        );
+        // Fixed shape: one started sample and one remaining sample before
+        // the fired closure returns. The old probe's extra sample reads the
+        // REAL clock (not this scripted one), so the count stays two under
+        // both shapes — the anchor equality above is the discriminator.
+        assert_eq!(
+            calls.load(AtomicOrdering::Acquire),
+            2,
+            "one started sample and one remaining sample before the wait fires"
+        );
+    }
+
+    /// r16 item 2 (injectable): any error other than EINTR propagates on the
+    /// first attempt — an unexpected syscall failure still fails honestly.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_eintr_wait_error_propagates_immediately() {
+        let error = wait_with_eintr_retry::<()>(Duration::from_secs(60), None, |_| {
+            Err(std::io::Error::other("boom"))
+        })
+        .expect_err("the non-EINTR error propagates");
+        assert_eq!(error.to_string(), "boom");
+    }
+
+    /// r16 item 2 (injectable): the first attempt may already see an elapsed
+    /// bound and answers TimedOut without ever entering the syscall.
+    #[cfg(unix)]
+    #[test]
+    fn a_zero_remaining_bound_times_out_without_a_wait() {
+        let outcome = wait_with_eintr_retry::<()>(
+            Duration::ZERO,
+            None,
+            |_| -> std::io::Result<InterruptibleEventWait<()>> {
+                unreachable!("no wait attempt happens after the deadline is gone")
+            },
+        )
+        .expect("the wait itself never returns an error");
+        assert_eq!(outcome, InterruptibleEventWait::<()>::TimedOut);
+    }
+
+    /// r16 item 4 (injectable; the coordinator also runs this on macOS): the
+    /// pre-arm move and the full kqueue-outcome × disposition decision table.
+    /// The kqueue syscall arm itself is macOS/BSD-only, but these rules are
+    /// pure and must hold on every unix target.
+    #[cfg(unix)]
+    #[test]
+    fn the_macos_exit_wait_confirms_zombies_before_arming_and_reads_ev_error() {
+        use ChildDisposition::{Alive, Gone, Unknown, Zombie};
+        use KqueueWaitOutcome::{BoundElapsed, ChangeError, NoteExit, WaitFailed};
+
+        // Pre-arm: an already-dead child is confirmed WITHOUT touching
+        // kqueue — the edge-triggered NOTE_EXIT never replays for a zombie
+        // that died before the EV_ADD (the r16 item 4 defect); an Alive or
+        // Unknown child is registered and watched.
+        assert_eq!(kqueue_pre_arm_move(Gone), KqueuePreArm::AlreadyConfirmed);
+        assert_eq!(kqueue_pre_arm_move(Zombie), KqueuePreArm::AlreadyConfirmed);
+        assert_eq!(kqueue_pre_arm_move(Alive), KqueuePreArm::RegisterAndWait);
+        assert_eq!(kqueue_pre_arm_move(Unknown), KqueuePreArm::RegisterAndWait);
+
+        // The ESRCH a dying child leaves in a changelist EV_ERROR must not be
+        // read as an exit by itself: with an inconclusive disposition the
+        // answer is false (the old arm treated every Ok(1) as an exit).
+        assert!(!kqueue_exit_confirmed(
+            ChangeError(nix::libc::ESRCH),
+            Unknown
+        ));
+        assert!(!kqueue_exit_confirmed(ChangeError(nix::libc::EPERM), Alive));
+        // …but the SAME changelist EV_ERROR confirms once a fresh classifier
+        // read independently says Gone/Zombie ("re-check on error").
+        assert!(kqueue_exit_confirmed(ChangeError(nix::libc::ESRCH), Gone));
+        assert!(kqueue_exit_confirmed(ChangeError(0), Zombie));
+
+        // A real NOTE_EXIT keeps the r15 item-2 confirming classifier read:
+        // the event alone with an Alive/Unknown disposition is not enough.
+        assert!(kqueue_exit_confirmed(NoteExit, Gone));
+        assert!(kqueue_exit_confirmed(NoteExit, Zombie));
+        assert!(!kqueue_exit_confirmed(NoteExit, Alive));
+        assert!(!kqueue_exit_confirmed(NoteExit, Unknown));
+
+        // The bound elapsing (the exact pre-close-proof hang the fix removes)
+        // and a failed wait are satisfied by Gone/Zombie alone, never by an
+        // Alive/Unknown read.
+        assert!(kqueue_exit_confirmed(BoundElapsed, Zombie));
+        assert!(!kqueue_exit_confirmed(BoundElapsed, Alive));
+        assert!(kqueue_exit_confirmed(WaitFailed, Gone));
+        assert!(!kqueue_exit_confirmed(WaitFailed, Unknown));
+    }
+
+    /// r16 item 2, Linux: a signal delivered to the WAITING thread while the
+    /// pidfd wait is parked interrupts the syscall (EINTR); the retry keeps
+    /// waiting against the SAME monotonic deadline and answers false only when
+    /// the live child's bound elapses.
+    ///
+    /// A signal only produces a userspace EINTR when CAUGHT, and a thread-
+    /// directed signal needs a pthread handle: the workspace forbids `unsafe`,
+    /// so the empty handler is installed through `signal-hook`'s safe
+    /// registration and delivery is `pthread_kill(3)` (nix's safe wrapper).
+    /// `ppoll(2)` returns EINTR even though the registry installs SA_RESTART
+    /// (poll is never auto-restarted per POSIX). The pre-fix waiter failed the
+    /// wait at the interruption (~a few ms in); the fixed waiter continues to
+    /// the bound.
+    #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn an_interrupted_active_exit_wait_continues_until_the_deadline() {
+        use nix::sys::pthread::{Pthread, pthread_kill, pthread_self};
+        use nix::sys::signal::Signal;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+
+        /// The bound: short enough for a hot EINTR retry loop, long enough to
+        /// separate the old fail-immediate behavior from a continued wait.
+        const WAIT: Duration = Duration::from_millis(400);
+        /// ppoll(2) on x86_64.
+        const PPOLL_NR: i32 = 271;
+
+        /// ACKNOWLEDGE the wait is ACTIVELY parked in ppoll (no sleep): read
+        /// the waiter's syscall file until it names ppoll, bounded by the
+        /// caller's named deadline.
+        fn acknowledge_waiter_parked_in_ppoll(
+            waiter_tid: &AtomicI32,
+            waiter_pthread: &AtomicUsize,
+            ppoll_nr: i32,
+            deadline: std::time::Instant,
+        ) -> usize {
+            loop {
+                let stored_tid = waiter_tid.load(Ordering::Acquire);
+                let stored_pthread = waiter_pthread.load(Ordering::Acquire);
+                if stored_tid != 0 && stored_pthread != 0 {
+                    let path = format!("/proc/{stored_tid}/syscall");
+                    if let Ok(text) = std::fs::read_to_string(&path) {
+                        let mut parts = text.split_whitespace();
+                        if parts.next().and_then(|nr| nr.parse::<i32>().ok()) == Some(ppoll_nr) {
+                            return stored_pthread;
+                        }
+                    }
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out acknowledging the exit wait parked in ppoll"
+                );
+                std::thread::yield_now();
+            }
+        }
+
+        /// The named bound for the waiter join: poll `is_finished` until the
+        /// deadline (yield, never sleep) and only then join, which is
+        /// immediate for a finished thread. Returns the waiter's answer and
+        /// the instant it captured INSIDE the waiter thread as its blocking
+        /// wait returned (ma-sdk-state r18 item 3).
+        fn join_waiter_bounded(
+            handle: std::thread::JoinHandle<(bool, std::time::Instant)>,
+            deadline: std::time::Instant,
+            what: &str,
+        ) -> (bool, std::time::Instant) {
+            while !handle.is_finished() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "bounded join timed out waiting for {what}"
+                );
+                std::thread::yield_now();
+            }
+            handle.join().expect("the waiter thread returns")
+        }
+
+        /// r17 item 3: the test-only SIGUSR1 registration must not survive
+        /// the test. The explicit assertions below cover the normal return;
+        /// this guard covers the unwind path (a failed assertion) so the
+        /// process-wide handler is removed either way.
+        struct SigIdGuard(Option<signal_hook::SigId>);
+
+        impl Drop for SigIdGuard {
+            fn drop(&mut self) {
+                if let Some(id) = self.0.take() {
+                    let _ = signal_hook::low_level::unregister(id);
+                }
+            }
+        }
+
+        // Install the empty handler BEFORE the waiter exists. process-wide,
+        // but SIGUSR1 is only ever sent thread-directed at the waiter below, so
+        // no other test observes it; the flag additionally records delivery.
+        // r17 item 3 unregisters this SigId before the test returns.
+        let caught = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sig_id = signal_hook::flag::register(nix::libc::SIGUSR1, Arc::clone(&caught))
+            .expect("register the safe SIGUSR1 handler");
+        let mut sig_guard = SigIdGuard(Some(sig_id));
+
+        let mut live = std::process::Command::new("/bin/sh")
+            .args(["-c", "exec sleep 30"])
+            .spawn()
+            .expect("spawn");
+        let live_pid = i32::try_from(live.id()).expect("pid");
+
+        // Probe for the REAL waiter (r17 item 2): where it computes its one
+        // deadline, and how many EINTR restarts it actually performs.
+        let probe = Arc::new(EintrWaitProbe::default());
+        let waiter_tid = Arc::new(AtomicI32::new(0));
+        let waiter_pthread = Arc::new(AtomicUsize::new(0));
+        let (waiter_tid_for_ack, waiter_pthread_for_signal) =
+            (Arc::clone(&waiter_tid), Arc::clone(&waiter_pthread));
+        let waiter = std::thread::spawn({
+            let probe = Arc::clone(&probe);
+            move || {
+                waiter_pthread_for_signal.store(pthread_self() as usize, Ordering::Release);
+                waiter_tid_for_ack.store(nix::unistd::gettid().as_raw(), Ordering::Release);
+
+                let satisfied = wait_child_exit_blocking(live_pid, WAIT, Some(&probe));
+                // ma-sdk-state r18 item 3: stamp the completion instant HERE,
+                // on the waiter thread, the moment the blocking wait returns
+                // — before the bounded join hands it back to the test thread.
+                (satisfied, std::time::Instant::now())
+            }
+        });
+
+        // ACKNOWLEDGE the wait is ACTIVELY parked in ppoll (no sleep) through
+        // the named bounded helper.
+        let ack_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let pthread = acknowledge_waiter_parked_in_ppoll(
+            &waiter_tid,
+            &waiter_pthread,
+            PPOLL_NR,
+            ack_deadline,
+        );
+
+        // Interrupt the parked wait ONCE, directed at the waiter thread.
+        pthread_kill(pthread as Pthread, Some(Signal::SIGUSR1))
+            .expect("interrupt the waiting thread");
+
+        let (answered, completed) = join_waiter_bounded(
+            waiter,
+            std::time::Instant::now() + Duration::from_secs(5),
+            "the EINTR-interrupted exit waiter",
+        );
+        assert!(
+            caught.load(Ordering::Acquire),
+            "the signal reached the caught handler"
+        );
+        assert!(
+            probe.eintr_retries() >= 1,
+            "the REAL waiter performed at least one EINTR retry against its deadline"
+        );
+        assert!(
+            !answered,
+            "a live child still does not satisfy the exit wait"
+        );
+        // ma-sdk-state r18 item 3: ONE started instant — sampled by the
+        // waiter, stamped unchanged into the probe, and used to derive the
+        // deadline — paired with the completion instant captured INSIDE the
+        // waiter thread at the blocking return and returned through the
+        // bounded join. A live-child wait must satisfy
+        // `completion - started >= WAIT`: the old assertion read
+        // `started.elapsed()` from the test thread AFTER the join (a second
+        // clock sample that tolerated a return before the deadline) and even
+        // accepted a return 150 ms early.
+        let started = probe
+            .deadline_anchor()
+            .expect("the real waiter recorded its single started instant");
+        let waited = completed
+            .checked_duration_since(started)
+            .expect("the captured completion instant follows the started instant");
+        assert!(
+            waited >= WAIT,
+            "EINTR must not fail the exit wait early: it continues until the same deadline ({waited:?})"
+        );
+        let _ = live.kill();
+        let _ = live.wait();
+
+        // r17 item 3: the process-wide SIGUSR1 handler is removed BEFORE the
+        // normal return. `unregister` reports whether the SigId was still
+        // registered (true here), and a second removal finds nothing — the
+        // observable proof that the handler does not leak into the rest of
+        // the binary.
+        let id = sig_guard.0.take().expect("the guard still owns the SigId");
+        assert!(
+            signal_hook::low_level::unregister(id),
+            "the test unregisters its SIGUSR1 SigId before returning"
+        );
+        assert!(
+            !signal_hook::low_level::unregister(id),
+            "the removed SIGUSR1 SigId is not registered a second time"
+        );
+    }
+}
+
+/// ma-sdk-state r14 item 4: the child-disposition classifier distinguishes a
+/// missing child (ENOENT / ESRCH) from UNAVAILABLE information (unreadable
+/// `/proc` for another reason), and reads zombie/alive state correctly.
+#[cfg(all(test, target_os = "linux"))]
+mod child_disposition_tests {
+    use super::*;
+    use std::io::{Error, ErrorKind};
+
+    fn ioerr(kind: ErrorKind) -> std::io::Result<String> {
+        Err(Error::new(kind, "synthetic /proc failure"))
+    }
+
+    #[test]
+    fn an_unreadable_proc_is_unknown_when_the_process_exists_not_gone() {
+        // The r13 bug: ANY /proc read error mapped to "gone". With the process
+        // answering signal 0, EACCES/other is unavailable information.
+        assert_eq!(
+            classify_linux_child(ioerr(ErrorKind::PermissionDenied), Ok(())),
+            ChildDisposition::Unknown
+        );
+        assert_eq!(
+            classify_linux_child(
+                ioerr(ErrorKind::PermissionDenied),
+                Err(nix::errno::Errno::EPERM)
+            ),
+            ChildDisposition::Unknown
+        );
+    }
+
+    #[test]
+    fn a_missing_proc_entry_is_gone_only_with_a_confirming_esrch() {
+        assert_eq!(
+            classify_linux_child(ioerr(ErrorKind::NotFound), Err(nix::errno::Errno::ESRCH)),
+            ChildDisposition::Gone
+        );
+    }
+
+    #[test]
+    fn a_hidden_proc_notfound_while_signal0_succeeds_is_unknown() {
+        // r15 item 3: inside a chroot or mount namespace /proc/<pid> is
+        // ENOENT while the child is alive. ENOENT is a /proc read error like
+        // any other — existence (Ok) or EPERM must read Unknown, never Gone.
+        assert_eq!(
+            classify_linux_child(ioerr(ErrorKind::NotFound), Ok(())),
+            ChildDisposition::Unknown,
+            "ENOENT + a live signal-0 answer: /proc is hidden, not the child gone"
+        );
+        assert_eq!(
+            classify_linux_child(ioerr(ErrorKind::NotFound), Err(nix::errno::Errno::EPERM)),
+            ChildDisposition::Unknown
+        );
+    }
+
+    #[test]
+    fn an_unreadable_proc_with_esrch_is_gone() {
+        assert_eq!(
+            classify_linux_child(
+                ioerr(ErrorKind::PermissionDenied),
+                Err(nix::errno::Errno::ESRCH)
+            ),
+            ChildDisposition::Gone
+        );
+    }
+
+    #[test]
+    fn proc_states_are_classified_zombie_alive_or_unknown() {
+        assert_eq!(
+            classify_linux_child(Ok("1234 (fake claude) Z 100 1234".into()), Ok(())),
+            ChildDisposition::Zombie
+        );
+        assert_eq!(
+            classify_linux_child(Ok("1234 (we)ird (name)) x 1 2".into()), Ok(())),
+            ChildDisposition::Zombie,
+            "state is parsed AFTER the last ')' so comms with parens work"
+        );
+        assert_eq!(
+            classify_linux_child(Ok("1234 (fake) S 100 1234".into()), Ok(())),
+            ChildDisposition::Alive
+        );
+        assert_eq!(
+            classify_linux_child(Ok("garbage".into()), Ok(())),
+            ChildDisposition::Unknown,
+            "an unparseable stat line is not guessed alive"
+        );
+    }
+
+    #[test]
+    fn a_pid_above_the_kernel_limit_is_gone_or_unknown_never_alive() {
+        // 99,999,999 exceeds both Linux PID_MAX_LIMIT and macOS's 99,999 cap.
+        let disposition = child_disposition(99_999_999);
+        assert_ne!(
+            disposition,
+            ChildDisposition::Alive,
+            "an impossible pid must never look alive"
+        );
+    }
+}
+
+/// ma-sdk-state r15 item 2: the non-Linux unix classifier. These run on EVERY
+/// host with injected inputs (the macOS `ps` invocation itself cannot run on
+/// the Linux devbox; the coordinator compiles that arm on macOS), which is
+/// exactly why the classification is split out of the `ps` call.
+#[cfg(all(test, unix))]
+mod ps_child_disposition_tests {
+    use super::*;
+
+    #[test]
+    fn esrch_is_gone_whatever_ps_saw() {
+        assert_eq!(
+            classify_ps_child(Err(nix::errno::Errno::ESRCH), None),
+            ChildDisposition::Gone
+        );
+        // A stale row must not outrank the kernel's "no such process".
+        assert_eq!(
+            classify_ps_child(Err(nix::errno::Errno::ESRCH), Some("Ss")),
+            ChildDisposition::Gone
+        );
+    }
+
+    #[test]
+    fn a_dead_ps_row_with_signal0_ok_is_a_zombie_not_alive() {
+        // The r15 finding: kill(pid,0) succeeds for an unreaped zombie, so the
+        // old Ok(()) => Alive arm misclassified SIGKILLed children on macOS.
+        for dead in ["Z", "Z+", "E", "Es", "?Es", "?E"] {
+            assert_eq!(
+                classify_ps_child(Ok(()), Some(dead)),
+                ChildDisposition::Zombie,
+                "{dead:?} is a dead-but-unreaped process"
+            );
+        }
+    }
+
+    #[test]
+    fn a_live_ps_row_with_signal0_ok_is_alive() {
+        for live in ["Ss", "Ss+", "?Ss", "R+", "S"] {
+            assert_eq!(
+                classify_ps_child(Ok(()), Some(live)),
+                ChildDisposition::Alive,
+                "{live:?} is a running process"
+            );
+        }
+    }
+
+    #[test]
+    fn no_ps_row_while_the_pid_exists_is_unknown_never_alive() {
+        // `ps` failed or the table did not show the pid: existence without
+        // state is unavailable information.
+        assert_eq!(classify_ps_child(Ok(()), None), ChildDisposition::Unknown);
+    }
+
+    #[test]
+    fn eperm_is_unknown_even_with_a_live_looking_row() {
+        assert_eq!(
+            classify_ps_child(Err(nix::errno::Errno::EPERM), Some("Ss")),
+            ChildDisposition::Unknown
+        );
+        assert_eq!(
+            classify_ps_child(Err(nix::errno::Errno::EPERM), None),
+            ChildDisposition::Unknown
+        );
+    }
+
+    #[test]
+    fn ps_pid_state_is_parsed_from_ps_o_output() {
+        // macOS `ps -o pid=,stat= -p <pid>` shape (leading spaces, state
+        // letters with the `?` no-tty marker).
+        let out = b"\n  4242 ?Es\n  9999 ?Ss\n";
+        assert_eq!(
+            parse_ps_pid_state(out, 4242).as_deref(),
+            Some("?Es"),
+            "the exiting leader's own row"
+        );
+        assert_eq!(
+            parse_ps_pid_state(out, 9999).as_deref(),
+            Some("?Ss"),
+            "an unrelated row is selectable by pid"
+        );
+        assert_eq!(
+            parse_ps_pid_state(out, 7),
+            None,
+            "a pid absent from the table yields no row"
+        );
     }
 }

@@ -395,7 +395,7 @@ D-011 的 Bot materializer 拒绝 bypass/dontAsk 规则继续存在，Bot 来源
 | `deadlineSource` | `native\|runtime-policy\|none\|unknown` | native/runtime-policy 对应已知 deadline；none 表示明确无截止时间，不能与未获取到期限混淆 |
 | `answer` | `Knowledge<{commandId: Id, actor: ActorRef, value: InteractionAnswer, committedAt: Timestamp}>` | Node CAS 决出的唯一答案 |
 | `delivery` | `not-sent\|intent-durable\|written\|confirmed\|rejected\|unknown` | 写回不等于 confirmed |
-| `resolution` | `Knowledge<{reason: answered\|native-cleared\|native-cancelled\|generation-ended\|timed-out, eventIds: Id[]}>` | resolved/expired/invalidated 必须说明证据 |
+| `resolution` | `Knowledge<{reason: answered\|native-cleared\|native-cancelled\|generation-ended\|agent-demoted\|timed-out, eventIds: Id[]}>` | resolved/expired/invalidated 必须说明证据；`agent-demoted`（transcript picker 降级等实体驱动 invalidation）与 `generation-ended`（进程结束结清）是两条不同的 reason，settlement 广播帧与 `settlement_events.reason` 逐字携带（r10 item 4(a)） |
 
 ~~~mermaid
 stateDiagram-v2
@@ -423,7 +423,15 @@ stateDiagram-v2
 >
 > 落实点（2026-10-06 r5：Node 与 Hub 共用一个进程结束分类器 `remuda_protocol::process_end`，ma-lineage/ma-sdk-state 后续复用，禁止再各写一份名称匹配；API：`process_end(&NativeLifecycle)`/`process_end_value(&Value)` 只判载荷（`at=None`，调用方用自身写时钟），`process_end_observation(&Observation)`/`process_end_event(&Value)` 返回 `ProcessEnd{kind,at}` 并从 `observedAt` 填 `at` 供 ended_at 盖章，`entity_process_end(entityType,state)` 只认 `entityType=instance`）：分类器**只**按真实驱动事件形态判定——shell-pty：`topic=session, nativeName=native_exit, status=exited`(severity info, 干净 exit-0→Exited) / `status=failed` 或非零退出/信号/PTY EOF(severity error→Failed)，且前置 Node 的 entity state=exited；print/SDK：`topic=session, nativeName=session, status=exited/failed`（`emit_exit`）；从未启动成功的 launch（`reasonCode=native-driver-start-failed`/start-fail 名）与 Node 报告 gone（`agent_not_ready`/`agent_gone`）→Failed。**不做名称子串匹配（旧的 `contains("exit")` 曾把干净 exit-0 误判 failed）、不看 severity、不看 affectsCompletion**；clean exit 的 Exited 与 Failed 等秩不互相覆盖。Node `native_failure_reason` 只在分类为 Failed 时才让 `record_task_exit` 追加 entity failed；Node `native_exit` 同时接受 `native_exit` 与 `session` 名并按分类映射 exited/failed。signal 层 `hook_activity` 与 live phase fold 只看非空 `relatedIds.agentId`（`agentType` 可选，r5 item 3）就判定 subagent 作用域，不 latch 根 turn-ended、不动 activity；根 `topic=turn` 的 `result status=error`/主会话 StopFailure(outcome=failed) 结束根 TURN（activity idle、lifecycle running，r5 item 4）。Hub `apply_instance_projection`/`derive_instance_state` 直接调用分类器；workflow run/phase/**member** entity（含 member state=failed）一律不折叠根 lifecycle/activity（r5 item 1），只有 `entityType=instance` 的 entity 参与。
 >
-> **Hub 终态同一事务结清（2026-10-01，c-cardsettle，c-deadcards 拆分的 A 部分；2026-10-05 r2/r3 修订）**：当 instance 因任何原因进入终态——Node 新 epoch/reconcile 报告缺失（`reconcile_reported_instances`）、显式 kill/close/delete 或对 Node 已未知实例的 stop（`settle_instance_exited`）、Node 拒绝 launch（`fail_instance`）、create 永不被 ack 的 reaper（`expire_stale_requested`）、host-lost 到期（`expire_lost_hosts`）、真实进程结束的 journaled exit/fail lifecycle（见上三级划分；configure 失败、主回合 StopFailure、subagent 失败都不是终态）、daemon inventory 报告终态（`reconcile_daemon_instances`）——Hub 在写 instance 终态的**同一事务**里把该实例仍为 `pending`（及 `answering`/`paused` 等可回答 UI 投影背后的 pending durable 行）的 durable interaction 置为 `invalidated`，清 `blocking`，entity 带 `resolution.reason=generation-ended`。复用既有 `pending → invalidated（generation 结束）` 边与既有 reason 枚举，**不引入新状态、新 reason**；新增的 `interaction_tombstones` 表是删除实例时留存终态的内部墓碑（不是 interaction 状态机取值）。结清幂等（只改 `state='pending'` 的行；第二次终态写入返回空 Settlement）。终态写入返回 `Settlement`（被结清的 `(instanceId, interactionId)` 对），调用方在事务提交后把每对作为**无 journal seq 的 `settlement` 控制帧**发到 `/v1/follow` 总线（Hub 不伪造 journal 条目，不会让任何 follower 把 journal 标 stale/duplicate）；打开的 inbox/会话据此立即 pin 该 id 并刷新 interaction 列表，错过通知则由下一次轮询/重载自愈。删除实例时终态行进 `interaction_tombstones`（见下「迟到回答」）。`GET /v1/interactions` 返回全部 pending 加最近 24h 的 `expired`/`invalidated` 行用于「已离队」；严格 pending 的角标计数继续只读 pending。即使 durable 终态行已超出 24h 展示窗口，合并仍用其权威终态（`terminal_interaction_ids`，并含 tombstone id，不按年龄过滤）压制 Node `interaction.list` 返回的同 id 陈旧 pending 副本，防止卡片重新入队/角标回升；重放的 `interaction.requested` 也不覆写已是 invalidated/expired 的行（保留其 payload 与 resolution）。
+> **Hub 终态同一事务结清（2026-10-01，c-cardsettle，c-deadcards 拆分的 A 部分；2026-10-05 r2/r3 修订；2026-10-10 r10 OA6 修订）**：当 instance 因任何原因进入终态——Node 新 epoch/reconcile 报告缺失（`reconcile_reported_instances`）、显式 kill/close/delete 或对 Node 已未知实例的 stop（`settle_instance_exited`；delete 事务在写墓碑**之前**先结清仍 pending 的卡并把 settlement 交 HTTP handler 发布）、Node 拒绝 launch（`fail_instance`）、create 永不被 ack 的 reaper（`expire_stale_requested`）、真实进程结束的 journaled exit/fail lifecycle（见上三级划分；configure 失败、主回合 StopFailure、subagent 失败都不是终态；**host-lost 到期（`expire_lost_hosts`）不是结清路径——见下「接触丢失 vs 进程结束」**）、daemon inventory 报告终态（`reconcile_daemon_instances`）——Hub 在写 instance 终态的**同一事务**里把该实例仍为 `pending`（及 `answering`/`paused` 等可回答 UI 投影背后的 pending durable 行）的 durable interaction 置为 `invalidated`，清 `blocking`，entity 带 `resolution.reason`。**reason 不再固定为 generation-ended（2026-10-10 r10 item 4(a)）**：进程结束路径写 `generation-ended`；实体驱动的 invalidation（transcript picker 降级 `agent-demoted` 等）写其真实 reason，写入哪个值 `settlement_events.reason` 与广播帧的 `reason` 就带哪个值（枚举含 `generation-ended` 与 `agent-demoted`；删除/force-delete 仍记 generation-ended）。复用既有 `pending → invalidated` 边；新增的 `interaction_tombstones` 表是删除实例时留存终态的内部墓碑（不是 interaction 状态机取值）。结清幂等（UPDATE 带 `state='pending'` 守卫；实体 invalidation 的 UPDATE 另带 `AND state <> 'invalidated'` 守卫，r10 item 4(b)，使重放降级实体不追加第二条 settlement_events）；第二次终态写入返回空 Settlement。终态写入返回 `Settlement`（被结清的 `(instanceId, interactionId)` 对），调用方在事务提交后把每对作为**无 journal seq 的 `settlement` 控制帧**发到 `/v1/follow` 总线（Hub 不伪造 journal 条目，不会让任何 follower 把 journal 标 stale/duplicate）；帧上 `reason` 取自该条 settlement 的真实 reason。发布一律在 Hub 级 **settlement_publish 锁**内（锁从事务/操作前持到 bus 发送后；delete handler 也通过 `publish_settlement` 包整段删除+广播，r11 item 3，防止迟到的删除结算越过先提交的 journal 退出结算）；打开的 inbox/会话据此立即 pin 该 id 并刷新 interaction 列表，错过通知则由下一次轮询/重载自愈。删除实例时终态行进 `interaction_tombstones`（见下「迟到回答」）。`GET /v1/interactions` 返回全部 pending 加最近 24h 的 `expired`/`invalidated` 行用于「已离队」；严格 pending 的角标计数继续只读 pending。即使 durable 终态行已超出 24h 展示窗口，合并仍用其权威终态（`terminal_interaction_ids`，并含 tombstone id，不按年龄过滤）压制 Node `interaction.list` 返回的同 id 陈旧 pending 副本，防止卡片重新入队/角标回升；重放的 `interaction.requested` 也不覆写已是 invalidated/expired 的行（保留其 payload 与 resolution）。
+>
+> **接触丢失 vs 进程结束 / host-lost revive（2026-10-08 r8 OA6；2026-10-10 r10/r11 修订）**：host-lost 到期（`expire_lost_hosts`）写**接触丢失**行（lifecycle=`exited`、last_error=`host-contact-lost`、`ended_at IS NULL`、卡片不结清），它是「进程可能仍活着」而不是终态。revive 路径（2026-10-10 r10 item 1 后）：**同一 epoch 与新 epoch 的 hello 都可 revive**（新 epoch inventory 列出该实例 live 即视为新进程/被 herdr 接管的同章节存活证据），且可上报的生命周期不再只有 ready/running——`starting`/`preparing` → Hub `starting`，`closing` → `closing`，`reconciling`/`unknown`/缺省 → `running`，`ready`/`running` → `running`（`closed`/`requested` 等仍不 revive）；revive 的 SQL 只认**新** `host-contact-lost` 标记（pre-r7 的老 `host-lost` 标记是真结束，永不 revive）。revive 后行回到上报的生命周期、清 `ended_at`/`last_error`、connectivity=connected，该存活进程的审批保持 pending、可回答。升级库上的**老** `host-lost` 已终态行被新 epoch 缺失时走「温和重扫」：ended_at 取自身 updated_at、保留老标记与 updated_at、只结清卡片、不发第二条 node-epoch-changed 诊断（r10 item 4(c)）；该温和处理只对**已终态**老标记行生效——一个仍 running/ready 但残留老标记的行被新 epoch 缺失时按**新损失**处理（盖 node-epoch-changed、推进 updated_at，r11 item 4）。默认实例列表只在行**同时**为终态且带任一 host-lost 标记时隐藏（revive 回 live 后重新可见）。
+>
+> **已结束 owner 的 interaction.requested 插入门（2026-10-07 r7 item 1；2026-10-08 r8 OA6/ordering 修订）**：journal append（新鲜与**重放**两条路径共用的 `apply_interaction_event`）在同一事务内先查 owner 行，再决定交互走向。owner 已携带进程结束证据时，请求**永不**走 pending/blocking 插入：直接以 invalidated + `resolution.reason=generation-ended` + `answerable=false` 落 durable 行（不覆写终态、不动 activity），该写返回的 `Settlement` 与其它终态路径一样在提交后广播为无 seq 的 `settlement` 控制帧——**重放行也广播**（它之后不会再有新鲜 journal 事件，不广播则该通知没有任何其它发出路径）。**owner 行缺失同样算已结束**：行被删除（与实例一同删除）或 Hub 从不认识该 id（absent）都不能让一张卡以 live 可答身份插入；判定函数读 `(lifecycle, last_error, ended_at)` 三元组而非只看生命周期。**r8 OA6：接触丢失不是进程结束**——`lifecycle=exited` 且 `last_error='host-contact-lost'` 且 `ended_at IS NULL` 的行**不**算已结束 owner（r12 item 3：接触丢失伪终态用的是新 `host-contact-lost` 标记；pre-r7 的老 `host-lost` 标记按真结束处理，见下）（共享谓词 `lifecycle_has_process_end_evidence`，与 ma-lineage r5 一致：`closed` 恒为结束；`exited` 需有 `ended_at` 或非 host-lost 标记；`failed` 需有 `ended_at` 或经 attest 的 launch-failure 标记；谓词只认**新** `host-contact-lost` 标记，老 `host-lost` 是真结束）。host-lost 清扫因此**不再结清卡片、不再盖 `ended_at`**；任一 epoch（同一 nodeEpoch 重连，或新 nodeEpoch 的 inventory 把被扫实例列为 live——后者曾只在同 epoch revive，r10 item 1 起两条路径都 revive）的 hello 若在 inventory 中把该实例报为 starting/preparing/closing/reconciling/unknown/ready/running，Hub 在丢失副作用运行之前把行 revive 到**上报的生命周期**（starting/closing/running，见上「接触丢失 vs 进程结束」段；缺省 lifecycle 也不 revive 的只有 closed/requested 等），清 `ended_at`/`last_error`、connectivity=connected，该存活进程随后抛出的新审批正常 pending、可回答。结清 guard 只在**事件自身**经共享分类器为进程结束时触发（r10 item 1：传事件的 next_life 而非 rank-held 的 EFFECTIVE 生命周期），所以落在接触丢失伪终态行上的非终态状态事件（存活进程 journal 的 interaction.requested，derive 出 running/blocked、stored rank 仍 exited）不会误结清卡片。
+>
+> **r9 item 1/2 修订（coordinator 裁决）**：① **终态转移上的结清是无条件的，插入门只看 `owner_instance_ended`**。卡片自己的 deadline 不构成豁免——每个真实 Claude hook 审批都带 `deadline=Known{now+15min}`，Hub 没有 deadline sweeper（deadline 投影只活在 web），若让「已知且未到期」的卡在新 epoch reconcile / 重放插入时留下，durable 行会永远 pending、角标永远计数、deadline 前答案仍能通过状态检查派发。② **host-lost 行的进程之后真的结束时，卡片必须结清**：新 epoch hello 缺失该实例（`reconcile_reported_instances` 候选集含 `exited/host-lost/ended_at IS NULL` 形状，UPDATE 盖 `ended_at` 后无条件结清）；同 epoch 重连的 journal 追赶带真实 exit（`settle_on_terminal_transition` 的「previous 是否已终态」用 `lifecycle_has_process_end_evidence(lifecycle,last_error,ended_at)` 判定，而非 lifecycle 字符串）；daemon inventory 权威报终态（`reconcile_daemon_instances` 同样按证据谓词判定并盖 `ended_at`）。owner 行缺失/被删除仍恒为已结束。
+>
+> **settlement 发布顺序与 follower 游标（2026-10-10 r9 item 3/4 取代 r8 方案）**：结清在同一事务内向新表 `settlement_events` 插入一行（`seq INTEGER PRIMARY KEY AUTOINCREMENT` + interaction/instance/reason/created_at），follower 投递游标就是该 **seq**——同毫秒两次清扫、id 乱序也无法让游标乱序（旧的 `(updated_at,id)` 复合键在此情况下可永久丢行）。lag 恢复与 connect replay 都读该表，按 seq 严格前进、512 行/页；删除实例只删 interactions 行、不删 log。订阅时游标在**订阅 settlement bus 之前**从 durable max seq 播种，pump 启动先做一次**不带 gap** 的 startup catch-up 把种子之后提交的结清全部补发（与 bus 直播重叠的帧由客户端按 id 去重），彻底关掉「种子读到一半、订阅刚建立」之间的跳过窗口；Lagged 恢复仍以 gap 帧收尾。发布锁只包住**结清提交 + settlement-bus 发送**这一段（r8 曾用它包住整个 journal ingest chunk，连带 alerts/usage/supply 的 await，串行化了全部 journal 写入）。
 >
 > **迟到回答的实际判定顺序（2026-10-05 r3 与代码逐行对齐）**：`answer_interaction` 在读出 durable 行后、碰任何 in-memory CAS / Node RPC 之前，按以下顺序：
 > 1. **删除墓碑**：durable 行不存在时先查 `interaction_tombstones`（实例删除时在同一事务留存的终态）。`expired` → **410 GONE**；`answer-committed`/`resolved` → **409 INTERACTION_SUPERSEDED（Hub 侧直接返回）**；其余（删除时仍 pending 或已 invalidated）→ **404 NOT_FOUND**。命中墓碑绝不转发 Node。
@@ -683,6 +691,15 @@ type MaterializedLaunch = {
 ~~~
 
 `--resume` 不恢复 ultracode，resume launch 按上面同一规则再带一次。`effort` 缺省表示「交给 harness 决定」，materializer **不发** `--effort`——这与请求某一档不是一回事。实测见 [effort-sync-4](evidence/effort-sync-4.md)。
+
+**回读不可用边（D-056 (4)，c-effortread r5/r6）。** `effort` 观察的 `effective` 正常时是 `{name, ultracode, source, observedAt}`；当一个已 verified 的 resume 边界在会话中途变为不可证明时，driver 只发**一条**撤回边：`{source: "unknown", observedAt, readbackAvailable: false}`。规则：
+
+- 触发撤回的边界变化（verified→不可证明）只有四类：**cursor 之下的 transcript shrink、文件 identity（dev/inode）变化、head 指纹变化（同路径重写）、任意一次 ENOENT**（哪怕只持续一个 poll；恢复时若 head 一致则从旧 offset 继续、内容不同则锚到新 EOF，但两种恢复都**不会**重新打开 gate）。exec 保留 shell pid、时钟回拨、缺进程启动证据这些情形从会话一开始就是 Unverified（不发撤回边，gate 本来就没开过）。
+- wire 上撤回边**省略** `name` 与 `ultracode`（`skip_serializing_if`：字段不存在，而不是显式 `null`）；Hub/web 解析器以「有效 name 缺失 + `readbackAvailable:false`」识别它。
+- `readbackAvailable` 缺省/`null`/`true` = 回读可用；只有字面 `false` 是撤回。
+- Hub 收到 `false` 时把实例的 `effortEffective` 投影**置空**（不存占位），web 的投影解析器对该边返回 null；UI 回退到 `?`，不再显示撤回前的档/开关。撤回是粘性的：乱序（observedAt 早于当前投影，如后加载的历史）到达的撤回边被忽略；轮询只在 Hub 自己的记录从有投影变为空时撤回，不由「updatedAt 更新但从未投影过」触发；web 单独记录 withdrawn 标记，待决 push-down **仅在收到过显式撤回边**时 chip 显示 `?` 而不是待决词，从未回读过的会话仍显示待决词。
+- 撤回**不结算**任何待决 configure：既不标 Applied 也不拒绝；待决开关由后续 configure 的结果或有界超时收场。driver 同时丢掉自己一侧的 armed generation，防止 displaced transcript 里的迟到 verdict 把它结算成 Applied。
+- 同一进程不会 respawn，撤回是粘性的、整条边只发一次。
 
 历史档名按**名字**归一，绝不按 index：`default→low`、`think→high`、`think-hard→xhigh`，无法识别的名字落到 `high`（一个过期的 UI 字符串不该让启动失败；这是归一兜底，不是默认档）。旧名 `ultracode` 是**只用于输入**的别名：读入时归一为 `{name: "xhigh", ultracode: true}`，不写回，客户端也不再写出它——要表达 `{max, true}` 这类组合只能用 `ultracode` 字段。按 index 归一会出错，因为旧表是 per-harness 且长度不同——claude 的 index 3 是 `ultracode`，codex 的 index 3 是 `ultra`。旧客户端发来的 `{index, name}` 仍然接受，`index` 在读取时被忽略、也不写回。
 
@@ -1096,7 +1113,7 @@ type InteractionAnswer =
 | --- | --- |
 | `lifecycle`, `type=entity` | `{type:"entity", entityType:host\|workspace\|instance\|run\|command\|interaction, entityId:Id, revision:U64, previousState:string\|null, state:string, reasonCode:string, evidenceEventIds:Id[], entity:对应完整实体}`；state 必须落在对应实体枚举，entity.state/lifecycle 一致 |
 | `lifecycle`, `type=native` | `{type:"native", topic:session\|turn\|hook\|subagent\|task\|plan\|configuration\|permission\|diagnostic\|reconciliation, nativeName:string, nativeId:Knowledge<string>, status:Knowledge<string>, relatedIds:Record<string,string>, dataRef:Id\|null, severity:info\|warning\|error, affectsCompletion:boolean}`；这类事件本身不强制终结 Run |
-| `usage` | `{usageId:Id, scope:message\|turn\|session\|workflow-member, scopeId:string, mode:snapshot\|delta, metricRevision:U64, inputTokens:Knowledge<U64>, inputAccounting:total-including-cache\|uncached\|provider-specific\|unknown, outputTokens:Knowledge<U64>, reasoningTokens:Knowledge<U64>, cacheReadTokens:Knowledge<U64>, cacheWriteTokens:Knowledge<U64>, totalTokens:Knowledge<U64>, cost:Knowledge<{amount:string,currency:string}>, accounting:reported\|estimated, nativeFieldsRef:Id\|null}` |
+| `usage` | `{usageId:Id, scope:message\|turn\|session\|workflow-member, scopeId:string, mode:snapshot\|delta, metricRevision:U64, inputTokens:Knowledge<U64>, inputAccounting:total-including-cache\|uncached\|provider-specific\|unknown, outputTokens:Knowledge<U64>, reasoningTokens:Knowledge<U64>, cacheReadTokens:Knowledge<U64>, cacheWriteTokens:Knowledge<U64>, totalTokens:Knowledge<U64>, cost:Knowledge<{amount:string,currency:string}>, accounting:reported\|estimated, contextWindow:U64?, nativeFieldsRef:Id\|null}`；`contextWindow` 可选、additive：harness 上报的该模型原生上下文窗口（如 stream-json `result.modelUsage[m].contextWindow`），Hub 用它而非静态目录解析窗口百分比 |
 | `artifact` | `{artifactId:Id, revision:U64, action:declared\|available\|updated\|removed, type:file\|image\|html\|url\|native\|diff, title:Knowledge<string>, mediaType:Knowledge<string>, sizeBytes:Knowledge<U64>, locator:ArtifactLocator, producerToolCallId:Id\|null, verification:declared\|read-verified\|native-confirmed}` |
 | `raw_tty`, `direction=output` | `{streamId:Id, streamEpoch:Id, direction:"output", representation:pty-bytes\|rendered-ansi, offset:U64, byteLength:U64, dataRef:RawRef, nativeFrame:Knowledge<{seq:U64,width:number,height:number,full:boolean}>}`；rendered-ansi 只表示原生 carrier 重绘的终端画面，不是原进程 stdout/PTY 原字节 |
 | `raw_tty`, `direction=input` | `{streamId:Id, streamEpoch:Id, direction:"input", inputId:Id, byteLength:U64, dataRef:RawRef\|null, actor:ActorRef, delivery:written\|unknown}`；交互输入可只记长度/身份，原文是否保存由明确 retention policy 决定 |
@@ -1104,6 +1121,8 @@ type InteractionAnswer =
 | `opaque` | `{nativeType:string, reason:unknown-type\|unknown-version\|malformed\|unsupported-extension\|unmapped-fields\|screen-snapshot, rawRef:RawRef, affects:(presentation\|control\|terminal)[], summary:string\|null}`；不含自行猜出的 outcome |
 
 `ObservationPayload` 是 §5.2 的 Message/Thought/ToolCall/ToolResult、§5.3 三种 workflow、§5.4 三种 interaction 和本表 variants 的联合。`InteractionEntity` 即 §2.6 全字段加 EntityMeta。host/workspace lifecycle 使用相同 payload，但 envelope 放在独立 `RegistryEvent`：`{schemaVersion:1,eventId,hostId,journalId,seq,observedAt,kind:"lifecycle",payload}`，不伪造 instanceId。Hub Command 入口事件另有自己的 journal，Node 镜像不能让同一实体出现两个权威 revision。
+
+根轮状态投影（D-057 OA6，ma-sdk-state）：结构化 stdio 引擎（claude-sdk、claude-print，共享同一 mapper）在用户帧写入原生进程之后发 `topic=turn, nativeName=turn_started, status=working`，活动态翻为 working；同 topic 的 `nativeName=result` 是否结算结束**按根轮的证据**判定（r3 修正，绝不由进程级 `result_index` 或单个进程级计数器推出）：驱动为每次本地写入的用户帧维护一个 FIFO 根轮队列，并按 `system/task_started`（task_type=local_workflow）的 **task id** 把后台 workflow 归属到发起它的根轮；workflow 只由它**自己**的终止证据关闭——`system/task_notification`（completed/failed/stopped）或终止态 `task_updated`（killed/cancelled），不由后续 result 递减计数。队首根轮的 result：若该轮仍有未终止的 workflow，则为该轮的中间结果（一个 workflow 轮次会为同一用户帧发 result 0 再发 result 1），既不改 activity 也不设标记；否则该轮完成，仅当没有排队后续轮（relatedIds.queuedTurnCount=0）**且 FIFO 中没有更新的本地写入轮仍未结算**时，才在该 result 上加盖 `relatedIds.settledRootTurn=true`。因此 result_index 与结算无关：它在长寿命 sdk 子进程上按进程跨轮增长，后续轮里的 workflow 中间结果可能带非零 index；而真实的 stopped-workflow 捕获里唯一的 result（index 0，queued 0）落在终止 task_notification **之后**，必须结算。读取顺序乱序时（旧 result 在更新的 turn_started 发布之后才被映射），旧 result 只关闭旧轮，不能 idle 更新的输入。status `turn_done` 与 status `error`（例如 API 429）在结算 result 上都只把 activity 置回 idle，**不**改 lifecycle。turn 级错误在实例投影上留下一个加性标记 lastTurnError（at=该 result 观测时间，text=原生错误文本截断 200 字符），下一次 turn_started 清除；实例保持 running 并保留全部 grant（含 address-owner），可原位重试。唯一的终态来自显式进程结束证据：topic=session 的原生退出/EOF、PTY 消失、未启动即被拒的 launch（reasonCode native-driver-start-failed/start-fail）或 Node 报告实例消失。即使 result 带 affectsCompletion=true，turn 错误本身也不是进程结束——一次性 print 子进程结束时由驱动另发一条 topic=session 退出事件。Node 仅对 print/sdk 引擎自身的 turn 事件应用该 activity 规则（按 source.driverKind 限定），hook/screen 路径不套用。
 
 `ArtifactLocator` 为 `{type:"blob",objectId:Id,digest:Digest}`、`{type:"workspace-file",workspaceId:Id,relativePath:string,revision:U64,digest:Knowledge<Digest>}`、`{type:"native",nativeUri:string}` 或 `{type:"url",url:string}`。可读 workspace-file 路径由 Node 按注册根解析，拒绝 `..`、越界 symlink 和跨 host 路径；下载校验 revision/digest 防止读错版本。native URI/URL 不自动抓取或执行。HTML 预览使用独立 origin 与 sandbox；TTY 的 clipboard/URL/escape sequences 不在 Hub 或普通 DOM 执行。Artifact 工具的调用只产生 declared，文件/API 的读回证据才产生 available；普通文件产物不能声称复现了 Claude 原生 Artifact 功能。
 
@@ -1126,7 +1145,7 @@ Grok ACP `_meta.usage.inputTokens` 已知包含 cache，故 inputAccounting=tota
 | `type:stream_event` 的 message_start/content_block_start | message/thought/tool_call open，记录 native message ID、block index | completeness=partial |
 | stream_event 的 text_delta / thinking_delta / input_json_delta | 对应 node append；input JSON 未完整前存 inputTextDelta | 不能把半个 JSON 当工具的可执行参数 |
 | stream_event 的 content_block_stop/message_delta/message_stop | 关闭 block、更新 stop_reason/usage 候选 | message_stop 是模型消息结束，不是 Run 成功；等完整 assistant/result |
-| `type:result` | lifecycle/native turn/result；message final 若仅 result 有文本且未与完整 assistant 重复；usage snapshot | `subtype`, `is_error`, `terminal_reason`, `result_index`, `origin` 保留；只按 §5.8 推进 Run |
+| `type:result` | lifecycle/native turn/result；message final 若仅 result 有文本且未与完整 assistant 重复；usage snapshot | `subtype`, `is_error`, `terminal_reason`, `result_index`, `origin` 保留；只按 §5.8 推进 Run。D-057 OA6：status 为 error 的 result 仅结束该根轮（activity idle + lastTurnError 标记），不是进程/启动失败；终态只来自独立的 session 退出事件 |
 | `system/hook_started` | lifecycle/native hook/started，hook_id/name/event | 它表示 hook 命令启动，不等于相应工具已经开始 |
 | `system/hook_response` / 版本支持的 hook_progress | lifecycle/native hook/response/progress，exit_code/outcome/output 引用 | hook 输出与原生 tool_result 分开；不是 approval answer ACK |
 | `system/permission_denied` | lifecycle/native permission/denied，tool_use_id、decision reason | 原生自动拒绝提示；没有待答 request，不生成批准按钮 |
@@ -2296,5 +2315,63 @@ PTY carrier 的完整 Herdr pin：
   "streamUuid": "01993ab0-0000-7000-8000-000000000001",
   "offset": "9007199254740993",
   "payloadLength": 3
+}
+~~~
+
+<!-- golden: usage-context-window -->
+一个 `scope=turn` 的 per-call usage 观察（`scopeId` 是该次 assistant 消息 id；provisional 首帧 revision 1，`message_delta` 终值 revision 2 增长替换）携带 harness 上报的原生模型窗口（stream-json `result.modelUsage[m].contextWindow`）。`contextWindow` 是 additive 可选字段；未上报时该键直接缺席（`skip_serializing_if`），Hub 回退到 effective-model → profile → 目录 → kind 默认解析窗口百分比。
+
+~~~json
+{
+  "schemaVersion": 1,
+  "eventId": "evt_01993ab0-0000-7000-8000-000000000001",
+  "journalId": "obj_01993ab0-0000-7000-8000-000000000002",
+  "instanceId": "ins_01993ab0-0000-7000-8000-000000000003",
+  "runId": "run_01993ab0-0000-7000-8000-000000000004",
+  "hostId": "hst_01993ab0-0000-7000-8000-000000000005",
+  "processGeneration": "1",
+  "runGeneration": "1",
+  "seq": "42",
+  "observedAt": "2026-10-08T03:37:18.123Z",
+  "nativeAt": { "state": "known", "value": "2026-10-08T03:37:18.000Z" },
+  "source": {
+    "driverKind": "claude-print",
+    "driverVersion": "2.1.289",
+    "adapterVersion": "1",
+    "channel": "stdout",
+    "delivery": "live",
+    "nativeSessionId": { "state": "known", "value": "sess_019abc" },
+    "nativeTurnId": { "state": "unknown", "reason": "not-emitted", "evidenceEventIds": [] },
+    "nativeAgentId": { "state": "not-applicable" },
+    "nativeItemId": { "state": "unknown", "reason": "not-emitted", "evidenceEventIds": [] },
+    "nativeEventId": { "state": "unknown", "reason": "not-emitted", "evidenceEventIds": [] },
+    "nativeRequestId": { "type": "none" },
+    "sourceCursor": {
+      "type": "runtime",
+      "ledgerRevision": "42"
+    }
+  },
+  "completeness": "structured",
+  "rawRef": null,
+  "evidenceEventIds": [],
+  "kind": "usage",
+  "payload": {
+    "usageId": "obj_01993ab0-0000-7000-8000-000000000006",
+    "scope": "turn",
+    "scopeId": "msg_019abc",
+    "mode": "snapshot",
+    "metricRevision": "1",
+    "inputTokens": { "state": "known", "value": "30000" },
+    "inputAccounting": "uncached",
+    "outputTokens": { "state": "known", "value": "718" },
+    "reasoningTokens": { "state": "known", "value": "1200" },
+    "cacheReadTokens": { "state": "known", "value": "5000" },
+    "cacheWriteTokens": { "state": "not-applicable" },
+    "totalTokens": { "state": "known", "value": "35718" },
+    "cost": { "state": "unknown", "reason": "not-emitted", "evidenceEventIds": [] },
+    "accounting": "estimated",
+    "contextWindow": "200000",
+    "nativeFieldsRef": null
+  }
 }
 ~~~

@@ -74,6 +74,8 @@ export type HomeRow = {
   bodyDetail: string | null;
   /** 0..100 used-context share; null = unknown, and the ring must not render. */
   contextPct: number | null;
+  /** True when contextPct uses a kind-fallback window guess (render ≈). */
+  contextPctApproximate: boolean;
   blocked: boolean;
   /** Exited rows advertise 恢复 only when the resume capability is really there (D-026). */
   canResume: boolean;
@@ -111,14 +113,27 @@ export type HomeRowsInput = {
 };
 
 /**
- * The error text that owns the body slot of a LIVE row when the session has
- * one (report §11.3 point 3: Moshi puts the raw error here, not a wire
- * string). Ended rows never use this: endReason() owns their sentence
+ * The body text of a RETRYABLE ROOT-TURN error on a LIVE row (D-057 OA6,
+ * ma-sdk-state): the durable `instance.lastTurnError` marker the Hub sets on a
+ * settled turn failure and clears on the next turn start. It is never a
+ * process error — the instance stays running — so it is a separate marker from
+ * [`homeError`] and does not survive a new turn.
+ */
+export function homeTurnError(instance: Instance): string | null {
+  return instance.lastTurnError?.text?.trim() || null;
+}
+
+/**
+ * The error text that owns the body slot of a LIVE row when the PROCESS (or
+ * launch) failed. Ended rows never use this: endReason() owns their sentence
  * (c-homeend).
  *
- * `instance.lastError` is the Hub-merged channel (hub store.rs folds native
- * severity=error lifecycle events into it); the journal fallback mirrors the
- * same merge for events the polled instance row has not folded yet.
+ * `instance.lastError` is the Hub-merged process/start-failure channel. A
+ * D-057 OA6 root-turn failure is deliberately NOT read here: it is emitted at
+ * severity=info on `topic=turn` and surfaced via `homeTurnError` /
+ * `instance.lastTurnError`, which the next turn start clears (a turn error
+ * must not be a sticky process failure). The journal fallback mirrors the
+ * process-error merge but skips turn/result frames and info-severity events.
  */
 export function homeError(instance: Instance, events?: Observation[]): string | null {
   const direct = instance.lastError?.trim();
@@ -129,19 +144,19 @@ export function homeError(instance: Instance, events?: Observation[]): string | 
     if (event.kind !== "lifecycle") continue;
     const payload = event.payload as {
       type?: string;
+      topic?: string;
       severity?: string;
       nativeName?: string;
       relatedIds?: { lastError?: unknown };
       status?: { value?: unknown };
     };
     if (payload?.type !== "native") continue;
+    // Turn results are root-turn evidence (severity info), not process death.
+    if (payload.topic === "turn") continue;
+    // Only a genuine error-severity non-turn event is a process failure.
+    if (payload.severity !== "error") continue;
     const name = String(payload.nativeName ?? "").toLowerCase();
-    const failed =
-      payload.severity === "error" ||
-      name.includes("error") ||
-      (typeof payload.relatedIds?.lastError === "string" &&
-        payload.relatedIds.lastError.trim().length > 0);
-    if (!failed) continue;
+    if (!name.includes("error")) continue;
     const text =
       typeof payload.relatedIds?.lastError === "string"
         ? payload.relatedIds.lastError
@@ -220,9 +235,25 @@ export function buildHomeRows(
         instance.capabilities.capabilities.resume?.state === "supported";
       const end = endReason(instance);
       const ended = end !== null && status !== "unknown" ? end : null;
+      // D-057 OA6 (ma-sdk-state r2 item 7): a live row's retryable turn error
+      // comes from the durable lastTurnError marker (cleared by the next turn
+      // start). It is shown verbatim but is NOT a red process failure; a
+      // genuine process error (homeError) keeps the error treatment.
+      //
+      // c-question-alert r3 item 8: UNKNOWN connectivity/lifecycle takes
+      // precedence over BOTH error channels — a disconnect (or a reconcile
+      // after reconnect) on an instance that still carries lastTurnError must
+      // read 状态待确认, never present the stale turn text as the live state.
+      const statusUnknown = status === "unknown";
+      const turnError = ended || statusUnknown ? null : homeTurnError(instance);
+      const processError = ended || statusUnknown || turnError
+        ? null
+        : homeError(instance, input.eventsOf?.(instance.id));
       const body = ended
         ? { text: canResume ? `${ended.label} · 可恢复` : ended.label, isError: false }
-        : homeBody(status, step, homeError(instance, input.eventsOf?.(instance.id)));
+        : turnError
+          ? { text: turnError, isError: false }
+          : homeBody(status, step, processError);
       rows.set(instance.id, {
         id: instance.id,
         instance,
@@ -233,6 +264,7 @@ export function buildHomeRows(
         bodyTone: ended?.tone ?? null,
         bodyDetail: ended?.detail ?? null,
         contextPct: input.rollupOf(instance.id)?.contextPct ?? null,
+        contextPctApproximate: input.rollupOf(instance.id)?.contextPctApproximate ?? false,
         blocked: status === "blocked",
         canResume,
         timeLabel: formatListTime(instance.updatedAt, nowMs),
@@ -356,7 +388,7 @@ export function homeRowsSignature(
   const rowPart = [...rows.values()]
     .map(
       (row) =>
-        `${row.id}|${row.status}|${row.title}|${row.body}|${row.bodyIsError ? 1 : 0}|${row.bodyTone ?? "-"}|${row.bodyDetail ?? "-"}|${row.contextPct ?? "-"}|${row.blocked ? 1 : 0}|${row.canResume ? 1 : 0}|${row.timeLabel}`,
+        `${row.id}|${row.status}|${row.title}|${row.body}|${row.bodyIsError ? 1 : 0}|${row.bodyTone ?? "-"}|${row.bodyDetail ?? "-"}|${row.contextPct ?? "-"}|${row.contextPctApproximate ? "a" : "x"}|${row.blocked ? 1 : 0}|${row.canResume ? 1 : 0}|${row.timeLabel}`,
     )
     .join("\n");
   // Prefs/closed tabs and workspace membership change WHICH instances a space

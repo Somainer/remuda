@@ -25,9 +25,11 @@ const target = path.resolve(repoRoot, process.env.CARGO_TARGET_DIR ?? "target");
 const serveBin = process.env.HUB_E2E_SERVE_BIN ?? path.join(target, "debug/examples/serve");
 
 /** Real worker source; stamp it exactly the way sw-build.ts does for dist. */
-async function swFor(build: string): Promise<string> {
+async function swFor(build: string, precacheUrls: readonly string[]): Promise<string> {
   const source = await readFile(path.join(webRoot, "sw.src.js"), "utf8");
-  return source.replaceAll("__CACHE_NAME__", cacheNameForBuild(build));
+  return source
+    .replaceAll("__CACHE_NAME__", cacheNameForBuild(build))
+    .replaceAll("__PRECACHE_MANIFEST__", JSON.stringify([...precacheUrls]));
 }
 
 const PNG_1PX = Buffer.from(
@@ -38,23 +40,41 @@ const PNG_1PX = Buffer.from(
 // A faked dist whose only moving part is the hashed module name and the build
 // string the module stamps into the DOM. The shell precache list in sw.src.js
 // (index.html, manifest, favicon, icons) must all exist or install() rejects
-// and the worker never controls the page.
+// and the worker never controls the page. A second hashed file stands in for a
+// lazy route chunk the first visit never loads; it must still be precached so
+// an offline first visit to its route works.
 async function writeDist(dir: string, build: string, assetHash: string): Promise<void> {
   const assets = path.join(dir, "assets");
   const icons = path.join(dir, "icons");
   await mkdir(assets, { recursive: true });
   await mkdir(icons, { recursive: true });
+  const appFile = `app-${assetHash}.js`;
+  const routeFile = `route-${assetHash}.js`;
   await writeFile(
     path.join(dir, "index.html"),
-    `<!doctype html><html lang="zh-CN"><head><meta charset="UTF-8"><link rel="manifest" href="/manifest.webmanifest"><link rel="icon" href="/favicon.svg"><title>runtime</title><script type="module" crossorigin src="/assets/app-${assetHash}.js"></script></head><body><div id="root"></div></body></html>\n`,
+    `<!doctype html><html lang="zh-CN"><head><meta charset="UTF-8"><link rel="manifest" href="/manifest.webmanifest"><link rel="icon" href="/favicon.svg"><title>runtime</title><script type="module" crossorigin src="/assets/${appFile}"></script></head><body><div id="root"></div></body></html>\n`,
   );
   await writeFile(
-    path.join(assets, `app-${assetHash}.js`),
+    path.join(assets, appFile),
     `document.documentElement.dataset.appBuild=${JSON.stringify(build)};` +
       `document.getElementById("root").textContent=${JSON.stringify(`build:${build}`)};` +
+      // Mirrors createLazyRoute: the route component lives in its own chunk,
+      // imported only when the route is opened. The chunk file name is baked
+      // in by the (fake) build, exactly like Vite's emitted import.
+      `window.__loadRoute=()=>import(${JSON.stringify(`/assets/${routeFile}`)})` +
+      `.then((m)=>{document.getElementById("root").textContent=m.routeText;return m;});` +
       `if("serviceWorker" in navigator){navigator.serviceWorker.register("/sw.js",{updateViaCache:"none"});}\n`,
   );
-  await writeFile(path.join(dir, "sw.js"), await swFor(build));
+  await writeFile(
+    path.join(assets, routeFile),
+    `export const routeText=${JSON.stringify(`route:${build}`)};\n`,
+  );
+  // The build-derived precache manifest sw-build.ts stamps: entry + the lazy
+  // route chunk (never imported on the online first visit below).
+  await writeFile(
+    path.join(dir, "sw.js"),
+    await swFor(build, [`/assets/${appFile}`, `/assets/${routeFile}`]),
+  );
   await writeFile(path.join(dir, "manifest.webmanifest"), JSON.stringify({ name: "runtime" }));
   await writeFile(path.join(dir, "favicon.svg"), "<svg xmlns='http://www.w3.org/2000/svg'/>");
   await writeFile(path.join(icons, "icon-192.png"), PNG_1PX);
@@ -79,6 +99,40 @@ async function stopChild(child: ChildProcess): Promise<void> {
   const timer = setTimeout(() => child.kill("SIGKILL"), 10_000);
   await exited;
   clearTimeout(timer);
+}
+
+/** Boot the serve example over a faked dist in `dir`. */
+function spawnServe(dir: string, port: number): ChildProcess {
+  return spawn(serveBin, [], {
+    cwd: dir,
+    stdio: ["ignore", "pipe", "pipe"],
+    env: {
+      ...process.env,
+      REMUDA_LISTEN: `127.0.0.1:${port}`,
+      REMUDA_DATA_DIR: path.join(dir, "data"),
+      REMUDA_WEB_ROOT: path.join(dir, "web"),
+      REMUDA_COOKIE_SECURE: "0",
+      REMUDA_BOOTSTRAP_TOKEN: "pwa-shell-e2e",
+      RUST_LOG: "warn",
+    },
+  });
+}
+
+async function waitForOrigin(page: import("@playwright/test").Page, origin: string, hub: ChildProcess, hubLog: string) {
+  await expect
+    .poll(
+      async () => {
+        if (hub.exitCode !== null || hub.signalCode !== null) {
+          throw new Error(`serve hub exited early: ${hubLog}`);
+        }
+        return await page.request
+          .get(`${origin}/index.html`)
+          .then((r) => r.status())
+          .catch(() => 0);
+      },
+      { timeout: 30_000 },
+    )
+    .toBe(200);
 }
 
 test.beforeAll(async () => {
@@ -211,6 +265,96 @@ test("a redeployed shell renders on reload with no 404 and no HTML for the modul
       return res ? await res.text() : "";
     }, cacheNameForBuild("v1"));
     expect(refreshedShell).not.toContain("app-1111aaaa.js");
+  } finally {
+    if (hub) await stopChild(hub);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// Retained alongside pwa-realbuild.hub.spec.ts (c-perffu r9): the real-build
+// spec proves the WORKER's build-derived manifest precaches every real lazy
+// chunk and an in-SPA offline router nav serves it. THIS synthetic case still
+// proves one thing the real one does not — a COLD offline DOCUMENT navigation
+// (page.goto to an unvisited deep URL while setOffline): the SW's navigate
+// handler must fall back to the cached index.html and then boot the module
+// graph with no network at all. The real-build spec navigates client-side
+// (the document is already loaded), so it never exercises that fallback.
+test("an offline first visit to a never-visited route loads the precached chunk", async ({ page, context }) => {
+  test.setTimeout(120_000);
+  const dir = await mkdtemp(path.join(target, "pwa-shell-"));
+  const served = path.join(dir, "web");
+  const dataDir = path.join(dir, "data");
+  await mkdir(dataDir, { recursive: true });
+  const port = await freePort();
+  const origin = `http://127.0.0.1:${port}`;
+  const routeUrl = "/assets/route-1111aaaa.js";
+  let hub: ChildProcess | undefined;
+  let hubLog = "";
+
+  try {
+    await writeDist(served, "v1", "1111aaaa");
+    hub = spawnServe(dir, port);
+    hub.stdout?.on("data", (chunk) => (hubLog += String(chunk)));
+    hub.stderr?.on("data", (chunk) => (hubLog += String(chunk)));
+    await waitForOrigin(page, origin, hub, hubLog);
+
+    // Record every same-origin request/response. The dynamic import below
+    // ALWAYS shows up as a page "request" even when the service worker
+    // fulfils it from the cache, so fromServiceWorker() — not the request
+    // list — is the proof the chunk came from the precache.
+    const requested: string[] = [];
+    page.on("request", (request) => {
+      const url = new URL(request.url());
+      if (url.origin === origin) requested.push(url.pathname);
+    });
+    let routeFromSW: boolean | null = null;
+    page.on("response", (response) => {
+      const url = new URL(response.url());
+      if (url.origin === origin && url.pathname === routeUrl) {
+        routeFromSW = response.fromServiceWorker();
+      }
+    });
+
+    // 1 — online first visit to "/" installs and activates the worker; it
+    // precaches the never-loaded route chunk at install time.
+    await page.goto(`${origin}/`);
+    await expect(page.locator("#root")).toHaveText("build:v1");
+    await expect
+      .poll(async () => await page.evaluate(() => Boolean(navigator.serviceWorker.controller)), {
+        timeout: 20_000,
+      })
+      .toBe(true);
+    expect(requested).not.toContain(routeUrl);
+    await expect
+      .poll(
+        async () => await page.evaluate(async (url) => Boolean(await caches.match(url)), routeUrl),
+        { timeout: 10_000 },
+      )
+      .toBe(true);
+
+    // 2 — fully offline, open a deep route the tab has never visited. The
+    // navigation falls back to the cached shell; the route's lazy chunk has
+    // never touched the network from this tab, so it must come from the
+    // build-derived precache.
+    await context.setOffline(true);
+    try {
+      await page.goto(`${origin}/never/visited`, { waitUntil: "domcontentloaded" });
+      await expect(page.locator("#root")).toHaveText("build:v1", { timeout: 10_000 });
+
+      const mod = await page.evaluate(async () => {
+        const load = (
+          window as unknown as { __loadRoute: () => Promise<{ routeText: string }> }
+        ).__loadRoute;
+        return await load();
+      });
+      expect(mod.routeText).toBe("route:v1");
+      await expect(page.locator("#root")).toHaveText("route:v1");
+      // The chunk the tab had never opened was fulfilled by the service
+      // worker from its build-derived precache, not by the network.
+      expect(routeFromSW, "route chunk served by the service worker").toBe(true);
+    } finally {
+      await context.setOffline(false);
+    }
   } finally {
     if (hub) await stopChild(hub);
     await rm(dir, { recursive: true, force: true });

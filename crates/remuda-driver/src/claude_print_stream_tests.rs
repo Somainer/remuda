@@ -20,6 +20,8 @@ fn mapper() -> Mapper {
         driver_kind: DriverKind::ClaudePrint,
         channel: SourceChannel::Stdout,
         media_stager: None,
+        turns: TurnBook::default(),
+        deferred_result: None,
     }
 }
 
@@ -589,4 +591,254 @@ fn repeated_tool_snapshot_uses_native_tool_id_across_different_frame_uuids() {
             .iter()
             .all(|p| p.tool_call_id == calls[0].tool_call_id)
     );
+}
+
+#[test]
+fn message_delta_revises_provisional_per_call_usage_to_final() {
+    let mut mapper = mapper();
+
+    // message_start carries the provisional in-flight usage; it never emits a
+    // usage observation, but its model label is remembered for the delta.
+    let start_obs = event(
+        &mut mapper,
+        json!({"type": "message_start", "message": {
+            "id": "msg_r2",
+            "model": "claude-opus-4-7",
+            "usage": {"input_tokens": 1, "cache_read_input_tokens": 100,
+                      "cache_creation_input_tokens": 50, "output_tokens": 8}
+        }}),
+    );
+    assert!(start_obs.is_empty(), "message_start never emits usage");
+
+    // The assistant record emits revision 1 with the provisional output count.
+    let assistant = map(
+        &mut mapper,
+        json!({"type": "assistant", "uuid": "u1", "message": {
+            "id": "msg_r2", "role": "assistant",
+            "content": [{"type": "text", "text": "done"}],
+            "model": "claude-opus-4-7",
+            "usage": {"input_tokens": 1, "cache_read_input_tokens": 100,
+                      "cache_creation_input_tokens": 50, "output_tokens": 8}
+        }}),
+    );
+    // message_delta revises to the FINAL count at revision 2; input/cache
+    // buckets are identical, output grows 8 -> 30.
+    let delta = event(
+        &mut mapper,
+        json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+            "usage": {"input_tokens": 1, "cache_read_input_tokens": 100,
+                      "cache_creation_input_tokens": 50, "output_tokens": 30,
+                      "output_tokens_details": {"thinking_tokens": 0}}}),
+    );
+
+    let mut usage: Vec<_> = assistant
+        .into_iter()
+        .chain(delta)
+        .filter_map(|obs| match obs.body {
+            ObservationPayload::Usage(payload) => Some(payload),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(usage.len(), 2, "provisional rev 1 + final rev 2");
+    let rev2 = usage.pop().unwrap();
+    let rev1 = usage.pop().unwrap();
+    for payload in [&rev1, &rev2] {
+        assert_eq!(payload.scope, UsageScope::Turn);
+        assert_eq!(payload.scope_id, "msg_r2");
+    }
+    assert_eq!(rev1.metric_revision, U64(1));
+    assert_eq!(rev1.output_tokens, Knowledge::Known { value: U64(8) });
+    assert_eq!(rev2.metric_revision, U64(2));
+    assert_eq!(rev2.output_tokens, Knowledge::Known { value: U64(30) });
+    // Context buckets are the same blob on both frames — growth, no decrease,
+    // so the Hub accepts the revision.
+    assert_eq!(rev2.input_tokens, rev1.input_tokens);
+    assert_eq!(rev2.cache_read_tokens, rev1.cache_read_tokens);
+    assert_eq!(rev2.cache_write_tokens, rev1.cache_write_tokens);
+
+    // message_stop retires the remembered model.
+    let stop = event(&mut mapper, json!({"type": "message_stop"}));
+    assert!(stop.is_empty());
+    assert!(!mapper.stream.message_models.contains_key("msg_r2"));
+}
+
+#[test]
+fn message_delta_with_only_output_tokens_overlays_the_revision1_buckets() {
+    // c-usagefu r3 item 2: Anthropic's documented message_delta shape carries
+    // only the changed usage keys; Bedrock/Vertex/gateway profiles commonly
+    // send {"output_tokens": n} with NO input/cache buckets. Building revision
+    // 2 from that delta alone zeroed the buckets and the Hub rejected the
+    // "decrease", leaving the provisional per-call output count frozen.
+    let mut mapper = mapper();
+    event(
+        &mut mapper,
+        json!({"type": "message_start", "message": {
+            "id": "msg_gw",
+            "model": "claude-opus-4-7",
+            "usage": {"input_tokens": 1, "cache_read_input_tokens": 100,
+                      "cache_creation_input_tokens": 50, "output_tokens": 8}
+        }}),
+    );
+    let assistant = map(
+        &mut mapper,
+        json!({"type": "assistant", "uuid": "u1", "message": {
+            "id": "msg_gw", "role": "assistant",
+            "content": [{"type": "text", "text": "done"}],
+            "model": "claude-opus-4-7",
+            "usage": {"input_tokens": 1, "cache_read_input_tokens": 100,
+                      "cache_creation_input_tokens": 50, "output_tokens": 8}
+        }}),
+    );
+    // Sparse gateway delta: output tokens only.
+    let delta = event(
+        &mut mapper,
+        json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+            "usage": {"output_tokens": 30}}),
+    );
+
+    let mut usage: Vec<_> = assistant
+        .into_iter()
+        .chain(delta)
+        .filter_map(|obs| match obs.body {
+            ObservationPayload::Usage(payload) => Some(payload),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        usage.len(),
+        2,
+        "rev 1 still emits; sparse delta still revises"
+    );
+    let rev2 = usage.pop().unwrap();
+    let rev1 = usage.pop().unwrap();
+    assert_eq!(rev2.metric_revision, U64(2));
+    assert_eq!(rev2.output_tokens, Knowledge::Known { value: U64(30) });
+    // The omitted buckets are carried over from revision 1, not read as zero.
+    assert_eq!(rev2.input_tokens, rev1.input_tokens);
+    assert_eq!(rev2.cache_read_tokens, rev1.cache_read_tokens);
+    assert_eq!(rev2.cache_write_tokens, rev1.cache_write_tokens);
+
+    // message_stop also retires the remembered revision-1 blob.
+    event(&mut mapper, json!({"type": "message_stop"}));
+    assert!(!mapper.stream.message_usage.contains_key("msg_gw"));
+}
+
+#[test]
+fn message_delta_with_explicit_null_buckets_keeps_the_revision1_values() {
+    // r4 item 5: gateways serializing missing fields as explicit nulls send
+    // {"input_tokens":null,"cache_read_input_tokens":null,
+    //  "cache_creation_input_tokens":null,"output_tokens":30}. Null means
+    // "absent", not zero: overlaying it must leave the revision-1 buckets.
+    let mut mapper = mapper();
+    event(
+        &mut mapper,
+        json!({"type": "message_start", "message": {
+            "id": "msg_null", "model": "claude-opus-4-7",
+            "usage": {"input_tokens": 1, "cache_read_input_tokens": 100,
+                      "cache_creation_input_tokens": 50, "output_tokens": 8}
+        }}),
+    );
+    let assistant = map(
+        &mut mapper,
+        json!({"type": "assistant", "uuid": "u1", "message": {
+            "id": "msg_null", "role": "assistant",
+            "content": [{"type": "text", "text": "done"}],
+            "model": "claude-opus-4-7",
+            "usage": {"input_tokens": 1, "cache_read_input_tokens": 100,
+                      "cache_creation_input_tokens": 50, "output_tokens": 8}
+        }}),
+    );
+    let delta = event(
+        &mut mapper,
+        json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+            "usage": {"input_tokens": null, "cache_read_input_tokens": null,
+                      "cache_creation_input_tokens": null, "output_tokens": 30}}),
+    );
+
+    let mut usage: Vec<_> = assistant
+        .into_iter()
+        .chain(delta)
+        .filter_map(|obs| match obs.body {
+            ObservationPayload::Usage(payload) => Some(payload),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        usage.len(),
+        2,
+        "nulls are skipped, not emitted as a decrease"
+    );
+    let rev2 = usage.pop().unwrap();
+    let rev1 = usage.pop().unwrap();
+    assert_eq!(rev2.output_tokens, Knowledge::Known { value: U64(30) });
+    assert_eq!(rev2.input_tokens, rev1.input_tokens);
+    assert_eq!(rev2.cache_read_tokens, rev1.cache_read_tokens);
+    assert_eq!(rev2.cache_write_tokens, rev1.cache_write_tokens);
+
+    event(&mut mapper, json!({"type": "message_stop"}));
+}
+
+#[test]
+fn nested_message_delta_emits_no_usage() {
+    let mut mapper = mapper();
+    let start = nested_event(
+        &mut mapper,
+        Some("toolu_sub"),
+        json!({"type": "message_start", "message": {
+            "id": "msg_sub", "model": "m",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }}),
+    );
+    assert!(start.is_empty());
+    let delta = nested_event(
+        &mut mapper,
+        Some("toolu_sub"),
+        json!({"type": "message_delta",
+            "usage": {"input_tokens": 1, "output_tokens": 99}}),
+    );
+    assert!(delta.is_empty(), "a sub-agent delta is a sidechain");
+}
+
+#[test]
+fn pty_transcript_carriers_do_not_emit_ungated_stream_usage() {
+    // c-usagefu r2 item 5a: the claude-pty (and shell-pty) hydrator rebuilds
+    // transcript records through this same mapper, but its authoritative usage
+    // comes from the group-gated flush, not the first assistant frame. Emitting
+    // here would double-count every pty transcript.
+    for carrier in [DriverKind::ClaudePty, DriverKind::ShellPty] {
+        let mut mapper = mapper();
+        mapper.driver_kind = carrier;
+        let frame = json!({"type": "assistant", "uuid": "u", "message": {
+            "id": "msg_pty", "role": "assistant",
+            "content": [{"type": "text", "text": "hi"}],
+            "model": "claude-opus-4-7",
+            "usage": {"input_tokens": 10, "output_tokens": 5,
+                      "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
+        }});
+        let obs = map(&mut mapper, frame);
+        assert!(
+            obs.iter()
+                .all(|o| !matches!(o.body, ObservationPayload::Usage(_))),
+            "{carrier:?} must not emit usage on the ungated first frame"
+        );
+    }
+
+    // The stdout carriers keep the emission.
+    for carrier in [DriverKind::ClaudePrint, DriverKind::ClaudeSdk] {
+        let mut mapper = mapper();
+        mapper.driver_kind = carrier;
+        let frame = json!({"type": "assistant", "uuid": "u", "message": {
+            "id": "msg_stdout", "role": "assistant",
+            "content": [{"type": "text", "text": "hi"}],
+            "model": "claude-opus-4-7",
+            "usage": {"input_tokens": 10, "output_tokens": 5,
+                      "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
+        }});
+        let obs = map(&mut mapper, frame);
+        assert!(
+            obs.iter()
+                .any(|o| matches!(o.body, ObservationPayload::Usage(_))),
+            "{carrier:?} emits per-call usage on the stream channel"
+        );
+    }
 }

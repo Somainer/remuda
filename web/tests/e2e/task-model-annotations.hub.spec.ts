@@ -190,8 +190,9 @@ test.describe("composer annotation drafts", () => {
       .first();
     await expect(echo).toBeVisible({ timeout: 20_000 });
 
-    // No drafts yet: no badge, but the additive entry point exists.
+    // No drafts yet: no badge, but the additive entry point exists in ⋯.
     expect(page.getByTestId("annotation-badge")).toHaveCount(0);
+    await page.getByTestId("session-more-open").click();
     await expect(page.getByTestId("annotation-add")).toBeVisible();
 
     // Carrier 1 — a card-level annotation.
@@ -268,8 +269,10 @@ test.describe("composer annotation drafts", () => {
     await login(page);
     const suffix = Date.now().toString(36);
     const instanceId = await createSession(page, `ann events check ${suffix}`);
-    // The structured (transcript) segment has the dock…
-    await expect(page.getByTestId("annotation-dock")).toBeVisible();
+    // The structured (transcript) segment offers 加批注 from ⋯…
+    await page.getByTestId("session-more-open").click();
+    await expect(page.getByTestId("annotation-add")).toBeVisible();
+    await page.keyboard.press("Escape");
     // …a terminal-style segment (raw events) carries no annotation context:
     // the page-level attribute that lets selection raise an anchor is absent.
     await page.goto(`/s/${instanceId}/events`);
@@ -289,6 +292,7 @@ test.describe("composer annotation drafts", () => {
     await expect(echo).toBeVisible({ timeout: 20_000 });
 
     // One card draft plus one ① transcript anchor, panel open at 1440.
+    await page.getByTestId("session-more-open").click();
     await page.getByTestId("annotation-add").click();
     await page.getByTestId("annotation-card-input").fill("这条实现需要先补回归测试再合入。");
     await page.getByTestId("annotation-card-save").click();

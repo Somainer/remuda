@@ -2332,6 +2332,13 @@ export interface components {
             instanceId: string;
             journalId: string;
             kind: string;
+            /** @description D-057 OA6 (ma-sdk-state): additive marker for the most recent settled root-turn failure (an API error such as 429 on the turn result) while the process stays running. Never a lifecycle: the instance keeps running and retryable in place; the next turn start clears it. Display text only, truncated to 200 characters. Absent after a clean turn end. */
+            lastTurnError?: {
+                at?: string;
+                text?: string;
+            } & {
+                [key: string]: unknown;
+            };
             /**
              * @description Who ran the launch command (D-028 §1.0 rule 4). Provenance only, never a capability level: a user-launched session is entitled to exactly the same signals as a Remuda-launched one. Derived from mode/promotedAt for rows written before D-028.
              * @enum {string|null}
@@ -2425,6 +2432,8 @@ export interface components {
             cacheReadTokens?: number | null;
             /** @description contextUsedTokens / contextWindowTokens, rounded and clamped to 0..100; null until both are known. */
             contextPct?: number | null;
+            /** @description True when contextWindowTokens came only from the harness-kind fallback (an unknown model with no native report, catalog row, or provider-profile window): contextPct is then an estimate and the client marks it ≈. False for native/profile/catalog evidence. */
+            contextPctApproximate?: boolean;
             /** @description Tokens the next request carries: the last turn's fresh input + cache read + cache creation; null when no component was reported. */
             contextUsedTokens?: number | null;
             /** @description Context window size from the [1m] tag, the model catalog, or the harness kind; null for kinds without a known window. */

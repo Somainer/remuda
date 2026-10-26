@@ -3181,6 +3181,7 @@ dependencies = [
  "remuda-ssh",
  "remuda-testing",
  "remuda-unix",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -3236,6 +3237,7 @@ dependencies = [
 name = "remuda-driver"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "base64 0.22.1",
  "chacha20poly1305",
@@ -3246,13 +3248,16 @@ dependencies = [
  "remuda-claude-wire",
  "remuda-driver",
  "remuda-herdr",
+ "remuda-journal",
  "remuda-protocol",
  "remuda-screen",
  "remuda-signal",
  "remuda-testing",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "signal-hook",
  "tempfile",
  "thiserror 2.0.20",
  "time",

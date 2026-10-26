@@ -7,6 +7,7 @@ import { knowledgeValue } from "../../types/command";
 import { Sheet } from "../../components/Sheet";
 import { StateDot } from "../../components/StateDot";
 import { formatListTime, shortId } from "../../lib/format";
+import { useNowTick } from "../../lib/useNowTick";
 import { nativeShort, projectStatus, uiMode } from "../../lib/status";
 import { hubStore, useHub } from "../../lib/store";
 import { useWorkbenchViewport } from "../../lib/viewport";
@@ -84,6 +85,9 @@ export function SessionList({
   const hub = useHub();
   const location = useLocation();
   const { mobile } = useWorkbenchViewport();
+  // Display-only clock for the relative time labels: quiet polls no longer
+  // emit on equal payloads, so labels advance on this local tick instead.
+  const nowMs = useNowTick();
   const [params, setParams] = useSearchParams();
   const conditions = readConditions(params);
   const global = conditions.scope === "all";
@@ -310,7 +314,7 @@ export function SessionList({
                 </span>
               </div>
               <div className={css.compactMeta}>
-                {hubStore.hostName(instance.hostId)} / {workspace?.label} · {formatListTime(instance.updatedAt)}
+                {hubStore.hostName(instance.hostId)} / {workspace?.label} · {formatListTime(instance.updatedAt, nowMs)}
               </div>
             </Link>
           );
@@ -678,7 +682,7 @@ export function SessionList({
                     </Link>
                   ) : null}
                   <div className={css.rowSide}>
-                    <span className={css.time}>{status === "unknown" ? "—" : formatListTime(instance.updatedAt)}</span>
+                    <span className={css.time}>{status === "unknown" ? "—" : formatListTime(instance.updatedAt, nowMs)}</span>
                     {/* Wire disclosure trigger: toggles the controlled
                         session-wire details without mutating the DOM. */}
                     <button
@@ -690,7 +694,7 @@ export function SessionList({
                       aria-label="运行详情"
                       title={`${instance.lifecycle} · ${activity} · ${instance.connectivity} | ${hubStore.hostName(instance.hostId)}${
                         worktree ? `/${worktree}` : ""
-                      } · ${instance.driver} · ${shortId(instance.id, 8)} · ${formatListTime(instance.updatedAt)}`}
+                      } · ${instance.driver} · ${shortId(instance.id, 8)} · ${formatListTime(instance.updatedAt, nowMs)}`}
                       onClick={(event) => {
                         event.preventDefault();
                         event.stopPropagation();
@@ -787,12 +791,34 @@ export function SessionList({
                         // effective level too, with `?` until it is observed.
                         const effective = hubStore.effortEffectiveOf(instance.id);
                         const effectiveName = effective?.name ?? "?";
-                        const mismatch =
-                          effective &&
-                          (effort.ultracode === true
-                            ? !(effective.name === "xhigh" && effective.ultracode === true)
-                            : effort.name !== effective.name);
+                        // D-056: level and switch are compared separately.
+                        const levelMismatch = Boolean(effective && effort.name !== effective.name);
+                        const flagMismatch =
+                          instance.kind === "claude"
+                          && Boolean(effective && (effort.ultracode === true) !== (effective.ultracode === true))
+                          // Only a positively observed flag participates.
+                          && effective?.ultracode !== null && effective?.ultracode !== undefined;
+                        const mismatch = levelMismatch || flagMismatch;
                         const ember = isEmberEffort(instance.kind, effort.index, effort.ultracode);
+                        const titleParts: string[] = [];
+                        if (effective) {
+                          titleParts.push(
+                            `请求 ${effort.name}${effort.ultracode ? " · ultracode" : ""} · 实际 ${effective.name}${effective.ultracode ? " · ultracode" : ""}（${effective.source}）`,
+                          );
+                        } else {
+                          titleParts.push("实际档位尚未从会话回读");
+                        }
+                        const suffixUltra = (() => {
+                          // c-effortui r3 item 6: three explicit states for
+                          // the SWITCH axis. A known level with an UNKNOWN flag
+                          // (e.g. resumed before any flag verdict) renders
+                          // `· ?`, never the explicit-off look; only Claude
+                          // has the flag axis.
+                          if (!effective) return "";
+                          if (effective.ultracode === true) return " · ultracode";
+                          if (effective.ultracode === false) return "";
+                          return instance.kind === "claude" ? " · ?" : "";
+                        })();
                         return (
                           <>
                             <span className={css.sep}>·</span>
@@ -801,14 +827,20 @@ export function SessionList({
                               data-testid="session-effort"
                               data-ember={ember ? "1" : "0"}
                               data-effort-effective={effective ? effective.name : "unknown"}
-                              data-effort-mismatch={mismatch ? "1" : "0"}
-                              title={
+                              data-ultracode-effective={
                                 effective
-                                  ? `请求 ${effort.ultracode ? "ultracode" : effort.name} · 实际 ${effective.name}（${effective.source}）`
-                                  : "实际档位尚未从会话回读"
+                                  ? effective.ultracode === true
+                                    ? "on"
+                                    : effective.ultracode === false
+                                      ? "off"
+                                      : "unknown"
+                                  : "unknown"
                               }
+                              data-effort-mismatch={mismatch ? "1" : "0"}
+                              title={titleParts[0]}
                             >
                               {effectiveName}
+                              {suffixUltra}
                             </span>
                           </>
                         );

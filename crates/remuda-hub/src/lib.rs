@@ -123,6 +123,29 @@ pub struct AppState {
     /// one-shot "your card was invalidated" notice (settlements are rare and
     /// tiny, so this channel effectively never lags).
     settlement_bus: tokio::sync::broadcast::Sender<crate::ws::SettlementNotice>,
+    /// c-cardsettle r8 item 4: publication-order lock for settlements. Held
+    /// across the settling transaction AND the bus publish, so notices from
+    /// two concurrent settles (a journal exit and an HTTP delete, or two
+    /// sweeps in the same millisecond) always enter the follower ring in the
+    /// order they committed — a lagging follower's strictly-forward cursor
+    /// can then never skip a lower-ordered row of an earlier transaction. The
+    /// bus send is synchronous (it never awaits a reader), so the section
+    /// only serialises two settling writers for the duration of the send.
+    settlement_publish: Arc<tokio::sync::Mutex<()>>,
+    /// c-cardsettle r11 item 1: test-only park seam for a follower's
+    /// settlement pump; always present but never armed in production.
+    #[cfg(any(test, feature = "test-faults"))]
+    follow_parks: crate::ws::FollowParks,
+    /// c-cardsettle-fu r1 item 2: test-only park seam for the detached
+    /// irreversible delete operation; never armed in production.
+    #[cfg(any(test, feature = "test-faults"))]
+    operation_parks: crate::ws::OperationParks,
+    /// c-cardsettle-fu2 r4 item 3: test-only per-interaction count of
+    /// settlement notices actually put on the bus. Lets a test prove a
+    /// parked delete has NOT broadcast without reading the follower socket
+    /// during the park window (cancelled WS reads starve the next poll).
+    #[cfg(any(test, feature = "test-faults"))]
+    test_settlement_counts: Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
     tty: crate::ws::TtyRelay,
     /// D-048 relay stream registry (per-Hub-process).
     api_relay: crate::api_relay::ApiRelay,
@@ -155,6 +178,56 @@ impl AppState {
     /// into a journal or make a follower mark its journal stale. A fresh
     /// follower converges against the durable (already-invalidated) rows
     /// regardless, so a missed notice is self-healing.
+    ///
+    /// r9 item 3: notices are sent in the vector's order, which the store
+    /// produces as ascending `settlement_events.seq` (AUTOINCREMENT assigned
+    /// inside the settling transaction; one sweep's rows are selected by id).
+    /// The follower's delivery max-seq cursor and its strict-forward lag
+    /// recovery both rely on that monotonic publication order — never reorder
+    /// or sort these before sending.
+    /// Acquire the settlement publication-order lock (r8 item 4) for a
+    /// settling transaction whose publication happens inline (the journal
+    /// append batch), rather than through [`Self::publish_settlement`].
+    pub(crate) async fn settlement_publish_lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.settlement_publish.lock().await
+    }
+
+    /// Run a settlement-producing store operation and publish its settlement
+    /// under the per-Hub publication-order lock (c-cardsettle r8 item 4). The
+    /// guard is acquired BEFORE the commit and released after the bus send, so
+    /// notices can never overtake an earlier settlement's publication even
+    /// when two settles race from different tasks (a journal exit vs an HTTP
+    /// delete; same-millisecond sweeps).
+    pub(crate) async fn publish_settlement<Fut, T>(
+        &self,
+        op: Fut,
+    ) -> Result<T, crate::store::StoreError>
+    where
+        Fut: std::future::Future<
+                Output = Result<(T, crate::store::Settlement), crate::store::StoreError>,
+            >,
+    {
+        let _guard = self.settlement_publish.lock().await;
+        let (value, settlement) = op.await?;
+        self.broadcast_settlement(&settlement);
+        Ok(value)
+    }
+
+    /// Same publication ordering for an operation that produces only a
+    /// [`Settlement`].
+    pub(crate) async fn publish_settlement_unit<Fut>(
+        &self,
+        op: Fut,
+    ) -> Result<(), crate::store::StoreError>
+    where
+        Fut: std::future::Future<Output = Result<crate::store::Settlement, crate::store::StoreError>>,
+    {
+        let _guard = self.settlement_publish.lock().await;
+        let settlement = op.await?;
+        self.broadcast_settlement(&settlement);
+        Ok(())
+    }
+
     pub(crate) fn broadcast_settlement(&self, settlement: &Settlement) {
         for settled in &settlement.interactions {
             // Publish on the DEDICATED settlement bus (not the journal bus): a
@@ -165,16 +238,59 @@ impl AppState {
                 instance_id: settled.instance_id.clone(),
                 interaction_id: settled.interaction_id.clone(),
                 state: "invalidated".to_string(),
-                reason: "generation-ended".to_string(),
-                updated_at: settled.updated_at.clone(),
+                // r10 item 4(a): carry the durable reason verbatim. The frame
+                // used to hard-code generation-ended, so a demotion
+                // invalidation (reason agent-demoted) reached followers with
+                // the wrong end reason.
+                reason: settled.reason.clone(),
+                seq: settled.seq,
             });
+            // r4 item 3: record a broadcast the bus actually accepted; keyed
+            // by interaction id so unrelated background settles cannot move
+            // a test's counter.
+            self.note_test_settlement_broadcast(&settled.interaction_id);
         }
     }
+
+    /// r4 item 3 test seam: count a broadcast per interaction id.
+    #[cfg(any(test, feature = "test-faults"))]
+    fn note_test_settlement_broadcast(&self, interaction_id: &str) {
+        *self
+            .test_settlement_counts
+            .lock()
+            .unwrap()
+            .entry(interaction_id.to_owned())
+            .or_insert(0) += 1;
+    }
+
+    #[cfg(not(any(test, feature = "test-faults")))]
+    fn note_test_settlement_broadcast(&self, _interaction_id: &str) {}
 
     /// Raw per-chunk cap for D-048 relay streams, from the D-048 protocol
     /// default (`TransportLimits.apiChunkBytes`, 64 KiB).
     pub(crate) fn config_relay_chunk_bytes(&self) -> usize {
         remuda_protocol::default_api_chunk_bytes() as usize
+    }
+}
+
+/// Test-only constructors for types private modules would otherwise hide
+/// from integration tests. Not part of the supported API.
+#[doc(hidden)]
+pub mod usage_store_test_support {
+    use rusqlite::Connection;
+
+    pub use crate::store::JournalRecord;
+    pub use crate::usage_store::{
+        RollupRequest, aggregate_instance, aggregate_supply, insert_usage_event, migrate,
+        project_usage_event, rollup_instance,
+    };
+
+    /// An in-memory, fully migrated Hub DB for projection/rollup tests that do
+    /// not need a running Hub or the writer/reader split.
+    pub fn migrated_memory() -> rusqlite::Result<Connection> {
+        let conn = Connection::open_in_memory()?;
+        crate::usage_store::migrate(&conn)?;
+        Ok(conn)
     }
 }
 
@@ -488,6 +604,62 @@ pub struct RunningHub {
     state: AppState,
 }
 
+/// Test-only `'static` handle to a running Hub's state.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct HubTestHandle {
+    state: AppState,
+}
+
+impl HubTestHandle {
+    /// Mount a synthetic Node transport (see
+    /// [`RunningHub::test_set_node_transport`]).
+    pub async fn test_set_node_transport(
+        &self,
+        host_id: &str,
+        transport: std::sync::Arc<dyn crate::transport::NodeTransport>,
+    ) {
+        self.state.nodes.insert(host_id.to_owned(), transport).await;
+    }
+
+    /// Arm the forward_if_online pre-send barrier.
+    pub fn test_arm_forward_send_barrier(
+        &self,
+        host_id: &str,
+        command_id: &str,
+    ) -> (
+        std::sync::Arc<tokio::sync::Notify>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let reached: std::sync::Arc<tokio::sync::Notify> =
+            std::sync::Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        self.state.race_barriers.insert(
+            crate::workspaces::RacePhase::ForwardSend,
+            (host_id.to_owned(), command_id.to_owned()),
+            crate::workspaces::BarrierSlot {
+                reached: reached.clone(),
+                release: release_rx,
+            },
+        );
+        (reached, release_tx)
+    }
+
+    /// Run one queued command through the real `forward_if_online` send path.
+    pub async fn test_forward_command_online(
+        &self,
+        command_id: &str,
+    ) -> anyhow::Result<crate::store::CommandRecord> {
+        let command = self
+            .state
+            .store
+            .get_command(command_id.to_owned())
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("unknown command {command_id}"))?;
+        Ok(crate::http::forward_if_online(&self.state, command, true).await?)
+    }
+}
+
 impl RunningHub {
     /// Borrow this Hub's store (audit queries, support tooling, tests).
     #[must_use]
@@ -531,6 +703,17 @@ impl RunningHub {
     #[cfg(any(test, feature = "test-faults"))]
     pub fn boot_epoch_value(&self) -> u64 {
         self.state.nodes.boot_epoch()
+    }
+
+    /// Test helper: an owned (`'static` + `Clone`) handle to the Hub state so
+    /// tests can drive a handler from a spawned task while orchestrating link
+    /// swaps on the main task.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn test_handle(&self) -> HubTestHandle {
+        HubTestHandle {
+            state: self.state.clone(),
+        }
     }
 
     /// Test helper: insert an online host row directly (no WS enroll).
@@ -610,6 +793,23 @@ impl RunningHub {
         transport: std::sync::Arc<dyn crate::transport::NodeTransport>,
     ) {
         self.state.nodes.insert(host_id.to_owned(), transport).await;
+    }
+
+    /// Test helper (c-dirpicker r11 item 2): mount a synthetic transport AS a
+    /// specific durable link generation — exactly what the `node.hello` arm
+    /// does after `bump_host_link_generation`. Lets interleave tests model the
+    /// bump→insert window with the previous session still registered.
+    #[doc(hidden)]
+    pub async fn test_set_node_transport_with_generation(
+        &self,
+        host_id: &str,
+        transport: std::sync::Arc<dyn crate::transport::NodeTransport>,
+        link_generation: i64,
+    ) {
+        self.state
+            .nodes
+            .insert_with_generation(host_id.to_owned(), transport, link_generation)
+            .await;
     }
 
     /// Test helper: block every Node-registry lookup (`kind_of`, `call`,
@@ -1091,19 +1291,58 @@ impl RunningHub {
             .map_err(|err| anyhow::anyhow!("{err}"))
     }
 
+    /// Test helper (c-cardsettle r8 item 3 / r9 item 3): backdate settlement
+    /// history to a fixed RFC3339 timestamp — both the interactions'
+    /// `updated_at` and their `settlement_events.created_at` log entries — so
+    /// an integration test can create settlement history outside the
+    /// 5-minute connect-replay window and prove the follower lag drain seeds
+    /// at the durable max seq instead of walking the whole history.
+    #[doc(hidden)]
+    /// Backdate `interaction_ids` to `rfc3339` in BOTH tables and return the
+    /// number of rows changed in EACH table, in order
+    /// `(interactions, settlement_events)`. c-cardsettle-fu r1 item 4: callers
+    /// assert the counts so a typo'd id / silent no-op UPDATE fails the test
+    /// instead of leaving the backdate unobserved.
+    #[doc(hidden)]
+    pub async fn test_backdate_interactions(
+        &self,
+        interaction_ids: Vec<String>,
+        rfc3339: &str,
+    ) -> anyhow::Result<(usize, usize)> {
+        let Some(store) = self.store.as_ref() else {
+            anyhow::bail!("hub store already closed");
+        };
+        let ts = rfc3339.to_string();
+        store
+            .run_named("test_backdate_interactions", move |conn| {
+                let mut interactions = 0usize;
+                let mut settlement_events = 0usize;
+                for id in &interaction_ids {
+                    interactions += conn.execute(
+                        "UPDATE interactions SET updated_at = ?1 WHERE id = ?2",
+                        rusqlite::params![ts, id],
+                    )?;
+                    settlement_events += conn.execute(
+                        "UPDATE settlement_events SET created_at = ?1 WHERE interaction_id = ?2",
+                        rusqlite::params![ts, id],
+                    )?;
+                }
+                Ok((interactions, settlement_events))
+            })
+            .await
+            .map_err(Into::into)
+    }
+
     /// Test helper: run the node.hello unregister reconciliation (c-dirpicker
     /// r7 item 1) — aborts every still-unsettled workspace.unregister command
-    /// on `host_id` created before the current instant (r9 item 2: commands a
-    /// live new-link DELETE just created are excluded).
+    /// on `host_id` stamped by a link older than the host's current link
+    /// generation (r10 item 1; a test modeling a reconnect bumps the
+    /// generation first, exactly as an adopting node.hello does).
     #[doc(hidden)]
     pub async fn test_reconcile_unsettled_unregisters(&self, host_id: &str) {
-        crate::workspaces::abort_unsettled_unregisters_on_reconnect(
-            &self.state,
-            host_id,
-            &crate::config::now_rfc3339(),
-        )
-        .await
-        .expect("reconcile unsettled unregisters");
+        crate::workspaces::abort_unsettled_unregisters_on_reconnect(&self.state, host_id)
+            .await
+            .expect("reconcile unsettled unregisters");
     }
 
     /// Test helper (round 6 item 3): arm a one-shot park point in the REAL
@@ -1138,6 +1377,140 @@ impl RunningHub {
             },
         );
         (reached, release_tx)
+    }
+
+    /// Test helper (c-dirpicker r11 item 2): arm the park point between the
+    /// forward-intent stamp and the prepare send of the REAL unregister DELETE
+    /// handler — after the handler pinned its transport. A test parks the
+    /// DELETE there, runs the next hello (generation bump + new transport
+    /// insert), releases, and asserts the prepare/commit stayed on the pinned
+    /// link.
+    #[doc(hidden)]
+    pub fn test_arm_forward_marked_barrier(
+        &self,
+        host_id: &str,
+        workspace_id: &str,
+    ) -> (
+        std::sync::Arc<tokio::sync::Notify>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let reached = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        self.state.race_barriers.insert(
+            crate::workspaces::RacePhase::ForwardMarked,
+            (host_id.to_owned(), workspace_id.to_owned()),
+            crate::workspaces::BarrierSlot {
+                reached: reached.clone(),
+                release: release_rx,
+            },
+        );
+        (reached, release_tx)
+    }
+
+    /// Test helper (c-dirpicker r12 item 1): arm the park point between the
+    /// command INSERT and `mark_forward_intent` in the REAL unregister DELETE
+    /// handler — after the handler pinned the (L1, generation) pair. A test
+    /// parks the DELETE there, bumps the durable host generation (as the next
+    /// hello would), and asserts the post-hello sweep still selects the row
+    /// stamped with the pinned generation.
+    #[doc(hidden)]
+    pub fn test_arm_forward_queued_barrier(
+        &self,
+        host_id: &str,
+        workspace_id: &str,
+    ) -> (
+        std::sync::Arc<tokio::sync::Notify>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let reached: std::sync::Arc<tokio::sync::Notify> =
+            std::sync::Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        self.state.race_barriers.insert(
+            crate::workspaces::RacePhase::ForwardQueued,
+            (host_id.to_owned(), workspace_id.to_owned()),
+            crate::workspaces::BarrierSlot {
+                reached: reached.clone(),
+                release: release_rx,
+            },
+        );
+        (reached, release_tx)
+    }
+
+    /// Test helper (c-dirpicker r12 item 1): arm the park point between the
+    /// transport pin and the command INSERT in the REAL unregister DELETE
+    /// handler.
+    #[doc(hidden)]
+    pub fn test_arm_forward_pinned_barrier(
+        &self,
+        host_id: &str,
+        workspace_id: &str,
+    ) -> (
+        std::sync::Arc<tokio::sync::Notify>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let reached: std::sync::Arc<tokio::sync::Notify> =
+            std::sync::Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        self.state.race_barriers.insert(
+            crate::workspaces::RacePhase::ForwardPinned,
+            (host_id.to_owned(), workspace_id.to_owned()),
+            crate::workspaces::BarrierSlot {
+                reached: reached.clone(),
+                release: release_rx,
+            },
+        );
+        (reached, release_tx)
+    }
+
+    /// c-cardsettle r11 item 1: arm a park on the REAL `/v1/follow`
+    /// settlement pump, after it processes the live notice with seq
+    /// `after_seq`. `reached` resolves with the seq the pump parked at
+    /// (assert it equals `after_seq`); dropping/sending on `release` lets
+    /// the pump continue.
+    #[cfg(any(test, feature = "test-faults"))]
+    #[doc(hidden)]
+    pub async fn test_arm_follow_park(
+        &self,
+        after_seq: i64,
+    ) -> (
+        tokio::sync::oneshot::Receiver<i64>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.state.follow_parks.arm(after_seq).await
+    }
+
+    /// c-cardsettle-fu2 r1 item 4: arm the park AFTER the delete DB job
+    /// commits (before publication/cleanup).
+    #[cfg(any(test, feature = "test-faults"))]
+    #[doc(hidden)]
+    pub async fn test_arm_post_delete_park(
+        &self,
+        instance_id: &str,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.state
+            .operation_parks
+            .arm_post_delete(instance_id)
+            .await
+    }
+
+    /// c-cardsettle-fu2 r4 item 3: number of settlement notices
+    /// `broadcast_settlement` has actually put on the bus for
+    /// `interaction_id`. A parked post-delete must keep this at 0 until the
+    /// park is released; keyed by interaction so unrelated background
+    /// settles (host sweeps, daemons) do not move the count.
+    #[cfg(any(test, feature = "test-faults"))]
+    #[doc(hidden)]
+    pub fn test_settlement_notice_count(&self, interaction_id: &str) -> u64 {
+        self.state
+            .test_settlement_counts
+            .lock()
+            .unwrap()
+            .get(interaction_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Mint a scoped device token against this Hub's store (D-018).
@@ -1471,6 +1844,13 @@ async fn spawn_inner(
             let (tx, _rx) = tokio::sync::broadcast::channel(64);
             tx
         },
+        settlement_publish: Arc::new(tokio::sync::Mutex::const_new(())),
+        #[cfg(any(test, feature = "test-faults"))]
+        follow_parks: crate::ws::FollowParks::default(),
+        #[cfg(any(test, feature = "test-faults"))]
+        operation_parks: crate::ws::OperationParks::default(),
+        #[cfg(any(test, feature = "test-faults"))]
+        test_settlement_counts: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         tty: crate::ws::TtyRelay::default(),
         api_relay: crate::api_relay::ApiRelay::new(),
         push,
@@ -1488,8 +1868,18 @@ async fn spawn_inner(
         race_barriers: crate::workspaces::RaceBarriers::default(),
         gate_decision_guards: crate::gatequeue::GateDecisionGuards::new(),
     };
-    let (_, lost_settlement) = store.expire_lost_hosts(config.host_lost_grace_ms).await?;
-    state.broadcast_settlement(&lost_settlement);
+    if let Err(err) = state
+        .publish_settlement_unit(async {
+            Ok(state
+                .store
+                .expire_lost_hosts(config.host_lost_grace_ms)
+                .await?
+                .1)
+        })
+        .await
+    {
+        tracing::error!(error = %err, "startup host-lost sweep failed");
+    }
     // A Hub restart must not inherit yesterday's unacknowledged creates: they
     // would keep holding placement slots with no Node that can ever settle them.
     expire_stale_requested(&state, config.requested_grace_ms).await;
@@ -1530,11 +1920,19 @@ async fn spawn_inner(
                     break;
                 }
                 _ = interval.tick() => {
-                    match reaper_state.store.expire_lost_hosts(config.host_lost_grace_ms).await {
-                        Ok((_, settlement)) => {
-                            // c-cardsettle: even the background reaper announces
-                            // the cards it invalidated.
-                            reaper_state.broadcast_settlement(&settlement);
+                    let sweep = reaper_state
+                        .publish_settlement(async {
+                            reaper_state
+                                .store
+                                .expire_lost_hosts(config.host_lost_grace_ms)
+                                .await
+                        })
+                        .await;
+                    match sweep {
+                        Ok(swept) => {
+                            if swept > 0 {
+                                tracing::debug!(swept, "host-lost sweep marked contact loss");
+                            }
                         }
                         Err(err) => tracing::error!(error = %err, "host-lost sweep failed"),
                     }
@@ -1563,14 +1961,16 @@ async fn spawn_inner(
 /// Each expiry gets a Hub-authored journal diagnostic so the row explains
 /// itself, and stops counting toward the host's `maxInstances` ceiling.
 async fn expire_stale_requested(state: &AppState, window_ms: u64) {
-    let (expired, settlement) = match state.store.expire_stale_requested(window_ms).await {
+    let expired = match state
+        .publish_settlement(state.store.expire_stale_requested(window_ms))
+        .await
+    {
         Ok(outcome) => outcome,
         Err(error) => {
             tracing::error!(%error, "stale-requested sweep failed");
             return;
         }
     };
-    state.broadcast_settlement(&settlement);
     for (host_id, instance_id) in expired {
         tracing::warn!(
             %host_id,

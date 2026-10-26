@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::info;
 
@@ -198,6 +198,10 @@ struct PtyLive {
     interaction_task: JoinHandle<()>,
     hook_task: Option<JoinHandle<()>>,
     transcript_task: Option<JoinHandle<()>>,
+    /// Cooperative shutdown for the transcript pump; closing sets it so the
+    /// pump reads the final append and publishes a finalised last turn
+    /// (c-ctxusage r4 item 2) before the task ends.
+    transcript_shutdown: Option<watch::Sender<bool>>,
     tty_task: Option<JoinHandle<()>>,
     /// Current alt-screen mode seen by the attach relay's byte scanner.
     alt_screen: Arc<AtomicBool>,
@@ -285,6 +289,14 @@ impl ClaudePtyDriver {
             reject_bot_bypass(&spec)?;
         }
         let session_id = session.session_id().to_string();
+        // Capture the resume session id before `session` moves into the
+        // materialize request; the boundary itself is taken after the final
+        // child env is assembled (so it uses the effective CLAUDE_CONFIG_DIR,
+        // including any extra_env/MCP override) but before the agent runs.
+        let resume_id: Option<String> = match &session {
+            crate::materializer::SessionAction::Resume { session_id } => Some(session_id.clone()),
+            crate::materializer::SessionAction::New { .. } => None,
+        };
         let request = MaterializeRequest {
             spec: &spec,
             profile: &self.options.profile,
@@ -359,6 +371,27 @@ impl ClaudePtyDriver {
         if let Some(context) = &self.options.agent_mcp {
             env.extend(context.environment()?);
         }
+
+        // D-056 (4), r4 item 3: snapshot the resume boundary from the FINAL
+        // child config dir (an extra_env/MCP CLAUDE_CONFIG_DIR override wins
+        // over the registered home; otherwise the registered native home the
+        // recipe pins), and before the agent runs so even records written
+        // between exec and hydration are read as current.
+        let config_dir = env
+            .get("CLAUDE_CONFIG_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| self.options.native_home.clone());
+        // r4: a resume whose transcript is present is verified; one whose file
+        // is not (or which cannot otherwise be bounded) is Unverified — never
+        // the fresh byte-0 path.
+        let resume_mode = match resume_id.as_deref() {
+            Some(id) => crate::claude_transcript::ResumeBoundary::mode_for(
+                &config_dir,
+                std::path::Path::new(&spec.cwd),
+                id,
+            ),
+            None => crate::claude_transcript::ResumeMode::Fresh,
+        };
 
         // §9.1 model list: discover the gateway cache / settings the launched
         // session can actually switch to, before the pane exists. The scoped
@@ -547,10 +580,7 @@ impl ClaudePtyDriver {
         // through the same transcript pump below.
         let effort_bridge = Arc::new(crate::effort::EffortBridge::new());
         if let Some(effort) = spec.effort {
-            effort_bridge.note_launch_request(crate::effort::EffortRequest {
-                name: effort.name,
-                ultracode: effort.ultracode,
-            });
+            effort_bridge.note_launch_request(crate::effort::EffortRequest::from_selection(effort));
         }
         let effort_queue = Arc::new(crate::effort::EffortQueue::new());
         // §9.1: /model switches share the pane I/O and transcript pump but
@@ -572,11 +602,13 @@ impl ClaudePtyDriver {
         let permission_queue = Arc::new(crate::permission::PermissionQueue::new());
         // The TUI's tool calls exist only in the native transcript; follow it as
         // soon as the hook names the file (D-025's mapper, claude-pty's carrier).
+        let (transcript_shutdown, transcript_shutdown_rx) = watch::channel(false);
         let transcript_task = spawn_transcript_pump(
             Arc::clone(&transcript_path),
             tx.clone(),
             ctx.clone(),
             Arc::clone(&self.seq),
+            transcript_shutdown_rx,
             Some(Arc::clone(&effort_bridge)),
             spec.effort,
             Some(TranscriptModelSync {
@@ -587,6 +619,7 @@ impl ClaudePtyDriver {
             Some(Arc::clone(&permission_bridge)),
             launch_permission,
             self.options.media_stager.clone(),
+            resume_mode,
         );
         let effort_io: Arc<dyn crate::effort::EffortSwitchIo> = Arc::new(HerdrEffortIo {
             client: client.clone(),
@@ -594,6 +627,7 @@ impl ClaudePtyDriver {
             events: tx.clone(),
             seq: Arc::clone(&self.seq),
             ctx: ctx.clone(),
+            transcript_path: Arc::clone(&transcript_path),
         });
         let effort_worker = crate::effort::spawn_worker(
             Arc::clone(&effort_bridge),
@@ -609,6 +643,7 @@ impl ClaudePtyDriver {
             events: tx.clone(),
             seq: Arc::clone(&self.seq),
             ctx: ctx.clone(),
+            transcript_path: Arc::clone(&transcript_path),
         });
         let model_worker = crate::model::spawn_model_worker(
             Arc::clone(&model_bridge),
@@ -699,6 +734,7 @@ impl ClaudePtyDriver {
             interaction_task,
             hook_task: Some(hook_task),
             transcript_task: Some(transcript_task),
+            transcript_shutdown: Some(transcript_shutdown),
             tty_task: None,
             alt_screen: Arc::new(AtomicBool::new(false)),
             closed: false,
@@ -718,24 +754,61 @@ impl ClaudePtyDriver {
 }
 
 impl ClaudePtyDriver {
-    /// §9.1: type `/effort <level>` and let the transcript pump prove it.
-    async fn switch_effort(&self, level: &str) -> DriverResult<DriverAck> {
-        let Some(request) = crate::effort::EffortRequest::from_level(level) else {
-            // An honest refusal for a word the in-session command does not take
-            // (`auto` is a mode, and an unknown future name must not be typed
-            // and hoped about). The Node surfaces the rejection in the UI.
-            return Err(DriverError::CapabilityUnsupported(format!(
-                "claude /effort does not accept {level:?} in-session; \
-                 valid: low, medium, high, xhigh, max, ultracode"
-            )));
-        };
-        let (pane_id, session_id, queue, ready, io) = {
+    /// §9.1: type `/effort <level>` (plus the D-056 ultracode axis) and let
+    /// the transcript pump prove it.
+    async fn switch_effort(
+        &self,
+        level: &str,
+        ultracode: Option<bool>,
+        axis: Option<remuda_protocol::EffortAxis>,
+        request_id: Option<String>,
+    ) -> DriverResult<DriverAck> {
+        let (pane_id, session_id, queue, ready, io, request) = {
             let inner = self.inner.lock().await;
             let live = inner.as_ref().ok_or(DriverError::ControlUnavailable)?;
             if live.closed {
                 return Err(DriverError::ControlUnavailable);
             }
             require_session_start(live)?;
+            // D-056: the exact command word depends on the REPORTED build:
+            // coupled builds take one bare `ultracode`, decoupled builds take
+            // `ultracode on|off` for a same-tier toggle.
+            let semantics = remuda_protocol::parse_effort_version(&live.recipe.binary.version)
+                .unwrap_or(remuda_protocol::EffortSemantics::Unknown);
+            if ultracode == Some(true) && !remuda_protocol::ultracode_supported(semantics) {
+                return Err(DriverError::CapabilityUnsupported(format!(
+                    "ultracode requires Claude Code >= 2.1.203; this session reports {semantics:?} ({})",
+                    live.recipe.binary.version,
+                )));
+            }
+            // c-effortui r4 item 2: classify against the latest OBSERVED
+            // effective selection (read-back); fall back to launch/requested
+            // provenance only before any read-back exists.
+            // c-effortread r15 item 5: the fallback is the VALID LAUNCH
+            // selection — a previously armed switch whose write failed left
+            // its attempted target in the payload echo, and using it here let
+            // a cold flag-on configure masquerade as a same-tier toggle.
+            let proven = live.effort_bridge.proven_selection();
+            let requested = live.effort_bridge.launch_selection();
+            let Some(request) = crate::effort::EffortRequest::for_configure(
+                level,
+                ultracode,
+                axis,
+                semantics,
+                proven,
+                requested,
+                request_id.as_deref(),
+            ) else {
+                // An honest refusal: a word the command does not take, or a
+                // flag-on a legacy/ambiguous request cannot disambiguate
+                // (c-effortread r9 item 6: execute exactly the stated axis,
+                // never a substituted tier command). The Node surfaces the
+                // rejection in the UI.
+                return Err(DriverError::CapabilityUnsupported(format!(
+                    "claude /effort cannot apply {ultracode:?} at {level:?} on this build/request; \
+                     valid: low, medium, high, xhigh, max, ultracode, ultracode on, ultracode off"
+                )));
+            };
             let ready = crate::pty_interaction::prompt_ready(&live.client, &live.pane_id)
                 .await
                 .is_ok();
@@ -745,6 +818,7 @@ impl ClaudePtyDriver {
                 events: live.events.clone(),
                 seq: Arc::clone(&self.seq),
                 ctx: live.ctx.clone(),
+                transcript_path: Arc::clone(&live.transcript_path),
             };
             (
                 live.pane_id.clone(),
@@ -752,6 +826,7 @@ impl ClaudePtyDriver {
                 Arc::clone(&live.effort_queue),
                 ready,
                 Arc::new(io) as Arc<dyn crate::effort::EffortSwitchIo>,
+                request,
             )
         };
 
@@ -770,9 +845,10 @@ impl ClaudePtyDriver {
         } else {
             // Ready ladder: a turn is running. Journal `queued` and hand off;
             // the worker types it at the next idle and journals the result.
-            io.journal(
+            io.journal_effort(
                 crate::effort::SwitchOutcome::Queued.journal_status(request.command_word(), ""),
                 Severity::Info,
+                request.request_id.clone(),
             )
             .await;
             queue.enqueue(request, None);
@@ -808,6 +884,7 @@ impl ClaudePtyDriver {
                 events: live.events.clone(),
                 seq: Arc::clone(&self.seq),
                 ctx: live.ctx.clone(),
+                transcript_path: Arc::clone(&live.transcript_path),
             };
             (
                 live.pane_id.clone(),
@@ -828,9 +905,10 @@ impl ClaudePtyDriver {
                 // claim applied from this command.
             }
         } else {
-            io.journal(
+            io.journal_effort(
                 crate::model::ModelSwitchOutcome::Queued.journal_status(&request.id, ""),
                 Severity::Info,
+                None,
             )
             .await;
             queue.enqueue(request, None);
@@ -1019,7 +1097,14 @@ impl Driver for ClaudePtyDriver {
             && !level.is_empty()
             && switch.model_id.is_empty()
         {
-            return self.switch_effort(level).await;
+            return self
+                .switch_effort(
+                    level,
+                    switch.effort_ultracode,
+                    switch.effort_axis,
+                    switch.effort_request_id.clone(),
+                )
+                .await;
         }
         // §9.1: a model switch is `/model <id>` typed into the composer and
         // proven by the transcript verdict. (A combined model+effort configure
@@ -1148,8 +1233,22 @@ impl Driver for ClaudePtyDriver {
         if let Some(task) = live.hook_task.take() {
             task.abort();
         }
+        // c-ctxusage r4 item 2: cooperative transcript shutdown — signal, let
+        // the pump read the final append and publish a finalised last turn,
+        // then wait one poll window before forcing the issue.
+        if let Some(shutdown) = live.transcript_shutdown.take() {
+            let _ = shutdown.send(true);
+        }
         if let Some(task) = live.transcript_task.take() {
-            task.abort();
+            const TRANSCRIPT_SHUTDOWN_TIMEOUT: std::time::Duration =
+                std::time::Duration::from_secs(2);
+            let mut task = task;
+            if tokio::time::timeout(TRANSCRIPT_SHUTDOWN_TIMEOUT, &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+            }
         }
         if let Some(task) = live.tty_task.take() {
             task.abort();
@@ -1357,12 +1456,15 @@ fn spawn_transcript_pump(
     tx: mpsc::Sender<Observation>,
     ctx: ObsCtx,
     seq: Arc<AtomicU64>,
+    mut shutdown: watch::Receiver<bool>,
     effort_bridge: Option<Arc<crate::effort::EffortBridge>>,
     launch_effort: Option<EffortSelection>,
     model: Option<TranscriptModelSync>,
     permission_bridge: Option<Arc<crate::permission::PermissionBridge>>,
     launch_permission: Option<remuda_protocol::ClaudePermissionMode>,
     media_stager: Option<Arc<dyn remuda_protocol::ToolMediaStager>>,
+    // Fresh / verified-resume / unverifiable-resume for this launch.
+    resume_mode: crate::claude_transcript::ResumeMode,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut hydrator: Option<(crate::claude_transcript::TranscriptTail, TranscriptMapper)> =
@@ -1437,7 +1539,11 @@ fn spawn_transcript_pump(
                         mapper =
                             mapper.with_permission_bridge(Arc::clone(bridge), launch_permission);
                     }
-                    hydrator = Some((crate::claude_transcript::TranscriptTail::new(path), mapper));
+                    // D-056 (4): the mode decides fresh vs proven vs
+                    // unverifiable resume; an unverifiable resume whose
+                    // transcript is still absent leaves the hydrator unbound
+                    // until the file appears — never a byte-0/current tail.
+                    hydrator = resume_mode.open_tail(&path).map(|tail| (tail, mapper));
                 }
             }
             if let Some(hydrated) = hydrator.take() {
@@ -1452,14 +1558,46 @@ fn spawn_transcript_pump(
                         TranscriptMapper,
                         Vec<Result<Vec<Observation>, DriverError>>,
                     ) {
+                        use crate::claude_transcript::TailProvenance;
                         let (mut tail, mut mapper) = hydrated;
-                        let lines = tail.poll().unwrap_or_default();
+                        // The tail reports whether these bytes are provenanced
+                        // to the current process; an unverified batch maps for
+                        // conversation only, and a verified→unverified
+                        // transition emits an explicit read-back-unavailable
+                        // edge that clears the projected effective state.
+                        let (provenance, poll_failed, poll_positions) = match tail.poll() {
+                            Ok(read) => (read.provenance, read.lines, read.positions),
+                            Err(error) => {
+                                tracing::debug!(%error, "transcript tail unreadable this poll");
+                                let p = if tail.verified() {
+                                    TailProvenance::Current
+                                } else {
+                                    TailProvenance::Unverified
+                                };
+                                (p, Vec::new(), Vec::new())
+                            }
+                        };
+                        let gate_edges = mapper
+                            .apply_effort_provenance(provenance == TailProvenance::Current)
+                            .expect("gate provenance is infallible");
                         // Flush the buffered assistant run at the end of the
                         // batch: the mapper holds a run open until superseded,
                         // so the final message of a finished turn would
                         // otherwise wait for the next record to arrive.
-                        let mut batches: Vec<_> =
-                            lines.iter().map(|line| mapper.map_line(line)).collect();
+                        let mut batches: Vec<Result<Vec<Observation>, DriverError>> =
+                            Vec::new();
+                        if !gate_edges.is_empty() {
+                            batches.push(Ok(gate_edges));
+                        }
+                        // c-effortread r15 item 4: each record rides with its
+                        // verified transcript position so an armed slash
+                        // attribution can exclude pre-submission records.
+                        batches.extend(
+                            poll_failed
+                                .iter()
+                                .zip(poll_positions.iter().copied())
+                                .map(|(line, position)| mapper.map_line_at(line, Some(position))),
+                        );
                         batches.push(mapper.flush());
                         (tail, mapper, batches)
                     })
@@ -1477,23 +1615,79 @@ fn spawn_transcript_pump(
                         }
                     };
                     for observation in mapped {
-                        if emit_obs(
-                            &tx,
-                            &seq,
-                            &ctx,
-                            SourceChannel::Transcript,
-                            observation.completeness,
-                            observation.body,
-                        )
-                        .await
-                        .is_err()
+                        // Preserve the mapper's envelope: deterministic event id
+                        // (§9.1), historical native_at and replay evidence.
+                        if emit_mapped_obs(&tx, &seq, &ctx, SourceChannel::Transcript, observation)
+                            .await
+                            .is_err()
                         {
                             return;
                         }
                     }
                 }
             }
-            tokio::time::sleep(TRANSCRIPT_POLL).await;
+            // c-ctxusage r4 item 2: cooperative shutdown. On close, read the
+            // final append and `finish()` the buffered assistant run so its
+            // usage reaches usage_events even with no stop_reason and no
+            // superseding record, instead of being aborted mid-run.
+            let shutdown_fired = *shutdown.borrow_and_update();
+            tokio::select! {
+                () = tokio::time::sleep(TRANSCRIPT_POLL), if !shutdown_fired => {}
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        if let Some((tail, mapper)) = hydrator.take() {
+                            // Owned move through the blocking task, mirroring
+                            // the regular poll batch.
+                            let (_tail, _mapper, batches) =
+                                tokio::task::spawn_blocking(move || -> (
+                                    crate::claude_transcript::TranscriptTail,
+                                    TranscriptMapper,
+                                    Vec<Result<Vec<Observation>, DriverError>>,
+                                ) {
+                                    let (mut tail, mut mapper) = (tail, mapper);
+                                    let mut batches: Vec<_> =
+                                        if let Ok(read) = tail.poll() {
+                                            read.lines
+                                                .iter()
+                                                .zip(read.positions.iter().copied())
+                                                .map(|(line, position)| {
+                                                    mapper.map_line_at(line, Some(position))
+                                                })
+                                                .collect()
+                                        } else {
+                                            Vec::new()
+                                        };
+                                    batches.push(mapper.finish());
+                                    (tail, mapper, batches)
+                                })
+                                .await
+                                .unwrap_or_else(|error| {
+                                    panic!("transcript mapping task panicked: {error}")
+                                });
+                            for batch in batches {
+                                let Ok(mapped) = batch else {
+                                    continue;
+                                };
+                                for observation in mapped {
+                                    if emit_mapped_obs(
+                                        &tx,
+                                        &seq,
+                                        &ctx,
+                                        SourceChannel::Transcript,
+                                        observation,
+                                    )
+                                    .await
+                                    .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        return;
+                    }
+                }
+            }
         }
     })
 }
@@ -1621,7 +1815,47 @@ async fn emit_obs(
     payload: ObservationPayload,
 ) -> DriverResult<()> {
     let n = seq.fetch_add(1, Ordering::SeqCst) + 1;
-    tx.send(build_observation(ctx, n, channel, completeness, payload)?)
+    tx.send(build_observation(
+        ctx,
+        n,
+        channel,
+        completeness,
+        payload,
+        Knowledge::Unknown {
+            reason: "herdr-clock".into(),
+            evidence_event_ids: vec![],
+        },
+    )?)
+    .await
+    .map_err(|_| DriverError::ControlUnavailable)?;
+    Ok(())
+}
+
+/// Emit a mapper-produced observation while PRESERVING its envelope:
+///
+/// * the deterministic `event_id` the transcript mapper minted (§9.1: an
+///   effort edge's id and the journal tailer's id for the same native edge are
+///   derived identically; rebuilding it with a fresh [`EventId::new`] would
+///   publish a different live id and break live/journal parity);
+/// * the historical `native_at` (c-ctxusage r3 item 5 — a replayed usage
+///   record keeps its own timestamp so the Hub rate windows exclude it);
+/// * the replay completeness/evidence the mapper computed.
+async fn emit_mapped_obs(
+    tx: &mpsc::Sender<Observation>,
+    seq: &AtomicU64,
+    ctx: &ObsCtx,
+    channel: SourceChannel,
+    mapped: Observation,
+) -> DriverResult<()> {
+    let n = seq.fetch_add(1, Ordering::SeqCst) + 1;
+    let event_id = mapped.event_id;
+    let native_at = mapped.native_at.clone();
+    let evidence = mapped.evidence_event_ids.clone();
+    let mut observation =
+        build_observation(ctx, n, channel, mapped.completeness, mapped.body, native_at)?;
+    observation.event_id = event_id;
+    observation.evidence_event_ids = evidence;
+    tx.send(observation)
         .await
         .map_err(|_| DriverError::ControlUnavailable)?;
     Ok(())
@@ -1633,6 +1867,7 @@ pub(crate) fn build_observation(
     channel: SourceChannel,
     completeness: Completeness,
     payload: ObservationPayload,
+    native_at: Knowledge<Timestamp>,
 ) -> DriverResult<Observation> {
     Ok(Observation {
         schema_version: SchemaVersion,
@@ -1645,10 +1880,7 @@ pub(crate) fn build_observation(
         run_generation: Some(U64(1)),
         seq: U64(seq),
         observed_at: now_ts()?,
-        native_at: Knowledge::Unknown {
-            reason: "herdr-clock".into(),
-            evidence_event_ids: vec![],
-        },
+        native_at,
         source: ObservationSource {
             driver_kind: ctx.driver,
             driver_version: ctx.pin_version.clone(),
@@ -1707,6 +1939,22 @@ pub(crate) fn dummy_digest() -> DriverResult<Digest> {
     .map_err(DriverError::Protocol)
 }
 
+/// Resolve the Herdr carrier's pre-submission provenance from its bound
+/// transcript path (c-effortread r16 item 3): a successful stat is the
+/// verified pre-submit EOF the switch's own slash is appended AT; no binding
+/// or a failed stat (the file was rotated/removed between bind and submit) is
+/// explicit provenance loss, never a word-only fallback.
+fn herdr_submission_provenance(path: Option<&str>) -> crate::effort::SubmissionProvenance {
+    use crate::effort::SubmissionProvenance;
+    match path {
+        Some(path) => match std::fs::metadata(path) {
+            Ok(metadata) => SubmissionProvenance::Floor(metadata.len()),
+            Err(_) => SubmissionProvenance::Unavailable,
+        },
+        None => SubmissionProvenance::Unavailable,
+    }
+}
+
 /// §9.1 [`crate::effort::EffortSwitchIo`] backed by a Herdr pane.
 struct HerdrEffortIo {
     client: Client,
@@ -1714,6 +1962,9 @@ struct HerdrEffortIo {
     events: mpsc::Sender<Observation>,
     seq: Arc<AtomicU64>,
     ctx: ObsCtx,
+    /// Bound transcript path, for the c-effortread r15 item 4 submission
+    /// floor (EOF captured immediately before typing a switch command).
+    transcript_path: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 #[async_trait]
@@ -1760,14 +2011,33 @@ impl crate::effort::EffortSwitchIo for HerdrEffortIo {
         Ok(read.text().to_owned())
     }
 
-    async fn journal(&self, status: String, severity: Severity) {
+    async fn submission_floor(&self) -> crate::effort::SubmissionProvenance {
+        // The bound transcript's EOF immediately before submission: the
+        // switch's own slash is appended starting AT this position, so only a
+        // record that starts at or after it can be this switch's command
+        // (c-effortread r15 item 4, r16 item 1). A missing binding or a failed
+        // stat is explicit provenance loss (r16 item 3): the mapper attributes
+        // nothing rather than falling back to word-only matching.
+        let path = match self.transcript_path.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => None,
+        };
+        herdr_submission_provenance(path.as_deref())
+    }
+
+    async fn journal_effort(&self, status: String, severity: Severity, request_id: Option<String>) {
+        // c-effortread r10: echo the configure's per-request id so the web
+        // binds the lifecycle edge to the exact in-flight switch.
+        let related_ids = request_id
+            .map(|id| BTreeMap::from([(remuda_protocol::EFFORT_REQUEST_ID_KEY.to_owned(), id)]))
+            .unwrap_or_default();
         let payload = ObservationPayload::Lifecycle(Box::new(LifecyclePayload::Native(Box::new(
             NativeLifecycle {
                 topic: LifecycleTopic::Configuration,
                 native_name: "instance.configure".into(),
                 native_id: Knowledge::NotApplicable,
                 status: Knowledge::Known { value: status },
-                related_ids: BTreeMap::new(),
+                related_ids,
                 data_ref: None,
                 severity,
                 affects_completion: false,
@@ -2461,6 +2731,3022 @@ mod tests {
         assert!(refuse_bare(&["--model".into(), "haiku".into()]).is_ok());
         assert!(refuse_bare(&["--bare".into()]).is_err());
         assert!(refuse_bare(&["--continue".into()]).is_err());
+    }
+
+    /// c-effortread r2: the deterministic effort edge id the transcript mapper
+    /// mints must survive live publication. The TUI pump used to rebuild every
+    /// observation (including a fresh random event id), so the published id did
+    /// not match the journal tailer's derived id.
+    #[tokio::test]
+    async fn mapped_effort_observation_keeps_its_deterministic_event_id() {
+        let instance = InstanceId::new();
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            instance.clone(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        );
+        // First assistant record always emits one effort edge with a
+        // deterministic id derived from the native message id.
+        let line = json!({
+            "type": "assistant",
+            "uuid": "msg-1",
+            "sessionId": "effort-session",
+            "version": "2.1.289",
+            "message": {
+                "id": "msg-1",
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "text", "text": "ok"}],
+            },
+            "effort": "high",
+            "perTurnEffort": null,
+        })
+        .to_string();
+        let mapped = mapper
+            .map_line(&line)
+            .expect("map")
+            .into_iter()
+            .find(|obs| matches!(obs.body, ObservationPayload::Effort(_)))
+            .expect("an effort edge");
+        let deterministic = mapped.event_id.clone();
+
+        let ctx = ObsCtx {
+            driver: DriverKind::ClaudePty,
+            instance_id: instance.clone(),
+            host_id: HostId::new(),
+            journal_id: Id::new("obj").expect("journal id"),
+            run_id: RunId::new(),
+            session_id: "effort-session".into(),
+            pin_version: "2.1.289".into(),
+        };
+        let (tx, mut rx) = mpsc::channel(4);
+        let seq = Arc::new(AtomicU64::new(0));
+        emit_mapped_obs(&tx, &seq, &ctx, SourceChannel::Transcript, mapped)
+            .await
+            .expect("emit");
+        let published = rx.try_recv().expect("the observation was published");
+        assert_eq!(
+            published.event_id, deterministic,
+            "the live TUI channel must publish the mapper's deterministic id"
+        );
+    }
+
+    /// A `/effort <word>` user record shaped exactly like claude writes it.
+    fn effort_slash_line(uuid: &str, word: &str) -> String {
+        json!({
+            "type": "user",
+            "uuid": uuid,
+            "sessionId": "effort-session",
+            "version": "2.1.289",
+            "message": {
+                "role": "user",
+                "content": format!(
+                    "<command-name>/effort</command-name>\n<command-message>effort</command-message>\n\
+                     <command-args>{word}</command-args>"
+                )
+            }
+        })
+        .to_string()
+    }
+
+    /// A `<local-command-stdout>` verdict user record.
+    fn effort_stdout_line(uuid: &str, body: &str) -> String {
+        json!({
+            "type": "user",
+            "uuid": uuid,
+            "sessionId": "effort-session",
+            "version": "2.1.289",
+            "message": {
+                "role": "user",
+                "content": format!("<local-command-stdout>{body}</local-command-stdout>")
+            }
+        })
+        .to_string()
+    }
+
+    /// c-effortread r11 item 2: an accepted `/effort` verdict that changes
+    /// NOTHING (a no-op switch targeting the state already in effect) produces
+    /// no tracker edge, but it still has to publish request-specific
+    /// completion evidence for OUR armed command — an observation carrying the
+    /// request id — so the web's moved axes can settle from the id instead of
+    /// leaving the chip on 切换中. Goes red when the no-edge accepted arm
+    /// emits nothing.
+    #[tokio::test]
+    async fn r11_item2_an_accepted_noop_verdict_still_echoes_the_request_id() {
+        use crate::effort::{EffortBridge, EffortRequest};
+        use remuda_protocol::EffortAxis::Flag;
+        use remuda_protocol::EffortSemantics::Decoupled;
+
+        let bridge = Arc::new(EffortBridge::new());
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            InstanceId::new(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        )
+        .with_effort_bridge(Arc::clone(&bridge) as Arc<EffortBridge>, None);
+
+        // The human already switched the flag OFF in the terminal: latch
+        // {high, flag false} via the accepted verdict (normal edge).
+        mapper
+            .map_line(&effort_slash_line("cmd-human", "ultracode off"))
+            .expect("map human slash");
+        let first = mapper
+            .map_line(&effort_stdout_line(
+                "out-human",
+                "Ultracode off. Effort stays high.",
+            ))
+            .expect("map human verdict");
+        assert!(
+            first
+                .iter()
+                .any(|obs| matches!(obs.body, ObservationPayload::Effort(_))),
+            "the first OFF verdict latches with a normal edge"
+        );
+
+        // Remuda now runs a NO-OP OFF configure (target already in effect).
+        let request = EffortRequest::for_configure(
+            "high",
+            Some(false),
+            Some(Flag),
+            Decoupled,
+            None,
+            None,
+            Some("req-noop"),
+        )
+        .expect("off toggle");
+        bridge.arm(request);
+        mapper
+            .map_line(&effort_slash_line("cmd-remuda", "ultracode off"))
+            .expect("map remuda slash");
+        let out = mapper
+            .map_line(&effort_stdout_line(
+                "out-remuda",
+                "Ultracode off. Effort stays high.",
+            ))
+            .expect("map remuda no-op verdict");
+        let edge = out
+            .iter()
+            .find_map(|obs| match &obs.body {
+                ObservationPayload::Effort(payload) => Some(payload),
+                _ => None,
+            })
+            .expect("a no-op accepted verdict still publishes completion evidence");
+        assert_eq!(edge.request_id.as_deref(), Some("req-noop"));
+        assert_eq!(edge.effective.ultracode, Some(false));
+        assert!(
+            !bridge.has_pending(),
+            "the accepted no-op resolves the armed switch"
+        );
+    }
+
+    /// c-effortread r11 item 1: each `/effort` verdict is labelled with the
+    /// request whose SLASH GENERATION asked for it, not the bridge's latest
+    /// armed request. Production sequence through the real mapper:
+    /// A executes (`ultracode off`) → A times out → B armed (`ultracode on`)
+    /// → A's delayed accepted-OFF verdict arrives. It must resolve only A's
+    /// stale generation (B stays pending) and its echo must carry A's id, not
+    /// B's; B's own later ON verdict then settles B.
+    #[tokio::test]
+    async fn r11_item1_a_delayed_verdict_carries_its_own_request_id_not_b() {
+        use crate::effort::{EffortBridge, EffortRequest};
+        use remuda_protocol::EffortAxis::Flag;
+        use remuda_protocol::EffortName::High;
+        use remuda_protocol::EffortSemantics::Decoupled;
+
+        let bridge = Arc::new(EffortBridge::new());
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            InstanceId::new(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        )
+        .with_effort_bridge(Arc::clone(&bridge) as Arc<EffortBridge>, None);
+
+        let request_a = EffortRequest::for_configure(
+            "high",
+            Some(false),
+            Some(Flag),
+            Decoupled,
+            None,
+            None,
+            Some("req-a"),
+        )
+        .expect("A is the off toggle");
+        assert_eq!(request_a.command_word(), "ultracode off");
+        let gen_a = bridge.arm(request_a);
+        mapper
+            .map_line(&effort_slash_line("cmd-a", "ultracode off"))
+            .expect("map A slash");
+
+        // A's read-back window passes with no verdict: the worker gives up on
+        // exactly A's generation (pending clears), exactly as perform_switch.
+        bridge.fail(gen_a);
+
+        let request_b = EffortRequest::for_configure(
+            "high",
+            Some(true),
+            Some(Flag),
+            Decoupled,
+            None,
+            None,
+            Some("req-b"),
+        )
+        .expect("B is the on toggle");
+        let _gen_b = bridge.arm(request_b);
+        mapper
+            .map_line(&effort_slash_line("cmd-b", "ultracode on"))
+            .expect("map B slash");
+
+        // A's DELAYED verdict lands after B's slash: accepted OFF.
+        let out_a = mapper
+            .map_line(&effort_stdout_line(
+                "out-a",
+                "Ultracode off. Effort stays high.",
+            ))
+            .expect("map A verdict");
+        let edge_a = out_a
+            .iter()
+            .find_map(|obs| match &obs.body {
+                ObservationPayload::Effort(payload) => Some(payload),
+                _ => None,
+            })
+            .expect("A's verdict emits an effort edge");
+        assert_eq!(
+            edge_a.request_id.as_deref(),
+            Some("req-a"),
+            "the delayed verdict echoes ITS request, not B"
+        );
+        assert_eq!(edge_a.effective.ultracode, Some(false));
+        assert!(
+            bridge.has_pending(),
+            "resolving A's stale generation must not clear B"
+        );
+        let pending_b = bridge.pending().expect("B stays armed");
+        assert_eq!(pending_b.request_id.as_deref(), Some("req-b"));
+        assert_eq!(pending_b.name, High);
+
+        // B's own ON verdict settles B.
+        let out_b = mapper
+            .map_line(&effort_stdout_line(
+                "out-b",
+                "Ultracode on (this session only): dynamic workflows on every \
+                 task. Effort stays high.",
+            ))
+            .expect("map B verdict");
+        let edge_b = out_b
+            .iter()
+            .find_map(|obs| match &obs.body {
+                ObservationPayload::Effort(payload) => Some(payload),
+                _ => None,
+            })
+            .expect("B's verdict emits an effort edge");
+        assert_eq!(edge_b.request_id.as_deref(), Some("req-b"));
+        assert_eq!(edge_b.effective.ultracode, Some(true));
+        assert!(!bridge.has_pending(), "B's verdict settles B");
+    }
+
+    /// c-effortread r12 item 1: the slash binds its (generation, request)
+    /// tuple from ONE bridge snapshot. In production the switch worker runs
+    /// on another task: if A times out and B is armed in the gap between two
+    /// snapshots, the old mapper stored B's tuple for A's slash, so A's
+    /// delayed verdict carried B's id and cleared B. The snapshot hook
+    /// reproduces that interleaving DETERMINISTICALLY, while A's slash record
+    /// is being mapped.
+    #[tokio::test]
+    async fn r12_item1_slash_binds_its_own_tuple_when_rearm_hits_snapshot_gap() {
+        use crate::effort::{EffortBridge, EffortRequest};
+        use remuda_protocol::EffortAxis::Flag;
+        use remuda_protocol::EffortSemantics::Decoupled;
+
+        let bridge = Arc::new(EffortBridge::new());
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            InstanceId::new(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        )
+        .with_effort_bridge(Arc::clone(&bridge) as Arc<EffortBridge>, None);
+
+        let request_a = EffortRequest::for_configure(
+            "high",
+            Some(false),
+            Some(Flag),
+            Decoupled,
+            None,
+            None,
+            Some("req-a"),
+        )
+        .expect("A is the off toggle");
+        let gen_a = bridge.arm(request_a);
+
+        // Between the snapshot taken for A's slash and the tuple attribution,
+        // the worker gives up on A and arms B.
+        let rearm_bridge = Arc::clone(&bridge);
+        mapper.set_effort_slash_snapshot_hook(Box::new(move || {
+            rearm_bridge.fail(gen_a);
+            let request_b = EffortRequest::for_configure(
+                "high",
+                Some(true),
+                Some(Flag),
+                Decoupled,
+                None,
+                None,
+                Some("req-b"),
+            )
+            .expect("B is the on toggle");
+            rearm_bridge.arm(request_b);
+        }));
+
+        mapper
+            .map_line(&effort_slash_line("cmd-a", "ultracode off"))
+            .expect("map A slash while the re-arm hits the snapshot gap");
+
+        // A's DELAYED verdict lands afterwards: it must carry A's id and must
+        // not resolve B's generation.
+        let out_a = mapper
+            .map_line(&effort_stdout_line(
+                "out-a",
+                "Ultracode off. Effort stays high.",
+            ))
+            .expect("map A verdict");
+        let edge_a = out_a
+            .iter()
+            .find_map(|obs| match &obs.body {
+                ObservationPayload::Effort(payload) => Some(payload),
+                _ => None,
+            })
+            .expect("A's verdict emits an effort edge");
+        assert_eq!(
+            edge_a.request_id.as_deref(),
+            Some("req-a"),
+            "A's slash was bound from the snapshot taken before the re-arm"
+        );
+        assert_eq!(edge_a.effective.ultracode, Some(false));
+        assert!(
+            bridge.has_pending(),
+            "A's stale generation must not clear the newly armed B"
+        );
+        let pending_b = bridge.pending().expect("B stays armed");
+        assert_eq!(pending_b.request_id.as_deref(), Some("req-b"));
+
+        // B's own later ON verdict settles B.
+        mapper
+            .map_line(&effort_slash_line("cmd-b", "ultracode on"))
+            .expect("map B slash");
+        let out_b = mapper
+            .map_line(&effort_stdout_line(
+                "out-b",
+                "Ultracode on (this session only): dynamic workflows on every \
+                 task. Effort stays high.",
+            ))
+            .expect("map B verdict");
+        let edge_b = out_b
+            .iter()
+            .find_map(|obs| match &obs.body {
+                ObservationPayload::Effort(payload) => Some(payload),
+                _ => None,
+            })
+            .expect("B's verdict emits an effort edge");
+        assert_eq!(edge_b.request_id.as_deref(), Some("req-b"));
+        assert_eq!(edge_b.effective.ultracode, Some(true));
+        assert!(!bridge.has_pending(), "B's verdict settles B");
+    }
+
+    /// c-effortread r15 item 4 / r16 item 1: an older native `/effort max`
+    /// slash already on disk but still UNREAD when web request B (also max)
+    /// is armed must not be attributed to B — its old refusal must never
+    /// reject B. The floor is the bound transcript's EOF captured immediately
+    /// before B submits, and B's OWN slash record is appended to the file
+    /// exactly AT that byte offset: the first byte after the pre-submit EOF
+    /// starts at position L, so a record starting at L is B's command, not a
+    /// pre-submission one. Only records starting BELOW L are excluded.
+    #[tokio::test]
+    async fn r16_item1_a_slash_appended_exactly_at_the_pre_submit_eof_claims_its_switch() {
+        use crate::effort::{EffortBridge, EffortRequest, SubmissionProvenance};
+
+        // A REAL transcript file: the offsets below are its measured byte
+        // lengths, not magic constants.
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("effort-session.jsonl");
+        let prefix = json!({
+            "type": "assistant",
+            "uuid": "msg-prefix",
+            "sessionId": "effort-session",
+            "version": "2.1.289",
+            "message": {"role": "assistant", "content": "warming the transcript"},
+        })
+        .to_string();
+        std::fs::write(&path, format!("{prefix}\n")).expect("seed prefix");
+
+        let bridge = Arc::new(EffortBridge::new());
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            InstanceId::new(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        )
+        .with_effort_bridge(Arc::clone(&bridge) as Arc<EffortBridge>, None);
+
+        // The OLDER native /effort max (a human or a replaced command) is
+        // already appended — slash plus its Kept refusal — but the pump has
+        // not read either yet. Record both records' REAL start offsets.
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open append");
+        let pos_old_slash = std::fs::metadata(&path).expect("stat").len();
+        use std::io::Write;
+        writeln!(file, "{}", effort_slash_line("cmd-old", "max")).expect("append old slash");
+        let pos_old_refusal = std::fs::metadata(&path).expect("stat").len();
+        writeln!(
+            file,
+            "{}",
+            effort_stdout_line("out-old", "Kept effort level as high")
+        )
+        .expect("append old refusal");
+        assert!(pos_old_slash < pos_old_refusal);
+
+        // B is armed at the bound transcript's EOF L, the exact byte offset
+        // perform_switch stats immediately before typing (carrier seam).
+        let floor = std::fs::metadata(&path).expect("stat").len();
+        let request_b = EffortRequest::from_level("max")
+            .expect("max")
+            .with_request_id(Some("req-b"));
+        let gen_b = bridge.arm_with_floor(request_b, Some(SubmissionProvenance::Floor(floor)));
+
+        // B's own command is appended to the file IMMEDIATELY AT L: the next
+        // record after a length-L file starts at byte L, so its verified
+        // position equals the floor.
+        let pos_b_slash = std::fs::metadata(&path).expect("stat").len();
+        assert_eq!(pos_b_slash, floor, "the next append starts exactly at EOF");
+        writeln!(file, "{}", effort_slash_line("cmd-b", "max")).expect("append B slash");
+        let pos_b_verdict = std::fs::metadata(&path).expect("stat").len();
+        writeln!(
+            file,
+            "{}",
+            effort_stdout_line("out-b", "Set effort level to max")
+        )
+        .expect("append B verdict");
+        drop(file);
+
+        // The pump catches up: the OLDER slash starts strictly BELOW the floor
+        // and is not attributed to B, so its refusal neither emits a request
+        // edge nor rejects B.
+        mapper
+            .map_line_at(&effort_slash_line("cmd-old", "max"), Some(pos_old_slash))
+            .expect("map old slash");
+        let old_verdict = mapper
+            .map_line_at(
+                &effort_stdout_line("out-old", "Kept effort level as high"),
+                Some(pos_old_refusal),
+            )
+            .expect("map old refusal");
+        assert!(
+            old_verdict
+                .iter()
+                .all(|obs| !matches!(obs.body, ObservationPayload::Effort(_))),
+            "the pre-submission refusal emits no request edge"
+        );
+        assert!(
+            bridge.has_pending(),
+            "B is not rejected by the older command's refusal"
+        );
+        assert!(
+            bridge
+                .wait(gen_b, std::time::Duration::from_millis(40))
+                .await
+                .is_none(),
+            "no verdict of the older command resolves B"
+        );
+
+        // B's own slash starts AT the floor and arms; its accepted max verdict
+        // resolves B and carries B's id.
+        mapper
+            .map_line_at(&effort_slash_line("cmd-b", "max"), Some(pos_b_slash))
+            .expect("map B slash at the floor");
+        let out_b = mapper
+            .map_line_at(
+                &effort_stdout_line("out-b", "Set effort level to max"),
+                Some(pos_b_verdict),
+            )
+            .expect("map B verdict");
+        let edge_b = out_b
+            .iter()
+            .find_map(|obs| match &obs.body {
+                ObservationPayload::Effort(payload) => Some(payload),
+                _ => None,
+            })
+            .expect("B's verdict emits an effort edge");
+        assert_eq!(edge_b.request_id.as_deref(), Some("req-b"));
+        assert_eq!(
+            edge_b.effective.name,
+            Some(remuda_protocol::EffortName::Max)
+        );
+        assert!(!bridge.has_pending(), "B's own verdict settles B");
+    }
+
+    /// c-effortread r16 item 2: a slash excluded from the armed request (an
+    /// older pre-floor command, or a human `/effort`) must still keep its PLACE
+    /// in the slash → verdict FIFO. Without that slot the old command's
+    /// delayed verdict pops the newer owned request B and rejects (or settles)
+    /// it. Sequence: old slash → B slash → old verdict → B verdict; the old
+    /// Kept refusal answers the unowned slot, B's own acceptance answers B.
+    #[tokio::test]
+    async fn r16_item2_a_pre_floor_slash_keeps_a_fifo_slot_so_its_verdict_never_consumes_b() {
+        use crate::effort::{EffortBridge, EffortRequest, SubmissionProvenance};
+
+        let bridge = Arc::new(EffortBridge::new());
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            InstanceId::new(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        )
+        .with_effort_bridge(Arc::clone(&bridge) as Arc<EffortBridge>, None);
+
+        // B arms at EOF 1000; nothing of B's is on disk yet.
+        let request_b = EffortRequest::from_level("max")
+            .expect("max")
+            .with_request_id(Some("req-b"));
+        let gen_b = bridge.arm_with_floor(request_b, Some(SubmissionProvenance::Floor(1000)));
+
+        // The pump catches up an OLDER same-word slash sitting below the floor.
+        mapper
+            .map_line_at(&effort_slash_line("cmd-old", "max"), Some(500))
+            .expect("map old slash");
+        assert!(
+            bridge.has_pending(),
+            "the pre-floor slash does not arm/clear B"
+        );
+
+        // B's own slash lands at/after the floor and arms.
+        mapper
+            .map_line_at(&effort_slash_line("cmd-b", "max"), Some(1500))
+            .expect("map B slash");
+
+        // The OLDER command's delayed Kept verdict is read BETWEEN B's slash
+        // and B's verdict: it answers the old slash's slot, so it never rejects
+        // B and emits no request edge.
+        let old_verdict = mapper
+            .map_line_at(
+                &effort_stdout_line("out-old", "Kept effort level as high"),
+                Some(1600),
+            )
+            .expect("map old refusal");
+        assert!(
+            old_verdict
+                .iter()
+                .all(|obs| !matches!(obs.body, ObservationPayload::Effort(_))),
+            "the old refusal carries no request edge"
+        );
+        assert!(
+            bridge.has_pending(),
+            "the old refusal must not reject B through the FIFO"
+        );
+        assert!(
+            bridge
+                .wait(gen_b, std::time::Duration::from_millis(40))
+                .await
+                .is_none(),
+            "B is still awaiting ITS OWN verdict"
+        );
+
+        // B's own acceptance now pops the owned slot and settles B with B's id.
+        let out_b = mapper
+            .map_line_at(
+                &effort_stdout_line("out-b", "Set effort level to max"),
+                Some(1700),
+            )
+            .expect("map B verdict");
+        let edge_b = out_b
+            .iter()
+            .find_map(|obs| match &obs.body {
+                ObservationPayload::Effort(payload) => Some(payload),
+                _ => None,
+            })
+            .expect("B's verdict emits an effort edge");
+        assert_eq!(edge_b.request_id.as_deref(), Some("req-b"));
+        assert!(!bridge.has_pending(), "B's own verdict settles B");
+    }
+
+    /// c-effortread r17 item 1: the r16-item2 case with an ACCEPTED old verdict
+    /// (not only a Kept refusal). The older pre-floor command is a SAME-WORD
+    /// `/effort max` whose "Set effort level to max" verdict lands between B's
+    /// slash and B's verdict. With B still armed, that unowned acceptance used
+    /// to borrow B's awaiting attribution (the edge was labelled Remuda) and
+    /// emit an id-less effective projection the store then settled B from. Now
+    /// it folds the transcript level silently (no observation, no bridge
+    /// observed refresh) and B settles only from ITS OWN id-bearing verdict.
+    #[tokio::test]
+    async fn r17_item1_an_unowned_accepted_verdict_while_b_is_armed_emits_nothing_and_b_waits_for_its_own()
+     {
+        use crate::effort::{EffortBridge, EffortRequest, SubmissionProvenance};
+
+        let bridge = Arc::new(EffortBridge::new());
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            InstanceId::new(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        )
+        .with_effort_bridge(Arc::clone(&bridge) as Arc<EffortBridge>, None);
+
+        // B arms at EOF 1000; nothing of B's is on disk yet.
+        let request_b = EffortRequest::from_level("max")
+            .expect("max")
+            .with_request_id(Some("req-b"));
+        let gen_b = bridge.arm_with_floor(request_b, Some(SubmissionProvenance::Floor(1000)));
+
+        // The pump catches up an OLDER same-word slash sitting below the floor.
+        mapper
+            .map_line_at(&effort_slash_line("cmd-old", "max"), Some(500))
+            .expect("map old slash");
+        // B's own slash lands at/after the floor and arms.
+        mapper
+            .map_line_at(&effort_slash_line("cmd-b", "max"), Some(1500))
+            .expect("map B slash");
+
+        // The OLDER command's delayed ACCEPTED verdict (same word max) is read
+        // BETWEEN B's slash and B's verdict: it answers the unowned slot while
+        // B is still armed, so it emits NO settlement-eligible edge and does
+        // not touch the bridge (neither resolve nor observed refresh).
+        let old_verdict = mapper
+            .map_line_at(
+                &effort_stdout_line("out-old", "Set effort level to max"),
+                Some(1600),
+            )
+            .expect("map old acceptance");
+        assert!(
+            old_verdict
+                .iter()
+                .all(|obs| !matches!(obs.body, ObservationPayload::Effort(_))),
+            "the unowned acceptance emits no effective projection while B is armed"
+        );
+        assert!(
+            bridge.has_pending(),
+            "the unowned acceptance never resolves B"
+        );
+        assert!(
+            bridge
+                .wait(gen_b, std::time::Duration::from_millis(40))
+                .await
+                .is_none(),
+            "B is still awaiting ITS OWN verdict"
+        );
+
+        // B's own acceptance now pops the owned slot, settles B with B's id,
+        // and carries the Remuda attribution (the old verdict did not consume
+        // B's armed awaiting).
+        let out_b = mapper
+            .map_line_at(
+                &effort_stdout_line("out-b", "Set effort level to max"),
+                Some(1700),
+            )
+            .expect("map B verdict");
+        let edge_b = out_b
+            .iter()
+            .find_map(|obs| match &obs.body {
+                ObservationPayload::Effort(payload) => Some(payload),
+                _ => None,
+            })
+            .expect("B's verdict emits an effort edge");
+        assert_eq!(edge_b.request_id.as_deref(), Some("req-b"));
+        assert_eq!(
+            edge_b.effective.name,
+            Some(remuda_protocol::EffortName::Max)
+        );
+        assert_eq!(
+            edge_b.effective.source,
+            remuda_protocol::EffortSource::Remuda
+        );
+        assert!(!bridge.has_pending(), "B's own verdict settles B");
+    }
+
+    /// c-effortread r18 item 1: the older pre-floor command's ACCEPTED verdict
+    /// is read BEFORE B's own slash record acquires its OWNED slot (the pump
+    /// catches up the old slash and its verdict while B is armed, then reaches
+    /// B's slash). The r17 guard keyed on a later OWNED slot in the FIFO: with
+    /// none yet pushed it fell through, and the id-less terminal projection
+    /// settled B through the store's value fallback (a later dismissal then
+    /// toasted against a cleared request). The r18 guard keys on the BRIDGE:
+    /// any armed switch suppresses the unowned verdict; B's own later verdict
+    /// still settles B with B's id.
+    #[tokio::test]
+    async fn r18_item1_a_pre_floor_accept_before_bs_slash_is_suppressed_and_bs_own_verdict_settles_b()
+     {
+        use crate::effort::{EffortBridge, EffortRequest, SubmissionProvenance};
+
+        let bridge = Arc::new(EffortBridge::new());
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            InstanceId::new(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        )
+        .with_effort_bridge(Arc::clone(&bridge) as Arc<EffortBridge>, None);
+
+        // B arms at EOF 1000; nothing of B's is on disk yet.
+        let request_b = EffortRequest::from_level("max")
+            .expect("max")
+            .with_request_id(Some("req-b"));
+        let gen_b = bridge.arm_with_floor(request_b, Some(SubmissionProvenance::Floor(1000)));
+
+        // The pump catches up the OLD same-word slash (500) and its ACCEPTED
+        // verdict (600) BEFORE B's own slash record (1500) is read. The old
+        // verdict pops the unowned slot while no owned FIFO slot exists yet —
+        // but the bridge still has B armed, so it is suppressed.
+        mapper
+            .map_line_at(&effort_slash_line("cmd-old", "max"), Some(500))
+            .expect("map old slash");
+        let old_verdict = mapper
+            .map_line_at(
+                &effort_stdout_line("out-old", "Set effort level to max"),
+                Some(600),
+            )
+            .expect("map old acceptance");
+        assert!(
+            old_verdict
+                .iter()
+                .all(|obs| !matches!(obs.body, ObservationPayload::Effort(_))),
+            "the pre-slash unowned acceptance emits no projection while B is armed"
+        );
+        assert!(
+            bridge.has_pending(),
+            "the pre-slash unowned acceptance never resolves B"
+        );
+        assert!(
+            bridge
+                .wait(gen_b, std::time::Duration::from_millis(40))
+                .await
+                .is_none(),
+            "B keeps waiting for ITS OWN verdict"
+        );
+
+        // B's own slash then acquires the owned FIFO slot, and B's own
+        // accepted verdict settles B with B's id.
+        mapper
+            .map_line_at(&effort_slash_line("cmd-b", "max"), Some(1500))
+            .expect("map B slash");
+        let out_b = mapper
+            .map_line_at(
+                &effort_stdout_line("out-b", "Set effort level to max"),
+                Some(1700),
+            )
+            .expect("map B verdict");
+        let edge_b = out_b
+            .iter()
+            .find_map(|obs| match &obs.body {
+                ObservationPayload::Effort(payload) => Some(payload),
+                _ => None,
+            })
+            .expect("B's own verdict emits the effort edge");
+        assert_eq!(edge_b.request_id.as_deref(), Some("req-b"));
+        assert_eq!(
+            edge_b.effective.name,
+            Some(remuda_protocol::EffortName::Max)
+        );
+        assert!(!bridge.has_pending(), "B's own verdict settles B");
+    }
+
+    /// c-effortread r18 item 1 refusal variant: the older pre-floor command's
+    /// refusal is likewise read BEFORE B's own slash acquires its owned slot.
+    /// The FIFO-keyed r17 guard found no owned slot and fell through to
+    /// `note_stdout`, resetting the tracker's attribution; the r18 bridge-keyed
+    /// guard folds NOTHING while B is armed. Observable on the next natural
+    /// read-back: its edge keeps the terminal `Slash` attribution instead of
+    /// being reset to `Unknown`, and B's own later acceptance still settles as
+    /// Remuda with B's id.
+    #[tokio::test]
+    async fn r18_item1_a_pre_floor_refusal_before_bs_slash_folds_nothing_and_bs_accept_still_settles()
+     {
+        use crate::effort::{EffortBridge, EffortRequest, SubmissionProvenance};
+
+        let bridge = Arc::new(EffortBridge::new());
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            InstanceId::new(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        )
+        .with_effort_bridge(Arc::clone(&bridge) as Arc<EffortBridge>, None);
+
+        let request_b = EffortRequest::from_level("max")
+            .expect("max")
+            .with_request_id(Some("req-b"));
+        let gen_b = bridge.arm_with_floor(request_b, Some(SubmissionProvenance::Floor(1000)));
+
+        mapper
+            .map_line_at(&effort_slash_line("cmd-old", "max"), Some(500))
+            .expect("map old slash");
+        let old_refusal = mapper
+            .map_line_at(
+                &effort_stdout_line("out-old", "Kept effort level as high"),
+                Some(600),
+            )
+            .expect("map old refusal");
+        assert!(
+            old_refusal
+                .iter()
+                .all(|obs| !matches!(obs.body, ObservationPayload::Effort(_))),
+            "the pre-slash unowned refusal emits nothing"
+        );
+        assert!(bridge.has_pending(), "the old refusal never rejects B");
+        assert!(
+            bridge
+                .wait(gen_b, std::time::Duration::from_millis(40))
+                .await
+                .is_none(),
+            "B keeps waiting for ITS OWN verdict"
+        );
+
+        // A natural assistant read-back BEFORE B's slash keeps the terminal
+        // attribution: the folded-away refusal never reset pending_source.
+        let readback = mapper
+            .map_line_at(
+                &json!({
+                    "type": "assistant",
+                    "uuid": "msg-max",
+                    "sessionId": "effort-session",
+                    "version": "2.1.289",
+                    "message": {"id": "msg-max", "role": "assistant", "type": "message",
+                                "content": [{"type": "text", "text": "done"}]},
+                    "effort": "max",
+                    "perTurnEffort": null,
+                })
+                .to_string(),
+                Some(700),
+            )
+            .expect("map readback");
+        let readback_edge = readback
+            .iter()
+            .find_map(|obs| match &obs.body {
+                ObservationPayload::Effort(payload) => Some(payload),
+                _ => None,
+            })
+            .expect("the assistant readback emits its edge");
+        assert_eq!(
+            readback_edge.effective.source,
+            remuda_protocol::EffortSource::Slash,
+            "the skipped refusal never reset the terminal attribution to Unknown"
+        );
+
+        // B's slash arms and B's own accepted verdict is credited Remuda with
+        // B's id despite the earlier refusal and read-back.
+        mapper
+            .map_line_at(&effort_slash_line("cmd-b", "max"), Some(1500))
+            .expect("map B slash");
+        let out_b = mapper
+            .map_line_at(
+                &effort_stdout_line("out-b", "Set effort level to max"),
+                Some(1700),
+            )
+            .expect("map B verdict");
+        let edge_b = out_b
+            .iter()
+            .find_map(|obs| match &obs.body {
+                ObservationPayload::Effort(payload) => Some(payload),
+                _ => None,
+            })
+            .expect("B's own verdict emits the effort edge");
+        assert_eq!(edge_b.request_id.as_deref(), Some("req-b"));
+        assert_eq!(
+            edge_b.effective.source,
+            remuda_protocol::EffortSource::Remuda
+        );
+        assert!(!bridge.has_pending());
+    }
+
+    /// c-effortread r18 item 3: the suppressed unowned acceptance must not
+    /// consume the effective-state update permanently. Sequence: high is
+    /// published; an older pre-floor `/effort max` is accepted and suppressed
+    /// while B is armed; B's own dialog is dismissed (Kept); the deferred max
+    /// edge is then published under the ORIGINAL verdict record's event id;
+    /// the later assistant max read-back dedups.
+    #[tokio::test]
+    async fn r18_item3_a_suppressed_pre_floor_accept_is_published_after_bs_refusal_under_its_own_record_id()
+     {
+        use crate::effort::{EffortBridge, EffortRequest, SubmissionProvenance};
+
+        let instance_id = InstanceId::new();
+        let bridge = Arc::new(EffortBridge::new());
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            instance_id.clone(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        )
+        .with_effort_bridge(Arc::clone(&bridge) as Arc<EffortBridge>, None);
+
+        // Published baseline high.
+        mapper
+            .map_line_at(
+                &json!({
+                    "type": "assistant",
+                    "uuid": "msg-high",
+                    "sessionId": "effort-session",
+                    "version": "2.1.289",
+                    "message": {"id": "msg-high", "role": "assistant", "type": "message",
+                                "content": [{"type": "text", "text": "on it"}]},
+                    "effort": "high",
+                    "perTurnEffort": null,
+                })
+                .to_string(),
+                Some(400),
+            )
+            .expect("map baseline");
+
+        let request_b = EffortRequest::from_level("max")
+            .expect("max")
+            .with_request_id(Some("req-b"));
+        let gen_b = bridge.arm_with_floor(request_b, Some(SubmissionProvenance::Floor(1000)));
+        mapper
+            .map_line_at(&effort_slash_line("cmd-old", "max"), Some(500))
+            .expect("map old slash");
+        mapper
+            .map_line_at(&effort_slash_line("cmd-b", "max"), Some(1500))
+            .expect("map B slash");
+
+        // The old acceptance is suppressed: nothing emitted yet.
+        let suppressed = mapper
+            .map_line_at(
+                &effort_stdout_line("out-old", "Set effort level to max"),
+                Some(1600),
+            )
+            .expect("map old acceptance");
+        assert!(
+            suppressed
+                .iter()
+                .all(|obs| !matches!(obs.body, ObservationPayload::Effort(_))),
+            "the old acceptance stays suppressed while B is armed"
+        );
+        assert!(bridge.has_pending());
+
+        // B's OWN dialog is dismissed (Kept). B rejects and the deferred max
+        // edge publishes on the same mapper call, id-less and terminal-side.
+        let dismissed = mapper
+            .map_line_at(
+                &effort_stdout_line("out-b", "Kept effort level as max"),
+                Some(1700),
+            )
+            .expect("map B refusal");
+        let deferred_edge = dismissed
+            .iter()
+            .find_map(|obs| match &obs.body {
+                ObservationPayload::Effort(payload) => Some((obs, payload)),
+                _ => None,
+            })
+            .expect("the suppressed max edge publishes after B's refusal");
+        let (observation, payload) = deferred_edge;
+        assert_eq!(payload.request_id.as_deref(), None, "never relabelled B");
+        assert_eq!(
+            payload.effective.name,
+            Some(remuda_protocol::EffortName::Max)
+        );
+        assert_eq!(
+            payload.effective.source,
+            remuda_protocol::EffortSource::Slash
+        );
+        // Live-vs-journal parity: the deferred edge keeps the ORIGINAL verdict
+        // record's deterministic id.
+        assert_eq!(
+            observation.event_id,
+            remuda_protocol::effort_record_event_id(
+                instance_id.as_id().as_str(),
+                remuda_protocol::EFFORT_STDOUT_NATIVE,
+                "out-old",
+                remuda_protocol::EffortName::Max,
+            )
+        );
+        assert!(!bridge.has_pending(), "B's refusal ends B");
+        let verdict = bridge
+            .wait(gen_b, std::time::Duration::from_millis(40))
+            .await
+            .expect("B recorded the rejection");
+        assert!(matches!(verdict, crate::effort::Readback::Rejected { .. }));
+
+        // Assistant records now report max: the value is already published, so
+        // this read-back is a dedup and emits no second edge.
+        let after = mapper
+            .map_line_at(
+                &json!({
+                    "type": "assistant",
+                    "uuid": "msg-max",
+                    "sessionId": "effort-session",
+                    "version": "2.1.289",
+                    "message": {"id": "msg-max", "role": "assistant", "type": "message",
+                                "content": [{"type": "text", "text": "done"}]},
+                    "effort": "max",
+                    "perTurnEffort": null,
+                })
+                .to_string(),
+                Some(1800),
+            )
+            .expect("map assistant max");
+        assert!(
+            after
+                .iter()
+                .all(|obs| !matches!(obs.body, ObservationPayload::Effort(_))),
+            "the already-published max read-back is a dedup, not a second edge"
+        );
+    }
+
+    /// c-effortread r18 item 3 read-back variant: the armed switch B ends
+    /// through its bounded timeout WITHOUT any verdict reaching the mapper
+    /// (failed-floor attribution), and the next authoritative assistant
+    /// read-back reports the suppressed value. Because suppression no longer
+    /// latches the last published state, that same-value read-back EMITS the
+    /// deferred effective edge instead of being swallowed as an unchanged
+    /// dedup — while B itself stays unresolved by the read-back.
+    #[tokio::test]
+    async fn r18_item3_after_a_suppressed_accept_the_next_same_value_readback_emits_while_b_stays_pending()
+     {
+        use crate::effort::{EffortBridge, EffortRequest, SubmissionProvenance};
+
+        let bridge = Arc::new(EffortBridge::new());
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            InstanceId::new(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        )
+        .with_effort_bridge(Arc::clone(&bridge) as Arc<EffortBridge>, None);
+
+        mapper
+            .map_line_at(
+                &json!({
+                    "type": "assistant",
+                    "uuid": "msg-high",
+                    "sessionId": "effort-session",
+                    "version": "2.1.289",
+                    "message": {"id": "msg-high", "role": "assistant", "type": "message",
+                                "content": [{"type": "text", "text": "on it"}]},
+                    "effort": "high",
+                    "perTurnEffort": null,
+                })
+                .to_string(),
+                Some(400),
+            )
+            .expect("map baseline");
+
+        let request_b = EffortRequest::from_level("max")
+            .expect("max")
+            .with_request_id(Some("req-b"));
+        let gen_b = bridge.arm_with_floor(request_b, Some(SubmissionProvenance::Floor(1000)));
+        // The pump catches up the old slash and its acceptance BEFORE B's own
+        // slash record is read: its edge is suppressed and stashed.
+        mapper
+            .map_line_at(&effort_slash_line("cmd-old", "max"), Some(500))
+            .expect("map old slash");
+        let suppressed = mapper
+            .map_line_at(
+                &effort_stdout_line("out-old", "Set effort level to max"),
+                Some(600),
+            )
+            .expect("map old acceptance");
+        assert!(
+            suppressed
+                .iter()
+                .all(|obs| !matches!(obs.body, ObservationPayload::Effort(_))),
+            "suppressed while B is armed"
+        );
+
+        // B never produces a mappable verdict (bounded path). Assistant
+        // records now report max — the same-value read-back EMITS the edge the
+        // suppression withheld (its own assistant message id).
+        let readback = mapper
+            .map_line_at(
+                &json!({
+                    "type": "assistant",
+                    "uuid": "msg-max",
+                    "sessionId": "effort-session",
+                    "version": "2.1.289",
+                    "message": {"id": "msg-max", "role": "assistant", "type": "message",
+                                "content": [{"type": "text", "text": "done"}]},
+                    "effort": "max",
+                    "perTurnEffort": null,
+                })
+                .to_string(),
+                Some(700),
+            )
+            .expect("map assistant max");
+        let edge = readback
+            .iter()
+            .find_map(|obs| match &obs.body {
+                ObservationPayload::Effort(payload) => Some(payload),
+                _ => None,
+            })
+            .expect("the same-value read-back publishes the deferred max");
+        assert_eq!(edge.effective.name, Some(remuda_protocol::EffortName::Max));
+        assert_eq!(edge.effective.source, remuda_protocol::EffortSource::Slash);
+        assert_eq!(edge.request_id.as_deref(), None);
+        // The read-back never resolves B: an assistant record is not B's
+        // verdict; B ends through its own bounded path.
+        assert!(bridge.has_pending());
+        assert!(
+            bridge
+                .wait(gen_b, std::time::Duration::from_millis(40))
+                .await
+                .is_none(),
+            "B stays pending for its bounded timeout"
+        );
+    }
+
+    /// c-effortread r19 item 2: (name, ultracode, requestId) of every effort
+    /// observation in one mapper output.
+    fn r19_effort_edges(
+        out: &[Observation],
+    ) -> Vec<(
+        Option<remuda_protocol::EffortName>,
+        Option<bool>,
+        Option<String>,
+    )> {
+        out.iter()
+            .filter_map(|obs| match &obs.body {
+                ObservationPayload::Effort(payload) => Some((
+                    payload.effective.name,
+                    payload.effective.ultracode,
+                    payload.request_id.clone(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A `/model` accepted verdict carrying the ` with `<level>` effort`
+    /// clause (c-effortread r19 item 2 scenario b).
+    fn r19_model_stdout_line(uuid: &str, level: &str) -> String {
+        json!({
+            "type": "user",
+            "uuid": uuid,
+            "sessionId": "effort-session",
+            "version": "2.1.289",
+            "message": {
+                "role": "user",
+                "content": format!(
+                    "<local-command-stdout>Set model to `Opus 5.5` and saved as your default \
+                     for new sessions with `{level}` effort</local-command-stdout>"
+                )
+            }
+        })
+        .to_string()
+    }
+
+    /// An `ultra_effort_enter|exit` attachment record.
+    fn r19_attachment_line(uuid: &str, label: &str) -> String {
+        json!({
+            "isSidechain": false,
+            "attachment": {"type": label, "reminderType": "full"},
+            "type": "attachment",
+            "uuid": uuid,
+            "sessionId": "effort-session",
+            "version": "2.1.289",
+        })
+        .to_string()
+    }
+
+    /// c-effortread r21: the `/effort` slash builder with an explicit record
+    /// version. `map_record_at` feeds every record's own `version` to the
+    /// tracker gate, so the coupled 2.1.272 scenario cannot reuse the
+    /// 2.1.289-hardcoded builders above (the gate would flip to decoupled).
+    fn r21_effort_slash_line_v(uuid: &str, word: &str, version: &str) -> String {
+        json!({
+            "type": "user",
+            "uuid": uuid,
+            "sessionId": "effort-session",
+            "version": version,
+            "message": {
+                "role": "user",
+                "content": format!(
+                    "<command-name>/effort</command-name>\n<command-message>effort</command-message>\n\
+                     <command-args>{word}</command-args>"
+                )
+            }
+        })
+        .to_string()
+    }
+
+    /// c-effortread r21: the `<local-command-stdout>` verdict builder with an
+    /// explicit record version (see [`Self::r21_effort_slash_line_v`]).
+    fn r21_effort_stdout_line_v(uuid: &str, body: &str, version: &str) -> String {
+        json!({
+            "type": "user",
+            "uuid": uuid,
+            "sessionId": "effort-session",
+            "version": version,
+            "message": {
+                "role": "user",
+                "content": format!("<local-command-stdout>{body}</local-command-stdout>")
+            }
+        })
+        .to_string()
+    }
+
+    /// c-effortread r21: a `/model` accepted verdict carrying the
+    /// ` with `<level>` effort` clause, with an explicit record version.
+    fn r21_model_stdout_line_v(uuid: &str, level: &str, version: &str) -> String {
+        json!({
+            "type": "user",
+            "uuid": uuid,
+            "sessionId": "effort-session",
+            "version": version,
+            "message": {
+                "role": "user",
+                "content": format!(
+                    "<local-command-stdout>Set model to `Opus 5.5` and saved as your default \
+                     for new sessions with `{level}` effort</local-command-stdout>"
+                )
+            }
+        })
+        .to_string()
+    }
+
+    /// c-effortread r19 item 2 ruling B, scenario (a): the suppressed stash is
+    /// ONE latest slot. With high published and B=max armed, a suppressed
+    /// `/effort max` acceptance is overwritten by a later suppressed
+    /// `/effort high` acceptance (a return to baseline); when B is Kept, the
+    /// slot publishes nothing — max is never published and effective stays
+    /// high.
+    #[tokio::test]
+    async fn r19_item2_a_suppressed_return_to_baseline_overwrites_max_and_nothing_publishes() {
+        use crate::effort::{EffortBridge, EffortRequest, SubmissionProvenance};
+
+        let instance_id = InstanceId::new();
+        let bridge = Arc::new(EffortBridge::new());
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            instance_id.clone(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        )
+        .with_effort_bridge(Arc::clone(&bridge) as Arc<EffortBridge>, None);
+
+        // Published baseline high.
+        mapper
+            .map_line_at(
+                &json!({
+                    "type": "assistant",
+                    "uuid": "msg-high",
+                    "sessionId": "effort-session",
+                    "version": "2.1.289",
+                    "message": {"id": "msg-high", "role": "assistant", "type": "message",
+                                "content": [{"type": "text", "text": "on it"}]},
+                    "effort": "high",
+                    "perTurnEffort": null,
+                })
+                .to_string(),
+                Some(400),
+            )
+            .expect("map baseline");
+
+        let request_b = EffortRequest::from_level("max")
+            .expect("max")
+            .with_request_id(Some("req-b"));
+        let gen_b = bridge.arm_with_floor(request_b, Some(SubmissionProvenance::Floor(1000)));
+        mapper
+            .map_line_at(&effort_slash_line("cmd-old-max", "max"), Some(500))
+            .expect("map old max slash");
+        mapper
+            .map_line_at(&effort_slash_line("cmd-old-high", "high"), Some(700))
+            .expect("map old high slash");
+        mapper
+            .map_line_at(&effort_slash_line("cmd-b", "max"), Some(1500))
+            .expect("map B slash");
+
+        // The old max acceptance is suppressed: stashed, nothing emitted.
+        let suppressed_max = mapper
+            .map_line_at(
+                &effort_stdout_line("out-old-max", "Set effort level to max"),
+                Some(1600),
+            )
+            .expect("map old max acceptance");
+        assert!(
+            suppressed_max
+                .iter()
+                .all(|obs| !matches!(obs.body, ObservationPayload::Effort(_))),
+            "the old max acceptance stays suppressed"
+        );
+
+        // The later old HIGH acceptance is also suppressed and OVERWRITES the
+        // slot (a return to baseline), still emitting nothing.
+        let suppressed_high = mapper
+            .map_line_at(
+                &effort_stdout_line("out-old-high", "Set effort level to high"),
+                Some(1700),
+            )
+            .expect("map old high acceptance");
+        assert!(
+            suppressed_high
+                .iter()
+                .all(|obs| !matches!(obs.body, ObservationPayload::Effort(_))),
+            "the return-to-baseline acceptance stays suppressed"
+        );
+        assert!(bridge.has_pending());
+
+        // B's OWN dialog is dismissed (Kept). B rejects; the one stashed slot
+        // is high == the published high, so it publishes NOTHING.
+        let dismissed = mapper
+            .map_line_at(
+                &effort_stdout_line("out-b", "Kept effort level as max"),
+                Some(1800),
+            )
+            .expect("map B refusal");
+        assert!(
+            dismissed
+                .iter()
+                .all(|obs| !matches!(obs.body, ObservationPayload::Effort(_))),
+            "no deferred edge after B ends: the stashed value was already published"
+        );
+        assert!(!bridge.has_pending());
+        let verdict = bridge
+            .wait(gen_b, std::time::Duration::from_millis(40))
+            .await
+            .expect("B recorded the rejection");
+        assert!(matches!(verdict, crate::effort::Readback::Rejected { .. }));
+
+        // Neither suppressed verdict's deterministic edge id is ever emitted,
+        // and max is never the effective state.
+        for (record, level) in [
+            ("out-old-max", remuda_protocol::EffortName::Max),
+            ("out-old-high", remuda_protocol::EffortName::High),
+        ] {
+            let suppressed_id = remuda_protocol::effort_record_event_id(
+                instance_id.as_id().as_str(),
+                remuda_protocol::EFFORT_STDOUT_NATIVE,
+                record,
+                level,
+            );
+            for out in [&suppressed_max, &suppressed_high, &dismissed] {
+                assert!(
+                    out.iter().all(|obs| obs.event_id != suppressed_id),
+                    "the suppressed {record:?} edge is never emitted"
+                );
+            }
+        }
+        // A later assistant high record dedups: effective stays high, no edge.
+        let after = mapper
+            .map_line_at(
+                &json!({
+                    "type": "assistant",
+                    "uuid": "msg-high-2",
+                    "sessionId": "effort-session",
+                    "version": "2.1.289",
+                    "message": {"id": "msg-high-2", "role": "assistant", "type": "message",
+                                "content": [{"type": "text", "text": "done"}]},
+                    "effort": "high",
+                    "perTurnEffort": null,
+                })
+                .to_string(),
+                Some(1900),
+            )
+            .expect("map assistant high");
+        assert!(
+            r19_effort_edges(&after).is_empty(),
+            "no max is ever published; high stays the effective level"
+        );
+    }
+
+    /// c-effortread r19 item 2 ruling B, scenario (b): a suppressed max is
+    /// superseded by a `/model` acceptance reporting xhigh; B is then refused
+    /// and the effective state stays xhigh — the stashed max edge is dropped
+    /// through the shared invalidation, never published.
+    #[tokio::test]
+    async fn r19_item2_b_a_model_readback_clears_the_stash_and_b_refuses_with_effective_xhigh() {
+        use crate::effort::{EffortBridge, EffortRequest, SubmissionProvenance};
+
+        let instance_id = InstanceId::new();
+        let bridge = Arc::new(EffortBridge::new());
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            instance_id.clone(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        )
+        .with_effort_bridge(Arc::clone(&bridge) as Arc<EffortBridge>, None);
+
+        mapper
+            .map_line_at(
+                &json!({
+                    "type": "assistant",
+                    "uuid": "msg-high",
+                    "sessionId": "effort-session",
+                    "version": "2.1.289",
+                    "message": {"id": "msg-high", "role": "assistant", "type": "message",
+                                "content": [{"type": "text", "text": "on it"}]},
+                    "effort": "high",
+                    "perTurnEffort": null,
+                })
+                .to_string(),
+                Some(400),
+            )
+            .expect("map baseline");
+
+        let request_b = EffortRequest::from_level("max")
+            .expect("max")
+            .with_request_id(Some("req-b"));
+        let gen_b = bridge.arm_with_floor(request_b, Some(SubmissionProvenance::Floor(1000)));
+        mapper
+            .map_line_at(&effort_slash_line("cmd-old", "max"), Some(500))
+            .expect("map old slash");
+        mapper
+            .map_line_at(&effort_slash_line("cmd-b", "max"), Some(1500))
+            .expect("map B slash");
+        let suppressed = mapper
+            .map_line_at(
+                &effort_stdout_line("out-old", "Set effort level to max"),
+                Some(1600),
+            )
+            .expect("map old acceptance");
+        assert!(
+            suppressed
+                .iter()
+                .all(|obs| !matches!(obs.body, ObservationPayload::Effort(_))),
+            "the old max acceptance stays suppressed"
+        );
+
+        // A /model acceptance reports xhigh effort: an authoritative
+        // effective-state publication that emits xhigh and clears the stash.
+        let model = mapper
+            .map_line_at(&r19_model_stdout_line("out-model", "xhigh"), Some(1700))
+            .expect("map /model acceptance");
+        let model_effort = r19_effort_edges(&model);
+        assert_eq!(
+            model_effort
+                .iter()
+                .map(|(name, _, _)| *name)
+                .collect::<Vec<_>>(),
+            vec![Some(remuda_protocol::EffortName::Xhigh)],
+            "the /model effort clause publishes xhigh"
+        );
+
+        // B is then refused (Kept). No switch remains armed; the dropped stash
+        // must not resurface as max.
+        let dismissed = mapper
+            .map_line_at(
+                &effort_stdout_line("out-b", "Kept effort level as max"),
+                Some(1800),
+            )
+            .expect("map B refusal");
+        assert!(
+            dismissed
+                .iter()
+                .all(|obs| !matches!(obs.body, ObservationPayload::Effort(_))),
+            "the suppressed max is never published after B's refusal"
+        );
+        assert!(matches!(
+            bridge
+                .wait(gen_b, std::time::Duration::from_millis(40))
+                .await
+                .expect("B recorded the rejection"),
+            crate::effort::Readback::Rejected { .. }
+        ));
+        let suppressed_id = remuda_protocol::effort_record_event_id(
+            instance_id.as_id().as_str(),
+            remuda_protocol::EFFORT_STDOUT_NATIVE,
+            "out-old",
+            remuda_protocol::EffortName::Max,
+        );
+        for out in [&model, &dismissed] {
+            assert!(
+                out.iter().all(|obs| obs.event_id != suppressed_id),
+                "the suppressed max edge id is never emitted"
+            );
+        }
+        // Effective stays xhigh.
+        let after = mapper
+            .map_line_at(
+                &json!({
+                    "type": "assistant",
+                    "uuid": "msg-xhigh",
+                    "sessionId": "effort-session",
+                    "version": "2.1.289",
+                    "message": {"id": "msg-xhigh", "role": "assistant", "type": "message",
+                                "content": [{"type": "text", "text": "done"}]},
+                    "effort": "xhigh",
+                    "perTurnEffort": null,
+                })
+                .to_string(),
+                Some(1900),
+            )
+            .expect("map assistant xhigh");
+        assert!(
+            r19_effort_edges(&after).is_empty(),
+            "xhigh is the published effective state and simply dedups"
+        );
+    }
+
+    /// c-effortread r19 item 2 ruling B, scenario (c): a suppressed max is
+    /// superseded by an `ultra_effort_enter` attachment; B is then Kept and
+    /// the effective state stays `{high, ultracode on}` — the tracker flag
+    /// agrees — and the stashed max never publishes.
+    #[tokio::test]
+    async fn r19_item2_c_an_ultra_attachment_clears_the_stash_and_b_refuses_with_flag_on() {
+        use crate::effort::{EffortBridge, EffortRequest, SubmissionProvenance};
+
+        let instance_id = InstanceId::new();
+        let bridge = Arc::new(EffortBridge::new());
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            instance_id.clone(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        )
+        .with_effort_bridge(Arc::clone(&bridge) as Arc<EffortBridge>, None);
+
+        mapper
+            .map_line_at(
+                &json!({
+                    "type": "assistant",
+                    "uuid": "msg-high",
+                    "sessionId": "effort-session",
+                    "version": "2.1.289",
+                    "message": {"id": "msg-high", "role": "assistant", "type": "message",
+                                "content": [{"type": "text", "text": "on it"}]},
+                    "effort": "high",
+                    "perTurnEffort": null,
+                })
+                .to_string(),
+                Some(400),
+            )
+            .expect("map baseline");
+
+        let request_b = EffortRequest::from_level("max")
+            .expect("max")
+            .with_request_id(Some("req-b"));
+        let gen_b = bridge.arm_with_floor(request_b, Some(SubmissionProvenance::Floor(1000)));
+        mapper
+            .map_line_at(&effort_slash_line("cmd-old", "max"), Some(500))
+            .expect("map old slash");
+        mapper
+            .map_line_at(&effort_slash_line("cmd-b", "max"), Some(1500))
+            .expect("map B slash");
+        let suppressed = mapper
+            .map_line_at(
+                &effort_stdout_line("out-old", "Set effort level to max"),
+                Some(1600),
+            )
+            .expect("map old acceptance");
+        assert!(
+            suppressed
+                .iter()
+                .all(|obs| !matches!(obs.body, ObservationPayload::Effort(_))),
+            "the old max acceptance stays suppressed"
+        );
+
+        // The ultra_effort_enter attachment is authoritative flag evidence:
+        // it emits {high, ultracode on} and clears the suppressed max stash.
+        let attachment = mapper
+            .map_line_at(
+                &r19_attachment_line("att-enter", "ultra_effort_enter"),
+                Some(1700),
+            )
+            .expect("map attachment");
+        assert_eq!(
+            r19_effort_edges(&attachment),
+            vec![(Some(remuda_protocol::EffortName::High), Some(true), None)],
+            "the attachment publishes high with ultracode on"
+        );
+
+        // B is refused: the dropped stash never publishes max.
+        let dismissed = mapper
+            .map_line_at(
+                &effort_stdout_line("out-b", "Kept effort level as max"),
+                Some(1800),
+            )
+            .expect("map B refusal");
+        assert!(
+            dismissed
+                .iter()
+                .all(|obs| !matches!(obs.body, ObservationPayload::Effort(_))),
+            "the suppressed max is never published after B's refusal"
+        );
+        assert!(matches!(
+            bridge
+                .wait(gen_b, std::time::Duration::from_millis(40))
+                .await
+                .expect("B recorded the rejection"),
+            crate::effort::Readback::Rejected { .. }
+        ));
+
+        // The tracker flag agrees with the published ultracode value: a sparse
+        // repeat ENTER is a dedup (no edge), and a later high assistant record
+        // keeps {high, on} and likewise emits nothing.
+        let repeat = mapper
+            .map_line_at(
+                &r19_attachment_line("att-repeat", "ultra_effort_enter"),
+                Some(1900),
+            )
+            .expect("map sparse repeat attachment");
+        assert!(
+            r19_effort_edges(&repeat).is_empty(),
+            "the flag already agrees: a sparse repeat enter emits nothing"
+        );
+        let after = mapper
+            .map_line_at(
+                &json!({
+                    "type": "assistant",
+                    "uuid": "msg-high-2",
+                    "sessionId": "effort-session",
+                    "version": "2.1.289",
+                    "message": {"id": "msg-high-2", "role": "assistant", "type": "message",
+                                "content": [{"type": "text", "text": "done"}]},
+                    "effort": "high",
+                    "perTurnEffort": null,
+                })
+                .to_string(),
+                Some(2000),
+            )
+            .expect("map assistant high");
+        assert!(
+            r19_effort_edges(&after).is_empty(),
+            "effective stays high with ultracode on; max is never published"
+        );
+    }
+
+    /// c-effortread r20 item 1 ruling B′ (ENTER): with `{high, off}`
+    /// published and B=max armed, a SUPPRESSED `Set effort level to max ·
+    /// Ultracode on` acceptance moves the tracker's flag latch to on without
+    /// publishing. The following `ultra_effort_enter` attachment must still
+    /// publish `{high, on}` EXACTLY ONCE (dedupe against the last PUBLISHED
+    /// tuple, never the moved latch). When B is then Kept nothing stale
+    /// surfaces: the stashed {max, on} never publishes and max is never the
+    /// effective level.
+    #[tokio::test]
+    async fn r20_item1_enter_after_a_flag_moving_suppressed_accept_publishes_high_on_once() {
+        use crate::effort::{EffortBridge, EffortRequest, SubmissionProvenance};
+
+        let instance_id = InstanceId::new();
+        let bridge = Arc::new(EffortBridge::new());
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            instance_id.clone(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        )
+        .with_effort_bridge(Arc::clone(&bridge) as Arc<EffortBridge>, None);
+
+        // Assistant high, then a human slider publishes {high, off} (bridge
+        // idle, so the unowned verdict takes the normal path).
+        mapper
+            .map_line_at(
+                &json!({
+                    "type": "assistant",
+                    "uuid": "msg-high",
+                    "sessionId": "effort-session",
+                    "version": "2.1.289",
+                    "message": {"id": "msg-high", "role": "assistant", "type": "message",
+                                "content": [{"type": "text", "text": "on it"}]},
+                    "effort": "high",
+                    "perTurnEffort": null,
+                })
+                .to_string(),
+                Some(400),
+            )
+            .expect("map baseline");
+        mapper
+            .map_line_at(&effort_slash_line("cmd-high-off", "high"), Some(430))
+            .expect("map human high slash");
+        let baseline = mapper
+            .map_line_at(
+                &effort_stdout_line("out-high-off", "Set effort level to high · Ultracode off"),
+                Some(450),
+            )
+            .expect("map high/off accept");
+        assert_eq!(
+            r19_effort_edges(&baseline),
+            vec![(Some(remuda_protocol::EffortName::High), Some(false), None)],
+            "the published baseline is {{high, off}}"
+        );
+
+        // B=max armed; an older pre-floor slash is answered first.
+        let request_b = EffortRequest::from_level("max")
+            .expect("max")
+            .with_request_id(Some("req-b"));
+        let gen_b = bridge.arm_with_floor(request_b, Some(SubmissionProvenance::Floor(1000)));
+        mapper
+            .map_line_at(&effort_slash_line("cmd-old", "max"), Some(500))
+            .expect("map old slash");
+        mapper
+            .map_line_at(&effort_slash_line("cmd-b", "max"), Some(1500))
+            .expect("map B slash");
+        let suppressed = mapper
+            .map_line_at(
+                &effort_stdout_line("out-old", "Set effort level to max · Ultracode on"),
+                Some(1600),
+            )
+            .expect("map suppressed max/on acceptance");
+        assert!(
+            r19_effort_edges(&suppressed).is_empty(),
+            "the old max/on acceptance stays suppressed"
+        );
+        assert!(bridge.has_pending());
+
+        // The attachment ENTER publishes {high, on} despite the latch already
+        // being on, exactly once.
+        let attachment = mapper
+            .map_line_at(
+                &r19_attachment_line("att-enter", "ultra_effort_enter"),
+                Some(1700),
+            )
+            .expect("map enter attachment");
+        assert_eq!(
+            r19_effort_edges(&attachment),
+            vec![(Some(remuda_protocol::EffortName::High), Some(true), None)],
+            "the attachment publishes {{high, on}} once"
+        );
+
+        // B is Kept: the dropped stash must never publish {max, on}.
+        let dismissed = mapper
+            .map_line_at(
+                &effort_stdout_line("out-b", "Kept effort level as max"),
+                Some(1800),
+            )
+            .expect("map B refusal");
+        assert!(
+            r19_effort_edges(&dismissed).is_empty(),
+            "nothing stale publishes after B's Kept"
+        );
+        assert!(matches!(
+            bridge
+                .wait(gen_b, std::time::Duration::from_millis(40))
+                .await
+                .expect("B recorded the rejection"),
+            crate::effort::Readback::Rejected { .. }
+        ));
+        let suppressed_id = remuda_protocol::effort_record_event_id(
+            instance_id.as_id().as_str(),
+            remuda_protocol::EFFORT_STDOUT_NATIVE,
+            "out-old",
+            remuda_protocol::EffortName::Max,
+        );
+        for out in [&suppressed, &dismissed] {
+            assert!(
+                out.iter().all(|obs| obs.event_id != suppressed_id),
+                "the suppressed max/on edge id is never emitted"
+            );
+        }
+        // The published tuple is {high, on}: a sparse repeat enter and a high
+        // assistant record both dedup, and max never surfaces.
+        let repeat = mapper
+            .map_line_at(
+                &r19_attachment_line("att-repeat", "ultra_effort_enter"),
+                Some(1900),
+            )
+            .expect("map sparse repeat enter");
+        assert!(
+            r19_effort_edges(&repeat).is_empty(),
+            "a sparse repeat enter dedups against the published tuple"
+        );
+        let after = mapper
+            .map_line_at(
+                &json!({
+                    "type": "assistant",
+                    "uuid": "msg-high-2",
+                    "sessionId": "effort-session",
+                    "version": "2.1.289",
+                    "message": {"id": "msg-high-2", "role": "assistant", "type": "message",
+                                "content": [{"type": "text", "text": "done"}]},
+                    "effort": "high",
+                    "perTurnEffort": null,
+                })
+                .to_string(),
+                Some(2000),
+            )
+            .expect("map assistant high");
+        assert!(
+            r19_effort_edges(&after).is_empty(),
+            "effective stays {{high, on}}; max is never published"
+        );
+    }
+
+    /// c-effortread r20 item 1 ruling B′ (EXIT mirror): with `{high, on}`
+    /// published and B=max armed, a suppressed `… · Ultracode off` acceptance
+    /// moves the latch off without publishing; the `ultra_effort_exit`
+    /// attachment publishes `{high, off}` exactly once, and B's later Kept
+    /// emits nothing stale.
+    #[tokio::test]
+    async fn r20_item1_exit_after_a_flag_moving_suppressed_accept_publishes_high_off_once() {
+        use crate::effort::{EffortBridge, EffortRequest, SubmissionProvenance};
+
+        let instance_id = InstanceId::new();
+        let bridge = Arc::new(EffortBridge::new());
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            instance_id.clone(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        )
+        .with_effort_bridge(Arc::clone(&bridge) as Arc<EffortBridge>, None);
+
+        mapper
+            .map_line_at(
+                &json!({
+                    "type": "assistant",
+                    "uuid": "msg-high",
+                    "sessionId": "effort-session",
+                    "version": "2.1.289",
+                    "message": {"id": "msg-high", "role": "assistant", "type": "message",
+                                "content": [{"type": "text", "text": "on it"}]},
+                    "effort": "high",
+                    "perTurnEffort": null,
+                })
+                .to_string(),
+                Some(400),
+            )
+            .expect("map baseline");
+        mapper
+            .map_line_at(&effort_slash_line("cmd-on", "ultracode on"), Some(430))
+            .expect("map human ultracode-on slash");
+        let baseline = mapper
+            .map_line_at(
+                &effort_stdout_line(
+                    "out-on",
+                    "Ultracode on (this session only): dynamic workflows on every task. Effort \
+                     stays high.",
+                ),
+                Some(450),
+            )
+            .expect("map high/on accept");
+        assert_eq!(
+            r19_effort_edges(&baseline),
+            vec![(Some(remuda_protocol::EffortName::High), Some(true), None)],
+            "the published baseline is {{high, on}}"
+        );
+
+        let request_b = EffortRequest::from_level("max")
+            .expect("max")
+            .with_request_id(Some("req-b"));
+        let gen_b = bridge.arm_with_floor(request_b, Some(SubmissionProvenance::Floor(1000)));
+        mapper
+            .map_line_at(&effort_slash_line("cmd-old", "high"), Some(500))
+            .expect("map old slash");
+        mapper
+            .map_line_at(&effort_slash_line("cmd-b", "max"), Some(1500))
+            .expect("map B slash");
+        let suppressed = mapper
+            .map_line_at(
+                &effort_stdout_line("out-old", "Set effort level to high · Ultracode off"),
+                Some(1600),
+            )
+            .expect("map suppressed high/off acceptance");
+        assert!(
+            r19_effort_edges(&suppressed).is_empty(),
+            "the old high/off acceptance stays suppressed"
+        );
+
+        let attachment = mapper
+            .map_line_at(
+                &r19_attachment_line("att-exit", "ultra_effort_exit"),
+                Some(1700),
+            )
+            .expect("map exit attachment");
+        assert_eq!(
+            r19_effort_edges(&attachment),
+            vec![(Some(remuda_protocol::EffortName::High), Some(false), None)],
+            "the attachment publishes {{high, off}} once"
+        );
+
+        let dismissed = mapper
+            .map_line_at(
+                &effort_stdout_line("out-b", "Kept effort level as max"),
+                Some(1800),
+            )
+            .expect("map B refusal");
+        assert!(
+            r19_effort_edges(&dismissed).is_empty(),
+            "nothing stale publishes after B's Kept"
+        );
+        assert!(matches!(
+            bridge
+                .wait(gen_b, std::time::Duration::from_millis(40))
+                .await
+                .expect("B recorded the rejection"),
+            crate::effort::Readback::Rejected { .. }
+        ));
+        let suppressed_id = remuda_protocol::effort_record_event_id(
+            instance_id.as_id().as_str(),
+            remuda_protocol::EFFORT_STDOUT_NATIVE,
+            "out-old",
+            remuda_protocol::EffortName::High,
+        );
+        for out in [&suppressed, &dismissed] {
+            assert!(
+                out.iter().all(|obs| obs.event_id != suppressed_id),
+                "the suppressed high/off stdout edge id is never emitted"
+            );
+        }
+        let repeat = mapper
+            .map_line_at(
+                &r19_attachment_line("att-repeat", "ultra_effort_exit"),
+                Some(1900),
+            )
+            .expect("map sparse repeat exit");
+        assert!(
+            r19_effort_edges(&repeat).is_empty(),
+            "a sparse repeat exit dedups against the published tuple"
+        );
+    }
+
+    /// c-effortread r20 item 2 ruling B′: with `{high, off}` published and
+    /// B=max armed, a suppressed `… max · Ultracode on` acceptance latches
+    /// `{max, on}`. A following same-level `/effort status` WITHOUT the
+    /// ultracode suffix is positive flag-OFF evidence: it emits no edge but
+    /// clears BOTH deferred copies, so when B is refused the stale
+    /// `{max, on}` never publishes — the effective state stays `{high, off}`
+    /// and the tracker flag is off.
+    #[tokio::test]
+    async fn r20_item2_a_same_level_flag_off_status_clears_the_stash_and_b_refuses_with_high_off() {
+        use crate::effort::{EffortBridge, EffortRequest, SubmissionProvenance};
+
+        let instance_id = InstanceId::new();
+        let bridge = Arc::new(EffortBridge::new());
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            instance_id.clone(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        )
+        .with_effort_bridge(Arc::clone(&bridge) as Arc<EffortBridge>, None);
+
+        mapper
+            .map_line_at(
+                &json!({
+                    "type": "assistant",
+                    "uuid": "msg-high",
+                    "sessionId": "effort-session",
+                    "version": "2.1.289",
+                    "message": {"id": "msg-high", "role": "assistant", "type": "message",
+                                "content": [{"type": "text", "text": "on it"}]},
+                    "effort": "high",
+                    "perTurnEffort": null,
+                })
+                .to_string(),
+                Some(400),
+            )
+            .expect("map baseline");
+        mapper
+            .map_line_at(&effort_slash_line("cmd-high-off", "high"), Some(430))
+            .expect("map human high slash");
+        let baseline = mapper
+            .map_line_at(
+                &effort_stdout_line("out-high-off", "Set effort level to high · Ultracode off"),
+                Some(450),
+            )
+            .expect("map high/off accept");
+        assert_eq!(
+            r19_effort_edges(&baseline),
+            vec![(Some(remuda_protocol::EffortName::High), Some(false), None)],
+            "the published baseline is {{high, off}}"
+        );
+
+        let request_b = EffortRequest::from_level("max")
+            .expect("max")
+            .with_request_id(Some("req-b"));
+        let gen_b = bridge.arm_with_floor(request_b, Some(SubmissionProvenance::Floor(1000)));
+        mapper
+            .map_line_at(&effort_slash_line("cmd-old", "max"), Some(500))
+            .expect("map old slash");
+        mapper
+            .map_line_at(&effort_slash_line("cmd-b", "max"), Some(1500))
+            .expect("map B slash");
+        let suppressed = mapper
+            .map_line_at(
+                &effort_stdout_line("out-old", "Set effort level to max · Ultracode on"),
+                Some(1600),
+            )
+            .expect("map suppressed max/on acceptance");
+        assert!(
+            r19_effort_edges(&suppressed).is_empty(),
+            "the old max/on acceptance stays suppressed"
+        );
+
+        // The same-level status without the ultracode suffix emits no edge but
+        // is authoritative flag-OFF evidence and drops both deferred copies.
+        let status = mapper
+            .map_line_at(
+                &effort_stdout_line(
+                    "out-status",
+                    "Current effort level: high (Comprehensive implementation with extensive \
+                     testing and documentation)",
+                ),
+                Some(1700),
+            )
+            .expect("map status");
+        assert!(
+            r19_effort_edges(&status).is_empty(),
+            "the same-level flag-off status publishes nothing"
+        );
+
+        // B is refused: the stashed {max, on} must never publish.
+        let dismissed = mapper
+            .map_line_at(
+                &effort_stdout_line("out-b", "Kept effort level as max"),
+                Some(1800),
+            )
+            .expect("map B refusal");
+        assert!(
+            r19_effort_edges(&dismissed).is_empty(),
+            "the suppressed max/on never publishes after B's refusal"
+        );
+        assert!(matches!(
+            bridge
+                .wait(gen_b, std::time::Duration::from_millis(40))
+                .await
+                .expect("B recorded the rejection"),
+            crate::effort::Readback::Rejected { .. }
+        ));
+        let suppressed_id = remuda_protocol::effort_record_event_id(
+            instance_id.as_id().as_str(),
+            remuda_protocol::EFFORT_STDOUT_NATIVE,
+            "out-old",
+            remuda_protocol::EffortName::Max,
+        );
+        for out in [&suppressed, &status, &dismissed] {
+            assert!(
+                out.iter().all(|obs| obs.event_id != suppressed_id),
+                "the suppressed max/on edge id is never emitted"
+            );
+        }
+        // The tracker flag is OFF: another same-level no-suffix status emits
+        // nothing, and a high assistant record keeps {high, off}.
+        let status_again = mapper
+            .map_line_at(
+                &effort_stdout_line(
+                    "out-status-2",
+                    "Current effort level: high (Comprehensive implementation with extensive \
+                     testing and documentation)",
+                ),
+                Some(1900),
+            )
+            .expect("map the second status");
+        assert!(
+            r19_effort_edges(&status_again).is_empty(),
+            "effective stays {{high, off}}; the status flag agrees off"
+        );
+        let after = mapper
+            .map_line_at(
+                &json!({
+                    "type": "assistant",
+                    "uuid": "msg-high-2",
+                    "sessionId": "effort-session",
+                    "version": "2.1.289",
+                    "message": {"id": "msg-high-2", "role": "assistant", "type": "message",
+                                "content": [{"type": "text", "text": "done"}]},
+                    "effort": "high",
+                    "perTurnEffort": null,
+                })
+                .to_string(),
+                Some(2000),
+            )
+            .expect("map assistant high");
+        assert!(
+            r19_effort_edges(&after).is_empty(),
+            "effective stays {{high, off}}; max is never published"
+        );
+    }
+
+    /// c-effortread r21 item 1 ruling B″(1) on a COUPLED 2.1.272 build: with
+    /// `{xhigh, on}` published and B=max armed, a suppressed older unowned
+    /// plain `Set effort level to xhigh` verdict is positive flag-OFF
+    /// evidence (a coupled plain-level accept positively clears the flag).
+    /// A following `/model` verdict carrying the `xhigh` effort clause is a
+    /// level-only read-back: its flag must come from the POSITIVE LATCH
+    /// (`{xhigh, off}` publishes exactly once), not from the published
+    /// `{xhigh, on}` fallback — otherwise the read-back dedups, clears the
+    /// stashes and B's Kept leaves the UI at "ultracode on". B's later Kept
+    /// emits nothing stale.
+    #[tokio::test]
+    async fn r21_item1_coupled_suppressed_plain_off_then_model_clause_publishes_xhigh_off_once() {
+        use crate::effort::{EffortBridge, EffortRequest, SubmissionProvenance};
+
+        let instance_id = InstanceId::new();
+        let bridge = Arc::new(EffortBridge::new());
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            instance_id.clone(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.272".into(),
+        )
+        .with_effort_bridge(Arc::clone(&bridge) as Arc<EffortBridge>, None);
+
+        // The {xhigh, on} baseline: a human coupled /effort ultracode and its
+        // verdict while the bridge is idle (normal path).
+        mapper
+            .map_line_at(
+                &r21_effort_slash_line_v("cmd-ultra", "ultracode", "2.1.272"),
+                Some(400),
+            )
+            .expect("map human ultracode slash");
+        let baseline = mapper
+            .map_line_at(
+                &r21_effort_stdout_line_v(
+                    "out-ultra",
+                    "Set effort level to ultracode (this session only): xhigh + dynamic workflows \
+                     enabled.",
+                    "2.1.272",
+                ),
+                Some(450),
+            )
+            .expect("map coupled ultracode accept");
+        assert_eq!(
+            r19_effort_edges(&baseline),
+            vec![(Some(remuda_protocol::EffortName::Xhigh), Some(true), None)],
+            "the published baseline is {{xhigh, on}}"
+        );
+
+        // B=max armed; the older pre-floor /effort max's plain xhigh verdict
+        // lands first and is suppressed while B is armed.
+        let request_b = EffortRequest::from_level("max")
+            .expect("max")
+            .with_request_id(Some("req-b"));
+        let gen_b = bridge.arm_with_floor(request_b, Some(SubmissionProvenance::Floor(1000)));
+        mapper
+            .map_line_at(
+                &r21_effort_slash_line_v("cmd-old", "max", "2.1.272"),
+                Some(500),
+            )
+            .expect("map old slash");
+        mapper
+            .map_line_at(
+                &r21_effort_slash_line_v("cmd-b", "max", "2.1.272"),
+                Some(1500),
+            )
+            .expect("map B slash");
+        let suppressed = mapper
+            .map_line_at(
+                &r21_effort_stdout_line_v(
+                    "out-old",
+                    "Set effort level to xhigh (saved as your default for new sessions): …",
+                    "2.1.272",
+                ),
+                Some(1600),
+            )
+            .expect("map suppressed plain xhigh accept");
+        assert!(
+            r19_effort_edges(&suppressed).is_empty(),
+            "the old plain xhigh/off acceptance stays suppressed"
+        );
+        assert!(bridge.has_pending());
+
+        // The /model verdict's `xhigh` effort clause: level-only read-back
+        // that publishes {xhigh, off} EXACTLY ONCE from the positive latch.
+        let model = mapper
+            .map_line_at(
+                &r21_model_stdout_line_v("mdl-xhigh", "xhigh", "2.1.272"),
+                Some(1700),
+            )
+            .expect("map /model verdict with the xhigh effort clause");
+        assert_eq!(
+            r19_effort_edges(&model),
+            vec![(Some(remuda_protocol::EffortName::Xhigh), Some(false), None)],
+            "exactly one {{xhigh, off}} publication, from the positive flag-off latch"
+        );
+
+        // B is Kept: the dropped stash must never publish and B records its
+        // own rejection.
+        let dismissed = mapper
+            .map_line_at(
+                &r21_effort_stdout_line_v("out-b", "Kept effort level as max", "2.1.272"),
+                Some(1800),
+            )
+            .expect("map B refusal");
+        assert!(
+            r19_effort_edges(&dismissed).is_empty(),
+            "nothing stale publishes after B's Kept"
+        );
+        assert!(matches!(
+            bridge
+                .wait(gen_b, std::time::Duration::from_millis(40))
+                .await
+                .expect("B recorded the rejection"),
+            crate::effort::Readback::Rejected { .. }
+        ));
+        let suppressed_id = remuda_protocol::effort_record_event_id(
+            instance_id.as_id().as_str(),
+            remuda_protocol::EFFORT_STDOUT_NATIVE,
+            "out-old",
+            remuda_protocol::EffortName::Xhigh,
+        );
+        for out in [&suppressed, &model, &dismissed] {
+            assert!(
+                out.iter().all(|obs| obs.event_id != suppressed_id),
+                "the suppressed xhigh/off edge id is never emitted"
+            );
+        }
+        // Effective stays {xhigh, off}: a following xhigh assistant record
+        // agrees and dedups.
+        let after = mapper
+            .map_line_at(
+                &json!({
+                    "type": "assistant",
+                    "uuid": "msg-xhigh",
+                    "sessionId": "effort-session",
+                    "version": "2.1.272",
+                    "message": {"id": "msg-xhigh", "role": "assistant", "type": "message",
+                                "content": [{"type": "text", "text": "done"}]},
+                    "effort": "xhigh",
+                    "perTurnEffort": null,
+                })
+                .to_string(),
+                Some(1900),
+            )
+            .expect("map assistant xhigh");
+        assert!(
+            r19_effort_edges(&after).is_empty(),
+            "effective stays {{xhigh, off}}; the on state never returns"
+        );
+    }
+
+    /// c-effortread r21 item 2 ruling B″(2): with NO switch and no assistant
+    /// record, a fresh mapper reads `Current effort level: high`, then
+    /// `/effort auto` and `Effort level: auto (currently medium)`. Status is
+    /// the only level evidence, so the resolved medium REPLACES the earlier
+    /// status-only high and publishes `{medium, off}` exactly once (previously
+    /// every status reused the last published level and high stuck). After an
+    /// assistant record establishes high, a later auto-resolved-medium status
+    /// YIELDS (the model-clamping precedence) and publishes nothing.
+    #[tokio::test]
+    async fn r21_item2_a_status_resolved_level_updates_a_status_only_level_then_yields_to_assistant()
+     {
+        // No effort bridge: every edge must be settlement-free (no request id).
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            InstanceId::new(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        );
+
+        // 1) /effort status reports high.
+        mapper
+            .map_line_at(&effort_slash_line("cmd-status-high", "status"), Some(400))
+            .expect("map the first status slash");
+        let high = mapper
+            .map_line_at(
+                &effort_stdout_line(
+                    "out-status-high",
+                    "Current effort level: high (Comprehensive implementation with extensive \
+                     testing and documentation)",
+                ),
+                Some(420),
+            )
+            .expect("map the high status");
+        assert_eq!(
+            r19_effort_edges(&high),
+            vec![(Some(remuda_protocol::EffortName::High), Some(false), None)],
+            "the first status publishes the status-only level {{high, off}}"
+        );
+
+        // 2) /effort auto: the acknowledgement changes nothing.
+        mapper
+            .map_line_at(&effort_slash_line("cmd-auto", "auto"), Some(500))
+            .expect("map the auto slash");
+        let ack = mapper
+            .map_line_at(
+                &effort_stdout_line("out-auto", "Effort level set to auto"),
+                Some(520),
+            )
+            .expect("map the auto acknowledgement");
+        assert!(
+            r19_effort_edges(&ack).is_empty(),
+            "the auto acknowledgement is not a level edge"
+        );
+
+        // 3) The auto status resolves to medium: the status-only level moves,
+        //    with no switch settlement.
+        mapper
+            .map_line_at(&effort_slash_line("cmd-status-medium", "status"), Some(600))
+            .expect("map the second status slash");
+        let medium = mapper
+            .map_line_at(
+                &effort_stdout_line("out-status-medium", "Effort level: auto (currently medium)"),
+                Some(620),
+            )
+            .expect("map the auto-resolved status");
+        assert_eq!(
+            r19_effort_edges(&medium),
+            vec![(Some(remuda_protocol::EffortName::Medium), Some(false), None)],
+            "the third record publishes {{medium, off}}; no request settles"
+        );
+
+        // Model-clamping precedence: an assistant record now ESTABLISHES
+        // high; a following auto-resolved-medium status must yield.
+        let established = mapper
+            .map_line_at(
+                &json!({
+                    "type": "assistant",
+                    "uuid": "msg-high",
+                    "sessionId": "effort-session",
+                    "version": "2.1.289",
+                    "message": {"id": "msg-high", "role": "assistant", "type": "message",
+                                "content": [{"type": "text", "text": "on it"}]},
+                    "effort": "high",
+                    "perTurnEffort": null,
+                })
+                .to_string(),
+                Some(700),
+            )
+            .expect("map the assistant high record");
+        assert_eq!(
+            r19_effort_edges(&established),
+            vec![(Some(remuda_protocol::EffortName::High), Some(false), None)],
+            "the assistant record establishes {{high, off}}"
+        );
+        mapper
+            .map_line_at(&effort_slash_line("cmd-status-yield", "status"), Some(800))
+            .expect("map the yielding status slash");
+        let yields = mapper
+            .map_line_at(
+                &effort_stdout_line("out-status-yield", "Effort level: auto (currently medium)"),
+                Some(820),
+            )
+            .expect("map the yielding status");
+        assert!(
+            r19_effort_edges(&yields).is_empty(),
+            "the status yields to the assistant-established high; medium never publishes"
+        );
+    }
+
+    /// c-effortread r22 ruling S through production `map_line_at` on a
+    /// decoupled 2.1.289 build:
+    /// (a) high published from STATUS, B=max armed, an older unowned
+    ///     "Set effort level to max" acceptance suppressed while B waits: a
+    ///     later status reporting medium PUBLISHES medium — the suppressed
+    ///     acceptance never protected the status-only level.
+    /// (b) an ordinary accepted verdict max publishes max; a later status
+    ///     reporting xhigh with no assistant record PUBLISHES xhigh — verdicts
+    ///     carry no clamping precedence.
+    /// (c) an assistant-established high: a status reporting medium yields on
+    ///     the LEVEL (its positive flag-off latch may edge, never medium).
+    #[tokio::test]
+    async fn r22_item1_suppressed_accept_keeps_status_movable_verdict_yields_only_assistant_holds()
+    {
+        use crate::effort::{EffortBridge, EffortRequest, SubmissionProvenance};
+
+        // (a) the suppressed acceptance does not protect a status-only level.
+        let instance_id = InstanceId::new();
+        let bridge = Arc::new(EffortBridge::new());
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            instance_id,
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        )
+        .with_effort_bridge(Arc::clone(&bridge) as Arc<EffortBridge>, None);
+
+        mapper
+            .map_line_at(&effort_slash_line("cmd-status-high", "status"), Some(400))
+            .expect("map the first status slash");
+        let high = mapper
+            .map_line_at(
+                &effort_stdout_line(
+                    "out-status-high",
+                    "Current effort level: high (Comprehensive implementation with extensive \
+                     testing and documentation)",
+                ),
+                Some(420),
+            )
+            .expect("map the high status");
+        assert_eq!(
+            r19_effort_edges(&high),
+            vec![(Some(remuda_protocol::EffortName::High), Some(false), None)],
+            "(a) high is published by the first status"
+        );
+
+        // B=max armed; the older pre-floor /effort max verdict lands first and
+        // is suppressed while B is armed.
+        let _gen_b = bridge.arm_with_floor(
+            EffortRequest::from_level("max")
+                .expect("max")
+                .with_request_id(Some("req-b")),
+            Some(SubmissionProvenance::Floor(1000)),
+        );
+        mapper
+            .map_line_at(&effort_slash_line("cmd-old", "max"), Some(500))
+            .expect("map the old slash");
+        mapper
+            .map_line_at(&effort_slash_line("cmd-b", "max"), Some(1500))
+            .expect("map B's slash");
+        let suppressed = mapper
+            .map_line_at(
+                &effort_stdout_line(
+                    "out-old",
+                    "Set effort level to max (saved as your default for new sessions): …",
+                ),
+                Some(1600),
+            )
+            .expect("map the suppressed max acceptance");
+        assert!(
+            r19_effort_edges(&suppressed).is_empty(),
+            "(a) the old max acceptance stays suppressed; high remains published"
+        );
+        assert!(bridge.has_pending());
+
+        // A status reporting medium while B waits: medium PUBLISHES.
+        mapper
+            .map_line_at(
+                &effort_slash_line("cmd-status-medium", "status"),
+                Some(1700),
+            )
+            .expect("map the second status slash");
+        let medium = mapper
+            .map_line_at(
+                &effort_stdout_line(
+                    "out-status-medium",
+                    "Current effort level: medium (Balanced, for everyday work)",
+                ),
+                Some(1720),
+            )
+            .expect("map the medium status");
+        assert_eq!(
+            r19_effort_edges(&medium),
+            vec![(Some(remuda_protocol::EffortName::Medium), Some(false), None)],
+            "(a) the status moves the status-only level past the suppression; no request settles"
+        );
+
+        // (b) an accepted verdict yields to a later status read-back.
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            InstanceId::new(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        );
+        mapper
+            .map_line_at(&effort_slash_line("cmd-max", "max"), Some(400))
+            .expect("map the human max slash");
+        let max_edge = mapper
+            .map_line_at(
+                &effort_stdout_line(
+                    "out-max",
+                    "Set effort level to max (saved as your default for new sessions): …",
+                ),
+                Some(420),
+            )
+            .expect("map the accepted max verdict");
+        assert_eq!(
+            r19_effort_edges(&max_edge),
+            vec![(Some(remuda_protocol::EffortName::Max), None, None)],
+            "(b) the verdict publishes max"
+        );
+        mapper
+            .map_line_at(&effort_slash_line("cmd-status-xhigh", "status"), Some(500))
+            .expect("map the status slash");
+        let xhigh = mapper
+            .map_line_at(
+                &effort_stdout_line(
+                    "out-status-xhigh",
+                    "Current effort level: xhigh (Maximum reasoning, workflows enabled)",
+                ),
+                Some(520),
+            )
+            .expect("map the xhigh status");
+        assert_eq!(
+            r19_effort_edges(&xhigh),
+            vec![(Some(remuda_protocol::EffortName::Xhigh), Some(false), None)],
+            "(b) a status replaces the verdict-published max; verdicts have no clamping precedence"
+        );
+
+        // (c) only an assistant-established level makes the status yield.
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            InstanceId::new(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        );
+        let established = mapper
+            .map_line_at(
+                &json!({
+                    "type": "assistant",
+                    "uuid": "msg-high",
+                    "sessionId": "effort-session",
+                    "version": "2.1.289",
+                    "message": {"id": "msg-high", "role": "assistant", "type": "message",
+                                "content": [{"type": "text", "text": "on it"}]},
+                    "effort": "high",
+                    "perTurnEffort": null,
+                })
+                .to_string(),
+                Some(400),
+            )
+            .expect("map the assistant high record");
+        assert_eq!(
+            r19_effort_edges(&established),
+            vec![(Some(remuda_protocol::EffortName::High), None, None)],
+            "(c) the assistant record establishes high"
+        );
+        mapper
+            .map_line_at(&effort_slash_line("cmd-status-yield", "status"), Some(500))
+            .expect("map the yielding status slash");
+        let yields = mapper
+            .map_line_at(
+                &effort_stdout_line(
+                    "out-status-yield",
+                    "Current effort level: medium (Balanced, for everyday work)",
+                ),
+                Some(520),
+            )
+            .expect("map the yielding status");
+        let levels: Vec<_> = r19_effort_edges(&yields)
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .collect();
+        assert!(
+            !levels.contains(&Some(remuda_protocol::EffortName::Medium)),
+            "(c) the status never publishes medium: {levels:?}"
+        );
+    }
+
+    /// c-effortread r22 item 2 ruling S: a demote/re-promotion seeds the
+    /// replacement tracker with the channel the PRIOR mapper published the
+    /// level with. A status-only high stays status-only after the seed, so a
+    /// status read-back after re-promotion still moves it to medium.
+    #[tokio::test]
+    async fn r22_item2_a_repromoted_status_only_level_is_moved_by_a_later_status() {
+        // The prior hydrator for this (pid, session): high is known ONLY from
+        // a /effort status read-back.
+        let mut prior = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            InstanceId::new(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        );
+        prior
+            .map_line_at(&effort_slash_line("cmd-status-high", "status"), Some(400))
+            .expect("map the status slash");
+        let high = prior
+            .map_line_at(
+                &effort_stdout_line(
+                    "out-status-high",
+                    "Current effort level: high (Comprehensive implementation with extensive \
+                     testing and documentation)",
+                ),
+                Some(420),
+            )
+            .expect("map the high status");
+        assert_eq!(
+            r19_effort_edges(&high),
+            vec![(Some(remuda_protocol::EffortName::High), Some(false), None)]
+        );
+        let seed = prior
+            .effort_seed()
+            .expect("the demoted hydrator captured a seed");
+
+        // The replacement hydrator is seeded on re-promotion.
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            InstanceId::new(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        )
+        .with_effort_seed(seed);
+
+        // A status read-back after re-promotion still moves the level.
+        mapper
+            .map_line_at(&effort_slash_line("cmd-status-medium", "status"), Some(600))
+            .expect("map the second status slash");
+        let medium = mapper
+            .map_line_at(
+                &effort_stdout_line(
+                    "out-status-medium",
+                    "Current effort level: medium (Balanced, for everyday work)",
+                ),
+                Some(620),
+            )
+            .expect("map the medium status");
+        assert_eq!(
+            r19_effort_edges(&medium),
+            vec![(Some(remuda_protocol::EffortName::Medium), Some(false), None)],
+            "the status-only level stayed movable across the re-promotion"
+        );
+    }
+
+    /// c-effortread r16 item 3: when the carrier's floor lookup FAILS (the
+    /// bound transcript was rotated/removed or the stat errors), production no
+    /// longer falls back to word-only attribution. The switch is armed with
+    /// explicit "provenance unavailable" and the mapper attributes NOTHING to
+    /// it, so an unread older same-word slash with a delayed refusal — and even
+    /// the switch's own read-back restored afterwards — can never settle B; the
+    /// request ends through its own bounded no-readback/unconfirmed path.
+    #[tokio::test]
+    async fn r16_item3_a_failed_floor_lookup_attributes_nothing_to_the_request() {
+        use crate::effort::{EffortBridge, EffortRequest, SubmissionProvenance};
+
+        // Exercise the carrier's REAL lookup seam against a REAL file.
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("effort-session.jsonl");
+        std::fs::write(&path, "a bound transcript the pump is following\n").expect("seed");
+        let present = herdr_submission_provenance(Some(path.to_string_lossy().as_ref()));
+        assert!(
+            matches!(present, SubmissionProvenance::Floor(_)),
+            "a successful stat is a verified floor"
+        );
+        // The bound file disappears (rotation/cleanup) immediately before the
+        // switch would stat it: the lookup fails.
+        std::fs::remove_file(&path).expect("rotate the transcript away");
+        let provenance = herdr_submission_provenance(Some(path.to_string_lossy().as_ref()));
+        assert!(
+            matches!(provenance, SubmissionProvenance::Unavailable),
+            "a failed stat is explicit provenance loss, never word-only"
+        );
+
+        let bridge = Arc::new(EffortBridge::new());
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            InstanceId::new(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        )
+        .with_effort_bridge(Arc::clone(&bridge) as Arc<EffortBridge>, None);
+
+        // B is armed THROUGH the production seam with the failed provenance.
+        let request_b = EffortRequest::from_level("max")
+            .expect("max")
+            .with_request_id(Some("req-b"));
+        let gen_b = bridge.arm_with_floor(request_b, Some(provenance));
+
+        // The pump restores an unread OLD same-word slash plus its refusal.
+        mapper
+            .map_line_at(&effort_slash_line("cmd-old", "max"), Some(500))
+            .expect("map old slash");
+        let old_verdict = mapper
+            .map_line_at(
+                &effort_stdout_line("out-old", "Kept effort level as high"),
+                Some(600),
+            )
+            .expect("map old refusal");
+        assert!(
+            old_verdict
+                .iter()
+                .all(|obs| !matches!(obs.body, ObservationPayload::Effort(_))),
+            "the old refusal emits no request edge"
+        );
+        assert!(
+            bridge.has_pending(),
+            "the restored old refusal never rejects B"
+        );
+        assert!(
+            bridge
+                .wait(gen_b, std::time::Duration::from_millis(40))
+                .await
+                .is_none(),
+            "nothing resolves B"
+        );
+
+        // Even B's OWN post-submission slash and accepted verdict attribute
+        // NOTHING while provenance is unavailable. c-effortread r18 item 1:
+        // with the ruling keyed on the BRIDGE (a switch armed) rather than on
+        // a later owned FIFO slot, B's own accepted verdict (its slot is
+        // Unowned too) emits NO observation at all — no id-less terminal edge
+        // the store could settle B from through its value fallback — and the
+        // bridge's observed selection is not refreshed. B stays pending and
+        // ends through its own bounded timeout/unconfirmed path.
+        mapper
+            .map_line_at(&effort_slash_line("cmd-b", "max"), Some(1500))
+            .expect("map B slash");
+        let out_b = mapper
+            .map_line_at(
+                &effort_stdout_line("out-b", "Set effort level to max"),
+                Some(1600),
+            )
+            .expect("map B verdict");
+        assert!(
+            out_b
+                .iter()
+                .all(|obs| !matches!(obs.body, ObservationPayload::Effort(_))),
+            "B's own accepted verdict emits no projection while armed under provenance loss"
+        );
+        assert!(bridge.has_pending(), "B is not settled by any read-back");
+        assert!(
+            bridge.proven_selection().is_none(),
+            "the suppressed verdict never refreshes the bridge's observed selection"
+        );
+        assert!(
+            bridge
+                .wait(gen_b, std::time::Duration::from_millis(40))
+                .await
+                .is_none(),
+            "B ends through its own timeout/unconfirmed path with no stray settlement"
+        );
+    }
+
+    /// c-r3 item 4: the claude-pty transcript pump driven through its REAL
+    /// output channel (the spawned pump task + mpsc receiver), not by calling
+    /// the emit helper on a hand-built observation. An effort edge read off the
+    /// channel carries the mapper/journal-derived deterministic event id.
+    #[tokio::test]
+    async fn the_transcript_pump_publishes_effort_ids_on_its_real_channel() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let transcript = dir.path().join("effort-session.jsonl");
+        std::fs::write(
+            &transcript,
+            serde_json::to_string(&json!({
+                "type": "assistant",
+                "uuid": "msg-pump",
+                "sessionId": "effort-session",
+                "version": "2.1.289",
+                "message": {
+                    "id": "msg-pump",
+                    "role": "assistant",
+                    "type": "message",
+                    "content": [{"type": "text", "text": "ok"}],
+                },
+                "effort": "high",
+                "perTurnEffort": null,
+            }))
+            .expect("json")
+                + "\n",
+        )
+        .expect("write transcript");
+
+        let instance = InstanceId::new();
+        let ctx = ObsCtx {
+            driver: DriverKind::ClaudePty,
+            instance_id: instance.clone(),
+            host_id: HostId::new(),
+            journal_id: Id::new("obj").expect("journal id"),
+            run_id: RunId::new(),
+            session_id: "effort-session".into(),
+            pin_version: "2.1.289".into(),
+        };
+        // The id the journal tailer derives for the same record — the pump's
+        // real output must match it.
+        // The mapper prefixes the bare message id internally as
+        // `effort:<message-id>:<name>`, so the journal derivation takes the id.
+        let expected = remuda_protocol::effort_event_id(
+            instance.as_id().as_str(),
+            "msg-pump",
+            remuda_protocol::EffortName::High,
+        );
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let seq = Arc::new(AtomicU64::new(0));
+        let slot: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(Some(
+            transcript.to_string_lossy().into_owned(),
+        )));
+        // A live (new-session) boundary: the pump reads from byte 0 as current.
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = spawn_transcript_pump(
+            slot,
+            tx,
+            ctx,
+            seq,
+            shutdown_rx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            crate::claude_transcript::ResumeMode::Fresh,
+        );
+
+        // Drain the real channel until the effort edge arrives.
+        let mut found: Option<Observation> = None;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(obs)) if matches!(obs.body, ObservationPayload::Effort(_)) => {
+                    found = Some(obs);
+                    break;
+                }
+                Ok(Some(_)) | Err(_) => continue,
+                Ok(None) => break,
+            }
+        }
+        task.abort();
+        let effort = found.expect("the real pump published an effort observation");
+        assert_eq!(
+            effort.event_id, expected,
+            "the pump's real channel carries the journal-derived deterministic id"
+        );
+        let ObservationPayload::Effort(payload) = effort.body else {
+            panic!("effort payload");
+        };
+        assert_eq!(
+            payload.effective.name,
+            Some(remuda_protocol::EffortName::High)
+        );
+    }
+
+    /// c-effortread r4 item 5, claude-pty pump: a VERIFIED resume whose bound
+    /// transcript is replaced emits the explicit read-back-unavailable edge
+    /// (clearing the projected `high`) on the pump's REAL channel, and a
+    /// pending Remuda switch is never settled Applied by a verdict that lands
+    /// after provenance is lost.
+    #[tokio::test]
+    async fn the_transcript_pump_clears_effective_state_when_provenance_is_lost() {
+        use crate::claude_transcript::{ResumeBoundary, ResumeMode};
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().expect("tmp");
+        let transcript = dir.path().join("effort-session.jsonl");
+        let history = "{\"type\":\"user\",\"sessionId\":\"effort-session\"}\n";
+        std::fs::write(&transcript, history).expect("history");
+        let boundary = ResumeBoundary::snapshot(&transcript).expect("pre-spawn EOF");
+
+        let instance = InstanceId::new();
+        let ctx = ObsCtx {
+            driver: DriverKind::ClaudePty,
+            instance_id: instance.clone(),
+            host_id: HostId::new(),
+            journal_id: Id::new("obj").expect("journal id"),
+            run_id: RunId::new(),
+            session_id: "effort-session".into(),
+            pin_version: "2.1.289".into(),
+        };
+        let bridge = Arc::new(crate::effort::EffortBridge::new());
+        let (tx, rx) = mpsc::channel(64);
+        let seq = Arc::new(AtomicU64::new(0));
+        let slot: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(Some(
+            transcript.to_string_lossy().into_owned(),
+        )));
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = spawn_transcript_pump(
+            slot,
+            tx,
+            ctx,
+            seq,
+            shutdown_rx,
+            Some(Arc::clone(&bridge)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            ResumeMode::Boundary(boundary),
+        );
+        let mut rx = rx;
+
+        let append = |line: serde_json::Value| {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&transcript)
+                .expect("open");
+            writeln!(file, "{line}").expect("append");
+        };
+        let effort_names = |obs: &[Observation]| {
+            obs.iter()
+                .filter_map(|o| match &o.body {
+                    ObservationPayload::Effort(payload) => {
+                        Some((payload.effective.name, payload.effective.readback_available))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // A current-process high edge after the verified boundary.
+        append(json!({
+            "type": "assistant",
+            "uuid": "msg-1",
+            "sessionId": "effort-session",
+            "version": "2.1.289",
+            "message": {
+                "id": "msg-1",
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "text", "text": "ok"}],
+            },
+            "effort": "high",
+            "perTurnEffort": null,
+        }));
+        let obs = drain_for(&mut rx, Duration::from_millis(800)).await;
+        assert_eq!(
+            effort_names(&obs),
+            vec![(Some(remuda_protocol::EffortName::High), None)]
+        );
+
+        // A Remuda switch is armed; its slash record is a current record.
+        let generation = bridge.arm(crate::effort::EffortRequest::from_level("max").expect("max"));
+        append(json!({
+            "type": "user",
+            "uuid": "cmd-2",
+            "sessionId": "effort-session",
+            "version": "2.1.289",
+            "message": {
+                "role": "user",
+                "content": "<command-name>/effort</command-name>\n<command-message>effort</command-message>\n<command-args>max</command-args>",
+            },
+        }));
+        let _ = drain_for(&mut rx, Duration::from_millis(400)).await;
+        assert!(bridge.has_pending());
+
+        // The transcript is replaced by something shorter: boundary lost.
+        std::fs::write(&transcript, "{\"rotated\":true}\n").expect("rotate");
+        let obs = drain_for(&mut rx, Duration::from_millis(800)).await;
+        assert_eq!(
+            effort_names(&obs),
+            vec![(None, Some(false))],
+            "the pump publishes one read-back-unavailable edge: {obs:?}"
+        );
+        assert!(bridge.has_pending());
+
+        // The max verdict in the recreated file cannot settle it.
+        append(json!({
+            "type": "user",
+            "uuid": "cmd-3",
+            "sessionId": "effort-session",
+            "version": "2.1.289",
+            "message": {
+                "role": "user",
+                "content": "<local-command-stdout>Set effort level to max</local-command-stdout>",
+            },
+        }));
+        let obs = drain_for(&mut rx, Duration::from_millis(800)).await;
+        assert!(
+            effort_names(&obs).is_empty(),
+            "no edge from an unverified verdict: {obs:?}"
+        );
+        assert!(bridge.has_pending(), "the switch is never resolved Applied");
+        let settled = bridge.wait(generation, Duration::from_millis(150)).await;
+        assert!(settled.is_none());
+
+        task.abort();
+    }
+
+    /// Collect everything the real pump emits within `window`.
+    async fn drain_for(rx: &mut mpsc::Receiver<Observation>, window: Duration) -> Vec<Observation> {
+        let deadline = tokio::time::Instant::now() + window;
+        let mut out = Vec::new();
+        while let Ok(Some(observation)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            out.push(observation);
+        }
+        out
     }
 }
 

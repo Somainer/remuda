@@ -64,7 +64,7 @@ it("shares one journal subscription when concurrent follows finish reading histo
   expect(hubStore.getSnapshot().events[instance.id]).toEqual([event]);
 });
 
-it("keeps concurrent follows of distinct journals independent", async () => {
+it("a concurrent follow of a DIFFERENT target supersedes the earlier mount (Ruling Y): only the current target seeds/subscribes", async () => {
   const first = fixture("project_a");
   const second = fixture("project_b");
   const barrier = deferred<void>();
@@ -77,15 +77,20 @@ it("keeps concurrent follows of distinct journals independent", async () => {
   const subscribe = vi.spyOn(api, "eventsSubscribe").mockImplementation(async (journalId) =>
     subscription(journalId === first.instance.journalId ? first.instance : second.instance));
 
+  // Two route entries in the same tick (rapid A -> B): ownership is chosen
+  // synchronously at entry, so A's continuation is fenced when its seed
+  // returns — it must never seed/subscribe/rebind, and B alone mounts.
   const follows = [hubStore.follow(first.instance.id), hubStore.follow(second.instance.id)];
-  await vi.waitFor(() => expect(read).toHaveBeenCalledTimes(2));
+  // B's lookup continuation owns the machine; A is fenced before its seed.
+  await vi.waitFor(() => expect(read).toHaveBeenCalledTimes(1));
   barrier.resolve();
   await Promise.all(follows);
 
-  expect(subscribe).toHaveBeenCalledTimes(2);
-  expect(subscribe.mock.calls.map(([journalId]) => journalId).sort())
-    .toEqual([first.instance.journalId, second.instance.journalId].sort());
-  expect(hubStore.getSnapshot().events[first.instance.id]).toEqual([first.event]);
+  expect(read).toHaveBeenCalledTimes(1);
+  expect(read.mock.calls[0]?.[0]?.journalId).toBe(second.instance.journalId);
+  expect(subscribe).toHaveBeenCalledTimes(1);
+  expect(subscribe.mock.calls[0]?.[0]).toBe(second.instance.journalId);
+  expect(hubStore.getSnapshot().events[first.instance.id]).toBeUndefined();
   expect(hubStore.getSnapshot().events[second.instance.id]).toEqual([second.event]);
 });
 

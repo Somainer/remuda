@@ -1,4 +1,5 @@
 import type { Command, CommandResult, Page } from "../types/command";
+import { profileRegion } from "./profileFlags";
 import type { Host, HostCli, Instance, TuiMode } from "../types/instance";
 import type { Interaction, InteractionAnswer } from "../types/interaction";
 import type { EventsBatch, Observation, Snapshot } from "../types/observation";
@@ -19,6 +20,7 @@ import type {
 } from "../features/providers";
 import { PROVIDER_PROFILES } from "../features/providers/fixtures";
 import { coerceUsageRollup } from "../features/session/contextUsage";
+import type { CapabilitySnapshot } from "../types/nativeRef";
 import type { components, paths } from "./api.generated";
 import { printCapabilities, ptyCapabilities, agentPtyCapabilities } from "./capabilities";
 import type { JournalRead } from "./journal";
@@ -241,6 +243,7 @@ export function mapInstance(rec: components["schemas"]["InstanceRecord"]): Insta
     tui?: TuiMode | null;
     effortName?: string | null;
     effortIndex?: number | null;
+    effortUltracode?: boolean | null;
     effortEffective?:
       | {
           name?: string;
@@ -267,16 +270,33 @@ export function mapInstance(rec: components["schemas"]["InstanceRecord"]): Insta
     launchedBy?: string | null;
     signalTier?: string | null;
     lastError?: string | null;
+    lastTurnError?: { at?: unknown; text?: unknown };
     usageRollup?: unknown;
     apiRoute?: components["schemas"]["ApiRoute"] | null;
   };
   const ptyDriver = driver === "generic-pty" || driver === "claude-pty" || driver === "shell-pty";
-  const capabilities =
-    ptyDriver && kind !== "terminal"
+  // Clone EVERY synthesized snapshot: the non-PTY fallback below is a
+  // module-level object (HUB_CAPABILITIES), and stamping binaryVersion on it
+  // leaked one instance's reported version onto every other non-PTY instance
+  // (c-effortui r3 item 12a).
+  const capabilities: CapabilitySnapshot = {
+    ...(ptyDriver && kind !== "terminal"
       ? agentPtyCapabilities(kind, driver)
       : ptyDriver
         ? ptyCapabilities(driver)
-        : HUB_CAPABILITIES;
+        : HUB_CAPABILITIES),
+  };
+  // The gate runs ONLY on a REPORTED version. The print matrix's static
+  // "2.1.268" is fixture data, not this instance's CLI: blank it for the
+  // synthesized fallback (pty matrices already blank) and stamp just the
+  // Hub/Node record's value, so one claude-print/sdk instance can never
+  // fabricate coupled/decoupled for its peers and an unreported build is
+  // honestly "unknown" (switch locked with a named reason).
+  const reportedVersion = (
+    rec as { capabilities?: { binaryVersion?: unknown } | null }
+  ).capabilities?.binaryVersion;
+  capabilities.binaryVersion =
+    typeof reportedVersion === "string" && reportedVersion.trim() ? reportedVersion.trim() : "";
   const launchedBy =
     extra.launchedBy === "remuda" || extra.launchedBy === "user" ? extra.launchedBy : null;
   const signalTier =
@@ -324,6 +344,15 @@ export function mapInstance(rec: components["schemas"]["InstanceRecord"]): Insta
     durableSeq: rec.durableSeq as U64,
     exit: { state: "not-applicable" },
     lastError: typeof extra.lastError === "string" ? extra.lastError : null,
+    // D-057 OA6: additive last root-turn-error marker, cleared by the next
+    // turn start. Drives the live-row turn-error display (not lastError).
+    lastTurnError:
+      extra.lastTurnError && typeof extra.lastTurnError.text === "string"
+        ? {
+            at: typeof extra.lastTurnError.at === "string" ? extra.lastTurnError.at : "",
+            text: extra.lastTurnError.text,
+          }
+        : undefined,
     launchedBy,
     cwd: extra.cwd ?? rec.workspaceId ?? null,
     name: extra.name ?? rec.title ?? null,
@@ -341,6 +370,9 @@ export function mapInstance(rec: components["schemas"]["InstanceRecord"]): Insta
     tui: extra.tui === "fullscreen" || extra.tui === "default" ? extra.tui : null,
     effortName: typeof extra.effortName === "string" ? extra.effortName : null,
     effortIndex: typeof extra.effortIndex === "number" ? extra.effortIndex : null,
+    // D-056 r2 item 4: the durable orthogonal flag must survive reload even
+    // when its effort event has fallen out of the journal tail.
+    effortUltracode: extra.effortUltracode === true,
     effortEffective:
       extra.effortEffective && typeof extra.effortEffective.name === "string"
         ? {
@@ -467,7 +499,27 @@ export type HelloResult = {
   features: string[];
 };
 
-export type EffortRef = { index: number; name: string };
+/** D-056 configure payload: native level word + orthogonal ultracode boolean. */
+export type EffortRef = {
+  index: number;
+  name: string;
+  ultracode?: boolean;
+  /**
+   * c-effortread r9 item 6: the axis this configure intends to move.
+   * "flag" = the orthogonal ultracode switch at the current tier;
+   * "tier" = a level move. The driver executes exactly that operation and
+   * refuses an ambiguous legacy flag-on rather than substituting a tier move.
+   */
+  axis?: "flag" | "tier";
+  /**
+   * c-effortread r10 items 1–4: per-request id minted in the tab. It rides to
+   * the driver and comes back on every effort lifecycle edge and the
+   * requested echo, so a stale edge for a replaced request can never settle
+   * the newer one. Absent on old drivers, which keep the timestamp/value
+   * fallback.
+   */
+  requestId?: string;
+};
 
 export type InstanceCreateSpec = {
   hostId: Id;
@@ -496,6 +548,8 @@ export type InstanceCreateSpec = {
   /** Composer/New Session effort. Stored in UI state; Hub ignores unknown create fields. */
   effortIndex?: number;
   effortName?: string;
+  /** D-056 orthogonal switch for launch (ultracode rides the same alias set). */
+  effortUltracode?: boolean;
   /**
    * D-047 per-dispatch delivery override: a proxy host id, `self` for the Hub
    * host, or `none` to force direct. A target the Hub cannot honour refuses
@@ -596,15 +650,15 @@ export type PasskeyAssertionBody = {
 
 export type HubApi = {
   mock: boolean;
-  login(bootstrapToken: string, deviceName: string): Promise<DeviceSession>;
-  pairRedeem(code: string, deviceName: string): Promise<DeviceSession>;
+  login(bootstrapToken: string, deviceName: string, signal?: AbortSignal): Promise<DeviceSession>;
+  pairRedeem(code: string, deviceName: string, signal?: AbortSignal): Promise<DeviceSession>;
   pairCode(): Promise<PairCode>;
   deviceList(): Promise<{ items: PairedDevice[] }>;
   deviceRevoke(deviceId: string): Promise<{ ok: boolean }>;
   passkeyRegisterStart(name: string): Promise<PasskeyEnvelope>;
   passkeyRegisterFinish(challengeId: string, attestation: PasskeyAttestationBody): Promise<PasskeyView>;
   passkeyLoginStart(mediation?: "conditional"): Promise<PasskeyEnvelope>;
-  passkeyLoginFinish(challengeId: string, assertion: PasskeyAssertionBody, deviceName?: string): Promise<DeviceSession>;
+  passkeyLoginFinish(challengeId: string, assertion: PasskeyAssertionBody, deviceName?: string, signal?: AbortSignal): Promise<DeviceSession>;
   passkeyList(): Promise<{ items: PasskeyView[] }>;
   passkeyRename(passkeyId: string, name: string): Promise<PasskeyView>;
   passkeyDelete(passkeyId: string): Promise<{ ok: boolean }>;
@@ -686,6 +740,18 @@ export type HubApi = {
   providerTest(id: string): Promise<ProviderTestResult>;
   /** Probe a gateway's `/v1/models` before the profile is saved. */
   providerDiscover(body: ProviderDiscoverBody): Promise<ProviderTestResult>;
+  /** D-056 static capability catalog (per-model default effort + ultracode). */
+  supplyCatalog(): Promise<{
+    revision?: number;
+    updated?: string;
+    models: Array<{
+      id: string;
+      aliases?: string[];
+      defaultEffort?: string | null;
+      ultracodeCapable?: boolean | null;
+      effortLevels?: readonly string[];
+    }>;
+  }>;
   eventsRead: JournalRead;
   eventsSubscribe(
     journalId: Id,
@@ -755,13 +821,17 @@ const REST_WRITE_TIMEOUT_MS = 15_000;
 
 /** Network-layer failure (timeout/offline), retriable by the outbox. */
 export class RestNetworkError extends Error {
-  constructor(message: string) {
-    super(message);
+  constructor(
+    message: string,
+    /** The underlying abort/network error (gate 48 item 4), if any. */
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
     this.name = "RestNetworkError";
   }
 }
 
-export async function rest<T>(path: string, req: RequestInit = {}): Promise<T> {
+export async function rest<T>(path: string, req: RequestInit = {}, cancelSignal?: AbortSignal): Promise<T> {
   const session = readSession();
   const headers = {
     "content-type": "application/json",
@@ -772,31 +842,48 @@ export async function rest<T>(path: string, req: RequestInit = {}): Promise<T> {
   const method = (req.method ?? "GET").toUpperCase();
   const isWrite = method !== "GET" && method !== "HEAD";
   const timeoutMs = isWrite ? REST_WRITE_TIMEOUT_MS : REST_READ_TIMEOUT_MS;
-  // A caller-supplied signal owns the timeout (e.g. the 65 s doctor probe);
-  // only attach our own when none was given.
+  // Gate 49 item 4: the internal read/write deadline is armed UNCONDITIONALLY,
+  // even when the caller supplied its own req.signal (e.g. the doctor probe).
+  // A caller/cancel abort and the internal timeout are independent ADDITIONAL
+  // abort sources; a live caller signal must never let the request or its body
+  // hang past the REST deadline.
   const external = req.signal;
   const controller = new AbortController();
   // The deadline must cover BOTH receiving headers AND reading the body: a
   // server that sends headers then stalls mid-body would otherwise leave the
   // fetch (and any outbox row/Web Lock behind it) pending forever. The timer
   // is only cleared once the body has been fully consumed (json/text below).
-  const timer = external
-    ? null
-    : setTimeout(
-        () => controller.abort(new DOMException("REST_TIMEOUT", "AbortError")),
-        timeoutMs,
-      );
+  const timer = setTimeout(
+    () => controller.abort(new DOMException("REST_TIMEOUT", "AbortError")),
+    timeoutMs,
+  );
   const clearTimer = () => {
-    if (timer) clearTimeout(timer);
+    clearTimeout(timer);
   };
   external?.addEventListener("abort", () => controller.abort(external.reason), { once: true });
+  cancelSignal?.addEventListener("abort", () => controller.abort(cancelSignal!.reason), { once: true });
+  // Gate 48 item 4: a signal ALREADY aborted before the call must reject
+  // WITHOUT issuing the fetch at all (an addEventListener("abort") on an
+  // already-aborted signal never fires, so forwarding alone used to miss it).
+  // Propagate the aborting signal's OWN reason so callers can distinguish a
+  // retirement/caller abort from a timeout.
+  const preAborted = cancelSignal?.aborted ? cancelSignal : external?.aborted ? external : null;
+  if (preAborted) {
+    clearTimer();
+    // The signal's own reason may be a DOMException (not an Error subclass in
+    // jsdom) or undefined; carry any truthy object through ErrorOptions.
+    const reason = preAborted.reason;
+    throw new RestNetworkError("request aborted", reason != null ? { cause: reason } : undefined);
+  }
   let res: Response;
   try {
     res = await fetch(`${hubBase()}${path}`, {
       credentials: "include",
       ...req,
       headers,
-      signal: external ?? controller.signal,
+      // Always driven by the internal controller so BOTH the deadline and any
+      // caller/cancel signal can abort it (it forwards each above).
+      signal: controller.signal,
     });
   } catch (err) {
     clearTimer();
@@ -804,9 +891,18 @@ export async function rest<T>(path: string, req: RequestInit = {}): Promise<T> {
     // retriable network error, never a business rejection (the outbox keeps
     // the same commandId and retries).
     if (err instanceof DOMException && err.name === "AbortError") {
-      throw new RestNetworkError(external?.aborted ? "request aborted" : `REST timeout after ${timeoutMs} ms`);
+      const aborted = external?.aborted || cancelSignal?.aborted;
+      if (aborted) {
+        const reason = cancelSignal?.aborted
+          ? cancelSignal.reason
+          : external?.reason;
+        throw new RestNetworkError("request aborted", reason != null ? { cause: reason } : undefined);
+      }
+      throw new RestNetworkError(`REST timeout after ${timeoutMs} ms`);
     }
-    throw new RestNetworkError(err instanceof Error ? err.message : String(err));
+    throw new RestNetworkError(err instanceof Error ? err.message : String(err), {
+      cause: err instanceof Error ? err : undefined,
+    });
   }
   if (!res.ok) {
     let text: string;
@@ -907,10 +1003,12 @@ function createMockApi(): HubApi {
   const subs = new Map<Id, (batch: EventsBatch["params"]) => void>();
   return {
     mock: true,
-    async login(bootstrapToken, deviceName) {
+    async login(bootstrapToken, deviceName, signal) {
+      void signal;
       return mockLogin(bootstrapToken, deviceName);
     },
-    async pairRedeem(code, deviceName) {
+    async pairRedeem(code, deviceName, signal) {
+      void signal;
       return mockPairRedeem(code, deviceName);
     },
     async pairCode() {
@@ -934,9 +1032,10 @@ function createMockApi(): HubApi {
     async passkeyLoginStart(mediation) {
       return mockPasskeyLoginStart(mediation);
     },
-    async passkeyLoginFinish(challengeId, assertion, deviceName) {
+    async passkeyLoginFinish(challengeId, assertion, deviceName, signal) {
       void challengeId;
       void assertion;
+      void signal;
       return mockPasskeyLoginFinish(deviceName);
     },
     async passkeyList() {
@@ -990,6 +1089,7 @@ function createMockApi(): HubApi {
       if (spec.effortName != null) {
         instance.effortName = spec.effortName;
         instance.effortIndex = spec.effortIndex ?? 0;
+        instance.effortUltracode = spec.kind === "claude" ? spec.effortUltracode === true : null;
       }
       return {
         instance,
@@ -1241,6 +1341,18 @@ function createMockApi(): HubApi {
         models,
       };
     },
+    async supplyCatalog() {
+      // Demo/offline mode: mirror the Hub catalog's Claude rows (D-056 §6).
+      return {
+        revision: 3,
+        models: [
+          { id: "claude-opus-5", aliases: ["opus"], defaultEffort: "medium", ultracodeCapable: true },
+          { id: "claude-sonnet-5", aliases: ["sonnet"], defaultEffort: "medium", ultracodeCapable: true },
+          { id: "claude-fable-5", aliases: ["fable"], defaultEffort: "high", ultracodeCapable: true },
+          { id: "claude-haiku-4-5", aliases: ["haiku"], defaultEffort: "high", ultracodeCapable: true },
+        ],
+      };
+    },
     async workspaceList(hostId) {
       const items = hostId ? mockDb.workspaces.filter((w) => w.hostId === hostId) : mockDb.workspaces;
       return mockPage(items);
@@ -1385,18 +1497,20 @@ function createLiveApi(): HubApi {
 
   return {
     mock: false,
-    async login(bootstrapToken, deviceName) {
-      const body = await rest<HubJson<"/v1/login", "post">>("/v1/login", {
-        method: "POST",
-        body: JSON.stringify({ bootstrapToken, deviceName }),
-      });
+    async login(bootstrapToken, deviceName, signal) {
+      const body = await rest<HubJson<"/v1/login", "post">>(
+        "/v1/login",
+        { method: "POST", body: JSON.stringify({ bootstrapToken, deviceName }) },
+        signal,
+      );
       return body;
     },
-    async pairRedeem(code, deviceName) {
-      const body = await rest<HubJson<"/v1/devices/pair", "post">>("/v1/devices/pair", {
-        method: "POST",
-        body: JSON.stringify({ code, deviceName }),
-      });
+    async pairRedeem(code, deviceName, signal) {
+      const body = await rest<HubJson<"/v1/devices/pair", "post">>(
+        "/v1/devices/pair",
+        { method: "POST", body: JSON.stringify({ code, deviceName }) },
+        signal,
+      );
       return body;
     },
     async pairCode() {
@@ -1430,11 +1544,13 @@ function createLiveApi(): HubApi {
         { method: "POST", body },
       ) as Promise<PasskeyEnvelope>;
     },
-    async passkeyLoginFinish(challengeId, assertion, deviceName) {
-      return rest<HubJson<"/v1/auth/passkeys/login/finish", "post">>(
+    async passkeyLoginFinish(challengeId, assertion, deviceName, signal) {
+      const body = await rest<HubJson<"/v1/auth/passkeys/login/finish", "post">>(
         "/v1/auth/passkeys/login/finish",
         { method: "POST", body: JSON.stringify({ challengeId, assertion, deviceName }) },
+        signal,
       );
+      return body;
     },
     async passkeyList() {
       return rest<HubJson<"/v1/auth/passkeys", "get">>("/v1/auth/passkeys");
@@ -1468,7 +1584,9 @@ function createLiveApi(): HubApi {
       const page = await rest<HubJson<"/v1/instances", "get">>(
         `/v1/instances${q?.hostId ? `?hostId=${encodeURIComponent(q.hostId)}` : ""}`,
       );
-      const items = page.items.map((row) => remember(mapInstance(row), instanceTitle(row)));
+      const items = profileRegion("api.mapInstances", () =>
+        page.items.map((row) => remember(mapInstance(row), instanceTitle(row))),
+      );
       return { items, nextCursor: page.nextCursor ?? null };
     },
     async instanceGet(instanceId) {
@@ -1509,7 +1627,15 @@ function createLiveApi(): HubApi {
         body: JSON.stringify({
           ...body,
           ...(spec.effortName != null
-            ? { effort: { name: spec.effortName, index: spec.effortIndex ?? 0, kind: spec.kind } }
+            ? {
+                effort: {
+                  name: spec.effortName,
+                  index: spec.effortIndex ?? 0,
+                  kind: spec.kind,
+                  // D-056: the switch rides launch as its own boolean.
+                  ...(spec.kind === "claude" ? { ultracode: spec.effortUltracode === true } : {}),
+                },
+              }
             : {}),
         }),
       });
@@ -1753,6 +1879,18 @@ function createLiveApi(): HubApi {
     },
     async providerDiscover(body) {
       return rest<ProviderTestResult>("/v1/providers/discover", { method: "POST", body: JSON.stringify(body) });
+    },
+    async supplyCatalog() {
+      return rest<{
+        revision?: number;
+        updated?: string;
+        models: Array<{
+          id: string;
+          aliases?: string[];
+          defaultEffort?: string | null;
+          ultracodeCapable?: boolean | null;
+        }>;
+      }>("/v1/supply/catalog");
     },
     async workspaceList(hostId) {
       const listed = hostId ? [await this.hostGet(hostId)] : (await this.hostList()).items;

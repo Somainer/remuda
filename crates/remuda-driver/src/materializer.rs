@@ -281,6 +281,9 @@ fn materialize_inner(
             } else {
                 None
             };
+            // D-056 (2): ultracode is refused below 2.1.203 or when the pinned
+            // version cannot be read; the version comes from `--version`.
+            crate::effort::ensure_claude_ultracode_version(&binary.version, request.spec.effort)?;
             argv = claude_argv(
                 request.spec.driver,
                 &ClaudeArgv {
@@ -662,6 +665,12 @@ fn materialize_shell_pty_agent(
     // codex (a top-level `--effort` is a clap error in codex), canonical
     // `--reasoning-effort` for grok. Absent effort emits nothing at all rather
     // than pinning a default the user never chose.
+    if request.spec.kind == AgentKind::Claude {
+        // D-056 (2): ultracode is refused below 2.1.203 or when the pinned
+        // version cannot be read; the version comes from the binary's
+        // `--version`, not the spec.
+        crate::effort::ensure_claude_ultracode_version(&binary.version, request.spec.effort)?;
+    }
     argv.extend(crate::effort::effort_argv(
         request.spec.kind,
         request.spec.effort,

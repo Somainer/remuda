@@ -123,6 +123,13 @@ impl RunHandle {
         self.events.recv().await
     }
 
+    /// Take the next observation if one is already buffered, without waiting.
+    /// Returns `None` when the buffer is empty OR the stream has closed (the
+    /// two are indistinguishable by design; callers that care use [`recv`]).
+    pub fn try_recv(&mut self) -> Option<Observation> {
+        self.events.try_recv().ok()
+    }
+
     /// Take the raw receiver.
     pub fn into_events(self) -> mpsc::Receiver<Observation> {
         self.events
@@ -158,6 +165,19 @@ pub trait Driver: Send + Sync {
     /// the Node can retain queued input and keep other control operations usable.
     async fn wait_control(&self) -> DriverResult<()> {
         Ok(())
+    }
+
+    /// Whether the driver has observed its managed child actually END.
+    ///
+    /// OA6 (c-cardsettle): a failed command or a failed observation commit is
+    /// NOT process-end evidence — the Node must never mark an instance failed
+    /// on its own errors while the child is alive. Drivers that emit an exit
+    /// observation when their child's stdout/PTY closes report that end here as
+    /// well, so a rejection arriving right around the death can still be
+    /// classified as an end without guessing from the error. Default `false`:
+    /// such drivers end instances only through their emitted exit event.
+    async fn process_gone(&self) -> bool {
+        false
     }
 
     /// Deliver prompt, steer, or model-switch input.
@@ -243,5 +263,23 @@ pub trait Driver: Send + Sync {
         Err(crate::error::DriverError::CapabilityUnsupported(
             "start_resumed requires a session-capable driver".into(),
         ))
+    }
+
+    /// Test seam: force the NEXT close's stop ladder verdict (the real ladder
+    /// still runs; only its conclusion is substituted). c-usagefu r19 item 1
+    /// Node census-epoch tests drive the real DevNode close this way.
+    #[cfg(any(test, feature = "test-stub"))]
+    fn test_force_stop_outcome(&self, _outcome: crate::shell_pty::lifecycle::StopOutcome) {}
+
+    /// Test seam: the spawned child's process group.
+    #[cfg(any(test, feature = "test-stub"))]
+    fn test_pgid(&self) -> Option<i32> {
+        None
+    }
+
+    /// Test seam: whether the live codex file adapter has bound a session.
+    #[cfg(any(test, feature = "test-stub"))]
+    fn test_codex_bound(&self) -> bool {
+        false
     }
 }

@@ -3,7 +3,7 @@
 use crate::AppState;
 use crate::auth::{device_cookie, hash_secret, require_device, require_origin};
 use crate::error::HubError;
-use crate::store::CommandRecord;
+use crate::store::{CommandRecord, StoreError};
 use axum::Json;
 use axum::Router;
 use axum::extract::{Path, Query, State};
@@ -648,40 +648,65 @@ pub async fn delete_instance(
         }
     }
 
-    let deleted = state
-        .store
-        .delete_instance(instance_id.clone())
-        .await
-        .map_err(map_store)?;
-    if !deleted {
-        return Err(HubError::NotFound);
+    // c-cardsettle-fu item 2: the WHOLE irreversible operation — the DB
+    // delete, the publication-ordered settlement broadcast, and the cleanup/
+    // audit tail (worktree returns, per-chapter instance.purge, audit row) —
+    // runs in one task DETACHED BEFORE the store call is enqueued. If the
+    // client disconnects after the request is accepted, hyper drops this
+    // handler future, but the detached task keeps running: the deletion
+    // commits, its settlement frame is published, and the audit/purge tail
+    // completes. Previously the delete+publish awaited inline and the tail
+    // was only spawned afterwards, so a drop between enqueue and response
+    // skipped the publication AND stranded the tail. A connected client
+    // still awaits the JoinHandle for the response.
+    //
+    // c-cardsettle r11 item 3 holds inside the task: delete + broadcast run
+    // under settlement_publish_lock, ordered against journal exits.
+    struct DeleteResult {
+        lease_returns: Vec<String>,
+        purge: String,
+        purge_outcomes: serde_json::Map<String, Value>,
+        chapter_ids: Vec<String>,
     }
+    let response_instance_id = instance_id.clone();
+    let op_state = state.clone();
+    let op = tokio::spawn(async move {
+        let state = op_state;
+        let chapters = chapters;
+        let instance_id = instance_id;
+        let device_id = device.id;
+        let host_id = instance.host_id;
+        let lifecycle = instance.lifecycle;
+        let lineage_id = instance.lineage_id;
 
-    // r10 item 4: the post-commit tail (worktree returns, per-chapter
-    // instance.purge, the durable audit) runs in its OWN task. The lineage
-    // rows are already gone; a CLIENT DISCONNECT dropping this handler future
-    // must not strand the lease returns/purges or leave a committed delete
-    // with no audit row. A live client still awaits the JoinHandle to build
-    // the response; dropping it (handler cancelled) detaches but does NOT
-    // cancel the tail, which runs to completion. This covers client
-    // cancellation only — a Hub shutdown aborts the server and closes the
-    // store, so an in-flight tail is not guaranteed to finish there (a future
-    // TaskTracker with bounded draining could cover that too).
-    let tail_state = state.clone();
-    let tail_chapters = chapters.clone();
-    let tail_instance_id = instance_id.clone();
-    let tail_device_id = device.id.clone();
-    let tail_host_id = instance.host_id.clone();
-    let tail_lifecycle = instance.lifecycle.clone();
-    let tail_lineage_id = instance.lineage_id.clone();
-    let tail = tokio::spawn(async move {
-        let state = tail_state;
-        let chapters = tail_chapters;
-        let instance_id = tail_instance_id;
-        let device_id = tail_device_id;
-        let host_id = tail_host_id;
-        let lifecycle = tail_lifecycle;
-        let lineage_id = tail_lineage_id;
+        let deleted = state
+            .publish_settlement(async {
+                let deleted = state.store.delete_instance(instance_id.clone()).await?;
+                let exists = deleted.is_some();
+                // Carry the settlement the delete transaction produced so
+                // publish_settlement broadcasts it (the cards it settled
+                // inside the transaction).
+                let settlement = deleted
+                    .as_ref()
+                    .map(|d| d.settlement.clone())
+                    .unwrap_or_default();
+                // c-cardsettle-fu2 r1 item 4: park AFTER the store delete
+                // committed but BEFORE the settlement tuple returns (so the
+                // broadcast has not happened yet), still holding the
+                // publication lock. RST here leaves the deletion durable with
+                // no frame published; after release the detached task
+                // publishes and runs the cleanup tail.
+                #[cfg(any(test, feature = "test-faults"))]
+                state
+                    .operation_parks
+                    .park_after_delete_if_armed(&instance_id)
+                    .await;
+                Ok((exists, settlement))
+            })
+            .await?;
+        if !deleted {
+            return Ok::<_, StoreError>(None);
+        }
 
         let mut lease_returns = Vec::new();
         let mut lease_keys_seen = std::collections::HashSet::new();
@@ -874,7 +899,7 @@ pub async fn delete_instance(
         state
         .store
         .append_audit(
-            device.id.clone(),
+            device_id.clone(),
             "instance.delete".into(),
             Some(instance_id.clone()),
             json!({
@@ -904,18 +929,27 @@ pub async fn delete_instance(
             .iter()
             .map(|chapter| chapter.instance_id.clone())
             .collect::<Vec<_>>();
-        (lease_returns, purge, purge_outcomes, chapter_ids)
+        Ok(Some(DeleteResult {
+            lease_returns,
+            purge,
+            purge_outcomes,
+            chapter_ids,
+        }))
     });
-    let (lease_returns, purge, purge_outcomes, chapter_ids) = tail
+    let result = op
         .await
-        .expect("post-commit instance.delete tail task panicked");
+        .map_err(|join| HubError::Internal(format!("instance.delete task panicked: {join}")))?
+        .map_err(map_store)?;
+    let Some(result) = result else {
+        return Err(HubError::NotFound);
+    };
     Ok(Json(json!({
         "deleted": true,
-        "instanceId": instance_id,
-        "nodePurge": purge,
-        "chapterPurges": Value::Object(purge_outcomes),
-        "chapterIds": chapter_ids,
-        "leaseReturns": lease_returns,
+        "instanceId": response_instance_id,
+        "nodePurge": result.purge,
+        "chapterPurges": Value::Object(result.purge_outcomes),
+        "chapterIds": result.chapter_ids,
+        "leaseReturns": result.lease_returns,
     })))
 }
 
@@ -937,6 +971,7 @@ async fn stop_before_delete(
             "instance.close".into(),
             json!({ "instanceId": instance.instance_id, "origin": "human" }),
             None,
+            None,
             // Hub-internal cleanup before an operator delete (main-agent.md
             // §7.1): never fenced.
             None,
@@ -955,14 +990,14 @@ async fn stop_before_delete(
             );
         }
     }
-    let (changed, settlement) = state
-        .store
-        .settle_instance_exited(instance.instance_id.clone(), "deleted-by-operator".into())
+    let changed = state
+        .publish_settlement(
+            state
+                .store
+                .settle_instance_exited(instance.instance_id.clone(), "deleted-by-operator".into()),
+        )
         .await
         .map_err(map_store)?;
-    // c-cardsettle: cards invalidated by the delete leave open inboxes
-    // immediately.
-    state.broadcast_settlement(&settlement);
     if changed {
         state
             .api_relay
@@ -2409,6 +2444,7 @@ async fn resume_lineage(
                 "instance.close".into(),
                 json!({ "instanceId": fenced.instance_id, "origin": "human" }),
                 None,
+                None,
                 // Hub-internal cleanup inside a continuation resume.
                 None,
                 None,
@@ -2742,6 +2778,7 @@ pub async fn post_command(
             body.operation,
             payload,
             body.idempotency_key,
+            None,
             initiator,
             initiator_device_id,
         )
@@ -3920,11 +3957,20 @@ pub(crate) async fn call_node(
     method: &str,
     params: Value,
 ) -> Result<Value, HubError> {
-    match state
+    let result = state
         .nodes
         .call(host_id, method, params, WORKTREE_RPC_TIMEOUT)
-        .await
-    {
+        .await;
+    translate_node_rpc(host_id, result)
+}
+
+/// Translate a Node JSON-RPC result into the Hub error/value shape shared by
+/// [`call_node`] and the pinned forwarding path.
+fn translate_node_rpc(
+    host_id: &str,
+    result: Result<Option<Value>, HubError>,
+) -> Result<Value, HubError> {
+    match result {
         Ok(Some(response)) => {
             if let Some(error) = response.get("error") {
                 let message = error
@@ -3940,6 +3986,19 @@ pub(crate) async fn call_node(
         }),
         Err(err) => Err(err),
     }
+}
+
+/// Forward one command frame on a transport the forwarding attempt PINNED at
+/// its start (c-dirpicker r11 item 2): the prepare and the commit of one
+/// command must ride the same link the row was stamped for.
+pub(crate) async fn call_node_pinned(
+    host_id: &str,
+    pinned: &crate::transport::PinnedNodeCall,
+    method: &str,
+    params: Value,
+) -> Result<Value, HubError> {
+    let result = pinned.call(method, params, WORKTREE_RPC_TIMEOUT).await;
+    translate_node_rpc(host_id, result)
 }
 
 /// How long a screen read may wait on the Node.
@@ -4147,11 +4206,25 @@ pub(crate) async fn forward_if_online(
     // the active attempt's PUBLISHED settled row (including an `Ok(None)`
     // release), so it can never report a transient `forwarded=1` belonging to
     // this or a later attempt. The durable guard remains the SQLite mark.
+    //
+    // c-dirpicker r12 item 2: these commands are instance.create/resume/send —
+    // NEVER workspace.unregister (that handler pins in `mutate`), and the
+    // reconnect sweep reads the generation stamp only for unregister rows. So
+    // pinning the transport here would protect nothing while widening the
+    // pin→send window across the mark, instance_token and launch-secret DB
+    // round-trips: a hello replacing the slot in that span would send to the
+    // retired L1 (Ok(None) resting queued, or a timeout into reconciling).
+    // Stamp from the durable counter at the mark and resolve the transport at
+    // SEND time, so a replaced link delivers the frame over the new one.
     let mut forward_attempt = match acquire_forward_leader(command.command_id.clone()) {
         Some(attempt) => {
+            let link_generation = state
+                .store
+                .host_link_generation(command.host_id.clone())
+                .await?;
             let first = state
                 .store
-                .mark_forward_intent(command.command_id.clone())
+                .mark_forward_intent(command.command_id.clone(), link_generation)
                 .await
                 .map_err(map_store)?;
             if !first {
@@ -4217,7 +4290,22 @@ pub(crate) async fn forward_if_online(
         object.insert("agentCredential".into(), json!({"token":token}));
         params = crate::providers::with_launch_secret(state, &command.host_id, params).await?;
     }
-    match state
+    // r12 item 2: resolve the transport at SEND time. A hello that replaced
+    // the slot during the mark/token/secret round-trips above delivers the
+    // frame over the new link instead of a retired one.
+    //
+    // Test seam: park right before the send lookup (keyed by command id), so
+    // a test can replace the registered link in the mark→send window. No-op in
+    // production.
+    state
+        .race_barriers
+        .wait_if_armed(
+            crate::workspaces::RacePhase::ForwardSend,
+            &command.host_id,
+            &command.command_id,
+        )
+        .await;
+    let rpc = state
         .nodes
         .call(
             &command.host_id,
@@ -4225,8 +4313,8 @@ pub(crate) async fn forward_if_online(
             params,
             Duration::from_millis(state.config.command_accept_timeout_ms.max(1)),
         )
-        .await
-    {
+        .await;
+    match rpc {
         Ok(Some(response)) if node_accepted(&response, &command.command_id) => {
             // The Node just told us which driver it really built. Record it
             // before anything reads the row back: a create that answers
@@ -4362,11 +4450,12 @@ pub(crate) async fn forward_if_online(
                     "instance.create" | "instance.resume"
                 ) && let Some(instance_id) = command.instance_id.clone()
                 {
-                    let settlement = state
-                        .store
-                        .fail_instance(instance_id, err.to_string())
+                    state
+                        .publish_settlement_unit(state.store.fail_instance(
+                            instance_id,
+                            err.to_string(),
+                        ))
                         .await?;
-                    state.broadcast_settlement(&settlement);
                 } else if command.operation == "instance.configure" {
                     // Persist the 503 (and its body) WITH the terminal row: a
                     // configure is non-replayable, so a same-id retry must
@@ -4442,14 +4531,14 @@ async fn settle_stop_for_unknown_instance(
         operation = %command.operation,
         "node does not know this instance; settling the stop as exited"
     );
-    let (changed, settlement) = state
-        .store
-        .settle_instance_exited(instance_id.clone(), "node-lost-instance".into())
+    let changed = state
+        .publish_settlement(
+            state
+                .store
+                .settle_instance_exited(instance_id.clone(), "node-lost-instance".into()),
+        )
         .await
         .map_err(map_store)?;
-    // c-cardsettle: the Node already forgot this generation; invalidate its
-    // cards for followers in the same breath.
-    state.broadcast_settlement(&settlement);
     if changed {
         state
             .api_relay
@@ -4493,11 +4582,9 @@ async fn fail_unaccepted_create(
     if command.operation == "instance.create"
         && let Some(instance_id) = command.instance_id.clone()
     {
-        let settlement = state
-            .store
-            .fail_instance(instance_id, message.clone())
+        state
+            .publish_settlement_unit(state.store.fail_instance(instance_id, message.clone()))
             .await?;
-        state.broadcast_settlement(&settlement);
         return Err(HubError::BadRequest(message));
     }
     // An explicit Node error reply is positive evidence the command did not
@@ -4548,6 +4635,7 @@ fn node_accepted(response: &Value, command_id: &str) -> bool {
         result.pointer("/command/state").and_then(Value::as_str),
         Some("accepted" | "settled")
     ) || result.get("accepted").and_then(Value::as_bool) == Some(true)
+        || result.get("accepted").and_then(Value::as_str).is_some()
 }
 
 fn schedule_create_settlement_watch(state: &AppState, command: &CommandRecord) {

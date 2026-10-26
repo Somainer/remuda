@@ -73,6 +73,47 @@ function userMessagePage(commandId: string): JournalPage {
   };
 }
 
+/** A journal row as the Hub stores it (the adapter coerces it into an Observation). */
+type HubRow = { seq: number; eventId: string; kind: string; payload: Record<string, unknown> };
+// Hub read_journal caps (crates/remuda-hub/src/store.rs JOURNAL_WINDOW_ROWS / _BYTES).
+const HUB_WINDOW_ROWS = 2_000;
+const HUB_WINDOW_BYTES = 8 * 1024 * 1024;
+
+/**
+ * GET /v1/instances/{id}/journal answered exactly as the Hub's read_journal
+ * does: rows in (afterSeq, min(beforeSeq, durableSeq)] walked NEWEST first
+ * under the row cap and the payload byte cap (the newest row is always
+ * kept), returned ascending; fromSeq is the returned floor and
+ * reachedAfterSeq is true for an empty window or a floor of afterSeq + 1.
+ */
+function hubJournalResponse(input: RequestInfo | URL, rows: HubRow[], durableSeq: number): Response {
+  const url = new URL(String(input), "http://hub.test");
+  const after = Number(url.searchParams.get("afterSeq") ?? "0");
+  const beforeRaw = url.searchParams.get("beforeSeq");
+  const high = beforeRaw === null ? durableSeq : Math.min(Number(beforeRaw), durableSeq);
+  const window: HubRow[] = [];
+  let bytes = 0;
+  for (const row of rows.filter((r) => r.seq > after && r.seq <= high).sort((a, b) => b.seq - a.seq)) {
+    if (window.length >= HUB_WINDOW_ROWS) break;
+    const size = JSON.stringify(row).length;
+    if (window.length > 0 && bytes + size > HUB_WINDOW_BYTES) break;
+    bytes += size;
+    window.push(row);
+  }
+  window.reverse();
+  const fromSeq = window[0]?.seq ?? null;
+  return new Response(
+    JSON.stringify({
+      instanceId: INSTANCE,
+      durableSeq: String(durableSeq),
+      fromSeq: fromSeq === null ? null : String(fromSeq),
+      reachedAfterSeq: fromSeq === null || fromSeq === after + 1,
+      events: window,
+    }),
+    { status: 200, headers: { "content-type": "application/json" } },
+  );
+}
+
 async function mountFollow(api: Api, hubStore: Store, seedPage: JournalPage = EMPTY_PAGE) {
   vi.spyOn(api, "instanceGet").mockResolvedValue({
     id: INSTANCE,
@@ -361,39 +402,22 @@ it("the debt tail makes FORWARD progress through the real adapter with 128 loade
   }));
   let appended = false;
 
-  // Emulate the Hub: newest up to 2000 rows in (afterSeq, beforeSeq],
-  // ascending order with fromSeq/reachedAfterSeq metadata.
+  // The Hub's read_journal window semantics (hubJournalResponse).
   const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
-    const url = new URL(String(input), "http://hub.test");
-    const after = Number(url.searchParams.get("afterSeq") ?? "0");
-    const beforeRaw = url.searchParams.get("beforeSeq");
-    const before = beforeRaw === null ? null : Number(beforeRaw);
+    const after = Number(new URL(String(input), "http://hub.test").searchParams.get("afterSeq") ?? "0");
     const userRow129 = {
       seq: 129,
       eventId: "evt_user_129",
       kind: "message",
       payload: { role: "user", commandId },
     };
-    const visible = appended ? [...rows, userRow129] : rows;
-    const page = visible
-      .filter((r) => r.seq > after && (before === null || r.seq <= before))
-      .sort((a, b) => b.seq - a.seq)
-      .slice(-2000)
-      .reverse();
+    const response = appended
+      ? hubJournalResponse(input, [...rows, userRow129], 129)
+      : hubJournalResponse(input, rows, 128);
     // The drain's empty resume (afterSeq=128) races the node append: the
     // command lands at seq 129 immediately AFTER that empty response.
-    if (after >= 128 && !appended && page.length === 0) appended = true;
-    const fromSeq = page[0]?.seq ?? null;
-    return new Response(
-      JSON.stringify({
-        instanceId: INSTANCE,
-        durableSeq: String(appended ? 129 : 128),
-        fromSeq: fromSeq === null ? null : String(fromSeq),
-        reachedAfterSeq: fromSeq === null || fromSeq === after + 1,
-        events: page,
-      }),
-      { status: 200, headers: { "content-type": "application/json" } },
-    );
+    if (after >= 128 && !appended) appended = true;
+    return response;
   });
   vi.stubGlobal("fetch", fetchMock);
 
@@ -1026,37 +1050,17 @@ it("r4 item 4: the debt scan cursor advances through a full unrelated page to th
   // The unrelated 129-256 burst and the owed 257 only become durable AFTER the
   // drain's empty resync (the command journals late, like the real race).
   let appended = false;
-  // Hub window semantics: newest 2000 in (afterSeq, beforeSeq], ascending.
+  // The Hub's read_journal window semantics (hubJournalResponse).
   vi.stubGlobal(
     "fetch",
     vi.fn(async (input: RequestInfo | URL) => {
-      const url = new URL(String(input), "http://hub.test");
-      const after = Number(url.searchParams.get("afterSeq") ?? "0");
-      const beforeRaw = url.searchParams.get("beforeSeq");
-      const before = beforeRaw === null ? null : Number(beforeRaw);
-      const visible = appended ? all : seedRows;
-      const resolved = visible.map((r) =>
-        r.seq === 257
-          ? { ...r, payload: { role: "user", commandId: sentCommandIdRef.value } }
-          : r,
+      const after = Number(new URL(String(input), "http://hub.test").searchParams.get("afterSeq") ?? "0");
+      const resolved: HubRow[] = (appended ? all : seedRows).map((r) =>
+        r.seq === 257 ? { ...r, payload: { role: "user", commandId: sentCommandIdRef.value } } : r,
       );
-      const page = resolved
-        .filter((r) => r.seq > after && (before === null || r.seq <= before))
-        .sort((a, b) => b.seq - a.seq)
-        .slice(-2000)
-        .reverse();
-      if (after >= 128 && !appended && page.length === 0) appended = true;
-      const fromSeq = page[0]?.seq ?? null;
-      return new Response(
-        JSON.stringify({
-          instanceId: INSTANCE,
-          durableSeq: appended ? "257" : "128",
-          fromSeq: fromSeq === null ? null : String(fromSeq),
-          reachedAfterSeq: fromSeq === null || fromSeq === after + 1,
-          events: page,
-        }),
-        { status: 200, headers: { "content-type": "application/json" } },
-      );
+      const response = hubJournalResponse(input, resolved, appended ? 257 : 128);
+      if (after >= 128 && !appended) appended = true;
+      return response;
     }),
   );
 
@@ -1313,3 +1317,114 @@ it("r4 item 2: a tail pass rejected while the Outbox is mid-succession does not 
   expect(h.owedTailRunning.has(INSTANCE)).toBe(false);
   expect(h.owedTail.get(INSTANCE)?.timer).toBeNull();
 });
+
+/**
+ * Real api.eventsRead adapter over {@link hubJournalResponse} with a 128-row
+ * loaded frontier. `tail(commandId)` becomes durable right AFTER the drain's
+ * empty post-delivery resync (the command journals late, like the real
+ * race), so only the debt tail can find the owed entry.
+ */
+async function sendOwedOverRealAdapter(tail: (commandId: string) => HubRow[]) {
+  const { api, hubStore } = await fresh();
+  const seed: HubRow[] = Array.from({ length: 128 }, (_, i) => ({
+    seq: i + 1,
+    eventId: `evt_seed_${i + 1}`,
+    kind: "raw_tty",
+    payload: { text: `filler ${i + 1}` },
+  }));
+  let commandId = "";
+  let appended: HubRow[] | null = null;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL) => {
+      const after = Number(new URL(String(input), "http://hub.test").searchParams.get("afterSeq") ?? "0");
+      const rows = appended ? [...seed, ...appended] : seed;
+      const response = hubJournalResponse(input, rows, rows[rows.length - 1]!.seq);
+      if (commandId && after >= 128 && !appended) appended = tail(commandId);
+      return response;
+    }),
+  );
+  vi.spyOn(api, "instanceGet").mockResolvedValue({ id: INSTANCE, journalId: JOURNAL } as never);
+  vi.spyOn(api, "instanceList").mockResolvedValue({
+    items: [{ id: INSTANCE, journalId: JOURNAL, revision: "1", durableSeq: "128", lifecycle: "running" } as never],
+    nextCursor: null,
+  });
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+  vi.spyOn(api, "eventsSubscribe").mockResolvedValue({
+    subscriptionId: "sub_debt_window",
+    journalId: JOURNAL,
+    durableSeq: "128",
+    windowFromSeq: "1",
+    reachedAfterSeq: true,
+    getReadyState: () => 1,
+    snapshot: {
+      projectionVersion: "v1",
+      projectionEpoch: "epoch_debt_window",
+      asOfSeq: "128",
+      instance: {} as never,
+      runs: [],
+      commands: [],
+      pendingInteractions: [],
+      nodes: [],
+      history: { earliestRetainedSeq: "1", complete: true },
+    },
+  });
+  vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+    commandId = _args[4] as string;
+    return Promise.resolve(commandResult(commandId, "accepted"));
+  });
+  await hubStore.refresh();
+  await hubStore.follow(INSTANCE);
+  await vi.waitFor(() => expect(hubStore.getSnapshot().events[INSTANCE]).toHaveLength(128));
+  await hubStore.send(INSTANCE, "owed behind a long tail");
+  const bubble = () => hubStore.getSnapshot().bubbles.find((b) => b.commandId === commandId)!;
+  await vi.waitFor(() => expect(bubble().outboxState).toBe("sent"));
+  return { hubStore, bubble };
+}
+
+it("r5 item 1: an owed command at F+1 settles although more than one Hub window of rows was journaled after it", async () => {
+  // Frontier 128, the owed command at 129, then 2100 unrelated rows: an
+  // unbounded read of (128, durable] gets the Hub's NEWEST 2000-row window
+  // (reachedAfterSeq false) and must never let the cursor jump past 129.
+  const { hubStore, bubble } = await sendOwedOverRealAdapter((commandId) => [
+    { seq: 129, eventId: "evt_user_129", kind: "message", payload: { role: "user", commandId } },
+    ...Array.from({ length: 2_100 }, (_, i) => ({
+      seq: i + 130,
+      eventId: `evt_noise_${i + 130}`,
+      kind: "raw_tty",
+      payload: { text: `unrelated ${i + 130}` },
+    })),
+  ]);
+  await vi.waitFor(
+    () => {
+      expect(bubble().state).toBe("settled");
+      expect(bubble().outboxState).toBe("done");
+    },
+    { timeout: 6_000 },
+  );
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+  // Evidence only: the owed node joined state, none of the 2100 others.
+  expect(hubStore.getSnapshot().events[INSTANCE]).toHaveLength(129);
+}, 15_000);
+
+it("r5 item 1: a byte-capped page short of the cursor is descended before the cursor moves past it", async () => {
+  // Two large rows after the owed command exceed the Hub's 8 MiB window, so
+  // even a bounded read (128, 256] returns only [131] with reachedAfterSeq
+  // false; the reader must descend below its floor to inspect 130 and 129.
+  const big = "x".repeat(Math.ceil(HUB_WINDOW_BYTES * 0.55));
+  const { hubStore, bubble } = await sendOwedOverRealAdapter((commandId) => [
+    { seq: 129, eventId: "evt_user_129", kind: "message", payload: { role: "user", commandId } },
+    { seq: 130, eventId: "evt_big_130", kind: "raw_tty", payload: { text: big } },
+    { seq: 131, eventId: "evt_big_131", kind: "raw_tty", payload: { text: big } },
+  ]);
+  await vi.waitFor(
+    () => {
+      expect(bubble().state).toBe("settled");
+      expect(bubble().outboxState).toBe("done");
+    },
+    { timeout: 6_000 },
+  );
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+  expect(hubStore.getSnapshot().events[INSTANCE]).toHaveLength(129);
+}, 15_000);

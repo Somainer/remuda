@@ -152,8 +152,19 @@ const OWED_TAIL_BASE_BACKOFF_MS = 300;
 const OWED_TAIL_MAX_BACKOFF_MS = 2_000;
 const OWED_TAIL_MAX_ATTEMPTS = 12;
 const OWED_TAIL_DEADLINE_MS = 45_000;
-/** Limit for the FORWARD debt read (rows strictly above the loaded frontier). */
+/**
+ * Upper bound of one FORWARD debt read: it asks for (scanAfter, scanAfter +
+ * OWED_TAIL_WINDOW] only. The Hub answers the NEWEST rows of a range (row and
+ * byte caps), so an unbounded read past a long tail would skip the seqs just
+ * above the cursor.
+ */
 const OWED_TAIL_WINDOW = 128;
+/**
+ * Descending pages one bounded debt read may issue when the Hub's byte cap
+ * cut a page short of its afterSeq (reachedAfterSeq false). A range still not
+ * covered after these pages resumes from the uninspected bound next pass.
+ */
+const OWED_TAIL_DESCENT_PAGES = 8;
 /**
  * Bounded lookback for the separate OVERLAP read (r2 item 2). The missed
  * entry can sit just BELOW the loaded frontier (the same turn's frames
@@ -170,6 +181,19 @@ const OWED_TAIL_OVERLAP = 64;
 const OWED_TAIL_STORAGE_RETRIES = 3;
 const OWED_TAIL_STORAGE_RETRY_MS = 1_000;
 const OWED_UNCONFIRMED_REASON = "journal confirmation deadline";
+
+/** Per-instance bounded debt tail state (see {@link HubStore.owedTail}). */
+type OwedTailState = {
+  attempts: number;
+  firstAt: number;
+  storageRetries: number;
+  scanAfter: number;
+  scanBound: number | null;
+  overlapBelow: number;
+  overlapBound: number | null;
+  timer: ReturnType<typeof setTimeout> | null;
+};
+
 /** Bounded backoff for Hub-held (Node offline) same-id re-POSTs. */
 const HELD_RETRY_BASE_MS = 2_000;
 const HELD_RETRY_MAX_MS = 30_000;
@@ -1350,18 +1374,13 @@ class HubStore {
    * independent of the store's folded events / live dedupe. `overlapBelow`
    * anchors the separate bounded lookback for an entry just below the
    * frontier the live stream passed by.
+   *
+   * r5 item 1: the cursor only ever advances over seqs a read actually
+   * inspected. `scanBound` / `overlapBound` hold the lowest still-uninspected
+   * upper bound of a range whose descent ran out of pages (null: start the
+   * range from its top).
    */
-  private owedTail = new Map<
-    Id,
-    {
-      attempts: number;
-      firstAt: number;
-      storageRetries: number;
-      scanAfter: number;
-      overlapBelow: number;
-      timer: ReturnType<typeof setTimeout> | null;
-    }
-  >();
+  private owedTail = new Map<Id, OwedTailState>();
   /**
    * Instances with a debt evidence pass currently queued or running. Several
    * triggers can fire for one instance while its bounded read is in flight
@@ -3995,14 +4014,7 @@ class HubStore {
     );
   }
 
-  private newOwedTail(instanceId: Id): {
-    attempts: number;
-    firstAt: number;
-    storageRetries: number;
-    scanAfter: number;
-    overlapBelow: number;
-    timer: ReturnType<typeof setTimeout> | null;
-  } {
+  private newOwedTail(instanceId: Id): OwedTailState {
     // The debt begins when a drained row's resync raced the node append, so
     // the owed entry can sit AT the current frontier; the forward scan starts
     // there and the bounded overlap covers just below it.
@@ -4012,7 +4024,9 @@ class HubStore {
       firstAt: Date.now(),
       storageRetries: 0,
       scanAfter: frontier,
+      scanBound: null,
       overlapBelow: frontier,
+      overlapBound: null,
       timer: null,
     };
   }
@@ -4075,6 +4089,52 @@ class HubStore {
     // Evidence (including evidence already present in state.events) clears
     // each owed command; anything still missing keeps the bounded tail.
     this.reevaluateOwedDebt(instanceId);
+  }
+
+  /**
+   * r5 item 1: inspect (after, before] for settlement evidence WITHOUT ever
+   * claiming a seq it did not see. The Hub answers the NEWEST rows of a range
+   * under its row/byte caps and reports `reachedAfterSeq` false when rows
+   * below the returned floor were cut, so a short page is followed by
+   * descending reads below its floor (beforeSeq = windowFromSeq - 1, same
+   * afterSeq) until the range reaches `after` or the page budget runs out.
+   *
+   * Returns null when ownership was lost while a read was parked. Otherwise
+   * `highest` is the top seq inspected and `uninspectedBelow` is null when
+   * the whole of (after, highest] was inspected, or the upper bound of the
+   * part still uninspected (the caller resumes the descent there and must not
+   * advance past it).
+   */
+  private async readOwedRange(
+    instanceId: Id,
+    journalId: Id,
+    after: number,
+    before: number,
+    limit: number,
+    stillOurs: () => boolean,
+  ): Promise<{ highest: number; uninspectedBelow: number | null } | null> {
+    let high = before;
+    let highest = after;
+    for (let page = 0; page < OWED_TAIL_DESCENT_PAGES && high > after; page += 1) {
+      const read = await api.eventsRead({
+        journalId,
+        afterSeq: String(after),
+        beforeSeq: String(high),
+        limit,
+      });
+      if (!stillOurs()) return null;
+      for (const ev of read.events) highest = Math.max(highest, Number(ev.seq) || 0);
+      this.applySettlementEvidence(instanceId, read.events);
+      const floor = read.windowFromSeq === null ? null : Number(read.windowFromSeq);
+      if (read.reachedAfterSeq || !read.events.length || floor === null || floor <= after + 1) {
+        return { highest, uninspectedBelow: null };
+      }
+      high = floor - 1;
+      // Evidence settled every owed command: stop descending (the rest of the
+      // range stays uninspected and is reported as such).
+      if (!this.owedCommandLacksEvidence(instanceId)) break;
+    }
+    return { highest, uninspectedBelow: high > after ? high : null };
   }
 
   /**
@@ -4165,35 +4225,42 @@ class HubStore {
           // Ruling AD3: the FORWARD scan uses the debt reader's OWN cursor
           // (tail.scanAfter), advanced through EVERY inspected page even when
           // it carries only unrelated events — otherwise a full unrelated page
-          // (the adapter slices to `limit`) would be reread forever and never
-          // reach a command journaled farther out. The bounded OVERLAP scan is
-          // separate, anchored at the frontier captured when the debt began.
+          // would be reread forever and never reach a command journaled
+          // farther out. r5 item 1: each read is bounded ABOVE (the Hub
+          // returns the newest rows of a range), and the cursor advances only
+          // over seqs a read inspected. The bounded OVERLAP scan is separate,
+          // anchored at the frontier captured when the debt began.
           try {
-            const forward = await api.eventsRead({
-              journalId: instance.journalId,
-              afterSeq: String(tail.scanAfter),
-              limit: OWED_TAIL_WINDOW,
-            });
+            const forward = await this.readOwedRange(
+              instanceId,
+              instance.journalId,
+              tail.scanAfter,
+              tail.scanBound ?? tail.scanAfter + OWED_TAIL_WINDOW,
+              OWED_TAIL_WINDOW,
+              stillOurs,
+            );
             // Retired WHILE a read was parked (held-response regression):
             // never fold the old identity's events into the successor store.
-            if (!stillOurs()) return;
+            if (!forward) return;
             answered = true;
             tail.attempts += 1;
-            const forwardHigh = forward.events.reduce(
-              (max, ev) => Math.max(max, Number(ev.seq) || 0),
-              tail.scanAfter,
-            );
-            tail.scanAfter = forwardHigh;
-            this.applySettlementEvidence(instanceId, forward.events);
+            if (forward.uninspectedBelow === null) {
+              tail.scanAfter = Math.max(tail.scanAfter, forward.highest);
+              tail.scanBound = null;
+            } else {
+              tail.scanBound = forward.uninspectedBelow;
+            }
             if (this.reconcileOwed.has(instanceId) && this.owedCommandLacksEvidence(instanceId)) {
-              const overlap = await api.eventsRead({
-                journalId: instance.journalId,
-                afterSeq: String(Math.max(0, tail.overlapBelow - OWED_TAIL_OVERLAP)),
-                beforeSeq: String(tail.overlapBelow),
-                limit: OWED_TAIL_OVERLAP,
-              });
-              if (!stillOurs()) return;
-              this.applySettlementEvidence(instanceId, overlap.events);
+              const overlap = await this.readOwedRange(
+                instanceId,
+                instance.journalId,
+                Math.max(0, tail.overlapBelow - OWED_TAIL_OVERLAP),
+                tail.overlapBound ?? tail.overlapBelow,
+                OWED_TAIL_OVERLAP,
+                stillOurs,
+              );
+              if (!overlap) return;
+              tail.overlapBound = overlap.uninspectedBelow;
             }
           } catch {
             if (!stillOurs()) return;

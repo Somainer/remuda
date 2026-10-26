@@ -5085,10 +5085,11 @@ fn write_qualified_dead_cert_bytes(
     write_qualified_dead_cert_bytes_locked(dir, cert, job_id, generation)
 }
 
-/// Certificate write body that assumes the ledger flock is already held. Used
-/// by the public writer (holds SHARED) and by startup migration (holds
-/// EXCLUSIVE), so the two never try to acquire conflicting flocks on two file
-/// descriptions in the same startup pass.
+/// Certificate write body that assumes the caller already holds the ledger
+/// SHARED flock. Only two callers qualify: the public writer above, and the
+/// startup legacy-fence migration, which runs inside the startup scan's SHARED
+/// guard. Every other writer, including the runtime legacy-cert migration
+/// (r39 item 1), must go through [`write_qualified_dead_cert_bytes`].
 #[cfg(unix)]
 fn write_qualified_dead_cert_bytes_locked(
     dir: &std::path::Path,
@@ -5426,9 +5427,15 @@ fn migrate_legacy_dead_cert(
     // Persist the migration under the qualified name with the legacy marker;
     // never stamp the request's merge into durable evidence. Best-effort: a
     // migration I/O failure simply re-attempts on the next probe.
+    //
+    // r39 item 1: this runtime path (a read-only probe migrating a legacy
+    // certificate) goes through the SHARED-flock writer, NOT the `_locked`
+    // helper which only a lock-holding caller (startup) may use — otherwise a
+    // migration rename could race startup reclamation the same way a live
+    // finalizer can.
     let mut migrated = cert.clone();
     migrated["provenance"] = json!(LEGACY_DEAD_CERT_PROVENANCE);
-    if write_qualified_dead_cert_bytes_locked(dir, &migrated, job_id, generation).is_ok() {
+    if write_qualified_dead_cert_bytes(dir, &migrated, job_id, generation).is_ok() {
         let _ = std::fs::remove_file(&legacy_path);
     }
     validate_dead_cert(
@@ -10420,6 +10427,104 @@ Running 8 tests across 2 projects
         assert!(
             super::read_land_group_dead_cert(&dir, job, 1, MERGE_A).is_some(),
             "the installed certificate survives reclamation"
+        );
+    }
+
+    /// r39 item 1: a RUNTIME legacy-cert migration (read-only probe lazily
+    /// promoting a `dead-<job>.json` to the qualified name) holds the ledger
+    /// SHARED flock for its rename. Reopening the ledger while that migration is
+    /// parked must NOT reclaim its temp; after release the qualified cert is
+    /// installed and the legacy source is removed.
+    #[test]
+    fn runtime_legacy_cert_migration_holds_ledger_flock_across_reopen() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        std::fs::create_dir_all(&dir).unwrap();
+        let job = "gjb_r39_legacymig";
+
+        // A valid pre-r34 legacy certificate (no mergeSha, legacy-fence provenance
+        // not required for the read-side migration).
+        let legacy_record = serde_json::json!({
+            "jobId": job,
+            "generation": 1,
+            "pgid": 6101,
+            "startTick": 13,
+            "diedAt": 1_700_000_000_000u64,
+            "cause": "killpg-esrch",
+        });
+        std::fs::write(
+            super::legacy_land_dead_cert_path(&dir, job),
+            legacy_record.to_string(),
+        )
+        .unwrap();
+        // An unrelated crash leftover that EXCLUSIVE startup would reclaim once
+        // no writer is active — it must survive while the migration is parked.
+        let leftover = dir.join(format!(
+            ".dead-other-g1.{}-{:09x}-2.tmp",
+            std::process::id(),
+            789u32
+        ));
+        std::fs::write(&leftover, b"{}").unwrap();
+
+        // Park the migration mid-rename (the barrier matches the migrated job).
+        let hold = arm_cert_temp_hold(dir.clone(), vec![job.to_owned()]);
+        let read_dir = dir.clone();
+        let reader = std::thread::spawn(move || {
+            // Triggers migrate_legacy_dead_cert under the SHARED flock.
+            super::read_land_group_dead_cert(&read_dir, job, 1, MERGE_A)
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while hold.entered() < 1 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            hold.entered(),
+            1,
+            "the legacy migration parks holding SHARED"
+        );
+
+        // Reopen while the migration is mid-rename: EXCLUSIVE is refused and
+        // reclamation must not touch its temp (or the leftover).
+        let _registry = super::GateRegistry::open(dir.clone());
+        let temps_during: usize = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                n.starts_with(".dead-") && n.ends_with(".tmp")
+            })
+            .count();
+        assert!(
+            temps_during >= 1,
+            "the parked migration's temp must survive reopen (found {temps_during})"
+        );
+        assert!(leftover.exists(), "reclamation skipped; leftover kept");
+        assert!(
+            !super::land_dead_cert_path(&dir, job, 1).exists(),
+            "qualified cert not installed while migration is parked"
+        );
+
+        // Release → migration finishes: qualified cert installed, legacy gone.
+        hold.release();
+        let cert = reader
+            .join()
+            .unwrap()
+            .expect("migration returns the migrated certificate");
+        assert_eq!(cert["jobId"], json!(job));
+        assert!(
+            super::land_dead_cert_path(&dir, job, 1).exists(),
+            "qualified cert installed"
+        );
+        assert!(
+            !super::legacy_land_dead_cert_path(&dir, job).exists(),
+            "legacy source removed after migration"
+        );
+
+        // Next reopen (no active migration) reclaims the leftover.
+        let _registry2 = super::GateRegistry::open(dir.clone());
+        assert!(
+            !leftover.exists(),
+            "leftover reclaimed once the ledger is free"
         );
     }
 

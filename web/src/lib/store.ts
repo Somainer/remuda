@@ -4125,8 +4125,12 @@ class HubStore {
         // same-identity rejection re-arms the CURRENT debt's tail: that
         // debt's own timer may have fired while this pass held the marker
         // and been coalesced away, which would otherwise strand it forever.
+        // No re-arm while the Outbox is mid-succession (null): a fresh pass
+        // would only reject again, so the next drain or trigger restarts it.
         if (!box || !debt || !stillOurs()) {
-          if (this.identityEpoch === epoch) this.scheduleOwedTail(instanceId, OWED_TAIL_BASE_BACKOFF_MS);
+          if (this.identityEpoch === epoch && this.outbox) {
+            this.scheduleOwedTail(instanceId, OWED_TAIL_BASE_BACKOFF_MS);
+          }
           return;
         }
         if (!this.owedCommandLacksEvidence(instanceId)) {

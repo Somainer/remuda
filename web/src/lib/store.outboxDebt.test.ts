@@ -1265,3 +1265,38 @@ it("r4 item 2: a queued stale drain then a queued past-deadline tail pass never 
   expect(h.outbox?.get(firstId)?.state).toBe("sent");
   expect(h.outbox?.get(secondId)?.state).toBe("sent");
 });
+
+it("r4 item 2: a tail pass rejected while the Outbox is mid-succession does not re-arm a timer loop", async () => {
+  // Ordinary credential succession disposes the Outbox WITHOUT bumping the
+  // identity epoch, so retained debt can meet a null Outbox. A pass rejected
+  // there must not re-arm itself every base backoff until the next Outbox.
+  const { api, hubStore } = await fresh();
+  await mountFollow(api, hubStore);
+  vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+    const commandId = _args[4] as string;
+    return Promise.resolve(commandResult(commandId, "accepted"));
+  });
+  const h = hubStore as unknown as {
+    applyAuthIdentityChange: () => void;
+    runOwedTailPass: (id: string) => void;
+    owedTail: Map<string, { timer: ReturnType<typeof setTimeout> | null }>;
+    owedTailRunning: Set<string>;
+    outbox: unknown;
+  };
+
+  await hubStore.send(INSTANCE, "owed across succession");
+  await vi.waitFor(() => expect(hubStore.getSnapshot().bubbles[0]?.outboxState).toBe("sent"));
+  await vi.waitFor(() => expect(h.owedTail.get(INSTANCE)?.timer).not.toBeNull());
+  const tail = h.owedTail.get(INSTANCE)!;
+  clearTimeout(tail.timer!);
+  tail.timer = null;
+
+  h.applyAuthIdentityChange();
+  expect(h.outbox).toBeNull();
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(true);
+
+  h.runOwedTailPass(INSTANCE);
+  for (let i = 0; i < 40; i += 1) await Promise.resolve();
+  expect(h.owedTailRunning.has(INSTANCE)).toBe(false);
+  expect(h.owedTail.get(INSTANCE)?.timer).toBeNull();
+});

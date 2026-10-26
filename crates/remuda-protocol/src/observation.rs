@@ -699,6 +699,14 @@ pub struct UsagePayload {
     pub mode: UsageMode,
     /// `metric_revision`; protocol §5.5.
     pub metric_revision: U64,
+    /// Native session id qualifying [`Self::metric_revision`]: the revision is
+    /// a record position WITHIN one native session transcript, so two
+    /// sessions both start at position 1 and their authorities must not
+    /// freeze each other. `None` for producers that do not report a session
+    /// (legacy/unknown lineage); the Hub compares watermarks only within one
+    /// qualified lineage (c-ctxusage r15 item 4).
+    #[serde(default, deserialize_with = "crate::scalar::required_option")]
+    pub source_session_id: Option<String>,
     /// `input_tokens`; protocol §5.5.
     pub input_tokens: Knowledge<U64>,
     /// `input_accounting`; protocol §5.5.

@@ -184,14 +184,20 @@ fn camel_counters(usage: &Value, shape: CamelShape) -> TokenCounters {
             "reasoning_tokens",
         )
     };
-    let input = usage[input_key].as_u64().unwrap_or(0);
-    let output = usage[output_key].as_u64().unwrap_or(0);
-    let cache_read = usage[read_key].as_u64().unwrap_or(0);
-    let cache_write = usage[write_key].as_u64().unwrap_or(0);
+    let known = |key: &str| usage.get(key).and_then(serde_json::Value::as_u64);
+    let input = known(input_key);
+    let output = known(output_key);
+    let cache_read = known(read_key);
+    let cache_write = known(write_key);
+    // Presence is preserved (c-ctxusage r15 item 5): the including-cache
+    // uncached derivation needs the total and both cache buckets.
     let uncached = match shape {
-        CamelShape::TotalIncludingCache => {
-            input.saturating_sub(cache_read).saturating_sub(cache_write)
-        }
+        CamelShape::TotalIncludingCache => match (input, cache_read, cache_write) {
+            (Some(total), Some(read), Some(write)) => {
+                Some(total.saturating_sub(read).saturating_sub(write))
+            }
+            _ => None,
+        },
         CamelShape::CamelUncached | CamelShape::SnakeUncached => input,
     };
     let _ = reasoning_key;
@@ -200,9 +206,10 @@ fn camel_counters(usage: &Value, shape: CamelShape) -> TokenCounters {
         output,
         cache_read,
         // Grok exposes no cache-write TTL split; price at the single tier
-        // (the table sets both TTL rates equal for grok families).
+        // (the table sets both TTL rates equal for grok families). The
+        // absent 1-hour tier is a structural zero for this provider.
         cache_write_5m: cache_write,
-        cache_write_1h: 0,
+        cache_write_1h: Some(0),
     }
 }
 
@@ -274,9 +281,9 @@ mod tests {
         let event = &events[0];
         assert_eq!(event.model.as_deref(), Some("grok-4.6-build"));
         // input includes cache: 26512 - 640 - 0 = 25872 uncached.
-        assert_eq!(event.tokens.uncached_input, 25872);
-        assert_eq!(event.tokens.cache_read, 640);
-        assert_eq!(event.tokens.output, 35);
+        assert_eq!(event.tokens.uncached_input, Some(25872));
+        assert_eq!(event.tokens.cache_read, Some(640));
+        assert_eq!(event.tokens.output, Some(35));
         assert_eq!(event.reasoning_tokens, Some(30));
         assert_eq!(event.reported_cost_usd, Some(0.00910418));
         assert!(event.cost_usd.is_some());
@@ -319,9 +326,9 @@ mod tests {
         });
         let event = usage_from_update_frame(&frame).expect("event");
         assert_eq!(event.turn_id.as_deref(), Some("prompt-9"));
-        assert_eq!(event.tokens.uncached_input, 750);
-        assert_eq!(event.tokens.cache_read, 200);
-        assert_eq!(event.tokens.cache_write_5m, 50);
+        assert_eq!(event.tokens.uncached_input, Some(750));
+        assert_eq!(event.tokens.cache_read, Some(200));
+        assert_eq!(event.tokens.cache_write_5m, Some(50));
         assert_eq!(event.source, UsageSource::GrokUpdates);
     }
 
@@ -366,12 +373,12 @@ mod tests {
         assert_eq!(events.len(), 2);
         let aggregate = &events[0];
         assert_eq!(aggregate.source, UsageSource::GrokHeadless);
-        assert_eq!(aggregate.tokens.uncached_input, 26512);
+        assert_eq!(aggregate.tokens.uncached_input, Some(26512));
         assert_eq!(aggregate.reported_cost_usd, Some(0.00910418));
         assert_eq!(events[1].model.as_deref(), Some("grok-4.6-build"));
         // The per-model camelCase object is still treated under headless
         // uncached semantics: its inputTokens matches the uncached aggregate.
-        assert_eq!(events[1].tokens.uncached_input, 26512);
+        assert_eq!(events[1].tokens.uncached_input, Some(26512));
     }
 
     #[test]

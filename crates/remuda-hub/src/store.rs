@@ -7653,6 +7653,39 @@ fn apply_instance_projection(
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
+        // c-dirpicker r8 (real-node unregister race), refined r37 item 9: a
+        // non-terminal ready/starting event must not resurrect a row an
+        // OPERATOR (or the stale-create sweep / Node launch rejection) ATTESTED
+        // failed — but the lifecycle STRING alone is not that attestation.
+        // A legacy `failed` row can be AMBIGUOUS: no ended_at and a nonterminal
+        // historical error (api-error/429, a configure/turn failure) recorded
+        // while the process stayed alive. Such a row is potentially live and a
+        // subsequent `ready` from the live process MUST recover it. Authority
+        // is therefore the shared lifecycle_has_process_end_evidence predicate
+        // over the already-loaded previous row: stamped ended_at (a classified
+        // end / fail_instance / the sweep all stamp it) or an exact
+        // never-started launch marker. Any additional authoritative operator
+        // action must write one of those markers, not merely set the string.
+        let non_terminal = !matches!(lifecycle, "exited" | "failed" | "closed");
+        let stored_attested_failed =
+            previous_row
+                .as_ref()
+                .is_some_and(|(prev_lifecycle, prev_error, prev_ended)| {
+                    prev_lifecycle == "failed"
+                        && lifecycle_has_process_end_evidence(
+                            prev_lifecycle,
+                            prev_error.as_deref(),
+                            prev_ended.as_deref(),
+                        )
+                });
+        if non_terminal && stored_attested_failed {
+            // Advance durable_seq/updated_at only; leave lifecycle failed.
+            conn.execute(
+                "UPDATE instances SET durable_seq = ?1, updated_at = ?2 WHERE id = ?3",
+                params![seq, now, instance_id],
+            )?;
+            return Ok(());
+        }
         conn.execute(
             "UPDATE instances SET durable_seq = ?1, lifecycle = ?2,
                     last_error = COALESCE(?3, last_error), updated_at = ?4
@@ -10818,6 +10851,119 @@ mod tests {
             .await
             .unwrap();
         assert!(!changed_again);
+        store.close().await;
+    }
+
+    /// r37 item 9 (case 1): an AMBIGUOUS legacy `failed` row — no ended_at and a
+    /// nonterminal error like `api-error: 429` recorded while the process stayed
+    /// alive — is not attested terminal evidence. A later live `ready` event
+    /// recovers it back to ready and clears the idle activity.
+    #[tokio::test]
+    async fn ambiguous_failed_row_recovers_on_a_live_ready_event() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "r37i9-recover").await;
+        let instance = seed_acknowledged_instance(&store, &host).await;
+        let db = rusqlite::Connection::open(dir.path().join("hub.sqlite")).unwrap();
+        db.execute(
+            "UPDATE instances SET lifecycle='failed', activity='idle',
+                ended_at=NULL, last_error='api-error: 429' WHERE id=?1",
+            rusqlite::params![instance.instance_id],
+        )
+        .unwrap();
+        drop(db);
+
+        store
+            .append_journal(
+                host,
+                instance.instance_id.clone(),
+                None,
+                json!({"kind":"lifecycle","payload":{
+                    "type":"entity","entityType":"instance","state":"ready"}}),
+            )
+            .await
+            .expect("append ready");
+
+        let row = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.lifecycle, "running",
+            "an ambiguous failed row with a live process recovers: the entity \
+             ready projects to ready and the derive layer normalizes it to the \
+             live 'running' lifecycle — it must never stay falsely terminal"
+        );
+        assert!(
+            !store.instance_has_process_end_evidence(&row).await.unwrap(),
+            "return-to-live leaves no process-end evidence"
+        );
+        store.close().await;
+    }
+
+    /// r37 item 9 (case 2): a genuinely ATTESTED failed row — one with stamped
+    /// process-end evidence (ended_at, or the never-started launch marker) —
+    /// stays protected: a later non-terminal ready/starting event only advances
+    /// the durable cursor and never resurrects it.
+    #[tokio::test]
+    async fn attested_failed_row_stays_failed_through_a_live_ready_event() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "r37i9-protect").await;
+        let ended = seed_acknowledged_instance(&store, &host).await;
+        let never_started = seed_acknowledged_instance(&store, &host).await;
+        let db = rusqlite::Connection::open(dir.path().join("hub.sqlite")).unwrap();
+        // A classified end: failed WITH ended_at.
+        db.execute(
+            "UPDATE instances SET lifecycle='failed', activity='idle',
+                ended_at='2026-10-01T00:00:00.000Z', last_error='exit code 1'
+              WHERE id=?1",
+            rusqlite::params![ended.instance_id],
+        )
+        .unwrap();
+        // A launch that never started: the exact attested marker, no ended_at.
+        db.execute(
+            "UPDATE instances SET lifecycle='failed', activity='idle',
+                ended_at=NULL, last_error=?2 WHERE id=?1",
+            rusqlite::params![never_started.instance_id, CREATE_NEVER_ACKNOWLEDGED_MARKER],
+        )
+        .unwrap();
+        drop(db);
+
+        for id in [&ended.instance_id, &never_started.instance_id] {
+            store
+                .append_journal(
+                    host.clone(),
+                    id.clone(),
+                    None,
+                    json!({"kind":"lifecycle","payload":{
+                        "type":"entity","entityType":"instance","state":"ready"}}),
+                )
+                .await
+                .expect("append ready");
+            let row = store.get_instance(id.clone()).await.unwrap().unwrap();
+            assert_eq!(
+                row.lifecycle, "failed",
+                "an attested failed row is never resurrected by a ready event"
+            );
+        }
+        let ended_preserved: Option<String> = {
+            let db = rusqlite::Connection::open(dir.path().join("hub.sqlite")).unwrap();
+            db.query_row(
+                "SELECT ended_at FROM instances WHERE id=?1",
+                rusqlite::params![ended.instance_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            ended_preserved.as_deref(),
+            Some("2026-10-01T00:00:00.000Z"),
+            "the attested end timestamp is preserved"
+        );
         store.close().await;
     }
 

@@ -305,8 +305,12 @@ fn an_unmatched_turn_only_call_and_a_message_call_sum_to_120() {
     assert_eq!(rollup.tpm_in_5m, Some(20));
 
     let instance = aggregate_instance(&conn, INSTANCE).unwrap();
-    assert_eq!(instance.output_tokens, 120, "aggregate keeps the Turn call");
-    assert_eq!(instance.input_tokens, 100);
+    assert_eq!(
+        instance.output_tokens,
+        Some(120),
+        "aggregate keeps the Turn call"
+    );
+    assert_eq!(instance.input_tokens, Some(100));
     // c-usagefu r10 item 6 (Ruling B): eligible flow EXISTS (the old Turn t1
     // plus the new Message), so COST follows the flow and the priced Session
     // stock is ignored: bill = the unmatched historical Turn's 0.10 + the new
@@ -314,12 +318,12 @@ fn an_unmatched_turn_only_call_and_a_message_call_sum_to_120() {
     let expected_cost = 0.10 + message_cost(&conn);
     let supply = aggregate_supply(&conn, PROFILE, MODEL).unwrap();
     assert!(
-        (instance.cost_usd - expected_cost).abs() < 1e-9,
+        (instance.cost_usd.unwrap() - expected_cost).abs() < 1e-9,
         "flow cost 0.10 + message, not the priced stock, got {}",
-        instance.cost_usd
+        instance.cost_usd.unwrap()
     );
-    assert_eq!(supply.output_tokens, 120);
-    assert!((supply.cost_usd - expected_cost).abs() < 1e-9);
+    assert_eq!(supply.output_tokens, Some(120));
+    assert!((supply.cost_usd.unwrap() - expected_cost).abs() < 1e-9);
 }
 
 #[test]
@@ -382,11 +386,18 @@ fn a_turn_represented_by_a_matching_message_is_counted_once_after_upgrade() {
     // bill is the adapter-priced Message stream only.
     let expected_cost = message_cost(&conn);
     let instance = aggregate_instance(&conn, INSTANCE).unwrap();
-    assert_eq!(instance.output_tokens, 120, "not 220 (100 turn + 100 + 20)");
-    assert!((instance.cost_usd - expected_cost).abs() < 1e-9, "no +0.10");
+    assert_eq!(
+        instance.output_tokens,
+        Some(120),
+        "not 220 (100 turn + 100 + 20)"
+    );
+    assert!(
+        (instance.cost_usd.unwrap() - expected_cost).abs() < 1e-9,
+        "no +0.10"
+    );
     let supply = aggregate_supply(&conn, PROFILE, MODEL).unwrap();
-    assert_eq!(supply.output_tokens, 120);
-    assert!((supply.cost_usd - expected_cost).abs() < 1e-9);
+    assert_eq!(supply.output_tokens, Some(120));
+    assert!((supply.cost_usd.unwrap() - expected_cost).abs() < 1e-9);
 }
 
 /// Insert an old-shape cumulative Session growth point into the pre-r6
@@ -450,19 +461,26 @@ fn session_only_cumulative_history_takes_the_latest_stock_not_the_sum() {
     assert_eq!(rollup.tpm_out_5m, Some(2));
 
     let instance = aggregate_instance(&conn, INSTANCE).unwrap();
-    assert_eq!(instance.input_tokens, 30, "aggregate latest, not 10+30");
-    assert_eq!(instance.output_tokens, 15);
-    assert!((instance.cost_usd - 0.03).abs() < 1e-9, "latest stock cost");
+    assert_eq!(
+        instance.input_tokens,
+        Some(30),
+        "aggregate latest, not 10+30"
+    );
+    assert_eq!(instance.output_tokens, Some(15));
+    assert!(
+        (instance.cost_usd.unwrap() - 0.03).abs() < 1e-9,
+        "latest stock cost"
+    );
     let supply = aggregate_supply(&conn, PROFILE, MODEL).unwrap();
-    assert_eq!(supply.input_tokens, 30);
-    assert_eq!(supply.output_tokens, 15);
-    assert!((supply.cost_usd - 0.03).abs() < 1e-9);
+    assert_eq!(supply.input_tokens, Some(30));
+    assert_eq!(supply.output_tokens, Some(15));
+    assert!((supply.cost_usd.unwrap() - 0.03).abs() < 1e-9);
 
     // Idempotent re-migrate keeps the latest-stock answer.
     migrate(&conn).unwrap();
     assert_eq!(
         aggregate_instance(&conn, INSTANCE).unwrap().input_tokens,
-        30
+        Some(30)
     );
 }
 
@@ -504,11 +522,15 @@ fn stock_only_instance_switches_to_flow_once_a_real_call_arrives() {
     assert_eq!(rollup.tpm_out_60s, Some(7));
 
     let instance = aggregate_instance(&conn, INSTANCE).unwrap();
-    assert_eq!(instance.output_tokens, 7, "no cumulative history on flow");
-    assert_eq!(instance.input_tokens, 5);
+    assert_eq!(
+        instance.output_tokens,
+        Some(7),
+        "no cumulative history on flow"
+    );
+    assert_eq!(instance.input_tokens, Some(5));
     let supply = aggregate_supply(&conn, PROFILE, MODEL).unwrap();
-    assert_eq!(supply.output_tokens, 7);
-    assert_eq!(supply.input_tokens, 5);
+    assert_eq!(supply.output_tokens, Some(7));
+    assert_eq!(supply.input_tokens, Some(5));
 }
 
 #[test]
@@ -554,9 +576,9 @@ fn a_legacy_null_scope_turn_counts_as_flow_against_cumulative_stock() {
     assert_eq!(rollup.tpm_out_60s, Some(20));
 
     let instance = aggregate_instance(&conn, INSTANCE).unwrap();
-    assert_eq!(instance.input_tokens, 40, "not 30 stock, not 30+40");
-    assert_eq!(instance.output_tokens, 20);
+    assert_eq!(instance.input_tokens, Some(40), "not 30 stock, not 30+40");
+    assert_eq!(instance.output_tokens, Some(20));
     let supply = aggregate_supply(&conn, PROFILE, MODEL).unwrap();
-    assert_eq!(supply.input_tokens, 40);
-    assert_eq!(supply.output_tokens, 20);
+    assert_eq!(supply.input_tokens, Some(40));
+    assert_eq!(supply.output_tokens, Some(20));
 }

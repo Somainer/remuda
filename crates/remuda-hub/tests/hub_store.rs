@@ -309,6 +309,131 @@ async fn bounded_ingest_yields_to_a_concurrent_point_read() -> Result<()> {
     Ok(())
 }
 
+/// Regression (Ruling X) for the unified usage-fold fixed prepare cost: with
+/// durable usage rows present across several native sessions (lineages), a
+/// concurrent point read must still land within [`POINT_READ_BUDGET`], because
+/// the ~41 KB fold graph is prepared ONCE and cached on the long-lived writer
+/// connection. The rollup totals must equal the hand-computed fold (parity with
+/// the `usage_store` fold unit suite).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn point_read_budget_holds_with_usage_rows() -> Result<()> {
+    use remuda_hub::store_test_support::{UsageEventRow, seed_usage_events};
+
+    let dir = tempfile::tempdir()?;
+    let (store, host_id) = open_with_host(dir.path(), "ingest-usage").await?;
+    let instance_id = "ins_ingest_usage".to_string();
+    store
+        .ensure_instance(host_id.clone(), instance_id.clone())
+        .await?;
+
+    // 48 winning turns spread evenly across 3 native sessions (lineages). Each
+    // turn is its own scope id with fully-known buckets, so the fold yields one
+    // winner per scope and the totals are a straight sum.
+    const TURNS: i64 = 48;
+    const LINEAGES: i64 = 3;
+    let per = TURNS / LINEAGES;
+    let mut rows = Vec::new();
+    let mut seq = 1i64;
+    for lineage in 0..LINEAGES {
+        for n in 0..per {
+            let idx = lineage * per + n + 1;
+            rows.push(UsageEventRow {
+                instance_id: instance_id.clone(),
+                seq,
+                profile_id: None,
+                model: Some("haiku".into()),
+                scope: "turn".into(),
+                scope_id: Some(format!("turn-{idx:02}")),
+                turn_id: None,
+                metric_revision: 1,
+                source_session_id: Some(format!("sess-{lineage}")),
+                mode: "snapshot".into(),
+                total_tokens: Some(1000 + 200 + 10 + 5),
+                input_tokens: Some(1000),
+                output_tokens: Some(200),
+                cache_read_tokens: Some(10),
+                cache_write_tokens: Some(5),
+                cost_usd: None,
+                accounting: "reported".into(),
+                observed_at: "2026-10-16T00:00:00.000Z".into(),
+                observed_at_source: "native".into(),
+                native_context_window: None,
+            });
+            seq += 1;
+        }
+    }
+    let inserted = seed_usage_events(&store, rows).await?;
+    assert_eq!(inserted as i64, TURNS);
+
+    // Steady-state warm-up: prepare every fold statement the rollup uses now,
+    // before the timed section, so the budget measures the cached steady-state
+    // read (the one-time per-process planner cost is paid off the hot path).
+    let warm = store
+        .get_instance(instance_id.clone())
+        .await?
+        .context("instance exists")?;
+    let rollup = warm
+        .usage_rollup
+        .context("rollup present with usage rows")?;
+    assert!(!rollup.unavailable, "rollup must not be unavailable");
+    assert_eq!(rollup.turns, TURNS);
+    assert_eq!(rollup.session_input_tokens, Some(1000 * TURNS));
+    assert_eq!(rollup.session_output_tokens, Some(200 * TURNS));
+    assert_eq!(rollup.cache_read_tokens, Some(10 * TURNS));
+    assert_eq!(rollup.cache_creation_tokens, Some(5 * TURNS));
+
+    // Same contention scenario as the zero-usage budget test: a 256-event
+    // ingest folded into 64-event chunks, with the point read queued alongside.
+    const BATCH: i64 = 256;
+    let events: Vec<Value> = (1..=BATCH)
+        .map(|n| json!({ "kind": "message", "payload": { "text": "ingest", "n": n } }))
+        .collect();
+    let writer = {
+        let store = store.clone();
+        let host_id = host_id.clone();
+        let instance_id = instance_id.clone();
+        tokio::spawn(async move {
+            let mut first = Some(1_i64);
+            for chunk in events.chunks(APPEND_CHUNK_MAX) {
+                store
+                    .append_journal_batch(
+                        host_id.clone(),
+                        instance_id.clone(),
+                        first,
+                        chunk.to_vec(),
+                    )
+                    .await
+                    .expect("append batch");
+                first = None;
+            }
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let probe = {
+        let store = store.clone();
+        let instance_id = instance_id.clone();
+        tokio::spawn(async move { store.get_instance(instance_id).await })
+    };
+    let started = Instant::now();
+    let record = probe
+        .await?
+        .expect("point read")
+        .context("instance exists")?;
+    assert!(
+        started.elapsed() < POINT_READ_BUDGET,
+        "point read (usage rows) waited {:?} while ingest landed",
+        started.elapsed()
+    );
+    assert_eq!(record.instance_id, instance_id);
+    writer.await?;
+
+    // Plain message ingest adds no usage; the rollup is unchanged afterwards.
+    let after = record.usage_rollup.context("rollup survives ingest")?;
+    assert_eq!(after.turns, TURNS);
+    assert_eq!(after.session_input_tokens, Some(1000 * TURNS));
+    Ok(())
+}
+
 /// Seed `total` message events for one instance via bounded batches.
 async fn seed_events(
     store: &remuda_hub::store_test_support::Store,

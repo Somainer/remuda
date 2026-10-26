@@ -15,9 +15,6 @@ import { login } from "./hub-auth";
  */
 
 test.describe.configure({ mode: "serial" });
-// The usage sentinel is served by the in-process fake Node; an external hub
-// cannot reproduce it (same gate as api-route.hub.spec.ts).
-test.skip(process.env.HUB_E2E_EXTERNAL === "1", "needs the in-process fake Nodes");
 
 const evidence =
   process.env.REMUDA_EVIDENCE === "1"
@@ -187,10 +184,8 @@ test("context chip: ring percentage and popover rollup over three turns", async 
   page,
 }, testInfo) => {
   test.setTimeout(180_000);
-  // Pin the desktop geometry explicitly — the chip's popover anchor and
-  // hit-testing are geometry-dependent; never rely on the config default.
-  await page.setViewportSize({ width: 1440, height: 900 });
   const instanceId = await createReadySession(page);
+  created.push(instanceId);
 
   // Before any usage observation the chip is an empty ring with a dash; per
   // RC3 it still opens the usage card in the "harness never reported" state.
@@ -275,9 +270,12 @@ test("context chip: ring percentage and popover rollup over three turns", async 
   await expect(page.getByTestId("context-usage-cell-缓存读")).toContainText("63.1k");
   await expect(page.getByTestId("context-usage-turns")).toHaveText("2");
 
-  // Turn 3 — Grok-shaped: output only (`-` channels). Session sums keep
-  // growing for reported channels; the context figure becomes unknown and
-  // the headline names the channel that would supply it.
+  // Turn 3 — Grok-shaped: output only (`-` channels). U1 (c-ctxusage r16
+  // item 4): a bucket omitted by ANY contributing turn folds the SESSION sum
+  // to Unknown, so the input/cache cells become "—" (never the turns 1-2
+  // partial sum, never 0); output was reported by every turn and keeps
+  // growing. The next-request context figure is unknown as well and the
+  // headline names the channel that would supply it.
   await sendUsageTurn(page, "-,420,-,-", true);
   await expect(chip).toHaveText("—", { timeout: 15_000 });
   await chip.click();
@@ -288,9 +286,9 @@ test("context chip: ring percentage and popover rollup over three turns", async 
     .getByTestId("context-usage-headline")
     .getAttribute("title");
   expect(headlineTitle ?? "").toMatch(/input|cacheRead|cacheCreation/);
-  await expect(page.getByTestId("context-usage-cell-入")).toContainText("6.6k");
+  await expect(page.getByTestId("context-usage-cell-入")).toContainText("—");
   await expect(page.getByTestId("context-usage-cell-出")).toContainText("865");
-  await expect(page.getByTestId("context-usage-cell-缓存读")).toContainText("63.1k");
+  await expect(page.getByTestId("context-usage-cell-缓存读")).toContainText("—");
   await expect(page.getByTestId("context-usage-turns")).toHaveText("3");
 
   await page.keyboard.press("Escape");
@@ -308,6 +306,7 @@ test("context chip popover becomes a sheet at 390 px touch width", async ({ brow
   try {
     await login(narrow);
     const instanceId = await createReadySession(narrow);
+    created.push(instanceId);
     await sendUsageTurn(narrow, "4794,260,29496,0", false, true);
     // D-042 (c-composer): at compact widths the context chip rides inside the
     // composer options sheet, not the collapsed bar. Open the sheet first.

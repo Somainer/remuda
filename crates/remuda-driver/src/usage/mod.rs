@@ -167,10 +167,14 @@ impl UsageEvent {
 pub struct UsageTotals {
     /// Number of deduped model calls represented.
     pub events: u64,
-    /// Normalized counters summed across calls.
+    /// Normalized counters summed across calls. A bucket is Known only when
+    /// EVERY contributing call reported it; one omission folds it to Unknown
+    /// (U1, c-ctxusage r16 item 4).
     pub tokens: TokenCounters,
-    /// Reasoning/thinking tokens summed when reported.
-    pub reasoning_tokens: u64,
+    /// Reasoning/thinking tokens summed when reported. `None` means either no
+    /// call has been folded yet or AT LEAST ONE contributing call omitted the
+    /// breakout — Unknown, never zero (U1, c-ctxusage r16 item 4).
+    pub reasoning_tokens: Option<u64>,
     /// Sum of table estimates; `None` when **any** call could not be priced
     /// (unknown model), so the figure is never presented as a complete bill.
     /// The initial `None` (no calls yet) is distinguished from a poisoned
@@ -183,24 +187,41 @@ pub struct UsageTotals {
 
 impl UsageTotals {
     pub(crate) fn add(&mut self, event: &UsageEvent) {
+        // The first contribution SEEDS the accumulator verbatim: a defaulted
+        // `None` bucket means "nothing folded yet", while the first real
+        // call's `None` means "this call omitted the bucket" — the two must
+        // not be conflated (U1, c-ctxusage r16 item 4). After seeding, an
+        // omission by ANY later call poisons the folded bucket to Unknown.
+        let first = self.events == 0;
         self.events += 1;
-        self.tokens.uncached_input += event.tokens.uncached_input;
-        self.tokens.output += event.tokens.output;
-        self.tokens.cache_read += event.tokens.cache_read;
-        self.tokens.cache_write_5m += event.tokens.cache_write_5m;
-        self.tokens.cache_write_1h += event.tokens.cache_write_1h;
-        self.reasoning_tokens += event.reasoning_tokens.unwrap_or(0);
-        // Once ANY folded call is unpriced, the cumulative estimate is
-        // permanently Unknown — it must never revive. A revival restarts the
-        // running sum at the later call's price, so the emitted cumulative
-        // Session cost can shrink below the previous point and the Hub freezes
-        // it until the running total catches up, stalling the context chip
-        // (c-usagefu r4 item 4). Token counters are unaffected by price-table
-        // coverage and keep summing above.
+        if first {
+            self.tokens = event.tokens;
+            self.reasoning_tokens = event.reasoning_tokens;
+        } else {
+            self.tokens = self.tokens.fold_counts(&event.tokens);
+            self.reasoning_tokens = match (self.reasoning_tokens, event.reasoning_tokens) {
+                (Some(total), Some(part)) => Some(
+                    total
+                        .checked_add(part)
+                        .expect("reasoning token total must not overflow"),
+                ),
+                // A call that does not break reasoning out makes the fold
+                // Unknown, even when other calls reported it (U1).
+                _ => None,
+            };
+        }
+        // Once ANY folded call is unpriced, the cumulative estimate stays
+        // Unknown permanently — a later priced call never revives it
+        // (c-usagefu r4 item 4: a revival restarts the running sum at the
+        // later price, the cumulative Session cost can shrink below the prior
+        // point and the Hub freezes it until the sum catches up, stalling the
+        // context chip). Token/reasoning counters are NOT affected by price
+        // coverage: they keep summing per field above.
         match event.cost_usd {
             Some(cost) if !self.cost_unpriceable => {
                 self.cost_usd = Some(self.cost_usd.unwrap_or(0.0) + cost);
             }
+            // Price coverage stays permanently gone after an unpriced call.
             Some(_) => {}
             None => {
                 self.cost_unpriceable = true;
@@ -305,8 +326,17 @@ impl UsageAggregator {
     }
 }
 
-fn known(value: u64) -> Knowledge<U64> {
-    Knowledge::Known { value: U64(value) }
+/// A reported bucket becomes `Known`; a bucket the source OMITTED stays
+/// `Unknown` with a provenance reason — never a fabricated zero
+/// (c-ctxusage r15 item 5).
+fn known_optional(value: Option<u64>) -> Knowledge<U64> {
+    match value {
+        Some(value) => Knowledge::Known { value: U64(value) },
+        None => Knowledge::Unknown {
+            reason: "bucket-not-reported".into(),
+            evidence_event_ids: Vec::new(),
+        },
+    }
 }
 
 fn cost_knowledge(totals: &UsageTotals) -> Knowledge<Cost> {
@@ -345,6 +375,7 @@ pub fn to_usage_payload(
     scope: UsageScope,
     scope_id: impl Into<String>,
     revision: u64,
+    source_session_id: Option<&str>,
     totals: &UsageTotals,
 ) -> UsagePayload {
     let total = totals.tokens.total();
@@ -354,13 +385,18 @@ pub fn to_usage_payload(
         scope_id: scope_id.into(),
         mode: UsageMode::Snapshot,
         metric_revision: U64(revision),
-        input_tokens: known(totals.tokens.uncached_input),
+        source_session_id: source_session_id
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned),
+        input_tokens: known_optional(totals.tokens.uncached_input),
         input_accounting: InputAccounting::Uncached,
-        output_tokens: known(totals.tokens.output),
-        reasoning_tokens: known(totals.reasoning_tokens),
-        cache_read_tokens: known(totals.tokens.cache_read),
-        cache_write_tokens: known(totals.tokens.cache_write()),
-        total_tokens: known(total),
+        output_tokens: known_optional(totals.tokens.output),
+        // U1 (c-ctxusage r16 item 4): reasoning is Unknown whenever any
+        // contributing call omitted the breakout — never a fabricated zero.
+        reasoning_tokens: known_optional(totals.reasoning_tokens),
+        cache_read_tokens: known_optional(totals.tokens.cache_read),
+        cache_write_tokens: known_optional(totals.tokens.cache_write()),
+        total_tokens: known_optional(total),
         cost: cost_knowledge(totals),
         accounting: Accounting::Estimated,
         native_fields_ref: None,
@@ -390,13 +426,14 @@ mod tests {
         )
     }
 
+    /// Fully-reported counters for the legacy "complete record" tests.
+    fn tk(input: u64, output: u64) -> TokenCounters {
+        TokenCounters::known(input, output, 0, 0, 0)
+    }
+
     #[test]
     fn claude_message_usage_is_deduped_per_message_id() {
-        let tokens = TokenCounters {
-            uncached_input: 10,
-            output: 20,
-            ..TokenCounters::default()
-        };
+        let tokens = tk(10, 20);
         let mut agg = UsageAggregator::new();
         // Five content-block records repeat the same message usage.
         let mut results = Vec::new();
@@ -413,23 +450,13 @@ mod tests {
         assert_eq!(results, vec![true, false, false, false, false]);
         let accepted = agg.session().events;
         assert_eq!(accepted, 1, "repeated content-block usage must count once");
-        assert_eq!(agg.turn("turn-1").unwrap().tokens.output, 20);
+        assert_eq!(agg.turn("turn-1").unwrap().tokens.output, Some(20));
     }
 
     #[test]
     fn codex_cumulative_token_count_snapshots_are_never_added() {
-        let per_response = TokenCounters {
-            uncached_input: 90,
-            cache_read: 10,
-            output: 20,
-            ..TokenCounters::default()
-        };
-        let cumulative = TokenCounters {
-            uncached_input: 900,
-            cache_read: 100,
-            output: 200,
-            ..TokenCounters::default()
-        };
+        let per_response = TokenCounters::known(90, 20, 10, 0, 0);
+        let cumulative = TokenCounters::known(900, 200, 100, 0, 0);
         let mut agg = UsageAggregator::new();
         assert!(agg.push(&event(
             UsageSource::CodexTokenUsageRecord,
@@ -446,7 +473,7 @@ mod tests {
             cumulative,
         )));
         assert_eq!(agg.ignored_cumulative(), 1);
-        assert_eq!(agg.session().tokens.output, 20);
+        assert_eq!(agg.session().tokens.output, Some(20));
     }
 
     #[test]
@@ -457,27 +484,19 @@ mod tests {
             Some("t1"),
             Some("r1"),
             Some("gpt-5.4"),
-            TokenCounters {
-                uncached_input: 100,
-                output: 5,
-                ..TokenCounters::default()
-            },
+            tk(100, 5),
         ));
         agg.push(&event(
             UsageSource::CodexTokenUsageRecord,
             Some("t2"),
             Some("r2"),
             Some("gpt-5.4"),
-            TokenCounters {
-                uncached_input: 200,
-                output: 7,
-                ..TokenCounters::default()
-            },
+            tk(200, 7),
         ));
         assert_eq!(agg.turns().len(), 2);
-        assert_eq!(agg.turn("t1").unwrap().tokens.uncached_input, 100);
-        assert_eq!(agg.turn("t2").unwrap().tokens.uncached_input, 200);
-        assert_eq!(agg.session().tokens.uncached_input, 300);
+        assert_eq!(agg.turn("t1").unwrap().tokens.uncached_input, Some(100));
+        assert_eq!(agg.turn("t2").unwrap().tokens.uncached_input, Some(200));
+        assert_eq!(agg.session().tokens.uncached_input, Some(300));
         assert_eq!(agg.session().events, 2);
         assert!(agg.session().cost_usd().is_some());
     }
@@ -489,10 +508,10 @@ mod tests {
         // priced one, emitting a cumulative Session cost that could shrink and
         // stall the Hub freeze check. Unknown is sticky; tokens keep summing.
         let mut totals = UsageTotals::default();
-        let tokens = |n| TokenCounters {
-            uncached_input: n,
-            ..TokenCounters::default()
-        };
+        // c-ctxusage U1: every billing bucket must be structurally present for
+        // a call to be priceable (an omitted bucket is Unknown, not zero), so
+        // the unused output/cache tiers are explicit zeros.
+        let tokens = |n| TokenCounters::known(n, 0, 0, 0, 0);
         totals.add(&event(
             UsageSource::ClaudeTranscript,
             Some("t1"),
@@ -525,7 +544,11 @@ mod tests {
             None,
             "a later priced call never revives the cumulative estimate"
         );
-        assert_eq!(totals.tokens.uncached_input, 300, "tokens are unaffected");
+        assert_eq!(
+            totals.tokens.uncached_input,
+            Some(300),
+            "tokens are unaffected"
+        );
     }
 
     #[test]
@@ -536,22 +559,14 @@ mod tests {
             Some("t1"),
             Some("m1"),
             Some("claude-sonnet-5"),
-            TokenCounters {
-                uncached_input: 10,
-                output: 10,
-                ..TokenCounters::default()
-            },
+            tk(10, 10),
         ));
         agg.push(&event(
             UsageSource::ClaudeTranscript,
             Some("t1"),
             Some("m2"),
             Some("some-internal-model"),
-            TokenCounters {
-                uncached_input: 10,
-                output: 10,
-                ..TokenCounters::default()
-            },
+            tk(10, 10),
         ));
         assert_eq!(agg.session().cost_usd(), None);
     }
@@ -564,14 +579,15 @@ mod tests {
             Some("turn-a"),
             Some("resp-a"),
             Some("gpt-5.4"),
-            TokenCounters {
-                uncached_input: 90,
-                cache_read: 10,
-                output: 20,
-                ..TokenCounters::default()
-            },
+            TokenCounters::known(90, 20, 10, 0, 0),
         ));
-        let payload = to_usage_payload(UsageScope::Turn, "turn-a", 1, agg.turn("turn-a").unwrap());
+        let payload = to_usage_payload(
+            UsageScope::Turn,
+            "turn-a",
+            1,
+            None,
+            agg.turn("turn-a").unwrap(),
+        );
         assert_eq!(payload.accounting, Accounting::Estimated);
         assert_eq!(payload.input_accounting, InputAccounting::Uncached);
         assert_eq!(payload.scope, UsageScope::Turn);
@@ -585,7 +601,155 @@ mod tests {
 
     #[test]
     fn empty_totals_serialize_cost_as_unknown_not_zero() {
-        let payload = to_usage_payload(UsageScope::Session, "s", 1, &UsageTotals::default());
+        let payload = to_usage_payload(UsageScope::Session, "s", 1, None, &UsageTotals::default());
         assert!(matches!(payload.cost, Knowledge::Unknown { .. }));
+    }
+
+    #[test]
+    fn an_omitted_bucket_is_unknown_in_the_payload_and_unpriced() {
+        // Only output reported: every other bucket and the derived total stay
+        // Unknown end to end, and no bill is produced (c-ctxusage r15 item 5).
+        let mut agg = UsageAggregator::new();
+        agg.push(&event(
+            UsageSource::ClaudeTranscript,
+            Some("turn-x"),
+            Some("msg-x"),
+            Some("claude-sonnet-5"),
+            TokenCounters {
+                output: Some(15),
+                ..TokenCounters::default()
+            },
+        ));
+        let payload = to_usage_payload(
+            UsageScope::Turn,
+            "turn-x",
+            1,
+            None,
+            agg.turn("turn-x").unwrap(),
+        );
+        assert_eq!(payload.output_tokens, Knowledge::Known { value: U64(15) });
+        for omitted in [
+            &payload.input_tokens,
+            &payload.cache_read_tokens,
+            &payload.cache_write_tokens,
+            &payload.total_tokens,
+        ] {
+            assert!(
+                matches!(omitted, Knowledge::Unknown { .. }),
+                "an omitted bucket is Unknown, never zero"
+            );
+        }
+        assert!(
+            matches!(payload.cost, Knowledge::Unknown { .. }),
+            "an omitted bucket is never priced for free"
+        );
+    }
+
+    /// U1 (c-ctxusage r16 item 4): folding two priced calls where the SECOND
+    /// omits the input bucket makes the folded input Unknown (the first call's
+    /// number is not the complete sum) — and the two-call total goes Unknown
+    /// with it.
+    #[test]
+    fn a_call_omitting_a_bucket_poisons_the_folded_total() {
+        let mut agg = UsageAggregator::new();
+        agg.push(&event(
+            UsageSource::ClaudeTranscript,
+            Some("t1"),
+            Some("msg-u1-a"),
+            Some("claude-sonnet-5"),
+            TokenCounters::known(100, 10, 0, 0, 0),
+        ));
+        // Second call reports output only.
+        agg.push(&event(
+            UsageSource::ClaudeTranscript,
+            Some("t1"),
+            Some("msg-u1-b"),
+            Some("claude-sonnet-5"),
+            TokenCounters {
+                output: Some(20),
+                ..TokenCounters::default()
+            },
+        ));
+        let totals = agg.session();
+        assert_eq!(
+            totals.tokens.uncached_input, None,
+            "input folded from a call that omitted it"
+        );
+        assert_eq!(
+            totals.tokens.output,
+            Some(30),
+            "output was reported by both"
+        );
+        assert_eq!(
+            totals.tokens.cache_read, None,
+            "never reported by either call: still Unknown, not zero"
+        );
+        assert_eq!(
+            totals.tokens.total(),
+            None,
+            "a partial fold never yields a total"
+        );
+    }
+
+    /// U1 (c-ctxusage r16 item 4): an empty accumulator is distinct from one
+    /// holding an unknown contribution — a single call that omits a bucket
+    /// folds to Unknown immediately, but the buckets it DID report stay Known.
+    #[test]
+    fn the_first_call_seeds_known_buckets_without_zeroing_omitted_ones() {
+        let mut agg = UsageAggregator::new();
+        agg.push(&event(
+            UsageSource::ClaudeTranscript,
+            Some("t1"),
+            Some("msg-u1-seed"),
+            Some("claude-sonnet-5"),
+            TokenCounters {
+                uncached_input: Some(7),
+                output: Some(3),
+                ..TokenCounters::default()
+            },
+        ));
+        let totals = agg.session();
+        assert_eq!(totals.tokens.uncached_input, Some(7));
+        assert_eq!(totals.tokens.output, Some(3));
+        assert_eq!(totals.tokens.cache_read, None);
+    }
+
+    /// U1 (c-ctxusage r16 item 4): reasoning is `Option` end to end. A call
+    /// that omits the reasoning breakout folds the reasoning total Unknown even
+    /// when another call reported one, and the wire payload carries Unknown —
+    /// never a fabricated zero.
+    #[test]
+    fn reasoning_is_unknown_when_any_call_omits_the_breakout() {
+        fn reasoning_event(request: &str, reasoning: Option<u64>) -> UsageEvent {
+            UsageEvent::new(
+                UsageSource::ClaudeTranscript,
+                Some("t-r".to_string()),
+                Some(request.to_string()),
+                Some("claude-sonnet-5".to_string()),
+                TokenCounters::known(10, 10, 0, 0, 0),
+                reasoning,
+                None,
+            )
+        }
+        // Two calls that both report reasoning sum on the wire as Known.
+        let mut agg = UsageAggregator::new();
+        agg.push(&reasoning_event("msg-r1", Some(3)));
+        agg.push(&reasoning_event("msg-r2", Some(4)));
+        let totals = agg.session();
+        assert_eq!(totals.reasoning_tokens, Some(7));
+        let payload = to_usage_payload(UsageScope::Session, "s", 1, None, totals);
+        assert_eq!(payload.reasoning_tokens, Knowledge::Known { value: U64(7) });
+
+        // A third call with no breakout: the fold goes Unknown on the wire.
+        let mut agg = UsageAggregator::new();
+        agg.push(&reasoning_event("msg-r1", Some(3)));
+        agg.push(&reasoning_event("msg-r3", None));
+        let totals = agg.session();
+        assert_eq!(totals.reasoning_tokens, None);
+        let payload = to_usage_payload(UsageScope::Session, "s", 2, None, totals);
+        assert!(
+            matches!(payload.reasoning_tokens, Knowledge::Unknown { .. }),
+            "reasoning omitted by one call is Unknown on the wire, not 0"
+        );
     }
 }

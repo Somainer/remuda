@@ -1554,13 +1554,19 @@ async fn provider_usage(
                 })
                 .await
                 .map_err(map_store)?;
-            if agg.events == 0 {
+            // Emit the row for proven contributions OR for ambiguous-only
+            // usage: an unprovable-lineage turn in this model must surface
+            // with Unknown buckets/budget, never be silently dropped
+            // (c-ctxusage r34 item 1).
+            if agg.events == 0 && !agg.ambiguous {
                 continue;
             }
             let budget_max = query.budget_max_usd;
             out.push(json!({
                 "model": model,
                 "events": agg.events,
+                "ambiguousEvents": agg.ambiguous_events,
+                "ambiguous": agg.ambiguous,
                 "totalTokens": agg.total_tokens,
                 "inputTokens": agg.input_tokens,
                 "outputTokens": agg.output_tokens,
@@ -1569,6 +1575,7 @@ async fn provider_usage(
                     crate::usage_store::BudgetStatus::Ok => "ok",
                     crate::usage_store::BudgetStatus::Warn => "warn",
                     crate::usage_store::BudgetStatus::Stop => "stop",
+                    crate::usage_store::BudgetStatus::Unknown => "unknown",
                 },
                 "estimated": true,
             }));

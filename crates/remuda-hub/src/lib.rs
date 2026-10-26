@@ -33,6 +33,24 @@ pub use interactions::delegated_decisions_test_support;
 /// Test-only seam for the D-057 continuation-resume race.
 #[doc(hidden)]
 pub use store::lineage_test_support;
+#[doc(hidden)]
+pub mod usage_store_test_support {
+    use rusqlite::Connection;
+
+    pub use crate::store::JournalRecord;
+    pub use crate::usage_store::{
+        RollupRequest, aggregate_instance, aggregate_supply, insert_usage_event, migrate,
+        project_usage_event, rollup_instance,
+    };
+
+    /// An in-memory, fully migrated Hub DB for projection/rollup tests that do
+    /// not need a running Hub or the writer/reader split.
+    pub fn migrated_memory() -> rusqlite::Result<Connection> {
+        let conn = Connection::open_in_memory()?;
+        crate::usage_store::migrate(&conn)?;
+        Ok(conn)
+    }
+}
 mod inventory;
 mod maintenance;
 mod model_catalog;
@@ -267,27 +285,6 @@ impl AppState {
 /// Test-only constructors for types private modules would otherwise hide
 /// from integration tests. Not part of the supported API.
 #[doc(hidden)]
-pub mod usage_store_test_support {
-    use rusqlite::Connection;
-
-    pub use crate::store::JournalRecord;
-    pub use crate::usage_store::{
-        RollupRequest, aggregate_instance, aggregate_supply, insert_usage_event, migrate,
-        project_usage_event, rollup_instance,
-    };
-
-    /// An in-memory, fully migrated Hub DB for projection/rollup tests that do
-    /// not need a running Hub or the writer/reader split.
-    pub fn migrated_memory() -> rusqlite::Result<Connection> {
-        let conn = Connection::open_in_memory()?;
-        crate::usage_store::migrate(&conn)?;
-        Ok(conn)
-    }
-}
-
-/// Test-only constructors for types private modules would otherwise hide
-/// from integration tests. Not part of the supported API.
-#[doc(hidden)]
 pub mod store_test_support {
     use std::path::Path;
     use std::time::Duration;
@@ -297,6 +294,10 @@ pub mod store_test_support {
     use std::collections::BTreeSet;
 
     pub use crate::store::{APPEND_CHUNK_MAX, JOURNAL_WINDOW_BYTES, JOURNAL_WINDOW_ROWS, Store};
+
+    /// Durable usage-event row shape for tests that seed usage through the
+    /// writer (see [`seed_usage_events`]).
+    pub use crate::usage_store::UsageEventRow;
 
     /// Test-only fault guard: arm failures on ONE store (per-Store flags,
     /// `test-faults` feature only) and clear them on drop, so a failed
@@ -378,6 +379,27 @@ pub mod store_test_support {
             "host enrollment rejected"
         );
         Ok((store, host_id))
+    }
+
+    /// Test fixture: insert durable `usage_events` directly on the writer
+    /// connection (production projects them via `usage_store::observe_journal`
+    /// from `kind:"usage"` journal records). Returns how many were inserted.
+    pub async fn seed_usage_events(
+        store: &Store,
+        rows: Vec<crate::usage_store::UsageEventRow>,
+    ) -> anyhow::Result<usize> {
+        store
+            .run_named("test.seed_usage_events", move |conn| {
+                let mut inserted = 0usize;
+                for row in &rows {
+                    if crate::usage_store::insert_usage_event(conn, row)? {
+                        inserted += 1;
+                    }
+                }
+                Ok::<_, crate::store::StoreError>(inserted)
+            })
+            .await
+            .map_err(Into::into)
     }
 
     /// Test fixture: settle an ensured instance as `exited` and bind it to a

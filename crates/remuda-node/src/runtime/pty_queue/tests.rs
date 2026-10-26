@@ -458,6 +458,7 @@ async fn stopping_a_pty_instance_reclaims_its_durable_carrier_ownership() {
             socket_path: socket.clone(),
             session: "remuda-stop-test".into(),
             workspace_id: workspace.workspace.workspace_id.clone(),
+            server_facet: None,
             workspace_label: workspace.workspace.label.clone(),
             tab_id: workspace.tab.tab_id.clone(),
             pane_id: workspace.root_pane.pane_id.clone(),

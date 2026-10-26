@@ -4495,6 +4495,7 @@ export type UsagePayload = ({
   "reasoningTokens": Knowledge3;
   "scope": UsageScope;
   "scopeId": (string);
+  "sourceSessionId": (string | null);
   "totalTokens": Knowledge3;
   "usageId": Id;
   [key: string]: unknown;

@@ -35,6 +35,8 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(any(test, feature = "test-stub"))]
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc, watch};
@@ -205,7 +207,19 @@ struct PtyLive {
     tty_task: Option<JoinHandle<()>>,
     /// Current alt-screen mode seen by the attach relay's byte scanner.
     alt_screen: Arc<AtomicBool>,
-    closed: bool,
+    /// Controls are disabled (coordination tasks retired) once close starts.
+    /// The driver-level `closed` flag mirrors this for callers that hold no
+    /// live lock (c-ctxusage r24 item 3).
+    /// Controls (send/keys/attach/tty bridge/…) are disabled once close begins.
+    /// Set BEFORE the carrier close runs and kept set if that close fails, so
+    /// a pane id the carrier reuses while we are between attempts can never
+    /// receive a follow-up control dispatch (c-ctxusage r25 item 1).
+    controls_disabled: bool,
+    /// Every close phase finished successfully exactly once (carrier closed,
+    /// terminal emission sent, launch cleanup done and live state retired).
+    /// A retry whose first `resources.close()` failed runs the remaining
+    /// phases; a retry after completion is a clean no-op.
+    close_complete: bool,
 }
 
 /// Native Claude TUI hosted in a Herdr pane.
@@ -217,10 +231,26 @@ pub struct ClaudePtyDriver {
     /// Last successfully materialized spec; `resume` re-materializes from this.
     last_spec: Mutex<Option<InstanceSpec>>,
     closed: AtomicBool,
+    /// Serializes the WHOLE close (c-ctxusage r25 item 2): carrier close,
+    /// launch cleanup, terminal emission and live-state retirement. One owner
+    /// runs the phases once; a concurrent/second caller waits and observes the
+    /// completion (a no-op) instead of duplicating the terminal work.
+    close_lock: Mutex<()>,
     seq: Arc<AtomicU64>,
+    /// c-ctxusage r26 item 4 test witness: number of times a completed close
+    /// retired the captured live state. Concurrent closes must retire once.
+    /// Gated like shell_pty's `fail_after_spawn` seam (cfg test / test-stub).
+    #[cfg(any(test, feature = "test-stub"))]
+    retirements: AtomicU32,
 }
 
 impl ClaudePtyDriver {
+    /// Number of times close completed live-state retirement (test witness for
+    /// exactly-once retirement under concurrent closes).
+    #[cfg(any(test, feature = "test-stub"))]
+    pub fn retirement_count(&self) -> u32 {
+        self.retirements.load(Ordering::SeqCst)
+    }
     /// Build a driver from explicit options.
     pub fn new(options: ClaudePtyOptions) -> Self {
         Self {
@@ -230,7 +260,10 @@ impl ClaudePtyDriver {
             last_recipe: Mutex::new(None),
             last_spec: Mutex::new(None),
             closed: AtomicBool::new(false),
+            close_lock: Mutex::new(()),
             seq: Arc::new(AtomicU64::new(0)),
+            #[cfg(any(test, feature = "test-stub"))]
+            retirements: AtomicU32::new(0),
         }
     }
 
@@ -271,7 +304,7 @@ impl ClaudePtyDriver {
     pub async fn open_observer(&self) -> DriverResult<TerminalObserver> {
         let inner = self.inner.lock().await;
         let live = inner.as_ref().ok_or(DriverError::ControlUnavailable)?;
-        if live.closed {
+        if live.controls_disabled {
             return Err(DriverError::ControlUnavailable);
         }
         TerminalObserver::open(&live.client, &live.pane_id, 80, 24)
@@ -737,7 +770,8 @@ impl ClaudePtyDriver {
             transcript_shutdown: Some(transcript_shutdown),
             tty_task: None,
             alt_screen: Arc::new(AtomicBool::new(false)),
-            closed: false,
+            controls_disabled: false,
+            close_complete: false,
         });
 
         info!(
@@ -766,7 +800,7 @@ impl ClaudePtyDriver {
         let (pane_id, session_id, queue, ready, io, request) = {
             let inner = self.inner.lock().await;
             let live = inner.as_ref().ok_or(DriverError::ControlUnavailable)?;
-            if live.closed {
+            if live.controls_disabled {
                 return Err(DriverError::ControlUnavailable);
             }
             require_session_start(live)?;
@@ -871,7 +905,7 @@ impl ClaudePtyDriver {
         let (pane_id, session_id, queue, ready, io) = {
             let inner = self.inner.lock().await;
             let live = inner.as_ref().ok_or(DriverError::ControlUnavailable)?;
-            if live.closed {
+            if live.controls_disabled {
                 return Err(DriverError::ControlUnavailable);
             }
             require_session_start(live)?;
@@ -933,7 +967,7 @@ impl ClaudePtyDriver {
         let (pane_id, session_id, queue, ready, io) = {
             let inner = self.inner.lock().await;
             let live = inner.as_ref().ok_or(DriverError::ControlUnavailable)?;
-            if live.closed {
+            if live.controls_disabled {
                 return Err(DriverError::ControlUnavailable);
             }
             require_session_start(live)?;
@@ -1025,7 +1059,7 @@ impl Driver for ClaudePtyDriver {
         let inner = self.inner.lock().await;
         let live = inner
             .as_ref()
-            .filter(|live| !live.closed)
+            .filter(|live| !live.controls_disabled)
             .ok_or(DriverError::ControlUnavailable)?;
         require_session_start(live)?;
         // SessionStart proves the native session is real, so no later screen
@@ -1038,7 +1072,7 @@ impl Driver for ClaudePtyDriver {
     async fn attach(&self, native_ref: NativeRef) -> DriverResult<DriverAck> {
         let mut inner = self.inner.lock().await;
         let live = inner.as_mut().ok_or(DriverError::NativeSessionNotFound)?;
-        if live.closed {
+        if live.controls_disabled {
             return Err(DriverError::ControlUnavailable);
         }
         match &native_ref.session_id {
@@ -1127,7 +1161,7 @@ impl Driver for ClaudePtyDriver {
         let text = prompt_text(&input)?;
         let inner = self.inner.lock().await;
         let live = inner.as_ref().ok_or(DriverError::ControlUnavailable)?;
-        if live.closed {
+        if live.controls_disabled {
             return Err(DriverError::ControlUnavailable);
         }
         require_session_start(live)?;
@@ -1153,7 +1187,7 @@ impl Driver for ClaudePtyDriver {
             .lock()
             .await
             .as_ref()
-            .filter(|live| !live.closed)
+            .filter(|live| !live.controls_disabled)
             .map(|live| Arc::clone(&live.interactions))
             .ok_or(DriverError::ControlUnavailable)?;
         interactions.send_keys(keys).await
@@ -1162,7 +1196,7 @@ impl Driver for ClaudePtyDriver {
     async fn tty_bridge(&self) -> Option<crate::tty::TtyBridge> {
         let inner = self.inner.lock().await;
         let live = inner.as_ref()?;
-        if live.closed {
+        if live.controls_disabled {
             return None;
         }
         Some(crate::tty::TtyBridge::Herdr {
@@ -1177,7 +1211,8 @@ impl Driver for ClaudePtyDriver {
         // pane's mode has no trustworthy observation.
         let inner = self.inner.lock().await;
         let live = inner.as_ref()?;
-        (live.tty_task.is_some() && !live.closed).then(|| live.alt_screen.load(Ordering::SeqCst))
+        (live.tty_task.is_some() && !live.controls_disabled)
+            .then(|| live.alt_screen.load(Ordering::SeqCst))
     }
 
     async fn cancel(&self) -> DriverResult<DriverAck> {
@@ -1194,75 +1229,109 @@ impl Driver for ClaudePtyDriver {
             .lock()
             .await
             .as_ref()
-            .filter(|live| !live.closed)
+            .filter(|live| !live.controls_disabled)
             .map(|live| Arc::clone(&live.interactions))
             .ok_or(DriverError::ControlUnavailable)?;
         interactions.respond(id, answer).await
     }
 
     async fn close(&self) -> DriverResult<DriverAck> {
+        // c-ctxusage r25 items 1+2:
+        //  - `closed` (controls_disabled) gates EVERY control and is set the
+        //    moment close BEGINS, so a failed close against a pane the carrier
+        //    later reuses can never dispatch a follow-up send/attach to a
+        //    foreign pane;
+        //  - the whole close is serialized by `close_lock`: one owner runs the
+        //    carrier close, launch cleanup, terminal emission and state
+        //    retirement exactly once. A concurrent caller waits, sees
+        //    completion, and returns a no-op. A close whose carrier phase
+        //    failed keeps controls disabled but leaves completion unset, so a
+        //    LATER (not concurrent) retry finishes the terminal phases.
         self.closed.store(true, Ordering::SeqCst);
+        let _phase = self.close_lock.lock().await;
         let mut inner = self.inner.lock().await;
         let Some(live) = inner.as_mut() else {
             drop(inner);
             self.resources.close().await?;
             return Ok(DriverAck::not_dispatched());
         };
-        if live.closed {
-            drop(inner);
-            self.resources.close().await?;
+        if close_action(live.controls_disabled, live.close_complete) == CloseAction::NoOp {
+            // A previous close finished every phase; this is a clean no-op.
             return Ok(DriverAck::not_dispatched());
         }
-        live.closed = true;
-        live.interaction_task.abort();
-        live.effort_queue.close();
-        if let Some(task) = live.effort_worker.take() {
-            task.abort();
-        }
-        live.model_queue.close();
-        if let Some(task) = live.model_worker.take() {
-            task.abort();
-        }
-        live.permission_queue.close();
-        if let Some(task) = live.permission_worker.take() {
-            task.abort();
-        }
-        if let Some(task) = live.status_task.take() {
-            task.abort();
-        }
-        if let Some(task) = live.hook_task.take() {
-            task.abort();
-        }
-        // c-ctxusage r4 item 2: cooperative transcript shutdown — signal, let
-        // the pump read the final append and publish a finalised last turn,
-        // then wait one poll window before forcing the issue.
-        if let Some(shutdown) = live.transcript_shutdown.take() {
-            let _ = shutdown.send(true);
-        }
-        if let Some(task) = live.transcript_task.take() {
-            const TRANSCRIPT_SHUTDOWN_TIMEOUT: std::time::Duration =
-                std::time::Duration::from_secs(2);
-            let mut task = task;
-            if tokio::time::timeout(TRANSCRIPT_SHUTDOWN_TIMEOUT, &mut task)
-                .await
-                .is_err()
-            {
+        // Disable the coordination tasks exactly once. The flag stays set after
+        // a failure: every control gate reads it and stays closed while a retry
+        // is pending.
+        if !live.controls_disabled {
+            live.controls_disabled = true;
+            // r26 item 1: revoke controls INSIDE the interaction layer before
+            // any awaited shutdown, so a request already queued on its state
+            // mutex behind a stalled RPC is refused even when the bounded
+            // interactions.close() cleanup below times out.
+            live.interactions.revoke();
+            live.interaction_task.abort();
+            live.effort_queue.close();
+            if let Some(task) = live.effort_worker.take() {
                 task.abort();
             }
+            live.model_queue.close();
+            if let Some(task) = live.model_worker.take() {
+                task.abort();
+            }
+            live.permission_queue.close();
+            if let Some(task) = live.permission_worker.take() {
+                task.abort();
+            }
+            if let Some(task) = live.status_task.take() {
+                task.abort();
+            }
+            if let Some(task) = live.hook_task.take() {
+                task.abort();
+            }
+            // c-ctxusage r4 item 2: cooperative transcript shutdown — signal,
+            // let the pump read the final append and publish a finalised last
+            // turn, then wait one poll window before forcing the issue.
+            if let Some(shutdown) = live.transcript_shutdown.take() {
+                let _ = shutdown.send(true);
+            }
+            if let Some(task) = live.transcript_task.take() {
+                const TRANSCRIPT_SHUTDOWN_TIMEOUT: std::time::Duration =
+                    std::time::Duration::from_secs(2);
+                let mut task = task;
+                if tokio::time::timeout(TRANSCRIPT_SHUTDOWN_TIMEOUT, &mut task)
+                    .await
+                    .is_err()
+                {
+                    task.abort();
+                }
+            }
+            if let Some(task) = live.tty_task.take() {
+                task.abort();
+            }
+            live.interactions.close().await?;
         }
-        if let Some(task) = live.tty_task.take() {
-            task.abort();
-        }
-        live.interactions.close().await?;
         let events = live.events.clone();
         let ctx = live.ctx.clone();
         let recipe = live.recipe.clone();
         drop(inner);
+        // Destructive carrier close; on failure keep the live state (controls
+        // stay disabled) so a later retry completes the terminal phases below.
+        // The held close_lock means no concurrent close reaches here.
         self.resources.close().await?;
         // S5: the pane is closed, so the launch overlays can go.
         crate::recipe::report_launch_cleanup(&recipe, "claude-pty");
         crate::claude_pty::emit_pty_closed(&events, &self.seq, &ctx).await?;
-        self.inner.lock().await.take();
+        let mut inner = self.inner.lock().await;
+        if let Some(live) = inner.as_mut() {
+            live.close_complete = true;
+        }
+        drop(inner);
+        #[cfg_attr(not(any(test, feature = "test-stub")), allow(unused_variables))]
+        let retired = self.inner.lock().await.take().is_some();
+        #[cfg(any(test, feature = "test-stub"))]
+        if retired {
+            self.retirements.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(DriverAck::not_dispatched())
     }
 
@@ -1815,23 +1884,14 @@ async fn emit_obs(
     payload: ObservationPayload,
 ) -> DriverResult<()> {
     let n = seq.fetch_add(1, Ordering::SeqCst) + 1;
-    tx.send(build_observation(
-        ctx,
-        n,
-        channel,
-        completeness,
-        payload,
-        Knowledge::Unknown {
-            reason: "herdr-clock".into(),
-            evidence_event_ids: vec![],
-        },
-    )?)
-    .await
-    .map_err(|_| DriverError::ControlUnavailable)?;
+    tx.send(build_observation(ctx, n, channel, completeness, payload)?)
+        .await
+        .map_err(|_| DriverError::ControlUnavailable)?;
     Ok(())
 }
 
-/// Emit a mapper-produced observation while PRESERVING its envelope:
+/// Emit a mapper-produced observation while PRESERVING the deterministic
+/// `event_id` the transcript mapper minted.
 ///
 /// * the deterministic `event_id` the transcript mapper minted (§9.1: an
 ///   effort edge's id and the journal tailer's id for the same native edge are
@@ -1849,11 +1909,15 @@ async fn emit_mapped_obs(
 ) -> DriverResult<()> {
     let n = seq.fetch_add(1, Ordering::SeqCst) + 1;
     let event_id = mapped.event_id;
-    let native_at = mapped.native_at.clone();
-    let evidence = mapped.evidence_event_ids.clone();
-    let mut observation =
-        build_observation(ctx, n, channel, mapped.completeness, mapped.body, native_at)?;
+    // Preserve the mapper's envelope: deterministic event id, the historical
+    // native_at (c-ctxusage r24 item 1 — rebuilding resets it to herdr-clock
+    // Unknown, which would drop live TUI usage from native TPM windows), and
+    // the replay evidence ids the journal tailer needs.
+    let native_at = mapped.native_at;
+    let evidence = mapped.evidence_event_ids;
+    let mut observation = build_observation(ctx, n, channel, mapped.completeness, mapped.body)?;
     observation.event_id = event_id;
+    observation.native_at = native_at;
     observation.evidence_event_ids = evidence;
     tx.send(observation)
         .await
@@ -1867,7 +1931,6 @@ pub(crate) fn build_observation(
     channel: SourceChannel,
     completeness: Completeness,
     payload: ObservationPayload,
-    native_at: Knowledge<Timestamp>,
 ) -> DriverResult<Observation> {
     Ok(Observation {
         schema_version: SchemaVersion,
@@ -1880,7 +1943,10 @@ pub(crate) fn build_observation(
         run_generation: Some(U64(1)),
         seq: U64(seq),
         observed_at: now_ts()?,
-        native_at,
+        native_at: Knowledge::Unknown {
+            reason: "herdr-clock".into(),
+            evidence_event_ids: vec![],
+        },
         source: ObservationSource {
             driver_kind: ctx.driver,
             driver_version: ctx.pin_version.clone(),
@@ -2614,6 +2680,29 @@ pub(crate) fn obs_ctx(
     }
 }
 
+/// What a close attempt should do given the live close-phase flags
+/// (c-ctxusage r24 item 3).
+#[derive(Debug, PartialEq, Eq)]
+enum CloseAction {
+    /// The carrier/terminal phases have never completed: run them (a fresh
+    /// close, or a retry after a failed first attempt).
+    RunPhases,
+    /// A previous close finished every phase: return a clean no-op.
+    NoOp,
+}
+
+/// Decide the close action from `controls_disabled` (a close has started and
+/// retired controls) and `close_complete` (the carrier/terminal phases all
+/// succeeded). A disabled-but-not-complete live is a RETRY, not a no-op.
+fn close_action(controls_disabled: bool, close_complete: bool) -> CloseAction {
+    if close_complete {
+        CloseAction::NoOp
+    } else {
+        let _ = controls_disabled;
+        CloseAction::RunPhases
+    }
+}
+
 pub(crate) async fn emit_pty_closed(
     tx: &mpsc::Sender<Observation>,
     seq: &AtomicU64,
@@ -2662,6 +2751,86 @@ pub(crate) async fn emit_on(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// c-ctxusage r24 item 3: the close phase decision given the live flags.
+    /// `controls_disabled` is set once at the start of the first close;
+    /// `close_complete` only after the carrier/terminal phases succeed.
+    /// A first failed close has disabled=true,complete=false and must RETRY
+    /// the terminal phases; a call after completion (true,true) is a no-op.
+    /// The old single-`closed` short circuit treated disabled as complete.
+    #[test]
+    fn close_phase_flags_separate_disabled_from_complete() {
+        // Fresh live: full first close.
+        assert_eq!(
+            close_action(false, false),
+            CloseAction::RunPhases,
+            "fresh live runs all phases"
+        );
+        // First close already disabled controls but failed before completion:
+        // the retry must still run the phases (NOT short-circuit).
+        assert_eq!(
+            close_action(true, false),
+            CloseAction::RunPhases,
+            "a retry after a failed close completes the phases"
+        );
+        // A previous close finished everything: clean no-op.
+        assert_eq!(
+            close_action(true, true),
+            CloseAction::NoOp,
+            "a completed close retries as a no-op"
+        );
+    }
+
+    /// c-ctxusage r24 item 1: the TUI pump's `emit_mapped_obs` rebuilds the
+    /// observation with run identity but must PRESERVE the mapper-stamped
+    /// native time, or live TUI usage projects as ingest-timed and drops out
+    /// of TPM/native lastTurnAt.
+    #[tokio::test]
+    async fn emit_mapped_obs_preserves_native_time() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let seq = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let ctx = ObsCtx {
+            driver: DriverKind::ClaudePty,
+            instance_id: InstanceId::new(),
+            host_id: HostId::new(),
+            journal_id: remuda_protocol::Id::new("obj").unwrap(),
+            run_id: RunId::new(),
+            session_id: "s".into(),
+            pin_version: "2.1.289".into(),
+        };
+        let at = "2026-10-13T10:00:00.000Z";
+        let mut mapped = build_observation(
+            &ctx,
+            1,
+            SourceChannel::Transcript,
+            Completeness::Structured,
+            ObservationPayload::Lifecycle(Box::new(LifecyclePayload::Native(Box::new(
+                NativeLifecycle {
+                    topic: LifecycleTopic::Session,
+                    native_name: "x".into(),
+                    native_id: Knowledge::NotApplicable,
+                    status: Knowledge::NotApplicable,
+                    related_ids: std::collections::BTreeMap::new(),
+                    data_ref: None,
+                    severity: Severity::Info,
+                    affects_completion: false,
+                },
+            )))),
+        )
+        .unwrap();
+        mapped.native_at = Knowledge::Known {
+            value: Timestamp::try_from(at.to_string()).unwrap(),
+        };
+        let expected = match &mapped.native_at {
+            Knowledge::Known { value } => value.clone(),
+            _ => panic!("set"),
+        };
+        emit_mapped_obs(&tx, &seq, &ctx, SourceChannel::Transcript, mapped)
+            .await
+            .expect("emits");
+        let out = rx.recv().await.expect("one observation");
+        assert_eq!(out.native_at, Knowledge::Known { value: expected });
+    }
 
     /// D-027: a PTY driver cannot inline bytes, so an attachment has to reach
     /// the agent as an absolute path it can open with its own Read tool.
@@ -5747,6 +5916,114 @@ mod tests {
             out.push(observation);
         }
         out
+    }
+
+    /// c-ctxusage r25 item 4: a timestamped native usage record fed through the
+    /// REAL `spawn_transcript_pump` reaches the channel with the record's native
+    /// time and its deterministic usage identity. Main's design keeps
+    /// `observed_at` at RECEIPT time (`build_observation` stamps `now_ts()`);
+    /// the record time rides `native_at`, which the r24 `emit_mapped_obs`
+    /// wrapper must preserve end to end. Reverting that wrapper's
+    /// `observation.native_at = native_at` line makes this test go RED.
+    #[tokio::test]
+    async fn transcript_pump_preserves_native_time_and_usage_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("transcript.jsonl");
+        // Distinct native record time, safely before the wall clock the pump
+        // stamps at receipt.
+        let native_ts = "2026-10-13T10:00:00.000Z";
+        let record = json!({
+            "type": "assistant",
+            "uuid": "pump-ts-a",
+            "sessionId": "pump-session",
+            "version": "2.1.289",
+            "message": {
+                "id": "msg-pump-ts",
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "text", "text": "done"}],
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": 100,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "output_tokens": 11
+                }
+            },
+            "timestamp": native_ts
+        });
+        std::fs::write(&transcript, format!("{record}\n")).unwrap();
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let seq = Arc::new(AtomicU64::new(0));
+        let instance_id = InstanceId::new();
+        let ctx = ObsCtx {
+            driver: DriverKind::ClaudePty,
+            instance_id: instance_id.clone(),
+            host_id: HostId::new(),
+            journal_id: Id::new("obj").unwrap(),
+            run_id: RunId::new(),
+            session_id: "pump-session".into(),
+            pin_version: "2.1.289".into(),
+        };
+        let slot = Arc::new(std::sync::Mutex::new(Some(
+            transcript.to_string_lossy().into_owned(),
+        )));
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let _pump = spawn_transcript_pump(
+            slot,
+            tx,
+            ctx,
+            seq,
+            shutdown_rx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            crate::claude_transcript::ResumeMode::Fresh,
+        );
+
+        // Collect until the usage observation arrives.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut got = None;
+        while let Ok(Some(obs)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            if let ObservationPayload::Usage(usage) = &obs.body
+                && usage.scope_id == "msg-pump-ts"
+            {
+                got = Some(obs);
+                break;
+            }
+        }
+        let obs = got.expect("pump emitted the timestamped usage observation");
+        assert_eq!(
+            obs.native_at,
+            Knowledge::Known {
+                value: Timestamp::try_from(native_ts.to_string()).unwrap()
+            },
+            "pump carries native_at as the record time, not herdr-clock Unknown"
+        );
+        // Main's documented split: observed_at is the live RECEIPT time; the
+        // native record time is carried separately as native_at.
+        assert_ne!(
+            String::from(obs.observed_at.clone()),
+            native_ts,
+            "observed_at stays receipt time by main's design"
+        );
+        let expected_usage_id = Id::derive(
+            "obj",
+            instance_id.as_id().as_str(),
+            "usage:turn:msg-pump-ts",
+        )
+        .expect("derived usage id");
+        if let ObservationPayload::Usage(usage) = &obs.body {
+            assert_eq!(usage.scope_id, "msg-pump-ts");
+            assert_eq!(
+                usage.usage_id, expected_usage_id,
+                "the pump keeps the mapper's deterministic, replay-stable usage id"
+            );
+        }
     }
 }
 

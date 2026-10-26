@@ -122,7 +122,76 @@ pub struct FakeHerdrOptions {
     /// Unlink the socket and stop serving once the shutdown window ends,
     /// modelling a server that actually exits.
     pub exit_after_unavailable: bool,
+    /// When set, a `pane.send_keys` carrying ctrl+c against a LIVE agent
+    /// appends the contents of `interrupt_record_file` to this transcript
+    /// (modelling the native writer appending the interrupted turn's usage
+    /// record while handling Ctrl-C) and then drops the agent from the agent
+    /// list (modelling its termination).
+    pub interrupt_transcript: Option<PathBuf>,
+    /// File whose contents are appended to `interrupt_transcript` on the first
+    /// live-agent ctrl+c.
+    pub interrupt_record_file: Option<PathBuf>,
+    /// Delayed-writer model (c-ctxusage r13 item 1): a LIVE agent that
+    /// receives ctrl+c neither appends nor terminates — it stays in the agent
+    /// list past the reclamation grace. Closing its pane (`pane.close`, the
+    /// forced-termination path) appends `force_close_record_file` to this
+    /// transcript — modelling the writer flushing its final record on the
+    /// forced SIGHUP/SIGTERM — and then removes the agent.
+    pub force_close_transcript: Option<PathBuf>,
+    /// File whose contents are appended to `force_close_transcript` when a
+    /// still-live agent pane is force-closed.
+    pub force_close_record_file: Option<PathBuf>,
+    /// c-ctxusage r26 item 4: every control dispatch (`agent.prompt`,
+    /// `agent.send_keys`) the fake serves appends one JSON line
+    /// (`{"method":…,"target":…}`) to this file. A close-gate regression arms
+    /// it and asserts ZERO lines reached a pane after a failed close.
+    pub control_dispatch_record_file: Option<PathBuf>,
+    /// Server-restart / ID-reuse model (c-ctxusage r14 item 1): the FIRST
+    /// live-agent ctrl+c makes the fake act like Herdr restarted — the boot
+    /// generation bumps and the deterministic ids (`w1`, `w1:t1`, `w1:p1`)
+    /// are handed to an UNRELATED workspace with a different creation label
+    /// and its own live agent. A closer that does not re-validate ownership
+    /// kills the foreign pane.
+    pub restart_reuses_ids_on_ctrlc: bool,
+    /// Restart barrier between the ownership audit and the destructive
+    /// `pane.close` (c-ctxusage r15 item 1). The barrier fires ONCE, the first
+    /// time a `pane.close` is processed after the barrier is armed:
+    /// * on a connection that served a `session.snapshot` (a verified
+    ///   audit-and-close connection), the state is swapped to the foreign
+    ///   boot and THAT connection is dropped WITHOUT processing the close —
+    ///   the replacement-server model; the close never lands;
+    /// * on a connection that served no snapshot (one RPC per connection), the
+    ///   state is swapped first and the close is then processed against the
+    ///   replacement boot — the gap-race model that kills the foreign pane.
+    pub restart_barrier_on_close: bool,
+    /// 1-based ordinal of the `pane.close` the restart barrier fires on
+    /// (c-ctxusage r16 item 1). Default 1 keeps the r15 behaviour (the first
+    /// close). Set 2 for the force-then-reap model: the forced pane.close
+    /// (interrupt phase) completes, and the barrier fires on the reap phase's
+    /// first pane.close instead.
+    pub restart_barrier_close_ordinal: u32,
+    /// Accept an `events.subscribe` connection but never send the
+    /// subscription_started ack (c-ctxusage r15 item 6). The connection parks
+    /// forever; other connections keep being served. Models a carrier wedged
+    /// during the polite-stop subscribe handshake.
+    pub subscribe_never_acks: bool,
+    /// Refuse EVERY `pane.send_text` with an ordinary live-boot API error
+    /// (`pane_not_found`), never a connection drop (c-ctxusage r17 item 7).
+    /// Models the optional polite shell-exit send landing against a pane that
+    /// vanished between the process probe and the send: the closer must skip
+    /// the courtesy and continue the polite/force path into reap, not abort
+    /// the interrupt with an uncertain/error outcome.
+    pub refuse_shell_exit_send_text: bool,
+    /// While set, close-PHASE lifecycle `events.subscribe` RPCs are refused
+    /// with a live-boot `server_unavailable` (c-ctxusage r25 item 3). The path
+    /// points at a marker FILE: the server refuses while the file exists, so a
+    /// test can arm/disarm deterministically without races.
+    pub refuse_close_subscribes_marker: Option<PathBuf>,
 }
+
+/// Creation label the simulated restart hands the reused `w1` workspace to.
+/// Deliberately does not match the driver's `remuda-<uuid>` label.
+pub(crate) const RESTART_FOREIGN_LABEL: &str = "unrelated-workspace-after-restart";
 
 impl FakeHerdrOptions {
     /// Default script and bundled frames, caller supplies the socket.
@@ -134,6 +203,17 @@ impl FakeHerdrOptions {
             agent_start_delay: Duration::ZERO,
             unavailable_calls: 0,
             exit_after_unavailable: false,
+            interrupt_transcript: None,
+            interrupt_record_file: None,
+            force_close_transcript: None,
+            force_close_record_file: None,
+            control_dispatch_record_file: None,
+            restart_reuses_ids_on_ctrlc: false,
+            restart_barrier_on_close: false,
+            restart_barrier_close_ordinal: 1,
+            subscribe_never_acks: false,
+            refuse_shell_exit_send_text: false,
+            refuse_close_subscribes_marker: None,
         }
     }
 
@@ -157,6 +237,100 @@ impl FakeHerdrOptions {
     #[must_use]
     pub fn exiting_after_shutdown(mut self) -> Self {
         self.exit_after_unavailable = true;
+        self
+    }
+
+    /// Model a native writer that appends `record_file`'s contents to
+    /// `transcript` and then terminates when a LIVE agent receives ctrl+c.
+    #[must_use]
+    pub fn interrupt_appends_record(
+        mut self,
+        transcript: impl Into<PathBuf>,
+        record_file: impl Into<PathBuf>,
+    ) -> Self {
+        self.interrupt_transcript = Some(transcript.into());
+        self.interrupt_record_file = Some(record_file.into());
+        self
+    }
+
+    /// Model a DELAYED writer (c-ctxusage r13 item 1): ctrl+c neither appends
+    /// nor terminates — the agent outlives the reclamation grace; its final
+    /// record is flushed only when its pane is force-closed, after which it is
+    /// gone from the agent list.
+    #[must_use]
+    pub fn force_close_appends_record(
+        mut self,
+        transcript: impl Into<PathBuf>,
+        record_file: impl Into<PathBuf>,
+    ) -> Self {
+        self.force_close_transcript = Some(transcript.into());
+        self.force_close_record_file = Some(record_file.into());
+        self
+    }
+
+    /// Append one JSON line per served control dispatch
+    /// (`agent.prompt`/`agent.send_keys`) to `record_file` (c-ctxusage r26
+    /// item 4): the zero-foreign-dispatch witness.
+    #[must_use]
+    pub fn control_dispatches_record_to(mut self, record_file: impl Into<PathBuf>) -> Self {
+        self.control_dispatch_record_file = Some(record_file.into());
+        self
+    }
+
+    /// Model Herdr restarting DURING a close (c-ctxusage r14 item 1): the
+    /// first ctrl+c against a live agent bumps the server generation and
+    /// re-creates a FOREIGN workspace (different creation label) under the
+    /// reused deterministic ids, with its own live agent on the reused pane
+    /// id. A closer that closes the pane without re-validating ownership
+    /// kills the foreign pane.
+    #[must_use]
+    pub fn restart_reuses_ids_on_ctrlc(mut self) -> Self {
+        self.restart_reuses_ids_on_ctrlc = true;
+        self
+    }
+
+    /// Model a Herdr restart in the gap between the final ownership audit and
+    /// the destructive `pane.close` (c-ctxusage r15 item 1). A close sent on
+    /// the SAME connection that carried the audit snapshot is never processed
+    /// (that connection dies with the replaced boot); a close sent on a fresh
+    /// connection lands against the replacement boot and kills the foreign
+    /// pane.
+    #[must_use]
+    pub fn restart_barrier_on_close(mut self) -> Self {
+        self.restart_barrier_on_close = true;
+        self
+    }
+
+    /// Fire the restart barrier on the NTH `pane.close` instead of the first
+    /// (c-ctxusage r16 item 1). Models a replacement server appearing during
+    /// REAP after the interrupt phase's forced pane.close already succeeded.
+    #[must_use]
+    pub fn restart_barrier_on_nth_close(mut self, ordinal: u32) -> Self {
+        self.restart_barrier_on_close = true;
+        self.restart_barrier_close_ordinal = ordinal.max(1);
+        self
+    }
+
+    /// Accept `events.subscribe` connections but never acknowledge them
+    /// (c-ctxusage r15 item 6). The closer's bounded handshake must give up
+    /// retryably rather than pin the close phase forever.
+    #[must_use]
+    pub fn subscribe_never_acks(mut self) -> Self {
+        self.subscribe_never_acks = true;
+        self
+    }
+
+    /// Refuse every `pane.send_text` with an ordinary live-boot
+    /// `pane_not_found` API error (c-ctxusage r17 item 7).
+    #[must_use]
+    pub fn refuse_shell_exit_send_text(mut self) -> Self {
+        self.refuse_shell_exit_send_text = true;
+        self
+    }
+
+    /// Refuse close lifecycle subscriptions while `marker` exists.
+    pub fn refuse_close_subscribes_while(mut self, marker: impl Into<PathBuf>) -> Self {
+        self.refuse_close_subscribes_marker = Some(marker.into());
         self
     }
 }
@@ -223,11 +397,45 @@ impl FakeHerdrServer {
         if options.exit_after_unavailable {
             command.arg("--exit-after-unavailable");
         }
+        if let Some(marker) = &options.refuse_close_subscribes_marker {
+            command.env("FAKE_HERDR_REFUSE_CLOSE_SUBSCRIBES_MARKER", marker);
+        }
         if options.agent_start_delay != Duration::ZERO {
             command.env(
                 "FAKE_HERDR_START_DELAY_MS",
                 options.agent_start_delay.as_millis().to_string(),
             );
+        }
+        if let Some(transcript) = &options.interrupt_transcript {
+            command.env("FAKE_HERDR_INTERRUPT_TRANSCRIPT", transcript);
+        }
+        if let Some(record_file) = &options.interrupt_record_file {
+            command.env("FAKE_HERDR_INTERRUPT_RECORD", record_file);
+        }
+        if let Some(transcript) = &options.force_close_transcript {
+            command.env("FAKE_HERDR_FORCE_CLOSE_TRANSCRIPT", transcript);
+        }
+        if let Some(record_file) = &options.force_close_record_file {
+            command.env("FAKE_HERDR_FORCE_CLOSE_RECORD", record_file);
+        }
+        if let Some(record_file) = &options.control_dispatch_record_file {
+            command.env("FAKE_HERDR_CONTROL_DISPATCH_RECORD", record_file);
+        }
+        if options.restart_reuses_ids_on_ctrlc {
+            command.env("FAKE_HERDR_RESTART_REUSES_IDS", "1");
+        }
+        if options.restart_barrier_on_close {
+            command.env("FAKE_HERDR_RESTART_BARRIER_ON_CLOSE", "1");
+            command.env(
+                "FAKE_HERDR_RESTART_BARRIER_CLOSE_ORDINAL",
+                options.restart_barrier_close_ordinal.to_string(),
+            );
+        }
+        if options.subscribe_never_acks {
+            command.env("FAKE_HERDR_SUBSCRIBE_NEVER_ACKS", "1");
+        }
+        if options.refuse_shell_exit_send_text {
+            command.env("FAKE_HERDR_REFUSE_SHELL_EXIT_SEND_TEXT", "1");
         }
 
         let mut child = command
@@ -320,7 +528,7 @@ pub fn run_fake_herdr() -> Result<i32, FakeHerdrError> {
             rt.block_on(async move {
                 // Exit requests arrive through `parent_watch` (parent death /
                 // stdin EOF) or the scripted shutdown window in `serve`.
-                let serve = serve(options);
+                let serve = serve(*options);
                 match parent_watch {
                     Some(parent_watch) => {
                         tokio::select! {
@@ -349,7 +557,9 @@ pub fn run_fake_herdr() -> Result<i32, FakeHerdrError> {
 }
 
 enum Cli {
-    Serve(FakeHerdrOptions),
+    // Boxed: the options struct (many PathBuf seams) must not inflate every
+    // other variant on the stack (clippy::large_enum_variant).
+    Serve(Box<FakeHerdrOptions>),
     Observe {
         frames: PathBuf,
         cols: u16,
@@ -383,11 +593,49 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
         .unwrap_or(0);
     let mut exit_after_unavailable = std::env::var("FAKE_HERDR_EXIT_AFTER_UNAVAILABLE")
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true"));
+    let refuse_close_subscribes_marker: Option<PathBuf> =
+        std::env::var("FAKE_HERDR_REFUSE_CLOSE_SUBSCRIBES_MARKER")
+            .ok()
+            .map(PathBuf::from);
     let agent_start_delay = std::env::var("FAKE_HERDR_START_DELAY_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .map(Duration::from_millis)
         .unwrap_or(Duration::ZERO);
+    let interrupt_transcript = std::env::var("FAKE_HERDR_INTERRUPT_TRANSCRIPT")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let interrupt_record_file = std::env::var("FAKE_HERDR_INTERRUPT_RECORD")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let force_close_transcript = std::env::var("FAKE_HERDR_FORCE_CLOSE_TRANSCRIPT")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let force_close_record_file = std::env::var("FAKE_HERDR_FORCE_CLOSE_RECORD")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let control_dispatch_record_file = std::env::var("FAKE_HERDR_CONTROL_DISPATCH_RECORD")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let mut restart_reuses_ids_on_ctrlc = std::env::var("FAKE_HERDR_RESTART_REUSES_IDS")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true"));
+    let mut restart_barrier_on_close = std::env::var("FAKE_HERDR_RESTART_BARRIER_ON_CLOSE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true"));
+    let mut restart_barrier_close_ordinal: u32 =
+        std::env::var("FAKE_HERDR_RESTART_BARRIER_CLOSE_ORDINAL")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1)
+            .max(1);
+    let mut subscribe_never_acks = std::env::var("FAKE_HERDR_SUBSCRIBE_NEVER_ACKS")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true"));
+    let mut refuse_shell_exit_send_text = std::env::var("FAKE_HERDR_REFUSE_SHELL_EXIT_SEND_TEXT")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true"));
     let mut positional = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -440,6 +688,22 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
                     .map_err(|_| FakeHerdrError::Args("bad --unavailable-calls".into()))?;
             }
             "--exit-after-unavailable" => exit_after_unavailable = true,
+            "--restart-reuses-ids-on-ctrlc" => restart_reuses_ids_on_ctrlc = true,
+            "--restart-barrier-on-close" => restart_barrier_on_close = true,
+            "--restart-barrier-nth-close" => {
+                restart_barrier_on_close = true;
+                i += 1;
+                restart_barrier_close_ordinal = args
+                    .get(i)
+                    .ok_or_else(|| {
+                        FakeHerdrError::Args("missing --restart-barrier-nth-close".into())
+                    })?
+                    .parse::<u32>()
+                    .map_err(|_| FakeHerdrError::Args("bad --restart-barrier-nth-close".into()))?
+                    .max(1);
+            }
+            "--subscribe-never-acks" => subscribe_never_acks = true,
+            "--refuse-shell-exit-send-text" => refuse_shell_exit_send_text = true,
             "--session" | "--takeover" => {
                 if args[i] == "--session" {
                     i += 1;
@@ -469,14 +733,25 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
         positional.first().map(String::as_str),
         Some("serve") | Some("server") | None
     ) {
-        return Ok(Cli::Serve(FakeHerdrOptions {
+        return Ok(Cli::Serve(Box::new(FakeHerdrOptions {
             socket,
             script,
             frames,
             agent_start_delay,
             unavailable_calls,
             exit_after_unavailable,
-        }));
+            interrupt_transcript,
+            interrupt_record_file,
+            force_close_transcript,
+            force_close_record_file,
+            control_dispatch_record_file,
+            restart_reuses_ids_on_ctrlc,
+            restart_barrier_on_close,
+            restart_barrier_close_ordinal,
+            subscribe_never_acks,
+            refuse_shell_exit_send_text,
+            refuse_close_subscribes_marker: refuse_close_subscribes_marker.clone(),
+        })));
     }
     Err(FakeHerdrError::Args(format!(
         "unknown command {}",
@@ -585,6 +860,17 @@ async fn serve(options: FakeHerdrOptions) -> Result<(), FakeHerdrError> {
         options.agent_start_delay,
         options.unavailable_calls,
         options.exit_after_unavailable,
+        options.interrupt_transcript,
+        options.interrupt_record_file,
+        options.force_close_transcript,
+        options.force_close_record_file,
+        options.control_dispatch_record_file,
+        options.restart_reuses_ids_on_ctrlc,
+        options.restart_barrier_on_close,
+        options.restart_barrier_close_ordinal,
+        options.subscribe_never_acks,
+        options.refuse_shell_exit_send_text,
+        options.refuse_close_subscribes_marker.clone(),
         trace_path,
     )));
     // Only the scripted shutdown window (`exit_after_unavailable`) stops the
@@ -635,6 +921,38 @@ struct State {
     slow_until: HashMap<String, Instant>,
     /// Index into [`ONBOARDING_STEPS`] per agent, for the `onboarding` script.
     onboarding_step: HashMap<String, usize>,
+    /// When set, the first ctrl+c sent to a pane with a live agent appends
+    /// `interrupt_record_file` to `interrupt_transcript` and then removes the
+    /// agent (the native-writer-finishes-on-Ctrl-C-C test model).
+    interrupt_transcript: Option<PathBuf>,
+    interrupt_record_file: Option<PathBuf>,
+    /// Delayed-writer model: ctrl+c leaves the agent alive; the final record
+    /// is appended (and the agent removed) only on the pane's force close.
+    force_close_transcript: Option<PathBuf>,
+    force_close_record_file: Option<PathBuf>,
+    /// Restart/ID-reuse model (c-ctxusage r14 item 1).
+    restart_on_ctrlc: bool,
+    /// The simulated restart fires once.
+    restart_done: bool,
+    /// Restart barrier on the close path (c-ctxusage r15 item 1).
+    restart_barrier_on_close: bool,
+    /// 1-based ordinal of the pane.close the barrier fires on (r16 item 1).
+    close_barrier_ordinal: u32,
+    /// pane.close calls seen since boot, compared against the ordinal.
+    pane_closes_seen: u32,
+    /// The close barrier fires once.
+    close_barrier_done: bool,
+    /// Accept events.subscribe but never acknowledge it (r15 item 6).
+    subscribe_never_acks: bool,
+    /// Refuse every pane.send_text with a live-boot API error (r17 item 7).
+    refuse_shell_exit_send_text: bool,
+    /// c-ctxusage r25 item 3: marker file; refuse closes-subscribes while it
+    /// exists.
+    refuse_close_subscribes_marker: Option<PathBuf>,
+    /// c-ctxusage r26 item 4: one JSON line per served control dispatch.
+    control_dispatch_record_file: Option<PathBuf>,
+    /// Bumped by the simulated restart; surfaced in `ping` capabilities.
+    server_generation: u32,
     /// JSONL append target recording the `env` map every `workspace.create`
     /// and `pane.split` actually received — the only place a driver test can
     /// assert on the pane environment the launch produced (the recipe's
@@ -643,11 +961,23 @@ struct State {
 }
 
 impl State {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         script: FakeHerdrScript,
         agent_start_delay: Duration,
         unavailable_calls: usize,
         exit_after_unavailable: bool,
+        interrupt_transcript: Option<PathBuf>,
+        interrupt_record_file: Option<PathBuf>,
+        force_close_transcript: Option<PathBuf>,
+        force_close_record_file: Option<PathBuf>,
+        control_dispatch_record_file: Option<PathBuf>,
+        restart_on_ctrlc: bool,
+        restart_barrier_on_close: bool,
+        close_barrier_ordinal: u32,
+        subscribe_never_acks: bool,
+        refuse_shell_exit_send_text: bool,
+        refuse_close_subscribes_marker: Option<PathBuf>,
         trace_path: Option<PathBuf>,
     ) -> Self {
         Self {
@@ -669,6 +999,21 @@ impl State {
             shell_panes: HashSet::new(),
             slow_until: HashMap::new(),
             onboarding_step: HashMap::new(),
+            interrupt_transcript,
+            interrupt_record_file,
+            force_close_transcript,
+            force_close_record_file,
+            control_dispatch_record_file,
+            restart_on_ctrlc,
+            restart_done: false,
+            restart_barrier_on_close,
+            close_barrier_ordinal,
+            pane_closes_seen: 0,
+            close_barrier_done: false,
+            subscribe_never_acks,
+            refuse_shell_exit_send_text,
+            refuse_close_subscribes_marker,
+            server_generation: 1,
         }
     }
 
@@ -714,6 +1059,10 @@ async fn handle_conn(
 ) -> Result<(), FakeHerdrError> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
+    // c-ctxusage r15 item 1: whether THIS connection carried an ownership
+    // snapshot. A verified audit-and-close connection sends both on one fd;
+    // the ordinary client dials a fresh fd per RPC.
+    let mut served_snapshot = false;
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
             continue;
@@ -744,6 +1093,60 @@ async fn handle_conn(
             }
         }
         if req.method == "events.subscribe" {
+            // c-ctxusage r25 item 3: transiently refuse the first N close
+            // lifecycle subscriptions. Only the close interrupt phase
+            // subscribes to pane.exited/pane.closed; launch subscribes to
+            // pane.agent_status_changed only, so this is a close-only refusal
+            // that models a transient carrier hiccup at close start.
+            let is_close_subscription = req
+                .params
+                .get("subscriptions")
+                .and_then(Value::as_array)
+                .is_some_and(|subs| {
+                    subs.iter().any(|sub| {
+                        matches!(
+                            sub.get("type").and_then(Value::as_str),
+                            Some("pane.exited" | "pane.closed")
+                        )
+                    })
+                });
+            if is_close_subscription {
+                let refuse = {
+                    let st = lock_state(&state)?;
+                    st.refuse_close_subscribes_marker
+                        .as_ref()
+                        .is_some_and(|marker| marker.exists())
+                };
+                if refuse {
+                    let body =
+                        error_reply(&req, "server_unavailable", "server is shutting down".into());
+                    writer.write_all(body.as_bytes()).await?;
+                    writer.flush().await?;
+                    continue;
+                }
+            }
+            // c-ctxusage r15 item 6: the wedged-carrier model. Only the
+            // close-path lifecycle handshake (pane.exited / pane.closed)
+            // parks; other subscriptions the driver uses at startup
+            // (pane.agent_status_changed) keep working, so the instance can
+            // come up normally before the close handshake wedges.
+            if lock_state(&state)?.subscribe_never_acks {
+                let closes = req
+                    .params
+                    .get("subscriptions")
+                    .and_then(Value::as_array)
+                    .is_some_and(|subs| {
+                        subs.iter().any(|sub| {
+                            matches!(
+                                sub.get("type").and_then(Value::as_str),
+                                Some("pane.exited" | "pane.closed")
+                            )
+                        })
+                    });
+                if closes {
+                    futures::future::pending::<()>().await;
+                }
+            }
             handle_subscribe(&req, &mut writer, &state).await?;
             return Ok(());
         }
@@ -756,6 +1159,47 @@ async fn handle_conn(
         if req.method == "agent.start" {
             let delay = lock_state(&state)?.agent_start_delay;
             tokio::time::sleep(delay).await;
+        }
+        // c-ctxusage r15 item 1 / r16 item 1: restart barrier between the
+        // ownership audit and the destructive close. Fires once, on the
+        // configured pane.close ordinal (default the first; r16 uses the
+        // second to model the replacement appearing during REAP, after the
+        // interrupt phase's forced close already succeeded). On a connection
+        // that served the audit snapshot, the boot is replaced (state swapped
+        // to the foreign-labelled reuse) and the dying server's connection is
+        // closed WITHOUT processing pane.close: the close never lands. On a
+        // one-RPC-per-call client the close lands against the replacement
+        // boot and removes the foreign pane — the race this guard exists to
+        // make unrepresentable.
+        if req.method == "pane.close" {
+            let kill_conn_after_swap = {
+                let mut st = lock_state(&state)?;
+                st.pane_closes_seen = st.pane_closes_seen.saturating_add(1);
+                if st.restart_barrier_on_close
+                    && !st.close_barrier_done
+                    && st.pane_closes_seen >= st.close_barrier_ordinal
+                {
+                    let pane_id = req
+                        .params
+                        .get("pane_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    st.close_barrier_done = true;
+                    simulate_restart_with_id_reuse(&mut st, &pane_id);
+                    served_snapshot
+                } else {
+                    false
+                }
+            };
+            if kill_conn_after_swap {
+                // Dropping the writer closes the accepted fd: the client sees
+                // EOF and must report the close outcome as uncertain.
+                return Ok(());
+            }
+        }
+        if req.method == "session.snapshot" {
+            served_snapshot = true;
         }
         let reply = match handle_rpc(&state, &req) {
             Ok(value) => success(&req, value),
@@ -844,7 +1288,7 @@ fn handle_rpc(
         .lock()
         .map_err(|_| ("internal_error", "state poisoned".into()))?;
     match req.method.as_str() {
-        "ping" => serde_json::to_value(pong()).map_err(json_err),
+        "ping" => serde_json::to_value(pong(&st)).map_err(json_err),
         "session.snapshot" => snapshot(&st),
         "workspace.create" => {
             trace_pane_env(&st, "workspace.create", &req.params);
@@ -891,7 +1335,7 @@ fn json_err(err: serde_json::Error) -> (&'static str, String) {
     ("internal_error", err.to_string())
 }
 
-fn pong() -> Pong {
+fn pong(st: &State) -> Pong {
     Pong {
         kind: "pong".into(),
         version: "0.9.0-fake".into(),
@@ -899,7 +1343,7 @@ fn pong() -> Pong {
         capabilities: Some(ServerCapabilities {
             live_handoff: true,
             detached_server_daemon: false,
-            endpoint_protocol_generation: Some(1),
+            endpoint_protocol_generation: Some(st.server_generation),
             surface_interest: true,
             health_check: true,
         }),
@@ -1114,6 +1558,10 @@ fn pane_close(st: &mut State, params: &Value) -> Result<Value, (&'static str, St
         .get("pane_id")
         .and_then(Value::as_str)
         .ok_or(("invalid_request", "missing pane_id".into()))?;
+    // Delayed-writer model (c-ctxusage r13 item 1): forcing the pane closed is
+    // the native writer's last chance to flush the interrupted turn's record,
+    // and it terminates with the pane. remove_pane below drops the agent.
+    force_close_live_agent(st, pane_id);
     remove_pane(st, pane_id);
     emit(
         st,
@@ -1121,6 +1569,31 @@ fn pane_close(st: &mut State, params: &Value) -> Result<Value, (&'static str, St
         json!({"type":"pane_exited","pane_id": pane_id, "workspace_id": "w1"}),
     );
     ok()
+}
+
+/// Append the force-close record for a pane that still hosts a LIVE agent,
+/// modelling the writer flushing its final record on the forced
+/// SIGHUP/SIGTERM before the pane reaps it. Fires once: only while the agent
+/// is live, so a reap's redundant close of the already-gone pane appends
+/// nothing.
+fn force_close_live_agent(st: &mut State, pane_id: &str) {
+    if !st.agents.values().any(|agent| agent.pane_id == pane_id) {
+        return;
+    }
+    if let (Some(transcript), Some(record_file)) =
+        (&st.force_close_transcript, &st.force_close_record_file)
+        && let Ok(record) = std::fs::read_to_string(record_file)
+    {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(transcript)
+            && file.write_all(record.as_bytes()).is_ok()
+        {
+            let _ = file.sync_all();
+        }
+    }
 }
 
 fn remove_pane(st: &mut State, pane_id: &str) {
@@ -1142,6 +1615,16 @@ fn pane_send_text(st: &mut State, params: &Value) -> Result<Value, (&'static str
         .get("pane_id")
         .and_then(Value::as_str)
         .ok_or(("invalid_request", "missing pane_id".into()))?;
+    // c-ctxusage r17 item 7: an ordinary live-boot refusal of the optional
+    // shell-exit send — the pane vanished between the process probe and this
+    // send. It is NOT a connection loss, so the closer skips the courtesy and
+    // continues into reap.
+    if st.refuse_shell_exit_send_text {
+        return Err((
+            "pane_not_found",
+            format!("pane {pane_id} is gone (refused shell-exit send)"),
+        ));
+    }
     let text = params.get("text").and_then(Value::as_str).unwrap_or("");
     st.screens
         .entry(pane_id.to_string())
@@ -1155,6 +1638,28 @@ fn pane_send_keys(st: &mut State, params: &Value) -> Result<Value, (&'static str
         .get("pane_id")
         .and_then(Value::as_str)
         .ok_or(("invalid_request", "missing pane_id".into()))?;
+    let keys: Vec<String> = params
+        .get("keys")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    if keys.iter().any(|key| key == "ctrl+c") {
+        // c-ctxusage r14 item 1: model Herdr restarting mid-close — the first
+        // ctrl+c lands as the server goes down and the reboot hands the
+        // deterministic ids to an unrelated workspace. The keystroke never
+        // reaches either agent.
+        if st.restart_on_ctrlc && !st.restart_done {
+            st.restart_done = true;
+            simulate_restart_with_id_reuse(st, pane_id);
+            return ok();
+        }
+        interrupt_live_agent(st, pane_id);
+    }
     if let Some(name) = st
         .agents
         .iter()
@@ -1165,6 +1670,159 @@ fn pane_send_keys(st: &mut State, params: &Value) -> Result<Value, (&'static str
         advance_onboarding(st, &name);
     }
     ok()
+}
+
+/// Model the native writer's Ctrl-C handling: append the interrupted turn's
+/// record to the transcript and terminate (leave the agent list; the pane
+/// reverts to its root shell). Fires only for a pane that still has a live
+/// agent, so the courtesy double-tap appends exactly once.
+///
+/// Delayed-writer model (c-ctxusage r13 item 1): when the final record is
+/// delivered on the forced pane close instead, ctrl+c is a no-op — the agent
+/// stays in the list past the reclamation grace.
+fn interrupt_live_agent(st: &mut State, pane_id: &str) {
+    if st.force_close_transcript.is_some() {
+        return;
+    }
+    if !st.agents.values().any(|agent| agent.pane_id == pane_id) {
+        return;
+    }
+    if let (Some(transcript), Some(record_file)) =
+        (&st.interrupt_transcript, &st.interrupt_record_file)
+        && let Ok(record) = std::fs::read_to_string(record_file)
+    {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(transcript)
+            && file.write_all(record.as_bytes()).is_ok()
+        {
+            let _ = file.sync_all();
+        }
+    }
+    st.agents.retain(|_, agent| agent.pane_id != pane_id);
+    st.shell_panes.insert(pane_id.to_string());
+    if let Some(pane) = st.panes.get_mut(pane_id) {
+        pane.agent = None;
+        pane.agent_status = AgentStatus::Unknown;
+        // Foreground process (the native agent) exited; the pane reverts to
+        // its root shell. Herdr emits pane.exited per foreground-process exit,
+        // which is the closer's event-driven polite-exit signal
+        // (c-ctxusage r15 item 1).
+        let workspace_id = pane.workspace_id.clone();
+        emit(
+            st,
+            "pane_exited",
+            json!({"type":"pane_exited","pane_id": pane_id, "workspace_id": workspace_id}),
+        );
+    }
+}
+
+/// Model a Herdr RESTART (c-ctxusage r14 item 1): bump the boot generation,
+/// wipe every state the predecessor owned, reset the deterministic id
+/// counters, and hand the fresh ids `w1` / `w1:t1` / `w1:p1` to an
+/// UNRELATED workspace with a different creation label and its own live
+/// agent. The predecessor's agent was launched on a split pane (the driver
+/// keeps its root shell on p1 and starts the agent on p2), so the foreign
+/// workspace reproduces the same layout — root shell on p1, its own live
+/// agent on the SAME pane id the closer is about to force-close. A closer
+/// that proves ownership against the predecessor must now refuse the
+/// destructive call: that pane belongs to a stranger.
+fn simulate_restart_with_id_reuse(st: &mut State, wanted_pane_id: &str) {
+    st.server_generation += 1;
+    st.workspaces.clear();
+    st.tabs.clear();
+    st.panes.clear();
+    st.agents.clear();
+    st.screens.clear();
+    st.dead_agents.clear();
+    st.shell_panes.clear();
+    st.slow_until.clear();
+    st.onboarding_step.clear();
+    st.next_ws = 1;
+    st.next_tab = 1;
+    st.next_pane = 1;
+
+    let ws_id = st.alloc_workspace();
+    let tab_id = st.alloc_tab(&ws_id);
+    let root_id = st.alloc_pane(&ws_id);
+    let root = blank_pane(&ws_id, &tab_id, &root_id, "/tmp/foreign-work", true);
+    st.screens.insert(root_id.clone(), "$ \n".to_string());
+    st.panes.insert(root_id, root);
+    // Deterministic ids restart at w1:p1: the fresh boot hands its root shell
+    // to p1 and starts its own live agent on p2 — the SAME split layout the
+    // predecessor used. When the barrier fires on a FORCED agent-pane close
+    // the wanted id is that pane (p2); when it fires on a REAP close the
+    // wanted id is the surviving root pane p1, and the foreign agent must
+    // still land canonically on p2 (c-ctxusage r16 item 1). Allocate until
+    // the wanted id; bounded, so an unexpected id shape still leaves the
+    // foreign agent live on a real pane.
+    let target_pane_id = if wanted_pane_id == "w1:p1" {
+        "w1:p2"
+    } else {
+        wanted_pane_id
+    };
+    let mut agent_pane_id = st.alloc_pane(&ws_id);
+    for _ in 0..16 {
+        if agent_pane_id == target_pane_id {
+            break;
+        }
+        let extra = blank_pane(&ws_id, &tab_id, &agent_pane_id, "/tmp/foreign-work", false);
+        st.screens.insert(agent_pane_id.clone(), "$ \n".to_string());
+        st.panes.insert(agent_pane_id.clone(), extra);
+        agent_pane_id = st.alloc_pane(&ws_id);
+    }
+    let agent_pane = blank_pane(&ws_id, &tab_id, &agent_pane_id, "/tmp/foreign-work", false);
+    st.screens
+        .insert(agent_pane.pane_id.clone(), "$ \n".to_string());
+    let pane_count = st.panes.len() + 1;
+    st.panes
+        .insert(agent_pane.pane_id.clone(), agent_pane.clone());
+    let tab = TabInfo {
+        tab_id: tab_id.clone(),
+        workspace_id: ws_id.clone(),
+        number: 1,
+        label: "1".into(),
+        focused: true,
+        pane_count,
+        agent_status: AgentStatus::Working,
+    };
+    let workspace = WorkspaceInfo {
+        pane_count,
+        tab_count: 1,
+        workspace_id: ws_id.clone(),
+        number: 1,
+        label: RESTART_FOREIGN_LABEL.into(),
+        focused: true,
+        active_tab_id: tab_id.clone(),
+        agent_status: AgentStatus::Working,
+    };
+    if let Some(pane) = st.panes.get_mut(&agent_pane.pane_id) {
+        pane.agent = Some("claude".into());
+        pane.agent_status = AgentStatus::Working;
+    }
+    let agent = AgentInfo {
+        terminal_id: "term_foreign".into(),
+        name: Some("foreign-agent".into()),
+        agent: Some("claude".into()),
+        agent_status: AgentStatus::Working,
+        workspace_id: ws_id,
+        tab_id: tab_id.clone(),
+        pane_id: agent_pane.pane_id.clone(),
+        focused: false,
+        agent_session: None,
+        interactive_ready: true,
+        launch_pending: false,
+        cwd: Some("/tmp/foreign-work".into()),
+        terminal_title: Some("Claude Code".into()),
+        terminal_title_stripped: Some("Claude Code".into()),
+        state_change_seq: 1,
+        revision: 1,
+    };
+    st.tabs.insert(tab_id, tab);
+    st.workspaces.insert("w1".into(), workspace);
+    st.agents.insert("foreign-agent".to_string(), agent);
 }
 
 fn pane_process_info(st: &mut State, params: &Value) -> Result<Value, (&'static str, String)> {
@@ -1390,11 +2048,36 @@ fn crash_screen(args: &[String]) -> String {
     "error: unexpected argument '--name' found\nUsage: grok [OPTIONS] [PROMPT]\n%\n".into()
 }
 
+/// Append one line per control dispatch the fake actually served
+/// (c-ctxusage r26 item 4). Best-effort: the witness file is test
+/// infrastructure, a write failure must never change the RPC result.
+fn record_control_dispatch(st: &State, method: &str, target: &str) {
+    let Some(path) = &st.control_dispatch_record_file else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(
+            file,
+            "{}",
+            serde_json::json!({ "method": method, "target": target })
+        );
+    }
+}
+
 fn agent_prompt(st: &mut State, params: &Value) -> Result<Value, (&'static str, String)> {
     let target = params
         .get("target")
         .and_then(Value::as_str)
         .ok_or(("invalid_request", "missing target".into()))?;
+    record_control_dispatch(st, "agent.prompt", target);
     let text = params.get("text").and_then(Value::as_str).unwrap_or("");
     let name = resolve_agent(st, target)?;
     if st.dead_agents.contains(&name) {
@@ -1494,6 +2177,7 @@ fn agent_send_keys(st: &mut State, params: &Value) -> Result<Value, (&'static st
         .get("target")
         .and_then(Value::as_str)
         .ok_or(("invalid_request", "missing target".into()))?;
+    record_control_dispatch(st, "agent.send_keys", target);
     let name = resolve_agent(st, target)?;
     let keys: Vec<String> = params
         .get("keys")

@@ -2904,12 +2904,6 @@ async fn maintain_binding_inner<FinalizeFut>(
     // collision once records carrying a cwd have actually been written.
     if !bindings.content_cwd_check() {
         bindings.mark_degraded("transcript cwd does not match the promoted terminal");
-        // c-ctxusage r5 item 1: DISCARD, do not finalise. A final tail read here
-        // would journal exactly the mismatched-cwd records — messages, tool
-        // calls and usage of a transcript the driver just declared foreign — so
-        // the chip would show another session's context. Demote/promote/
-        // rebind/vanish/close keep their reading finalise; only the
-        // cwd-mismatch degrade drops the hydrator unread.
         hydrator.take();
         let mut related = BTreeMap::from([
             ("sessionId".to_owned(), binding.session_id.clone()),
@@ -3550,8 +3544,12 @@ async fn emit_mapped(
     mapped: Observation,
 ) -> DriverResult<()> {
     let event_id = mapped.event_id;
-    let native_at = mapped.native_at.clone();
-    let evidence = mapped.evidence_event_ids.clone();
+    // c-ctxusage r24 item 1: preserve the mapper-stamped native time so live
+    // promoted TUI usage stays native-timed (TPM / lastTurnAt); rebuilding the
+    // observation resets it to Unknown and reclassifies the row as ingest.
+    // The mapper's replay evidence ids ride the envelope too (§9.1).
+    let native_at = mapped.native_at;
+    let evidence = mapped.evidence_event_ids;
     let mut observation = build(
         ctx,
         seq.fetch_add(1, Ordering::SeqCst) + 1,
@@ -3619,6 +3617,53 @@ mod tests {
     use super::*;
     use remuda_protocol::{QuestionAnswer, QuestionFieldAnswer};
     use std::io::Write;
+
+    /// c-ctxusage r24 item 1: the promoted TUI pump's `emit_mapped` rebuilds
+    /// run identity but must preserve the mapper-stamped native time so live
+    /// usage projects as native-timed (TPM / lastTurnAt).
+    #[tokio::test]
+    async fn emit_mapped_preserves_native_time() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let ctx = ctx_in(dir.path());
+        let (events, mut rx) = mpsc::channel(4);
+        let seq = Arc::new(AtomicU64::new(0));
+        let at = "2026-10-13T10:00:00.000Z";
+        let mut mapped = build(
+            &ctx,
+            99,
+            SourceChannel::Transcript,
+            Completeness::Structured,
+            ObservationPayload::Lifecycle(Box::new(LifecyclePayload::Native(Box::new(
+                NativeLifecycle {
+                    topic: LifecycleTopic::Session,
+                    native_name: "x".into(),
+                    native_id: Knowledge::NotApplicable,
+                    status: Knowledge::NotApplicable,
+                    related_ids: BTreeMap::new(),
+                    data_ref: None,
+                    severity: Severity::Info,
+                    affects_completion: false,
+                },
+            )))),
+            Knowledge::Unknown {
+                reason: "not-emitted".into(),
+                evidence_event_ids: Vec::new(),
+            },
+        )
+        .expect("builds");
+        mapped.native_at = Knowledge::Known {
+            value: Timestamp::try_from(at.to_string()).unwrap(),
+        };
+        let expected = match &mapped.native_at {
+            Knowledge::Known { value } => value.clone(),
+            _ => panic!("set"),
+        };
+        emit_mapped(&events, &seq, &ctx, SourceChannel::Transcript, mapped)
+            .await
+            .expect("emits");
+        let out = rx.recv().await.expect("one observation");
+        assert_eq!(out.native_at, Knowledge::Known { value: expected });
+    }
 
     fn ctx_in(dir: &Path) -> PromoteCtx {
         PromoteCtx {
@@ -7901,6 +7946,74 @@ mod tests {
         assert!(
             conversation_hydrated(&observations, "between report and first poll"),
             "the between-instant record hydrates instead of being skipped: {observations:?}"
+        );
+    }
+
+    /// c-ctxusage r25 item 4: a timestamped native usage record fed through the
+    /// REAL production promotion pump (`Hydrator::open` -> `pump` ->
+    /// `emit_mapped`) reaches the channel with the record's native timestamp
+    /// and the deterministic usage id. Main's design keeps `observed_at` as
+    /// the receipt time; the record time rides `native_at`. Reverting the r24
+    /// wrapper's `observation.native_at = native_at` line makes this go RED.
+    #[tokio::test]
+    async fn promotion_pump_preserves_native_time_and_usage_identity() {
+        let native_ts = "2026-10-13T10:00:00.000Z";
+        let mut line = serde_json::json!({
+            "type": "assistant",
+            "uuid": "msg-usage-1",
+            "sessionId": PUMP_SESSION,
+            "version": DECOUPLED,
+            "timestamp": native_ts,
+            "message": {
+                "id": "msg-usage-1",
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "text", "text": "done"}],
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": 100,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "output_tokens": 11
+                }
+            },
+        })
+        .to_string();
+        line.push('\n');
+        let dir = tempfile::tempdir().expect("tmp");
+        let mut fx = pump_fixture(dir.path(), &line);
+        let mut hydrator = open_hydrator(&fx, ResumeMode::Fresh, None);
+        pump_once(&mut hydrator, &fx).await;
+        let observations = drain(&mut fx);
+        let (obs, payload) = observations
+            .iter()
+            .filter_map(|observation| match &observation.body {
+                ObservationPayload::Usage(payload) => Some((observation, payload)),
+                _ => None,
+            })
+            .find(|(_, payload)| payload.scope_id == "msg-usage-1")
+            .expect("the production promotion pump emitted the usage observation");
+        assert_eq!(
+            obs.native_at,
+            Knowledge::Known {
+                value: Timestamp::try_from(native_ts.to_string()).unwrap()
+            },
+            "the promoted pump carries native_at as the record time, not Unknown"
+        );
+        assert_ne!(
+            String::from(obs.observed_at.clone()),
+            native_ts,
+            "observed_at stays receipt time by main's design"
+        );
+        let expected_usage_id = Id::derive(
+            "obj",
+            fx.ctx.instance_id.as_id().as_str(),
+            "usage:turn:msg-usage-1",
+        )
+        .expect("derived usage id");
+        assert_eq!(
+            payload.usage_id, expected_usage_id,
+            "the pump keeps the mapper's deterministic, replay-stable usage id"
         );
     }
 }

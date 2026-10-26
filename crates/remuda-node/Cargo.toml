@@ -49,7 +49,9 @@ tokio-tungstenite.workspace = true
 url = "2"
 tracing.workspace = true
 uuid.workspace = true
-nix = { version = "0.28", features = ["process", "fs", "signal"] }
+# `event` exposes nix's safe kqueue/kevent wrapper on the BSD/macOS waiter
+# in tests/usage_native_rollup.rs (it only adds epoll/eventfd on Linux).
+nix = { version = "0.28", features = ["process", "fs", "signal", "inotify", "event"] }
 plist = { version = "1.10.1", default-features = false }
 
 [features]
@@ -58,6 +60,7 @@ plist = { version = "1.10.1", default-features = false }
 test-stub = ["remuda-driver/test-stub"]
 
 [dev-dependencies]
+libc = "0.2"
 portable-pty.workspace = true
 remuda-driver = { workspace = true, features = ["test-stub"] }
 remuda-node = { path = ".", features = ["test-stub"] }

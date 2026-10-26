@@ -217,6 +217,7 @@ pub(super) fn map_stream(
             if let Some(usage_obs) =
                 super::turn_usage_observation(mapper, &native, model.as_deref(), &final_usage, 2)?
             {
+                mapper.saw_per_call_usage = true;
                 return Ok(vec![usage_obs]);
             }
         }
@@ -470,6 +471,7 @@ pub(super) fn map_assistant(
         && stream_usage_carrier(mapper.driver_kind)
         && let Some(usage_obs) = super::usage_from_assistant_message(mapper, msg)?
     {
+        mapper.saw_per_call_usage = true;
         out.push(usage_obs);
     }
     if let Some(id) = &msg.uuid {
@@ -480,8 +482,10 @@ pub(super) fn map_assistant(
 
 /// Whether this carrier reads stream-json as its authoritative output channel
 /// (and therefore takes per-call usage straight off the assistant / delta
-/// frames). The interactive pty carriers instead hydrate a native transcript
-/// and emit usage through the group-gated flush (r2 item 5a).
-fn stream_usage_carrier(kind: DriverKind) -> bool {
+/// frames, stamped with the frame receipt time). The interactive pty carriers
+/// instead hydrate a native transcript and emit usage through the group-gated
+/// flush (r2 item 5a); their per-call observations stay un-stamped here and
+/// keep transcript timestamps.
+pub(super) fn stream_usage_carrier(kind: DriverKind) -> bool {
     matches!(kind, DriverKind::ClaudePrint | DriverKind::ClaudeSdk)
 }

@@ -759,6 +759,7 @@ mod tests {
             socket_path: client.socket_path().into(),
             session: "remuda-reclaim-test".into(),
             workspace_id: created.workspace.workspace_id,
+            server_facet: None,
             workspace_label: created.workspace.label,
             tab_id: created.tab.tab_id,
             pane_id,

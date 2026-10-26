@@ -1193,3 +1193,76 @@ it("r4 item 2: a queued tail pass whose debt generation was cleared still lets t
   );
   expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
 }, 15_000);
+
+it("r4 item 2: a queued stale drain then a queued past-deadline tail pass never terminalise the successor's rows", async () => {
+  // The review's exact trigger: the old identity owes a command, a pending
+  // journal job holds the chain, a second accepted drain queues behind it,
+  // then the tail pass queues. Logout + a public successor login restore the
+  // persisted sent rows under a new Outbox. Releasing the chain after the
+  // captured tail's deadline must neither recreate the debt (retired drain)
+  // nor patch the successor's rows to unknown (retired exhaustion).
+  const { api, hubStore } = await fresh();
+  await mountFollow(api, hubStore);
+  vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+  vi.spyOn(api, "hostList").mockResolvedValue({ items: [], nextCursor: null } as Awaited<
+    ReturnType<Api["hostList"]>
+  >);
+  vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as Awaited<ReturnType<Api["deviceList"]>>);
+  vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as Awaited<ReturnType<Api["passkeyList"]>>);
+  vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+  vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+  vi.spyOn(api, "login").mockResolvedValue({
+    deviceId: "dev_successor_r4_tail",
+    token: "tok_successor_r4_tail",
+    name: "successor",
+  } as Awaited<ReturnType<Api["login"]>>);
+  vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+    const commandId = _args[4] as string;
+    return Promise.resolve(commandResult(commandId, "accepted"));
+  });
+  const h = hubStore as unknown as {
+    chainReconcile: (id: string, job: () => Promise<unknown>) => Promise<unknown>;
+    reconcileChain: Map<string, Promise<unknown>>;
+    runOwedTailPass: (id: string) => void;
+    owedTail: Map<string, { timer: ReturnType<typeof setTimeout> | null; firstAt: number }>;
+    outbox: { get: (id: string) => OutboxRecord | undefined } | null;
+  };
+
+  await hubStore.send(INSTANCE, "old identity owed");
+  const bubbleOf = (text: string) => hubStore.getSnapshot().bubbles.find((b) => b.text === text)!;
+  await vi.waitFor(() => expect(bubbleOf("old identity owed").outboxState).toBe("sent"));
+  await vi.waitFor(() => expect(h.owedTail.get(INSTANCE)?.timer).not.toBeNull());
+  const firstId = bubbleOf("old identity owed").commandId!;
+  // Take over the tail timer so the pass is queued exactly once, in order.
+  const tail = h.owedTail.get(INSTANCE)!;
+  clearTimeout(tail.timer!);
+  tail.timer = null;
+
+  // A pending journal job holds the chain…
+  let releaseBlock: (() => void) | null = null;
+  void h.chainReconcile(INSTANCE, () => new Promise<void>((resolve) => (releaseBlock = resolve)));
+  const blocker = h.reconcileChain.get(INSTANCE);
+  // …another accepted drain queues behind it…
+  await hubStore.send(INSTANCE, "second accepted drain");
+  await vi.waitFor(() => expect(bubbleOf("second accepted drain").outboxState).toBe("sent"));
+  await vi.waitFor(() => expect(h.reconcileChain.get(INSTANCE)).not.toBe(blocker));
+  const secondId = bubbleOf("second accepted drain").commandId!;
+  // …followed by the tail timer's job, whose captured deadline has passed.
+  h.runOwedTailPass(INSTANCE);
+  tail.firstAt = 0;
+
+  hubStore.logout();
+  vi.mocked(api.instanceList).mockResolvedValue({ items: [], nextCursor: null });
+  await expect(hubStore.login("bootstrap", "secret", "dev")).resolves.toBe("settled");
+  expect(h.outbox?.get(firstId)?.state).toBe("sent");
+  expect(h.outbox?.get(secondId)?.state).toBe("sent");
+
+  releaseBlock!();
+  for (let i = 0; i < 120; i += 1) await Promise.resolve();
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  // Neither retired job wrote anything into the successor identity.
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+  expect(h.outbox?.get(firstId)?.state).toBe("sent");
+  expect(h.outbox?.get(secondId)?.state).toBe("sent");
+});

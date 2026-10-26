@@ -4718,10 +4718,10 @@ class HubStore {
       if (!box.pendingFor(instanceId).length) {
         const drainJournalId =
           this.state.instances.find((i) => i.id === instanceId)?.journalId ?? null;
-        // r3 item 1: capture the issuing epoch/box BEFORE queueing; the
-        // nested resumeAfterReconnect receives it as isCurrent, so a read
-        // parked across logout is dropped inside the JournalClient before it
-        // can apply the retired identity's events.
+        // r3 item 1: capture the issuing epoch/box BEFORE queueing. The
+        // post-drain resync below receives it as isCurrent, which drops ITS
+        // OWN tail read when parked across logout; a nested gap fill that read
+        // starts is fenced by generation only (see the catch-up comment).
         const drainEpoch = this.identityEpoch;
         const drainStillOurs = () => this.identityEpoch === drainEpoch && this.outbox === box;
         await this.chainReconcile(instanceId, async () => {
@@ -4748,10 +4748,18 @@ class HubStore {
           // it: a live→recovering flip while we waited behind an earlier slow
           // catch-up must be observed here (fix-5 item 2). If THIS instance's
           // follow currently owns recovery, its reopenFollow resync is
-          // authoritative — skip the redundant REST read (which would
-          // otherwise queue ahead of the socket reopen past the 20 s
-          // watchdog); that fold re-checks the debt. Otherwise run the
-          // bounded REST catch-up now.
+          // authoritative — skip the redundant read (which would otherwise
+          // queue ahead of the socket reopen past the 20 s watchdog); that
+          // fold re-checks the debt. Otherwise run the mounted JournalClient's
+          // ordinary post-delivery resync now: resumeAfterReconnect, the
+          // pre-existing main path (this branch only added the isCurrent
+          // fence). It is NOT part of the self-contained debt machinery — it
+          // folds the page through the client like any resync, and only the
+          // debt recorded above plus the re-check below involve the debt
+          // tail. Its nested gap fill (journal.ts fillGap) still checks
+          // generation only, so a gap read parked across logout + a successor
+          // login can apply the retired page; fencing that belongs to the
+          // follow/journal ownership-fencing follow-up, not here.
           if (!this.followOwnsCatchupNow(instanceId, drainJournalId)) {
             const client = drainJournalId ? this.journals.get(drainJournalId) : undefined;
             try {

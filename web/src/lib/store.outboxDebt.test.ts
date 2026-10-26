@@ -915,10 +915,11 @@ it("r4 item 2: a queued stale drain job retired at entry neither recreates debt 
 });
 
 it("r4 item 3: the debt fallback trigger applies evidence only and leaves permission request B pending", async () => {
-  // The ACTUAL fallback path is runOwedReconcile (resume failure / failed
-  // reopen / bind-away / watchdog). On 87712402 it drives the mounted
-  // JournalClient.resumeAfterReconnect, whose onEvents runs the permission
-  // reducer on an OLD readback for A and clears request B. AD3: it must be a
+  // The ACTUAL fallback trigger: the bound follow's reopen FAILS inside the
+  // connection machine's resume action, whose catch runs the debt fallback.
+  // On 87712402 that fallback drove the mounted
+  // JournalClient.resumeAfterReconnect, whose onEvents ran the permission
+  // reducer on an OLD readback for A and cleared request B. AD3: it must be a
   // self-contained evidence-only REST read.
   const { api, hubStore } = await fresh();
   await mountFollow(api, hubStore);
@@ -942,6 +943,16 @@ it("r4 item 3: the debt fallback trigger applies evidence only and leaves permis
   await vi.waitFor(() => expect(bubble().outboxState).toBe("sent"));
   const commandId = bubble().commandId!;
   expect(debtOf(hubStore).has(INSTANCE)).toBe(true);
+  const owed = hubStore as unknown as {
+    owedTail: Map<string, { timer: ReturnType<typeof setTimeout> | null }>;
+    connectionBoundTo: string | null;
+    resumeConnection: () => Promise<void>;
+  };
+  // Own the tail timer so ONLY the fallback trigger below can read.
+  await vi.waitFor(() => expect(owed.owedTail.get(INSTANCE)?.timer).not.toBeNull());
+  clearTimeout(owed.owedTail.get(INSTANCE)!.timer!);
+  owed.owedTail.get(INSTANCE)!.timer = null;
+  expect(owed.connectionBoundTo).toBe(INSTANCE);
 
   // The fallback's read returns an OLD permission effective readback for A
   // (newer than the seeded effective) AND the owed command entry.
@@ -972,9 +983,11 @@ it("r4 item 3: the debt fallback trigger applies evidence only and leaves permis
     reachedAfterSeq: true,
   });
 
-  // Fire the actual fallback handler.
-  (hubStore as unknown as { runOwedReconcile: (id: string) => void }).runOwedReconcile(INSTANCE);
-  for (let i = 0; i < 80; i += 1) await Promise.resolve();
+  // The resume reopens the bound follow and the subscribe is refused (proxy
+  // refusing the upgrade): the resume rejects and its catch runs the fallback.
+  vi.mocked(api.eventsSubscribe).mockRejectedValue(new Error("follow upgrade refused"));
+  await expect(owed.resumeConnection()).rejects.toThrow("follow upgrade refused");
+  await vi.waitFor(() => expect(bubble().outboxState).toBe("done"));
 
   // Owed command settled durably…
   expect(bubble().outboxState).toBe("done");

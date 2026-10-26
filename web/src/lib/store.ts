@@ -1339,13 +1339,6 @@ class HubStore {
     { bindGen: number; attemptId: number | null; commands: Set<Id> }
   >();
   /**
-   * Instances with an owed REST fallback currently running. Several triggers
-   * can fire for one instance while its bounded read is in flight (rebind,
-   * failed reopen, watchdog — and N drained rows); they collapse into the
-   * ONE coalesced self-contained evidence pass (owedTailRunning in
-   * runOwedTailPass).
-   */
-  /**
    * Ruling AD: bounded debt-driven tail re-read state per instance. `attempts`
    * counts actual journal reads the driver issued while evidence was missing;
    * `firstAt` bounds the whole chase with a wall deadline even while no
@@ -1369,6 +1362,12 @@ class HubStore {
       timer: ReturnType<typeof setTimeout> | null;
     }
   >();
+  /**
+   * Instances with a debt evidence pass currently queued or running. Several
+   * triggers can fire for one instance while its bounded read is in flight
+   * (tail timer, rebind, failed reopen, watchdog — and N drained rows); they
+   * collapse into the ONE coalesced self-contained pass in runOwedTailPass.
+   */
   private owedTailRunning = new Set<Id>();
   /**
    * Ruling AD r2 item 3: command ids whose durable terminal ("unknown")
@@ -3918,17 +3917,20 @@ class HubStore {
    * Ruling AD: debt is PER COMMAND — `commandIds` are added to the entry's
    * outstanding set; recording debt for an instance already in debt merges
    * the sets instead of replacing them.
+   *
+   * The entry OBJECT is the debt generation a tail pass pins (AD3): a merge
+   * updates it in place, so only clearing and re-recording starts a new
+   * generation — a pass queued behind a drain that merely merged more owed
+   * commands still owns the (larger) debt.
    */
   private recordOwed(instanceId: Id, commandIds?: Iterable<Id>) {
-    const existing = this.reconcileOwed.get(instanceId);
-    const commands = existing?.commands ?? new Set<Id>();
-    if (commandIds) for (const commandId of commandIds) commands.add(commandId);
     const ref = this.connection?.attemptRef() ?? null;
-    this.reconcileOwed.set(instanceId, {
-      bindGen: this.connectionBindGen,
-      attemptId: ref?.attemptId ?? existing?.attemptId ?? null,
-      commands,
-    });
+    const existing = this.reconcileOwed.get(instanceId);
+    const debt = existing ?? { bindGen: 0, attemptId: null, commands: new Set<Id>() };
+    if (commandIds) for (const commandId of commandIds) debt.commands.add(commandId);
+    debt.bindGen = this.connectionBindGen;
+    debt.attemptId = ref?.attemptId ?? existing?.attemptId ?? null;
+    this.reconcileOwed.set(instanceId, debt);
   }
 
   /**
@@ -4116,10 +4118,17 @@ class HubStore {
       this.owedTail.get(instanceId) === capturedTail &&
       this.reconcileOwed.get(instanceId) === debt;
     void this.chainReconcile(instanceId, async () => {
-      // Entry gate: a queued callback that survived logout is dropped before
-      // any mutation.
-      if (!box || !debt || this.reconcileOwed.get(instanceId) !== debt) return;
       try {
+        // Entry gate: a queued callback that survived logout (or whose debt
+        // generation was cleared while it waited) is dropped before any
+        // mutation. It still releases the running marker in `finally`, and a
+        // same-identity rejection re-arms the CURRENT debt's tail: that
+        // debt's own timer may have fired while this pass held the marker
+        // and been coalesced away, which would otherwise strand it forever.
+        if (!box || !debt || !stillOurs()) {
+          if (this.identityEpoch === epoch) this.scheduleOwedTail(instanceId, OWED_TAIL_BASE_BACKOFF_MS);
+          return;
+        }
         if (!this.owedCommandLacksEvidence(instanceId)) {
           this.clearOwed(instanceId);
           return;

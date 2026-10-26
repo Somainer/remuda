@@ -1097,3 +1097,99 @@ it("r4 item 4: the debt scan cursor advances through a full unrelated page to th
   // Only the owed node entered store state — the unrelated 128 did not.
   expect(hubStore.getSnapshot().events[INSTANCE]).toHaveLength(129);
 });
+
+it("r4 item 2: a queued tail pass whose debt generation was cleared still lets the NEXT debt's tail run", async () => {
+  // Liveness of the entry gate. A tail pass is queued behind a chain blocker
+  // for debt D1; live evidence clears D1 while it waits and a second drained
+  // send records a NEW debt D2 behind it. The stale pass must reject itself
+  // at entry WITHOUT keeping the per-instance running marker, or every later
+  // D2 tail pass is coalesced away and D2's row stays accepted forever.
+  const { api, hubStore } = await fresh();
+  await mountFollow(api, hubStore);
+  vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+    const commandId = _args[4] as string;
+    return Promise.resolve(commandResult(commandId, "accepted"));
+  });
+  const h = hubStore as unknown as {
+    chainReconcile: (id: string, job: () => Promise<unknown>) => Promise<unknown>;
+    runOwedTailPass: (id: string) => void;
+    owedTail: Map<string, { timer: unknown }>;
+  };
+
+  await hubStore.send(INSTANCE, "first owed");
+  const bubbleOf = (text: string) => hubStore.getSnapshot().bubbles.find((b) => b.text === text)!;
+  await vi.waitFor(() => expect(bubbleOf("first owed").outboxState).toBe("sent"));
+  await vi.waitFor(() => expect(debtOf(hubStore).has(INSTANCE)).toBe(true));
+  const firstId = bubbleOf("first owed").commandId!;
+  const firstDebt = debtOf(hubStore).get(INSTANCE);
+
+  // Park the journal chain, then queue a D1 tail pass behind it.
+  let releaseBlock: (() => void) | null = null;
+  void h.chainReconcile(INSTANCE, () => new Promise<void>((resolve) => (releaseBlock = resolve)));
+  h.runOwedTailPass(INSTANCE);
+
+  // Live evidence for the first command clears D1 while the pass waits.
+  const onBatch = await liveBatch(api);
+  onBatch({
+    subscriptionId: "sub_outbox_debt",
+    journalId: JOURNAL,
+    fromSeq: "1",
+    toSeq: "1",
+    durableSeq: "1",
+    events: [
+      {
+        kind: "message",
+        eventId: "evt_user_first_live",
+        journalId: JOURNAL,
+        instanceId: INSTANCE,
+        seq: "1",
+        completeness: "structured",
+        payload: { role: "user", commandId: firstId },
+      } as unknown as Observation,
+    ],
+  });
+  await vi.waitFor(() => expect(bubbleOf("first owed").outboxState).toBe("done"));
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+
+  // A second drained send queues its post-drain job behind the stale pass.
+  await hubStore.send(INSTANCE, "second owed");
+  await vi.waitFor(() => expect(bubbleOf("second owed").outboxState).toBe("sent"));
+  const secondId = bubbleOf("second owed").commandId!;
+
+  // Release: the stale pass enters and rejects; the drain records D2 and its
+  // empty resync arms D2's tail timer.
+  releaseBlock!();
+  await vi.waitFor(() => {
+    const debt = debtOf(hubStore).get(INSTANCE);
+    expect(debt).toBeDefined();
+    expect(debt).not.toBe(firstDebt);
+    expect(h.owedTail.get(INSTANCE)?.timer).not.toBeNull();
+  });
+
+  // The Node's journal write for the second command is now durable; only a
+  // D2 tail pass can read it (the live socket missed it).
+  vi.mocked(api.eventsRead).mockResolvedValue({
+    events: [
+      {
+        kind: "message",
+        eventId: "evt_user_second_tail",
+        journalId: JOURNAL,
+        instanceId: INSTANCE,
+        seq: "2",
+        completeness: "structured",
+        payload: { role: "user", commandId: secondId },
+      } as unknown as Observation,
+    ],
+    durableSeq: "2",
+    windowFromSeq: "2",
+    reachedAfterSeq: true,
+  });
+  await vi.waitFor(
+    () => {
+      expect(bubbleOf("second owed").state).toBe("settled");
+      expect(bubbleOf("second owed").outboxState).toBe("done");
+    },
+    { timeout: 4_000 },
+  );
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+}, 15_000);

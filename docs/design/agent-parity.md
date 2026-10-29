@@ -152,9 +152,9 @@ The page's create form is not wired to the Hub yet (`web/src/features/fleet/stor
 
 | Subcommand | Hub route | Today (origin/main) | Planned |
 |---|---|---|---|
-| `instance create` | `POST /v1/instances` | Agent route, as "Create a session" | `ma-admission` (OA1) |
-| `instance list` | `GET /v1/instances` | Agent route, as "See the session list" | — |
-| `agents` | `GET /v1/instances` | Agent route, as `instance list` | — |
+| `instance create` | `POST /v1/instances`; `GET /v1/hosts` only for label or unplaced creates | Agent route, as "Create a session". With an explicit `--host` the CLI reads no host list; with `--labels` or no host it tries `GET /v1/hosts`, which is refused for Agent origin, and lets the Hub place (`crates/remuda/src/cmd/instance.rs`). A computer-use create needs the list and fails for Agent origin | `ma-admission` (OA1) |
+| `instance list` | `GET /v1/hosts` and `GET /v1/instances`; with `--watch`, `GET /v1/follow` | Gap. The CLI path (`agents::list` in `crates/remuda/src/cmd/agents.rs`) joins the host inventory, `GET /v1/hosts` (operator-only, `list_hosts`), with `GET /v1/instances`, so it fails for Agent origin even though `GET /v1/instances` itself admits a `dispatch` holder. `--watch` also opens the all-instances follow socket, which is not admitted for Agent origin | `ap-agent-list` |
+| `agents` | as `instance list` | Gap. The same `agents::list` path, with the same host-inventory and follow-socket dependencies | `ap-agent-list` |
 | `instance show` | `GET /v1/instances/{id}` | Agent route. Owned targets | — |
 | `instance send` | commands, `instance.send` | Agent route. The send rule | — |
 | `instance respond` | `GET /v1/interactions?instanceId=`, `POST /v1/interactions/{id}/answer` | Agent route under the D-051 limits for questions and plan reviews; approvals: Safety | `ma-admission` (OA3) |
@@ -298,6 +298,7 @@ Every Gap row above, by the task that closes it. The `ap-*` tasks are defined in
 | `ma-admission` | `dispatch`; `watch`, `report` (worker reads); `retire`; `worker nudge`, `answer`, `switch-model`, `resume`, `replace`, `stop`; `brief send`; worker resume from the PWA; the D-051 bypass exclusion (OA3) |
 | `ap-command-read` | a send's receipt and every command read (`GET /v1/instances/{id}/commands`, `…/commands/{commandId}`) |
 | `ap-gate-reads` | `gate log`; `gate list` without `--project`; the gate parts of `watch` and `report`; the failure log of `gate <branch>` |
+| `ap-agent-list` | `instance list` and `agents`, including `--watch` |
 | `ap-configure` | model, effort and ultracode changes |
 | `ap-configure-mode` | permission-mode changes, after the owner decides how OA1 applies |
 | `ap-resume` | resuming an owned instance that is not a worker |

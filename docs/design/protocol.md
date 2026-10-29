@@ -1560,10 +1560,33 @@ object 上传授权绑定 actor、host/workspace 和用途；uploadId 使用 obj
 | hello `capabilities.lineageFence` | Node→Hub | `true` 表示支持 `lineage.fence` 及本表其余字段；缺失即不支持。Hub 不向不支持的 Node 发送续接血缘发起的命令或直连操作（409，reason `node-lacks-fence`，§9），也不发送 `hub` 来源输入；发往它的其余流量不变 |
 | create / resume 的 `lineage` | Hub→Node | `instance.create` 与 `instance.resume` 的 params 增加 `lineage:{id:Id,generation:U64}`，让 Node 知道实例所属的血缘与代数 |
 | Agent 来源 create 的 `creatorPermissionMode` | Hub→Node | Hub 依据创建者章节上记录的生效档位盖章，绝不取自请求体；Node 物化器据此执行 §Origin 的「子不超父」 |
-| create / resume 的 `memoryContext`（D-060） | Hub→Node | `instance.create` 与 `instance.resume` 的 params 增加 `memoryContext:{rev:U64,text:string}`：血缘记忆的渲染索引加 about-me（§8.4，[main-agent.md §12.3](./main-agent.md#123-reading)）。与 `creatorPermissionMode` 一样由 Hub 盖章，请求体里的同名字段一律剥掉；它绝不是 `InstanceSpec.args` 里的 flag。Node 物化器是它唯一的写入方：Claude 的两条启动路径，`claude_argv` 与 `shell-pty` 的 `materialize_shell_pty_agent`，都在调用方参数之后自己发出一次 `--append-system-prompt`；非 Claude harness 改为第一条输入之前的数据块。调用方 `args` 里的 `--system-prompt`、`--append-system-prompt` 照旧被拒：Hub 回 HTTP 400、code `BAD_REQUEST`（消息为 `native feature disabled: flag --… is prohibited`），Node 以 driver 错误 `NativeFeatureDisabled` 拒绝；两者都保持不变。`InstanceCreateParams` 不拒绝未知字段，老 Node 会静默忽略它，所以 Hub 只给在 hello 中声明 `capabilities.memoryContext` 的 Node 盖这个字段；对其余 Node，Hub 在血缘记录里写明该章节启动时没有注入索引 |
+| create / resume 的 `memoryContext`（D-060） | Hub→Node | `instance.create` 与 `instance.resume` 的 params 增加 `memoryContext:{rev:U64,text:string}`：血缘记忆的渲染索引加 about-me（§8.4，[main-agent.md §12.3](./main-agent.md#123-reading)）。与 `creatorPermissionMode` 一样由 Hub 盖章，请求体里的同名字段一律剥掉；它绝不是 `InstanceSpec.args` 里的 flag。Node 物化器是它唯一的写入方，每条启动路径的机制见本表下方的穷尽表：只有 `claude` 类实例的 `claude_argv` 与 `materialize_shell_pty_agent` 在调用方参数之后自己发出一次 `--append-system-prompt`；`generic-pty` 上的每种 agent 类与每个非 Claude harness 改为第一条输入之前的数据块；`terminal`、`generic` 两类不注入。调用方 `args` 里的 `--system-prompt`、`--append-system-prompt` 照旧被拒：Hub 回 HTTP 400、code `BAD_REQUEST`（消息为 `native feature disabled: flag --… is prohibited`），Node 以 driver 错误 `NativeFeatureDisabled` 拒绝；两者都保持不变。`InstanceCreateParams` 不拒绝未知字段，老 Node 会静默忽略它，所以 Hub 只给在 hello 中声明 `capabilities.memoryContext` 的 Node 盖这个字段；对其余 Node，Hub 在血缘记录里写明该章节启动时没有注入索引 |
 | 转发命令的 `initiator` | Hub→Node | §2.5 的 `initiator`（不含设备 id）；Node 持久化到它的 Command 记录并写入 journal |
 | `initiator` 与 `opId` | Hub→Node | 加在 `interaction.answer`、`worker.provision`、`worker.remove`、`worktree.lease`、`worktree.return`、`gate.run` 的 params 上。`opId` 是 Hub 在任何外部效果之前已持久化的受理记录 id：`interaction.answer` 用该答案的 commandId，`gate.run` 用 gate job id，其余方法用 Hub 的直连操作行 id。Node 在分发入口（`dispatch_frame`）、任何副作用之前按已持久化的 fence 拒绝被隔离的发起者（reason `fenced`）；对放行的操作，在任何副作用之前持久记下 opId、方法与发起者，之后再记结果。只有入口记录、没有结果的操作在 fence 确认里报告 `unknown` |
 | `gate.then` / `gate.land` / `gate.unpin` / `gate.cancel` | Hub→Node | 带 job id，是一个已开跑 job 的延续：Node 把它们作为 fence 之前已到达执行者的操作的后续步骤接纳，已开跑的 job（含 land 步骤）执行完毕 |
+
+`memoryContext` 在各启动路径上的注入机制（D-060；与 [main-agent.md §12.3](./main-agent.md#123-reading) 的表一致）。它覆盖 `materialize_inner` 里 driver match 的每个分支（:239）与之前的 shell-pty agent 分支（:229），乘以 Node 的 `validate_kind_driver`（`crates/remuda-node/src/runtime.rs:3047`）为该 driver 接受的每种 kind；其余组合在物化之前即被拒绝。此表对该 match 是穷尽的，新增 `DriverKind` 分支或新接受的组合必须同时加行。
+
+| # | Driver | Kind | `crates/remuda-driver/src/materializer.rs` 中的 match 分支（origin/main `c27e0eac`） | 机制 |
+|---|---|---|---|---|
+| 1 | `claude-print` | `claude` | Claude 分支（`ClaudePrint`、`ClaudeSdk`、`ClaudePty`、`ClaudeBg`，:240-243），argv 由 `claude_argv`（:1356）构建，调用处 :287 | flag |
+| 2 | `claude-sdk` | `claude` | Claude 分支（`ClaudePrint`、`ClaudeSdk`、`ClaudePty`、`ClaudeBg`，:240-243），argv 由 `claude_argv`（:1356）构建，调用处 :287 | flag |
+| 3 | `claude-pty` | `claude` | Claude 分支（`ClaudePrint`、`ClaudeSdk`、`ClaudePty`、`ClaudeBg`，:240-243），argv 由 `claude_argv`（:1356）构建，调用处 :287 | flag |
+| 4 | `claude-bg` | `claude` | Claude 分支（`ClaudePrint`、`ClaudeSdk`、`ClaudePty`、`ClaudeBg`，:240-243），argv 由 `claude_argv`（:1356）构建，调用处 :287 | flag |
+| 5 | `codex-appserver` | `codex` | `DriverKind::CodexAppserver` （:344） | 数据块 |
+| 6 | `grok-acp` | `grok` | `DriverKind::GrokAcp` （:369） | 数据块 |
+| 7 | `agy-print` | `agy` | `DriverKind::AgyPrint` （:406） | 数据块 |
+| 8 | `generic-pty` | `claude` | `DriverKind::GenericPty`（:430），`argv = extras` | 数据块 |
+| 9 | `generic-pty` | `codex` | `DriverKind::GenericPty`（:430） | 数据块 |
+| 10 | `generic-pty` | `grok` | `DriverKind::GenericPty`（:430） | 数据块 |
+| 11 | `generic-pty` | `agy` | `DriverKind::GenericPty`（:430） | 数据块 |
+| 12 | `generic-pty` | `generic` | `DriverKind::GenericPty`（:430） | 不适用 |
+| 13 | `shell-pty` | `claude` | match 之前的 shell-pty agent 分支（:229），进入 `materialize_shell_pty_agent`（:576） | flag |
+| 14 | `shell-pty` | `codex` | match 之前的 shell-pty agent 分支（:229），进入 `materialize_shell_pty_agent`（:576） | 数据块 |
+| 15 | `shell-pty` | `grok` | match 之前的 shell-pty agent 分支（:229），进入 `materialize_shell_pty_agent`（:576） | 数据块 |
+| 16 | `shell-pty` | `agy` | match 之前的 shell-pty agent 分支（:229），进入 `materialize_shell_pty_agent`（:576） | 数据块 |
+| 17 | `shell-pty` | `terminal` | `DriverKind::ShellPty`（:439），登录 shell | 不适用 |
+| 18 | `shell-pty` | `generic` | `DriverKind::ShellPty`（:439），登录 shell | 不适用 |
 
 示例（只为说明形状；本节新增的帧与字段一律放在 text 围栏里，不进 JSON 金样）：
 

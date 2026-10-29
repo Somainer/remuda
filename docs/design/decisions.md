@@ -1934,8 +1934,34 @@ registry 锁外加独立 DB claim（跨域，reconcile 先于 slot 切换提交�
      - 物化器对调用方参数的扫描（`crates/remuda-driver/src/materializer.rs` 中 `claude_argv` 与 `materialize_shell_pty_agent` 对 `extras` 的 `is_banned_flag_token`）不变。
      - 新增：参数带 `memoryContext` 时，物化器在调用方参数之后自己追加一次 `--append-system-prompt <text>`，作为系统提示的最后一节，以保住前面内容的提示缓存。Claude 的两条启动路径都这样做：`claude_argv`（claude-print、claude-sdk、claude-pty、claude-bg），以及 `materialize_shell_pty_agent`（原生 `shell-pty` carrier 上的 `claude` 类实例，它不经过 `claude_argv`）。两者都把这一对记在 recipe 上，作为物化器自己的发出。
      - 对成品 argv 的检查，即 `crates/remuda-driver/src/claude_print.rs` 的 `refuse_prohibited_argv`（claude-print、claude-sdk）与 `crates/remuda-driver/src/claude_pty.rs` 的 `refuse_bare`（claude-pty、claude-bg），今天拒绝任何 `--append-system-prompt`。改为只放过物化器记在 recipe 上的那一对，其余出现照旧拒绝。`shell-pty` 启动在 origin/main 上不做成品 argv 检查（`crates/remuda-driver/src/shell_pty/launch.rs` 直接把 recipe 交给 PTY），它唯一的检查是 `extras` 扫描，保持不变；以后在那里加成品 argv 检查时，同样只放过这一对。`--system-prompt` 从不发出，处处照旧拒绝。
-     - 只有非 Claude 的 harness（codex、grok、agy，任何 carrier）没有这个 flag；只对它们，物化器把文本作为框起来的数据块放在第一条输入之前。
-   - 验收要求真实启动路径上的测试：经 Hub 创建、由 Node 物化出的 claude-sdk argv（用假 `claude` 记录的实际 argv 断言，即 `crates/remuda-testing/src/fake.rs` 的 `FAKE_CLAUDE_ARGV_FILE`）恰好含一个位于调用方参数之后、值为索引的 `--append-system-prompt`，且通过 `refuse_prohibited_argv`；`shell-pty` 上的 `claude` 实例同理，`materialize_shell_pty_agent` 生成的 argv 恰好含一个位于调用方参数之后的 `--append-system-prompt`；请求体 `args` 里带 `--append-system-prompt` 或 `--system-prompt` 的创建照旧以今天的错误被拒，请求体里的 `memoryContext` 被剥掉。
+     - **每条启动路径用什么（穷尽）。** flag 只用于物化器自己构建 Claude argv 的路径：`claude` 类实例的 `claude_argv` 与 `materialize_shell_pty_agent`。其余所有 agent 启动一律改用框起来的首条输入数据块：`generic-pty` 上的每种 agent 类（它是原始 PTY，二进制不一定是 `claude`，所以不得往它的 argv 注入 flag；该分支就是 `argv = extras`），以及每个非 Claude harness。`terminal` 与 `generic` 两类都不注入：没有 agent 读它们的首条输入，文本会被敲进 shell 或任意程序；Hub 也不为它们盖 `memoryContext`。
+     - **数据块。** 物化器把框好的文本记在 recipe 上，driver 把它作为数据放在它投递的第一条输入之前（stdio 回合、延后 argv 的提示或 PTY 提示）。原生 resume 不再重发。
+     - **下表**覆盖 `materialize_inner` 里 driver match 的每个分支（:239）以及它之前的 shell-pty agent 分支（:229），乘以 Node 为该 driver 接受的每种 kind（`crates/remuda-node/src/runtime.rs:3047` 的 `validate_kind_driver`）。其余 (kind, driver) 组合在 `materialize` 运行之前就被 Node 拒绝；两个入口 `materialize`（:158）与 `materialize_with_token_broker`（:167）都经过 `materialize_inner`（:174）。因此此表对该 match 是穷尽的：新增 `DriverKind` 分支或新接受的 (kind, driver) 组合，必须在同一次改动里在这里加一行。
+   - 验收要求真实启动路径上的测试，下表每行一个（18 个），都经 Hub 创建、断言启动的假进程实际收到的东西，而不是只断言渲染出的字符串：flag 行（1-4、13）断言假 `claude` 记录的实际 argv（`crates/remuda-testing/src/fake.rs` 的 `FAKE_CLAUDE_ARGV_FILE`）恰好含一个位于调用方参数之后、值为索引的 `--append-system-prompt`，且通过成品 argv 检查（行 1-2 为 `refuse_prohibited_argv`，行 3-4 为 `refuse_bare`，行 13 在 origin/main 上没有）；数据块行（5-11、14-16）断言 argv 里没有 `--append-system-prompt`，且假进程收到的第一条输入以框起来的数据块开头（假进程尚不记录首条输入的，由 `cb-memory-inject` 补上）；不适用行（12、17、18）断言 argv 与首条输入都不含索引。各行共同：请求体 `args` 里带 `--append-system-prompt` 或 `--system-prompt` 的创建照旧以今天的错误被拒，请求体里的 `memoryContext` 被剥掉。
+
+   上文所说的启动路径表（对该 match 穷尽，18 行）：
+
+   | # | Driver | Kind | `crates/remuda-driver/src/materializer.rs` 中的 match 分支（origin/main `c27e0eac`） | 机制 |
+   |---|---|---|---|---|
+   | 1 | `claude-print` | `claude` | Claude 分支（`ClaudePrint`、`ClaudeSdk`、`ClaudePty`、`ClaudeBg`，:240-243），argv 由 `claude_argv`（:1356）构建，调用处 :287 | flag |
+   | 2 | `claude-sdk` | `claude` | Claude 分支（`ClaudePrint`、`ClaudeSdk`、`ClaudePty`、`ClaudeBg`，:240-243），argv 由 `claude_argv`（:1356）构建，调用处 :287 | flag |
+   | 3 | `claude-pty` | `claude` | Claude 分支（`ClaudePrint`、`ClaudeSdk`、`ClaudePty`、`ClaudeBg`，:240-243），argv 由 `claude_argv`（:1356）构建，调用处 :287 | flag |
+   | 4 | `claude-bg` | `claude` | Claude 分支（`ClaudePrint`、`ClaudeSdk`、`ClaudePty`、`ClaudeBg`，:240-243），argv 由 `claude_argv`（:1356）构建，调用处 :287 | flag |
+   | 5 | `codex-appserver` | `codex` | `DriverKind::CodexAppserver` （:344） | 数据块 |
+   | 6 | `grok-acp` | `grok` | `DriverKind::GrokAcp` （:369） | 数据块 |
+   | 7 | `agy-print` | `agy` | `DriverKind::AgyPrint` （:406） | 数据块 |
+   | 8 | `generic-pty` | `claude` | `DriverKind::GenericPty`（:430），`argv = extras` | 数据块 |
+   | 9 | `generic-pty` | `codex` | `DriverKind::GenericPty`（:430） | 数据块 |
+   | 10 | `generic-pty` | `grok` | `DriverKind::GenericPty`（:430） | 数据块 |
+   | 11 | `generic-pty` | `agy` | `DriverKind::GenericPty`（:430） | 数据块 |
+   | 12 | `generic-pty` | `generic` | `DriverKind::GenericPty`（:430） | 不适用 |
+   | 13 | `shell-pty` | `claude` | match 之前的 shell-pty agent 分支（:229），进入 `materialize_shell_pty_agent`（:576） | flag |
+   | 14 | `shell-pty` | `codex` | match 之前的 shell-pty agent 分支（:229），进入 `materialize_shell_pty_agent`（:576） | 数据块 |
+   | 15 | `shell-pty` | `grok` | match 之前的 shell-pty agent 分支（:229），进入 `materialize_shell_pty_agent`（:576） | 数据块 |
+   | 16 | `shell-pty` | `agy` | match 之前的 shell-pty agent 分支（:229），进入 `materialize_shell_pty_agent`（:576） | 数据块 |
+   | 17 | `shell-pty` | `terminal` | `DriverKind::ShellPty`（:439），登录 shell | 不适用 |
+   | 18 | `shell-pty` | `generic` | `DriverKind::ShellPty`（:439），登录 shell | 不适用 |
+
    - 章节中途记忆有变化时不重启，只在下一条输入或下一个事实批次之前加一行「记忆自本章开始已变更（rev N）」。原生 resume 不重复注入。
    - 回复下方显示「已记住：<title>」。为此 Hub 在写入时记下写入实例和回合引用，所有回合都显示。
 

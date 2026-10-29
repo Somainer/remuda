@@ -576,7 +576,12 @@ Routed facts (§10) extend condition 2 to turn errors, exits and blocked timers.
 ## 9 Chat surface
 
 Phase 1:
-- **Main entry**, pinned in `/m` and in the desktop session list. It resolves to the live address-owner chapter. When the lineage is paused, it resolves to the latest chapter of the most recent address-owner lineage, labelled for example "paused by you at T".
+- **Main entry.** It resolves to the live address-owner chapter. When the lineage is paused, it resolves to the latest chapter of the most recent address-owner lineage, labelled for example "paused by you at T". With no address-owner lineage nothing is rendered.
+- **On the home, Main is a card plus an input, not a separate tab** (D-061; [home.md](./home.md) §6). On `/m` and `/sessions`, Main is one card above the "needs you" queue, plus one 问 Main input. On the phone, that input is the 56px compact Composer docked above PhoneNav. On the desktop it is an inline input in the right column at ≥1440, or at the top of the main column below 1440. There is no Main tab, no fifth PhoneNav slot and no pinned list row.
+  - **The card.** It shows a status phrase and the first line of Main's latest reply. That line becomes a send echo right after the owner sends something.
+  - **The input.** It sends through `POST /v1/instances/{id}/commands` with a commandId, and reconciles an unknown outcome through `GET /v1/instances/{id}/commands/{commandId}`.
+  - **Main's own questions.** They sit first in the home queue and count once.
+  - **Shared resolution.** `ma-main-ui` and the home card resolve Main in one shared place.
 - **One conversation across chapters.** Chapters render in order, separated by dividers. Each divider shows the cause, the time, the predecessor's superseded interactions (linked to /approvals) and a summary of fence outcomes: cancelled, ran, and still unknown with the host named. Earlier chapters are collapsed and load on demand. A new read route returns a lineage's chapters, states and fence records.
 - **Status line.** Shows the chapter number, lifecycle and activity, restarts in the last 24 h with their causes, the last activity, and the lineage state: paused by you at T, restart cap, host offline since T, or restarting.
 - **Controls**, on Human devices only: Stop (cancel the turn), Pause (close the current chapter), and Resume (continuation resume, shown only while the lineage is paused).

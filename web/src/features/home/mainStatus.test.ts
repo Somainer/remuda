@@ -67,7 +67,7 @@ describe("mainStatus line-1 phrase", () => {
     const host = { id: "host-a", state: "offline", online: false, lastSeenAt: "2026-10-30T10:00:00Z" } as unknown as Host;
     const s = status(entry({ activity: known("working") }), { host });
     expect(s.phase).toBe("host-offline");
-    expect(s.phrase).toBe("主机 devbox 离线 · 2 小时");
+    expect(s.phrase).toBe("主机 devbox 离线 · 2h");
     expect(s.tone).toBe("attention");
     expect(s.hostOffline).toBe(true);
     expect(s.resumable).toBe(false);

@@ -7,7 +7,7 @@ import type { LineageRecord } from "../../lib/api";
 import type { LocalBubble, MainEntry } from "../../lib/store";
 import type { Instance } from "../../types/instance";
 import { known, type Id } from "../../types/wire";
-import { MainCard } from "./MainCard";
+import { MainAskDock, MainCard } from "./MainCard";
 
 const hub = {
   hosts: [{ id: "host-a", label: "devbox", online: true, state: "online" }],
@@ -55,10 +55,19 @@ function chapter(patch: Partial<Instance> = {}): Instance {
   } as Instance;
 }
 
-function renderCard() {
+function renderCard(placement: "phone" | "desktop" = "desktop") {
+  return render(
+    <MemoryRouter>
+      <MainCard placement={placement} />
+    </MemoryRouter>,
+  );
+}
+
+function renderPhone() {
   return render(
     <MemoryRouter>
       <MainCard placement="phone" />
+      <MainAskDock />
     </MemoryRouter>,
   );
 }
@@ -104,7 +113,24 @@ describe("MainCard", () => {
     // The compact input: no options trigger, the 问 Main placeholder.
     expect(screen.queryByTestId("model-effort-chip")).toBeNull();
     expect(screen.queryByTestId("composer-options-trigger")).toBeNull();
-    expect(screen.getByTestId("composer-input").getAttribute("placeholder")).toBe("问 Main…");
+    expect(screen.getByTestId("composer-input").getAttribute("placeholder")).toBe("问 Main…  ⌘↵ 发送");
+    // Desktop extras: chapter number and 展开 › to the Main session.
+    expect(screen.getByTestId("main-card-chapter").textContent).toBe("第 1 章");
+    expect(screen.getByTestId("main-card-expand").getAttribute("href")).toBe("/s/ins_main");
+  });
+
+  it("on the phone the card carries no input; the 问 Main input docks separately", () => {
+    renderPhone();
+    const card = screen.getByTestId("main-card");
+    expect(card.querySelector("[data-testid='composer-input']")).toBeNull();
+    const dock = screen.getByTestId("main-ask-dock");
+    expect(dock.querySelector("[data-testid='composer-input']")).not.toBeNull();
+  });
+
+  it("renders no dock without an address-owner lineage", () => {
+    main = null;
+    const { container } = renderPhone();
+    expect(container.querySelector("[data-testid='main-ask-dock']")).toBeNull();
   });
 
   it("sends to the resolved chapter through the store (D-055 outbox)", async () => {
@@ -113,6 +139,10 @@ describe("MainCard", () => {
     await user.type(screen.getByTestId("composer-input"), "看一下 gate");
     await user.click(screen.getByTestId("composer-send"));
     expect(send).toHaveBeenCalledWith("ins_main", "看一下 gate", [], []);
+    // ⌘/Ctrl+Enter sends from the desktop input too.
+    await user.type(screen.getByTestId("composer-input"), "第二条");
+    await user.keyboard("{Control>}{Enter}{/Control}");
+    expect(send).toHaveBeenLastCalledWith("ins_main", "第二条", [], []);
   });
 
   it("while paused the send button becomes 恢复 and resumes the chapter", async () => {

@@ -78,17 +78,17 @@ export function pausedLabel(paused: PausedBy, nowMs: number): string {
   }
 }
 
-/** Compact elapsed span: 「3 分」「2 小时」「4 天」. */
+/** Compact elapsed span (home.md §6.2): 「3分」「2h」「4d」. */
 export function sinceLabel(iso: string | null | undefined, nowMs: number): string | null {
   if (!iso) return null;
   const t = Date.parse(iso);
   if (!Number.isFinite(t)) return null;
   const minutes = Math.max(0, Math.floor((nowMs - t) / 60_000));
-  if (minutes < 1) return "不到 1 分";
-  if (minutes < 60) return `${minutes} 分`;
+  if (minutes < 1) return "<1分";
+  if (minutes < 60) return `${minutes}分`;
   const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours} 小时`;
-  return `${Math.floor(hours / 24)} 天`;
+  if (hours < 24) return `${hours}h`;
+  return `${Math.floor(hours / 24)}d`;
 }
 
 const CAUSE_LABEL: Record<string, string> = {

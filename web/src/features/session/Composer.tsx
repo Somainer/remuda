@@ -900,6 +900,14 @@ export function Composer({
     // The remaining shortcuts are desktop-keyboard semantics; on a phone
     // Enter types a newline and Cmd/Ctrl+Enter is not bound.
     if (mobile) return;
+    // 问 Main (home.md §6.3): ⌘/Ctrl+Enter sends; a plain Enter is a newline.
+    if (ask) {
+      if (event.key === "Enter" && (event.metaKey || event.ctrlKey) && !event.shiftKey) {
+        event.preventDefault();
+        void submitPrimary();
+      }
+      return;
+    }
     // Cmd/Ctrl+Enter while working = 插队: interrupt and send this first.
     if (
       event.key === "Enter"

@@ -87,11 +87,11 @@
   }
 }
 
-/* D-057 Main card column (ma-main-ui): ≥1440 only; below that the card heads
-   the list column instead (SessionsPage). */
+/* D-061 right column (home.md §2.2): ≥1440 only, 360px — Main card with its
+   inline input, then 工作中. Below 1440 the card heads the list column. */
 .aside {
   flex: none;
-  width: var(--aside);
+  width: 360px;
   min-height: 0;
   overflow: auto;
   border-left: 1px solid var(--divider);

@@ -1438,6 +1438,19 @@ describe("Composer ask variant (ma-main-ui 问 Main)", () => {
     expect(screen.getByTestId("composer-input").getAttribute("placeholder")).toBe("问 Main…");
   });
 
+  it("desktop ask sends on ⌘/Ctrl+Enter; a plain Enter is a newline", async () => {
+    const user = userEvent.setup();
+    const onSend = vi.fn();
+    render(<Composer instanceId="ins_ask_keys" mobile={false} variant="ask" onSend={onSend} />);
+    const area = screen.getByTestId("composer-input");
+    await user.type(area, "line1{Enter}line2");
+    expect(onSend).not.toHaveBeenCalled();
+    expect((area as HTMLTextAreaElement).value).toBe("line1\nline2");
+    await user.keyboard("{Control>}{Enter}{/Control}");
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(onSend.mock.calls[0][0]).toBe("line1\nline2");
+  });
+
   it("a primary override replaces send, and Enter never sends while it is set", async () => {
     const user = userEvent.setup();
     const onSend = vi.fn();
@@ -1454,6 +1467,7 @@ describe("Composer ask variant (ma-main-ui 问 Main)", () => {
     expect(screen.queryByTestId("composer-send")).toBeNull();
     const area = screen.getByTestId("composer-input");
     await user.type(area, "draft{Enter}");
+    await user.keyboard("{Control>}{Enter}{/Control}");
     expect(onSend).not.toHaveBeenCalled();
     await user.click(screen.getByTestId("main-ask-resume"));
     expect(onResume).toHaveBeenCalledTimes(1);

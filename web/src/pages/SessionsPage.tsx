@@ -1,12 +1,13 @@
 import { useEffect, useState } from "react";
 import { SessionList } from "../features/session/SessionList";
-import { useHub, useMainEntry } from "../lib/store";
+import { useHub } from "../lib/store";
 import { useWorkbenchViewport } from "../lib/viewport";
 import { SpacesPanel } from "../features/spaces/SpacesPanel";
 import { spaceStore, type Space } from "../features/spaces/store";
 import { useSpaceWorkbench } from "../features/spaces/useSpaceWorkbench";
 import { PageHeader } from "../components/PageHeader";
 import { MainCard } from "../features/home/MainCard";
+import { WorkingList } from "../features/home/WorkingList";
 import { useMainAside } from "../features/home/useMain";
 import ui from "../styles/ui.module.css";
 import css from "./SessionsPage.module.css";
@@ -15,8 +16,10 @@ export function SessionsPage({ dimmed = false }: { dimmed?: boolean }) {
   const hub = useHub();
   const { mobile } = useWorkbenchViewport();
   const { spaces, active, prefs, instanceId, newHref } = useSpaceWorkbench();
-  // D-057 Main card: heads the right column at ≥1440, the main column below.
-  // Never behind the dimmed /sessions/new sheet (one 问 Main input at a time).
+  // D-061 (home.md §2.2–2.4): ≥1440 adds the right column — Main card with
+  // its inline input, then 工作中; 1280–1439 puts the Main card at the top of
+  // the main column. Never behind the dimmed /sessions/new sheet (one 问 Main
+  // input at a time).
   const mainAside = useMainAside();
   const showMain = !mobile && !dimmed;
   // Below 1024 the index column folds into the header's 空间 button, which
@@ -81,19 +84,14 @@ export function SessionsPage({ dimmed = false }: { dimmed?: boolean }) {
             space={active ? { id: active.id, name: active.name, hostId: active.hostId, workspaceId: active.workspaceId } : undefined}
           />
         </div>
-        {showMain && mainAside ? <MainAside /> : null}
+        {showMain && mainAside ? (
+          <aside className={css.aside} aria-label="Main 与工作中" data-testid="sessions-aside">
+            <MainCard placement="desktop" />
+            <WorkingList />
+          </aside>
+        ) : null}
       </div>
     </div>
   );
 }
 
-/** ≥1440 right column; empty (not rendered) without an address-owner Main. */
-function MainAside() {
-  const main = useMainEntry();
-  if (!main) return null;
-  return (
-    <aside className={css.aside} aria-label="Main" data-testid="sessions-aside">
-      <MainCard placement="desktop" />
-    </aside>
-  );
-}

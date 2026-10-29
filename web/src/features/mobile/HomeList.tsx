@@ -32,7 +32,7 @@ import {
 import { TaskGroups, useTaskLedger } from "../tasks/TaskList";
 import { SpacesDrawer } from "../spaces/SpacesMobile";
 import { ContextRing } from "./ContextRing";
-import { MainCard } from "../home/MainCard";
+import { MainAskDock, MainCard } from "../home/MainCard";
 import ui from "../../styles/ui.module.css";
 import css from "./home.module.css";
 
@@ -476,6 +476,8 @@ export const HomeList = memo(function HomeList() {
         query={query}
         sessionEmpty={groups.length === 0}
       />
+      {/* D-061 ⑨: 问 Main docked at the bottom, above PhoneNav. */}
+      <MainAskDock />
     </div>
   );
 });

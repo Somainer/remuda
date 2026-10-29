@@ -4,12 +4,11 @@ import { StateDot } from "../../components/StateDot";
 import { api } from "../../lib/api";
 import { hubStore, useHub, useMainEntry, type MainEntry } from "../../lib/store";
 import { useNowTick } from "../../lib/useNowTick";
-import { useWorkbenchViewport } from "../../lib/viewport";
 import type { Instance } from "../../types/instance";
 import type { Id, U64 } from "../../types/wire";
 import { Composer } from "../session/Composer";
 import { mainEcho, mainStatus, readMainTail, type MainEcho, type MainTail } from "./mainStatus";
-import { useLineageSync } from "./useMain";
+import { useCompactLayout, useLineageSync } from "./useMain";
 import css from "./mainCard.module.css";
 
 /** Journal rows read for line 2 (same bounded window as the list phrases). */
@@ -53,12 +52,33 @@ function useMainTail(instance: Instance | null): { tail: MainTail | null; carrie
   return { tail, carried };
 }
 
+/** Everything the card and the 问 Main input read about the resolved Main. */
+function useMainView(entry: MainEntry) {
+  const hub = useHub();
+  const nowMs = useNowTick();
+  useLineageSync(entry);
+  const instance = entry.instance;
+  const lineage = hub.lineages[entry.lineageId] ?? null;
+  const status = mainStatus({
+    entry,
+    lineage,
+    host: hub.hosts.find((row) => row.id === instance.hostId),
+    hostName: hubStore.hostName(instance.hostId),
+    asking: hub.interactions.some((row) => row.instanceId === instance.id && row.state === "pending"),
+    summary: hub.summaries[instance.id],
+    nowMs,
+  });
+  const online = hub.connection === "live";
+  return { hub, instance, status, online };
+}
+
 /**
- * Home Main card (D-057 §9 / H8a): line 1 is dot · Main · a status phrase,
- * line 2 the first line of Main's last reply — or the echo of this device's
- * latest send — and under it the 问 Main input. Renders nothing without an
- * address-owner lineage. The /m home and the desktop /sessions page mount the
- * same card; sends go to the resolved chapter through the D-055 outbox.
+ * Home Main card (D-061 ③, home.md §6.2; resolution D-057 §9): line 1 is
+ * dot · Main · a status phrase, line 2 the first line of Main's last reply —
+ * or the echo of this device's latest send. Renders nothing without an
+ * address-owner lineage. The phone card carries no input (the 问 Main input
+ * docks at the bottom of /m, {@link MainAskDock}); the desktop card holds the
+ * inline input plus the read-only model·effort chip, the chapter and 展开 ›.
  */
 export function MainCard({ placement }: { placement: "phone" | "desktop" }) {
   const entry = useMainEntry();
@@ -67,26 +87,8 @@ export function MainCard({ placement }: { placement: "phone" | "desktop" }) {
 }
 
 function MainCardBody({ entry, placement }: { entry: MainEntry; placement: "phone" | "desktop" }) {
-  const hub = useHub();
-  const { mobile } = useWorkbenchViewport();
-  const nowMs = useNowTick();
-  useLineageSync(entry);
-  const instance = entry.instance;
-  const lineage = hub.lineages[entry.lineageId] ?? null;
-  const host = hub.hosts.find((row) => row.id === instance.hostId);
-  const hostName = hubStore.hostName(instance.hostId);
-  const asking = hub.interactions.some((row) => row.instanceId === instance.id && row.state === "pending");
-  const status = mainStatus({
-    entry,
-    lineage,
-    host,
-    hostName,
-    asking,
-    summary: hub.summaries[instance.id],
-    nowMs,
-  });
+  const { hub, instance, status, online } = useMainView(entry);
   const { tail, carried } = useMainTail(instance);
-  const online = hub.connection === "live";
   const echo = mainEcho({
     entry,
     bubbles: hub.bubbles,
@@ -95,29 +97,10 @@ function MainCardBody({ entry, placement }: { entry: MainEntry; placement: "phon
     busy: status.phase === "working" || status.phase === "asking",
     online,
   });
-  const [resuming, setResuming] = useState(false);
   const [checking, setChecking] = useState(false);
-
-  const sendText = async (text: string) => hubStore.send(instance.id as Id, text);
-
-  const resume = async () => {
-    setResuming(true);
-    try {
-      // The store refreshes the list on success; the resolution then lands on
-      // the new chapter and the input turns back into 发送.
-      await hubStore.resume(instance.id as Id, "structured");
-    } finally {
-      setResuming(false);
-    }
-  };
-
-  const placeholder = status.resumable
-    ? "Main 已暂停 · 点 恢复 继续"
-    : status.hostOffline
-      ? "主机离线 · 消息会排队，上线后送达"
-      : online
-        ? "问 Main…"
-        : "离线 · 消息会排队，恢复连接后送达";
+  const desktop = placement === "desktop";
+  const modelWord = instance.modelEffective?.id ?? instance.model ?? null;
+  const effortWord = instance.effortEffective?.name ?? instance.effortName ?? null;
 
   return (
     <section
@@ -139,17 +122,12 @@ function MainCardBody({ entry, placement }: { entry: MainEntry; placement: "phon
           <span className={css.phrase} data-testid="main-card-status" title={status.phrase}>
             {status.phrase}
           </span>
-          {placement === "desktop" && entry.generation > 1 ? (
-            <span className={css.chapter} data-testid="main-card-chapter">
-              第 {entry.generation} 章
-            </span>
-          ) : null}
         </span>
       </Link>
       <EchoLine
         echo={echo}
         checking={checking}
-        onRetry={(text) => void sendText(text)}
+        onRetry={(text) => void hubStore.send(instance.id as Id, text)}
         onReconcile={async (commandId) => {
           setChecking(true);
           try {
@@ -159,43 +137,108 @@ function MainCardBody({ entry, placement }: { entry: MainEntry; placement: "phon
           }
         }}
       />
-      <div className={css.ask} data-testid="main-ask">
-        <Composer
-          key={instance.id}
-          variant="ask"
-          instanceId={instance.id}
-          mobile={mobile}
-          kind={instance.kind}
-          phase="idle"
-          capabilities={instance.capabilities}
-          placeholder={placeholder}
-          primaryOverride={
-            status.resumable
-              ? {
-                  label: resuming ? "恢复中…" : "恢复",
-                  testId: "main-ask-resume",
-                  disabled: resuming,
-                  title: "恢复 Main（续接下一章）",
-                  onClick: () => void resume(),
-                }
-              : null
-          }
-          onSend={async (text, attachments, staged) => {
-            const previews = (staged ?? [])
-              .filter((item) => item.objectId)
-              .map((item) => ({
-                objectId: item.objectId as string,
-                name: item.name,
-                previewUrl: item.previewUrl,
-                kind: item.kind,
-                mediaType: item.mediaType,
-                size: item.size,
-              }));
-            return hubStore.send(instance.id as Id, text, attachments ?? [], previews);
-          }}
-        />
-      </div>
+      {desktop ? (
+        <div className={css.meta} data-testid="main-card-meta">
+          {modelWord || effortWord ? (
+            <span className={css.modelChip} data-testid="main-card-model" title="只读：model · effort">
+              {[modelWord, effortWord].filter(Boolean).join(" · ")}
+            </span>
+          ) : null}
+          <span data-testid="main-card-chapter">第 {entry.generation} 章</span>
+          <Link className={css.expand} to={`/s/${instance.id}`} data-testid="main-card-expand">
+            展开 ›
+          </Link>
+        </div>
+      ) : null}
+      {desktop ? (
+        <div className={css.ask} data-testid="main-ask">
+          <AskMain entry={entry} />
+        </div>
+      ) : null}
     </section>
+  );
+}
+
+/**
+ * /m ⑨: the 问 Main input docked at the bottom of the home, directly above
+ * PhoneNav — one bottom band (D-061). While it holds the soft keyboard the
+ * nav steps aside (keyboardCompact.css) and the dock rides the band's bottom
+ * edge; the list keeps its scroll position. Nothing renders without a Main.
+ */
+export function MainAskDock() {
+  const entry = useMainEntry();
+  if (!entry) return null;
+  return (
+    <div className={css.dock} data-testid="main-ask-dock">
+      <AskMain entry={entry} />
+    </div>
+  );
+}
+
+/**
+ * The 问 Main input: the compact Composer as one 56px row. Sends go to the
+ * resolved chapter through the D-055 outbox; while Main is paused or stopped
+ * the send button is 恢复; a host-offline / Hub-offline placeholder says the
+ * message will queue.
+ */
+function AskMain({ entry }: { entry: MainEntry }) {
+  const { instance, status, online } = useMainView(entry);
+  const mobile = useCompactLayout();
+  const [resuming, setResuming] = useState(false);
+  const resume = async () => {
+    setResuming(true);
+    try {
+      // The store refreshes the list on success; the resolution then lands on
+      // the new chapter and the input turns back into 发送.
+      await hubStore.resume(instance.id as Id, "structured");
+    } finally {
+      setResuming(false);
+    }
+  };
+  const placeholder = status.resumable
+    ? "Main 已暂停 · 点 恢复 继续"
+    : status.hostOffline
+      ? "主机离线 · 消息会排队，上线后送达"
+      : !online
+        ? "离线 · 消息会排队，恢复连接后送达"
+        : mobile
+          ? "问 Main…"
+          : "问 Main…  ⌘↵ 发送";
+  return (
+    <Composer
+      key={instance.id}
+      variant="ask"
+      instanceId={instance.id}
+      mobile={mobile}
+      kind={instance.kind}
+      phase="idle"
+      capabilities={instance.capabilities}
+      placeholder={placeholder}
+      primaryOverride={
+        status.resumable
+          ? {
+              label: resuming ? "恢复中…" : "恢复",
+              testId: "main-ask-resume",
+              disabled: resuming,
+              title: "恢复 Main（续接下一章）",
+              onClick: () => void resume(),
+            }
+          : null
+      }
+      onSend={async (text, attachments, staged) => {
+        const previews = (staged ?? [])
+          .filter((item) => item.objectId)
+          .map((item) => ({
+            objectId: item.objectId as string,
+            name: item.name,
+            previewUrl: item.previewUrl,
+            kind: item.kind,
+            mediaType: item.mediaType,
+            size: item.size,
+          }));
+        return hubStore.send(instance.id as Id, text, attachments ?? [], previews);
+      }}
+    />
   );
 }
 

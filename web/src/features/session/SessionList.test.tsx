@@ -38,8 +38,6 @@ const hub = {
 
 vi.mock("../../lib/store", () => ({
   useHub: () => hub,
-  // No address-owner Main in these fixtures: the pinned row renders nothing.
-  useMainEntry: () => null,
   hubStore: {
     titleOf: (id: string) => titles[id] ?? id,
     summaryOf: (id: string) => summaries[id] ?? "",

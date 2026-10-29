@@ -18,7 +18,6 @@ import { switchSlots } from "../../lib/sessionSlots";
 import { isEmberEffort } from "./effort";
 import { nextStep } from "./nextStep";
 import { LaunchedByMark } from "./LaunchedBy";
-import { MainRow } from "../home/MainRow";
 import {
   applyFilters,
   availableConditions,
@@ -273,26 +272,18 @@ export function SessionList({
       </p>
     );
   }
-  // D-057 §9: the pinned Main row does not depend on the Space, so it stays
-  // above the list's own empty states too.
   if (empty === "no-workspaces") {
     return (
-      <>
-        <MainRow />
-        <p className={css.empty} data-testid="session-list" data-empty="no-workspaces">
-          主机已连接，但还没有注册工作目录。<Link to="/hosts">注册工作目录</Link>
-        </p>
-      </>
+      <p className={css.empty} data-testid="session-list" data-empty="no-workspaces">
+        主机已连接，但还没有注册工作目录。<Link to="/hosts">注册工作目录</Link>
+      </p>
     );
   }
   if (empty === "no-sessions") {
     return (
-      <>
-        <MainRow />
-        <p className={css.empty} data-testid="session-list" data-empty="no-sessions">
-          {title} 还没有会话。<Link to={newHref}>新建会话</Link>
-        </p>
-      </>
+      <p className={css.empty} data-testid="session-list" data-empty="no-sessions">
+        {title} 还没有会话。<Link to={newHref}>新建会话</Link>
+      </p>
     );
   }
 
@@ -560,8 +551,6 @@ export function SessionList({
           </form>
         ) : null}
       </div>
-      {/* D-057 §9: Main is pinned above every status group and filter result. */}
-      <MainRow />
       {empty === "no-matches" ? (
         <div className={css.noMatches} data-testid="session-no-matches" data-empty="no-matches">
           <p className={css.noMatchesTitle}>没有会话符合当前筛选条件。</p>

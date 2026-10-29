@@ -256,15 +256,21 @@ pub(crate) fn hub_http_error(err: ClientError) -> anyhow::Error {
                     lines.push(format!("  - {reason}"));
                 }
             }
-            // c-cberrors: a refusal's `next` is the instruction, so it sits
-            // directly under the message in plain text, not inside a JSON dump.
+            // D-060 §9.1: a refusal's `next.hint` is the instruction, so it
+            // sits directly under the message in plain text, never inside the
+            // JSON detail dump.
             let refusal = err.refusal().unwrap_or_default();
-            let next = refusal.next.is_some();
-            if let Some(reason) = refusal.reason.as_deref().filter(|_| next) {
+            let next = refusal
+                .next
+                .as_ref()
+                .map(remuda_hub_client::NextStep::render)
+                .unwrap_or_default();
+            let has_next = !next.is_empty();
+            if let Some(reason) = refusal.reason.as_deref().filter(|_| has_next) {
                 lines.push(format!("  reason: {reason}"));
             }
-            if let Some(text) = refusal.next.as_deref() {
-                lines.push(format!("  next: {text}"));
+            if has_next {
+                lines.push(format!("  next: {next}"));
             }
             // Preserve EVERY other body field. A 429 SUPPLY_DEFERRED merges
             // the full supply decision into this body (`rejected[]`
@@ -277,7 +283,7 @@ pub(crate) fn hub_http_error(err: ClientError) -> anyhow::Error {
                     object
                         .iter()
                         .filter(|(key, _)| !matches!(key.as_str(), "error" | "code" | "reasons"))
-                        .filter(|(key, _)| !(next && matches!(key.as_str(), "next" | "reason")))
+                        .filter(|(key, _)| !(has_next && matches!(key.as_str(), "next" | "reason")))
                         .map(|(key, value)| (key.clone(), value.clone()))
                         .collect()
                 })
@@ -325,16 +331,32 @@ mod tests {
     }
 
     #[test]
-    fn refusal_next_renders_under_the_message() {
+    fn refusal_next_hint_renders_under_the_message() {
         let text = refused(json!({
             "error": "forbidden", "code": "FORBIDDEN",
-            "reason": "MISSING_GRANT", "next": "ask the launcher for `land`",
+            "reason": "grant-required",
+            "next": {"action": "ask-owner", "grant": "land",
+                     "hint": "ask the launcher for `land`"},
         }));
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], "hub HTTP 403: forbidden");
-        assert_eq!(lines[1], "  reason: MISSING_GRANT");
-        assert_eq!(lines[2], "  next: ask the launcher for `land`");
+        assert_eq!(lines[1], "  reason: grant-required");
+        assert_eq!(lines[2], "  next: ask-owner — ask the launcher for `land`");
         assert_eq!(lines.len(), 3, "reason/next are not dumped again as JSON");
+    }
+
+    #[test]
+    fn approval_next_renders_its_hint() {
+        let text = refused(json!({
+            "error": "human approval required", "code": "HUMAN_APPROVAL_REQUIRED",
+            "interactionId": "int_1", "reason": "approval-required",
+            "next": {"action": "await-approval", "interactionId": "int_1",
+                     "hint": "wait for the owner"},
+        }));
+        assert!(
+            text.contains("  next: await-approval — wait for the owner"),
+            "{text}"
+        );
     }
 
     #[test]

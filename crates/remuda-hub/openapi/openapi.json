@@ -5208,7 +5208,7 @@
             "$ref": "#/components/schemas/MemoryOrigin"
           },
           "revision": {
-            "description": "1 on create, +1 on every content change.",
+            "description": "The slug's next revision on every write, never reused: a slug recreated after a delete continues after its last revision. 1 for a slug never used before.",
             "minimum": 1,
             "type": "integer"
           },
@@ -7829,7 +7829,7 @@
         ]
       },
       "post": {
-        "description": "Create one entry at revision 1; 409 MEMORY_SLUG_EXISTS when the slug exists (archived included). Soft limits (entry 2048 bytes, index 4096 bytes) come back as warnings with the actual numbers; above 8192 bytes the entry is refused (413). Human devices write any existing lineage; an Agent writes only its own lineage and only from the lineage's current, unfenced chapter (403 otherwise). Bot devices are refused. A retired lineage takes no writes (404).",
+        "description": "Create one entry at the slug's next revision (1 for a slug never used before; a recreated slug continues after its last revision); 409 MEMORY_SLUG_EXISTS when the slug exists (archived included). Soft limits (entry 2048 bytes, index 4096 bytes) come back as warnings with the actual numbers; above 8192 bytes the entry is refused (413). Human devices write any existing lineage; an Agent writes only its own lineage and only from the lineage's current, unfenced chapter (403 otherwise). Bot devices are refused. A retired lineage takes no writes (404).",
         "operationId": "memoryCreate",
         "parameters": [
           {

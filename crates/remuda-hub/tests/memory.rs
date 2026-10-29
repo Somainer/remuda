@@ -977,14 +977,14 @@ async fn the_memory_step_upgrades_the_current_main_schema() -> Result<()> {
         let objects: Vec<String> = db
             .prepare(
                 "SELECT name FROM sqlite_master
-                  WHERE name IN ('memory_entries', 'memory_fts',
+                  WHERE name IN ('memory_entries', 'memory_fts', 'memory_slug_revisions',
                                  'memory_entries_fts_insert', 'memory_entries_fts_delete',
                                  'memory_entries_fts_update')
                   ORDER BY name",
             )?
             .query_map([], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?;
-        assert_eq!(objects.len(), 5, "{objects:?}");
+        assert_eq!(objects.len(), 6, "{objects:?}");
         let lineage_kept: i64 = db.query_row(
             "SELECT COUNT(*) FROM lineages WHERE lineage_id = 'ins_premigration'",
             [],

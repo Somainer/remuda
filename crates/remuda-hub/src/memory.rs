@@ -81,6 +81,11 @@ const ENTRY_COLUMNS_M: &str = "m.lineage_id, m.slug, m.type, m.title, m.descript
 /// that caused an Agent write (cb-rootturn) and stays NULL until then.
 /// `type` and `origin` carry no CHECK: SQLite cannot alter one, and both are
 /// validated before every write.
+///
+/// `memory_slug_revisions` keeps the highest revision ever issued for each
+/// (lineage, slug). A delete leaves it behind, so a recreated slug continues
+/// after its last revision and a stale `expectedRevision` can never match a
+/// replacement entry (no ABA across delete and recreate).
 pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS memory_entries (
@@ -101,6 +106,12 @@ pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             archived_at TEXT,
             UNIQUE (lineage_id, slug)
         );
+        CREATE TABLE IF NOT EXISTS memory_slug_revisions (
+            lineage_id TEXT NOT NULL,
+            slug TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            PRIMARY KEY (lineage_id, slug)
+        ) WITHOUT ROWID;
         CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
             title, description, body,
             content = 'memory_entries', content_rowid = 'id',
@@ -630,6 +641,37 @@ fn require_entry(
     })
 }
 
+/// One past the highest revision `slug` ever had in this lineage, live or
+/// deleted: a revision is never issued twice for a (lineage, slug).
+fn next_revision(conn: &Connection, lineage_id: &str, slug: &str) -> rusqlite::Result<u64> {
+    let high: i64 = conn.query_row(
+        "SELECT MAX(
+            COALESCE((SELECT revision FROM memory_slug_revisions
+                       WHERE lineage_id = ?1 AND slug = ?2), 0),
+            COALESCE((SELECT revision FROM memory_entries
+                       WHERE lineage_id = ?1 AND slug = ?2), 0))",
+        params![lineage_id, slug],
+        |row| row.get(0),
+    )?;
+    Ok(high.max(0) as u64 + 1)
+}
+
+/// Raise the slug's high-water revision to at least `revision`.
+fn record_revision(
+    conn: &Connection,
+    lineage_id: &str,
+    slug: &str,
+    revision: u64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO memory_slug_revisions (lineage_id, slug, revision) VALUES (?1, ?2, ?3)
+         ON CONFLICT (lineage_id, slug)
+         DO UPDATE SET revision = MAX(revision, excluded.revision)",
+        params![lineage_id, slug, revision as i64],
+    )?;
+    Ok(())
+}
+
 fn check_revision(entry: &MemoryEntry, expected: u64) -> Result<(), MemoryError> {
     if entry.revision == expected {
         Ok(())
@@ -660,7 +702,9 @@ fn create_tx(
         });
     }
     let now = now_rfc3339();
-    insert_entry(&tx, lineage_id, writer, input, 1, &now, &now)?;
+    let revision = next_revision(&tx, lineage_id, &input.slug)?;
+    insert_entry(&tx, lineage_id, writer, input, revision, &now, &now)?;
+    record_revision(&tx, lineage_id, &input.slug, revision)?;
     let entry = require_entry(&tx, lineage_id, &input.slug)?;
     let result = write_result(&tx, entry, Vec::new())?;
     tx.commit()?;
@@ -689,10 +733,11 @@ fn update_tx(
     check_size(slug, &title, &description, &body)?;
     let refs = merge_refs(&current.source_refs, &patch.source_refs);
     let now = now_rfc3339();
+    let revision = next_revision(&tx, lineage_id, slug)?;
     let changed = tx.execute(
         "UPDATE memory_entries
             SET type = ?3, title = ?4, description = ?5, body = ?6,
-                revision = revision + 1, origin = ?7, source_refs_json = ?8,
+                revision = ?12, origin = ?7, source_refs_json = ?8,
                 writer_instance = ?9, updated_at = ?10
           WHERE lineage_id = ?1 AND slug = ?2 AND revision = ?11",
         params![
@@ -707,6 +752,7 @@ fn update_tx(
             writer.instance(),
             now,
             expected as i64,
+            revision as i64,
         ],
     )?;
     if changed != 1 {
@@ -714,6 +760,7 @@ fn update_tx(
             "memory update matched no row after the revision check".into(),
         )));
     }
+    record_revision(&tx, lineage_id, slug, revision)?;
     let entry = require_entry(&tx, lineage_id, slug)?;
     let result = write_result(&tx, entry, Vec::new())?;
     tx.commit()?;
@@ -731,6 +778,8 @@ fn delete_tx(
     authorize_write(&tx, lineage_id, writer)?;
     let current = require_entry(&tx, lineage_id, slug)?;
     check_revision(&current, expected)?;
+    // The slug's revisions continue past this one if it is ever recreated.
+    record_revision(&tx, lineage_id, slug, current.revision)?;
     tx.execute(
         "DELETE FROM memory_entries WHERE lineage_id = ?1 AND slug = ?2 AND revision = ?3",
         params![lineage_id, slug, expected as i64],
@@ -786,12 +835,14 @@ fn consolidate_tx(
         source_refs: merge_refs(&refs, &input.source_refs),
         ..input.clone()
     };
-    let (revision, created_at) = match reused {
-        Some(entry) => (entry.revision + 1, entry.created_at.clone()),
-        None => (1, now_rfc3339()),
+    let created_at = match reused {
+        Some(entry) => entry.created_at.clone(),
+        None => now_rfc3339(),
     };
     let mut removed = Vec::new();
     for entry in &inputs {
+        // Removed inputs keep their high-water revision, like a delete.
+        record_revision(&tx, lineage_id, &entry.slug, entry.revision)?;
         tx.execute(
             "DELETE FROM memory_entries WHERE lineage_id = ?1 AND slug = ?2",
             params![lineage_id, entry.slug],
@@ -801,6 +852,9 @@ fn consolidate_tx(
         }
     }
     let now = now_rfc3339();
+    // A reused input continues its own sequence; a new target continues
+    // after any revision the slug had before.
+    let revision = next_revision(&tx, lineage_id, &input.slug)?;
     insert_entry(
         &tx,
         lineage_id,
@@ -810,6 +864,7 @@ fn consolidate_tx(
         &created_at,
         &now,
     )?;
+    record_revision(&tx, lineage_id, &input.slug, revision)?;
     let entry = require_entry(&tx, lineage_id, &input.slug)?;
     let result = write_result(&tx, entry, removed)?;
     tx.commit()?;
@@ -1762,6 +1817,104 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// r2 item 2: a slug's revisions never repeat, so a revision read before
+    /// a delete and recreate cannot update, delete or consolidate the
+    /// replacement (no ABA).
+    #[tokio::test]
+    async fn revisions_never_repeat_across_delete_and_recreate() {
+        let fx = fixture().await;
+        let lineage = fx.seat().await;
+        let owner = MemoryWriter::Owner;
+        let create = |slug: &str, body: &str| {
+            fx.store.memory_create(
+                lineage.clone(),
+                owner.clone(),
+                input(slug, MemoryType::User, body),
+            )
+        };
+        // A client reads "pref" at revision 1 …
+        create("pref", "original").await.unwrap();
+        // … meanwhile it is deleted and recreated with other content.
+        fx.store
+            .memory_delete(lineage.clone(), "pref".into(), owner.clone(), 1)
+            .await
+            .unwrap();
+        let recreated = create("pref", "replacement").await.unwrap();
+
+        let stale_update = fx
+            .store
+            .memory_update(
+                lineage.clone(),
+                "pref".into(),
+                owner.clone(),
+                MemoryPatch {
+                    body: Some("written against the original".into()),
+                    ..MemoryPatch::default()
+                },
+                1,
+            )
+            .await;
+        assert!(
+            matches!(&stale_update, Err(MemoryError::RevisionConflict(m)) if m[0].expected == 1),
+            "a stale update must not overwrite the replacement: {stale_update:?}"
+        );
+        let stale_delete = fx
+            .store
+            .memory_delete(lineage.clone(), "pref".into(), owner.clone(), 1)
+            .await;
+        assert!(
+            matches!(&stale_delete, Err(MemoryError::RevisionConflict(_))),
+            "a stale delete must not remove the replacement: {stale_delete:?}"
+        );
+        create("other", "x").await.unwrap();
+        let stale_consolidate = fx
+            .store
+            .memory_consolidate(
+                lineage.clone(),
+                owner.clone(),
+                vec![("pref".into(), 1), ("other".into(), 1)],
+                input("merged", MemoryType::User, ""),
+            )
+            .await;
+        assert!(
+            matches!(&stale_consolidate, Err(MemoryError::RevisionConflict(m))
+                if m.len() == 1 && m[0].slug == "pref"),
+            "a stale consolidate input must be refused: {stale_consolidate:?}"
+        );
+        assert_eq!(
+            recreated.entry.revision, 2,
+            "the slug continues its sequence"
+        );
+        let kept = fx
+            .store
+            .memory_get(lineage.clone(), "pref".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((kept.revision, kept.body.as_str()), (2, "replacement"));
+
+        // Consolidation targets too: a target slug that existed before
+        // continues after its last revision, and removed inputs keep theirs.
+        create("target", "t").await.unwrap();
+        fx.store
+            .memory_delete(lineage.clone(), "target".into(), owner.clone(), 1)
+            .await
+            .unwrap();
+        let merged = fx
+            .store
+            .memory_consolidate(
+                lineage.clone(),
+                owner.clone(),
+                vec![("pref".into(), 2), ("other".into(), 1)],
+                input("target", MemoryType::User, "merged"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(merged.entry.revision, 2);
+        let again = create("other", "back").await.unwrap();
+        assert_eq!(again.entry.revision, 2);
     }
 
     #[tokio::test]

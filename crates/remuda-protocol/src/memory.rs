@@ -93,8 +93,11 @@ pub struct MemoryEntry {
     pub description: String,
     /// Entry body; read on demand, never in the index.
     pub body: String,
-    /// Revision, 1 on create, +1 on every content change. Updates and
-    /// deletes carry it back as `expectedRevision`.
+    /// Revision: the next one for this slug on every write, never reused —
+    /// a slug recreated after a delete continues after its last revision, so
+    /// a stale `expectedRevision` never matches a replacement. 1 for a slug
+    /// never used before. Updates and deletes carry it back as
+    /// `expectedRevision`.
     pub revision: u64,
     /// How the caller of the last write authenticated.
     pub origin: MemoryOrigin,

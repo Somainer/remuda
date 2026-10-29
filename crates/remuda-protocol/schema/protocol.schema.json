@@ -10464,7 +10464,7 @@
           "description": "How the caller of the last write authenticated."
         },
         "revision": {
-          "description": "Revision, 1 on create, +1 on every content change. Updates and\ndeletes carry it back as `expectedRevision`.",
+          "description": "Revision: the next one for this slug on every write, never reused —\na slug recreated after a delete continues after its last revision, so\na stale `expectedRevision` never matches a replacement. 1 for a slug\nnever used before. Updates and deletes carry it back as\n`expectedRevision`.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"

@@ -1932,10 +1932,10 @@ registry 锁外加独立 DB claim（跨域，reconcile 先于 slot 切换提交�
    - Node 物化器是它唯一的写入方，并且由它自己发出这个 flag（协调员裁定：`append-system-prompt` 按 `RESERVED` 那类「物化器自己发、调用方不得带」的 flag 处理）。确切的改动：
      - `crates/remuda-driver/src/flags.rs` 的 `BANNED` 两项都保留。Node 的 `validate_spec_args` 与 Hub 的镜像 `validate_launch_args`（`crates/remuda-hub/src/http.rs`）照旧拒绝 `InstanceSpec.args` 里的 `--system-prompt` 与 `--append-system-prompt`，错误仍是今天的 `NativeFeatureDisabled`。只改 `BANNED` 的文档注释：从「不得发出、也不得从 `InstanceSpec.args` 接受」改为「不得从 `InstanceSpec.args` 接受；物化器只从 `memoryContext` 自己发出 `append-system-prompt`」。
      - 物化器对调用方参数的扫描（`crates/remuda-driver/src/materializer.rs` 中 `claude_argv` 与 `materialize_shell_pty_agent` 对 `extras` 的 `is_banned_flag_token`）不变。
-     - 新增：参数带 `memoryContext` 时，`claude_argv` 在调用方参数之后自己追加一次 `--append-system-prompt <text>`，作为系统提示的最后一节，以保住前面内容的提示缓存。
-     - 对成品 argv 的检查，即 `crates/remuda-driver/src/claude_print.rs` 的 `refuse_prohibited_argv`（claude-print、claude-sdk）与 `crates/remuda-driver/src/claude_pty.rs` 的 `refuse_bare`（claude-pty、claude-bg），今天拒绝任何 `--append-system-prompt`。改为只放过物化器记在 recipe 上的那一对，其余出现照旧拒绝。`--system-prompt` 从不发出，处处照旧拒绝。
-     - 没有这个 flag 的非 Claude harness，由物化器把文本作为框起来的数据块放在第一条输入之前。
-   - 验收要求真实启动路径上的测试：经 Hub 创建、由 Node 物化出的 claude-sdk argv（用假 `claude` 记录的实际 argv 断言，即 `crates/remuda-testing/src/fake.rs` 的 `FAKE_CLAUDE_ARGV_FILE`）恰好含一个位于调用方参数之后、值为索引的 `--append-system-prompt`，且通过 `refuse_prohibited_argv`；请求体 `args` 里带 `--append-system-prompt` 或 `--system-prompt` 的创建照旧以今天的错误被拒，请求体里的 `memoryContext` 被剥掉。
+     - 新增：参数带 `memoryContext` 时，物化器在调用方参数之后自己追加一次 `--append-system-prompt <text>`，作为系统提示的最后一节，以保住前面内容的提示缓存。Claude 的两条启动路径都这样做：`claude_argv`（claude-print、claude-sdk、claude-pty、claude-bg），以及 `materialize_shell_pty_agent`（原生 `shell-pty` carrier 上的 `claude` 类实例，它不经过 `claude_argv`）。两者都把这一对记在 recipe 上，作为物化器自己的发出。
+     - 对成品 argv 的检查，即 `crates/remuda-driver/src/claude_print.rs` 的 `refuse_prohibited_argv`（claude-print、claude-sdk）与 `crates/remuda-driver/src/claude_pty.rs` 的 `refuse_bare`（claude-pty、claude-bg），今天拒绝任何 `--append-system-prompt`。改为只放过物化器记在 recipe 上的那一对，其余出现照旧拒绝。`shell-pty` 启动在 origin/main 上不做成品 argv 检查（`crates/remuda-driver/src/shell_pty/launch.rs` 直接把 recipe 交给 PTY），它唯一的检查是 `extras` 扫描，保持不变；以后在那里加成品 argv 检查时，同样只放过这一对。`--system-prompt` 从不发出，处处照旧拒绝。
+     - 只有非 Claude 的 harness（codex、grok、agy，任何 carrier）没有这个 flag；只对它们，物化器把文本作为框起来的数据块放在第一条输入之前。
+   - 验收要求真实启动路径上的测试：经 Hub 创建、由 Node 物化出的 claude-sdk argv（用假 `claude` 记录的实际 argv 断言，即 `crates/remuda-testing/src/fake.rs` 的 `FAKE_CLAUDE_ARGV_FILE`）恰好含一个位于调用方参数之后、值为索引的 `--append-system-prompt`，且通过 `refuse_prohibited_argv`；`shell-pty` 上的 `claude` 实例同理，`materialize_shell_pty_agent` 生成的 argv 恰好含一个位于调用方参数之后的 `--append-system-prompt`；请求体 `args` 里带 `--append-system-prompt` 或 `--system-prompt` 的创建照旧以今天的错误被拒，请求体里的 `memoryContext` 被剥掉。
    - 章节中途记忆有变化时不重启，只在下一条输入或下一个事实批次之前加一行「记忆自本章开始已变更（rev N）」。原生 resume 不重复注入。
    - 回复下方显示「已记住：<title>」。为此 Hub 在写入时记下写入实例和回合引用，所有回合都显示。
 

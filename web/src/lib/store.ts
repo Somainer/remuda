@@ -4054,20 +4054,19 @@ class HubStore {
    * disposes the box WITHOUT bumping the identity epoch (a failed login then
    * restores it), so the current identity's debts survive while their tail
    * passes are rejected in the null window — by design without re-arming.
-   * Re-check each of them now: evidence folded while no box was installed
-   * retires the durable row, and anything still unobserved gets its bounded
-   * tail re-armed. Debts of another owner generation are never touched
-   * (every retirement clears the map; the check is defence in depth).
+   * Re-arm each of them now. The pass commits the durable done for evidence
+   * folded while no box was installed — awaited on the box it captured, the
+   * debt kept until it commits (r6 item 3) — then clears what is proven and
+   * chases what is still unobserved. Debts of another owner generation are
+   * never touched (every retirement clears the map; the check is defence in
+   * depth).
    */
   private resumeOwedDebts() {
     for (const [instanceId, debt] of this.reconcileOwed) {
       if (debt.gen !== this.owedGeneration) continue;
-      this.settleFromJournal(instanceId, this.state.events[instanceId] ?? []);
-      if (this.owedCommandLacksEvidence(instanceId)) {
-        this.scheduleOwedTail(instanceId, OWED_TAIL_BASE_BACKOFF_MS);
-      } else {
-        this.clearOwed(instanceId);
-      }
+      // Presentation only: bubbles settle off the evidence already folded.
+      this.emit({ bubbles: settleBubbles(this.state.bubbles, instanceId, this.state.events[instanceId] ?? []) });
+      this.scheduleOwedTail(instanceId, OWED_TAIL_BASE_BACKOFF_MS);
     }
   }
 
@@ -4115,9 +4114,11 @@ class HubStore {
    * Ruling AD2 — apply SETTLEMENT EVIDENCE ONLY. A debt tail/overlap read is
    * not a journal fold: it scans the returned page exclusively for user
    * messages carrying one of THIS instance's owed command ids. Each matched
-   * command is recorded on the debt as observed and settled (bubble ->
-   * settled from the matched evidence itself, durable row -> done, including
-   * a row that had earlier reached the "unknown" not-confirmed state).
+   * command is recorded on the debt as observed and its bubble settles off
+   * the matched evidence itself. The durable done (including a row that had
+   * earlier reached the "unknown" not-confirmed state) is committed by the
+   * calling pass through {@link commitOwedSettlement}, awaited on its
+   * captured Outbox (r6 item 3).
    *
    * Ruling AD3 / r6 item 2: the matched entry is NOT inserted into
    * state.events — the live follow is the only writer of store events. The
@@ -4151,16 +4152,61 @@ class HubStore {
       debt.observed.add(commandId);
       matched.push(ev);
     }
-    if (matched.length) {
-      // Settlement-only: bubbles settle off the matched evidence and the
-      // durable rows retire to done (no acceptance side effects beyond the
-      // single progress helper; settleFromJournal patches including a
-      // previously "unknown" row — r3 item 4).
-      this.settleFromJournal(instanceId, matched);
+    if (matched.length) this.emit({ bubbles: settleBubbles(this.state.bubbles, instanceId, matched) });
+  }
+
+  /**
+   * r6 item 3: owed commands of `debt` that have journal evidence — observed
+   * by a debt read, or folded into store events (also while no Outbox was
+   * installed) — but whose row in `box` is not yet durably done.
+   */
+  private owedSettlementPending(instanceId: Id, debt: { commands: Set<Id>; observed: Set<Id> }, box: Outbox): Id[] {
+    const evidenced = new Set<Id>(debt.observed);
+    for (const ev of this.state.events[instanceId] ?? []) {
+      const commandId = ev.kind === "message" ? (ev.payload as { commandId?: Id }).commandId : undefined;
+      if (commandId) evidenced.add(commandId);
     }
-    // Evidence (including evidence already present in state.events) clears
-    // each owed command; anything still missing keeps the bounded tail.
-    this.reevaluateOwedDebt(instanceId);
+    return [...debt.commands].filter((commandId) => {
+      if (!evidenced.has(commandId)) return false;
+      const rec = box.get(commandId);
+      return !!rec && rec.state !== "done" && rec.state !== "rejected";
+    });
+  }
+
+  /**
+   * r6 item 3: commit the durable done for journal-evidenced owed commands,
+   * AWAITED on the pass's captured Outbox (never the fire-and-forget live
+   * settlement). Returns null when the pass lost ownership while a write was
+   * parked, false when a write failed to commit (the debt is kept and the
+   * pass retries), true when every evidenced row is durably done or gone.
+   */
+  private async commitOwedSettlement(
+    instanceId: Id,
+    commandIds: Id[],
+    box: Outbox,
+    owns: () => boolean,
+  ): Promise<boolean | null> {
+    let allCommitted = true;
+    for (const commandId of commandIds) {
+      if (!owns()) return null;
+      let written: OutboxRecord | null = null;
+      try {
+        written = await box.patch(commandId, { state: "done", serverState: "journal-settled" });
+      } catch {
+        written = null;
+      }
+      if (!owns()) return null;
+      if (written) {
+        if (this.outbox === box) this.syncBubbleFromOutbox(commandId);
+        void this.recordAcceptedDelivery(instanceId, commandId, box);
+        continue;
+      }
+      // null: the row vanished (fine) or the transaction aborted (the row is
+      // still there, not done — keep the obligation).
+      const after = box.get(commandId);
+      if (after && after.state !== "done" && after.state !== "rejected") allCommitted = false;
+    }
+    return allCommitted;
   }
 
   /**
@@ -4259,6 +4305,25 @@ class HubStore {
       lostOwnership = true;
       return false;
     };
+    // r6 item 3: commit the durable done for every evidenced owed command on
+    // the captured box. False means the pass must stop: ownership was lost,
+    // or a write failed to commit — then the debt is KEPT and a bounded
+    // storage retry runs at the base cadence (after the bounded retries the
+    // obligation is retained without a timer, like an aborted exhaustion
+    // write). No await happens when nothing is pending.
+    const settleEvidenced = async (): Promise<boolean> => {
+      if (!box || !debt) return false;
+      const pending = this.owedSettlementPending(instanceId, debt, box);
+      if (!pending.length) return true;
+      const committed = await this.commitOwedSettlement(instanceId, pending, box, owns);
+      if (committed === null) return false;
+      if (committed) return true;
+      tail.storageRetries += 1;
+      if (tail.storageRetries <= OWED_TAIL_STORAGE_RETRIES) {
+        this.scheduleOwedTail(instanceId, OWED_TAIL_BASE_BACKOFF_MS);
+      }
+      return false;
+    };
     void this.chainReconcile(instanceId, async () => {
       try {
         // Entry gate: a queued callback that survived logout (or whose debt
@@ -4268,6 +4333,10 @@ class HubStore {
           lostOwnership = true;
           return;
         }
+        // r6 item 3: commit what is already evidenced (an earlier pass's
+        // observation, or evidence folded while no Outbox was installed)
+        // before anything can clear the debt.
+        if (!(await settleEvidenced())) return;
         if (!this.owedCommandLacksEvidence(instanceId)) {
           this.clearOwed(instanceId);
           return;
@@ -4343,6 +4412,7 @@ class HubStore {
           }
         }
         if (!owns() || !this.reconcileOwed.has(instanceId)) return;
+        if (!(await settleEvidenced())) return;
         if (!this.owedCommandLacksEvidence(instanceId)) {
           this.clearOwed(instanceId);
           return;

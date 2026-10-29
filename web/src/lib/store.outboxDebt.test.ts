@@ -1710,3 +1710,155 @@ it("r6 item 2: a debt read settles a command far above the frontier without movi
   expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
   expect(frontier()).toBe(F);
 }, 20_000);
+
+/**
+ * Make the FIRST `state: "done"` storage transaction of a storage accepted by
+ * `shouldAbort` abort. jsdom has no IndexedDB, so the store's Outbox runs on
+ * the localStorage backend; the spy sits on the store's own module instance
+ * (not the test file's static import), BELOW Outbox.patch, so the patch
+ * promise a caller fires and forgets really rejects. Returns the abort count.
+ */
+/**
+ * Collect unhandled promise rejections while `body` runs (the test runner's
+ * Node process; web tsconfig has no Node types, hence the narrow cast).
+ */
+async function collectUnhandled(body: (unhandled: unknown[]) => Promise<void>) {
+  const proc = (
+    globalThis as unknown as {
+      process: { on(event: string, fn: (reason: unknown) => void): void; off(event: string, fn: (reason: unknown) => void): void };
+    }
+  ).process;
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => unhandled.push(reason);
+  proc.on("unhandledRejection", onUnhandled);
+  try {
+    await body(unhandled);
+  } finally {
+    proc.off("unhandledRejection", onUnhandled);
+  }
+}
+
+async function abortFirstDoneWrite(shouldAbort: (storage: unknown) => boolean) {
+  const { LocalStorageOutboxStorage } = await import("./outbox");
+  const realMerge = LocalStorageOutboxStorage.prototype.mergeUnlessDone;
+  const state = { aborted: 0 };
+  vi.spyOn(LocalStorageOutboxStorage.prototype, "mergeUnlessDone").mockImplementation(function (
+    this: InstanceType<typeof LocalStorageOutboxStorage>,
+    commandId: string,
+    patch: Partial<OutboxRecord>,
+  ) {
+    if (patch.state === "done" && state.aborted === 0 && shouldAbort(this)) {
+      state.aborted += 1;
+      return Promise.reject(new Error("IDB_TRANSACTION_ABORTED"));
+    }
+    return realMerge.call(this, commandId, patch);
+  });
+  return state;
+}
+
+it("r6 item 3: the restored Outbox's aborted done transaction keeps the debt until the next pass commits it", async () => {
+  // r5 item 2's sequence (evidence folded while a failed login had the Outbox
+  // disposed) but the RESTORED Outbox's first done transaction aborts. The
+  // debt must survive the abort, the next pass must commit done, and nothing
+  // may surface as an unhandled rejection.
+  await collectUnhandled(async (unhandled) => {
+    const { api, hubStore } = await fresh();
+    await mountFollow(api, hubStore);
+    vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+      const commandId = _args[4] as string;
+      return Promise.resolve(commandResult(commandId, "accepted"));
+    });
+    let refuseLogin: ((err: Error) => void) | null = null;
+    vi.spyOn(api, "login").mockImplementation(
+      () => new Promise<never>((_resolve, reject) => (refuseLogin = reject)),
+    );
+    const h = hubStore as unknown as { outbox: { get: (id: string) => OutboxRecord | undefined } | null };
+
+    await hubStore.send(INSTANCE, "owed, confirmed during the gap, first commit aborts");
+    const bubble = () => hubStore.getSnapshot().bubbles[0]!;
+    await vi.waitFor(() => expect(bubble().outboxState).toBe("sent"));
+    await vi.waitFor(() => expect(debtOf(hubStore).has(INSTANCE)).toBe(true));
+    const commandId = bubble().commandId!;
+    const storageA = (h.outbox as unknown as { storage: unknown }).storage;
+
+    const login = hubStore.login("bootstrap", "secret", "dev").catch((err: unknown) => err);
+    await vi.waitFor(() => expect(h.outbox).toBeNull());
+    const onBatch = await liveBatch(api);
+    onBatch({
+      subscriptionId: "sub_outbox_debt",
+      journalId: JOURNAL,
+      fromSeq: "1",
+      toSeq: "1",
+      durableSeq: "1",
+      events: [
+        {
+          kind: "message",
+          eventId: "evt_user_gap_abort",
+          journalId: JOURNAL,
+          instanceId: INSTANCE,
+          seq: "1",
+          completeness: "structured",
+          payload: { role: "user", commandId },
+        } as unknown as Observation,
+      ],
+    });
+    const abort = await abortFirstDoneWrite((storage) => storage !== storageA);
+
+    refuseLogin!(new Error("credential refused"));
+    expect(await login).toBeInstanceOf(Error);
+    await vi.waitFor(() => expect(h.outbox).not.toBeNull());
+    await vi.waitFor(() => expect(abort.aborted).toBe(1), { timeout: 3_000 });
+    // The aborted commit did not discharge the obligation.
+    expect(debtOf(hubStore).has(INSTANCE)).toBe(true);
+    expect(h.outbox?.get(commandId)?.state).toBe("sent");
+
+    // The next pass commits done and only then retires the debt.
+    await vi.waitFor(
+      () => {
+        expect(h.outbox?.get(commandId)?.state).toBe("done");
+        expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+      },
+      { timeout: 3_000 },
+    );
+    expect(bubble().outboxState).toBe("done");
+    expect(unhandled).toEqual([]);
+  });
+}, 15_000);
+
+it("r6 item 3: a debt read's aborted done transaction keeps the debt until the next pass commits it", async () => {
+  // Same storage failure on the debt-read path: the tail read observes the
+  // owed entry, the done transaction aborts once; the evidence is held on the
+  // debt (the cursor moved past it) and the next pass commits it.
+  await collectUnhandled(async (unhandled) => {
+    const { api, hubStore } = await fresh();
+    await mountFollow(api, hubStore);
+    vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+      const commandId = _args[4] as string;
+      return Promise.resolve(commandResult(commandId, "accepted"));
+    });
+    const h = hubStore as unknown as { outbox: { get: (id: string) => OutboxRecord | undefined } | null };
+
+    await hubStore.send(INSTANCE, "owed, debt-read commit aborts once");
+    const bubble = () => hubStore.getSnapshot().bubbles[0]!;
+    await vi.waitFor(() => expect(bubble().outboxState).toBe("sent"));
+    await vi.waitFor(() => expect(debtOf(hubStore).has(INSTANCE)).toBe(true));
+    const commandId = bubble().commandId!;
+
+    const abort = await abortFirstDoneWrite(() => true);
+    vi.mocked(api.eventsRead).mockResolvedValue(userMessagePage(commandId));
+    await vi.waitFor(() => expect(abort.aborted).toBe(1), { timeout: 3_000 });
+    expect(debtOf(hubStore).has(INSTANCE)).toBe(true);
+    expect(h.outbox?.get(commandId)?.state).toBe("sent");
+
+    await vi.waitFor(
+      () => {
+        expect(h.outbox?.get(commandId)?.state).toBe("done");
+        expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+      },
+      { timeout: 3_000 },
+    );
+    expect(bubble().state).toBe("settled");
+    expect(bubble().outboxState).toBe("done");
+    expect(unhandled).toEqual([]);
+  });
+}, 15_000);

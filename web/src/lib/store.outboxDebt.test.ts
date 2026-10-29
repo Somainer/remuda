@@ -73,17 +73,28 @@ function userMessagePage(commandId: string): JournalPage {
   };
 }
 
-/** A journal row as the Hub stores it (the adapter coerces it into an Observation). */
+/**
+ * A journal row as a test fixture: `kind` + `payload` form the opaque event
+ * JSON the Node appended (the Hub's payload_json); seq and eventId are the
+ * Hub's own columns.
+ */
 type HubRow = { seq: number; eventId: string; kind: string; payload: Record<string, unknown> };
 // Hub read_journal caps (crates/remuda-hub/src/store.rs JOURNAL_WINDOW_ROWS / _BYTES).
 const HUB_WINDOW_ROWS = 2_000;
 const HUB_WINDOW_BYTES = 8 * 1024 * 1024;
+const utf8 = new TextEncoder();
+
+/** The stored event JSON of a row (payload_json, serde_json compact form). */
+function hubEventJson(row: HubRow): string {
+  return JSON.stringify({ kind: row.kind, payload: row.payload });
+}
 
 /**
  * GET /v1/instances/{id}/journal answered exactly as the Hub's read_journal
  * does: rows in (afterSeq, min(beforeSeq, durableSeq)] walked NEWEST first
- * under the row cap and the payload byte cap (the newest row is always
- * kept), returned ascending; fromSeq is the returned floor and
+ * under the row cap and the byte cap — UTF-8 bytes of each row's stored
+ * event JSON (payload.len() in Rust), the newest row always kept — returned
+ * ascending as JournalRecord envelopes; fromSeq is the returned floor and
  * reachedAfterSeq is true for an empty window or a floor of afterSeq + 1.
  */
 function hubJournalResponse(input: RequestInfo | URL, rows: HubRow[], durableSeq: number): Response {
@@ -91,24 +102,31 @@ function hubJournalResponse(input: RequestInfo | URL, rows: HubRow[], durableSeq
   const after = Number(url.searchParams.get("afterSeq") ?? "0");
   const beforeRaw = url.searchParams.get("beforeSeq");
   const high = beforeRaw === null ? durableSeq : Math.min(Number(beforeRaw), durableSeq);
-  const window: HubRow[] = [];
+  const window: { row: HubRow; json: string }[] = [];
   let bytes = 0;
   for (const row of rows.filter((r) => r.seq > after && r.seq <= high).sort((a, b) => b.seq - a.seq)) {
     if (window.length >= HUB_WINDOW_ROWS) break;
-    const size = JSON.stringify(row).length;
+    const json = hubEventJson(row);
+    const size = utf8.encode(json).length;
     if (window.length > 0 && bytes + size > HUB_WINDOW_BYTES) break;
     bytes += size;
-    window.push(row);
+    window.push({ row, json });
   }
   window.reverse();
-  const fromSeq = window[0]?.seq ?? null;
+  const fromSeq = window[0]?.row.seq ?? null;
   return new Response(
     JSON.stringify({
       instanceId: INSTANCE,
       durableSeq: String(durableSeq),
       fromSeq: fromSeq === null ? null : String(fromSeq),
       reachedAfterSeq: fromSeq === null || fromSeq === after + 1,
-      events: window,
+      events: window.map(({ row, json }) => ({
+        instanceId: INSTANCE,
+        seq: row.seq,
+        eventId: row.eventId,
+        event: JSON.parse(json) as unknown,
+        observedAt: "2026-10-29T00:00:00.000Z",
+      })),
     }),
     { status: 200, headers: { "content-type": "application/json" } },
   );
@@ -1862,3 +1880,77 @@ it("r6 item 3: a debt read's aborted done transaction keeps the debt until the n
     expect(unhandled).toEqual([]);
   });
 }, 15_000);
+
+/** One window the exact Hub stub serves for (after, before]. */
+async function stubWindow(rows: HubRow[], after: number, before: number) {
+  const response = hubJournalResponse(
+    `http://hub.test/v1/instances/${INSTANCE}/journal?afterSeq=${after}&beforeSeq=${before}`,
+    rows,
+    Math.max(...rows.map((r) => r.seq)),
+  );
+  const body = (await response.json()) as { fromSeq: string | null; reachedAfterSeq: boolean; events: { seq: number }[] };
+  return { seqs: body.events.map((e) => Number(e.seq)), fromSeq: body.fromSeq, reachedAfterSeq: body.reachedAfterSeq };
+}
+
+const textRow = (seq: number, text: string): HubRow => ({
+  seq,
+  eventId: `evt_text_${seq}`,
+  kind: "raw_tty",
+  payload: { text },
+});
+
+it("r6 item 4: the exact Hub stub caps a window by UTF-8 bytes of the stored event JSON", async () => {
+  // Multi-byte text: each big row is ~1.5M UTF-16 code units but ~4.5 MiB of
+  // UTF-8. A character count keeps 129..131 in one 8 MiB window; the Hub's
+  // byte count (payload.len()) keeps only the newest row and reports the cut.
+  const cjk = "汉".repeat(1_500_000);
+  const owedRow: HubRow = { seq: 129, eventId: "evt_user_129", kind: "message", payload: { role: "user", commandId: "cmd_x" } };
+  const multiByte = [owedRow, textRow(130, cjk), textRow(131, cjk)];
+  expect(hubEventJson(multiByte[1]!).length * 2).toBeLessThan(HUB_WINDOW_BYTES);
+  expect(await stubWindow(multiByte, 128, 256)).toEqual({ seqs: [131], fromSeq: "131", reachedAfterSeq: false });
+  expect(await stubWindow(multiByte, 128, 130)).toEqual({ seqs: [129, 130], fromSeq: "129", reachedAfterSeq: true });
+
+  // Exact boundary: a window whose rows sum to the cap EXACTLY keeps both
+  // (the Hub breaks only when adding a row would exceed it); one byte more cuts.
+  const newest = textRow(2, "a".repeat(1_000));
+  const overhead = utf8.encode(hubEventJson(textRow(1, ""))).length;
+  const fill = HUB_WINDOW_BYTES - utf8.encode(hubEventJson(newest)).length - overhead;
+  expect(await stubWindow([textRow(1, "a".repeat(fill)), newest], 0, 2)).toEqual({
+    seqs: [1, 2],
+    fromSeq: "1",
+    reachedAfterSeq: true,
+  });
+  expect(await stubWindow([textRow(1, "a".repeat(fill + 1)), newest], 0, 2)).toEqual({
+    seqs: [2],
+    fromSeq: "2",
+    reachedAfterSeq: false,
+  });
+
+  // A newest row larger than the whole budget is still served, alone.
+  const oversized = textRow(2, "b".repeat(HUB_WINDOW_BYTES + 1));
+  expect(await stubWindow([textRow(1, "small"), oversized], 0, 2)).toEqual({
+    seqs: [2],
+    fromSeq: "2",
+    reachedAfterSeq: false,
+  });
+}, 30_000);
+
+it("r6 item 4: a window the Hub byte-caps on multi-byte text is descended before the cursor moves past it", async () => {
+  // The store-level counterpart: the owed command at 129 sits below two rows
+  // of multi-byte text that a character count would have served together.
+  const cjk = "汉".repeat(1_500_000);
+  const { hubStore, bubble } = await sendOwedOverRealAdapter((commandId) => [
+    { seq: 129, eventId: "evt_user_129", kind: "message", payload: { role: "user", commandId } },
+    textRow(130, cjk),
+    textRow(131, cjk),
+  ]);
+  await vi.waitFor(
+    () => {
+      expect(bubble().state).toBe("settled");
+      expect(bubble().outboxState).toBe("done");
+    },
+    { timeout: 8_000 },
+  );
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+  expect(hubStore.getSnapshot().events[INSTANCE]).toHaveLength(128);
+}, 30_000);

@@ -28,6 +28,32 @@ Board-aligned goldens from the design-align pass (same folder, `1a`–`1f` prefi
 - Primary/danger buttons, more-menu rows, settings chips, and install actions are ≥44px on the phone breakpoint.
 - Manifest `theme_color` `#12161c` (`--ink`), `background_color` `#0c0f14` (`--canvas`); icons any+maskable 192/512.
 
+## Home state checklist (D-061)
+
+The home is `/m` at 390 and `/sessions` at 1280 and 1440. Its layout and rules live in [`home.md`](home.md). The evidence spec is `web/tests/e2e/home-evidence.hub.spec.ts` (task `home-evidence`).
+
+Capture rules:
+- **When it writes.** It writes PNGs only when `REMUDA_EVIDENCE` is set. Without its trigger it skips, and a default run writes nothing.
+- **Matrix.** Capture every state below at 390, 1280 and 1440, in both appearances (浅色 and 深色).
+- **Fixture content.** The showcase fixture uses neutral host names (`forge`, `studio`, `laptop`) and readable titles. It never shows random-suffix test strings, real host names, user names or paths.
+- **Where PNGs go.** Whether PNGs are committed follows D-060 Q6; until that is decided, new home captures stay out of git.
+- **Real-condition captures.** Captures from real-condition checks (home.md §12) stay in the worktree's scratch directory and are never committed.
+
+| State | How to reach it | Must be visible |
+|---|---|---|
+| Queue full | ≥ 5 pending items: a Main question, an approval, a simple question, a plan review, one task waiting on the owner | ① counts 需要你 N; ④ shows 3 cards on the phone and 4 on desktop, plus 「还有 N 条」; the approval card has only 拒绝 / 允许一次; the plan card has only 审阅计划; the simple question shows option chips and 其他… |
+| All handled | no pending items, ≥ 1 working session | ① starts with the time-of-day greeting and 「都处理完了」; ④ collapses to one line; h1 is still 会话 |
+| Before first snapshot | delay the first `/v1/instances` response | skeletons in ④ and ⑦, 「–」 in ①, never 「暂无会话」 |
+| Hub unreachable | `context.setOffline(true)` for longer than the banner delay | ⑧ 「连不上 Hub · 上次更新 N 秒前 · 重试」; queue buttons disabled with 「数据可能过期」; ① greyed with 「更新于 T」 |
+| Host offline | stop one Node | ② the offline host first, dashed and grey, 「离线 Nm」; no green anywhere |
+| Main paused | pause the address-owner lineage | ③ 「已暂停」; ⑨ send becomes 「恢复」 |
+| No Main | no address-owner lineage | ③ and ⑨ absent; the phone's bottom band is PhoneNav only |
+| Done-unseen | a session ends a turn while no device views it (after `seen-hub`) | ⑤ 刚完成 with bold title and ◉ in `--link` (not green); ① shows ◉ N |
+| Turn failed | a session's last root turn failed (`lastTurnError`) | a failed-turn card after the counted cards, not included in 需要你 N |
+| Keyboard up (390 only) | focus ⑨ in the WebKit iPhone project | PhoneNav hidden, quick-ask chips above the input, list content still visible |
+| Searching | type in the ledger search | ④ hidden; folds expanded |
+| Narrow desktop (1280 only) | 1280×800 | Main card and input at the top of the main column; no right column |
+
 ## Regenerate
 
 ```bash

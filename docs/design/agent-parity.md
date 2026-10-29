@@ -1,6 +1,6 @@
 # Agent/user capability ledger: the human half
 
-> Status: proposed with ADR D-060 (2026-10-29), decision 12. Derived from origin/main `c27e0eac`: one row per PWA action (the routes in `web/src/app/router.tsx`, and the Hub calls their pages make through `web/src/lib/api.ts`, `web/src/lib/store.ts` and the feature modules) and one row per clap subcommand (`crates/remuda/src/cmd/`). The Agent side is read from the Hub's route filter `restrict_agent_routes` (`crates/remuda-hub/src/agent_scope.rs`) and each handler. The machine half is a later task: a table generated from the Hub router, `restrict_agent_routes` and the clap registry, with a gate check that the two halves do not drift.
+> Status: proposed with ADR D-060 (2026-10-29), decision 12. Derived from origin/main `c27e0eac`: one row per PWA action (the routes in `web/src/app/router.tsx`, and the Hub calls their pages make through `web/src/lib/api.ts`, `web/src/lib/store.ts` and the feature modules) and one row per clap subcommand (`crates/remuda/src/cmd/`). The Agent side is read from the Hub's route filter `restrict_agent_routes` (`crates/remuda-hub/src/agent_scope.rs`) and each handler. Coverage was checked mechanically against that tree: every exported method of `web/src/lib/api.ts` (71), every Hub route (126 method-and-path pairs, plus the static web fallback) and every clap entry (98, of which 14 are pure command groups) maps to a row below, to "Hub routes no human action calls", or to "Not agent actions". The machine half is a later task: a table generated from the Hub router, `restrict_agent_routes` and the clap registry, with a gate check that the two halves do not drift.
 
 ## The rule
 
@@ -67,10 +67,10 @@ Two limits recur below:
 | Toggle ultracode, independently of effort (D-056; `onUltracode` in `web/src/pages/SessionPage.tsx`) | commands, `instance.configure` | Gap. As above | `ap-configure` |
 | Change the permission mode | commands, `instance.configure` | Gap. As above | `ap-configure-mode`, after an owner decision on how OA1 applies to a mode change |
 | Attach a file | `POST /v1/objects` | Gap. Operator-only (`upload` in `crates/remuda-hub/src/objects.rs`) | `ap-attachments` |
-| Open an attachment | `GET /v1/objects/{id}` | Gap. Operator-only for devices; an agent reads only its own session's attachments, through `GET /v1/attachments/{id}/content` (D-028) | `ap-attachments` (owned targets) |
+| Open an attachment | `GET /v1/objects/{id}` | Gap. Operator-only for devices; an agent reads only its own session's attachments, through `GET /v1/attachments/{objectId}/content` (D-028) | `ap-attachments` (owned targets) |
 | Send keys from the key bar | commands, `instance.keys` | Safety. Keystrokes | — |
 | Type into the terminal | `/v1/follow?tty=1` | Safety. Keystrokes: the socket is not admitted for Agents, and `tty.write` always needs the D-017 approval | — |
-| See workspace changes (Files tab) | `GET /v1/hosts/{id}/workspaces/{workspaceId}/changes`, `…/diff`, `…/file` | Safety. Cross-host: operator-only (`proxy_scm`). On its own host the seat reads the same through its harness's shell; reading another host through the Hub would skip the D-017 cross-host approval | — |
+| See workspace changes (Files tab) | `GET /v1/hosts/{id}/workspaces/{workspaceId}/changes`, `GET /v1/hosts/{id}/workspaces/{workspaceId}/changes/diff`, `GET /v1/hosts/{id}/workspaces/{workspaceId}/changes/file` | Safety. Cross-host: operator-only (`proxy_scm`). On its own host the seat reads the same through its harness's shell; reading another host through the Hub would skip the D-017 cross-host approval | — |
 | Open a subagent's transcript | `GET /v1/instances/{id}/subagents/{agentId}/transcript` | Gap. Refused by `read_target`, as for command reads, though the handler re-checks ownership | `ap-subagent-read` |
 
 ### New session (`/sessions/new`)
@@ -80,7 +80,8 @@ Two limits recur below:
 | Create a session | `POST /v1/instances` | Agent route. `dispatch` and scope (`prepare_create`); a cross-host or shell-driver create needs the D-017 approval; only `manual` or `plan` permission (`restrict_permission`); no argv or executable (`restrict_launch_overrides`) | `ma-admission`: "never beyond the creator" (OA1) replaces the `manual`/`plan` rule |
 | Create a worktree for it | `POST /v1/worktrees` | Agent route by another path: a task binding (`POST /v1/tasks` with `workspaceBinding`, D-050, `dispatch`) or a dispatch leases the worktree; the raw worktree routes stay operator-only (main-agent.md §7.5) | — |
 | Pick a host | `GET /v1/hosts` | Gap. Operator-only (`list_hosts`); an agent reads hosts in its scope one by one through `GET /v1/hosts/{id}/hostcap` | `ap-host-read` |
-| Pick a workspace | `GET /v1/hosts/{id}/workspaces` | Gap. Operator-only (`workspaces.rs`) | `ap-host-read` |
+| Pick a workspace | `GET /v1/follow` (the host-workspace snapshot frames, `hostWorkspaceSubscribe` in `web/src/lib/api.ts`) | Gap. The follow socket is not admitted for Agent origin, and the REST list `GET /v1/hosts/{id}/workspaces` is operator-only (`workspaces.rs`) | `ap-host-read` |
+| Choose a provider | `GET /v1/providers` (filtered by `hostId`) | Gap. Not admitted for Agent origin | `ap-supply-read` (no secrets) |
 | Browse directories | `GET /v1/hosts/{id}/dirs` | Safety. Cross-host, as for workspace changes (`host_dirs.rs`, D-058) | — |
 | Register a directory as a workspace | `POST /v1/hosts/{id}/workspaces` | Safety. Act only on what you own: a registered root is open to every session on that host | — |
 | Load the model and supply catalog | `GET /v1/supply/catalog` | Gap. Operator-only (`catalog_http`) | `ap-supply-read` |
@@ -89,7 +90,7 @@ Two limits recur below:
 
 | Human action | Hub route | Today (origin/main) | Planned |
 |---|---|---|---|
-| List pending items | `GET /v1/interactions` | Agent route under the D-051 limits | `ma-admission` (OA3) |
+| List pending items | `GET /v1/interactions`; settlement frames on `GET /v1/follow` (`settlementSubscribe`) | Agent route under the D-051 limits for the list. The settlement frames ride the follow socket, which is not admitted for Agent origin; an agent re-reads the list instead | `ma-admission` (OA3) |
 | Answer a question or a plan review | `POST /v1/interactions/{id}/answer` | Agent route under the D-051 limits | `ma-admission` (OA3) |
 | Answer an approval | `POST /v1/interactions/{id}/answer` | Safety. Approvals are answered only by humans | — |
 
@@ -116,9 +117,10 @@ The page's create form is not wired to the Hub yet (`web/src/features/fleet/stor
 | Human action | Hub route | Today (origin/main) | Planned |
 |---|---|---|---|
 | See hosts | `GET /v1/hosts` | Gap. Operator-only (`list_hosts`) | `ap-host-read` (hosts in the caller's scope) |
+| Run host diagnostics; recheck (`HostDiagnostics.tsx`) | `GET /v1/hosts/{id}/doctor` (`fetchHostDoctor`) | Gap. Operator-only (`doctor_host`) | `ap-host-read` (hosts in the caller's scope) |
 | Add an SSH host | `POST /v1/hosts/ssh` | Safety. Credentials: enrolment mints a host credential | — |
 | Remove a host | `DELETE /v1/hosts/{id}` | Safety. Act only on what you own: it retires the host and tears down its live link and relay streams, which every session on that host depends on (`remove_host`) | — |
-| Change a host's provider binding | `PATCH /v1/hosts/{id}` | Safety. Credentials: it picks which provider credential every session on the host uses | — |
+| Change a host's provider binding | `GET /v1/providers` (filtered by `hostId`), then `PATCH /v1/hosts/{id}` | Safety. Credentials: it picks which provider credential every session on the host uses | — |
 | Change a host's launch defaults: default args, Claude binary, default TUI | `PATCH /v1/hosts/{id}` | Safety. An agent never chooses argv or an executable (`restrict_launch_overrides`), and the defaults apply to every session on the host | — |
 | Unregister a workspace | `DELETE /v1/hosts/{id}/workspaces` | Safety. Act only on what you own, as for registering | — |
 
@@ -127,6 +129,7 @@ The page's create form is not wired to the Hub yet (`web/src/features/fleet/stor
 | Human action | Hub route | Today (origin/main) | Planned |
 |---|---|---|---|
 | See providers | `GET /v1/providers` | Gap. Not admitted for Agent origin | `ap-supply-read` (no secrets) |
+| Open a provider's detail | `GET /v1/providers/{id}` (`providerGet`) | Gap. Not admitted for Agent origin | `ap-supply-read` (no secrets) |
 | Add a provider | `POST /v1/providers` | Safety. Credentials: the body carries a provider token | — |
 | Edit a provider | `PATCH /v1/providers/{id}` | Safety. Credentials | — |
 | Make a provider the default gateway | `PATCH /v1/providers/{id}` (`defaultGateway`) | Safety. Credentials and shared configuration: every gateway session then uses it | — |
@@ -139,9 +142,10 @@ The page's create form is not wired to the Hub yet (`web/src/features/fleet/stor
 | Human action | Hub route | Today (origin/main) | Planned |
 |---|---|---|---|
 | Issue a pair code | `POST /v1/devices/pair-code` | Safety. Credentials: it mints a Human credential | — |
+| List passkeys | `GET /v1/auth/passkeys` (`passkeyList`) | Safety. Credentials: passkeys are how a person signs in as Human; an agent neither reads nor manages them | — |
 | List devices | `GET /v1/devices` | Safety. Credentials: device rows are the Human credentials | — |
 | Revoke a device | `DELETE /v1/devices/{id}` | Safety. Credentials | — |
-| Add a passkey | `POST /v1/auth/passkeys/register/start`, `…/finish` | Safety. Credentials | — |
+| Add a passkey | `POST /v1/auth/passkeys/register/start`, `POST /v1/auth/passkeys/register/finish` | Safety. Credentials | — |
 | Rename a passkey | `PATCH /v1/auth/passkeys/{id}` | Safety. Credentials | — |
 | Delete a passkey | `DELETE /v1/auth/passkeys/{id}` | Safety. Credentials | — |
 | Set a host's default terminal UI | `PATCH /v1/hosts/{id}` (`defaultTui`) | Safety. As launch defaults | — |
@@ -156,7 +160,7 @@ The page's create form is not wired to the Hub yet (`web/src/features/fleet/stor
 | `instance list` | `GET /v1/hosts` and `GET /v1/instances`; with `--watch`, `GET /v1/follow` | Gap. The CLI path (`agents::list` in `crates/remuda/src/cmd/agents.rs`) joins the host inventory, `GET /v1/hosts` (operator-only, `list_hosts`), with `GET /v1/instances`, so it fails for Agent origin even though `GET /v1/instances` itself admits a `dispatch` holder. `--watch` also opens the all-instances follow socket, which is not admitted for Agent origin | `ap-agent-list` |
 | `agents` | as `instance list` | Gap. The same `agents::list` path, with the same host-inventory and follow-socket dependencies | `ap-agent-list` |
 | `instance show` | `GET /v1/instances/{id}` | Agent route. Owned targets | — |
-| `instance send` | commands, `instance.send` | Agent route. The send rule | — |
+| `instance send` | commands, `instance.send`; then `GET /v1/instances/{id}/commands` to follow a forwarded command | Agent route for the send. The send rule. The follow-up read (`resolve_command_state` in `crates/remuda/src/cmd/instance.rs`) is refused for Agent origin by `read_target`; the CLI then prints the POST's own row, so a send whose reply was lost stays `queued` in its output | `ap-command-read` for the follow-up read |
 | `instance respond` | `GET /v1/interactions?instanceId=`, `POST /v1/interactions/{id}/answer` | Agent route under the D-051 limits for questions and plan reviews; approvals: Safety | `ma-admission` (OA3) |
 | `instance wait` | `GET /v1/instances/{id}/journal` | Agent route. Owned targets | — |
 | `instance read` | `GET /v1/instances/{id}/journal` | Agent route. Owned targets | — |
@@ -199,16 +203,16 @@ The page's create form is not wired to the Hub yet (`web/src/features/fleet/stor
 | Subcommand | Hub route | Today (origin/main) | Planned |
 |---|---|---|---|
 | `dispatch` | `POST /v1/workers/dispatch` | Gap. `restrict_agent_routes` does not admit `/v1/workers/*`, and dispatch writes a control-off mode for every harness (main-agent.md §4.2) | `ma-admission` |
-| `watch` | `POST /v1/workers/observe`, `GET /v1/gate/jobs`, `GET /v1/instances` | Gap. The worker and cross-project gate reads are not admitted | `ma-admission`; `ap-gate-reads` |
-| `report` | `GET /v1/workers`, gate job reads | Gap. Worker reads are not admitted; without `--project` it also reads `GET /v1/gate/jobs` | `ma-admission`; `ap-gate-reads` |
-| `retire` | `POST /v1/workers/{id}/retire` | Gap. Not admitted | `ma-admission`, with lineage-subtree ownership (main-agent.md §4.2 item 1) |
-| `worker nudge` | `POST /v1/workers/{id}/nudge` | Gap. Not admitted | `ma-admission`, as `retire` |
-| `worker answer` | `POST /v1/workers/{id}/answer` | Gap. Not admitted | `ma-admission` admits it; it writes keys, so every Agent use then needs the D-017 approval (Safety, main-agent.md §13) |
-| `worker switch-model` | `POST /v1/workers/{id}/switch-model` | Gap. Not admitted | `ma-admission`, as `retire` |
-| `worker resume` | `POST /v1/workers/{id}/resume` | Gap. Not admitted | `ma-admission` (scoped respawn helper) |
-| `worker replace` | `POST /v1/workers/{id}/replace` | Gap. Not admitted | `ma-admission` (scoped respawn helper) |
-| `worker stop` | `POST /v1/workers/{id}/stop` | Gap. Not admitted | `ma-admission`, as `retire` |
-| `brief send` | `POST /v1/workers/{id}/brief` | Gap. Not admitted | `ma-admission`, as `retire` |
+| `watch` | `POST /v1/workers/observe`, `POST /v1/workers/{id}/state`, `GET /v1/gate/jobs`, `GET /v1/instances` | Gap. The worker and cross-project gate routes are not admitted | `ma-admission`; `ap-gate-reads` |
+| `report` | `GET /v1/workers`, `POST /v1/workers/{id}/state`, gate job reads | Gap. Worker routes are not admitted; without `--project` it also reads `GET /v1/gate/jobs` | `ma-admission`; `ap-gate-reads` |
+| `retire` | `GET /v1/workers/{id}` (resolving the worker), `POST /v1/workers/{id}/retire` | Gap. Not admitted | `ma-admission`, with lineage-subtree ownership (main-agent.md §4.2 item 1) |
+| `worker nudge` | `GET /v1/workers/{id}` (resolving the worker), `POST /v1/workers/{id}/nudge` | Gap. Not admitted | `ma-admission`, as `retire` |
+| `worker answer` | `GET /v1/workers/{id}` (resolving the worker), `POST /v1/workers/{id}/answer` | Gap. Not admitted | `ma-admission` admits it; it writes keys, so every Agent use then needs the D-017 approval (Safety, main-agent.md §13) |
+| `worker switch-model` | `GET /v1/workers/{id}` (resolving the worker), `POST /v1/workers/{id}/switch-model` | Gap. Not admitted | `ma-admission`, as `retire` |
+| `worker resume` | `GET /v1/workers/{id}` (resolving the worker), `POST /v1/workers/{id}/resume` | Gap. Not admitted | `ma-admission` (scoped respawn helper) |
+| `worker replace` | `GET /v1/workers/{id}` (resolving the worker), `POST /v1/workers/{id}/replace` | Gap. Not admitted | `ma-admission` (scoped respawn helper) |
+| `worker stop` | `GET /v1/workers/{id}` (resolving the worker), `POST /v1/workers/{id}/stop` | Gap. Not admitted | `ma-admission`, as `retire` |
+| `brief send` | `GET /v1/workers/{id}` (resolving the worker), `POST /v1/workers/{id}/brief` | Gap. Not admitted | `ma-admission`, as `retire` |
 | `hostcap` | `GET /v1/hosts/{id}/hostcap` | Agent route. `dispatch` and host scope (D-045) | — |
 
 ### Fleet, host files and diagnostics
@@ -269,10 +273,25 @@ These call no Hub route as an Agent action. "Local" commands run on the caller's
 | `hook launch` | Local: merges a Claude settings file and execs Claude in place | Local | — |
 | `mcp` | Local: the in-session MCP server, which calls the Hub with the session's own credential | Local; its tools reach the Hub routes above under the same rules | — |
 
+## Hub routes no human action calls
+
+On origin/main no PWA action and no CLI subcommand calls these routes, so they have no row above:
+- `GET /healthz`: the PWA's connectivity probe (`hello`), not an action on Remuda state.
+- `GET /v1/node`, `GET /node/v1/connect`: the Node link, under a host credential.
+- `GET /v1/bot/card-tickets`, `POST /v1/bot/card-tickets`, `POST /v1/bot/card-tickets/expire-session`, `POST /v1/bot/card-tickets/{id}/state`, `POST /v1/bot/owner-allowlist`: the Feishu dispatcher, under a Bot credential.
+- `GET /v1/caller`: credential introspection the CLI makes internally; Agent-admitted.
+- `POST /v1/instances/{id}/mcp-token`: the in-session MCP server minting its token.
+- `GET /v1/attachments`, `GET /v1/attachments/{objectId}/content`: the in-session MCP server reading its own session's attachments (`crates/remuda/src/cmd/mcp/attachment.rs`, D-028); Agent-admitted, pinned to the caller's own session.
+- `POST /v1/hosts/{id}/files/objects`: a Node staging file bytes, under a host credential.
+- `POST /v1/hosts/enroll-token`: mints a host-enrolment credential; neither the PWA nor the CLI calls it (a Node reads its enrolment token from a file).
+- `GET /v1/lineages/{id}`: no client reads it yet (`ma-main-ui` will); Agent-admitted for the caller's own lineage.
+- `GET /v1/instances/{id}/usage`, `GET /v1/hosts/{id}`, `GET /v1/hosts/{id}/workspaces`, `GET /v1/worktrees`, `POST /v1/worktrees/{name}/lease`, `POST /v1/worktrees/{name}/return`, `GET /v1/fleet/{id}`, `POST /v1/fleet/{id}/commands`, `POST /v1/placement/resolve`, `POST /v1/tasks/{id}/land`, `POST /v1/tasks/{id}/placements`, `DELETE /v1/projects/{id}`: API routes with no PWA or CLI caller today.
+- The static web fallback: it serves the PWA's files.
+
 ## Not agent actions
 
 These change only a person's own browser or device:
-- logging in, redeeming a pair code, passkey login, logging out, and this browser's push subscription;
+- logging in (`POST /v1/login`), redeeming a pair code (`POST /v1/devices/pair`), passkey login (`POST /v1/auth/passkeys/login/start`, `POST /v1/auth/passkeys/login/finish`), logging out, and this browser's push subscription (`GET /push/config`, `POST /push/subscriptions`, `DELETE /push/subscriptions`);
 - appearance, density and other local preferences;
 - retracting a held prompt: it never left the browser;
 - editing a host's label, labels or instance cap on `/hosts`: the page keeps them in the browser's host registry and sends nothing to the Hub;
@@ -296,7 +315,7 @@ Every Gap row above, by the task that closes it. The `ap-*` tasks are defined in
 | Task | Closes |
 |---|---|
 | `ma-admission` | `dispatch`; `watch`, `report` (worker reads); `retire`; `worker nudge`, `answer`, `switch-model`, `resume`, `replace`, `stop`; `brief send`; worker resume from the PWA; the D-051 bypass exclusion (OA3) |
-| `ap-command-read` | a send's receipt and every command read (`GET /v1/instances/{id}/commands`, `…/commands/{commandId}`) |
+| `ap-command-read` | a send's receipt, `instance send`'s follow-up read, and every command read (`GET /v1/instances/{id}/commands`, `GET /v1/instances/{id}/commands/{commandId}`) |
 | `ap-gate-reads` | `gate log`; `gate list` without `--project`; the gate parts of `watch` and `report`; the failure log of `gate <branch>` |
 | `ap-agent-list` | `instance list` and `agents`, including `--watch` |
 | `ap-configure` | model, effort and ultracode changes |

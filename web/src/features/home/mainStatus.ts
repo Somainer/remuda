@@ -94,10 +94,25 @@ export function sinceLabel(iso: string | null | undefined, nowMs: number): strin
 const CAUSE_LABEL: Record<string, string> = {
   "owner-resume": "你恢复",
   "process-exit": "进程退出",
-  "process-exited": "进程退出",
+  "process-loss": "进程退出",
   "start-failed": "启动失败",
   "node-restarted": "Node 重启",
 };
+
+/**
+ * The C1 restart causes (main-agent.md §6.3): process loss, start failure and
+ * node restart. Only these count as restarts; an owner resume is the owner's
+ * own action, and a spelling not listed here is never counted. The Hub writes
+ * only `owner-resume` until ma-restart lands; §6.3 names `start-failed` and
+ * `node-restarted`, and leaves the process-loss row unspelled, so both the
+ * restart-policy word (`process-loss`) and the paused-by word (`process-exit`)
+ * are accepted for it.
+ */
+const C1_CAUSES: ReadonlySet<string> = new Set(["process-loss", "process-exit", "start-failed", "node-restarted"]);
+
+export function isRestartCause(cause: string | null | undefined): boolean {
+  return cause != null && C1_CAUSES.has(cause);
+}
 
 /** A chapter cause in words; unknown spellings stay verbatim (never guessed). */
 export function causeLabel(cause: string | null | undefined): string {
@@ -157,7 +172,7 @@ export function mainStatus(input: MainStatusInput): MainStatus {
   }
   const status = projectStatus(instance);
   if (status === "starting") {
-    const restarting = entry.generation > 1 && !!instance.chapterCause && instance.chapterCause !== "owner-resume";
+    const restarting = entry.generation > 1 && isRestartCause(instance.chapterCause);
     return {
       ...base,
       phase: restarting ? "restarting" : "starting",
@@ -181,8 +196,9 @@ export function mainStatus(input: MainStatusInput): MainStatus {
 }
 
 /**
- * Restarts in the last 24 h with their causes (status line). `null` until the
- * lineage record is read — never a fabricated zero.
+ * C1 restarts in the last 24 h with their causes (status line). Owner resumes
+ * and unknown causes are not restarts. `null` until the lineage record is
+ * read — never a fabricated zero.
  */
 export function restartsIn24h(
   lineage: LineageRecord | null | undefined,
@@ -193,7 +209,7 @@ export function restartsIn24h(
   const counts = new Map<string, number>();
   let count = 0;
   for (const chapter of lineage.chapters) {
-    if (chapter.generation <= 1) continue;
+    if (chapter.generation <= 1 || !isRestartCause(chapter.chapterCause)) continue;
     const t = Date.parse(chapter.createdAt);
     if (!Number.isFinite(t) || t < since) continue;
     count += 1;

@@ -97,23 +97,37 @@ describe("lineage read helpers", () => {
     expect(lineagePausedBy(lineage({ state: "paused" }))).toEqual({ by: null, at: null });
   });
 
-  it("counts restarts in the last 24 h with causes, null before the record is read", () => {
+  it("counts only C1 restarts in the last 24 h, with causes; null before the record is read", () => {
     expect(restartsIn24h(null, NOW)).toBeNull();
     const record = lineage({
       chapters: [
         { instanceId: "a" as Id, generation: 1, createdAt: "2026-10-28T00:00:00Z" },
-        { instanceId: "b" as Id, generation: 2, chapterCause: "owner-resume", createdAt: "2026-10-28T01:00:00Z" },
+        { instanceId: "b" as Id, generation: 2, chapterCause: "start-failed", createdAt: "2026-10-28T01:00:00Z" },
         { instanceId: "c" as Id, generation: 3, chapterCause: "process-exit", createdAt: "2026-10-30T09:00:00Z" },
         { instanceId: "d" as Id, generation: 4, chapterCause: "owner-resume", createdAt: "2026-10-30T10:00:00Z" },
+        { instanceId: "e" as Id, generation: 5, chapterCause: "node-restarted", createdAt: "2026-10-30T10:30:00Z" },
+        { instanceId: "f" as Id, generation: 6, chapterCause: "some-new-cause", createdAt: "2026-10-30T11:00:00Z" },
       ],
     });
+    // The 10-28 restart is older than 24 h; owner-resume is the owner's own
+    // action, and an unknown spelling is never counted as a restart.
     expect(restartsIn24h(record, NOW)).toEqual({
       count: 2,
       causes: [
         { cause: "进程退出", count: 1 },
-        { cause: "你恢复", count: 1 },
+        { cause: "Node 重启", count: 1 },
       ],
     });
+  });
+
+  it("an owner resume is not a restart", () => {
+    const record = lineage({
+      chapters: [
+        { instanceId: "a" as Id, generation: 1, createdAt: "2026-10-30T08:00:00Z" },
+        { instanceId: "b" as Id, generation: 2, chapterCause: "owner-resume", createdAt: "2026-10-30T09:00:00Z" },
+      ],
+    });
+    expect(restartsIn24h(record, NOW)).toEqual({ count: 0, causes: [] });
   });
 });
 

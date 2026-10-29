@@ -4959,6 +4959,15 @@ async fn configure_replay_in_flight_is_409_then_returns_stored_original() -> Res
             .contains("still in flight"),
         "{conflict}"
     );
+    // D-060: the real replay path (not just the constructor) tells the caller
+    // the delivery is unknown and names the row to read.
+    assert_eq!(conflict["reason"], json!("delivery-unknown"), "{conflict}");
+    assert_eq!(conflict["next"]["action"], json!("read-then-decide"));
+    assert_eq!(
+        conflict["next"]["commandId"],
+        json!(command_id.as_id().as_str()),
+        "{conflict}"
+    );
 
     // The original completes exactly once. It answers accepted (the Node's
     // settle notification can even land before the response serializes, in
@@ -5053,6 +5062,22 @@ async fn configure_replay_while_accepted_is_409_in_flight() -> Result<()> {
                 .unwrap_or_default()
                 .contains("still in flight"),
             "{conflict}"
+        );
+        // D-060: `accepted` rests unknown on the Node, so the caller reads the
+        // row instead of re-sending; the message itself is unchanged.
+        assert_eq!(conflict["reason"], json!("delivery-unknown"), "{conflict}");
+        assert_eq!(conflict["next"]["action"], json!("read-then-decide"));
+        assert_eq!(
+            conflict["next"]["commandId"],
+            json!(command_id.as_id().as_str()),
+            "{conflict}"
+        );
+        assert!(
+            !conflict["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(command_id.as_id().as_str()),
+            "the message keeps its {{commandId}} placeholder: {conflict}"
         );
     }
     assert_eq!(

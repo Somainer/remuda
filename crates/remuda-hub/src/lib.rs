@@ -18,6 +18,7 @@ mod auth;
 mod bot;
 mod config;
 mod devices;
+mod digest;
 mod error;
 mod fleet;
 mod gatequeue;
@@ -1517,6 +1518,7 @@ pub fn router(state: AppState) -> Router {
         .merge(workers::routes())
         .merge(gatequeue::routes())
         .merge(worker_watch::routes())
+        .merge(digest::routes())
         .merge(bot::routes());
     if let Some(push) = state.push.clone() {
         app = app.nest_service("/push", push_http::nest(push, state.store.clone()));

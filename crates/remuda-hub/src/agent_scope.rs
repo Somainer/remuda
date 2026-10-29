@@ -174,6 +174,61 @@ fn lineage_read_target(path: &str) -> Option<&str> {
     (!rest.is_empty() && !rest.contains('/')).then_some(rest)
 }
 
+/// `GET /v1/lineages/{id}/glance` (cb-digest): the lineage read predicate,
+/// extended to the one projection hung under it. Same rule as
+/// [`lineage_read_target`]: the path id must be the caller's own lineage.
+fn glance_read_target(path: &str) -> Option<&str> {
+    let id = path
+        .strip_prefix("/v1/lineages/")?
+        .strip_suffix("/glance")?;
+    (!id.is_empty() && !id.contains('/')).then_some(id)
+}
+
+/// `GET /v1/workers/{id}/digest` (cb-digest): the ONLY `/v1/workers/*` shape an
+/// Agent may read. It is admitted under the lineage read predicate (see
+/// [`agent_owns_worker`]), not by widening the worker routes: every other
+/// `/v1/workers/*` path, `GET /v1/workers` and `GET /v1/workers/{id}` included,
+/// stays behind the Agent refusal.
+pub(crate) fn digest_read_target(path: &str) -> Option<&str> {
+    let id = path.strip_prefix("/v1/workers/")?.strip_suffix("/digest")?;
+    (!id.is_empty() && !id.contains('/')).then_some(id)
+}
+
+/// Whether an Agent device may read the digest of the worker addressed by
+/// `id_or_name`: the worker's instance is in the caller's lineage or was
+/// dispatched by it (`lineage_owns`, the edge the journal read already uses).
+/// A name may match several projects; any owned match admits the request and
+/// the handler re-filters to the owned ones.
+async fn agent_owns_worker(
+    state: &AppState,
+    device: &Device,
+    id_or_name: &str,
+) -> Result<bool, HubError> {
+    let workers = if id_or_name.starts_with("wkr_") {
+        state
+            .store
+            .get_worker(id_or_name.to_string())
+            .await
+            .map_err(crate::http::map_store)?
+            .into_iter()
+            .collect()
+    } else {
+        state
+            .store
+            .find_active_workers_named(id_or_name.to_string())
+            .await
+            .map_err(crate::http::map_store)?
+    };
+    for worker in workers {
+        if let Some(instance) = worker.instance_id.as_ref()
+            && owns(state, device, instance.as_id().as_str()).await?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Whether an Agent device's bound instance belongs to `lineage_id`.
 async fn agent_owns_lineage(
     state: &AppState,
@@ -546,6 +601,10 @@ async fn get_caller(
         Some(id) => state.store.get_instance(id.clone()).await?,
         None => None,
     };
+    let lineage_id = match &device.instance_id {
+        Some(id) => state.store.lineage_id_for_instance(id.clone()).await?,
+        None => None,
+    };
     let children: Vec<String> = state
         .store
         .list_instances(None)
@@ -561,6 +620,7 @@ async fn get_caller(
         .collect();
     Ok(Json(
         json!({"origin": origin(&device), "instanceId": device.instance_id,
+        "lineageId": lineage_id,
         "hostId": instance.as_ref().map(|row| row.host_id.clone()),
         "role": instance.as_ref().and_then(|row| row.role.clone()),
         "projectId": instance.as_ref().and_then(|row| row.project_id.clone()),
@@ -725,8 +785,12 @@ pub async fn restrict_agent_routes(
                     // and the feature switch; admitting the path loosens
                     // nothing by itself.
                     || path == "/v1/interactions"
-                    || match lineage_read_target(path) {
+                    || match lineage_read_target(path).or_else(|| glance_read_target(path)) {
                         Some(id) => agent_owns_lineage(&state, &device, id).await?,
+                        None => false,
+                    }
+                    || match digest_read_target(path) {
+                        Some(id) => agent_owns_worker(&state, &device, id).await?,
                         None => false,
                     }
                     || match read_target(path) {

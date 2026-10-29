@@ -332,7 +332,7 @@ pub fn rfc3339_minutes_ago(minutes: i64) -> String {
     rfc3339(t)
 }
 
-fn rfc3339(t: time::OffsetDateTime) -> String {
+pub(crate) fn rfc3339(t: time::OffsetDateTime) -> String {
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
         t.year(),

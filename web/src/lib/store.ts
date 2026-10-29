@@ -1379,14 +1379,23 @@ class HubStore {
        * debt is never cleared while one of their rows is not durably done.
        */
       owedDone: Set<Id>;
+      /**
+       * r8 item 2: each owed command's OWN bounded window — when it joined the
+       * debt and the tail's attempt count then. A command merged into a debt
+       * whose earlier window is long spent still gets its full deadline and
+       * read budget; exhaustion only ever moves commands whose own window
+       * expired.
+       */
+      windows: Map<Id, { at: number; attempts: number }>;
     }
   >();
   /**
    * Ruling AD: bounded debt-driven tail re-read state per instance. `attempts`
    * counts actual journal reads the driver issued while evidence was missing;
-   * `firstAt` bounds the whole chase with a wall deadline even while no
-   * journal client is mounted (those passes do not spend attempts). At most
-   * ONE timer is armed per instance.
+   * the wall deadline bounds the chase even while no journal client is
+   * mounted (those passes do not spend attempts) — per owed command since r8
+   * item 2 (the debt's `windows`; `firstAt` is only the fallback start of a
+   * command recorded without one). At most ONE timer is armed per instance.
    *
    * Ruling AD3 item 4: `scanAfter` is the debt reader's OWN forward cursor,
    * advanced through every inspected page (including full unrelated pages),
@@ -3992,8 +4001,16 @@ class HubStore {
       commands: new Set<Id>(),
       observed: new Set<Id>(),
       owedDone: new Set<Id>(),
+      windows: new Map<Id, { at: number; attempts: number }>(),
     };
-    if (commandIds) for (const commandId of commandIds) debt.commands.add(commandId);
+    const attemptsNow = this.owedTail.get(instanceId)?.attempts ?? 0;
+    if (commandIds) {
+      for (const commandId of commandIds) {
+        if (debt.commands.has(commandId)) continue;
+        debt.commands.add(commandId);
+        debt.windows.set(commandId, { at: Date.now(), attempts: attemptsNow });
+      }
+    }
     debt.bindGen = this.connectionBindGen;
     debt.attemptId = ref?.attemptId ?? existing?.attemptId ?? null;
     this.reconcileOwed.set(instanceId, debt);
@@ -4416,26 +4433,29 @@ class HubStore {
           settleOrClear();
           return;
         }
-        const exhausted =
-          tail.attempts >= OWED_TAIL_MAX_ATTEMPTS ||
-          Date.now() - tail.firstAt >= OWED_TAIL_DEADLINE_MS;
-        if (exhausted) {
-          const committed = await this.exhaustOwedDebt(instanceId, debt, box, owns);
+        // r8 item 2: exhaust ONLY the unevidenced commands whose own window
+        // expired; commands merged later keep reading on their own budget.
+        const expired = this.owedExpiredCommands(instanceId, debt, box, tail);
+        if (expired.length) {
+          const committed = await this.exhaustOwedDebt(instanceId, debt, box, owns, expired);
           if (!owns()) return;
-          if (committed) {
+          if (!committed) {
+            // r2 item 3: a terminal write failed to persist. Retain the debt
+            // and run a BOUNDED storage retry; the bubble already presents
+            // not-confirmed from memory. After the bounded retries the
+            // obligation is still retained (no eternal timer), so later
+            // evidence, a trigger or a reload can finish it.
+            tail.storageRetries += 1;
+            if (tail.storageRetries <= OWED_TAIL_STORAGE_RETRIES) {
+              this.scheduleOwedTail(instanceId, OWED_TAIL_STORAGE_RETRY_MS);
+            }
+            return;
+          }
+          if (!this.owedCommandLacksEvidence(instanceId)) {
             settleOrClear();
             return;
           }
-          // r2 item 3: a terminal write failed to persist. Retain the debt
-          // and run a BOUNDED storage retry; the bubble already presents
-          // not-confirmed from memory. After the bounded retries the
-          // obligation is still retained (no eternal timer), so later
-          // evidence, a trigger or a reload can finish it.
-          tail.storageRetries += 1;
-          if (tail.storageRetries <= OWED_TAIL_STORAGE_RETRIES) {
-            this.scheduleOwedTail(instanceId, OWED_TAIL_STORAGE_RETRY_MS);
-          }
-          return;
+          // Other commands' windows are still open: keep reading for them.
         }
         const instance =
           this.state.instances.find((i) => i.id === instanceId) ??
@@ -4542,13 +4562,15 @@ class HubStore {
     debt: { commands: Set<Id>; observed: Set<Id> },
     box: Outbox,
     stillOurs: () => boolean,
+    only: Id[],
   ): Promise<boolean> {
     if (this.reconcileOwed.get(instanceId) !== debt || this.outbox !== box) return true;
     // r7 item 3: a journal-confirmed command is never moved to not-confirmed
     // here — its pending done write is owed (and retried) separately.
     const evidenced = this.owedEvidenced(instanceId, debt);
     let allCommitted = true;
-    for (const commandId of debt.commands) {
+    // r8 item 2: only the commands whose own window expired.
+    for (const commandId of only) {
       // r4 item 2: fence EVERY terminal write with the exact captured
       // Outbox + debt ownership BEFORE the patch, never only after its await.
       if (!stillOurs()) return true;
@@ -4582,6 +4604,30 @@ class HubStore {
     }
     // The caller discharges the debt (or keeps its owed done writes).
     return allCommitted;
+  }
+
+  /**
+   * r8 item 2: owed commands that still lack journal evidence (row present
+   * and not yet done/rejected/unknown) and whose OWN window — from when the
+   * command joined the debt — has spent its read budget or passed the wall
+   * deadline. A command recorded without a window falls back to the tail's
+   * start.
+   */
+  private owedExpiredCommands(
+    instanceId: Id,
+    debt: { commands: Set<Id>; observed: Set<Id>; windows: Map<Id, { at: number; attempts: number }> },
+    box: Outbox,
+    tail: OwedTailState,
+  ): Id[] {
+    const evidenced = this.owedEvidenced(instanceId, debt);
+    const now = Date.now();
+    return [...debt.commands].filter((commandId) => {
+      if (evidenced.has(commandId)) return false;
+      const rec = box.get(commandId);
+      if (!rec || rec.state === "done" || rec.state === "rejected" || rec.state === "unknown") return false;
+      const window = debt.windows.get(commandId) ?? { at: tail.firstAt, attempts: 0 };
+      return tail.attempts - window.attempts >= OWED_TAIL_MAX_ATTEMPTS || now - window.at >= OWED_TAIL_DEADLINE_MS;
+    });
   }
 
   /**

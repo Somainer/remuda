@@ -1294,9 +1294,12 @@ it("r4 item 2: a queued stale drain then a queued past-deadline tail pass never 
   await vi.waitFor(() => expect(bubbleOf("second accepted drain").outboxState).toBe("sent"));
   await vi.waitFor(() => expect(h.reconcileChain.get(INSTANCE)).not.toBe(blocker));
   const secondId = bubbleOf("second accepted drain").commandId!;
-  // …followed by the tail timer's job, whose captured deadline has passed.
+  // …followed by the tail timer's job, whose captured deadline has passed
+  // (every owed command's own window, r8 item 2).
   h.runOwedTailPass(INSTANCE);
   tail.firstAt = 0;
+  const windows = (debtOf(hubStore).get(INSTANCE) as { windows: Map<string, { at: number }> }).windows;
+  for (const window of windows.values()) window.at = 0;
 
   hubStore.logout();
   vi.mocked(api.instanceList).mockResolvedValue({ items: [], nextCursor: null });
@@ -2272,3 +2275,91 @@ it("r8 item 1: a live-evidenced command whose fire-and-forget done rejects keeps
   );
   expect(bubble().outboxState).toBe("done");
 }, 15_000);
+
+it("r8 item 2: a command merged into a retained debt after its window expired gets its own window and settles", async () => {
+  // r7 item 3's end state: C is journal-confirmed but every done write fails,
+  // so the debt is retained (no timer) long past C's 45 s window. A new
+  // command E then merges into that debt. E must get its own bounded window
+  // and journal reads — never exhausted to 状态待确认 off C's stale deadline.
+  vi.useFakeTimers();
+  try {
+    await collectUnhandled(async (unhandled) => {
+      const { api, hubStore } = await fresh();
+      await mountFollow(api, hubStore);
+      vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+        const commandId = _args[4] as string;
+        return Promise.resolve(commandResult(commandId, "accepted"));
+      });
+      const h = hubStore as unknown as {
+        outbox: { get: (id: string) => OutboxRecord | undefined } | null;
+        owedTail: Map<string, { timer: unknown }>;
+      };
+      const pump = async () => {
+        for (let i = 0; i < 30; i += 1) await vi.advanceTimersByTimeAsync(0);
+      };
+      const run = async (ms: number) => {
+        for (let t = 0; t < ms; t += 500) {
+          await vi.advanceTimersByTimeAsync(500);
+          for (let i = 0; i < 5; i += 1) await Promise.resolve();
+        }
+        await pump();
+      };
+      const bubbleOf = (text: string) => hubStore.getSnapshot().bubbles.find((b) => b.text === text)!;
+      const userMessage = (seq: number, commandId: string): Observation =>
+        ({
+          kind: "message",
+          eventId: `evt_user_${seq}`,
+          journalId: JOURNAL,
+          instanceId: INSTANCE,
+          seq: String(seq),
+          completeness: "structured",
+          payload: { role: "user", commandId },
+        }) as unknown as Observation;
+
+      await hubStore.send(INSTANCE, "command C");
+      await pump();
+      const c = bubbleOf("command C").commandId!;
+      let e = "";
+      const { LocalStorageOutboxStorage } = await import("./outbox");
+      const realMerge = LocalStorageOutboxStorage.prototype.mergeUnlessDone;
+      let unknownWritesForE = 0;
+      vi.spyOn(LocalStorageOutboxStorage.prototype, "mergeUnlessDone").mockImplementation(function (
+        this: InstanceType<typeof LocalStorageOutboxStorage>,
+        commandId: string,
+        patch: Partial<OutboxRecord>,
+      ) {
+        if (patch.state === "done" && commandId === c) return Promise.reject(new Error("IDB_TRANSACTION_ABORTED"));
+        if (patch.state === "unknown" && commandId === e) unknownWritesForE += 1;
+        return realMerge.call(this, commandId, patch);
+      });
+      // Debt reads (bounded with beforeSeq) see C — and E once it journals.
+      vi.mocked(api.eventsRead).mockImplementation(async (args) => {
+        if (args.beforeSeq === undefined) return EMPTY_PAGE;
+        const events = [userMessage(1, c), ...(e ? [userMessage(2, e)] : [])];
+        return { events, durableSeq: String(events.length), windowFromSeq: "1", reachedAfterSeq: true };
+      });
+
+      // Reach the retained end state: C shown not-confirmed, debt kept, no timer.
+      await run(60_000);
+      expect(bubbleOf("command C").state).toBe("unknown");
+      expect(debtOf(hubStore).has(INSTANCE)).toBe(true);
+      expect(h.owedTail.get(INSTANCE)?.timer ?? null).toBeNull();
+
+      // E is accepted and merges into the retained debt.
+      await hubStore.send(INSTANCE, "command E");
+      await pump();
+      e = bubbleOf("command E").commandId!;
+      expect((debtOf(hubStore).get(INSTANCE) as { commands: Set<string> }).commands).toEqual(new Set([c, e]));
+      await run(10_000);
+
+      // E got journal reads in its own window and settled durably.
+      expect(h.outbox?.get(e)?.state).toBe("done");
+      expect(bubbleOf("command E").state).toBe("settled");
+      expect(unknownWritesForE).toBe(0);
+      expect(unhandled).toEqual([]);
+      hubStore.logout();
+    });
+  } finally {
+    vi.useRealTimers();
+  }
+}, 30_000);

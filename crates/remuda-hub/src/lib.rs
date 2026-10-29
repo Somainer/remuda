@@ -339,6 +339,18 @@ pub mod store_test_support {
         })
     }
 
+    /// A seat's delegation: no grants, a restart policy, so the insert
+    /// creates a continuity lineage row with itself as the current chapter.
+    pub fn continuity_delegation() -> InstanceDelegation {
+        InstanceDelegation {
+            restart: Some(crate::store::RestartPolicy {
+                on_process_loss: true,
+                max_per_hour: 3,
+            }),
+            ..InstanceDelegation::default()
+        }
+    }
+
     /// Open a Hub DB and enroll one host, returning the store and its host id.
     ///
     /// The Store-direct equivalent of the `spawn` + fake-node WS dance, for

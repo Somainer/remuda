@@ -187,6 +187,8 @@ type OwedTailState = {
   attempts: number;
   firstAt: number;
   storageRetries: number;
+  /** r7 item 3: retries of failed debt done writes once nothing lacks evidence. */
+  settleRetries: number;
   scanAfter: number;
   scanBound: number | null;
   overlapBelow: number;
@@ -4115,6 +4117,7 @@ class HubStore {
       attempts: 0,
       firstAt: Date.now(),
       storageRetries: 0,
+      settleRetries: 0,
       scanAfter: frontier,
       scanBound: null,
       overlapBelow: frontier,
@@ -4184,17 +4187,23 @@ class HubStore {
     if (matched.length) this.emit({ bubbles: settleBubbles(this.state.bubbles, instanceId, matched) });
   }
 
+  /** Owed command ids with journal evidence: observed by a debt read or folded into store events. */
+  private owedEvidenced(instanceId: Id, debt: { observed: Set<Id> }): Set<Id> {
+    const evidenced = new Set<Id>(debt.observed);
+    for (const ev of this.state.events[instanceId] ?? []) {
+      const commandId = ev.kind === "message" ? (ev.payload as { commandId?: Id }).commandId : undefined;
+      if (commandId) evidenced.add(commandId);
+    }
+    return evidenced;
+  }
+
   /**
    * r6 item 3: owed commands of `debt` that have journal evidence — observed
    * by a debt read, or folded into store events (also while no Outbox was
    * installed) — but whose row in `box` is not yet durably done.
    */
   private owedSettlementPending(instanceId: Id, debt: { commands: Set<Id>; observed: Set<Id> }, box: Outbox): Id[] {
-    const evidenced = new Set<Id>(debt.observed);
-    for (const ev of this.state.events[instanceId] ?? []) {
-      const commandId = ev.kind === "message" ? (ev.payload as { commandId?: Id }).commandId : undefined;
-      if (commandId) evidenced.add(commandId);
-    }
+    const evidenced = this.owedEvidenced(instanceId, debt);
     return [...debt.commands].filter((commandId) => {
       if (!evidenced.has(commandId)) return false;
       const rec = box.get(commandId);
@@ -4340,23 +4349,40 @@ class HubStore {
       return false;
     };
     // r6 item 3: commit the durable done for every evidenced owed command on
-    // the captured box. False means the pass must stop: ownership was lost,
-    // or a write failed to commit — then the debt is KEPT and a bounded
-    // storage retry runs at the base cadence (after the bounded retries the
-    // obligation is retained without a timer, like an aborted exhaustion
-    // write). No await happens when nothing is pending.
+    // the captured box. False only when ownership was lost. r7 item 3: a
+    // write that fails to commit does NOT stop the pass — the command stays
+    // owed (debt.owedDone, retried at every pass entry) while the evidence
+    // and deadline processing of the debt's OTHER commands continues. No
+    // await happens when nothing is pending.
     const settleEvidenced = async (): Promise<boolean> => {
       if (!box || !debt) return false;
       const pending = this.owedSettlementPending(instanceId, debt, box);
       if (!pending.length) return true;
-      const committed = await this.commitOwedSettlement(instanceId, debt, pending, box, owns);
-      if (committed === null) return false;
-      if (committed) return true;
-      tail.storageRetries += 1;
-      if (tail.storageRetries <= OWED_TAIL_STORAGE_RETRIES) {
-        this.scheduleOwedTail(instanceId, OWED_TAIL_BASE_BACKOFF_MS);
+      return (await this.commitOwedSettlement(instanceId, debt, pending, box, owns)) !== null;
+    };
+    // r7 item 3: no owed command lacks evidence any more (observed, or at the
+    // existing not-confirmed state after exhaustion). Discharge the debt —
+    // unless a done write it owes is still uncommitted: retry that on its OWN
+    // bounded budget at the base cadence, and once the budget is spent show
+    // the row VISIBLY not-confirmed (状态待确认 from memory) with the
+    // obligation retained, never a silent strand.
+    const settleOrClear = () => {
+      if (!box || !debt) return;
+      if (!this.owedDoneOutstanding(debt, box)) {
+        this.clearOwed(instanceId);
+        return;
       }
-      return false;
+      tail.settleRetries += 1;
+      if (tail.settleRetries <= OWED_TAIL_STORAGE_RETRIES) {
+        this.scheduleOwedTail(instanceId, OWED_TAIL_BASE_BACKOFF_MS);
+        return;
+      }
+      for (const commandId of debt.owedDone) {
+        const rec = box.get(commandId);
+        if (!rec || rec.state === "done" || rec.state === "rejected") continue;
+        this.owedPresentedUnknown.add(commandId);
+        this.syncBubbleFromOutbox(commandId);
+      }
     };
     void this.chainReconcile(instanceId, async () => {
       try {
@@ -4372,7 +4398,7 @@ class HubStore {
         // before anything can clear the debt.
         if (!(await settleEvidenced())) return;
         if (!this.owedCommandLacksEvidence(instanceId)) {
-          this.clearOwed(instanceId);
+          settleOrClear();
           return;
         }
         const exhausted =
@@ -4381,7 +4407,10 @@ class HubStore {
         if (exhausted) {
           const committed = await this.exhaustOwedDebt(instanceId, debt, box, owns);
           if (!owns()) return;
-          if (committed) return;
+          if (committed) {
+            settleOrClear();
+            return;
+          }
           // r2 item 3: a terminal write failed to persist. Retain the debt
           // and run a BOUNDED storage retry; the bubble already presents
           // not-confirmed from memory. After the bounded retries the
@@ -4448,7 +4477,7 @@ class HubStore {
         if (!owns() || !this.reconcileOwed.has(instanceId)) return;
         if (!(await settleEvidenced())) return;
         if (!this.owedCommandLacksEvidence(instanceId)) {
-          this.clearOwed(instanceId);
+          settleOrClear();
           return;
         }
         // An unanswered read (no instance resolution, or a rejected/404
@@ -4495,16 +4524,20 @@ class HubStore {
    */
   private async exhaustOwedDebt(
     instanceId: Id,
-    debt: { commands: Set<Id> },
+    debt: { commands: Set<Id>; observed: Set<Id> },
     box: Outbox,
     stillOurs: () => boolean,
   ): Promise<boolean> {
     if (this.reconcileOwed.get(instanceId) !== debt || this.outbox !== box) return true;
+    // r7 item 3: a journal-confirmed command is never moved to not-confirmed
+    // here — its pending done write is owed (and retried) separately.
+    const evidenced = this.owedEvidenced(instanceId, debt);
     let allCommitted = true;
     for (const commandId of debt.commands) {
       // r4 item 2: fence EVERY terminal write with the exact captured
       // Outbox + debt ownership BEFORE the patch, never only after its await.
       if (!stillOurs()) return true;
+      if (evidenced.has(commandId)) continue;
       const rec = box.get(commandId);
       if (!rec || rec.state === "done" || rec.state === "rejected" || rec.state === "unknown") continue;
       // Present not-confirmed from memory BEFORE the write so even an aborting
@@ -4532,7 +4565,7 @@ class HubStore {
       }
       allCommitted = false;
     }
-    if (allCommitted && stillOurs()) this.clearOwed(instanceId);
+    // The caller discharges the debt (or keeps its owed done writes).
     return allCommitted;
   }
 

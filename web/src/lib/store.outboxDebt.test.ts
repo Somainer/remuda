@@ -2101,3 +2101,91 @@ it("r7 item 2: an unrelated live batch between a failed debt done write and its 
     expect(unhandled).toEqual([]);
   });
 }, 15_000);
+
+it("r7 item 3: persistent done-write failures for C never strand D — D reaches 状态待确认 at the deadline and C is shown not-confirmed", async () => {
+  // One merged debt owes C and D. A debt read observes only C, and EVERY
+  // durable done write for C fails. The settlement retries must not stop the
+  // deadline processing: D (never evidenced) reaches the existing bounded
+  // exhaustion, and C ends visibly not-confirmed with its obligation kept —
+  // never a silent accepted row, never an endless timer.
+  vi.useFakeTimers();
+  try {
+    await collectUnhandled(async (unhandled) => {
+      const { api, hubStore } = await fresh();
+      await mountFollow(api, hubStore);
+      vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+        const commandId = _args[4] as string;
+        return Promise.resolve(commandResult(commandId, "accepted"));
+      });
+      const h = hubStore as unknown as { outbox: { get: (id: string) => OutboxRecord | undefined } | null };
+      const pump = async () => {
+        for (let i = 0; i < 30; i += 1) await vi.advanceTimersByTimeAsync(0);
+      };
+      const bubbleOf = (text: string) => hubStore.getSnapshot().bubbles.find((b) => b.text === text)!;
+
+      await hubStore.send(INSTANCE, "command C");
+      await pump();
+      await hubStore.send(INSTANCE, "command D");
+      await pump();
+      expect(bubbleOf("command C").outboxState).toBe("sent");
+      expect(bubbleOf("command D").outboxState).toBe("sent");
+      const c = bubbleOf("command C").commandId!;
+      const d = bubbleOf("command D").commandId!;
+      expect((debtOf(hubStore).get(INSTANCE) as { commands: Set<string> }).commands).toEqual(new Set([c, d]));
+
+      // Every done write for C aborts; nothing else fails.
+      const { LocalStorageOutboxStorage } = await import("./outbox");
+      const realMerge = LocalStorageOutboxStorage.prototype.mergeUnlessDone;
+      let doneFailures = 0;
+      vi.spyOn(LocalStorageOutboxStorage.prototype, "mergeUnlessDone").mockImplementation(function (
+        this: InstanceType<typeof LocalStorageOutboxStorage>,
+        commandId: string,
+        patch: Partial<OutboxRecord>,
+      ) {
+        if (patch.state === "done" && commandId === c) {
+          doneFailures += 1;
+          return Promise.reject(new Error("IDB_TRANSACTION_ABORTED"));
+        }
+        return realMerge.call(this, commandId, patch);
+      });
+      // Only debt reads (bounded with beforeSeq) see C's entry; D never journals.
+      vi.mocked(api.eventsRead).mockImplementation(async (args) =>
+        args.beforeSeq === undefined ? EMPTY_PAGE : userMessagePage(c),
+      );
+
+      // Run past the 45 s deadline plus the settlement retry budget.
+      for (let t = 0; t < 60_000; t += 500) {
+        await vi.advanceTimersByTimeAsync(500);
+        for (let i = 0; i < 5; i += 1) await Promise.resolve();
+      }
+      await pump();
+
+      const { projectCommandStatus } = await import("./commandStatus");
+      const label = (outboxState: string | undefined) =>
+        projectCommandStatus({ hasServerCommandId: true, outboxState: outboxState as never }).label;
+      // D: the existing bounded exhaustion, durably.
+      expect(h.outbox?.get(d)?.state).toBe("unknown");
+      expect(bubbleOf("command D").state).toBe("unknown");
+      expect(label(bubbleOf("command D").outboxState)).toBe("状态待确认");
+      // C: journal-confirmed but its done never commits — retried, then shown
+      // not-confirmed with the obligation retained (never moved to unknown
+      // durably, never left as a silent accepted row).
+      expect(doneFailures).toBeGreaterThan(1);
+      expect(h.outbox?.get(c)?.state).toBe("sent");
+      expect(bubbleOf("command C").state).toBe("unknown");
+      expect(label(bubbleOf("command C").outboxState)).toBe("状态待确认");
+      expect(debtOf(hubStore).has(INSTANCE)).toBe(true);
+
+      // Bounded: no further reads or writes once both are settled visibly.
+      const reads = vi.mocked(api.eventsRead).mock.calls.length;
+      const failures = doneFailures;
+      for (let t = 0; t < 20_000; t += 500) await vi.advanceTimersByTimeAsync(500);
+      expect(vi.mocked(api.eventsRead).mock.calls.length).toBe(reads);
+      expect(doneFailures).toBe(failures);
+      expect(unhandled).toEqual([]);
+      hubStore.logout();
+    });
+  } finally {
+    vi.useRealTimers();
+  }
+}, 30_000);

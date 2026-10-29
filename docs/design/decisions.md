@@ -1936,7 +1936,12 @@ origin/main（`c27e0eac`）的首页现状：
    - **失败卡离队：** `seen-hub` 之前，回合失败卡在实例恢复、关闭或下一回合开始时离队，另有一个本设备的「知道了」；之后改为「被看过就离开」（home.md §4.5）。
 
 3. **一个 `rank()`（R1）。**
-   - 七档：blocked > 完成未看 > working > 待唤醒 > starting > idle > exited，档内新的在前；档位用 ui-spec §2.1 状态点的投影条件判定。
+   - 七档：blocked > 完成未看 > working > 待唤醒 > starting > idle > exited，档内新的在前。
+   - 档位从现有投影 `projectStatus`（`web/src/lib/status.ts`）推出，是一张自上而下、先命中先得的全表（home.md §3.1）：
+     - 每个 `(lifecycle, activity)` 组合恰好得到一个档；
+     - 空闲一族（完成未看、待唤醒、idle）对 `ready` 和 `running` 一视同仁，因为跑完回合、进程仍在的实例报告的是 `running` + `idle`；
+     - `failed`、`closing`、`exited` 落在 exited；`unknown`、`reconciling` 落在 starting，除非已知在等人；`draining` 落在 working；
+     - 与状态点只有两处偏离：`connectivity` 不参与档位；lifecycle 未知时按 starting 排。
    - `/m` 台账、桌面 `SessionList` 与「工作中」共用这一个定义。
    - 每个项目组里，空闲行折成「还有 N 个空闲 ▾」；没有活跃行的项目折进「安静的项目 · N」；搜索时全部展开。
    - 组头用点计数（`⚠1 ●2 ◉1 ○4`，单行）。

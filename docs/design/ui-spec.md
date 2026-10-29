@@ -301,13 +301,15 @@ wire 用 `lifecycle` × `activity` × `connectivity`（`protocol.md` §2.3）。
 
 | UI 点 | 色 | 投影 | 禁止 |
 |---|---|---|---|
-| `blocked` | 琥珀 ⚠（`--attention-fg`） | `activity=waiting-interaction` | 优先级最高 |
-| `working` | `--link` 实心点 | `activity=working` | |
+| `blocked` | 琥珀 ⚠（`--attention-fg`） | `activity=waiting-interaction`（Hub 的 `blocked` 也映射到这里） | 除 unknown 外优先级最高 |
+| `working` | `--link` 实心点 | `activity ∈ {working, draining}`；或 `lifecycle ∈ {ready, running}` 而 activity 未知 | |
 | `starting` | `--fg-faint`，dim 脉冲 | `lifecycle ∈ {requested,preparing,starting}` | |
-| `done-unseen`（D-061） | `--link` 环 + 中心实心点 ◉ | idle 的条件成立，并且投影 `unseen=true`（owner 还没看过最近一次成功结束的根回合，[home.md](./home.md) §7）。看过之后回到 idle ○ | 不用绿色；`seen-hub` 落地前不会出现 |
-| `idle` | `--fg-muted` 描边 ○ | `activity=idle` 且 `lifecycle=ready`。含 `--bg` 原生 `state=done` 但进程仍在（可 send） | **不要**把这种情况画成会话结束；在线不用绿色 |
-| `exited` | `--fg-faint` 灰 ■ | `lifecycle=exited` | jsonl 可能还在；**禁止**画成 ×，× 只表示关闭标签（D-024 addendum） |
+| `done-unseen`（D-061） | `--link` 环 + 中心实心点 ◉ | idle 的条件成立（`lifecycle` 为 `ready` 或 `running`），并且投影 `unseen=true`（owner 还没看过最近一次成功结束的根回合，[home.md](./home.md) §7）。看过之后回到 idle ○ | 不用绿色；`seen-hub` 落地前不会出现 |
+| `idle` | `--fg-muted` 描边 ○ | `activity=idle` 且 `lifecycle ∈ {ready, running}`。一个跑完回合、进程仍在的实例报告的是 `running` + `idle`，同样是 idle；含 `--bg` 原生 `state=done` 但进程仍在（可 send） | **不要**把这种情况画成会话结束；在线不用绿色 |
+| `exited` | `--fg-faint` 灰 ■ | `lifecycle ∈ {exited, failed, closing}` | jsonl 可能还在；**禁止**画成 ×，× 只表示关闭标签（D-024 addendum） |
 | `unknown` | 虚线环 | `lifecycle ∈ {unknown,reconciling}` 或 `connectivity ≠ connected` | **禁止**画成 idle/exited 成功 |
+
+**判定顺序**（`web/src/lib/status.ts` 的 `projectStatus`，先命中先得）：unknown → blocked → starting → exited → working → idle；`lifecycle ∈ {ready, running}` 而 activity 未知时画成 working。十个 lifecycle 值与四个 activity 值（外加「未知」）都恰好落到一个点上。首页的排序档位从同一个投影推出，只在两处偏离：`connectivity` 不参与档位；`lifecycle` 未知或正在对账时按 starting 排（[home.md](./home.md) §3.1）。
 
 没有名为 `done` 的 Instance 点。Run 成功只出现在 transcript usage / 回合脚，不改列表点。`done-unseen` ◉ 不是「完成」状态，而是 idle 上叠加的一个 owner 注意力标记：进程仍在、可以 send，只是最近一次成功结束的回合 owner 还没看过（D-061）。
 

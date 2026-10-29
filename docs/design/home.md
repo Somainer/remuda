@@ -195,20 +195,43 @@
 
 `rank()` 只有一个定义，放在 `web/src/features/mobile/homeRows.ts`。`/m` 的台账、桌面的 `SessionList` 和 ⑥「工作中」都用它（任务 `home-rank-fold`）。
 
-档位用 ui-spec §2.1 状态点表的投影条件来判定，不另造状态机：
+七个档位：
 
-| 档 | 名称 | 判定 | 点（ui-spec §2.1） |
-|---|---|---|---|
-| 1 | blocked | §2.1 的 blocked 条件（`activity=waiting-interaction`） | ⚠ |
-| 2 | done-unseen | §2.1 的 idle 条件（`activity=idle` 且 `lifecycle=ready`），并且 `unseen=true`（§7） | ◉ |
-| 3 | working | §2.1 的 working 条件（`activity=working`） | ● |
-| 4 | awaiting-wake | §2.1 的 idle 条件，并且满足以下任一条：有正在运行的子实例（子实例的 `parentInstanceId` 指向它）；它所在血缘有一个未来的 wake（`home-wakes` 落地后） | ○ 加状态词「待唤醒」 |
-| 5 | starting | §2.1 的 starting 条件（`lifecycle ∈ {requested, preparing, starting}`），以及 `lifecycle ∈ {unknown, reconciling}` | 脉冲点 / 虚线环 |
-| 6 | idle | §2.1 的 idle 条件，并且不属于第 2、4 档 | ○ |
-| 7 | exited | §2.1 的 exited 条件（`lifecycle=exited`，含失败退出） | ■ |
+| 档 | 名称 | 点（ui-spec §2.1） |
+|---|---|---|
+| 1 | blocked | ⚠ |
+| 2 | done-unseen | ◉ |
+| 3 | working | ● |
+| 4 | awaiting-wake | ○ 加状态词「待唤醒」 |
+| 5 | starting | 脉冲点；lifecycle 未知或正在对账时画虚线环 |
+| 6 | idle | ○ |
+| 7 | exited | ■ |
+
+**判定。** 档位从现有投影 `projectStatus`（`web/src/lib/status.ts`，ui-spec §2.1）推出，不另造状态机。输入有三个：
+- `L` 是 Web 投影里的 `lifecycle`，取 `requested`、`preparing`、`starting`、`ready`、`running`、`closing`、`exited`、`failed`、`unknown`、`reconciling` 十个值之一。Hub 发来的其他字符串由 `mapLifecycle`（`web/src/lib/api.ts`）映射为 `unknown`。
+- `A` 是 `activity` 的已知值，取 `idle`、`working`、`waiting-interaction`、`draining` 之一；activity 未知时记为「未知」。Hub 的 `blocked` 由 `mapActivity` 映射为 `waiting-interaction`。
+- **活着** 指 `L ∈ {ready, running}`。一个刚跑完一回合、进程仍在的实例报告的是 `L=running`、`A=idle`，所以「空闲」一族（第 2、4、6 档）的判定对 `ready` 和 `running` 一视同仁，与 `projectStatus` 的 idle 分支相同。
+
+判定按下表**自上而下，先命中先得**：
+
+| 顺序 | 条件 | 档 |
+|---|---|---|
+| a | `A = waiting-interaction`（任何 `L`） | 1 blocked |
+| b | `L ∈ {requested, preparing, starting, unknown, reconciling}` | 5 starting |
+| c | `L ∈ {exited, failed, closing}` | 7 exited |
+| d | `A ∈ {working, draining}` | 3 working |
+| e | `A = idle`，`unseen=true`，并且没有 `lastTurnError`，即最近一个结束的根回合是成功的（§7）。失败的回合不进这一档，而是在队列里出一张回合失败卡（§4.5） | 2 done-unseen |
+| f | `A = idle`，并且满足以下任一条：至少有一个子实例（子实例的 `parentInstanceId` 指向它）落在第 1、3 或 5 档；它所在血缘有一个未来的 wake（`home-wakes` 落地后） | 4 awaiting-wake |
+| g | `A = idle` | 6 idle |
+| h | 其余情形，也就是活着但 `A` 未知 | 3 working |
+
+**这张表是全的。** 走完 b、c 两行之后，`L` 只剩活着的两个值，所以 e–g 隐含「活着」。`A` 的四个已知值和「未知」分别落在 a、d、e–g、h。因此每个 `(L, A)` 组合恰好得到一个档位。各个非活着的状态各对应一个档：`failed`、`closing`、`exited` → 7；`unknown`、`reconciling` → 5；`requested`、`preparing`、`starting` → 5。`draining` 属于 activity，对应第 3 档。
+
+**和状态点的关系。** 档位只在两处偏离 `projectStatus`，其余与状态点逐条一致：
+- **`connectivity` 不参与档位。** `connectivity ≠ connected` 只把点画成虚线环、把下一步写成「状态待确认」（ui-spec §2.1）；行仍按 `L` 与 `A` 排档。这样主机掉线时，blocked 的行不会掉出第 1 档。
+- **`L ∈ {unknown, reconciling}` 时**，状态点是虚线环；档位走 a 行或 b 行。也就是说，已知在等人的行仍在第 1 档，其余的行与 starting 同排，不会被排到 idle 或 exited。
 
 - **同一档内新的排在前面**：按 `lastEventAt` 降序，没有就用 `updatedAt`；时间相同时按 `instanceId` 排，保证结果确定。
-- **连接状态不改变档位**：`connectivity ≠ connected` 只把点画成虚线环、把下一步写成「状态待确认」（ui-spec §2.1），行仍然按最后投影出的 activity 排档。这样主机掉线时，blocked 的行不会掉出第 1 档。
 - 第 2 档在 `seen-hub` 落地之前恒为空。第 4 档在 `home-wakes` 落地之前只按子实例判定。
 - `homeRowsSignature`（`homeRows.ts`）必须把档位和下面的折叠字段都包含进去，否则档位变化时列表不会重画。
 

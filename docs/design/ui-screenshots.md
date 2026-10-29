@@ -41,7 +41,7 @@ Capture rules:
 
 | State | How to reach it | Must be visible |
 |---|---|---|
-| Queue full | ≥ 5 pending items: a Main question, an approval, a simple question, a plan review, one task waiting on the owner | ① counts 需要你 N; ④ shows 3 cards on the phone and 4 on desktop, plus 「还有 N 条」; the approval card has only 拒绝 / 允许一次; the plan card has only 审阅计划; the simple question shows option chips and 其他… |
+| Queue full | ≥ 5 pending items: a Main question, an approval, a simple question, a plan review, one task waiting on the owner | ① counts 需要你 N; ④ shows 3 cards on the phone and 4 on desktop, plus 「还有 N 条 ▾」; tapping it expands the whole queue in place (capture both states), and 「去收件箱 ›」 is a separate header link; the approval card has only 拒绝 / 允许一次; the plan card has only 审阅计划; the simple question shows option chips and 其他… |
 | All handled | no pending items, ≥ 1 working session | ① starts with the time-of-day greeting and 「都处理完了」; ④ collapses to one line; h1 is still 会话 |
 | Before first snapshot | delay the first `/v1/instances` response | skeletons in ④ and ⑦, 「–」 in ①, never 「暂无会话」 |
 | Hub unreachable | `context.setOffline(true)` for longer than the banner delay | ⑧ 「连不上 Hub · 上次更新 N 秒前 · 重试」; queue buttons disabled with 「数据可能过期」; ① greyed with 「更新于 T」 |

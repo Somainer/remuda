@@ -1965,6 +1965,72 @@ CLI exit 0 只表示 API 请求成功返回；返回对象的 commandState/resol
 
 Bot 入口以 platform delivery/message ID 在 Hub durable inbox 去重，身份验证后才生成 commandId；项目路由输出具体 host/workspace/profile/driver，不把聊天平台文本直接变成任意 shell command。Bot 的“已接收”对应 queued，“原生已接纳”对应 accepted，“本轮/任务结束”对应所选 Run scope。审批卡片携带 interactionId/version/generation，回调仍由 Node CAS；消息重复投递、卡片重复点击或 Hub 重启都不会绕开同一账本。推送/邮件等外部发送只由明确配置的 dispatcher 通道执行，native output 中出现“通知某人”不会自动成为 runtime 的发送指令。
 
+### 8.4 伙伴层的读写路由（D-060）
+
+**2026-10-29 补（D-060）。** 记忆路由由所有者裁定 R1 采纳；digest 与 glance 仍为 proposed。机制见 [main-agent.md §10.2 与 §12](./main-agent.md#12-memory-d-060-hub-entries-now)。全部是新增路由，不改任何既有帧；下面的形状是说明性文本，不是可解析的 wire 样例。
+
+**Agent 的放行。** 今天 `restrict_agent_routes` 的血缘读谓词 `lineage_read_target` 只匹配 `/v1/lineages/{id}` 本身（`crates/remuda-hub/src/agent_scope.rs`）。新增谓词只放行下面列出的子路径，并且和 `agent_owns_lineage` 一样，把路径里的 `{id}` 钉在调用者自己的血缘上；处理器再查一次。worker digest 单独放行这一个 GET 形状，与 `hostcap_read_target` 同法；处理器要求 `dispatch` grant 和项目 scope，与 worker 的其他读一样覆盖整个 scope。Human 与 Bot 调用方照常经过设备认证。
+
+**记忆（`cb-memory-core`）。**
+
+~~~text
+GET    /v1/lineages/{id}/memory?q=<query>&type=<type>&includeArchived=0|1
+  -> 200 {lineageId, memoryRev, items: [{slug, type, title, description, revision,
+          origin, updatedAt, archived}], indexBytes}
+     q: FTS5 MATCH first; LIKE when MATCH finds nothing or q contains CJK
+GET    /v1/lineages/{id}/memory/index
+  -> 200 {lineageId, memoryRev, text}      rendered index plus about-me, as injected at chapter start
+GET    /v1/lineages/{id}/memory/{slug}
+  -> 200 MemoryEntry
+PUT    /v1/lineages/{id}/memory/{slug}
+  body {type: user|feedback|project|reference, title, description, body,
+        expectedRevision (0 = create), sourceRefs?: [{instanceId, seq}]}
+  -> 200 {entry: MemoryEntry, sizes: {bodyBytes, indexBytes}, warnings: [..]}
+DELETE /v1/lineages/{id}/memory/{slug}?expectedRevision=<n>
+  -> 200 {slug, revision, deletedAt}
+POST   /v1/lineages/{id}/memory/consolidate
+  body {sources: [{slug, expectedRevision}], target: {slug, type, title, description, body}}
+  -> 200 {entry: MemoryEntry, removed: [slug]}      one writer job, all or nothing
+
+MemoryEntry = {lineageId, slug, type, title, description, body, revision,
+               origin: human|agent|hub, writerInstanceId, turnRef, sourceRefs,
+               createdAt, updatedAt, archived}
+~~~
+
+- 写入按条目做 revision CAS。`expectedRevision` 不符：409，`code: "MEMORY_REVISION_CONFLICT"`，`reason: "revision-mismatch"`，并带 `currentRevision`；绝不覆盖。
+- 正文超过 8 KiB：422，`code: "MEMORY_ENTRY_TOO_LARGE"`。正文超过 2 KiB 或索引超过 4 KiB 时写入成功，`warnings` 给出实际字节数。
+- 秘密 lint 命中：422，`code: "MEMORY_SECRET_REJECTED"`，错误体不回显命中的文本。
+- Agent 写入只接受血缘当前章节：否则 409，`reason: "not-current-chapter"`；F 落地后改为既有的 `reason: "fenced"`（§9.1）。Agent 写 `about-me`：403，`reason: "owner-authored"`。已归档的血缘拒绝写入：409，`reason: "archived"`。
+- `origin`、`writerInstanceId` 与 `turnRef` 由 Hub 盖章，请求体里的同名字段被剥掉。`cb-rootturn` 落地后，`origin` 取自 `rootTurn.origin`。
+- CLI：`remuda memory write|read|search|rm|consolidate`。超过软上限时打印实际数字。
+
+**worker digest 与血缘 glance（`cb-digest`）。**
+
+~~~text
+GET /v1/workers/{id}/digest          {id} = wkr_… or worker name
+  -> 200, at most 2048 bytes of UTF-8 JSON, always valid:
+     {v: 1, workerId, instanceId, name, projectId, taskId, branch, sha,
+      roster: {state, watch},                     watch = the observe classification
+      turn: {result, endedAt} | null,
+      lastText: {head, tail} | null,              untrusted text
+      pending: {kind, question, tool, argsSummary} | null,
+      model: {requested, effective, effort: {requested, effective},
+              configure: {state, requestId} | null},
+      supply: {windowId, resetsAt} | null,        a cooling-down window
+      queued, sinceProgressSecs, toolInFlight,
+      shrunk: [field, ..]}                        fields whose text was shortened to fit
+
+GET /v1/lineages/{id}/glance
+  -> 200 {lineageId, generatedAt,
+          waiting: [{instanceId, name, since, kind, question}],   at most 50
+          working: [{instanceId, name, since, taskId}],           at most 50
+          more: {waiting, working}, doneToday}
+~~~
+
+- 超长时按固定顺序缩短文本字段（`lastText`、`question`、`argsSummary`），并在 `shrunk` 里列出；绝不截断成非法 JSON。
+- `argsSummary` 是有界的、按不可信内容引用的待批参数摘要，只排除秘密形状（与 `scripts/ci/secret-scan.py` 同一组候选）和输入交接值。
+- CLI：`remuda worker digest <worker>`、`remuda glance`。
+
 ## 9. 错误码、未知值与兼容性
 
 ### 9.1 错误对象
@@ -2043,6 +2109,25 @@ JSON-RPC response.error 使用 `{code:rpcCode,message,data:{code,retry,execution
 - `node-lacks-fence`：目标 Node 未在 hello 中声明 `capabilities.lineageFence`，而命令或直连操作由续接血缘发起。Hub 沿用既有 409 形状并带 `reason: "node-lacks-fence"`，不写出帧。
 
 见 [main-agent.md §7.3 与 §7.6](./main-agent.md#73-commit-time-authority-check)。
+
+**2026-10-29 补（D-060，proposed）：Hub HTTP 错误体的 `reason` 与 `next`。** 上表是 JSON-RPC 的错误对象。Hub 的 HTTP 错误体另有自己的形状：`{error, code}`，再按错误类型带 `interactionId`、`winner`、`hostId`、`retryAfterMs` 等字段（`crates/remuda-hub/src/error.rs` 的 `response_body`）。今天每一种 403 拒绝的 `code` 都是 `FORBIDDEN`，座位分不出缺 grant、超出 scope 还是不归它所有。`cb-errors` 只增不改：
+- `error`、`code` 和既有的附加字段保持不变；客户端今天按 `code` 判别（例如 web 按 `NODE_BUSY` 重试），这一点不受影响。
+- 新增 `reason`：稳定的小写原因，与 D-057 的 `fenced`、`node-lacks-fence` 属同一词汇。首批取值：`grant-required`、`out-of-scope`、`not-owner`、`operator-only`、`agent-route`（中间件不对 Agent 放行该路由）、`approval-required`、`fenced`、`node-lacks-fence`。
+- 新增 `next`：给调用方的下一步提示，`{action, hint}`，另可带 `grant`、`interactionId`、`commandId`。`action` 取值：`ask-owner`（这是所有者选定的配置，不要重试；把目标、动作和原因报告给所有者）、`await-approval`（等人答复交互，再带 `approvalId` 重试）、`read-then-decide`（结果未知，先读命令状态或 digest，再决定是否重发，D-055）、`retry-same-command`（稍后用同一 commandId 重试）、`stop`（本章节已被隔离，结束本回合）、`fix-request`（请求本身有误）。
+- `next` 只是提示，永不构成授权；**不新增任何拒绝路径**。旧客户端忽略这两个未知字段。CLI 打印 `next.hint`。
+
+~~~text
+HTTP 403
+{"error": "forbidden", "code": "FORBIDDEN", "reason": "grant-required",
+ "next": {"action": "ask-owner", "grant": "land",
+          "hint": "this seat does not hold land; enqueue verify and report the branch to the owner"}}
+
+HTTP 409
+{"error": "human approval required; answer interaction int_…, then retry with approvalId",
+ "code": "HUMAN_APPROVAL_REQUIRED", "interactionId": "int_…", "reason": "approval-required",
+ "next": {"action": "await-approval", "interactionId": "int_…",
+          "hint": "a human must answer the approval; then retry the same request with approvalId"}}
+~~~
 
 ### 9.2 Unknown 与 reconciliation 的实现要求
 

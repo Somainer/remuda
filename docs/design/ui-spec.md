@@ -4,6 +4,8 @@
 产品定位：unified remote agent runtime 的遥控面（产品名已定 **Remuda**：UI 文案、窗口标题与 manifest 均用 Remuda，D-001/D-053）。
 **不是** harness，**不造** agent loop。界面只观察 + 下发控制；resume 权威是原生会话。
 
+**v0.2.5 changelog（2026-10-30，首页分诊优先，见 D-061 与 [home.md](./home.md)）**：首页（`/m` 与 `/sessions`）以全页唯一的「需要你」队列为主体，Main 改为一张卡加一条「问 Main」输入条，PhoneNav 仍为 4 槽，h1 仍为「会话」；机械细节以 home.md 为准。本次修订的位置：§1.2（`/sessions?focus=` 推送落点）；§1.4（`/sessions` 上的 SpacesPanel 默认折叠在「空间 ▸」开关后面）；§2.1（首页带；Main 卡取代 Main 置顶行；新增完成未看点 ◉；投影字段 `unread?` 改为按 owner 的 `unseen?`；裸按键移到终端页）；§2.5（首页上的简单单选题例外）；§3.1（seen 按 owner 存于 Hub）；§3.3（没有真实来源的计数隐藏）；§4.5（更正角标现状；角标数等于首页「需要你」数）；§4.7（`/m` 结构、底部停靠带与桌面断点）；§6（◉ 不用绿色）。
+
 **v0.2.4 changelog（2026-09-25，c-ghostbadge 角标一致性）**：收件箱角标（compact 底栏、桌面侧栏、OS Badging API）与 `/m/inbox`、`/approvals` 的「待你处理」队列是同一个派生结果（`deriveInboxQueue`），不再有第二处 `state==="pending"` 计数——一张 durable 仍是 `pending` 但已知 deadline 已过（投影为 expired）的卡在角标与列表里同时消失。deadline 跨越由共享的客户端时钟在到期瞬间驱动重算：store 无变化（如主机离线）时，角标、列表与 OS 角标也在同一刻翻牌，无需刷新或下一次轮询。桌面 `/approvals` 的队列档与 compact 同源；「已离队」档仍只在桌面。状态机本身不变（下表 pending=「`status=pending` 且未过期」）。
 
 **v0.2.3 changelog（2026-09-20，task 优先模型，见 D-050）**：新增 §1.5「Task 层」（Task 是 instance 之上的聚合而非第二状态机；看板列只读投影；目录绑定 reuse\|pool 与 attach-lock；任务空间=文件视图过滤投影；批注=composer 草稿；工作台多 session 用 tab 不分屏；/m 任务分组）与 §2.9「任务列表与看板 `/board`」（三列+已归档过滤、failed 角标按 placement 归位、拖卡多跳、`SE-nn` 派生 key、父子嵌套、「需要你」首组、只读预览、任务/项目空间面板、批注徽标、项目切换器）；§1.1 projects 行与「项目」段改为采纳 Hub `Project` 实体（Space 键不放松，D-024）；§1.2 路由表新增 `/board`；§1.3 映射表补看板 compact 落点；§4.7 `/m` 子树补任务分组与看板单列过滤。机械细节（表结构、RPC/路由形状、迁移预算、grant 门控）以 [task-model.md](./task-model.md) 为准。
@@ -80,7 +82,7 @@ Hash 路由不要。用 **React Router**（History API）。认证 cookie 必须
 |---|---|---|
 | `/login` | 设备登录 | 未登录唯一公开页 |
 | `/` | 按视口落点（D-049） | compact（§1.3 断点）→ `/m`；其余 → `/sessions`。PWA `start_url` 用 `/`（§4.6） |
-| `/sessions` | 会话列表 | query：`?host=&workspace=&kind=&status=`（`status` 是 §2.1 投影名）。compact 下 `<Navigate replace>` 到 `/m`（D-049） |
+| `/sessions` | 会话列表 | query：`?host=&workspace=&kind=&status=`（`status` 是 §2.1 投影名），以及 `?focus=:interactionId`（D-061：高亮首页队列里的对应卡，[home.md](./home.md) §4）。compact 下 `<Navigate replace>` 到 `/m`（D-049），`?focus=` 等 query 原样保留 |
 | `/m` | 手机会话 home（D-049） | 手机优先路由树的首页（§4.7）：仅 compact 使用独立形态；桌面访问 `<Navigate replace>` 回 `/sessions` |
 | `/sessions/new` | 新建会话 | query 可预填 `host` `workspace` `kind`；compact 与桌面**都不重定向**（共享页） |
 | `/s/:instanceId` | 会话页 | print 默认 structured；pty-backed（codex/grok/agy/`claude-pty`/`terminal`）默认终端。**任何视口下都不重定向**（D-049） |
@@ -101,7 +103,7 @@ Hash 路由不要。用 **React Router**（History API）。认证 cookie 必须
 | `/settings` | 设置 | |
 | `/pair` | 设备配对（可选，herdrx `#pair=` 同类） | 第一里程碑可不做 |
 
-深链：Web Push `data.url`、飞书卡片「在 runtime 打开」都进 `/s/:id` 或 `/approvals?focus=`。
+深链：Web Push `data.url`、飞书卡片「在 runtime 打开」都进 `/s/:id` 或 `/approvals?focus=`。D-061 起，交互推送的 `data.url` 改为与视口无关的 `/sessions?focus=:interactionId`：手机经重定向落到 `/m?focus=`，桌面落到 `/sessions`，两边都高亮首页队列里的对应卡（任务 `home-queue`，改 `crates/remuda-hub/src/alerts.rs`）。
 
 重定向层（D-049，全部 `<Navigate replace>`，不新增鉴权、不改 query，详见 §4.7）：
 
@@ -140,7 +142,7 @@ Hash 路由不要。用 **React Router**（History API）。认证 cookie 必须
 
 - 一条带文字的侧栏（≥1024 为 248px，768–1023 为 216px）：品牌行（Remuda + QuickFind + 折叠按钮）、`<nav aria-label="主导航">`（首项必须是「会话」，其后「收件箱」「任务看板」）、「项目」区、底部「新建会话」与「管理」菜单。⌘/Ctrl+B 在所有桌面路由把侧栏收成 48px 图标列。取消旧的 48px 图标轨（D-053）。
 - 每页一条 48px `PageHeader`：面包屑 + 当前页 `<h1>` + 本页动作。
-- `/sessions` 和 `/board` 在内容区左边多一条索引列（宽 `--index`）：`/sessions` 挂 SpacesPanel，`/board` 是任务清单；宽度 <1024 时索引列收成页头上的按钮，点开是覆盖层，里面是同一个组件、同样的 testid。会话路由 `/s/*` **没有**第二列。
+- `/sessions` 和 `/board` 在内容区左边多一条索引列（宽 `--index`）：`/sessions` 挂 SpacesPanel（D-061 起默认折叠在「空间 ▸」开关后面，§1.4），`/board` 是任务清单；宽度 <1024 时索引列收成页头上的按钮，点开是覆盖层，里面是同一个组件、同样的 testid。会话路由 `/s/*` **没有**第二列。
 - tab 条只在 `/s/*` 上渲染（36px），列表路由不再有 tab 条；集合语义见 §1.4。
 - 右栏文件视图在 ≥1280 时并排（300px）；<1280 时从页头「文件」按钮或 ⋯ 菜单以覆盖 sheet 打开。
 - 会话页页头：面包屑/标题、host、cost、状态点（§2.1 投影）、`终端|结构` 分段、Stop、文件开关、⋯。这排元素在 compact 下允许重排与减铬，但 **`终端|结构` 分段与 Stop 必须始终留在页头，永不进 ⋯ 溢出菜单**（D-040 (2) 不变）：另一个视图是一等入口，不是「更多」里的设置。host 与 cost 留在桌面主行；诊断字段（driver / delegation / provider / lifecycle / seq / connectivity / native / promoted）进 ⋯ 菜单里的「运行详情」（§2.2；D-053 取代旧 ui-spec §2.2 第二行「只有这一个触发器」的版式（基线 `80db05b8:docs/design/ui-spec.md:335`），D-040 (3) 钉住的面板内容、按设备持久化与 `session-meta` 不变）。
@@ -191,7 +193,7 @@ Paseo compact 是左列表 / 中 agent / 右文件三态互斥（`paseo/docs/mob
 本节为 2026-09-13 的信息架构增补。借鉴 herdr 的 workspace → tabs → panes，当前实现前两个维度：**Space = 主机上一个已注册 Workspace，Tabs = 会话**；仍不做多 pane 分屏。D-053 修订的是面板所在位置与 tab 条的出现范围，Space 身份、关闭语义与快捷键原则不变。
 
 - Space 来源是 D-023 的主机已注册 Workspace，以 `(hostId, workspaceId)` 区分；注册 wire 字段为 `workspaceId / hostId / root`，现有 UI 投影保持 `id / hostId / rootPath / label`。默认名称取根目录 basename，客户端重命名不会修改注册目录或后端 Workspace。实例严格按 host 与 workspace 两个 ID 归属，未注册、取消注册或无匹配的实例统一进「其他」。
-- **Space 面板移到 `/sessions` 的索引列（D-053）。** SpacesPanel（重命名、手动排序、分组展开、「已退出 (n)」分组）挂在 `/sessions` 内容区左侧，宽 `--index`；宽度 <1024 时收成页头上的「空间」按钮，点开是覆盖层，里面是同一个组件、同样的 testid。不属于任何项目的 Space 也要能在这里管理。面板**不再有自己的折叠开关**，也删除旧的品牌色左竖线与首字母窄轨；折叠统一是侧栏的概念（⌘B）。显示名、手动顺序、分组展开状态继续写入本设备 `localStorage`，不跨设备同步。
+- **Space 面板移到 `/sessions` 的索引列（D-053）。** SpacesPanel（重命名、手动排序、分组展开、「已退出 (n)」分组）挂在 `/sessions` 内容区左侧，宽 `--index`；宽度 <1024 时收成页头上的「空间」按钮，点开是覆盖层，里面是同一个组件、同样的 testid。不属于任何项目的 Space 也要能在这里管理。面板**不再有自己的折叠开关**，也删除旧的品牌色左竖线与首字母窄轨；折叠统一是侧栏的概念（⌘B）。显示名、手动顺序、分组展开状态继续写入本设备 `localStorage`，不跨设备同步。**D-061 修订（2026-10-30）**：在首页 `/sessions` 上，SpacesPanel 默认折叠在主机条最右端的「空间 ▸」开关后面；展开后 ≥1024 是索引列，<1024 是覆盖层，组件与 testid 不变，展开状态按设备记（[home.md](./home.md) §2.5）。
 - **tab 条只在 `/s/*` 上渲染**（36px，位于页头下方）；列表路由（`/sessions`、`/board`、`/approvals` 等）不再有 tab 条。tab 显示标题、harness 字形、状态点和关闭入口。每个 Space 分别记住最后选中的 tab；切换容器恢复其选择，不能把上一个容器的选中实例或新建默认值带过来。会话可从列表或深链重新打开，这不自动 resume；会话内 Stop 控制仍可使用。
 - **tab 集合（所有者 2026-09-23 拍板，D-050：实例经既有 `instances.task_id` 归属 task）**：
   - 会话的 `instance.taskId` 非空：tab 集合是该 Task 的全部会话——取 hub 快照里 `taskId` 相同的所有实例，按所属 Space 的 dismissal 过滤后排序；
@@ -246,7 +248,28 @@ Paseo compact 是左列表 / 中 agent / 右文件三态互斥（`paseo/docs/mob
 
 compact（手机）不渲染这个页面：`<Navigate replace>` 到 `/m`（D-049），手机首页见 §4.7。
 
-**Main 置顶行（D-057，2026-10-05；机制见 [main-agent.md §9](./main-agent.md#9-chat-surface)）**：桌面会话列表顶部固定一行「Main」，解析为当前持有 `address-owner` 的那条血缘的现行章节；血缘暂停时解析为最近一条 address-owner 血缘的最新章节，并标注例如「已由你暂停 · T」。没有 address-owner 血缘时不渲染。点开进入该章节的 `/s/:instanceId`，一条会话跨章节显示（§2.2 的「Main 会话」）。行内容口径同下面的行规则（状态点 + 标题 + 一句下一步）。
+**首页带（D-061，2026-10-30；机械权威是 [home.md](./home.md)）**：`/sessions` 是桌面首页，列表上方从上到下依次是：
+- PageHeader：h1 仍是「会话」，右侧是计数行（`⚠N 需要你 · ◉N 完成未看 · ●N 工作中 · 今日完成 N`）；
+- 32px 的主机条，最右端是「空间 ▸」开关（§1.4）；
+- Hub 横幅，连续失败满 5 s 才出现；
+- 「需要你」队列：全页唯一的一个，2 列网格，最多 4 张；
+- 「刚完成」一行；
+- 下面才是本节的会话列表。
+
+列表和队列共用 home.md §3 的 `rank()`：blocked > 完成未看 > working > 待唤醒 > starting > idle > exited，同一档内新的在前。空闲行折成「还有 N 个空闲 ▾」，交互期间不重排。
+
+断点：≥1440 时右栏（360px）依次放 Main 卡、「问 Main」、「今天」卡和「工作中」；1280–1439 时右栏收起，Main 卡和输入移到主列顶部；<1280 时侧栏初始为图标列（§4.7、home.md §2.4）。
+
+列表上方原有的工具行（搜索、范围、筛选、计数）保留在列表的头部。
+
+**Main 卡（D-061 取代 D-057 的「Main 置顶行」版式；解析机制见 [main-agent.md §9](./main-agent.md#9-chat-surface)）**：首页上的 Main 是一张卡加一条「问 Main」输入条，不是列表里的置顶行，也不是单独的 tab。
+
+解析不变：
+- 取当前持有 `address-owner` 的那条血缘的现行章节；
+- 血缘暂停时，取最近一条 address-owner 血缘的最新章节，并标注例如「已由你暂停 · T」；
+- 没有 address-owner 血缘时，卡和输入条都不渲染。
+
+点卡片进入该章节的 `/s/:instanceId`，一条会话跨章节显示（§2.2 的「Main 会话」）。卡片的两行内容（状态短语、最近一条回复的首行）和输入条的各种状态见 home.md §6。
 
 **行内容 = 状态点 + 标题 + 一句下一步（D-038，2026-09-19 增补）**
 
@@ -255,7 +278,10 @@ compact（手机）不渲染这个页面：`<Navigate replace>` 到 `/m`（D-049
 - **默认视口里只出现**：状态点（§2.1 上表的三维投影）、标题、kind 芯片、unread/pending 徽标、以及一句「下一步」；容器 ≥960 时宽行 grid 另有「主机/工作区·分支」与相对时间两列（D-053 对本条的显式增补，见下「行栅格」）。行内**不出现** `lifecycle`/`activity`/`connectivity` 的原文三元组（`ready · waiting-interaction · connected`），也不出现 `ins_…` 短码、`driver`、`model`。
 - 那句「下一步」由**已有字段投影**得出（`projectStatus` / `Interaction.request.kind|description` / `exitLabel` / screen 终态），**不新造状态机、不猜成功**。`connectivity ≠ connected` 与 `lifecycle ∈ {unknown,reconciling}` 必须产出「状态待确认」，**不得**回落成 idle/空闲一类正向文案；`exited` 用「已退出」而不是「完成」。
 - 三维 wire、`ins_`、driver、model 退到每行的 `<details data-testid="session-wire">` 展开内容或 `title`：**默认视口不可见**，可读性不丢。
-- 行内遥控（`send…` 输入框、enter / esc / ctrl+c 按键）收进长按/溢出 `Sheet`（**保留全部既有 testid 与命令路径**，只是不再常驻行内）；「待处理」组在行上保留**一个**主操作（「去处理」，`board-go-handle`，用 `.btnPrimary .btnSm`，直达 `/approvals?focus=` 或该会话）。
+- 行内遥控（`send…` 输入框、enter / esc / ctrl+c 按键）收进长按/溢出 `Sheet`（**保留全部既有 testid 与命令路径**，只是不再常驻行内）；「待处理」组在行上保留**一个**主操作（「去处理」，`board-go-handle`，用 `.btnPrimary .btnSm`，直达 `/approvals?focus=` 或该会话）。**D-061 修订（2026-10-30，任务 `seen-web`）**：
+  - 裸按键 enter / esc / ctrl+c 从列表的遥控 sheet 移到 `/s/:id/tty`；
+  - 列表行的 ⋯ 菜单只保留这些项：标为已看、中断、重命名、复制目录、复制恢复命令、在此项目新建、关闭…；
+  - 「停止」和「关闭…」都要确认，确认框写明会话名和主机名（[home.md](./home.md) §9）。
 - 状态点仍是三维投影（下表），本条只改**文本**的呈现位置，不改状态语义。
 
 **行栅格（D-053；宽行修订 D-038 的默认视口清单）**：列表容器设 `container-type: inline-size`。
@@ -278,11 +304,12 @@ wire 用 `lifecycle` × `activity` × `connectivity`（`protocol.md` §2.3）。
 | `blocked` | 琥珀 ⚠（`--attention-fg`） | `activity=waiting-interaction` | 优先级最高 |
 | `working` | `--link` 实心点 | `activity=working` | |
 | `starting` | `--fg-faint`，dim 脉冲 | `lifecycle ∈ {requested,preparing,starting}` | |
+| `done-unseen`（D-061） | `--link` 环 + 中心实心点 ◉ | idle 的条件成立，并且投影 `unseen=true`（owner 还没看过最近一次成功结束的根回合，[home.md](./home.md) §7）。看过之后回到 idle ○ | 不用绿色；`seen-hub` 落地前不会出现 |
 | `idle` | `--fg-muted` 描边 ○ | `activity=idle` 且 `lifecycle=ready`。含 `--bg` 原生 `state=done` 但进程仍在（可 send） | **不要**把这种情况画成会话结束；在线不用绿色 |
 | `exited` | `--fg-faint` 灰 ■ | `lifecycle=exited` | jsonl 可能还在；**禁止**画成 ×，× 只表示关闭标签（D-024 addendum） |
 | `unknown` | 虚线环 | `lifecycle ∈ {unknown,reconciling}` 或 `connectivity ≠ connected` | **禁止**画成 idle/exited 成功 |
 
-没有名为 `done` 的 Instance 点。Run 成功只出现在 transcript usage / 回合脚，不改列表点。
+没有名为 `done` 的 Instance 点。Run 成功只出现在 transcript usage / 回合脚，不改列表点。`done-unseen` ◉ 不是「完成」状态，而是 idle 上叠加的一个 owner 注意力标记：进程仍在、可以 send，只是最近一次成功结束的回合 owner 还没看过（D-061）。
 
 过滤：`hostId`、`workspaceId`、`kind`（claude/codex/grok/agy）。多选。URL query 同步，可分享。
 
@@ -302,7 +329,7 @@ wire 用 `lifecycle` × `activity` × `connectivity`（`protocol.md` §2.3）。
 | `nativeRef` | `NativeRef`；列表只展示 `kind` + 短码，不把 paneId 当 instanceId |
 | `pendingInteraction?` | `{id, type: approval\|question\|plan-review, summary}` |
 | `lastEventAt`, `updatedAt` | |
-| `unread?` | 本设备 last-read seq 落后 |
+| `unseen?` | owner 还没看过最近一次结束的根回合：该回合的结束位置晚于 owner 的 `seen_seq`。按 owner 记，不按设备记，手机与桌面结果一致（D-061 取代原「本设备 last-read seq 落后」的 `unread?`，后者从未实现）。由 `seen-hub` 新增，写入走 `POST /v1/instances/{id}/seen {durableSeq}`（[home.md](./home.md) §7） |
 | `capabilities` | 见 §3，决定行上是否显示「终端」入口 |
 
 子 agent / Workflow member **不**出现在默认列表（DSH `origin:'subagent'` 隐藏）。父行可显示「3 个子任务 running」。点进父会话的 Workflow 树再打开 child。
@@ -723,6 +750,18 @@ Bot / `claude-print` 实例没有终端 tab。Artifact 产物页走订阅登录�
 
 AskUserQuestion 不在列表里填完（题太长）；「去回答」进会话页表单。Allow/Deny 可在列表一键完成。
 
+**首页的简单单选题例外（D-061，2026-10-30）**：首页「需要你」队列（`ApprovalCard mode="home"`，任务 `home-queue`）可以用选项 chip 一键回答一道问题，前提是它同时满足四个条件：
+- 只有一个字段（`fields.length=1`）；
+- 该字段是单选（`input=single-select`）；
+- 选项不超过 4 个；
+- 不是 sensitive。
+
+chip 之外另给「其他…」，点了进入会话页表单。不满足条件的问题仍然是「去回答」。
+
+首页的权限卡只给「允许一次」和「拒绝」，计划卡只给「审阅计划」，任何界面都没有批量批准（「小界面授权更少」，人类界面规则，[home.md](./home.md) §4.3）。
+
+收件箱本身的行为不变，原生 tty 单字段问题的快答（`PtyQuestionAnswers`）也不变。
+
 **QuestionForm、ElicitationCard、PtyQuestionAnswers**：套用同一张卡片外壳；选项行在 fine 指针下 36px，coarse 下 44px。
 
 **单壳口径（InboxShell，D-052）**
@@ -914,7 +953,8 @@ AskUserQuestion 不在列表里填完（题太长）；「去回答」进会话�
 | transcript 节点、tool 卡、Workflow 树、usage、interaction 终态 | observation journal `seq` follow | 消息、call/result、wf member |
 | Instance `lifecycle`/`activity`/`connectivity`、主机 online、CLI 版本、capabilities | Hub registry + Node 心跳 / `capabilities()` | 列表点（§2.1 投影）、终端 tab 是否存在 |
 | 本设备 composer 草稿、侧栏宽度、主题、`autoRevealTty`（默认 false） | 设备 localStorage | 不跨设备 |
-| last-read seq、推送订阅 | 按用户+设备存在 Hub | 未读、badge |
+| seen（完成未看） | 按 owner 存在 Hub（`instance_views`，`seen_seq` 只增不减；D-061 取代原「按用户+设备的 last-read seq」，后者从未实现） | ◉、首页「刚完成」、回合失败卡何时离开队列（[home.md](./home.md) §7） |
+| 推送订阅 | 按设备存在 Hub | 推送、关闭态 badge |
 
 `capabilities` 快照在 create 时写入 Instance，UI 按它藏按钮：无 `ttyAttach` 或 `driver=claude-print` 无终端 tab；无 `resume` 无 Resume；无 `structuredWorkflow` 则 Workflow 卡降级 Generic（仍可有 tool 名 Workflow）；无 `artifact` 则不因产物切 tty。**不要**用「曾经见过某种事件」反推能力。print 会话不会出现 Artifact 工具。
 
@@ -947,6 +987,15 @@ envelope `completeness`（`deepseek-harness.md` §8.3）：`structured` / `parti
 **折叠不得吞掉 completeness（D-052）。** partial 卡被 compact 折叠行（§2.2 `FoldedToolRow`）收起后，虚线边 +「不完整」标记必须**原样活在折叠行上**——一张 partial 卡折起来后 operator 仍要能判断结果不完整；折叠态与展开态的 partial 标记同时存在或同时不存在。completeness 仍只有上表三值，**不新增第四种**。D-041 的硬顺序（折叠分支在 family 判定之后；Workflow / error / interaction 豁免）原样保留，由实现批次的回归断言钉死（settled Workflow 卡 compact 下 `data-folded="0"`；running Workflow 卡头 elapsed 每秒递增）。**本批不把 completeness 推到 interaction transcript 节点或审批卡**：那条数据通路不存在（interaction 节点不经 transcript 节点分发；审批卡的数据源是 hub 的 interactions 列表而非 transcript 节点，`Interaction` 类型上既无 completeness 也无回指 observation 的 eventId），要接通需先做 store / assemble 连接键调研，且可能要求新 wire 字段——按批次计划 D11 的默认结论，本批不做，只做 `FoldedToolRow` 这完全可落地的一半。
 
 **无法识别的事件也要可溯源（D-052）。** opaque 节点携带 envelope 上**既有**的 `seq` 与 `source`（零新 wire；现状 `assemble.ts` 构造 opaque 节点时把两者丢掉，由实现批次补上），折叠行 summary 显 `seq N · <source>` 前缀，raw JSON 仍折叠在 details 内。opaque 依旧不参与 Compact 折算成功、依旧禁止当终态。
+
+**不知道的计数不画（D-061）。** 计数、徽标和角标也按「不知道就别猜」：
+- 一个数字没有真实来源时（对应的路由还没落地，或者那一段的数据源读失败），整段隐藏；
+- 首个快照到达之前显示「–」；
+- 绝不画成 0，也不用别的数字冒充（例如用通知条数冒充角标，§4.5）；
+- 已知为 0 的段可以省略；
+- 过期的计数变灰，并标出「更新于 T」。
+
+首页计数行各段的来源与新鲜度阈值见 [home.md](./home.md) §5、§8。
 
 禁止：把 PTY 里看到的 “✓” 写成 tool ok；把 `logs` ANSI 录像当 transcript（`claude logs` 是 PTY 转储，`claude-control-plane.md` §1.4）。
 
@@ -1018,15 +1067,26 @@ envelope `completeness`（`deepseek-harness.md` §8.3）：`structured` / `parti
 ### 4.5 Web Push
 
 事件：`interaction.requested`（审批/提问）、`activity=waiting-interaction` 持续、`lifecycle=exited` 且失败。不要对 `--bg` idle 发「已完成」。  
-载荷：`title, body, tag`（`interaction:{id}` 或 `instance:{id}` 去重）, `data.url`，外加一个**可选**整数字段 `badge`（D-049）：等于该设备当前 pending interaction 数。
+载荷：`title, body, tag`（`interaction:{id}` 或 `instance:{id}` 去重）, `data.url`，外加一个**可选**整数字段 `badge`（D-049）：等于该设备当前 pending interaction 数；D-061 起改为首页「需要你」数 N（见下文「角标数」）。
 
 实现抄 herdrx：`GET /push/config` 公钥、`POST /push/subscriptions`（endpoint/p256dh/auth）、VAPID（`herdrx/internal/httpapi/push.go`、`internal/push/service.go`）。
 
-**应用角标 badge（D-049，2026-09-19 增补）**：service worker 在 `push` 事件里对支持的平台调 `navigator.setAppBadge(n)` / `clearAppBadge()`；站内 pending 归零时同步清零。**降级必须诚实**：Badging API 不存在的平台什么都不做，绝不用通知条数冒充角标数。载荷缺 `badge` 字段时行为与今天逐字节一致（老 Hub / 老客户端混搭不炸）——这是一个可选 Rust 字段，不新增推送事件类型。今天全库无 `setAppBadge` 调用，角标只有站内计数。
+**应用角标 badge（D-049，2026-09-19 增补）**：service worker 在 `push` 事件里对支持的平台调 `navigator.setAppBadge(n)` / `clearAppBadge()`；站内 pending 归零时同步清零。**降级必须诚实**：Badging API 不存在的平台什么都不做，绝不用通知条数冒充角标数。载荷缺 `badge` 字段时行为与今天逐字节一致（老 Hub / 老客户端混搭不炸）——这是一个可选 Rust 字段，不新增推送事件类型。
+
+**现状更正（D-061，2026-10-30，取代原「今天全库无 `setAppBadge` 调用，角标只有站内计数」）：**
+- **页面打开时，角标已经同步。** `syncAppBadge`（`web/src/lib/push.ts`）由 `startAppBadgeSync` 在 `web/src/app/Root.tsx` 启动，跟随 store 的待处理计数调用 `setAppBadge` / `clearAppBadge`。
+- **Hub 已经在推送载荷里带上 `badge`。** 值来自 `crates/remuda-hub/src/alerts.rs` 的 `with_badge(pending)`。
+- **缺的只有 PWA 关闭时的那条路径。** service worker 的 `push` 处理（`web/sw.src.js`）不读 `payload.badge`，所以 App 关着时角标不变。任务 `home-polish` 补上：有 `badge` 时设置，为 0 时清除。
+- **`push.ts` 里「iOS 不支持 Badging API」的注释**，以 `home-polish` 的真机核验为准。
+
+**角标数 = 首页「需要你」数（D-061）。** 它等于两部分之和：真正在等 owner 的交互，加上没有对应交互的 owner 阻塞任务。Main 的提问只算一次；完成未看、通知和回合失败都不计入（[home.md](./home.md) §5.1）。因此：
+- v0.2.4「OS 角标与收件箱队列同源」改为「OS 角标 = 首页 N」；
+- 导航上「收件箱」的数字仍是收件箱队列本身，两者的差恰好是「任务待你」卡的张数；
+- Hub 的 `with_badge` 计数由 `home-queue`（加入任务）和 `routed-to`（只计 `routedTo=owner`）对齐到同一口径。
 
 **权限申请位置（D-049）**：绝不在 App 启动时弹——用户还没有待办时消耗唯一一次授权机会没有意义。只允许两处由用户手势触发：(a) compact 收件箱 `/m/inbox` 顶部横幅（报告 §11.3 实测 Moshi 同位置），点「开启」才调 `Notification.requestPermission()` 与 `subscribePush()`（`push.ts:108-114`），横幅可关闭；(b) 设置 → 通知（既有，`SettingsPage.tsx:724` 的通知组）。横幅文案随能力变：未加主屏幕的 iOS 改为「先加到主屏幕」并复用 `needsHomeScreenForNotifications()`（`push.ts:19`），点「开启推送」静默无效的情况不允许发生。
 
-**PWA 关闭态**：SW 仍被系统唤醒并 `showNotification`（`sw.src.js:97`），点按走 `notificationclick` 聚焦既有窗口或 `openWindow`（`sw.src.js:106-120`），落点仍是 `data.url`（`/s/:id` 或 compact 下重定向到的 `/m/inbox?focus=`，§1.2）。「PWA 关着」正是推送真正生效的场景。
+**PWA 关闭态**：SW 仍被系统唤醒并 `showNotification`（`sw.src.js:97`），点按走 `notificationclick` 聚焦既有窗口或 `openWindow`（`sw.src.js:106-120`），落点仍是 `data.url`（`/s/:id` 或 compact 下重定向到的 `/m/inbox?focus=`，§1.2）。`home-queue` 落地后，交互推送的落点改为 `/sessions?focus=`（compact 下重定向到 `/m?focus=`），高亮首页队列里的对应卡（§1.2，D-061）。「PWA 关着」正是推送真正生效的场景。
 
 **抑制与新增推送（D-057，2026-10-05，取代原「Hub 在有设备正 follow 该实例时抑制推送，这条抑制规则不改」；机制见 [main-agent.md §8](./main-agent.md#8-push)）**：
 - **按设备静音**：follow 只静音正在 follow 且页面可见的那台设备，其余设备照常推送。PWA 用新增的加性 follow 可见性帧报告 document hidden / shown；从不发送该帧的客户端按可见处理，等于今天对这一台设备的行为。桌面标签页停在 Main 上不再静音手机。这是对所有会话的投递修正（今天 `crates/remuda-hub/src/alerts.rs` 只要有任一设备 follow 就静音全部设备）。
@@ -1059,8 +1119,8 @@ iOS：必须加到主屏幕才有 Notification（herdrx `needsHomeScreenForNotif
 
 | `/m` 子树内容 | 说明 |
 |---|---|
-| `/m` 会话 home | 分组会话首页（项目 + git branch 组头、一句下一步、context 剩余环，行口径同 §2.1 / D-038）；D-050 起在项目/branch 分组上**叠加 task 分组层**（「需要你」首组、父子任务嵌套、`SE-nn` 派生 key、已归档折叠，§2.9） |
-| Main 置顶行（D-057，2026-10-05） | `/m` home 最上方固定一行「Main」，在所有分组之上；解析与标注口径同 §2.1 的 Main 置顶行，点开是共享的 `/s/:instanceId`（§2.2 的「Main 会话」），不进 `/m` |
+| `/m` 会话 home | **D-061 起为分诊优先的首页（机械权威 [home.md](./home.md) §2.1）。** 从上到下：<br>① 页头 52 与计数行 28 一起吸顶（合计 80px），队列为空时计数行以问候开头，h1 仍为「会话」；<br>⑧ Hub 横幅（连续失败满 5 s）；<br>② 主机条 28px，随页面滚动；<br>③ Main 卡；<br>④「需要你」队列：全页唯一，最多 3 张，后接「还有 N 条 → 收件箱」；<br>⑤「刚完成」；<br>⑦ 台账。<br>底部是 ⑨「问 Main」输入条。<br>台账仍是分组会话列表（项目 + git branch 组头、一句下一步、context 剩余环，行口径同 §2.1 / D-038），叠加 D-050 的 task 分组层（父子任务嵌套、`SE-nn` 派生 key、已归档折叠，§2.9）。但**不再单独渲染任务层的「需要你」首组**：owner 阻塞的任务并进队列，成为「任务待你」卡（home.md §4.6）。台账用共享的 `rank()` 与空闲折叠（home.md §3） |
+| Main 卡与「问 Main」（D-061 取代 D-057 的 Main 置顶行） | Main 在 `/m` 上是 ③ 一张卡，加上底部 ⑨ 一条 56px compact Composer 输入条，不是置顶行，也不是单独的 tab；PhoneNav 仍是 4 槽。解析与标注口径同 §2.1 的 Main 卡。点开是共享的 `/s/:instanceId`（§2.2 的「Main 会话」），不进 `/m`。没有 address-owner 血缘时卡和输入条都不渲染 |
 | 看板的 compact 形态 | 不复制桌面三列：单列滚动 + 待办/进行中/已完成/已归档分段过滤（`GET /v1/board` 同一投影，一次一段；D-050）；桌面 `/board` 在 compact 不重定向到一个新页面，分段过滤就是 `/m` 子树内的看板形态。**实现状态（D-052，批次计划 D8）**：`/m` home 的 task 分组层已上线（`HomeList.tsx` 的 `buildHomeTaskLayer`），但单列**分段过滤尚不存在**（`features/mobile/` 无「待办/进行中/已完成」分段）；compact 访问 `/board` 仍由既有重定向落 `/m`（`mobileRoute.ts`）。ui-upgrade 批次**不实现**分段过滤（目标形态以本行为准，实现排后续批次），不得在证据里声称它已由 /m home 承载 |
 | `/m/inbox` 收件箱 | 两档（待你处理 / 进行中·最近，无第三档），与桌面 `/approvals` 渲染同一 InboxShell、同一张 ApprovalCard 与同一 kind 分段（§2.5，D-052） |
 | Jump To sheet | 从 home 顶栏与终端键盘条打开的覆盖层，不独占路由；分组 + 时钟/列表，**不做第二套空间模型**（报告 §10-23 / §11.2） |
@@ -1070,9 +1130,22 @@ iOS：必须加到主屏幕才有 Notification（herdrx `needsHomeScreenForNotif
 
 **重定向与深链**：见 §1.2 表后那张重定向表。要点三连：compact 下 `/sessions`→`/m`、`/approvals?focus=`→`/m/inbox?focus=`（query 原样保留）；桌面下 `/m*`→`/sessions`；**`/s/:id` 永不重定向**——它在两套壳下是同一条路由。
 
+**桌面首页 `/sessions` 的断点（D-061，[home.md](./home.md) §2.2–§2.4）**
+
+| 宽度 | 布局 |
+|---|---|
+| ≥1440 | 三栏：侧栏 248、主列、右栏 360。右栏依次是 Main 卡、「问 Main」内联输入（⌘↵）、「今天」卡、「工作中」（只在桌面） |
+| 1280–1439 | 右栏收起：Main 卡与输入移到主列顶部、「需要你」之上；「工作中」改为点击计数行后的筛选 |
+| 1024–1279 | 同 1280–1439；本设备没有显式侧栏偏好时，侧栏初始为 48px 图标列（与 ⌘B 收起态相同） |
+| 768–1023 | 同 1024–1279 |
+
+断点只决定布局。命中区仍按 `pointer: coarse` 判定（§3.4）。
+
 **铬预算（390×844 起测，全部可测量）**
 
 - 任一手机屏最多**一条顶栏 + 一条底栏**。顶栏高 `--top-mobile`（52px）；首页级屏底栏高 `--phone-nav-h`（**56px**，D-053 从 64px 改）+ `--safe-bottom`。
+- **`/m` 的底部停靠带（D-061）。** 有 Main 时，「问 Main」输入条（56px compact Composer，高度不另起数值）和 PhoneNav 合起来算**一条**底部停靠带：输入条在上，导航在下，中间没有间隙。这是本条预算唯一的例外。计数行与页头一起吸顶，吸顶合计 80px。390×844 时，可滚动区为 844 − 47 − 80 − 56 − 56 − 34 = 571px（68%）。
+- 软键盘为输入条弹起时：PhoneNav 隐藏，快捷提问 chip 行出现在输入条上方，页面不能变空（[home.md](./home.md) §2.1）。
 - **会话路由 `/s/:id*` 在 compact 下不渲染 app 底栏、也不渲染 tab 行**（§1.3 / §1.4）：结构段底部只有收起态 composer（56px，D-042），终端段底部是本地输入条（fine 指针 36px / coarse 指针 44px）；键盘条 44px 仅 coarse 指针设备渲染（§2.3）。顶栏返回键字形 20px；`pointer: coarse` 下其热区 ≥ `--touch`（§3.4），fine 指针下不撑大。
 - **正文（transcript 或 xterm）在 composer 收起、无软键盘时，可视高度 ≥ 视口高的 60%。** 结构段测 `data-testid="session-body"`，终端段测 xterm 容器。390×844 的预算余量：
 
@@ -1234,6 +1307,7 @@ web/
 
 - **角色颜色**：颜色只按角色引用（背景 / 文字 / 线条 / 链接与焦点 / 状态 / 主按钮 / 终端与代码专用域），不按色相命名；十六进制字面量只允许出现在 `tokens.css`、`tty/theme.ts`、`index.html`、`manifest.webmanifest` 四处。
 - **「墨」一套调色板，深浅两态**：默认外观跟随系统，由纯 CSS 媒体查询解析，无阻塞脚本；偏好取 `system | dark | light`——只有显式选了 `dark` / `light` 时 `main.tsx` 才在挂载前写 `:root[data-appearance]`，选 `system`（及键缺失）时**不写属性**、完全交给 `@media (prefers-color-scheme: light)`；旧值 `night` / `ledger` 分别读作 `dark` / `light`。两态各自调校、不做反相。状态色有纪律：琥珀=需要你，红=失败/破坏，绿=权威确认（idle、在线、已连接不用绿），未知=中性虚线+文字。主按钮是中性反色填充，不用状态色。
+- **完成未看 ◉（D-061）**：`--link` 环加中心实心点。它和 working 的实心点、idle 的空心环靠形状区分，不靠颜色；**不用绿色**，因为「做完了」不是权威确认，只是「你还没看」。有 ◉ 的行标题加粗。主机在线同样不用绿色：主机条里的离线主机用灰色虚线 chip，排在最前（[home.md](./home.md) §1 ②）。
 - **终端跟随外观**：深、浅两套调色板随外观在线切换（不重建终端、不丢滚动历史）；两板各自每个非黑 ANSI 色 ≥ 4.5:1；浅板 white/brightWhite 用浅灰 #96918a/#a39e96（黑字/默认字印其上 ≥4.5:1；它们作为前景字印在浅页面上是已记录的低对比例外）；标准 256 色立方不染色，truecolor 与终端输出不改写。
 - **字体**：UI 与长文同用平台系统无衬线字体栈（含 PingFang SC、微软雅黑、Noto Sans CJK），不打包正文 webfont；等宽只保留 IBM Plex Mono（OFL-1.1，许可入库），用于代码、路径、终端、ID 与对齐数字。
 - **度量**：正文 16px/28px；阅读列上限 720px，页边距 32 / 24 / 16；composer、live 行、结束条都与阅读列对齐。

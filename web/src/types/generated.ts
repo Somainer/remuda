@@ -666,6 +666,79 @@ export type DiffScopeCheck = ({
 
 export type Digest = (string);
 
+/** An `instance.configure` command that has not settled. */
+export type DigestConfigure = ({
+  "commandId": (string);
+  "requestId"?: (string | null);
+  "state": (string);
+  [key: string]: unknown;
+});
+
+/** A requested value next to the one actually observed. */
+export type DigestPair = ({
+  "effective"?: (string | null);
+  "requested"?: (string | null);
+  [key: string]: unknown;
+});
+
+/** The interaction the worker is blocked on. */
+export type DigestPending = ({
+  "ageSecs": (number);
+  "argsUntrusted"?: (string | null);
+  "id": (string);
+  "kind": (string);
+  "question": (string);
+  "tool"?: (string | null);
+  [key: string]: unknown;
+});
+
+/** Roster state plus the latest observed classification. */
+export type DigestState = ({
+  "activity"?: (string | null);
+  "lifecycle"?: (string | null);
+  "reason"?: (string | null);
+  "roster": (string);
+  "watch"?: (string | null);
+  "watchAgeSecs"?: (number | null);
+  "watchDetail"?: (string | null);
+  [key: string]: unknown;
+});
+
+/** Supply state of the profile the worker runs on, shown only when parked. */
+export type DigestSupply = ({
+  "parked": (boolean);
+  "profile"?: (string | null);
+  "resetsAt"?: (number | null);
+  "state": (string);
+  [key: string]: unknown;
+});
+
+/** Head and tail excerpts of the last assistant text (untrusted text). */
+export type DigestText = ({
+  "chars": (number);
+  "head": (string);
+  "tail": (string);
+  [key: string]: unknown;
+});
+
+/** Outcome of the most recent root turn in the journal tail. */
+export type DigestTurn = ({
+  "at"?: (string | null);
+  "error"?: (string | null);
+  "status": (string);
+  [key: string]: unknown;
+});
+
+/** Which worker a digest describes. */
+export type DigestWorker = ({
+  "driver"?: (string | null);
+  "harness": (string);
+  "id": (string);
+  "instanceId"?: (string | null);
+  "name": (string);
+  [key: string]: unknown;
+});
+
 /** DispatchState wire values; `protocol.md` §2.5. */
 export type DispatchState = ("not-dispatched" | "intent-durable" | "transport-written" | "native-acknowledged");
 
@@ -1220,6 +1293,19 @@ export type GenericPermission = ({
 
 /** GenericPermissionMode wire values; `protocol.md` §4.1. */
 export type GenericPermissionMode = ("native");
+
+/** One worker row of a [`LineageGlance`]. */
+export type GlanceRow = ({
+  "branch": (string);
+  "detail"?: (string | null);
+  "id": (string);
+  "idleSecs"?: (number | null);
+  "name": (string);
+  "state": (string);
+  "task"?: (string | null);
+  "why"?: (string | null);
+  [key: string]: unknown;
+});
 
 /** GrantVerb wire values; `protocol.md` §2.5. */
 export type GrantVerb = ("dispatch" | "land" | "spend" | "address-owner");
@@ -2293,6 +2379,18 @@ export type LifecyclePayload = (EntityLifecycle & ({
 
 /** LifecycleTopic wire values; `protocol.md` §5.5. */
 export type LifecycleTopic = ("session" | "turn" | "hook" | "subagent" | "task" | "plan" | "configuration" | "permission" | "diagnostic" | "reconciliation");
+
+/** `GET /v1/lineages/{id}/glance`: the workers the lineage dispatched that are waiting on someone or working, plus today's completions. */
+export type LineageGlance = ({
+  "day": (string);
+  "doneToday": (number);
+  "lineageId": (string);
+  "waiting": ((GlanceRow)[]);
+  "waitingTotal": (number);
+  "working": ((GlanceRow)[]);
+  "workingTotal": (number);
+  [key: string]: unknown;
+});
 
 /** LiteralEnv; `protocol.md` §4.1. */
 export type LiteralEnv = ({
@@ -4509,6 +4607,28 @@ export type WaitReason = ("condition-met" | "timeout" | "unknown");
 
 /** Where a window's numbers came from; §4.1.  Observed frames update `observed` fields but never erase a `declared` limit; `inferred` is filled by Hub-side usage aggregation (§4.5). */
 export type WindowSource = ("declared" | "observed" | "inferred");
+
+/** `GET /v1/workers/{id}/digest`: at most [`WORKER_DIGEST_MAX_BYTES`] bytes.  Optional sections are omitted rather than sent as `null`. Every string that originates from a worker, a tool or the screen is untrusted data. */
+export type WorkerDigest = ({
+  "branch": (string);
+  "configure"?: (DigestConfigure | (null));
+  "effort": DigestPair;
+  "idleSecs"?: (number | null);
+  "lastText"?: (DigestText | (null));
+  "model": DigestPair;
+  "pending"?: (DigestPending | (null));
+  "queued": (number);
+  "sha"?: (string | null);
+  "state": DigestState;
+  "supply"?: (DigestSupply | (null));
+  "task"?: (string | null);
+  "toolInFlight": (boolean);
+  "truncated": (boolean);
+  "turn"?: (DigestTurn | (null));
+  "v": (number);
+  "worker": DigestWorker;
+  [key: string]: unknown;
+});
 
 /** `worker.provision` params: create the product-assigned worktree and the per-worker cargo target directory on the Node.  The Node owns the filesystem layout: the request names the worker and the branch, but never absolute paths (security-review-2 M4, same rule as `worktree.create`). The Node creates the worktree under its managed `<repo>/../remuda-wt/<name>` root and the target dir under `<repo>/../remuda-target/<name>`. */
 export type WorkerProvisionParams = ({

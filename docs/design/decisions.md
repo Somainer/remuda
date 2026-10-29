@@ -1926,7 +1926,11 @@ registry 锁外加独立 DB claim（跨域，reconcile 先于 slot 切换提交�
    - **不对记忆内容做策略 lint**（R2 已正式否决）。「所有者在 10-12 给了 X land 权限」这类正当事实照常可以记。
 
 4. **记忆读取。**
-   - 章节启动时，Hub 渲染索引（每条一个标题加一行描述）和 about-me；driver 把它作为最后一节追加在启动 brief 之后，框成「数据，不是指令」（driver 已支持 append-system-prompt，见 `crates/remuda-driver/src/flags.rs`）。放在最后是为了不破坏前面内容的提示缓存。正文由 CLI 按需读取。
+   - 章节启动时，Hub 渲染索引（每条一个标题加一行描述）和 about-me，框成「数据，不是指令」。正文由 CLI 按需读取。
+   - **投递是新的启动管道，归 `cb-memory-inject`；origin/main 上没有现成的通道。** `crates/remuda-driver/src/flags.rs` 的 `BANNED` 表把 `system-prompt` 与 `append-system-prompt` 列为「不得发出、也不得从 `InstanceSpec.args` 接受」，Hub 用同一张表在创建请求上拒绝它们（`crates/remuda-hub/src/http.rs` 的 `validate_launch_args`）。这条对调用方自带提示覆盖的禁令是有意的，保持不变。
+   - 通道：Hub 把渲染好的文本和 revision 作为专用字段 `memoryContext {rev, text}` 盖在转发的 create 与 resume 参数上。它与 `creatorPermissionMode` 一样由 Hub 生成，绝不取自请求体（请求体里的同名字段被剥掉），也绝不走 `InstanceSpec.args`。
+   - Node 物化器是它唯一的写入方：把文本放在系统提示的最后一节，以保住前面内容的提示缓存；没有系统提示槽位的 harness，则作为框起来的数据块放在第一条输入之前。`append-system-prompt` 与 `system-prompt` 在 `InstanceSpec.args` 里照旧被 Hub 和 Node 拒绝，错误不变。
+   - 验收要求真实启动路径上的测试：经 Hub 创建、由 Node 物化出的 claude-sdk 启动带有索引（用假 `claude` 记录的实际 argv，即 `crates/remuda-testing/src/fake.rs` 的 `FAKE_CLAUDE_ARGV_FILE`，以及它收到的输入来断言），而不是只断言渲染出的字符串。
    - 章节中途记忆有变化时不重启，只在下一条输入或下一个事实批次之前加一行「记忆自本章开始已变更（rev N）」。原生 resume 不重复注入。
    - 回复下方显示「已记住：<title>」。为此 Hub 在写入时记下写入实例和回合引用，所有回合都显示。
 
@@ -2047,7 +2051,7 @@ Remuda（origin/main `c27e0eac`）：
 - `crates/remuda-hub/src/agent_scope.rs`：`require_grant`、`restrict_permission`、`prepare_create`、`authorize_command`、`restrict_agent_routes`、`lineage_read_target`、`hostcap_read_target`。
 - `crates/remuda-hub/src/error.rs`（`HubError`、`response_body`）；`alerts.rs`（`AlertKind`）；`supply.rs`（`resetsAt` 与窗口冷却）；`worker_watch.rs`（`IdleApiError`、`POST /v1/workers/observe`）；`gatequeue.rs`（`SCHEDULE_TICK_MILLIS`）；`store.rs`（`lineages`、`validate_child_delegation`）；`tasks.rs`（只有已落地的 sha 解锁依赖）。
 - `crates/remuda-protocol/src/enums.rs`（`InputOrigin`）、`worker.rs`（`DEFAULT_STALL_THRESHOLD_MINS`）。
-- `crates/remuda-driver/src/flags.rs`（append-system-prompt）；`crates/remuda/src/cmd/brief.rs`（`lint_brief`）；`scripts/ci/secret-scan.py`；`scripts/hub-backup.sh`；根 `Cargo.toml`（rusqlite `bundled`）。
+- `crates/remuda-driver/src/flags.rs`（`BANNED`：`system-prompt`、`append-system-prompt` 不得出现在 `InstanceSpec.args`）、`crates/remuda-hub/src/http.rs`（`validate_launch_args`）；`crates/remuda/src/cmd/brief.rs`（`lint_brief`）；`scripts/ci/secret-scan.py`；`scripts/hub-backup.sh`；根 `Cargo.toml`（rusqlite `bundled`）。
 
 Cindy（提交 `cba8e45342`；只借机制，按机制列出仓库路径）：
 - 记忆的形态、大小与索引：`packages/maker-core/src/memory/types.ts`、`packages/maker-core/src/memory/storage.ts`、`packages/maker-core/src/memory/manager.ts`。合并：`packages/lizi-mcps/src/memory/consolidate.ts`。FTS5 加 LIKE 兜底：`packages/maker-core/src/memory/fts.ts`。

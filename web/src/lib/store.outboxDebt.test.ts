@@ -271,12 +271,12 @@ it("bounded tail re-read exhaustion moves the accepted bubble to the existing �
   }
 });
 
-it("a debt read BELOW the live cursor folds the missed command entry and settles the bubble", async () => {
+it("a debt read BELOW the live cursor observes the missed command entry and settles the bubble", async () => {
   // The e2e shape: the same turn's assistant frames advance the journal
   // client's applied cursor past the missed user entry, and a normal
   // resumeAfterReconnect read (generation-gated, cursor-anchored) can never
-  // fold it. The debt tail reads a window BELOW the cursor and folds by
-  // command id.
+  // fold it. The debt tail reads a window BELOW the cursor and settles by
+  // command id (AD3: without folding the entry into store events).
   const { api, hubStore } = await fresh();
   await mountFollow(api, hubStore);
   vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
@@ -323,10 +323,11 @@ it("a debt read BELOW the live cursor folds the missed command entry and settles
     },
     { timeout: 5_000 },
   );
+  // Ruling AD3: the live follow is the only writer of store events.
   const folded = hubStore
     .getSnapshot()
     .events[INSTANCE]?.some((e) => (e.payload as { commandId?: string }).commandId === commandId);
-  expect(folded).toBe(true);
+  expect(folded).toBe(false);
   expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
 });
 
@@ -1110,8 +1111,9 @@ it("r4 item 4: the debt scan cursor advances through a full unrelated page to th
     },
     { timeout: 6_000 },
   );
-  // Only the owed node entered store state — the unrelated 128 did not.
-  expect(hubStore.getSnapshot().events[INSTANCE]).toHaveLength(129);
+  // AD3: nothing the debt read inspected entered store state — neither the
+  // unrelated 128 nor the owed node.
+  expect(hubStore.getSnapshot().events[INSTANCE]).toHaveLength(128);
 }, 15_000);
 
 it("r4 item 2: a queued tail pass whose debt generation was cleared still lets the NEXT debt's tail run", async () => {
@@ -1404,8 +1406,8 @@ it("r5 item 1: an owed command at F+1 settles although more than one Hub window 
     { timeout: 6_000 },
   );
   expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
-  // Evidence only: the owed node joined state, none of the 2100 others.
-  expect(hubStore.getSnapshot().events[INSTANCE]).toHaveLength(129);
+  // AD3: evidence only — neither the owed node nor the 2100 others entered state.
+  expect(hubStore.getSnapshot().events[INSTANCE]).toHaveLength(128);
 }, 15_000);
 
 it("r5 item 1: a byte-capped page short of the cursor is descended before the cursor moves past it", async () => {
@@ -1426,7 +1428,7 @@ it("r5 item 1: a byte-capped page short of the cursor is descended before the cu
     { timeout: 6_000 },
   );
   expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
-  expect(hubStore.getSnapshot().events[INSTANCE]).toHaveLength(129);
+  expect(hubStore.getSnapshot().events[INSTANCE]).toHaveLength(128);
 }, 15_000);
 
 it("r5 item 2: a debt whose tail was rejected during a failed credential login settles once the Outbox is re-installed", async () => {
@@ -1610,3 +1612,101 @@ it("r6 item 1: a direct login that establishes a different device retires the pr
     localStorage.removeItem(SESSION_KEY);
   }
 }, 15_000);
+
+it("r6 item 2: a debt read settles a command far above the frontier without moving it, so a later debt still finds F+5", async () => {
+  // Folded frontier F = 128. Command C is journaled at S = F + 100 and an
+  // earlier-journaled command D sits at F + 5. Rows above F reach ONLY debt
+  // reads (they are bounded with beforeSeq): the live stream missed them, so
+  // the seed and the drains' ordinary resyncs see the journal end at F.
+  // Ruling AD3: the debt read settles C without writing store events; had it
+  // folded C, the frontier would jump to S and the later debt for D would
+  // start its forward scan above D (the 64-row overlap stops at S - 64).
+  const { api, hubStore } = await fresh();
+  const F = 128;
+  const S = F + 100;
+  const ids = { c: "", d: "" };
+  const seed: HubRow[] = Array.from({ length: F }, (_, i) => ({
+    seq: i + 1,
+    eventId: `evt_seed_${i + 1}`,
+    kind: "raw_tty",
+    payload: { text: `filler ${i + 1}` },
+  }));
+  const appended = (): HubRow[] =>
+    Array.from({ length: S - F }, (_, i) => {
+      const seq = F + 1 + i;
+      if (seq === F + 5) return { seq, eventId: "evt_user_d", kind: "message", payload: { role: "user", commandId: ids.d } };
+      if (seq === S) return { seq, eventId: "evt_user_c", kind: "message", payload: { role: "user", commandId: ids.c } };
+      return { seq, eventId: `evt_noise_${seq}`, kind: "raw_tty", payload: { text: `unrelated ${seq}` } };
+    });
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL) => {
+      const debtRead = new URL(String(input), "http://hub.test").searchParams.has("beforeSeq");
+      return debtRead ? hubJournalResponse(input, [...seed, ...appended()], S) : hubJournalResponse(input, seed, F);
+    }),
+  );
+  vi.spyOn(api, "instanceGet").mockResolvedValue({ id: INSTANCE, journalId: JOURNAL } as never);
+  vi.spyOn(api, "instanceList").mockResolvedValue({
+    items: [{ id: INSTANCE, journalId: JOURNAL, revision: "1", durableSeq: String(F), lifecycle: "running" } as never],
+    nextCursor: null,
+  });
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+  vi.spyOn(api, "eventsSubscribe").mockResolvedValue({
+    subscriptionId: "sub_debt_frontier",
+    journalId: JOURNAL,
+    durableSeq: String(F),
+    windowFromSeq: "1",
+    reachedAfterSeq: true,
+    getReadyState: () => 1,
+    snapshot: {
+      projectionVersion: "v1",
+      projectionEpoch: "epoch_debt_frontier",
+      asOfSeq: String(F),
+      instance: {} as never,
+      runs: [],
+      commands: [],
+      pendingInteractions: [],
+      nodes: [],
+      history: { earliestRetainedSeq: "1", complete: true },
+    },
+  });
+  vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+    const commandId = _args[4] as string;
+    if (!ids.c) ids.c = commandId;
+    else ids.d = commandId;
+    return Promise.resolve(commandResult(commandId, "accepted"));
+  });
+  await hubStore.refresh();
+  await hubStore.follow(INSTANCE);
+  await vi.waitFor(() => expect(hubStore.getSnapshot().events[INSTANCE]).toHaveLength(F));
+  const bubbleOf = (commandId: string) => hubStore.getSnapshot().bubbles.find((b) => b.commandId === commandId)!;
+  const frontier = () => Math.max(...(hubStore.getSnapshot().events[INSTANCE] ?? []).map((e) => Number(e.seq)));
+
+  await hubStore.send(INSTANCE, "command C");
+  await vi.waitFor(() => expect(bubbleOf(ids.c)?.outboxState).toBe("sent"));
+  await vi.waitFor(
+    () => {
+      expect(bubbleOf(ids.c).state).toBe("settled");
+      expect(bubbleOf(ids.c).outboxState).toBe("done");
+    },
+    { timeout: 6_000 },
+  );
+  await vi.waitFor(() => expect(debtOf(hubStore).has(INSTANCE)).toBe(false));
+  // Store events are untouched: still exactly the folded 1..F.
+  expect(frontier()).toBe(F);
+  expect(hubStore.getSnapshot().events[INSTANCE]).toHaveLength(F);
+
+  // A second debt, recorded afterwards, for D at F + 5.
+  await hubStore.send(INSTANCE, "command D");
+  await vi.waitFor(() => expect(bubbleOf(ids.d)?.outboxState).toBe("sent"));
+  await vi.waitFor(
+    () => {
+      expect(bubbleOf(ids.d).state).toBe("settled");
+      expect(bubbleOf(ids.d).outboxState).toBe("done");
+    },
+    { timeout: 6_000 },
+  );
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+  expect(frontier()).toBe(F);
+}, 20_000);

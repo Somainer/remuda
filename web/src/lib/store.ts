@@ -1360,7 +1360,17 @@ class HubStore {
    */
   private reconcileOwed = new Map<
     Id,
-    { bindGen: number; attemptId: number | null; gen: number; commands: Set<Id> }
+    {
+      bindGen: number;
+      attemptId: number | null;
+      gen: number;
+      commands: Set<Id>;
+      /**
+       * r6 item 2: owed command ids whose journal entry a DEBT read observed.
+       * The evidence is held here, never folded into state.events (AD3).
+       */
+      observed: Set<Id>;
+    }
   >();
   /**
    * Ruling AD: bounded debt-driven tail re-read state per instance. `attempts`
@@ -3971,6 +3981,7 @@ class HubStore {
       attemptId: null,
       gen: this.owedGeneration,
       commands: new Set<Id>(),
+      observed: new Set<Id>(),
     };
     if (commandIds) for (const commandId of commandIds) debt.commands.add(commandId);
     debt.bindGen = this.connectionBindGen;
@@ -3983,7 +3994,8 @@ class HubStore {
    * journal evidence. Evidence is (a) the follow/journal client OBSERVED the
    * command's journal entry — a message with its commandId already folded
    * into this instance's events (live batch / snapshot / seed / resync) —
-   * which also retires the durable row; or a missing row (retracted /
+   * which also retires the durable row; (b) a debt read observed it (held on
+   * the debt, r6 item 2); or a missing row (retracted /
    * removed by another tab) and terminal rows — "done", "rejected",
    * "unknown" (already at the not-confirmed state). An outbox-less page has
    * nothing to prove.
@@ -3991,7 +4003,7 @@ class HubStore {
   private owedCommandLacksEvidence(instanceId: Id): boolean {
     const debt = this.reconcileOwed.get(instanceId);
     if (!debt) return false;
-    const observed = new Set<Id>();
+    const observed = new Set<Id>(debt.observed);
     for (const ev of this.state.events[instanceId] ?? []) {
       if (ev.kind !== "message") continue;
       const commandId = (ev.payload as { commandId?: Id }).commandId;
@@ -4103,11 +4115,16 @@ class HubStore {
    * Ruling AD2 — apply SETTLEMENT EVIDENCE ONLY. A debt tail/overlap read is
    * not a journal fold: it scans the returned page exclusively for user
    * messages carrying one of THIS instance's owed command ids. Each matched
-   * entry is:
-   *  - appended to state.events as the authoritative transcript node (merge
-   *    by seq) so the optimistic bubble joins its real row;
-   *  - settled (bubble -> settled, durable row -> done, including a row that
-   *    had earlier reached the "unknown" not-confirmed state);
+   * command is recorded on the debt as observed and settled (bubble ->
+   * settled from the matched evidence itself, durable row -> done, including
+   * a row that had earlier reached the "unknown" not-confirmed state).
+   *
+   * Ruling AD3 / r6 item 2: the matched entry is NOT inserted into
+   * state.events — the live follow is the only writer of store events. The
+   * settled optimistic bubble keeps rendering the user's row until the live
+   * stream (or a later mount seed) brings the journal node it joins; and the
+   * folded frontier (owedFrontier) never jumps past an unread gap, so a later
+   * debt's forward scan still starts below commands journaled there.
    * Nothing else in the page is touched — no model/permission/effort or other
    * reducer runs, no activity/screen/summary projection, and the event ids
    * are NOT recorded in the live JournalClient dedupe path, so a current
@@ -4117,25 +4134,27 @@ class HubStore {
   private applySettlementEvidence(instanceId: Id, events: Observation[]) {
     const debt = this.reconcileOwed.get(instanceId);
     if (!debt) return;
-    const owed = debt.commands;
-    const current = this.state.events[instanceId] ?? [];
-    const seenIds = new Set(current.map((e) => e.eventId));
+    const folded = new Set<Id>();
+    for (const ev of this.state.events[instanceId] ?? []) {
+      const commandId = ev.kind === "message" ? (ev.payload as { commandId?: Id }).commandId : undefined;
+      if (commandId) folded.add(commandId);
+    }
     const matched: Observation[] = [];
     for (const ev of events) {
       if (ev.kind !== "message") continue;
       const commandId = (ev.payload as { commandId?: Id }).commandId;
-      if (!commandId || !owed.has(commandId) || seenIds.has(ev.eventId)) continue;
-      seenIds.add(ev.eventId);
+      // Already folded by the live follow (it settled the row) or already
+      // observed by an earlier debt read: nothing new to settle.
+      if (!commandId || !debt.commands.has(commandId) || folded.has(commandId) || debt.observed.has(commandId)) {
+        continue;
+      }
+      debt.observed.add(commandId);
       matched.push(ev);
     }
     if (matched.length) {
-      const next = current.concat(matched).sort((a, b) => Number(a.seq) - Number(b.seq));
-      this.emit({
-        events: { ...this.state.events, [instanceId]: next },
-        bubbles: settleBubbles(this.state.bubbles, instanceId, next),
-      });
-      // Settlement-only durable retirement (no acceptance side effects beyond
-      // the single progress helper; settleFromJournal patches including a
+      // Settlement-only: bubbles settle off the matched evidence and the
+      // durable rows retire to done (no acceptance side effects beyond the
+      // single progress helper; settleFromJournal patches including a
       // previously "unknown" row — r3 item 4).
       this.settleFromJournal(instanceId, matched);
     }

@@ -1862,6 +1862,20 @@
         ],
         "type": "object"
       },
+      "LineageGlance": {
+        "type": "object",
+        "description": "Generated shape: LineageGlance in crates/remuda-protocol/schema/protocol.schema.json.",
+        "required": [
+          "lineageId",
+          "day",
+          "waiting",
+          "waitingTotal",
+          "working",
+          "workingTotal",
+          "doneToday"
+        ],
+        "additionalProperties": true
+      },
       "RestartPolicy": {
         "additionalProperties": false,
         "description": "D-057 §6.1 C1 restart policy chosen at create time.",
@@ -4749,6 +4763,22 @@
           "state"
         ]
       },
+      "WorkerDigest": {
+        "type": "object",
+        "description": "Generated shape: WorkerDigest in crates/remuda-protocol/schema/protocol.schema.json.",
+        "required": [
+          "v",
+          "worker",
+          "state",
+          "model",
+          "effort",
+          "queued",
+          "branch",
+          "toolInFlight",
+          "truncated"
+        ],
+        "additionalProperties": true
+      },
       "WorkerPage": {
         "properties": {
           "items": {
@@ -7353,6 +7383,42 @@
         ]
       }
     },
+    "/v1/lineages/{id}/glance": {
+      "get": {
+        "operationId": "lineageGlance",
+        "summary": "Waiting and working workers a lineage dispatched, plus today's DONE count",
+        "description": "At most 50 rows in each of waiting and working; the *Total counters carry the overflow. Human/Bot devices may read any lineage; an Agent may read only its own lineage (403 otherwise). Row detail text is untrusted data.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Lineage glance",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LineageGlance"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "tags": [
+          "instances"
+        ]
+      }
+    },
     "/v1/login": {
       "post": {
         "operationId": "login",
@@ -9253,6 +9319,48 @@
               "type": "string"
             }
           }
+        ]
+      }
+    },
+    "/v1/workers/{id}/digest": {
+      "get": {
+        "operationId": "workerDigest",
+        "summary": "Bounded (<= 2048 bytes) read-only digest of one worker",
+        "description": "Roster state, last turn outcome, head/tail of the last assistant text, the pending interaction with a bounded untrusted-quoted tool-argument summary (secrets and input-handoff values withheld), requested vs effective model/effort, a pending instance.configure, parked supply with resetsAt, queued command count, task/branch/sha, time since progress and tool-in-flight. Always valid JSON of at most 2048 UTF-8 bytes: over budget, text fields shrink. Human/Bot devices read any worker; an Agent only workers in its own lineage or dispatched by it (403 otherwise). Free-text fields are untrusted data.",
+        "parameters": [
+          {
+            "description": "wkr_ id or active worker name",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Worker digest",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkerDigest"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "tags": [
+          "workers"
         ]
       }
     },

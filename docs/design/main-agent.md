@@ -1057,6 +1057,22 @@ Each keeps the full gated suite green on its own, like the tasks above. `cb-adr`
 - `ma-fence`: §10.1 item 3 (run generation in the fact key) in its acceptance.
 - `ma-main-ui`: origin labels on audit rows and the status line.
 
+### 15.2 Parity follow-ups (agent-parity.md)
+
+Each closes Gap rows of the capability ledger ([agent-parity.md](./agent-parity.md), "Gap index"). Like every Agent route, each keeps the existing admission rules: grants, scope, lineage ownership, the D-017 approval where a create or keys would need it, and, once F lands, `check_initiator`. None adds a policy gate.
+
+| Task | Content | After |
+|---|---|---|
+| `ap-gate-reads` | admit `GET /v1/gate/jobs` (already filtered to the caller's scope) and `GET /v1/gate/logs/{id}` (checked against the job's project scope) for Agent origin. A seat that gates needs the failure log (§14.1, E2) | none |
+| `ap-configure` | admit `instance.configure` for model, effort and ultracode on owned targets in `authorize_command`; the permission mode is not included | none |
+| `ap-configure-mode` | an owner decision on how OA1 applies to a permission-mode change, then that rule in the Hub and the Node | the owner's decision; `ma-admission` |
+| `ap-resume` | resume an owned instance that is not a worker, under `dispatch` and the same admission as a create (OA1; the D-017 approval for cross-host or shell-driver); the public operator route (D-026) is unchanged | `ma-admission` |
+| `ap-attachments` | Agent upload to `POST /v1/objects`, and reading the attachments of owned targets | none |
+| `ap-subagent-read` | admit `GET /v1/instances/{id}/subagents/{agentId}/transcript` in the middleware's `read_target` for owned targets | none |
+| `ap-host-read` | host detail, the workspace list and doctor for hosts in the caller's scope, and the host list filtered to that scope, under `dispatch` | none |
+| `ap-supply-read` | read-only provider, supply, catalog and usage views and the dry-run `POST /v1/supply/resolve`, under `dispatch`, with no secret material | none |
+| `ap-supply-event` | Agent supply evidence (`POST /v1/providers/{id}/supply/events`) only for a supply its own workers use, recorded with the caller's initiator | none |
+
 ## 16 Cutover (D4)
 
 - **Before the exit criteria pass,** the human-run coordinator keeps the self-development loop. During the exit-evidence window it is quiesced (no dispatch, gate or land), and the scripted landing gate stays idle on the devbox. The two share ports and the e2e lock. So there is never a second actor on the project.

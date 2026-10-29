@@ -64,20 +64,27 @@ const MAX_SEARCH_LIMIT: usize = 100;
 
 const ENTRY_COLUMNS: &str = "lineage_id, slug, type, title, description, body, revision, \
      origin, source_refs_json, writer_instance, created_at, updated_at, archived_at";
+/// [`ENTRY_COLUMNS`] qualified with the `m` alias, for queries that join the
+/// FTS table (which has its own title/description/body columns).
+const ENTRY_COLUMNS_M: &str = "m.lineage_id, m.slug, m.type, m.title, m.description, m.body, \
+     m.revision, m.origin, m.source_refs_json, m.writer_instance, m.created_at, m.updated_at, \
+     m.archived_at";
 
 // ─── Migration ─────────────────────────────────────────────────────────────
 
 /// `user_version` 4: the memory table, its FTS5 index and the sync triggers.
 ///
 /// `id` is an INTEGER PRIMARY KEY so the FTS rowid survives VACUUM (a plain
-/// rowid may be renumbered). `root_turn_json` is reserved for the root turn
+/// rowid may be renumbered), and AUTOINCREMENT so a deleted row's id is never
+/// issued again: nothing outside one transaction may mistake a new row for an
+/// old one. `root_turn_json` is reserved for the root turn
 /// that caused an Agent write (cb-rootturn) and stays NULL until then.
 /// `type` and `origin` carry no CHECK: SQLite cannot alter one, and both are
 /// validated before every write.
 pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS memory_entries (
-            id INTEGER PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             lineage_id TEXT NOT NULL,
             slug TEXT NOT NULL,
             type TEXT NOT NULL,
@@ -462,15 +469,6 @@ fn load_entry(
     conn.query_row(
         &format!("SELECT {ENTRY_COLUMNS} FROM memory_entries WHERE lineage_id = ?1 AND slug = ?2"),
         params![lineage_id, slug],
-        entry_from_row,
-    )
-    .optional()
-}
-
-fn load_entry_by_id(conn: &Connection, id: i64) -> rusqlite::Result<Option<MemoryEntry>> {
-    conn.query_row(
-        &format!("SELECT {ENTRY_COLUMNS} FROM memory_entries WHERE id = ?1"),
-        params![id],
         entry_from_row,
     )
     .optional()
@@ -880,29 +878,63 @@ fn like_pattern(term: &str) -> String {
     out
 }
 
-/// `(rowid, bm25)` of the FTS hits, best first.
+/// Full-text hits, best first: the entry rows themselves, selected under the
+/// lineage and archive predicates, with their bm25 score.
 fn fts_hits(
     conn: &Connection,
     lineage_id: &str,
     terms: &[&str],
     limit: usize,
     include_archived: bool,
-) -> rusqlite::Result<Vec<(i64, f64)>> {
-    let mut stmt = conn.prepare(
-        "SELECT m.id, bm25(memory_fts, 3.0, 2.0, 1.0) AS score
+) -> rusqlite::Result<Vec<(MemoryEntry, f64)>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {ENTRY_COLUMNS_M}, bm25(memory_fts, 3.0, 2.0, 1.0) AS score
            FROM memory_fts JOIN memory_entries m ON m.id = memory_fts.rowid
           WHERE memory_fts MATCH ?1 AND m.lineage_id = ?2
             AND (?3 OR m.archived_at IS NULL)
           ORDER BY score, m.slug
-          LIMIT ?4",
-    )?;
+          LIMIT ?4"
+    ))?;
     stmt.query_map(
         params![fts_query(terms), lineage_id, include_archived, limit as i64],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| Ok((entry_from_row(row)?, row.get(13)?)),
     )?
     .collect()
 }
 
+/// Substring hits: every term in the title, description or body. The entry
+/// rows themselves, selected under the lineage and archive predicates.
+fn like_hits(
+    conn: &Connection,
+    lineage_id: &str,
+    terms: &[&str],
+    include_archived: bool,
+) -> rusqlite::Result<Vec<MemoryEntry>> {
+    let mut sql = format!(
+        "SELECT {ENTRY_COLUMNS_M} FROM memory_entries m
+          WHERE m.lineage_id = ?1 AND (?2 OR m.archived_at IS NULL)"
+    );
+    let mut values: Vec<rusqlite::types::Value> = vec![
+        lineage_id.to_string().into(),
+        rusqlite::types::Value::Integer(i64::from(include_archived)),
+    ];
+    for term in terms {
+        values.push(like_pattern(term).into());
+        let n = values.len();
+        sql.push_str(&format!(
+            " AND (m.title LIKE ?{n} ESCAPE '\\' OR m.description LIKE ?{n} ESCAPE '\\' \
+               OR m.body LIKE ?{n} ESCAPE '\\')"
+        ));
+    }
+    sql.push_str(" ORDER BY m.updated_at DESC, m.slug");
+    let mut stmt = conn.prepare(&sql)?;
+    stmt.query_map(params_from_iter(values), entry_from_row)?
+        .collect()
+}
+
+/// One search, both passes in ONE deferred read transaction: every row it
+/// returns comes from the same snapshot and was selected with the lineage
+/// and archive predicates. No row is ever re-read by id.
 fn search_conn(
     conn: &Connection,
     lineage_id: &str,
@@ -914,63 +946,41 @@ fn search_conn(
     if terms.is_empty() {
         return Ok(Vec::new());
     }
+    let tx = conn.unchecked_transaction()?;
     let mut hits = Vec::new();
     let mut seen = std::collections::HashSet::new();
     // 1. FTS5, bm25-ranked (title weighs most). A query the FTS grammar
     // rejects is not an error: the LIKE pass still answers it.
-    match fts_hits(conn, lineage_id, &terms, limit, include_archived) {
+    match fts_hits(&tx, lineage_id, &terms, limit, include_archived) {
         Ok(rows) => {
-            for (id, score) in rows {
-                if let Some(entry) = load_entry_by_id(conn, id)? {
-                    seen.insert(id);
-                    hits.push(MemorySearchHit {
-                        entry,
-                        matched_by: MemoryMatch::Fts,
-                        score: Some(score),
-                    });
-                }
+            for (entry, score) in rows {
+                seen.insert(entry.slug.clone());
+                hits.push(MemorySearchHit {
+                    entry,
+                    matched_by: MemoryMatch::Fts,
+                    score: Some(score),
+                });
             }
         }
         Err(error) => tracing::debug!(%error, "memory FTS query refused; LIKE only"),
     }
-    if hits.len() >= limit {
-        return Ok(hits);
-    }
-    // 2. LIKE: every term must appear somewhere in title, description or body.
-    let mut sql = String::from(
-        "SELECT id FROM memory_entries WHERE lineage_id = ?1 AND (?2 OR archived_at IS NULL)",
-    );
-    let mut values: Vec<rusqlite::types::Value> = vec![
-        lineage_id.to_string().into(),
-        rusqlite::types::Value::Integer(i64::from(include_archived)),
-    ];
-    for term in &terms {
-        values.push(like_pattern(term).into());
-        let n = values.len();
-        sql.push_str(&format!(
-            " AND (title LIKE ?{n} ESCAPE '\\' OR description LIKE ?{n} ESCAPE '\\' \
-               OR body LIKE ?{n} ESCAPE '\\')"
-        ));
-    }
-    sql.push_str(" ORDER BY updated_at DESC, slug");
-    let mut stmt = conn.prepare(&sql)?;
-    let ids = stmt
-        .query_map(params_from_iter(values), |row| row.get::<_, i64>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    for id in ids {
-        if hits.len() >= limit {
-            break;
-        }
-        if seen.insert(id)
-            && let Some(entry) = load_entry_by_id(conn, id)?
-        {
-            hits.push(MemorySearchHit {
-                entry,
-                matched_by: MemoryMatch::Like,
-                score: None,
-            });
+    search_hook(lineage_id);
+    if hits.len() < limit {
+        // 2. LIKE: what the tokenizer cannot see.
+        for entry in like_hits(&tx, lineage_id, &terms, include_archived)? {
+            if hits.len() >= limit {
+                break;
+            }
+            if seen.insert(entry.slug.clone()) {
+                hits.push(MemorySearchHit {
+                    entry,
+                    matched_by: MemoryMatch::Like,
+                    score: None,
+                });
+            }
         }
     }
+    tx.commit()?;
     Ok(hits)
 }
 
@@ -1514,6 +1524,33 @@ async fn derived(
     Ok(Json(json!({ "items": items })))
 }
 
+// ─── Test seam ─────────────────────────────────────────────────────────────
+//
+// Kept below the routes: tests/openapi.rs scans each source file only up to
+// its first test-only attribute.
+
+/// Test seam: runs on the reader thread after a search's full-text pass and
+/// before its substring pass, with the searched lineage.
+#[cfg(test)]
+type SearchHook = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+#[cfg(test)]
+static SEARCH_HOOK: std::sync::Mutex<Option<SearchHook>> = std::sync::Mutex::new(None);
+
+fn search_hook(lineage_id: &str) {
+    #[cfg(test)]
+    {
+        let hook = SEARCH_HOOK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook(lineage_id);
+        }
+    }
+    #[cfg(not(test))]
+    let _ = lineage_id;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1867,6 +1904,87 @@ mod tests {
             .await
             .unwrap();
         assert!(hits.iter().all(|hit| hit.entry.slug == "replies"));
+    }
+
+    /// r2 item 1: a delete in this lineage plus a create in another, landing
+    /// between a search's passes, must not surface the other lineage's row
+    /// (a rowid the delete freed would be reused by the create).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn search_never_returns_another_lineages_entry_mid_search() {
+        let fx = fixture().await;
+        let mine = fx.seat().await;
+        let theirs = fx.seat().await;
+        let owner = MemoryWriter::Owner;
+        fx.store
+            .memory_create(
+                mine.clone(),
+                owner.clone(),
+                input("pref", MemoryType::User, "a secret preference"),
+            )
+            .await
+            .unwrap();
+
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let reached_tx = std::sync::Mutex::new(reached_tx);
+        let go_rx = std::sync::Mutex::new(go_rx);
+        let target = mine.clone();
+        let hook: SearchHook = std::sync::Arc::new(move |lineage: &str| {
+            if lineage != target {
+                return;
+            }
+            let _ = reached_tx.lock().unwrap().send(());
+            let _ = go_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(10));
+        });
+        *SEARCH_HOOK.lock().unwrap() = Some(hook);
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                *SEARCH_HOOK
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            }
+        }
+        let _clear = Clear;
+
+        let store = fx.store.clone();
+        let searched = mine.clone();
+        let search = tokio::spawn(async move {
+            store
+                .memory_search(searched, "secret".into(), 10, false)
+                .await
+        });
+        tokio::task::spawn_blocking(move || {
+            reached_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("search reached the seam")
+        })
+        .await
+        .unwrap();
+        // Concurrent writes while the search is between its passes.
+        fx.store
+            .memory_delete(mine.clone(), "pref".into(), owner.clone(), 1)
+            .await
+            .unwrap();
+        fx.store
+            .memory_create(
+                theirs.clone(),
+                owner,
+                input("private", MemoryType::User, "another lineage's secret"),
+            )
+            .await
+            .unwrap();
+        go_tx.send(()).unwrap();
+        let hits = search.await.unwrap().unwrap();
+        for hit in &hits {
+            assert_eq!(hit.entry.lineage_id, mine, "leaked: {hit:?}");
+        }
+        // Both passes answer from the snapshot the search started on.
+        let slugs: Vec<&str> = hits.iter().map(|hit| hit.entry.slug.as_str()).collect();
+        assert_eq!(slugs, ["pref"], "{hits:?}");
     }
 
     #[tokio::test]

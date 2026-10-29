@@ -18,6 +18,7 @@ import { switchSlots } from "../../lib/sessionSlots";
 import { isEmberEffort } from "./effort";
 import { nextStep } from "./nextStep";
 import { LaunchedByMark } from "./LaunchedBy";
+import { MainRow } from "../home/MainRow";
 import {
   applyFilters,
   availableConditions,
@@ -551,6 +552,8 @@ export function SessionList({
           </form>
         ) : null}
       </div>
+      {/* D-057 §9: Main is pinned above every status group and filter result. */}
+      <MainRow />
       {empty === "no-matches" ? (
         <div className={css.noMatches} data-testid="session-no-matches" data-empty="no-matches">
           <p className={css.noMatchesTitle}>没有会话符合当前筛选条件。</p>

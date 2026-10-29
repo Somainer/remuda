@@ -7144,7 +7144,19 @@ class HubStore {
    * failed read keeps the previous projection — the Main surfaces then fall
    * back to what the instance rows alone prove — and never toasts.
    */
-  async refreshLineage(lineageId: Id): Promise<LineageRecord | null> {
+  refreshLineage(lineageId: Id): Promise<LineageRecord | null> {
+    // Coalesce: the card, the pinned row and the status line can all ask at
+    // once; one read serves them.
+    const inFlight = this.lineageReads.get(lineageId);
+    if (inFlight) return inFlight;
+    const read = this.readLineage(lineageId).finally(() => this.lineageReads.delete(lineageId));
+    this.lineageReads.set(lineageId, read);
+    return read;
+  }
+
+  private readonly lineageReads = new Map<Id, Promise<LineageRecord | null>>();
+
+  private async readLineage(lineageId: Id): Promise<LineageRecord | null> {
     const epoch = this.bootGen;
     try {
       const record = await api.lineageGet(lineageId);

@@ -2326,6 +2326,79 @@ export type MediaBlock = ({
   [key: string]: unknown;
 });
 
+/** One memory entry of one lineage. */
+export type MemoryEntry = ({
+  "archivedAt"?: (string | null);
+  "body": (string);
+  "createdAt": (string);
+  "description": (string);
+  "lineageId": (string);
+  "origin": MemoryOrigin;
+  "revision": (number);
+  "slug": (string);
+  "sourceRefs": ((MemorySourceRef)[]);
+  "title": (string);
+  "type": MemoryType;
+  "updatedAt": (string);
+  "writerInstance"?: (string | null);
+  [key: string]: unknown;
+});
+
+/** The Hub-rendered index: one line per live entry, stable-ordered by type then slug. */
+export type MemoryIndex = ({
+  "bytes": (number);
+  "count": (number);
+  "lineageId": (string);
+  "text": (string);
+  "warnings": ((MemorySizeWarning)[]);
+  [key: string]: unknown;
+});
+
+/** MemoryLimit wire values; `protocol.md` §8. */
+export type MemoryLimit = ("entry-soft" | "index-soft");
+
+/** MemoryMatch wire values; `protocol.md` §8. */
+export type MemoryMatch = ("fts" | "like");
+
+/** MemoryOrigin wire values; `protocol.md` §8. */
+export type MemoryOrigin = ("human" | "agent");
+
+/** One search hit. */
+export type MemorySearchHit = ({
+  "entry": MemoryEntry;
+  "matchedBy": MemoryMatch;
+  "score"?: (number | null);
+  [key: string]: unknown;
+});
+
+/** A soft limit a write crossed, with the actual numbers. */
+export type MemorySizeWarning = ({
+  "bytes": (number);
+  "limit": MemoryLimit;
+  "maxBytes": (number);
+  [key: string]: unknown;
+});
+
+/** A journal row an entry was derived from. Lets a later journal-redaction pass find every entry that repeats a redacted row. */
+export type MemorySourceRef = ({
+  "instanceId": (string);
+  "seq": (number);
+  [key: string]: unknown;
+});
+
+/** MemoryType wire values; `protocol.md` §8. */
+export type MemoryType = ("user" | "feedback" | "project" | "reference");
+
+/** Result of a create, update or consolidate. */
+export type MemoryWriteResult = ({
+  "entry": MemoryEntry;
+  "entryBytes": (number);
+  "indexBytes": (number);
+  "removed"?: (((string))[]);
+  "warnings": ((MemorySizeWarning)[]);
+  [key: string]: unknown;
+});
+
 /** MessageOrigin wire values; `protocol.md` §5.2. */
 export type MessageOrigin = ("human" | "injected-skill" | "injected-command-output" | "hook-context" | "tool-result" | "compaction" | "unknown");
 

@@ -1004,11 +1004,15 @@ fn fts_hits(
 
 /// Substring hits: every term in the title, description or body. The entry
 /// rows themselves, selected under the lineage and archive predicates.
+/// Slugs in `exclude` (what FTS already returned) are skipped in SQL and at
+/// most `remaining` rows are read, so the pass decodes only rows it returns.
 fn like_hits(
     conn: &Connection,
     lineage_id: &str,
     terms: &[&str],
     include_archived: bool,
+    exclude: &[String],
+    remaining: usize,
 ) -> rusqlite::Result<Vec<MemoryEntry>> {
     let mut sql = format!(
         "SELECT {ENTRY_COLUMNS_M} FROM memory_entries m
@@ -1026,10 +1030,25 @@ fn like_hits(
                OR m.body LIKE ?{n} ESCAPE '\\')"
         ));
     }
-    sql.push_str(" ORDER BY m.updated_at DESC, m.slug");
+    if !exclude.is_empty() {
+        let first = values.len() + 1;
+        let slots: Vec<String> = (first..first + exclude.len())
+            .map(|n| format!("?{n}"))
+            .collect();
+        sql.push_str(&format!(" AND m.slug NOT IN ({})", slots.join(", ")));
+        values.extend(exclude.iter().map(|slug| slug.clone().into()));
+    }
+    values.push(rusqlite::types::Value::Integer(remaining as i64));
+    sql.push_str(&format!(
+        " ORDER BY m.updated_at DESC, m.slug LIMIT ?{}",
+        values.len()
+    ));
     let mut stmt = conn.prepare(&sql)?;
-    stmt.query_map(params_from_iter(values), entry_from_row)?
-        .collect()
+    stmt.query_map(params_from_iter(values), |row| {
+        note_like_row_decoded();
+        entry_from_row(row)
+    })?
+    .collect()
 }
 
 /// One search, both passes in ONE deferred read transaction: every row it
@@ -1050,13 +1069,13 @@ fn search_conn(
     }
     let tx = conn.unchecked_transaction()?;
     let mut hits = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = Vec::new();
     // 1. FTS5, bm25-ranked (title weighs most). A query the FTS grammar
     // rejects is not an error: the LIKE pass still answers it.
     match fts_hits(&tx, lineage_id, &terms, limit, include_archived) {
         Ok(rows) => {
             for (entry, score) in rows {
-                seen.insert(entry.slug.clone());
+                seen.push(entry.slug.clone());
                 hits.push(MemorySearchHit {
                     entry,
                     matched_by: MemoryMatch::Fts,
@@ -1068,18 +1087,14 @@ fn search_conn(
     }
     search_hook(lineage_id);
     if hits.len() < limit {
-        // 2. LIKE: what the tokenizer cannot see.
-        for entry in like_hits(&tx, lineage_id, &terms, include_archived)? {
-            if hits.len() >= limit {
-                break;
-            }
-            if seen.insert(entry.slug.clone()) {
-                hits.push(MemorySearchHit {
-                    entry,
-                    matched_by: MemoryMatch::Like,
-                    score: None,
-                });
-            }
+        // 2. LIKE: what the tokenizer cannot see, bounded to the slots left.
+        let remaining = limit - hits.len();
+        for entry in like_hits(&tx, lineage_id, &terms, include_archived, &seen, remaining)? {
+            hits.push(MemorySearchHit {
+                entry,
+                matched_by: MemoryMatch::Like,
+                score: None,
+            });
         }
     }
     tx.commit()?;
@@ -1691,6 +1706,17 @@ fn search_hook(lineage_id: &str) {
     let _ = lineage_id;
 }
 
+// Test seam: entry rows the LIKE pass decoded on this thread.
+#[cfg(test)]
+thread_local! {
+    static LIKE_ROWS_DECODED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn note_like_row_decoded() {
+    #[cfg(test)]
+    LIKE_ROWS_DECODED.with(|count| count.set(count.get() + 1));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2275,6 +2301,63 @@ mod tests {
             hits[1].entry.body, "a supersecretnote",
             "the snapshot's row"
         );
+    }
+
+    /// r3 item 3: the LIKE pass decodes only the rows it can still return:
+    /// it skips what FTS already returned in SQL and stops at the remaining
+    /// slots, however many large entries match.
+    #[tokio::test]
+    async fn the_like_pass_decodes_only_the_rows_it_returns() {
+        let fx = fixture().await;
+        let lineage = fx.seat().await;
+        let owner = MemoryWriter::Owner;
+        let filler = "x".repeat(6000);
+        fx.store
+            .memory_create(
+                lineage.clone(),
+                owner.clone(),
+                input("fts-hit", MemoryType::User, "a secret"),
+            )
+            .await
+            .unwrap();
+        for n in 0..30 {
+            fx.store
+                .memory_create(
+                    lineage.clone(),
+                    owner.clone(),
+                    input(
+                        &format!("big-{n:02}"),
+                        MemoryType::Reference,
+                        &format!("topsecretplan 确认边界条件 {filler}"),
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+        let run = |query: &'static str, limit: usize| {
+            let lineage = lineage.clone();
+            fx.store.read("test.like_rows", move |conn| {
+                LIKE_ROWS_DECODED.with(|count| count.set(0));
+                let hits = search_conn(conn, &lineage, query, limit, false)?;
+                Ok((hits, LIKE_ROWS_DECODED.with(|count| count.get())))
+            })
+        };
+        // FTS returns "fts-hit"; one slot is left for LIKE, which must not
+        // decode "fts-hit" again or any of the other 29 matches.
+        let (hits, decoded) = run("secret", 2).await.unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(
+            (hits[0].matched_by, hits[1].matched_by),
+            (MemoryMatch::Fts, MemoryMatch::Like)
+        );
+        assert_eq!(decoded, 1, "LIKE decoded {decoded} rows for one slot");
+        // A CJK substring is LIKE-only: limit 1 decodes one row of 31.
+        let (hits, decoded) = run("边界", 1).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(decoded, 1, "LIKE decoded {decoded} rows for one slot");
+        // FTS fills the limit: the LIKE pass decodes nothing.
+        let (_, decoded) = run("secret", 1).await.unwrap();
+        assert_eq!(decoded, 0);
     }
 
     /// r3 item 2: AUTOINCREMENT never reissues a freed row id, so an id seen

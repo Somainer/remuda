@@ -6726,10 +6726,14 @@ fn open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     }
 }
 
-/// Top rung of the `PRAGMA user_version` migration ladder in
-/// [`try_open_conn`]: 2 and 3 are the ma-lineage ended_at backfills, 4 is the
-/// seen-hub schema.
-pub(crate) const SCHEMA_USER_VERSION: i64 = 4;
+/// The seen-hub rung of the `PRAGMA user_version` ladder in
+/// [`try_open_conn`] (`instance_views` + `instances.turn_end_seq`). 2 and 3
+/// are the ma-lineage ended_at backfills.
+pub(crate) const SEEN_SCHEMA_RUNG: i64 = 4;
+
+/// Top rung of the ladder; a fresh database climbs to it (asserted by tests).
+#[cfg(test)]
+pub(crate) const SCHEMA_USER_VERSION: i64 = SEEN_SCHEMA_RUNG;
 
 /// Writer-side connection opener: sets WAL, the busy timeout, and runs the
 /// schema batch below.
@@ -7172,7 +7176,7 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         conn.execute_batch("PRAGMA user_version = 3;")?;
     }
-    if backfill_version < 4 {
+    if backfill_version < SEEN_SCHEMA_RUNG {
         // seen-hub (H6): per-owner done-unseen tracking — the instance_views
         // table and instances.turn_end_seq. One transaction with the marker,
         // so a crash between the DDL and the bump re-runs an idempotent rung.
@@ -7180,7 +7184,7 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
         // therefore read as seen: an upgrade never floods the home with ◉.
         let tx = conn.unchecked_transaction()?;
         crate::seen::migrate(&tx)?;
-        tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_USER_VERSION};"))?;
+        tx.execute_batch(&format!("PRAGMA user_version = {SEEN_SCHEMA_RUNG};"))?;
         tx.commit()?;
     }
     // Rows written before the column existed are each their own lineage.

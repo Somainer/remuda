@@ -373,18 +373,45 @@ mod tests {
             .unwrap()
     }
 
-    /// The user_version 4 rung: a pre-seen (v3) database gains the
-    /// `instance_views` table and `instances.turn_end_seq`, every existing row
-    /// reads seen (an upgrade never floods the home with ◉), and turns after
-    /// the upgrade are tracked.
+    /// The seen schema is present. Checked after every open, so a rung the
+    /// ladder skipped (e.g. a version number another rung already claimed)
+    /// fails here by name rather than as a missing column deep in a read.
+    fn assert_seen_schema(dir: &std::path::Path, when: &str) {
+        let db = rusqlite::Connection::open(dir.join("hub.sqlite")).unwrap();
+        assert!(
+            crate::store::column_exists(&db, "instances", "turn_end_seq").unwrap(),
+            "{when}: instances.turn_end_seq is missing — the seen rung did not run"
+        );
+        let table: Option<String> = db
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'instance_views'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert!(
+            table.is_some(),
+            "{when}: instance_views is missing — the seen rung did not run"
+        );
+        assert!(crate::store::column_exists(&db, "instance_views", "seen_seq").unwrap());
+    }
+
+    /// The seen rung: a database one rung below it gains the `instance_views`
+    /// table and `instances.turn_end_seq`, every existing row reads seen (an
+    /// upgrade never floods the home with ◉), and turns after the upgrade are
+    /// tracked. Written against the rung constant, so a renumber keeps it
+    /// honest.
     #[tokio::test]
-    async fn the_v4_rung_upgrades_a_v3_database_without_flooding_unseen() {
+    async fn the_seen_rung_upgrades_the_previous_schema_without_flooding_unseen() {
+        use crate::store::{SCHEMA_USER_VERSION, SEEN_SCHEMA_RUNG};
         let dir = tempfile::tempdir().unwrap();
         let (store, host) = crate::store_test_support::open_with_host(dir.path(), "seen-upgrade")
             .await
             .unwrap();
         // A fresh database climbs the whole ladder.
-        assert_eq!(user_version(dir.path()), crate::store::SCHEMA_USER_VERSION);
+        assert_seen_schema(dir.path(), "fresh database");
+        assert_eq!(user_version(dir.path()), SCHEMA_USER_VERSION);
         store
             .ensure_instance(host.clone(), "ins-seen-old".into())
             .await
@@ -392,23 +419,21 @@ mod tests {
         finish_turn(&store, &host, "ins-seen-old").await;
         store.close().await;
 
-        // Rewind to the exact pre-seen shape: v3, neither table nor column.
-        // The row keeps its journal (including the finished turn).
+        // Rewind to the exact pre-seen shape: the rung below, neither table
+        // nor column. The row keeps its journal (including the finished turn).
         let db = rusqlite::Connection::open(dir.path().join("hub.sqlite")).unwrap();
-        db.execute_batch(
+        db.execute_batch(&format!(
             "DROP TABLE instance_views;
              ALTER TABLE instances DROP COLUMN turn_end_seq;
-             PRAGMA user_version = 3;",
-        )
+             PRAGMA user_version = {};",
+            SEEN_SCHEMA_RUNG - 1
+        ))
         .unwrap();
         drop(db);
 
         let store = Store::open(dir.path()).unwrap();
-        assert_eq!(user_version(dir.path()), 4);
-        let db = rusqlite::Connection::open(dir.path().join("hub.sqlite")).unwrap();
-        assert!(crate::store::column_exists(&db, "instances", "turn_end_seq").unwrap());
-        assert!(crate::store::column_exists(&db, "instance_views", "seen_seq").unwrap());
-        drop(db);
+        assert_seen_schema(dir.path(), "upgrade from the previous rung");
+        assert_eq!(user_version(dir.path()), SCHEMA_USER_VERSION);
         let old = store
             .get_instance("ins-seen-old".into())
             .await
@@ -434,9 +459,10 @@ mod tests {
         assert!(marked.advanced && !marked.view.unseen);
         store.close().await;
 
-        // Re-opening at v4 does not re-run the rung and keeps the seen state.
+        // Re-opening at the top rung does not re-run it and keeps the state.
         let store = Store::open(dir.path()).unwrap();
-        assert_eq!(user_version(dir.path()), 4);
+        assert_seen_schema(dir.path(), "re-open at the top rung");
+        assert_eq!(user_version(dir.path()), SCHEMA_USER_VERSION);
         let row = store
             .get_instance("ins-seen-old".into())
             .await

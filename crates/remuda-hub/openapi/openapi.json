@@ -5336,7 +5336,7 @@
       },
       "MemoryIndex": {
         "additionalProperties": false,
-        "description": "The Hub-rendered index of a lineage's live entries.",
+        "description": "The Hub-rendered index of a lineage's live entries (archived ones too on request).",
         "properties": {
           "bytes": {
             "description": "Rendered size in bytes.",
@@ -5350,7 +5350,7 @@
             "type": "string"
           },
           "text": {
-            "description": "One `- [type] slug: title — description` line per entry.",
+            "description": "One `- [type] slug: title — description` line per entry; an archived entry's line ends ` (archived)`.",
             "type": "string"
           },
           "warnings": {
@@ -8065,7 +8065,7 @@
     },
     "/v1/lineages/{id}/memory/index": {
       "get": {
-        "description": "The Hub-rendered index of the lineage's live entries: one `- [type] slug: title — description` line each, ordered by type then slug, with a warning above 4096 bytes. Human devices read any lineage; an Agent reads only its own lineage (403 otherwise). Bot devices are refused.",
+        "description": "The Hub-rendered index of the lineage's live entries (archived ones too with includeArchived=true, each line ending ` (archived)`): one `- [type] slug: title — description` line each, ordered by type then slug, with a warning above 4096 bytes. Human devices read any lineage; an Agent reads only its own lineage (403 otherwise). Bot devices are refused.",
         "operationId": "memoryIndex",
         "parameters": [
           {
@@ -8073,6 +8073,15 @@
           },
           {
             "$ref": "#/components/parameters/CallerInstance"
+          },
+          {
+            "description": "Include archived entries; their lines end ` (archived)`. The size warning is computed for what is rendered.",
+            "in": "query",
+            "name": "includeArchived",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
           }
         ],
         "responses": {

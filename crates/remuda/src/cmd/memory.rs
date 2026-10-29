@@ -115,7 +115,11 @@ enum MemoryCommand {
         entry: EntryFlags,
     },
     /// Print the Hub-rendered index (one line per live entry).
-    Index,
+    Index {
+        /// Include archived entries (marked `(archived)`).
+        #[arg(long)]
+        include_archived: bool,
+    },
     /// Owner only: restore archived entries (all when no slug is given).
     Restore { slugs: Vec<String> },
 }
@@ -251,9 +255,14 @@ async fn run(args: MemoryArgs) -> anyhow::Result<()> {
                 .map_err(hub_http_error)?;
             report_write(&value, json_out)
         }
-        MemoryCommand::Index => {
+        MemoryCommand::Index { include_archived } => {
+            let query = if include_archived {
+                vec!["includeArchived=true".to_string()]
+            } else {
+                Vec::new()
+            };
             let value = client
-                .get(&format!("{base}/index"))
+                .get(&with_query(&format!("{base}/index"), &query))
                 .await
                 .map_err(hub_http_error)?;
             if json_out {

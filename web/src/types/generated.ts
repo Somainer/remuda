@@ -2344,7 +2344,7 @@ export type MemoryEntry = ({
   [key: string]: unknown;
 });
 
-/** The Hub-rendered index: one line per live entry, stable-ordered by type then slug. */
+/** The Hub-rendered index: one line per live entry (archived entries too when asked for, marked `(archived)`), stable-ordered by type then slug. */
 export type MemoryIndex = ({
   "bytes": (number);
   "count": (number);

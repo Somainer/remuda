@@ -1023,7 +1023,7 @@ export interface paths {
         };
         /**
          * Render a lineage's memory index
-         * @description The Hub-rendered index of the lineage's live entries: one `- [type] slug: title — description` line each, ordered by type then slug, with a warning above 4096 bytes. Human devices read any lineage; an Agent reads only its own lineage (403 otherwise). Bot devices are refused.
+         * @description The Hub-rendered index of the lineage's live entries (archived ones too with includeArchived=true, each line ending ` (archived)`): one `- [type] slug: title — description` line each, ordered by type then slug, with a warning above 4096 bytes. Human devices read any lineage; an Agent reads only its own lineage (403 otherwise). Bot devices are refused.
          */
         get: operations["memoryIndex"];
         put?: never;
@@ -2676,14 +2676,14 @@ export interface components {
         MemoryEntryPage: {
             items: components["schemas"]["MemoryEntry"][];
         };
-        /** @description The Hub-rendered index of a lineage's live entries. */
+        /** @description The Hub-rendered index of a lineage's live entries (archived ones too on request). */
         MemoryIndex: {
             /** @description Rendered size in bytes. */
             bytes: number;
             /** @description Entries in the index. */
             count: number;
             lineageId: string;
-            /** @description One `- [type] slug: title — description` line per entry. */
+            /** @description One `- [type] slug: title — description` line per entry; an archived entry's line ends ` (archived)`. */
             text: string;
             warnings: components["schemas"]["MemorySizeWarning"][];
         };
@@ -5673,7 +5673,10 @@ export interface operations {
     };
     memoryIndex: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Include archived entries; their lines end ` (archived)`. The size warning is computed for what is rendered. */
+                includeArchived?: boolean;
+            };
             header?: {
                 /** @description Narrow a device credential to an existing instance with Agent origin. Cannot promote or rebind a scoped credential. */
                 "x-remuda-instance-id"?: components["parameters"]["CallerInstance"];

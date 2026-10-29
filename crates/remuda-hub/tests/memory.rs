@@ -543,6 +543,25 @@ async fn retiring_a_lineage_archives_and_the_owner_restores() -> Result<()> {
         (index["count"].clone(), index["text"].clone()),
         (json!(0), json!(""))
     );
+    // r2 item 4: the index honours includeArchived like list and search.
+    let archived_index = ctx
+        .ok(
+            "GET",
+            &mem(&lineage, "/index?includeArchived=true"),
+            &ctx.human,
+            None,
+        )
+        .await?;
+    assert_eq!(archived_index["count"], 2, "{archived_index}");
+    assert_eq!(
+        archived_index["text"],
+        "- [project] alpha: Title alpha — About alpha (archived)\n\
+         - [project] beta: Title beta — About beta (archived)\n"
+    );
+    assert_eq!(
+        archived_index["bytes"],
+        archived_index["text"].as_str().unwrap().len()
+    );
     let live = ctx.ok("GET", &mem(&lineage, ""), &ctx.human, None).await?;
     assert_eq!(live["items"], json!([]));
     let hits = ctx

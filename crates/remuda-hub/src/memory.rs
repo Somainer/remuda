@@ -547,33 +547,49 @@ fn authorize_write(
     }
 }
 
-/// Live entries of a lineage, index order: type rank, then slug.
-fn live_index_rows(
+/// One index row: type, slug, title, description, archived.
+type IndexRow = (MemoryType, String, String, String, bool);
+
+/// A lineage's entries in index order (type rank, then slug): the live ones,
+/// and the archived ones too when `include_archived`.
+fn index_rows(
     conn: &Connection,
     lineage_id: &str,
-) -> rusqlite::Result<Vec<(MemoryType, String, String, String)>> {
+    include_archived: bool,
+) -> rusqlite::Result<Vec<IndexRow>> {
     let mut stmt = conn.prepare(
-        "SELECT type, slug, title, description FROM memory_entries
-          WHERE lineage_id = ?1 AND archived_at IS NULL",
+        "SELECT type, slug, title, description, archived_at IS NOT NULL
+           FROM memory_entries
+          WHERE lineage_id = ?1 AND (?2 OR archived_at IS NULL)",
     )?;
     let mut rows = stmt
-        .query_map(params![lineage_id], |row| {
+        .query_map(params![lineage_id, include_archived], |row| {
             let raw: String = row.get(0)?;
             let memory_type = MemoryType::parse(&raw)
                 .ok_or_else(|| conversion(0, format!("unknown memory type {raw:?}")))?;
-            Ok((memory_type, row.get(1)?, row.get(2)?, row.get(3)?))
+            Ok((
+                memory_type,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
         })?
-        .collect::<rusqlite::Result<Vec<(MemoryType, String, String, String)>>>()?;
+        .collect::<rusqlite::Result<Vec<IndexRow>>>()?;
     rows.sort_by(|a, b| a.0.rank().cmp(&b.0.rank()).then_with(|| a.1.cmp(&b.1)));
     Ok(rows)
 }
 
-fn render_index(conn: &Connection, lineage_id: &str) -> rusqlite::Result<MemoryIndex> {
-    let rows = live_index_rows(conn, lineage_id)?;
+fn render_index(
+    conn: &Connection,
+    lineage_id: &str,
+    include_archived: bool,
+) -> rusqlite::Result<MemoryIndex> {
+    let rows = index_rows(conn, lineage_id, include_archived)?;
     let text: String = rows
         .iter()
-        .map(|(memory_type, slug, title, description)| {
-            memory_index_line(*memory_type, slug, title, description)
+        .map(|(memory_type, slug, title, description, archived)| {
+            memory_index_line(*memory_type, slug, title, description, *archived)
         })
         .collect();
     let bytes = text.len() as u64;
@@ -601,7 +617,8 @@ fn write_result(
     removed: Vec<String>,
 ) -> rusqlite::Result<MemoryWriteResult> {
     let entry_bytes = memory_entry_bytes(&entry.title, &entry.description, &entry.body);
-    let index = render_index(conn, &entry.lineage_id)?;
+    // The size that matters is the index a seat is given: live entries.
+    let index = render_index(conn, &entry.lineage_id, false)?;
     let mut warnings = Vec::new();
     if entry_bytes > MEMORY_ENTRY_SOFT_BYTES {
         warnings.push(MemorySizeWarning {
@@ -1218,9 +1235,13 @@ impl Store {
     }
 
     /// The Hub-rendered index of a lineage's live entries.
-    pub(crate) async fn memory_index(&self, lineage_id: String) -> Result<MemoryIndex, StoreError> {
+    pub(crate) async fn memory_index(
+        &self,
+        lineage_id: String,
+        include_archived: bool,
+    ) -> Result<MemoryIndex, StoreError> {
         self.read("memory_index", move |conn| {
-            Ok(render_index(conn, &lineage_id)?)
+            Ok(render_index(conn, &lineage_id, include_archived)?)
         })
         .await
     }
@@ -1427,6 +1448,13 @@ struct ListQuery {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct IndexQuery {
+    #[serde(default)]
+    include_archived: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SearchQuery {
     #[serde(default)]
     q: String,
@@ -1531,9 +1559,15 @@ async fn get_index(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(lineage_id): Path<String>,
+    Query(query): Query<IndexQuery>,
 ) -> Result<Json<MemoryIndex>, MemoryError> {
     memory_caller(&state, &headers, &lineage_id).await?;
-    Ok(Json(state.store.memory_index(lineage_id).await?))
+    Ok(Json(
+        state
+            .store
+            .memory_index(lineage_id, query.include_archived)
+            .await?,
+    ))
 }
 
 async fn search(
@@ -2238,7 +2272,7 @@ mod tests {
             );
         }
         let last = last.unwrap();
-        let index = fx.store.memory_index(lineage).await.unwrap();
+        let index = fx.store.memory_index(lineage, false).await.unwrap();
         assert!(index.bytes > 4096);
         assert_eq!(index.bytes, index.text.len() as u64);
         assert_eq!(last.index_bytes, index.bytes);
@@ -2271,7 +2305,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let index = fx.store.memory_index(lineage.clone()).await.unwrap();
+        let index = fx.store.memory_index(lineage.clone(), false).await.unwrap();
         assert_eq!(
             index.text,
             "- [user] alpha-user: title alpha-user — description alpha-user\n\
@@ -2282,9 +2316,27 @@ mod tests {
         );
         assert_eq!(index.count, 5);
         assert!(index.warnings.is_empty());
+        // r2 item 4: archived entries only on request, marked as such.
+        let archive = lineage.clone();
+        fx.store
+            .run_named("test.archive", move |conn| {
+                archive_lineage(conn, &archive, "2026-10-30T00:00:00.000Z")?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let live = fx.store.memory_index(lineage.clone(), false).await.unwrap();
+        assert_eq!((live.count, live.text.as_str()), (0, ""));
+        let all = fx.store.memory_index(lineage.clone(), true).await.unwrap();
+        assert_eq!(all.count, 5);
+        assert_eq!(
+            all.text.lines().next(),
+            Some("- [user] alpha-user: title alpha-user — description alpha-user (archived)")
+        );
+        assert_eq!(all.bytes, all.text.len() as u64);
         let listed: Vec<String> = fx
             .store
-            .memory_list(lineage, None, false)
+            .memory_list(lineage, None, true)
             .await
             .unwrap()
             .into_iter()
@@ -2475,7 +2527,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let index = fx.store.memory_index(lineage.clone()).await.unwrap();
+        let index = fx.store.memory_index(lineage.clone(), false).await.unwrap();
         assert_eq!((index.count, index.text.as_str()), (0, ""));
         assert!(
             fx.store
@@ -2529,7 +2581,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(restored, ["one"]);
-        let index = fx.store.memory_index(lineage.clone()).await.unwrap();
+        let index = fx.store.memory_index(lineage.clone(), false).await.unwrap();
         assert_eq!(index.count, 2);
         let entry = fx
             .store

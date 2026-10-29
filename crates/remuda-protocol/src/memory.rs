@@ -152,14 +152,15 @@ pub struct MemoryWriteResult {
     pub warnings: Vec<MemorySizeWarning>,
 }
 
-/// The Hub-rendered index: one line per live entry, stable-ordered by type
-/// then slug.
+/// The Hub-rendered index: one line per live entry (archived entries too
+/// when asked for, marked `(archived)`), stable-ordered by type then slug.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryIndex {
     /// Lineage.
     pub lineage_id: String,
-    /// Rendered text, one `- [type] slug: title — description` line per entry.
+    /// Rendered text, one `- [type] slug: title — description` line per
+    /// entry; an archived entry's line ends ` (archived)`.
     pub text: String,
     /// Number of entries in the index.
     pub count: u64,
@@ -195,15 +196,17 @@ pub fn memory_entry_bytes(title: &str, description: &str, body: &str) -> u64 {
     (title.len() + description.len() + body.len()) as u64
 }
 
-/// Render one index line.
+/// Render one index line; an archived entry's line ends ` (archived)`.
 pub fn memory_index_line(
     memory_type: MemoryType,
     slug: &str,
     title: &str,
     description: &str,
+    archived: bool,
 ) -> String {
+    let marker = if archived { " (archived)" } else { "" };
     format!(
-        "- [{}] {slug}: {title} — {description}\n",
+        "- [{}] {slug}: {title} — {description}{marker}\n",
         memory_type.as_str()
     )
 }
@@ -250,8 +253,18 @@ mod tests {
     #[test]
     fn index_line_shape_is_stable() {
         assert_eq!(
-            memory_index_line(MemoryType::Feedback, "terse", "Be terse", "short replies"),
+            memory_index_line(
+                MemoryType::Feedback,
+                "terse",
+                "Be terse",
+                "short replies",
+                false
+            ),
             "- [feedback] terse: Be terse — short replies\n"
+        );
+        assert_eq!(
+            memory_index_line(MemoryType::User, "old", "Old", "retired", true),
+            "- [user] old: Old — retired (archived)\n"
         );
         let ranks: Vec<usize> = MemoryType::ALL.iter().map(|t| t.rank()).collect();
         assert_eq!(ranks, vec![0, 1, 2, 3]);

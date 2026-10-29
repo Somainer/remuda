@@ -10517,7 +10517,7 @@
       "type": "object"
     },
     "MemoryIndex": {
-      "description": "The Hub-rendered index: one line per live entry, stable-ordered by type\nthen slug.",
+      "description": "The Hub-rendered index: one line per live entry (archived entries too\nwhen asked for, marked `(archived)`), stable-ordered by type then slug.",
       "properties": {
         "bytes": {
           "description": "Rendered size in bytes.",
@@ -10536,7 +10536,7 @@
           "type": "string"
         },
         "text": {
-          "description": "Rendered text, one `- [type] slug: title — description` line per entry.",
+          "description": "Rendered text, one `- [type] slug: title — description` line per\nentry; an archived entry's line ends ` (archived)`.",
           "type": "string"
         },
         "warnings": {

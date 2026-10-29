@@ -5079,6 +5079,16 @@ async fn configure_replay_while_accepted_is_409_in_flight() -> Result<()> {
                 .contains(command_id.as_id().as_str()),
             "the message keeps its {{commandId}} placeholder: {conflict}"
         );
+        // Pinned to the pre-D-060 bytes over the real HTTP path, so changing
+        // the sentence (even by one word) fails here.
+        assert_eq!(
+            conflict["error"],
+            json!(
+                "instance.configure is still in flight; poll GET \
+                 /v1/instances/{id}/commands/{commandId} for its outcome"
+            ),
+            "{conflict}"
+        );
     }
     assert_eq!(
         configures.load(Ordering::Relaxed),

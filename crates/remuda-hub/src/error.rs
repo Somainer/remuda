@@ -597,6 +597,15 @@ mod tests {
         let (status, body) = crate::http::configure_in_flight("cmd_9").status_code_and_body();
         assert_eq!(status, 409);
         assert_eq!(body["code"], "COMMAND_ID_CONFLICT");
+        // The message is pinned to the pre-D-060 bytes: the id lives only in
+        // `next.commandId`.
+        assert_eq!(
+            body["error"],
+            json!(
+                "instance.configure is still in flight; poll GET \
+                 /v1/instances/{id}/commands/{commandId} for its outcome"
+            )
+        );
         assert_eq!(body["reason"], "delivery-unknown");
         assert_eq!(body["next"]["action"], "read-then-decide");
         assert_eq!(body["next"]["commandId"], "cmd_9");

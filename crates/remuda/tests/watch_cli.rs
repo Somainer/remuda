@@ -670,9 +670,9 @@ async fn worker_digest_and_glance_print_bounded_json() -> Result<()> {
         compact.len()
     );
     assert_eq!(digest["v"], 1);
-    assert_eq!(digest["worker"]["name"], "c-digest");
-    assert_eq!(digest["state"]["roster"], "working");
-    assert_eq!(digest["worker"]["instanceId"], instance_id);
+    assert_eq!(digest["name"], "c-digest");
+    assert_eq!(digest["roster"]["state"], "working");
+    assert_eq!(digest["instanceId"], instance_id);
 
     // An unknown worker is a nonzero exit, not an empty digest.
     let output = hub.run(&["worker", "digest", "c-nobody"]);
@@ -687,7 +687,7 @@ async fn worker_digest_and_glance_print_bounded_json() -> Result<()> {
     );
     let glance: Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(glance["lineageId"], instance_id);
-    assert_eq!(glance["waitingTotal"], 0);
+    assert_eq!(glance["more"]["waiting"], 0);
     assert_eq!(glance["doneToday"], 0);
     assert!(glance["waiting"].is_array() && glance["working"].is_array());
 

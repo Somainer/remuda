@@ -668,24 +668,30 @@ export type Digest = (string);
 
 /** An `instance.configure` command that has not settled. */
 export type DigestConfigure = ({
-  "commandId": (string);
   "requestId"?: (string | null);
   "state": (string);
   [key: string]: unknown;
 });
 
-/** A requested value next to the one actually observed. */
-export type DigestPair = ({
+/** Requested and effective effort. */
+export type DigestEffort = ({
   "effective"?: (string | null);
+  "requested"?: (string | null);
+  [key: string]: unknown;
+});
+
+/** Requested vs effective model, with effort and a pending configure nested in. */
+export type DigestModel = ({
+  "configure"?: (DigestConfigure | (null));
+  "effective"?: (string | null);
+  "effort": DigestEffort;
   "requested"?: (string | null);
   [key: string]: unknown;
 });
 
 /** The interaction the worker is blocked on. */
 export type DigestPending = ({
-  "ageSecs": (number);
-  "argsUntrusted"?: (string | null);
-  "id": (string);
+  "argsSummary"?: (string | null);
   "kind": (string);
   "question": (string);
   "tool"?: (string | null);
@@ -693,29 +699,21 @@ export type DigestPending = ({
 });
 
 /** Roster state plus the latest observed classification. */
-export type DigestState = ({
-  "activity"?: (string | null);
-  "lifecycle"?: (string | null);
-  "reason"?: (string | null);
-  "roster": (string);
+export type DigestRoster = ({
+  "state": (string);
   "watch"?: (string | null);
-  "watchAgeSecs"?: (number | null);
-  "watchDetail"?: (string | null);
   [key: string]: unknown;
 });
 
-/** Supply state of the profile the worker runs on, shown only when parked. */
+/** Supply state of the profile the worker runs on, shown only when a window is cooling down. */
 export type DigestSupply = ({
-  "parked": (boolean);
-  "profile"?: (string | null);
   "resetsAt"?: (number | null);
-  "state": (string);
+  "windowId"?: (string | null);
   [key: string]: unknown;
 });
 
 /** Head and tail excerpts of the last assistant text (untrusted text). */
 export type DigestText = ({
-  "chars": (number);
   "head": (string);
   "tail": (string);
   [key: string]: unknown;
@@ -723,19 +721,8 @@ export type DigestText = ({
 
 /** Outcome of the most recent root turn in the journal tail. */
 export type DigestTurn = ({
-  "at"?: (string | null);
-  "error"?: (string | null);
-  "status": (string);
-  [key: string]: unknown;
-});
-
-/** Which worker a digest describes. */
-export type DigestWorker = ({
-  "driver"?: (string | null);
-  "harness": (string);
-  "id": (string);
-  "instanceId"?: (string | null);
-  "name": (string);
+  "endedAt"?: (string | null);
+  "result": (string);
   [key: string]: unknown;
 });
 
@@ -1294,16 +1281,29 @@ export type GenericPermission = ({
 /** GenericPermissionMode wire values; `protocol.md` §4.1. */
 export type GenericPermissionMode = ("native");
 
-/** One worker row of a [`LineageGlance`]. */
-export type GlanceRow = ({
-  "branch": (string);
-  "detail"?: (string | null);
-  "id": (string);
-  "idleSecs"?: (number | null);
+/** How many workers the glance lists left out because of the row cap. */
+export type GlanceMore = ({
+  "waiting": (number);
+  "working": (number);
+  [key: string]: unknown;
+});
+
+/** One waiting worker of a [`LineageGlance`]. */
+export type GlanceWaiting = ({
+  "instanceId"?: (string | null);
+  "kind": (string);
   "name": (string);
-  "state": (string);
-  "task"?: (string | null);
-  "why"?: (string | null);
+  "question"?: (string | null);
+  "since"?: (number | null);
+  [key: string]: unknown;
+});
+
+/** One working worker of a [`LineageGlance`]. */
+export type GlanceWorking = ({
+  "instanceId"?: (string | null);
+  "name": (string);
+  "since"?: (number | null);
+  "taskId"?: (string | null);
   [key: string]: unknown;
 });
 
@@ -2382,13 +2382,12 @@ export type LifecycleTopic = ("session" | "turn" | "hook" | "subagent" | "task" 
 
 /** `GET /v1/lineages/{id}/glance`: the workers the lineage dispatched that are waiting on someone or working, plus today's completions. */
 export type LineageGlance = ({
-  "day": (string);
   "doneToday": (number);
+  "generatedAt": (string);
   "lineageId": (string);
-  "waiting": ((GlanceRow)[]);
-  "waitingTotal": (number);
-  "working": ((GlanceRow)[]);
-  "workingTotal": (number);
+  "more": GlanceMore;
+  "waiting": ((GlanceWaiting)[]);
+  "working": ((GlanceWorking)[]);
   [key: string]: unknown;
 });
 
@@ -4611,22 +4610,23 @@ export type WindowSource = ("declared" | "observed" | "inferred");
 /** `GET /v1/workers/{id}/digest`: at most [`WORKER_DIGEST_MAX_BYTES`] bytes.  Optional sections are omitted rather than sent as `null`. Every string that originates from a worker, a tool or the screen is untrusted data. */
 export type WorkerDigest = ({
   "branch": (string);
-  "configure"?: (DigestConfigure | (null));
-  "effort": DigestPair;
-  "idleSecs"?: (number | null);
+  "instanceId"?: (string | null);
   "lastText"?: (DigestText | (null));
-  "model": DigestPair;
+  "model": DigestModel;
+  "name": (string);
   "pending"?: (DigestPending | (null));
+  "projectId"?: (string | null);
   "queued": (number);
+  "roster": DigestRoster;
   "sha"?: (string | null);
-  "state": DigestState;
+  "shrunk"?: (((string))[]);
+  "sinceProgressSecs"?: (number | null);
   "supply"?: (DigestSupply | (null));
-  "task"?: (string | null);
+  "taskId"?: (string | null);
   "toolInFlight": (boolean);
-  "truncated": (boolean);
   "turn"?: (DigestTurn | (null));
   "v": (number);
-  "worker": DigestWorker;
+  "workerId": (string);
   [key: string]: unknown;
 });
 

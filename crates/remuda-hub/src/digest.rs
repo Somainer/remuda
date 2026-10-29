@@ -32,9 +32,10 @@ use axum::http::HeaderMap;
 use axum::routing::get;
 use axum::{Json, Router};
 use remuda_protocol::{
-    DigestConfigure, DigestPair, DigestPending, DigestState, DigestSupply, DigestText, DigestTurn,
-    DigestWorker, GlanceRow, InputOrigin, LINEAGE_GLANCE_ROW_CAP, LineageGlance,
-    WORKER_DIGEST_MAX_BYTES, WorkerDigest, WorkerRoster, WorkerState, WorkerWatchStatus,
+    DigestConfigure, DigestEffort, DigestModel, DigestPending, DigestRoster, DigestSupply,
+    DigestText, DigestTurn, GlanceMore, GlanceWaiting, GlanceWorking, InputOrigin,
+    LINEAGE_GLANCE_ROW_CAP, LineageGlance, WORKER_DIGEST_MAX_BYTES, WorkerDigest, WorkerRoster,
+    WorkerState, WorkerWatchStatus,
 };
 use rusqlite::params;
 use serde_json::Value;
@@ -499,11 +500,9 @@ fn scan_tail(events: &[Value]) -> Tail {
 
 struct PendingParts {
     kind: String,
-    id: String,
     question: String,
     tool: Option<String>,
     args: Option<String>,
-    age_secs: i64,
 }
 
 fn parse_unix(stamp: &str) -> Option<i64> {
@@ -512,7 +511,7 @@ fn parse_unix(stamp: &str) -> Option<i64> {
         .ok()
 }
 
-fn pending_parts(record: &InteractionRecord, open: &[OpenTool], now: i64) -> PendingParts {
+fn pending_parts(record: &InteractionRecord, open: &[OpenTool]) -> PendingParts {
     let interaction = record
         .payload
         .pointer("/payload/interaction")
@@ -596,22 +595,19 @@ fn pending_parts(record: &InteractionRecord, open: &[OpenTool], now: i64) -> Pen
     };
     PendingParts {
         kind: kind.to_string(),
-        id: record.interaction_id.clone(),
         question: redact_secrets(&question),
         tool,
         // Every value in the summary was redacted as it was rendered; a second
         // pass would rewrite the `[withheld]` markers.
         args: args.filter(|args| !args.is_empty()),
-        age_secs: parse_unix(&record.created_at).map_or(0, |at| (now - at).max(0)),
     }
 }
 
 // ── supply ─────────────────────────────────────────────────────────────────
 
 struct SupplyFacts {
-    state: &'static str,
+    window_id: Option<String>,
     resets_at: Option<i64>,
-    profile: String,
 }
 
 /// Parked supply for `model` on `profile`: the account is cooling/exhausted,
@@ -626,12 +622,13 @@ fn supply_facts(profile: &ProviderRecord, model: &str, now: i64) -> Option<Suppl
     let mut windows = profile.supply.windows.clone();
     windows.extend(model_windows.iter().cloned());
     let state = crate::supply::refresh_state(&mut windows, Some(profile.supply.state), now);
-    let label = match state {
-        remuda_protocol::SupplyState::Cooling => "cooling",
-        remuda_protocol::SupplyState::Exhausted => "exhausted",
-        _ if model_windows.iter().any(|w| w.is_cooling_at(now)) => "cooling",
-        _ => return None,
-    };
+    let parked = matches!(
+        state,
+        remuda_protocol::SupplyState::Cooling | remuda_protocol::SupplyState::Exhausted
+    ) || model_windows.iter().any(|w| w.is_cooling_at(now));
+    if !parked {
+        return None;
+    }
     // `refresh_state` cleared elapsed cooldowns on `windows`; the survivors
     // are the windows actually parking admissions now.
     let resets_at = windows
@@ -639,10 +636,14 @@ fn supply_facts(profile: &ProviderRecord, model: &str, now: i64) -> Option<Suppl
         .filter(|window| window.is_cooling_at(now))
         .filter_map(|window| window.resets_at.or(window.cooldown_until))
         .max();
+    let window_id = windows
+        .iter()
+        .filter(|window| window.is_cooling_at(now))
+        .max_by_key(|window| window.resets_at.or(window.cooldown_until).unwrap_or(0))
+        .map(|window| window.id.clone());
     Some(SupplyFacts {
-        state: label,
+        window_id,
         resets_at,
-        profile: profile.name.clone(),
     })
 }
 
@@ -665,18 +666,14 @@ enum Slot {
     ModelEff,
     EffortReq,
     EffortEff,
-    Profile,
     Task,
     Sha,
     WorkerId,
     InstanceId,
-    PendingId,
-    CommandId,
-    RequestId,
-    Driver,
+    ProjectId,
 }
 
-const SLOTS: [(Slot, usize, usize); 23] = [
+const SLOTS: [(Slot, usize, usize); 17] = [
     // (slot, initial char cap, shrink weight): prose shrinks before ids.
     (Slot::Head, 420, 3),
     (Slot::Tail, 260, 3),
@@ -692,15 +689,18 @@ const SLOTS: [(Slot, usize, usize); 23] = [
     (Slot::ModelEff, 64, 1),
     (Slot::EffortReq, 24, 1),
     (Slot::EffortEff, 24, 1),
-    (Slot::Profile, 48, 1),
     (Slot::Task, 64, 1),
     (Slot::Sha, 64, 1),
-    (Slot::WorkerId, 64, 1),
-    (Slot::InstanceId, 64, 1),
-    (Slot::PendingId, 64, 1),
-    (Slot::CommandId, 64, 1),
-    (Slot::RequestId, 64, 1),
-    (Slot::Driver, 32, 1),
+    (Slot::ProjectId, 64, 1),
+];
+
+/// Slots that identify the worker. They are never shortened: a digest that
+/// cannot name its worker is useless, and the skeleton is the fallback.
+const UNSHRINKABLE: &[Slot] = &[
+    Slot::Name,
+    Slot::WorkerId,
+    Slot::InstanceId,
+    Slot::ProjectId,
 ];
 
 /// Everything a digest says, before the byte budget is applied.
@@ -708,15 +708,10 @@ struct Parts {
     worker_id: String,
     name: String,
     instance_id: Option<String>,
-    harness: String,
-    driver: Option<String>,
     roster: String,
     reason: Option<String>,
-    lifecycle: Option<String>,
-    activity: Option<String>,
     watch: Option<String>,
     watch_detail: Option<String>,
-    watch_age_secs: Option<i64>,
     turn: Option<(String, Option<String>, Option<String>)>,
     last_text: Option<String>,
     pending: Option<PendingParts>,
@@ -724,10 +719,11 @@ struct Parts {
     model_eff: Option<String>,
     effort_req: Option<String>,
     effort_eff: Option<String>,
-    configure: Option<(String, String, Option<String>)>,
+    configure: Option<(String, Option<String>)>,
     supply: Option<SupplyFacts>,
     queued: u32,
     task: Option<String>,
+    project_id: Option<String>,
     branch: String,
     sha: Option<String>,
     idle_secs: Option<i64>,
@@ -750,15 +746,11 @@ impl Parts {
             Slot::ModelEff => self.model_eff.as_deref(),
             Slot::EffortReq => self.effort_req.as_deref(),
             Slot::EffortEff => self.effort_eff.as_deref(),
-            Slot::Profile => self.supply.as_ref().map(|s| s.profile.as_str()),
             Slot::Task => self.task.as_deref(),
             Slot::Sha => self.sha.as_deref(),
+            Slot::ProjectId => self.project_id.as_deref(),
             Slot::WorkerId => Some(&self.worker_id),
             Slot::InstanceId => self.instance_id.as_deref(),
-            Slot::PendingId => self.pending.as_ref().map(|p| p.id.as_str()),
-            Slot::CommandId => self.configure.as_ref().map(|c| c.1.as_str()),
-            Slot::RequestId => self.configure.as_ref().and_then(|c| c.2.as_deref()),
-            Slot::Driver => self.driver.as_deref(),
         }
     }
 
@@ -801,7 +793,46 @@ fn req_clip(parts: &Parts, caps: &Caps, slot: Slot) -> String {
     clip_chars(parts.raw(slot).unwrap_or_default(), caps.get(slot))
 }
 
-fn render(parts: &Parts, caps: &Caps, truncated: bool) -> WorkerDigest {
+/// The wire name of a slot, for the `shrunk` list.
+fn slot_field(slot: Slot) -> &'static str {
+    match slot {
+        Slot::Head | Slot::Tail => "lastText",
+        Slot::Question => "question",
+        Slot::Args => "argsSummary",
+        Slot::WatchDetail => "watch",
+        Slot::TurnError => "turn",
+        Slot::Reason => "reason",
+        Slot::Branch => "branch",
+        Slot::Name => "name",
+        Slot::Tool => "tool",
+        Slot::ModelReq | Slot::ModelEff => "model",
+        Slot::EffortReq | Slot::EffortEff => "effort",
+        Slot::Task => "taskId",
+        Slot::Sha => "sha",
+        Slot::ProjectId => "projectId",
+        Slot::WorkerId => "workerId",
+        Slot::InstanceId => "instanceId",
+    }
+}
+
+/// Fields whose rendered text is shorter than the source, in shrink order.
+fn shrunk_fields(parts: &Parts, caps: &Caps) -> Vec<String> {
+    let mut fields = Vec::new();
+    for (slot, _, _) in SLOTS {
+        let Some(raw) = parts.raw(slot) else {
+            continue;
+        };
+        if raw.chars().count() > caps.get(slot) {
+            let field = slot_field(slot);
+            if !fields.iter().any(|seen| seen == field) {
+                fields.push(field.to_string());
+            }
+        }
+    }
+    fields
+}
+
+fn render(parts: &Parts, caps: &Caps) -> WorkerDigest {
     let last_text = parts.last_text.as_deref().map(|text| {
         let chars: Vec<char> = text.chars().collect();
         let head_cap = caps.get(Slot::Head);
@@ -819,73 +850,55 @@ fn render(parts: &Parts, caps: &Caps, truncated: bool) -> WorkerDigest {
                 chars[chars.len() - tail_cap..].iter().collect(),
             )
         };
-        DigestText {
-            head,
-            tail,
-            chars: chars.len() as u64,
-        }
+        DigestText { head, tail }
     });
     WorkerDigest {
         v: 1,
-        worker: DigestWorker {
-            id: req_clip(parts, caps, Slot::WorkerId),
-            name: req_clip(parts, caps, Slot::Name),
-            instance_id: opt_clip(parts, caps, Slot::InstanceId),
-            harness: clip_chars(&parts.harness, 24),
-            driver: opt_clip(parts, caps, Slot::Driver),
-        },
-        state: DigestState {
-            roster: parts.roster.clone(),
-            reason: opt_clip(parts, caps, Slot::Reason),
-            lifecycle: parts.lifecycle.clone(),
-            activity: parts.activity.clone(),
+        worker_id: parts.worker_id.clone(),
+        instance_id: parts.instance_id.clone(),
+        name: req_clip(parts, caps, Slot::Name),
+        project_id: opt_clip(parts, caps, Slot::ProjectId),
+        task_id: opt_clip(parts, caps, Slot::Task),
+        branch: req_clip(parts, caps, Slot::Branch),
+        sha: opt_clip(parts, caps, Slot::Sha),
+        roster: DigestRoster {
+            state: parts.roster.clone(),
             watch: parts.watch.clone(),
-            watch_detail: opt_clip(parts, caps, Slot::WatchDetail),
-            watch_age_secs: parts.watch_age_secs,
         },
         turn: parts.turn.as_ref().map(|(status, at, _)| DigestTurn {
-            status: clip_chars(status, 32),
-            at: at.clone(),
-            error: opt_clip(parts, caps, Slot::TurnError),
+            result: clip_chars(status, 32),
+            ended_at: at.clone(),
         }),
         last_text,
         pending: parts.pending.as_ref().map(|pending| DigestPending {
             kind: pending.kind.clone(),
-            id: req_clip(parts, caps, Slot::PendingId),
             question: req_clip(parts, caps, Slot::Question),
             tool: opt_clip(parts, caps, Slot::Tool),
-            args_untrusted: opt_clip(parts, caps, Slot::Args),
-            age_secs: pending.age_secs,
+            args_summary: opt_clip(parts, caps, Slot::Args),
         }),
-        model: DigestPair {
+        model: DigestModel {
             requested: opt_clip(parts, caps, Slot::ModelReq),
             effective: opt_clip(parts, caps, Slot::ModelEff),
+            effort: DigestEffort {
+                requested: opt_clip(parts, caps, Slot::EffortReq),
+                effective: opt_clip(parts, caps, Slot::EffortEff),
+            },
+            configure: parts
+                .configure
+                .as_ref()
+                .map(|(state, request_id)| DigestConfigure {
+                    state: state.clone(),
+                    request_id: request_id.clone(),
+                }),
         },
-        effort: DigestPair {
-            requested: opt_clip(parts, caps, Slot::EffortReq),
-            effective: opt_clip(parts, caps, Slot::EffortEff),
-        },
-        configure: parts
-            .configure
-            .as_ref()
-            .map(|(state, _, _)| DigestConfigure {
-                state: state.clone(),
-                command_id: req_clip(parts, caps, Slot::CommandId),
-                request_id: opt_clip(parts, caps, Slot::RequestId),
-            }),
         supply: parts.supply.as_ref().map(|supply| DigestSupply {
-            parked: true,
-            state: supply.state.to_string(),
+            window_id: supply.window_id.clone(),
             resets_at: supply.resets_at,
-            profile: opt_clip(parts, caps, Slot::Profile),
         }),
         queued: parts.queued,
-        task: opt_clip(parts, caps, Slot::Task),
-        branch: req_clip(parts, caps, Slot::Branch),
-        sha: opt_clip(parts, caps, Slot::Sha),
-        idle_secs: parts.idle_secs,
+        since_progress_secs: parts.idle_secs,
         tool_in_flight: parts.tool_in_flight,
-        truncated,
+        shrunk: shrunk_fields(parts, caps),
     }
 }
 
@@ -895,40 +908,36 @@ fn encoded_len(digest: &WorkerDigest) -> usize {
 
 /// The smallest document that still names its worker: the last resort when
 /// shrinking every text slot to nothing is not enough.
+/// The smallest document that still names its worker: the last resort when
+/// shrinking every text slot to nothing is not enough.
 fn skeleton(parts: &Parts) -> WorkerDigest {
-    let id: String = parts.worker_id.chars().take(64).collect();
     WorkerDigest {
         v: 1,
-        worker: DigestWorker {
-            id,
-            name: String::new(),
-            instance_id: None,
-            harness: String::new(),
-            driver: None,
-        },
-        state: DigestState {
-            roster: parts.roster.clone(),
-            reason: None,
-            lifecycle: None,
-            activity: None,
+        worker_id: parts.worker_id.chars().take(64).collect(),
+        instance_id: None,
+        name: parts.name.chars().take(64).collect(),
+        project_id: None,
+        task_id: None,
+        branch: String::new(),
+        sha: None,
+        roster: DigestRoster {
+            state: parts.roster.clone(),
             watch: None,
-            watch_detail: None,
-            watch_age_secs: None,
         },
         turn: None,
         last_text: None,
-        pending: None,
-        model: DigestPair::default(),
-        effort: DigestPair::default(),
-        configure: None,
+        pending: parts.pending.as_ref().map(|pending| DigestPending {
+            kind: pending.kind.clone(),
+            question: String::new(),
+            tool: None,
+            args_summary: None,
+        }),
+        model: DigestModel::default(),
         supply: None,
         queued: parts.queued,
-        task: None,
-        branch: String::new(),
-        sha: None,
-        idle_secs: parts.idle_secs,
+        since_progress_secs: parts.idle_secs,
         tool_in_flight: parts.tool_in_flight,
-        truncated: true,
+        shrunk: vec!["workerId".to_string()],
     }
 }
 
@@ -940,7 +949,7 @@ fn skeleton(parts: &Parts) -> WorkerDigest {
 /// three quarters — so prose shrinks long before identifiers do.
 fn fit(parts: &Parts) -> WorkerDigest {
     let mut caps = Caps::full();
-    let digest = render(parts, &caps, false);
+    let digest = render(parts, &caps);
     if encoded_len(&digest) <= WORKER_DIGEST_MAX_BYTES {
         return digest;
     }
@@ -948,6 +957,7 @@ fn fit(parts: &Parts) -> WorkerDigest {
         let candidate = SLOTS
             .iter()
             .enumerate()
+            .filter(|(_, (slot, _, _))| !UNSHRINKABLE.contains(slot))
             .map(|(index, (slot, _, weight))| (index, parts.used(*slot, caps.0[index]) * weight))
             .max_by_key(|(_, weighted)| *weighted);
         let Some((index, weighted)) = candidate else {
@@ -959,7 +969,7 @@ fn fit(parts: &Parts) -> WorkerDigest {
         let slot = SLOTS[index].0;
         let used = parts.used(slot, caps.0[index]);
         caps.0[index] = if used <= 8 { 0 } else { used * 3 / 4 };
-        let digest = render(parts, &caps, true);
+        let digest = render(parts, &caps);
         if encoded_len(&digest) <= WORKER_DIGEST_MAX_BYTES {
             return digest;
         }
@@ -1047,11 +1057,7 @@ fn build_parts(facts: &Facts<'_>) -> Parts {
                 .map(str::trim)
                 .filter(|id| !id.is_empty())
                 .map(str::to_string);
-            (
-                command.state.clone(),
-                command.command_id.clone(),
-                request_id,
-            )
+            (command.state.clone(), request_id)
         });
     let queued = commands
         .iter()
@@ -1062,7 +1068,7 @@ fn build_parts(facts: &Facts<'_>) -> Parts {
         .iter()
         .find(|row| row.blocking)
         .or_else(|| pending.first());
-    let pending_parts = pending_record.map(|row| pending_parts(row, &tail.open_tools, now));
+    let pending_parts = pending_record.map(|row| pending_parts(row, &tail.open_tools));
 
     let supply = profile.and_then(|profile| {
         let model = model_eff
@@ -1085,20 +1091,13 @@ fn build_parts(facts: &Facts<'_>) -> Parts {
         worker_id: worker.meta.id.as_id().to_string(),
         name: worker.name.clone(),
         instance_id: worker.instance_id.as_ref().map(|id| id.as_id().to_string()),
-        harness: worker.harness.clone(),
-        driver: worker.driver.clone(),
         roster: roster.to_string(),
         reason: reason.map(|text| redact_secrets(&text)),
-        lifecycle: instance.map(|row| row.lifecycle.clone()),
-        activity: instance.map(|row| row.activity.clone()),
         watch: watch.map(|w| watch_label(&w.status).to_string()),
         watch_detail: watch
             .and_then(|w| w.detail.as_deref())
             .map(redact_secrets)
             .filter(|text| !text.is_empty()),
-        watch_age_secs: watch
-            .and_then(|w| parse_unix(&String::from(w.observed_at.clone())))
-            .map(|at| (now - at).max(0)),
         turn: tail.turn.map(|(status, at)| {
             // A result observed in the journal wins; the instance marker
             // supplies the failure text the result event does not carry.
@@ -1119,6 +1118,7 @@ fn build_parts(facts: &Facts<'_>) -> Parts {
         supply,
         queued,
         task: worker.task_id.as_ref().map(|id| id.as_id().to_string()),
+        project_id: Some(worker.project_id.as_id().to_string()),
         branch: worker.branch.clone(),
         sha,
         idle_secs: last_progress.map(|at| (now - at).max(0)),
@@ -1182,29 +1182,47 @@ pub(crate) async fn collect_digest(
 
 // ── glance ─────────────────────────────────────────────────────────────────
 
-fn glance_row(worker: &WorkerRoster, why: Option<(&str, Option<String>)>, now: i64) -> GlanceRow {
-    let moved = worker
+fn glance_since(worker: &WorkerRoster, now: i64) -> Option<i64> {
+    worker
         .watch
         .as_ref()
         .and_then(|w| w.last_activity_at.clone())
         .map(String::from)
         .or_else(|| Some(String::from(worker.meta.updated_at.clone())))
-        .and_then(|stamp| parse_unix(&stamp));
-    GlanceRow {
-        id: worker.meta.id.as_id().to_string(),
+        .and_then(|stamp| parse_unix(&stamp))
+        .map(|at| (now - at).max(0))
+}
+
+fn glance_instance(worker: &WorkerRoster) -> Option<String> {
+    worker.instance_id.as_ref().map(|id| id.as_id().to_string())
+}
+
+fn glance_waiting(
+    worker: &WorkerRoster,
+    kind: &str,
+    question: Option<String>,
+    now: i64,
+) -> GlanceWaiting {
+    GlanceWaiting {
+        instance_id: glance_instance(worker),
         name: clip_chars(&worker.name, 64),
-        state: worker.state.kind().to_string(),
-        why: why.as_ref().map(|(code, _)| (*code).to_string()),
-        detail: why
-            .and_then(|(_, detail)| detail)
+        since: glance_since(worker, now),
+        kind: kind.to_string(),
+        question: question
             .map(|text| clip_chars(&redact_secrets(&text), 80))
             .filter(|text| !text.is_empty()),
-        task: worker
+    }
+}
+
+fn glance_working(worker: &WorkerRoster, now: i64) -> GlanceWorking {
+    GlanceWorking {
+        instance_id: glance_instance(worker),
+        name: clip_chars(&worker.name, 64),
+        since: glance_since(worker, now),
+        task_id: worker
             .task_id
             .as_ref()
             .map(|id| clip_chars(id.as_id().as_str(), 64)),
-        branch: clip_chars(&worker.branch, 96),
-        idle_secs: moved.map(|at| (now - at).max(0)),
     }
 }
 
@@ -1214,7 +1232,7 @@ fn classify_glance(
     workers: &[WorkerRoster],
     pending_by_instance: &HashMap<String, (String, Option<String>)>,
     now: i64,
-) -> (Vec<GlanceRow>, Vec<GlanceRow>) {
+) -> (Vec<GlanceWaiting>, Vec<GlanceWorking>) {
     let mut waiting = Vec::new();
     let mut working = Vec::new();
     for worker in workers {
@@ -1244,8 +1262,8 @@ fn classify_glance(
             }
         };
         match why {
-            Some(why) => waiting.push(glance_row(worker, Some(why), now)),
-            None => working.push(glance_row(worker, None, now)),
+            Some((kind, question)) => waiting.push(glance_waiting(worker, kind, question, now)),
+            None => working.push(glance_working(worker, now)),
         }
     }
     (waiting, working)
@@ -1254,24 +1272,28 @@ fn classify_glance(
 /// Classify, cap and total the rows of one glance.
 fn assemble_glance(
     lineage_id: String,
-    day: String,
+    generated_at: String,
     workers: &[WorkerRoster],
     pending_by_instance: &HashMap<String, (String, Option<String>)>,
     done_today: u32,
     now: i64,
 ) -> LineageGlance {
     let (mut waiting, mut working) = classify_glance(workers, pending_by_instance, now);
-    let waiting_total = u32::try_from(waiting.len()).unwrap_or(u32::MAX);
-    let working_total = u32::try_from(working.len()).unwrap_or(u32::MAX);
+    let waiting_more =
+        u32::try_from(waiting.len().saturating_sub(LINEAGE_GLANCE_ROW_CAP)).unwrap_or(u32::MAX);
+    let working_more =
+        u32::try_from(working.len().saturating_sub(LINEAGE_GLANCE_ROW_CAP)).unwrap_or(u32::MAX);
     waiting.truncate(LINEAGE_GLANCE_ROW_CAP);
     working.truncate(LINEAGE_GLANCE_ROW_CAP);
     LineageGlance {
         lineage_id,
-        day,
+        generated_at,
         waiting,
-        waiting_total,
         working,
-        working_total,
+        more: GlanceMore {
+            waiting: waiting_more,
+            working: working_more,
+        },
         done_today,
     }
 }
@@ -1427,12 +1449,6 @@ async fn lineage_glance(
     };
     let now = OffsetDateTime::now_utc();
     let day_start = now.replace_time(time::Time::MIDNIGHT);
-    let day = format!(
-        "{:04}-{:02}-{:02}",
-        day_start.year(),
-        u8::from(day_start.month()),
-        day_start.day()
-    );
     let workers = state
         .store
         .list_lineage_workers(lineage_id.clone())
@@ -1486,7 +1502,7 @@ async fn lineage_glance(
         .map_err(map_store)?;
     Ok(Json(assemble_glance(
         lineage_id,
-        day,
+        crate::config::rfc3339(now),
         &workers,
         &pending_by_instance,
         done_today,
@@ -1632,13 +1648,12 @@ mod tests {
         let worker = worker(json!({ "state": "working" }));
         let journal = vec![assistant_text("m1", "open", "all good so far")];
         let digest = digest_of(&facts(&worker, None, &journal, &[], &[], None));
-        assert!(!digest.truncated);
+        assert!(digest.shrunk.is_empty());
         let text = digest.last_text.expect("text");
         assert_eq!(
             (text.head.as_str(), text.tail.as_str()),
             ("all good so far", "")
         );
-        assert_eq!(text.chars, 15);
         assert_valid_and_bounded(&digest_of(&facts(&worker, None, &journal, &[], &[], None)));
     }
 
@@ -1687,11 +1702,14 @@ mod tests {
                 &commands,
                 None,
             ));
-            assert!(digest.truncated, "oversized input must report truncation");
+            assert!(
+                !digest.shrunk.is_empty(),
+                "oversized input must report shrinkage"
+            );
             let len = assert_valid_and_bounded(&digest);
             assert!(len <= WORKER_DIGEST_MAX_BYTES);
             // The identity of the worker and the pending kind survive.
-            assert_eq!(digest.worker.name, "c-fixture");
+            assert_eq!(digest.name, "c-fixture");
             assert_eq!(
                 digest.pending.as_ref().map(|p| p.kind.as_str()),
                 Some("approval")
@@ -1704,9 +1722,9 @@ mod tests {
         let worker = worker(json!({ "state": "working" }));
         let parts = build_parts(&facts(&worker, None, &[], &[], &[], None));
         let digest = skeleton(&parts);
-        assert!(digest.truncated);
+        assert_eq!(digest.shrunk, vec!["workerId".to_string()]);
         assert!(assert_valid_and_bounded(&digest) < 400);
-        assert_eq!(digest.worker.id, parts.worker_id);
+        assert_eq!(digest.worker_id, parts.worker_id);
     }
 
     #[test]
@@ -1718,7 +1736,6 @@ mod tests {
         let journal = vec![assistant_text("m1", "open", &long)];
         let digest = digest_of(&facts(&worker, None, &journal, &[], &[], None));
         let text = digest.last_text.expect("text");
-        assert_eq!(text.chars, 1500);
         assert!(long.starts_with(&text.head) && long.ends_with(&text.tail));
         assert!(!text.head.is_empty() && !text.tail.is_empty());
         let medium: String = long.chars().take(600).collect();
@@ -1837,15 +1854,11 @@ mod tests {
         assert_eq!(pending.kind, "approval");
         assert_eq!(pending.tool.as_deref(), Some("Bash"));
         assert_eq!(pending.question, "run it?");
-        let args = pending.args_untrusted.expect("args");
+        let args = pending.args_summary.expect("args");
         assert!(args.starts_with("command=sleep 300 && echo done"), "{args}");
         assert!(
             args.contains("token=[withheld]") && !args.contains("abc123def456"),
             "{args}"
-        );
-        assert_eq!(
-            pending.age_secs,
-            NOW - parse_unix("2026-10-29T01:06:00.000Z").unwrap()
         );
         assert!(digest.tool_in_flight);
     }
@@ -1875,7 +1888,7 @@ mod tests {
         );
         assert!(pending.question.contains("(sensitive)"));
         assert!(!pending.question.contains("hunter2-default"));
-        assert!(pending.tool.is_none() && pending.args_untrusted.is_none());
+        assert!(pending.tool.is_none() && pending.args_summary.is_none());
     }
 
     #[test]
@@ -1934,8 +1947,7 @@ mod tests {
         let journal = vec![turn_result("error")];
         let digest = digest_of(&facts(&worker, Some(&inst), &journal, &[], &[], None));
         let turn = digest.turn.expect("turn");
-        assert_eq!(turn.status, "error");
-        assert_eq!(turn.error.as_deref(), Some("API Error: 429 rate limited"));
+        assert_eq!(turn.result, "error");
     }
 
     fn provider(windows: Value, state: &str) -> ProviderRecord {
@@ -1961,11 +1973,9 @@ mod tests {
         );
         let digest = digest_of(&facts(&worker, None, &[], &[], &[], Some(&parked)));
         let supply = digest.supply.expect("parked supply");
-        assert!(supply.parked);
-        assert_eq!(supply.state, "cooling");
+        assert_eq!(supply.window_id.as_deref(), Some("primary"));
         assert_eq!(supply.resets_at, Some(reset));
-        assert_eq!(supply.profile.as_deref(), Some("acme-gateway"));
-        // A backoff-only park (no reset time known) is parked without resetsAt.
+        // A backoff-only park (no reset time known) reports the backoff window.
         let backoff = provider(
             json!([{ "id": "primary", "appliesTo": ["*"], "cooldownUntil": NOW + 60,
                      "source": "observed" }]),
@@ -1973,7 +1983,10 @@ mod tests {
         );
         let digest = digest_of(&facts(&worker, None, &[], &[], &[], Some(&backoff)));
         let supply = digest.supply.expect("backoff park");
-        assert_eq!((supply.parked, supply.resets_at), (true, Some(NOW + 60)));
+        assert_eq!(
+            (supply.window_id.as_deref(), supply.resets_at),
+            (Some("primary"), Some(NOW + 60))
+        );
         // An elapsed cooldown, or a healthy profile, shows nothing.
         let elapsed = provider(
             json!([{ "id": "primary", "appliesTo": ["*"], "cooldownUntil": NOW - 5,
@@ -2023,21 +2036,21 @@ mod tests {
             ),
         ];
         let digest = digest_of(&facts(&worker, Some(&inst), &[], &[], &commands, None));
-        let configure = digest.configure.expect("pending configure");
+        let configure = digest.model.configure.expect("pending configure");
         assert_eq!(configure.state, "queued");
         assert_eq!(configure.request_id.as_deref(), Some("effreq-abc"));
-        assert_eq!(configure.command_id, "cmd_instance.configure_queued");
         assert_eq!(
             digest.queued, 2,
             "the send and the configure are still queued"
         );
-        assert_eq!(digest.effort.requested.as_deref(), Some("medium"));
-        assert_eq!(digest.effort.effective.as_deref(), Some("low"));
+        assert_eq!(digest.model.effort.requested.as_deref(), Some("medium"));
+        assert_eq!(digest.model.effort.effective.as_deref(), Some("low"));
         assert_eq!(digest.model.requested.as_deref(), Some("claude-sonnet-5-5"));
         // Settled configures are not pending.
         let settled = vec![command("instance.configure", "settled", json!({}))];
         assert!(
             digest_of(&facts(&worker, Some(&inst), &[], &[], &settled, None))
+                .model
                 .configure
                 .is_none()
         );
@@ -2065,17 +2078,11 @@ mod tests {
             7,
             NOW,
         );
-        assert_eq!((glance.waiting_total, glance.working_total), (60, 60));
+        assert_eq!((glance.more.waiting, glance.more.working), (10, 10));
         assert_eq!(glance.waiting.len(), LINEAGE_GLANCE_ROW_CAP);
         assert_eq!(glance.working.len(), LINEAGE_GLANCE_ROW_CAP);
         assert_eq!(glance.done_today, 7);
-        assert!(
-            glance
-                .waiting
-                .iter()
-                .all(|row| row.why.as_deref() == Some("blocked"))
-        );
-        assert!(glance.working.iter().all(|row| row.why.is_none()));
+        assert!(glance.waiting.iter().all(|row| row.kind == "blocked"));
         // A pending approval makes an otherwise-working worker wait.
         let one = worker(json!({ "state": "working" }));
         let mut pending = HashMap::new();
@@ -2084,8 +2091,8 @@ mod tests {
             ("approval".to_string(), Some("Bash".to_string())),
         );
         let glance = assemble_glance("l".into(), "d".into(), &[one], &pending, 0, NOW);
-        assert_eq!(glance.waiting[0].why.as_deref(), Some("approval"));
-        assert_eq!(glance.waiting[0].detail.as_deref(), Some("Bash"));
+        assert_eq!(glance.waiting[0].kind, "approval");
+        assert_eq!(glance.waiting[0].question.as_deref(), Some("Bash"));
         assert!(glance.working.is_empty());
     }
 

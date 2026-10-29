@@ -342,38 +342,36 @@ async fn digest_is_assembled_from_stored_rows_and_stays_within_budget() -> Resul
     );
     let digest = json_of(&bytes);
     assert_eq!(digest["v"], 1);
-    assert_eq!(digest["worker"]["id"], worker_id);
-    assert_eq!(digest["worker"]["name"], "c-digest");
-    assert_eq!(digest["state"]["roster"], "working");
-    assert_eq!(digest["truncated"], true, "30k CJK characters cannot fit");
-    assert_eq!(digest["lastText"]["chars"], 30_000);
+    assert_eq!(digest["workerId"], worker_id);
+    assert_eq!(digest["name"], "c-digest");
+    assert_eq!(digest["roster"]["state"], "working");
+    assert!(
+        digest["shrunk"].as_array().is_some_and(|s| !s.is_empty()),
+        "30k CJK characters cannot fit"
+    );
     assert_eq!(digest["toolInFlight"], true);
     assert_eq!(digest["pending"]["kind"], "approval");
     assert_eq!(digest["pending"]["tool"], "Bash");
     assert_eq!(digest["pending"]["question"], "Run a long command?");
-    let args = digest["pending"]["argsUntrusted"]
-        .as_str()
-        .context("args")?;
+    let args = digest["pending"]["argsSummary"].as_str().context("args")?;
     assert!(args.starts_with("command=sleep 120"), "{args}");
     assert!(
         !args.contains("sk-ant-api03") && !args.contains("owner-typed-handoff"),
         "{args}"
     );
     assert!(args.contains("handoff=[withheld]"), "{args}");
-    assert_eq!(digest["configure"]["state"], "queued");
-    assert_eq!(digest["configure"]["requestId"], "effreq-digest");
-    assert_eq!(digest["supply"]["parked"], true);
+    assert_eq!(digest["model"]["configure"]["state"], "queued");
+    assert_eq!(digest["model"]["configure"]["requestId"], "effreq-digest");
     assert_eq!(digest["supply"]["resetsAt"], 9_999_999_999_i64);
-    assert_eq!(digest["supply"]["profile"], "relay");
     assert!(digest["queued"].as_u64().unwrap_or(0) >= 1);
     assert_eq!(digest["model"]["requested"], "claude-sonnet-5-5");
-    assert!(digest["idleSecs"].is_number());
+    assert!(digest["sinceProgressSecs"].is_number());
     assert_eq!(digest["branch"], "wt/c-digest/b-digest-md");
 
     // The operator reads the same document, addressed by worker name.
     let (status, by_name) = ctx.get(&ctx.human, "/v1/workers/c-digest/digest").await?;
     assert_eq!(status, 200);
-    assert_eq!(json_of(&by_name)["worker"]["id"], worker_id);
+    assert_eq!(json_of(&by_name)["workerId"], worker_id);
     Ok(())
 }
 
@@ -440,11 +438,12 @@ async fn an_agent_reads_only_its_own_lineages_workers_and_nothing_else_under_wor
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&bytes));
     let glance = json_of(&bytes);
     assert_eq!(glance["lineageId"], coordinator_a);
-    assert_eq!(glance["waitingTotal"], 1);
+    assert!(glance["generatedAt"].is_string());
+    assert_eq!(glance["more"]["waiting"], 0);
     assert_eq!(glance["waiting"][0]["name"], "c-owned");
-    assert_eq!(glance["waiting"][0]["why"], "approval");
-    assert_eq!(glance["waiting"][0]["detail"], "Bash");
-    assert_eq!(glance["workingTotal"], 1);
+    assert_eq!(glance["waiting"][0]["kind"], "approval");
+    assert_eq!(glance["waiting"][0]["question"], "Bash");
+    assert_eq!(glance["more"]["working"], 0);
     assert_eq!(glance["working"][0]["name"], "c-sibling");
     assert_eq!(glance["doneToday"], 0);
     // Another lineage's Agent is refused; its own glance is empty.
@@ -456,8 +455,8 @@ async fn an_agent_reads_only_its_own_lineages_workers_and_nothing_else_under_wor
     );
     assert_eq!(
         (
-            own_b["waitingTotal"].as_u64(),
-            own_b["workingTotal"].as_u64()
+            own_b["more"]["waiting"].as_u64(),
+            own_b["more"]["working"].as_u64()
         ),
         (Some(0), Some(0))
     );

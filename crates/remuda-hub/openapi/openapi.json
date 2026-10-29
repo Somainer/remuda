@@ -1867,11 +1867,10 @@
         "description": "Generated shape: LineageGlance in crates/remuda-protocol/schema/protocol.schema.json.",
         "required": [
           "lineageId",
-          "day",
+          "generatedAt",
           "waiting",
-          "waitingTotal",
           "working",
-          "workingTotal",
+          "more",
           "doneToday"
         ],
         "additionalProperties": true
@@ -4768,14 +4767,13 @@
         "description": "Generated shape: WorkerDigest in crates/remuda-protocol/schema/protocol.schema.json.",
         "required": [
           "v",
-          "worker",
-          "state",
-          "model",
-          "effort",
-          "queued",
+          "workerId",
+          "name",
           "branch",
-          "toolInFlight",
-          "truncated"
+          "roster",
+          "model",
+          "queued",
+          "toolInFlight"
         ],
         "additionalProperties": true
       },

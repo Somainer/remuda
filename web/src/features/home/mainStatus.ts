@@ -289,12 +289,14 @@ export function mainEcho(input: {
   busy: boolean;
   /** The connection to the Hub is live. */
   online: boolean;
+  /** The newest reply an earlier chapter showed, for a chapter with none yet. */
+  carriedReply?: string | null;
 }): MainEcho {
-  const { entry, bubbles, tail, busy, online } = input;
+  const { entry, bubbles, tail, busy, online, carriedReply } = input;
   const lineage = new Set<string>([entry.instance.id, ...entry.chapterIds]);
   const bubble = [...bubbles].reverse().find((b) => lineage.has(b.instanceId) && !b.held) ?? null;
-  const lastReply = tail?.reply ?? null;
-  const replyEcho: MainEcho = lastReply ? { kind: "reply", text: lastReply.text } : { kind: "empty" };
+  const lastText = tail?.reply?.text ?? carriedReply ?? null;
+  const replyEcho: MainEcho = lastText ? { kind: "reply", text: lastText } : { kind: "empty" };
   if (!bubble) return replyEcho;
   const state = bubble.outboxState;
   if (state === "rejected") {

@@ -185,6 +185,13 @@ describe("mainEcho line 2", () => {
     expect(mainEcho({ entry: entry(), bubbles: [pending], tail: null, busy: false, online: false }).kind).toBe("queued");
   });
 
+  it("a fresh chapter with no reply of its own keeps the carried reply", () => {
+    const fresh = readMainTail([]);
+    expect(
+      mainEcho({ entry: entry(), bubbles: [], tail: fresh, busy: false, online: true, carriedReply: "上一章的回复" }),
+    ).toEqual({ kind: "reply", text: "上一章的回复" });
+  });
+
   it("ignores sends to other sessions", () => {
     const other = bubble({ instanceId: "ins_other" as Id });
     expect(mainEcho({ entry: entry(), bubbles: [other], tail: tailWithReply, busy: false, online: true }).kind).toBe("reply");

@@ -18,8 +18,11 @@ const MAIN_TAIL = 64;
  * The bounded journal tail behind line 2, re-read only when the chapter's
  * durableSeq moves (the 2 s instance poll carries it).
  */
-function useMainTail(instance: Instance | null): MainTail | null {
+function useMainTail(instance: Instance | null): { tail: MainTail | null; carried: string | null } {
   const [state, setState] = useState<{ key: string; tail: MainTail } | null>(null);
+  // The newest reply seen on ANY chapter of this card: a fresh chapter has
+  // no reply of its own yet, and the conversation is one across chapters.
+  const [carried, setCarried] = useState<string | null>(null);
   const id = instance?.id ?? "";
   const journalId = instance?.journalId ?? "";
   const seq = String(instance?.durableSeq ?? "0");
@@ -33,7 +36,10 @@ function useMainTail(instance: Instance | null): MainTail | null {
     api
       .eventsRead({ journalId: journalId as Id, afterSeq: String(from) as U64, limit: MAIN_TAIL })
       .then((page) => {
-        if (!cancelled) setState({ key, tail: readMainTail(page.events) });
+        if (cancelled) return;
+        const tail = readMainTail(page.events);
+        setState({ key, tail });
+        if (tail.reply) setCarried(tail.reply.text);
       })
       .catch(() => {
         // Unreadable now: allow the next poll edge to try again.
@@ -43,8 +49,8 @@ function useMainTail(instance: Instance | null): MainTail | null {
       cancelled = true;
     };
   }, [id, journalId, seq, key]);
-  if (!state || !state.key.startsWith(`${id}@`)) return null;
-  return state.tail;
+  const tail = state && state.key.startsWith(`${id}@`) ? state.tail : null;
+  return { tail, carried };
 }
 
 /**
@@ -79,12 +85,13 @@ function MainCardBody({ entry, placement }: { entry: MainEntry; placement: "phon
     summary: hub.summaries[instance.id],
     nowMs,
   });
-  const tail = useMainTail(instance);
+  const { tail, carried } = useMainTail(instance);
   const online = hub.connection === "live";
   const echo = mainEcho({
     entry,
     bubbles: hub.bubbles,
     tail,
+    carriedReply: carried,
     busy: status.phase === "working" || status.phase === "asking",
     online,
   });

@@ -73,6 +73,7 @@ import {
   type PasskeyView,
   type PtyKey,
   type ResumeMode,
+  type SeenView,
   type WorktreeCreateSpec,
 } from "./api";
 import {
@@ -952,6 +953,30 @@ function sameArrayIdentity<T>(next: readonly T[], prev: readonly T[]): boolean {
   return true;
 }
 
+/** seen-hub: a turn end newer than the seen seq ("never seen" sits below 0). */
+export function seenUnseen(turnEndSeq?: U64, seenSeq?: U64): boolean {
+  return turnEndSeq != null && BigInt(turnEndSeq) > (seenSeq == null ? -1n : BigInt(seenSeq));
+}
+
+function maxSeq(a?: U64, b?: U64): U64 | undefined {
+  if (a == null) return b;
+  if (b == null) return a;
+  return BigInt(b) > BigInt(a) ? b : a;
+}
+
+/**
+ * seen-hub: fold another copy's seen state into `base`. Both seqs only grow on
+ * the Hub, so the newer of each wins and `unseen` follows from them — a poll
+ * that predates a seen report (or a broadcast) can never bring ◉ back.
+ * Returns `base` itself when nothing moves.
+ */
+function mergeSeen(base: Instance, other: Pick<Instance, "seenSeq" | "turnEndSeq">): Instance {
+  const seenSeq = maxSeq(base.seenSeq, other.seenSeq);
+  const turnEndSeq = maxSeq(base.turnEndSeq, other.turnEndSeq);
+  if (seenSeq === base.seenSeq && turnEndSeq === base.turnEndSeq) return base;
+  return { ...base, seenSeq, turnEndSeq, unseen: seenUnseen(turnEndSeq, seenSeq) };
+}
+
 function mergeInstanceSnapshots(
   incoming: Instance[],
   current: Instance[],
@@ -960,9 +985,10 @@ function mergeInstanceSnapshots(
   outstanding?: ReadonlySet<number>,
 ): Instance[] {
   const previous = new Map(current.map((instance) => [instance.id, instance]));
-  const merged = incoming.map((instance) => {
-    const newer = previous.get(instance.id);
-    if (newer && BigInt(newer.durableSeq) > BigInt(instance.durableSeq)) return newer;
+  const merged = incoming.map((polled) => {
+    const newer = previous.get(polled.id);
+    if (newer && BigInt(newer.durableSeq) > BigInt(polled.durableSeq)) return mergeSeen(newer, polled);
+    const instance = newer ? mergeSeen(polled, newer) : polled;
     // Equal content from a fresh JSON parse: keep the prior object identity so
     // an unchanged poll is a no-op for every memoized consumer.
     if (newer && structuralEqual(newer, instance)) return newer;
@@ -4956,7 +4982,7 @@ class HubStore {
           this.settlementRefreshTimer = null;
           void this.refresh().catch(() => undefined);
         }, 300);
-      });
+      }, (view) => this.applySeenView(view));
       // Re-validate immediately before installing the connection (and through
       // it the outbox), and again after the install settles before polling.
       if (!extLive()) return "retired";
@@ -7143,6 +7169,63 @@ class HubStore {
       this.toast(error instanceof Error ? error.message : "恢复会话失败");
       return null;
     }
+  }
+
+  /**
+   * seen-hub: report that the owner saw `instanceId` up to `durableSeq`
+   * (default: the row's durable seq). Optimistic on this device (home.md §7):
+   * the row stops reading unseen at once, clamped to its journal the way the
+   * Hub clamps; other devices follow on the broadcast or their next poll. A
+   * refused or failed report rolls the optimistic seen back, so it never
+   * leaves a local "seen" the Hub does not share. Pass `visible` from a page
+   * that is showing the session (`true`, renewed while on screen) or leaving
+   * it (`false`); omit it for a list action such as "mark all seen".
+   * Rejections propagate; callers that report in the background should catch.
+   */
+  async markSeen(instanceId: Id, options: { durableSeq?: U64; visible?: boolean } = {}): Promise<SeenView | null> {
+    const row = this.state.instances.find((instance) => instance.id === instanceId);
+    const durableSeq = options.durableSeq ?? row?.durableSeq;
+    if (durableSeq == null) return null;
+    const optimistic = row && BigInt(durableSeq) > BigInt(row.durableSeq) ? row.durableSeq : durableSeq;
+    const previous = row?.seenSeq;
+    this.applySeenView({ instanceId, unseen: false, seenSeq: optimistic });
+    try {
+      const view = await api.instanceSeen(instanceId, durableSeq, options.visible);
+      this.applySeenView(view);
+      return view;
+    } catch (error) {
+      this.rollbackSeen(instanceId, optimistic, previous);
+      throw error;
+    }
+  }
+
+  /**
+   * Undo an optimistic seen the Hub never confirmed, unless something moved
+   * the row since. Erring low is safe: the next poll merges the Hub's real
+   * seen seq back in.
+   */
+  private rollbackSeen(instanceId: Id, optimistic: U64, previous: U64 | undefined) {
+    const instances = this.state.instances;
+    const index = instances.findIndex((instance) => instance.id === instanceId);
+    if (index < 0 || previous === optimistic || instances[index].seenSeq !== optimistic) return;
+    const next = instances.slice();
+    next[index] = { ...instances[index], seenSeq: previous, unseen: seenUnseen(instances[index].turnEndSeq, previous) };
+    this.emit({ instances: next });
+  }
+
+  /** seen-hub: fold a seen view (route answer or `instance.seen` broadcast). */
+  applySeenView(view: SeenView) {
+    const instances = this.state.instances;
+    const index = instances.findIndex((instance) => instance.id === view.instanceId);
+    if (index < 0) return;
+    const merged = mergeSeen(instances[index], {
+      seenSeq: view.seenSeq as U64 | undefined,
+      turnEndSeq: view.turnEndSeq as U64 | undefined,
+    });
+    if (merged === instances[index]) return;
+    const next = instances.slice();
+    next[index] = merged;
+    this.emit({ instances: next });
   }
 
   /**

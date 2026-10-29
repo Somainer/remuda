@@ -53,6 +53,7 @@ import type { ResumeMode } from "../lib/api";
 import { hubStore, type HubState } from "../lib/store";
 import { e2eSeamsEnabled } from "../lib/e2eSeams";
 import { usePublishedElementHeight } from "../lib/usePublishedElementHeight";
+import { useSeenReporter } from "../features/session/useSeenReporter";
 import type { Id } from "../types/wire";
 import { useWorkbenchViewport } from "../lib/viewport";
 import { useSpaceWorkbench } from "../features/spaces/useSpaceWorkbench";
@@ -327,6 +328,13 @@ function SessionPageBody({
       if (instanceId && !isTtyLabFixtureId(instanceId)) hubStore.releaseRouteTarget(instanceId);
     };
   }, [instanceId]);
+
+  // seen-hub: this page on screen is the owner looking at the session.
+  useSeenReporter(
+    instanceId && !isTtyLabFixtureId(instanceId) ? instanceId : undefined,
+    hub.instance?.durableSeq,
+    hub.instance?.unseen === true,
+  );
 
   // D-056 §6: per-model default + ultracode capability rows (best-effort).
   useEffect(() => {

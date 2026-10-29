@@ -128,3 +128,34 @@ it("sends a release with keepalive so it survives the page unloading", async () 
   await api.instanceSeen(ID, "3" as U64);
   expect(JSON.parse(String(fetchSpy.mock.calls.at(-1)?.[1]?.body))).toEqual({ durableSeq: "3" });
 });
+
+it("a visible report answered unseen re-reports once at the answer's turn end, never more", async () => {
+  await boot(row({ durableSeq: "6" as U64, unseen: false, turnEndSeq: "4" as U64, seenSeq: "4" as U64 }));
+  // The turn ended (seq 9) just before this report's lease: the answer still
+  // reads unseen. The page is on screen, so it covers that turn end once.
+  const post = vi.spyOn(api, "instanceSeen")
+    .mockResolvedValueOnce({ instanceId: ID, unseen: true, seenSeq: "6", turnEndSeq: "9" })
+    .mockResolvedValueOnce({ instanceId: ID, unseen: true, seenSeq: "9", turnEndSeq: "10" })
+    .mockResolvedValue({ instanceId: ID, unseen: true, seenSeq: "9", turnEndSeq: "11" });
+  const view = await hubStore.markSeen(ID, { visible: true });
+  expect(post.mock.calls).toEqual([
+    [ID, "6", true],
+    [ID, "9", true],
+  ]);
+  // Bounded: an answer that is still unseen is left to the next renewal.
+  expect(view).toMatchObject({ seenSeq: "9", turnEndSeq: "10" });
+  expect(current()).toMatchObject({ seenSeq: "9", turnEndSeq: "10", unseen: true });
+
+  // Reports that are not about the screen never re-report.
+  post.mockClear();
+  post.mockResolvedValueOnce({ instanceId: ID, unseen: true, seenSeq: "9", turnEndSeq: "12" });
+  await hubStore.markSeen(ID);
+  expect(post).toHaveBeenCalledTimes(1);
+
+  // A failed re-report keeps the first answer and does not throw.
+  post.mockClear();
+  post.mockResolvedValueOnce({ instanceId: ID, unseen: true, seenSeq: "9", turnEndSeq: "13" })
+    .mockRejectedValueOnce(new Error("503"));
+  await expect(hubStore.markSeen(ID, { visible: true })).resolves.toMatchObject({ turnEndSeq: "13" });
+  expect(post).toHaveBeenCalledTimes(2);
+});

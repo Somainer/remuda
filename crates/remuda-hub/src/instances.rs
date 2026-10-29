@@ -95,16 +95,10 @@ async fn mark_seen(
     let seq = body.durable_seq.value()?;
     let marked = state
         .store
-        .mark_seen(instance_id.clone(), seq)
+        .report_seen(instance_id, &device.id, seq, body.visible)
         .await
         .map_err(http::map_store)?
         .ok_or(HubError::NotFound)?;
-    let presence = state.store.seen_presence();
-    match body.visible {
-        Some(true) => presence.hold(&instance_id, &device.id),
-        Some(false) => presence.release(&instance_id, &device.id),
-        None => {}
-    }
     if marked.advanced {
         crate::ws::publish_seen(&state.bus, &marked.view);
     }

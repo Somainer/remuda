@@ -246,6 +246,32 @@ pub(crate) fn fold_turn_end(
 }
 
 impl Store {
+    /// One seen report from an owner device: the route's write path.
+    ///
+    /// `visible: Some(true)` takes the device's lease BEFORE the seen write is
+    /// queued, so a turn end appended while this report waits on the writer is
+    /// folded seen instead of racing it (a lease taken only after the write
+    /// returned let such a turn end read unseen on the page being shown). The
+    /// lease stays even if the write fails: the client is still showing the
+    /// session and renews. `Some(false)` releases only after a successful
+    /// write, so a failed leave keeps nothing it did not already have.
+    pub async fn report_seen(
+        &self,
+        instance_id: String,
+        device_id: &str,
+        durable_seq: i64,
+        visible: Option<bool>,
+    ) -> Result<Option<SeenMarked>, StoreError> {
+        if visible == Some(true) {
+            self.seen_presence().hold(&instance_id, device_id);
+        }
+        let marked = self.mark_seen(instance_id.clone(), durable_seq).await?;
+        if visible == Some(false) && marked.is_some() {
+            self.seen_presence().release(&instance_id, device_id);
+        }
+        Ok(marked)
+    }
+
     /// Raise the owner's seen seq for `instance_id` to `durable_seq`, clamped
     /// to the instance's durable seq. `None` when the instance does not exist.
     pub async fn mark_seen(
@@ -470,6 +496,101 @@ mod tests {
             .unwrap();
         assert!(!row.unseen);
         assert_eq!(row.seen_seq, Some(end.to_string()));
+        store.close().await;
+    }
+
+    /// r2 item 3: a `visible: true` report takes its lease BEFORE its seen
+    /// write is queued, so a turn end appended while the report waits on the
+    /// writer is folded seen instead of racing it. The writer is parked so the
+    /// order is deterministic: the report's write sits behind the park, and the
+    /// lease must already be held.
+    #[tokio::test]
+    async fn a_visible_report_holds_its_lease_before_its_write_is_queued() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, host) = crate::store_test_support::open_with_host(dir.path(), "seen-race")
+            .await
+            .unwrap();
+        let id = "ins-seen-race".to_owned();
+        store
+            .ensure_instance(host.clone(), id.clone())
+            .await
+            .unwrap();
+        store
+            .append_journal(
+                host.clone(),
+                id.clone(),
+                None,
+                turn("turn_started", "working", serde_json::json!({})),
+            )
+            .await
+            .unwrap();
+        let shown = store.get_instance(id.clone()).await.unwrap().unwrap();
+
+        // Park the single writer.
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let park = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .run_named("seen_race_park", move |_| {
+                        let _ = parked_tx.send(());
+                        let _ = release_rx.recv();
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        tokio::task::spawn_blocking(move || parked_rx.recv())
+            .await
+            .unwrap()
+            .expect("writer parked");
+
+        // The desk opens the session: its report queues behind the park.
+        let report = {
+            let store = store.clone();
+            let id = id.clone();
+            let seq: i64 = shown.durable_seq.parse().unwrap();
+            tokio::spawn(async move { store.report_seen(id, "dev_desk", seq, Some(true)).await })
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !store.seen_presence().is_visible(&id) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            store.seen_presence().is_visible(&id),
+            "the lease is held while the report's seen write is still queued"
+        );
+
+        // The turn ends while the report is still queued, then the writer runs.
+        let end = {
+            let store = store.clone();
+            let host = host.clone();
+            let id = id.clone();
+            tokio::spawn(async move {
+                store
+                    .append_journal(
+                        host,
+                        id,
+                        None,
+                        turn(
+                            "result",
+                            "turn_done",
+                            serde_json::json!({ "settledRootTurn": "true" }),
+                        ),
+                    )
+                    .await
+            })
+        };
+        release_tx.send(()).unwrap();
+        park.await.unwrap().unwrap();
+        report.await.unwrap().unwrap().expect("instance exists");
+        let end = end.await.unwrap().unwrap();
+        assert!(end.seen.is_some(), "a settled turn end");
+
+        let row = store.get_instance(id).await.unwrap().unwrap();
+        assert!(!row.unseen, "watched turn end folded seen: {row:?}");
+        assert_eq!(row.seen_seq, Some(end.record.seq.to_string()));
         store.close().await;
     }
 

@@ -7189,14 +7189,29 @@ class HubStore {
     const optimistic = row && BigInt(durableSeq) > BigInt(row.durableSeq) ? row.durableSeq : durableSeq;
     const previous = row?.seenSeq;
     this.applySeenView({ instanceId, unseen: false, seenSeq: optimistic });
+    let view: SeenView;
     try {
-      const view = await api.instanceSeen(instanceId, durableSeq, options.visible);
+      view = await api.instanceSeen(instanceId, durableSeq, options.visible);
       this.applySeenView(view);
-      return view;
     } catch (error) {
       this.rollbackSeen(instanceId, optimistic, previous);
       throw error;
     }
+    // A turn end that committed just before this report's lease reads unseen
+    // in the answer although the page is showing it: cover it once, at the
+    // answer's own turn end (the Hub clamps to its journal). Bounded — the
+    // follow-up never re-reports, and a failed follow-up keeps the first
+    // answer; the next renewal covers anything newer.
+    if (options.visible === true && view.unseen && view.turnEndSeq != null) {
+      try {
+        const again = await api.instanceSeen(instanceId, view.turnEndSeq as U64, true);
+        this.applySeenView(again);
+        return again;
+      } catch {
+        return view;
+      }
+    }
+    return view;
   }
 
   /**

@@ -115,7 +115,7 @@ function MainSessionBarBody({ entry, instance, mobile }: { entry: MainEntry; ins
               打开当前 Main
             </Link>
           ) : null}
-          {entry.live && turnBusy ? (
+          {entry.live && !superseded && turnBusy ? (
             <button
               type="button"
               className={css.btn}
@@ -127,7 +127,7 @@ function MainSessionBarBody({ entry, instance, mobile }: { entry: MainEntry; ins
               {busy === "stop" ? "打断中…" : "打断"}
             </button>
           ) : null}
-          {entry.live ? (
+          {entry.live && !superseded ? (
             <button
               type="button"
               className={css.btn}

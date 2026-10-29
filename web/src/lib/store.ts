@@ -1360,7 +1360,7 @@ class HubStore {
    */
   private reconcileOwed = new Map<
     Id,
-    { bindGen: number; attemptId: number | null; epoch: number; commands: Set<Id> }
+    { bindGen: number; attemptId: number | null; gen: number; commands: Set<Id> }
   >();
   /**
    * Ruling AD: bounded debt-driven tail re-read state per instance. `attempts`
@@ -1388,6 +1388,14 @@ class HubStore {
    * collapse into the ONE coalesced self-contained pass in runOwedTailPass.
    */
   private owedTailRunning = new Set<Id>();
+  /**
+   * r6 item 1: debt OWNER generation. Bumped by {@link retireOwedDebts} on
+   * every retirement — the external teardown AND a successful credential turn
+   * that establishes a different device (ordinary succession, which bumps no
+   * identity epoch). Debts are stamped with it, and every debt pass and drain
+   * job captures it, so nothing a predecessor queued can act for a successor.
+   */
+  private owedGeneration = 0;
   /**
    * Ruling AD r2 item 3: command ids whose durable terminal ("unknown")
    * exhaustion write FAILED to commit. The durable row stays non-terminal,
@@ -1749,6 +1757,24 @@ class HubStore {
    * recovering/live, so the banner can never stick on a stale false offline.
    * Idempotent.
    */
+  /**
+   * Retire EVERY catch-up debt with its bounded tail timer, running marker
+   * and in-memory not-confirmed presentation, and start a new debt owner
+   * generation (r6 item 1). Used by the retirement teardown and by a
+   * successful credential turn that establishes a different device.
+   */
+  private retireOwedDebts() {
+    this.owedGeneration += 1;
+    this.reconcileOwed.clear();
+    // Ruling AD: retire every bounded tail re-read timer with the binding.
+    for (const tail of this.owedTail.values()) {
+      if (tail.timer) clearTimeout(tail.timer);
+    }
+    this.owedTail.clear();
+    this.owedTailRunning.clear();
+    this.owedPresentedUnknown.clear();
+  }
+
   private disposeConnectionForAuthChange() {
     // Gate 41 S1/S2: drop the install stamp with the machine so a later
     // same-epoch (impossible after an external epoch bump) or post-login
@@ -1766,14 +1792,7 @@ class HubStore {
     // clears the machine. It is idempotent — logout can invoke it once
     // directly and again through externalIdentityRetire — so no counter
     // lives here.
-    this.reconcileOwed.clear();
-    // Ruling AD: retire every bounded tail re-read timer with the binding.
-    for (const tail of this.owedTail.values()) {
-      if (tail.timer) clearTimeout(tail.timer);
-    }
-    this.owedTail.clear();
-    this.owedTailRunning.clear();
-    this.owedPresentedUnknown.clear();
+    this.retireOwedDebts();
     this.followReadyState.clear();
     this.followFrameAt.clear();
     // r12: a deferred route departure must never fire under the next identity,
@@ -3950,7 +3969,7 @@ class HubStore {
     const debt = existing ?? {
       bindGen: 0,
       attemptId: null,
-      epoch: this.identityEpoch,
+      gen: this.owedGeneration,
       commands: new Set<Id>(),
     };
     if (commandIds) for (const commandId of commandIds) debt.commands.add(commandId);
@@ -4025,12 +4044,12 @@ class HubStore {
    * passes are rejected in the null window — by design without re-arming.
    * Re-check each of them now: evidence folded while no box was installed
    * retires the durable row, and anything still unobserved gets its bounded
-   * tail re-armed. Debts of another identity epoch are never touched (every
-   * retirement clears the map; the epoch check is defence in depth).
+   * tail re-armed. Debts of another owner generation are never touched
+   * (every retirement clears the map; the check is defence in depth).
    */
   private resumeOwedDebts() {
     for (const [instanceId, debt] of this.reconcileOwed) {
-      if (debt.epoch !== this.identityEpoch) continue;
+      if (debt.gen !== this.owedGeneration) continue;
       this.settleFromJournal(instanceId, this.state.events[instanceId] ?? []);
       if (this.owedCommandLacksEvidence(instanceId)) {
         this.scheduleOwedTail(instanceId, OWED_TAIL_BASE_BACKOFF_MS);
@@ -4195,6 +4214,7 @@ class HubStore {
     // pass's tail record BEFORE the job is queued, so a stale job can be
     // rejected before any mutation.
     const epoch = this.identityEpoch;
+    const gen = this.owedGeneration;
     const box = this.outbox;
     const debt = this.reconcileOwed.get(instanceId);
     // Immediate fallback triggers (resume failure / bind-away / watchdog) run
@@ -4208,6 +4228,7 @@ class HubStore {
     const capturedTail = tail;
     const stillOurs = () =>
       this.identityEpoch === epoch &&
+      this.owedGeneration === gen &&
       this.outbox === box &&
       this.owedTail.get(instanceId) === capturedTail &&
       this.reconcileOwed.get(instanceId) === debt;
@@ -4315,7 +4336,7 @@ class HubStore {
       } finally {
         // Only the owning identity's job clears its running marker; a
         // retired job leaves the successor's (fresh) marker untouched.
-        if (this.identityEpoch === epoch) {
+        if (this.identityEpoch === epoch && this.owedGeneration === gen) {
           this.owedTailRunning.delete(instanceId);
           // A same-identity pass that lost ownership (its debt generation was
           // cleared, or the Outbox was replaced while it was queued or parked)
@@ -4723,13 +4744,15 @@ class HubStore {
         // OWN tail read when parked across logout; a nested gap fill that read
         // starts is fenced by generation only (see the catch-up comment).
         const drainEpoch = this.identityEpoch;
-        const drainStillOurs = () => this.identityEpoch === drainEpoch && this.outbox === box;
+        const drainGen = this.owedGeneration;
+        const drainStillOurs = () =>
+          this.identityEpoch === drainEpoch && this.owedGeneration === drainGen && this.outbox === box;
         await this.chainReconcile(instanceId, async () => {
           // r4 item 2: this callback may have been QUEUED before an auth
           // retirement (chained promises outlive logout — only timers are
           // torn down). Reject the retired job at ENTRY, before recording
           // debt, reading or settling anything.
-          if (this.identityEpoch !== drainEpoch || this.outbox !== box) return;
+          if (!drainStillOurs()) return;
           // Ruling AD: record PER-COMMAND catch-up debt for every accepted
           // (Hub-accepted, journal-unconfirmed) "sent" row of this instance
           // BEFORE any read. An empty resync certifies live but proves nothing
@@ -5713,6 +5736,13 @@ class HubStore {
     // in the cold mock path, a peer event); if the epoch moved after the last
     // check, write/publish nothing.
     if (this.extEpoch !== ext) return "retired";
+    // r6 item 1: a credential that establishes a DIFFERENT device must not
+    // adopt the predecessor's catch-up debts (ordinary succession bumps no
+    // identity epoch). Retire them exactly as the retirement teardown does,
+    // before the successor's Outbox can install. A same-device re-login keeps
+    // them, and a failed request never reaches here (its catch restores the
+    // predecessor's Outbox with the debts intact).
+    if (previousDeviceId !== session.deviceId) this.retireOwedDebts();
     writeSession(session, { mock: api.mock });
     // Gate 49 items 5/6: when the credential establishes a DIFFERENT identity,
     // do not republish the predecessor's instance rows under the new session:

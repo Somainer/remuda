@@ -1542,3 +1542,71 @@ it("r5 item 2: journal evidence folded while the Outbox is disposed retires the 
   });
   expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
 }, 15_000);
+
+it("r6 item 1: a direct login that establishes a different device retires the predecessor's debts", async () => {
+  // Session A owes a sent command. A public login WITHOUT logout succeeds as
+  // device B: ordinary succession bumps no identity epoch, so B's Outbox
+  // install must not adopt A's debt, arm its tail, or settle A's row through
+  // either Outbox — even though the debt reader could find the evidence.
+  const SESSION_KEY = "runtime.device-session";
+  localStorage.setItem(SESSION_KEY, JSON.stringify({ deviceId: "dev_device_a", name: "desk-a" }));
+  try {
+    const { api, hubStore } = await fresh();
+    await mountFollow(api, hubStore);
+    vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+    vi.spyOn(api, "hostList").mockResolvedValue({ items: [], nextCursor: null } as Awaited<
+      ReturnType<Api["hostList"]>
+    >);
+    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as Awaited<ReturnType<Api["deviceList"]>>);
+    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as Awaited<ReturnType<Api["passkeyList"]>>);
+    vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+    vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+    vi.spyOn(api, "login").mockResolvedValue({
+      deviceId: "dev_device_b",
+      token: "tok_device_b",
+      name: "desk-b",
+    } as Awaited<ReturnType<Api["login"]>>);
+    vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+      const commandId = _args[4] as string;
+      return Promise.resolve(commandResult(commandId, "accepted"));
+    });
+    type Box = { get: (id: string) => OutboxRecord | undefined };
+    const h = hubStore as unknown as {
+      outbox: Box | null;
+      owedTail: Map<string, { timer: ReturnType<typeof setTimeout> | null }>;
+    };
+
+    await hubStore.send(INSTANCE, "owed by device A");
+    const bubble = () => hubStore.getSnapshot().bubbles[0]!;
+    await vi.waitFor(() => expect(bubble().outboxState).toBe("sent"));
+    await vi.waitFor(() => expect(h.owedTail.get(INSTANCE)?.timer).not.toBeNull());
+    const commandId = bubble().commandId!;
+    const boxA = h.outbox!;
+
+    // Only a DEBT read (always bounded with beforeSeq) can see A's command;
+    // every other read stays empty so no live/resync fold settles it.
+    vi.mocked(api.eventsRead).mockImplementation(async (args) =>
+      args.beforeSeq === undefined ? EMPTY_PAGE : userMessagePage(commandId),
+    );
+    vi.mocked(api.instanceList).mockResolvedValue({ items: [], nextCursor: null });
+    await expect(hubStore.login("bootstrap", "secret", "dev")).resolves.toBe("settled");
+    await vi.waitFor(() => expect(h.outbox).not.toBeNull());
+    expect(h.outbox).not.toBe(boxA);
+    const debtReadsAtLogin = vi.mocked(api.eventsRead).mock.calls.filter((c) => c[0].beforeSeq !== undefined).length;
+
+    // A's debt is retired with its tail; nothing was adopted by B.
+    expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+    expect(h.owedTail.has(INSTANCE)).toBe(false);
+
+    // Give any (wrongly) re-armed tail time to fire: no debt read, no patch.
+    await new Promise((resolve) => setTimeout(resolve, 1_200));
+    expect(vi.mocked(api.eventsRead).mock.calls.filter((c) => c[0].beforeSeq !== undefined).length).toBe(
+      debtReadsAtLogin,
+    );
+    expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+    expect(h.outbox?.get(commandId)?.state).toBe("sent");
+    expect(boxA.get(commandId)?.state).toBe("sent");
+  } finally {
+    localStorage.removeItem(SESSION_KEY);
+  }
+}, 15_000);

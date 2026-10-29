@@ -1950,7 +1950,7 @@ registry 锁外加独立 DB claim（跨域，reconcile 先于 slot 切换提交�
    5. 血缘 paused 时事实只 hold，不进重试循环；Resume 或继任章节时重新成批，与 F 的重新成批一致。
    6. 先写一条可见的 hub 来源行，再转发 `instance.send`。
    7. 事实文本用 Hub 的口吻写，绝不写成所有者的第一人称；开头标签和页脚模板的版本记在批次行上。
-   8. 工具在途时用另一个 stall 阈值：driver 已能配对 tool_use 与 tool_result。新的项目设置 `stallToolThresholdMins` 未设置时等于现有的 `stallThresholdMins`（默认 30，`crates/remuda-protocol/src/worker.rs` 的 `DEFAULT_STALL_THRESHOLD_MINS`），所以默认行为不变，Hub 不自己选数值。
+   8. 工具在途（从调用到结果；journal 里二者共享 `toolCallId`，protocol.md §5.2）时，**不产生 stall 事实**，除非项目显式设置了有限的 `stallToolThresholdMins`；设置后，工具在途超过该时长时产生一条 stall 事实。stall 计时从工具结果重新开始，普通的 `stallThresholdMins`（默认 30，`crates/remuda-protocol/src/worker.rs` 的 `DEFAULT_STALL_THRESHOLD_MINS`）从结果起算。Hub 不自己选数值。失控工具的兜底是任务的 wall 预算：`TaskBudget.max_wall_mins`（`crates/remuda-protocol/src/task.rs`）到期时给父级发一条 budget-expired 事实，不杀进程，由父级决定；origin/main 上这个字段已存储但无人执行。
    9. 投递日志只记类别、计数和错误码，不记事实文本和 worker 输出。
 
 7. **wake-up 与 owner notify（[main-agent.md §11](./main-agent.md#11-wake-ups-phase-2)）。**

@@ -631,7 +631,10 @@ The inbox tasks (`cb-inbox-facts`, `cb-inbox-deliver`) implement these on the Hu
 5. **Paused lineages hold.** While the subscriber lineage is paused, its facts are held and enter no retry loop. Resume, or a successor chapter, re-batches them, as F already does (§10, Fencing).
 6. **Visible row first.** The batch's hub-origin row (§9, Phase 2) is written before its `instance.send` is forwarded.
 7. **Hub voice.** Fact text is written in the Hub's voice, never in the owner's first person. The batch row records the opening tag and the footer template version.
-8. **Tool in flight.** While a tool call is in flight the stall fallback uses its own window; the driver already pairs `tool_use` with `tool_result`. The new project setting `stallToolThresholdMins` defaults to the existing `stallThresholdMins` (30, `DEFAULT_STALL_THRESHOLD_MINS` in `crates/remuda-protocol/src/worker.rs`). Today's behaviour is unchanged by default, and the Hub chooses neither number.
+8. **Tool in flight.** A tool call is in flight from its call to its result; in the journal they share a `toolCallId` (protocol.md §5.2), and `cb-stall-tooluse` makes that state available to the stall fallback for every carrier. The Hub picks no number for it:
+   - While a tool call is in flight, **no stall fact is produced** unless the project sets an explicit, finite `stallToolThresholdMins`. With it set, one stall fact follows once the call has been in flight that long.
+   - Stall timing restarts from the tool result: the ordinary `stallThresholdMins` window (default 30, `DEFAULT_STALL_THRESHOLD_MINS` in `crates/remuda-protocol/src/worker.rs`) counts quiet time from the result, not from the call.
+   - **The backstop for a runaway tool is the task's wall budget.** When a task's `TaskBudget.max_wall_mins` (`crates/remuda-protocol/src/task.rs`) elapses, its parent gets one budget-expired fact. Nothing is killed; the parent decides. On origin/main the field is stored but nothing acts on it.
 9. **Logs carry categories only.** Delivery logs record the kind, counts and error codes, never fact text or worker output.
 
 ### 10.2 Digest and glance (D-060)
@@ -841,7 +844,7 @@ Additive, like the Phase 1 budget. Each item lands with the task named in bracke
   - `owner notify` claim rows, unique per dedupe key [`cb-owner-notify`].
 - Hub columns: instances `auto_continue` [`cb-usage-resume`]; memory write references (instance, turn) [`cb-memory-ui`].
 - Task and dispatch documents gain `requestedBy {lineageId, commandId}` inside the existing `doc_json`, with a serde default and no migration [`cb-requested-by`].
-- Project policy gains `stallToolThresholdMins` (defaulting to `stallThresholdMins`) and the 24-hour fact cap (default 6) [`cb-stall-tooluse`, `cb-inbox-facts`].
+- Project policy gains an optional `stallToolThresholdMins` (unset by default: no stall fact while a tool call is in flight) and the 24-hour fact cap (default 6) [`cb-stall-tooluse`, `cb-inbox-facts`].
 - On the Node: nothing for memory, digest or glance. `check` runs keep their exit code and a bounded stdout [`cb-wake-check`].
 
 **Wire, all additive.**
@@ -929,7 +932,9 @@ Exit additions from D-060, each in the gated suite against fake Nodes unless it 
 - **No subscriber.** With the subscriber muted, a fact of a paging kind reaches the owner's phone and is not recorded as consumed.
 - **Pause.** Facts held while the lineage is paused arrive as one batch after Resume.
 - **Order.** The visible hub-origin row exists before the batch's `instance.send` is forwarded, and the batch row records its template version.
-- **Tool in flight.** A worker in a long tool call yields no stall fact. Once the tool ends and the quiet window passes, it yields one.
+- **Tool in flight, cap unset.** A worker in a tool call that stays in flight far past `stallThresholdMins` yields no stall fact. Once the tool result arrives and the ordinary window then passes quietly, it yields one.
+- **Tool in flight, cap set.** With `stallToolThresholdMins` set, a tool call in flight longer than that yields exactly one stall fact.
+- **Wall budget.** A task whose `max_wall_mins` elapses yields one budget-expired fact to its parent, and its worker keeps running.
 - **Wake runs.** A Hub restart during a running run leaves it `interrupted` and does not replay it. A `check` that times out yields a failure fact. Exit code 2 runs no model turn and does not refresh the last real run time.
 - **Owner notify.** The claim row exists before the push; a repeat with the same dedupe key pushes once; a hub-origin turn pushes no reply-ready.
 - **Usage limits (A5).** A subscription 429 with a known `resetsAt` yields exactly one limit fact, then one reset fact after `resetsAt`. A gateway or API-key 429 creates no wait row. A reset more than 8 days away yields the fact only. With `autoContinue` on, the fourth automatic continuation without substantive progress is not sent, any Human or Agent input cancels the wait, and the wait survives a Hub restart.
@@ -1039,7 +1044,7 @@ Each keeps the full gated suite green on its own, like the tasks above. `cb-adr`
 |---|---|---|
 | `cb-inbox-facts` | the inbox, journal-driven fact sources, dedupe key, persistent occurrence cap, run generation in the key, no facts about a lineage's own chapters (§10, §10.1 items 1–4) | `ma-initiator`, `ma-fence`, `ma-restart` |
 | `cb-inbox-deliver` | batching, hold while paused, re-check at batch formation, owner-push fallback, visible row first, Hub voice and template version (§10.1 items 4–7, 9) | `cb-inbox-facts` |
-| `cb-stall-tooluse` | the driver reports a tool call in flight; the stall fallback uses `stallToolThresholdMins` (§10.1 item 8) | `cb-inbox-facts` |
+| `cb-stall-tooluse` | tool-in-flight state for every carrier; no stall fact while a tool is in flight unless `stallToolThresholdMins` is set; stall timing restarts at the tool result; the `max_wall_mins` budget-expired fact (§10.1 item 8) | `cb-inbox-facts` |
 | `cb-usage-resume` | `resume_on_reset`, the reset fact, `autoContinue` and the continuation input (§11.6) | `cb-inbox-deliver` |
 | `cb-wake-engine` | `wake_ups`, `wake_runs`, the run state machine, the envelope, fresh mode, `remuda wake`, `/healthz` tick fields (§11, §11.1, §11.3, §11.4) | `cb-inbox-deliver` |
 | `cb-wake-check` | `check` on the Node: mandatory timeout, `sh -n` precheck, exit-code routing, its admission rule (§11.2) | `cb-wake-engine` |

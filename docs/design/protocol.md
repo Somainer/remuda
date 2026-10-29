@@ -370,6 +370,21 @@ Hub 在 create 与 command 的载荷外层覆盖 `origin: "human" | "bot" | "age
 
 MCP `call_tool` 在副作用前决定范围，并把需审批动作送到 Hub broker gate；Hub 重新依据认证与真实目标检查后才排队或转发。需要审批时 HTTP 返回 `409 HUMAN_APPROVAL_REQUIRED` 和 `interactionId`，MCP 将其作为明确的工具错误返回。票据显示在 `GET /v1/interactions`，只能由 Human 设备通过既有 `/v1/interactions/{id}/answer` 提交 `allow-once` / `deny` 及匹配的 `inputDigest`。随后用 MCP `approvalId`（HTTP `x-remuda-approval-id`）重试完全相同的动作。grant 绑定 caller device、caller instance/host、操作、目标 host/instance 和完整有效载荷；更改文本/目标、其他设备使用、重复消费、拒绝、过期均不能执行。复用 `InteractionBroker` 的 first-answer-wins，TTL 为 15 分钟；Hub 重启丢弃未消费 grant，必须重新申请审批。超时或 ACK 丢失不自动重放已批准的动作。
 
+**可操作的拒绝（c-cberrors，只增不改）。** Hub 的 HTTP 错误体在原有 `error`、`code` 和状态码之外，对下列拒绝追加两个可选字段；旧客户端忽略它们，旧 Hub 不发送它们，客户端必须容忍缺失。`reason` 是稳定的机器值，`next` 是给被拒绝方的一句话指引，意思永远是"先读这句，不要原样重试"。这些字段只解释既有拒绝，不新增拒绝路径，也不改任何授权判断。
+
+~~~text
+403 FORBIDDEN                reason=MISSING_GRANT        next: 座位缺少哪个 grant、为何不能重试、向谁申请
+403 FORBIDDEN                reason=OUT_OF_SCOPE         next: 目标超出委派范围，换范围内目标或请求放宽
+403 FORBIDDEN                reason=AGENT_NOT_PERMITTED  next: Agent 座位不可做此操作，向 owner 报告所需
+403 FORBIDDEN                reason=CALLER_RETIRED       next: 凭证背后的实例已不存在，停止并报告
+403 FORBIDDEN                reason=APPROVAL_INVALID     next: approvalId 未知/过期/已用/不匹配，不要复用，重新发起
+409 HUMAN_APPROVAL_REQUIRED  reason=HUMAN_APPROVAL_REQUIRED
+                                                         next: 审批已挂起，等待 owner，不要重复提交
+409 COMMAND_ID_CONFLICT      reason=DELIVERY_UNKNOWN     next: 投递结果未知，先读命令状态再决定，不要重发（D-055）
+~~~
+
+CLI 在错误信息下方单独一行打印 `next`。
+
 **Agent create 的权限档位：子不超父（2026-10-05，D-057）。** Agent 创建的子实例，只有当它的 Agent 创建者自身运行在关闭 harness 控制的档位时，才可以使用关闭控制的档位（Claude `bypassPermissions`/`dontAsk`、Codex `never`、Grok `always-approve`、Agy `always-proceed`）；否则可以使用任何保留 harness 控制的档位。省略权限模式时，子实例继承创建者自己的档位，框架不另选档位，也不跨 driver 翻译（§6.4）；创建者的档位不是子实例 harness 词表里的值时，create 被拒并说明原因，由调用者显式指定。「创建者的档位」是 Hub 依据创建者章节上记录的生效档位、盖章在转发 create 上的 `creatorPermissionMode`（§7.2），绝不取自请求体。Hub 的 `restrict_permission` 与 Node 侧每一处执行 Agent 来源规则的位置一起改为这条规则：
 - 物化器 `permission_plan`：Agent 来源请求关闭控制的档位时，只有 `creatorPermissionMode` 同样是关闭控制的档位才放行，否则拒绝；
 - generic-pty：Agent create 的 bypass/dontAsk 只在创建者自身关闭控制时保留，否则在 materialize 前降为 asking mode，得到非 yolo argv；

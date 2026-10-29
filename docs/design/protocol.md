@@ -370,7 +370,7 @@ Hub 在 create 与 command 的载荷外层覆盖 `origin: "human" | "bot" | "age
 
 MCP `call_tool` 在副作用前决定范围，并把需审批动作送到 Hub broker gate；Hub 重新依据认证与真实目标检查后才排队或转发。需要审批时 HTTP 返回 `409 HUMAN_APPROVAL_REQUIRED` 和 `interactionId`，MCP 将其作为明确的工具错误返回。票据显示在 `GET /v1/interactions`，只能由 Human 设备通过既有 `/v1/interactions/{id}/answer` 提交 `allow-once` / `deny` 及匹配的 `inputDigest`。随后用 MCP `approvalId`（HTTP `x-remuda-approval-id`）重试完全相同的动作。grant 绑定 caller device、caller instance/host、操作、目标 host/instance 和完整有效载荷；更改文本/目标、其他设备使用、重复消费、拒绝、过期均不能执行。复用 `InteractionBroker` 的 first-answer-wins，TTL 为 15 分钟；Hub 重启丢弃未消费 grant，必须重新申请审批。超时或 ACK 丢失不自动重放已批准的动作。
 
-**可操作的拒绝（c-cberrors，只增不改）。** Hub 的 HTTP 错误体在原有 `error`、`code` 和状态码之外，对下列拒绝追加两个可选字段；旧客户端忽略它们，旧 Hub 不发送它们，客户端必须容忍缺失。`reason` 是稳定的机器值，`next` 是给被拒绝方的一句话指引，意思永远是"先读这句，不要原样重试"。这些字段只解释既有拒绝，不新增拒绝路径，也不改任何授权判断。
+**可操作的拒绝（c-cberrors，只增不改）。** Hub 的 HTTP 错误体在原有 `error`、`code` 和状态码之外，对下列拒绝追加两个可选字段；旧客户端忽略它们，旧 Hub 不发送它们，客户端必须容忍缺失。`reason` 是稳定的机器值，`next` 是给被拒绝方的一句话指引，意思永远是“先读这句，不要原样重试”。这些字段只解释既有拒绝，不新增拒绝路径，也不改任何授权判断。
 
 ~~~text
 403 FORBIDDEN                reason=MISSING_GRANT        next: 座位缺少哪个 grant、为何不能重试、向谁申请

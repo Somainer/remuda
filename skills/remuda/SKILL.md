@@ -436,6 +436,13 @@ Learned from the dogfood-1..3 acceptance runs
 - **A green `DONE` is not a green gate.** Workers run crate-scoped checks;
   `remuda merge --gate` runs the workspace gate on the *merged* tree. Land
   through it rather than trusting the worker's own test run.
+- **A refusal tells you what to do next — read it.** A Hub error body can
+  carry a `reason` (`MISSING_GRANT`, `OUT_OF_SCOPE`, `AGENT_NOT_PERMITTED`,
+  `CALLER_RETIRED`, `HUMAN_APPROVAL_REQUIRED`, `DELIVERY_UNKNOWN`) and a
+  `next` line, which the CLI prints under the message. Do not retry a refusal
+  blindly: a missing grant or scope does not change between attempts. Follow
+  `next` — report the blocked action, ask for the grant, wait for the pending
+  approval, or read the command's state before re-sending.
 
 ## See also
 

@@ -535,8 +535,13 @@ function SessionPageBody({
     }
   };
   const canResume = instance.capabilities.capabilities.resume?.state === "supported";
+  // An earlier chapter of the Main lineage: Resume would act on the current
+  // chapter, not this one, so the bar links there instead (D-057 §9).
+  const currentMainHref =
+    mainLineage && mainEntry && mainEntry.instance.id !== instance.id ? `/s/${mainEntry.instance.id}` : null;
   const endedBar = ended ? (
     <WorkbenchEndedBar
+      currentMainHref={currentMainHref}
       reason={ended}
       nodeRestarted={nodeRestarted}
       heldCount={heldBubbles.length}

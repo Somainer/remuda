@@ -121,19 +121,38 @@ impl CodexUsage {
 }
 
 /// Map a Codex usage object onto normalized buckets.
+///
+/// Presence is preserved (c-ctxusage r15 item 5): an omitted bucket is
+/// Unknown. The uncached input derives from `input - cached - write`.
+/// `input_tokens` includes cache. The cache-write tier is reported under two
+/// spellings across codex/CLI builds (`cache_creation_input_tokens` is the
+/// OpenAI Responses field name the real harness and fixtures emit; older
+/// records say `cache_write_input_tokens`); a record that omits it entirely
+/// is treated as zero write — input minus cache is still exactly the uncached
+/// input, and structural absence must not blank that bucket (main behaviour).
+/// The absent 1-hour write tier is a structural zero for this provider.
 fn counters(usage: &serde_json::Value) -> TokenCounters {
-    let input = usage["input_tokens"].as_u64().unwrap_or(0);
-    let cached = usage["cached_input_tokens"].as_u64().unwrap_or(0);
-    let write = usage["cache_write_input_tokens"].as_u64().unwrap_or(0);
+    let known = |key: &str| usage.get(key).and_then(serde_json::Value::as_u64);
+    let input = known("input_tokens");
+    let cached = known("cached_input_tokens");
+    let write = known("cache_write_input_tokens").or_else(|| known("cache_creation_input_tokens"));
     // input_tokens includes cache; never let a sparse/odd record go negative.
-    let uncached = input.saturating_sub(cached).saturating_sub(write);
+    // Missing write defaults to zero (no 5-minute cache-creation tier).
+    let uncached = match (input, cached) {
+        (Some(total), Some(cached)) => Some(
+            total
+                .saturating_sub(cached)
+                .saturating_sub(write.unwrap_or(0)),
+        ),
+        _ => None,
+    };
     TokenCounters {
         uncached_input: uncached,
-        output: usage["output_tokens"].as_u64().unwrap_or(0),
+        output: known("output_tokens"),
         cache_read: cached,
         // Single provider tier; the table prices writes at the input rate.
         cache_write_5m: write,
-        cache_write_1h: 0,
+        cache_write_1h: Some(0),
     }
 }
 
@@ -179,9 +198,9 @@ mod tests {
         assert_eq!(event.turn_id.as_deref(), Some("turn-1"));
         assert_eq!(event.request_id.as_deref(), Some("resp_1"));
         assert_eq!(event.model.as_deref(), Some("gpt-5.4"));
-        assert_eq!(event.tokens.uncached_input, 90);
-        assert_eq!(event.tokens.cache_read, 10);
-        assert_eq!(event.tokens.output, 20);
+        assert_eq!(event.tokens.uncached_input, Some(90));
+        assert_eq!(event.tokens.cache_read, Some(10));
+        assert_eq!(event.tokens.output, Some(20));
         assert_eq!(event.reasoning_tokens, Some(5));
         assert!(event.cost_usd.is_some());
     }
@@ -211,8 +230,8 @@ mod tests {
         .unwrap();
         let event = CodexUsage::new().on_record(&snapshot).expect("event");
         assert_eq!(event.source, UsageSource::CodexTokenCount);
-        assert_eq!(event.tokens.uncached_input, 450);
-        assert_eq!(event.tokens.output, 100);
+        assert_eq!(event.tokens.uncached_input, Some(450));
+        assert_eq!(event.tokens.output, Some(100));
     }
 
     #[test]

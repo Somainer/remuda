@@ -49,8 +49,17 @@ pub struct BusContext {
 /// deterministic when two terminals each run their own `claude`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionBinding {
-    /// Agent pid that reported this session.
+    /// Agent pid that reported this session. When the harness runs hooks
+    /// through a shell wrapper (codex invokes `/bin/sh -c …`) this is the
+    /// transient wrapper pid, already reaped by the time a later poll runs;
+    /// [`Self::pgid`] is the group identity that survives it.
     pub pid: i32,
+    /// Process group of [`Self::pid`] captured WHILE the hook delivery was in
+    /// flight (the wrapper is alive then). It is the agent job's group; pty
+    /// launches match the group leader and promoted terminals match the
+    /// foreground group, so consumers should accept either pid or pgid. `None`
+    /// when it could not be queried (non-unix / process already gone).
+    pub pgid: Option<i32>,
     /// Native session id, for `--resume` (D-026).
     pub session_id: String,
     /// Transcript the agent is writing.
@@ -588,6 +597,7 @@ impl SignalBus {
         {
             *slot = Some(SessionBinding {
                 pid: event.ppid,
+                pgid: process_group_of(event.ppid),
                 session_id,
                 transcript_path: mapped.transcript_path.clone(),
                 // c-effortread r9 item 1: carry the native SessionStart source
@@ -1423,6 +1433,25 @@ fn answer_overlap(open: &OpenQuestion, raw_answers: &serde_json::Value) -> usize
         .count()
 }
 
+/// Process group of `pid`, captured while a SessionStart hook delivery is in
+/// flight. Hook wrappers (`/bin/sh -c …`) are transient and reaped moments
+/// after delivery, so the group id — the agent job's stable identity — is
+/// queried HERE, at the one time the wrapper is guaranteed alive.
+#[cfg(unix)]
+#[must_use]
+pub(crate) fn process_group_of(pid: i32) -> Option<i32> {
+    nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(pid)))
+        .ok()
+        .map(|group| group.as_raw())
+}
+
+/// Non-unix builds do not match on process groups.
+#[cfg(not(unix))]
+#[must_use]
+pub(crate) fn process_group_of(_pid: i32) -> Option<i32> {
+    None
+}
+
 /// `ObservationPayload` accessor used by the Node's fold; keeps the match on
 /// lifecycle payloads in one place.
 #[must_use]
@@ -1696,6 +1725,7 @@ mod tests {
             bus.binding(),
             Some(SessionBinding {
                 pid: 4242,
+                pgid: process_group_of(4242),
                 session_id: "0199a1f0-0000-7000-8000-000000000000".into(),
                 transcript_path: Some("/w/s.jsonl".into()),
                 source: None,

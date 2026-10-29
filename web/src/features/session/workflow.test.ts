@@ -49,6 +49,7 @@ describe("usageLine", () => {
     scopeId: "run",
     mode: "snapshot",
     metricRevision: "1",
+    sourceSessionId: null,
     inputTokens: known("100"),
     inputAccounting: "unknown",
     outputTokens: known("20"),

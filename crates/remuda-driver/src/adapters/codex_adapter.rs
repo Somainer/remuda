@@ -624,7 +624,7 @@ impl CodexAdapter {
                 // Stamp the native turn id so the Hub rollup can count
                 // distinct turns from Message rows (r6 item 5).
                 let mut obs = AdapterObservation::structured(ObservationPayload::Usage(Box::new(
-                    to_usage_payload(UsageScope::Message, response_id, 1, &totals),
+                    to_usage_payload(UsageScope::Message, response_id, 1, None, &totals),
                 )))
                 // r7 item 7: stamp the record's own timestamp so the Hub
                 // native-time rate SQL (60 s / 5 min TPM) and lastTurnAt use
@@ -780,17 +780,6 @@ impl CodexAdapter {
             }
         }
         out.push(AdapterObservation::structured(turn_lifecycle(name, "idle")).with_turn(turn_id));
-        // c-usagefu r6 item 5: codex emits each priced call as a Message
-        // usage observation (on_record, see on_line). It must NOT also emit a
-        // Turn snapshot of the same totals: the Hub cost rollup treats Message
-        // and Turn rows as two billable streams and would double-count
-        // (0.10 + 0.20 read as 0.60 on priced/unpriced/priced turns). The
-        // composer context basket does not need the Turn row — its turn
-        // coverage rule already falls back to Message-scope sums when no Turn
-        // rows exist.
-        //
-        // Session snapshot at turn end (cumulative; cost semantics decided by
-        // the Hub rollup).
         self.session_usage_revision += 1;
         let payload = to_usage_payload(
             UsageScope::Session,
@@ -799,6 +788,7 @@ impl CodexAdapter {
                 .map(|binding| binding.session_id.clone())
                 .unwrap_or_else(|| "codex-session".into()),
             self.session_usage_revision,
+            None,
             self.usage_totals.session(),
         );
         out.push(

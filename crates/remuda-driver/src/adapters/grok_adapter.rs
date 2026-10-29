@@ -50,8 +50,8 @@ use serde_json::Value;
 
 use crate::adapters::{
     AdapterBinding, AdapterHome, AdapterObservation, FileSignalAdapter, first_mutation,
-    message_chunk, message_close, message_payload, node_id, not_emitted, thought_chunk,
-    turn_lifecycle,
+    message_chunk, message_close, message_payload, native_timestamp, node_id, not_emitted,
+    thought_chunk, turn_lifecycle,
 };
 use crate::error::DriverResult;
 use crate::grok_session::{
@@ -434,17 +434,33 @@ impl GrokAdapter {
     /// Append a cumulative Session-scoped usage snapshot built from the current
     /// totals. Snapshot overwrite semantics (protocol §5.5): the Hub replaces
     /// the same `(scope, scope_id)` at the bumped `metricRevision`.
-    fn emit_usage_snapshot(&mut self, out: &mut Vec<AdapterObservation>) {
+    /// Append a cumulative Session-scoped usage snapshot. `native_at` stamps
+    /// the Grok turn-end time when emitted from the events poll (the native
+    /// timestamp is otherwise unavailable — c-ctxusage r9 item 4); other
+    /// callers pass None.
+    fn emit_usage_snapshot_with_native_at(
+        &mut self,
+        out: &mut Vec<AdapterObservation>,
+        native_at: Option<&str>,
+    ) {
         self.session_usage_revision += 1;
         let payload = to_usage_payload(
             UsageScope::Session,
             self.session_id(),
             self.session_usage_revision,
+            None,
             self.usage_totals.session(),
         );
-        out.push(AdapterObservation::structured(ObservationPayload::Usage(
-            Box::new(payload),
-        )));
+        let mut observed =
+            AdapterObservation::structured(ObservationPayload::Usage(Box::new(payload)));
+        if let Some(at) = native_timestamp(native_at) {
+            observed = observed.with_native_at(Some(at));
+        }
+        out.push(observed);
+    }
+
+    fn emit_usage_snapshot(&mut self, out: &mut Vec<AdapterObservation>) {
+        self.emit_usage_snapshot_with_native_at(out, None);
     }
 
     /// Emit close snapshots for one finished prompt.
@@ -624,6 +640,11 @@ impl GrokAdapter {
         };
         let mut out = Vec::new();
         let mut ended_turn = false;
+        // Native turn-end timestamp of the last turn_ended in this batch:
+        // Grok usage observations otherwise carry no native time, so the
+        // Hub's native-only rate/freshness queries dropped every Grok row
+        // (c-ctxusage r9 item 4).
+        let mut ended_at: Option<String> = None;
         for line in tail_lines(tail)? {
             let Ok(record) = parse_event_line(&line) else {
                 continue;
@@ -675,6 +696,7 @@ impl GrokAdapter {
                         }
                         out.push(observed);
                         ended_turn = true;
+                        ended_at = record.timestamp.clone();
                     }
                     // Post-hoc permission bookkeeping (§A5): journaled, never
                     // an answer channel. The wait_ms=0 case is not "no prompt".
@@ -698,13 +720,14 @@ impl GrokAdapter {
             }
         }
         if ended_turn {
-            self.emit_session_usage(&mut out);
+            self.emit_session_usage(&mut out, ended_at);
         }
         Ok(out)
     }
 
-    /// Read `usage.json` once per new content and emit a session snapshot.
-    fn emit_session_usage(&mut self, out: &mut Vec<AdapterObservation>) {
+    /// Read `usage.json` once per new content and emit a session snapshot,
+    /// stamped with the native turn-end timestamp (c-ctxusage r9 item 4).
+    fn emit_session_usage(&mut self, out: &mut Vec<AdapterObservation>, ended_at: Option<String>) {
         let Ok(text) = std::fs::read_to_string(
             self.binding
                 .as_ref()
@@ -724,7 +747,7 @@ impl GrokAdapter {
         for event in usage_from_usage_json(&doc) {
             self.usage_totals.push(&event);
         }
-        self.emit_usage_snapshot(out);
+        self.emit_usage_snapshot_with_native_at(out, ended_at.as_deref());
     }
 }
 

@@ -3395,6 +3395,7 @@ dependencies = [
  "futures",
  "glob",
  "ignore",
+ "libc",
  "nix",
  "plist",
  "portable-pty",

@@ -59,13 +59,16 @@ tokio-tungstenite.workspace = true
 url = "2"
 tracing.workspace = true
 uuid.workspace = true
-nix = { version = "0.28", features = ["process", "fs", "signal"] }
+# `event` exposes nix's safe kqueue/kevent wrapper on the BSD/macOS waiter
+# in tests/usage_native_rollup.rs (it only adds epoll/eventfd on Linux).
+nix = { version = "0.28", features = ["process", "fs", "signal", "inotify", "event"] }
 # r20 item 1 / R8(c): portable (Linux + macOS) libc::waitid wrapper for the
 # non-reaping land-leader exit observer.
 remuda-unix.workspace = true
 plist = { version = "1.10.1", default-features = false }
 
 [dev-dependencies]
+libc = "0.2"
 portable-pty.workspace = true
 remuda-unix = { workspace = true, features = ["test-faults"] }
 remuda-driver = { workspace = true, features = ["test-stub"] }

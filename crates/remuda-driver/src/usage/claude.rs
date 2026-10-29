@@ -126,25 +126,43 @@ pub fn usage_from_result_frame(frame: &Value, model: Option<&str>) -> Option<Usa
 }
 
 /// Map an Anthropic `usage` object onto the normalized billing buckets.
+///
+/// Field PRESENCE is preserved: a bucket the record omits stays `None`
+/// (Unknown), it is never a fabricated zero (c-ctxusage r15 item 5). Only a
+/// genuinely reported `0` is `Some(0)`. The cache-write TTL split is applied
+/// only when both TTL fields are present and reconcile to the reported
+/// total; otherwise a reported whole-write count is priced at the cheaper
+/// 5-minute tier, and an omitted write bucket leaves both write buckets
+/// Unknown.
 fn counters_from_anthropic_usage(usage: &Value) -> TokenCounters {
-    let cache_write = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
-    let write_5m = usage["cache_creation"]["ephemeral_5m_input_tokens"]
-        .as_u64()
-        .unwrap_or(0);
-    let write_1h = usage["cache_creation"]["ephemeral_1h_input_tokens"]
-        .as_u64()
-        .unwrap_or(0);
-    let (write_5m, write_1h) = if write_5m + write_1h == cache_write {
-        (write_5m, write_1h)
-    } else {
-        // No trustworthy TTL split (older clients, partial frames): price the
-        // whole write at the cheaper 5-minute tier rather than overstating.
-        (cache_write, 0)
+    let known = |key: &str| {
+        if let Some(path) = key.strip_prefix("cache_creation.") {
+            usage
+                .pointer(&format!("/cache_creation/{path}"))
+                .and_then(Value::as_u64)
+        } else {
+            usage.get(key).and_then(Value::as_u64)
+        }
+    };
+    let cache_write = known("cache_creation_input_tokens");
+    let write_5m = known("cache_creation.ephemeral_5m_input_tokens");
+    let write_1h = known("cache_creation.ephemeral_1h_input_tokens");
+    let (write_5m, write_1h) = match (cache_write, write_5m, write_1h) {
+        // A trustworthy TTL split prices each tier separately.
+        (Some(total), Some(write_5m), Some(write_1h)) if write_5m + write_1h == total => {
+            (Some(write_5m), Some(write_1h))
+        }
+        // A reported whole without a reconciling split is priced at the
+        // cheaper tier rather than overstated; the absent tier is a
+        // structural zero FOR THIS RECORD.
+        (Some(total), _, _) => (Some(total), Some(0)),
+        // No write bucket reported: both stay Unknown.
+        (None, _, _) => (None, None),
     };
     TokenCounters {
-        uncached_input: usage["input_tokens"].as_u64().unwrap_or(0),
-        output: usage["output_tokens"].as_u64().unwrap_or(0),
-        cache_read: usage["cache_read_input_tokens"].as_u64().unwrap_or(0),
+        uncached_input: known("input_tokens"),
+        output: known("output_tokens"),
+        cache_read: known("cache_read_input_tokens"),
         cache_write_5m: write_5m,
         cache_write_1h: write_1h,
     }
@@ -184,11 +202,11 @@ mod tests {
         assert_eq!(event.turn_id.as_deref(), Some("req_42"));
         assert_eq!(event.request_id.as_deref(), Some("msg_abc"));
         assert_eq!(event.model.as_deref(), Some("claude-haiku-4-5-20251001"));
-        assert_eq!(event.tokens.uncached_input, 18);
-        assert_eq!(event.tokens.output, 261);
-        assert_eq!(event.tokens.cache_read, 40627);
-        assert_eq!(event.tokens.cache_write_5m, 0);
-        assert_eq!(event.tokens.cache_write_1h, 3874);
+        assert_eq!(event.tokens.uncached_input, Some(18));
+        assert_eq!(event.tokens.output, Some(261));
+        assert_eq!(event.tokens.cache_read, Some(40627));
+        assert_eq!(event.tokens.cache_write_5m, Some(0));
+        assert_eq!(event.tokens.cache_write_1h, Some(3874));
         assert_eq!(event.reasoning_tokens, Some(123));
         assert!(event.cost_usd.is_some());
         assert!(event.estimated);
@@ -210,8 +228,54 @@ mod tests {
             }
         });
         let event = usage_from_transcript_record(&record).unwrap();
-        assert_eq!(event.tokens.cache_write_5m, 40);
-        assert_eq!(event.tokens.cache_write_1h, 0);
+        assert_eq!(event.tokens.cache_write_5m, Some(40));
+        assert_eq!(event.tokens.cache_write_1h, Some(0));
+    }
+
+    #[test]
+    fn omitted_buckets_stay_unknown_never_zero() {
+        // A partial record (a later content block, or an older/newer client
+        // shape) that reports only output: every other bucket stays Unknown.
+        let record = json!({
+            "type": "assistant",
+            "message": {
+                "id": "m",
+                "model": "claude-sonnet-5",
+                "usage": {"output_tokens": 15}
+            }
+        });
+        let event = usage_from_transcript_record(&record).unwrap();
+        assert_eq!(event.tokens.output, Some(15));
+        assert_eq!(event.tokens.uncached_input, None);
+        assert_eq!(event.tokens.cache_read, None);
+        assert_eq!(event.tokens.cache_write_5m, None);
+        assert_eq!(event.tokens.cache_write_1h, None);
+        // An omitted bucket is never priced for free.
+        assert_eq!(event.cost_usd, None);
+    }
+
+    #[test]
+    fn a_reported_zero_bucket_is_known_zero() {
+        let record = json!({
+            "type": "assistant",
+            "message": {
+                "id": "m",
+                "model": "claude-sonnet-5",
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0
+                }
+            }
+        });
+        let event = usage_from_transcript_record(&record).unwrap();
+        assert_eq!(event.tokens.output, Some(0), "reported zero is known");
+        assert_eq!(event.tokens.cache_write_5m, Some(0));
+        assert!(
+            event.cost_usd.is_some(),
+            "a fully-reported record is priced"
+        );
     }
 
     #[test]
@@ -236,7 +300,8 @@ mod tests {
                         "usage": {"input_tokens": 10, "output_tokens": 5}}
         });
         let event = usage_from_transcript_record(&record).unwrap();
-        assert_eq!(event.tokens.output, 5);
+        assert_eq!(event.tokens.output, Some(5));
+        assert_eq!(event.tokens.uncached_input, Some(10));
         assert_eq!(event.cost_usd, None);
     }
 

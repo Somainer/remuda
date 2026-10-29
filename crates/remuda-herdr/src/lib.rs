@@ -19,7 +19,9 @@ mod types;
 
 pub use alt_screen::AltScreenScanner;
 
-pub use client::{Client, EventStream, default_api_socket, herdr_config_dir, session_sockets};
+pub use client::{
+    Client, EventStream, PersistentClient, default_api_socket, herdr_config_dir, session_sockets,
+};
 pub use error::{Error, SERVER_UNAVAILABLE};
 pub use events::{Event, EventKind, EventsSubscribeParams, Subscription, normalize_event_name};
 pub use retry::{DEFAULT_MAX_WAIT, RetryPolicy, WaitOutcome};

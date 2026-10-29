@@ -14,7 +14,7 @@ use tracing::debug;
 
 use crate::error::Error;
 use crate::events::{Event, EventsSubscribeParams, Subscription};
-use crate::rpc::{Incoming, call, connect_subscribe, next_id, parse_line};
+use crate::rpc::{Incoming, PersistentConn, call, connect_subscribe, next_id, parse_line};
 use crate::types::*;
 
 /// Default RPC timeout for methods that do not wait on an agent turn.
@@ -83,6 +83,19 @@ impl Client {
     #[must_use]
     pub fn binary(&self) -> &Path {
         &self.binary
+    }
+
+    /// Open a PERSISTENT connection that stays open across several calls.
+    ///
+    /// Use it for audit-and-destroy sequences (ownership snapshot followed by
+    /// a destructive call): unlike the one-shot methods, the connection is
+    /// never reconnected and never half-closes, so every response and dispatch
+    /// is provably served by the same server process. If it drops mid-sequence
+    /// its calls return [`Error::Disconnected`] and the caller must treat the
+    /// destructive outcome as unknown rather than replaying the call
+    /// (c-ctxusage r15 item 1).
+    pub async fn persistent(&self) -> Result<PersistentClient, Error> {
+        PersistentClient::open(&self.socket_path, self.timeout).await
     }
 
     /// Raw RPC. `params` may be `null` (sent as `{}`).
@@ -412,6 +425,192 @@ impl Client {
             rx,
             _writer: conn.writer,
         })
+    }
+}
+
+/// A single held-open Herdr connection for audit-and-destroy sequences.
+///
+/// Obtain from [`Client::persistent`]. Every call goes over the SAME Unix
+/// connection, in send order, with no reconnect: a dropped connection is a
+/// failed sequence, never a transparent retry. See [`PersistentConn`] for the
+/// guarantee (c-ctxusage r15 item 1).
+pub struct PersistentClient {
+    conn: PersistentConn,
+    timeout: Duration,
+}
+
+impl PersistentClient {
+    async fn open(socket_path: &Path, timeout: Duration) -> Result<Self, Error> {
+        // Connection establishment is bounded by the same RPC timeout: a
+        // carrier that never finishes accepting must not wedge the caller
+        // (c-ctxusage r16 item 2).
+        let conn = PersistentConn::connect(socket_path, timeout).await?;
+        Ok(Self { conn, timeout })
+    }
+
+    async fn typed<T: DeserializeOwned>(
+        &mut self,
+        method: &str,
+        params: Value,
+        wanted: &'static str,
+    ) -> Result<T, Error> {
+        let value = self.conn.invoke(method, params, self.timeout).await?;
+        let found = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("<missing>")
+            .to_string();
+        if found != wanted && wanted != "*" {
+            return Err(Error::UnexpectedResult { wanted, found });
+        }
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// `ping` on the held connection.
+    pub async fn ping(&mut self) -> Result<Pong, Error> {
+        self.typed("ping", json!({}), "pong").await
+    }
+
+    /// `session.snapshot` on the held connection.
+    pub async fn session_snapshot(&mut self) -> Result<SessionSnapshot, Error> {
+        let result: SessionSnapshotResult = self
+            .typed("session.snapshot", json!({}), "session_snapshot")
+            .await?;
+        Ok(result.snapshot)
+    }
+
+    /// `pane.close` on the held connection. A disconnect here means the close
+    /// outcome is unknown; the caller must never replay it on another
+    /// connection.
+    pub async fn pane_close(&mut self, pane_id: impl Into<String>) -> Result<OkResult, Error> {
+        self.typed(
+            "pane.close",
+            serde_json::to_value(PaneTarget {
+                pane_id: pane_id.into(),
+            })?,
+            "ok",
+        )
+        .await
+    }
+
+    /// `tab.close` on the held connection. Same uncertain-outcome rule as
+    /// [`Self::pane_close`]: never replayed on another connection.
+    pub async fn tab_close(&mut self, tab_id: impl Into<String>) -> Result<OkResult, Error> {
+        self.typed(
+            "tab.close",
+            serde_json::to_value(TabTarget {
+                tab_id: tab_id.into(),
+            })?,
+            "ok",
+        )
+        .await
+    }
+
+    /// `workspace.close` on the held connection. Same uncertain-outcome rule
+    /// as [`Self::pane_close`].
+    pub async fn workspace_close(
+        &mut self,
+        workspace_id: impl Into<String>,
+    ) -> Result<OkResult, Error> {
+        self.typed(
+            "workspace.close",
+            json!({"workspace_id": workspace_id.into()}),
+            "ok",
+        )
+        .await
+    }
+
+    /// `pane.send_keys` on the held connection. Used for the polite-stop
+    /// Ctrl-C: a disconnect after the write means the keystroke may have
+    /// reached a dying server and the close outcome is unknown.
+    pub async fn pane_send_keys(
+        &mut self,
+        pane_id: impl Into<String>,
+        keys: Vec<String>,
+    ) -> Result<OkResult, Error> {
+        self.typed(
+            "pane.send_keys",
+            serde_json::to_value(PaneSendKeysParams {
+                pane_id: pane_id.into(),
+                keys,
+            })?,
+            "ok",
+        )
+        .await
+    }
+
+    /// `pane.send_text` on the held connection. The polite-stop shell `exit`
+    /// is destructive (it closes the foreground shell), so the same
+    /// uncertain-outcome rule applies.
+    pub async fn pane_send_text(
+        &mut self,
+        pane_id: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Result<OkResult, Error> {
+        self.typed(
+            "pane.send_text",
+            serde_json::to_value(PaneSendTextParams {
+                pane_id: pane_id.into(),
+                text: text.into(),
+            })?,
+            "ok",
+        )
+        .await
+    }
+
+    /// `pane.process_info` on the held connection.
+    pub async fn pane_process_info(
+        &mut self,
+        pane_id: Option<String>,
+    ) -> Result<PaneProcessInfoResult, Error> {
+        self.typed(
+            "pane.process_info",
+            serde_json::to_value(PaneProcessInfoParams { pane_id })?,
+            "pane_process_info",
+        )
+        .await
+    }
+
+    /// `agent.get` on the held connection. Used by interaction refreshes that
+    /// must share their pinned connection with a possible auto-answer
+    /// dispatch.
+    pub async fn agent_get(&mut self, target: impl Into<String>) -> Result<AgentInfoResult, Error> {
+        self.typed(
+            "agent.get",
+            serde_json::to_value(AgentTarget {
+                target: target.into(),
+            })?,
+            "agent_info",
+        )
+        .await
+    }
+
+    /// `agent.read` on the held connection.
+    pub async fn agent_read(&mut self, params: AgentReadParams) -> Result<PaneReadResult, Error> {
+        self.typed("agent.read", serde_json::to_value(params)?, "*")
+            .await
+    }
+
+    /// `agent.send_keys` on the held connection (c-ctxusage r27 item 1). This
+    /// is the interaction dispatch transport: it MUST run on a connection
+    /// pinned to the carrier boot that was verified before the final
+    /// revocation check. A restart that reuses the pane id breaks this
+    /// connection, so the keystroke fails as `Disconnected` instead of being
+    /// dialled fresh onto the replacement foreign carrier.
+    pub async fn agent_send_keys(
+        &mut self,
+        target: impl Into<String>,
+        keys: Vec<String>,
+    ) -> Result<OkResult, Error> {
+        self.typed(
+            "agent.send_keys",
+            serde_json::to_value(AgentSendKeysParams {
+                target: target.into(),
+                keys,
+            })?,
+            "ok",
+        )
+        .await
     }
 }
 

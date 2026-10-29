@@ -500,6 +500,11 @@ pub struct ShellPtyDriver {
     /// File-tail signal adapters (codex rollout, grok ACP files). Dropped on
     /// close, which stops their poll tasks (D-028 P6).
     adapters: Mutex<Option<crate::adapters::supervisor::AdapterHandle>>,
+    /// Detached one-shot model-catalog refresh task. Published on a
+    /// successful launch and cancelled/adopted on a same-driver resume
+    /// (c-ctxusage r17 item 4), so a prior run's pending refresh never
+    /// outlives that run.
+    catalog_refresh: Mutex<Option<JoinHandle<()>>>,
     /// c-usagefu r10 item 1; r11 items 2/3 (Ruling A2): the OWNER guard of the
     /// codex instance-lifetime cohort for a driver-launched (native/resumed)
     /// codex, held for the whole run independent of whether its file adapter
@@ -656,6 +661,7 @@ impl ShellPtyDriver {
             fallbacks: crate::hook_answer::FallbackLedger::new(),
             hooks: Mutex::new(None),
             adapters: Mutex::new(None),
+            catalog_refresh: Mutex::new(None),
             codex_lifetime: Mutex::new(None),
             promoted_codex_lifetimes: Arc::new(std::sync::Mutex::new(Vec::new())),
             recipe: std::sync::Mutex::new(None),
@@ -1605,10 +1611,20 @@ impl ShellPtyDriver {
                 return Err(error);
             }
         }
-        // On a successful launch the one-shot catalog refresh outlives this
-        // function and must keep running detached; dropping its JoinHandle
-        // (without abort) does exactly that.
-        drop(catalog_refresh_task);
+        // On a successful launch publish the one-shot catalog-refresh task to
+        // the driver field (c-ctxusage r17 item 4): it keeps running detached
+        // AND a same-driver resume can cancel/adopt it. Without this the task
+        // is unowned and resume cannot stop a prior run's still-pending
+        // refresh (and the new run's spawn would conflict with it). Cancel any
+        // prior run's pending refresh before publishing.
+        if let Some(refresh) = catalog_refresh_task.take() {
+            if let Some(mut previous) = self.catalog_refresh.lock().await.take() {
+                previous.abort();
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), &mut previous).await;
+            }
+            *self.catalog_refresh.lock().await = Some(refresh);
+        }
         if self.options.promote {
             // Built before `hooks` moves into the poller: the silence probe
             // needs the live session's *real* socket path. Under a long data
@@ -2156,11 +2172,12 @@ impl ShellPtyDriver {
         *self.poller_shutdown.lock().await = resumed.poller_shutdown.lock().await.take();
         *self.poller_finalised.lock().await = resumed.poller_finalised.lock().await.take();
         *self.waiter.lock().await = resumed.waiter.lock().await.take();
-        // c-usagefu r8 item 2: adopt the resumed driver's file-tail adapter
-        // handle (its process is the live one; the previous driver's tails
-        // followed a dead pid). Production single-point of the move:
-        // supervisor::adopt_resumed_handle.
-        crate::adapters::supervisor::adopt_resumed_handle(&self.adapters, &resumed.adapters).await;
+        // Run-scoped adoption (c-ctxusage r17/r24): abort/dispose the previous
+        // run's catalog-refresh task and file adapters (bounded) before
+        // adopting the resumed driver's — this is the stricter form of the
+        // usagefu supervisor::adopt_resumed_handle move and covers the catalog
+        // task usagefu does not own.
+        self.adopt_run_scoped_handles(&resumed).await;
         // c-usagefu r10 item 1: adopt the resumed run's live codex census
         // cohort. The previous run's guard is superseded by a newer epoch, so
         // dropping it here does not record a close for the continued session.
@@ -2226,6 +2243,21 @@ impl ShellPtyDriver {
             ours.clone_from(&theirs);
         }
         Ok(handle)
+    }
+
+    async fn adopt_run_scoped_handles(&self, resumed: &ShellPtyDriver) {
+        // c-usagefu r8 item 2: adopt the resumed driver's file-tail adapter
+        // handle with the supervisor's own single-point move (dispose the
+        // previous process's tails first, then move). Do NOT abort the
+        // resumed handle: its tails follow the LIVE process after a resume.
+        // c-ctxusage r17 item 4: separately abort/dispose the previous run's
+        // detached catalog-refresh task before adopting the resumed one.
+        crate::adapters::supervisor::adopt_resumed_handle(&self.adapters, &resumed.adapters).await;
+        if let Some(mut previous) = self.catalog_refresh.lock().await.take() {
+            previous.abort();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut previous).await;
+        }
+        *self.catalog_refresh.lock().await = resumed.catalog_refresh.lock().await.take();
     }
 }
 
@@ -3296,6 +3328,13 @@ impl Driver for ShellPtyDriver {
         if let Some(worker) = self.permission_worker.lock().await.take() {
             worker.abort();
         }
+        // Claim the run's observation sender ONCE, here at the top of close
+        // (c-ctxusage r4 item 2: the poller holds its own clone, so winding it
+        // down below still delivers finalised observations). It MUST survive
+        // to the teardown-ownership claim: the stop ladder's stop-incomplete
+        // warning (c-usagefu Ruling W0) is sent through it, so this is a move,
+        // not a drop.
+        let run_events = self.events_tx.lock().await.take();
         // c-ctxusage r4 item 2: cooperative poller shutdown. Signal closure
         // first, then give the poller one window to read the final append and
         // publish its last turn via `finish()` (an assistant record with usage
@@ -3312,11 +3351,12 @@ impl Driver for ShellPtyDriver {
         }
         if let Some(poller) = self.poller.lock().await.take() {
             // c-ctxusage r5 item 6: the poller may be mid first-bind pump over a
-            // large transcript. It finalises the hydrator AFTER its current pump
-            // returns and signals once that is done; wait for that signal rather
-            // than aborting on a fixed 2 s deadline while `finish()` is running.
-            // 15 s only bounds a genuinely wedged pump; on timeout the abort is
-            // covered by the FinaliseGuard's synchronous best-effort finish.
+            // large transcript. It finalises the hydrator AFTER its current
+            // pump returns and signals once that is done; wait for that signal
+            // rather than aborting on a fixed 2 s deadline while `finish()` is
+            // running. 15 s only bounds a genuinely wedged pump; on timeout the
+            // abort is covered by the FinaliseGuard's synchronous best-effort
+            // finish.
             const PROMOTER_FINALISE_TIMEOUT: std::time::Duration =
                 std::time::Duration::from_secs(15);
             let finalised = self.poller_finalised.lock().await.take();
@@ -3344,6 +3384,12 @@ impl Driver for ShellPtyDriver {
             if !finished {
                 poller.abort();
             }
+        }
+        // c-ctxusage r17 item 4: stop the detached catalog-refresh task so it
+        // does not keep an event sender alive past close.
+        if let Some(mut refresh) = self.catalog_refresh.lock().await.take() {
+            refresh.abort();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut refresh).await;
         }
         if let Ok(mut slot) = self.promoted.lock() {
             *slot = None;
@@ -3389,9 +3435,12 @@ impl Driver for ShellPtyDriver {
         let close_ctx;
         let claimed = {
             let Some(state) = self.inner.lock().await.take() else {
+                // No teardown to own; release the claimed sender with the
+                // early return (a serialized second close always finds None).
+                drop(run_events);
                 return Ok(DriverAck::not_dispatched());
             };
-            close_events = self.events_tx.lock().await.take();
+            close_events = run_events;
             close_ctx = self.promote_ctx.lock().await.clone();
             state
         };
@@ -4208,6 +4257,395 @@ impl crate::permission::PermissionSwitchIo for ShellPermissionIo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// c-ctxusage r24 item 2: resume transfers the run-scoped catalog refresh
+    /// and file-adapter handles OFF the temporary resumed driver; dropping it
+    /// afterwards must not abort the new run's adapter tasks.
+    #[tokio::test]
+    async fn adapter_and_catalog_handles_transfer_off_the_resumed_driver() {
+        let current = ShellPtyDriver::new(ShellPtyOptions::login(std::path::PathBuf::from(
+            "/unused/a",
+        )));
+        let resumed = ShellPtyDriver::new(ShellPtyOptions::login(std::path::PathBuf::from(
+            "/unused/b",
+        )));
+        *resumed.catalog_refresh.lock().await = Some(tokio::spawn(std::future::pending::<()>()));
+        *resumed.adapters.lock().await = Some(
+            crate::adapters::supervisor::AdapterHandle::from_tasks(vec![]),
+        );
+
+        current.adopt_run_scoped_handles(&resumed).await;
+
+        assert!(
+            resumed.catalog_refresh.lock().await.is_none(),
+            "source gives up refresh"
+        );
+        assert!(
+            resumed.adapters.lock().await.is_none(),
+            "source gives up adapters"
+        );
+        assert!(
+            current.catalog_refresh.lock().await.is_some(),
+            "current owns refresh"
+        );
+        assert!(
+            current.adapters.lock().await.is_some(),
+            "current owns adapters"
+        );
+
+        // Dropping the source driver must NOT abort the transferred task.
+        drop(resumed);
+        let taken = current.catalog_refresh.lock().await.take();
+        assert!(taken.is_some(), "task survived the source driver drop");
+        if let Some(task) = taken {
+            task.abort();
+            let _ = task.await;
+        }
+        *current.adapters.lock().await = None;
+    }
+
+    /// c-ctxusage r25 item 5: a REAL codex resume with a REAL file adapter.
+    ///
+    /// The deterministic fake-harness runs as the production `codex` binary
+    /// under a full ShellPtyDriver launch: it writes a real rollout under the
+    /// shadow `CODEX_HOME` and fires the SessionStart hook, so the production
+    /// supervisor spawns and binds a real CodexAdapter. The test then:
+    /// 1. appends a native `token_usage_record` + `task_complete` BEFORE resume
+    ///    and requires its usage through the first run handle (the predecessor
+    ///    adapter really tails the file);
+    /// 2. calls the production `Driver::resume`;
+    /// 3. requires the predecessor adapter/catalog tasks to be CANCELLED and
+    ///    the adopted handles to be the resumed run's and actually ALIVE;
+    /// 4. appends another native record AFTER resume and requires its usage
+    ///    through the RETURNED run handle.
+    ///
+    /// Removing `adopt_run_scoped_handles` at the resume site makes step 4 go
+    /// RED: the resumed driver drops with the handles and aborts the adapter.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn r25_item5_resumed_codex_file_adapter_keeps_emitting() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let workspace = std::fs::create_dir_all(root.join("workspace"))
+            .map(|_| std::fs::canonicalize(root.join("workspace")).unwrap())
+            .unwrap();
+        let native_home = root.join("native-home");
+        std::fs::create_dir_all(&native_home).unwrap();
+        // c-usagefu r6: a driver launch's rollout claim is keyed by the STABLE
+        // instance id and outlives each per-run adapter (including the resumed
+        // scratch driver), so name the instance dir after a fixed instance id
+        // exactly as the Node does (native.rs always sets options.instance_id
+        // and the hook overlay lives under `<that id>/launch`).
+        let instance_id = InstanceId::new();
+        let instance_dir = root.join(instance_id.as_id().as_str());
+
+        // Install a `codex` wrapper around the deterministic fake-harness.
+        // The production argv carries no dialect selector (the real binary's
+        // name IS the dialect), so the wrapper supplies `--kind codex`.
+        // c-ctxusage r26 item 5: the executable path is POSIX-quoted — the
+        // checkout/target dir may contain spaces or apostrophes.
+        let install = root.join("opt/bin");
+        let harness = remuda_testing::ensure_workspace_bin("fake-harness");
+        let quoted_harness = posix_single_quote(&harness.to_string_lossy());
+        let codex_bin = remuda_testing::install_executable(
+            &install,
+            "codex",
+            format!("#!/bin/sh\nexec {quoted_harness} --kind codex \"$@\"\n"),
+        );
+
+        // Real relay the codex hook overlay invokes.
+        let deps_dir = std::env::current_exe().unwrap();
+        let deps_dir = deps_dir.parent().unwrap();
+        let relay_binary = [deps_dir.join("remuda"), deps_dir.join("../remuda")]
+            .into_iter()
+            .find(|candidate| candidate.is_file())
+            .unwrap_or_else(|| remuda_testing::workspace_root().join("target/debug/remuda"));
+
+        let mut spec: InstanceSpec =
+            serde_json::from_str(include_str!("../tests/fixtures/instance-spec.json")).unwrap();
+        spec.driver = DriverKind::ShellPty;
+        spec.kind = AgentKind::Codex;
+        spec.cwd = workspace.to_string_lossy().into_owned();
+        spec.model_id = Some("gpt-5.4".into());
+        spec.effort = None;
+
+        let launch = ShellPtyOptions::agent(
+            workspace.clone(),
+            AgentKind::Codex,
+            AgentLaunch {
+                profile: Box::new(crate::profile::ProviderProfile {
+                    id: spec.provider_profile.id.clone(),
+                    kind: ProviderKind::OpenaiResponses,
+                    base_url: String::new(),
+                    delegation: Delegation::None,
+                    secret_ref: None,
+                    models: vec!["gpt-5.4".into()],
+                    health: crate::profile::ProviderHealth::Healthy,
+                }),
+                launch_dir: instance_dir.join("launch"),
+                native_home: native_home.clone(),
+                binary: Some(codex_bin),
+                origin: crate::materializer::LaunchOrigin::Human,
+                native_home_managed: true,
+                settings_overlay: None,
+            },
+        );
+        let mut options = launch;
+        options.claude_home = Some(native_home);
+        // Stable identity shared by the first run and the `--resume` run below,
+        // so the resumed file adapter reclaims the same rollout claim.
+        options.instance_id = Some(instance_id);
+        options.hooks = Some(HookConfig {
+            instance_dir: instance_dir.clone(),
+            relay_binary,
+            tui: crate::launch::TuiMode::Default,
+        });
+
+        let driver = ShellPtyDriver::new(options);
+        let resume_spec = spec.clone();
+        let mut first_events = driver
+            .start(spec)
+            .await
+            .expect("real codex launch")
+            .into_events();
+
+        // The fake creates the rollout under the shadow CODEX_HOME; read the
+        // real thread id the production adapter will bind to.
+        let rollout = r25_wait_rollout(&instance_dir).await;
+        let session_id = r25_session_id(&rollout);
+
+        // Step 1: the FIRST run's production adapter tails the real file.
+        r25_append_turn(&rollout, &session_id, "r25-pre-turn", 7, 1_000);
+        r25_expect_turn_usage(&mut first_events, "r25-pre-turn", 7).await;
+
+        // Non-consuming handles to the PREDECESSOR tasks.
+        let pred_adapter_aborts: Vec<_> = driver
+            .adapters
+            .lock()
+            .await
+            .as_ref()
+            .expect("the first run owns an adapter handle")
+            .tasks
+            .iter()
+            .map(tokio::task::JoinHandle::abort_handle)
+            .collect();
+        let pred_catalog_abort = driver
+            .catalog_refresh
+            .lock()
+            .await
+            .as_ref()
+            .expect("the first run owns a catalog refresh task")
+            .abort_handle();
+
+        // Step 2: the production resume path (fresh codex `--resume <id>`),
+        // with the launch spec the Node hands the driver on D-026.
+        let mut resumed_events = driver
+            .start_resumed(resume_spec, session_id.clone())
+            .await
+            .expect("real codex resume")
+            .into_events();
+
+        // Step 3a: predecessor tasks are cancelled (adapter tasks never finish
+        // naturally — finished-here means the bounded abort landed).
+        r25_wait_finished(&pred_adapter_aborts, "predecessor adapter tasks").await;
+        r25_wait_finished(
+            std::slice::from_ref(&pred_catalog_abort),
+            "predecessor catalog task",
+        )
+        .await;
+
+        // Step 3b: the adopted handles are the resumed run's own tasks and they
+        // are actually alive (the catalog task sleeps 500ms before discovery,
+        // adoption happens within milliseconds of its spawn).
+        let adapters_alive = {
+            let guard = driver.adapters.lock().await;
+            let handle = guard.as_ref().expect("the adopted adapter handle");
+            !handle.tasks.is_empty() && handle.tasks.iter().all(|task| !task.is_finished())
+        };
+        assert!(adapters_alive, "the adopted codex adapter task is alive");
+        {
+            let guard = driver.catalog_refresh.lock().await;
+            assert!(
+                guard.as_ref().is_some_and(|task| !task.is_finished()),
+                "the adopted catalog refresh task is alive"
+            );
+        }
+
+        // Step 4: a native record appended AFTER resume reaches the RETURNED
+        // run handle through the adopted adapter.
+        r25_append_turn(&rollout, &session_id, "r25-post-turn", 4242, 2_000);
+        r25_expect_turn_usage(&mut resumed_events, "r25-post-turn", 4242).await;
+
+        Driver::close(&driver).await.expect("clean close");
+    }
+
+    /// POSIX single-quote a path for interpolation into a `/bin/sh` script:
+    /// the whole value is wrapped in single quotes and every embedded
+    /// apostrophe closes the quote, inserts an escaped quote, and reopens
+    /// (`…'…` -> `'…'\''…'`). Safe for spaces, apostrophes and any byte
+    /// except NUL.
+    fn posix_single_quote(value: &str) -> String {
+        let mut quoted = String::with_capacity(value.len() + 2);
+        quoted.push('\'');
+        for ch in value.chars() {
+            if ch == '\'' {
+                quoted.push_str("'\\''");
+            } else {
+                quoted.push(ch);
+            }
+        }
+        quoted.push('\'');
+        quoted
+    }
+
+    /// Recursively locate the codex rollout the fake-harness created.
+    fn r25_find_rollout(dir: &Path, found: &mut Option<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                r25_find_rollout(&path, found);
+            } else if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
+            {
+                *found = Some(path);
+            }
+        }
+    }
+
+    async fn r25_wait_rollout(root: &Path) -> PathBuf {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let mut found = None;
+            r25_find_rollout(root, &mut found);
+            if let Some(path) = found {
+                return path;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "the fake codex never created its rollout under {}",
+                    root.display()
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Read the thread id from a rollout's `session_meta` header.
+    fn r25_session_id(rollout: &Path) -> String {
+        let first = std::fs::read_to_string(rollout).expect("rollout readable");
+        let line = first.lines().next().expect("session_meta header");
+        let record: serde_json::Value = serde_json::from_str(line).expect("meta parses");
+        record
+            .pointer("/payload/id")
+            .and_then(serde_json::Value::as_str)
+            .expect("session_meta carries the thread id")
+            .to_owned()
+    }
+
+    /// Append one real codex turn to the rollout: a `token_usage_record`
+    /// (distinct output counters) followed by `task_complete`, exactly the
+    /// envelope shape the production parser tails.
+    fn r25_append_turn(rollout: &Path, session_id: &str, turn: &str, output: u64, ordinal: u64) {
+        use std::io::Write;
+        let input = output + 100;
+        let token = serde_json::json!({
+            "timestamp": "2026-10-14T10:00:00.000Z",
+            "ordinal": ordinal,
+            "type": "token_usage_record",
+            "payload": {
+                "thread_id": session_id,
+                "turn_id": turn,
+                "session_id": session_id,
+                "root_turn_id": turn,
+                "response_id": format!("resp-{turn}"),
+                "usage": {
+                    "input_tokens": input,
+                    "cached_input_tokens": 0,
+                    "cache_write_input_tokens": 0,
+                    "output_tokens": output,
+                    "reasoning_output_tokens": 0,
+                    "total_tokens": input + output
+                }
+            }
+        });
+        let complete = serde_json::json!({
+            "timestamp": "2026-10-14T10:00:00.000Z",
+            "ordinal": ordinal + 1,
+            "type": "event_msg",
+            "payload": {
+                "type": "task_complete",
+                "turn_id": turn,
+                "last_agent_message": format!("done {turn}"),
+                "started_at": 1,
+                "completed_at": 2,
+                "duration_ms": 0,
+                "time_to_first_token_ms": 0
+            }
+        });
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(rollout)
+            .expect("rollout opens for append");
+        writeln!(file, "{token}").unwrap();
+        writeln!(file, "{complete}").unwrap();
+    }
+
+    /// Drain a run handle until the turn usage observation for `turn` arrives
+    /// and assert its output counters.
+    ///
+    /// c-ctxusage × c-usagefu merge: the final codex adapter emits one
+    /// MESSAGE-scoped usage observation per model response (durable
+    /// file/offset scope id), carrying the native turn id on the observation
+    /// source (`with_turn`); the end-of-turn Turn emission was removed in
+    /// c-usagefu r6 item 5. The adoption guarantee this test pins is unchanged.
+    async fn r25_expect_turn_usage(
+        events: &mut mpsc::Receiver<remuda_protocol::Observation>,
+        turn: &str,
+        output: u64,
+    ) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(25);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let Ok(Some(observation)) = tokio::time::timeout(remaining, events.recv()).await else {
+                panic!("turn usage for {turn} never observed through the run handle");
+            };
+            if let remuda_protocol::ObservationPayload::Usage(usage) = &observation.body
+                && usage.scope == remuda_protocol::UsageScope::Message
+                && observation.source.native_turn_id
+                    == (remuda_protocol::Knowledge::Known {
+                        value: turn.to_owned(),
+                    })
+            {
+                assert_eq!(
+                    usage.output_tokens,
+                    remuda_protocol::Knowledge::Known { value: U64(output) },
+                    "the native rollout counters ride through the adapter"
+                );
+                return;
+            }
+        }
+    }
+
+    /// Wait until every abort handle reports finished, bounded.
+    async fn r25_wait_finished(handles: &[tokio::task::AbortHandle], what: &str) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            if handles.iter().all(tokio::task::AbortHandle::is_finished) {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("{what} were not cancelled after resume");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
 
     struct RecordingWriter(Arc<std::sync::Mutex<Vec<u8>>>);
 

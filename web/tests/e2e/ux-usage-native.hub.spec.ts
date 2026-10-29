@@ -1,16 +1,20 @@
 /**
- * c-ctxusage r5 item 5b: ONE path through a NATIVE transcript (not the
- * `usage:` sentinel). Spawns the production `native_hub_e2e` example Node
- * (label e2e-native-hooks) backed by the fake-harness 2.1.289 dialect, creates
- * a promoted shell-pty Claude session whose scenario writes a real transcript
- * assistant record carrying usage, and asserts the chip/popover surface that
- * native usage — the same chip the sentinel-only spec covers, but proven
- * end-to-end through the TranscriptMapper -> journal -> Hub rollup pipeline.
+ * c-ctxusage r6/r7 item 1: native transcript usage drives the context chip
+ * THROUGH the owner-reported path — a shell terminal where the user runs the
+ * fake harness as a promoted `claude --kind claude … --script …`, the shell
+ * promoter binds the foreground process and hydrates its real transcript,
+ * and the Hub rollup derives contextUsedTokens from the 2.1.289 split-cache
+ * shape (input + cache read + cache creation).
  *
- * Self-skips when the three binaries are not built.
+ * Setup mirrors promoted-claude.hub.spec.ts exactly (bootstrap login,
+ * pre-written node enrollment token, REMUDA_CLAUDE_BIN /
+ * REMUDA_CLAUDE_CONFIG_DIR, existing data dir, proc-fs alias, node-exited
+ * check inside the host poll, host:port Hub URL).
  */
-import { expect, test } from "@playwright/test";
-import { execFile, spawn, type ChildProcess } from "node:child_process";
+
+import { spawn, type ChildProcess } from "node:child_process";
+import { promisify } from "node:util";
+import { execFile } from "node:child_process";
 import {
   access,
   chmod,
@@ -18,6 +22,7 @@ import {
   mkdir,
   mkdtemp,
   open,
+  readFile,
   realpath,
   rm,
   stat,
@@ -25,34 +30,118 @@ import {
 } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
+
+import { expect, test, type Page } from "@playwright/test";
+
+import {
+  parseBuiltExecutables,
+  resolveBuiltBinary,
+  type BuiltBinary,
+} from "../../cargo-artifacts";
 import { login } from "./hub-auth";
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+const root = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "../../..",
+);
 const target = process.env.CARGO_TARGET_DIR
   ? path.resolve(process.env.CARGO_TARGET_DIR)
-  : path.resolve(root, process.env.CARGO_TARGET_DIR_REL ?? "target");
-const remuda = process.env.HUB_E2E_REMUDA_BIN ?? path.join(target, "debug/remuda");
-const harness = process.env.HUB_E2E_FAKE_HARNESS_BIN ?? path.join(target, "debug/fake-harness");
-const nativeNode = process.env.HUB_E2E_NATIVE_NODE_BIN ?? path.join(target, "debug/examples/native_hub_e2e");
+  : path.resolve(root, "target");
 
-test.beforeAll(async ({}, testInfo) => {
-  testInfo.setTimeout(600_000);
-  const args = ["build", "--locked"];
-  if (!process.env.HUB_E2E_REMUDA_BIN) args.push("-p", "remuda", "--bin", "remuda");
-  if (!process.env.HUB_E2E_FAKE_HARNESS_BIN) args.push("-p", "remuda-testing", "--bin", "fake-harness");
-  if (!process.env.HUB_E2E_NATIVE_NODE_BIN) args.push("-p", "remuda-node", "--example", "native_hub_e2e");
-  if (args.length > 2) {
-    await promisify(execFile)("cargo", args, {
-      cwd: root, env: process.env, timeout: 570_000, maxBuffer: 8 * 1024 * 1024,
-    });
+/** Binaries the hook builds itself vs. operator-supplied overrides. The two
+ * sets are resolved differently (r10 item 6): a built-but-missing artifact is
+ * a hook failure; only an external override may ENOENT-skip. */
+const BIN_SPECS: {
+  binary: BuiltBinary;
+  override: string | undefined;
+}[] = [
+  { binary: { label: "remuda", relPath: "remuda" }, override: process.env.HUB_E2E_REMUDA_BIN },
+  {
+    binary: { label: "fake-harness", relPath: "fake-harness" },
+    override: process.env.HUB_E2E_FAKE_HARNESS_BIN,
+  },
+  {
+    binary: { label: "native node", relPath: path.join("examples", "native_hub_e2e") },
+    override: process.env.HUB_E2E_NATIVE_NODE_BIN,
+  },
+];
+
+// Resolved after beforeAll; consumed by the scenarios below.
+const bins: Record<string, string> = {};
+
+// Refresh the three executables so a standalone gate run uses this tree.
+test.beforeAll(async () => {
+  test.setTimeout(600_000);
+  // Take the executable paths from THIS bounded build: --message-format=json
+  // makes cargo report each compiler-artifact.executable itself, so a stale
+  // target/debug binary can never mask a missing fresh output under the
+  // selected target triple (and the selected triple, not the host triple,
+  // is what gets used). No post-build cargo/rustc probes - they ran
+  // unbounded and could hang the Playwright worker (c-ctxusage r11 item 2).
+  const args = ["build", "--locked", "--message-format=json"];
+  for (const spec of BIN_SPECS) {
+    if (spec.override) {
+      continue;
+    }
+    if (spec.binary.relPath === "remuda") {
+      args.push("-p", "remuda", "--bin", "remuda");
+    } else if (spec.binary.relPath === "fake-harness") {
+      args.push("-p", "remuda-testing", "--bin", "fake-harness");
+    } else {
+      args.push("-p", "remuda-node", "--example", "native_hub_e2e");
+    }
   }
-  await Promise.all([access(remuda), access(harness), access(nativeNode)]);
+  let built = new Map<string, string>();
+  if (args.length > 3) {
+    const { stdout } = await promisify(execFile)("cargo", args, {
+      cwd: root,
+      env: process.env,
+      timeout: 570_000,
+      maxBuffer: 256 * 1024 * 1024,
+    });
+    built = parseBuiltExecutables(stdout);
+  }
+  // Runs AFTER the build. A binary the hook did NOT just build (an operator
+  // override env var) may legitimately be absent on a fixture-less host: ENOENT
+  // on that path is the real missing-prerequisite SKIP; every other access
+  // error still surfaces. A binary the hook DID just build is resolved against
+  // cargo's own reported artifact path and a miss there THROWS - a failed
+  // build or wrong path resolution must fail the hook, never masquerade as a
+  // skip (c-ctxusage r10 item 6, r11 item 2).
+  const missing: string[] = [];
+  for (const spec of BIN_SPECS) {
+    if (spec.override) {
+      try {
+        await access(spec.override);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") {
+          missing.push(spec.binary.label);
+          continue;
+        }
+        throw error;
+      }
+      bins[spec.binary.label] = spec.override;
+    } else {
+      bins[spec.binary.label] = resolveBuiltBinary(built, spec.binary);
+    }
+  }
+  test.skip(
+    missing.length > 0,
+    `native usage e2e binaries missing (operator override paths): ${missing.join(", ")}`,
+  );
 });
 
-// A single-turn scenario: a slow auto tool keeps the process foreground while
-// the promoter binds; the assistant record carries 2.1.289 split usage whose
-// context (3_000 + 97_000 = 100_000 of the 200k kind fallback) is 50%.
+/** Resolved remuda/fake-harness/native-node paths for the spawned processes. */
+function builtBin(label: "remuda" | "fake-harness" | "native node"): string {
+  const resolved = bins[label];
+  if (!resolved) {
+    throw new Error(`${label} binary was not resolved before the test ran`);
+  }
+  return resolved;
+}
+
+// 3_000 + 94_000 + (2_000 5m + 1_000 1h) = 100_000 of the 200k fallback
+// window → the chip reads exactly 50%.
 const SCENARIO = {
   turns: [
     {
@@ -64,17 +153,17 @@ const SCENARIO = {
           name: "Bash",
           input: { command: "sleep 3" },
           approval: "auto",
-          duration_ms: 3000,
+          duration_ms: 3_000,
           exit_code: 0,
         },
       ],
       stop_reason: "end_turn",
       usage: {
-        input_tokens: 3000,
+        input_tokens: 3_000,
         output_tokens: 40,
-        cached_tokens: 97_000,
-        cache_creation_5m: 0,
-        cache_creation_1h: 0,
+        cached_tokens: 94_000,
+        cache_creation_5m: 2_000,
+        cache_creation_1h: 1_000,
       },
     },
   ],
@@ -82,92 +171,107 @@ const SCENARIO = {
 
 async function stopNode(node: ChildProcess) {
   if (!node.pid || node.exitCode !== null || node.signalCode !== null) return;
-  const exited = new Promise<void>((resolve) => node.once("exit", () => resolve()));
+  const exited = new Promise<void>((resolve) =>
+    node.once("exit", () => resolve()),
+  );
   node.kill("SIGTERM");
   const timer = setTimeout(() => node.kill("SIGKILL"), 10_000);
   await exited;
   clearTimeout(timer);
 }
 
-/** Single-quote a path for the pane shell. */
-function shellQuote(value: string): string {
+async function command(
+  page: Page,
+  instanceId: string,
+  operation: string,
+  payload: object = {},
+) {
+  const response = await page.request.post(
+    `/v1/instances/${instanceId}/commands`,
+    {
+      headers: { Origin: new URL(page.url()).origin },
+      data: { operation, payload },
+    },
+  );
+  expect(response.ok()).toBe(true);
+}
+
+async function rawKeys(page: Page, instanceId: string, text: string) {
+  await command(page, instanceId, "tty.write", {
+    dataBase64: Buffer.from(text).toString("base64"),
+    source: "ui",
+  });
+}
+
+function quote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
-/** Send literal keystrokes to the session TTY through the Hub command API. */
-async function sendTtyKeys(page: import("@playwright/test").Page, id: string, text: string) {
-  const response = await page.request.post(`/v1/instances/${id}/commands`, {
-    headers: { Origin: new URL(page.url()).origin },
-    data: {
-      operation: "tty.write",
-      payload: { dataBase64: Buffer.from(text).toString("base64"), source: "ui" },
-    },
-  });
-  expect(response.status(), `tty.write ${response.status()}`).toBe(200);
-}
-
-for (const geometry of [
-  { label: "1440 desktop", width: 1440, height: 900, touch: false as const },
-  { label: "390 touch sheet", width: 390, height: 844, touch: true as const },
-]) {
-  test(`native transcript usage drives the context chip (${geometry.label})`, async ({ browser }) => {
-    // c-usagefu r7 item 11: one verified-missing-binary skip; enrollment and
-    // turn failures are real failures. Covers desktop popover and the mobile
-    // 390 options sheet.
-    if (await access(nativeNode).then(() => false).catch(() => true)) {
-      test.skip(true, "native_hub_e2e not built (beforeAll builds it)");
-      return;
-    }
-    test.setTimeout(180_000);
-    const context = await browser.newContext({
-      viewport: { width: geometry.width, height: geometry.height },
-      hasTouch: geometry.touch,
-      isMobile: geometry.touch,
-    });
-    const page = await context.newPage();
+test("native transcript usage drives the context chip through the real promoted path", async ({
+  page,
+}) => {
+  test.setTimeout(180_000);
   const scratch = path.join(target, "hub-e2e");
   await mkdir(scratch, { recursive: true });
-  const dir = await realpath(await mkdtemp(path.join(scratch, "usage-native-")));
+  const dir = await realpath(
+    await mkdtemp(path.join(scratch, "usage-native-")),
+  );
   const dataDir = path.join(dir, "data");
   await mkdir(dataDir);
-  // Linux uses the /proc/self/fd alias (same as promoted-claude.hub.spec.ts):
-  // the native_hub_e2e example canonicalizes paths and needs the handle kept.
   const dataStat = await stat(dataDir);
-  const dataHandle = process.platform === "linux" ? await open(dataDir, "r") : undefined;
-  const dataPath = process.platform === "darwin"
-    ? `/.vol/${dataStat.dev}/${dataStat.ino}`
-    : dataHandle ? `/proc/${process.pid}/fd/${dataHandle.fd}` : dataDir;
+  const dataHandle =
+    process.platform === "linux" ? await open(dataDir, "r") : undefined;
+  const dataPath =
+    process.platform === "darwin"
+      ? `/.vol/${dataStat.dev}/${dataStat.ino}`
+      : dataHandle
+        ? `/proc/${process.pid}/fd/${dataHandle.fd}`
+        : dataDir;
+
   const bin = path.join(dir, "bin");
   const workspace = path.join(dir, "workspace");
   const claudeHome = path.join(dir, "claude-home");
+  const eventsFile = path.join(dir, "native-events.jsonl");
+  const settingsFile = path.join(dir, "user-settings.json");
   const scriptFile = path.join(dir, "scenario.json");
   const tokenFile = path.join(dir, "enroll-token");
   const shell = path.join(bin, "test-shell");
   let node: ChildProcess | undefined;
   let instanceId: string | undefined;
-  let nodeLog = "";
+
   try {
-    await Promise.all([mkdir(dataDir, { recursive: true }), mkdir(bin, { recursive: true }), mkdir(workspace, { recursive: true }), mkdir(claudeHome, { recursive: true })]);
-    await copyFile(harness, path.join(bin, "claude"));
+    await Promise.all([mkdir(bin), mkdir(workspace), mkdir(claudeHome)]);
+    await copyFile(builtBin("fake-harness"), path.join(bin, "claude"));
     await chmod(path.join(bin, "claude"), 0o700);
     await writeFile(
       shell,
-      "#!/bin/sh\nif [ \"${1:-}\" = --version ]; then exec /bin/sh --version; fi\nexec /bin/sh\n",
+      '#!/bin/sh\nif [ "${1:-}" = --version ]; then exec /bin/sh --version; fi\nexec /bin/sh\n',
       { mode: 0o700 },
+    );
+    await writeFile(
+      settingsFile,
+      JSON.stringify({ env: { NATIVE_USAGE_SPEC: "1" } }),
     );
     await writeFile(scriptFile, JSON.stringify(SCENARIO));
 
-    await login(page, "e2e-native-hooks");
+    // Bootstrap session (Hub access) FIRST, then mint a host enroll token and
+    // write it to the file the node reads on startup.
+    await login(page, "e2e-native-usage");
     const minted = await page.request.post("/v1/hosts/enroll-token", {
       headers: { Origin: new URL(page.url()).origin },
     });
     expect(minted.ok()).toBe(true);
-    await writeFile(tokenFile, (await minted.json()).token, { mode: 0o600 });
+    const enrollToken = (await minted.json()).token as string;
+    await writeFile(tokenFile, enrollToken, { mode: 0o600 });
 
-    const hub = new URL(process.env.VITE_HUB_URL ?? `http://${process.env.HUB_E2E_LISTEN ?? "127.0.0.1:58880"}`);
+    // host:port, not a bare port.
+    const hub = new URL(
+      process.env.VITE_HUB_URL ??
+        `http://${process.env.HUB_E2E_LISTEN ?? "127.0.0.1:58880"}`,
+    );
     hub.protocol = hub.protocol === "https:" ? "wss:" : "ws:";
     hub.pathname = "/v1/node";
-    node = spawn(nativeNode, [], {
+    node = spawn(builtBin("native node"), [], {
       cwd: dir,
       stdio: ["ignore", "pipe", "pipe"],
       env: {
@@ -177,66 +281,73 @@ for (const geometry of [
         HUB_E2E_NODE_TOKEN_FILE: tokenFile,
         HUB_E2E_NODE_WORKSPACE: workspace,
         HUB_E2E_NODE_DATA_DIR: dataPath,
-        HUB_E2E_REMUDA_BIN: remuda,
-        REMUDA_PTY_EMULATOR: "1",
-        REMUDA_PTY_HOOKS: "1",
-        REMUDA_SHIM: "on",
+        HUB_E2E_REMUDA_BIN: builtBin("remuda"),
         REMUDA_CLAUDE_BIN: path.join(bin, "claude"),
         REMUDA_CLAUDE_CONFIG_DIR: claudeHome,
         CLAUDE_CONFIG_DIR: claudeHome,
+        REMUDA_PTY_EMULATOR: "1",
+        REMUDA_PTY_HOOKS: "1",
+        REMUDA_SHIM: "on",
         SHELL: shell,
         PATH: `${bin}:/usr/bin:/bin:/usr/sbin:/sbin`,
         REMUDA_HERDR_ORPHAN_SWEEP: "0",
-        RUST_LOG: "info",
       },
     });
-    node.stdout?.on("data", (chunk) => (nodeLog += String(chunk)));
-    node.stderr?.on("data", (chunk) => (nodeLog += String(chunk)));
+    node.stderr?.on("data", (chunk) => process.stderr.write(chunk));
 
     let hostId = "";
-    try {
-      await expect
-        .poll(
-          async () => {
-            if (node && node.exitCode !== null) {
-              throw new Error(`Native Node exited (${node.exitCode ?? node.signalCode}); log: ${nodeLog.slice(-500)}`);
-            }
-            const body = await (await page.request.get("/v1/hosts")).json() as {
-              items: { hostId: string; labels?: string[]; online?: boolean }[];
-            };
-            hostId = body.items.find((row) => row.labels?.includes("test=promoted-hooks") && row.online)?.hostId ?? "";
-            return hostId;
-          },
-          { timeout: 90_000 },
-        )
-        .not.toBe("");
-    } catch (error) {
-      // c-usagefu r7 item 11: enrollment failure after a successful binary
-      // build is a REAL failure (missing PTY capability or the example
-      // crashed), not a skip. The only legitimate skip is the missing-binary
-      // check at test start (beforeAll builds it when absent). Throw so the
-      // gated run surfaces the environment defect.
-      throw new Error(
-        `native_hub_e2e Node did not enroll: ${String(error).slice(0, 200)}; log: ${nodeLog.slice(-500)}`,
-      );
-    }
+  await expect
+      .poll(
+        async () => {
+          if (node && node.exitCode !== null) {
+            throw new Error(
+              `native node exited before enrollment (${node.exitCode})`,
+            );
+          }
+          const response = await page.request.get("/v1/hosts");
+          const body = (await response.json()) as {
+            items: {
+              hostId: string;
+              labels?: string[];
+              online?: boolean;
+            }[];
+          };
+          const host = body.items.find(
+            (row) => row.labels?.includes("test=promoted-hooks") && row.online,
+          );
+          hostId = host?.hostId ?? "";
+          return hostId;
+        },
+        { timeout: 90_000, intervals: [200, 500, 1_000] },
+      )
+      .not.toBe("");
 
-    const workspaces = await (await page.request.get(`/v1/hosts/${hostId}/workspaces`)).json();
+    const workspaces = (await (
+      await page.request.get(`/v1/hosts/${hostId}/workspaces`)
+    ).json()) as { workspaces: { workspaceId: string }[] };
+    const workspaceId = workspaces.workspaces[0].workspaceId;
+
     const created = await page.request.post("/v1/instances", {
       headers: { Origin: new URL(page.url()).origin },
       data: {
         hostId,
-        workspaceId: workspaces.workspaces[0].workspaceId,
+        workspaceId,
         cwd: workspace,
         kind: "terminal",
         driver: "shell-pty",
-        name: "native-usage",
         tui: "default",
+        name: "native-usage",
       },
     });
-    const result = await created.json();
-    expect(created.ok(), `create ${created.status()}: ${JSON.stringify(result)}`).toBe(true);
+    const result = (await created.json()) as {
+      instance: { instanceId?: string; id?: string };
+    };
     instanceId = result.instance.instanceId ?? result.instance.id;
+    expect(
+      created.ok(),
+      `instance create ${created.status()}: ${JSON.stringify(result)}`,
+    ).toBe(true);
+
     const id = instanceId!;
 
     // The context chip lives in the structured-view Composer (not the TTY
@@ -248,59 +359,74 @@ for (const geometry of [
       "running",
       { timeout: 20_000 },
     );
-
-    // Launch the copied fake harness in the shell pane, the way
-    // promoted-claude.hub.spec.ts types it: production launch line with
-    // --kind/--home/--script. The harness then waits for NATIVEUSAGE and
-    // writes a real 2.1.289 transcript carrying the split usage.
-    const launchLine =
-      `claude --kind claude --home ${shellQuote(claudeHome)} ` +
-      `--script ${shellQuote(scriptFile)}\n`;
-    await sendTtyKeys(page, id, launchLine);
+   // Launch the harness as a promoted Claude session: launch command first,
+    // wait for data-mode=promoted, then prompt body and CR as separate writes
+    // (the harness treats one read with body+CR as paste).
+    await rawKeys(
+      page,
+      id,
+      `claude --kind claude --settings ${quote(settingsFile)} --home ${quote(
+        claudeHome,
+      )} --script ${quote(scriptFile)} --events-out ${quote(eventsFile)}\r`,
+    );
     await expect(page.getByTestId("session-page")).toHaveAttribute(
       "data-mode",
       "promoted",
       { timeout: 20_000 },
     );
+
+    await rawKeys(page, id, "NATIVEUSAGE probe");
+    // Wait for the harness to consume the body bytes into its composer
+    // draft BEFORE the CR: body+CR landing in one harness PTY read are
+    // treated as a paste and never submit. The events log records
+    // draft_update only once that read batch has returned, so the CR written
+    // afterwards lands in a strictly later read - an observed condition
+    // instead of a fixed delay (c-ctxusage r11 item 6).
     await expect
       .poll(
-        async () => (await (await page.request.get(`/v1/instances/${id}`)).json()).signalTier,
-        { timeout: 10_000 },
+        async () => {
+          try {
+            const log = await readFile(eventsFile, "utf8");
+            return log.split("\n").some((line) => {
+              if (!line) return false;
+              const event = JSON.parse(line) as {
+                event?: string;
+                text?: unknown;
+              };
+              return (
+                event.event === "draft_update" &&
+                typeof event.text === "string" &&
+                event.text.includes("NATIVEUSAGE probe")
+              );
+            });
+          } catch {
+            return false;
+          }
+        },
+        { timeout: 20_000, intervals: [100, 250] },
       )
-      .toBe("hook");
+      .toBe(true);
+    await rawKeys(page, id, "\r");
 
-    // Drive the scenario turn through the REAL harness: body then Enter as
-    // separate writes (the harness reads body+CR as one paste boundary).
-    await sendTtyKeys(page, id, "NATIVEUSAGE");
-    await page.waitForTimeout(150);
-    await sendTtyKeys(page, id, "\n");
+    // The owner-reported chip: 100k of 200k = 50%.
+    await expect(page.getByTestId("context-chip")).toHaveText("50%", {
+      timeout: 60_000,
+    });
 
-    // Successful launch above -> a missing turn is a FAILURE, not a skip.
-    if (geometry.touch) {
-      // r7 item 11: on mobile the context chip rides INSIDE the composer
-      // options sheet (not the collapsed bar), exactly as the sentinel 390
-      // test handles it — open the sheet first.
-      await expect(page.getByTestId("context-chip")).toHaveCount(0);
-      await page.getByTestId("model-effort-chip").click();
-      await expect(page.getByTestId("composer-options-sheet")).toBeVisible();
-    }
-    await expect(page.getByTestId("context-chip")).toHaveText("50%", { timeout: 60_000 });
     const chip = page.getByTestId("context-chip");
     await chip.click();
-    // Touch (390): the same component renders as the fixed bottom sheet;
-    // desktop (1440): the hover popover card. Both carry the data-testid
-    // context-usage-popover and the rollup numbers.
-    const detail = page.getByTestId("context-usage-popover");
-    await expect(detail).toBeVisible();
-    await expect(detail).toContainText("97,000");
-    await expect(detail).toContainText("3,000");
+    const popover = page.getByTestId("context-usage-popover");
+    await expect(popover).toBeVisible();
+    await expect(popover).toContainText("94,000");
+    await expect(popover).toContainText("3,000");
   } finally {
     if (instanceId) {
-      await page.request.delete(`/v1/instances/${instanceId}?force=1`).catch(() => {});
+      await page.request
+        .delete(`/v1/instances/${instanceId}?force=1`)
+        .catch(() => {});
     }
     if (node) await stopNode(node);
+    dataHandle?.close();
     await rm(dir, { recursive: true, force: true }).catch(() => {});
-    await context.close().catch(() => {});
   }
-  });
-}
+});

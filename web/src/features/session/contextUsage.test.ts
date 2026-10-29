@@ -209,4 +209,35 @@ describe("sessionCells / tpmCells / lastTurnLabel", () => {
     expect(cell.value).toBe("—");
     expect(cell.missingChannel).toMatch(/usage 观察/);
   });
+
+  // U1 (c-ctxusage r16 item 4): the backend folds a session total to null
+  // when ANY contributing turn omitted the bucket. The chip must show the
+  // unknown dash, never a fabricated 0, while reported buckets stay exact.
+  it("renders a U1 partial-fold rollup with dashes, never zeros", () => {
+    const partial = coerceUsageRollup({
+      contextUsedTokens: null,
+      contextWindowTokens: 200_000,
+      contextPct: null,
+      sessionInputTokens: null,
+      sessionOutputTokens: 30,
+      cacheReadTokens: null,
+      cacheCreationTokens: null,
+      turns: 2,
+      tpmIn60s: null,
+      tpmOut60s: 30,
+      tpmIn5m: null,
+      tpmOut5m: null,
+      lastTurnAt: "2026-10-10T00:00:00.000Z",
+    })!;
+    const cells = sessionCells(partial);
+    expect(cells[0].value).toBe("—");
+    expect(cells[1].value).toBe("30");
+    expect(cells[2].value).toBe("—");
+    expect(cells[3].value).toBe("—");
+    for (const cell of [cells[0], cells[2], cells[3]]) {
+      expect(cell.value).not.toBe("0");
+      expect(cell.value).not.toContain("$");
+    }
+    expect(contextHeadline(partial).text).toBe("—/200.0k (—%)");
+  });
 });

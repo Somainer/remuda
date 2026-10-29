@@ -1,6 +1,8 @@
 # Main agent: a resident Remuda instance on the always-on Hub
 
 > Status: design v3, 2026-10-05. Decision record: ADR D-057 in [decisions.md](./decisions.md). This document lands before any Phase 1 code (§15). Owner decisions D1–D4 and the owner amendments OA1–OA6 (§0) are binding. Where this document and an older design disagree, the owner decisions win.
+>
+> Companion layer: ADR D-060 (2026-10-29) adds per-entry Hub memory (§3.6, §12), fact and wake-up delivery constraints (§10.1, §11), usage-limit resume (§11.6), read projections (§10.2), and the companion-track tasks (§14.5, §15). The owner adopted its memory, origin and usage-limit rulings (R1–R3) on 2026-10-29; its other parts are proposed. The agent/user capability ledger is [agent-parity.md](./agent-parity.md).
 
 ## 0 Binding owner decisions (2026-10-05)
 
@@ -112,9 +114,12 @@ Until Phase 2, the seat watches by bounded polling of Hub reads from inside its 
 
 ### 3.6 Memory in Phase 1
 
-- Work memory is the Hub: tasks (D-050), the roster, gate jobs and interactions.
+- Work memory is the Hub: tasks (D-050), the roster, gate jobs and interactions. Task state never goes into memory; the task ledger already holds it.
 - The verbatim archive is the journal of every chapter and every worker. After a restart, the agent reads predecessor chapters with `remuda instance read`.
-- Identity and memory documents are plain files in the seat's persistent workspace, named in its launch brief. They hold no secrets. Hub-held, revisioned, owner-editable documents are Phase 3 (§12).
+- Until `cb-memory-core` lands, identity and memory documents are plain files in the seat's persistent workspace, named in its launch brief. They hold no secrets.
+- From `cb-memory-core` on, memory is per-entry rows in the Hub (§12, D-060 R1). This is not deferred to Phase 3 and does not wait for the fence: it depends on no `ma-*` task. `cb-memory-guard` imports the Phase 1 files once. A file the import cannot read (a permission or I/O error) is an error and deletes nothing; only a missing file counts as empty.
+- Remuda memory is the seat's only durable memory. The skill (`cb-skill`) tells the agent not to use its harness's native auto-memory: native memory is keyed by host and working directory, so it splits across chapters and Nodes, which is failure A6 again.
+- The identity document stays a workspace file until Phase 3 (§14.3).
 
 ## 4 Authority (D3)
 
@@ -612,21 +617,152 @@ Phase 2 adds:
 - **Fencing.** Batches target the live chapter and carry the Hub-internal initiator for its generation. F cancels an undelivered batch, and its rows are re-batched for the successor under a new id.
 - **Defaults.** Facts are delivered to continuity lineages and to coordinators created by agents. A Human-created instance without continuity gets none unless its creator opts in, so the owner's own sessions see no new behaviour. The agent can mute each kind.
 
+### 10.1 Delivery constraints (D-060)
+
+The inbox tasks (`cb-inbox-facts`, `cb-inbox-deliver`) implement these on the Hub writer thread. They add acceptance items to Phase 2; they do not widen its scope. The mechanisms follow Cindy's completion and watch path (`apps/desktop/src/main/maker-ipc/botDelegationService.ts`, `apps/desktop/src/main/bot-autonomy/events.ts`, `apps/desktop/src/main/bot-autonomy/runtime.ts`, `apps/desktop/src/main/bot-autonomy/taskWatch.ts`, `apps/desktop/src/main/bot-autonomy/followUpPrompt.ts`).
+
+1. **Stable dedupe key.** `dedupeKey = kind:instance:stateEnteredAt`. `stateEnteredAt` is the journal time at which the subject entered the state, so the key is the same after a Hub restart.
+2. **Persistent occurrence cap.** The inbox table keeps an occurrence count per `(subscriber, instance, kind)` and a cap per 24 hours. The cap is a project setting with default 6. It only stops re-delivering the same fact; it limits nothing the agent can do. The count survives a Hub restart, and the next delivered fact carries it.
+3. **Run generation in the fact key.** A fact names the run it is about: the instance and its run generation. A late result of an earlier run is delivered as that run's outcome and never settles a newer run.
+4. **Subscriber resolution.**
+   - No subscriber, or a subscriber that muted the kind: the fact falls back to the existing owner push (`alerts.rs`) where that kind pages today. The fact is neither held forever nor recorded as consumed.
+   - The subscriber is re-checked when the batch is formed, not when the row is written: it is still the parent, it has not muted the kind, and the subject has not been re-parented.
+   - **A lineage never receives facts about its own chapters.** Waking yourself only queues behind your own failing turn.
+5. **Paused lineages hold.** While the subscriber lineage is paused, its facts are held and enter no retry loop. Resume, or a successor chapter, re-batches them, as F already does (§10, Fencing).
+6. **Visible row first.** The batch's hub-origin row (§9, Phase 2) is written before its `instance.send` is forwarded.
+7. **Hub voice.** Fact text is written in the Hub's voice, never in the owner's first person. The batch row records the opening tag and the footer template version.
+8. **Tool in flight.** While a tool call is in flight the stall fallback uses its own window; the driver already pairs `tool_use` with `tool_result`. The new project setting `stallToolThresholdMins` defaults to the existing `stallThresholdMins` (30, `DEFAULT_STALL_THRESHOLD_MINS` in `crates/remuda-protocol/src/worker.rs`). Today's behaviour is unchanged by default, and the Hub chooses neither number.
+9. **Logs carry categories only.** Delivery logs record the kind, counts and error codes, never fact text or worker output.
+
+### 10.2 Digest and glance (D-060)
+
+A woken seat reads one bounded projection per worker instead of a whole journal. Both routes are read-only and need no migration (protocol.md §8.4). They follow Cindy's digest and glance (`packages/lizi-mcps/src/xdt-helper/get_task_digest.ts`, `apps/desktop/src/main/bot-autonomy/glance.ts`).
+
+- **Worker digest.** `GET /v1/workers/{id}/digest`, CLI `remuda worker digest <worker>`. It has a fixed shape of at most 2048 UTF-8 bytes and is always valid JSON. When it is too long, text fields shrink first; it is never cut into invalid JSON. Fields:
+  - the roster state and the observe classification;
+  - the latest turn result;
+  - the head and tail of the last assistant text;
+  - the pending interaction: kind, question, the tool awaiting approval, and a bounded summary of its arguments quoted as untrusted data;
+  - the requested and effective model and effort, and the pending state and requestId of `instance.configure`;
+  - the cooling-down supply window and its `resetsAt`;
+  - the number of queued commands;
+  - task, branch and sha;
+  - the time since the last progress, and whether a tool call is in flight.
+- **Argument summary.** It excludes secrets (the shapes of `scripts/ci/secret-scan.py`) and input-handoff values, and nothing else. Cindy gives no arguments at all, which is its own privacy and size trade-off. Main needs the command text to decide whether to answer for the worker or escalate.
+- **Lineage glance.** `GET /v1/lineages/{id}/glance`, CLI `remuda glance`: at most 50 waiting rows and 50 working rows across the lineage's children, plus the number done today.
+- **Who reads them.** The PWA board reuses the same projection. Phase 1 polling (§3.5) switches from journal reads to one digest per worker, and a fact batch's footer points at the digest. The middleware admits exactly the digest path shape for Agent origin, as it does for hostcap; the handler requires `dispatch` and project scope, like the other scope-wide worker reads (§4.2 item 1). The glance sits under the existing lineage read predicate. Neither waits for `ma-admission`.
+
 ## 11 Wake-ups (Phase 2)
 
 No existing capability survives a restart: harness cron and monitors are session-only. Phase 2 therefore adds wake-up rows that the agent writes. A wake-up fires at a time, at every interval, or when a condition over facts holds (including context percentage). The agent manages them with a small CLI (`remuda wake add|list|rm`). The writer thread claims each one once, and delivery goes through the inbox. A recurring wake-up that missed occurrences fires once and reports how many it missed. There are no quiet hours, and the Hub chooses no cadence or thresholds. `/healthz` reports the last tick and the delivery age, and returns 503 when the tick is stale.
 
-## 12 Memory documents (Phase 3)
+The subsections below are D-060. Their mechanisms follow Cindy's routine engine and scheduler host (`packages/maker-scheduler/src/routines.ts`, `packages/maker-scheduler/src/routine-engine.ts`, `apps/desktop/src/main/routines/service.ts`, `apps/desktop/src/main/scheduler-host/pre-run-hook.ts`, `apps/desktop/src/main/scheduler-host/runner.ts`, `apps/desktop/src/main/scheduler-host/silent-output.ts`, `apps/desktop/src/main/scheduler-host/notifier.ts`, `apps/desktop/src/main/maker-ipc/usageLimitAutoResume.ts`).
 
-The Hub holds an identity document and a memory document (Facts, Preferences, Commitments, Lessons) as objects with a revisioned pointer:
-- their size is bounded;
-- writes replace the whole document and carry a revision check; conflicts are shown, never overwritten;
-- a lint keeps secrets out;
-- they are included in hub-backup and editable from the PWA.
+### 11.1 Rows and the run state machine
 
-One replaceable instruction block in the launch brief names them. They are data and are never injected as instructions.
+- `wake_ups`: id, lineage, name (unique per lineage, so `remuda wake add --name` is idempotent), trigger (`at`, `every` or `when`), optional `check` (§11.2), mode (§11.4), `notify` (§11.5), state, next fire time, missed count, creator.
+- `wake_runs`: id, wake-up, scheduled time, state, start and end times, check exit code, the inbox batch it produced, and the occurrences missed before it.
+- Run states: `queued` → `running` → `success`, `failed` or `skipped`.
+- **Interrupted, never replayed.** At boot the Hub sets every `running` run to `interrupted` and does not replay it. The next occurrence is computed as usual.
+- **Missed occurrences** fire once with their count, as above. Remuda keeps that count; it does not silently merge queued runs.
+- **Busy lineage.** A due run is delivered through the inbox, so it waits for the idle point like any fact (§10). There is no separate busy deferral.
+- **Result writes.** If persisting a run's result fails, only the write is retried, never the run.
+
+### 11.2 Optional check
+
+A wake-up may carry a `check`, a shell command that decides whether the model runs at all.
+- It runs on a named Node in the lineage's scope, with a **mandatory timeout**: there is no default, because a hung check would stall the wake-up forever. The Node runs `sh -n` on it first.
+- Exit 0: the model turn runs, and the check's bounded stdout, quoted as untrusted data, is the run's summary. Exit 2: `skipped`, no model turn. Any other exit, or the timeout: `failed`, with a failure fact to the lineage.
+- `skipped` does not refresh the wake-up's "last real run" time. Otherwise a check that tests "time since the last real run" would lock itself out.
+- **Admission.** A check is a shell command that does not pass through the harness's own permission control. It is therefore admitted on the same axis as OA1: an Agent may add a check without approval only on its own host, and only if the creator itself runs with its harness's permission control switched off. Any other check, a cross-host one included, needs the D-017 one-shot human approval when it is added. Changing the command needs a new add.
+
+### 11.3 The unattended envelope
+
+Each delivered wake run opens with an envelope in the Hub's voice:
+- the fire time, the wake-up's id and name, and the missed count;
+- "The owner is not watching. Put open questions in your reply or use `remuda owner notify`; do not ask an interactive question.";
+- "End the turn when the work is done; do not sleep-poll."
+
+The envelope restricts no action. Unlike Cindy's, it carries no turn-authority line (D-060 R2).
+
+### 11.4 Fresh mode
+
+`mode: persistent` (the default) delivers to the live chapter. `mode: fresh` makes the Hub create a short-lived child instance under the lineage, briefed with the wake-up's text. The create is an ordinary Agent create made on the lineage's behalf, with its initiator; it passes the same admission (grants, scope, OA1, D-017) as any other, and its facts come back to the lineage.
+
+### 11.5 Silence and `owner notify`
+
+- **Hub-origin turns are silent by default.** Reply-ready pushes only when Human-origin input reached the turn (§8.5), so a fact- or wake-triggered turn pushes nothing by itself.
+- **`remuda owner notify --title --body [--dedupe-key]`.** The caller must hold `address-owner`. The Hub writes a claim row first, then pushes. A repeat with the same dedupe key returns the original row and pushes nothing. A crash between claim and push is resent at boot under the same push tag, which replaces the notification instead of adding a second one (as §8.3). The PWA renders it as a "to you" card in the Owner thread.
+- **Each wake-up declares `notify` when it is added:** `never`, `failure` or `always`. The Hub does not choose for it. For a reminder, the notification is the point. A failure that repeats while the previous one of the same kind has not recovered pushes only once.
+- Exits and turn errors keep paging through `alerts.rs`, and approvals always page (D-017).
+
+### 11.6 Resume after a usage-limit reset (A5)
+
+D-060 R3 (owner-adopted, 2026-10-29).
+- **The reset time** is the first available of:
+  1. the harness's structured rate-limit event;
+  2. a subscription window that is actually full (`resetsAt` in `crates/remuda-hub/src/supply.rs`);
+  3. a time in the error text, only when it states its time zone.
+- **Only subscription windows wait.** A 429 from an API key or a gateway relay is usually a per-minute rate limit. It creates no wait row, even when it carries a retry time; it produces the usual error fact.
+- **`resume_on_reset`** rows hold instance, run generation, supply window, fire time, attempts and state. The writer tick claims each row once. The fire time is `resetsAt` plus 60 s plus a jitter in [0, 30 s). A reset more than 8 days away creates no row, only the fact. The wait survives a Hub restart.
+- **The reset fact is always sent.** At the fire time the Hub first writes a supply-reset fact to the parent, whether or not `autoContinue` is on.
+- **`autoContinue`** is a per-instance property, default off. The agent may turn it on at dispatch or create, and so may the owner. When it is on, the Hub sends one continuation input with origin `hub` and a persisted commandId: `continue` if the failed turn produced output, otherwise the original input again. The failed turn is already settled as a root-turn failure (OA6), so this is a new command, not a replay under a new id (D-055).
+- **Cap.** At most 3 automatic continuations between two pieces of substantive journal progress.
+- **Cancel.** Any Human or Agent input to the instance cancels the wait. A switch-model is such an input.
+- A remote Node uses only the `resetsAt` from its own supply report.
+- Hub-authored input is a new actor, so this needs the `hub` origin (`ma-restart`) and F (`ma-fence`). The continuation carries the Hub-internal initiator of the subscriber lineage's live generation, and F re-attributes a pending row as it re-batches facts.
+
+## 12 Memory (D-060): Hub entries, now
+
+D-060 R1 (owner-adopted, 2026-10-29) replaces the earlier Phase 3 design, a whole memory document (Facts, Preferences, Commitments, Lessons) replaced at once under a revision check. Memory becomes per-entry rows in the Hub, built now on the companion track (§14.5), independent of F and of every `ma-*` task. Commitments are not memory: they are D-050 tasks. The identity document and the instruction block stay in Phase 3 (§14.3): one replaceable instruction block in the launch brief names the identity document, which is data and is never injected as instructions.
+
+The entry model follows Cindy's memory store (`packages/maker-core/src/memory/types.ts`, `packages/maker-core/src/memory/storage.ts`, `packages/maker-core/src/memory/manager.ts`, `packages/maker-core/src/memory/fts.ts`, `packages/lizi-mcps/src/memory/consolidate.ts`). Its owner-edit conflict check and write receipts follow `apps/desktop/src/main/maker-ipc/botMemoryService.ts` and `apps/desktop/src/main/maker-ipc/botLearningTracker.ts`.
+
+### 12.1 The store
+
+- **Table** `memory_entries`: lineage, slug, type, title, one-line description, body, revision, origin, source references, writing instance, turn reference, created, updated and deleted times. `(lineage, slug)` is unique.
+- **Types:** `user`, `feedback`, `project`, `reference`.
+- **Revision CAS per entry.** A write carries `expectedRevision`; a mismatch is a 409 that returns the current revision. A PWA edit and a seat write therefore never collide on a whole document. Conflicts are shown, never overwritten.
+- **Sizes.** A body over 2 KiB, or a rendered index over 4 KiB, is accepted, and the response states the actual sizes. A body over 8 KiB is refused. `consolidate` merges several entries into one atomically, in one writer job.
+- **Search.** SQLite FTS5 `MATCH` first; the bundled SQLite build compiles FTS5 in (rusqlite `bundled` in the root `Cargo.toml`). When `MATCH` finds nothing, or the query contains CJK characters, the search falls back to `LIKE`. The `unicode61` tokenizer treats a run of Chinese text as one token, and a trigram tokenizer returns nothing for queries under 3 characters.
+- **Backup.** Entries live in the Hub's SQLite file, which `scripts/hub-backup.sh` already bundles. A backup and restore must round-trip them.
+- **CLI.** `remuda memory write|read|search|rm|consolidate`; routes in protocol.md §8.4.
+
+### 12.2 Writers and origin
+
+- **The seat** writes with its own Agent credential through the CLI. Only the lineage's current chapter may write; once F lands, the writer job checks `check_initiator` (§7.3).
+- **The owner** writes from the PWA (§12.3).
+- **`about-me`** is one entry the owner writes; the agent reads it (open question Q1 in D-060, recommended default).
+- **Origin.** Every write records the origin of the turn it was made in, plus the writing instance and the turn reference. Until `cb-rootturn` lands that origin is the caller's `InputOrigin`; afterwards it is `rootTurn.origin`. The owner can then tell a preference written in a turn they started from one written in a turn that worker text triggered.
+- **Rules the skill teaches** (`cb-skill`): store on the first clear statement; write statements, not commands to yourself; a `feedback` entry carries **Why** and **How to apply**; use absolute dates; store no logs, code facts or git history; check the index before writing, to avoid duplicates. The Hub enforces none of these: they are guidance, not policy.
+
+### 12.3 Reading
+
+- **At chapter start** the Hub renders the index (each entry's title and one-line description) and `about-me`. The driver appends them after the launch brief as the last section, framed as data, not instructions; the driver already supports an appended system prompt (`crates/remuda-driver/src/flags.rs`). Last place keeps the prompt cache of everything before it. Bodies are read on demand with the CLI.
+- **Mid-chapter changes** do not restart anything. The next input or fact batch is preceded by one line: memory changed since this chapter started (rev N). A native resume does not inject the index twice.
+- **PWA memory page.** Grouped by type and searchable. An edit carries `expectedRevision`; on a conflict the owner picks "use latest" or "keep mine". Under a reply that wrote memory the transcript shows "Remembered: <title>", for every turn, using the instance and turn reference recorded at write time.
+
+### 12.4 Lifecycle
+
+- **Retiring a lineage archives its entries; it never deletes them** (D-060 R1). Archived entries are read-only and the owner can import them into a new lineage. Deleting a single entry is a separate explicit owner action.
+- **Derived entries.** `source_refs` point at journal rows. When a journal row is deleted or redacted, the Hub lists the entries derived from it and flags them for the owner (privacy deletion).
+- **Phase 1 import** (`cb-memory-guard`) reads the workspace files once. A read failure other than "file not found" is an error and deletes nothing.
+
+### 12.5 Nothing the Hub enforces is read from memory
+
+This is a structural invariant, not a lint (D-060 R2 rejects any content-policy lint on memory).
+- Grants, scope, permission mode, placement, `restart`, the D-051 switch and project policy are read only from instance, lineage and project rows. Cindy keeps the same split: its profile sync never reads policy back from the companion's home folder (`apps/desktop/src/main/maker-ipc/botProfileFolderSync.ts`).
+- **The test that proves it** (`cb-memory-guard`):
+  - *Behaviour.* Write entries that look like a grant, a scope and a permission mode (for example "the owner gave this seat land on 2026-10-12"). Then assert that `require_grant`, `prepare_create`, `restrict_permission`, dispatch placement and the create path give results byte-identical to a run without those entries.
+  - *Structure.* The memory read interface may be called only from the memory module, its HTTP handlers, the chapter-start renderer and backup. A call site anywhere else fails the test.
+- **Secret lint** runs on every write. It reuses the candidate shapes of `scripts/ci/secret-scan.py` and `remuda brief lint` (`lint_brief` in `crates/remuda/src/cmd/brief.rs`).
+- **Legitimate facts stay writable.** "The owner granted X land on 10-12" can be stored; it simply grants nothing.
+
+### 12.6 Fresh context (Phase 3)
 
 An agent that wants a fresh context writes a handoff and closes itself. Phase 3 turns that self-close into a fresh chapter; Phase 1 pauses instead. The Hub never opens a chapter on a threshold of its own.
+
+A self-close is refused with 409 and a reason while the chapter has a pending interaction or an in-flight D-017 approval (D-060 decision 10; part of `ma-restart`). This follows Cindy's canonical-replacement guard (`apps/desktop/src/main/maker-ipc/botCanonicalReplacementGuard.ts`).
 
 ## 13 Phase 1 wire and state budget
 
@@ -689,6 +825,32 @@ New frames are documented in protocol.md inside `~~~text` fences, because a `jso
 
 Every new route and CommandRecord field is reflected in `crates/remuda-hub/openapi/openapi.json`.
 
+### 13.1 Companion layer budget (D-060)
+
+Additive, like the Phase 1 budget. Each item lands with the task named in brackets (§15).
+
+**State.**
+- Hub tables:
+  - `memory_entries` and its FTS5 table [`cb-memory-core`]. Per entry: a body of at most 8 KiB, with warnings above 2 KiB and above a 4 KiB rendered index (§12.1). The Hub sets no cap on the number of entries.
+  - inbox occurrence counts per `(subscriber, instance, kind)`, and batch rows with their template version [`cb-inbox-facts`, `cb-inbox-deliver`]. The inbox table itself is §10.
+  - `wake_ups` and `wake_runs` [`cb-wake-engine`].
+  - `resume_on_reset` [`cb-usage-resume`].
+  - `owner notify` claim rows, unique per dedupe key [`cb-owner-notify`].
+- Hub columns: instances `auto_continue` [`cb-usage-resume`]; memory write references (instance, turn) [`cb-memory-ui`].
+- Task and dispatch documents gain `requestedBy {lineageId, commandId}` inside the existing `doc_json`, with a serde default and no migration [`cb-requested-by`].
+- Project policy gains `stallToolThresholdMins` (defaulting to `stallThresholdMins`) and the 24-hour fact cap (default 6) [`cb-stall-tooluse`, `cb-inbox-facts`].
+- On the Node: nothing for memory, digest or glance. `check` runs keep their exit code and a bounded stdout [`cb-wake-check`].
+
+**Wire, all additive.**
+- Memory routes under `/v1/lineages/{id}/memory` [`cb-memory-core`].
+- `GET /v1/workers/{id}/digest` (at most 2048 bytes) and `GET /v1/lineages/{id}/glance` (at most 50 + 50 rows) [`cb-digest`].
+- Error bodies gain `reason` and `next`; the existing `error` and `code` are unchanged [`cb-errors`].
+- `rootTurn {commandId, origin, continuation}` on the initiator, journal rows, audit rows and gate jobs. It is derived by the Hub, never read from a request body, and read by no admission rule [`cb-rootturn`, after `ma-initiator`].
+- `autoContinue` on dispatch and create [`cb-usage-resume`].
+- `remuda wake …` routes and `/healthz` tick fields [`cb-wake-engine`]; `remuda owner notify` [`cb-owner-notify`].
+
+New frames and bodies are documented in protocol.md inside `~~~text` fences (§8.4, §9.1), for the same reason as above.
+
 ## 14 Phases and exit criteria
 
 ### 14.1 Phase 1: a resident main agent you can chat with from the phone
@@ -743,7 +905,8 @@ Scope:
 - the layered transcript;
 - `owner notify`: an `address-owner`-gated push for fact-triggered turns, rendered as a "to you" card;
 - `remuda chat`;
-- clock health.
+- clock health;
+- from D-060: the delivery constraints (§10.1), the wake run state machine, `check`, envelope and `notify` declaration (§11.1–§11.5), usage-limit resume (§11.6), the stall window for a tool in flight, and `requestedBy` on approval cards.
 
 Exit:
 - A synthetic 429 on a worker yields exactly one fact to its parent within one sweep, and the reset fact after `resetsAt`.
@@ -755,11 +918,24 @@ Exit:
 - Owner-thread mode on the phone shows only owner turns, replies and "to you" cards.
 - The session-only monitors and cron are no longer used.
 
+Exit additions from D-060, each in the gated suite against fake Nodes unless it says otherwise:
+- **Dedupe and cap.** The occurrence cap still holds after a Hub restart. A worker that enters waiting seven times within the window yields six deliveries, and the next delivered fact carries the count.
+- **Run generation.** A late result of an earlier run does not settle a newer one.
+- **Own chapters.** A lineage gets no fact about its own chapters.
+- **No subscriber.** With the subscriber muted, a fact of a paging kind reaches the owner's phone and is not recorded as consumed.
+- **Pause.** Facts held while the lineage is paused arrive as one batch after Resume.
+- **Order.** The visible hub-origin row exists before the batch's `instance.send` is forwarded, and the batch row records its template version.
+- **Tool in flight.** A worker in a long tool call yields no stall fact. Once the tool ends and the quiet window passes, it yields one.
+- **Wake runs.** A Hub restart during a running run leaves it `interrupted` and does not replay it. A `check` that times out yields a failure fact. Exit code 2 runs no model turn and does not refresh the last real run time.
+- **Owner notify.** The claim row exists before the push; a repeat with the same dedupe key pushes once; a hub-origin turn pushes no reply-ready.
+- **Usage limits (A5).** A subscription 429 with a known `resetsAt` yields exactly one limit fact, then one reset fact after `resetsAt`. A gateway or API-key 429 creates no wait row. A reset more than 8 days away yields the fact only. With `autoContinue` on, the fourth automatic continuation without substantive progress is not sent, any Human or Agent input cancels the wait, and the wait survives a Hub restart.
+- **Approvals.** An approval raised in a hub-origin turn is labelled "agent-initiated"; one raised in an owner turn shows the owner's words (`requestedBy`).
+
 ### 14.3 Phase 3: durable memory, agent-opened chapters, idempotent writes
 
 Scope:
-- Hub memory documents and the instruction block;
-- self-close becomes a fresh chapter, briefed with the documents, a snapshot and predecessor ids;
+- the Hub identity document and the instruction block (memory itself moved to the companion track, §14.5, by D-060 R1);
+- self-close becomes a fresh chapter, briefed with the identity document, the memory index, a snapshot and predecessor ids; self-close is refused while an interaction or a D-017 approval is pending (§12.6);
 - caller idempotency keys on dispatch, create, gate enqueue and land, with intent recorded before acting and reconciliation from Node and git state;
 - the gate's `conflict` status passed through with its file list (today `crates/remuda-node/src/gate.rs` folds it into `failed`);
 - reviews as child tasks.
@@ -768,7 +944,8 @@ Exit:
 - A context-threshold wake-up leads to a handoff and a fresh chapter that continues a multi-worker task without losing a commitment.
 - A duplicate gate enqueue and a duplicate dispatch from a Human-token session each collapse to one.
 - Rebooting the devbox resumes the seat, with worker states arriving as facts.
-- An owner edit to the memory document on the phone is reflected in the next turn.
+- An owner edit to the identity document on the phone is reflected in the next turn.
+- A self-close with a pending interaction gets 409, and the chapter keeps running.
 
 ### 14.4 Later options (not scheduled)
 
@@ -788,6 +965,29 @@ Exit:
 - content in push bodies;
 - binding devices to an owner.
 
+D-060 records two of these as open owner questions: relocating a seat to another host (Q2; it needs memory in the Hub first) and the Feishu owner route as an inbound channel (Q3).
+
+### 14.5 Companion track (D-060)
+
+**Goal.** Memory survives chapters and Nodes (A6), the seat reads bounded projections instead of whole journals, and refusals tell the agent what to do next. The track runs alongside Phase 1 and Phase 2 and needs no `ma-*` task.
+
+**Scope.** `cb-memory-core`, `cb-memory-guard`, `cb-memory-inject`, `cb-memory-ui`, `cb-digest`, `cb-skill` and `cb-errors` (§15).
+
+**Exit**, in the gated suite unless it says otherwise:
+- **Memory CAS.** Two writes at the same revision: one succeeds, one gets 409 with the current revision.
+- **Search.** A two-character Chinese query, for example 边界, finds its entry through the `LIKE` fallback.
+- **Backup.** A backup and restore round-trips every entry.
+- **Writers.** A write from a chapter that is not the lineage's current one is refused.
+- **Retire.** Retiring a lineage archives its entries and deletes none.
+- **Secrets.** A write containing a secret shape is refused.
+- **Invariant.** The §12.5 behaviour and structure tests pass.
+- **Import.** An unreadable Phase 1 file (permission or I/O error) deletes nothing; only a missing file counts as empty.
+- **Injection.** A real claude-sdk chapter starts with the index as the last section of its system prompt and no bodies. A mid-chapter edit produces the "memory changed" line before the next input. A native resume does not inject twice.
+- **PWA.** The owner edits an entry on the phone while the seat writes the same one. The conflict dialog appears, "keep mine" wins, and the seat sees the "memory changed" line on its next turn.
+- **Skill.** A seat that hears a preference from the owner stores it with `remuda memory write`, with Why, How to apply and an absolute date; the harness's native memory directory for that working directory gains no file; a new chapter reads the entry.
+- **Digest.** For inputs with multi-byte characters the digest is always valid JSON of at most 2048 bytes. The argument summary is bounded and holds no handoff values and no known secret shape. It shows `resetsAt` for a cooling-down supply and the pending `instance.configure`. On real workers, a digest taken mid-turn, while an approval is pending and after DONE matches the journal field by field.
+- **Errors.** Existing clients still parse every error body. The 403 for a missing grant, the approval-required 409 and the out-of-scope 403 carry `reason` and `next`. A seat without `land` that tries to land acts on `next` in its following turn instead of retrying blindly.
+
 ## 15 Phase 1 task order
 
 Docs come first. Each task keeps the full gated suite (Rust, web, and hub e2e against fake Nodes) green on its own.
@@ -805,6 +1005,48 @@ Docs come first. Each task keeps the full gated suite (Rust, web, and hub e2e ag
 11. `ma-main-ui`: Main entry, chapters, status line, controls, hub-origin rows.
 12. `ma-skill`: the skill update for an Agent seat.
 13. `ma-evidence-cutover`: upgrade to the Phase 1 commit, seat Main, collect E1–E9, cut over.
+
+### 15.1 Companion-layer tasks (D-060)
+
+Each keeps the full gated suite green on its own, like the tasks above. `cb-adr` (D-060 and these documents) comes first.
+
+**Companion track (§14.5).** It depends on no in-flight or unstarted `ma-*` task and is the critical path.
+
+| Task | Content | After |
+|---|---|---|
+| `cb-memory-core` | `memory_entries` and its FTS5 table, the memory routes and CLI, Agent scope (own lineage only), current-chapter writes, archive on retire, `source_refs` back-references, backup round trip (§12.1, §12.2, §12.4) | `cb-adr` |
+| `cb-digest` | `GET /v1/workers/{id}/digest`, `GET /v1/lineages/{id}/glance`, `remuda worker digest`, `remuda glance`, generated web types (§10.2) | `cb-adr` |
+| `cb-skill` | a memory section in `skills/remuda/sections/`, "no native auto-memory", "the engine is not the identity", when to delegate, "read before retrying an unknown outcome". It merges into `ma-skill` if that is dispatched first | `cb-adr` |
+| `cb-errors` | `reason` and `next` on error bodies, CLI rendering of `next.hint` (protocol.md §9.1); no new refusal path | none |
+| `cb-memory-guard` | the secret lint, the §12.5 invariant tests, the one-time Phase 1 import | `cb-memory-core` |
+| `cb-memory-inject` | the index rendered at create and appended by the driver; the "memory changed" line; no double injection on native resume (§12.3) | `cb-memory-core` |
+| `cb-memory-ui` | the PWA memory page, the `about-me` editor, "Remembered: <title>" rows, write references (§12.3) | `cb-memory-core` |
+
+**After `ma-initiator` lands.**
+
+| Task | Content | After |
+|---|---|---|
+| `cb-rootturn` | `rootTurn {commandId, origin, continuation}` on the initiator, derived by the Hub from the turn record; written to audit rows, journal rows and gate jobs; never a gate (D-060 R2). Until `ma-restart` adds `hub`, a fact-triggered turn is recorded as `agent` with `continuation` | `ma-initiator` |
+| `cb-requested-by` | `requestedBy {lineageId, commandId}` stamped from `rootTurn` in owner turns; `/approvals` shows the owner's words, or "agent-initiated" for a hub-origin turn. It never replaces the approval | `cb-rootturn` |
+
+**Phase 2 (after `ma-initiator`, `ma-fence` and `ma-restart`).**
+
+| Task | Content | After |
+|---|---|---|
+| `cb-inbox-facts` | the inbox, journal-driven fact sources, dedupe key, persistent occurrence cap, run generation in the key, no facts about a lineage's own chapters (§10, §10.1 items 1–4) | `ma-initiator`, `ma-fence`, `ma-restart` |
+| `cb-inbox-deliver` | batching, hold while paused, re-check at batch formation, owner-push fallback, visible row first, Hub voice and template version (§10.1 items 4–7, 9) | `cb-inbox-facts` |
+| `cb-stall-tooluse` | the driver reports a tool call in flight; the stall fallback uses `stallToolThresholdMins` (§10.1 item 8) | `cb-inbox-facts` |
+| `cb-usage-resume` | `resume_on_reset`, the reset fact, `autoContinue` and the continuation input (§11.6) | `cb-inbox-deliver` |
+| `cb-wake-engine` | `wake_ups`, `wake_runs`, the run state machine, the envelope, fresh mode, `remuda wake`, `/healthz` tick fields (§11, §11.1, §11.3, §11.4) | `cb-inbox-deliver` |
+| `cb-wake-check` | `check` on the Node: mandatory timeout, `sh -n` precheck, exit-code routing, its admission rule (§11.2) | `cb-wake-engine` |
+| `cb-owner-notify` | `remuda owner notify`, claim rows, dedupe, the "to you" card, the `notify` declaration (§11.5) | `cb-inbox-deliver` |
+
+**Amendments to unstarted `ma-*` briefs** (made before each is dispatched; the in-flight `ma-initiator` brief is not changed):
+- `ma-admission`: read the creator's permission mode at the commit point, inside the create transaction after the worktree or pool lease, and re-check its generation. If the creator's mode changed while the create was being prepared, the create aborts, and the Node materializer refuses a stale stamp. This follows Cindy's submit-time read (`apps/desktop/src/main/maker-ipc/botDelegationService.ts`).
+- `ma-skill`: merge `cb-skill`, and generate the capability section from launch facts: grants held, `land` or not, herdr on the host, the project's D-051 switch, whether the inbox exists. A seat without `land` sees no land verb. This follows Cindy's flag-gated guide (`apps/desktop/src/main/maker-ipc/teammateGuide.ts`, `apps/desktop/src/main/maker-ipc/botProfileRuntime.ts`).
+- `ma-restart`: the self-close guard (§12.6).
+- `ma-fence`: §10.1 item 3 (run generation in the fact key) in its acceptance.
+- `ma-main-ui`: origin labels on audit rows and the status line.
 
 ## 16 Cutover (D4)
 
@@ -828,7 +1070,9 @@ Out:
 - tunnels or a public front door (D-031);
 - delegating approvals;
 - any keystroke path around approvals;
-- project-wide switches changed on the seat's behalf.
+- project-wide switches changed on the seat's behalf;
+- any policy gate on fact- or wake-triggered turns, and any content-policy lint on memory (D-060 R2);
+- routine templates built into the Hub.
 
 Rejected:
 - **Keep the main agent in a laptop session with better scripts:** fails A1–A4 by placement.
@@ -842,6 +1086,23 @@ Rejected:
 - **Reject facts while busy:** starves a coordinator that is almost always mid-turn.
 - **A per-harness posture map, OS-user isolation and land-grant machinery in Phase 1:** removed by D3 and listed in §14.4.
 
+Rejected by D-060:
+- **An autonomous-turn allowlist that refuses everything else with "needs an owner request"** (Cindy `apps/desktop/src/main/maker-ipc/taskActionHost.ts`, `apps/desktop/src/main/maker-ipc/taskActionAuthorization.ts`): a policy restriction, not a safety property. Its rules reversed themselves several times in a few days (`docs/product-rules/teammate-authority.md`), and a per-turn gate does not stop injected content. Remuda takes only the separation of origin from authority (`rootTurn`, recorded and never a gate; R2).
+- **Forbidding wake-up writes in fact-triggered turns:** a wake-up carries no authority of its own and uses the same credential as the turn that wrote it. The paths that could widen authority (grants, scope, `restart`) are already closed (`validate_child_delegation`, §6.1).
+- **A "looks like a grant" lint on memory content:** a policy restriction; the real property is §12.5 (R2).
+- **Routine templates built into the Hub** (follow-up, todo check, nightly): they contradict "the Hub chooses no cadence" (§11). The skill teaches the agent to add its own with `remuda wake add` under stable names.
+- **A review after every reply, and a commitments ledger the model writes:** Cindy dropped its per-reply review after about 22 fix commits (`docs/product-rules/cindy-bots-runtime.md`). Commitments are D-050 tasks.
+- **Hidden synthetic continuation triggers:** every continuation is a visible hub-origin row (§9).
+- **Each Node following its own tasks:** one central Hub lets one lineage follow every Node.
+- **A whole-document memory:** whole-document replacement makes an owner edit and a seat write collide on the entire document. Per-entry CAS is what makes a conflict always visible and never an overwrite (§12).
+- **Resetting the permission mode when a seat moves:** OA2 makes the mode the owner's choice at creation.
+- **Binding the Feishu owner on first private message:** keep the explicit allowlist.
+- **Completion or convergence judged only by a prompt:** `DONE <sha>`, and dependencies unlocked only by a landed sha (`crates/remuda-hub/src/tasks.rs`), are harder evidence.
+
 Reference studied: open-muse (open source).
 - Adopted: the loop on always-on infrastructure; a service that is a clock and never reasons; proactive turns as ordinary messages that never interrupt a conversation waiting on the person; notifications suppressed only where the app is in front.
 - Not adopted: a fixed check-in cadence, hidden machine turns, and rejecting work when busy.
+
+Reference studied: Cindy (open source, Apache-2.0; D-060). Designs only; no prompt or code text is copied.
+- Adopted: host-side deterministic bookkeeping (detection, dedupe, receipts, validation, version CAS) with the model deciding from bounded, sourced data; per-entry typed memory with FTS and a `LIKE` fallback; completion delivery in the order "settle, visible row, then wake"; a run state machine where interrupted runs never replay; a timed pre-run check; usage-limit resume only for subscription windows; a fixed-size digest; recording whose turn it is without gating on it; a capability ledger.
+- Not adopted: its permission policy layer, built-in routines, per-reply learning review, hidden triggers, per-machine following, permission reset on relocation, first-message owner binding, and prompt-only convergence.

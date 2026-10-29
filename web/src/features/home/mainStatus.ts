@@ -137,13 +137,32 @@ export type MainStatusInput = {
   nowMs: number;
 };
 
+/**
+ * The lineage projection only speaks for the chapter it was read for: one
+ * whose generation is older than the resolved chapter predates a chapter
+ * switch and is ignored (the instance rows decide instead).
+ */
+export function lineageFor(lineage: LineageRecord | null | undefined, entry: MainEntry): LineageRecord | null {
+  if (!lineage) return null;
+  return lineage.generation >= entry.generation ? lineage : null;
+}
+
 export function mainStatus(input: MainStatusInput): MainStatus {
-  const { entry, lineage, host, hostName, asking, summary, nowMs } = input;
+  const { entry, host, hostName, asking, summary, nowMs } = input;
+  const lineage = lineageFor(input.lineage, entry);
   const instance = entry.instance;
   const base = { hostName, hostOffline: false, resumable: false };
-  const paused = lineagePausedBy(lineage);
+  // Live instance evidence wins over a cached paused record: 恢复 is never
+  // offered for a chapter that is running.
+  const paused = entry.live ? null : lineagePausedBy(lineage);
   if (paused) {
     return { ...base, phase: "paused", dot: "exited", phrase: pausedLabel(paused, nowMs), tone: "muted", resumable: true };
+  }
+  if (!entry.live && lineage && lineage.generation > entry.generation) {
+    // The lineage already holds a successor the instance list has not shown
+    // yet (a resume from another device, a restart): it is starting, not
+    // stopped, and resuming again would open yet another chapter.
+    return { ...base, phase: "starting", dot: "starting", phrase: "正在启动下一章", tone: "normal" };
   }
   if (!entry.live) {
     // No live chapter and no paused-by record: the chapter ended (a Pause
@@ -230,10 +249,13 @@ export function lineageStateLabel(
     return since ? `主机离线，已 ${since}` : "主机离线";
   }
   if (status.phase === "restarting") return "正在重启";
+  if (status.phase === "starting") return status.phrase;
   if (!lineage) return null;
   if (lineage.state === "running") return "运行中";
   if (lineage.state === "starting") return "启动中";
-  return lineage.state || null;
+  // "paused" on a live chapter is a stale read (live evidence wins); other
+  // words are shown only through the phases above.
+  return null;
 }
 
 // ── line 2: the last reply, or the echo of the latest send ────────────────

@@ -10,6 +10,7 @@ import type { Id, U64 } from "../../types/wire";
 import { useLineageSync } from "../home/useMain";
 import {
   causeLabel,
+  lineageFor,
   lineageStateLabel,
   mainStatus,
   restartsIn24h,
@@ -48,7 +49,8 @@ function MainSessionBarBody({ entry, instance, mobile }: { entry: MainEntry; ins
   const hub = useHub();
   const nowMs = useNowTick();
   const navigate = useNavigate();
-  const lineage = hub.lineages[entry.lineageId] ?? null;
+  // Only a projection read for this chapter speaks for it (r2 item 3).
+  const lineage = lineageFor(hub.lineages[entry.lineageId], entry);
   const current = entry.instance;
   const status = mainStatus({
     entry,

@@ -1,8 +1,8 @@
-import { describe, expect, it } from "vitest";
-import { mapInstance } from "./api";
+import { describe, expect, it, vi } from "vitest";
+import { api, mapInstance, type LineageRecord } from "./api";
 import type { components } from "./api.generated";
 import { mockDb } from "./mock";
-import { ADDRESS_OWNER_GRANT, resolveMain, selectMain, type HubState } from "./store";
+import { ADDRESS_OWNER_GRANT, hubStore, resolveMain, selectMain, type HubState } from "./store";
 import type { Instance } from "../types/instance";
 import type { Id } from "../types/wire";
 
@@ -107,5 +107,50 @@ describe("mapInstance lineage fields", () => {
     expect(mapped.chapterCause).toBe("owner-resume");
     expect(mapped.fencedAt).toBeUndefined();
     expect(mapped.grants).toEqual(["address-owner"]);
+  });
+});
+
+describe("refreshLineage across a chapter switch (r2 item 3)", () => {
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((r) => (resolve = r));
+    return { promise, resolve };
+  }
+  const record = (generation: number, state: string): LineageRecord => ({
+    lineageId: "ins_lsw" as Id,
+    state,
+    generation,
+    chapters: Array.from({ length: generation }, (_, i) => ({
+      instanceId: `ins_lsw_g${i + 1}` as Id,
+      generation: i + 1,
+      createdAt: "2026-10-30T08:00:00Z",
+    })),
+  });
+
+  it("a post-switch read never joins the in-flight pre-switch GET, and a late pre-switch answer never wins", async () => {
+    const before = deferred<LineageRecord>();
+    const after = deferred<LineageRecord>();
+    const get = vi.spyOn(api, "lineageGet").mockReturnValueOnce(before.promise).mockReturnValueOnce(after.promise);
+    const pre = hubStore.refreshLineage("ins_lsw" as Id, "ins_lsw_g1");
+    const post = hubStore.refreshLineage("ins_lsw" as Id, "ins_lsw_g2");
+    expect(get).toHaveBeenCalledTimes(2);
+    after.resolve(record(2, "running"));
+    await post;
+    before.resolve(record(1, "paused"));
+    await pre;
+    expect(hubStore.getSnapshot().lineages["ins_lsw"]?.generation).toBe(2);
+    expect(hubStore.getSnapshot().lineages["ins_lsw"]?.state).toBe("running");
+    get.mockRestore();
+  });
+
+  it("the same view still shares one read", async () => {
+    const one = deferred<LineageRecord>();
+    const get = vi.spyOn(api, "lineageGet").mockReturnValueOnce(one.promise);
+    const a = hubStore.refreshLineage("ins_lsw" as Id, "ins_lsw_g3");
+    const b = hubStore.refreshLineage("ins_lsw" as Id, "ins_lsw_g3");
+    expect(get).toHaveBeenCalledTimes(1);
+    one.resolve(record(3, "running"));
+    await Promise.all([a, b]);
+    get.mockRestore();
   });
 });

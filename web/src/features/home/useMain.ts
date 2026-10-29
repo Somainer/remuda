@@ -39,8 +39,11 @@ export function useLineageSync(entry: MainEntry | null) {
     : "";
   useEffect(() => {
     if (!lineageId) return;
-    void hubStore.refreshLineage(lineageId as Id);
-    const timer = window.setInterval(() => void hubStore.refreshLineage(lineageId as Id), LINEAGE_POLL_MS);
+    // The view is the resolved chapter and its lifecycle edge: a read issued
+    // after a chapter switch (or a pause landing) never joins one that started
+    // before it (store.refreshLineage).
+    void hubStore.refreshLineage(lineageId as Id, chapterKey);
+    const timer = window.setInterval(() => void hubStore.refreshLineage(lineageId as Id, chapterKey), LINEAGE_POLL_MS);
     return () => window.clearInterval(timer);
   }, [lineageId, chapterKey]);
 }

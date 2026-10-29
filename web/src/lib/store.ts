@@ -7141,26 +7141,39 @@ class HubStore {
    */
   /**
    * D-057 §13: read one lineage projection into `lineages` (ma-main-ui). A
-   * failed read keeps the previous projection — the Main surfaces then fall
-   * back to what the instance rows alone prove — and never toasts.
+   * failed read keeps the previous projection and never toasts; the Main
+   * surfaces only trust a projection that covers the chapter they resolved
+   * (features/home/mainStatus.ts), so a kept stale one falls back to what the
+   * instance rows prove.
+   *
+   * `view` names the chapter the caller resolved (its id). Reads coalesce
+   * only within one view: a refresh issued after a chapter switch never joins
+   * a GET that started before it. Answers apply in issue order per lineage,
+   * so a slow pre-switch answer can never overwrite a newer one.
    */
-  refreshLineage(lineageId: Id): Promise<LineageRecord | null> {
-    // Coalesce: the card, the pinned row and the status line can all ask at
-    // once; one read serves them.
-    const inFlight = this.lineageReads.get(lineageId);
+  refreshLineage(lineageId: Id, view = ""): Promise<LineageRecord | null> {
+    const key = `${lineageId} ${view}`;
+    const inFlight = this.lineageReads.get(key);
     if (inFlight) return inFlight;
-    const read = this.readLineage(lineageId).finally(() => this.lineageReads.delete(lineageId));
-    this.lineageReads.set(lineageId, read);
+    const read = this.readLineage(lineageId).finally(() => this.lineageReads.delete(key));
+    this.lineageReads.set(key, read);
     return read;
   }
 
-  private readonly lineageReads = new Map<Id, Promise<LineageRecord | null>>();
+  private readonly lineageReads = new Map<string, Promise<LineageRecord | null>>();
+  /** Per lineage: the issue number of the last read whose answer applied. */
+  private readonly lineageApplied = new Map<Id, number>();
+  private lineageIssued = 0;
 
   private async readLineage(lineageId: Id): Promise<LineageRecord | null> {
     const epoch = this.bootGen;
+    const issued = ++this.lineageIssued;
     try {
       const record = await api.lineageGet(lineageId);
       if (epoch !== this.bootGen) return null;
+      // A later-issued read already answered: this one is older news.
+      if ((this.lineageApplied.get(lineageId) ?? 0) > issued) return record;
+      this.lineageApplied.set(lineageId, issued);
       const previous = this.state.lineages[lineageId];
       if (!previous || !structuralEqual(previous, record)) {
         this.emit({ lineages: { ...this.state.lineages, [lineageId]: record } });

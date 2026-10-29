@@ -47,12 +47,35 @@ const status = (e: MainEntry, extra: Partial<Parameters<typeof mainStatus>[0]> =
 
 describe("mainStatus line-1 phrase", () => {
   it("names a device pause with its time and turns the input into 恢复", () => {
-    const s = status(entry(), {
+    // A pause closes the current chapter: it is no longer live.
+    const s = status(entry({ lifecycle: "exited" }, false), {
       lineage: lineage({ state: "paused", pausedBy: { by: "device", at: "2026-10-30T11:59:40Z" } }),
     });
     expect(s.phase).toBe("paused");
     expect(s.phrase).toBe("已由你暂停 · 刚刚");
     expect(s.resumable).toBe(true);
+  });
+
+  it("live evidence wins over a cached paused record: no 恢复 for a live chapter (r2 item 3)", () => {
+    const s = status(entry({}, true, 2), {
+      lineage: lineage({ state: "paused", generation: 2, pausedBy: { by: "device", at: "2026-10-30T11:00:00Z" } }),
+    });
+    expect(s.phase).not.toBe("paused");
+    expect(s.resumable).toBe(false);
+  });
+
+  it("a record older than the resolved chapter is ignored", () => {
+    // The cached projection still describes chapter 1 as paused; the instance
+    // list already holds a live chapter 2.
+    const s = status(entry({}, true, 2), { lineage: lineage({ state: "paused", generation: 1, pausedBy: "device" }) });
+    expect(s.resumable).toBe(false);
+    expect(s.phrase.startsWith("空闲")).toBe(true);
+  });
+
+  it("an ended chapter whose lineage already moved on offers no 恢复", () => {
+    // The record already names a successor the instance list has not shown yet.
+    const s = status(entry({ lifecycle: "exited" }, false, 1), { lineage: lineage({ state: "starting", generation: 2 }) });
+    expect(s.resumable).toBe(false);
   });
 
   it("an ended chapter with no paused-by record reads 已停止, names no actor, and offers 恢复", () => {

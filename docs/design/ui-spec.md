@@ -752,7 +752,7 @@ Bot / `claude-print` 实例没有终端 tab。Artifact 产物页走订阅登录�
 
 AskUserQuestion 不在列表里填完（题太长）；「去回答」进会话页表单。Allow/Deny 可在列表一键完成。
 
-**首页的简单单选题例外（D-061，2026-10-30）**：首页「需要你」队列（`ApprovalCard mode="home"`，任务 `home-queue`）可以用选项 chip 一键回答一道问题，前提是它同时满足四个条件：
+**首页的简单单选题例外（D-061，2026-10-30）**：首页「需要你」队列（`DecisionCard mode="home"`，任务 `home-queue`）可以用选项 chip 一键回答一道问题，前提是它同时满足四个条件：
 - 只有一个字段（`fields.length=1`）；
 - 该字段是单选（`input=single-select`）；
 - 选项不超过 4 个；

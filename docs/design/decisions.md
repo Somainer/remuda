@@ -1876,9 +1876,14 @@ registry 锁外加独立 DB claim（跨域，reconcile 先于 slot 切换提交�
 ### 背景
 
 origin/main（`c27e0eac`）的首页现状：
-- **`/m` 首页**是分组台账（`web/src/features/mobile/HomeList.tsx`）。D-050 的任务层在台账顶部放了自己的「需要你」组（`buildHomeTaskLayer`），而收件箱是另一个「需要你」。所以首页上有两个「需要你」，口径并不相同。
+- **`/m` 首页**是分组台账（`web/src/features/mobile/HomeList.tsx`）。台账上方是 D-050 的任务层（`HomeTaskLayer`，由 `buildHomeTaskLayer` 推出），它的第一组是任务口径的「需要你」：会话上有待处理人工交互的任务，或 `blockedReason` 非空的任务（`web/src/features/tasks/taskRows.ts`）。这一组只是行，不能直接作答。
+- **收件箱**（`/m/inbox`、桌面 `/approvals`）是另一个页面，口径是交互：只列交互，没有任务层。
+- **两者的关系：** 首页上的任务注意力组和收件箱范围不同。同一件事可能在两处各出现一次，也可能只在其中一处出现；首页上则没有一个统一、可作答的「需要你」。
 - **排序与折叠：** 排序只把 blocked 顶到最前（`homeRows.ts` 的比较函数），其余行全部渲染，没有空闲折叠。
-- **一键作答：** 能一键作答的 `ApprovalCard` 只出现在收件箱里。收件箱的 compact 卡会把计划审阅的选项内联画出来，不能直接搬到首页。
+- **可作答的卡：** 首页上没有。可作答的卡只在两个地方出现：
+  - 收件箱渲染 `DecisionCard`：桌面用 `mode="desktop"`，compact 用 `mode="compact"`（`web/src/features/approvals/InboxShell.tsx`；组件在 `ApprovalCard.tsx`，`InboxMode` 只有这两个值）；
+  - 会话页渲染可操作的 `ApprovalCard`（`web/src/pages/SessionPage.tsx`）。
+  - 收件箱的 compact 卡会把计划审阅的选项内联画出来（`ApprovalCard.tsx`），所以不能直接搬到首页：首页变体必须去掉这些选项。
 - **Main：** 「Main 置顶行」只存在于规格（ui-spec §2.1、§4.7），`ma-main-ui` 直到这次裁定之前都没有排期。
 - **完成未看：** 没有实现。ui-spec §3.1 规定的「按用户+设备的 last-read seq」与投影字段 `unread?` 从未实现。
 - **角标：**
@@ -1958,7 +1963,7 @@ origin/main（`c27e0eac`）的首页现状：
    - **owner glance**（`GET /v1/owner/glance`）落地后，计数、今日完成与每行 headline 改读它，并删除首页逐行读 journal 的 2.5 s 轮询。
 
 5. **小界面授权更少，以及简单单选例外（R6、R7）。**
-   - 首页卡片是 `ApprovalCard mode="home"`。权限卡只渲染 `effect` 为 `deny` 和 `allow-once` 的两个选项；计划卡只给「审阅计划」；sensitive 与 elicitation 只给「去会话」；任何界面都没有批量批准。
+   - 首页卡片是 `DecisionCard` 的新模式 `mode="home"`（`ApprovalCard.tsx`，`InboxMode` 加一个值）。权限卡只渲染 `effect` 为 `deny` 和 `allow-once` 的两个选项；计划卡只给「审阅计划」；sensitive 与 elicitation 只给「去会话」；任何界面都没有批量批准。
    - 满足以下全部条件的问题，可以在首页用 chip 回答，chip 之外另给「其他…」：单字段、`input=single-select`、选项不超过 4 个、`sensitive=false`。这一条修订 ui-spec §2.5「AskUserQuestion 不在列表里填完」；收件箱行为不变。
    - 这是人类界面的规则。Main 受 grant 与 D-017、D-051(a) 约束：approval 只由人回答。
 
@@ -2097,7 +2102,7 @@ origin/main（`c27e0eac`）的首页现状：
 - **Web：**
   - `web/src/features/mobile/HomeList.tsx`（任务层、2.5 s 逐行 journal 轮询、空态）、`homeRows.ts`（比较函数、`homeRowsSignature`、`buildHomeTaskLayer`）；
   - `web/src/features/tasks/taskRows.ts`（`blockedReason` 与「需要你」组）；
-  - `web/src/features/approvals/ApprovalCard.tsx`、`InboxShell.tsx`；
+  - `web/src/features/approvals/ApprovalCard.tsx`（`DecisionCard`、`InboxMode`、`ApprovalCard`）、`InboxShell.tsx`；`web/src/pages/SessionPage.tsx`（会话页的 `ApprovalCard`）；`web/src/features/tasks/taskRows.ts`（任务注意力组的口径）；
   - `web/src/components/PtyQuestionAnswers.tsx`（只检查 `fields.length`）；
   - `web/src/types/interaction.ts`（`QuestionField.input`、`sensitive`，`DecisionOption.effect`）；
   - `web/src/lib/store.ts`（`startPoll` 2 s）、`push.ts`（`syncAppBadge`、`startAppBadgeSync`）、`mobileRoute.ts`；

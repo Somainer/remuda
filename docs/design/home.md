@@ -274,7 +274,7 @@
 
 ### 4.2 卡片种类与首页上能做什么
 
-首页卡片是 `ApprovalCard` 的一个新变体 `mode="home"`（任务 `home-queue`）。它沿用 ui-spec §2.5 的卡片外壳和按钮标签规则（按钮上直接显示 `opt.label` 的原文），只是能做的事更少：
+首页卡片是 `DecisionCard`（`web/src/features/approvals/ApprovalCard.tsx`）的一个新模式 `mode="home"`（任务 `home-queue`）。今天 `InboxMode` 只有收件箱用的 `desktop` 和 `compact` 两个值；会话页用的是另一个组件 `ApprovalCard`。它沿用 ui-spec §2.5 的卡片外壳和按钮标签规则（按钮上直接显示 `opt.label` 的原文），只是能做的事更少：
 
 | 卡片种类 | 判定 | 首页上能做什么 |
 |---|---|---|

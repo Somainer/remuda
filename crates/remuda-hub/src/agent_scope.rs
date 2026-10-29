@@ -40,7 +40,7 @@ pub async fn caller(state: &AppState, headers: &HeaderMap) -> Result<Device, Hub
             return Err(HubError::Forbidden);
         }
         if state.store.get_instance(id.to_string()).await?.is_none() {
-            return Err(HubError::Forbidden);
+            return Err(HubError::caller_retired());
         }
         device.kind = "agent".into();
         device.instance_id = Some(id.into());
@@ -77,7 +77,7 @@ pub async fn owns(state: &AppState, device: &Device, target: &str) -> Result<boo
 pub async fn require_operator(state: &AppState, headers: &HeaderMap) -> Result<Device, HubError> {
     let device = caller(state, headers).await?;
     if origin(&device) == InputOrigin::Agent {
-        return Err(HubError::Forbidden);
+        return Err(HubError::agent_not_permitted());
     }
     Ok(device)
 }
@@ -98,7 +98,7 @@ pub async fn caller_project_scope(
         .store
         .get_instance(id.into())
         .await?
-        .ok_or(HubError::Forbidden)?;
+        .ok_or_else(HubError::caller_retired)?;
     Ok(instance.scope)
 }
 
@@ -119,7 +119,7 @@ pub async fn require_grant(
         .store
         .get_instance(id.into())
         .await?
-        .ok_or(HubError::Forbidden)?;
+        .ok_or_else(HubError::caller_retired)?;
     let wire = serde_json::to_value(grant)
         .ok()
         .and_then(|value| value.as_str().map(str::to_string))
@@ -127,7 +127,7 @@ pub async fn require_grant(
     if instance.grants.iter().any(|held| held == &wire) {
         Ok(())
     } else {
-        Err(HubError::Forbidden)
+        Err(HubError::missing_grant(&wire))
     }
 }
 
@@ -139,7 +139,7 @@ pub async fn require_instance_read(
 ) -> Result<(), HubError> {
     let device = caller(state, headers).await?;
     if origin(&device) == InputOrigin::Agent && !owns(state, &device, instance_id).await? {
-        return Err(HubError::Forbidden);
+        return Err(HubError::out_of_scope());
     }
     Ok(())
 }
@@ -304,7 +304,7 @@ pub async fn same_host(state: &AppState, device: &Device, host: &str) -> Result<
         .store
         .get_instance(caller.into())
         .await?
-        .ok_or(HubError::Forbidden)?;
+        .ok_or_else(HubError::caller_retired)?;
     Ok(instance.host_id == host)
 }
 
@@ -316,7 +316,11 @@ pub fn restrict_permission(device: &Device, spec: &mut Value) -> Result<(), HubE
     if origin(device) == InputOrigin::Agent
         && !matches!(spec["permissionMode"].as_str(), Some("manual" | "plan"))
     {
-        return Err(HubError::Forbidden);
+        return Err(HubError::Forbidden.with_next(
+            "AGENT_NOT_PERMITTED",
+            "Agent launches may only use permissionMode `manual` or `plan`. Do not retry the \
+             same spec; relaunch with one of those, or ask the owner to launch it.",
+        ));
     }
     Ok(())
 }
@@ -337,7 +341,11 @@ pub fn restrict_launch_overrides(device: &Device, spec: &Value) -> Result<(), Hu
         .as_str()
         .is_some_and(|value| !value.trim().is_empty());
     if has_args || has_binary {
-        return Err(HubError::Forbidden);
+        return Err(HubError::Forbidden.with_next(
+            "AGENT_NOT_PERMITTED",
+            "Agent seats cannot set `args` or `binaryPath`. Do not retry with them; remove \
+             both from the spec, or ask the owner to launch it.",
+        ));
     }
     Ok(())
 }
@@ -365,9 +373,9 @@ pub async fn prepare_create(
             .store
             .get_instance(caller_id.into())
             .await?
-            .ok_or(HubError::Forbidden)?;
+            .ok_or_else(HubError::caller_retired)?;
         if !caller_instance.scope.allows_host(host) {
-            return Err(HubError::Forbidden);
+            return Err(HubError::out_of_scope());
         }
         if let Some(workspace) = spec
             .get("workspaceId")
@@ -375,7 +383,7 @@ pub async fn prepare_create(
             .filter(|value| !value.is_empty())
             && !caller_instance.scope.allows_workspace(workspace)
         {
-            return Err(HubError::Forbidden);
+            return Err(HubError::out_of_scope());
         }
         if !same_host(state, device, host).await?
             || shell_driver(driver)
@@ -407,7 +415,7 @@ pub async fn authorize_command(
             operation,
             "instance.send" | "instance.cancel" | "instance.close" | "tty.write" | "instance.keys"
         ) {
-            return Err(HubError::Forbidden);
+            return Err(HubError::agent_not_permitted());
         }
         // D-031 follow-up (host-search-1): an Agent may message an instance
         // inside its own project scope with no per-message human approval; the
@@ -481,7 +489,7 @@ pub async fn require_approval(
         .store
         .get_instance(id.clone())
         .await?
-        .ok_or(HubError::Forbidden)?;
+        .ok_or_else(HubError::caller_retired)?;
     let caller = crate::agent_approvals::ApprovalCaller {
         device_id: device.id.clone(),
         instance_id: id.parse().map_err(|_| HubError::Forbidden)?,
@@ -758,7 +766,7 @@ pub async fn restrict_agent_routes(
                         .is_some_and(|rest| rest.ends_with("/members")))
                         || task_write_target(request.method(), path)));
             if !read && !write {
-                return Err(HubError::Forbidden);
+                return Err(HubError::agent_not_permitted());
             }
         }
     }

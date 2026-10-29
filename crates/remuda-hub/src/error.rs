@@ -24,6 +24,19 @@ pub enum HubError {
         "human approval required; answer interaction {interaction_id}, then retry with approvalId"
     )]
     ApprovalRequired { interaction_id: String },
+    /// An existing refusal annotated with a stable machine `reason` and a
+    /// `next` step for the caller. Status, `code` and `error` text are exactly
+    /// the wrapped error's; only the two additive body fields are new, so
+    /// wrapping can never change an authorization decision.
+    #[error("{source}")]
+    Actionable {
+        /// Stable machine reason (`MISSING_GRANT`, `OUT_OF_SCOPE`, …).
+        reason: &'static str,
+        /// What the refused caller should do instead of retrying.
+        next: String,
+        /// The refusal being annotated.
+        source: Box<HubError>,
+    },
     /// Target does not exist.
     #[error("not found")]
     NotFound,
@@ -132,8 +145,57 @@ impl HubError {
         }
     }
 
+    /// Annotate this refusal with a machine `reason` and a `next` step.
+    pub fn with_next(self, reason: &'static str, next: impl Into<String>) -> Self {
+        Self::Actionable {
+            reason,
+            next: next.into(),
+            source: Box::new(self),
+        }
+    }
+
+    /// 403 for an Agent seat that lacks `grant` (design §2.5).
+    pub fn missing_grant(grant: &str) -> Self {
+        Self::Forbidden.with_next(
+            "MISSING_GRANT",
+            format!(
+                "This seat does not hold the `{grant}` grant. Do not retry: grants are fixed \
+                 when a seat is launched. Report the blocked action to the agent or person \
+                 that launched you and ask for a seat created with `{grant}`."
+            ),
+        )
+    }
+
+    /// 403 for a target or placement outside the caller's delegation scope.
+    pub fn out_of_scope() -> Self {
+        Self::Forbidden.with_next(
+            "OUT_OF_SCOPE",
+            "The target is outside this seat's delegation scope (project, host or workspace). \
+             Do not retry. Use a target inside your scope, or ask the owner to widen it.",
+        )
+    }
+
+    /// 403 for an action Agent seats are never given.
+    pub fn agent_not_permitted() -> Self {
+        Self::Forbidden.with_next(
+            "AGENT_NOT_PERMITTED",
+            "Agent seats cannot do this, or the target is not in your lineage. Do not retry; \
+             report to the owner what you needed so they can do it or change the plan.",
+        )
+    }
+
+    /// 403 for a caller whose instance no longer exists (retired or stale).
+    pub fn caller_retired() -> Self {
+        Self::Forbidden.with_next(
+            "CALLER_RETIRED",
+            "The instance behind this credential no longer exists (retired or replaced). \
+             Do not retry with this credential; stop and report so a live seat can continue.",
+        )
+    }
+
     fn status(&self) -> StatusCode {
         match self {
+            Self::Actionable { source, .. } => source.status(),
             Self::Unauthenticated => StatusCode::UNAUTHORIZED,
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::ForbiddenReason(_) => StatusCode::FORBIDDEN,
@@ -170,6 +232,7 @@ impl HubError {
 
     fn code(&self) -> &'static str {
         match self {
+            Self::Actionable { source, .. } => source.code(),
             Self::Unauthenticated => "UNAUTHENTICATED",
             Self::Forbidden => "FORBIDDEN",
             Self::ForbiddenReason(_) => "FORBIDDEN",
@@ -199,12 +262,29 @@ impl HubError {
     /// The JSON body paired with [`Self::status`] (see
     /// [`Self::status_code_and_body`]).
     fn response_body(&self) -> serde_json::Value {
+        if let Self::Actionable {
+            reason,
+            next,
+            source,
+        } = self
+        {
+            let mut body = source.response_body();
+            body["reason"] = json!(reason);
+            body["next"] = json!(next);
+            return body;
+        }
         let mut body = json!({
             "error": self.to_string(),
             "code": self.code(),
         });
         if let Self::ApprovalRequired { interaction_id } = &self {
             body["interactionId"] = json!(interaction_id);
+            body["reason"] = json!("HUMAN_APPROVAL_REQUIRED");
+            body["next"] = json!(
+                "An approval is already pending for this exact action. Do not resubmit or \
+                 retry: wait for the owner to answer it, then repeat the same call with \
+                 the approvalId."
+            );
         }
         if let Self::Unsatisfiable { reasons } | Self::ProviderNotConfigured { reasons } = &self
             && let Some(obj) = body.as_object_mut()
@@ -277,4 +357,43 @@ pub fn rpc_error(id: serde_json::Value, code: i32, message: &str) -> serde_json:
 /// JSON-RPC 2.0 success object.
 pub fn rpc_ok(id: serde_json::Value, result: serde_json::Value) -> serde_json::Value {
     json!({ "jsonrpc": "2.0", "id": id, "result": result })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn actionable_wrapper_keeps_status_code_and_message() {
+        let plain = HubError::Forbidden;
+        let wrapped = HubError::missing_grant("land");
+        assert_eq!(wrapped.status(), plain.status());
+        assert_eq!(wrapped.code(), plain.code());
+        assert_eq!(wrapped.to_string(), plain.to_string());
+        let (status, body) = wrapped.status_code_and_body();
+        assert_eq!(status, 403);
+        assert_eq!(body["code"], "FORBIDDEN");
+        assert_eq!(body["error"], "forbidden");
+        assert_eq!(body["reason"], "MISSING_GRANT");
+        assert!(body["next"].as_str().unwrap().contains("`land`"));
+    }
+
+    #[test]
+    fn caller_retired_and_delivery_unknown_carry_next() {
+        let (_, body) = HubError::caller_retired().status_code_and_body();
+        assert_eq!(body["reason"], "CALLER_RETIRED");
+        assert!(body["next"].as_str().unwrap().contains("Do not retry"));
+
+        let (status, body) = crate::http::configure_in_flight().status_code_and_body();
+        assert_eq!(status, 409);
+        assert_eq!(body["code"], "COMMAND_ID_CONFLICT");
+        assert_eq!(body["reason"], "DELIVERY_UNKNOWN");
+        assert!(body["next"].as_str().unwrap().contains("Do not re-send"));
+    }
+
+    #[test]
+    fn errors_without_guidance_keep_the_old_shape() {
+        let (_, body) = HubError::NotFound.status_code_and_body();
+        assert!(body.get("next").is_none() && body.get("reason").is_none());
+    }
 }

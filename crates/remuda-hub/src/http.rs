@@ -1434,7 +1434,7 @@ pub async fn create_instance(
                 .store
                 .get_instance(id.into())
                 .await?
-                .ok_or(HubError::Forbidden)?
+                .ok_or_else(HubError::caller_retired)?
                 .scope,
         ),
         None => None,
@@ -1470,7 +1470,7 @@ pub async fn create_instance(
                     .store
                     .get_instance(instance_id.into())
                     .await?
-                    .ok_or(HubError::Forbidden)?;
+                    .ok_or_else(HubError::caller_retired)?;
                 caller_instance
                     .grants
                     .iter()
@@ -2991,11 +2991,16 @@ async fn replay_existing_command(
 /// Clear 409 for a configure whose first attempt's outcome is not persisted
 /// yet (the forward RPC is running or rests unknown): the caller polls the
 /// command row rather than replaying.
-fn configure_in_flight() -> HubError {
+pub(crate) fn configure_in_flight() -> HubError {
     HubError::Conflict(
         "instance.configure is still in flight; poll GET \
          /v1/instances/{id}/commands/{commandId} for its outcome"
             .to_string(),
+    )
+    .with_next(
+        "DELIVERY_UNKNOWN",
+        "Delivery is not yet known and the Node may still be applying it. Do not re-send: \
+         read GET /v1/instances/{id}/commands/{commandId} until it settles, then decide.",
     )
 }
 

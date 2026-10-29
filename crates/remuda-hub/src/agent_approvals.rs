@@ -103,12 +103,20 @@ impl AgentApprovals {
                 .map_err(|_| HubError::Forbidden)?
                 .parse()
                 .map_err(|_| HubError::Forbidden)?;
-            let grant = grants.get_mut(&id).ok_or(HubError::Forbidden)?;
+            let invalid = || {
+                HubError::Forbidden.with_next(
+                    "APPROVAL_INVALID",
+                    "This approvalId is unknown, expired, already used, not yet answered, or \
+                     for a different action. Do not reuse it. Repeat the call without \
+                     approvalId to open a new approval, then wait for the owner.",
+                )
+            };
+            let grant = grants.get_mut(&id).ok_or_else(invalid)?;
             if grant.caller != *caller
                 || grant.request != request
                 || grant.state != GrantState::Allowed
             {
-                return Err(HubError::Forbidden);
+                return Err(invalid());
             }
             // An absent id remains forbidden on replay and occupies no capacity.
             grants.remove(&id);
@@ -364,7 +372,10 @@ mod tests {
             }
             assert!(matches!(
                 approvals.require(&headers, &caller, request).await,
-                Err(HubError::Forbidden)
+                Err(HubError::Actionable {
+                    reason: "APPROVAL_INVALID",
+                    ..
+                })
             ));
             assert!(approvals.list(&device(&caller)).await.is_empty());
         }

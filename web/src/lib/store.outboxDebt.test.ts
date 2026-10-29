@@ -140,7 +140,7 @@ async function mountFollow(api: Api, hubStore: Store, seedPage: JournalPage = EM
   vi.spyOn(api, "eventsRead").mockResolvedValue(seedPage);
   vi.spyOn(api, "instanceList").mockResolvedValue({
     items: [
-      { id: INSTANCE, journalId: JOURNAL, revision: "1", durableSeq: "0", lifecycle: "running" } as Awaited<
+      { id: INSTANCE, hostId: "hst_1", journalId: JOURNAL, revision: "1", durableSeq: "0", lifecycle: "running" } as Awaited<
         ReturnType<Api["instanceList"]>
       >["items"][number],
     ],
@@ -1954,3 +1954,88 @@ it("r6 item 4: a window the Hub byte-caps on multi-byte text is descended before
   expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
   expect(hubStore.getSnapshot().events[INSTANCE]).toHaveLength(128);
 }, 30_000);
+
+it("r7 item 1: a debt-only settlement keeps exactly one visible user row, and still one once the live node arrives", async () => {
+  // The page path, not store state: SessionPage's selectSession feeds the
+  // transcript assembler. A debt read settles the bubble WITHOUT writing the
+  // journal node into store events (AD3), so the settled bubble must stay in
+  // the transcript input until the authoritative user node joins it.
+  const { api, hubStore } = await fresh();
+  const { selectSession } = await import("../pages/SessionPage");
+  const { assembleTranscript } = await import("../features/session/assemble");
+  await mountFollow(api, hubStore);
+  vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+    const commandId = _args[4] as string;
+    return Promise.resolve(commandResult(commandId, "accepted"));
+  });
+  const userRows = () => {
+    const slice = selectSession(hubStore.getSnapshot(), INSTANCE);
+    return assembleTranscript(slice.events ?? [], slice.bubbles).filter(
+      (node) => node.type === "message" && node.role === "user",
+    );
+  };
+
+  await hubStore.send(INSTANCE, "settled by the debt read only");
+  const bubble = () => hubStore.getSnapshot().bubbles[0]!;
+  await vi.waitFor(() => expect(bubble().outboxState).toBe("sent"));
+  const commandId = bubble().commandId!;
+  expect(userRows()).toHaveLength(1);
+
+  // Only the debt reader sees the journaled entry; the live stream missed it.
+  vi.mocked(api.eventsRead).mockResolvedValue(userMessagePage(commandId));
+  await vi.waitFor(
+    () => {
+      expect(bubble().state).toBe("settled");
+      expect(bubble().outboxState).toBe("done");
+      expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+    },
+    { timeout: 5_000 },
+  );
+  expect(hubStore.getSnapshot().events[INSTANCE] ?? []).toHaveLength(0);
+  const afterDebt = userRows();
+  expect(afterDebt).toHaveLength(1);
+  expect(afterDebt[0]).toMatchObject({ commandId, status: "settled" });
+
+  // The live node arrives: the assembler joins it and hides the bubble.
+  const onBatch = await liveBatch(api);
+  onBatch({
+    subscriptionId: "sub_outbox_debt",
+    journalId: JOURNAL,
+    fromSeq: "1",
+    toSeq: "1",
+    durableSeq: "1",
+    events: [
+      {
+        kind: "message",
+        eventId: "evt_user_debt_1",
+        journalId: JOURNAL,
+        instanceId: INSTANCE,
+        seq: "1",
+        observedAt: "2026-10-30T00:00:01Z",
+        source: { channel: "runtime" },
+        completeness: "structured",
+        payload: {
+          role: "user",
+          commandId,
+          messageId: "msg_user_debt_1",
+          nodeId: "node_user_debt_1",
+          revision: "1",
+          baseRevision: null,
+          operation: "replace",
+          targetBlock: null,
+          status: "complete",
+          phase: "input",
+          origin: "human",
+          nativeOrigin: { state: "unknown" },
+          parentToolCallId: null,
+          blocks: [{ type: "text", text: "settled by the debt read only" }],
+        },
+      } as unknown as Observation,
+    ],
+  });
+  await vi.waitFor(() => expect(hubStore.getSnapshot().events[INSTANCE] ?? []).toHaveLength(1));
+  const afterLive = userRows();
+  expect(afterLive).toHaveLength(1);
+  expect(afterLive[0]).toMatchObject({ commandId });
+  expect((afterLive[0] as { local?: unknown }).local).toBeUndefined();
+}, 15_000);

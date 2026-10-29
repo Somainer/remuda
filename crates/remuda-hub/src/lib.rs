@@ -53,6 +53,7 @@ pub mod usage_store_test_support {
 }
 mod inventory;
 mod maintenance;
+mod memory;
 mod model_catalog;
 /// Built-in model catalog revision (tests compare the served catalog against it).
 pub use model_catalog::CATALOG_REVISION;
@@ -1503,6 +1504,7 @@ pub fn router(state: AppState) -> Router {
         .merge(placement::routes())
         .merge(projects::routes())
         .merge(tasks::routes())
+        .merge(memory::routes())
         .merge(fleet::routes())
         .merge(devices::routes())
         .merge(passkeys::routes())

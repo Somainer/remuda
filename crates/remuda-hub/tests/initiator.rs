@@ -7346,6 +7346,122 @@ async fn an_attempt_cap_base_moved_failure_binds_its_own_results_evidence() {
 /// probe completes), but the row's bound dispatch_session stays A — even after
 /// the stale A socket tears down. A genuine reconnect (empty slot) would
 /// rebind; the takeover must not.
+/// Poll the host row until it reports `state` (bounded).
+async fn wait_host_state(ctx: &Ctx, state: &str) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let current = ctx
+            .store()
+            .get_host(ctx.host.clone())
+            .await
+            .unwrap()
+            .expect("host row")
+            .state;
+        if current == state || std::time::Instant::now() >= deadline {
+            return current;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// r41 item 1: two hellos for one host whose installs land in REVERSE bump
+/// order. Hello A bumps the durable link generation, then parks before it
+/// installs; hello B bumps past it and installs; A resumes. A is superseded:
+/// it never installs and its socket is closed, so B stays current, closing B
+/// takes the host offline, and host-loss processing sweeps the host's live
+/// chapter. Before the fix A installed its OLDER generation over B, and once
+/// both sockets closed the generation-qualified offline write never applied:
+/// the host stayed online and nothing ever repaired it.
+#[tokio::test]
+async fn an_older_hello_installing_after_a_newer_one_never_leaves_the_host_online() {
+    let (ctx, node0) = Ctx::boot().await.unwrap();
+    // Start with no live socket for the host.
+    node0.disconnect();
+    assert_eq!(wait_host_state(&ctx, "offline").await, "offline");
+
+    // A: bumps, then parks just before its registry install.
+    let (parked, release) = ctx.hub.test_arm_hello_install_park(&ctx.host).await;
+    let hello_a = FakeNode::reconnect(&ctx.hub, &ctx.creds, &ctx.workspace);
+    tokio::pin!(hello_a);
+    tokio::select! {
+        _ = &mut hello_a => panic!("hello A finished before reaching its install park"),
+        arrived = tokio::time::timeout(Duration::from_secs(10), parked) => {
+            arrived.expect("hello A parked in time").expect("park armed");
+        }
+    }
+    // B: bumps past A and installs while A is parked.
+    let node_b = FakeNode::reconnect(&ctx.hub, &ctx.creds, &ctx.workspace)
+        .await
+        .expect("hello B completes");
+    let session_b = ctx
+        .hub
+        .test_node_session(&ctx.host)
+        .await
+        .expect("B installed");
+    // A resumes and tries to install its older generation.
+    release.send(()).ok();
+    let node_a = tokio::time::timeout(Duration::from_secs(10), &mut hello_a)
+        .await
+        .expect("hello A finished");
+    let current_after_a = ctx.hub.test_node_session(&ctx.host).await;
+
+    // A live chapter on the host, so host-loss processing has work to do.
+    let store = ctx.store();
+    let live = store
+        .insert_instance(
+            ctx.host.clone(),
+            None,
+            "codex".into(),
+            "codex-appserver".into(),
+            None,
+            json!({}),
+        )
+        .await
+        .unwrap();
+    store
+        .append_journal(
+            ctx.host.clone(),
+            live.instance_id.clone(),
+            Some(1),
+            json!({"kind":"lifecycle","payload":{"type":"entity","state":"ready"}}),
+        )
+        .await
+        .unwrap();
+
+    // Close both sockets.
+    node_b.disconnect();
+    if let Ok(node_a) = &node_a {
+        node_a.disconnect();
+    }
+    assert_eq!(
+        wait_host_state(&ctx, "offline").await,
+        "offline",
+        "both sockets closed, yet the host stayed online"
+    );
+    let (swept, _) = store.expire_lost_hosts(0).await.unwrap();
+    assert!(swept >= 1, "host-loss processing swept nothing");
+    let row = store
+        .get_instance(live.instance_id.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.lifecycle, "exited",
+        "the live chapter was swept host-lost"
+    );
+
+    // A never replaced B: its hello was refused and B stayed current.
+    assert!(
+        node_a.is_err(),
+        "the older hello must be refused, not installed"
+    );
+    assert_eq!(
+        current_after_a,
+        Some(session_b),
+        "the superseded hello replaced the newer link"
+    );
+}
+
 #[tokio::test]
 async fn a_live_takeover_socket_does_not_inherit_the_old_landing_grant() {
     let (ctx, node_a) = Ctx::boot().await.unwrap();

@@ -543,7 +543,9 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
                                 ))
                                 .await;
                         }
-                        if matches!(err, HubError::Unauthenticated) {
+                        // A superseded hello (r41 item 1) is terminal too: the
+                        // newer link owns the host.
+                        if matches!(err, HubError::Unauthenticated | HubError::LinkSuperseded) {
                             break;
                         }
                     }
@@ -825,7 +827,11 @@ pub(crate) async fn handle_node_method(
                     .await?;
             }
             reconcile_lost_instances(state, &host.host_id, &params).await?;
-            let inserted = state
+            // Test-only: a regression parks this hello here, after its
+            // generation bump and inventory awaits, to reorder two hellos.
+            #[cfg(any(test, feature = "test-faults"))]
+            state.nodes.park_before_install(&host.host_id).await;
+            let Some(inserted) = state
                 .nodes
                 .insert_with_generation(
                     host.host_id.clone(),
@@ -837,7 +843,23 @@ pub(crate) async fn handle_node_method(
                     ),
                     link_generation,
                 )
-                .await;
+                .await
+            else {
+                // r41 item 1: a newer hello bumped past this one and already
+                // installed while this hello awaited; installing now would put
+                // the OLDER link over it (and its later close could then never
+                // take the host offline). This socket owns nothing: clear the
+                // host binding so its teardown touches neither the registry
+                // nor the host row, and close it.
+                tracing::warn!(
+                    host_id = %host.host_id,
+                    link_generation,
+                    "node hello superseded by a newer link; closing the older socket"
+                );
+                *host_id = None;
+                *hello_done = false;
+                return Err(HubError::LinkSuperseded);
+            };
             *session_generation = Some(inserted.generation);
             // r16 item 6: capture the hello-time takeover flag for the detached
             // post-hello Landing decision (never re-queried after).

@@ -42,6 +42,10 @@ pub enum HubError {
     /// Interaction deadline already passed.
     #[error("interaction expired")]
     Expired,
+    /// A Node hello lost to a newer hello for the same host: the newer link
+    /// is installed and this socket is closed without installing (r41 item 1).
+    #[error("node link superseded by a newer hello")]
+    LinkSuperseded,
     /// A different commandId already committed the unique answer.
     #[error("interaction already answered")]
     Superseded {
@@ -148,6 +152,7 @@ impl HubError {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Fenced => StatusCode::CONFLICT,
+            Self::LinkSuperseded => StatusCode::CONFLICT,
             Self::Expired => StatusCode::GONE,
             Self::Superseded { .. } => StatusCode::CONFLICT,
             Self::Unsatisfiable { .. } | Self::ProviderNotConfigured { .. } => {
@@ -185,6 +190,7 @@ impl HubError {
             Self::BadRequest(_) => "BAD_REQUEST",
             Self::Conflict(_) => "COMMAND_ID_CONFLICT",
             Self::Fenced => "fenced",
+            Self::LinkSuperseded => "LINK_SUPERSEDED",
             Self::Expired => "INTERACTION_EXPIRED",
             Self::Superseded { .. } => "INTERACTION_SUPERSEDED",
             Self::Unsatisfiable { .. } => "PLACEMENT_UNSATISFIABLE",

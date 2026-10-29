@@ -834,6 +834,20 @@ impl RunningHub {
             .await;
     }
 
+    /// Test helper (r41 item 1): park the next hello for `host_id` just before
+    /// it installs its registry slot. Returns (parked, release).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_arm_hello_install_park(
+        &self,
+        host_id: &str,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.state.nodes.arm_install_park(host_id).await
+    }
+
     /// Test helper: block every Node-registry lookup (`kind_of`, `call`,
     /// `insert`) until `release` is sent (or dropped). Returns only once the
     /// lock is actually held, so a command POST parked afterwards is

@@ -502,6 +502,19 @@ async fn supervise(state: AppState, host: ManagedHost) {
         {
             return;
         }
+        // r41 item 1: a hello superseded by a newer link never installed and
+        // owns nothing; like a stale teardown above, it must not take the host
+        // offline or tear down the newer link's relay state.
+        if generation.is_none()
+            && result.as_ref().err().is_some_and(|error| {
+                matches!(
+                    error.downcast_ref::<crate::error::HubError>(),
+                    Some(crate::error::HubError::LinkSuperseded)
+                )
+            })
+        {
+            return;
+        }
         // D-048: tear down relay streams this SSH carrier owned, exactly as
         // the WebSocket session teardown does — otherwise proxy-link losses
         // never reach W, worker blocks never fire, and stream slots leak.

@@ -466,6 +466,42 @@ struct NodeSlot {
     link: Arc<dyn NodeTransport>,
 }
 
+/// Test-only one-shot park: the parked side reports arrival, then waits for
+/// release (a dropped release sender also releases it).
+#[cfg(any(test, feature = "test-faults"))]
+pub(crate) struct TestPark {
+    parked: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(any(test, feature = "test-faults"))]
+impl TestPark {
+    /// A park plus the test's (parked, release) handles.
+    pub(crate) fn new() -> (
+        Self,
+        (
+            tokio::sync::oneshot::Receiver<()>,
+            tokio::sync::oneshot::Sender<()>,
+        ),
+    ) {
+        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        (
+            Self {
+                parked: parked_tx,
+                release: release_rx,
+            },
+            (parked_rx, release_tx),
+        )
+    }
+
+    /// Report arrival, then wait for release.
+    pub(crate) async fn wait(self) {
+        let _ = self.parked.send(());
+        let _ = self.release.await;
+    }
+}
+
 /// Result of registering a carrier session.
 pub(crate) struct InsertedSession {
     /// The NON-REUSED authenticated session identity minted for this socket.
@@ -532,6 +568,16 @@ pub struct ConnectedNodes {
     /// socket inheritance of the old session's Landing grants (a genuine
     /// reconnect after a full disconnect leaves the map empty).
     live_takeover: Arc<Mutex<HashMap<String, u64>>>,
+    /// Highest durable link generation installed per host in this Hub process
+    /// (r41 item 1). Installation is monotonic in it: a hello whose bumped
+    /// generation is lower was superseded by a newer hello while it awaited
+    /// and must never replace the newer slot. Kept after the slot is removed,
+    /// so a superseded hello also cannot install after the newer link closed.
+    installed_link: Arc<Mutex<HashMap<String, i64>>>,
+    /// Test-only: one-shot per-host park a hello waits on just before it
+    /// installs (r41 item 1 ordering regression).
+    #[cfg(any(test, feature = "test-faults"))]
+    install_parks: Arc<Mutex<HashMap<String, TestPark>>>,
     /// Test-only: notified once per host when a session replacement (insert)
     /// has to WAIT for an in-flight Landing authority decision to commit — the
     /// deterministic witness that takeover and verdict-writer are serialized
@@ -564,6 +610,9 @@ impl ConnectedNodes {
             inner: Arc::new(Mutex::new(HashMap::new())),
             authority: Arc::new(Mutex::new(HashMap::new())),
             live_takeover: Arc::new(Mutex::new(HashMap::new())),
+            installed_link: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(any(test, feature = "test-faults"))]
+            install_parks: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(any(test, feature = "test-faults"))]
             authority_contention: Arc::new(Mutex::new(HashMap::new())),
             boot_epoch,
@@ -583,6 +632,9 @@ impl ConnectedNodes {
             inner: Arc::new(Mutex::new(HashMap::new())),
             authority: Arc::new(Mutex::new(HashMap::new())),
             live_takeover: Arc::new(Mutex::new(HashMap::new())),
+            installed_link: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(any(test, feature = "test-faults"))]
+            install_parks: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(any(test, feature = "test-faults"))]
             authority_contention: Arc::new(Mutex::new(HashMap::new())),
             boot_epoch,
@@ -676,41 +728,93 @@ impl ConnectedNodes {
     /// session in [`Self::remove_generation`].
     ///
     /// Test seam: no real hello bumped a durable link generation for a
-    /// directly mounted scripted transport, so the slot carries 0.
+    /// directly mounted scripted transport, so the slot carries 0 and the
+    /// mount is never refused as superseded.
     pub(crate) async fn insert(
         &self,
         host_id: String,
         link: Arc<dyn NodeTransport>,
     ) -> InsertedSession {
-        self.insert_with_generation(host_id, link, 0).await
+        let _authority = self.install_guard(&host_id).await;
+        self.insert_locked(host_id, link, 0).await
     }
 
     /// Record a live session together with the durable per-host link generation
     /// the adopting hello just stamped (c-dirpicker r11 item 2). Session
     /// identity and takeover reporting are as in [`Self::insert`].
+    ///
+    /// r41 item 1: monotonic in `link_generation`. `None` = superseded: a
+    /// newer hello already installed a higher generation for this host, so
+    /// this (older) hello must not replace it; the caller closes its socket.
+    /// An equal or higher generation installs with the r16 takeover semantics.
     pub(crate) async fn insert_with_generation(
         &self,
         host_id: String,
         link: Arc<dyn NodeTransport>,
         link_generation: i64,
-    ) -> InsertedSession {
-        // Exclusive with every in-flight Landing authority decision for this
-        // host (r15 item 3): a writer that passed its current-session pre-check
-        // must commit before this socket becomes current, and vice versa.
-        let lock = self.host_authority(host_id.as_str()).await;
+    ) -> Option<InsertedSession> {
+        // The check and the install both run under the per-host exclusive
+        // authority guard every install takes, so they cannot interleave with
+        // another hello's install for this host.
+        let _authority = self.install_guard(&host_id).await;
+        {
+            let mut installed = self.installed_link.lock().await;
+            if installed
+                .get(&host_id)
+                .is_some_and(|newest| *newest > link_generation)
+            {
+                return None;
+            }
+            installed.insert(host_id.clone(), link_generation);
+        }
+        Some(self.insert_locked(host_id, link, link_generation).await)
+    }
+
+    /// The exclusive per-host authority guard an install holds (r15 item 3):
+    /// a Landing writer that passed its current-session pre-check commits
+    /// before the new socket becomes current, and vice versa.
+    async fn install_guard(&self, host_id: &str) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        let lock = self.host_authority(host_id).await;
         // Fast path under no contention; when a reader (a parked settlement)
         // holds the guard, notify test waiters BEFORE awaiting.
-        if let Ok(guard) = lock.try_write() {
-            let _authority = guard;
-            return self.insert_locked(host_id, link, link_generation).await;
+        if let Ok(guard) = lock.clone().try_write_owned() {
+            return guard;
         }
         #[cfg(any(test, feature = "test-faults"))]
         {
-            let notify = self.authority_write_notify(host_id.as_str()).await;
+            let notify = self.authority_write_notify(host_id).await;
             notify.notify_waiters();
         }
-        let _authority = lock.write_owned().await;
-        self.insert_locked(host_id, link, link_generation).await
+        lock.write_owned().await
+    }
+
+    /// Test-only: arm a one-shot park for the next hello of `host_id`, just
+    /// before it installs. Returns (parked, release): `parked` fires once the
+    /// hello waits there; sending (or dropping) `release` lets it continue.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn arm_install_park(
+        &self,
+        host_id: &str,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (park, handles) = TestPark::new();
+        self.install_parks
+            .lock()
+            .await
+            .insert(host_id.to_owned(), park);
+        handles
+    }
+
+    /// Test-only: wait on an armed install park for `host_id` (no-op if none).
+    #[cfg(any(test, feature = "test-faults"))]
+    pub(crate) async fn park_before_install(&self, host_id: &str) {
+        let park = self.install_parks.lock().await.remove(host_id);
+        if let Some(park) = park {
+            park.wait().await;
+        }
     }
 
     /// Register the new session with the authority guard already held.

@@ -1108,7 +1108,12 @@ async fn refusals_carry_reason_and_next_without_changing_old_fields() -> Result<
     assert_eq!(body["code"], "FORBIDDEN");
     assert_eq!(body["reason"], "out-of-scope");
     assert_eq!(body["next"]["action"], "ask-owner");
-    assert!(body["next"]["hint"].as_str().unwrap().contains("scope"));
+    // The hint promises only what the Hub can do: scope is fixed at launch,
+    // so it must not tell the seat to ask for the scope to be widened.
+    let hint = body["next"]["hint"].as_str().unwrap();
+    assert!(hint.contains("scope"));
+    assert!(hint.contains("fixed when a seat is launched"), "{hint}");
+    assert!(!hint.contains("widen"), "{hint}");
 
     // Needs a D-017 approval: 409, the approval is pending, do not resubmit.
     let coordinator_token = ctx.agent_token_for(&coordinator_id).await?;

@@ -258,8 +258,9 @@ impl HubError {
             NextStep::new(
                 action::ASK_OWNER,
                 "the target is outside this seat's delegation scope (project, host or \
-                 workspace); do not retry — use a target inside the scope, or ask the \
-                 owner to widen it",
+                 workspace); do not retry: the scope is fixed when a seat is launched. Use a \
+                 target inside the scope, or ask the owner for a seat launched with a scope \
+                 that covers the target",
             ),
         )
     }

@@ -502,6 +502,11 @@ impl TestPark {
     }
 }
 
+/// Test-only teardown park: the park plus the sender told when the parked
+/// teardown has finished.
+#[cfg(any(test, feature = "test-faults"))]
+type TeardownPark = (TestPark, tokio::sync::oneshot::Sender<()>);
+
 /// Result of registering a carrier session.
 pub(crate) struct InsertedSession {
     /// The NON-REUSED authenticated session identity minted for this socket.
@@ -578,6 +583,11 @@ pub struct ConnectedNodes {
     /// installs (r41 item 1 ordering regression).
     #[cfg(any(test, feature = "test-faults"))]
     install_parks: Arc<Mutex<HashMap<String, TestPark>>>,
+    /// Test-only: one-shot per-host park a socket teardown waits on before its
+    /// gate-session recovery step, plus the sender told when that teardown
+    /// finishes (r41 item 2 ordering regression).
+    #[cfg(any(test, feature = "test-faults"))]
+    teardown_parks: Arc<Mutex<HashMap<String, TeardownPark>>>,
     /// Test-only: notified once per host when a session replacement (insert)
     /// has to WAIT for an in-flight Landing authority decision to commit — the
     /// deterministic witness that takeover and verdict-writer are serialized
@@ -614,6 +624,8 @@ impl ConnectedNodes {
             #[cfg(any(test, feature = "test-faults"))]
             install_parks: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(any(test, feature = "test-faults"))]
+            teardown_parks: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(any(test, feature = "test-faults"))]
             authority_contention: Arc::new(Mutex::new(HashMap::new())),
             boot_epoch,
             next_session: Arc::new(AtomicU32::new(0)),
@@ -635,6 +647,8 @@ impl ConnectedNodes {
             installed_link: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(any(test, feature = "test-faults"))]
             install_parks: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(any(test, feature = "test-faults"))]
+            teardown_parks: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(any(test, feature = "test-faults"))]
             authority_contention: Arc::new(Mutex::new(HashMap::new())),
             boot_epoch,
@@ -806,6 +820,41 @@ impl ConnectedNodes {
             .await
             .insert(host_id.to_owned(), park);
         handles
+    }
+
+    /// Test-only: arm a one-shot park for the next socket teardown of
+    /// `host_id`, before its gate-session recovery step. Returns (parked,
+    /// release, done): `done` fires when that teardown has finished.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn arm_teardown_recovery_park(
+        &self,
+        host_id: &str,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let (park, (parked, release)) = TestPark::new();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        self.teardown_parks
+            .lock()
+            .await
+            .insert(host_id.to_owned(), (park, done_tx));
+        (parked, release, done_rx)
+    }
+
+    /// Test-only: wait on an armed teardown park for `host_id`; returns the
+    /// sender to fire once the teardown finishes (`None` if none was armed).
+    #[cfg(any(test, feature = "test-faults"))]
+    pub(crate) async fn park_teardown_recovery(
+        &self,
+        host_id: &str,
+    ) -> Option<tokio::sync::oneshot::Sender<()>> {
+        let armed = self.teardown_parks.lock().await.remove(host_id);
+        let (park, done) = armed?;
+        park.wait().await;
+        Some(done)
     }
 
     /// Test-only: wait on an armed install park for `host_id` (no-op if none).

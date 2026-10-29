@@ -554,10 +554,6 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
         }
     }
 
-    // Drain every waiter first: calls in flight when the socket ends must not
-    // sit until their timeout (and must never leak as dead map entries).
-    fail_all_pending(&pending);
-
     if let Some(host_id) = host_id {
         // Resolve session staleness first: if a newer link for this host has
         // already registered (a reconnect that superseded this socket), its
@@ -579,15 +575,6 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
                 (true, None)
             }
         };
-        // r13 item 3: this authenticated session is over. Whatever its
-        // staleness, any pre-grant gate run dispatched on EXACTLY it has lost
-        // the only carrier allowed to run it; requeue/finish those rows so a
-        // replacement session (or a later reconnect) can retry instead of the
-        // job sitting Running forever. Landing rows keep occupancy and are
-        // settled by the bounded Landing reconciliation.
-        if let Some(generation) = session_generation {
-            crate::gatequeue::recover_ended_session(&state, &host_id, generation).await;
-        }
         // r16 item 6: no unconditional clear here. The live-takeover mark is
         // keyed by the TAKEOVER generation and cleared under the per-host guard
         // ONLY by remove_generation removing that exact current session (which
@@ -598,6 +585,12 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
             // D-048: tear down relay streams this link owned. A vanished proxy
             // host ends streams with via-host-offline and blocks routed
             // instances; a vanished worker host cancels the upstream legs.
+            //
+            // r41 item 2: this runs IMMEDIATELY after the stale decision (main's
+            // adjacency), before any other await of this teardown: the relay
+            // teardown is host-keyed, so the later it runs, the wider the window
+            // in which a replacement hello reinstalls egress contexts that it
+            // would then revoke.
             state.api_relay.on_link_lost(&state, &host_id).await;
             // r40: the staleness above was decided before the awaits in
             // between, so a replacement Node's hello may already have marked
@@ -606,13 +599,44 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
             let _ = match removed_link {
                 Some(link) => state
                     .store
-                    .mark_host_offline_for_link(host_id, link)
+                    .mark_host_offline_for_link(host_id.clone(), link)
                     .await
                     .map(|_| ()),
-                None => state.store.mark_host_offline(host_id).await,
+                None => state.store.mark_host_offline(host_id.clone()).await,
             };
         }
+        // r13 item 3: this authenticated session is over. Whatever its
+        // staleness, any pre-grant gate run dispatched on EXACTLY it has lost
+        // the only carrier allowed to run it; requeue/finish those rows so a
+        // replacement session (or a later reconnect) can retry instead of the
+        // job sitting Running forever. Landing rows keep occupancy and are
+        // settled by the bounded Landing reconciliation.
+        //
+        // r41 item 2: recovery runs only after the relay teardown and the
+        // offline write above, never between the stale decision and them.
+        //
+        // Test-only: a regression parks the teardown here (and is told when
+        // it finishes) to complete a replacement hello in this window.
+        #[cfg(any(test, feature = "test-faults"))]
+        let teardown_done = state.nodes.park_teardown_recovery(&host_id).await;
+        if let Some(generation) = session_generation {
+            crate::gatequeue::recover_ended_session(&state, &host_id, generation).await;
+        }
+        #[cfg(any(test, feature = "test-faults"))]
+        if let Some(done) = teardown_done {
+            let _ = done.send(());
+        }
     }
+
+    // Then drain every waiter: calls in flight when the socket ends must not
+    // sit until their timeout (and must never leak as dead map entries).
+    // r41 item 2: this runs AFTER the session recovery above, not before the
+    // teardown. A gate.run waiter dropped here fails its dispatch task with
+    // "node rpc dropped"; draining first let that failure mark the run failed
+    // before recover_ended_session requeued it (the relay teardown now runs
+    // first, which widened that race). After recovery the run is already
+    // requeued and the per-generation failure guard leaves it alone.
+    fail_all_pending(&pending);
 }
 
 /// Spawn the D-048 B.2 post-hello re-push of a host's api.egress contexts.

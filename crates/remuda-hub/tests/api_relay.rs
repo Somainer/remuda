@@ -2966,6 +2966,118 @@ async fn proxy_reconnect_gets_fresh_api_egress_before_next_open() -> Result<()> 
     Ok(())
 }
 
+/// r41 item 2: proxy H's first link A drops; its teardown parks right before
+/// its gate-session recovery step. Replacement link B hellos, gets its egress
+/// context and carries a live stream; then A's teardown resumes and finishes.
+/// The relay teardown runs right after A's stale decision, so it can never
+/// land after B's reinstall: B's egress context and live stream survive.
+/// Before the fix the recovery step ran first and A's late, host-keyed relay
+/// teardown revoked B's context and ended B's stream.
+#[tokio::test]
+async fn a_stale_teardown_never_revokes_the_replacement_links_relay_state() -> Result<()> {
+    let gateway = FakeGateway::start().await?;
+    let (mut fixture, mut proxy) = fixture_routed_via_h(&gateway.base_url_v1()).await?;
+    let proxy_host = proxy.host_id.clone();
+    let instance_id = fixture.instance_id.clone();
+    let is_revoke = |frame: &Value| {
+        frame["method"] == json!("api.egress")
+            && frame["params"]["instanceId"] == json!(instance_id)
+            && frame["params"]["revoke"] == json!(true)
+    };
+
+    // A drops; its teardown removes its slot and parks before recovery.
+    let (parked, release, done) = fixture
+        ._hub
+        .test_arm_teardown_recovery_park(&proxy_host)
+        .await;
+    proxy.drop_link();
+    tokio::time::timeout(TIMEOUT, parked)
+        .await
+        .context("A's teardown parked in time")??;
+
+    // B: the replacement hello; W opens a live stream over it.
+    proxy.reconnect(fixture.addr, "relay-proxy").await?;
+    let buffered = proxy.take_pending();
+    anyhow::ensure!(
+        !buffered.iter().any(is_revoke),
+        "B received a revoke before its stream opened: {buffered:?}"
+    );
+    notify(
+        &mut fixture.node,
+        "api.open",
+        api_open_params(&fixture.instance_id, "st_live", &messages_body()),
+    )
+    .await?;
+    let live_open = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let frame = recv_json(proxy.socket()).await?;
+            anyhow::ensure!(!is_revoke(&frame), "B's context revoked early: {frame}");
+            if frame["method"] == json!("api.open") {
+                return Ok::<_, anyhow::Error>(frame);
+            }
+        }
+    })
+    .await??;
+    let b_live_stream = live_open["params"]["streamId"].clone();
+
+    // A's teardown resumes and finishes.
+    let _ = release.send(());
+    tokio::time::timeout(TIMEOUT, done)
+        .await
+        .context("A's teardown finished in time")??;
+
+    // B's egress context survived: a new open reaches B with no revoke first.
+    notify(
+        &mut fixture.node,
+        "api.open",
+        api_open_params(&fixture.instance_id, "st_probe", &messages_body()),
+    )
+    .await?;
+    tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let frame = recv_json(proxy.socket()).await?;
+            anyhow::ensure!(
+                !is_revoke(&frame),
+                "the stale teardown revoked the replacement link's egress context: {frame}"
+            );
+            if frame["method"] == json!("api.open")
+                && frame["params"]["streamId"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("st_probe"))
+            {
+                return Ok::<_, anyhow::Error>(());
+            }
+        }
+    })
+    .await??;
+
+    // B's live stream survived: B's head reaches W, with no end before it.
+    send_json(
+        proxy.socket(),
+        json!({
+            "jsonrpc": "2.0", "method": "api.head",
+            "params": {"streamId": b_live_stream, "status": 200, "headers": []}
+        }),
+    )
+    .await?;
+    tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let frame = recv_json(&mut fixture.node).await?;
+            let for_live = frame["params"]["streamId"] == json!("st_live");
+            anyhow::ensure!(
+                !(for_live && frame["method"] == json!("api.end")),
+                "the stale teardown ended the replacement link's live stream: {frame}"
+            );
+            if for_live && frame["method"] == json!("api.head") {
+                return Ok::<_, anyhow::Error>(());
+            }
+        }
+    })
+    .await??;
+    gateway.shutdown().await;
+    Ok(())
+}
+
 /// Round-4 item 2: the reconnect re-send goes through the SecretBroker host
 /// scope gate like every other release path. A profile narrowed to *another*
 /// host after launch must not be re-delivered to the proxy when it

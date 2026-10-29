@@ -848,6 +848,21 @@ impl RunningHub {
         self.state.nodes.arm_install_park(host_id).await
     }
 
+    /// Test helper (r41 item 2): park the next socket teardown for `host_id`
+    /// before its gate-session recovery step. Returns (parked, release, done).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_arm_teardown_recovery_park(
+        &self,
+        host_id: &str,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        self.state.nodes.arm_teardown_recovery_park(host_id).await
+    }
+
     /// Test helper: block every Node-registry lookup (`kind_of`, `call`,
     /// `insert`) until `release` is sent (or dropped). Returns only once the
     /// lock is actually held, so a command POST parked afterwards is

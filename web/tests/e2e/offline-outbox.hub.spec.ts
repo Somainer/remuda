@@ -441,15 +441,26 @@ async function expectDelivered(page: Page, commandId: string | null) {
   const bubble = page.locator(
     `[data-testid="optimistic-bubble"][data-command-id="${commandId}"]`,
   );
+  // Presence, status and label come from ONE DOM evaluation, so the journal
+  // node joining between two separate reads cannot race the check.
+  const observeBubble = () =>
+    bubble.evaluateAll((nodes) =>
+      nodes.length === 0
+        ? { state: "joined", text: "" }
+        : { state: nodes[0]!.getAttribute("data-status") ?? "", text: nodes[0]!.textContent ?? "" },
+    );
+  let delivered = { state: "", text: "" };
   await expect
-    .poll(async () => ((await bubble.count()) === 0 ? "joined" : await bubble.getAttribute("data-status")), {
-      timeout: 30_000,
-    })
+    .poll(async () => (delivered = await observeBubble()).state, { timeout: 30_000 })
     .toMatch(/^(joined|settled)$/);
   // Still exactly one row: a joined node never renders next to its bubble.
   await expect(userRow).toHaveCount(1);
-  // A still-visible settled bubble shows the delivered label (like :720).
-  if ((await bubble.count()) > 0) await expect(bubble).toContainText("已受理");
+  if (delivered.state === "settled") {
+    // The settled bubble observed above shows the delivered label (like
+    // :720) and no waiting/unconfirmed one — asserted on that same snapshot.
+    expect(delivered.text).toContain("已受理");
+    for (const label of UNDELIVERED_LABELS) expect(delivered.text).not.toContain(label);
+  }
   // The row for THIS command never shows a waiting/unconfirmed label (other
   // scripted commands on the page may independently show their own status
   // and are not asserted here).

@@ -23,6 +23,8 @@ vi.mock("../../lib/store", () => ({
   // The home reads the store through the cached external-store seam: the mock
   // offers the same subscribe/getSnapshot surface (no store polling in unit
   // tests) plus the imperative row helpers the component calls.
+  // No address-owner Main in these fixtures: the Main card renders nothing.
+  useMainEntry: () => null,
   hubStore: {
     subscribe: (listener: () => void) => {
       listeners.add(listener);

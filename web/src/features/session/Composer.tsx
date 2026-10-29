@@ -138,6 +138,9 @@ export function Composer({
   capabilities,
   interrupted: interruptedProp,
   onInterruptedChange,
+  variant = "session",
+  placeholder,
+  primaryOverride = null,
 }: {
   instanceId: string;
   mobile: boolean;
@@ -238,7 +241,27 @@ export function Composer({
    */
   interrupted?: boolean;
   onInterruptedChange?: (interrupted: boolean) => void;
+  /**
+   * "ask" is the home 问 Main input (ma-main-ui): the same compact 56px row on
+   * every width, without the session options trigger (permission / effort /
+   * context belong to the Main session page, not to a home input).
+   */
+  variant?: "session" | "ask";
+  /** Overrides the platform placeholder. */
+  placeholder?: string;
+  /**
+   * Replaces the send button with another primary action (Main paused → 恢复).
+   * While set, Enter and submit never send; the draft stays in the box.
+   */
+  primaryOverride?: {
+    label: string;
+    testId: string;
+    onClick: () => void;
+    disabled?: boolean;
+    title?: string;
+  } | null;
 }) {
+  const ask = variant === "ask";
   const [text, setText] = useState(() => readDraft(instanceId));
   const [menu, setMenu] = useState<MenuId>(null);
   // D-042: phone options sheet (attachments / harness / permission / effort),
@@ -649,6 +672,7 @@ export function Composer({
   }, [interrupted]);
 
   const canSubmit = () => {
+    if (primaryOverride) return false;
     const value = expandCodeQuotes(text.trim(), codeQuotes.quotes);
     if ((!value && images.attachments.length === 0) || disabled || sending) return false;
     if (images.uploading) return false;
@@ -1406,16 +1430,29 @@ export function Composer({
           {controls.interrupt.note ? <span className={css.controlSub}>{controls.interrupt.note}</span> : null}
         </button>
       ) : null}
-      <button
-        type="submit"
-        className={controls.primary.kind === "queue" ? css.queueBtn : css.send}
-        data-testid={primaryTestId}
-        data-mode={controls.primary.kind === "queue" ? "queue" : controls.primary.mode}
-        data-holder={controls.primary.kind === "queue" ? controls.primary.holder : undefined}
-        disabled={disabled || sending || images.uploading || (!text.trim() && images.attachments.length === 0)}
-      >
-        {primaryLabel}
-      </button>
+      {primaryOverride ? (
+        <button
+          type="button"
+          className={css.send}
+          data-testid={primaryOverride.testId}
+          disabled={primaryOverride.disabled}
+          title={primaryOverride.title}
+          onClick={primaryOverride.onClick}
+        >
+          {primaryOverride.label}
+        </button>
+      ) : (
+        <button
+          type="submit"
+          className={controls.primary.kind === "queue" ? css.queueBtn : css.send}
+          data-testid={primaryTestId}
+          data-mode={controls.primary.kind === "queue" ? "queue" : controls.primary.mode}
+          data-holder={controls.primary.kind === "queue" ? controls.primary.holder : undefined}
+          disabled={disabled || sending || images.uploading || (!text.trim() && images.attachments.length === 0)}
+        >
+          {primaryLabel}
+        </button>
+      )}
     </>
   );
   return (
@@ -1428,7 +1465,8 @@ export function Composer({
       data-effort-index={String(currentEffort.index)}
       data-ultracode={ultraOn ? "1" : "0"}
       data-model={model}
-      className={css.composerRoot}
+      data-variant={ask ? "ask" : undefined}
+      className={ask ? `${css.composerRoot} ${css.askRoot}` : css.composerRoot}
       onSubmit={(e) => {
         e.preventDefault();
         void submitPrimary();
@@ -1531,9 +1569,10 @@ export function Composer({
           // D-042: phones get a plain hint — Enter is newline there and ⌘
           // does not exist, so advertising desktop shortcuts would mislead.
           placeholder={
-            mobile
+            placeholder ??
+            (mobile
               ? "输入提示词…"
-              : "输入提示词…  Enter 排队 · ⌘/Ctrl+Enter 插队 · 工作中 Esc 打断 · IME 组字期间不送"
+              : "输入提示词…  Enter 排队 · ⌘/Ctrl+Enter 插队 · 工作中 Esc 打断 · IME 组字期间不送")
           }
           onChange={(e) => {
             textRef.current = e.target.value;
@@ -1553,11 +1592,12 @@ export function Composer({
         />
         {voiceNode}
       </div>
-      <div className={css.controlBar} data-testid="composer-bar" data-collapsed={mobile ? "1" : "0"}>
-        {mobile ? (
+      <div className={css.controlBar} data-testid="composer-bar" data-collapsed={mobile || ask ? "1" : "0"}>
+        {mobile || ask ? (
           <>
-            {/* D-042: one trigger + input + primary; options live in sheet. */}
-            {mobileTriggerNode}
+            {/* D-042: one trigger + input + primary; options live in sheet.
+                The 问 Main input carries no options trigger at all. */}
+            {ask ? null : mobileTriggerNode}
             {voiceHintNode}
             {queueStatusNode}
             {interruptedNode}

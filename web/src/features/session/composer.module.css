@@ -473,3 +473,47 @@
 .radioOn {
   composes: radioOn from "./effort.module.css";
 }
+
+/* ma-main-ui 问 Main: the compact composer as ONE 56px row on every width —
+   textarea, mic (where speech input exists) and the primary button inline.
+   No options trigger renders in this variant. */
+.askRoot {
+  flex-direction: row;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: var(--composer-row);
+}
+
+.askRoot .composer {
+  flex: 1 1 auto;
+  min-width: 0;
+  align-items: center;
+}
+
+.askRoot .input {
+  min-height: var(--control-h);
+  max-height: calc(var(--composer-row) * 2);
+  padding: var(--space-2) var(--space-3);
+  border-color: var(--border-control);
+  background: var(--bg-input);
+  color: var(--fg-body);
+  font-size: var(--text-input);
+  resize: none;
+}
+
+.askRoot .controlBar {
+  flex: none;
+  flex-wrap: nowrap;
+}
+
+.askRoot .barSpacer {
+  display: none;
+}
+
+.askRoot .send {
+  height: var(--control-h);
+  border-color: var(--primary-fill);
+  background: var(--primary-fill);
+  color: var(--on-primary);
+  white-space: nowrap;
+}

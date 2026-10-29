@@ -1,11 +1,13 @@
 import { useEffect, useState } from "react";
 import { SessionList } from "../features/session/SessionList";
-import { useHub } from "../lib/store";
+import { useHub, useMainEntry } from "../lib/store";
 import { useWorkbenchViewport } from "../lib/viewport";
 import { SpacesPanel } from "../features/spaces/SpacesPanel";
 import { spaceStore, type Space } from "../features/spaces/store";
 import { useSpaceWorkbench } from "../features/spaces/useSpaceWorkbench";
 import { PageHeader } from "../components/PageHeader";
+import { MainCard } from "../features/home/MainCard";
+import { useMainAside } from "../features/home/useMain";
 import ui from "../styles/ui.module.css";
 import css from "./SessionsPage.module.css";
 
@@ -13,6 +15,10 @@ export function SessionsPage({ dimmed = false }: { dimmed?: boolean }) {
   const hub = useHub();
   const { mobile } = useWorkbenchViewport();
   const { spaces, active, prefs, instanceId, newHref } = useSpaceWorkbench();
+  // D-057 Main card: heads the right column at ≥1440, the main column below.
+  // Never behind the dimmed /sessions/new sheet (one 问 Main input at a time).
+  const mainAside = useMainAside();
+  const showMain = !mobile && !dimmed;
   // Below 1024 the index column folds into the header's 空间 button, which
   // opens the same panel as an overlay (one instance, same testids).
   const [indexOpen, setIndexOpen] = useState(false);
@@ -62,6 +68,7 @@ export function SessionsPage({ dimmed = false }: { dimmed?: boolean }) {
           </>
         ) : null}
         <div className={css.list}>
+          {showMain && !mainAside ? <MainCard placement="desktop" /> : null}
           {hub.hosts.length === 0 && hub.instances.length === 0 ? (
             <div className={css.placeholder}>无主机。请添加主机。</div>
           ) : null}
@@ -74,7 +81,19 @@ export function SessionsPage({ dimmed = false }: { dimmed?: boolean }) {
             space={active ? { id: active.id, name: active.name, hostId: active.hostId, workspaceId: active.workspaceId } : undefined}
           />
         </div>
+        {showMain && mainAside ? <MainAside /> : null}
       </div>
     </div>
+  );
+}
+
+/** ≥1440 right column; empty (not rendered) without an address-owner Main. */
+function MainAside() {
+  const main = useMainEntry();
+  if (!main) return null;
+  return (
+    <aside className={css.aside} aria-label="Main" data-testid="sessions-aside">
+      <MainCard placement="desktop" />
+    </aside>
   );
 }

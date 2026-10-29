@@ -32,6 +32,7 @@ import {
 import { TaskGroups, useTaskLedger } from "../tasks/TaskList";
 import { SpacesDrawer } from "../spaces/SpacesMobile";
 import { ContextRing } from "./ContextRing";
+import { MainCard } from "../home/MainCard";
 import ui from "../../styles/ui.module.css";
 import css from "./home.module.css";
 
@@ -460,6 +461,10 @@ export const HomeList = memo(function HomeList() {
           ) : null}
         </>
       </CommitProbe>
+      {/* D-057 Main card + 问 Main (H8a): outside the probe so its own echo
+          and tail reads never report commit:HomeList; flex order 0 keeps it
+          right under the sticky head. Renders nothing without a Main. */}
+      <MainCard placement="phone" />
       {/* Outside the probe: its 5s ledger poll never reports commit:HomeList.
           CSS order keeps it under the sticky head and above project groups. */}
       <HomeTaskLayer

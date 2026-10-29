@@ -86,3 +86,14 @@
     background: var(--scrim);
   }
 }
+
+/* D-057 Main card column (ma-main-ui): ≥1440 only; below that the card heads
+   the list column instead (SessionsPage). */
+.aside {
+  flex: none;
+  width: var(--aside);
+  min-height: 0;
+  overflow: auto;
+  border-left: 1px solid var(--divider);
+  background: var(--bg-canvas);
+}

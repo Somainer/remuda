@@ -273,18 +273,26 @@ export function SessionList({
       </p>
     );
   }
+  // D-057 §9: the pinned Main row does not depend on the Space, so it stays
+  // above the list's own empty states too.
   if (empty === "no-workspaces") {
     return (
-      <p className={css.empty} data-testid="session-list" data-empty="no-workspaces">
-        主机已连接，但还没有注册工作目录。<Link to="/hosts">注册工作目录</Link>
-      </p>
+      <>
+        <MainRow />
+        <p className={css.empty} data-testid="session-list" data-empty="no-workspaces">
+          主机已连接，但还没有注册工作目录。<Link to="/hosts">注册工作目录</Link>
+        </p>
+      </>
     );
   }
   if (empty === "no-sessions") {
     return (
-      <p className={css.empty} data-testid="session-list" data-empty="no-sessions">
-        {title} 还没有会话。<Link to={newHref}>新建会话</Link>
-      </p>
+      <>
+        <MainRow />
+        <p className={css.empty} data-testid="session-list" data-empty="no-sessions">
+          {title} 还没有会话。<Link to={newHref}>新建会话</Link>
+        </p>
+      </>
     );
   }
 

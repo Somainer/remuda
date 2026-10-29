@@ -8,9 +8,10 @@ import type { LocalBubble, MainEntry } from "../../lib/store";
 import type { Instance } from "../../types/instance";
 import { known, type Id } from "../../types/wire";
 import { MainAskDock, MainCard } from "./MainCard";
-import { TAIL_RETRY_MS } from "./mainTail";
+import { resetMainRepliesForTest, TAIL_RETRY_MS } from "./mainTail";
 
 const hub = {
+  instances: [] as Instance[],
   hosts: [{ id: "host-a", label: "devbox", online: true, state: "online" }],
   interactions: [] as unknown[],
   bubbles: [] as LocalBubble[],
@@ -90,6 +91,8 @@ beforeEach(() => {
   }) as unknown as typeof window.matchMedia;
   hub.bubbles = [];
   hub.lineages = {};
+  hub.instances = [];
+  resetMainRepliesForTest();
   hub.connection = "live";
   main = { instance: chapter(), lineageId: "ins_main" as Id, generation: 1, live: true, chapterIds: ["ins_main" as Id] };
   send.mockReset().mockResolvedValue(true);
@@ -332,5 +335,71 @@ describe("line 2 when the tail cannot be read (r2 item 7)", () => {
     renderCard();
     await waitFor(() => expect(screen.getByTestId("main-card-reply").getAttribute("data-kind")).toBe("empty"));
     expect(screen.getByTestId("main-card-reply").textContent).toBe("还没有回复");
+  });
+});
+
+describe("the carried reply belongs to its lineage (r2 item 2)", () => {
+  const page = (text: string | null) => ({
+    events: text
+      ? [{ seq: "8", kind: "message", instanceId: "x", payload: { role: "assistant", text } }]
+      : [],
+    durableSeq: "9",
+    windowFromSeq: text ? "8" : null,
+    reachedAfterSeq: true,
+  });
+
+  it("a new address-owner lineage never shows the old one's reply", async () => {
+    eventsRead.mockReset().mockImplementation(({ journalId }: { journalId: string }) =>
+      Promise.resolve(page(journalId === "jrn_main" ? "A 的回复" : null)),
+    );
+    const view = renderCard();
+    await waitFor(() => expect(screen.getByTestId("main-card-reply").textContent).toBe("A 的回复"));
+    // The old lineage ended; a NEW address-owner lineage is seated.
+    main = {
+      instance: chapter({ id: "ins_b1" as Id, journalId: "jrn_b1" as Id, lineageId: "ins_b1" as Id }),
+      lineageId: "ins_b1" as Id,
+      generation: 1,
+      live: true,
+      chapterIds: ["ins_b1" as Id],
+    };
+    view.rerender(
+      <MemoryRouter>
+        <MainCard placement="desktop" />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(screen.getByTestId("main-card-reply").getAttribute("data-kind")).toBe("empty"));
+    expect(screen.getByTestId("main-card-reply").textContent).not.toContain("A 的回复");
+  });
+
+  it("after a reload, chapter N+1 with no reply yet shows chapter N's reply", async () => {
+    const g1 = chapter({ id: "ins_g1" as Id, journalId: "jrn_g1" as Id, lineageId: "ins_g1" as Id, generation: 1, lifecycle: "exited" });
+    const g2 = chapter({ id: "ins_g2" as Id, journalId: "jrn_g2" as Id, lineageId: "ins_g1" as Id, generation: 2 });
+    hub.instances = [g1, g2];
+    main = { instance: g2, lineageId: "ins_g1" as Id, generation: 2, live: true, chapterIds: ["ins_g1" as Id, "ins_g2" as Id] };
+    eventsRead.mockReset().mockImplementation(({ journalId }: { journalId: string }) =>
+      Promise.resolve(page(journalId === "jrn_g1" ? "第一章的回复" : null)),
+    );
+    renderCard();
+    await waitFor(() => expect(screen.getByTestId("main-card-reply").textContent).toBe("第一章的回复"));
+  });
+
+  it("a remount keeps the carried reply without reading again", async () => {
+    eventsRead.mockReset().mockImplementation(({ journalId }: { journalId: string }) =>
+      Promise.resolve(page(journalId === "jrn_main" ? "记住我" : null)),
+    );
+    const first = renderCard();
+    await waitFor(() => expect(screen.getByTestId("main-card-reply").textContent).toBe("记住我"));
+    first.unmount();
+    // Resume moved Main to chapter 2, whose tail has nothing yet.
+    main = {
+      instance: chapter({ id: "ins_g2" as Id, journalId: "jrn_g2" as Id, lineageId: "ins_main" as Id, generation: 2 }),
+      lineageId: "ins_main" as Id,
+      generation: 2,
+      live: true,
+      chapterIds: ["ins_main" as Id, "ins_g2" as Id],
+    };
+    renderCard();
+    await waitFor(() => expect(eventsRead).toHaveBeenCalledWith(expect.objectContaining({ journalId: "jrn_g2" })));
+    expect(screen.getByTestId("main-card-reply").textContent).toBe("记住我");
   });
 });

@@ -47,7 +47,7 @@ export function MainCard({ placement }: { placement: "phone" | "desktop" }) {
 
 function MainCardBody({ entry, placement }: { entry: MainEntry; placement: "phone" | "desktop" }) {
   const { hub, instance, status, online } = useMainView(entry);
-  const { tail, carried, read } = useMainTail(instance);
+  const { tail, carried, read } = useMainTail(entry, hub.instances);
   const echo = mainEcho({
     entry,
     bubbles: hub.bubbles,

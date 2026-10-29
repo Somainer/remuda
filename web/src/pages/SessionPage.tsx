@@ -333,7 +333,6 @@ function SessionPageBody({
   useSeenReporter(
     instanceId && !isTtyLabFixtureId(instanceId) ? instanceId : undefined,
     hub.instance?.durableSeq,
-    hub.instance?.unseen === true,
   );
 
   // D-056 §6: per-model default + ultracode capability rows (best-effort).

@@ -18,9 +18,9 @@ const onScreen = () => document.visibilityState === "visible";
  * device. Hiding the tab, leaving the route, or unloading the page (close,
  * reload, full navigation: `pagehide`, sent keepalive) releases the lease; a
  * release that never arrives lets it lapse. Data only: renders nothing, and
- * every report is best-effort — a failure is retried by the next renewal.
+ * every report is best-effort — the 4 s renewal is the only retry path.
  */
-export function useSeenReporter(instanceId: Id | undefined, durableSeq: U64 | undefined, unseen: boolean) {
+export function useSeenReporter(instanceId: Id | undefined, durableSeq: U64 | undefined) {
   const seq = useRef(durableSeq);
   const report = useRef<(visible: boolean) => void>(() => undefined);
 
@@ -52,11 +52,14 @@ export function useSeenReporter(instanceId: Id | undefined, durableSeq: U64 | un
     };
   }, [instanceId]);
 
-  // Report at once on opening the page, when the row arrives after a deep
-  // link, and when a turn end the Hub could not fold (no lease yet, or a Hub
-  // restart dropped it) shows up as unseen while the page is on screen.
+  // Report at once on opening the page and when the row first arrives after a
+  // deep link. Never on the row's `unseen`: a report flips it (optimistic
+  // seen) and a failed report flips it back (rollback), so reacting to it
+  // re-posted in a loop for as long as the Hub failed. A turn end the Hub
+  // could not fold (no lease yet, or a Hub restart dropped it) is covered by
+  // the next renewal, which reports the row's current durable seq.
   const known = durableSeq != null;
   useEffect(() => {
     if (known && onScreen()) report.current(true);
-  }, [instanceId, known, unseen]);
+  }, [instanceId, known]);
 }

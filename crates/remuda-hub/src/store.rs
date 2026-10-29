@@ -11051,7 +11051,9 @@ mod tests {
             db.query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap()
         };
-        assert_eq!(version, 3);
+        // The marker sits at the top of the one ladder (the D-060 memory
+        // step follows the ended_at backfills).
+        assert_eq!(version, crate::memory::MEMORY_SCHEMA_VERSION);
         // Another open changes neither row (one-time migration).
         store.close().await;
         let _store = Store::open(dir.path()).expect("store");

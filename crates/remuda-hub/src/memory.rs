@@ -2144,23 +2144,33 @@ mod tests {
         assert!(hits.iter().all(|hit| hit.entry.slug == "replies"));
     }
 
-    /// r2 item 1: a delete in this lineage plus a create in another, landing
-    /// between a search's passes, must not surface the other lineage's row
-    /// (a rowid the delete freed would be reused by the create).
+    /// r2 item 1 / r3 item 2: both passes of a search answer from ONE
+    /// snapshot. Writes landing between the passes (a LIKE-only match
+    /// deleted, another changed so it no longer matches, a new LIKE-only
+    /// match inserted, a row created in another lineage) are invisible to
+    /// the second pass, which must still return the pre-write rows.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn search_never_returns_another_lineages_entry_mid_search() {
+    async fn search_answers_both_passes_from_one_snapshot() {
         let fx = fixture().await;
         let mine = fx.seat().await;
         let theirs = fx.seat().await;
         let owner = MemoryWriter::Owner;
-        fx.store
-            .memory_create(
-                mine.clone(),
-                owner.clone(),
-                input("pref", MemoryType::User, "a secret preference"),
-            )
-            .await
-            .unwrap();
+        // "secret" is a whole token only in "pref" (an FTS hit); the others
+        // contain it inside a longer token, so only LIKE can find them.
+        for (slug, body) in [
+            ("pref", "a secret preference"),
+            ("like-gone", "the topsecretplan file"),
+            ("like-changed", "a supersecretnote"),
+        ] {
+            fx.store
+                .memory_create(
+                    mine.clone(),
+                    owner.clone(),
+                    input(slug, MemoryType::User, body),
+                )
+                .await
+                .unwrap();
+        }
 
         let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
         let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
@@ -2208,6 +2218,31 @@ mod tests {
             .await
             .unwrap();
         fx.store
+            .memory_delete(mine.clone(), "like-gone".into(), owner.clone(), 1)
+            .await
+            .unwrap();
+        fx.store
+            .memory_update(
+                mine.clone(),
+                "like-changed".into(),
+                owner.clone(),
+                MemoryPatch {
+                    body: Some("nothing to find here now".into()),
+                    ..MemoryPatch::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        fx.store
+            .memory_create(
+                mine.clone(),
+                owner.clone(),
+                input("like-new", MemoryType::User, "an ultrasecretcode"),
+            )
+            .await
+            .unwrap();
+        fx.store
             .memory_create(
                 theirs.clone(),
                 owner,
@@ -2217,12 +2252,68 @@ mod tests {
             .unwrap();
         go_tx.send(()).unwrap();
         let hits = search.await.unwrap().unwrap();
-        for hit in &hits {
-            assert_eq!(hit.entry.lineage_id, mine, "leaked: {hit:?}");
-        }
-        // Both passes answer from the snapshot the search started on.
-        let slugs: Vec<&str> = hits.iter().map(|hit| hit.entry.slug.as_str()).collect();
-        assert_eq!(slugs, ["pref"], "{hits:?}");
+        let seen: Vec<(&str, &str, MemoryMatch)> = hits
+            .iter()
+            .map(|hit| {
+                (
+                    hit.entry.lineage_id.as_str(),
+                    hit.entry.slug.as_str(),
+                    hit.matched_by,
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (mine.as_str(), "pref", MemoryMatch::Fts),
+                (mine.as_str(), "like-changed", MemoryMatch::Like),
+                (mine.as_str(), "like-gone", MemoryMatch::Like),
+            ],
+            "both passes must return the pre-write snapshot: {hits:?}"
+        );
+        assert_eq!(
+            hits[1].entry.body, "a supersecretnote",
+            "the snapshot's row"
+        );
+    }
+
+    /// r3 item 2: AUTOINCREMENT never reissues a freed row id, so an id seen
+    /// before a delete can never name a row created after it (in any lineage).
+    #[tokio::test]
+    async fn freed_row_ids_are_never_reissued() {
+        let fx = fixture().await;
+        let mine = fx.seat().await;
+        let theirs = fx.seat().await;
+        let owner = MemoryWriter::Owner;
+        let id_of = |lineage: String, slug: &'static str| {
+            fx.store.read("test.id_of", move |conn| {
+                Ok(conn.query_row(
+                    "SELECT id FROM memory_entries WHERE lineage_id = ?1 AND slug = ?2",
+                    params![lineage, slug],
+                    |row| row.get::<_, i64>(0),
+                )?)
+            })
+        };
+        fx.store
+            .memory_create(
+                mine.clone(),
+                owner.clone(),
+                input("first", MemoryType::User, ""),
+            )
+            .await
+            .unwrap();
+        let freed = id_of(mine.clone(), "first").await.unwrap();
+        fx.store
+            .memory_delete(mine.clone(), "first".into(), owner.clone(), 1)
+            .await
+            .unwrap();
+        // The table is now empty: a plain rowid would restart at the freed id.
+        fx.store
+            .memory_create(theirs.clone(), owner, input("second", MemoryType::User, ""))
+            .await
+            .unwrap();
+        let next = id_of(theirs, "second").await.unwrap();
+        assert!(next > freed, "freed id {freed} was reissued as {next}");
     }
 
     #[tokio::test]

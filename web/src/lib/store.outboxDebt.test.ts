@@ -2039,3 +2039,65 @@ it("r7 item 1: a debt-only settlement keeps exactly one visible user row, and st
   expect(afterLive[0]).toMatchObject({ commandId });
   expect((afterLive[0] as { local?: unknown }).local).toBeUndefined();
 }, 15_000);
+
+it("r7 item 2: an unrelated live batch between a failed debt done write and its retry does not cancel the retry", async () => {
+  // The debt read observes the sole owed command C; its done transaction
+  // aborts once and the pass schedules the retry. Before the retry an
+  // unrelated live frame arrives: the live reevaluation must not discharge
+  // the debt off C's evidence while C's durable row is still sent.
+  await collectUnhandled(async (unhandled) => {
+    const { api, hubStore } = await fresh();
+    await mountFollow(api, hubStore);
+    vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+      const commandId = _args[4] as string;
+      return Promise.resolve(commandResult(commandId, "accepted"));
+    });
+    const h = hubStore as unknown as { outbox: { get: (id: string) => OutboxRecord | undefined } | null };
+
+    await hubStore.send(INSTANCE, "owed, retry must survive a live frame");
+    const bubble = () => hubStore.getSnapshot().bubbles[0]!;
+    await vi.waitFor(() => expect(bubble().outboxState).toBe("sent"));
+    await vi.waitFor(() => expect(debtOf(hubStore).has(INSTANCE)).toBe(true));
+    const commandId = bubble().commandId!;
+
+    const abort = await abortFirstDoneWrite(() => true);
+    vi.mocked(api.eventsRead).mockResolvedValue(userMessagePage(commandId));
+    await vi.waitFor(() => expect(abort.aborted).toBe(1), { timeout: 3_000 });
+    expect(debtOf(hubStore).has(INSTANCE)).toBe(true);
+
+    // An unrelated live frame (an assistant message, not C) before the retry.
+    const onBatch = await liveBatch(api);
+    onBatch({
+      subscriptionId: "sub_outbox_debt",
+      journalId: JOURNAL,
+      fromSeq: "1",
+      toSeq: "1",
+      durableSeq: "1",
+      events: [
+        {
+          kind: "message",
+          eventId: "evt_assistant_unrelated",
+          journalId: JOURNAL,
+          instanceId: INSTANCE,
+          seq: "1",
+          completeness: "structured",
+          payload: { role: "assistant", text: "unrelated" },
+        } as unknown as Observation,
+      ],
+    });
+    await vi.waitFor(() => expect(hubStore.getSnapshot().events[INSTANCE] ?? []).toHaveLength(1));
+    // The live reevaluation kept the debt: C's done is still owed.
+    expect(debtOf(hubStore).has(INSTANCE)).toBe(true);
+    expect(h.outbox?.get(commandId)?.state).toBe("sent");
+
+    // The retry commits done and only then retires the debt.
+    await vi.waitFor(
+      () => {
+        expect(h.outbox?.get(commandId)?.state).toBe("done");
+        expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+      },
+      { timeout: 3_000 },
+    );
+    expect(unhandled).toEqual([]);
+  });
+}, 15_000);

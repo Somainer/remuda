@@ -1370,6 +1370,13 @@ class HubStore {
        * The evidence is held here, never folded into state.events (AD3).
        */
       observed: Set<Id>;
+      /**
+       * r7 item 2: evidenced owed command ids whose durable done the DEBT path
+       * owes and has not committed yet — observed by a debt read, folded while
+       * no Outbox was installed, or a debt-path done write that failed. The
+       * debt is never cleared while one of their rows is not durably done.
+       */
+      owedDone: Set<Id>;
     }
   >();
   /**
@@ -3982,6 +3989,7 @@ class HubStore {
       gen: this.owedGeneration,
       commands: new Set<Id>(),
       observed: new Set<Id>(),
+      owedDone: new Set<Id>(),
     };
     if (commandIds) for (const commandId of commandIds) debt.commands.add(commandId);
     debt.bindGen = this.connectionBindGen;
@@ -4041,12 +4049,27 @@ class HubStore {
    * installing the next Outbox re-checks it ({@link resumeOwedDebts}).
    */
   private reevaluateOwedDebt(instanceId: Id) {
-    if (!this.reconcileOwed.has(instanceId) || !this.outbox) return;
-    if (!this.owedCommandLacksEvidence(instanceId)) {
-      this.clearOwed(instanceId);
+    const debt = this.reconcileOwed.get(instanceId);
+    if (!debt || !this.outbox) return;
+    if (this.owedCommandLacksEvidence(instanceId)) {
+      this.scheduleOwedTail(instanceId);
       return;
     }
-    this.scheduleOwedTail(instanceId);
+    // r7 item 2: evidence alone does not discharge a debt whose durable done
+    // the debt path still owes (a failed write awaiting its retry). Keep it;
+    // the awaited debt settlement retries it — an unrelated live batch must
+    // not cancel that.
+    if (this.owedDoneOutstanding(debt, this.outbox)) return;
+    this.clearOwed(instanceId);
+  }
+
+  /** r7 item 2: a command the debt path owes a durable done for is not yet done. */
+  private owedDoneOutstanding(debt: { owedDone: Set<Id> }, box: Outbox): boolean {
+    for (const commandId of debt.owedDone) {
+      const rec = box.get(commandId);
+      if (rec && rec.state !== "done" && rec.state !== "rejected") return true;
+    }
+    return false;
   }
 
   /**
@@ -4064,6 +4087,11 @@ class HubStore {
   private resumeOwedDebts() {
     for (const [instanceId, debt] of this.reconcileOwed) {
       if (debt.gen !== this.owedGeneration) continue;
+      // r7 item 2: evidence folded while no box was installed was never
+      // durably settled by the live path; the debt path owes those dones.
+      if (this.outbox) {
+        for (const commandId of this.owedSettlementPending(instanceId, debt, this.outbox)) debt.owedDone.add(commandId);
+      }
       // Presentation only: bubbles settle off the evidence already folded.
       this.emit({ bubbles: settleBubbles(this.state.bubbles, instanceId, this.state.events[instanceId] ?? []) });
       this.scheduleOwedTail(instanceId, OWED_TAIL_BASE_BACKOFF_MS);
@@ -4150,6 +4178,7 @@ class HubStore {
         continue;
       }
       debt.observed.add(commandId);
+      debt.owedDone.add(commandId);
       matched.push(ev);
     }
     if (matched.length) this.emit({ bubbles: settleBubbles(this.state.bubbles, instanceId, matched) });
@@ -4182,6 +4211,7 @@ class HubStore {
    */
   private async commitOwedSettlement(
     instanceId: Id,
+    debt: { owedDone: Set<Id> },
     commandIds: Id[],
     box: Outbox,
     owns: () => boolean,
@@ -4189,6 +4219,8 @@ class HubStore {
     let allCommitted = true;
     for (const commandId of commandIds) {
       if (!owns()) return null;
+      // Owed until it commits (r7 item 2): a failure below keeps it owed.
+      debt.owedDone.add(commandId);
       let written: OutboxRecord | null = null;
       try {
         written = await box.patch(commandId, { state: "done", serverState: "journal-settled" });
@@ -4197,6 +4229,7 @@ class HubStore {
       }
       if (!owns()) return null;
       if (written) {
+        debt.owedDone.delete(commandId);
         if (this.outbox === box) this.syncBubbleFromOutbox(commandId);
         void this.recordAcceptedDelivery(instanceId, commandId, box);
         continue;
@@ -4205,6 +4238,7 @@ class HubStore {
       // still there, not done — keep the obligation).
       const after = box.get(commandId);
       if (after && after.state !== "done" && after.state !== "rejected") allCommitted = false;
+      else debt.owedDone.delete(commandId);
     }
     return allCommitted;
   }
@@ -4315,7 +4349,7 @@ class HubStore {
       if (!box || !debt) return false;
       const pending = this.owedSettlementPending(instanceId, debt, box);
       if (!pending.length) return true;
-      const committed = await this.commitOwedSettlement(instanceId, pending, box, owns);
+      const committed = await this.commitOwedSettlement(instanceId, debt, pending, box, owns);
       if (committed === null) return false;
       if (committed) return true;
       tail.storageRetries += 1;

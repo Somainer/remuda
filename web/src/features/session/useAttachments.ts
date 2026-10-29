@@ -30,7 +30,7 @@ export type AddedAnchor = { index: number; kind: AnchorKind };
  * ref mirrors state synchronously — React state updates are async, but two
  * pastes in the same tick must claim different numbers.
  */
-export function useAttachments(instanceId: string) {
+export function useAttachments(instanceId: string, scope: string = instanceId) {
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
   // Files are kept so a failed upload can be retried without re-picking.
@@ -38,6 +38,9 @@ export function useAttachments(instanceId: string) {
   // Synchronous mirror of `attachments`, for anchor-position arithmetic.
   const listRef = useRef<Attachment[]>([]);
   const live = useRef(true);
+  // The instance uploads currently go to. An upload that resolves after the
+  // target moved is stale: its object is bound to the old instance.
+  const target = useRef(instanceId);
 
   useEffect(() => {
     listRef.current = attachments;
@@ -50,7 +53,8 @@ export function useAttachments(instanceId: string) {
     };
   }, []);
 
-  // Switching sessions drops any draft files; bytes must not leak across.
+  // Switching scope (a session switch) drops any draft files; bytes must not
+  // leak across. Within one scope (the 问 Main lineage) they stay.
   useEffect(() => {
     // Capture the map now: by cleanup time `files.current` may already point
     // at the next session's state.
@@ -63,7 +67,7 @@ export function useAttachments(instanceId: string) {
       listRef.current = [];
       pending.clear();
     };
-  }, [instanceId]);
+  }, [scope]);
 
   const upload = useCallback(
     async (localId: string, file: File) => {
@@ -76,7 +80,7 @@ export function useAttachments(instanceId: string) {
           throw new Error(`文件太大（上限 ${formatSize(MAX_ATTACHMENT_BYTES)}）`);
         }
         const staged = await api.objectUpload(instanceId, blob, mediaType, file.name);
-        if (!live.current) return;
+        if (!live.current || target.current !== instanceId) return;
         setAttachments((current) =>
           current.map((attachment) =>
             attachment.localId === localId
@@ -93,7 +97,7 @@ export function useAttachments(instanceId: string) {
           ),
         );
       } catch (error) {
-        if (!live.current) return;
+        if (!live.current || target.current !== instanceId) return;
         const message = error instanceof Error ? error.message : "上传失败";
         setAttachments((current) =>
           current.map((attachment) =>
@@ -106,6 +110,25 @@ export function useAttachments(instanceId: string) {
     },
     [instanceId],
   );
+
+  // Same scope, new target (the 问 Main lineage moved to its next chapter):
+  // Hub objects are bound to the instance they were uploaded under, so every
+  // staged file is uploaded again to the new one. The chips stay put.
+  useEffect(() => {
+    if (target.current === instanceId) return;
+    target.current = instanceId;
+    const restage = listRef.current.filter((attachment) => files.current.has(attachment.localId));
+    if (restage.length === 0) return;
+    const ids = new Set(restage.map((attachment) => attachment.localId));
+    const next = listRef.current.map((attachment) =>
+      ids.has(attachment.localId)
+        ? { ...attachment, state: "uploading" as const, objectId: undefined, error: undefined }
+        : attachment,
+    );
+    listRef.current = next;
+    setAttachments(next);
+    for (const attachment of restage) void upload(attachment.localId, files.current.get(attachment.localId)!);
+  }, [instanceId, upload]);
 
   /**
    * Stage a batch of picked, pasted, or dropped files (any type, D-027b).

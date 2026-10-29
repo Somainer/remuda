@@ -141,8 +141,17 @@ export function Composer({
   variant = "session",
   placeholder,
   primaryOverride = null,
+  draftScope,
 }: {
+  /** The instance sends and uploads go to. */
   instanceId: string;
+  /**
+   * Where the draft and the staged attachments live; defaults to
+   * `instanceId`. The 问 Main input scopes them to the Main LINEAGE, so a
+   * chapter switch keeps both (staged files are re-uploaded to the new
+   * chapter, whose Hub objects are bound to it).
+   */
+  draftScope?: string;
   mobile: boolean;
   disabled?: boolean;
   sending?: boolean;
@@ -262,7 +271,8 @@ export function Composer({
   } | null;
 }) {
   const ask = variant === "ask";
-  const [text, setText] = useState(() => readDraft(instanceId));
+  const scope = draftScope ?? instanceId;
+  const [text, setText] = useState(() => readDraft(scope));
   const [menu, setMenu] = useState<MenuId>(null);
   // D-042: phone options sheet (attachments / harness / permission / effort),
   // and the Sheet that replaces both window.confirm calls.
@@ -290,7 +300,7 @@ export function Composer({
   // leaves must not dismiss it. Reset on every real dismiss path.
   const usagePinned = useRef(false);
   const rootRef = useRef<HTMLFormElement>(null);
-  const images = useAttachments(instanceId);
+  const images = useAttachments(instanceId, scope);
   const codeQuotes = useCodeQuotes((index) => insertCodeTokenRef.current?.(index));
   const inputRef = useRef<HTMLTextAreaElement>(null);
   // Synchronous mirror so rapid pastes and the drop handler see the text the
@@ -360,7 +370,7 @@ export function Composer({
     span.own = next;
     textRef.current = next;
     setText(next);
-    writeDraft(instanceId, next);
+    writeDraft(scope, next);
     // No focus() and no caret juggling: the textarea is not focused while the
     // mic owns the gesture (focusing would raise the on-screen keyboard,
     // §4.1), and a controlled value naturally rests the caret at its end.
@@ -692,7 +702,7 @@ export function Composer({
     const result = insertAnchorFor(kind, textRef.current, caret, index);
     textRef.current = result.text;
     setText(result.text);
-    writeDraft(instanceId, result.text);
+    writeDraft(scope, result.text);
     requestAnimationFrame(() => {
       const next = inputRef.current;
       if (!next) return;
@@ -714,7 +724,7 @@ export function Composer({
     const result = insertAttachmentAnchors(textRef.current, caret, anchors);
     textRef.current = result.text;
     setText(result.text);
-    writeDraft(instanceId, result.text);
+    writeDraft(scope, result.text);
     requestAnimationFrame(() => {
       const next = inputRef.current;
       if (!next) return;
@@ -738,7 +748,7 @@ export function Composer({
     const next = removeAndRenumberAttachment(textRef.current, index);
     textRef.current = next;
     setText(next);
-    writeDraft(instanceId, next);
+    writeDraft(scope, next);
   };
 
   /** Quote chip × : drop the quote and strip/renumber its [Code #n] token. */
@@ -747,7 +757,7 @@ export function Composer({
     const next = removeAndRenumberFor("Code", textRef.current, index);
     textRef.current = next;
     setText(next);
-    writeDraft(instanceId, next);
+    writeDraft(scope, next);
   };
 
   /** Chips whose [Image #n]/[File #n] token was edited out; still sent. */
@@ -767,7 +777,7 @@ export function Composer({
   );
 
   const clearBox = () => {
-    writeDraft(instanceId, "");
+    writeDraft(scope, "");
     setText("");
     images.handOff();
     codeQuotes.clear();
@@ -1585,7 +1595,7 @@ export function Composer({
           onChange={(e) => {
             textRef.current = e.target.value;
             setText(e.target.value);
-            writeDraft(instanceId, e.target.value);
+            writeDraft(scope, e.target.value);
           }}
           onPaste={(event) => {
             // Swallow the paste only when a file was actually taken: otherwise

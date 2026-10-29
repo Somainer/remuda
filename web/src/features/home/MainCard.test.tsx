@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -22,6 +22,7 @@ const send = vi.fn();
 const resume = vi.fn();
 const reconcileSend = vi.fn();
 const eventsRead = vi.fn();
+const objectUpload = vi.fn();
 
 vi.mock("../../lib/store", () => ({
   useHub: () => hub,
@@ -37,7 +38,14 @@ vi.mock("../../lib/store", () => ({
 
 vi.mock("../../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../lib/api")>();
-  return { ...actual, api: { ...actual.api, eventsRead: (...args: unknown[]) => eventsRead(...args) } };
+  return {
+    ...actual,
+    api: {
+      ...actual.api,
+      eventsRead: (...args: unknown[]) => eventsRead(...args),
+      objectUpload: (...args: unknown[]) => objectUpload(...args),
+    },
+  };
 });
 
 function chapter(patch: Partial<Instance> = {}): Instance {
@@ -84,6 +92,13 @@ beforeEach(() => {
   hub.connection = "live";
   main = { instance: chapter(), lineageId: "ins_main" as Id, generation: 1, live: true, chapterIds: ["ins_main" as Id] };
   send.mockReset().mockResolvedValue(true);
+  localStorage.clear();
+  globalThis.URL.createObjectURL = vi.fn(() => "blob:preview");
+  globalThis.URL.revokeObjectURL = vi.fn();
+  // Hub objects are bound to the instance they were uploaded under.
+  objectUpload.mockReset().mockImplementation((instanceId: string, blob: Blob, mediaType: string, name?: string) =>
+    Promise.resolve({ objectId: `obj_${instanceId}`, size: blob.size, kind: "file", name: name ?? null, mediaType }),
+  );
   resume.mockReset().mockResolvedValue("ins_g2");
   reconcileSend.mockReset().mockResolvedValue("sent");
   eventsRead.mockReset().mockResolvedValue({
@@ -212,5 +227,75 @@ describe("MainCard", () => {
     expect(screen.getByTestId("main-card-status").textContent).toMatch(/^主机 devbox 离线/);
     expect(screen.getByTestId("composer-input").getAttribute("placeholder")).toBe("主机离线 · 消息会排队，上线后送达");
     hub.hosts = [{ id: "host-a", label: "devbox", online: true, state: "online" }];
+  });
+});
+
+function textFile(name = "notes.txt"): File {
+  return new File(["hello"], name, { type: "text/plain" });
+}
+
+function pasteFiles(files: File[]) {
+  return {
+    clipboardData: {
+      items: files.map((file) => ({ kind: "file", type: file.type, getAsFile: () => file })),
+      files,
+      types: ["Files"],
+    },
+  };
+}
+
+describe("问 Main across a chapter switch (r2 item 1)", () => {
+  it("keeps the typed draft and the staged attachment when Resume moves Main to the next chapter", async () => {
+    const user = userEvent.setup();
+    main = { ...main!, instance: chapter({ lifecycle: "exited", lineageId: "ins_main" as Id }), live: false };
+    const view = renderCard();
+    const input = screen.getByTestId("composer-input") as HTMLTextAreaElement;
+    await user.type(input, "draft stays");
+    fireEvent.paste(input, pasteFiles([textFile()]));
+    await waitFor(() => expect(objectUpload).toHaveBeenCalledTimes(1));
+    expect(objectUpload.mock.calls[0][0]).toBe("ins_main");
+    expect(await screen.findByTestId("attachment-chip")).toBeTruthy();
+
+    // The resume lands: the resolution moves to chapter 2 of the SAME lineage.
+    main = {
+      instance: chapter({ id: "ins_g2" as Id, generation: 2, lineageId: "ins_main" as Id, chapterCause: "owner-resume" }),
+      lineageId: "ins_main" as Id,
+      generation: 2,
+      live: true,
+      chapterIds: ["ins_main" as Id, "ins_g2" as Id],
+    };
+    view.rerender(
+      <MemoryRouter>
+        <MainCard placement="desktop" />
+      </MemoryRouter>,
+    );
+    const after = screen.getByTestId("composer-input") as HTMLTextAreaElement;
+    expect(after.value).toContain("draft stays");
+    expect(screen.getByTestId("attachment-chip")).toBeTruthy();
+    // The object is re-staged under the new chapter (Hub objects are bound to
+    // their instance), then the send carries it there.
+    await waitFor(() => expect(objectUpload).toHaveBeenCalledTimes(2));
+    expect(objectUpload.mock.calls[1][0]).toBe("ins_g2");
+    await waitFor(() => expect(screen.getByTestId("composer-send")).toBeEnabled());
+    await user.click(screen.getByTestId("composer-send"));
+    expect(send).toHaveBeenCalledTimes(1);
+    const [target, text, refs] = send.mock.calls[0] as [string, string, { objectId: string }[]];
+    expect(target).toBe("ins_g2");
+    expect(text).toContain("draft stays");
+    expect(refs.map((ref) => ref.objectId)).toEqual(["obj_ins_g2"]);
+  });
+
+  it("moves a draft left under an earlier chapter's id into the Main input", () => {
+    localStorage.setItem("runtime.draft.ins_old", "left over");
+    main = {
+      instance: chapter({ id: "ins_cur" as Id, generation: 2, lineageId: "ins_old" as Id }),
+      lineageId: "ins_old" as Id,
+      generation: 2,
+      live: true,
+      chapterIds: ["ins_old" as Id, "ins_cur" as Id],
+    };
+    renderCard();
+    expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe("left over");
+    expect(localStorage.getItem("runtime.draft.ins_old")).toBeNull();
   });
 });

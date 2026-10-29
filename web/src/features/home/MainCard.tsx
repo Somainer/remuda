@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { StateDot } from "../../components/StateDot";
 import { api } from "../../lib/api";
+import { readDraft, writeDraft } from "../../lib/drafts";
 import { hubStore, useHub, useMainEntry, type MainEntry } from "../../lib/store";
 import { useNowTick } from "../../lib/useNowTick";
 import type { Instance } from "../../types/instance";
@@ -184,6 +185,10 @@ export function MainAskDock() {
 function AskMain({ entry }: { entry: MainEntry }) {
   const { instance, status, online } = useMainView(entry);
   const mobile = useCompactLayout();
+  // The draft and staged files belong to the LINEAGE: Resume or a restart
+  // moves Main to a new chapter and the half-typed message must survive it.
+  const scope = askScope(entry.lineageId);
+  useState(() => adoptChapterDrafts(scope, entry));
   const [resuming, setResuming] = useState(false);
   const resume = async () => {
     setResuming(true);
@@ -206,9 +211,10 @@ function AskMain({ entry }: { entry: MainEntry }) {
           : "问 Main…  ⌘↵ 发送";
   return (
     <Composer
-      key={instance.id}
+      key={scope}
       variant="ask"
       instanceId={instance.id}
+      draftScope={scope}
       mobile={mobile}
       kind={instance.kind}
       phase="idle"
@@ -240,6 +246,29 @@ function AskMain({ entry }: { entry: MainEntry }) {
       }}
     />
   );
+}
+
+/** Draft scope of the 问 Main input: one per Main lineage. */
+function askScope(lineageId: string): string {
+  return `main-ask:${lineageId}`;
+}
+
+/**
+ * Move a draft left under an earlier chapter's id (r1 kept the input per
+ * chapter; an ended chapter's own page has no composer) into the lineage
+ * draft, once, before the input reads it. The current chapter's draft stays:
+ * it belongs to that chapter's session page.
+ */
+function adoptChapterDrafts(scope: string, entry: MainEntry) {
+  if (readDraft(scope)) return;
+  const earlier = entry.chapterIds.filter((id) => id !== entry.instance.id).reverse();
+  for (const id of earlier) {
+    const draft = readDraft(id);
+    if (!draft) continue;
+    writeDraft(scope, draft);
+    writeDraft(id, "");
+    return;
+  }
 }
 
 function EchoLine({

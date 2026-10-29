@@ -299,6 +299,8 @@ export function readMainTail(events: readonly Observation[]): MainTail {
 export type MainEcho =
   | { kind: "reply"; text: string }
   | { kind: "empty" }
+  /** The tail is not read yet or unreadable: line 2 must not claim "no reply". */
+  | { kind: "unread" }
   | { kind: "sending"; text: string }
   | { kind: "queued"; text: string }
   | { kind: "rejected"; text: string; reason: string | null; superseded: boolean; bubble: LocalBubble }
@@ -329,12 +331,18 @@ export function mainEcho(input: {
   online: boolean;
   /** The newest reply an earlier chapter showed, for a chapter with none yet. */
   carriedReply?: string | null;
+  /** Whether `tail` is known (`ok`); defaults to known for pure callers. */
+  tailRead?: "pending" | "ok" | "error";
 }): MainEcho {
-  const { entry, bubbles, tail, busy, online, carriedReply } = input;
+  const { entry, bubbles, tail, busy, online, carriedReply, tailRead = "ok" } = input;
   const lineage = new Set<string>([entry.instance.id, ...entry.chapterIds]);
   const bubble = [...bubbles].reverse().find((b) => lineage.has(b.instanceId) && !b.held) ?? null;
   const lastText = tail?.reply?.text ?? carriedReply ?? null;
-  const replyEcho: MainEcho = lastText ? { kind: "reply", text: lastText } : { kind: "empty" };
+  const replyEcho: MainEcho = lastText
+    ? { kind: "reply", text: lastText }
+    : tailRead === "ok"
+      ? { kind: "empty" }
+      : { kind: "unread" };
   if (!bubble) return replyEcho;
   const state = bubble.outboxState;
   if (state === "rejected") {

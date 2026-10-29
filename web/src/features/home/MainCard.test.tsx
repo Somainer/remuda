@@ -8,6 +8,7 @@ import type { LocalBubble, MainEntry } from "../../lib/store";
 import type { Instance } from "../../types/instance";
 import { known, type Id } from "../../types/wire";
 import { MainAskDock, MainCard } from "./MainCard";
+import { TAIL_RETRY_MS } from "./mainTail";
 
 const hub = {
   hosts: [{ id: "host-a", label: "devbox", online: true, state: "online" }],
@@ -297,5 +298,39 @@ describe("问 Main across a chapter switch (r2 item 1)", () => {
     renderCard();
     expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe("left over");
     expect(localStorage.getItem("runtime.draft.ins_old")).toBeNull();
+  });
+});
+
+describe("line 2 when the tail cannot be read (r2 item 7)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("an unreadable tail is not reported as 还没有回复, and the read is retried", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    eventsRead.mockReset().mockRejectedValueOnce(new Error("offline")).mockResolvedValue({
+      events: [{ seq: "8", kind: "message", instanceId: "ins_main", payload: { role: "assistant", text: "回来了" } }],
+      durableSeq: "9",
+      windowFromSeq: "8",
+      reachedAfterSeq: true,
+    });
+    renderCard();
+    await waitFor(() => expect(eventsRead).toHaveBeenCalledTimes(1));
+    await act(async () => undefined);
+    const line2 = screen.getByTestId("main-card-reply");
+    expect(line2.getAttribute("data-kind")).toBe("unread");
+    expect(line2.textContent).not.toContain("还没有回复");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(TAIL_RETRY_MS);
+    });
+    await waitFor(() => expect(screen.getByTestId("main-card-reply").textContent).toBe("回来了"));
+    expect(eventsRead).toHaveBeenCalledTimes(2);
+  });
+
+  it("a read tail with no reply says so", async () => {
+    eventsRead.mockReset().mockResolvedValue({ events: [], durableSeq: "9", windowFromSeq: null, reachedAfterSeq: true });
+    renderCard();
+    await waitFor(() => expect(screen.getByTestId("main-card-reply").getAttribute("data-kind")).toBe("empty"));
+    expect(screen.getByTestId("main-card-reply").textContent).toBe("还没有回复");
   });
 });

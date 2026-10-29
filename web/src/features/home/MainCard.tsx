@@ -1,57 +1,15 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { StateDot } from "../../components/StateDot";
-import { api } from "../../lib/api";
 import { readDraft, writeDraft } from "../../lib/drafts";
 import { hubStore, useHub, useMainEntry, type MainEntry } from "../../lib/store";
 import { useNowTick } from "../../lib/useNowTick";
-import type { Instance } from "../../types/instance";
-import type { Id, U64 } from "../../types/wire";
+import type { Id } from "../../types/wire";
 import { Composer } from "../session/Composer";
-import { mainEcho, mainStatus, readMainTail, type MainEcho, type MainTail } from "./mainStatus";
+import { mainEcho, mainStatus, type MainEcho } from "./mainStatus";
+import { useMainTail } from "./mainTail";
 import { useCompactLayout, useLineageSync } from "./useMain";
 import css from "./mainCard.module.css";
-
-/** Journal rows read for line 2 (same bounded window as the list phrases). */
-const MAIN_TAIL = 64;
-/**
- * The bounded journal tail behind line 2, re-read only when the chapter's
- * durableSeq moves (the 2 s instance poll carries it).
- */
-function useMainTail(instance: Instance | null): { tail: MainTail | null; carried: string | null } {
-  const [state, setState] = useState<{ key: string; tail: MainTail } | null>(null);
-  // The newest reply seen on ANY chapter of this card: a fresh chapter has
-  // no reply of its own yet, and the conversation is one across chapters.
-  const [carried, setCarried] = useState<string | null>(null);
-  const id = instance?.id ?? "";
-  const journalId = instance?.journalId ?? "";
-  const seq = String(instance?.durableSeq ?? "0");
-  const key = `${id}@${seq}`;
-  const fetched = useRef<string | null>(null);
-  useEffect(() => {
-    if (!id || !journalId || fetched.current === key) return;
-    fetched.current = key;
-    let cancelled = false;
-    const from = Math.max(0, Number(seq) - MAIN_TAIL);
-    api
-      .eventsRead({ journalId: journalId as Id, afterSeq: String(from) as U64, limit: MAIN_TAIL })
-      .then((page) => {
-        if (cancelled) return;
-        const tail = readMainTail(page.events);
-        setState({ key, tail });
-        if (tail.reply) setCarried(tail.reply.text);
-      })
-      .catch(() => {
-        // Unreadable now: allow the next poll edge to try again.
-        if (fetched.current === key) fetched.current = null;
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [id, journalId, seq, key]);
-  const tail = state && state.key.startsWith(`${id}@`) ? state.tail : null;
-  return { tail, carried };
-}
 
 /** Everything the card and the 问 Main input read about the resolved Main. */
 function useMainView(entry: MainEntry) {
@@ -89,11 +47,12 @@ export function MainCard({ placement }: { placement: "phone" | "desktop" }) {
 
 function MainCardBody({ entry, placement }: { entry: MainEntry; placement: "phone" | "desktop" }) {
   const { hub, instance, status, online } = useMainView(entry);
-  const { tail, carried } = useMainTail(instance);
+  const { tail, carried, read } = useMainTail(instance);
   const echo = mainEcho({
     entry,
     bubbles: hub.bubbles,
     tail,
+    tailRead: read,
     carriedReply: carried,
     busy: status.phase === "working" || status.phase === "asking",
     online,
@@ -286,6 +245,10 @@ function EchoLine({
     switch (echo.kind) {
       case "empty":
         return "还没有回复";
+      case "unread":
+        // Not read yet, or unreadable right now: a neutral mark, never the
+        // claim that Main has not replied.
+        return "—";
       case "rejected":
         return echo.reason ? `${echo.text}：${echo.reason}` : echo.text;
       default:

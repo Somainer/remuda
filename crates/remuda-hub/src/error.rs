@@ -334,10 +334,13 @@ impl HubError {
     /// 409 for an `instance.configure` replay whose delivery is not yet known
     /// (D-055): the caller reads the command row instead of re-sending.
     pub fn delivery_unknown(command_id: &str) -> Self {
-        Self::Conflict(format!(
+        // Byte-identical to the pre-D-060 body: the command id belongs in
+        // `next.commandId` only, never in the message an old client may match.
+        Self::Conflict(
             "instance.configure is still in flight; poll GET \
-             /v1/instances/{{id}}/commands/{command_id} for its outcome"
-        ))
+             /v1/instances/{id}/commands/{commandId} for its outcome"
+                .to_string(),
+        )
         .with_next(
             "delivery-unknown",
             NextStep::new(

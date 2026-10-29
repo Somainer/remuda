@@ -8110,7 +8110,7 @@
     },
     "/v1/lineages/{id}/memory/search": {
       "get": {
-        "description": "FTS5 MATCH hits ranked by bm25, then LIKE hits the tokenizer cannot see (a run of CJK characters is one token, so a two-character query hits by substring). Every whitespace-separated term must match. Human devices read any lineage; an Agent reads only its own lineage (403 otherwise). Bot devices are refused.",
+        "description": "FTS5 MATCH hits ranked by bm25, then LIKE hits the tokenizer cannot see (a run of CJK characters is one token, so a two-character query hits by substring). Every whitespace-separated term must match; a query of more than 8 terms is refused (400), never shortened. Human devices read any lineage; an Agent reads only its own lineage (403 otherwise). Bot devices are refused.",
         "operationId": "memorySearch",
         "parameters": [
           {
@@ -8120,7 +8120,7 @@
             "$ref": "#/components/parameters/CallerInstance"
           },
           {
-            "description": "Query text.",
+            "description": "Query text: at most 8 whitespace-separated terms, all of which must match.",
             "in": "query",
             "name": "q",
             "required": true,

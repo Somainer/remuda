@@ -89,7 +89,7 @@ enum MemoryCommand {
     },
     /// Search titles, descriptions and bodies (full-text, then substring).
     Search {
-        /// Query terms; every term must match.
+        /// Query terms (at most 8); every term must match.
         #[arg(required = true, num_args = 1..)]
         query: Vec<String>,
         #[arg(long)]

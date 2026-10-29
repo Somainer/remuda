@@ -1042,7 +1042,9 @@ fn search_conn(
     limit: usize,
     include_archived: bool,
 ) -> rusqlite::Result<Vec<MemorySearchHit>> {
-    let terms: Vec<&str> = query.split_whitespace().take(MAX_SEARCH_TERMS).collect();
+    // The term count was checked by `Store::memory_search`; every term is
+    // evaluated.
+    let terms: Vec<&str> = query.split_whitespace().collect();
     if terms.is_empty() {
         return Ok(Vec::new());
     }
@@ -1246,24 +1248,34 @@ impl Store {
         .await
     }
 
-    /// FTS5 (bm25) hits first, then LIKE hits the tokenizer missed.
+    /// FTS5 (bm25) hits first, then LIKE hits the tokenizer missed. Every
+    /// whitespace-separated term must match, so a query with more terms
+    /// than [`MAX_SEARCH_TERMS`] is refused rather than shortened.
     pub(crate) async fn memory_search(
         &self,
         lineage_id: String,
         query: String,
         limit: usize,
         include_archived: bool,
-    ) -> Result<Vec<MemorySearchHit>, StoreError> {
-        self.read("memory_search", move |conn| {
-            Ok(search_conn(
-                conn,
-                &lineage_id,
-                &query,
-                limit,
-                include_archived,
-            )?)
-        })
-        .await
+    ) -> Result<Vec<MemorySearchHit>, MemoryError> {
+        let terms = query.split_whitespace().count();
+        if terms > MAX_SEARCH_TERMS {
+            return Err(MemoryError::BadRequest(format!(
+                "search takes at most {MAX_SEARCH_TERMS} terms (every term must match); \
+                 got {terms}"
+            )));
+        }
+        Ok(self
+            .read("memory_search", move |conn| {
+                Ok(search_conn(
+                    conn,
+                    &lineage_id,
+                    &query,
+                    limit,
+                    include_archived,
+                )?)
+            })
+            .await?)
     }
 
     /// Every entry (any lineage, archived included) that names `instance_id`

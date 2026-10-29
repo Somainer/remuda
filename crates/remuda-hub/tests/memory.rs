@@ -349,6 +349,63 @@ async fn writes_record_origin_and_report_sizes_and_the_index() -> Result<()> {
     Ok(())
 }
 
+/// r2 item 5: every term must match, so a query with more terms than the
+/// search evaluates is refused, never silently shortened.
+#[tokio::test]
+async fn search_refuses_more_terms_than_it_evaluates() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let lineage = ctx.seat().await?;
+    ctx.ok(
+        "POST",
+        &mem(&lineage, ""),
+        &ctx.human,
+        Some(entry(
+            "counting",
+            "reference",
+            "one two three four five six seven eight",
+        )),
+    )
+    .await?;
+    let eight = ctx
+        .ok(
+            "GET",
+            &mem(
+                &lineage,
+                "/search?q=one+two+three+four+five+six+seven+eight",
+            ),
+            &ctx.human,
+            None,
+        )
+        .await?;
+    assert_eq!(eight["items"][0]["entry"]["slug"], "counting");
+    let nine = ctx
+        .call(
+            "GET",
+            &mem(
+                &lineage,
+                "/search?q=one+two+three+four+five+six+seven+eight+absent",
+            ),
+            &ctx.human,
+            None,
+            None,
+        )
+        .await?;
+    assert_eq!(
+        nine.status, 400,
+        "a ninth term must not be dropped: {}",
+        nine.body
+    );
+    assert_eq!(nine.body["code"], "BAD_REQUEST");
+    assert!(
+        nine.body["error"]
+            .as_str()
+            .is_some_and(|m| m.contains("at most 8 terms") && m.contains("9")),
+        "{}",
+        nine.body
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_non_current_chapter_cannot_write() -> Result<()> {
     let ctx = Ctx::spawn().await?;

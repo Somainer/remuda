@@ -20,7 +20,7 @@ The ledger makes that rule auditable, and it keeps the seat's skill (`ma-skill`,
     - agent callers act only on what they own (D-057 §4.1), so an agent does not change configuration shared by sessions it does not own;
     - scope narrows and never grows (`validate_child_delegation`);
     - records are truthful (D-057 §0), so an agent does not erase the record of what agents did.
-  - **Gap.** Nothing stops it except a missing route or a missing rule. Every gap has a task id in **Planned**: `ma-admission` (main-agent.md §15), `cb-errors` (§15.1), or an `ap-*` follow-up (§15.2).
+  - **Gap.** Nothing stops it except a missing route or a missing rule. Every gap has a task id in **Planned**: `ma-admission` (main-agent.md §15) or an `ap-*` follow-up (§15.2).
 - **Planned** is the change a named task makes, or "—" when nothing is planned to change.
 
 How a row is decided on origin/main:
@@ -57,7 +57,7 @@ Two limits recur below:
 | Send a new turn | commands, `instance.send` | Agent route. The send rule | — |
 | Queue a prompt while the session works | held in the browser, then `instance.send` in queue mode | Agent route. The send rule | — |
 | Steer with a held prompt | `instance.send` in steer mode | Agent route. The send rule | — |
-| See a send's receipt | `GET /v1/instances/{id}/commands/{commandId}` | Gap. The middleware's `read_target` admits only `/journal` and `/screen` below an instance, so command reads are refused for Agent origin; an agent cannot reconcile an unknown outcome by commandId (D-055) | `cb-errors` admits command reads for owned targets |
+| See a send's receipt | `GET /v1/instances/{id}/commands/{commandId}` | Gap. The middleware's `read_target` admits only `/journal` and `/screen` below an instance, so command reads are refused for Agent origin; an agent cannot reconcile an unknown outcome by commandId (D-055) | `ap-command-read` admits both command reads for owned targets |
 | Stop the turn | commands, `instance.cancel` | Agent route. Owned targets; any other needs the D-017 approval | — |
 | Close the session | commands, `instance.close` | Agent route. As Stop. A chapter closing itself becomes `paused{self}`; pausing Main is the owner's control (main-agent.md §6.5) | — |
 | Answer a question or a plan review inline | `POST /v1/interactions/{id}/answer` | Agent route under the D-051 limits | `ma-admission` (OA3) |
@@ -296,7 +296,7 @@ Every Gap row above, by the task that closes it. The `ap-*` tasks are defined in
 | Task | Closes |
 |---|---|
 | `ma-admission` | `dispatch`; `watch`, `report` (worker reads); `retire`; `worker nudge`, `answer`, `switch-model`, `resume`, `replace`, `stop`; `brief send`; worker resume from the PWA; the D-051 bypass exclusion (OA3) |
-| `cb-errors` | a send's receipt and every command read |
+| `ap-command-read` | a send's receipt and every command read (`GET /v1/instances/{id}/commands`, `…/commands/{commandId}`) |
 | `ap-gate-reads` | `gate log`; `gate list` without `--project`; the gate parts of `watch` and `report`; the failure log of `gate <branch>` |
 | `ap-configure` | model, effort and ultracode changes |
 | `ap-configure-mode` | permission-mode changes, after the owner decides how OA1 applies |

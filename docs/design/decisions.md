@@ -1987,7 +1987,7 @@ registry 锁外加独立 DB claim（跨域，reconcile 先于 slot 切换提交�
 
 11. **结构化、可操作的拒绝（`cb-errors`，[protocol.md §9.1](./protocol.md)）。** 错误体已有 `error` 与 `code`，`code` 的既有取值不变。只增不改地新增两个字段：`reason`（稳定的小写原因，例如 `grant-required`、`out-of-scope`、`not-owner`、`approval-required`，与 D-057 已定的 `fenced` 属同一词汇）和 `next`（下一步提示：一个 `action` 加一行 `hint`）。CLI 打印 `next.hint`，skill 教座位按它行事。**不新增任何拒绝路径**；`next` 永不构成授权。
 
-12. **能力台账（[agent-parity.md](./agent-parity.md)）。** 现在写人工的一半：每个 PWA 动作、每个 clap 子命令各一行，分为「Agent 路由已有」「被真实安全性质挡住」「已知缺口」三类，并分开写「今天（origin/main）」与「计划」两栏。每个已知缺口都有任务 id：`ma-admission`、`cb-errors`，或 main-agent.md §15.2 新建的 `ap-*` 后续任务。机器的一半以后由 Hub router、`restrict_agent_routes` 和 clap 注册表生成，再由 gate 检查两者是否漂移。它让「框架提供能力」这条原则可以审计，也让 ma-skill 不会承诺座位做不到的事。
+12. **能力台账（[agent-parity.md](./agent-parity.md)）。** 现在写人工的一半：每个 PWA 动作、每个 clap 子命令各一行，分为「Agent 路由已有」「被真实安全性质挡住」「已知缺口」三类，并分开写「今天（origin/main）」与「计划」两栏。每个已知缺口都有任务 id：`ma-admission`，或 main-agent.md §15.2 新建的 `ap-*` 后续任务。机器的一半以后由 Hub router、`restrict_agent_routes` 和 clap 注册表生成，再由 gate 检查两者是否漂移。它让「框架提供能力」这条原则可以审计，也让 ma-skill 不会承诺座位做不到的事。
 
 ### 保证与不保证
 
@@ -2042,7 +2042,7 @@ R1–R3 已经回答原调研的记忆、来源与续跑三问。下面六问仍
 - **不依赖任何在途或未派出的 ma-* 任务（关键路径）：** `cb-memory-core`，其后 `cb-memory-guard`、`cb-memory-inject`、`cb-memory-ui`；`cb-digest`；`cb-skill`；`cb-errors`。
 - **ma-initiator 落地后：** `cb-rootturn`，其后 `cb-requested-by`。
 - **ma-initiator、ma-fence、ma-restart 落地后：** `cb-inbox-facts`，其后 `cb-inbox-deliver`、`cb-stall-tooluse`；`cb-inbox-deliver` 之后是 `cb-usage-resume`、`cb-wake-engine`（其后 `cb-wake-check`）和 `cb-owner-notify`。
-- **能力台账的后续任务**（main-agent.md §15.2）：`ap-gate-reads`、`ap-configure`、`ap-configure-mode`（先要所有者决定 OA1 如何作用于权限模式的变更）、`ap-resume`、`ap-attachments`、`ap-subagent-read`、`ap-host-read`、`ap-supply-read`、`ap-supply-event`。
+- **能力台账的后续任务**（main-agent.md §15.2）：`ap-command-read`（Agent 按 commandId 读命令结果，D-055 对账所需）、`ap-gate-reads`、`ap-configure`、`ap-configure-mode`（先要所有者决定 OA1 如何作用于权限模式的变更）、`ap-resume`、`ap-attachments`、`ap-subagent-read`、`ap-host-read`、`ap-supply-read`、`ap-supply-event`。
 - **未派出 ma-* 任务的 brief 修订**（派出前改 brief；在途的 ma-initiator 不改）：
   - ma-admission：creator 的权限模式在提交点读取，即租借 worktree 或 pool 之后的创建事务里，并复核 generation；准备期间 creator 改了模式，创建中止；Node 物化器拒绝过期的盖章。
   - ma-skill：并入 `cb-skill`，加上按启动事实生成的能力段。

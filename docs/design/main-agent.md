@@ -1068,6 +1068,7 @@ Each closes Gap rows of the capability ledger ([agent-parity.md](./agent-parity.
 
 | Task | Content | After |
 |---|---|---|
+| `ap-command-read` | admit `GET /v1/instances/{id}/commands` and `GET /v1/instances/{id}/commands/{commandId}` for owned targets, by listing the `/commands` suffixes in the middleware's `read_target` (today it lists only `/journal` and `/screen`); the handlers already call `require_instance_read`. This is what D-055 reconciliation by commandId needs, and what `cb-errors`' `read-then-decide` hint points at | none |
 | `ap-gate-reads` | admit `GET /v1/gate/jobs` (already filtered to the caller's scope) and `GET /v1/gate/logs/{id}` (checked against the job's project scope) for Agent origin. A seat that gates needs the failure log (§14.1, E2) | none |
 | `ap-configure` | admit `instance.configure` for model, effort and ultracode on owned targets in `authorize_command`; the permission mode is not included | none |
 | `ap-configure-mode` | an owner decision on how OA1 applies to a permission-mode change, then that rule in the Hub and the Node | the owner's decision; `ma-admission` |

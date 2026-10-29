@@ -38,6 +38,7 @@
 | D-057 | 2026-10-05 | **main agent = an ordinary claude-sdk instance holding address-owner on the always-on intranet Hub**; lineage continuation (restart only on Node-attested process loss or start failure, any close pauses, Resume only from paused); fence transaction F is the Hub admission boundary, Nodes apply fences eventually and every pre-fence operation gets a truthful outcome; direct RPCs share one initiator-aware boundary; push suppressed only for interactions routed to an effectively running Agent parent, lifted when it stops running; no special permission design (D3). **Owner amendments OA1–OA6 (same day)**: an Agent-created child may turn its harness's permission control off only if its Agent creator runs with it off, and an omitted mode inherits the creator's (the one change to the Agent-origin permission rules, Hub and Node together); the seat's mode and grants are creation-time configuration with no stated default; D-051(b) amended so questions and plan reviews reach the Agent parent even under bypass, approvals stay human-only; failed is not the process exiting (only process-end evidence is terminal; other failures are retryable in place and never restart; only settled root-turn end evidence sets activity idle (a root StopFailure counts only once protocol §5.6 settles it, otherwise the turn stays unknown and held prompts do not flush), while subagent, workflow, configure and diagnostic failures leave it unchanged; C1 restarts only on process loss or start failure) | owner + coordinator | [main-agent.md](./main-agent.md) |
 | D-058 | 2026-10-05 | **新建任务的目录浏览器与「移除目录」占用门（c-dirpicker）**：新增 Node RPC `host.dirs.list`（只列目录、lstat 不跟随 symlink、限定 `workspace_roots` allowlist、隐藏目录默认关、4096 条目/16384 扫描上限并回 `truncated`，给 home/roots/已注册根/allowlist 边界 parent）与 Hub `GET /v1/hosts/{id}/dirs` 代理（Human-only，Bot/Agent 403，未知主机 404，离线 409）；前端「+ 添加目录」改为浏览器 Modal（面包屑+过滤+隐藏开关+使用此文件夹），手敲绝对路径保留为高级选项，注册仍走既有两阶段 `workspace.register`；unregister 增加占用门——Hub 在排队命令前按 live 会话（进程结束证据 exited/failed 均算结束）与未归档且非 done/failed 的绑定任务计数 409 拒绝，Node 在 prepare 做同一 live-session 门（canonical 别名同样挡住，幂等 prepare 重放豁免），只解绑不删文件、已结束会话保留历史；前端移除先确认、理由内联。非目标：文件浏览仍归 `host.files.*`，不做递归/提权浏览，不自动结束会话或归档任务。 | coordinator（c-dirpicker） | [ui-spec.md §2.4/§2.6](./ui-spec.md)；D-023；[files-view-contract.md](./files-view-contract.md) |
 | D-059 | 2026-10-07 | **回答栅栏（answer fence）proposed——待所有者拍板：让「回答/按键能否到达一个仍在运行的进程」可验证。** 三个彼此独立的串行域（SQLite writer、出站 registry/link FIFO、每个进程的内存状态）的检查与生效分处不同域上，局部加固给不出统一顺序；本决策把三者收进同一顺序：所有者令牌（host+实例+nodeEpoch+processGeneration，由 Node 盖在 journal 上，客户端提示永不参与授权）、单一 writer 派发口（`Store::dispatch_answer` 无 await、claim 先于入队落盘）、出站写闸（回答帧在交给 socket 前对在飞 attempt 做 CAS，线性化点从入队移到「写出决定」）、Node 每实例 `RunGate`（放行与按键持共享读锁，进程结束分类器的证据取独占锁，按键 `tty.write`/`instance.keys` 同受 AF-K 栅栏）、durable link 身份单一来源 + hello 有序采纳（`hello_seq`，只有当前采纳的 link 能登记）、卡状态机（`invalidated`/`unknown` 是关闭态而非吸收态，可被 Node journal 证据细化为 `answer-committed`/`expired`）、commandId 即身份（无 TTL，对账器重驱）、单 Hub 进程硬前提（`hub.lock` fail-closed）、**无 Node 证据时时钟清扫只投影非终态的「联系丢失/未知」、绝不自主结束实例**（Hub 停机不计失联；结束只来自共享进程结束分类器）。只在**进程结束证据**出现时栅栏才收紧（对齐 D-057 OA6：turn/subagent/workflow/configure/diagnostic 失败都不触发，判定交 c-cardsettle 的共享进程结束分类器）。实现切片已列但未排期，c-cardsettle（终态结清、settlement 总线）与 hub.lock 是前置。 | coordinator（c-answerfence，proposed docs-only） | 本 ADR；D-055、D-057 OA6、[hub-topology §3](./hub-topology.md)、[protocol.md §2.5/§2.6/§5.6/§6.1/§7.2/§9.1](./protocol.md)；依赖 c-cardsettle |
+| D-060 | 2026-10-29 | **主 agent 的伙伴层（部分 adopted）：记忆按条目存于 Hub、来源只记录不设闸、事实与唤醒的送达约束、用量上限后的续跑。** 所有者 2026-10-29 拍板三项：(R1) 记忆改为 Hub 的 `memory_entries` 条目表（每条 revision CAS、FTS5 加 LIKE 兜底、秘密 lint、纳入 hub-backup、只接受当前章节写入），现在就做、不依赖 F，血缘退役时归档不删除，取代 main-agent.md §12 原「第三阶段整份文档」；(R2) `rootTurn {commandId, origin, continuation}` 由 Hub 从回合记录推出，只用于审计和显示、永远不是闸，作为 ma-initiator 之后的独立切片 `cb-rootturn`，由事实触发的回合仍可发起 D-017 审批并在 `/approvals` 标为 "agent-initiated"，正式否决 autonomous 回合白名单与记忆内容的策略 lint；(R3) 用量上限：reset 事实一定发送，`autoContinue` 按实例、默认关、agent 可在 dispatch 时打开，两次实质进展之间最多续跑 3 次，任何 Human 或 Agent 输入都取消等待。仍为 proposed 的部分：结构不变量「Hub 执行的任何东西都不从记忆读取」并有测试证明；章节启动只注入记忆索引；inbox 的九条送达约束（稳定 dedupeKey、持久 occurrence 上限、run generation 入键、无订阅者退回所有者推送、不给自己章节发事实、暂停时 hold、先写可见行再发送、Hub 口吻、工具在途的 stall 阈值）；wake run 状态机（interrupted 不重放、错过只补一次）、超时必填的 `check`、无人值守信封与 `owner notify`；不超过 2 KB 的 worker digest 与血缘 glance；自我关闭守卫；错误体只增不改的 `reason`/`next`；能力台账 [agent-parity.md](./agent-parity.md)。待所有者决定 Q1–Q6（about-me 归属、跨 host 迁移、飞书主路由、记忆整理、跟随自己会话、证据位图）各附推荐默认 | coordinator（c-cbadr，docs-only）；R1–R3 由所有者拍板 | 本 ADR；[main-agent.md §3.6/§10–§15/§17](./main-agent.md)、[agent-parity.md](./agent-parity.md)、[protocol.md §8.4/§9.1](./protocol.md)；D-017、D-050、D-051、D-055、D-057；参考 Cindy（Apache-2.0） |
 
 ## Cargo workspace 布局（coordinator 定，bootstrap 与计划以此为准）
 
@@ -1861,3 +1862,202 @@ registry 锁外加独立 DB claim（跨域，reconcile 先于 slot 切换提交�
 - Node/driver：`crates/remuda-node/src/interactions.rs`（`InteractionRuntime`、`answer`、`register_driver`、`DriverOwner::apply_answer`）、`crates/remuda-node/src/store.rs`（`processGeneration` 盖章）、`runtime.rs`/`runtime_link.rs`/`transport/hubnode_codec.rs`/`transport/wss/runtime_wss.rs`/`transport/wss.rs`/`stdio.rs`/`daemon.rs`（派发、按键、hello 与错误码）、`crates/remuda-driver/src/interaction.rs`（broker `answer_for`、`StaleGeneration`）。
 - protocol：`crates/remuda-protocol/src/error.rs`（§9.1）、`interaction.rs`（`InteractionRequestKey`、卡状态）、`enums.rs`（`InteractionState`/`DeliveryState`）、`hubnode.rs`（按键方法）。
 - 前置件：c-cardsettle 分支的 `settle_instance_interactions`、`FollowEvent::settlement` 与共享进程结束分类器；hub-topology §3 的 `hub.lock` 规格。
+
+## D-060
+
+**2026-10-29 · 主 agent 的伙伴层：记忆按条目存于 Hub；来源只记录、不设闸；事实与唤醒的送达约束；用量上限后的续跑**
+
+| 日期 | 2026-10-29 |
+|---|---|
+| 状态 | **部分 adopted**。所有者 2026-10-29 已拍板三项（见「所有者裁定」），覆盖决策 1、2、8，以及决策 3 中「不对记忆内容做策略 lint」一条；其余部分仍为 **proposed**，「待所有者决定」的每一问都写明了推荐默认值，正文按推荐默认值书写。所有者答复后，一次 docs 提交把状态改为 adopted，并只改写所有者改判的那几处。docs-only，不含代码。 |
+| 相关 | D-057（main agent；OA1–OA6 约束本决策）、D-055（commandId 重放身份）、D-050（tasks 是工作记忆；门控读 grant）、D-051（委托决策）、D-017（Agent 的一次性人工审批）、D-059（回答栅栏）；[main-agent.md](./main-agent.md) §3.6、§10–§15、§17（机制以它为准）；[agent-parity.md](./agent-parity.md)；[protocol.md §8.4、§9.1](./protocol.md) |
+| 参考 | Cindy（Apache-2.0 开源桌面 agent，github.com/makecindy/cindy，对照提交 `cba8e45342`）的伙伴实现。只借机制，不抄它的提示词和代码文本；每条借鉴都在「依据」里写明 Cindy 的仓库路径 |
+| 取代 | D-057 第三阶段里「Hub 持有的记忆文档」一项，以及 main-agent.md §12 原来「整份记忆文档、第三阶段再做」的设计。身份文档与指令块仍在第三阶段，不变 |
+
+### 背景
+
+- **失败项。** A5（worker 因 429 或上下文上限停住后闲置多日）与 A6（只追加的记忆文件、压缩丢失细节）沿用 [main-agent.md §1](./main-agent.md#1-goal-and-the-failures-it-removes) 表中的定义，本 ADR 不重新定义。
+- **origin/main（`c27e0eac`）现状。**
+  - 血缘已落地（`crates/remuda-hub/src/store.rs` 的 `lineages` 表）。`InputOrigin` 只有 human、bot、agent（`crates/remuda-protocol/src/enums.rs`）；`restrict_permission` 只给 Agent 放行 manual 与 plan（`crates/remuda-hub/src/agent_scope.rs`）。fence、`creatorPermissionMode`、inbox、wake-up 都还没有实现。
+  - 记忆：crates 里没有记忆表，也没有全文索引；`skills/remuda/sections/` 里没有记忆章节。「Hub 从不从记忆读策略」只是设计意图，没有测试。
+  - 推送：`crates/remuda-hub/src/alerts.rs` 的 `AlertKind` 只有 Interaction、TurnError、Exited、Waiting 四类。
+  - A5：`crates/remuda-hub/src/supply.rs` 按 `(supplyId, windowId)` 记录 `resetsAt`，只用于准入冷却；`crates/remuda-hub/src/worker_watch.rs` 的 `IdleApiError` 只能手动 nudge。
+  - 读：`remuda instance read` 按行窗口读 journal，没有有界摘要。
+  - 拒绝：`require_grant` 只返回裸的 `HubError::Forbidden`，错误体 `{error, code}` 里的 `code` 一律是 `FORBIDDEN`（`crates/remuda-hub/src/error.rs` 的 `response_body`）。
+  - Agent 路由：`restrict_agent_routes` 不放行 `/v1/workers/*`。
+- **从 Cindy 学到的三点。**
+  1. 它完成度高，是因为确定性的记账都在宿主：事件检测、去重、回执、校验和版本 CAS 都是代码，模型拿到的是有界、标明来源的数据，只负责做决定。Remuda 由单写者 Hub 做这些，比它在桌面客户端里做简单得多；这也与 D-057 借 open-muse 的口径一致：服务只充当时钟，不做推理。
+  2. 该借的是机制，不是它的权限策略层。Cindy 按回合判定「替谁行事」的规则在 2026-10-19 至 10-23 之间翻转过几次，根源是同一个开关被用来同时回答「这是谁的意图」和「这有多危险」；它自己也承认按回合设闸挡不住注入内容。这类规则属于所有者明确拒绝的策略限制，不是安全性质（D-057 D3、OA1、OA2）。
+  3. Remuda 相对它最大的缺口是记忆（A6）、事实推送和用量上限后的续跑（A5）。驱动会话、隔离和审批这几块，Remuda 的设计已经更严。
+
+### 所有者裁定（2026-10-29，约束本决策）
+
+| # | 裁定 | 落在 |
+|---|---|---|
+| R1 | **记忆：采纳。** §12 从「第三阶段整份文档替换」改为 Hub 中按条目存储的 `memory_entries` 表，**现在就做**，不依赖 F。血缘退役时，它的条目**归档，不删除**。 | 决策 2、3、4；main-agent.md §3.6、§12、§14.5 |
+| R2 | **来源：采纳。** rootTurn 只记录，永远不是闸；它是 ma-initiator 落地之后的独立切片 `cb-rootturn`，不并进在途的 ma-initiator。由事实触发的回合照样可以发起 D-017 审批，`/approvals` 把它标为 "agent-initiated"。这同时正式否决照搬 Cindy 的 autonomous 回合白名单，以及对记忆内容做任何策略 lint。 | 决策 1；决策 3 的「不做内容策略 lint」；「否决方案」 |
+| R3 | **用量上限后的续跑（A5）：采纳。** reset 事实一定发送。`autoContinue` 按实例设置、默认关，**agent 可以在 dispatch 时打开**，所有者也可以。上限：两次实质的 journal 进展之间最多自动续跑 3 次；任何 Human 或 Agent 输入都会取消等待。 | 决策 8；main-agent.md §11.6 |
+
+### 决策
+
+1. **来源与授权分开（rootTurn；R2 已采纳）。** ma-initiator 落地后，由独立切片 `cb-rootturn` 在已有的 initiator 上增加 `rootTurn {commandId, origin, continuation}`。
+   - Hub 从回合记录推出它，绝不读请求体（与 `stamp()` 剥掉请求体里的 `actor`、`initiator` 同理）。claude-sdk 给出确切的根回合边界。
+   - `origin` 是触发这个根回合的输入来源。`continuation` 表示这是 Hub 对同一意图的自动续接（例如决策 8 的续跑），不算新的所有者输入。
+   - 它写进审计行、journal 行和 gate job。PWA 据此标出「Main 自主（由事实触发）」。
+   - **它不是闸。** 没有任何受理、准入或审批规则读它。安全性质维持不变：D-017 与 D-051(a) 的审批只由人答；OA1；血缘子树归属；grant 不增长。`hub` 来源永远不等于 Human。
+   - 由事实或 wake-up 触发的回合照样可以发起 D-017 审批，只是在 `/approvals` 卡片上标为 "agent-initiated"（`cb-requested-by`）。
+   - 不并进在途的 ma-initiator：往一个处于评审尾声的分支里加字段，会让它重新打开。
+
+2. **记忆按条目存于 Hub（R1 已采纳；[main-agent.md §12](./main-agent.md#12-memory-d-060-hub-entries-now)）。**
+   - 新表 `memory_entries(lineage_id, slug, type, title, description, body, revision, origin, source_refs, writer_instance, turn_ref, created_at, updated_at, deleted_at)`，`(lineage_id, slug)` 唯一。类型四种：`user`、`feedback`、`project`、`reference`。
+   - 每条单独做 revision CAS：写入带 `expectedRevision`，不符返回 409 并带当前 revision。PWA 编辑与座位写入因此不会在整份文档上冲突；冲突一定显示，绝不静默覆盖。
+   - 大小：单条正文超过 2 KiB、或渲染后的索引超过 4 KiB 时，写入照常成功，并在回复里给出实际字节数；单条正文超过 8 KiB 拒绝。`consolidate` 在一个 writer 事务里原子合并多条。
+   - 搜索：先用 SQLite FTS5 的 MATCH（bundled 构建已编入 FTS5，见根 `Cargo.toml` 的 rusqlite `bundled`），没有命中或查询含 CJK 字符时退回 LIKE。原因：unicode61 分词器把连续中文当作一个词元，trigram 分词器对少于 3 个字符的查询返回空。
+   - 写入方：座位用自己的 Agent 凭据经 CLI 写；所有者在 PWA 上写。Agent 写入只接受血缘当前章节；F 落地后改为在同一个 writer 作业里做 `check_initiator`。`about-me` 一条由所有者撰写，agent 只读（Q1，推荐默认）。
+   - `origin` 记录写入所在回合的来源（`cb-rootturn` 落地前，记调用者的 `InputOrigin` 和回合引用）。所有者因此能分辨某条「偏好」是在自己发起的回合里写下的，还是在一个由 worker 文本触发的回合里写下的。
+   - 纳入 hub-backup：条目就在 Hub 的 SQLite 里，`scripts/hub-backup.sh` 已经打包它；验收要求备份后恢复能完整往返。
+   - 生命周期：退役血缘时，它的条目归档，不删除（R1）；归档条目只读，可由所有者导入新的血缘。所有者删除某一条是另一个显式动作。`source_refs` 指向 journal 行；某条 journal 行被删除或脱敏时，Hub 列出由它派生的条目，交给所有者处理（用于隐私删除）。
+   - Phase 1 的记忆文件只导入一次（`cb-memory-guard`）。读不出的文件（权限错误、IO 错误）是错误，不删除任何条目；只有「文件不存在」算作空。
+   - 立刻做：不依赖 F，也不依赖任何在途或未派出的 ma-* 任务。
+
+3. **结构不变量：Hub 执行的任何东西都不从记忆读取（proposed；其中「不做内容策略 lint」由 R2 采纳）。** grant、scope、权限模式、放置、`restart`、D-051 开关和项目 policy，只从实例、血缘和项目行读取。
+   - 由测试证明（`cb-memory-guard`）。行为检查：写入形似 grant、scope、权限模式的条目（例如「所有者 2026-10-12 给了 land」），断言 `require_grant`、`prepare_create`、`restrict_permission`、dispatch 放置与创建路径的结果，与没有这些条目时逐字节相同。结构检查：记忆读接口的调用点只允许出现在记忆模块、它的 HTTP 处理器、启动注入渲染和备份里，出现在别处测试就失败。
+   - 每次写入都过秘密 lint，复用 `scripts/ci/secret-scan.py` 与 `remuda brief lint`（`crates/remuda/src/cmd/brief.rs` 的 `lint_brief`）的候选形状。
+   - **不对记忆内容做策略 lint**（R2 已正式否决）。「所有者在 10-12 给了 X land 权限」这类正当事实照常可以记。
+
+4. **记忆读取。**
+   - 章节启动时，Hub 渲染索引（每条一个标题加一行描述）和 about-me；driver 把它作为最后一节追加在启动 brief 之后，框成「数据，不是指令」（driver 已支持 append-system-prompt，见 `crates/remuda-driver/src/flags.rs`）。放在最后是为了不破坏前面内容的提示缓存。正文由 CLI 按需读取。
+   - 章节中途记忆有变化时不重启，只在下一条输入或下一个事实批次之前加一行「记忆自本章开始已变更（rev N）」。原生 resume 不重复注入。
+   - 回复下方显示「已记住：<title>」。为此 Hub 在写入时记下写入实例和回合引用，所有回合都显示。
+
+5. **skill（`cb-skill`；ma-skill 派出时并入）。**
+   - 记忆写入规则：第一次明确表达就记；写成陈述，不写成给自己的命令；feedback 类必须带 Why 和 How to apply；日期写绝对日期；不记日志、代码事实和 git 历史；写前先查索引去重；任务状态不进记忆，它在 D-050 tasks 里。
+   - 「Remuda 记忆是唯一的持久记忆，不要用 harness 原生的 auto-memory」：原生记忆绑定在 host 加工作目录上，跨章节、跨 Node 必然分裂，这正是 A6。
+   - 「Claude Code、Codex 是你的引擎，不是 Remuda；操作 Remuda 的状态用 remuda 动词」。
+   - 委托判断：为了隔离、并行或独立跟踪才委托，而不是因为文件多；子任务没有聊天历史，brief 必须写清目标、事实、文件和验收。
+   - 「结果未知时先读再决定」，与 D-055 一致。
+   - 能力段由 driver 按启动事实生成：持有哪些 grant、能否 land、host 上有没有 herdr、项目的 D-051 开关是否打开、inbox 是否存在。没有 `land` 的座位，skill 里不出现 land 动词。
+
+6. **事实收件箱的送达约束（[main-agent.md §10.1](./main-agent.md#101-delivery-constraints-d-060)，九条）。** 不扩大第二阶段的范围，只给 inbox 任务加验收条目，在 Hub writer 线程里实现。
+   1. `dedupeKey = kind:instance:stateEnteredAt`，由持久行推出，跨重启稳定。
+   2. 每个 (subscriber, instance, kind) 的 occurrence 计数和 24 小时上限持久化在 inbox 表里。上限是项目设置，默认 6。上限只停止重复投递同一个事实，不限制 agent 能做的任何动作。
+   3. 事实键带上 (instance, run generation)，迟到的旧轮结果不能结算新的一轮。
+   4. 订阅者解析：没有订阅者、或订阅者 mute 了该类时，退回现有的所有者推送（`alerts.rs`），事实既不永远挂起，也不记为已消费；在批次形成时（而不是写入时）复核订阅者仍是父级、没有 mute、对象没有换父；**血缘永远收不到关于自己章节的事实**。
+   5. 血缘 paused 时事实只 hold，不进重试循环；Resume 或继任章节时重新成批，与 F 的重新成批一致。
+   6. 先写一条可见的 hub 来源行，再转发 `instance.send`。
+   7. 事实文本用 Hub 的口吻写，绝不写成所有者的第一人称；开头标签和页脚模板的版本记在批次行上。
+   8. 工具在途时用另一个 stall 阈值：driver 已能配对 tool_use 与 tool_result。新的项目设置 `stallToolThresholdMins` 未设置时等于现有的 `stallThresholdMins`（默认 30，`crates/remuda-protocol/src/worker.rs` 的 `DEFAULT_STALL_THRESHOLD_MINS`），所以默认行为不变，Hub 不自己选数值。
+   9. 投递日志只记类别、计数和错误码，不记事实文本和 worker 输出。
+
+7. **wake-up 与 owner notify（[main-agent.md §11](./main-agent.md#11-wake-ups-phase-2)）。**
+   - 新表 `wake_ups` 与 `wake_runs`。run 状态有 queued、running、interrupted、success、failed、skipped 六种。Hub 启动时把 running 的 run 标为 interrupted，从不重放。错过的触发只补发一次，并报告错过的次数。结果持久化失败时只重试持久化，不重跑。
+   - 可选的 `check`：在指定 Node 上运行，超时必填，运行前先做 `sh -n` 预检。退出码 0 运行模型回合，并把有界的 stdout 作为摘要；2 记为 skipped；其他退出码或超时记为 failed，并发一条失败事实。skipped 不刷新「上次真正运行」的时间。
+   - check 是一条不经 harness 权限控制的 shell 命令，所以按 OA1 同一口径受理：只有创建者自己关着 harness 的权限控制时，在它自己的 host 上加 check 才不需要审批；其余情形（包括跨 host）在 `wake add` 时走 D-017 的一次性人工审批。
+   - `fresh` 模式在血缘下开一个短命子实例，走普通 Agent 创建的全部准入规则。
+   - 无人值守信封：触发时间、wake id 与名字、错过次数；「所有者不在：开放问题写进回复或用 `remuda owner notify`，不要发起交互式提问」；「做完就结束本回合，不要 sleep 轮询」。信封里没有任何限制 agent 动作的规则。
+   - hub 来源的回合默认静默：reply-ready 只在有 Human 来源输入进入该回合时推送（D-057，main-agent.md §8.5）。`remuda owner notify --title --body [--dedupe-key]` 要求调用者持有 `address-owner`；先写认领行再推送，同一去重键只推一次；PWA 渲染为「to you」卡。
+   - 每个 wake-up 在创建时显式声明 `notify`（`never`、`failure` 或 `always`），Hub 不替它选。未恢复的同类失败只推一次。退出和回合错误照常经 `alerts.rs` 推送。
+
+8. **用量上限后的续跑（A5；R3 已采纳；[main-agent.md §11.6](./main-agent.md#116-resume-after-a-usage-limit-reset-a5)）。**
+   - reset 时间按顺序取第一个可用的：harness 的结构化事件；确实已满的订阅窗口（`supply.rs` 的 `resetsAt`）；错误文本里带明确时区的时刻。不带时区的时刻不予采信。
+   - 只有订阅窗口能建等待行。API key 和网关 relay 的 429 多半是按分钟的速率限制，即使带了重试时刻也不等待，只照常产生错误事实。
+   - 新表 `resume_on_reset(instance, run_generation, supply_window, fire_at, attempts, state)`，由 writer tick 认领一次。`fire_at = resetsAt + 60 s + [0, 30 s) 的抖动`；距今超过 8 天不建行，只发事实。等待状态跨 Hub 重启有效。
+   - 到点后一定先给父级写一条 supply-reset 事实；reset 事实一定发送，与 `autoContinue` 是否打开无关（R3）。
+   - 实例属性 `autoContinue`，按实例设置，默认关；agent 可以在 dispatch 或创建时打开，所有者也可以（R3）。打开时，Hub 以 `hub` 来源和持久化的 commandId 发一条续跑输入：上一回合有输出就发 continue，没有输出就重发原文。上一回合已按 OA6 结算为根回合失败，所以这是一条新命令，不是换 id 重放（D-055）。两次实质的 journal 进展之间最多续跑 3 次；任何 Human 或 Agent 输入都会取消等待（switch-model 也是这样一条输入）。
+   - 远端 Node 只采信它自己供给报告里的 `resetsAt`。
+   - Hub 自动发输入，相当于引入一个新的行动者，所以它依赖 `hub` 来源（ma-restart）和 F（ma-fence）。
+
+9. **worker digest 与 glance（[main-agent.md §10.2](./main-agent.md#102-digest-and-glance-d-060)；[protocol.md §8.4](./protocol.md)）。**
+   - `GET /v1/workers/{id}/digest`：形状固定，不超过 2048 个 UTF-8 字节，永远是合法 JSON；超长时先缩短文本字段，绝不截断成非法 JSON。字段：roster 状态和观察分类；最近回合结果；最后一条 assistant 文本的首尾片段；待处理交互（种类、问题、待批工具名，加一段有界、按不可信内容引用的参数摘要）；请求的和生效的模型与 effort，以及 `instance.configure` 的 pending 状态和 requestId；正在冷却的供给窗口和 `resetsAt`；排队命令数；task、branch、sha；距上次进展的时间；是否有工具在途。
+   - 参数摘要只排除秘密和输入交接值。Cindy 完全不给参数，那是它在隐私和大小上的取舍；Main 需要看到命令文本，才能判断是代答还是上报，所以不照搬。
+   - `GET /v1/lineages/{id}/glance`：waiting 与 working 各不超过 50 行，另带当日完成数。
+   - CLI 为 `remuda worker digest` 与 `remuda glance`，PWA 看板复用同一个投影。Phase 1 的轮询改为每个 worker 读一次 digest，不再读整份 journal。
+   - 只读，不需要迁移，不依赖任何 ma-* 任务：中间件为 Agent 单独放行 digest 这一个路径形状（与 `hostcap_read_target` 同法），处理器仍要求 `dispatch` grant 和项目 scope；glance 挂在已有的血缘读谓词 `lineage_read_target` 下。
+
+10. **新开章节的自我关闭守卫（并入 ma-restart，[main-agent.md §12.6](./main-agent.md#126-fresh-context-phase-3)）。** 章节有待处理交互，或有在途的 D-017 审批时，拒绝自我关闭并继任，返回 409 并说明原因。
+
+11. **结构化、可操作的拒绝（`cb-errors`，[protocol.md §9.1](./protocol.md)）。** 错误体已有 `error` 与 `code`，`code` 的既有取值不变。只增不改地新增两个字段：`reason`（稳定的小写原因，例如 `grant-required`、`out-of-scope`、`not-owner`、`approval-required`，与 D-057 已定的 `fenced` 属同一词汇）和 `next`（下一步提示：一个 `action` 加一行 `hint`）。CLI 打印 `next.hint`，skill 教座位按它行事。**不新增任何拒绝路径**；`next` 永不构成授权。
+
+12. **能力台账（[agent-parity.md](./agent-parity.md)）。** 现在写人工的一半：每个 PWA 或 CLI 上的人类动作一行，分为「Agent 路由已有」「被真实安全性质挡住」「已知缺口（附任务 id）」三类。机器的一半以后由 Hub router、`restrict_agent_routes` 和 clap 注册表生成，再由 gate 检查两者是否漂移。它让「框架提供能力」这条原则可以审计，也让 ma-skill 不会承诺座位做不到的事。
+
+### 保证与不保证
+
+由机制（而不是提示词）保证：
+- 事实不丢、不重复送达：每个批次至多投递一次（D-055 重放身份）；dedupeKey 与 occurrence 计数跨 Hub 重启有效。
+- 旧轮的迟到结果不能结算新的一轮。
+- 血缘收不到关于自己章节的事实；没有订阅者时事实退回所有者推送，不会无声挂起。
+- 记忆冲突一定显示，不会被静默覆盖；每次写入都记下写入实例、回合引用和来源。
+- 记忆不会变成策略：Hub 执行的任何东西都不读记忆，并有测试证明。
+- 来源记录真实：rootTurn 由 Hub 推出，不取自请求体；`hub` 来源永远不是 Human。
+- Hub 重启时 running 的 wake run 变为 interrupted，绝不重放。
+- 用量上限的等待只由订阅窗口建立；续跑次数有上限，任何输入都会取消等待。
+
+不保证：
+- 来源记录挡不住注入内容。它让审计和 UI 如实，但一个被 worker 文本诱导的回合仍以座位的权限行事；边界仍是 grant、scope、OA1 和人工审批。
+- 记忆整理（若排期，见 Q4）的原话校验只保护新建条目；更新和删除只检查 revision。
+- reset 时间估计偏早时，续跑可能再撞一次限额，由次数上限兜住。
+- check 命令的副作用由命令作者负责；超时只停止等待，不撤销已经做过的事。
+- digest 的参数摘要可能带敏感文本：秘密 lint 只拦已知形状。
+- 至多一次不等于恰好一次：批次在发送之后、确认之前崩溃时，结果按 D-055 对账，可能停在 unknown。
+
+### 待所有者决定
+
+R1–R3 已经回答原调研的记忆、来源与续跑三问。下面六问仍待所有者答复；proposed 期间设计按推荐默认书写，答复后按「若改判」一列修改。
+
+| # | 问题 | 推荐默认 | 若改判 |
+|---|---|---|---|
+| Q1 | about-me 是否由所有者亲自撰写、agent 只读？ | 是 | agent 也可写，写入照常记录来源 |
+| Q2 | 是否排期跨 host 迁移（main-agent.md §14.4 的 later option「把座位迁到另一台 host，作为新章节」）？它以记忆进入 Hub 为前提 | 先排一个 docs-only 的 ADR 切片，排在 `cb-memory-core` 与 ma-fence 之后；实现另行拍板 | 维持 later option |
+| Q3 | 是否排期飞书主路由（§14.4 的 later option「入站渠道」）：所有者私聊直接进 `address-owner` 血缘的现行章节？ | 维持 later option，`cb-owner-notify` 落地后再议 | 排期；保留显式的 owner allowlist，不做「首次私聊即视为所有者」 |
+| Q4 | 是否做记忆整理：由 Main 自己的 wake-up 拉起短命子实例出 JSON 计划，Hub 确定性校验后应用，可逐条撤销？ | 做，排在 `cb-memory-core` 与 `cb-wake-engine` 之后；频率由 Main 自己的 wake-up 决定 | 不做；记忆只由座位和所有者直接写 |
+| Q5 | 是否给 Main 一个「跟随我自己会话」的 opt-in？ | 不给，保持决策 6 第 4 条：血缘收不到关于自己章节的事实 | 加 opt-in，默认关 |
+| Q6 | 新的证据截图是否改为不入 git，只提交文字索引并附链接？（origin/main 有 506 个 PNG，其中 `docs/` 下 460 个） | 是，但前提是有所有者批准的存放位置；在那之前维持现状，已有图片保留、不改历史 | 维持现状 |
+
+### 否决方案
+
+- **照搬 Cindy 的 autonomous 白名单和 `NEEDS_OWNER_REQUEST`**（R2 正式否决）。它是策略限制，不是安全性质；规则自身反复翻转；它挡不住注入内容。Remuda 只借「来源与授权分开」（决策 1）。
+- **在由事实触发的回合里禁止写 wake-up 或定时任务。** wake-up 不带任何权限，用的是与发起回合同一张凭据；会扩大权限的真实路径（grant、scope、`restart`）已经挡住（`validate_child_delegation`；main-agent.md §6.1）。
+- **对记忆内容做「形似 grant」的 lint**（R2 正式否决）。这是策略限制；真实的性质是决策 3。
+- **Hub 自带例程模板**（follow-up、todo-check、nightly）。它与「Hub 不选节奏和阈值」（main-agent.md §11）冲突。改为由 skill 教 agent 自己用 `remuda wake add` 创建，并用稳定的名字保证幂等。
+- **每条回复后的学习 review，以及模型自写的承诺账本。** Cindy 修了约 22 个提交后停用了按回复的 review；承诺放在 D-050 tasks 里。
+- **隐藏的合成续跑触发。** Remuda 不要隐藏消息（main-agent.md §17）；续跑一律是可见的 hub 来源行。
+- **每个 Node 各自跟随各自的任务。** Remuda 有中心 Hub，一条血缘就能跟随所有 Node。
+- **整份文档的记忆**（§12 原设计）。整份替换让所有者编辑与座位写入在整份文档上冲突；只有按条目做 CAS，才能做到「冲突一定显示、绝不覆盖」。
+- **迁移时重置权限档。** OA2 规定权限模式由所有者在创建时选定。
+- **飞书所有者的首次私聊即绑定。** 保留显式的 allowlist。
+- **只靠提示词的完成与收敛判定。** Remuda 的 `DONE <sha>` 加上「只有已落地的 sha 才解锁依赖」（`crates/remuda-hub/src/tasks.rs`）更硬。
+
+### 实施切片
+
+顺序与依赖以 [main-agent.md §15](./main-agent.md#15-phase-1-task-order) 为准，这里只列要点：
+- **不依赖任何在途或未派出的 ma-* 任务（关键路径）：** `cb-memory-core`，其后 `cb-memory-guard`、`cb-memory-inject`、`cb-memory-ui`；`cb-digest`；`cb-skill`；`cb-errors`。
+- **ma-initiator 落地后：** `cb-rootturn`，其后 `cb-requested-by`。
+- **ma-initiator、ma-fence、ma-restart 落地后：** `cb-inbox-facts`，其后 `cb-inbox-deliver`、`cb-stall-tooluse`；`cb-inbox-deliver` 之后是 `cb-usage-resume`、`cb-wake-engine`（其后 `cb-wake-check`）和 `cb-owner-notify`。
+- **未派出 ma-* 任务的 brief 修订**（派出前改 brief；在途的 ma-initiator 不改）：
+  - ma-admission：creator 的权限模式在提交点读取，即租借 worktree 或 pool 之后的创建事务里，并复核 generation；准备期间 creator 改了模式，创建中止；Node 物化器拒绝过期的盖章。
+  - ma-skill：并入 `cb-skill`，加上按启动事实生成的能力段。
+  - ma-restart：决策 10 的自我关闭守卫。
+  - ma-fence：决策 6 第 3 条（run generation 进入事实键）写进验收。
+  - ma-main-ui：审计行和状态行显示来源标签。
+
+### 依据
+
+Remuda（origin/main `c27e0eac`）：
+- 文档：main-agent.md §1（A5、A6）、§6.1、§8.5、§10–§12、§14、§17；D-017、D-050、D-051、D-055、D-057。
+- `crates/remuda-hub/src/agent_scope.rs`：`require_grant`、`restrict_permission`、`prepare_create`、`authorize_command`、`restrict_agent_routes`、`lineage_read_target`、`hostcap_read_target`。
+- `crates/remuda-hub/src/error.rs`（`HubError`、`response_body`）；`alerts.rs`（`AlertKind`）；`supply.rs`（`resetsAt` 与窗口冷却）；`worker_watch.rs`（`IdleApiError`、`POST /v1/workers/observe`）；`gatequeue.rs`（`SCHEDULE_TICK_MILLIS`）；`store.rs`（`lineages`、`validate_child_delegation`）；`tasks.rs`（只有已落地的 sha 解锁依赖）。
+- `crates/remuda-protocol/src/enums.rs`（`InputOrigin`）、`worker.rs`（`DEFAULT_STALL_THRESHOLD_MINS`）。
+- `crates/remuda-driver/src/flags.rs`（append-system-prompt）；`crates/remuda/src/cmd/brief.rs`（`lint_brief`）；`scripts/ci/secret-scan.py`；`scripts/hub-backup.sh`；根 `Cargo.toml`（rusqlite `bundled`）。
+
+Cindy（提交 `cba8e45342`；只借机制，按机制列出仓库路径）：
+- 记忆的形态、大小与索引：`packages/maker-core/src/memory/types.ts`、`packages/maker-core/src/memory/storage.ts`、`packages/maker-core/src/memory/manager.ts`。合并：`packages/lizi-mcps/src/memory/consolidate.ts`。FTS5 加 LIKE 兜底：`packages/maker-core/src/memory/fts.ts`。
+- 写入规则与「不用原生记忆」：`packages/maker-core/src/memory/system-prompt.md`、`apps/desktop/src/main/maker-ipc/botSystemPrompt.ts`。策略不从记忆回读：`apps/desktop/src/main/maker-ipc/botProfileFolderSync.ts`。所有者编辑的冲突检测：`apps/desktop/src/main/maker-ipc/botMemoryService.ts`。写入回执：`apps/desktop/src/main/maker-ipc/botLearningTracker.ts`、`apps/desktop/src/renderer/features/bots/BotLearningFooter.tsx`。读取失败不当作删除：`apps/desktop/src/main/companion-cloud/host.ts`。
+- 来源与授权：`apps/desktop/src/main/maker-ipc/taskActionHost.ts`、`apps/desktop/src/main/maker-ipc/taskActionAuthorization.ts`、`apps/desktop/src/main/maker-ipc/agent-input-coordinator.ts`；规则的翻转史：`docs/product-rules/teammate-authority.md`。
+- 送达约束：`apps/desktop/src/main/maker-ipc/botDelegationService.ts`（完成回执的顺序与重试）；`apps/desktop/src/main/bot-autonomy/events.ts`、`apps/desktop/src/main/bot-autonomy/runtime.ts`、`apps/desktop/src/main/bot-autonomy/follower.ts`、`apps/desktop/src/main/bot-autonomy/taskWatch.ts`、`apps/desktop/src/main/bot-autonomy/followUpPrompt.ts`；阈值与上限：`apps/desktop/src/shared/botAutonomy.ts`、`docs/product-rules/bot-routines.md`。
+- wake-up：`packages/maker-scheduler/src/routines.ts`、`packages/maker-scheduler/src/routine-engine.ts`、`apps/desktop/src/main/routines/service.ts`、`apps/desktop/src/main/scheduler-host/pre-run-hook.ts`、`apps/desktop/src/main/scheduler-host/runner.ts`、`apps/desktop/src/main/scheduler-host/silent-output.ts`、`apps/desktop/src/main/scheduler-host/notifier.ts`。
+- 用量上限后的续跑：`apps/desktop/src/main/maker-ipc/usageLimitAutoResume.ts`、`docs/product-rules/usage-limit-auto-continue.md`。
+- digest 与 glance：`packages/lizi-mcps/src/xdt-helper/get_task_digest.ts`、`apps/desktop/src/main/bot-autonomy/glance.ts`。
+- 能力段与「引擎不是身份」：`apps/desktop/src/main/maker-ipc/teammateGuide.ts`、`apps/desktop/src/main/maker-ipc/botProfileRuntime.ts`。委托判断：`packages/lizi-mcps/src/lizi_xdtHelperMcpServer.ts`。结果未知先读：`packages/lizi-mcps/src/xdt-helper/bot_workbench.ts`。
+- 提交点读取调用者模式：`apps/desktop/src/main/maker-ipc/botDelegationService.ts`。自我关闭守卫：`apps/desktop/src/main/maker-ipc/botCanonicalReplacementGuard.ts`。审批卡上的原话：`apps/desktop/src/shared/forwardedRequest.ts`。
+- 能力台账：`docs/product-rules/agent-user-parity.md`。
+- 否决项的出处：`docs/product-rules/teammate-authority.md`、`docs/product-rules/cindy-bots-runtime.md`、`docs/product-rules/cloud-companions.md`、`apps/desktop/src/main/goal-host/controller.ts`。

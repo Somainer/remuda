@@ -599,6 +599,49 @@ async fn retiring_a_lineage_archives_and_the_owner_restores() -> Result<()> {
         .await?;
     assert!(alpha.get("archivedAt").is_none());
     assert_eq!(alpha["revision"], 1);
+
+    // r2 item 3: the owner can still correct and remove restored memory of
+    // the retired lineage; creating new memory there stays refused.
+    let edited = ctx
+        .call(
+            "PUT",
+            &mem(&lineage, "/entries/alpha"),
+            &ctx.human,
+            None,
+            Some(json!({"expectedRevision": 1, "body": "corrected by the owner"})),
+        )
+        .await?;
+    assert_eq!(edited.status, 200, "owner update: {}", edited.body);
+    assert_eq!(edited.body["entry"]["revision"], 2);
+    assert_eq!(edited.body["entry"]["origin"], "human");
+    let removed = ctx
+        .call(
+            "DELETE",
+            &mem(&lineage, "/entries/beta?expectedRevision=1"),
+            &ctx.human,
+            None,
+            None,
+        )
+        .await?;
+    assert_eq!(removed.status, 200, "owner delete: {}", removed.body);
+    let still_refused = ctx
+        .call(
+            "POST",
+            &mem(&lineage, ""),
+            &ctx.human,
+            None,
+            Some(entry("delta", "project", "")),
+        )
+        .await?;
+    assert_eq!(still_refused.status, 404, "{}", still_refused.body);
+    let left = ctx.ok("GET", &mem(&lineage, ""), &ctx.human, None).await?;
+    let slugs: Vec<&str> = left["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["slug"].as_str().unwrap())
+        .collect();
+    assert_eq!(slugs, ["alpha"]);
     Ok(())
 }
 

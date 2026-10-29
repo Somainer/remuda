@@ -16,7 +16,9 @@
 //! - **Readers.** The owner reads any lineage; an Agent reads its own.
 //! - **Retirement archives.** Deleting a lineage stamps `archived_at` on its
 //!   entries in the delete transaction; archived entries leave the index and
-//!   search until the owner restores them.
+//!   search until the owner restores them. The owner can still update,
+//!   delete and consolidate retained entries without the lineage row; no new
+//!   memory is created for a lineage that no longer exists.
 //! - **Search.** FTS5 `MATCH` ranked by bm25, plus a `LIKE` pass for what the
 //!   tokenizer cannot see: `unicode61` makes a run of CJK characters one
 //!   token, so a two-character query such as 边界 only hits by substring.
@@ -489,14 +491,33 @@ fn refs_json(refs: &[MemorySourceRef]) -> Result<String, MemoryError> {
     serde_json::to_string(refs).map_err(|error| MemoryError::Hub(HubError::Store(error.into())))
 }
 
-/// Writer authorization inside the write transaction. The lineage must exist
-/// (a retired lineage takes no writes; its archived entries are restored by
-/// the owner). An Agent must be the lineage's current, unfenced chapter.
+/// What a write does to the lineage's set of slugs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteKind {
+    /// Brings a slug into existence (create; consolidate into a new slug).
+    Create,
+    /// Changes or removes entries that already exist (update; delete;
+    /// consolidate into one of its inputs).
+    Modify,
+}
+
+/// Writer authorization inside the write transaction.
+///
+/// - An Agent must be the lineage's current, unfenced chapter, so the
+///   lineage row must exist.
+/// - The owner may create memory only for an existing lineage. The owner may
+///   modify retained entries without one: retirement deletes the lineage row
+///   but keeps (archives) its memory, and restored memory must stay
+///   correctable and removable.
 fn authorize_write(
     conn: &Connection,
     lineage_id: &str,
     writer: &MemoryWriter,
+    kind: WriteKind,
 ) -> Result<(), MemoryError> {
+    if *writer == MemoryWriter::Owner && kind == WriteKind::Modify {
+        return Ok(());
+    }
     let current: Option<(String, Option<String>)> = conn
         .query_row(
             "SELECT l.current_instance_id, i.fenced_at
@@ -693,7 +714,7 @@ fn create_tx(
     input: &MemoryInput,
 ) -> Result<MemoryWriteResult, MemoryError> {
     let tx = immediate_tx(conn)?;
-    authorize_write(&tx, lineage_id, writer)?;
+    authorize_write(&tx, lineage_id, writer, WriteKind::Create)?;
     if let Some(existing) = load_entry(&tx, lineage_id, &input.slug)? {
         return Err(MemoryError::SlugExists {
             slug: existing.slug,
@@ -720,7 +741,7 @@ fn update_tx(
     expected: u64,
 ) -> Result<MemoryWriteResult, MemoryError> {
     let tx = immediate_tx(conn)?;
-    authorize_write(&tx, lineage_id, writer)?;
+    authorize_write(&tx, lineage_id, writer, WriteKind::Modify)?;
     let current = require_entry(&tx, lineage_id, slug)?;
     if current.archived_at.is_some() {
         return Err(MemoryError::Archived(slug.to_string()));
@@ -775,7 +796,7 @@ fn delete_tx(
     expected: u64,
 ) -> Result<MemoryEntry, MemoryError> {
     let tx = immediate_tx(conn)?;
-    authorize_write(&tx, lineage_id, writer)?;
+    authorize_write(&tx, lineage_id, writer, WriteKind::Modify)?;
     let current = require_entry(&tx, lineage_id, slug)?;
     check_revision(&current, expected)?;
     // The slug's revisions continue past this one if it is ever recreated.
@@ -796,7 +817,14 @@ fn consolidate_tx(
     input: &MemoryInput,
 ) -> Result<MemoryWriteResult, MemoryError> {
     let tx = immediate_tx(conn)?;
-    authorize_write(&tx, lineage_id, writer)?;
+    // Merging into one of the inputs rewrites existing memory; merging into
+    // a new slug creates memory.
+    let kind = if sources.iter().any(|(slug, _)| slug == &input.slug) {
+        WriteKind::Modify
+    } else {
+        WriteKind::Create
+    };
+    authorize_write(&tx, lineage_id, writer, kind)?;
     let mut inputs = Vec::with_capacity(sources.len());
     let mut stale = Vec::new();
     for (slug, expected) in sources {
@@ -2464,7 +2492,8 @@ mod tests {
                 .len(),
             2
         );
-        // A retired lineage takes no writes.
+        // Archived memory waits for restore, and a retired lineage takes no
+        // new memory.
         let write = fx
             .store
             .memory_update(
@@ -2476,7 +2505,17 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(write, MemoryError::NotFound(_)), "{write:?}");
+        assert!(matches!(write, MemoryError::Archived(_)), "{write:?}");
+        let create = fx
+            .store
+            .memory_create(
+                lineage.clone(),
+                owner.clone(),
+                input("three", MemoryType::Project, ""),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(create, MemoryError::NotFound(_)), "{create:?}");
 
         let restored = fx
             .store
@@ -2505,6 +2544,110 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(unknown, MemoryError::NotFound(_)));
+    }
+
+    /// r2 item 3: retirement removes the lineage row, not the owner's
+    /// authority over retained entries. Creating memory there stays refused.
+    #[tokio::test]
+    async fn the_owner_edits_and_removes_restored_memory_of_a_retired_lineage() {
+        let fx = fixture().await;
+        let lineage = fx.seat().await;
+        let owner = MemoryWriter::Owner;
+        for slug in ["one", "two", "three", "four"] {
+            fx.store
+                .memory_create(
+                    lineage.clone(),
+                    agent(&lineage),
+                    input(slug, MemoryType::Project, slug),
+                )
+                .await
+                .unwrap();
+        }
+        fx.end_all(&lineage).await;
+        fx.store
+            .delete_instance(lineage.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        fx.store
+            .memory_restore(lineage.clone(), None)
+            .await
+            .unwrap();
+
+        let updated = fx
+            .store
+            .memory_update(
+                lineage.clone(),
+                "one".into(),
+                owner.clone(),
+                MemoryPatch {
+                    body: Some("corrected".into()),
+                    ..MemoryPatch::default()
+                },
+                1,
+            )
+            .await;
+        assert!(updated.is_ok(), "owner update after restore: {updated:?}");
+        let deleted = fx
+            .store
+            .memory_delete(lineage.clone(), "two".into(), owner.clone(), 1)
+            .await;
+        assert!(deleted.is_ok(), "owner delete after restore: {deleted:?}");
+        // Consolidating into one of the inputs rewrites retained memory …
+        let merged = fx
+            .store
+            .memory_consolidate(
+                lineage.clone(),
+                owner.clone(),
+                vec![("one".into(), 2), ("three".into(), 1)],
+                input("one", MemoryType::Project, "one and three"),
+            )
+            .await;
+        assert!(
+            merged.is_ok(),
+            "owner consolidate into an input: {merged:?}"
+        );
+        // … but nothing new is created for a lineage that no longer exists.
+        let new_target = fx
+            .store
+            .memory_consolidate(
+                lineage.clone(),
+                owner.clone(),
+                vec![("one".into(), 3), ("four".into(), 1)],
+                input("five", MemoryType::Project, ""),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(new_target, MemoryError::NotFound(_)),
+            "{new_target:?}"
+        );
+        let create = fx
+            .store
+            .memory_create(
+                lineage.clone(),
+                owner,
+                input("six", MemoryType::Project, ""),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(create, MemoryError::NotFound(_)), "{create:?}");
+        // An Agent still needs the lineage's current chapter.
+        let agent_write = fx
+            .store
+            .memory_update(
+                lineage.clone(),
+                "four".into(),
+                agent(&lineage),
+                MemoryPatch::default(),
+                1,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(agent_write, MemoryError::NotFound(_)),
+            "{agent_write:?}"
+        );
     }
 
     #[tokio::test]

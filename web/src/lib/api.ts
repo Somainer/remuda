@@ -273,6 +273,7 @@ export function mapInstance(rec: components["schemas"]["InstanceRecord"]): Insta
     lastTurnError?: { at?: unknown; text?: unknown };
     usageRollup?: unknown;
     apiRoute?: components["schemas"]["ApiRoute"] | null;
+    grants?: unknown;
   };
   const ptyDriver = driver === "generic-pty" || driver === "claude-pty" || driver === "shell-pty";
   // Clone EVERY synthesized snapshot: the non-PTY fallback below is a
@@ -439,6 +440,14 @@ export function mapInstance(rec: components["schemas"]["InstanceRecord"]): Insta
           ...(extra.apiRoute.viaHostLabel ? { viaHostLabel: extra.apiRoute.viaHostLabel } : {}),
         }
       : null,
+    // D-057 §5 lineage fields, verbatim (ma-main-ui resolves Main from them).
+    ...(typeof rec.lineageId === "string" && rec.lineageId ? { lineageId: rec.lineageId as Id } : {}),
+    ...(typeof rec.generation === "number" ? { generation: rec.generation } : {}),
+    ...(typeof rec.chapterCause === "string" ? { chapterCause: rec.chapterCause } : {}),
+    ...(typeof rec.fencedAt === "string" ? { fencedAt: rec.fencedAt } : {}),
+    ...(Array.isArray(extra.grants)
+      ? { grants: extra.grants.filter((g): g is string => typeof g === "string") }
+      : {}),
   };
 }
 
@@ -601,6 +610,28 @@ export type ResumeResult = {
   replayed: boolean;
 };
 
+/**
+ * `GET /v1/lineages/{id}` (D-057 §13) as the Hub serves it. `pausedBy` stays
+ * an opaque value: the paused-by record lands with ma-fence, so readers
+ * feature-detect its shape instead of assuming one. Chapters keep any extra
+ * fields the Hub adds later (fence outcomes) for the same reason.
+ */
+export type LineageRecord = {
+  lineageId: Id;
+  state: "starting" | "running" | "paused" | "host-offline" | string;
+  pausedBy?: unknown;
+  pausedAt?: string | null;
+  generation: number;
+  chapters: ({
+    instanceId: Id;
+    generation: number;
+    chapterCause?: string | null;
+    createdAt: string;
+    endedAt?: string | null;
+    fencedAt?: string | null;
+  } & Record<string, unknown>)[];
+};
+
 /** Hub GET `/v1/providers` row. Auth token is never present. */
 export type HubProviderRow = {
   id: string;
@@ -703,6 +734,8 @@ export type HubApi = {
   screenRead(instanceId: Id, lines?: number): Promise<ScreenRead>;
   instanceClose(instanceId: Id): Promise<CommandResult>;
   instanceResume(instanceId: Id, mode?: ResumeMode): Promise<ResumeResult>;
+  /** `GET /v1/lineages/{id}`: lineage state and every chapter (D-057). */
+  lineageGet(lineageId: Id): Promise<LineageRecord>;
   /** `DELETE /v1/instances/{id}`; `force` stops a live Instance first. */
   instanceDelete(instanceId: Id, force?: boolean): Promise<InstanceDeleted>;
   instanceConfigure(instanceId: Id, permissionMode: string, extras?: InstanceConfigurePatch): Promise<CommandResult>;
@@ -1189,6 +1222,20 @@ function createMockApi(): HubApi {
     },
     async instanceResume(instanceId, mode = "structured") {
       return mockResume(instanceId, mode);
+    },
+    async lineageGet(lineageId) {
+      const chapters = mockDb.instances
+        .filter((row) => (row.lineageId ?? row.id) === lineageId)
+        .map((row) => ({
+          instanceId: row.id,
+          generation: row.generation ?? 1,
+          chapterCause: row.chapterCause ?? null,
+          createdAt: row.createdAt,
+          fencedAt: row.fencedAt ?? null,
+        }))
+        .sort((a, b) => a.generation - b.generation);
+      if (!chapters.length) throw new HubHttpError(404, "NOT_FOUND", "lineage not found");
+      return { lineageId, state: "running", generation: chapters.at(-1)!.generation, chapters };
     },
     async instanceDelete(instanceId, force) {
       return mockDelete(instanceId, force);
@@ -1766,6 +1813,9 @@ function createLiveApi(): HubApi {
         mode: body.mode,
         replayed: Boolean(body.replayed),
       };
+    },
+    async lineageGet(lineageId) {
+      return rest<LineageRecord>(`/v1/lineages/${encodeURIComponent(lineageId)}`);
     },
     async instanceDelete(instanceId, force) {
       // `force=1` is what stops a live Instance — the Hub stops and deletes

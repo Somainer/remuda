@@ -137,6 +137,19 @@ export type Instance = EntityMeta & {
   launchedBy?: "remuda" | "user" | null;
   /** context-usage-1: additive per-session token/context rollup from the Hub; absent until the harness reports usage. */
   usageRollup?: UsageRollup | null;
+  /**
+   * D-057 §5 lineage projection, verbatim from InstanceRecord. A plain
+   * instance is its own lineage (`lineageId === id`, generation 1); absent on
+   * rows from Hubs older than ma-lineage.
+   */
+  lineageId?: Id;
+  generation?: number;
+  /** Why this chapter exists (`owner-resume`, later C1 causes); null on a first chapter. */
+  chapterCause?: string | null;
+  /** When authority moved to the successor chapter; null while current. */
+  fencedAt?: string | null;
+  /** Granted verbs (`dispatch` / `land` / `spend` / `address-owner`); empty = leaf. */
+  grants?: string[];
 };
 
 export type HostTransport = "outbound-wss" | "ssh-dev";

@@ -870,6 +870,9 @@ pub(crate) async fn handle_node_method(
                 for appended in appended_chunk {
                     if !appended.replayed {
                         publish_journal(&state.bus, &appended.record);
+                        if let Some(view) = &appended.seen {
+                            publish_seen(&state.bus, view);
+                        }
                         crate::alerts::observe(state, &appended.record);
                         crate::usage_store::observe_journal(state, &appended.record).await;
                         crate::supply::observe_journal_text(state, &appended.record).await;
@@ -1537,6 +1540,28 @@ fn publish_journal(bus: &Bus, record: &JournalRecord) {
         record.seq,
         record.event.clone(),
     ));
+}
+
+/// seen-hub: publish an owner seen-state change on the follow bus.
+///
+/// Rides the journal bus the way workspace `host.updated` does: addressed to
+/// instance `""`, so only unfiltered (global) followers receive it and a
+/// per-session follower never mistakes it for a journal row. The frame's
+/// `seq` is the seen seq (0 before the first report); the instance id travels
+/// inside the event. Missed frames converge on the next instance poll.
+pub(crate) fn publish_seen(bus: &Bus, view: &crate::seen::SeenView) {
+    let seq = view
+        .seen_seq
+        .as_deref()
+        .and_then(|seq| seq.parse().ok())
+        .unwrap_or(0);
+    let mut event = json!({ "type": "instance.seen" });
+    if let (Some(object), Ok(Value::Object(fields))) =
+        (event.as_object_mut(), serde_json::to_value(view))
+    {
+        object.extend(fields);
+    }
+    bus.publish(FollowEvent::json("", seq, event));
 }
 
 fn hello_result(host: &HostRecord, node_token: Option<String>) -> Result<Value, HubError> {

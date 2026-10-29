@@ -67,6 +67,7 @@ mod proxy;
 mod push_http;
 mod rate_limit;
 mod registry;
+mod seen;
 pub mod ssh_hosts;
 mod store;
 mod store_tickets;

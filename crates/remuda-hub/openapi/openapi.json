@@ -1748,6 +1748,21 @@
             "$ref": "#/components/schemas/InstanceUsageRollup",
             "description": "Additive per-session token/context rollup (context-usage-1), Hub-computed from the journal's usage observations and refreshed every turn. Absent until the harness has reported at least one usage event; every counter is null until the adapter reports that channel (never a fabricated zero).",
             "readOnly": true
+          },
+          "unseen": {
+            "description": "seen-hub (home done-unseen): true when the latest settled turn end (turnEndSeq) is newer than the owner's seen seq. Owner-scoped, so every owner device reads the same value. A turn end that lands while an owner client reported the session visible is folded seen in the same write and never reads true. Always sent by this Hub; read an absent value as false.",
+            "readOnly": true,
+            "type": "boolean"
+          },
+          "seenSeq": {
+            "description": "seen-hub: highest journal seq the owner has seen (decimal). Monotonic. Absent until the first POST /v1/instances/{id}/seen.",
+            "readOnly": true,
+            "type": "string"
+          },
+          "turnEndSeq": {
+            "description": "seen-hub: journal seq (decimal) of the latest settled turn end, i.e. the latest row that moved activity from working, blocked or draining to idle. Absent before any turn end; a resumed instance or a new lineage chapter starts without one (home.md §7).",
+            "readOnly": true,
+            "type": "string"
           }
         },
         "required": [
@@ -5141,6 +5156,54 @@
         "required": [
           "hostId"
         ]
+      },
+      "SeenRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "durableSeq": {
+            "description": "Highest journal seq the client has shown for this instance, as the decimal string the Hub serializes (a JSON integer is also accepted). Clamped to the instance's durable seq; a value at or below the current seen seq changes nothing.",
+            "type": [
+              "string",
+              "integer"
+            ]
+          },
+          "visible": {
+            "description": "true while the client is showing the session: holds a short per-device visibility lease (10 s, renewed by repeating the report) so a turn that ends meanwhile is folded seen instead of becoming unseen. false releases this device's lease when it stops showing the session. Omit for a report that is not about the screen, such as marking a row seen from a list.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "durableSeq"
+        ],
+        "type": "object"
+      },
+      "SeenView": {
+        "additionalProperties": false,
+        "properties": {
+          "instanceId": {
+            "type": "string"
+          },
+          "seenAt": {
+            "description": "When the seen seq last advanced.",
+            "type": "string"
+          },
+          "seenSeq": {
+            "description": "Owner's seen seq after this report (decimal).",
+            "type": "string"
+          },
+          "turnEndSeq": {
+            "description": "Latest settled turn end (decimal); absent before any.",
+            "type": "string"
+          },
+          "unseen": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "instanceId",
+          "unseen"
+        ],
+        "type": "object"
       }
     }
   },
@@ -7184,6 +7247,55 @@
           }
         },
         "summary": "Continue an exited Claude session on a new instance (D-026)",
+        "tags": [
+          "instances"
+        ]
+      }
+    },
+    "/v1/instances/{id}/seen": {
+      "post": {
+        "description": "seen-hub: the owner saw this instance up to durableSeq. Seen is tracked per owner (scope owner), so phone and desktop agree. Monotonic: a lower seq never moves seen back. When the seen seq advances, the Hub publishes an instance.seen event on the /v1/follow bus to unfiltered followers. Human devices only: Agent credentials are refused by the agent-route policy and Bot devices by the handler.",
+        "operationId": "instanceSeen",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SeenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SeenView"
+                }
+              }
+            },
+            "description": "Seen state after the report"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Mark an instance seen by the owner (done-unseen)",
         "tags": [
           "instances"
         ]

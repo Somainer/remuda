@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-pub use error::ClientError;
+pub use error::{ClientError, Refusal};
 pub use types::{
     CommandRequest, InstanceCreate, InstanceCreateResult, InstanceRecord, JournalPage,
     LoginRequest, LoginResponse,

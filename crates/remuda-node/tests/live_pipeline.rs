@@ -168,6 +168,7 @@ async fn start_run(hooks: bool) -> LiveRun {
         .expect("dev node");
 
     let request = CreateInstanceRequest {
+        initiator: None,
         origin: remuda_protocol::InputOrigin::Human,
         agent_credential: None,
         command_id: None,
@@ -363,6 +364,7 @@ impl LiveRun {
             .submit_command(
                 &self.instance.meta.id,
                 InstanceCommandRequest {
+                    initiator: None,
                     origin: remuda_protocol::InputOrigin::Human,
                     command_id: None,
                     operation: CommandAction::WriteTty,

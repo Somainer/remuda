@@ -4,7 +4,9 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -676,6 +678,86 @@ fn concurrent_main_update_loses_cas_without_pushing() {
 }
 
 #[test]
+fn local_main_advancing_during_an_onto_main_verify_is_base_moved() {
+    // r13 item 7(a): verifying `--gate --onto main` while local main advances
+    // must report base_moved(expected, current) from the VERDICT rather than
+    // persisting a "verified" report pinned to the stale base.
+    let repo = Repo::new();
+    // A forward commit for main to move to during the gate (the topic tip).
+    let concurrent = repo.branch_commit.clone();
+    let (output, report) = repo.merge(
+        &["--gate", "--onto", "main", "--no-push"],
+        &[("REMUDA_TEST_GATE_CAS", &concurrent)],
+    );
+    assert_exit(&output, &report, 2);
+    assert_eq!(report["status"], "base_moved", "{report}");
+    assert_eq!(
+        report["base"], repo.base,
+        "expected base is retained: {report}"
+    );
+    assert_eq!(
+        report["currentMain"], concurrent,
+        "current main is reported: {report}"
+    );
+    // Nothing was pushed and the checkout main really did advance.
+    assert_eq!(report["pushed"], false);
+    assert_eq!(repo.remote_main(), repo.base);
+    assert_eq!(repo.main(), concurrent);
+    repo.assert_cleaned();
+}
+
+#[test]
+fn origin_only_main_advance_at_land_push_is_base_moved_with_remote_current() {
+    // r13 item 7(b): local main still equals the pinned base at --land, but
+    // ORIGIN main advanced (an origin-only move the coordinator checkout never
+    // fetched). The local update-ref CAS succeeds but the push is rejected; the
+    // CLI must fetch, classify it base_moved(base, remote), and never push.
+    let repo = Repo::new();
+    // 1. Verify the merge onto main (no push) and capture the pinned tuple.
+    let (verified_out, verified) = repo.merge(&["--gate", "--onto", "main", "--no-push"], &[]);
+    assert_exit(&verified_out, &verified, 0);
+    let merged = verified["merged"].as_str().unwrap().to_owned();
+    assert_eq!(verified["base"], repo.base);
+
+    // 2. Advance ONLY the remote from a throwaway clone; local main stays base.
+    let side = repo.root.parent().unwrap().join("origin-side-clone");
+    git(
+        &repo.root,
+        &[
+            "clone",
+            "-q",
+            &repo.origin.to_string_lossy(),
+            &side.to_string_lossy(),
+        ],
+    );
+    git(&side, &["config", "user.email", "t@example.com"]);
+    git(&side, &["config", "user.name", "T"]);
+    fs::write(side.join("remote-only.txt"), "from another coordinator\n").unwrap();
+    git(&side, &["add", "--", "remote-only.txt"]);
+    git(&side, &["commit", "-q", "-m", "remote-only main advance"]);
+    git(&side, &["push", "-q", "origin", "main"]);
+    let remote_current = git(&repo.origin, &["rev-parse", "main"]);
+    assert_ne!(remote_current, repo.base);
+    assert_eq!(
+        repo.main(),
+        repo.base,
+        "local main still at the pinned base"
+    );
+
+    // 3. Land the immutable report: the push must be classified base_moved.
+    let (output, report) = repo.merge(&["--land", "--onto", "main", "--report", &merged], &[]);
+    assert_exit(&output, &report, 2);
+    assert_eq!(report["status"], "base_moved", "{report}");
+    assert_eq!(report["base"], repo.base, "{report}");
+    assert_eq!(
+        report["currentMain"], remote_current,
+        "currentMain must name the remote tip, not a generic error: {report}"
+    );
+    // The rejected push did not move origin; it still holds the other commit.
+    assert_eq!(repo.remote_main(), remote_current);
+}
+
+#[test]
 fn staged_source_changes_are_refused_before_creating_a_worktree() {
     let repo = Repo::new();
     fs::write(repo.source.join("staged.txt"), "unfinished\n").unwrap();
@@ -1160,4 +1242,479 @@ fn pending_lists_only_ahead_local_worker_branches_and_reports_conflicts_and_stag
     assert_eq!(git(&repo.root, &["show-ref"]), before);
     assert!(repo.trace().is_empty());
     repo.assert_cleaned();
+}
+
+/// r14 item 5 (R4): the push applied the exact granted merge server-side but
+/// the client's acknowledgement is lost. A pre-receive hook on the bare origin
+/// migrates the quarantined objects into the store and moves the ref exactly
+/// like the server did, then rejects the push — the client sees a failure while
+/// remote main already contains its merge. Before the verdict, the land fetches
+/// and finds the exact merge on remote main, and reports LANDED — never failed
+/// or base-moved.
+#[cfg(unix)]
+#[test]
+fn a_push_that_landed_but_lost_its_acknowledgement_is_reported_landed() {
+    let repo = Repo::new();
+    // 1. A real verified merge pinned at the old base.
+    let (verified_out, verified) = repo.merge(&["--gate", "--onto", "main", "--no-push"], &[]);
+    assert_exit(&verified_out, &verified, 0);
+    let merged = verified["merged"].as_str().unwrap().to_owned();
+    let base = repo.base.clone();
+    assert_ne!(repo.remote_main(), merged);
+
+    // 2. A pre-receive hook that applies the incoming ref (migrating the
+    //    quarantine objects into the object store first) and THEN rejects the
+    //    push — a server-side commit with a lost client acknowledgement.
+    let real_git: PathBuf = {
+        let path = std::env::var_os("PATH").expect("PATH");
+        std::env::split_paths(&path)
+            .map(|dir| dir.join("git"))
+            .find(|candidate| candidate.is_file())
+            .expect("real git on PATH")
+    };
+    let hook_dir = repo.origin.join("hooks");
+    fs::create_dir_all(&hook_dir).unwrap();
+    let hook = hook_dir.join("pre-receive");
+    fs::write(
+        &hook,
+        format!(
+            r#"#!/bin/sh
+read old new dst
+# Migrate incoming objects out of the quarantine into the real store, so the
+# ref update below resolves after the quarantine is destroyed.
+find "$GIT_QUARANTINE_PATH" -type f -not -path "*/pack/*" 2>/dev/null | while IFS= read -r f; do
+  rel="${{f#$GIT_QUARANTINE_PATH/}}"
+  mkdir -p "$GIT_DIR/objects/$(dirname "$rel")"
+  cp -f "$f" "$GIT_DIR/objects/$rel"
+done
+env -i HOME="$HOME" PATH="{path_dir}" \
+  "{real_git}" --git-dir="$GIT_DIR" update-ref "$dst" "$new" "$old"
+echo "simulated post-update acknowledgement loss" >&2
+exit 1
+"#,
+            path_dir = std::env::var("PATH").unwrap_or_default(),
+            real_git = real_git.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+    // 3. Land: the update-ref CAS succeeds locally, the server-side ref moved,
+    //    and the push is rejected — the remote resolution turns it into landed.
+    let (output, report) = repo.merge(&["--land", "--onto", "main", "--report", &merged], &[]);
+    assert_exit(&output, &report, 0);
+    assert_eq!(report["status"], "landed", "{report}");
+    assert_eq!(
+        report["pushed"], true,
+        "resolved as landed despite the lost ack: {report}"
+    );
+    assert_eq!(report["merged"].as_str(), Some(merged.as_str()), "{report}");
+
+    // Exactly the granted merge is on remote main; never reported base-moved.
+    assert_eq!(
+        repo.remote_main(),
+        merged,
+        "the exact granted merge is on remote main"
+    );
+    // The land optimistically advanced local main to the merge; the remote
+    // resolution confirms it landed, so local main keeps the merge (no rollback).
+    assert_eq!(repo.main(), merged, "local main keeps the landed merge");
+    let _ = base;
+}
+
+/// Write the r14-R5 lost-ack pre-receive hook: applies the incoming ref
+/// server-side, then rejects the push so the client sees a failure while the
+/// remote already contains the merge. Returns nothing; the hook lives at
+/// `$origin/hooks/pre-receive`.
+fn install_lost_ack_hook(origin: &Path) {
+    let real_git: PathBuf = {
+        let path = std::env::var_os("PATH").expect("PATH");
+        std::env::split_paths(&path)
+            .map(|dir| dir.join("git"))
+            .find(|candidate| candidate.is_file())
+            .expect("real git on PATH")
+    };
+    let hook_dir = origin.join("hooks");
+    fs::create_dir_all(&hook_dir).unwrap();
+    let hook = hook_dir.join("pre-receive");
+    fs::write(
+        &hook,
+        format!(
+            r#"#!/bin/sh
+read old new dst
+find "$GIT_QUARANTINE_PATH" -type f -not -path "*/pack/*" 2>/dev/null | while IFS= read -r f; do
+  rel="${{f#$GIT_QUARANTINE_PATH/}}"
+  mkdir -p "$GIT_DIR/objects/$(dirname "$rel")"
+  cp -f "$f" "$GIT_DIR/objects/$rel"
+done
+env -i HOME="$HOME" PATH="{path_dir}" \
+  "{real_git}" --git-dir="$GIT_DIR" update-ref "$dst" "$new" "$old"
+echo "simulated post-update acknowledgement loss" >&2
+exit 1
+"#,
+            path_dir = std::env::var("PATH").unwrap_or_default(),
+            real_git = real_git.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Write a `git` wrapper on a throwaway PATH dir that delegates every call to
+/// the real git EXCEPT the named recovery read, which it makes fail. Used to
+/// prove r15 R5: a failed recovery read after a rejected push is `uncertain`,
+/// never `gate_failed`.
+///
+/// `fail`: "fetch" fails the ref-free remote-tip read (`ls-remote`, with
+/// `fetch` for older flows); "merge-base" fails the ancestry read. Hardened
+/// recovery prepends `-c` options, so the wrapper scans ALL args for the
+/// subcommand instead of checking $1.
+fn install_failing_git_wrapper(parent: &Path, fail: &str) -> PathBuf {
+    let real_git: PathBuf = {
+        let path = std::env::var_os("PATH").expect("PATH");
+        std::env::split_paths(&path)
+            .map(|dir| dir.join("git"))
+            .find(|candidate| candidate.is_file())
+            .expect("real git on PATH")
+    };
+    let wrapper_dir = parent.join("wrapper-bin");
+    fs::create_dir_all(&wrapper_dir).unwrap();
+    let wrapper = wrapper_dir.join("git");
+    fs::write(
+        &wrapper,
+        format!(
+            r#"#!/bin/sh
+# Recovery prepends -c options; find the subcommand anywhere in argv.
+sub=""
+for a in "$@"; do
+  case "$a" in
+    ls-remote|fetch|merge-base) sub="$a"; break ;;
+  esac
+done
+if [ "{fail}" = "fetch" ] && {{ [ "$sub" = "fetch" ] || [ "$sub" = "ls-remote" ]; }}; then
+  echo "wrapper: simulated recovery fetch failure" >&2
+  exit 1
+fi
+if [ "{fail}" = "merge-base" ] && [ "$sub" = "merge-base" ]; then
+  echo "wrapper: simulated merge-base failure" >&2
+  exit 2
+fi
+exec "{real_git}" "$@"
+"#,
+            fail = fail,
+            real_git = real_git.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    wrapper_dir
+}
+
+/// r15 item 1 (R5): the push landed server-side but the client saw a failure
+/// AND the recovery `git fetch` also fails. The outcome cannot be established
+/// — the CLI must report `uncertain` (exit 4), never `gate_failed` (exit 1),
+/// keep the reachability pin, and surface what could not be established. The
+/// exact merge IS on remote main (the hook moved it).
+#[test]
+fn a_lost_ack_with_a_failed_recovery_fetch_is_uncertain_never_failed() {
+    let repo = Repo::new();
+    let (verified_out, verified) = repo.merge(&["--gate", "--onto", "main", "--no-push"], &[]);
+    assert_exit(&verified_out, &verified, 0);
+    let merged = verified["merged"].as_str().unwrap().to_owned();
+    let base = repo.base.clone();
+
+    install_lost_ack_hook(&repo.origin);
+    let wrapper_dir = install_failing_git_wrapper(repo.root.parent().unwrap(), "fetch");
+    let wrapped_path = format!(
+        "{}:{}",
+        wrapper_dir.display(),
+        std::env::var("PATH").unwrap()
+    );
+
+    let (output, report) = repo.merge(
+        &["--land", "--onto", "main", "--report", &merged],
+        &[("PATH", wrapped_path.as_str())],
+    );
+    assert_exit(&output, &report, 4);
+    assert_eq!(
+        report["status"], "uncertain",
+        "a failed recovery fetch must be uncertain, not failed: {report}"
+    );
+    assert!(
+        report["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("remote base ls-remote"),
+        "the error must name the failed remote read: {report}"
+    );
+    // The merge actually landed despite the uncertainty — remote main is the
+    // exact granted merge (the hook applied it).
+    assert_eq!(
+        repo.remote_main(),
+        merged,
+        "the lost-ack push landed remotely"
+    );
+    // The reachability pin is KEPT (uncertain is not a failure; the merge may
+    // be on the remote and must not be garbage-collected).
+    let pin_ref = format!("refs/remuda/merge/topic/{base}");
+    let pin_check = git_command(&repo.root)
+        .args(["rev-parse", "--verify", &pin_ref])
+        .output()
+        .unwrap();
+    assert!(
+        pin_check.status.success(),
+        "uncertain land must keep the merge reachability pin {pin_ref}: {}",
+        String::from_utf8_lossy(&pin_check.stderr)
+    );
+}
+
+/// r15 item 1 (R5): the push landed server-side but the client saw a failure;
+/// the recovery fetch SUCCEEDS but the ancestry read (`merge-base
+/// --is-ancestor`) fails. Presence/absence cannot be established → uncertain,
+/// never a failed/base-moved verdict.
+#[test]
+fn a_lost_ack_with_a_failed_ancestry_read_is_uncertain() {
+    let repo = Repo::new();
+    let (verified_out, verified) = repo.merge(&["--gate", "--onto", "main", "--no-push"], &[]);
+    assert_exit(&verified_out, &verified, 0);
+    let merged = verified["merged"].as_str().unwrap().to_owned();
+
+    install_lost_ack_hook(&repo.origin);
+    let wrapper_dir = install_failing_git_wrapper(repo.root.parent().unwrap(), "merge-base");
+    let wrapped_path = format!(
+        "{}:{}",
+        wrapper_dir.display(),
+        std::env::var("PATH").unwrap()
+    );
+
+    let (output, report) = repo.merge(
+        &["--land", "--onto", "main", "--report", &merged],
+        &[("PATH", wrapped_path.as_str())],
+    );
+    assert_exit(&output, &report, 4);
+    assert_eq!(
+        report["status"], "uncertain",
+        "a failed ancestry read must be uncertain: {report}"
+    );
+    assert_eq!(
+        repo.remote_main(),
+        merged,
+        "the lost-ack push landed remotely"
+    );
+}
+
+/// r15 item 1 (R5) companion: a recovery that ESTABLISHES absence (fetch works,
+/// the merge is not on the remote, remote main is still the expected base) is a
+/// genuine push rejection — `gate_failed` (exit 1), not uncertain. Unknown is
+/// only for reads that cannot establish a fact.
+#[test]
+fn an_established_rejection_with_remote_unchanged_is_failed_not_uncertain() {
+    let repo = Repo::new();
+    let (verified_out, verified) = repo.merge(&["--gate", "--onto", "main", "--no-push"], &[]);
+    assert_exit(&verified_out, &verified, 0);
+    let merged = verified["merged"].as_str().unwrap().to_owned();
+    let base = repo.base.clone();
+
+    // A pre-receive hook that refuses WITHOUT moving the ref: the remote stays
+    // at the expected base, so absence is established and the rejection is real.
+    let hook_dir = repo.origin.join("hooks");
+    fs::create_dir_all(&hook_dir).unwrap();
+    let hook = hook_dir.join("pre-receive");
+    fs::write(&hook, "#!/bin/sh\necho \"policy: rejected\" >&2\nexit 1\n").unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (output, report) = repo.merge(&["--land", "--onto", "main", "--report", &merged], &[]);
+    assert_eq!(output.status.code(), Some(1), "{report}");
+    assert_eq!(report["status"], "gate_failed", "{report}");
+    // Remote provably unchanged at the expected base.
+    assert_eq!(repo.remote_main(), base, "remote never moved");
+}
+
+/// r15 item 1 (R5): a granted land child whose start barrier is not released
+/// (an unreadable/closed fd) exits BEFORE touching git — it must never run a
+/// push as an unfenced child. The CLI exits 4 without a report.
+#[test]
+fn a_land_child_refuses_to_run_without_a_released_start_barrier() {
+    let repo = Repo::new();
+    // fd 99 is not open in the child: read(2) fails EBADF → immediate refusal.
+    let output = repo
+        .command()
+        .args(["merge", "topic", "--json", "--gate", "--onto", "main"])
+        .env("REMUDA_START_BARRIER_FD", "99")
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "barrier read failure must exit 4: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("start barrier"),
+        "the refusal must name the start barrier: {stderr}"
+    );
+    // Nothing ran: no merge commit, remote unchanged.
+    assert_eq!(repo.remote_main(), repo.base);
+}
+
+/// r16 item 1: with the REAL land CLI against a pinned verified report, the
+/// granted land child BLOCKS on the stdin release byte before any lock or git
+/// operation while the parent holds the pipe, and on EOF (the parent could not
+/// persist the fence) exits 4 without moving local main. This is the half the
+/// Node's production spawn builder relies on.
+#[test]
+fn a_released_barrier_gates_the_real_land_and_eof_aborts_before_main_moves() {
+    let repo = Repo::new();
+    let (verified_out, verified) = repo.merge(&["--gate", "--onto", "main", "--no-push"], &[]);
+    assert_exit(&verified_out, &verified, 0);
+    let merged = verified["merged"].as_str().unwrap().to_owned();
+    let main_before = repo.main();
+
+    let mut child = repo
+        .command()
+        .args([
+            "merge",
+            "topic",
+            "--land",
+            "--onto",
+            "main",
+            "--json",
+            "--report",
+            &merged,
+            "--no-push",
+        ])
+        .env("REMUDA_START_BARRIER_FD", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Bounded observation: the child stays ALIVE and main stays put the whole
+    // time the release byte is withheld — the barrier is ahead of locks/git.
+    let deadline = Instant::now() + Duration::from_millis(800);
+    while Instant::now() < deadline {
+        match child.try_wait().unwrap() {
+            Some(status) => panic!("the land child must block on the barrier, exited {status}"),
+            None => assert_eq!(
+                repo.main(),
+                main_before,
+                "main moved while the barrier byte was withheld"
+            ),
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // EOF: the fence never became durable; the CLI must refuse without running.
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "barrier EOF on a granted land must exit 4: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("start barrier closed before release"),
+        "the refusal must name the closed barrier: {stderr}"
+    );
+    assert_eq!(
+        repo.main(),
+        main_before,
+        "an EOF-aborted land must never move local main"
+    );
+}
+
+/// r14 item 6: local main moving between verification and the land is a
+/// structured `base_moved(expected, current)` (exit 2), not an ordinary
+/// `gate_failed` (exit 1). The pinned report is loaded first; the land CAS then
+/// detects the current main and reports BOTH shas.
+#[test]
+fn a_local_main_move_between_verify_and_land_is_base_moved_with_both_shas() {
+    let repo = Repo::new();
+    // Verify onto the current base and pin the captured merge.
+    let (verified_out, verified) = repo.merge(&["--gate", "--onto", "main", "--no-push"], &[]);
+    assert_exit(&verified_out, &verified, 0);
+    let merged = verified["merged"].as_str().unwrap().to_owned();
+    let base = repo.base.clone();
+
+    // Another commit lands on LOCAL main directly (no remote move yet).
+    let newer = commit_file(
+        &repo.root,
+        "post-verify main move.txt",
+        "a coordinator landed this after verification\n",
+    );
+    assert_eq!(repo.main(), newer);
+    assert_ne!(newer, base);
+
+    // Land the pinned merge: the update-ref CAS fails because main is no longer
+    // at the pinned base — classified base_moved, with BOTH expected and the
+    // real current sha, never an opaque gate_failed.
+    let (output, report) = repo.merge(&["--land", "--onto", "main", "--report", &merged], &[]);
+    assert_exit(&output, &report, 2);
+    assert_eq!(report["status"], "base_moved", "{report}");
+    assert_eq!(
+        report["base"],
+        json!(base),
+        "pinned expected base retained: {report}"
+    );
+    assert_eq!(
+        report["currentMain"],
+        json!(newer),
+        "currentMain must name the real moved local main: {report}"
+    );
+    assert_eq!(
+        report["pushed"], false,
+        "a moved base is never pushed: {report}"
+    );
+
+    // Local main is untouched; the merge was not forced through.
+    assert_eq!(repo.main(), newer);
+}
+
+/// r19 item 5: a PREFLIGHT refusal on a granted, pinned land — the source
+/// branch advanced after verification without a re-verify — must still emit a
+/// `gate_failed` (exit 1) that NAMES the attempted merge M. Previously
+/// report.merged was only stamped after the whole preflight succeeded, so the
+/// Node validated the refusal as Unknown (a gate_failed with no merge).
+#[test]
+fn a_branch_moved_preflight_refusal_names_the_attempted_merge() {
+    let repo = Repo::new();
+    // Verify onto current main (no push) and pin the captured merge M.
+    let (verified_out, verified) = repo.merge(&["--gate", "--onto", "main", "--no-push"], &[]);
+    assert_exit(&verified_out, &verified, 0);
+    let merged = verified["merged"].as_str().unwrap().to_owned();
+    assert!(!merged.is_empty());
+    let recorded_head = verified["head"].as_str().unwrap().to_owned();
+
+    // The source branch advances AFTER verification (a real `--report` pin,
+    // no re-verify): the preflight's branch snapshot check must refuse.
+    let new_tip = commit_file(
+        &repo.source,
+        "post-verify branch move.txt",
+        "the branch moved after the gate ran\n",
+    );
+    assert_ne!(new_tip, recorded_head);
+
+    let (output, report) = repo.merge(&["--land", "--onto", "main", "--report", &merged], &[]);
+    assert_exit(&output, &report, 1);
+    assert_eq!(report["status"], json!("gate_failed"), "{report}");
+    assert_eq!(
+        report["merged"],
+        json!(merged),
+        "the refusal must name the attempted merge M: {report}"
+    );
+    assert!(
+        report["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("branch moved since verification"),
+        "the error names the branch-moved preflight refusal: {report}"
+    );
+    // Nothing landed or was pushed.
+    assert_eq!(
+        report["pushed"], false,
+        "a preflight refusal never pushes: {report}"
+    );
+    assert_eq!(repo.main(), repo.base);
 }

@@ -88,6 +88,8 @@ pub fn computer_use_evaluate(
 pub fn computer_use_default_client_path() -> Option<std::path::PathBuf> {
     computer_use::default_client_path()
 }
+#[cfg(all(unix, feature = "test-faults"))]
+pub use daemon::run_daemon_runtime_socket;
 #[cfg(unix)]
 pub use daemon::{
     DaemonControl, DaemonListener, DaemonWssLease, bind_daemon, connect_daemon_bridge,
@@ -129,6 +131,36 @@ pub use signal::{
 // Hook-channel silence diagnostics live in remuda-signal next to the socket
 // they probe; re-exported here as the Node-owned surface the instance badge
 // reads.
+/// Test-only cleanup/owner-release hold for blocking land-owner paths.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-faults"))]
+pub use gate::CleanupHold;
+/// Test implementability of the pre-run Hub-authority fence.
+#[doc(hidden)]
+pub use gate::GateAuthorizer;
+/// Test-only gate.run entry hold for carrier-level cancel-race tests.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-faults"))]
+pub use gate::GateRunHold;
+/// Land-grant answer type used by the durable daemon authorizer and tests.
+#[doc(hidden)]
+pub use gate::LandGrantAnswer as GateLandGrantAnswer;
+/// r36 item 2 test-only record of one finished gate.run (production verdict +
+/// acquired lane) for real-Node Landing regressions.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-faults"))]
+pub use gate::LastGateVerdict;
+/// Test-only: pids still alive in a process group (r13 item 5 kill/reap test).
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-faults"))]
+#[cfg(unix)]
+pub use gate::gate_test_alive_pids_in_group;
+/// Test-only: portable group-existence probe via `killpg(pgid, 0)` (r24
+/// item 5, macOS-safe).
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-faults"))]
+#[cfg(unix)]
+pub use gate::gate_test_group_exists;
 pub use remuda_signal::hook_silence::{
     HookSilenceProbes, HookSilenceReason, classify as classify_hook_silence,
     diagnose as diagnose_hook_silence, link_fresh as hook_link_fresh,

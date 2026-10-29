@@ -6,6 +6,87 @@ use axum::response::{IntoResponse, Response};
 use serde_json::json;
 use thiserror::Error;
 
+/// D-060 §9.1: the `next.action` vocabulary. `next` is only ever a hint; it
+/// never grants anything and never adds a refusal path.
+pub mod action {
+    /// Owner-selected configuration: do not retry, report to the owner.
+    pub const ASK_OWNER: &str = "ask-owner";
+    /// Wait for a human to answer the interaction, then retry with approvalId.
+    pub const AWAIT_APPROVAL: &str = "await-approval";
+    /// Outcome unknown: read the command state before deciding (D-055).
+    pub const READ_THEN_DECIDE: &str = "read-then-decide";
+    // D-060 §9.1 also defines `retry-same-command` and `stop`. No refusal in
+    // this crate emits them yet (NODE_BUSY is retried by `code`, and the
+    // D-057 `fenced` refusals live in the writer path), so they are documented
+    // in protocol §9.1 rather than declared unused here.
+    /// The request itself is wrong.
+    pub const FIX_REQUEST: &str = "fix-request";
+}
+
+/// The `next` step a refusal carries (D-060 §9.1): a stable `action`, one
+/// human/agent-readable `hint`, and optional `grant` / `interactionId` /
+/// `commandId` that name what the caller needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NextStep {
+    /// One of [`action`].
+    pub action: &'static str,
+    /// What the caller should do instead of retrying blindly.
+    pub hint: String,
+    /// The grant to ask the owner for.
+    pub grant: Option<String>,
+    /// The pending interaction to answer.
+    pub interaction_id: Option<String>,
+    /// The command whose state answers an unknown delivery.
+    pub command_id: Option<String>,
+}
+
+impl NextStep {
+    /// A step with an action and a hint.
+    pub fn new(action: &'static str, hint: impl Into<String>) -> Self {
+        Self {
+            action,
+            hint: hint.into(),
+            grant: None,
+            interaction_id: None,
+            command_id: None,
+        }
+    }
+
+    /// Name the grant the caller needs.
+    pub fn grant(mut self, grant: impl Into<String>) -> Self {
+        self.grant = Some(grant.into());
+        self
+    }
+
+    /// Name the pending interaction the caller waits on.
+    pub fn interaction(mut self, id: impl Into<String>) -> Self {
+        self.interaction_id = Some(id.into());
+        self
+    }
+
+    /// Name the command whose state answers an unknown delivery.
+    pub fn command(mut self, id: impl Into<String>) -> Self {
+        self.command_id = Some(id.into());
+        self
+    }
+
+    fn json(&self) -> serde_json::Value {
+        let mut value = json!({ "action": self.action, "hint": self.hint });
+        if let Some(object) = value.as_object_mut() {
+            if let Some(grant) = &self.grant {
+                object.insert("grant".into(), json!(grant));
+            }
+            if let Some(id) = &self.interaction_id {
+                object.insert("interactionId".into(), json!(id));
+            }
+            if let Some(id) = &self.command_id {
+                object.insert("commandId".into(), json!(id));
+            }
+        }
+        value
+    }
+}
+
 /// Recoverable Hub failures.
 #[derive(Debug, Error)]
 pub enum HubError {
@@ -24,16 +105,16 @@ pub enum HubError {
         "human approval required; answer interaction {interaction_id}, then retry with approvalId"
     )]
     ApprovalRequired { interaction_id: String },
-    /// An existing refusal annotated with a stable machine `reason` and a
-    /// `next` step for the caller. Status, `code` and `error` text are exactly
+    /// An existing refusal annotated with a stable lowercase `reason` and a
+    /// `next` step (D-060 §9.1). Status, `code` and `error` text are exactly
     /// the wrapped error's; only the two additive body fields are new, so
     /// wrapping can never change an authorization decision.
     #[error("{source}")]
     Actionable {
-        /// Stable machine reason (`MISSING_GRANT`, `OUT_OF_SCOPE`, …).
+        /// Stable lowercase reason (`grant-required`, `out-of-scope`, …).
         reason: &'static str,
-        /// What the refused caller should do instead of retrying.
-        next: String,
+        /// The next step for the caller (boxed: the variant must stay small).
+        next: Box<NextStep>,
         /// The refusal being annotated.
         source: Box<HubError>,
     },
@@ -146,50 +227,125 @@ impl HubError {
     }
 
     /// Annotate this refusal with a machine `reason` and a `next` step.
-    pub fn with_next(self, reason: &'static str, next: impl Into<String>) -> Self {
+    pub fn with_next(self, reason: &'static str, next: NextStep) -> Self {
         Self::Actionable {
             reason,
-            next: next.into(),
+            next: Box::new(next),
             source: Box::new(self),
         }
     }
 
-    /// 403 for an Agent seat that lacks `grant` (design §2.5).
+    /// 403 for an Agent seat that lacks `grant` (design §2.5, D-060).
     pub fn missing_grant(grant: &str) -> Self {
         Self::Forbidden.with_next(
-            "MISSING_GRANT",
-            format!(
-                "This seat does not hold the `{grant}` grant. Do not retry: grants are fixed \
-                 when a seat is launched. Report the blocked action to the agent or person \
-                 that launched you and ask for a seat created with `{grant}`."
-            ),
+            "grant-required",
+            NextStep::new(
+                action::ASK_OWNER,
+                format!(
+                    "this seat does not hold `{grant}`; do not retry: grants are \
+                     fixed when a seat is launched. Report the target and action to \
+                     the owner and ask for a seat created with `{grant}`"
+                ),
+            )
+            .grant(grant),
         )
     }
 
     /// 403 for a target or placement outside the caller's delegation scope.
     pub fn out_of_scope() -> Self {
         Self::Forbidden.with_next(
-            "OUT_OF_SCOPE",
-            "The target is outside this seat's delegation scope (project, host or workspace). \
-             Do not retry. Use a target inside your scope, or ask the owner to widen it.",
+            "out-of-scope",
+            NextStep::new(
+                action::ASK_OWNER,
+                "the target is outside this seat's delegation scope (project, host or \
+                 workspace); do not retry — use a target inside the scope, or ask the \
+                 owner to widen it",
+            ),
         )
     }
 
-    /// 403 for an action Agent seats are never given.
-    pub fn agent_not_permitted() -> Self {
+    /// 403 for a target that is not in the caller's lineage.
+    pub fn not_owner() -> Self {
         Self::Forbidden.with_next(
-            "AGENT_NOT_PERMITTED",
-            "Agent seats cannot do this, or the target is not in your lineage. Do not retry; \
-             report to the owner what you needed so they can do it or change the plan.",
+            "not-owner",
+            NextStep::new(
+                action::ASK_OWNER,
+                "the target is not yours or a child of yours; do not retry — report \
+                 what you needed to the owner",
+            ),
         )
     }
 
-    /// 403 for a caller whose instance no longer exists (retired or stale).
-    pub fn caller_retired() -> Self {
+    /// 403 for an operator-only action or route reaching an Agent seat.
+    pub fn operator_only() -> Self {
         Self::Forbidden.with_next(
-            "CALLER_RETIRED",
-            "The instance behind this credential no longer exists (retired or replaced). \
-             Do not retry with this credential; stop and report so a live seat can continue.",
+            "operator-only",
+            NextStep::new(
+                action::ASK_OWNER,
+                "this action is operator-only and no Agent seat holds it; do not \
+                 retry — report what you needed to the owner so a person can do it",
+            ),
+        )
+    }
+
+    /// 403 for an Agent seat asking for an operator-level spec field.
+    pub fn operator_field(hint: impl Into<String>) -> Self {
+        Self::Forbidden.with_next("operator-only", NextStep::new(action::FIX_REQUEST, hint))
+    }
+
+    /// 403 for a route the Agent middleware does not admit.
+    pub fn agent_route() -> Self {
+        Self::Forbidden.with_next(
+            "agent-route",
+            NextStep::new(
+                action::ASK_OWNER,
+                "this route is not opened to Agent seats; do not retry — report the \
+                 action you needed to the owner",
+            ),
+        )
+    }
+
+    /// 403 for a caller whose instance row is gone (retired or replaced).
+    pub fn stale_caller() -> Self {
+        Self::Forbidden.with_next(
+            "stale-caller",
+            NextStep::new(
+                action::ASK_OWNER,
+                "the instance behind this credential no longer exists (retired or \
+                 replaced); do not retry with it — stop and report so a live seat can \
+                 continue",
+            ),
+        )
+    }
+
+    /// 403 for an approvalId that cannot authorize this call (D-017).
+    pub fn approval_invalid() -> Self {
+        Self::Forbidden.with_next(
+            "approval-invalid",
+            NextStep::new(
+                action::FIX_REQUEST,
+                "this approvalId is unknown, expired, already used, not yet answered, \
+                 or for a different action; do not reuse it — repeat the call without \
+                 approvalId to open a new approval, then wait for the owner",
+            ),
+        )
+    }
+
+    /// 409 for an `instance.configure` replay whose delivery is not yet known
+    /// (D-055): the caller reads the command row instead of re-sending.
+    pub fn delivery_unknown(command_id: &str) -> Self {
+        Self::Conflict(format!(
+            "instance.configure is still in flight; poll GET \
+             /v1/instances/{{id}}/commands/{command_id} for its outcome"
+        ))
+        .with_next(
+            "delivery-unknown",
+            NextStep::new(
+                action::READ_THEN_DECIDE,
+                "delivery is not yet known and the Node may still be applying it; do \
+                 not re-send — read the command state until it settles, then decide",
+            )
+            .command(command_id),
         )
     }
 
@@ -270,7 +426,7 @@ impl HubError {
         {
             let mut body = source.response_body();
             body["reason"] = json!(reason);
-            body["next"] = json!(next);
+            body["next"] = next.json();
             return body;
         }
         let mut body = json!({
@@ -279,12 +435,14 @@ impl HubError {
         });
         if let Self::ApprovalRequired { interaction_id } = &self {
             body["interactionId"] = json!(interaction_id);
-            body["reason"] = json!("HUMAN_APPROVAL_REQUIRED");
-            body["next"] = json!(
-                "An approval is already pending for this exact action. Do not resubmit or \
-                 retry: wait for the owner to answer it, then repeat the same call with \
-                 the approvalId."
-            );
+            body["reason"] = json!("approval-required");
+            body["next"] = NextStep::new(
+                action::AWAIT_APPROVAL,
+                "a human must answer the approval; do not resubmit — then retry the same \
+                 request with approvalId",
+            )
+            .interaction(interaction_id)
+            .json();
         }
         if let Self::Unsatisfiable { reasons } | Self::ProviderNotConfigured { reasons } = &self
             && let Some(obj) = body.as_object_mut()
@@ -374,21 +532,77 @@ mod tests {
         assert_eq!(status, 403);
         assert_eq!(body["code"], "FORBIDDEN");
         assert_eq!(body["error"], "forbidden");
-        assert_eq!(body["reason"], "MISSING_GRANT");
-        assert!(body["next"].as_str().unwrap().contains("`land`"));
+        assert_eq!(body["reason"], "grant-required");
+        assert_eq!(body["next"]["action"], "ask-owner");
+        assert_eq!(body["next"]["grant"], "land");
+        assert!(
+            body["next"]["hint"].as_str().unwrap().contains("`land`"),
+            "{body}"
+        );
     }
 
     #[test]
-    fn caller_retired_and_delivery_unknown_carry_next() {
-        let (_, body) = HubError::caller_retired().status_code_and_body();
-        assert_eq!(body["reason"], "CALLER_RETIRED");
-        assert!(body["next"].as_str().unwrap().contains("Do not retry"));
+    fn refusal_vocabulary_is_lowercase_and_hyphenated() {
+        let bodies = [
+            HubError::out_of_scope(),
+            HubError::not_owner(),
+            HubError::operator_only(),
+            HubError::operator_field("hint"),
+            HubError::agent_route(),
+            HubError::stale_caller(),
+            HubError::approval_invalid(),
+        ];
+        for error in bodies {
+            let (_, body) = error.status_code_and_body();
+            assert_eq!(body["code"], "FORBIDDEN", "{body}");
+            let reason = body["reason"].as_str().unwrap();
+            assert!(
+                reason.chars().all(|c| c.is_ascii_lowercase() || c == '-'),
+                "reason {reason} is a stable lowercase reason (D-060 §9.1)"
+            );
+            let action = body["next"]["action"].as_str().unwrap();
+            assert!(
+                [
+                    action::ASK_OWNER,
+                    action::AWAIT_APPROVAL,
+                    action::READ_THEN_DECIDE,
+                    action::FIX_REQUEST,
+                ]
+                .contains(&action),
+                "action {action} is in the D-060 vocabulary"
+            );
+            assert!(!body["next"]["hint"].as_str().unwrap().is_empty());
+        }
+    }
 
-        let (status, body) = crate::http::configure_in_flight().status_code_and_body();
+    #[test]
+    fn approval_required_names_the_pending_interaction() {
+        let (status, body) = HubError::ApprovalRequired {
+            interaction_id: "int_1".into(),
+        }
+        .status_code_and_body();
+        assert_eq!(status, 409);
+        assert_eq!(body["code"], "HUMAN_APPROVAL_REQUIRED");
+        assert_eq!(body["interactionId"], "int_1");
+        assert_eq!(body["reason"], "approval-required");
+        assert_eq!(body["next"]["action"], "await-approval");
+        assert_eq!(body["next"]["interactionId"], "int_1");
+    }
+
+    #[test]
+    fn delivery_unknown_names_the_command_to_read() {
+        let (status, body) = crate::http::configure_in_flight("cmd_9").status_code_and_body();
         assert_eq!(status, 409);
         assert_eq!(body["code"], "COMMAND_ID_CONFLICT");
-        assert_eq!(body["reason"], "DELIVERY_UNKNOWN");
-        assert!(body["next"].as_str().unwrap().contains("Do not re-send"));
+        assert_eq!(body["reason"], "delivery-unknown");
+        assert_eq!(body["next"]["action"], "read-then-decide");
+        assert_eq!(body["next"]["commandId"], "cmd_9");
+        assert!(
+            body["next"]["hint"]
+                .as_str()
+                .unwrap()
+                .contains("do not re-send")
+        );
     }
 
     #[test]

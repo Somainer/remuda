@@ -1049,13 +1049,19 @@ async fn refusals_carry_reason_and_next_without_changing_old_fields() -> Result<
     .await?;
     assert_eq!(body["code"], "FORBIDDEN");
     assert_eq!(body["error"], "forbidden");
-    assert_eq!(body["reason"], "MISSING_GRANT");
+    assert_eq!(body["reason"], "grant-required");
+    assert_eq!(body["next"]["action"], "ask-owner");
+    assert_eq!(body["next"]["grant"], "dispatch");
     assert!(
-        body["next"].as_str().unwrap().contains("`dispatch`"),
+        body["next"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("`dispatch`"),
         "{body}"
     );
 
-    // Not available to Agent seats at all (operator-only route).
+    // A route the Agent middleware never admits (it refuses before the
+    // handler's own operator check can answer operator-only).
     let body = refusal(
         ctx.http
             .post(format!("{}/v1/projects", ctx.base()))
@@ -1067,8 +1073,8 @@ async fn refusals_carry_reason_and_next_without_changing_old_fields() -> Result<
     )
     .await?;
     assert_eq!(body["code"], "FORBIDDEN");
-    assert_eq!(body["reason"], "AGENT_NOT_PERMITTED");
-    assert!(body["next"].as_str().unwrap().contains("Do not retry"));
+    assert_eq!(body["reason"], "agent-route");
+    assert_eq!(body["next"]["action"], "ask-owner");
 
     // Outside the delegation scope: a coordinator boxed to host A may not
     // place a child on host B.
@@ -1100,8 +1106,9 @@ async fn refusals_carry_reason_and_next_without_changing_old_fields() -> Result<
     )
     .await?;
     assert_eq!(body["code"], "FORBIDDEN");
-    assert_eq!(body["reason"], "OUT_OF_SCOPE");
-    assert!(body["next"].as_str().unwrap().contains("scope"));
+    assert_eq!(body["reason"], "out-of-scope");
+    assert_eq!(body["next"]["action"], "ask-owner");
+    assert!(body["next"]["hint"].as_str().unwrap().contains("scope"));
 
     // Needs a D-017 approval: 409, the approval is pending, do not resubmit.
     let coordinator_token = ctx.agent_token_for(&coordinator_id).await?;
@@ -1115,9 +1122,10 @@ async fn refusals_carry_reason_and_next_without_changing_old_fields() -> Result<
         .await?;
     let body = refusal(pending, 409).await?;
     assert_eq!(body["code"], "HUMAN_APPROVAL_REQUIRED");
-    assert_eq!(body["reason"], "HUMAN_APPROVAL_REQUIRED");
+    assert_eq!(body["reason"], "approval-required");
     assert!(body["interactionId"].is_string());
-    assert!(body["next"].as_str().unwrap().contains("Do not resubmit"));
+    assert_eq!(body["next"]["action"], "await-approval");
+    assert_eq!(body["next"]["interactionId"], body["interactionId"]);
 
     // A made-up approval id is refused with its own reason.
     let body = refusal(
@@ -1135,7 +1143,8 @@ async fn refusals_carry_reason_and_next_without_changing_old_fields() -> Result<
         403,
     )
     .await?;
-    assert_eq!(body["reason"], "APPROVAL_INVALID");
+    assert_eq!(body["reason"], "approval-invalid");
+    assert_eq!(body["next"]["action"], "fix-request");
 
     // Stale caller: the instance row behind a still-valid credential is gone.
     let db = rusqlite::Connection::open(ctx._dir.path().join("hub").join("hub.sqlite"))?;
@@ -1155,6 +1164,6 @@ async fn refusals_carry_reason_and_next_without_changing_old_fields() -> Result<
     )
     .await?;
     assert_eq!(body["code"], "FORBIDDEN");
-    assert_eq!(body["reason"], "CALLER_RETIRED");
+    assert_eq!(body["reason"], "stale-caller");
     Ok(())
 }

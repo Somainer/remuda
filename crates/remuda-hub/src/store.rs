@@ -3312,16 +3312,41 @@ impl Store {
     /// Mark a host offline when its WS drops.
     pub async fn mark_host_offline(&self, host_id: String) -> Result<(), StoreError> {
         self.run_named("mark_host_offline", move |conn| {
-            conn.execute(
-                "UPDATE hosts SET state = 'offline', offline_since = ?2 WHERE id = ?1 AND state = 'online'",
-                params![&host_id, now_rfc3339()],
-            )?;
-            conn.execute(
-                "UPDATE instances SET connectivity = 'disconnected', updated_at = ?1
-                 WHERE host_id = ?2 AND connectivity != 'disconnected'",
-                params![now_rfc3339(), host_id],
-            )?;
+            mark_host_offline_rows(conn, &host_id)?;
             Ok(())
+        })
+        .await
+    }
+
+    /// [`Self::mark_host_offline`] for the teardown of ONE registered link:
+    /// applies only while `hosts.link_generation` still equals the durable
+    /// generation that link registered with. A replaced socket's teardown can
+    /// run after the new hello already marked the host online; the new hello
+    /// bumps the generation before it marks the host online, so this late
+    /// write is then a no-op instead of leaving a live host offline. Returns
+    /// whether the host was marked.
+    pub async fn mark_host_offline_for_link(
+        &self,
+        host_id: String,
+        link_generation: i64,
+    ) -> Result<bool, StoreError> {
+        self.run_named("mark_host_offline_for_link", move |conn| {
+            // Read-then-write: IMMEDIATE so the generation check and the
+            // offline write commit as one unit against a concurrent bump.
+            let tx = immediate_tx(conn)?;
+            let current: Option<i64> = tx
+                .query_row(
+                    "SELECT link_generation FROM hosts WHERE id = ?1",
+                    params![host_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if current != Some(link_generation) {
+                return Ok(false);
+            }
+            mark_host_offline_rows(&tx, &host_id)?;
+            tx.commit()?;
+            Ok(true)
         })
         .await
     }
@@ -8697,6 +8722,62 @@ mod tests {
 
     fn verify_eq(presented: &str, hash: &str) -> bool {
         presented == hash
+    }
+
+    /// r40: a replaced link's late teardown never takes a host offline once a
+    /// newer hello has adopted a link; the current link's teardown still does.
+    #[tokio::test]
+    async fn a_replaced_links_offline_write_is_a_noop_after_a_newer_link_adopts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let host = new_id("hst").unwrap();
+        store
+            .authenticate_host(
+                HostAuthRequest {
+                    presented: enroll_token(&store, "enroll-relink").await,
+                    hello_host_id: Some(host.clone()),
+                    label: Some("relink-test".into()),
+                    node_version: None,
+                },
+                verify_eq,
+                |_| Ok("test-hash".into()),
+            )
+            .await
+            .unwrap();
+        let instance = seed_acknowledged_instance(&store, &host).await.instance_id;
+        // Link A registers with generation 1; link B's hello bumps to 2 and
+        // marks the host online before A's teardown gets to write.
+        let link_a = store.bump_host_link_generation(host.clone()).await.unwrap();
+        let link_b = store.bump_host_link_generation(host.clone()).await.unwrap();
+        assert!(link_b > link_a);
+        store
+            .apply_inventory(host.clone(), Default::default(), None)
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .mark_host_offline_for_link(host.clone(), link_a)
+                .await
+                .unwrap(),
+            "the replaced link's teardown must not apply"
+        );
+        let row = store.get_instance(instance.clone()).await.unwrap().unwrap();
+        assert_eq!(row.connectivity, "connected");
+        assert_eq!(
+            store.expire_lost_hosts(0).await.unwrap().0,
+            0,
+            "the host stayed online"
+        );
+        // The current link's own teardown still takes the host offline.
+        assert!(
+            store
+                .mark_host_offline_for_link(host.clone(), link_b)
+                .await
+                .unwrap()
+        );
+        let row = store.get_instance(instance).await.unwrap().unwrap();
+        assert_eq!(row.connectivity, "disconnected");
+        store.close().await;
     }
 
     #[tokio::test]
@@ -16044,6 +16125,21 @@ fn owner_instance_ended(conn: &Connection, instance_id: &str) -> Result<bool, St
 /// resolve that upgrade). IMMEDIATE waits on the busy timeout instead.
 pub(crate) fn immediate_tx(conn: &mut Connection) -> rusqlite::Result<rusqlite::Transaction<'_>> {
     conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+}
+
+/// The host-offline rows: the host leaves `online` (stamping `offline_since`
+/// for the host-lost grace) and its instances read disconnected.
+fn mark_host_offline_rows(conn: &Connection, host_id: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE hosts SET state = 'offline', offline_since = ?2 WHERE id = ?1 AND state = 'online'",
+        params![host_id, now_rfc3339()],
+    )?;
+    conn.execute(
+        "UPDATE instances SET connectivity = 'disconnected', updated_at = ?1
+         WHERE host_id = ?2 AND connectivity != 'disconnected'",
+        params![now_rfc3339(), host_id],
+    )?;
+    Ok(())
 }
 
 /// c-cardsettle: invalidate every still-`pending` interaction owned by

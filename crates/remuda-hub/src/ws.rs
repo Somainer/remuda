@@ -561,11 +561,20 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
         // already registered (a reconnect that superseded this socket), its
         // teardown must not wipe the contexts the live link just installed and
         // block instances that are reachable again.
-        let stale = match session_generation {
-            Some(generation) => state.nodes.remove_generation(&host_id, generation).await,
+        // `removed_link`: the durable link generation of this socket's own
+        // session when its teardown removed it (r40, see below).
+        let (stale, removed_link) = match session_generation {
+            Some(generation) => match state
+                .nodes
+                .remove_generation_link(&host_id, generation)
+                .await
+            {
+                Some(link) => (true, Some(link)),
+                None => (false, None),
+            },
             None => {
                 state.nodes.remove(&host_id).await;
-                true
+                (true, None)
             }
         };
         // r13 item 3: this authenticated session is over. Whatever its
@@ -588,7 +597,18 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
             // host ends streams with via-host-offline and blocks routed
             // instances; a vanished worker host cancels the upstream legs.
             state.api_relay.on_link_lost(&state, &host_id).await;
-            let _ = state.store.mark_host_offline(host_id).await;
+            // r40: the staleness above was decided before the awaits in
+            // between, so a replacement Node's hello may already have marked
+            // the host online. Write offline only while the host is still on
+            // the link this session registered; a newer hello bumped it first.
+            let _ = match removed_link {
+                Some(link) => state
+                    .store
+                    .mark_host_offline_for_link(host_id, link)
+                    .await
+                    .map(|_| ()),
+                None => state.store.mark_host_offline(host_id).await,
+            };
         }
     }
 }
@@ -752,6 +772,31 @@ pub(crate) async fn handle_node_method(
             };
             *host_id = Some(host.host_id.clone());
             *hello_done = true;
+            // c-dirpicker r10 item 1: adopt the new link generation BEFORE the
+            // transport is registered. Commands can only be forwarded once
+            // the registry slot below exists, so every DELETE issued on this
+            // new link stamps the new generation and the post-hello sweep
+            // attributes it to the live link; unregister intents the dead
+            // previous link left behind carry the old value and are aborted.
+            // Durable and monotonic, so hub restarts and backward wall-clock
+            // steps neither reuse nor move a generation.
+            //
+            // r11 item 2: the bumped value is stored IN the registry slot
+            // together with the transport. `ConnectedNodes::pin` hands the pair
+            // out atomically, so a forwarding attempt stamps and rides the very
+            // same link even while a half-open previous session is still
+            // registered during this hello window.
+            //
+            // r40: the bump also precedes `apply_inventory`, which marks the
+            // host online. A replaced socket's teardown may still be running
+            // (its staleness was decided before this hello); its offline write
+            // applies only while the host is still on the link that socket
+            // registered (`mark_host_offline_for_link`), so once this bump has
+            // landed it can no longer overwrite this hello's online state.
+            let link_generation = state
+                .store
+                .bump_host_link_generation(host.host_id.clone())
+                .await?;
             let mut inventory = inventory::from_node_params(&params);
             if inventory.transport.is_none() {
                 inventory.transport = Some(TransportKind::OutboundWss);
@@ -780,24 +825,6 @@ pub(crate) async fn handle_node_method(
                     .await?;
             }
             reconcile_lost_instances(state, &host.host_id, &params).await?;
-            // c-dirpicker r10 item 1: adopt the new link generation BEFORE the
-            // transport is registered. Commands can only be forwarded once
-            // the registry slot below exists, so every DELETE issued on this
-            // new link stamps the new generation and the post-hello sweep
-            // attributes it to the live link; unregister intents the dead
-            // previous link left behind carry the old value and are aborted.
-            // Durable and monotonic, so hub restarts and backward wall-clock
-            // steps neither reuse nor move a generation.
-            //
-            // r11 item 2: the bumped value is stored IN the registry slot
-            // together with the transport. `ConnectedNodes::pin` hands the pair
-            // out atomically, so a forwarding attempt stamps and rides the very
-            // same link even while a half-open previous session is still
-            // registered during this hello window.
-            let link_generation = state
-                .store
-                .bump_host_link_generation(host.host_id.clone())
-                .await?;
             let inserted = state
                 .nodes
                 .insert_with_generation(

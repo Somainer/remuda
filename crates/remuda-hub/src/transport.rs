@@ -794,18 +794,29 @@ impl ConnectedNodes {
 
     /// Drop the session only if `generation` is still current (stale WS must not offline a live host).
     pub async fn remove_generation(&self, host_id: &str, generation: u64) -> bool {
+        self.remove_generation_link(host_id, generation)
+            .await
+            .is_some()
+    }
+
+    /// [`Self::remove_generation`], also returning the durable link generation
+    /// the removed session registered with (`None` = nothing removed). The
+    /// teardown uses it so its offline write applies only while the host is
+    /// still on that link.
+    pub async fn remove_generation_link(&self, host_id: &str, generation: u64) -> Option<i64> {
         let _authority = self.host_authority(host_id).await.write_owned().await;
         let removed = {
             let mut inner = self.inner.lock().await;
             match inner.get(host_id) {
                 Some(slot) if slot.generation == generation => {
+                    let link_generation = slot.link_generation;
                     inner.remove(host_id);
-                    true
+                    Some(link_generation)
                 }
-                _ => false,
+                _ => None,
             }
         };
-        if removed {
+        if removed.is_some() {
             // The guard is still held; clear the mark only when it was this
             // exact generation. A stale older socket's remove_generation(old)
             // matched nothing and never reaches here, so it cannot clear a

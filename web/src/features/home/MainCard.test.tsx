@@ -200,7 +200,7 @@ describe("MainCard", () => {
     renderCard();
     expect(screen.getByTestId("main-card-reply").getAttribute("data-kind")).toBe("rejected");
     await user.click(screen.getByTestId("main-card-send-current"));
-    expect(send).toHaveBeenCalledWith("ins_g2", "还在吗");
+    expect(send).toHaveBeenCalledWith("ins_g2", "还在吗", [], []);
   });
 
   it("an unknown outcome is reconciled by one read, never resent", async () => {
@@ -401,5 +401,71 @@ describe("the carried reply belongs to its lineage (r2 item 2)", () => {
     renderCard();
     await waitFor(() => expect(eventsRead).toHaveBeenCalledWith(expect.objectContaining({ journalId: "jrn_g2" })));
     expect(screen.getByTestId("main-card-reply").textContent).toBe("记住我");
+  });
+});
+
+describe("重试 keeps the message's attachments (r2 item 6)", () => {
+  const attached = {
+    objectId: "obj_shot",
+    name: "shot.png",
+    previewUrl: "blob:shot",
+    kind: "image" as const,
+    mediaType: "image/png",
+    size: 4,
+    index: 1,
+  };
+
+  it("重试 on the same chapter resends the text with the same attachment refs and previews", async () => {
+    const user = userEvent.setup();
+    hub.bubbles = [
+      {
+        clientRequestId: "loc_att" as Id,
+        instanceId: "ins_main" as Id,
+        text: "看图 [Image #1]",
+        commandId: "cmd_att" as Id,
+        state: "unknown",
+        outboxState: "rejected",
+        outboxError: "node busy",
+        attachments: [attached],
+        createdAt: "2026-10-30T11:00:00Z",
+      },
+    ];
+    renderCard();
+    await user.click(screen.getByTestId("main-card-retry"));
+    expect(send).toHaveBeenCalledWith(
+      "ins_main",
+      "看图 [Image #1]",
+      [{ index: 1, objectId: "obj_shot", kind: "image", mediaType: "image/png", name: "shot.png", size: 4 }],
+      [attached],
+    );
+  });
+
+  it("发送给当前 Main cannot carry another chapter's attachments: it is disabled and says why", async () => {
+    const user = userEvent.setup();
+    main = {
+      instance: chapter({ id: "ins_g2" as Id, generation: 2, lineageId: "ins_main" as Id }),
+      lineageId: "ins_main" as Id,
+      generation: 2,
+      live: true,
+      chapterIds: ["ins_main" as Id, "ins_g2" as Id],
+    };
+    hub.bubbles = [
+      {
+        clientRequestId: "loc_att2" as Id,
+        instanceId: "ins_main" as Id,
+        text: "看图 [Image #1]",
+        commandId: "cmd_att2" as Id,
+        state: "unknown",
+        outboxState: "rejected",
+        attachments: [attached],
+        createdAt: "2026-10-30T11:00:00Z",
+      },
+    ];
+    renderCard();
+    const action = screen.getByTestId("main-card-send-current");
+    expect(action).toBeDisabled();
+    expect(screen.getByTestId("main-card-reply").textContent).toContain("附件");
+    await user.click(action);
+    expect(send).not.toHaveBeenCalled();
   });
 });

@@ -2,7 +2,8 @@ import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { StateDot } from "../../components/StateDot";
 import { readDraft, writeDraft } from "../../lib/drafts";
-import { hubStore, useHub, useMainEntry, type MainEntry } from "../../lib/store";
+import type { AttachmentRef } from "../../lib/attachments";
+import { hubStore, useHub, useMainEntry, type LocalBubble, type MainEntry } from "../../lib/store";
 import { useNowTick } from "../../lib/useNowTick";
 import type { Id } from "../../types/wire";
 import { Composer } from "../session/Composer";
@@ -87,7 +88,7 @@ function MainCardBody({ entry, placement }: { entry: MainEntry; placement: "phon
       <EchoLine
         echo={echo}
         checking={checking}
-        onRetry={(text) => void hubStore.send(instance.id as Id, text)}
+        onRetry={(bubble) => resend(instance.id as Id, bubble)}
         onReconcile={async (commandId) => {
           setChecking(true);
           try {
@@ -207,6 +208,24 @@ function AskMain({ entry }: { entry: MainEntry }) {
   );
 }
 
+/**
+ * 重试 / 发送给当前 Main: a NEW send of the rejected message — its text and
+ * the same attachment refs and previews. Only reached for a message whose
+ * attachments are valid for `target` (same chapter, or none).
+ */
+function resend(target: Id, bubble: LocalBubble): Promise<boolean> {
+  const previews = bubble.attachments ?? [];
+  const refs: AttachmentRef[] = previews.map((item, position) => ({
+    index: item.index ?? position + 1,
+    objectId: item.objectId,
+    kind: item.kind,
+    mediaType: item.mediaType,
+    name: item.name,
+    size: item.size,
+  }));
+  return hubStore.send(target, bubble.text, refs, previews);
+}
+
 /** Draft scope of the 问 Main input: one per Main lineage. */
 function askScope(lineageId: string): string {
   return `main-ask:${lineageId}`;
@@ -238,9 +257,12 @@ function EchoLine({
 }: {
   echo: MainEcho;
   checking: boolean;
-  onRetry: (text: string) => void;
+  onRetry: (bubble: LocalBubble) => void;
   onReconcile: (commandId: string) => void;
 }) {
+  // Hub objects are bound to the chapter they were uploaded under, so a
+  // message with attachments cannot move to another chapter (r2 item 6).
+  const stranded = echo.kind === "rejected" && echo.superseded && (echo.bubble.attachments?.length ?? 0) > 0;
   const text = useMemo(() => {
     switch (echo.kind) {
       case "empty":
@@ -249,12 +271,14 @@ function EchoLine({
         // Not read yet, or unreadable right now: a neutral mark, never the
         // claim that Main has not replied.
         return "—";
-      case "rejected":
-        return echo.reason ? `${echo.text}：${echo.reason}` : echo.text;
+      case "rejected": {
+        const line = echo.reason ? `${echo.text}：${echo.reason}` : echo.text;
+        return stranded ? `${line} · 含附件，请在当前 Main 重新添加` : line;
+      }
       default:
         return echo.text;
     }
-  }, [echo]);
+  }, [echo, stranded]);
   return (
     <div className={css.line2} data-testid="main-card-reply" data-kind={echo.kind} role={echo.kind === "rejected" ? "alert" : undefined}>
       <span className={css.replyText} title={text}>
@@ -265,9 +289,11 @@ function EchoLine({
           type="button"
           className={css.action}
           data-testid={echo.superseded ? "main-card-send-current" : "main-card-retry"}
+          disabled={stranded}
+          title={stranded ? "附件属于原来的章节，无法转发；请在当前 Main 重新添加" : undefined}
           // A NEW send with a new commandId (D-055: never an automatic resend
           // under a new id — this is the owner's explicit choice).
-          onClick={() => onRetry(echo.bubble.text)}
+          onClick={() => onRetry(echo.bubble)}
         >
           {echo.superseded ? "发送给当前 Main" : "重试"}
         </button>

@@ -2042,7 +2042,7 @@ R1–R3 已经回答原调研的记忆、来源与续跑三问。下面六问仍
 - **不依赖任何在途或未派出的 ma-* 任务（关键路径）：** `cb-memory-core`，其后 `cb-memory-guard`、`cb-memory-inject`、`cb-memory-ui`；`cb-digest`；`cb-skill`；`cb-errors`。
 - **ma-initiator 落地后：** `cb-rootturn`，其后 `cb-requested-by`。
 - **ma-initiator、ma-fence、ma-restart 落地后：** `cb-inbox-facts`，其后 `cb-inbox-deliver`、`cb-stall-tooluse`；`cb-inbox-deliver` 之后是 `cb-usage-resume`、`cb-wake-engine`（其后 `cb-wake-check`）和 `cb-owner-notify`。
-- **能力台账的后续任务**（main-agent.md §15.2）：`ap-command-read`（Agent 按 commandId 读命令结果，D-055 对账所需）、`ap-agent-list`（让 `remuda instance list` 与 `remuda agents` 在 Agent 来源下可用）、`ap-gate-reads`、`ap-configure`、`ap-configure-mode`（先要所有者决定 OA1 如何作用于权限模式的变更）、`ap-resume`、`ap-attachments`、`ap-subagent-read`、`ap-host-read`、`ap-supply-read`、`ap-supply-event`。
+- **能力台账的后续任务**（main-agent.md §15.2）：`ap-command-read`（Agent 按 commandId 读命令结果，D-055 对账所需）、`ap-agent-list`（让 `remuda instance list` 与 `remuda agents` 在 Agent 来源下可用）、`ap-own-scope`（`own claim`/`own release` 今天只查 `dispatch`、不查目标任务的项目 scope，补上并加跨项目的反例测试）、`ap-gate-reads`、`ap-configure`、`ap-configure-mode`（先要所有者决定 OA1 如何作用于权限模式的变更）、`ap-resume`、`ap-attachments`、`ap-subagent-read`、`ap-host-read`、`ap-supply-read`、`ap-supply-event`。
 - **未派出 ma-* 任务的 brief 修订**（派出前改 brief；在途的 ma-initiator 不改）：
   - ma-admission：creator 的权限模式在提交点读取，即租借 worktree 或 pool 之后的创建事务里，并复核 generation；准备期间 creator 改了模式，创建中止；Node 物化器拒绝过期的盖章。
   - ma-skill：并入 `cb-skill`，加上按启动事实生成的能力段。

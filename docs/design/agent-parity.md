@@ -179,8 +179,8 @@ The page's create form is not wired to the Hub yet (`web/src/features/fleet/stor
 | `task show` | `GET /v1/tasks/{id}` | Agent route. Project scope only, no grant | — |
 | `task split` | `POST /v1/tasks/{id}/split` | Agent route. `dispatch` and scope | — |
 | `task set-state` | `PATCH /v1/tasks/{id}` | Agent route. `dispatch` and scope | — |
-| `own claim` | `POST /v1/tasks/{id}/own` | Agent route. **`dispatch`** and scope (`require_dispatch` in `claim_own`) | — |
-| `own release` | `DELETE /v1/tasks/{id}/own` | Agent route. **`dispatch`** and scope (`require_dispatch` in `release_own`) | — |
+| `own claim` | `POST /v1/tasks/{id}/own` | Agent route. **`dispatch` is enforced; the target task's project scope is not.** `claim_own` calls `require_dispatch` (grant only) and then mutates the named task; unlike every other task mutation (`create_task`, `set_task_state`, `archive_task`, `split_task`, `add_placement`), it never calls `require_project_scope` (`crates/remuda-hub/src/tasks.rs`). An Agent with `dispatch` can therefore claim paths on a task in a project outside its scope | `ap-own-scope` |
+| `own release` | `DELETE /v1/tasks/{id}/own` | Agent route. **`dispatch` is enforced; the target task's project scope is not**, exactly as for `own claim` (`release_own`). An Agent with `dispatch` can release another project's claims | `ap-own-scope` |
 | `own check` | `POST /v1/own/check` | Agent route. Project scope only, no grant | — |
 | `own list` | `GET /v1/own` | Agent route. Project scope only, no grant | — |
 
@@ -304,6 +304,7 @@ Every Gap row above, by the task that closes it. The `ap-*` tasks are defined in
 | `ap-resume` | resuming an owned instance that is not a worker |
 | `ap-attachments` | attaching a file; opening an attachment of an owned session |
 | `ap-subagent-read` | a subagent's transcript |
+| `ap-own-scope` | the missing target-project scope check on `own claim` and `own release` (an over-broad Agent route today, not a missing one) |
 | `ap-host-read` | the host list, a host's workspaces and `doctor`, for hosts in the caller's scope |
 | `ap-supply-read` | `profile catalog`, `list`, `show`, `usage`, `probe`; the provider list; the model and supply catalog |
 | `ap-supply-event` | `profile event` |

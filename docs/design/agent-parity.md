@@ -200,19 +200,21 @@ The page's create form is not wired to the Hub yet (`web/src/features/fleet/stor
 
 ### Workers: `remuda dispatch`, `worker`, `watch`, `report`, `retire`, `brief send`, `hostcap`
 
+The worker subcommands send the worker's name or `wkr_…` id as given; the Hub resolves it (`resolve_worker` in `crates/remuda-hub/src/workers.rs`).
+
 | Subcommand | Hub route | Today (origin/main) | Planned |
 |---|---|---|---|
 | `dispatch` | `POST /v1/workers/dispatch` | Gap. `restrict_agent_routes` does not admit `/v1/workers/*`, and dispatch writes a control-off mode for every harness (main-agent.md §4.2) | `ma-admission` |
-| `watch` | `POST /v1/workers/observe`, `POST /v1/workers/{id}/state`, `GET /v1/gate/jobs`, `GET /v1/instances` | Gap. The worker and cross-project gate routes are not admitted | `ma-admission`; `ap-gate-reads` |
-| `report` | `GET /v1/workers`, `POST /v1/workers/{id}/state`, gate job reads | Gap. Worker routes are not admitted; without `--project` it also reads `GET /v1/gate/jobs` | `ma-admission`; `ap-gate-reads` |
-| `retire` | `GET /v1/workers/{id}` (resolving the worker), `POST /v1/workers/{id}/retire` | Gap. Not admitted | `ma-admission`, with lineage-subtree ownership (main-agent.md §4.2 item 1) |
-| `worker nudge` | `GET /v1/workers/{id}` (resolving the worker), `POST /v1/workers/{id}/nudge` | Gap. Not admitted | `ma-admission`, as `retire` |
-| `worker answer` | `GET /v1/workers/{id}` (resolving the worker), `POST /v1/workers/{id}/answer` | Gap. Not admitted | `ma-admission` admits it; it writes keys, so every Agent use then needs the D-017 approval (Safety, main-agent.md §13) |
-| `worker switch-model` | `GET /v1/workers/{id}` (resolving the worker), `POST /v1/workers/{id}/switch-model` | Gap. Not admitted | `ma-admission`, as `retire` |
-| `worker resume` | `GET /v1/workers/{id}` (resolving the worker), `POST /v1/workers/{id}/resume` | Gap. Not admitted | `ma-admission` (scoped respawn helper) |
-| `worker replace` | `GET /v1/workers/{id}` (resolving the worker), `POST /v1/workers/{id}/replace` | Gap. Not admitted | `ma-admission` (scoped respawn helper) |
-| `worker stop` | `GET /v1/workers/{id}` (resolving the worker), `POST /v1/workers/{id}/stop` | Gap. Not admitted | `ma-admission`, as `retire` |
-| `brief send` | `GET /v1/workers/{id}` (resolving the worker), `POST /v1/workers/{id}/brief` | Gap. Not admitted | `ma-admission`, as `retire` |
+| `watch` | `POST /v1/workers/observe`, `GET /v1/instances`, `GET /v1/gate/jobs` (active jobs) or `GET /v1/projects/{id}/gate` with `--project` | Gap. `/v1/workers/*` and the cross-project gate read are not admitted | `ma-admission`; `ap-gate-reads` |
+| `report` | `GET /v1/workers`, and the gate queue: `GET /v1/projects/{id}/gate` with `--project`, otherwise `GET /v1/gate/jobs` | Gap. Worker routes are not admitted; without `--project` the gate read is refused too | `ma-admission`; `ap-gate-reads` |
+| `retire` | `POST /v1/workers/{id}/retire` | Gap. Not admitted | `ma-admission`, with lineage-subtree ownership (main-agent.md §4.2 item 1) |
+| `worker nudge` | `POST /v1/workers/{id}/nudge` | Gap. Not admitted | `ma-admission`, as `retire` |
+| `worker answer` | `POST /v1/workers/{id}/answer` | Gap. Not admitted | `ma-admission` admits it; it writes keys, so every Agent use then needs the D-017 approval (Safety, main-agent.md §13) |
+| `worker switch-model` | `POST /v1/workers/{id}/switch-model` | Gap. Not admitted | `ma-admission`, as `retire` |
+| `worker resume` | `POST /v1/workers/{id}/resume` | Gap. Not admitted | `ma-admission` (scoped respawn helper) |
+| `worker replace` | `POST /v1/workers/{id}/replace` | Gap. Not admitted | `ma-admission` (scoped respawn helper) |
+| `worker stop` | `POST /v1/workers/{id}/stop` | Gap. Not admitted | `ma-admission`, as `retire` |
+| `brief send` | `POST /v1/workers/{id}/brief` | Gap. Not admitted | `ma-admission`, as `retire` |
 | `hostcap` | `GET /v1/hosts/{id}/hostcap` | Agent route. `dispatch` and host scope (D-045) | — |
 
 ### Fleet, host files and diagnostics
@@ -285,7 +287,7 @@ On origin/main no PWA action and no CLI subcommand calls these routes, so they h
 - `POST /v1/hosts/{id}/files/objects`: a Node staging file bytes, under a host credential.
 - `POST /v1/hosts/enroll-token`: mints a host-enrolment credential; neither the PWA nor the CLI calls it (a Node reads its enrolment token from a file).
 - `GET /v1/lineages/{id}`: no client reads it yet (`ma-main-ui` will); Agent-admitted for the caller's own lineage.
-- `GET /v1/instances/{id}/usage`, `GET /v1/hosts/{id}`, `GET /v1/hosts/{id}/workspaces`, `GET /v1/worktrees`, `POST /v1/worktrees/{name}/lease`, `POST /v1/worktrees/{name}/return`, `GET /v1/fleet/{id}`, `POST /v1/fleet/{id}/commands`, `POST /v1/placement/resolve`, `POST /v1/tasks/{id}/land`, `POST /v1/tasks/{id}/placements`, `DELETE /v1/projects/{id}`: API routes with no PWA or CLI caller today.
+- `GET /v1/instances/{id}/usage`, `GET /v1/hosts/{id}`, `GET /v1/hosts/{id}/workspaces`, `GET /v1/worktrees`, `POST /v1/worktrees/{name}/lease`, `POST /v1/worktrees/{name}/return`, `GET /v1/fleet/{id}`, `POST /v1/fleet/{id}/commands`, `POST /v1/placement/resolve`, `POST /v1/tasks/{id}/land`, `POST /v1/tasks/{id}/placements`, `DELETE /v1/projects/{id}`, `GET /v1/workers/{id}`, `POST /v1/workers/{id}/state`: API routes with no PWA or CLI caller today (only Hub tests call the last).
 - The static web fallback: it serves the PWA's files.
 
 ## Not agent actions

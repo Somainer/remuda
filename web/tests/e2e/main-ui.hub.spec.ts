@@ -158,7 +158,16 @@ test.describe("desktop Main entry", () => {
     await bar.getByTestId("main-chapters-toggle").click();
     await expect(bar.getByTestId("main-chapter-divider")).toHaveCount(2);
     await expect(bar.getByTestId("main-chapter-divider").last()).toContainText("你恢复");
+    // An owner resume is not a restart (r2 item 5).
+    await expect(bar.getByTestId("main-status-restarts")).toHaveText("24 小时内无重启");
     await shot(page, "main-ui-chapters.png");
+
+    // r2 item 4: the predecessor's page offers no resume, only the current Main.
+    await page.goto(`/s/${firstId}`);
+    await expect(page.getByTestId("ended-bar")).toBeVisible({ timeout: 20_000 });
+    await expect(page.getByTestId("ended-open-current-main")).toHaveAttribute("href", `/s/${secondId}`);
+    await expect(page.getByTestId("resume-control")).toHaveCount(0);
+    await expect(page.getByTestId("main-resume")).toHaveCount(0);
   });
 });
 

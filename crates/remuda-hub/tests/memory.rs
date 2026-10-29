@@ -568,6 +568,105 @@ async fn another_lineages_agent_and_a_bot_are_refused_both_ways() -> Result<()> 
     Ok(())
 }
 
+/// r3 item 1: a Bot credential stays refused when it names a chapter with
+/// `x-remuda-instance-id`: the refusal is decided on the authenticated device,
+/// before narrowing. A Human narrowing to the current chapter still writes
+/// as that Agent.
+#[tokio::test]
+async fn a_bot_cannot_reach_memory_by_naming_a_chapter() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let lineage = ctx.seat().await?;
+    let seat = ctx.agent(&lineage).await?;
+    let bot = ctx.hub.mint_bot_device_token("memory-bot-narrowed").await?;
+    for slug in ["private", "other"] {
+        ctx.ok(
+            "POST",
+            &mem(&lineage, ""),
+            &seat,
+            Some(entry(slug, "user", "the owner's secret")),
+        )
+        .await?;
+    }
+    let consolidate = json!({
+        "sources": [{"slug": "private", "expectedRevision": 1},
+                    {"slug": "other", "expectedRevision": 1}],
+        "entry": entry("merged", "user", ""),
+    });
+    let attempts: Vec<(&str, String, Option<Value>)> = vec![
+        ("GET", mem(&lineage, ""), None),
+        ("GET", mem(&lineage, "/entries/private"), None),
+        ("GET", mem(&lineage, "/search?q=secret"), None),
+        ("GET", mem(&lineage, "/index"), None),
+        (
+            "POST",
+            mem(&lineage, ""),
+            Some(entry("planted", "user", "")),
+        ),
+        (
+            "PUT",
+            mem(&lineage, "/entries/private"),
+            Some(json!({"expectedRevision": 1, "body": "overwritten"})),
+        ),
+        (
+            "DELETE",
+            mem(&lineage, "/entries/other?expectedRevision=1"),
+            None,
+        ),
+        ("POST", mem(&lineage, "/consolidate"), Some(consolidate)),
+        ("POST", mem(&lineage, "/restore"), Some(json!({}))),
+        (
+            "GET",
+            format!("/v1/memory/derived?instanceId={lineage}"),
+            None,
+        ),
+    ];
+    for (method, path, body) in &attempts {
+        let reply = ctx
+            .call(method, path, &bot, Some(&lineage), body.clone())
+            .await?;
+        assert_eq!(
+            reply.status, 403,
+            "bot narrowed to the current chapter: {method} {path}: {}",
+            reply.body
+        );
+    }
+    // Nothing moved.
+    let listed = ctx.ok("GET", &mem(&lineage, ""), &ctx.human, None).await?;
+    let state: Vec<(String, u64, String)> = listed["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            (
+                e["slug"].as_str().unwrap().to_string(),
+                e["revision"].as_u64().unwrap(),
+                e["body"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        state,
+        [
+            ("other".to_string(), 1, "the owner's secret".to_string()),
+            ("private".to_string(), 1, "the owner's secret".to_string()),
+        ]
+    );
+    // A Human narrowing to the current chapter acts as that chapter.
+    let narrowed = ctx
+        .call(
+            "POST",
+            &mem(&lineage, ""),
+            &ctx.human,
+            Some(&lineage),
+            Some(entry("by-narrowing", "user", "")),
+        )
+        .await?;
+    assert_eq!(narrowed.status, 200, "{}", narrowed.body);
+    assert_eq!(narrowed.body["entry"]["origin"], "agent");
+    assert_eq!(narrowed.body["entry"]["writerInstance"], json!(lineage));
+    Ok(())
+}
+
 #[tokio::test]
 async fn retiring_a_lineage_archives_and_the_owner_restores() -> Result<()> {
     let ctx = Ctx::spawn().await?;

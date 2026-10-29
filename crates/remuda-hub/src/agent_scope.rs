@@ -29,7 +29,28 @@ pub fn origin(device: &Device) -> InputOrigin {
 
 /// A caller header can narrow a Human/Bot token; it cannot promote a scoped token.
 pub async fn caller(state: &AppState, headers: &HeaderMap) -> Result<Device, HubError> {
-    let mut device = auth::require_device(&state.store, headers).await?;
+    let device = auth::require_device(&state.store, headers).await?;
+    narrow(state, headers, device).await
+}
+
+/// The authenticated device and the caller it narrows to, for a boundary
+/// that must decide on how the credential authenticated as well as on whom
+/// it acts for (D-060 memory refuses a Bot credential whatever it names).
+pub async fn authenticated_caller(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(Device, Device), HubError> {
+    let authenticated = auth::require_device(&state.store, headers).await?;
+    let narrowed = narrow(state, headers, authenticated.clone()).await?;
+    Ok((authenticated, narrowed))
+}
+
+/// Apply `x-remuda-instance-id` to an authenticated device.
+async fn narrow(
+    state: &AppState,
+    headers: &HeaderMap,
+    mut device: Device,
+) -> Result<Device, HubError> {
     if let Some(raw) = headers.get("x-remuda-instance-id") {
         let id = raw.to_str().map_err(|_| HubError::Forbidden)?;
         if device

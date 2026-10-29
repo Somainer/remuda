@@ -30,11 +30,11 @@
 //! the same transaction as the row.
 
 use crate::AppState;
-use crate::agent_scope::{caller, origin};
+use crate::agent_scope::{authenticated_caller, origin};
 use crate::auth::require_origin;
 use crate::config::now_rfc3339;
 use crate::error::HubError;
-use crate::store::{Store, StoreError, immediate_tx};
+use crate::store::{Device, Store, StoreError, immediate_tx};
 use axum::Json;
 use axum::Router;
 use axum::extract::{Path, Query, State};
@@ -1324,14 +1324,28 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/memory/derived", get(derived))
 }
 
+/// The caller at the memory boundary: the narrowed identity it acts as, after
+/// refusing a Bot credential on how it AUTHENTICATED. `x-remuda-instance-id`
+/// turns any unbound device into that chapter's Agent, so deciding on the
+/// narrowed caller alone would let a Bot act as any chapter it can name.
+async fn memory_device(state: &AppState, headers: &HeaderMap) -> Result<Device, HubError> {
+    require_origin(headers, &state.config)?;
+    let (authenticated, narrowed) = authenticated_caller(state, headers).await?;
+    // A Bot relays other people's words; memory is the owner's and the
+    // seat's only (D-060).
+    if origin(&authenticated) == InputOrigin::Bot {
+        return Err(HubError::Forbidden);
+    }
+    Ok(narrowed)
+}
+
 /// The authenticated memory caller of one lineage.
 async fn memory_caller(
     state: &AppState,
     headers: &HeaderMap,
     lineage_id: &str,
 ) -> Result<MemoryWriter, HubError> {
-    require_origin(headers, &state.config)?;
-    let device = caller(state, headers).await?;
+    let device = memory_device(state, headers).await?;
     match origin(&device) {
         InputOrigin::Human => Ok(MemoryWriter::Owner),
         InputOrigin::Agent => {
@@ -1346,15 +1360,12 @@ async fn memory_caller(
             }
             Ok(MemoryWriter::Agent { instance_id: bound })
         }
-        // A Bot relays other people's words; memory is the owner's and the
-        // seat's only (D-060).
         _ => Err(HubError::Forbidden),
     }
 }
 
 async fn require_owner(state: &AppState, headers: &HeaderMap) -> Result<(), HubError> {
-    require_origin(headers, &state.config)?;
-    let device = caller(state, headers).await?;
+    let device = memory_device(state, headers).await?;
     if origin(&device) == InputOrigin::Human {
         Ok(())
     } else {

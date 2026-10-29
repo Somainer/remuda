@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { StateDot } from "../../components/StateDot";
 import { readDraft, writeDraft } from "../../lib/drafts";
@@ -59,6 +59,8 @@ function MainCardBody({ entry, placement }: { entry: MainEntry; placement: "phon
     online,
   });
   const [checking, setChecking] = useState(false);
+  const [retrying, setRetrying] = useState(false);
+  const retryingRef = useRef(false);
   const desktop = placement === "desktop";
   const modelWord = instance.modelEffective?.id ?? instance.model ?? null;
   const effortWord = instance.effortEffective?.name ?? instance.effortName ?? null;
@@ -88,7 +90,17 @@ function MainCardBody({ entry, placement }: { entry: MainEntry; placement: "phon
       <EchoLine
         echo={echo}
         checking={checking}
-        onRetry={(bubble) => resend(instance.id as Id, bubble)}
+        retrying={retrying}
+        onRetry={(bubble) => {
+          // One send per tap: a double tap never sends twice (r2 item 8).
+          if (retryingRef.current) return;
+          retryingRef.current = true;
+          setRetrying(true);
+          void resend(instance.id as Id, bubble).finally(() => {
+            retryingRef.current = false;
+            setRetrying(false);
+          });
+        }}
         onReconcile={async (commandId) => {
           setChecking(true);
           try {
@@ -252,11 +264,14 @@ function adoptChapterDrafts(scope: string, entry: MainEntry) {
 function EchoLine({
   echo,
   checking,
+  retrying,
   onRetry,
   onReconcile,
 }: {
   echo: MainEcho;
   checking: boolean;
+  /** A 重试 / 发送给当前 Main send is in flight. */
+  retrying: boolean;
   onRetry: (bubble: LocalBubble) => void;
   onReconcile: (commandId: string) => void;
 }) {
@@ -289,7 +304,7 @@ function EchoLine({
           type="button"
           className={css.action}
           data-testid={echo.superseded ? "main-card-send-current" : "main-card-retry"}
-          disabled={stranded}
+          disabled={stranded || retrying}
           title={stranded ? "附件属于原来的章节，无法转发；请在当前 Main 重新添加" : undefined}
           // A NEW send with a new commandId (D-055: never an automatic resend
           // under a new id — this is the owner's explicit choice).

@@ -469,3 +469,30 @@ describe("重试 keeps the message's attachments (r2 item 6)", () => {
     expect(send).not.toHaveBeenCalled();
   });
 });
+
+describe("重试 in flight (r2 item 8)", () => {
+  it("a double tap sends once; the action is disabled until the send settles", async () => {
+    const user = userEvent.setup();
+    let settle!: (value: boolean) => void;
+    send.mockReset().mockReturnValue(new Promise<boolean>((resolve) => (settle = resolve)));
+    hub.bubbles = [
+      {
+        clientRequestId: "loc_dbl" as Id,
+        instanceId: "ins_main" as Id,
+        text: "再来一次",
+        commandId: "cmd_dbl" as Id,
+        state: "unknown",
+        outboxState: "rejected",
+        createdAt: "2026-10-30T11:00:00Z",
+      },
+    ];
+    renderCard();
+    const action = screen.getByTestId("main-card-retry");
+    await user.dblClick(action);
+    await user.click(action);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(action).toBeDisabled();
+    await act(async () => settle(true));
+    expect(screen.getByTestId("main-card-retry")).toBeEnabled();
+  });
+});

@@ -491,8 +491,11 @@
 }
 
 .askRoot .input {
-  min-height: var(--control-h);
-  max-height: calc(var(--composer-row) * 2);
+  /* One control row (the textarea's default is two rows); longer drafts
+     scroll inside it, so the whole input stays a 56px row. */
+  height: var(--control-h-lg);
+  min-height: var(--control-h-lg);
+  max-height: var(--control-h-lg);
   padding: var(--space-2) var(--space-3);
   border-color: var(--border-control);
   background: var(--bg-input);

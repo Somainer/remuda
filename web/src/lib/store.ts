@@ -4057,21 +4057,37 @@ class HubStore {
       this.scheduleOwedTail(instanceId);
       return;
     }
-    // r7 item 2: evidence alone does not discharge a debt whose durable done
-    // the debt path still owes (a failed write awaiting its retry). Keep it;
-    // the awaited debt settlement retries it — an unrelated live batch must
-    // not cancel that.
-    if (this.owedDoneOutstanding(debt, this.outbox)) return;
+    // r7 item 2 / r8 item 1: evidence alone does not discharge a debt whose
+    // evidenced rows are not yet durably done on the Outbox — a failed debt
+    // write awaiting its retry, or the live/resync fold's fire-and-forget
+    // done patch that may still be in flight or have failed (the fold calls
+    // this synchronously right after firing it). Keep the debt and arm the
+    // awaited debt settlement: it commits or retries the done on its captured
+    // Outbox, then discharges. An unrelated live batch must not cancel that.
+    if (this.owedDoneStillOwed(instanceId, debt, this.outbox).length) {
+      this.scheduleOwedTail(instanceId, OWED_TAIL_BASE_BACKOFF_MS);
+      return;
+    }
     this.clearOwed(instanceId);
   }
 
-  /** r7 item 2: a command the debt path owes a durable done for is not yet done. */
-  private owedDoneOutstanding(debt: { owedDone: Set<Id> }, box: Outbox): boolean {
+  /**
+   * r7 item 2 / r8 item 1: the debt's owed commands whose durable done is
+   * still owed on `box` — derived from the evidence (debt read observation or
+   * folded store events) plus the row's ACTUAL state on that Outbox, together
+   * with any done write the debt path itself recorded as uncommitted.
+   */
+  private owedDoneStillOwed(
+    instanceId: Id,
+    debt: { commands: Set<Id>; observed: Set<Id>; owedDone: Set<Id> },
+    box: Outbox,
+  ): Id[] {
+    const owed = new Set<Id>(this.owedSettlementPending(instanceId, debt, box));
     for (const commandId of debt.owedDone) {
       const rec = box.get(commandId);
-      if (rec && rec.state !== "done" && rec.state !== "rejected") return true;
+      if (rec && rec.state !== "done" && rec.state !== "rejected") owed.add(commandId);
     }
-    return false;
+    return [...owed];
   }
 
   /**
@@ -4368,7 +4384,8 @@ class HubStore {
     // obligation retained, never a silent strand.
     const settleOrClear = () => {
       if (!box || !debt) return;
-      if (!this.owedDoneOutstanding(debt, box)) {
+      const stillOwed = this.owedDoneStillOwed(instanceId, debt, box);
+      if (!stillOwed.length) {
         this.clearOwed(instanceId);
         return;
       }
@@ -4377,9 +4394,7 @@ class HubStore {
         this.scheduleOwedTail(instanceId, OWED_TAIL_BASE_BACKOFF_MS);
         return;
       }
-      for (const commandId of debt.owedDone) {
-        const rec = box.get(commandId);
-        if (!rec || rec.state === "done" || rec.state === "rejected") continue;
+      for (const commandId of stillOwed) {
         this.owedPresentedUnknown.add(commandId);
         this.syncBubbleFromOutbox(commandId);
       }

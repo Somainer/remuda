@@ -1,7 +1,7 @@
 import { afterEach, expect, it, vi } from "vitest";
 import type { CommandResult } from "../types/command";
 import type { Observation } from "../types/observation";
-import { OUTBOX_LS_KEY, type OutboxRecord } from "./outbox";
+import { OUTBOX_LS_KEY, type Outbox as OutboxInstance, type OutboxRecord } from "./outbox";
 
 /**
  * Ruling AD (outboxdebt r1): catch-up debt for a drained (sent-while-offline)
@@ -1164,27 +1164,38 @@ it("r4 item 2: a queued tail pass whose debt generation was cleared still lets t
   void h.chainReconcile(INSTANCE, () => new Promise<void>((resolve) => (releaseBlock = resolve)));
   h.runOwedTailPass(INSTANCE);
 
-  // Live evidence for the first command clears D1 while the pass waits.
+  // Live evidence for the first command clears D1 while the pass waits. The
+  // fold's done patch is fire-and-forget, so the fold itself keeps the debt
+  // (r8 item 1); once the row is durably done, the next live frame's
+  // reevaluation finds nothing owed and discharges D1.
   const onBatch = await liveBatch(api);
+  const liveMessage = (seq: number, eventId: string, payload: Record<string, unknown>) =>
+    ({
+      kind: "message",
+      eventId,
+      journalId: JOURNAL,
+      instanceId: INSTANCE,
+      seq: String(seq),
+      completeness: "structured",
+      payload,
+    }) as unknown as Observation;
   onBatch({
     subscriptionId: "sub_outbox_debt",
     journalId: JOURNAL,
     fromSeq: "1",
     toSeq: "1",
     durableSeq: "1",
-    events: [
-      {
-        kind: "message",
-        eventId: "evt_user_first_live",
-        journalId: JOURNAL,
-        instanceId: INSTANCE,
-        seq: "1",
-        completeness: "structured",
-        payload: { role: "user", commandId: firstId },
-      } as unknown as Observation,
-    ],
+    events: [liveMessage(1, "evt_user_first_live", { role: "user", commandId: firstId })],
   });
   await vi.waitFor(() => expect(bubbleOf("first owed").outboxState).toBe("done"));
+  onBatch({
+    subscriptionId: "sub_outbox_debt",
+    journalId: JOURNAL,
+    fromSeq: "2",
+    toSeq: "2",
+    durableSeq: "2",
+    events: [liveMessage(2, "evt_assistant_after_first", { role: "assistant", text: "next" })],
+  });
   expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
 
   // A second drained send queues its post-drain job behind the stale pass.
@@ -2189,3 +2200,75 @@ it("r7 item 3: persistent done-write failures for C never strand D — D reaches
     vi.useRealTimers();
   }
 }, 30_000);
+
+it("r8 item 1: a live-evidenced command whose fire-and-forget done rejects keeps the debt until the next pass commits it", async () => {
+  // The live fold fires `void outbox.patch(C, done)` and reevaluates the debt
+  // synchronously. C is in store events but its row is not durably done, so
+  // the debt must survive (it used to clear right there), and the awaited
+  // debt settlement commits the done when that live write is lost. The live
+  // settlement path is unchanged: its write is rejected here through a spy on
+  // Outbox.prototype.patch, whose own promise tracking keeps that unchanged
+  // fire-and-forget rejection from surfacing as an unhandled error.
+  const { api, hubStore } = await fresh();
+  await mountFollow(api, hubStore);
+  vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+    const commandId = _args[4] as string;
+    return Promise.resolve(commandResult(commandId, "accepted"));
+  });
+  const h = hubStore as unknown as { outbox: { get: (id: string) => OutboxRecord | undefined } | null };
+
+  await hubStore.send(INSTANCE, "live-evidenced, live done lost");
+  const bubble = () => hubStore.getSnapshot().bubbles[0]!;
+  await vi.waitFor(() => expect(bubble().outboxState).toBe("sent"));
+  await vi.waitFor(() => expect(debtOf(hubStore).has(INSTANCE)).toBe(true));
+  const commandId = bubble().commandId!;
+
+  const { Outbox } = await import("./outbox");
+  const realPatch = Outbox.prototype.patch;
+  let liveDoneRejected = 0;
+  vi.spyOn(Outbox.prototype, "patch").mockImplementation(function (
+    this: OutboxInstance,
+    id: string,
+    patch: Partial<OutboxRecord>,
+  ) {
+    if (patch.state === "done" && id === commandId && liveDoneRejected === 0) {
+      liveDoneRejected += 1;
+      return Promise.reject(new Error("IDB_TRANSACTION_ABORTED"));
+    }
+    return realPatch.call(this, id, patch);
+  });
+
+  const onBatch = await liveBatch(api);
+  onBatch({
+    subscriptionId: "sub_outbox_debt",
+    journalId: JOURNAL,
+    fromSeq: "1",
+    toSeq: "1",
+    durableSeq: "1",
+    events: [
+      {
+        kind: "message",
+        eventId: "evt_user_live_lost_done",
+        journalId: JOURNAL,
+        instanceId: INSTANCE,
+        seq: "1",
+        completeness: "structured",
+        payload: { role: "user", commandId },
+      } as unknown as Observation,
+    ],
+  });
+  expect(liveDoneRejected).toBe(1);
+  // The fold's own reevaluation kept the debt: C's row is still sent.
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(true);
+  expect(h.outbox?.get(commandId)?.state).toBe("sent");
+
+  // The awaited debt settlement commits the done and only then discharges.
+  await vi.waitFor(
+    () => {
+      expect(h.outbox?.get(commandId)?.state).toBe("done");
+      expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+    },
+    { timeout: 3_000 },
+  );
+  expect(bubble().outboxState).toBe("done");
+}, 15_000);

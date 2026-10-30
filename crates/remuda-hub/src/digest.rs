@@ -1790,11 +1790,9 @@ async fn lineage_glance(
                     .and_then(Value::as_str)
                     .or_else(|| interaction.get("kind").and_then(Value::as_str))
                     .unwrap_or(&row.kind);
-                let kind = if kind == "permission" {
-                    "approval"
-                } else {
-                    kind
-                };
+                // The stored kind is a Node's untyped JSON: report the wire
+                // vocabulary only, exactly as the digest does.
+                let kind = clip_chars(pending_kind(kind), PENDING_KIND_CHARS);
                 let title = request
                     .get("title")
                     .and_then(Value::as_str)

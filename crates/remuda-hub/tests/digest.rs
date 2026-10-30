@@ -447,7 +447,7 @@ async fn digest_is_assembled_from_stored_rows_and_stays_within_budget() -> Resul
 async fn an_off_wire_pending_kind_keeps_the_response_within_budget() -> Result<()> {
     let ctx = Ctx::spawn().await?;
     let project = ctx.project("digest-kind").await?;
-    let (_coordinator, token) = ctx.coordinator(&project).await?;
+    let (coordinator, token) = ctx.coordinator(&project).await?;
     let (worker_id, instance_id) = ctx.worker_under(&token, &project, "c-kind", None).await?;
     // A Node journals untyped JSON, so the kind can be any length it likes.
     let wall = "k".repeat(3000);
@@ -469,6 +469,16 @@ async fn an_off_wire_pending_kind_keeps_the_response_within_budget() -> Result<(
     );
     let digest = json_of(&bytes);
     assert_eq!(digest["pending"]["kind"], "unknown");
+    // The glance reports the same vocabulary, never the raw string.
+    let glance = json_of(
+        &ctx.get(&token, &format!("/v1/lineages/{coordinator}/glance"))
+            .await?
+            .1,
+    );
+    assert_eq!(
+        glance["waiting"][0]["kind"], "unknown",
+        "an off-wire kind is not echoed: {glance}"
+    );
     Ok(())
 }
 

@@ -139,6 +139,27 @@ describe("an unsaved about-me draft survives reloads", () => {
     );
   });
 
+  it("keeps a brand-new about-me draft when the entry is still missing", async () => {
+    listMemory.mockResolvedValue([entry({ slug: "other" })]);
+    renderPage("/s/ins_x/memory");
+    const textarea = (await screen.findByTestId("memory-about-body")) as HTMLTextAreaElement;
+    await waitFor(() => expect(screen.getByTestId("memory-about-save")).not.toBeDisabled());
+    fireEvent.change(textarea, { target: { value: "new about draft" } });
+
+    // A search reloads the list and refreshes the still-missing about-me copy.
+    fireEvent.change(await screen.findByTestId("memory-search"), { target: { value: "边界" } });
+    await waitFor(() => expect(searchMemory).toHaveBeenCalled());
+    expect(textarea.value).toBe("new about draft");
+
+    fireEvent.click(screen.getByTestId("memory-about-save"));
+    await waitFor(() =>
+      expect(createMemory).toHaveBeenCalledWith(
+        "ins_l",
+        expect.objectContaining({ slug: "about-me", body: "new about draft" }),
+      ),
+    );
+  });
+
   it("offers the conflict choice when the server moved under a dirty draft", async () => {
     const first = entry({ slug: "about-me", body: "theirs v1", revision: 1 });
     const moved = entry({ slug: "about-me", body: "theirs v2", revision: 2 });

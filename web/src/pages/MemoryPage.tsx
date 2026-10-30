@@ -266,10 +266,13 @@ export function MemoryPage() {
     if (!aboutLoaded) return;
     const server = aboutEntry;
     if (!server) {
-      if (aboutBaseRevision === null) {
+      // Still missing: a NEW entry the owner is composing keeps its text; only
+      // a clean draft (nothing typed yet) is (re)set to empty.
+      if (aboutDraft === aboutCleanBody) {
         setAboutDraft("");
         setAboutCleanBody("");
       }
+      setAboutBaseRevision(null);
       return;
     }
     if (server.archivedAt != null) {

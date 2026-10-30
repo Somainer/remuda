@@ -359,11 +359,18 @@
   flex-wrap: wrap;
 }
 
+/* D-061 r3: the session-pinned card's options are the same authorization
+   choices as the inbox card's, so they carry the same exemption. */
 .allowBtn {
   composes: btnPrimary from "../../styles/ui.module.css";
+  composes: btnAllowWrap from "../../styles/ui.module.css";
 }
 
-.denyBtn,
+.denyBtn {
+  composes: btn from "../../styles/ui.module.css";
+  composes: btnAllowWrap from "../../styles/ui.module.css";
+}
+
 .quietBtn {
   composes: btn from "../../styles/ui.module.css";
 }

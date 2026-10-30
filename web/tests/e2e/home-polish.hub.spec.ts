@@ -53,6 +53,10 @@ const LONG_OPTION = "始终允许 (acceptEdits)";
 const HOOK_CARD_BODY = "/tmp/hook-approval.txt";
 /** A Space name far wider than the phone's header button or drawer row. */
 const LONG_SPACE = "项目-用于检查超长空间名称在手机宽度下的省略与完整标题-第二段";
+/** The opt-in `hook-approval long-option` fixture's session-wide grant label:
+ *  wider than the 390px card's content box, so it can only be readable if
+ *  the inline card wraps it instead of clipping. */
+const LONG_SCOPE = "始终允许本次会话内对该工作目录下所有文件的编辑与写入操作 (acceptEdits)";
 
 type Seed = { blockedId: string; exitedId: string };
 
@@ -460,5 +464,52 @@ test("390 light: long approval options and a long Space name stay readable", asy
   } finally {
     await context.close();
     await prepared!.request.delete(`/v1/instances/${approvalId}?force=1`).catch(() => undefined);
+  }
+});
+
+/**
+ * D-061 r3: the same exemption on the session-pinned card above the composer.
+ * `hook-approval long-option` makes the fake Node emit a session-wide grant
+ * label wider than the 390px card, so a nowrap button would hide the scope.
+ */
+test("390 light: the session-pinned approval card wraps a long scope label", async ({ browser }) => {
+  const baseURL = test.info().project.use.baseURL;
+  expect(baseURL, "project baseURL").toBeTruthy();
+  const prepared = await prepare(browser, baseURL!);
+  test.skip(!prepared, "needs the in-process fake Node (e2e-fake-node)");
+
+  const create = await prepared!.request.post("/v1/instances", {
+    data: {
+      hostId: prepared!.hostId,
+      workspaceId: "wsp_e2e",
+      kind: "claude",
+      driver: "claude-print",
+      title: "homepolish long scope",
+      prompt: `hook-approval long-option ${Date.now().toString(36)}`,
+    },
+  });
+  expect(create.ok(), `create long-scope approval: ${create.status()}`).toBe(true);
+  const body = (await create.json()) as { instance?: { instanceId?: string; id?: string } };
+  const instanceId = body.instance?.instanceId ?? body.instance?.id;
+  expect(instanceId, "long-scope instance").toBeTruthy();
+
+  const context = await browser.newContext({
+    ...devices["iPhone 13"],
+    baseURL: baseURL!,
+    storageState: prepared!.storage,
+  });
+  try {
+    const page = await context.newPage();
+    await seedMode(page, "light");
+    await page.goto(`/s/${instanceId}`);
+    const card = page.getByTestId("approval-card");
+    await expect(card).toBeVisible({ timeout: 20_000 });
+    await expectFullyReadable(card.getByRole("button", { name: LONG_SCOPE }), LONG_SCOPE);
+    await expectFullyReadable(card.getByRole("button", { name: "拒绝" }), "拒绝");
+    expect(await truncatedWithoutFullLabel(page), "no truncated card option").toEqual([]);
+    await expectNoHorizontalOverflow(page);
+  } finally {
+    await context.close();
+    await prepared!.request.delete(`/v1/instances/${instanceId}?force=1`).catch(() => undefined);
   }
 });

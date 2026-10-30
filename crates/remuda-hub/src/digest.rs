@@ -1483,65 +1483,53 @@ fn glance_working(worker: &WorkerRoster, now: i64) -> GlanceWorking {
     }
 }
 
-/// Sort active workers into waiting (needs someone) and working. Done and
-/// retired workers are in neither list.
-fn classify_glance(
-    workers: &[WorkerRoster],
+/// Why a waiting worker needs someone: its pending interaction first, then a
+/// blocked lifecycle, then the point-in-time watch classification.
+///
+/// Membership (which page a worker is on) is decided in SQL by the same
+/// predicate; this only names the reason for display.
+fn waiting_reason(
+    worker: &WorkerRoster,
     pending_by_instance: &HashMap<String, (String, Option<String>)>,
-    now: i64,
-) -> (Vec<GlanceWaiting>, Vec<GlanceWorking>) {
-    let mut waiting = Vec::new();
-    let mut working = Vec::new();
-    for worker in workers {
-        if !worker.state.is_in_progress() && !matches!(worker.state, WorkerState::Blocked { .. }) {
-            continue;
-        }
-        let pending = worker
-            .instance_id
-            .as_ref()
-            .and_then(|id| pending_by_instance.get(id.as_id().as_str()));
-        let why: Option<(&str, Option<String>)> = if let Some((kind, detail)) = pending {
-            Some((kind.as_str(), detail.clone()))
-        } else if let WorkerState::Blocked { reason } = &worker.state {
-            Some(("blocked", Some(reason.clone())))
-        } else {
-            match worker.watch.as_ref().map(|w| &w.status) {
-                Some(WorkerWatchStatus::Blocked { reason }) => {
-                    Some(("blocked", Some(reason.clone())))
-                }
-                Some(WorkerWatchStatus::IdleApiError) => Some(("api-error", None)),
-                Some(WorkerWatchStatus::Stalled) => Some(("stalled", None)),
-                Some(WorkerWatchStatus::Gone { reason }) => Some(("gone", Some(reason.clone()))),
-                Some(WorkerWatchStatus::Failed { reason }) => {
-                    Some(("failed", Some(reason.clone())))
-                }
-                _ => None,
-            }
-        };
-        match why {
-            Some((kind, question)) => waiting.push(glance_waiting(worker, kind, question, now)),
-            None => working.push(glance_working(worker, now)),
-        }
+) -> (String, Option<String>) {
+    let pending = worker
+        .instance_id
+        .as_ref()
+        .and_then(|id| pending_by_instance.get(id.as_id().as_str()));
+    if let Some((kind, question)) = pending {
+        return (kind.clone(), question.clone());
     }
-    (waiting, working)
+    if let WorkerState::Blocked { reason } = &worker.state {
+        return ("blocked".to_string(), Some(reason.clone()));
+    }
+    match worker.watch.as_ref().map(|watch| &watch.status) {
+        Some(WorkerWatchStatus::Blocked { reason }) => {
+            ("blocked".to_string(), Some(reason.clone()))
+        }
+        Some(WorkerWatchStatus::IdleApiError) => ("api-error".to_string(), None),
+        Some(WorkerWatchStatus::Stalled) => ("stalled".to_string(), None),
+        Some(WorkerWatchStatus::Gone { reason }) => ("gone".to_string(), Some(reason.clone())),
+        Some(WorkerWatchStatus::Failed { reason }) => ("failed".to_string(), Some(reason.clone())),
+        // The SQL predicate put this row on the waiting page, so one of the
+        // three reasons holds; this arm is unreachable in practice.
+        _ => ("blocked".to_string(), None),
+    }
 }
 
 /// Classify, cap and total the rows of one glance.
 fn assemble_glance(
     lineage_id: String,
     generated_at: String,
-    workers: &[WorkerRoster],
-    pending_by_instance: &HashMap<String, (String, Option<String>)>,
+    waiting: Vec<GlanceWaiting>,
+    working: Vec<GlanceWorking>,
+    waiting_total: u32,
+    working_total: u32,
     done_today: u32,
-    now: i64,
 ) -> LineageGlance {
-    let (mut waiting, mut working) = classify_glance(workers, pending_by_instance, now);
     let waiting_more =
-        u32::try_from(waiting.len().saturating_sub(LINEAGE_GLANCE_ROW_CAP)).unwrap_or(u32::MAX);
+        waiting_total.saturating_sub(u32::try_from(waiting.len()).unwrap_or(u32::MAX));
     let working_more =
-        u32::try_from(working.len().saturating_sub(LINEAGE_GLANCE_ROW_CAP)).unwrap_or(u32::MAX);
-    waiting.truncate(LINEAGE_GLANCE_ROW_CAP);
-    working.truncate(LINEAGE_GLANCE_ROW_CAP);
+        working_total.saturating_sub(u32::try_from(working.len()).unwrap_or(u32::MAX));
     LineageGlance {
         lineage_id,
         generated_at,
@@ -1555,32 +1543,75 @@ fn assemble_glance(
     }
 }
 
+/// One lineage's glance rows: the two group totals plus one capped page of
+/// each, classified in SQL so a glance costs the page, not the roster.
+pub(crate) struct GlanceRows {
+    pub waiting_total: u32,
+    pub working_total: u32,
+    pub waiting: Vec<WorkerRoster>,
+    pub working: Vec<WorkerRoster>,
+}
+
+/// Active roster rows of a lineage that need someone.
+///
+/// The predicate mirrors the display reasons: a blocked lifecycle, a
+/// terminal/attention watch classification, or a pending interaction on the
+/// worker's instance. `COALESCE` keeps a missing JSON path from making the
+/// whole expression NULL (which would drop the row from both pages).
+const GLANCE_WAITING_PREDICATE: &str = "w.state_kind = 'blocked'
+     OR COALESCE(json_extract(w.doc_json, '$.watch.status') IN
+          ('blocked', 'idle-api-error', 'stalled', 'gone', 'failed'), 0)
+     OR COALESCE(json_extract(w.doc_json, '$.instanceId') IN
+          (SELECT instance_id FROM interactions WHERE state = 'pending'), 0)";
+
+/// Active roster rows of a lineage, whatever their classification.
+const GLANCE_ACTIVE_SQL: &str = " FROM worker_roster w
+ WHERE w.state_kind IN ('dispatched', 'working', 'blocked')
+   AND (SELECT COALESCE(p.lineage_id, p.id)
+          FROM instances i
+          JOIN instances p
+            ON p.id = json_extract(i.spec_json, '$.parentInstanceId')
+         WHERE i.id = json_extract(w.doc_json, '$.instanceId')) = ?1";
+
 impl Store {
-    /// Active (not retired) roster rows for workers that the lineage
-    /// dispatched: their instance's creator is a chapter of `lineage_id`.
-    pub(crate) async fn list_lineage_workers(
+    /// The lineage's two group totals and one page of each.
+    ///
+    /// Deterministic order (`updated_at`, then id) so a page is stable across
+    /// polls; `more` in the response is the total minus the page.
+    pub(crate) async fn lineage_glance_rows(
         &self,
         lineage_id: String,
-    ) -> Result<Vec<WorkerRoster>, crate::store::StoreError> {
-        self.read("list_lineage_workers", move |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT w.doc_json FROM worker_roster w
-                 WHERE w.state_kind IN ('dispatched', 'working', 'blocked')
-                   AND (SELECT COALESCE(p.lineage_id, p.id)
-                          FROM instances i
-                          JOIN instances p
-                            ON p.id = json_extract(i.spec_json, '$.parentInstanceId')
-                         WHERE i.id = json_extract(w.doc_json, '$.instanceId')) = ?1
-                 ORDER BY w.updated_at DESC",
-            )?;
-            // Every row is classified: `more` must count the whole lineage, and
-            // a page cap here would silently under-report the overflow.
-            let rows = stmt
-                .query_map(params![lineage_id], |row| row.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?;
-            rows.iter()
-                .map(|raw| serde_json::from_str(raw).map_err(crate::store::StoreError::from))
-                .collect()
+        page: usize,
+    ) -> Result<GlanceRows, crate::store::StoreError> {
+        self.read("lineage_glance_rows", move |conn| {
+            let count = |filter: &str| -> Result<u32, crate::store::StoreError> {
+                let sql = format!("SELECT COUNT(*) {GLANCE_ACTIVE_SQL}{filter}");
+                let count: i64 = conn.query_row(&sql, params![&lineage_id], |row| row.get(0))?;
+                Ok(u32::try_from(count).unwrap_or(u32::MAX))
+            };
+            let rows = |filter: &str| -> Result<Vec<WorkerRoster>, crate::store::StoreError> {
+                let sql = format!(
+                    "SELECT w.doc_json {GLANCE_ACTIVE_SQL}{filter}
+                         ORDER BY w.updated_at DESC, w.id ASC LIMIT ?2"
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let docs = stmt
+                    .query_map(params![&lineage_id, page as i64], |row| {
+                        row.get::<_, String>(0)
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                docs.iter()
+                    .map(|raw| serde_json::from_str(raw).map_err(crate::store::StoreError::from))
+                    .collect()
+            };
+            let waiting_filter = format!(" AND ({GLANCE_WAITING_PREDICATE})");
+            let working_filter = format!(" AND NOT ({GLANCE_WAITING_PREDICATE})");
+            Ok(GlanceRows {
+                waiting_total: count(&waiting_filter)?,
+                working_total: count(&working_filter)?,
+                waiting: rows(&waiting_filter)?,
+                working: rows(&working_filter)?,
+            })
         })
         .await
     }
@@ -1757,15 +1788,18 @@ async fn lineage_glance(
     }
     let now = OffsetDateTime::now_utc();
     let day_start = now.replace_time(time::Time::MIDNIGHT);
-    let workers = state
+    // Totals are counted in SQL and only one page per group is materialized,
+    // so a glance costs its page rather than the lineage's whole roster.
+    let rows = state
         .store
-        .list_lineage_workers(lineage_id.clone())
+        .lineage_glance_rows(lineage_id.clone(), LINEAGE_GLANCE_ROW_CAP)
         .await
         .map_err(map_store)?;
-    // Only this lineage's pending rows, filtered in SQL: the glance must not
-    // read every pending interaction in the Hub.
-    let wanted: Vec<String> = workers
+    // Only the page's pending rows, filtered in SQL.
+    let wanted: Vec<String> = rows
+        .waiting
         .iter()
+        .chain(rows.working.iter())
         .filter_map(|worker| worker.instance_id.as_ref())
         .map(|id| id.as_id().to_string())
         .collect();
@@ -1805,13 +1839,28 @@ async fn lineage_glance(
         .count_lineage_done_since(lineage_id.clone(), crate::config::rfc3339(day_start))
         .await
         .map_err(map_store)?;
+    let now_unix = now.unix_timestamp();
+    let waiting = rows
+        .waiting
+        .iter()
+        .map(|worker| {
+            let (kind, question) = waiting_reason(worker, &pending_by_instance);
+            glance_waiting(worker, &kind, question, now_unix)
+        })
+        .collect();
+    let working = rows
+        .working
+        .iter()
+        .map(|worker| glance_working(worker, now_unix))
+        .collect();
     Ok(Json(assemble_glance(
         lineage_id,
         crate::config::rfc3339(now),
-        &workers,
-        &pending_by_instance,
+        waiting,
+        working,
+        rows.waiting_total,
+        rows.working_total,
         done_today,
-        now.unix_timestamp(),
     )))
 }
 
@@ -2764,43 +2813,81 @@ mod tests {
     }
 
     #[test]
-    fn glance_splits_waiting_from_working_and_caps_each_list() {
-        let mut workers = Vec::new();
-        for index in 0..120 {
-            let mut row = if index % 2 == 0 {
-                worker(json!({ "state": "working" }))
-            } else {
-                worker(json!({ "state": "blocked", "reason": format!("need input {index}") }))
-            };
-            row.name = format!("w{index}");
-            workers.push(row);
-        }
-        // A done worker is in neither list.
-        workers.push(worker(json!({ "state": "done", "sha": "0a10ebf351aa" })));
+    fn a_glance_reports_the_true_overflow_and_the_displayed_reason() {
+        // Membership and totals are counted in SQL; the assembly carries the
+        // totals it was given and the page it was given.
+        let page: Vec<GlanceWaiting> = (0..LINEAGE_GLANCE_ROW_CAP)
+            .map(|index| GlanceWaiting {
+                instance_id: Some(format!("ins_{index}")),
+                name: format!("w{index}"),
+                since: Some(10),
+                kind: "blocked".into(),
+                question: Some(format!("need input {index}")),
+            })
+            .collect();
+        let working: Vec<GlanceWorking> = (0..3)
+            .map(|index| GlanceWorking {
+                instance_id: Some(format!("ins_w{index}")),
+                name: format!("v{index}"),
+                since: Some(5),
+                task_id: None,
+            })
+            .collect();
         let glance = assemble_glance(
             "ins_lineage".into(),
             "2026-10-29".into(),
-            &workers,
-            &HashMap::new(),
+            page,
+            working,
+            120,
+            3,
             7,
-            NOW,
         );
-        assert_eq!((glance.more.waiting, glance.more.working), (10, 10));
+        assert_eq!((glance.more.waiting, glance.more.working), (70, 0));
         assert_eq!(glance.waiting.len(), LINEAGE_GLANCE_ROW_CAP);
-        assert_eq!(glance.working.len(), LINEAGE_GLANCE_ROW_CAP);
         assert_eq!(glance.done_today, 7);
-        assert!(glance.waiting.iter().all(|row| row.kind == "blocked"));
-        // A pending approval makes an otherwise-working worker wait.
-        let one = worker(json!({ "state": "working" }));
+
+        // The displayed reason prefers a pending interaction, then a blocked
+        // lifecycle, then the watch classification.
+        let row = worker(json!({ "state": "blocked", "reason": "need input" }));
         let mut pending = HashMap::new();
         pending.insert(
-            one.instance_id.as_ref().unwrap().as_id().to_string(),
+            row.instance_id.as_ref().unwrap().as_id().to_string(),
             ("approval".to_string(), Some("Bash".to_string())),
         );
-        let glance = assemble_glance("l".into(), "d".into(), &[one], &pending, 0, NOW);
-        assert_eq!(glance.waiting[0].kind, "approval");
-        assert_eq!(glance.waiting[0].question.as_deref(), Some("Bash"));
-        assert!(glance.working.is_empty());
+        let (kind, question) = waiting_reason(&row, &pending);
+        assert_eq!(
+            (kind.as_str(), question.as_deref()),
+            ("approval", Some("Bash"))
+        );
+        let (kind, question) = waiting_reason(&row, &HashMap::new());
+        assert_eq!(
+            (kind.as_str(), question.as_deref()),
+            ("blocked", Some("need input"))
+        );
+        let mut stalled = worker(json!({ "state": "working" }));
+        stalled.watch = Some(remuda_protocol::WorkerWatch {
+            status: remuda_protocol::WorkerWatchStatus::Stalled,
+            observed_at: remuda_protocol::Timestamp::try_from(
+                "2026-10-29T01:05:00.000Z".to_string(),
+            )
+            .expect("timestamp"),
+            detail: None,
+            last_done_sha: None,
+            last_blocked: None,
+            last_screen_digest: None,
+            last_activity_at: None,
+        });
+        let (kind, question) = waiting_reason(&stalled, &HashMap::new());
+        assert_eq!((kind.as_str(), question.is_none()), ("stalled", true));
+        // The row's question is untrusted text, clipped and redacted.
+        let waiting = glance_waiting(
+            &row,
+            "approval",
+            Some("api_key=sk-ant-api03-AAAAAAAAAAAAAAAAAAAA".to_string()),
+            NOW,
+        );
+        let question = waiting.question.expect("question");
+        assert!(!question.contains("sk-ant-api03"), "{question}");
     }
 
     #[test]

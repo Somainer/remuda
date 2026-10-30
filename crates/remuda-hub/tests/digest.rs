@@ -516,6 +516,76 @@ async fn a_legacy_done_row_is_not_stamped_by_a_later_observation() -> Result<()>
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_glance_classifies_blocked_and_terminal_watch_workers_as_waiting() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("glance-classify").await?;
+    let (coordinator, token) = ctx.coordinator(&project).await?;
+    let (blocked, _) = ctx
+        .worker_under(&token, &project, "c-blocked", None)
+        .await?;
+    let (stalled, _) = ctx
+        .worker_under(&token, &project, "c-stalled", None)
+        .await?;
+    let (fine, _) = ctx.worker_under(&token, &project, "c-fine", None).await?;
+    let store = ctx.hub.store().context("store")?;
+    store
+        .mutate_worker(blocked, |row| {
+            row.state = remuda_protocol::WorkerState::Blocked {
+                reason: "need input".into(),
+            };
+            Ok(())
+        })
+        .await
+        .context("block")?;
+    let observed_at = remuda_protocol::Timestamp::try_from("2026-10-29T01:05:00.000Z".to_string())
+        .expect("timestamp");
+    store
+        .mutate_worker(stalled, move |row| {
+            row.watch = Some(remuda_protocol::WorkerWatch {
+                status: remuda_protocol::WorkerWatchStatus::Stalled,
+                observed_at: observed_at.clone(),
+                detail: None,
+                last_done_sha: None,
+                last_blocked: None,
+                last_screen_digest: None,
+                last_activity_at: None,
+            });
+            Ok(())
+        })
+        .await
+        .context("stall")?;
+    let glance = json_of(
+        &ctx.get(&token, &format!("/v1/lineages/{coordinator}/glance"))
+            .await?
+            .1,
+    );
+    let mut waiting: Vec<(String, String)> = glance["waiting"]
+        .as_array()
+        .context("waiting")?
+        .iter()
+        .map(|row| {
+            (
+                row["name"].as_str().unwrap_or_default().to_string(),
+                row["kind"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    waiting.sort();
+    assert_eq!(
+        waiting,
+        vec![
+            ("c-blocked".to_string(), "blocked".to_string()),
+            ("c-stalled".to_string(), "stalled".to_string()),
+        ]
+    );
+    assert_eq!(glance["working"][0]["name"], "c-fine");
+    assert_eq!(glance["more"]["waiting"], 0);
+    assert_eq!(glance["more"]["working"], 0);
+    assert!(!fine.is_empty(), "the fixture keeps its instance id");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pending_interactions_are_loaded_for_the_given_instances_only() -> Result<()> {
     let ctx = Ctx::spawn().await?;
     let project = ctx.project("pending-a").await?;

@@ -1,55 +1,40 @@
-import { useCallback, useEffect, useRef, useState, type RefObject } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 /**
- * How long a hold survives with no activity inside the rows region. A lost
- * `pointerup` (released outside the browser window, or on a row that vanished)
+ * How long a hold survives with no pointer or focus activity at all. A lost
+ * `pointerup` (released over the header, another window, or a removed row)
  * would otherwise freeze the list for the rest of the session.
  */
 export const HOLD_IDLE_RELEASE_MS = 10_000;
 
-/**
- * Where a hold comes from. They are independent: the list stays frozen while
- * any one of them is active, and releases when the last one ends.
- *
- * - `pointer` — a press inside the rows region; ends on a window pointerup or
- *   pointercancel, and is subject to the idle timeout.
- * - `focus` — keyboard focus inside the rows region; ends when focus leaves
- *   that region, and is subject to the idle timeout.
- * - `sheet` — a row action Sheet or the spaces drawer is open; ends only when
- *   it closes (or the list unmounts). Pointer and timeout activity inside the
- *   sheet must not release it.
- */
-export type HoldSource = "pointer" | "focus" | "sheet";
-
 export type HeldOrder<T> = {
-  /** True while any source is active. */
+  /** True while the list must not re-rank. */
   held: boolean;
-  /** The structure captured when the first source began, or null. */
+  /** The structure captured when the hold began, or null. */
   snapshot: T | null;
-  /** Begin (or refresh) one source; the snapshot is taken on the first one. */
-  begin: (source: HoldSource, build: () => T) => void;
-  /** End one source; the snapshot drops when none remain. */
-  end: (source: HoldSource) => void;
-  /**
-   * Attach to the rows region (rows only — never the toolbar or search). The
-   * idle timer is re-armed only by activity in here.
-   */
-  regionRef: RefObject<HTMLDivElement | null>;
+  /** Begin a hold; a second call while held only refreshes the idle timer. */
+  start: (build: () => T) => void;
+  /** End the hold; the list re-ranks once, on the next render. */
+  release: () => void;
 };
 
 /**
  * One source of truth for "do not re-rank right now" (home.md §3.3).
  *
- * The caller snapshots the PAINTED structure when the first source begins and
- * renders from that snapshot while held, swapping in live row content by id.
- * Sources are tracked by name, so a lost `pointerup` or a click inside an open
- * Sheet cannot end a hold that another source still owns.
+ * The caller snapshots the PAINTED structure when the hold begins and renders
+ * from that snapshot while held, swapping in live row content by id. This hook
+ * only owns the lifetime: it stays held until the release conditions below, so
+ * there is no counter that can drift.
+ *
+ * Release happens on a window-level `pointerup`/`pointercancel` (wherever the
+ * finger or mouse ends up), on an explicit `release()` (a Sheet closing, focus
+ * leaving the list), on unmount, and after {@link HOLD_IDLE_RELEASE_MS} with
+ * no pointer or keyboard activity.
  */
 export function useHeldOrder<T>(): HeldOrder<T> {
   const [snapshot, setSnapshot] = useState<T | null>(null);
-  const sources = useRef<Set<HoldSource>>(new Set());
+  const heldRef = useRef(false);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const regionRef = useRef<HTMLDivElement | null>(null);
 
   const clearTimer = useCallback(() => {
     if (timer.current !== null) {
@@ -58,79 +43,57 @@ export function useHeldOrder<T>(): HeldOrder<T> {
     }
   }, []);
 
+  const release = useCallback(() => {
+    clearTimer();
+    heldRef.current = false;
+    setSnapshot(null);
+  }, [clearTimer]);
+
   const arm = useCallback(() => {
     clearTimer();
     timer.current = setTimeout(() => {
       timer.current = null;
-      // The idle timeout only ends the interactive sources: an open Sheet keeps
-      // the list frozen until the person closes it.
-      sources.current.delete("pointer");
-      sources.current.delete("focus");
-      if (sources.current.size === 0) setSnapshot(null);
+      heldRef.current = false;
+      setSnapshot(null);
     }, HOLD_IDLE_RELEASE_MS);
   }, [clearTimer]);
 
-  const begin = useCallback(
-    (source: HoldSource, build: () => T) => {
-      const first = sources.current.size === 0;
-      sources.current.add(source);
-      if (first) setSnapshot(build());
-      if (source !== "sheet") arm();
+  const start = useCallback(
+    (build: () => T) => {
+      if (!heldRef.current) {
+        heldRef.current = true;
+        setSnapshot(build());
+      }
+      arm();
     },
     [arm],
   );
 
-  const end = useCallback(
-    (source: HoldSource) => {
-      sources.current.delete(source);
-      if (sources.current.size === 0) {
-        clearTimer();
-        setSnapshot(null);
-      }
-    },
-    [clearTimer],
-  );
-
-  // A press ends wherever the pointer does; a pointer release is the one end
-  // signal that has to come from the window.
   useEffect(() => {
     if (snapshot === null) return;
-    const releasePointer = () => end("pointer");
-    window.addEventListener("pointerup", releasePointer);
-    window.addEventListener("pointercancel", releasePointer);
-    return () => {
-      window.removeEventListener("pointerup", releasePointer);
-      window.removeEventListener("pointercancel", releasePointer);
-    };
-  }, [snapshot, end]);
-
-  // Idle activity is scoped to the rows region: typing in the search box or
-  // moving the mouse over the page must not keep a lost press alive.
-  useEffect(() => {
-    const region = regionRef.current;
-    if (snapshot === null || !region) return;
+    const end = () => release();
     const live = () => arm();
-    region.addEventListener("pointerdown", live);
-    region.addEventListener("pointermove", live);
-    region.addEventListener("keydown", live);
-    region.addEventListener("focusin", live);
+    window.addEventListener("pointerup", end);
+    window.addEventListener("pointercancel", end);
+    // A keyboard activation (Enter on a fold or row control) ends a focus hold.
+    window.addEventListener("click", end);
+    window.addEventListener("pointerdown", live);
+    window.addEventListener("pointermove", live);
+    window.addEventListener("keydown", live);
+    window.addEventListener("focusin", live);
     return () => {
-      region.removeEventListener("pointerdown", live);
-      region.removeEventListener("pointermove", live);
-      region.removeEventListener("keydown", live);
-      region.removeEventListener("focusin", live);
+      window.removeEventListener("pointerup", end);
+      window.removeEventListener("pointercancel", end);
+      window.removeEventListener("click", end);
+      window.removeEventListener("pointerdown", live);
+      window.removeEventListener("pointermove", live);
+      window.removeEventListener("keydown", live);
+      window.removeEventListener("focusin", live);
     };
-  }, [snapshot, arm]);
+  }, [snapshot, release, arm]);
 
-  // A hold never outlives the list that began it, and the timer never fires
-  // into an unmounted component.
-  useEffect(
-    () => () => {
-      clearTimer();
-      sources.current.clear();
-    },
-    [clearTimer],
-  );
+  // A hold never outlives the list that began it.
+  useEffect(() => release, [release]);
 
-  return { held: snapshot !== null, snapshot, begin, end, regionRef };
+  return { held: snapshot !== null, snapshot, start, release };
 }

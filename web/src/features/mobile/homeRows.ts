@@ -492,13 +492,13 @@ export type RankRow = Pick<HomeRow, "id" | "rank" | "title" | "updatedAt">;
 /**
  * The one comparator both surfaces use. Rank first (blocked above done-unseen
  * above working above awaiting-wake above starting above idle above exited),
- * newest change first inside a rank. `list` ordering is the device preference
- * that sorts by title instead of time, still inside the rank.
+ * newest change first inside a rank. The 列表 device preference is NOT read
+ * here: home.md §3.1 makes recency within a rank part of the ordering, so the
+ * preference only reorders groups (`compareGroups`), never rows.
  */
-export function compareRanked(a: RankRow, b: RankRow, order: HomeOrder = "clock"): number {
+export function compareRanked(a: RankRow, b: RankRow): number {
   const byRank = rankOrder(a.rank) - rankOrder(b.rank);
   if (byRank !== 0) return byRank;
-  if (order === "list") return a.title.localeCompare(b.title) || a.id.localeCompare(b.id);
   return rowTime(b) - rowTime(a) || a.id.localeCompare(b.id);
 }
 
@@ -571,7 +571,7 @@ export function arrangeHomeGroups(input: {
       if (row) rows.push(row);
     }
     if (!rows.length) continue;
-    rows.sort((a, b) => compareRanked(a, b, input.order));
+    rows.sort((a, b) => compareRanked(a, b));
     const quiet = rows.every((row) => !rankIsActive(row.rank));
     groups.push({
       id: space.id,

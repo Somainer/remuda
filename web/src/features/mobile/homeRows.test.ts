@@ -389,7 +389,7 @@ describe("buildHomeGroups ordering and blocked pinning", () => {
     ]);
   });
 
-  it("list ordering sorts groups by project and rows by title, blocked still pinned", () => {
+  it("list ordering sorts groups by project, but rows inside a rank stay newest-first", () => {
     const instances = [
       session("ins-a", { updatedAt: "2026-09-19T08:00:00.000Z" }),
       session("ins-zblocked", {
@@ -398,22 +398,29 @@ describe("buildHomeGroups ordering and blocked pinning", () => {
         activity: known("waiting-interaction"),
         updatedAt: "2026-09-19T08:00:00.000Z",
       }),
-      session("ins-z", {
+      // Same rank, and their title order is the reverse of their recency.
+      session("ins-z-new", {
         hostId: "host-beta",
         workspaceId: "wsp-beta",
-        activity: known("working"),
         updatedAt: "2026-09-19T20:00:00.000Z",
+      }),
+      session("ins-z-old", {
+        hostId: "host-beta",
+        workspaceId: "wsp-beta",
+        updatedAt: "2026-09-19T09:00:00.000Z",
       }),
     ];
     named(instances);
     titles["ins-a"] = "aaa title";
-    titles["ins-z"] = "zzz title";
+    titles["ins-z-new"] = "zzz title";
+    titles["ins-z-old"] = "aaa older title";
     titles["ins-zblocked"] = "zzz blocked title";
     const groups = build(instances, "list");
-    // Groups: alpha (project name) before beta even though beta is fresher.
+    // Groups: alpha (project name) before beta even though beta is fresher —
+    // the device preference only reaches this secondary grouping.
     expect(groups.map((group) => group.project)).toEqual(["alpha", "beta"]);
-    // The blocked row is pinned despite its title sorting last.
-    expect(groups[1].rows.map((row) => row.title)).toEqual(["zzz blocked title", "zzz title"]);
+    // Inside the group: rank first (blocked pinned), then recency, never title.
+    expect(groups[1].rows.map((row) => row.id)).toEqual(["ins-zblocked", "ins-z-new", "ins-z-old"]);
   });
 
   it("clock ordering sorts groups by their newest change", () => {

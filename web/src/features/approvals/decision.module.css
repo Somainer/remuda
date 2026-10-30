@@ -156,22 +156,29 @@
   margin-top: var(--space-1);
 }
 
+/* D-061 r2: an option label states the authorization scope it grants, so it
+   is exempt from the single-line clip — the button wraps instead of
+   truncating (btnAllowWrap). */
 .actionPrimary {
   composes: btnPrimary from "../../styles/ui.module.css";
+  composes: btnAllowWrap from "../../styles/ui.module.css";
 }
 
 .actionBtn {
   composes: btn from "../../styles/ui.module.css";
+  composes: btnAllowWrap from "../../styles/ui.module.css";
 }
 
 .actionGhost {
   composes: btnGhost from "../../styles/ui.module.css";
 }
 
-/* Compact: the first two options share the row (ui-spec §2.5). */
+/* Compact: each option gets its own full-width row. Three options sharing one
+   row squeezed the scope out of a label like 始终允许 (acceptEdits); a
+   permission scope is never worth truncating (D-061 r2). */
 .actionsCompact .actionPrimary,
 .actionsCompact .actionBtn {
-  flex: 1 1 0;
+  flex: 1 1 100%;
 }
 
 .openLink {

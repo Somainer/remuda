@@ -49,6 +49,23 @@
   white-space: nowrap;
 }
 
+/* D-061 r2 exemption: a label that states an authorization scope or a
+   filesystem target (approval options, path-bearing actions) must always be
+   readable, so it wraps — or takes a whole row — instead of truncating.
+   Composed by the approval option buttons, which are the reason this exists. */
+.btnAllowWrap {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  overflow-wrap: anywhere;
+}
+
+.btnAllowWrap > span {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+}
+
 .btn:hover:not(:disabled) {
   border-color: var(--border-control);
 }

@@ -342,6 +342,8 @@ tokenGuard 断言两条：
 
 **`.iconBtn`**：可见 32×32，字形 16px。coarse 下加 `::after` 热区 44×44，相邻 iconBtn 间距 ≥ 12px（32 + 12 = 44，热区不重叠）。
 
+**授权范围与路径目标的例外（D-061 r2）**：标签本身说明授权范围或文件系统目标的按钮（审批卡选项、带路径的操作）**不受单行省略约束**——它们必须完整可读，放不下时换行或独占一整行（compact 审批卡每个选项一行），绝不省略；CSS 上是 `.btnAllowWrap`（`white-space: normal; overflow: visible; text-overflow: clip`），而不是 `.btn` 的 nowrap + ellipsis。其余按钮保持 nowrap + 省略号；凡是被截断的标签，完整文字必须同时在 `title` 里（只有图标的按钮放 `aria-label`）。
+
 ### 8.2 分段 `.seg` / `.segItem`
 
 - 轨道：1px `--border`，2px 内边距，`--bg-inset` 底，8px 圆角，总高 32px；

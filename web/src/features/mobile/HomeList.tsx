@@ -459,8 +459,13 @@ export const HomeList = memo(function HomeList() {
                   startHold("focus");
                 }
               }}
+              // Mirror the start predicate: the focus hold ends as soon as
+              // focus moves anywhere that is not a row control — including the
+              // fold toggles in this region, which must take effect at once.
               onBlur={(event) => {
-                if (!event.currentTarget.contains(event.relatedTarget as Node | null)) end("focus");
+                if (!(event.relatedTarget as Element | null)?.closest('[data-testid="home-row"]')) {
+                  end("focus");
+                }
               }}
             >
               <HomeGroups

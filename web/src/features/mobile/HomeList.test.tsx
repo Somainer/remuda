@@ -19,8 +19,8 @@ beforeAll(() => {
   });
 });
 
-const HELD = "[data-order-held='1'], [data-held='1']";
-const RELEASED = "[data-order-held='0'], [data-held='0']";
+const HELD = "[data-order-held='1']";
+const RELEASED = "[data-order-held='0']";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -354,6 +354,25 @@ describe("HomeList hold against the painted structure", () => {
       held.dispatchEvent(new PointerEvent("pointerup", { bubbles: true }));
     });
     expect(projects()).toEqual(["beta", "alpha"]);
+  });
+
+  it("lets a fold toggle take effect while a row holds focus", async () => {
+    hub.instances = [
+      row("ins-held", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+      row("ins-idle", { activity: known("idle"), updatedAt: "2026-09-19T08:00:00.000Z" }),
+    ];
+    renderHome();
+    act(() => {
+      screen.getByText("title ins-held").closest("a")!.focus();
+    });
+    expect(document.querySelector(HELD)).not.toBeNull();
+    expect(screen.queryByText("title ins-idle")).toBeNull();
+
+    // Focus moves onto the fold toggle: that is not a row control, so the hold
+    // ends and the toggle's own render (not the frozen one) applies.
+    await userEvent.click(screen.getByTestId("home-idle-fold"));
+    expect(await screen.findByText("title ins-idle")).toBeTruthy();
+    expect(document.querySelector(RELEASED)).not.toBeNull();
   });
 
   it("keeps the list frozen while the spaces drawer is open, through taps inside it", async () => {

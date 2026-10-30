@@ -1,9 +1,7 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 
-// The r3 rename moved the list attribute to `data-order-held`; the tolerant
-// selector lets the same tests run against the previous build for the RED proof.
-const HELD = "[data-order-held='1'], [data-held='1']";
-const RELEASED = "[data-order-held='0'], [data-held='0']";
+const HELD = "[data-order-held='1']";
+const RELEASED = "[data-order-held='0']";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -849,6 +847,70 @@ describe("SessionList hold", () => {
     const moved = document.querySelector('[data-instance-id="ins_held"]')!;
     expect(screen.getByTestId("session-group-recent").contains(moved)).toBe(true);
     expect(screen.queryByTestId("session-group-working")).toBeNull();
+  });
+
+  it("releases the focus hold when focus leaves the row for the toolbar", () => {
+    renderList("", {
+      instances: [
+        session("ins_held", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+      ],
+    });
+    const checkbox = document.querySelector<HTMLInputElement>(
+      '[data-instance-id="ins_held"] input[type="checkbox"]',
+    )!;
+    act(() => {
+      checkbox.focus();
+    });
+    expect(document.querySelector(HELD)).not.toBeNull();
+
+    act(() => {
+      screen.getByTestId("session-search").focus();
+    });
+    expect(document.querySelector(RELEASED)).not.toBeNull();
+  });
+
+  it("closes the action Sheet when its row goes stale", async () => {
+    const store = await import("../../lib/store");
+    const { rerender } = renderList("", {
+      instances: [
+        session("ins_held", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+        session("ins_peer", { activity: known("working"), updatedAt: "2026-09-19T08:00:00.000Z" }),
+      ],
+    });
+    await userEvent.click(screen.getAllByTestId("board-more")[0]);
+    expect(screen.getByTestId("board-actions-panel")).toBeTruthy();
+
+    rerender(
+      tree([session("ins_peer", { activity: known("working"), updatedAt: "2026-09-19T08:00:00.000Z" })]),
+    );
+    // The sheet goes with the row it belonged to, so nothing can send to it —
+    // and closing it releases the hold, so the stale row drops.
+    expect(screen.queryByTestId("board-actions-panel")).toBeNull();
+    expect(document.querySelector('[data-instance-id="ins_held"]')).toBeNull();
+    expect(store.hubStore.send).not.toHaveBeenCalled();
+    expect(store.hubStore.close).not.toHaveBeenCalled();
+  });
+
+  it("makes 去处理 inert on a stale placeholder", () => {
+    hub.interactions = [approvalInteraction("int_1", "ins_held", "echo hi")];
+    const { rerender } = renderList("", {
+      instances: [
+        session("ins_held", { activity: known("waiting-interaction"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+        session("ins_peer", { activity: known("working"), updatedAt: "2026-09-19T08:00:00.000Z" }),
+      ],
+    });
+    const go = document.querySelector('[data-instance-id="ins_held"] [data-testid="board-go-handle"]')!;
+    expect(go.getAttribute("aria-disabled")).toBeNull();
+
+    fireEvent.pointerDown(document.querySelector('[data-instance-id="ins_held"]')!);
+    rerender(
+      tree([session("ins_peer", { activity: known("working"), updatedAt: "2026-09-19T08:00:00.000Z" })]),
+    );
+    const staleGo = document.querySelector('[data-instance-id="ins_held"] [data-testid="board-go-handle"]')!;
+    expect(staleGo).toHaveAttribute("aria-disabled", "true");
+    expect(staleGo).toHaveAttribute("tabindex", "-1");
+    fireEvent.pointerUp(document.body);
+    hub.interactions = [];
   });
 
   it("re-establishes the focus hold when focus moves inside the row after a timeout", () => {

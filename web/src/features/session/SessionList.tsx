@@ -264,6 +264,12 @@ export function SessionList({
     );
   }, [holdSnapshot, filtered]);
 
+  // The Sheet belongs to a row: if that row vanished mid-hold, close it so no
+  // control can send to a gone id. The normal release then runs.
+  useEffect(() => {
+    if (actionFor !== null && staleIds.has(actionFor)) setActionFor(null);
+  }, [actionFor, staleIds]);
+
   // Rows currently on screen (IntersectionObserver), so the screen poll can
   // prefer them. The viewport root stays correct inside an overflow
   // container: intersection accounts for clipping by intermediate scrollers.
@@ -670,8 +676,12 @@ export function SessionList({
             startHold("focus");
           }
         }}
+        // Mirror the start predicate: focus leaving the row for anything else
+        // (the toolbar, a section heading) ends the hold.
         onBlur={(event) => {
-          if (!event.currentTarget.contains(event.relatedTarget as Node | null)) end("focus");
+          if (!(event.relatedTarget as Element | null)?.closest('[data-testid="board-card"]')) {
+            end("focus");
+          }
         }}
       >
       {sections.map((group) => {
@@ -791,6 +801,9 @@ export function SessionList({
                       className={css.goHandle}
                       data-testid="board-go-handle"
                       to={`/approvals?focus=${encodeURIComponent(pending.id)}`}
+                      aria-disabled={stale || undefined}
+                      tabIndex={stale ? -1 : undefined}
+                      onClick={stale ? (event) => event.preventDefault() : undefined}
                     >
                       去处理
                     </Link>

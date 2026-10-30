@@ -98,17 +98,20 @@ impl AgentApprovals {
         let mut grants = self.grants.lock().await;
         grants.retain(|_, grant| grant.expires > Instant::now());
         if let Some(raw) = headers.get("x-remuda-approval-id") {
+            // An unusable header value is the same refusal as an unusable id:
+            // still 403, but the caller is told the approvalId is the problem.
+            let invalid = HubError::approval_invalid;
             let id: InteractionId = raw
                 .to_str()
-                .map_err(|_| HubError::Forbidden)?
+                .map_err(|_| invalid())?
                 .parse()
-                .map_err(|_| HubError::Forbidden)?;
-            let grant = grants.get_mut(&id).ok_or(HubError::Forbidden)?;
+                .map_err(|_| invalid())?;
+            let grant = grants.get_mut(&id).ok_or_else(invalid)?;
             if grant.caller != *caller
                 || grant.request != request
                 || grant.state != GrantState::Allowed
             {
-                return Err(HubError::Forbidden);
+                return Err(invalid());
             }
             // An absent id remains forbidden on replay and occupies no capacity.
             grants.remove(&id);
@@ -364,7 +367,10 @@ mod tests {
             }
             assert!(matches!(
                 approvals.require(&headers, &caller, request).await,
-                Err(HubError::Forbidden)
+                Err(HubError::Actionable {
+                    reason: "approval-invalid",
+                    ..
+                })
             ));
             assert!(approvals.list(&device(&caller)).await.is_empty());
         }
@@ -375,6 +381,48 @@ mod tests {
             instance_id: None,
         };
         assert_eq!(approvals.list(&operator).await.len(), 1);
+    }
+
+    /// An approvalId that cannot even be parsed is the same refusal as one
+    /// that does not match: 403 with the `approval-invalid` guidance, never a
+    /// bare FORBIDDEN that leaves the seat guessing.
+    #[tokio::test]
+    async fn malformed_approval_id_header_is_approval_invalid() {
+        let approvals = AgentApprovals::new().unwrap();
+        let caller = ApprovalCaller {
+            device_id: "caller-device".into(),
+            instance_id: InstanceId::new(),
+            host_id: HostId::new(),
+        };
+        let request = json!({"operation":"instance.send", "target":"sibling", "text":"hi"});
+        let cases = [
+            axum::http::HeaderValue::from_static("garbage"),
+            axum::http::HeaderValue::from_bytes(b"int_\xff").unwrap(),
+        ];
+        for raw in cases {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-remuda-approval-id", raw);
+            let error = approvals
+                .require(&headers, &caller, request.clone())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    HubError::Actionable {
+                        reason: "approval-invalid",
+                        ..
+                    }
+                ),
+                "{error}"
+            );
+            let (status, body) = error.status_code_and_body();
+            assert_eq!(status, 403);
+            assert_eq!(body["code"], "FORBIDDEN");
+            assert_eq!(body["next"]["action"], "fix-request");
+        }
+        // A malformed id never opens or consumes a grant.
+        assert!(approvals.list(&device(&caller)).await.is_empty());
     }
 
     #[tokio::test]

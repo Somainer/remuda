@@ -2154,6 +2154,8 @@ HTTP 409
           "hint": "a human must answer the approval; then retry the same request with approvalId"}}
 ~~~
 
+**实现现状（`cb-errors`）。** 除首批取值外，当前实现还发出同一词汇的三个原因：`stale-caller`（凭证背后的实例行已不存在，`ask-owner`）、`approval-invalid`（approvalId 未知、过期、已用或不属于本次动作，`fix-request`）、`delivery-unknown`（`instance.configure` 重放的投递结果未知，`read-then-decide`，并带 `commandId`）。
+
 ### 9.2 Unknown 与 reconciliation 的实现要求
 
 Unknown reason 使用稳定小写代码，例如 `not-emitted`、`unsupported-source-version`、`native-ack-missing`、`control-channel-lost`、`native-session-missing`、`incomplete-transcript`、`ambiguous-run-correlation`、`unverified-task-boundary`、`source-conflict`。这些 reason 可扩展展示，但不能当新的成功状态。null 与 unknown 的区别在所有 SDK 保持；UI 显示未知，不渲染成空文本、0 token、0 cost 或“未运行”。

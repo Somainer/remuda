@@ -1438,7 +1438,7 @@ pub async fn create_instance(
                 .store
                 .get_instance(id.into())
                 .await?
-                .ok_or(HubError::Forbidden)?
+                .ok_or_else(HubError::stale_caller)?
                 .scope,
         ),
         None => None,
@@ -1474,7 +1474,7 @@ pub async fn create_instance(
                     .store
                     .get_instance(instance_id.into())
                     .await?
-                    .ok_or(HubError::Forbidden)?;
+                    .ok_or_else(HubError::stale_caller)?;
                 caller_instance
                     .grants
                     .iter()
@@ -2947,12 +2947,14 @@ async fn replay_existing_command(
     existing: CommandRecord,
     payload: &mut Value,
 ) -> Result<CommandRecord, HubError> {
+    // Read before `existing` moves into the fresh row below.
+    let command_id = existing.command_id.clone();
     match operation {
         "instance.configure" => {
             // Peek, never await: a live attempt must answer 409 at once, not be
             // hidden behind the attempt's eventual terminal row.
             if subscribe_forward_attempt(&existing.command_id).is_some() {
-                return Err(configure_in_flight());
+                return Err(configure_in_flight(&command_id));
             }
             // Fresh durable read: the HTTP-level lookup can predate this point.
             let command = state
@@ -2963,7 +2965,7 @@ async fn replay_existing_command(
             match command.state.as_str() {
                 // The Node accepted the configure and it has not settled: it is
                 // still in progress there, so the caller polls.
-                "accepted" => Err(configure_in_flight()),
+                "accepted" => Err(configure_in_flight(&command_id)),
                 // Stored durable state decides: an in-flight intent vs a row
                 // that never went out (offline queue / pre-registration window).
                 "queued" => {
@@ -2975,7 +2977,7 @@ async fn replay_existing_command(
                         // slot acquired while the read ran, or the first POST
                         // still between insertion and forward registration:
                         // in progress.
-                        Err(configure_in_flight())
+                        Err(configure_in_flight(&command_id))
                     } else {
                         // Unfinished, never forwarded, and the first POST has
                         // finished (host offline). Applying anything again is
@@ -3011,12 +3013,8 @@ async fn replay_existing_command(
 /// Clear 409 for a configure whose first attempt's outcome is not persisted
 /// yet (the forward RPC is running or rests unknown): the caller polls the
 /// command row rather than replaying.
-fn configure_in_flight() -> HubError {
-    HubError::Conflict(
-        "instance.configure is still in flight; poll GET \
-         /v1/instances/{id}/commands/{commandId} for its outcome"
-            .to_string(),
-    )
+pub(crate) fn configure_in_flight(command_id: &str) -> HubError {
+    HubError::delivery_unknown(command_id)
 }
 
 /// Clear 409 for a configure resting in the queue without ever being

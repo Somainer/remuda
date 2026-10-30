@@ -930,6 +930,31 @@ describe("SessionList hold", () => {
     expect(cards()).toEqual(["ins_peer", "ins_held"]);
   });
 
+  it("keeps a vanished held row as an inert placeholder until release", () => {
+    const { rerender } = renderList("", {
+      instances: [
+        session("ins_held", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+        session("ins_peer", { activity: known("working"), updatedAt: "2026-09-19T08:00:00.000Z" }),
+      ],
+    });
+    const held = document.querySelector('[data-instance-id="ins_held"]')!;
+    fireEvent.pointerDown(held);
+    expect(document.querySelector(HELD)).not.toBeNull();
+
+    // Another device deletes it mid-hold.
+    rerender(
+      tree([session("ins_peer", { activity: known("working"), updatedAt: "2026-09-19T08:00:00.000Z" })]),
+    );
+    const stale = document.querySelector('[data-instance-id="ins_held"]')!;
+    expect(stale).toHaveAttribute("data-stale", "1");
+    expect(stale.querySelector('[data-testid="session-row"]')).toHaveAttribute("aria-disabled", "true");
+    expect(stale.querySelector('[data-testid="board-more"]')).toBeDisabled();
+    expect(stale.querySelector('[data-testid="board-select"]')).toBeDisabled();
+
+    fireEvent.pointerUp(document.body);
+    expect(document.querySelector('[data-instance-id="ins_held"]')).toBeNull();
+  });
+
   it("holds while the action Sheet is open", async () => {
     const { rerender } = renderList("", {
       instances: [

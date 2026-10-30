@@ -20,7 +20,7 @@ import { nextStep } from "./nextStep";
 import { LaunchedByMark } from "./LaunchedBy";
 import { HarnessGlyph } from "../spaces/SpacesPanel";
 import { compareRanked, liveChildParents, rank, rankStateWord } from "../mobile/homeRows";
-import { useHeldOrder } from "../../lib/useHeldOrder";
+import { useHeldOrder, type HoldSource } from "../../lib/useHeldOrder";
 import {
   applyFilters,
   availableConditions,
@@ -135,8 +135,7 @@ export function SessionList({
   // One hold: a finger in the list, keyboard focus in a row, or the open
   // action Sheet. It freezes the painted buckets and row order; content still
   // updates by instance id, and the list re-ranks once, on release.
-  const { start: beginHold, release: holdEnd, held, snapshot: holdSnapshot } =
-    useHeldOrder<DesktopSnapshot>();
+  const { begin, end, held, snapshot: holdSnapshot, regionRef } = useHeldOrder<DesktopSnapshot>();
 
   // Ids of rows whose wire disclosure is open (multiple rows may be open at
   // once; drives the side triggers' aria-expanded).
@@ -222,14 +221,24 @@ export function SessionList({
   useEffect(() => {
     paintedRef.current = painted;
   }, [painted]);
-  const holdStart = useCallback(() => beginHold(() => paintedRef.current), [beginHold]);
+  const startHold = useCallback(
+    (source: HoldSource) => begin(source, () => paintedRef.current),
+    [begin],
+  );
 
-  // The open action Sheet holds the list too, derived from its state rather
-  // than counted across hover/focus handlers.
+  // The open action Sheet is its own sticky source: pointer and keyboard
+  // activity inside it must not release the freeze, only closing it.
   useEffect(() => {
-    if (actionFor !== null) holdStart();
-    else holdEnd();
-  }, [actionFor, holdStart, holdEnd]);
+    if (actionFor !== null) {
+      startHold("sheet");
+    } else {
+      // Closing releases the Sheet's own source, and the focus source it
+      // restored to the ⋯ trigger: that focus is a side effect of closing,
+      // not a new interaction. A later Tab re-establishes it.
+      end("sheet");
+      end("focus");
+    }
+  }, [actionFor, startHold, end]);
 
   // While held, the snapshot owns the buckets and the order; live data only
   // replaces each row by id. A row that vanished keeps its last painted
@@ -242,6 +251,18 @@ export function SessionList({
       instances: section.instances.map((instance) => live.get(instance.id) ?? instance),
     }));
   }, [painted.sections, holdSnapshot, filtered]);
+
+  // A row painted at hold start that has since left the live data keeps its
+  // place as a placeholder, with its controls inert until release.
+  const staleIds = useMemo<ReadonlySet<string>>(() => {
+    if (!holdSnapshot) return new Set<string>();
+    const live = new Set(filtered.map((instance) => instance.id));
+    return new Set(
+      holdSnapshot.sections
+        .flatMap((section) => section.instances.map((instance) => instance.id))
+        .filter((id) => !live.has(id)),
+    );
+  }, [holdSnapshot, filtered]);
 
   // Rows currently on screen (IntersectionObserver), so the screen poll can
   // prefer them. The viewport root stays correct inside an overflow
@@ -379,17 +400,7 @@ export function SessionList({
     <div
       className={css.root}
       data-testid="session-list"
-      data-held={held ? "1" : "0"}
       ref={listRootRef}
-      // A finger anywhere in the list, or keyboard focus inside a row, freezes
-      // the painted buckets and order until the interaction ends.
-      onPointerDown={holdStart}
-      onFocus={(event) => {
-        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) holdStart();
-      }}
-      onBlur={(event) => {
-        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) holdEnd();
-      }}
     >
       <header className={css.top}>
         <div className={css.title}>{title}</div>
@@ -645,6 +656,24 @@ export function SessionList({
           </div>
         </div>
       ) : null}
+      <div
+        className={css.rows}
+        ref={regionRef}
+        data-order-held={held ? "1" : "0"}
+        // Only the ROWS freeze the order: the toolbar, filters and search sit
+        // outside this region, so typing there keeps filtering live.
+        onPointerDown={() => startHold("pointer")}
+        // Focus only freezes on a ROW control; the toolbar is outside this
+        // region and a row's own controls are what the spec covers.
+        onFocus={(event) => {
+          if ((event.target as Element | null)?.closest('[data-testid="board-card"]')) {
+            startHold("focus");
+          }
+        }}
+        onBlur={(event) => {
+          if (!event.currentTarget.contains(event.relatedTarget as Node | null)) end("focus");
+        }}
+      >
       {sections.map((group) => {
         const items = group.instances;
         if (!items.length) return null;
@@ -680,6 +709,7 @@ export function SessionList({
               const step = nextStep(instance, pending ?? null, screen, hubStore.summaryOf(instance.id));
               const exit = exitLabel(instance);
               const sheetOpen = actionFor === instance.id;
+              const stale = staleIds.has(instance.id);
               return (
                 <article
                   key={instance.id}
@@ -690,11 +720,14 @@ export function SessionList({
                   data-rank={homeRank}
                   data-lifecycle={instance.lifecycle}
                   data-kind={instance.kind}
+                  data-stale={stale ? "1" : undefined}
+                  aria-disabled={stale || undefined}
                 >
                   <label className={css.check}>
                     <input
                       type="checkbox"
                       data-testid="board-select"
+                      disabled={stale}
                       checked={checked}
                       onChange={() => {
                         setSelected((cur) => (cur.includes(instance.id) ? cur.filter((id) => id !== instance.id) : [...cur, instance.id]));
@@ -705,6 +738,9 @@ export function SessionList({
                     to={to}
                     className={css.body}
                     data-testid="session-row"
+                    aria-disabled={stale || undefined}
+                    tabIndex={stale ? -1 : undefined}
+                    onClick={stale ? (event) => event.preventDefault() : undefined}
                     data-status={status}
                     data-kind={instance.kind}
                     aria-keyshortcuts={gestureEnabled && slot ? modifierAriaShortcut(slot, platform) : undefined}
@@ -784,6 +820,7 @@ export function SessionList({
                       type="button"
                       className={css.moreBtn}
                       data-testid="board-more"
+                      disabled={stale}
                       aria-haspopup="dialog"
                       aria-expanded={sheetOpen}
                       aria-controls={sheetOpen ? "board-actions-panel" : undefined}
@@ -1030,6 +1067,7 @@ export function SessionList({
           </section>
         );
       })}
+      </div>
       {gestureEnabled && slots.length ? (
         <footer className={css.switchHint} data-testid="session-switch-hint" aria-hidden="true">
           按住 {platform.glyph} 快捷切换

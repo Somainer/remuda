@@ -385,7 +385,32 @@ describe("HomeList hold against the painted structure", () => {
   });
 
 
-  it("releases when the pointerup lands outside the list", () => {
+  it("keeps a vanished held row as an inert placeholder until release", () => {
+    hub.instances = [
+      exited("ins-gone"),
+      row("ins-peer", { activity: known("working"), updatedAt: "2026-09-19T08:00:00.000Z" }),
+    ];
+    renderHome();
+    const gone = screen.getByText("title ins-gone").closest("article")!;
+    act(() => {
+      fireEvent.pointerDown(gone);
+    });
+    expect(document.querySelector(HELD)).not.toBeNull();
+
+    // Another device deletes the instance while the finger is down.
+    setInstances([row("ins-peer", { activity: known("working"), updatedAt: "2026-09-19T08:00:00.000Z" })]);
+    expect(gone).toHaveAttribute("data-stale", "1");
+    const link = gone.querySelector('[data-testid="home-row-link"]')!;
+    expect(link).toHaveAttribute("aria-disabled", "true");
+    expect(gone.querySelector('[data-testid="home-resume"]')).toBeDisabled();
+
+    act(() => {
+      fireEvent.pointerUp(document.body);
+    });
+    expect(screen.queryByText("title ins-gone")).toBeNull();
+  });
+
+  it("releases when the pointerup lands outside the list", async () => {
     hub.instances = [row("ins-held", { activity: known("working") })];
     renderHome();
     const held = screen.getByText("title ins-held").closest("article")!;

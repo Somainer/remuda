@@ -22,6 +22,7 @@ import {
   createMemory,
   deleteMemory,
   getMemory,
+  lineageExists,
   listMemory,
   restoreMemory,
   searchMemory,
@@ -94,7 +95,8 @@ export function MemoryPage() {
   const q = params.get("q") ?? "";
   const slugParam = params.get("slug");
   const [lineageId, setLineageId] = useState<string | null>(null);
-  const lineageKnown = lineageId === null ? null : true;
+  /** `null` while checking; whether the Hub has a lineage row at all. */
+  const [lineageKnown, setLineageKnown] = useState<boolean | null>(null);
   const [entries, setEntries] = useState<MemoryEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -130,23 +132,36 @@ export function MemoryPage() {
   useEffect(() => {
     let live = true;
     setLineageId(null);
+    setLineageKnown(null);
     setAboutLoaded(false);
     (async () => {
+      let lineage = instanceId;
       try {
         const instance = await api.instanceGet(instanceId as Id);
         if (!live) return;
-        setLineageId(instance.lineageId ?? instanceId);
+        lineage = instance.lineageId ?? instanceId;
       } catch (error) {
         if (!live) return;
         // A retired lineage has no session row any more, but its memory is
         // archived, not deleted (D-060 §12.4): a first chapter's instance id
         // IS its lineage id, so the owner can still reach the archived
         // entries (and 恢复 them) from a bookmarked route.
-        if (error instanceof HubHttpError && error.status === 404) {
-          setLineageId(instanceId);
+        if (!(error instanceof HubHttpError && error.status === 404)) {
+          setLoadError(`读取会话失败：${saveErrorText(error)}`);
+          setLoading(false);
           return;
         }
-        setLoadError(`读取会话失败：${saveErrorText(error)}`);
+      }
+      try {
+        const exists = await lineageExists(lineage);
+        if (!live) return;
+        setLineageId(lineage);
+        setLineageKnown(exists);
+        if (!exists) setLoading(false);
+      } catch (error) {
+        if (!live) return;
+        setLineageId(lineage);
+        setLoadError(saveErrorText(error));
         setLoading(false);
       }
     })();
@@ -700,7 +715,11 @@ export function MemoryPage() {
 
           {!loading && !loadError && !hasAnything ? (
             <p className={css.empty} data-testid="memory-empty">
-              {q.trim() ? "没有匹配的记忆。" : "这个会话还没有记忆。"}
+              {lineageKnown === false
+                ? "这个会话还不是连续血缘，记忆从连续会话开始记录。"
+                : q.trim()
+                  ? "没有匹配的记忆。"
+                  : "这个会话还没有记忆。"}
             </p>
           ) : null}
 

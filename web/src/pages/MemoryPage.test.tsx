@@ -22,11 +22,13 @@ vi.mock("../features/memory/api", async (importOriginal) => {
     updateMemory: vi.fn(),
     deleteMemory: vi.fn(),
     restoreMemory: vi.fn(),
+    lineageExists: vi.fn(),
     listMemoryWrites: vi.fn(),
   };
 });
 
 const instanceGet = vi.mocked(api.instanceGet);
+const lineageExists = vi.mocked(memoryApi.lineageExists);
 const listMemory = vi.mocked(memoryApi.listMemory);
 const searchMemory = vi.mocked(memoryApi.searchMemory);
 const getMemory = vi.mocked(memoryApi.getMemory);
@@ -64,6 +66,7 @@ function renderPage(initialEntry: string) {
 beforeEach(() => {
   vi.clearAllMocks();
   instanceGet.mockResolvedValue({ id: "ins_x", lineageId: "ins_l" } as never);
+  lineageExists.mockResolvedValue(true);
   listMemory.mockResolvedValue([]);
   searchMemory.mockResolvedValue([]);
   getMemory.mockRejectedValue(new HubHttpError(404, "NOT_FOUND", "missing"));
@@ -153,5 +156,22 @@ describe("an unsaved about-me draft survives reloads", () => {
     await waitFor(() => expect(screen.getByTestId("memory-conflict")).toBeTruthy());
     expect(screen.getByTestId("memory-conflict-server")).toHaveTextContent("theirs v2");
     expect(screen.getByTestId("memory-conflict-mine")).toHaveTextContent("mine");
+  });
+});
+
+describe("a plain session without a lineage row", () => {
+  it("shows the no-lineage state and hides the editors", async () => {
+    lineageExists.mockResolvedValue(false);
+    listMemory.mockResolvedValue([]);
+
+    renderPage("/s/ins_x/memory");
+
+    await waitFor(() =>
+      expect(screen.getByTestId("memory-empty")).toHaveTextContent("还不是连续血缘"),
+    );
+    expect(screen.queryByTestId("memory-about")).toBeNull();
+    expect(screen.queryByTestId("memory-new")).toBeNull();
+    expect(screen.queryByTestId("memory-search")).toBeNull();
+    expect(createMemory).not.toHaveBeenCalled();
   });
 });

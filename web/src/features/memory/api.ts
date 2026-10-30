@@ -7,6 +7,7 @@
  * lineage first.
  */
 import { rest } from "../../lib/api";
+import { HubHttpError } from "../../lib/httpError";
 import type { components } from "../../lib/api.generated";
 
 export type MemoryEntry = components["schemas"]["MemoryEntry"];
@@ -69,6 +70,22 @@ export async function searchMemory(
   });
   const page = await rest<{ items?: MemorySearchHit[] }>(`${base(lineageId)}/search?${params}`);
   return (Array.isArray(page?.items) ? page.items : []).map((hit) => hit.entry);
+}
+
+/** Whether the Hub has a lineage row for `lineageId`.
+ *
+ * An unknown lineage answers `200 {items: []}` on the list route, so the page
+ * decides existence explicitly. A retired lineage also has no row, but its
+ * archived entries are still listed (and restorable) by the memory routes.
+ */
+export async function lineageExists(lineageId: string): Promise<boolean> {
+  try {
+    await rest(`/v1/lineages/${encodeURIComponent(lineageId)}`);
+    return true;
+  } catch (error) {
+    if (error instanceof HubHttpError && error.status === 404) return false;
+    throw error;
+  }
 }
 
 export async function getMemory(lineageId: string, slug: string): Promise<MemoryEntry> {

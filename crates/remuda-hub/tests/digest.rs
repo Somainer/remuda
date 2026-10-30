@@ -144,6 +144,25 @@ impl Ctx {
         Ok((status, response.bytes().await?.to_vec()))
     }
 
+    /// GET `path` as `token` with one extra caller header.
+    async fn get_with_header(
+        &self,
+        token: &str,
+        path: &str,
+        name: &str,
+        value: &str,
+    ) -> Result<(u16, Vec<u8>)> {
+        let response = self
+            .http
+            .get(format!("{}{path}", self.base()))
+            .bearer_auth(token)
+            .header(name, value)
+            .send()
+            .await?;
+        let status = response.status().as_u16();
+        Ok((status, response.bytes().await?.to_vec()))
+    }
+
     async fn post(&self, token: &str, path: &str, body: Value) -> Result<Value> {
         let response = self
             .http
@@ -552,10 +571,11 @@ async fn an_agent_reads_only_its_own_lineages_workers_and_nothing_else_under_wor
     ] {
         assert_eq!(ctx.get(&token_a, &path).await?.0, 403, "{path}");
     }
-    // The worker's own token (a leaf, same lineage chain as a child) can read
-    // its own digest through the shared edge, but not a sibling's.
+    // A leaf worker holds no `dispatch` grant (project.rs:35), so even its own
+    // digest is refused — the same rule as every other scope-wide worker read
+    // (D-060 §8.4: require the grant and re-check the caller's project scope).
     let worker_token = ctx.agent_token_for(&instance_a).await?;
-    assert_eq!(ctx.get(&worker_token, &digest_path).await?.0, 200);
+    assert_eq!(ctx.get(&worker_token, &digest_path).await?.0, 403);
     let (sibling, _) = ctx
         .worker_under(&token_a, &project, "c-sibling", None)
         .await?;
@@ -565,6 +585,26 @@ async fn an_agent_reads_only_its_own_lineages_workers_and_nothing_else_under_wor
             .0,
         403
     );
+
+    // A Bot device reads as an operator, but it is a courier: presenting the
+    // caller header would let it borrow an Agent's scope, so it is refused
+    // before the narrowing. The decision is made on the authenticated device.
+    let bot = ctx
+        .post(
+            "unused-bearer",
+            "/v1/login",
+            json!({ "bootstrapToken": ctx.hub.bootstrap_token,
+                "deviceName": "digest-bot", "deviceKind": "bot" }),
+        )
+        .await?["token"]
+        .as_str()
+        .context("bot token")?
+        .to_string();
+    assert_eq!(ctx.get(&bot, &digest_path).await?.0, 200);
+    let (status, _) = ctx
+        .get_with_header(&bot, &digest_path, "x-remuda-instance-id", &coordinator_a)
+        .await?;
+    assert_eq!(status, 403, "a Bot must not narrow itself into Agent scope");
 
     // Glance: a lineage lists the workers it dispatched; waiting vs working.
     ctx.journal(
@@ -610,6 +650,14 @@ async fn an_agent_reads_only_its_own_lineages_workers_and_nothing_else_under_wor
             .0,
         404
     );
+    // The glance carries the same grant and courier rules as the digest: a
+    // leaf has no `dispatch` grant, and a Bot may not narrow itself.
+    assert_eq!(ctx.get(&worker_token, &glance_path).await?.0, 403);
+    assert_eq!(ctx.get(&bot, &glance_path).await?.0, 200);
+    let (status, _) = ctx
+        .get_with_header(&bot, &glance_path, "x-remuda-instance-id", &coordinator_a)
+        .await?;
+    assert_eq!(status, 403, "a Bot must not narrow itself into Agent scope");
     // The lineage read itself is unchanged for the owner, refused for B.
     assert_eq!(
         ctx.get(&token_a, &format!("/v1/lineages/{coordinator_a}"))

@@ -22,7 +22,7 @@
 //! secrets and input-handoff values, and is bounded.
 
 use crate::AppState;
-use crate::agent_scope::{caller, origin, owns};
+use crate::agent_scope::{caller, caller_project_scope, origin, owns, require_grant};
 use crate::auth::require_origin;
 use crate::error::HubError;
 use crate::http::map_store;
@@ -1537,14 +1537,41 @@ async fn resolve_readable_worker(
     }
 }
 
+/// Authenticate a caller for the digest family, deciding two rules beyond
+/// `caller()` itself.
+///
+/// * The AUTHENTICATED device kind decides first. `caller()` re-stamps any
+///   device that presents `x-remuda-instance-id` as an Agent; for a Bot that
+///   would be a courier borrowing an Agent's scope, so the header is refused
+///   on a Bot token before the narrowing.
+/// * D-060 §8.4: an Agent needs the `dispatch` grant, exactly like every other
+///   scope-wide worker read (`workers.rs` list/get). The returned scope is the
+///   caller's project scope for the handler to re-check.
+async fn digest_caller(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(crate::store::Device, remuda_protocol::InstanceScope), HubError> {
+    let authenticated = crate::auth::require_device(&state.store, headers).await?;
+    if authenticated.kind == "bot" && headers.contains_key("x-remuda-instance-id") {
+        return Err(HubError::Forbidden);
+    }
+    let device = caller(state, headers).await?;
+    require_grant(state, &device, remuda_protocol::GrantVerb::Dispatch).await?;
+    let scope = caller_project_scope(state, &device).await?;
+    Ok((device, scope))
+}
+
 async fn worker_digest(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<WorkerDigest>, HubError> {
     require_origin(&headers, &state.config)?;
-    let device = caller(&state, &headers).await?;
+    let (device, scope) = digest_caller(&state, &headers).await?;
     let worker = resolve_readable_worker(&state, &device, &id).await?;
+    if !scope.allows_project(worker.project_id.as_id().as_str()) {
+        return Err(HubError::Forbidden);
+    }
     Ok(Json(collect_digest(&state, &worker).await?))
 }
 
@@ -1554,7 +1581,7 @@ async fn lineage_glance(
     Path(lineage_id): Path<String>,
 ) -> Result<Json<LineageGlance>, HubError> {
     require_origin(&headers, &state.config)?;
-    let device = caller(&state, &headers).await?;
+    let (device, scope) = digest_caller(&state, &headers).await?;
     let own = match device.instance_id.as_deref() {
         Some(bound) if origin(&device) == InputOrigin::Agent => state
             .store
@@ -1578,6 +1605,27 @@ async fn lineage_glance(
             .map_err(map_store)?
             .ok_or(HubError::NotFound)?
     };
+    // D-060 §8.4: the caller's project scope covers the whole read. The
+    // lineage's current chapter names the project; an empty scope (human, Bot,
+    // top coordinator) admits everything.
+    if let Some(lineage) = state
+        .store
+        .get_lineage(lineage_id.clone())
+        .await
+        .map_err(map_store)?
+    {
+        let project = state
+            .store
+            .get_instance_read(lineage.current_instance_id)
+            .await
+            .map_err(map_store)?
+            .and_then(|row| row.project_id);
+        if let Some(project) = project
+            && !scope.allows_project(&project)
+        {
+            return Err(HubError::Forbidden);
+        }
+    }
     let now = OffsetDateTime::now_utc();
     let day_start = now.replace_time(time::Time::MIDNIGHT);
     let workers = state

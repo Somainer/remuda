@@ -6,6 +6,7 @@ import {
   type APIRequestContext,
   type Browser,
   type BrowserContext,
+  type Locator,
   type Page,
 } from "@playwright/test";
 import { seedMode } from "./appearanceHelper";
@@ -45,10 +46,17 @@ type StorageState = Awaited<ReturnType<BrowserContext["storageState"]>>;
 const LONG_TITLE = "帮我检查一下这个长会话的构建日志并总结所有失败的测试用例以及下一步应该怎么处理";
 const BLOCKED_TOKEN = "homepolish-blocked";
 const EXITED_TOKEN = "homepolish-exited";
+/** The hook approval the fake Node raises for a `hook-approval` prompt
+ *  carries this exact option set (crates/remuda-hub/examples/hub_e2e.rs,
+ *  fake_hook_approval): the session-wide grant label is the long one. */
+const LONG_OPTION = "始终允许 (acceptEdits)";
+const HOOK_CARD_BODY = "/tmp/hook-approval.txt";
+/** A Space name far wider than the phone's header button or drawer row. */
+const LONG_SPACE = "项目-用于检查超长空间名称在手机宽度下的省略与完整标题-第二段";
 
 type Seed = { blockedId: string; exitedId: string };
 
-type Session = { storage: StorageState; request: APIRequestContext; seed: Seed };
+type Session = { storage: StorageState; request: APIRequestContext; seed: Seed; hostId: string };
 
 let session: Session | null = null;
 let unavailable = false;
@@ -128,6 +136,7 @@ async function prepare(browser: Browser, baseURL: string): Promise<Session | nul
       // the cookie jar so afterAll can delete the seeded instances.
       request: await apiRequest.newContext({ baseURL, storageState: storage }),
       seed: { blockedId, exitedId },
+      hostId,
     };
     return session;
   } finally {
@@ -203,6 +212,84 @@ async function expectNoHorizontalOverflow(page: Page): Promise<void> {
   ).toBeLessThanOrEqual(overflow.client + 1);
 }
 
+type TruncatedUnlabeled = { testid: string; text: string };
+
+/**
+ * D-061: a button that IS truncated (nowrap/ellipsis buttons and their label
+ * spans) must carry the full label in `title` or `aria-label`. Buttons that
+ * wrap (`white-space: normal`) are the authorization-scope / path-target
+ * exemption and never truncate horizontally, so they are out of this check.
+ */
+async function truncatedWithoutFullLabel(page: Page): Promise<TruncatedUnlabeled[]> {
+  return page.evaluate(() => {
+    const SELECTOR = 'button, [role="button"], a[data-testid^="phone-nav-"]';
+    const norm = (value: string) => value.replace(/\s+/g, " ").trim();
+    const out: { testid: string; text: string }[] = [];
+    for (const el of Array.from(new Set(document.querySelectorAll(SELECTOR)))) {
+      const style = getComputedStyle(el);
+      if (style.display === "none" || style.visibility === "hidden") continue;
+      const box = el.getBoundingClientRect();
+      if (box.width < 1 || box.height < 1) continue;
+      if (style.whiteSpace !== "nowrap") continue; // the wrap exemption
+      const clipped: string[] = [];
+      if (el.scrollWidth > el.clientWidth + 1) clipped.push(norm(el.textContent ?? ""));
+      for (const span of Array.from(el.querySelectorAll(":scope > span"))) {
+        if (span.scrollWidth > span.clientWidth + 1) clipped.push(norm(span.textContent ?? ""));
+      }
+      if (clipped.length === 0) continue;
+      const sources = [
+        el.getAttribute("title"),
+        el.getAttribute("aria-label"),
+        ...Array.from(el.querySelectorAll("[title], [aria-label]")).flatMap((node) => [
+          node.getAttribute("title"),
+          node.getAttribute("aria-label"),
+        ]),
+      ]
+        .filter((value): value is string => Boolean(value))
+        .map(norm);
+      const missing = clipped.filter((text) => text && !sources.some((source) => source.includes(text)));
+      if (missing.length > 0) {
+        out.push({
+          testid: el.getAttribute("data-testid") ?? el.tagName.toLowerCase(),
+          text: missing.map((text) => text.slice(0, 40)).join(" | "),
+        });
+      }
+    }
+    return out;
+  });
+}
+
+/** An exempt button (authorization scope / path target) must show its whole
+ *  label: it wraps, is not ellipsized, and nothing overflows its box. */
+async function expectFullyReadable(button: Locator, label: string): Promise<void> {
+  await expect(button).toBeVisible();
+  await expect(button).toHaveText(label);
+  const geometry = await button.evaluate((el) => {
+    const style = getComputedStyle(el);
+    return {
+      scrollWidth: el.scrollWidth,
+      clientWidth: el.clientWidth,
+      whiteSpace: style.whiteSpace,
+      textOverflow: style.textOverflow,
+      textRect: (() => {
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        const rect = range.getBoundingClientRect();
+        const box = el.getBoundingClientRect();
+        return { left: rect.left - box.left, right: rect.right - box.right };
+      })(),
+    };
+  });
+  expect(
+    geometry.scrollWidth,
+    `${label}: label fits (scrollWidth ${geometry.scrollWidth} > clientWidth ${geometry.clientWidth})`,
+  ).toBeLessThanOrEqual(geometry.clientWidth + 1);
+  expect(geometry.textRect.left, `${label}: text starts inside the button`).toBeGreaterThanOrEqual(-1);
+  expect(geometry.textRect.right, `${label}: text ends inside the button`).toBeLessThanOrEqual(1);
+  expect(geometry.whiteSpace, `${label}: wraps instead of truncating`).toBe("normal");
+  expect(geometry.textOverflow, `${label}: is not ellipsized`).not.toBe("ellipsis");
+}
+
 for (const theme of THEMES) {
   for (const viewport of VIEWPORTS) {
     test(`${viewport.label}px ${theme}: every visible button on /m and /sessions is one line`, async ({
@@ -249,6 +336,7 @@ for (const theme of THEMES) {
           await expect(page.getByTestId("home-resume").first()).toBeVisible();
 
           expect(await singleLineOffenders(page), "/m buttons render one line").toEqual([]);
+          expect(await truncatedWithoutFullLabel(page), "/m truncated buttons carry their full text").toEqual([]);
           await expectNoHorizontalOverflow(page);
         } else {
           await page.goto("/sessions");
@@ -269,6 +357,10 @@ for (const theme of THEMES) {
           await expect(page.getByTestId("session-filter-open")).toBeVisible();
 
           expect(await singleLineOffenders(page), "/sessions buttons render one line").toEqual([]);
+          expect(
+            await truncatedWithoutFullLabel(page),
+            "/sessions truncated buttons carry their full text",
+          ).toEqual([]);
           await expectNoHorizontalOverflow(page);
         }
       } finally {
@@ -277,3 +369,96 @@ for (const theme of THEMES) {
     });
   }
 }
+
+/**
+ * D-061 r2: buttons whose label states an authorization scope (approval
+ * options) or a filesystem target (the Space name) are exempt from the
+ * single-line clip. The hook approval's 始终允许 (acceptEdits) is wider than a
+ * compact card row third: it must stay fully readable, and a truncated Space
+ * name must carry the full name in its title.
+ */
+test("390 light: long approval options and a long Space name stay readable", async ({ browser }) => {
+  const baseURL = test.info().project.use.baseURL;
+  expect(baseURL, "project baseURL").toBeTruthy();
+  const prepared = await prepare(browser, baseURL!);
+  test.skip(!prepared, "needs the in-process fake Node (e2e-fake-node)");
+
+  const approvalCreate = await prepared!.request.post("/v1/instances", {
+    data: {
+      hostId: prepared!.hostId,
+      workspaceId: "wsp_e2e",
+      kind: "claude",
+      driver: "claude-print",
+      title: "homepolish hook approval",
+      prompt: `hook-approval ${Date.now().toString(36)}`,
+    },
+  });
+  expect(approvalCreate.ok(), `create hook approval: ${approvalCreate.status()}`).toBe(true);
+  const approvalBody = (await approvalCreate.json()) as { instance?: { instanceId?: string; id?: string } };
+  const approvalId = approvalBody.instance?.instanceId ?? approvalBody.instance?.id;
+  expect(approvalId, "hook approval instance").toBeTruthy();
+
+  const context = await browser.newContext({
+    ...devices["iPhone 13"],
+    baseURL: baseURL!,
+    storageState: prepared!.storage,
+  });
+  try {
+    const page = await context.newPage();
+    await seedMode(page, "light");
+
+    // ---- the compact approval card: full option labels, never clipped ----
+    await page.goto("/m/inbox");
+    await expect(page.getByTestId("m-inbox")).toBeVisible({ timeout: 20_000 });
+    const card = page.getByTestId("approval-row").filter({ hasText: HOOK_CARD_BODY });
+    await expect(card).toBeVisible({ timeout: 20_000 });
+    await expectFullyReadable(card.getByRole("button", { name: LONG_OPTION }), LONG_OPTION);
+    await expectFullyReadable(card.getByRole("button", { name: "允许一次" }), "允许一次");
+    await expectFullyReadable(card.getByRole("button", { name: "拒绝" }), "拒绝");
+    // Exempt labels never truncate, so the general title rule has nothing to
+    // report on this card either.
+    expect(await truncatedWithoutFullLabel(page), "/m/inbox truncated buttons carry their full text").toEqual(
+      [],
+    );
+
+    // ---- a long Space name: the header button ellipsizes, title keeps all ----
+    await page.goto("/m");
+    await expect(page.getByTestId("home-list")).toBeVisible({ timeout: 20_000 });
+    await page.getByTestId("spaces-drawer-open").click();
+    const drawer = page.getByTestId("spaces-drawer");
+    await expect(drawer).toBeVisible();
+    await drawer.getByRole("button", { name: "重命名" }).click();
+    await drawer.getByLabel("空间名称").fill(LONG_SPACE);
+    await drawer.getByRole("button", { name: "保存" }).click();
+
+    const spaceRow = drawer.getByTestId("space-select").filter({ hasText: LONG_SPACE });
+    await expect(spaceRow).toHaveCount(1);
+    // The drawer row clips the name (it is genuinely too wide) but its title
+    // carries the whole name for a long-press / hover read.
+    expect(await spaceRow.getAttribute("title")).toContain(LONG_SPACE);
+    const nameClipped = await spaceRow.evaluate((el) => {
+      const name = el.querySelector("span");
+      return name ? name.scrollWidth > name.clientWidth + 1 : false;
+    });
+    expect(nameClipped, "the long Space name really is wider than the drawer row").toBe(true);
+
+    // Select the renamed Space: with no remembered selection the home shows
+    // the first Space by name, and the rename moved this one out of first
+    // place. Selecting it closes the drawer and lands back on /m.
+    await spaceRow.click();
+    await page.waitForURL((url) => url.pathname === "/m" || url.pathname.startsWith("/s/"), {
+      timeout: 20_000,
+    });
+    if (new URL(page.url()).pathname !== "/m") await page.goto("/m");
+    await expect(page.getByTestId("home-list")).toBeVisible({ timeout: 20_000 });
+    const header = page.getByTestId("spaces-drawer-open");
+    await expect(header).toHaveAttribute("title", LONG_SPACE);
+    expect(await truncatedWithoutFullLabel(page), "the header Space button carries its full name").toEqual(
+      [],
+    );
+    await expectNoHorizontalOverflow(page);
+  } finally {
+    await context.close();
+    await prepared!.request.delete(`/v1/instances/${approvalId}?force=1`).catch(() => undefined);
+  }
+});

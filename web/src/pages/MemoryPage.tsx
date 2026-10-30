@@ -97,6 +97,7 @@ export function MemoryPage() {
   const [entries, setEntries] = useState<MemoryEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [noLineage, setNoLineage] = useState(false);
   const [editor, setEditor] = useState<EditorState | null>(null);
   const [editorError, setEditorError] = useState<string | null>(null);
   const [editorWarnings, setEditorWarnings] = useState<string[]>([]);
@@ -149,8 +150,16 @@ export function MemoryPage() {
           ? await searchMemory(lineage, query.trim(), true)
           : await listMemory(lineage, true);
         setEntries(items);
+        setNoLineage(false);
       } catch (error) {
-        setLoadError(saveErrorText(error));
+        // A plain (non-continuity) instance has no lineage row yet, so it has
+        // no memory to show: that is a state, not a failure.
+        if (error instanceof HubHttpError && error.status === 404) {
+          setEntries([]);
+          setNoLineage(true);
+        } else {
+          setLoadError(saveErrorText(error));
+        }
       } finally {
         setLoading(false);
       }
@@ -455,10 +464,7 @@ export function MemoryPage() {
     <div className={css.page} data-testid="memory-page" data-lineage={lineageId ?? ""}>
       <PageHeader
         testId="memory-header"
-        crumbs={[
-          { label: "会话", to: `/s/${instanceId}` },
-          { label: "记忆" },
-        ]}
+        crumbs={[{ label: "会话", to: `/s/${instanceId}` }]}
         title="记忆"
         actions={
           <Button data-testid="memory-new" onClick={() => openCreate("user")}>
@@ -522,7 +528,7 @@ export function MemoryPage() {
             ) : (
               <>
                 <textarea
-                  className={css.textarea}
+                  className={`${css.textarea} ${css.aboutInput}`}
                   value={aboutDraft}
                   placeholder="写下关于你自己的信息，席位会在章节开始时读到索引。"
                   aria-label="关于我"
@@ -543,7 +549,7 @@ export function MemoryPage() {
                   <Button
                     variant="primary"
                     data-testid="memory-about-save"
-                    disabled={aboutSaving}
+                    disabled={aboutSaving || !lineageId}
                     onClick={() => void saveAbout()}
                   >
                     {aboutSaving ? "保存中…" : "保存"}
@@ -555,7 +561,11 @@ export function MemoryPage() {
 
           {!loading && !loadError && !hasAnything ? (
             <p className={css.empty} data-testid="memory-empty">
-              {q.trim() ? "没有匹配的记忆。" : "这个会话还没有记忆。"}
+              {noLineage
+                ? "这个会话还不是连续血缘，记忆从连续会话开始记录。"
+                : q.trim()
+                  ? "没有匹配的记忆。"
+                  : "这个会话还没有记忆。"}
             </p>
           ) : null}
 

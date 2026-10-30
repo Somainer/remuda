@@ -211,6 +211,10 @@
 
 /* ── editor ───────────────────────────────────────────────────────────── */
 
+.aboutInput {
+  min-height: 5lh;
+}
+
 .editor {
   display: flex;
   flex-direction: column;

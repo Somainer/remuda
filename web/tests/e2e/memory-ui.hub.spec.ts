@@ -1,4 +1,4 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, webkit, devices, type Browser, type Page } from "@playwright/test";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -86,11 +86,21 @@ async function raiseKeyboard(page: Page, keyboardHeight = 308) {
 }
 
 async function fakeHostId(page: Page): Promise<string | null> {
-  const response = await page.request.get("/v1/hosts");
-  if (!response.ok()) return null;
-  const body = (await response.json()) as { items?: { id?: string; hostId?: string; label?: string }[] };
-  const host = (body.items ?? []).find((row) => row.label === "e2e-fake-node");
-  return host?.hostId ?? host?.id ?? null;
+  // The fake Node registers shortly after the Hub boots; poll instead of
+  // racing it (home-polish's idiom). A Hub without it skips, never fails.
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const response = await page.request.get("/v1/hosts");
+    if (response.ok()) {
+      const body = (await response.json()) as {
+        items?: { id?: string; hostId?: string; label?: string }[];
+      };
+      const host = (body.items ?? []).find((row) => row.label === "e2e-fake-node");
+      const id = host?.hostId ?? host?.id;
+      if (id) return id;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  return null;
 }
 
 async function seedSession(page: Page): Promise<string | null> {
@@ -104,6 +114,9 @@ async function seedSession(page: Page): Promise<string | null> {
       driver: "claude-print",
       title: "记忆页会话",
       prompt: "memoryui-seed",
+      // A restart policy makes this instance a continuity lineage (D-057
+      // §6.1); memory belongs to a lineage, so a plain instance has none.
+      restart: { onProcessLoss: true, maxPerHour: 3 },
     },
   });
   expect(response.ok(), `create session: ${response.status()} ${await response.text()}`).toBe(true);
@@ -229,9 +242,11 @@ for (const theme of THEMES) {
     await expect(page.getByTestId("memory-editor")).toBeVisible();
     await page.getByTestId("memory-editor-body").fill("叫我老王。边界条件也用中文写清楚。更新一版。");
     if (phone) {
+      await page.getByTestId("memory-editor-body").evaluate((el) => el.scrollIntoView({ block: "center" }));
       await page.getByTestId("memory-editor-body").focus();
       await raiseKeyboard(page);
-      const geometry = await page.getByTestId("memory-editor").evaluate((el) => {
+      const dialog = page.getByRole("dialog").filter({ has: page.getByTestId("memory-editor") });
+      const geometry = await dialog.evaluate((el) => {
         const rect = el.getBoundingClientRect();
         const vv = window.visualViewport!;
         return {
@@ -241,8 +256,17 @@ for (const theme of THEMES) {
           bandBottom: vv.offsetTop + vv.height,
         };
       });
+      // The dialog rides the visible band (Modal tracks visualViewport), so
+      // the keyboard never covers it.
       expect(geometry.top).toBeGreaterThanOrEqual(geometry.bandTop - 1);
       expect(geometry.bottom).toBeLessThanOrEqual(geometry.bandBottom + 1);
+      const field = await page.getByTestId("memory-editor-body").evaluate((el) => {
+        const rect = el.getBoundingClientRect();
+        const vv = window.visualViewport!;
+        return { top: rect.top, bottom: rect.bottom, bandTop: vv.offsetTop, bandBottom: vv.offsetTop + vv.height };
+      });
+      expect(field.bottom).toBeGreaterThan(field.bandTop);
+      expect(field.top).toBeLessThan(field.bandBottom);
     }
     await shot(page, `memory-ui-${label(phone)}-${theme}-editor.png`, phone);
     await page.getByTestId("memory-editor-save").click();
@@ -311,6 +335,11 @@ for (const theme of THEMES) {
 
     await page.goto(`/s/${lineage}/memory`);
     await expect(page.getByTestId("memory-about")).toBeVisible({ timeout: 20_000 });
+    // The card paints before the lineage resolves; wait for the list so the
+    // save button is armed (it is disabled until then).
+    await expect(page.getByTestId("memory-row").filter({ hasText: "临时记忆" })).toBeVisible({
+      timeout: 20_000,
+    });
     await page.getByTestId("memory-about-body").fill("我是这个 Hub 的所有者，偏好简短回答。");
     await page.getByTestId("memory-about-save").click();
     await expect
@@ -350,3 +379,74 @@ for (const theme of THEMES) {
       .toBeNull();
   });
 }
+
+/**
+ * 390 WebKit iPhone 13. Connects to the jammy WebKit run-server
+ * (`PW_TEST_CONNECT_WS_ENDPOINT`, e.g. ws://127.0.0.1:3177) the same way
+ * composer-popover's iPhone case does, and skips on hosts without one. The
+ * hub config's chromium project hosts this case so it runs with m-home and
+ * ux-keys under one lock.
+ */
+test("390 WebKit iPhone 13: memory page, and the keyboard never covers the editor (light and dark)", async () => {
+  const endpoint = process.env.PW_TEST_CONNECT_WS_ENDPOINT;
+  test.skip(!endpoint, "needs PW_TEST_CONNECT_WS_ENDPOINT (jammy WebKit run-server)");
+  const baseURL = test.info().project.use.baseURL;
+  expect(baseURL, "project baseURL").toBeTruthy();
+  let browser: Browser | null = null;
+  try {
+    browser = await webkit.connect(endpoint!);
+    const context = await browser.newContext({ ...devices["iPhone 13"], baseURL: baseURL! });
+    const page = await context.newPage();
+    try {
+      await login(page, "e2e-memory-ui-webkit");
+      for (const theme of THEMES) {
+        await seedMode(page, theme);
+        const id = await seedSession(page);
+        if (!id) {
+          test.skip(true, "needs the in-process fake Node (e2e-fake-node)");
+        }
+        const lineage = id!;
+        await writeEntry(page, lineage, {
+          slug: "pref",
+          type: "user",
+          title: "称呼",
+          description: "怎么称呼我",
+          body: "叫我老王。边界条件也用中文写清楚。",
+        });
+        await page.goto(`/s/${lineage}/memory`);
+        await expect(page.getByTestId("memory-page")).toBeVisible({ timeout: 20_000 });
+        await expect(page.getByTestId("memory-row")).toHaveCount(1, { timeout: 20_000 });
+        await expectNoHorizontalOverflow(page);
+        await shot(page, `memory-ui-390-webkit-${theme}-page.png`, true);
+
+        await page.getByTestId("memory-row").first().click();
+        await expect(page.getByTestId("memory-editor")).toBeVisible();
+        await page.getByTestId("memory-editor-body").evaluate((el) => el.scrollIntoView({ block: "center" }));
+        await page.getByTestId("memory-editor-body").focus();
+        await raiseKeyboard(page);
+        const dialog = page.getByRole("dialog").filter({ has: page.getByTestId("memory-editor") });
+        const geometry = await dialog.evaluate((el) => {
+          const rect = el.getBoundingClientRect();
+          const vv = window.visualViewport!;
+          return {
+            top: rect.top,
+            bottom: rect.bottom,
+            bandTop: vv.offsetTop,
+            bandBottom: vv.offsetTop + vv.height,
+          };
+        });
+        expect(geometry.top).toBeGreaterThanOrEqual(geometry.bandTop - 1);
+        expect(geometry.bottom).toBeLessThanOrEqual(geometry.bandBottom + 1);
+        await shot(page, `memory-ui-390-webkit-${theme}-editor.png`, true);
+        await page.getByTestId("memory-editor-cancel").click();
+      }
+    } finally {
+      for (const id of created.splice(0)) {
+        await page.request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
+      }
+      await context.close();
+    }
+  } finally {
+    await browser?.close();
+  }
+});

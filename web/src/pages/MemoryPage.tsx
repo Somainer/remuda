@@ -94,10 +94,10 @@ export function MemoryPage() {
   const q = params.get("q") ?? "";
   const slugParam = params.get("slug");
   const [lineageId, setLineageId] = useState<string | null>(null);
+  const lineageKnown = lineageId === null ? null : true;
   const [entries, setEntries] = useState<MemoryEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [noLineage, setNoLineage] = useState(false);
   const [editor, setEditor] = useState<EditorState | null>(null);
   const [editorError, setEditorError] = useState<string | null>(null);
   const [editorWarnings, setEditorWarnings] = useState<string[]>([]);
@@ -108,6 +108,10 @@ export function MemoryPage() {
     kind: "entry" | "about";
   } | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<MemoryEntry | null>(null);
+  // The about-me entry is loaded on its own, independent of the list/search:
+  // a search that does not match it must never make it look absent.
+  const [aboutEntry, setAboutEntry] = useState<MemoryEntry | null>(null);
+  const [aboutLoaded, setAboutLoaded] = useState(false);
   const [aboutDraft, setAboutDraft] = useState("");
   const [aboutError, setAboutError] = useState<string | null>(null);
   const [aboutWarnings, setAboutWarnings] = useState<string[]>([]);
@@ -117,10 +121,14 @@ export function MemoryPage() {
   const searchRef = useRef<HTMLInputElement>(null);
   const rowRefs = useRef(new Map<string, HTMLDivElement>());
 
-  // The memory route is keyed by lineage; a chapter instance resolves first.
+  // The memory route is keyed by lineage; a chapter instance resolves first,
+  // and lineage existence is decided explicitly. An unknown lineage answers
+  // `200 {items: []}` on the list route, which must not masquerade as "no
+  // memory yet" (a plain instance has no lineage row to write to at all).
   useEffect(() => {
     let live = true;
     setLineageId(null);
+    setAboutLoaded(false);
     (async () => {
       try {
         const instance = await api.instanceGet(instanceId as Id);
@@ -154,13 +162,11 @@ export function MemoryPage() {
           ? await searchMemory(lineage, query.trim(), true)
           : await listMemory(lineage, true);
         setEntries(items);
-        setNoLineage(false);
       } catch (error) {
-        // A plain (non-continuity) instance has no lineage row yet, so it has
-        // no memory to show: that is a state, not a failure.
+        // A retired lineage's rows can have gone; an empty page is a state,
+        // not a failure.
         if (error instanceof HubHttpError && error.status === 404) {
           setEntries([]);
-          setNoLineage(true);
         } else {
           setLoadError(saveErrorText(error));
         }
@@ -176,13 +182,17 @@ export function MemoryPage() {
     void reload(lineageId, q);
   }, [lineageId, q, reload]);
 
+  const canEdit = lineageKnown === true;
   const live = useMemo(() => entries.filter((entry) => entry.archivedAt == null), [entries]);
-  const archived = useMemo(() => entries.filter((entry) => entry.archivedAt != null), [entries]);
-  const aboutMe = useMemo(() => live.find((entry) => entry.slug === ABOUT_ME_SLUG) ?? null, [live]);
-  const aboutMeArchived = useMemo(
-    () => archived.find((entry) => entry.slug === ABOUT_ME_SLUG) ?? null,
-    [archived],
+  const archivedAll = useMemo(() => entries.filter((entry) => entry.archivedAt != null), [entries]);
+  // The card owns the about-me entry; when the card is hidden (no lineage),
+  // its archived copy stays in the read-only archived group instead.
+  const archived = useMemo(
+    () => (canEdit ? archivedAll.filter((entry) => entry.slug !== ABOUT_ME_SLUG) : archivedAll),
+    [archivedAll, canEdit],
   );
+  const aboutMe = aboutEntry;
+  const aboutMeArchived = aboutEntry?.archivedAt != null ? aboutEntry : null;
   const grouped = useMemo(() => {
     const groups = new Map<MemoryType, MemoryEntry[]>();
     for (const entry of live) {
@@ -194,9 +204,37 @@ export function MemoryPage() {
     return groups;
   }, [live]);
 
+  const loadAbout = useCallback(async (lineage: string) => {
+    try {
+      const entry = await getMemory(lineage, ABOUT_ME_SLUG);
+      setAboutEntry(entry);
+      setAboutLoaded(true);
+    } catch (error) {
+      if (error instanceof HubHttpError && error.status === 404) {
+        setAboutEntry(null);
+        setAboutLoaded(true);
+        return;
+      }
+      setAboutError(saveErrorText(error));
+    }
+  }, []);
+
   useEffect(() => {
-    setAboutDraft(aboutMe?.body ?? "");
-  }, [aboutMe]);
+    if (!lineageId || lineageKnown !== true) return;
+    void loadAbout(lineageId);
+  }, [lineageId, lineageKnown, loadAbout]);
+
+  // Refresh the standalone about-me copy whenever the list finishes loading
+  // (search changes included): the sync effect below then either keeps a clean
+  // draft in step or offers the conflict choice under a dirty one.
+  useEffect(() => {
+    if (!lineageId || lineageKnown !== true || loading) return;
+    void loadAbout(lineageId);
+  }, [entries, loading, lineageId, lineageKnown, loadAbout]);
+
+  useEffect(() => {
+    if (aboutLoaded) setAboutDraft(aboutEntry?.body ?? "");
+  }, [aboutLoaded, aboutEntry]);
 
   // A 「已记住」 row links here with ?slug=: scroll to it and mark it once.
   useEffect(() => {
@@ -218,7 +256,7 @@ export function MemoryPage() {
   }
 
   function openEditor(entry: MemoryEntry) {
-    if (entry.archivedAt != null) return;
+    if (!canEdit || entry.archivedAt != null) return;
     setEditorError(null);
     setEditorWarnings([]);
     setEditor({
@@ -284,6 +322,7 @@ export function MemoryPage() {
       const { server, kind } = conflict;
       setConflict(null);
       if (kind === "about") {
+        setAboutEntry(server);
         setAboutDraft(server.body);
         setAboutError("已载入服务器上的最新版本。");
         return;
@@ -313,6 +352,7 @@ export function MemoryPage() {
       await reload(lineageId, q);
       const warnings = warningText(result.warnings);
       if (kind === "about") {
+        setAboutEntry(result.entry);
         setAboutDraft(result.entry.body);
         setAboutError(null);
         setAboutWarnings(warnings);
@@ -372,7 +412,10 @@ export function MemoryPage() {
   }
 
   async function saveAbout() {
-    if (!lineageId) return;
+    // Never take the create path before the standalone about-me load has
+    // confirmed the entry is absent (a search can hide it from the list) and
+    // never write without a lineage row.
+    if (!lineageId || !canEdit || !aboutLoaded) return;
     setAboutSaving(true);
     setAboutError(null);
     setAboutWarnings([]);
@@ -386,6 +429,8 @@ export function MemoryPage() {
             description: ABOUT_ME_DESCRIPTION,
             body: aboutDraft,
           });
+      setAboutEntry(result.entry);
+      setAboutDraft(result.entry.body);
       setAboutWarnings(warningText(result.warnings));
       await reload(lineageId, q);
     } catch (error) {
@@ -407,6 +452,11 @@ export function MemoryPage() {
         } catch (readError) {
           setAboutError(saveErrorText(readError));
         }
+      } else if (error instanceof HubHttpError && error.code === "MEMORY_SLUG_EXISTS") {
+        // Created by another tab between our GET and this save: adopt the
+        // server copy instead of looping on create.
+        await loadAbout(lineageId);
+        setAboutError(saveErrorText(error));
       } else {
         setAboutError(saveErrorText(error));
       }
@@ -499,24 +549,28 @@ export function MemoryPage() {
         crumbs={[{ label: "会话", to: `/s/${instanceId}` }]}
         title="记忆"
         actions={
-          <Button data-testid="memory-new" onClick={() => openCreate("user")}>
-            新建
-          </Button>
+          canEdit ? (
+            <Button data-testid="memory-new" onClick={() => openCreate("user")}>
+              新建
+            </Button>
+          ) : undefined
         }
       />
       <div className={css.body}>
         <div className={css.inner}>
           <div className={css.toolbar}>
-            <input
-              ref={searchRef}
-              className={css.search}
-              type="search"
-              value={q}
-              placeholder="搜索记忆（FTS5，中文按子串）"
-              aria-label="搜索记忆"
-              data-testid="memory-search"
-              onChange={(event) => setQuery(event.target.value)}
-            />
+            {canEdit ? (
+              <input
+                ref={searchRef}
+                className={css.search}
+                type="search"
+                value={q}
+                placeholder="搜索记忆（FTS5，中文按子串）"
+                aria-label="搜索记忆"
+                data-testid="memory-search"
+                onChange={(event) => setQuery(event.target.value)}
+              />
+            ) : null}
             <span className={css.meta} data-testid="memory-count">
               {loading ? "加载中…" : `${live.length} 条${archived.length ? ` · ${archived.length} 条已归档` : ""}`}
             </span>
@@ -533,6 +587,7 @@ export function MemoryPage() {
             </p>
           ) : null}
 
+          {canEdit ? (
           <section className={css.aboutCard} data-testid="memory-about" aria-labelledby="memory-about-title">
             <div className={css.aboutHead}>
               <h2 className={css.sectionTitle} id="memory-about-title">
@@ -581,7 +636,7 @@ export function MemoryPage() {
                   <Button
                     variant="primary"
                     data-testid="memory-about-save"
-                    disabled={aboutSaving || !lineageId}
+                    disabled={aboutSaving || !lineageId || !aboutLoaded || !canEdit}
                     onClick={() => void saveAbout()}
                   >
                     {aboutSaving ? "保存中…" : "保存"}
@@ -590,14 +645,11 @@ export function MemoryPage() {
               </>
             )}
           </section>
+          ) : null}
 
           {!loading && !loadError && !hasAnything ? (
             <p className={css.empty} data-testid="memory-empty">
-              {noLineage
-                ? "这个会话还不是连续血缘，记忆从连续会话开始记录。"
-                : q.trim()
-                  ? "没有匹配的记忆。"
-                  : "这个会话还没有记忆。"}
+              {q.trim() ? "没有匹配的记忆。" : "这个会话还没有记忆。"}
             </p>
           ) : null}
 
@@ -614,7 +666,7 @@ export function MemoryPage() {
                 <h2 className={css.sectionTitle} id={`memory-group-title-${kind}`}>
                   {MEMORY_TYPE_LABEL[kind]}
                 </h2>
-                <div className={css.list}>{rows.map((entry) => row(entry, false))}</div>
+                <div className={css.list}>{rows.map((entry) => row(entry, !canEdit))}</div>
               </section>
             );
           })}

@@ -244,6 +244,49 @@ impl Ctx {
         Ok((roster_id, instance_id))
     }
 
+    /// A DONE worker under `token`'s coordinator. `done_at` is the day it
+    /// reported; `None` leaves the stamp to the insert (today).
+    async fn done_worker(
+        &self,
+        token: &str,
+        project: &str,
+        name: &str,
+        done_at: Option<&str>,
+    ) -> Result<(String, String)> {
+        let created = self
+            .post(
+                token,
+                "/v1/instances",
+                json!({ "role": "worker", "projectId": project, "prompt": "work",
+                        "driver": "claude-pty" }),
+            )
+            .await?;
+        let instance_id = created["instance"]["instanceId"]
+            .as_str()
+            .context("id")?
+            .to_string();
+        let roster_id = remuda_protocol::WorkerRosterId::new().as_id().to_string();
+        let mut doc = json!({
+            "id": roster_id, "revision": "1",
+            "createdAt": "2026-10-29T01:00:00.000Z", "updatedAt": "2026-10-29T01:00:00.000Z",
+            "projectId": project, "name": name, "instanceId": instance_id,
+            "hostId": self.host, "workspaceId": self.workspace, "harness": "claude",
+            "driver": "claude-sdk", "model": "claude-sonnet-5-5",
+            "branch": format!("wt/{name}/b-digest-md"), "worktreePath": format!("/w/{name}"),
+            "state": { "state": "done", "sha": "0a10ebf351aa" },
+        });
+        if let Some(at) = done_at {
+            doc["doneAt"] = json!(at);
+        }
+        let worker: remuda_protocol::WorkerRoster = serde_json::from_value(doc)?;
+        self.hub
+            .store()
+            .context("store")?
+            .insert_worker(worker, "digest-test".into())
+            .await?;
+        Ok((roster_id, instance_id))
+    }
+
     async fn journal(&self, instance_id: &str, event: Value) -> Result<()> {
         self.hub
             .store()
@@ -378,6 +421,70 @@ async fn digest_is_assembled_from_stored_rows_and_stays_within_budget() -> Resul
     let (status, by_name) = ctx.get(&ctx.human, "/v1/workers/c-digest/digest").await?;
     assert_eq!(status, 200);
     assert_eq!(json_of(&by_name)["workerId"], worker_id);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn done_today_counts_the_day_a_worker_reported_done_not_its_last_write() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("digest-done").await?;
+    let (coordinator, token) = ctx.coordinator(&project).await?;
+    // Reported DONE long ago, then re-observed (watched) today.
+    let (stale, _) = ctx
+        .done_worker(
+            &token,
+            &project,
+            "c-stale",
+            Some("2020-01-02T03:04:05.000Z"),
+        )
+        .await?;
+    // Reported DONE today, with the stamp written by the transition.
+    let (fresh, _) = ctx.done_worker(&token, &project, "c-fresh", None).await?;
+    let glance_path = format!("/v1/lineages/{coordinator}/glance");
+
+    let glance = json_of(&ctx.get(&token, &glance_path).await?.1);
+    assert_eq!(
+        glance["doneToday"], 1,
+        "only the worker that reported done today counts: {glance}"
+    );
+
+    // Every watch pass rewrites the roster row and its updated_at. A DONE
+    // worker watched today must keep the day it actually reported.
+    let store = ctx.hub.store().context("store")?;
+    for id in [&stale, &fresh] {
+        store
+            .mutate_worker(id.to_string(), |_| Ok(()))
+            .await
+            .context("re-observe")?;
+    }
+    let glance = json_of(&ctx.get(&token, &glance_path).await?.1);
+    assert_eq!(
+        glance["doneToday"], 1,
+        "a re-observed DONE worker keeps its day: {glance}"
+    );
+
+    // A worker that leaves DONE and reports again today counts again.
+    store
+        .mutate_worker(stale.clone(), |row| {
+            row.state = remuda_protocol::WorkerState::Working;
+            Ok(())
+        })
+        .await
+        .context("reopen")?;
+    store
+        .mutate_worker(stale, |row| {
+            row.state = remuda_protocol::WorkerState::Done {
+                sha: "0a10ebf351aa".into(),
+            };
+            Ok(())
+        })
+        .await
+        .context("re-done")?;
+    let glance = json_of(&ctx.get(&token, &glance_path).await?.1);
+    assert_eq!(
+        glance["doneToday"], 2,
+        "a fresh DONE today counts: {glance}"
+    );
     Ok(())
 }
 

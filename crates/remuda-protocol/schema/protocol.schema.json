@@ -20851,6 +20851,17 @@
           "$ref": "#/$defs/Timestamp",
           "description": "`created_at`; protocol §1.1."
         },
+        "doneAt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When the worker last entered `done`, stamped by the Hub at the\ntransition and cleared on any other state.\n\nKept apart from `updatedAt` because every watch pass rewrites the row:\n\"today's DONE count\" must answer when the work landed, not when the\nowner last looked at it."
+        },
         "driver": {
           "description": "Carrier driver the agent **actually** launched on, as reported back by\nthe Node's create result (`shell-pty` / `claude-pty` / …).\n\nRecorded from the Node's answer rather than from the Hub's request: the\ntwo diverged silently once (a roster row said `claude-pty` while the Node\nran `claude-print`), which made every screen read and nudge on that\nworker inexplicable. Absent on rows written before this field existed.",
           "type": [

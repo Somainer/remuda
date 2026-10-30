@@ -1354,6 +1354,10 @@ impl Store {
     }
 
     /// Workers of the lineage that reported DONE at or after `since` (RFC3339).
+    ///
+    /// `doneAt` is the transition stamp, not `updated_at`: every watch pass
+    /// rewrites a roster row, so counting writes would report a worker that
+    /// finished last week as today's work.
     pub(crate) async fn count_lineage_done_since(
         &self,
         lineage_id: String,
@@ -1362,7 +1366,7 @@ impl Store {
         self.read("count_lineage_done_since", move |conn| {
             let count: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM worker_roster w
-                 WHERE w.state_kind = 'done' AND w.updated_at >= ?2
+                 WHERE w.state_kind = 'done' AND json_extract(w.doc_json, '$.doneAt') >= ?2
                    AND (SELECT COALESCE(p.lineage_id, p.id)
                           FROM instances i
                           JOIN instances p

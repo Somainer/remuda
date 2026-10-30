@@ -716,6 +716,8 @@ pub(crate) async fn dispatch_core(
             brief_object_id: Some(object_id),
             task_id: task.as_ref().map(|task| task.meta.id.clone()),
             state: WorkerState::Working,
+            // Stamped by the store when (and only when) the row enters `done`.
+            done_at: None,
             watch: None,
             last_nudge_at: None,
             resumed_from: None,
@@ -1687,6 +1689,8 @@ impl Store {
         self.run_named("insert_worker", move |conn| {
             let id = worker.meta.id.as_id().to_string();
             let now = crate::config::now_rfc3339();
+            let mut worker = worker;
+            stamp_done_at(&mut worker, &now);
             let doc = serde_json::to_string(&worker)?;
             conn.execute(
                 "INSERT INTO worker_roster
@@ -1800,6 +1804,7 @@ impl Store {
             };
             mutate(&mut worker)?;
             let now = crate::config::now_rfc3339();
+            stamp_done_at(&mut worker, &now);
             worker.meta.revision = U64(worker.meta.revision.0 + 1);
             worker.meta.updated_at = remuda_protocol::Timestamp::try_from(now.clone())
                 .map_err(|err| StoreError::Id(err.to_string()))?;
@@ -1813,6 +1818,19 @@ impl Store {
             load_worker(conn, &id)
         })
         .await
+    }
+}
+
+/// Keep `doneAt` honest across roster writes: a worker entering `done` is
+/// stamped once, a DONE worker rewritten by a later watch pass keeps the day
+/// it actually reported, and any other state clears the stamp.
+fn stamp_done_at(worker: &mut WorkerRoster, now: &str) {
+    if matches!(worker.state, remuda_protocol::WorkerState::Done { .. }) {
+        if worker.done_at.is_none() {
+            worker.done_at = remuda_protocol::Timestamp::try_from(now.to_string()).ok();
+        }
+    } else {
+        worker.done_at = None;
     }
 }
 

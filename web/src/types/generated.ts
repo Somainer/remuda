@@ -4671,6 +4671,7 @@ export type WorkerRoster = ({
   "branch": (string);
   "briefObjectId"?: (string | null);
   "createdAt": Timestamp;
+  "doneAt"?: (Timestamp | (null));
   "driver"?: (string | null);
   "harness": (string);
   "hostId": HostId;

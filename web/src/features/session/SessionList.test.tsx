@@ -1,4 +1,9 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
+
+// The r3 rename moved the list attribute to `data-order-held`; the tolerant
+// selector lets the same tests run against the previous build for the RED proof.
+const HELD = "[data-order-held='1'], [data-held='1']";
+const RELEASED = "[data-order-held='0'], [data-held='0']";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -756,6 +761,30 @@ describe("desktop buckets", () => {
   });
 });
 
+describe("SessionList hold scope", () => {
+  it("does not freeze when focus is in the search box, so typing still filters", async () => {
+    titles.ins_alpha = "alpha run";
+    titles.ins_beta = "beta run";
+    renderList("", {
+      instances: [
+        session("ins_alpha", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+        session("ins_beta", { activity: known("idle"), updatedAt: "2026-09-19T08:00:00.000Z" }),
+      ],
+    });
+    const search = screen.getByTestId("session-search") as HTMLInputElement;
+    // Focus arrives from outside the list (a shortcut), then the user types.
+    act(() => {
+      search.focus();
+    });
+    expect(document.querySelector(HELD)).toBeNull();
+
+    await userEvent.type(search, "alpha");
+    // The list filters live: the non-matching row is gone.
+    expect(screen.queryByText("beta run")).toBeNull();
+    expect(screen.getByText("alpha run")).toBeTruthy();
+  });
+});
+
 describe("SessionList hold", () => {
   function cards() {
     return screen.queryAllByTestId("board-card").map((card) => card.getAttribute("data-instance-id"));
@@ -776,7 +805,7 @@ describe("SessionList hold", () => {
 
     const held = document.querySelector('[data-instance-id="ins_held"]')!;
     fireEvent.pointerDown(held);
-    expect(document.querySelector("[data-held='1']")).not.toBeNull();
+    expect(document.querySelector(HELD)).not.toBeNull();
 
     // The peer becomes blocked: its section would be created above the held
     // row and the held row would fall under the pointer.
@@ -822,6 +851,40 @@ describe("SessionList hold", () => {
     expect(screen.queryByTestId("session-group-working")).toBeNull();
   });
 
+  it("re-establishes the focus hold when focus moves inside the row after a timeout", () => {
+    vi.useFakeTimers();
+    try {
+      renderList("", {
+        instances: [
+          session("ins_held", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+          session("ins_peer", { activity: known("working"), updatedAt: "2026-09-19T08:00:00.000Z" }),
+        ],
+      });
+      const checkbox = document.querySelector<HTMLInputElement>(
+        '[data-instance-id="ins_held"] input[type="checkbox"]',
+      )!;
+      act(() => {
+        checkbox.focus();
+      });
+      expect(document.querySelector(HELD)).not.toBeNull();
+
+      // The idle timeout releases it while focus stays put...
+      act(() => {
+        vi.advanceTimersByTime(10_000);
+      });
+      expect(document.querySelector(RELEASED)).not.toBeNull();
+
+      // ...and the next focus change inside the row holds again.
+      const more = document.querySelector<HTMLElement>('[data-instance-id="ins_held"] [data-testid="board-more"]')!;
+      act(() => {
+        more.focus();
+      });
+      expect(document.querySelector(HELD)).not.toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("holds on keyboard focus anywhere in a row, not just the ⋯ trigger", () => {
     renderList("", {
       instances: [
@@ -833,7 +896,38 @@ describe("SessionList hold", () => {
     act(() => {
       (checkbox as HTMLInputElement).focus();
     });
-    expect(document.querySelector("[data-held='1']")).not.toBeNull();
+    expect(document.querySelector(HELD)).not.toBeNull();
+  });
+
+  it("survives pointer and click activity inside the open Sheet", async () => {
+    const { rerender } = renderList("", {
+      instances: [
+        session("ins_held", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+        session("ins_peer", { activity: known("working"), updatedAt: "2026-09-19T08:00:00.000Z" }),
+      ],
+    });
+    await userEvent.click(screen.getAllByTestId("board-more")[0]);
+    expect(document.querySelector(HELD)).not.toBeNull();
+
+    // Press, release and click inside the Sheet: none of it may release the hold.
+    const prompt = screen.getByTestId("board-actions-panel").querySelector("input")!;
+    fireEvent.pointerDown(prompt);
+    fireEvent.pointerUp(prompt);
+    await userEvent.click(prompt);
+    fireEvent.click(document.body);
+    expect(document.querySelector(HELD)).not.toBeNull();
+
+    rerender(
+      tree([
+        session("ins_held", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+        session("ins_peer", { activity: known("waiting-interaction"), updatedAt: "2026-09-19T12:00:00.000Z" }),
+      ]),
+    );
+    expect(cards()).toEqual(["ins_held", "ins_peer"]);
+
+    await userEvent.click(screen.getByTestId("board-actions-close"));
+    expect(document.querySelector(RELEASED)).not.toBeNull();
+    expect(cards()).toEqual(["ins_peer", "ins_held"]);
   });
 
   it("holds while the action Sheet is open", async () => {
@@ -846,7 +940,7 @@ describe("SessionList hold", () => {
     expect(cards()).toEqual(["ins_a", "ins_b"]);
 
     await userEvent.click(screen.getAllByTestId("board-more")[0]);
-    expect(document.querySelector("[data-held='1']")).not.toBeNull();
+    expect(document.querySelector(HELD)).not.toBeNull();
 
     rerender(
       tree([

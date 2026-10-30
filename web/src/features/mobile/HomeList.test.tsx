@@ -1,7 +1,29 @@
-import { render, screen, waitFor, act } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, act } from "@testing-library/react";
+
+// The r3 rename moved the list attribute to `data-order-held`; the tolerant
+// selector lets the same tests run against the previous build for the RED proof.
+// jsdom has no matchMedia; the Spaces drawer's viewport hook needs one.
+beforeAll(() => {
+  Object.defineProperty(window, "matchMedia", {
+    writable: true,
+    value: (query: string) => ({
+      matches: false,
+      media: query,
+      onchange: null,
+      addListener: () => {},
+      removeListener: () => {},
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+    }),
+  });
+});
+
+const HELD = "[data-order-held='1'], [data-held='1']";
+const RELEASED = "[data-order-held='0'], [data-held='0']";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { mockDb } from "../../lib/mock";
 import type { Instance } from "../../types/instance";
 import { known, type Id } from "../../types/wire";
@@ -22,6 +44,7 @@ const resumeMock = vi.fn();
 const listeners = new Set<() => void>();
 
 vi.mock("../../lib/store", () => ({
+  useHub: () => hub,
   // The home reads the store through the cached external-store seam: the mock
   // offers the same subscribe/getSnapshot surface (no store polling in unit
   // tests) plus the imperative row helpers the component calls.
@@ -148,7 +171,7 @@ describe("HomeList hold", () => {
     act(() => {
       held.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
     });
-    expect(document.querySelector("[data-held='1']")).not.toBeNull();
+    expect(document.querySelector(HELD)).not.toBeNull();
 
     // The other worker becomes blocked, which outranks the held row. The finger
     // is still down, so the held row keeps its place.
@@ -166,7 +189,7 @@ describe("HomeList hold", () => {
     act(() => {
       held.dispatchEvent(new PointerEvent("pointerup", { bubbles: true }));
     });
-    expect(document.querySelector("[data-held='0']")).not.toBeNull();
+    expect(document.querySelector(RELEASED)).not.toBeNull();
     // Released, blocked outranks working, so the changed worker moves above.
     expect(ids()).toEqual(["/s/ins-other", "/s/ins-held"]);
   });
@@ -183,7 +206,7 @@ describe("HomeList hold", () => {
     act(() => {
       link.focus();
     });
-    expect(document.querySelector("[data-held='1']")).not.toBeNull();
+    expect(document.querySelector(HELD)).not.toBeNull();
 
     act(() => {
       hub.instances = [
@@ -198,7 +221,7 @@ describe("HomeList hold", () => {
     act(() => {
       link.blur();
     });
-    expect(document.querySelector("[data-held='0']")).not.toBeNull();
+    expect(document.querySelector(RELEASED)).not.toBeNull();
     expect(ids()).toEqual(["/s/ins-peer", "/s/ins-focused"]);
   });
 });
@@ -270,7 +293,7 @@ describe("HomeList hold against the painted structure", () => {
     act(() => {
       held.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
     });
-    expect(document.querySelector("[data-held='1']")).not.toBeNull();
+    expect(document.querySelector(HELD)).not.toBeNull();
 
     // The turn ends: every row in the project is idle now, so the project
     // would fold into 安静的项目 and the held row would disappear.
@@ -333,6 +356,35 @@ describe("HomeList hold against the painted structure", () => {
     expect(projects()).toEqual(["beta", "alpha"]);
   });
 
+  it("keeps the list frozen while the spaces drawer is open, through taps inside it", async () => {
+    hub.instances = [
+      row("ins-held", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+      row("ins-peer", { activity: known("working"), updatedAt: "2026-09-19T08:00:00.000Z" }),
+    ];
+    renderHome();
+    const before = ids();
+    await userEvent.click(screen.getByTestId("spaces-drawer-open"));
+    expect(document.querySelector(HELD)).not.toBeNull();
+
+    // Press, release and click inside the drawer: none of it may release.
+    const drawer = screen.getByTestId("spaces-drawer");
+    fireEvent.pointerDown(drawer);
+    fireEvent.pointerUp(drawer);
+    fireEvent.click(drawer);
+    expect(document.querySelector(HELD)).not.toBeNull();
+
+    setInstances([
+      row("ins-held", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+      row("ins-peer", { activity: known("waiting-interaction"), updatedAt: "2026-09-19T12:00:00.000Z" }),
+    ]);
+    expect(ids()).toEqual(before);
+
+    await userEvent.click(screen.getByLabelText("关闭空间面板"));
+    expect(document.querySelector(RELEASED)).not.toBeNull();
+    expect(ids()).toEqual(["/s/ins-peer", "/s/ins-held"]);
+  });
+
+
   it("releases when the pointerup lands outside the list", () => {
     hub.instances = [row("ins-held", { activity: known("working") })];
     renderHome();
@@ -340,12 +392,39 @@ describe("HomeList hold against the painted structure", () => {
     act(() => {
       held.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
     });
-    expect(document.querySelector("[data-held='1']")).not.toBeNull();
+    expect(document.querySelector(HELD)).not.toBeNull();
 
     act(() => {
       document.body.dispatchEvent(new PointerEvent("pointerup", { bubbles: true }));
     });
-    expect(document.querySelector("[data-held='0']")).not.toBeNull();
+    expect(document.querySelector(RELEASED)).not.toBeNull();
+  });
+
+  it("times a lost press out even while the rest of the page is used", () => {
+    vi.useFakeTimers();
+    try {
+      hub.instances = [row("ins-held", { activity: known("working") })];
+      renderHome();
+      const held = screen.getByText("title ins-held").closest("article")!;
+      act(() => {
+        fireEvent.pointerDown(held);
+      });
+      expect(document.querySelector(HELD)).not.toBeNull();
+
+      // No pointerup ever arrives. Moving the pointer over the page and typing
+      // in the search box are NOT list activity and must not postpone release.
+      act(() => {
+        document.body.dispatchEvent(new PointerEvent("pointermove", { bubbles: true }));
+        fireEvent.keyDown(screen.getByTestId("home-search"));
+        vi.advanceTimersByTime(9_000);
+        document.body.dispatchEvent(new PointerEvent("pointermove", { bubbles: true }));
+        fireEvent.keyDown(screen.getByTestId("home-search"));
+        vi.advanceTimersByTime(9_000);
+      });
+      expect(document.querySelector(RELEASED)).not.toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("does not stay held when the focused row disappears", () => {
@@ -356,7 +435,7 @@ describe("HomeList hold against the painted structure", () => {
       act(() => {
         screen.getByText("title ins-held").closest("a")!.focus();
       });
-      expect(document.querySelector("[data-held='1']")).not.toBeNull();
+      expect(document.querySelector(HELD)).not.toBeNull();
 
       // The row is filtered away while it holds focus: no blur ever fires.
       act(() => {
@@ -366,7 +445,7 @@ describe("HomeList hold against the painted structure", () => {
       act(() => {
         vi.advanceTimersByTime(10_000);
       });
-      expect(document.querySelector("[data-held='0']")).not.toBeNull();
+      expect(document.querySelector(RELEASED)).not.toBeNull();
     } finally {
       vi.useRealTimers();
     }

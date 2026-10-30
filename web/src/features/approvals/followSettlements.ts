@@ -1,3 +1,5 @@
+import type { SeenView } from "../../lib/api";
+
 /**
  * Global follow socket for Hub settlement notices (c-cardsettle).
  *
@@ -13,10 +15,16 @@
  * Missed notices are self-healing: the next poll (and every reload) reads the
  * durable invalidated rows, so a dropped socket cannot strand a card.
  * Reconnects with the same 1 s backoff as the workspace follow.
+ *
+ * seen-hub: the same global socket carries owner seen-state changes, an
+ * `event` frame addressed to instance `""` whose event is `instance.seen`
+ * (the shape workspace `host.updated` rides). `onSeen` receives the view;
+ * missed ones converge on the next instance poll, like settlements.
  */
 export function followSettlements(
   url: string,
   onSettlement: (interactionId: string, reason?: string) => void,
+  onSeen?: (view: SeenView) => void,
 ) {
   let stopped = false;
   let socket: WebSocket;
@@ -32,7 +40,13 @@ export function followSettlements(
           state?: string;
           interactionId?: string;
           reason?: string;
+          event?: Record<string, unknown> | null;
         };
+        if (frame.type === "event") {
+          const view = frame.event ? seenViewOf(frame.event) : null;
+          if (view) onSeen?.(view);
+          return;
+        }
         if (frame.type === "settlement" && frame.state === "invalidated" && frame.interactionId) {
           // Carry the Hub's resolution reason through verbatim: a
           // non-process-end settlement (e.g. transcript-picker demotion =
@@ -53,5 +67,20 @@ export function followSettlements(
     stopped = true;
     clearTimeout(timer);
     socket.close();
+  };
+}
+
+/** An `instance.seen` follow event as a SeenView, or null for anything else. */
+export function seenViewOf(event: Record<string, unknown>): SeenView | null {
+  if (event.type !== "instance.seen" || typeof event.instanceId !== "string" || typeof event.unseen !== "boolean") {
+    return null;
+  }
+  const seq = (value: unknown) => (typeof value === "string" && /^\d+$/.test(value) ? value : undefined);
+  return {
+    instanceId: event.instanceId,
+    unseen: event.unseen,
+    seenSeq: seq(event.seenSeq),
+    seenAt: typeof event.seenAt === "string" ? event.seenAt : undefined,
+    turnEndSeq: seq(event.turnEndSeq),
   };
 }

@@ -1780,6 +1780,21 @@
             "$ref": "#/components/schemas/InstanceUsageRollup",
             "description": "Additive per-session token/context rollup (context-usage-1), Hub-computed from the journal's usage observations and refreshed every turn. Absent until the harness has reported at least one usage event; every counter is null until the adapter reports that channel (never a fabricated zero).",
             "readOnly": true
+          },
+          "unseen": {
+            "description": "seen-hub (home done-unseen): true when the latest settled turn end (turnEndSeq) is newer than the owner's seen seq. Owner-scoped, so every owner device reads the same value. A turn end that lands while an owner client reported the session visible is folded seen in the same write and never reads true. Always sent by this Hub; read an absent value as false.",
+            "readOnly": true,
+            "type": "boolean"
+          },
+          "seenSeq": {
+            "description": "seen-hub: highest journal seq the owner has seen (decimal). Monotonic. Absent until the first POST /v1/instances/{id}/seen.",
+            "readOnly": true,
+            "type": "string"
+          },
+          "turnEndSeq": {
+            "description": "seen-hub: journal seq (decimal) of the latest settled turn end, i.e. the latest row that moved activity from working, blocked or draining to idle. Absent before any turn end; a resumed instance or a new lineage chapter starts without one (home.md §7).",
+            "readOnly": true,
+            "type": "string"
           }
         },
         "required": [
@@ -1893,6 +1908,19 @@
           "chapters"
         ],
         "type": "object"
+      },
+      "LineageGlance": {
+        "type": "object",
+        "description": "Generated shape: LineageGlance in crates/remuda-protocol/schema/protocol.schema.json.",
+        "required": [
+          "lineageId",
+          "generatedAt",
+          "waiting",
+          "working",
+          "more",
+          "doneToday"
+        ],
+        "additionalProperties": true
       },
       "RestartPolicy": {
         "additionalProperties": false,
@@ -4781,6 +4809,21 @@
           "state"
         ]
       },
+      "WorkerDigest": {
+        "type": "object",
+        "description": "Generated shape: WorkerDigest in crates/remuda-protocol/schema/protocol.schema.json.",
+        "required": [
+          "v",
+          "workerId",
+          "name",
+          "branch",
+          "roster",
+          "model",
+          "queued",
+          "toolInFlight"
+        ],
+        "additionalProperties": true
+      },
       "WorkerPage": {
         "properties": {
           "items": {
@@ -5173,6 +5216,473 @@
         "required": [
           "hostId"
         ]
+      },
+      "MemoryType": {
+        "description": "Memory entry type (index order).",
+        "enum": [
+          "user",
+          "feedback",
+          "project",
+          "reference"
+        ],
+        "type": "string"
+      },
+      "MemoryOrigin": {
+        "description": "How the writing caller authenticated.",
+        "enum": [
+          "human",
+          "agent"
+        ],
+        "type": "string"
+      },
+      "MemorySourceRef": {
+        "additionalProperties": false,
+        "description": "A journal row an entry was derived from.",
+        "properties": {
+          "instanceId": {
+            "description": "Instance whose journal holds the row.",
+            "type": "string"
+          },
+          "seq": {
+            "description": "Journal sequence number.",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "instanceId",
+          "seq"
+        ],
+        "type": "object"
+      },
+      "MemoryEntry": {
+        "additionalProperties": false,
+        "description": "One memory entry of one lineage (D-060).",
+        "properties": {
+          "archivedAt": {
+            "description": "Set when the lineage retired; absent while live.",
+            "type": "string"
+          },
+          "body": {
+            "description": "Entry body (read on demand; never in the index).",
+            "type": "string"
+          },
+          "createdAt": {
+            "description": "First write.",
+            "type": "string"
+          },
+          "description": {
+            "description": "One-line description shown in the index.",
+            "type": "string"
+          },
+          "lineageId": {
+            "description": "Owning lineage.",
+            "type": "string"
+          },
+          "origin": {
+            "$ref": "#/components/schemas/MemoryOrigin"
+          },
+          "revision": {
+            "description": "The slug's next revision on every write, never reused: a slug recreated after a delete continues after its last revision. 1 for a slug never used before.",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "slug": {
+            "description": "Stable handle, unique within the lineage.",
+            "type": "string"
+          },
+          "sourceRefs": {
+            "description": "Journal rows the entry was derived from.",
+            "items": {
+              "$ref": "#/components/schemas/MemorySourceRef"
+            },
+            "type": "array"
+          },
+          "title": {
+            "description": "One-line title.",
+            "type": "string"
+          },
+          "type": {
+            "$ref": "#/components/schemas/MemoryType"
+          },
+          "updatedAt": {
+            "description": "Last write.",
+            "type": "string"
+          },
+          "writerInstance": {
+            "description": "Chapter that made the last write; absent for an owner write.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "body",
+          "createdAt",
+          "description",
+          "lineageId",
+          "origin",
+          "revision",
+          "slug",
+          "sourceRefs",
+          "title",
+          "type",
+          "updatedAt"
+        ],
+        "type": "object"
+      },
+      "MemoryEntryPage": {
+        "additionalProperties": false,
+        "description": "Memory entries.",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryEntry"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      },
+      "MemorySizeWarning": {
+        "additionalProperties": false,
+        "description": "A soft limit a write crossed, with the actual numbers.",
+        "properties": {
+          "bytes": {
+            "description": "Actual size in bytes.",
+            "type": "integer"
+          },
+          "limit": {
+            "enum": [
+              "entry-soft",
+              "index-soft"
+            ],
+            "type": "string"
+          },
+          "maxBytes": {
+            "description": "The limit in bytes.",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "bytes",
+          "limit",
+          "maxBytes"
+        ],
+        "type": "object"
+      },
+      "MemoryWriteResult": {
+        "additionalProperties": false,
+        "description": "A committed create, update or consolidate.",
+        "properties": {
+          "entry": {
+            "$ref": "#/components/schemas/MemoryEntry"
+          },
+          "entryBytes": {
+            "description": "title + description + body, UTF-8 bytes.",
+            "type": "integer"
+          },
+          "indexBytes": {
+            "description": "Rendered index size after the write.",
+            "type": "integer"
+          },
+          "removed": {
+            "description": "Slugs a consolidate removed.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "warnings": {
+            "items": {
+              "$ref": "#/components/schemas/MemorySizeWarning"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "entry",
+          "entryBytes",
+          "indexBytes",
+          "warnings"
+        ],
+        "type": "object"
+      },
+      "MemoryIndex": {
+        "additionalProperties": false,
+        "description": "The Hub-rendered index of a lineage's live entries (archived ones too on request).",
+        "properties": {
+          "bytes": {
+            "description": "Rendered size in bytes.",
+            "type": "integer"
+          },
+          "count": {
+            "description": "Entries in the index.",
+            "type": "integer"
+          },
+          "lineageId": {
+            "type": "string"
+          },
+          "text": {
+            "description": "One `- [type] slug: title — description` line per entry; an archived entry's line ends ` (archived)`.",
+            "type": "string"
+          },
+          "warnings": {
+            "items": {
+              "$ref": "#/components/schemas/MemorySizeWarning"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "bytes",
+          "count",
+          "lineageId",
+          "text",
+          "warnings"
+        ],
+        "type": "object"
+      },
+      "MemorySearchHit": {
+        "additionalProperties": false,
+        "description": "One search hit.",
+        "properties": {
+          "entry": {
+            "$ref": "#/components/schemas/MemoryEntry"
+          },
+          "matchedBy": {
+            "description": "`fts` (bm25-ranked) or `like` (substring).",
+            "enum": [
+              "fts",
+              "like"
+            ],
+            "type": "string"
+          },
+          "score": {
+            "description": "bm25 score of an fts hit (lower is better).",
+            "type": "number"
+          }
+        },
+        "required": [
+          "entry",
+          "matchedBy"
+        ],
+        "type": "object"
+      },
+      "MemorySearchPage": {
+        "additionalProperties": false,
+        "description": "Search hits, fts first.",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/MemorySearchHit"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      },
+      "MemoryCreate": {
+        "additionalProperties": false,
+        "description": "A new memory entry.",
+        "properties": {
+          "body": {
+            "type": "string"
+          },
+          "description": {
+            "description": "One line.",
+            "type": "string"
+          },
+          "slug": {
+            "description": "1-64 of a-z 0-9 . _ -, starting with a letter or digit.",
+            "type": "string"
+          },
+          "sourceRefs": {
+            "description": "At most 64.",
+            "items": {
+              "$ref": "#/components/schemas/MemorySourceRef"
+            },
+            "type": "array"
+          },
+          "title": {
+            "description": "One line.",
+            "type": "string"
+          },
+          "type": {
+            "$ref": "#/components/schemas/MemoryType"
+          }
+        },
+        "required": [
+          "description",
+          "slug",
+          "title",
+          "type"
+        ],
+        "type": "object"
+      },
+      "MemoryUpdate": {
+        "additionalProperties": false,
+        "description": "A revision-CAS update; omitted fields keep their values.",
+        "properties": {
+          "body": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "expectedRevision": {
+            "description": "Required: the revision being replaced.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sourceRefs": {
+            "description": "Appended to the entry's refs.",
+            "items": {
+              "$ref": "#/components/schemas/MemorySourceRef"
+            },
+            "type": "array"
+          },
+          "title": {
+            "type": "string"
+          },
+          "type": {
+            "$ref": "#/components/schemas/MemoryType"
+          }
+        },
+        "required": [
+          "expectedRevision"
+        ],
+        "type": "object"
+      },
+      "MemoryConsolidate": {
+        "additionalProperties": false,
+        "description": "Replace 2-32 entries with one, CAS on every input.",
+        "properties": {
+          "entry": {
+            "$ref": "#/components/schemas/MemoryCreate"
+          },
+          "sources": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "expectedRevision": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "slug": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "expectedRevision",
+                "slug"
+              ],
+              "type": "object"
+            },
+            "maxItems": 32,
+            "minItems": 2,
+            "type": "array"
+          }
+        },
+        "required": [
+          "entry",
+          "sources"
+        ],
+        "type": "object"
+      },
+      "MemoryDeleteResult": {
+        "additionalProperties": false,
+        "description": "The entry as deleted.",
+        "properties": {
+          "deleted": {
+            "$ref": "#/components/schemas/MemoryEntry"
+          }
+        },
+        "required": [
+          "deleted"
+        ],
+        "type": "object"
+      },
+      "MemoryRestore": {
+        "additionalProperties": false,
+        "description": "Entries to restore; every archived entry when omitted.",
+        "properties": {
+          "slugs": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "MemoryRestoreResult": {
+        "additionalProperties": false,
+        "description": "Slugs restored.",
+        "properties": {
+          "restored": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "restored"
+        ],
+        "type": "object"
+      },
+      "SeenRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "durableSeq": {
+            "description": "Highest journal seq the client has shown for this instance, as the decimal string the Hub serializes (a JSON integer is also accepted). Clamped to the instance's durable seq; a value at or below the current seen seq changes nothing.",
+            "type": [
+              "string",
+              "integer"
+            ]
+          },
+          "visible": {
+            "description": "true while the client is showing the session: holds a short per-device visibility lease (10 s, renewed by repeating the report) so a turn that ends meanwhile is folded seen instead of becoming unseen. false releases this device's lease when it stops showing the session. Omit for a report that is not about the screen, such as marking a row seen from a list.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "durableSeq"
+        ],
+        "type": "object"
+      },
+      "SeenView": {
+        "additionalProperties": false,
+        "properties": {
+          "instanceId": {
+            "type": "string"
+          },
+          "seenAt": {
+            "description": "When the seen seq last advanced.",
+            "type": "string"
+          },
+          "seenSeq": {
+            "description": "Owner's seen seq after this report (decimal).",
+            "type": "string"
+          },
+          "turnEndSeq": {
+            "description": "Latest settled turn end (decimal); absent before any.",
+            "type": "string"
+          },
+          "unseen": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "instanceId",
+          "unseen"
+        ],
+        "type": "object"
       }
     }
   },
@@ -7221,6 +7731,55 @@
         ]
       }
     },
+    "/v1/instances/{id}/seen": {
+      "post": {
+        "description": "seen-hub: the owner saw this instance up to durableSeq. Seen is tracked per owner (scope owner), so phone and desktop agree. Monotonic: a lower seq never moves seen back. When the seen seq advances, the Hub publishes an instance.seen event on the /v1/follow bus to unfiltered followers. Human devices only: Agent credentials are refused by the agent-route policy and Bot devices by the handler.",
+        "operationId": "instanceSeen",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SeenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SeenView"
+                }
+              }
+            },
+            "description": "Seen state after the report"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Mark an instance seen by the owner (done-unseen)",
+        "tags": [
+          "instances"
+        ]
+      }
+    },
     "/v1/instances/{id}/usage": {
       "get": {
         "operationId": "instanceUsage",
@@ -7382,6 +7941,604 @@
         "summary": "Read one agent lineage and its chapters (D-057)",
         "tags": [
           "instances"
+        ]
+      }
+    },
+    "/v1/lineages/{id}/glance": {
+      "get": {
+        "operationId": "lineageGlance",
+        "summary": "Waiting and working workers a lineage dispatched, plus today's DONE count",
+        "description": "At most 50 rows in each of waiting and working; the *Total counters carry the overflow. Human/Bot devices may read any lineage; an Agent may read only its own lineage (403 otherwise). Row detail text is untrusted data.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Lineage glance",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LineageGlance"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "tags": [
+          "instances"
+        ]
+      }
+    },
+    "/v1/lineages/{id}/memory": {
+      "get": {
+        "description": "D-060 memory entries of one lineage in index order (type, then slug). Archived entries only with includeArchived=true. Human devices read any lineage; an Agent reads only its own lineage (403 otherwise). Bot devices are refused.",
+        "operationId": "memoryList",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          },
+          {
+            "$ref": "#/components/parameters/CallerInstance"
+          },
+          {
+            "description": "Only this type.",
+            "in": "query",
+            "name": "type",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/MemoryType"
+            }
+          },
+          {
+            "description": "Include archived entries.",
+            "in": "query",
+            "name": "includeArchived",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryEntryPage"
+                }
+              }
+            },
+            "description": "Entries"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List a lineage's memory entries",
+        "tags": [
+          "memory"
+        ]
+      },
+      "post": {
+        "description": "Create one entry at the slug's next revision (1 for a slug never used before; a recreated slug continues after its last revision); 409 MEMORY_SLUG_EXISTS when the slug exists (archived included). Soft limits (entry 2048 bytes, index 4096 bytes) come back as warnings with the actual numbers; above 8192 bytes the entry is refused (413). Human devices create memory only for an existing lineage (404 for a retired one) and may update, delete and consolidate (into one of the inputs) any lineage's retained entries, a retired lineage's included. An Agent writes only its own lineage and only from the lineage's current, unfenced chapter (403 otherwise). Bot devices are refused.",
+        "operationId": "memoryCreate",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          },
+          {
+            "$ref": "#/components/parameters/CallerInstance"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemoryCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryWriteResult"
+                }
+              }
+            },
+            "description": "Committed entry"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Create a memory entry",
+        "tags": [
+          "memory"
+        ]
+      }
+    },
+    "/v1/lineages/{id}/memory/entries/{slug}": {
+      "get": {
+        "description": "One entry, archived or not. Human devices read any lineage; an Agent reads only its own lineage (403 otherwise). Bot devices are refused.",
+        "operationId": "memoryGet",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          },
+          {
+            "description": "Entry slug (1-64 of a-z 0-9 . _ -).",
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/CallerInstance"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryEntry"
+                }
+              }
+            },
+            "description": "Entry"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Read a memory entry",
+        "tags": [
+          "memory"
+        ]
+      },
+      "put": {
+        "description": "Revision compare-and-set update: expectedRevision is required, and a stale one is 409 MEMORY_REVISION_CONFLICT with currentRevision. Omitted fields keep their values; sourceRefs are appended. An archived entry is 409 MEMORY_ARCHIVED until restored. Human devices create memory only for an existing lineage (404 for a retired one) and may update, delete and consolidate (into one of the inputs) any lineage's retained entries, a retired lineage's included. An Agent writes only its own lineage and only from the lineage's current, unfenced chapter (403 otherwise). Bot devices are refused.",
+        "operationId": "memoryUpdate",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          },
+          {
+            "description": "Entry slug (1-64 of a-z 0-9 . _ -).",
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/CallerInstance"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemoryUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryWriteResult"
+                }
+              }
+            },
+            "description": "Committed entry"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Update a memory entry (revision CAS)",
+        "tags": [
+          "memory"
+        ]
+      },
+      "delete": {
+        "description": "Revision compare-and-set delete: the expectedRevision query parameter is required; a stale one is 409 MEMORY_REVISION_CONFLICT. Human devices create memory only for an existing lineage (404 for a retired one) and may update, delete and consolidate (into one of the inputs) any lineage's retained entries, a retired lineage's included. An Agent writes only its own lineage and only from the lineage's current, unfenced chapter (403 otherwise). Bot devices are refused.",
+        "operationId": "memoryDelete",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          },
+          {
+            "description": "Entry slug (1-64 of a-z 0-9 . _ -).",
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/CallerInstance"
+          },
+          {
+            "description": "The revision being deleted.",
+            "in": "query",
+            "name": "expectedRevision",
+            "required": true,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryDeleteResult"
+                }
+              }
+            },
+            "description": "Deleted entry"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Delete a memory entry (revision CAS)",
+        "tags": [
+          "memory"
+        ]
+      }
+    },
+    "/v1/lineages/{id}/memory/index": {
+      "get": {
+        "description": "The Hub-rendered index of the lineage's live entries (archived ones too with includeArchived=true, each line ending ` (archived)`): one `- [type] slug: title — description` line each, ordered by type then slug, with a warning above 4096 bytes. Human devices read any lineage; an Agent reads only its own lineage (403 otherwise). Bot devices are refused.",
+        "operationId": "memoryIndex",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          },
+          {
+            "$ref": "#/components/parameters/CallerInstance"
+          },
+          {
+            "description": "Include archived entries; their lines end ` (archived)`. The size warning is computed for what is rendered.",
+            "in": "query",
+            "name": "includeArchived",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryIndex"
+                }
+              }
+            },
+            "description": "Rendered index"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Render a lineage's memory index",
+        "tags": [
+          "memory"
+        ]
+      }
+    },
+    "/v1/lineages/{id}/memory/search": {
+      "get": {
+        "description": "FTS5 MATCH hits ranked by bm25, then LIKE hits the tokenizer cannot see (a run of CJK characters is one token, so a two-character query hits by substring). Every whitespace-separated term must match; a query of more than 8 terms is refused (400), never shortened. Human devices read any lineage; an Agent reads only its own lineage (403 otherwise). Bot devices are refused.",
+        "operationId": "memorySearch",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          },
+          {
+            "$ref": "#/components/parameters/CallerInstance"
+          },
+          {
+            "description": "Query text: at most 8 whitespace-separated terms, all of which must match.",
+            "in": "query",
+            "name": "q",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Hits to return (default 10, at most 100).",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Search archived entries too.",
+            "in": "query",
+            "name": "includeArchived",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemorySearchPage"
+                }
+              }
+            },
+            "description": "Hits"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Search a lineage's memory",
+        "tags": [
+          "memory"
+        ]
+      }
+    },
+    "/v1/lineages/{id}/memory/consolidate": {
+      "post": {
+        "description": "Atomically replace 2-32 entries with one: every source carries its expectedRevision, and any stale one is 409 MEMORY_REVISION_CONFLICT listing each conflict, with nothing changed. The new entry may reuse a source's slug (its revision then continues) or take a new one (409 when that slug exists elsewhere); it keeps every source's sourceRefs. Human devices create memory only for an existing lineage (404 for a retired one) and may update, delete and consolidate (into one of the inputs) any lineage's retained entries, a retired lineage's included. An Agent writes only its own lineage and only from the lineage's current, unfenced chapter (403 otherwise). Bot devices are refused.",
+        "operationId": "memoryConsolidate",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          },
+          {
+            "$ref": "#/components/parameters/CallerInstance"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemoryConsolidate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryWriteResult"
+                }
+              }
+            },
+            "description": "Committed entry and removed slugs"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Consolidate memory entries (CAS on every input)",
+        "tags": [
+          "memory"
+        ]
+      }
+    },
+    "/v1/lineages/{id}/memory/restore": {
+      "post": {
+        "description": "Owner (Human) only: clear archivedAt on the named entries, or on every archived entry of the lineage when slugs is omitted. Lineage retirement archives entries; it never deletes them.",
+        "operationId": "memoryRestore",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemoryRestore"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRestoreResult"
+                }
+              }
+            },
+            "description": "Restored slugs"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Restore archived memory entries",
+        "tags": [
+          "memory"
+        ]
+      }
+    },
+    "/v1/memory/derived": {
+      "get": {
+        "description": "Owner (Human) only: every memory entry, in any lineage and archived included, whose sourceRefs name this journal row (or any row of the instance when seq is omitted). For journal redaction.",
+        "operationId": "memoryDerived",
+        "parameters": [
+          {
+            "description": "Instance whose journal holds the row.",
+            "in": "query",
+            "name": "instanceId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Journal sequence number.",
+            "in": "query",
+            "name": "seq",
+            "required": false,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryEntryPage"
+                }
+              }
+            },
+            "description": "Derived entries"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Find memory entries derived from a journal row",
+        "tags": [
+          "memory"
         ]
       }
     },
@@ -9285,6 +10442,48 @@
               "type": "string"
             }
           }
+        ]
+      }
+    },
+    "/v1/workers/{id}/digest": {
+      "get": {
+        "operationId": "workerDigest",
+        "summary": "Bounded (<= 2048 bytes) read-only digest of one worker",
+        "description": "Roster state, last turn outcome, head/tail of the last assistant text, the pending interaction with a bounded untrusted-quoted tool-argument summary (secrets and input-handoff values withheld), requested vs effective model/effort, a pending instance.configure, parked supply with resetsAt, queued command count, task/branch/sha, time since progress and tool-in-flight. Always valid JSON of at most 2048 UTF-8 bytes: over budget, text fields shrink. Human/Bot devices read any worker; an Agent only workers in its own lineage or dispatched by it (403 otherwise). Free-text fields are untrusted data.",
+        "parameters": [
+          {
+            "description": "wkr_ id or active worker name",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Worker digest",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkerDigest"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "tags": [
+          "workers"
         ]
       }
     },
@@ -11540,6 +12739,9 @@
     },
     {
       "name": "workers"
+    },
+    {
+      "name": "memory"
     }
   ]
 }

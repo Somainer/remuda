@@ -18,6 +18,7 @@ mod auth;
 mod bot;
 mod config;
 mod devices;
+mod digest;
 mod error;
 mod fleet;
 mod gatequeue;
@@ -58,6 +59,7 @@ pub mod usage_store_test_support {
 }
 mod inventory;
 mod maintenance;
+mod memory;
 mod model_catalog;
 /// Built-in model catalog revision (tests compare the served catalog against it).
 pub use model_catalog::CATALOG_REVISION;
@@ -73,6 +75,7 @@ mod proxy;
 mod push_http;
 mod rate_limit;
 mod registry;
+mod seen;
 pub mod ssh_hosts;
 mod store;
 mod store_tickets;
@@ -302,7 +305,9 @@ pub mod store_test_support {
     use serde_json::{Value, json};
     use std::collections::BTreeSet;
 
-    pub use crate::store::{APPEND_CHUNK_MAX, JOURNAL_WINDOW_BYTES, JOURNAL_WINDOW_ROWS, Store};
+    pub use crate::store::{
+        APPEND_CHUNK_MAX, JOURNAL_WINDOW_BYTES, JOURNAL_WINDOW_ROWS, SCHEMA_USER_VERSION, Store,
+    };
 
     /// D-057 §7.3 commit-time check error (the initiator suite matches on it).
     pub use crate::store::StoreError;
@@ -366,6 +371,18 @@ pub mod store_test_support {
             enforce_tree: true,
             restart: None,
         })
+    }
+
+    /// A seat's delegation: no grants, a restart policy, so the insert
+    /// creates a continuity lineage row with itself as the current chapter.
+    pub fn continuity_delegation() -> InstanceDelegation {
+        InstanceDelegation {
+            restart: Some(crate::store::RestartPolicy {
+                on_process_loss: true,
+                max_per_hour: 3,
+            }),
+            ..InstanceDelegation::default()
+        }
     }
 
     /// Open a Hub DB and enroll one host, returning the store and its host id.
@@ -2052,6 +2069,7 @@ pub fn router(state: AppState) -> Router {
         .merge(placement::routes())
         .merge(projects::routes())
         .merge(tasks::routes())
+        .merge(memory::routes())
         .merge(fleet::routes())
         .merge(devices::routes())
         .merge(passkeys::routes())
@@ -2066,6 +2084,7 @@ pub fn router(state: AppState) -> Router {
         .merge(workers::routes())
         .merge(gatequeue::routes())
         .merge(worker_watch::routes())
+        .merge(digest::routes())
         .merge(bot::routes());
     if let Some(push) = state.push.clone() {
         app = app.nest_service("/push", push_http::nest(push, state.store.clone()));

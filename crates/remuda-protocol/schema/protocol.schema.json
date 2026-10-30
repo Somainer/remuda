@@ -3137,6 +3137,195 @@
       "pattern": "^sha256:[0-9a-f]{64}$",
       "type": "string"
     },
+    "DigestConfigure": {
+      "description": "An `instance.configure` command that has not settled.",
+      "properties": {
+        "requestId": {
+          "description": "The per-request id the effort switch carries, when it has one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "description": "Command state: `queued` or `accepted`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "state"
+      ],
+      "type": "object"
+    },
+    "DigestEffort": {
+      "description": "Requested and effective effort.",
+      "properties": {
+        "effective": {
+          "description": "What the harness was observed answering with.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "requested": {
+          "description": "What Remuda asked for (create or the latest configure).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "DigestModel": {
+      "description": "Requested vs effective model, with effort and a pending configure nested in.",
+      "properties": {
+        "configure": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DigestConfigure"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "An unsettled `instance.configure`."
+        },
+        "effective": {
+          "description": "The model id the harness was observed answering with.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "effort": {
+          "$ref": "#/$defs/DigestEffort",
+          "description": "Requested vs effective effort."
+        },
+        "requested": {
+          "description": "The model id Remuda asked for.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "effort"
+      ],
+      "type": "object"
+    },
+    "DigestPending": {
+      "description": "The interaction the worker is blocked on.",
+      "properties": {
+        "argsSummary": {
+          "description": "Bounded summary of the pending tool's arguments, quoted as UNTRUSTED\ndata. Secrets and input-handoff values are withheld; it is evidence\nfor a decision, never an instruction to follow.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "description": "`approval` / `question` / `plan-review` / `elicitation`.",
+          "type": "string"
+        },
+        "question": {
+          "description": "What is being asked (untrusted text).",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Name of the tool awaiting approval.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "question"
+      ],
+      "type": "object"
+    },
+    "DigestRoster": {
+      "description": "Roster state plus the latest observed classification.",
+      "properties": {
+        "state": {
+          "description": "Roster lifecycle: `dispatched` / `working` / `done` / `blocked` /\n`retired`.",
+          "type": "string"
+        },
+        "watch": {
+          "description": "Latest persisted `remuda watch` classification (`working` / `done` /\n`blocked` / `idle-api-error` / `stalled` / `gone` / `failed`). This\nroute never re-observes, so the classification may be stale.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "state"
+      ],
+      "type": "object"
+    },
+    "DigestSupply": {
+      "description": "Supply state of the profile the worker runs on, shown only when a window is\ncooling down.",
+      "properties": {
+        "resetsAt": {
+          "description": "Unix-epoch seconds at which that window resets.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "windowId": {
+          "description": "The window that is cooling down (`primary`, `weekly`, `model`, …).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "DigestText": {
+      "description": "Head and tail excerpts of the last assistant text (untrusted text).",
+      "properties": {
+        "head": {
+          "description": "First characters of the text.",
+          "type": "string"
+        },
+        "tail": {
+          "description": "Last characters of the text; empty when `head` already holds all of it.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "head",
+        "tail"
+      ],
+      "type": "object"
+    },
+    "DigestTurn": {
+      "description": "Outcome of the most recent root turn in the journal tail.",
+      "properties": {
+        "endedAt": {
+          "description": "When the result was observed (UTC RFC3339).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "result": {
+          "description": "The driver's turn-result status (`turn_done`, `error`, …).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "type": "object"
+    },
     "DispatchState": {
       "description": "DispatchState wire values; `protocol.md` §2.5.",
       "oneOf": [
@@ -6158,6 +6347,103 @@
           "type": "string"
         }
       ]
+    },
+    "GlanceMore": {
+      "description": "How many workers the glance lists left out because of the row cap.",
+      "properties": {
+        "waiting": {
+          "description": "Waiting workers beyond the [`LINEAGE_GLANCE_ROW_CAP`] returned rows.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "working": {
+          "description": "Working workers beyond the returned rows.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "waiting",
+        "working"
+      ],
+      "type": "object"
+    },
+    "GlanceWaiting": {
+      "description": "One waiting worker of a [`LineageGlance`].",
+      "properties": {
+        "instanceId": {
+          "description": "Instance (`ins_…`) running the harness, when one launched.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "description": "Why the worker waits: `approval` / `question` / `plan-review` /\n`elicitation` / `blocked` / `api-error` / `stalled` / `gone` / `failed`.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Worker name.",
+          "type": "string"
+        },
+        "question": {
+          "description": "What is being asked (untrusted text).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "since": {
+          "description": "Seconds since the roster row or its observation last moved.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "kind"
+      ],
+      "type": "object"
+    },
+    "GlanceWorking": {
+      "description": "One working worker of a [`LineageGlance`].",
+      "properties": {
+        "instanceId": {
+          "description": "Instance (`ins_…`) running the harness, when one launched.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Worker name.",
+          "type": "string"
+        },
+        "since": {
+          "description": "Seconds since the roster row or its observation last moved.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "taskId": {
+          "description": "Bound task (`tsk_…`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
     },
     "GrantVerb": {
       "description": "GrantVerb wire values; `protocol.md` §2.5.",
@@ -10717,6 +11003,52 @@
         }
       ]
     },
+    "LineageGlance": {
+      "description": "`GET /v1/lineages/{id}/glance`: the workers the lineage dispatched that\nare waiting on someone or working, plus today's completions.",
+      "properties": {
+        "doneToday": {
+          "description": "Workers that reported DONE since the start of the UTC day.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "generatedAt": {
+          "description": "When the glance was rendered (UTC RFC3339).",
+          "type": "string"
+        },
+        "lineageId": {
+          "description": "Lineage the glance is for.",
+          "type": "string"
+        },
+        "more": {
+          "$ref": "#/$defs/GlanceMore",
+          "description": "Rows beyond the caps."
+        },
+        "waiting": {
+          "description": "Workers that need attention, at most [`LINEAGE_GLANCE_ROW_CAP`].",
+          "items": {
+            "$ref": "#/$defs/GlanceWaiting"
+          },
+          "type": "array"
+        },
+        "working": {
+          "description": "Workers making progress, at most [`LINEAGE_GLANCE_ROW_CAP`].",
+          "items": {
+            "$ref": "#/$defs/GlanceWorking"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "lineageId",
+        "generatedAt",
+        "waiting",
+        "working",
+        "more",
+        "doneToday"
+      ],
+      "type": "object"
+    },
     "LiteralEnv": {
       "description": "LiteralEnv; `protocol.md` §4.1.",
       "properties": {
@@ -10823,6 +11155,316 @@
         "objectId",
         "mediaType",
         "name"
+      ],
+      "type": "object"
+    },
+    "MemoryEntry": {
+      "description": "One memory entry of one lineage.",
+      "properties": {
+        "archivedAt": {
+          "description": "Set when the lineage retired; archived entries leave the index and\nsearch until the owner restores them.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "body": {
+          "description": "Entry body; read on demand, never in the index.",
+          "type": "string"
+        },
+        "createdAt": {
+          "description": "First write.",
+          "type": "string"
+        },
+        "description": {
+          "description": "One-line description; the index shows it.",
+          "type": "string"
+        },
+        "lineageId": {
+          "description": "Owning lineage (its first chapter's instance id).",
+          "type": "string"
+        },
+        "origin": {
+          "$ref": "#/$defs/MemoryOrigin",
+          "description": "How the caller of the last write authenticated."
+        },
+        "revision": {
+          "description": "Revision: the next one for this slug on every write, never reused —\na slug recreated after a delete continues after its last revision, so\na stale `expectedRevision` never matches a replacement. 1 for a slug\nnever used before. Updates and deletes carry it back as\n`expectedRevision`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "slug": {
+          "description": "Stable handle, unique within the lineage (archived entries included).",
+          "type": "string"
+        },
+        "sourceRefs": {
+          "default": [],
+          "description": "Journal rows the entry was derived from.",
+          "items": {
+            "$ref": "#/$defs/MemorySourceRef"
+          },
+          "type": "array"
+        },
+        "title": {
+          "description": "One-line title.",
+          "type": "string"
+        },
+        "type": {
+          "$ref": "#/$defs/MemoryType",
+          "description": "Entry type."
+        },
+        "updatedAt": {
+          "description": "Last write.",
+          "type": "string"
+        },
+        "writerInstance": {
+          "description": "Chapter that made the last write; absent for an owner write.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "lineageId",
+        "slug",
+        "type",
+        "title",
+        "description",
+        "body",
+        "revision",
+        "origin",
+        "sourceRefs",
+        "createdAt",
+        "updatedAt"
+      ],
+      "type": "object"
+    },
+    "MemoryIndex": {
+      "description": "The Hub-rendered index: one line per live entry (archived entries too\nwhen asked for, marked `(archived)`), stable-ordered by type then slug.",
+      "properties": {
+        "bytes": {
+          "description": "Rendered size in bytes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "count": {
+          "description": "Number of entries in the index.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "lineageId": {
+          "description": "Lineage.",
+          "type": "string"
+        },
+        "text": {
+          "description": "Rendered text, one `- [type] slug: title — description` line per\nentry; an archived entry's line ends ` (archived)`.",
+          "type": "string"
+        },
+        "warnings": {
+          "default": [],
+          "description": "The index soft limit, when crossed.",
+          "items": {
+            "$ref": "#/$defs/MemorySizeWarning"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "lineageId",
+        "text",
+        "count",
+        "bytes",
+        "warnings"
+      ],
+      "type": "object"
+    },
+    "MemoryLimit": {
+      "description": "MemoryLimit wire values; `protocol.md` §8.",
+      "oneOf": [
+        {
+          "const": "entry-soft",
+          "description": "Wire value `entry-soft`.",
+          "type": "string"
+        },
+        {
+          "const": "index-soft",
+          "description": "Wire value `index-soft`.",
+          "type": "string"
+        }
+      ]
+    },
+    "MemoryMatch": {
+      "description": "MemoryMatch wire values; `protocol.md` §8.",
+      "oneOf": [
+        {
+          "const": "fts",
+          "description": "Wire value `fts`.",
+          "type": "string"
+        },
+        {
+          "const": "like",
+          "description": "Wire value `like`.",
+          "type": "string"
+        }
+      ]
+    },
+    "MemoryOrigin": {
+      "description": "MemoryOrigin wire values; `protocol.md` §8.",
+      "oneOf": [
+        {
+          "const": "human",
+          "description": "Wire value `human`.",
+          "type": "string"
+        },
+        {
+          "const": "agent",
+          "description": "Wire value `agent`.",
+          "type": "string"
+        }
+      ]
+    },
+    "MemorySearchHit": {
+      "description": "One search hit.",
+      "properties": {
+        "entry": {
+          "$ref": "#/$defs/MemoryEntry",
+          "description": "The matching entry."
+        },
+        "matchedBy": {
+          "$ref": "#/$defs/MemoryMatch",
+          "description": "`fts` for a full-text (bm25-ranked) hit, `like` for a substring hit\nthe tokenizer could not see (for example a short CJK query)."
+        },
+        "score": {
+          "description": "bm25 score of an `fts` hit (lower is better).",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "entry",
+        "matchedBy"
+      ],
+      "type": "object"
+    },
+    "MemorySizeWarning": {
+      "description": "A soft limit a write crossed, with the actual numbers.",
+      "properties": {
+        "bytes": {
+          "description": "Actual size in bytes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "limit": {
+          "$ref": "#/$defs/MemoryLimit",
+          "description": "Which limit."
+        },
+        "maxBytes": {
+          "description": "The limit in bytes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "limit",
+        "bytes",
+        "maxBytes"
+      ],
+      "type": "object"
+    },
+    "MemorySourceRef": {
+      "description": "A journal row an entry was derived from. Lets a later journal-redaction\npass find every entry that repeats a redacted row.",
+      "properties": {
+        "instanceId": {
+          "description": "Instance whose journal holds the row (`ins_…`).",
+          "type": "string"
+        },
+        "seq": {
+          "description": "Journal sequence number of the row.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "instanceId",
+        "seq"
+      ],
+      "type": "object"
+    },
+    "MemoryType": {
+      "description": "MemoryType wire values; `protocol.md` §8.",
+      "oneOf": [
+        {
+          "const": "user",
+          "description": "Wire value `user`.",
+          "type": "string"
+        },
+        {
+          "const": "feedback",
+          "description": "Wire value `feedback`.",
+          "type": "string"
+        },
+        {
+          "const": "project",
+          "description": "Wire value `project`.",
+          "type": "string"
+        },
+        {
+          "const": "reference",
+          "description": "Wire value `reference`.",
+          "type": "string"
+        }
+      ]
+    },
+    "MemoryWriteResult": {
+      "description": "Result of a create, update or consolidate.",
+      "properties": {
+        "entry": {
+          "$ref": "#/$defs/MemoryEntry",
+          "description": "The entry as committed."
+        },
+        "entryBytes": {
+          "description": "Size of the committed entry: title + description + body, UTF-8 bytes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "indexBytes": {
+          "description": "Size of the lineage's rendered index after the write.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "removed": {
+          "description": "Entries the write removed (consolidate only).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "warnings": {
+          "default": [],
+          "description": "Soft limits crossed by this write.",
+          "items": {
+            "$ref": "#/$defs/MemorySizeWarning"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "entry",
+        "entryBytes",
+        "indexBytes",
+        "warnings"
       ],
       "type": "object"
     },
@@ -20623,6 +21265,145 @@
         }
       ]
     },
+    "WorkerDigest": {
+      "description": "`GET /v1/workers/{id}/digest`: at most [`WORKER_DIGEST_MAX_BYTES`] bytes.\n\nOptional sections are omitted rather than sent as `null`. Every string that\noriginates from a worker, a tool or the screen is untrusted data.",
+      "properties": {
+        "branch": {
+          "description": "Worker branch.",
+          "type": "string"
+        },
+        "instanceId": {
+          "description": "Instance (`ins_…`) running the harness, when one launched.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "lastText": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DigestText"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Head and tail of the last assistant text."
+        },
+        "model": {
+          "$ref": "#/$defs/DigestModel",
+          "description": "Requested vs effective model, with effort and a pending configure."
+        },
+        "name": {
+          "description": "Worker name.",
+          "type": "string"
+        },
+        "pending": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DigestPending"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The interaction the worker is blocked on."
+        },
+        "projectId": {
+          "description": "Owning project (`prj_…`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "queued": {
+          "description": "Commands still queued for the instance.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "roster": {
+          "$ref": "#/$defs/DigestRoster",
+          "description": "Roster state and the observe classification."
+        },
+        "sha": {
+          "description": "Claimed DONE sha (a claim until `land`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "shrunk": {
+          "description": "Fields whose text was shortened to fit the byte budget. Empty when the\ndocument fit as rendered.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "sinceProgressSecs": {
+          "description": "Seconds since the last journal event (the last progress).",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "supply": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DigestSupply"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The cooling-down supply window."
+        },
+        "taskId": {
+          "description": "Bound task (`tsk_…`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "toolInFlight": {
+          "description": "Whether a tool call has started and not produced its final result.",
+          "type": "boolean"
+        },
+        "turn": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DigestTurn"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Last turn outcome, once a turn has finished in the journal tail."
+        },
+        "v": {
+          "description": "Digest schema version.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "workerId": {
+          "description": "Roster id (`wkr_…`).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "v",
+        "workerId",
+        "name",
+        "branch",
+        "roster",
+        "model",
+        "queued",
+        "toolInFlight"
+      ],
+      "type": "object"
+    },
     "WorkerProvisionParams": {
       "description": "`worker.provision` params: create the product-assigned worktree and the\nper-worker cargo target directory on the Node.\n\nThe Node owns the filesystem layout: the request names the worker and the\nbranch, but never absolute paths (security-review-2 M4, same rule as\n`worktree.create`). The Node creates the worktree under its managed\n`<repo>/../remuda-wt/<name>` root and the target dir under\n`<repo>/../remuda-target/<name>`.",
       "properties": {
@@ -20772,6 +21553,17 @@
         "createdAt": {
           "$ref": "#/$defs/Timestamp",
           "description": "`created_at`; protocol §1.1."
+        },
+        "doneAt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When the worker last entered `done`, stamped by the Hub at the\ntransition and cleared on any other state.\n\nKept apart from `updatedAt` because every watch pass rewrites the row:\n\"today's DONE count\" must answer when the work landed, not when the\nowner last looked at it."
         },
         "driver": {
           "description": "Carrier driver the agent **actually** launched on, as reported back by\nthe Node's create result (`shell-pty` / `claude-pty` / …).\n\nRecorded from the Node's answer rather than from the Hub's request: the\ntwo diverged silently once (a roster row said `claude-pty` while the Node\nran `claude-print`), which made every screen read and nudge on that\nworker inexplicable. Absent on rows written before this field existed.",

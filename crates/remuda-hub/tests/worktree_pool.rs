@@ -298,6 +298,8 @@ impl Ctx {
             state: WorkerState::Done {
                 sha: "0123456789abcdef".into(),
             },
+            // Stamped by the store when the row enters `done`.
+            done_at: None,
             watch: None,
             last_nudge_at: None,
             resumed_from: None,

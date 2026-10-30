@@ -354,6 +354,9 @@ pub struct Store {
     /// [`Arc`] so every clone of the store arms the SAME flags.
     #[cfg(any(test, feature = "test-faults"))]
     faults: Arc<test_faults::FaultFlags>,
+    /// seen-hub: owner clients showing a session right now. Read by the append
+    /// path so a turn end that lands while one is visible folds seen.
+    seen_presence: Arc<crate::seen::SeenPresence>,
 }
 
 impl Store {
@@ -361,6 +364,11 @@ impl Store {
     #[cfg(any(test, feature = "test-faults"))]
     pub(crate) fn fault_flags(&self) -> &Arc<test_faults::FaultFlags> {
         &self.faults
+    }
+
+    /// seen-hub: visible leases from owner clients (ephemeral presence).
+    pub(crate) fn seen_presence(&self) -> &crate::seen::SeenPresence {
+        &self.seen_presence
     }
 }
 
@@ -400,6 +408,10 @@ fn delete_instance_rows(tx: &Transaction, instance_id: &str) -> Result<(), Store
     )?;
     tx.execute(
         "DELETE FROM fleet_members WHERE instance_id = ?1",
+        params![instance_id],
+    )?;
+    tx.execute(
+        "DELETE FROM instance_views WHERE instance_id = ?1",
         params![instance_id],
     )?;
     // t-pool: a deleted instance must not keep holding an attach lock.
@@ -903,6 +915,22 @@ pub struct InstanceRecord {
     /// C1 restart policy copied to every chapter of a continuity lineage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart: Option<Value>,
+    /// seen-hub (home ◉): the latest settled turn end is newer than what the
+    /// owner has seen. Owner-scoped, so every owner device reads the same
+    /// value. See [`crate::seen`].
+    #[serde(default)]
+    pub unseen: bool,
+    /// Owner's seen seq (decimal), absent until the first seen report.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "seenSeq")]
+    pub seen_seq: Option<String>,
+    /// Journal seq (decimal) of the latest settled turn end. Absent before
+    /// any, including on a freshly resumed instance or new chapter.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "turnEndSeq"
+    )]
+    pub turn_end_seq: Option<String>,
 }
 
 /// Additive marker for a root turn that ended in failure while the process
@@ -1939,6 +1967,10 @@ pub struct JournalAppend {
     /// event moved the instance into a terminal lifecycle. Empty on replay.
     /// Callers broadcast it AFTER the transaction committed.
     pub settlement: Settlement,
+    /// seen-hub: the instance's seen view when this append recorded a settled
+    /// turn end. `None` on replay and for every other row. Callers publish it
+    /// on the follow bus after commit.
+    pub seen: Option<crate::seen::SeenView>,
 }
 
 /// One bounded [`Store::read_journal`] window with the metadata a caller needs
@@ -2502,6 +2534,7 @@ impl Store {
             gate_resolve_probe_barrier: Arc::new(crate::gatequeue::SimpleBarrier::new()),
             #[cfg(any(test, feature = "test-faults"))]
             faults: Arc::new(test_faults::FaultFlags::default()),
+            seen_presence: Arc::default(),
         })
     }
 
@@ -3793,6 +3826,9 @@ impl Store {
                     params![&instance.lineage_id],
                 )?;
             }
+            // D-060: a retired lineage's memory is archived, not deleted; the
+            // owner can restore it.
+            crate::memory::archive_lineage(&tx, &instance.lineage_id, &now)?;
             tx.commit()?;
             Ok(Some(DeletedInstance { settlement }))
         })
@@ -6064,6 +6100,7 @@ impl Store {
         first_seq: Option<i64>,
         events: Vec<Value>,
     ) -> Result<Vec<JournalAppend>, StoreError> {
+        let presence = self.seen_presence.clone();
         self.run_named("append_journal_batch", move |conn| {
             // BEGIN IMMEDIATE: the append reads the instance row and journal
             // cursor and then writes; a deferred tx would take SHARED first and
@@ -6083,6 +6120,7 @@ impl Store {
                     &host_id,
                     &instance_id,
                     &mut cursor,
+                    &presence,
                     event,
                 )?);
             }
@@ -7290,6 +7328,19 @@ fn open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     }
 }
 
+/// The seen-hub rung of the `PRAGMA user_version` ladder in
+/// [`try_open_conn`] (`instance_views` + `instances.turn_end_seq`): 2 and 3
+/// are the ma-lineage ended_at backfills, 4 is the D-060 memory schema.
+pub(crate) const SEEN_SCHEMA_RUNG: i64 = 5;
+
+/// Top rung of the ladder; a fresh database climbs to it. Exposed to the
+/// schema tests through [`crate::store_test_support`], never used by the Hub.
+pub const SCHEMA_USER_VERSION: i64 = SEEN_SCHEMA_RUNG;
+
+/// One ladder, no gaps: the seen rung sits above the D-060 memory rung, which
+/// sits above the ma-lineage backfills.
+const _: () = assert!(SEEN_SCHEMA_RUNG > crate::memory::MEMORY_SCHEMA_VERSION);
+
 /// Writer-side connection opener: sets WAL, the busy timeout, and runs the
 /// schema batch below.
 ///
@@ -7696,11 +7747,13 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     ensure_column(&conn, "instances", "ended_at", "TEXT")?;
     // ma-lineage r4 item 3 + r6 item 7 + r7 item 5(e): the ended_at
     // backfills run ONCE per schema PRAGMA marker, not on every Store::open
-    // for every evidence-less terminal row (that set only grows).
-    let backfill_version: i64 = conn
+    // for every evidence-less terminal row (that set only grows). This is the
+    // Hub's one `user_version` ladder: each step runs once, in order, and
+    // leaves the marker at its own number.
+    let schema_version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap_or(0);
-    if backfill_version < 2 {
+    if schema_version < 2 {
         // r6 item 3(b) ONE-TIME legacy fallback (guarded by PRAGMA
         // user_version): evidence-less historical rows that already reached a
         // live lifecycle, and LEGACY 'host-lost'-marked rows (the pre-r7
@@ -7726,7 +7779,7 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
         )?;
         conn.execute_batch("PRAGMA user_version = 2;")?;
     }
-    if backfill_version < 3 {
+    if schema_version < 3 {
         // ma-lineage r4 item 3: backfill `ended_at` from durable,
         // classifier-qualified process-end EVENTS in each row's journal —
         // never blindly from updated_at. A later return-to-live event after
@@ -7741,6 +7794,26 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
         backfill_ended_at_from_journal(&conn)
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         conn.execute_batch("PRAGMA user_version = 3;")?;
+    }
+    if schema_version < crate::memory::MEMORY_SCHEMA_VERSION {
+        // D-060 (cb-memory-core): the per-entry memory table, its FTS5 index
+        // and the triggers that keep the index in the row's transaction. The
+        // tables and the marker commit together.
+        let tx = conn.unchecked_transaction()?;
+        crate::memory::migrate(&tx)?;
+        tx.pragma_update(None, "user_version", crate::memory::MEMORY_SCHEMA_VERSION)?;
+        tx.commit()?;
+    }
+    if schema_version < SEEN_SCHEMA_RUNG {
+        // seen-hub (H6): per-owner done-unseen tracking — the instance_views
+        // table and instances.turn_end_seq. One transaction with the marker,
+        // so a crash between the DDL and the bump re-runs an idempotent rung.
+        // Rows that existed before the upgrade have no turn end recorded and
+        // therefore read as seen: an upgrade never floods the home with ◉.
+        let tx = conn.unchecked_transaction()?;
+        crate::seen::migrate(&tx)?;
+        tx.execute_batch(&format!("PRAGMA user_version = {SEEN_SCHEMA_RUNG};"))?;
+        tx.commit()?;
     }
     // Rows written before the column existed are each their own lineage.
     conn.execute(
@@ -11720,7 +11793,9 @@ mod tests {
             db.query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap()
         };
-        assert_eq!(version, 3);
+        // The marker sits at the top of the one ladder (the D-060 memory
+        // step and the seen-hub step follow the ended_at backfills).
+        assert_eq!(version, SCHEMA_USER_VERSION);
         // Another open changes neither row (one-time migration).
         store.close().await;
         let _store = Store::open(dir.path()).expect("store");
@@ -15281,9 +15356,11 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 mode, promoted_at, launched_by,
                 role, scope_json, grants_json, task_id, api_route_json, configure_seq,
                 lineage_id, generation, chapter_cause, fenced_at, restart_json,
-                turn_error_json
+                turn_error_json, turn_end_seq,
+                (SELECT seen_seq FROM instance_views
+                  WHERE instance_id = instances.id AND scope = ?2)
          FROM instances WHERE id = ?1",
-        params![id],
+        params![id, crate::seen::OWNER_SCOPE],
         |row| {
             let durable: i64 = row.get(10)?;
             let workspace_id: Option<String> = row.get(2)?;
@@ -15409,6 +15486,10 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 .as_ref()
                 .and_then(|value| value.get("id"))
                 .and_then(Value::as_str);
+            let seen_marks = crate::seen::SeenMarks {
+                turn_end_seq: row.get(30)?,
+                seen_seq: row.get(31)?,
+            };
             let usage_rollup = crate::usage_store::rollup_instance(
                 conn,
                 &crate::usage_store::RollupRequest {
@@ -15500,6 +15581,9 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                     .get::<_, Option<String>>(29)?
                     .filter(|raw| !raw.is_empty())
                     .and_then(|raw| serde_json::from_str(&raw).ok()),
+                unseen: seen_marks.unseen(),
+                seen_seq: seen_marks.seen_seq.map(|seq| seq.to_string()),
+                turn_end_seq: seen_marks.turn_end_seq.map(|seq| seq.to_string()),
             })
         },
     )
@@ -15543,6 +15627,7 @@ fn append_loaded_event(
     host_id: &str,
     instance_id: &str,
     cursor: &mut AppendCursor,
+    presence: &crate::seen::SeenPresence,
     mut event: Value,
 ) -> Result<JournalAppend, StoreError> {
     let seq = cursor.next_hint.unwrap_or(cursor.expected_next);
@@ -15561,6 +15646,7 @@ fn append_loaded_event(
             replayed: true,
             durable_seq: cursor.durable,
             settlement,
+            seen: None,
         });
     }
     if seq != cursor.expected_next {
@@ -15599,7 +15685,20 @@ fn append_loaded_event(
     // invalidated and its settlement notice is folded in with any settlement
     // this event's own terminal transition produced.
     settlement.merge(apply_interaction_event(conn, host_id, instance_id, &event)?);
-    apply_instance_lifecycle(conn, instance_id, &event, &mut settlement)?;
+    let turn_ended = apply_instance_lifecycle(conn, instance_id, &event, &mut settlement)?;
+    // seen-hub: a settled turn end becomes the instance's turn-end mark; an
+    // owner client showing the session right now folds it seen in this write.
+    let seen = if turn_ended {
+        crate::seen::fold_turn_end(
+            conn,
+            instance_id,
+            seq,
+            presence.is_visible(instance_id),
+            &now,
+        )?
+    } else {
+        None
+    };
     cursor.expected_next = seq + 1;
     cursor.durable = seq;
     cursor.next_hint = Some(seq.saturating_add(1));
@@ -15614,6 +15713,7 @@ fn append_loaded_event(
         replayed: false,
         durable_seq: seq,
         settlement,
+        seen,
     })
 }
 
@@ -16687,18 +16787,24 @@ pub(crate) fn derive_instance_state(event: &Value) -> (Option<&'static str>, Opt
     (lifecycle, activity)
 }
 
+/// Fold one event's derived lifecycle/activity into the instance row.
+///
+/// Returns whether the row is a settled root turn end for seen-hub: the
+/// event's own derived activity is `idle` and the row was busy before it
+/// (`working` / `blocked` / `draining`). The transition, not the idle
+/// observation, is the turn end, so repeated idle statuses never re-arm ◉.
 fn apply_instance_lifecycle(
     conn: &Connection,
     instance_id: &str,
     event: &Value,
     settlement: &mut Settlement,
-) -> Result<(), StoreError> {
+) -> Result<bool, StoreError> {
     let (next_life, mut next_act) = derive_instance_state(event);
     if next_life.is_none() && next_act.is_none() {
-        return Ok(());
+        return Ok(false);
     }
     let Some(current) = load_instance(conn, instance_id)? else {
-        return Ok(());
+        return Ok(false);
     };
     // r9 item 2: read the PREVIOUS row shape together with `current` — after
     // apply_instance_projection ran but BEFORE the UPDATE below — so the
@@ -16738,6 +16844,7 @@ fn apply_instance_lifecycle(
     // state change. `Some("")` clears it (next turn start), `Some(json)` sets
     // it (a SETTLED turn error), `None` leaves it untouched.
     let turn_error = turn_error_projection(event, &now);
+    let turn_ended = next_act == Some("idle") && crate::seen::is_busy_activity(&current.activity);
     conn.execute(
         "UPDATE instances SET lifecycle = ?1, activity = ?2, updated_at = ?3,
              turn_error_json = COALESCE(?4, turn_error_json) WHERE id = ?5",
@@ -16773,7 +16880,7 @@ fn apply_instance_lifecycle(
         &now,
         settlement,
     )?;
-    Ok(())
+    Ok(turn_ended)
 }
 
 const TURN_ERROR_TEXT_MAX_CHARS: usize = 200;

@@ -667,6 +667,66 @@ export type DiffScopeCheck = ({
 
 export type Digest = (string);
 
+/** An `instance.configure` command that has not settled. */
+export type DigestConfigure = ({
+  "requestId"?: (string | null);
+  "state": (string);
+  [key: string]: unknown;
+});
+
+/** Requested and effective effort. */
+export type DigestEffort = ({
+  "effective"?: (string | null);
+  "requested"?: (string | null);
+  [key: string]: unknown;
+});
+
+/** Requested vs effective model, with effort and a pending configure nested in. */
+export type DigestModel = ({
+  "configure"?: (DigestConfigure | (null));
+  "effective"?: (string | null);
+  "effort": DigestEffort;
+  "requested"?: (string | null);
+  [key: string]: unknown;
+});
+
+/** The interaction the worker is blocked on. */
+export type DigestPending = ({
+  "argsSummary"?: (string | null);
+  "kind": (string);
+  "question": (string);
+  "tool"?: (string | null);
+  [key: string]: unknown;
+});
+
+/** Roster state plus the latest observed classification. */
+export type DigestRoster = ({
+  "state": (string);
+  "watch"?: (string | null);
+  [key: string]: unknown;
+});
+
+/** Supply state of the profile the worker runs on, shown only when a window is cooling down. */
+export type DigestSupply = ({
+  "resetsAt"?: (number | null);
+  "windowId"?: (string | null);
+  [key: string]: unknown;
+});
+
+/** Head and tail excerpts of the last assistant text (untrusted text). */
+export type DigestText = ({
+  "head": (string);
+  "tail": (string);
+  [key: string]: unknown;
+});
+
+/** Outcome of the most recent root turn in the journal tail. */
+export type DigestTurn = ({
+  "endedAt"?: (string | null);
+  "result": (string);
+  [key: string]: unknown;
+});
+
 /** DispatchState wire values; `protocol.md` §2.5. */
 export type DispatchState = ("not-dispatched" | "intent-durable" | "transport-written" | "native-acknowledged");
 
@@ -1304,6 +1364,32 @@ export type GenericPermission = ({
 
 /** GenericPermissionMode wire values; `protocol.md` §4.1. */
 export type GenericPermissionMode = ("native");
+
+/** How many workers the glance lists left out because of the row cap. */
+export type GlanceMore = ({
+  "waiting": (number);
+  "working": (number);
+  [key: string]: unknown;
+});
+
+/** One waiting worker of a [`LineageGlance`]. */
+export type GlanceWaiting = ({
+  "instanceId"?: (string | null);
+  "kind": (string);
+  "name": (string);
+  "question"?: (string | null);
+  "since"?: (number | null);
+  [key: string]: unknown;
+});
+
+/** One working worker of a [`LineageGlance`]. */
+export type GlanceWorking = ({
+  "instanceId"?: (string | null);
+  "name": (string);
+  "since"?: (number | null);
+  "taskId"?: (string | null);
+  [key: string]: unknown;
+});
 
 /** GrantVerb wire values; `protocol.md` §2.5. */
 export type GrantVerb = ("dispatch" | "land" | "spend" | "address-owner");
@@ -2386,6 +2472,17 @@ export type LifecyclePayload = (EntityLifecycle & ({
 /** LifecycleTopic wire values; `protocol.md` §5.5. */
 export type LifecycleTopic = ("session" | "turn" | "hook" | "subagent" | "task" | "plan" | "configuration" | "permission" | "diagnostic" | "reconciliation");
 
+/** `GET /v1/lineages/{id}/glance`: the workers the lineage dispatched that are waiting on someone or working, plus today's completions. */
+export type LineageGlance = ({
+  "doneToday": (number);
+  "generatedAt": (string);
+  "lineageId": (string);
+  "more": GlanceMore;
+  "waiting": ((GlanceWaiting)[]);
+  "working": ((GlanceWorking)[]);
+  [key: string]: unknown;
+});
+
 /** LiteralEnv; `protocol.md` §4.1. */
 export type LiteralEnv = ({
   "value": (string);
@@ -2415,6 +2512,79 @@ export type MediaBlock = ({
   "name": (string | null);
   "objectId": Id;
   "size"?: (number | null);
+  [key: string]: unknown;
+});
+
+/** One memory entry of one lineage. */
+export type MemoryEntry = ({
+  "archivedAt"?: (string | null);
+  "body": (string);
+  "createdAt": (string);
+  "description": (string);
+  "lineageId": (string);
+  "origin": MemoryOrigin;
+  "revision": (number);
+  "slug": (string);
+  "sourceRefs": ((MemorySourceRef)[]);
+  "title": (string);
+  "type": MemoryType;
+  "updatedAt": (string);
+  "writerInstance"?: (string | null);
+  [key: string]: unknown;
+});
+
+/** The Hub-rendered index: one line per live entry (archived entries too when asked for, marked `(archived)`), stable-ordered by type then slug. */
+export type MemoryIndex = ({
+  "bytes": (number);
+  "count": (number);
+  "lineageId": (string);
+  "text": (string);
+  "warnings": ((MemorySizeWarning)[]);
+  [key: string]: unknown;
+});
+
+/** MemoryLimit wire values; `protocol.md` §8. */
+export type MemoryLimit = ("entry-soft" | "index-soft");
+
+/** MemoryMatch wire values; `protocol.md` §8. */
+export type MemoryMatch = ("fts" | "like");
+
+/** MemoryOrigin wire values; `protocol.md` §8. */
+export type MemoryOrigin = ("human" | "agent");
+
+/** One search hit. */
+export type MemorySearchHit = ({
+  "entry": MemoryEntry;
+  "matchedBy": MemoryMatch;
+  "score"?: (number | null);
+  [key: string]: unknown;
+});
+
+/** A soft limit a write crossed, with the actual numbers. */
+export type MemorySizeWarning = ({
+  "bytes": (number);
+  "limit": MemoryLimit;
+  "maxBytes": (number);
+  [key: string]: unknown;
+});
+
+/** A journal row an entry was derived from. Lets a later journal-redaction pass find every entry that repeats a redacted row. */
+export type MemorySourceRef = ({
+  "instanceId": (string);
+  "seq": (number);
+  [key: string]: unknown;
+});
+
+/** MemoryType wire values; `protocol.md` §8. */
+export type MemoryType = ("user" | "feedback" | "project" | "reference");
+
+/** Result of a create, update or consolidate. */
+export type MemoryWriteResult = ({
+  "entry": MemoryEntry;
+  "entryBytes": (number);
+  "indexBytes": (number);
+  "removed"?: (((string))[]);
+  "warnings": ((MemorySizeWarning)[]);
   [key: string]: unknown;
 });
 
@@ -4602,6 +4772,29 @@ export type WaitReason = ("condition-met" | "timeout" | "unknown");
 /** Where a window's numbers came from; §4.1.  Observed frames update `observed` fields but never erase a `declared` limit; `inferred` is filled by Hub-side usage aggregation (§4.5). */
 export type WindowSource = ("declared" | "observed" | "inferred");
 
+/** `GET /v1/workers/{id}/digest`: at most [`WORKER_DIGEST_MAX_BYTES`] bytes.  Optional sections are omitted rather than sent as `null`. Every string that originates from a worker, a tool or the screen is untrusted data. */
+export type WorkerDigest = ({
+  "branch": (string);
+  "instanceId"?: (string | null);
+  "lastText"?: (DigestText | (null));
+  "model": DigestModel;
+  "name": (string);
+  "pending"?: (DigestPending | (null));
+  "projectId"?: (string | null);
+  "queued": (number);
+  "roster": DigestRoster;
+  "sha"?: (string | null);
+  "shrunk"?: (((string))[]);
+  "sinceProgressSecs"?: (number | null);
+  "supply"?: (DigestSupply | (null));
+  "taskId"?: (string | null);
+  "toolInFlight": (boolean);
+  "turn"?: (DigestTurn | (null));
+  "v": (number);
+  "workerId": (string);
+  [key: string]: unknown;
+});
+
 /** `worker.provision` params: create the product-assigned worktree and the per-worker cargo target directory on the Node.  The Node owns the filesystem layout: the request names the worker and the branch, but never absolute paths (security-review-2 M4, same rule as `worktree.create`). The Node creates the worktree under its managed `<repo>/../remuda-wt/<name>` root and the target dir under `<repo>/../remuda-target/<name>`. */
 export type WorkerProvisionParams = ({
   "branch": (string);
@@ -4643,6 +4836,7 @@ export type WorkerRoster = ({
   "branch": (string);
   "briefObjectId"?: (string | null);
   "createdAt": Timestamp;
+  "doneAt"?: (Timestamp | (null));
   "driver"?: (string | null);
   "harness": (string);
   "hostId": HostId;

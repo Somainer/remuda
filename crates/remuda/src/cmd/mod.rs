@@ -9,6 +9,7 @@ pub mod dispatcher;
 pub mod doctor;
 pub mod fleet;
 mod gate;
+mod glance;
 pub mod hook;
 mod host;
 mod hostcap;
@@ -19,6 +20,7 @@ pub mod instance;
 mod instance_interaction;
 pub mod journal_diff;
 pub mod mcp;
+mod memory;
 pub mod merge;
 pub mod node;
 mod own;
@@ -65,11 +67,13 @@ commands! {
     Project(project::ProjectArgs),
     Task(task::TaskArgs),
     Own(own::OwnArgs),
+    Memory(memory::MemoryArgs),
     Profile(profile::ProfileArgs),
     Dispatch(dispatch::DispatchArgs),
     Gate(gate::GateArgs),
     Land(gate::LandArgs),
     Watch(watch::WatchArgs),
+    Glance(glance::GlanceArgs),
     Worker(worker::WorkerArgs),
     Report(report::ReportArgs),
     Retire(retire::RetireArgs),

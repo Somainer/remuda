@@ -13,7 +13,7 @@ import type {
 import type { Workspace } from "../types/workspace";
 import { known, unknownKnowledge, type Id, type U64 } from "../types/wire";
 import { printCapabilities, ptyCapabilities } from "./capabilities";
-import type { ResumeMode, ResumeResult } from "./api";
+import type { ResumeMode, ResumeResult, SeenView } from "./api";
 import type { DriverKind, CapabilitySnapshot } from "../types/nativeRef";
 import { HubHttpError } from "./httpError";
 import { digestPlaceholder, id, now } from "./ids";
@@ -1343,6 +1343,16 @@ export function mockDelete(instanceId: Id, force = false): { deleted: true; inst
   titles.delete(instanceId);
   summaries.delete(instanceId);
   return { deleted: true, instanceId, nodePurge: "purged" };
+}
+
+/** seen-hub: the Hub's monotonic owner seen seq on a mock instance, clamped to its journal. */
+export function mockSeen(instanceId: Id, durableSeq: U64): SeenView {
+  const ins = instances.find((i) => i.id === instanceId);
+  if (!ins) throw new HubHttpError(404, "NOT_FOUND", "NOT_FOUND");
+  const reported = BigInt(durableSeq) < BigInt(ins.durableSeq) ? BigInt(durableSeq) : BigInt(ins.durableSeq);
+  if (ins.seenSeq == null || reported > BigInt(ins.seenSeq)) ins.seenSeq = reported.toString() as U64;
+  ins.unseen = ins.turnEndSeq != null && BigInt(ins.turnEndSeq) > BigInt(ins.seenSeq);
+  return { instanceId, unseen: ins.unseen, seenSeq: ins.seenSeq, seenAt: now(), turnEndSeq: ins.turnEndSeq };
 }
 
 export function mockCreate(prompt: string, extras?: { hostId?: Id; workspaceId?: Id; driver?: Instance["driver"]; kind?: Instance["kind"] }): Instance {

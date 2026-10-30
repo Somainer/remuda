@@ -52,6 +52,12 @@ const COMMAND_WINDOW: usize = 200;
 const GLANCE_LOAD_CAP: i64 = 500;
 /// Per-value cap inside the pending-tool argument summary.
 const ARG_VALUE_CHARS: usize = 160;
+/// Interaction kinds the wire defines (protocol §5.4). A stored kind comes
+/// from a Node's untyped journal event, so anything else is reported as
+/// `unknown` instead of being echoed at whatever length the event carried.
+const PENDING_KINDS: &[&str] = &["approval", "question", "plan-review", "elicitation"];
+/// Character cap on the reported kind, belt and braces around the set check.
+const PENDING_KIND_CHARS: usize = 32;
 const REDACTED: &str = "[redacted]";
 const WITHHELD: &str = "[withheld]";
 
@@ -535,6 +541,17 @@ fn parse_unix(stamp: &str) -> Option<i64> {
         .ok()
 }
 
+/// The wire kind, or `unknown`. `permission` is the older spelling of an
+/// approval.
+fn pending_kind(raw: &str) -> &'static str {
+    let kind = if raw == "permission" { "approval" } else { raw };
+    PENDING_KINDS
+        .iter()
+        .find(|known| **known == kind)
+        .copied()
+        .unwrap_or("unknown")
+}
+
 fn pending_parts(record: &InteractionRecord, open: &[OpenTool]) -> PendingParts {
     let interaction = record
         .payload
@@ -547,11 +564,7 @@ fn pending_parts(record: &InteractionRecord, open: &[OpenTool]) -> PendingParts 
         .and_then(Value::as_str)
         .or_else(|| interaction.get("kind").and_then(Value::as_str))
         .unwrap_or(&record.kind);
-    let kind = if kind == "permission" {
-        "approval"
-    } else {
-        kind
-    };
+    let kind = pending_kind(kind);
     let title = request
         .get("title")
         .and_then(Value::as_str)
@@ -959,7 +972,7 @@ fn render(parts: &Parts, caps: &Caps) -> WorkerDigest {
         }),
         last_text,
         pending: parts.pending.as_ref().map(|pending| DigestPending {
-            kind: pending.kind.clone(),
+            kind: clip_chars(&pending.kind, PENDING_KIND_CHARS),
             question: req_clip(parts, caps, Slot::Question),
             tool: opt_clip(parts, caps, Slot::Tool),
             args_summary: opt_clip(parts, caps, Slot::Args),
@@ -1015,7 +1028,7 @@ fn skeleton(parts: &Parts) -> WorkerDigest {
         turn: None,
         last_text: None,
         pending: parts.pending.as_ref().map(|pending| DigestPending {
-            kind: pending.kind.clone(),
+            kind: clip_chars(&pending.kind, PENDING_KIND_CHARS),
             question: String::new(),
             tool: None,
             args_summary: None,
@@ -1064,7 +1077,43 @@ fn fit(parts: &Parts) -> WorkerDigest {
             return digest;
         }
     }
-    skeleton(parts)
+    // The ceiling is a promise, so the fallback is measured too: the skeleton
+    // normally fits by a wide margin, and `minimal` cannot exceed it.
+    let skeleton = skeleton(parts);
+    if encoded_len(&skeleton) <= WORKER_DIGEST_MAX_BYTES {
+        return skeleton;
+    }
+    minimal(parts)
+}
+
+/// The last resort when even the skeleton is over budget. Every text here is
+/// clipped to a hard bound; ids and names are the only fields left.
+fn minimal(parts: &Parts) -> WorkerDigest {
+    let mut digest = WorkerDigest {
+        v: 1,
+        worker_id: clip_chars(&parts.worker_id, 64),
+        instance_id: None,
+        name: clip_chars(&parts.name, 32),
+        project_id: None,
+        task_id: None,
+        branch: String::new(),
+        sha: None,
+        roster: DigestRoster {
+            state: clip_chars(&parts.roster, 16),
+            watch: None,
+        },
+        turn: None,
+        last_text: None,
+        pending: None,
+        model: DigestModel::default(),
+        supply: None,
+        queued: parts.queued,
+        since_progress_secs: parts.idle_secs,
+        tool_in_flight: parts.tool_in_flight,
+        shrunk: Vec::new(),
+    };
+    digest.shrunk = shrunk_fields(&digest, parts);
+    digest
 }
 
 // ── assembling the facts ───────────────────────────────────────────────────
@@ -2116,6 +2165,42 @@ mod tests {
             "{args}"
         );
         assert!(digest.tool_in_flight);
+    }
+
+    #[test]
+    fn a_hostile_pending_kind_cannot_break_the_byte_ceiling() {
+        let worker = worker(json!({ "state": "working" }));
+        let journal = vec![tool_call("tc1", "Bash", json!({ "command": "ls" }))];
+        // A Node's journal event is untyped JSON; the kind rides it verbatim.
+        let wall = "k".repeat(3000);
+        let mut event = approval_event("tc1", "Bash");
+        event["payload"]["interaction"]["kind"] = json!(wall);
+        event["payload"]["interaction"]["request"]["kind"] = json!(wall);
+        let pending = vec![interaction(event)];
+        let digest = digest_of(&facts(&worker, None, &journal, &pending, &[], None));
+        let len = assert_valid_and_bounded(&digest);
+        assert!(len <= WORKER_DIGEST_MAX_BYTES, "{len} bytes");
+        let pending = digest.pending.expect("pending");
+        assert_eq!(pending.kind, "unknown", "an off-wire kind is not repeated");
+        // The skeleton keeps the kind valid and bounded too.
+        let parts = build_parts(&facts(
+            &worker,
+            None,
+            &journal,
+            &pending_of(&wall),
+            &[],
+            None,
+        ));
+        assert_valid_and_bounded(&skeleton(&parts));
+        assert_valid_and_bounded(&minimal(&parts));
+    }
+
+    /// One pending approval whose request kind is `kind`.
+    fn pending_of(kind: &str) -> Vec<InteractionRecord> {
+        let mut event = approval_event("tc1", "Bash");
+        event["payload"]["interaction"]["kind"] = json!(kind);
+        event["payload"]["interaction"]["request"]["kind"] = json!(kind);
+        vec![interaction(event)]
     }
 
     #[test]

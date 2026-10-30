@@ -425,6 +425,35 @@ async fn digest_is_assembled_from_stored_rows_and_stays_within_budget() -> Resul
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_off_wire_pending_kind_keeps_the_response_within_budget() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("digest-kind").await?;
+    let (_coordinator, token) = ctx.coordinator(&project).await?;
+    let (worker_id, instance_id) = ctx.worker_under(&token, &project, "c-kind", None).await?;
+    // A Node journals untyped JSON, so the kind can be any length it likes.
+    let wall = "k".repeat(3000);
+    ctx.journal(
+        &instance_id,
+        json!({ "kind": "interaction.requested", "payload": { "interaction": {
+            "id": "int_kind", "kind": wall, "state": "pending", "blocking": true,
+            "request": { "kind": wall, "title": "T", "description": "d", "options": [] } }}}),
+    )
+    .await?;
+    let (status, bytes) = ctx
+        .get(&token, &format!("/v1/workers/{worker_id}/digest"))
+        .await?;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&bytes));
+    assert!(
+        bytes.len() <= WORKER_DIGEST_MAX_BYTES,
+        "{} bytes",
+        bytes.len()
+    );
+    let digest = json_of(&bytes);
+    assert_eq!(digest["pending"]["kind"], "unknown");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn done_today_counts_the_day_a_worker_reported_done_not_its_last_write() -> Result<()> {
     let ctx = Ctx::spawn().await?;
     let project = ctx.project("digest-done").await?;

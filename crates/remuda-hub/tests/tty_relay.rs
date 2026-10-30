@@ -822,6 +822,8 @@ async fn seed_hub_worker(
         brief_object_id: None,
         task_id: None,
         state: WorkerState::Working,
+        // Stamped by the store when the row enters `done`.
+        done_at: None,
         watch: None,
         last_nudge_at: None,
         resumed_from: None,

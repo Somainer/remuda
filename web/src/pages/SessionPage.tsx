@@ -107,6 +107,27 @@ function sameValue(a: unknown, b: unknown): boolean {
  * emit that touches another session, the host/workspace lists, or re-fetches
  * an unchanged row selects an equal slice and the body does not re-render.
  */
+/**
+ * The optimistic bubbles the transcript must still show for one session.
+ * A settled bubble drops out only once the authoritative user node carrying
+ * its commandId is in the session's events — the assembler then joins and
+ * hides it. A bubble settled by a catch-up DEBT read is not in events (the
+ * live follow is the only writer of store events), so it keeps rendering
+ * the user's row until the live stream delivers the node (outboxdebt r7
+ * item 1).
+ */
+function transcriptBubbles(state: HubState, instanceId: string): HubState["bubbles"] {
+  const own = state.bubbles.filter((b) => b.instanceId === instanceId);
+  if (!own.some((b) => b.state === "settled")) return own;
+  const journaled = new Set<string>();
+  for (const ev of state.events[instanceId] ?? []) {
+    if (ev.kind !== "message") continue;
+    const payload = ev.payload as { role?: string; commandId?: string | null };
+    if (payload.role === "user" && payload.commandId) journaled.add(payload.commandId);
+  }
+  return own.filter((b) => b.state !== "settled" || (!!b.commandId && !journaled.has(b.commandId)));
+}
+
 /** Selected slice for one session (c-effortread r10 item 8: exported for tests). */
 export function selectSession(state: HubState, instanceId: string) {
   const instance = state.instances.find((i) => i.id === instanceId);
@@ -120,7 +141,7 @@ export function selectSession(state: HubState, instanceId: string) {
     journalStatus: state.journalStatus[instanceId],
     earlierFloor: state.journalFloors[instanceId] ?? null,
     pending: state.interactions.filter((i) => i.instanceId === instanceId && i.state === "pending"),
-    bubbles: state.bubbles.filter((b) => b.instanceId === instanceId && b.state !== "settled"),
+    bubbles: transcriptBubbles(state, instanceId),
     // c-steer: Remuda-held queue rows (Enter while busy / while a question is
     // pending). Posted in order by flushHeld when the wait ends.
     held: hubStore.heldBubbles(instanceId),
@@ -488,7 +509,9 @@ function SessionPageBody({
   // never a fake success). With no pending bubble it shows the instance-level
   // status wording as before. This is the only commandStatus call on the
   // page.
-  const pendingBubble = bubbles.at(-1) ?? null;
+  // A settled bubble still awaiting its journal node is shown in the
+  // transcript but is not in flight.
+  const pendingBubble = bubbles.findLast((b) => b.state !== "settled") ?? null;
   const commandRow = pendingBubble
     ? projectCommandStatus({
         instance,

@@ -423,11 +423,31 @@ mod tests {
         assert!(crate::store::column_exists(&db, "instance_views", "seen_seq").unwrap());
     }
 
-    /// The seen rung: a database one rung below it gains the `instance_views`
-    /// table and `instances.turn_end_seq`, every existing row reads seen (an
-    /// upgrade never floods the home with ◉), and turns after the upgrade are
-    /// tracked. Written against the rung constant, so a renumber keeps it
-    /// honest.
+    /// The D-060 memory schema is present (the rung below the seen one).
+    fn assert_memory_schema(dir: &std::path::Path, when: &str) {
+        let db = rusqlite::Connection::open(dir.join("hub.sqlite")).unwrap();
+        for object in ["table memory_entries", "table memory_fts"] {
+            let (kind, name) = object.split_once(' ').unwrap();
+            let found: Option<String> = db
+                .query_row(
+                    "SELECT name FROM sqlite_master WHERE type = ?1 AND name = ?2",
+                    params![kind, name],
+                    |row| row.get(0),
+                )
+                .optional()
+                .unwrap();
+            assert!(
+                found.is_some(),
+                "{when}: {name} is missing — the memory rung did not run"
+            );
+        }
+    }
+
+    /// The seen rung, from the version-4 (memory-only) schema: the database
+    /// gains the `instance_views` table and `instances.turn_end_seq`, every
+    /// existing row reads seen (an upgrade never floods the home with ◉), and
+    /// turns after the upgrade are tracked. Written against the rung
+    /// constants, so a renumber keeps it honest.
     #[tokio::test]
     async fn the_seen_rung_upgrades_the_previous_schema_without_flooding_unseen() {
         use crate::store::{SCHEMA_USER_VERSION, SEEN_SCHEMA_RUNG};
@@ -435,7 +455,9 @@ mod tests {
         let (store, host) = crate::store_test_support::open_with_host(dir.path(), "seen-upgrade")
             .await
             .unwrap();
-        // A fresh database climbs the whole ladder.
+        // A fresh database climbs the whole ladder: memory (rung 4) then
+        // seen (rung 5), ending at the top with both schemas present.
+        assert_memory_schema(dir.path(), "fresh database");
         assert_seen_schema(dir.path(), "fresh database");
         assert_eq!(user_version(dir.path()), SCHEMA_USER_VERSION);
         store
@@ -445,8 +467,9 @@ mod tests {
         finish_turn(&store, &host, "ins-seen-old").await;
         store.close().await;
 
-        // Rewind to the exact pre-seen shape: the rung below, neither table
-        // nor column. The row keeps its journal (including the finished turn).
+        // Rewind to the exact pre-seen shape: user_version 4, the D-060
+        // memory schema present, neither seen object. The row keeps its
+        // journal (including the finished turn).
         let db = rusqlite::Connection::open(dir.path().join("hub.sqlite")).unwrap();
         db.execute_batch(&format!(
             "DROP TABLE instance_views;
@@ -458,7 +481,8 @@ mod tests {
         drop(db);
 
         let store = Store::open(dir.path()).unwrap();
-        assert_seen_schema(dir.path(), "upgrade from the previous rung");
+        assert_memory_schema(dir.path(), "upgrade from the memory-only rung");
+        assert_seen_schema(dir.path(), "upgrade from the memory-only rung");
         assert_eq!(user_version(dir.path()), SCHEMA_USER_VERSION);
         let old = store
             .get_instance("ins-seen-old".into())
@@ -496,6 +520,44 @@ mod tests {
             .unwrap();
         assert!(!row.unseen);
         assert_eq!(row.seen_seq, Some(end.to_string()));
+        store.close().await;
+    }
+
+    /// The one ladder from below both new rungs: a version-3 database runs the
+    /// memory rung and THEN the seen rung, each bumping the marker, and ends
+    /// at the top with both schemas present.
+    #[tokio::test]
+    async fn a_version_three_database_runs_memory_then_seen() {
+        use crate::store::{SCHEMA_USER_VERSION, SEEN_SCHEMA_RUNG};
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _host) = crate::store_test_support::open_with_host(dir.path(), "seen-v3")
+            .await
+            .unwrap();
+        assert_eq!(user_version(dir.path()), SCHEMA_USER_VERSION);
+        store.close().await;
+
+        // Rewind past BOTH rungs: neither schema, marker at 3.
+        let db = rusqlite::Connection::open(dir.path().join("hub.sqlite")).unwrap();
+        db.execute_batch(&format!(
+            "DROP TABLE instance_views;
+             ALTER TABLE instances DROP COLUMN turn_end_seq;
+             DROP TRIGGER memory_entries_fts_insert;
+             DROP TRIGGER memory_entries_fts_delete;
+             DROP TRIGGER memory_entries_fts_update;
+             DROP TABLE memory_fts;
+             DROP TABLE memory_slug_revisions;
+             DROP TABLE memory_entries;
+             PRAGMA user_version = 3;"
+        ))
+        .unwrap();
+        drop(db);
+        assert_eq!(user_version(dir.path()), 3);
+        assert!(SEEN_SCHEMA_RUNG > crate::memory::MEMORY_SCHEMA_VERSION);
+
+        let store = Store::open(dir.path()).unwrap();
+        assert_memory_schema(dir.path(), "after the v3 ladder walk");
+        assert_seen_schema(dir.path(), "after the v3 ladder walk");
+        assert_eq!(user_version(dir.path()), SCHEMA_USER_VERSION);
         store.close().await;
     }
 

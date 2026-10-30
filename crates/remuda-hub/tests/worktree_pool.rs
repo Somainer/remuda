@@ -306,7 +306,11 @@ impl Ctx {
             reclaimed_bytes: None,
         };
         self.store()
-            .insert_worker(worker.clone(), "pool-human".into())
+            .insert_worker(
+                worker.clone(),
+                "pool-human".into(),
+                remuda_hub::agent_scope_test_support::CallerAuthority::internal(),
+            )
             .await
             .expect("insert worker")
     }

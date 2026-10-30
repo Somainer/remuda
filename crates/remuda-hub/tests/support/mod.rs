@@ -560,6 +560,8 @@ pub(crate) fn real_command_result(command_id: &str, instance_id: &str) -> Result
             instance_id: Some(instance_id.clone()),
         },
         origin: CommandOrigin::Ui,
+        // A Human-origin fixture: no Hub-stamped initiator (D-057 §7.1).
+        initiator: None,
         operation: CommandOperation::InstanceSend,
         target: CommandTarget {
             host_id,

@@ -34,6 +34,8 @@ toml = "0.8"
 tracing.workspace = true
 tracing-subscriber.workspace = true
 nix = { version = "0.28", features = ["process", "fs"] }
+# r20 items 4+5 / R8(b)/(c): portable non-reaping waitid shared with the Node.
+remuda-unix.workspace = true
 
 [target.'cfg(target_env = "musl")'.dependencies]
 # Static Node artifacts (just linux-musl / deploy/m1) vendor OpenSSL so
@@ -45,11 +47,13 @@ time.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
+remuda-unix = { workspace = true, features = ["test-faults"] }
 base64 = "0.22"
 futures.workspace = true
 nix = { version = "0.28", features = ["signal"] }
 remuda-driver = { workspace = true, features = ["test-stub"] }
 remuda-hub.workspace = true
+remuda-node = { workspace = true, features = ["test-faults"] }
 remuda-protocol.workspace = true
 remuda-signal.workspace = true
 remuda-testing.workspace = true

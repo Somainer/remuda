@@ -139,6 +139,7 @@ async fn start_in(root: PathBuf, _dir: Option<tempfile::TempDir>) -> Run {
         .expect("dev node");
 
     let request = CreateInstanceRequest {
+        initiator: None,
         origin: InputOrigin::Human,
         agent_credential: None,
         command_id: None,
@@ -204,6 +205,7 @@ impl Run {
             .submit_command(
                 &self.instance.meta.id,
                 InstanceCommandRequest {
+                    initiator: None,
                     origin: InputOrigin::Human,
                     command_id: None,
                     operation: CommandAction::Send,

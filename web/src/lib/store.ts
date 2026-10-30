@@ -142,6 +142,61 @@ const MAX_FLUSH_PASSES = 100;
 /** Bounded reconciliation of a forwarded-but-reconciling command (GET loop). */
 const RECONCILE_GET_DEADLINE_MS = 30_000;
 const RECONCILE_GET_INTERVAL_MS = 1_000;
+/**
+ * Ruling AD (outboxdebt): bounded debt-driven TAIL re-read for a drained
+ * command whose empty resync certified the link live without observing the
+ * command's journal entry. Doubling backoff, a small attempt cap, and a wall
+ * deadline — after it, owed rows move to the existing not-confirmed state
+ * (outbox "unknown" -> 状态待确认), never an eternal accepted bubble.
+ */
+const OWED_TAIL_BASE_BACKOFF_MS = 300;
+const OWED_TAIL_MAX_BACKOFF_MS = 2_000;
+const OWED_TAIL_MAX_ATTEMPTS = 12;
+const OWED_TAIL_DEADLINE_MS = 45_000;
+/**
+ * Upper bound of one FORWARD debt read: it asks for (scanAfter, scanAfter +
+ * OWED_TAIL_WINDOW] only. The Hub answers the NEWEST rows of a range (row and
+ * byte caps), so an unbounded read past a long tail would skip the seqs just
+ * above the cursor.
+ */
+const OWED_TAIL_WINDOW = 128;
+/**
+ * Descending pages one bounded debt read may issue when the Hub's byte cap
+ * cut a page short of its afterSeq (reachedAfterSeq false). A range still not
+ * covered after these pages resumes from the uninspected bound next pass.
+ */
+const OWED_TAIL_DESCENT_PAGES = 8;
+/**
+ * Bounded lookback for the separate OVERLAP read (r2 item 2). The missed
+ * entry can sit just BELOW the loaded frontier (the same turn's frames
+ * advanced past it). It stays small: contiguity/gap-fill means an entry much
+ * farther back could not have been skipped, and the forward read owns the
+ * frontier.
+ */
+const OWED_TAIL_OVERLAP = 64;
+/**
+ * Bounded extra retries for a terminal ("unknown") exhaustion write whose
+ * durable transaction ABORTED (r2 item 3). The obligation is retained
+ * across them and the bubble presents not-confirmed from memory meanwhile.
+ */
+const OWED_TAIL_STORAGE_RETRIES = 3;
+const OWED_TAIL_STORAGE_RETRY_MS = 1_000;
+const OWED_UNCONFIRMED_REASON = "journal confirmation deadline";
+
+/** Per-instance bounded debt tail state (see {@link HubStore.owedTail}). */
+type OwedTailState = {
+  attempts: number;
+  firstAt: number;
+  storageRetries: number;
+  /** r7 item 3: retries of failed debt done writes once nothing lacks evidence. */
+  settleRetries: number;
+  scanAfter: number;
+  scanBound: number | null;
+  overlapBelow: number;
+  overlapBound: number | null;
+  timer: ReturnType<typeof setTimeout> | null;
+};
+
 /** Bounded backoff for Hub-held (Node offline) same-id re-POSTs. */
 const HELD_RETRY_BASE_MS = 2_000;
 const HELD_RETRY_MAX_MS = 30_000;
@@ -1319,17 +1374,90 @@ class HubStore {
    * bind-away navigation (the previous owner can never service it) schedules
    * one coalesced REST fallback for the instance so its accepted row can
    * still settle. A failed fallback KEEPS the debt for the next trigger.
-   * Cleared only after a catch-up actually succeeds and folds the journal.
+   *
+   * Ruling AD (outboxdebt): the debt is PER COMMAND (`commands`): it is
+   * discharged ONLY by evidence that each drained command reached the
+   * journal — the follow/journal client observed the command's journal
+   * entry (its outbox row is retired "done" by that observation), or the
+   * row otherwise reached a terminal state (rejected/unknown/removed). An
+   * EMPTY resync certifies the connection live but proves nothing, so it
+   * must never delete the debt. Outstanding debt is re-checked on every
+   * journal batch and backed by the bounded tail re-read driver
+   * ({@link HubStore.runOwedTailPass}); its deadline moves the rows to the
+   * existing not-confirmed ("unknown") state.
    */
-  private reconcileOwed = new Map<Id, { bindGen: number; attemptId: number | null }>();
+  private reconcileOwed = new Map<
+    Id,
+    {
+      bindGen: number;
+      attemptId: number | null;
+      gen: number;
+      commands: Set<Id>;
+      /**
+       * r6 item 2: owed command ids whose journal entry a DEBT read observed.
+       * The evidence is held here, never folded into state.events (AD3).
+       */
+      observed: Set<Id>;
+      /**
+       * r7 item 2: evidenced owed command ids whose durable done the DEBT path
+       * owes and has not committed yet — observed by a debt read, folded while
+       * no Outbox was installed, or a debt-path done write that failed. The
+       * debt is never cleared while one of their rows is not durably done.
+       */
+      owedDone: Set<Id>;
+      /**
+       * r8 item 2: each owed command's OWN bounded window — when it joined the
+       * debt and the tail's attempt count then. A command merged into a debt
+       * whose earlier window is long spent still gets its full deadline and
+       * read budget; exhaustion only ever moves commands whose own window
+       * expired.
+       */
+      windows: Map<Id, { at: number; attempts: number }>;
+    }
+  >();
   /**
-   * Instances with an owed REST fallback currently running. Several triggers
-   * can fire for one instance while its bounded read is in flight (rebind,
-   * failed reopen, watchdog — and N drained rows); they must collapse into the
-   * ONE coalesced read the doc comment on runOwedReconcile promises instead of
-   * queueing N reads behind each other (c-reconnfu gate 6 item 4a).
+   * Ruling AD: bounded debt-driven tail re-read state per instance. `attempts`
+   * counts actual journal reads the driver issued while evidence was missing;
+   * the wall deadline bounds the chase even while no journal client is
+   * mounted (those passes do not spend attempts) — per owed command since r8
+   * item 2 (the debt's `windows`; `firstAt` is only the fallback start of a
+   * command recorded without one). At most ONE timer is armed per instance.
+   *
+   * Ruling AD3 item 4: `scanAfter` is the debt reader's OWN forward cursor,
+   * advanced through every inspected page (including full unrelated pages),
+   * independent of the store's folded events / live dedupe. `overlapBelow`
+   * anchors the separate bounded lookback for an entry just below the
+   * frontier the live stream passed by.
+   *
+   * r5 item 1: the cursor only ever advances over seqs a read actually
+   * inspected. `scanBound` / `overlapBound` hold the lowest still-uninspected
+   * upper bound of a range whose descent ran out of pages (null: start the
+   * range from its top).
    */
-  private owedReconcileRunning = new Set<Id>();
+  private owedTail = new Map<Id, OwedTailState>();
+  /**
+   * Instances with a debt evidence pass currently queued or running. Several
+   * triggers can fire for one instance while its bounded read is in flight
+   * (tail timer, rebind, failed reopen, watchdog — and N drained rows); they
+   * collapse into the ONE coalesced self-contained pass in runOwedTailPass.
+   */
+  private owedTailRunning = new Set<Id>();
+  /**
+   * r6 item 1: debt OWNER generation. Bumped by {@link retireOwedDebts} on
+   * every retirement — the external teardown AND a successful credential turn
+   * that establishes a different device (ordinary succession, which bumps no
+   * identity epoch). Debts are stamped with it, and every debt pass and drain
+   * job captures it, so nothing a predecessor queued can act for a successor.
+   */
+  private owedGeneration = 0;
+  /**
+   * Ruling AD r2 item 3: command ids whose durable terminal ("unknown")
+   * exhaustion write FAILED to commit. The durable row stays non-terminal,
+   * but the bubble must already present the existing not-confirmed state
+   * (状态待确认) from memory while the bounded storage retry runs — never an
+   * eternal accepted bubble.
+   */
+  private owedPresentedUnknown = new Set<Id>();
   private outboxInit: Promise<"ok" | "obsolete" | "unavailable"> | null = null;
   /**
    * Auth-identity generation (c-reconnfu gate 33 item 2; kept under S3).
@@ -1683,6 +1811,24 @@ class HubStore {
    * recovering/live, so the banner can never stick on a stale false offline.
    * Idempotent.
    */
+  /**
+   * Retire EVERY catch-up debt with its bounded tail timer, running marker
+   * and in-memory not-confirmed presentation, and start a new debt owner
+   * generation (r6 item 1). Used by the retirement teardown and by a
+   * successful credential turn that establishes a different device.
+   */
+  private retireOwedDebts() {
+    this.owedGeneration += 1;
+    this.reconcileOwed.clear();
+    // Ruling AD: retire every bounded tail re-read timer with the binding.
+    for (const tail of this.owedTail.values()) {
+      if (tail.timer) clearTimeout(tail.timer);
+    }
+    this.owedTail.clear();
+    this.owedTailRunning.clear();
+    this.owedPresentedUnknown.clear();
+  }
+
   private disposeConnectionForAuthChange() {
     // Gate 41 S1/S2: drop the install stamp with the machine so a later
     // same-epoch (impossible after an external epoch bump) or post-login
@@ -1700,8 +1846,7 @@ class HubStore {
     // clears the machine. It is idempotent — logout can invoke it once
     // directly and again through externalIdentityRetire — so no counter
     // lives here.
-    this.reconcileOwed.clear();
-    this.owedReconcileRunning.clear();
+    this.retireOwedDebts();
     this.followReadyState.clear();
     this.followFrameAt.clear();
     // r12: a deferred route departure must never fire under the next identity,
@@ -1860,8 +2005,10 @@ class HubStore {
         // Gate 48 item 3: this initializer runs INSIDE the auth turn's
         // install — bound its lock so a sibling-held instance lock cannot park
         // the turn (or poison the flushChain the turn drain joins).
-        if (!obsolete() && this.outbox === box)
+        if (!obsolete() && this.outbox === box) {
           void this.flushAllOutbox(new Set(), false, true);
+          this.resumeOwedDebts();
+        }
         return "ok";
       } catch {
         if (obsolete()) return "obsolete";
@@ -3860,61 +4007,670 @@ class HubStore {
    * the live attempt is honoured when THAT attempt fails or its watchdog
    * fires; a null attempt id (recorded while offline between attempts) is
    * honoured by any attempt-end for the binding.
+   *
+   * Ruling AD: debt is PER COMMAND — `commandIds` are added to the entry's
+   * outstanding set; recording debt for an instance already in debt merges
+   * the sets instead of replacing them.
+   *
+   * The entry OBJECT is the debt generation a tail pass pins (AD3): a merge
+   * updates it in place, so only clearing and re-recording starts a new
+   * generation — a pass queued behind a drain that merely merged more owed
+   * commands still owns the (larger) debt.
    */
-  private recordOwed(instanceId: Id) {
+  private recordOwed(instanceId: Id, commandIds?: Iterable<Id>) {
     const ref = this.connection?.attemptRef() ?? null;
-    this.reconcileOwed.set(instanceId, {
-      bindGen: this.connectionBindGen,
-      attemptId: ref?.attemptId ?? null,
+    const existing = this.reconcileOwed.get(instanceId);
+    const debt = existing ?? {
+      bindGen: 0,
+      attemptId: null,
+      gen: this.owedGeneration,
+      commands: new Set<Id>(),
+      observed: new Set<Id>(),
+      owedDone: new Set<Id>(),
+      windows: new Map<Id, { at: number; attempts: number }>(),
+    };
+    const attemptsNow = this.owedTail.get(instanceId)?.attempts ?? 0;
+    if (commandIds) {
+      for (const commandId of commandIds) {
+        if (debt.commands.has(commandId)) continue;
+        debt.commands.add(commandId);
+        debt.windows.set(commandId, { at: Date.now(), attempts: attemptsNow });
+      }
+    }
+    debt.bindGen = this.connectionBindGen;
+    debt.attemptId = ref?.attemptId ?? existing?.attemptId ?? null;
+    this.reconcileOwed.set(instanceId, debt);
+  }
+
+  /**
+   * Ruling AD: true while the instance's debt still names a command with NO
+   * journal evidence. Evidence is (a) the follow/journal client OBSERVED the
+   * command's journal entry — a message with its commandId already folded
+   * into this instance's events (live batch / snapshot / seed / resync) —
+   * which also retires the durable row; (b) a debt read observed it (held on
+   * the debt, r6 item 2); or a missing row (retracted /
+   * removed by another tab) and terminal rows — "done", "rejected",
+   * "unknown" (already at the not-confirmed state). An outbox-less page has
+   * nothing to prove.
+   */
+  private owedCommandLacksEvidence(instanceId: Id): boolean {
+    const debt = this.reconcileOwed.get(instanceId);
+    if (!debt) return false;
+    const observed = new Set<Id>(debt.observed);
+    for (const ev of this.state.events[instanceId] ?? []) {
+      if (ev.kind !== "message") continue;
+      const commandId = (ev.payload as { commandId?: Id }).commandId;
+      if (commandId) observed.add(commandId);
+    }
+    for (const commandId of debt.commands) {
+      if (observed.has(commandId)) continue;
+      const rec = this.outbox?.get(commandId);
+      if (!rec) continue;
+      if (rec.state === "done" || rec.state === "rejected" || rec.state === "unknown") continue;
+      return true;
+    }
+    return false;
+  }
+
+  /** Delete the debt AND retire its bounded tail driver. */
+  private clearOwed(instanceId: Id) {
+    const debt = this.reconcileOwed.get(instanceId);
+    if (debt) for (const commandId of debt.commands) this.owedPresentedUnknown.delete(commandId);
+    this.reconcileOwed.delete(instanceId);
+    const tail = this.owedTail.get(instanceId);
+    if (tail?.timer) clearTimeout(tail.timer);
+    this.owedTail.delete(instanceId);
+  }
+
+  /**
+   * Ruling AD: re-check outstanding catch-up debt against the journal
+   * evidence folded SO FAR. Called after EVERY journal observation (live
+   * batch, catch-up/resync fold, mount seed): evidence clears the debt;
+   * missing evidence arms (once) the bounded debt-driven tail re-read.
+   *
+   * r5 item 2: while ordinary credential succession has the Outbox disposed
+   * (null, same identity epoch) nothing can be proven or retired — a fold
+   * then could not patch the durable row — so the debt is left untouched;
+   * installing the next Outbox re-checks it ({@link resumeOwedDebts}).
+   */
+  private reevaluateOwedDebt(instanceId: Id) {
+    const debt = this.reconcileOwed.get(instanceId);
+    if (!debt || !this.outbox) return;
+    if (this.owedCommandLacksEvidence(instanceId)) {
+      this.scheduleOwedTail(instanceId);
+      return;
+    }
+    // r7 item 2 / r8 item 1: evidence alone does not discharge a debt whose
+    // evidenced rows are not yet durably done on the Outbox — a failed debt
+    // write awaiting its retry, or the live/resync fold's fire-and-forget
+    // done patch that may still be in flight or have failed (the fold calls
+    // this synchronously right after firing it). Keep the debt and arm the
+    // awaited debt settlement: it commits or retries the done on its captured
+    // Outbox, then discharges. An unrelated live batch must not cancel that.
+    if (this.owedDoneStillOwed(instanceId, debt, this.outbox).length) {
+      this.scheduleOwedTail(instanceId, OWED_TAIL_BASE_BACKOFF_MS);
+      return;
+    }
+    this.clearOwed(instanceId);
+  }
+
+  /**
+   * r7 item 2 / r8 item 1: the debt's owed commands whose durable done is
+   * still owed on `box` — derived from the evidence (debt read observation or
+   * folded store events) plus the row's ACTUAL state on that Outbox, together
+   * with any done write the debt path itself recorded as uncommitted.
+   */
+  private owedDoneStillOwed(
+    instanceId: Id,
+    debt: { commands: Set<Id>; observed: Set<Id>; owedDone: Set<Id> },
+    box: Outbox,
+  ): Id[] {
+    const owed = new Set<Id>(this.owedSettlementPending(instanceId, debt, box));
+    for (const commandId of debt.owedDone) {
+      const rec = box.get(commandId);
+      if (rec && rec.state !== "done" && rec.state !== "rejected") owed.add(commandId);
+    }
+    return [...owed];
+  }
+
+  /**
+   * r5 item 2: an Outbox was installed. Ordinary credential succession
+   * disposes the box WITHOUT bumping the identity epoch (a failed login then
+   * restores it), so the current identity's debts survive while their tail
+   * passes are rejected in the null window — by design without re-arming.
+   * Re-arm each of them now. The pass commits the durable done for evidence
+   * folded while no box was installed — awaited on the box it captured, the
+   * debt kept until it commits (r6 item 3) — then clears what is proven and
+   * chases what is still unobserved. Debts of another owner generation are
+   * never touched (every retirement clears the map; the check is defence in
+   * depth).
+   */
+  private resumeOwedDebts() {
+    for (const [instanceId, debt] of this.reconcileOwed) {
+      if (debt.gen !== this.owedGeneration) continue;
+      // r7 item 2: evidence folded while no box was installed was never
+      // durably settled by the live path; the debt path owes those dones.
+      if (this.outbox) {
+        for (const commandId of this.owedSettlementPending(instanceId, debt, this.outbox)) debt.owedDone.add(commandId);
+      }
+      // Presentation only: bubbles settle off the evidence already folded.
+      this.emit({ bubbles: settleBubbles(this.state.bubbles, instanceId, this.state.events[instanceId] ?? []) });
+      this.scheduleOwedTail(instanceId, OWED_TAIL_BASE_BACKOFF_MS);
+    }
+  }
+
+  /** Highest journal seq folded into this instance's live state (scan anchor). */
+  private owedFrontier(instanceId: Id): number {
+    return (this.state.events[instanceId] ?? []).reduce(
+      (max, ev) => Math.max(max, Number(ev.seq) || 0),
+      0,
+    );
+  }
+
+  private newOwedTail(instanceId: Id): OwedTailState {
+    // The debt begins when a drained row's resync raced the node append, so
+    // the owed entry can sit AT the current frontier; the forward scan starts
+    // there and the bounded overlap covers just below it.
+    const frontier = this.owedFrontier(instanceId);
+    return {
+      attempts: 0,
+      firstAt: Date.now(),
+      storageRetries: 0,
+      settleRetries: 0,
+      scanAfter: frontier,
+      scanBound: null,
+      overlapBelow: frontier,
+      overlapBound: null,
+      timer: null,
+    };
+  }
+
+  /** Arm ONE bounded tail re-read pass with doubling backoff. */
+  private scheduleOwedTail(instanceId: Id, delayOverride?: number) {
+    if (!this.reconcileOwed.has(instanceId)) return;
+    const tail = this.owedTail.get(instanceId) ?? this.newOwedTail(instanceId);
+    if (tail.timer !== null) return;
+    const delay =
+      delayOverride ??
+      Math.min(OWED_TAIL_BASE_BACKOFF_MS * 2 ** tail.attempts, OWED_TAIL_MAX_BACKOFF_MS);
+    tail.timer = setTimeout(() => {
+      tail.timer = null;
+      this.runOwedTailPass(instanceId);
+    }, delay);
+    this.owedTail.set(instanceId, tail);
+  }
+
+  /**
+   * Ruling AD2 — apply SETTLEMENT EVIDENCE ONLY. A debt tail/overlap read is
+   * not a journal fold: it scans the returned page exclusively for user
+   * messages carrying one of THIS instance's owed command ids. Each matched
+   * command is recorded on the debt as observed and its bubble settles off
+   * the matched evidence itself. The durable done (including a row that had
+   * earlier reached the "unknown" not-confirmed state) is committed by the
+   * calling pass through {@link commitOwedSettlement}, awaited on its
+   * captured Outbox (r6 item 3).
+   *
+   * Ruling AD3 / r6 item 2: the matched entry is NOT inserted into
+   * state.events — the live follow is the only writer of store events. The
+   * settled optimistic bubble keeps rendering the user's row until the live
+   * stream (or a later mount seed) brings the journal node it joins; and the
+   * folded frontier (owedFrontier) never jumps past an unread gap, so a later
+   * debt's forward scan still starts below commands journaled there.
+   * Nothing else in the page is touched — no model/permission/effort or other
+   * reducer runs, no activity/screen/summary projection, and the event ids
+   * are NOT recorded in the live JournalClient dedupe path, so a current
+   * request's verdict sitting in the same page still arrives intact through
+   * the live socket callback.
+   */
+  private applySettlementEvidence(instanceId: Id, events: Observation[]) {
+    const debt = this.reconcileOwed.get(instanceId);
+    if (!debt) return;
+    const folded = new Set<Id>();
+    for (const ev of this.state.events[instanceId] ?? []) {
+      const commandId = ev.kind === "message" ? (ev.payload as { commandId?: Id }).commandId : undefined;
+      if (commandId) folded.add(commandId);
+    }
+    const matched: Observation[] = [];
+    for (const ev of events) {
+      if (ev.kind !== "message") continue;
+      const commandId = (ev.payload as { commandId?: Id }).commandId;
+      // Already folded by the live follow (it settled the row) or already
+      // observed by an earlier debt read: nothing new to settle.
+      if (!commandId || !debt.commands.has(commandId) || folded.has(commandId) || debt.observed.has(commandId)) {
+        continue;
+      }
+      debt.observed.add(commandId);
+      debt.owedDone.add(commandId);
+      matched.push(ev);
+    }
+    if (matched.length) this.emit({ bubbles: settleBubbles(this.state.bubbles, instanceId, matched) });
+  }
+
+  /** Owed command ids with journal evidence: observed by a debt read or folded into store events. */
+  private owedEvidenced(instanceId: Id, debt: { observed: Set<Id> }): Set<Id> {
+    const evidenced = new Set<Id>(debt.observed);
+    for (const ev of this.state.events[instanceId] ?? []) {
+      const commandId = ev.kind === "message" ? (ev.payload as { commandId?: Id }).commandId : undefined;
+      if (commandId) evidenced.add(commandId);
+    }
+    return evidenced;
+  }
+
+  /**
+   * r6 item 3: owed commands of `debt` that have journal evidence — observed
+   * by a debt read, or folded into store events (also while no Outbox was
+   * installed) — but whose row in `box` is not yet durably done.
+   */
+  private owedSettlementPending(instanceId: Id, debt: { commands: Set<Id>; observed: Set<Id> }, box: Outbox): Id[] {
+    const evidenced = this.owedEvidenced(instanceId, debt);
+    return [...debt.commands].filter((commandId) => {
+      if (!evidenced.has(commandId)) return false;
+      const rec = box.get(commandId);
+      return !!rec && rec.state !== "done" && rec.state !== "rejected";
+    });
+  }
+
+  /**
+   * r6 item 3: commit the durable done for journal-evidenced owed commands,
+   * AWAITED on the pass's captured Outbox (never the fire-and-forget live
+   * settlement). Returns null when the pass lost ownership while a write was
+   * parked, false when a write failed to commit (the debt is kept and the
+   * pass retries), true when every evidenced row is durably done or gone.
+   */
+  private async commitOwedSettlement(
+    instanceId: Id,
+    debt: { owedDone: Set<Id> },
+    commandIds: Id[],
+    box: Outbox,
+    owns: () => boolean,
+  ): Promise<boolean | null> {
+    let allCommitted = true;
+    for (const commandId of commandIds) {
+      if (!owns()) return null;
+      // Owed until it commits (r7 item 2): a failure below keeps it owed.
+      debt.owedDone.add(commandId);
+      let written: OutboxRecord | null = null;
+      try {
+        written = await box.patch(commandId, { state: "done", serverState: "journal-settled" });
+      } catch {
+        written = null;
+      }
+      if (!owns()) return null;
+      if (written) {
+        debt.owedDone.delete(commandId);
+        if (this.outbox === box) this.syncBubbleFromOutbox(commandId);
+        void this.recordAcceptedDelivery(instanceId, commandId, box);
+        continue;
+      }
+      // null: the row vanished (fine) or the transaction aborted (the row is
+      // still there, not done — keep the obligation).
+      const after = box.get(commandId);
+      if (after && after.state !== "done" && after.state !== "rejected") allCommitted = false;
+      else debt.owedDone.delete(commandId);
+    }
+    return allCommitted;
+  }
+
+  /**
+   * r5 item 1: inspect (after, before] for settlement evidence WITHOUT ever
+   * claiming a seq it did not see. The Hub answers the NEWEST rows of a range
+   * under its row/byte caps and reports `reachedAfterSeq` false when rows
+   * below the returned floor were cut, so a short page is followed by
+   * descending reads below its floor (beforeSeq = windowFromSeq - 1, same
+   * afterSeq) until the range reaches `after` or the page budget runs out.
+   *
+   * Returns null when ownership was lost while a read was parked. Otherwise
+   * `highest` is the top seq inspected and `uninspectedBelow` is null when
+   * the whole of (after, highest] was inspected, or the upper bound of the
+   * part still uninspected (the caller resumes the descent there and must not
+   * advance past it).
+   */
+  private async readOwedRange(
+    instanceId: Id,
+    journalId: Id,
+    after: number,
+    before: number,
+    limit: number,
+    stillOurs: () => boolean,
+  ): Promise<{ highest: number; uninspectedBelow: number | null } | null> {
+    let high = before;
+    let highest = after;
+    for (let page = 0; page < OWED_TAIL_DESCENT_PAGES && high > after; page += 1) {
+      const read = await api.eventsRead({
+        journalId,
+        afterSeq: String(after),
+        beforeSeq: String(high),
+        limit,
+      });
+      if (!stillOurs()) return null;
+      for (const ev of read.events) highest = Math.max(highest, Number(ev.seq) || 0);
+      this.applySettlementEvidence(instanceId, read.events);
+      const floor = read.windowFromSeq === null ? null : Number(read.windowFromSeq);
+      if (read.reachedAfterSeq || !read.events.length || floor === null || floor <= after + 1) {
+        return { highest, uninspectedBelow: null };
+      }
+      high = floor - 1;
+      // Evidence settled every owed command: stop descending (the rest of the
+      // range stays uninspected and is reported as such).
+      if (!this.owedCommandLacksEvidence(instanceId)) break;
+    }
+    return { highest, uninspectedBelow: high > after ? high : null };
+  }
+
+  /**
+   * Ruling AD2: one pass of the bounded debt-driven tail re-read. Runs on the
+   * instance's journal chain (serialized with the drain/reopen reads) and
+   * reads the journal DIRECTLY over REST, applying SETTLEMENT EVIDENCE ONLY
+   * via {@link applySettlementEvidence} — neither the mounted
+   * JournalClient's binding/socket-open latency nor its cursor/generation
+   * rules can suppress the owed entry this way. A read that observes the
+   * owed command's entry retires the row to done and clears the debt; an
+   * empty answered read schedules the next backed-off pass.
+   *
+   * A REJECTED read spends NO attempt (the route storm right after unblock
+   * can lose a read or two, and an unresolved instance GET retries at the
+   * base cadence): only answered reads count against the attempt cap,
+   * while the wall deadline bounds the chase regardless. At the cap or
+   * deadline the owed rows move to the existing not-confirmed state
+   * (outbox "unknown" -> 状态待确认).
+   */
+  private runOwedTailPass(instanceId: Id) {
+    if (this.owedTailRunning.has(instanceId)) return;
+    this.owedTailRunning.add(instanceId);
+    // r3 item 1: capture the issuing identity epoch, exact Outbox and this
+    // pass's tail record BEFORE the job is queued, so a stale job can be
+    // rejected before any mutation.
+    const epoch = this.identityEpoch;
+    const gen = this.owedGeneration;
+    const box = this.outbox;
+    const debt = this.reconcileOwed.get(instanceId);
+    // Immediate fallback triggers (resume failure / bind-away / watchdog) run
+    // a pass without a previously armed timer, so lazily ensure the per-
+    // instance tail record exists and pin the exact object captured.
+    let tail = this.owedTail.get(instanceId);
+    if (!tail) {
+      tail = this.newOwedTail(instanceId);
+      this.owedTail.set(instanceId, tail);
+    }
+    const capturedTail = tail;
+    const stillOurs = () =>
+      this.identityEpoch === epoch &&
+      this.owedGeneration === gen &&
+      this.outbox === box &&
+      this.owedTail.get(instanceId) === capturedTail &&
+      this.reconcileOwed.get(instanceId) === debt;
+    // Every ownership check inside the job goes through `owns`, which also
+    // records that this pass LOST ownership — see the `finally` re-arm.
+    let lostOwnership = false;
+    const owns = () => {
+      if (stillOurs()) return true;
+      lostOwnership = true;
+      return false;
+    };
+    // r6 item 3: commit the durable done for every evidenced owed command on
+    // the captured box. False only when ownership was lost. r7 item 3: a
+    // write that fails to commit does NOT stop the pass — the command stays
+    // owed (debt.owedDone, retried at every pass entry) while the evidence
+    // and deadline processing of the debt's OTHER commands continues. No
+    // await happens when nothing is pending.
+    const settleEvidenced = async (): Promise<boolean> => {
+      if (!box || !debt) return false;
+      const pending = this.owedSettlementPending(instanceId, debt, box);
+      if (!pending.length) return true;
+      return (await this.commitOwedSettlement(instanceId, debt, pending, box, owns)) !== null;
+    };
+    // r7 item 3: no owed command lacks evidence any more (observed, or at the
+    // existing not-confirmed state after exhaustion). Discharge the debt —
+    // unless a done write it owes is still uncommitted: retry that on its OWN
+    // bounded budget at the base cadence, and once the budget is spent show
+    // the row VISIBLY not-confirmed (状态待确认 from memory) with the
+    // obligation retained, never a silent strand.
+    const settleOrClear = () => {
+      if (!box || !debt) return;
+      const stillOwed = this.owedDoneStillOwed(instanceId, debt, box);
+      if (!stillOwed.length) {
+        this.clearOwed(instanceId);
+        return;
+      }
+      tail.settleRetries += 1;
+      if (tail.settleRetries <= OWED_TAIL_STORAGE_RETRIES) {
+        this.scheduleOwedTail(instanceId, OWED_TAIL_BASE_BACKOFF_MS);
+        return;
+      }
+      for (const commandId of stillOwed) {
+        this.owedPresentedUnknown.add(commandId);
+        this.syncBubbleFromOutbox(commandId);
+      }
+    };
+    void this.chainReconcile(instanceId, async () => {
+      try {
+        // Entry gate: a queued callback that survived logout (or whose debt
+        // generation was cleared while it waited) is dropped before any
+        // mutation.
+        if (!box || !debt || !owns()) {
+          lostOwnership = true;
+          return;
+        }
+        // r6 item 3: commit what is already evidenced (an earlier pass's
+        // observation, or evidence folded while no Outbox was installed)
+        // before anything can clear the debt.
+        if (!(await settleEvidenced())) return;
+        if (!this.owedCommandLacksEvidence(instanceId)) {
+          settleOrClear();
+          return;
+        }
+        // r8 item 2: exhaust ONLY the unevidenced commands whose own window
+        // expired; commands merged later keep reading on their own budget.
+        const expired = this.owedExpiredCommands(instanceId, debt, box, tail);
+        if (expired.length) {
+          const committed = await this.exhaustOwedDebt(instanceId, debt, box, owns, expired);
+          if (!owns()) return;
+          if (!committed) {
+            // r2 item 3: a terminal write failed to persist. Retain the debt
+            // and run a BOUNDED storage retry; the bubble already presents
+            // not-confirmed from memory. After the bounded retries the
+            // obligation is still retained (no eternal timer), so later
+            // evidence, a trigger or a reload can finish it.
+            tail.storageRetries += 1;
+            if (tail.storageRetries <= OWED_TAIL_STORAGE_RETRIES) {
+              this.scheduleOwedTail(instanceId, OWED_TAIL_STORAGE_RETRY_MS);
+            }
+            return;
+          }
+          if (!this.owedCommandLacksEvidence(instanceId)) {
+            settleOrClear();
+            return;
+          }
+          // Other commands' windows are still open: keep reading for them.
+        }
+        const instance =
+          this.state.instances.find((i) => i.id === instanceId) ??
+          (await api.instanceGet(instanceId).catch(() => null));
+        // Retired WHILE the instance lookup was parked: drop its result.
+        if (!owns()) return;
+        let answered = false;
+        if (instance) {
+          // Ruling AD3: the FORWARD scan uses the debt reader's OWN cursor
+          // (tail.scanAfter), advanced through EVERY inspected page even when
+          // it carries only unrelated events — otherwise a full unrelated page
+          // would be reread forever and never reach a command journaled
+          // farther out. r5 item 1: each read is bounded ABOVE (the Hub
+          // returns the newest rows of a range), and the cursor advances only
+          // over seqs a read inspected. The bounded OVERLAP scan is separate,
+          // anchored at the frontier captured when the debt began.
+          try {
+            const forward = await this.readOwedRange(
+              instanceId,
+              instance.journalId,
+              tail.scanAfter,
+              tail.scanBound ?? tail.scanAfter + OWED_TAIL_WINDOW,
+              OWED_TAIL_WINDOW,
+              owns,
+            );
+            // Retired WHILE a read was parked (held-response regression):
+            // never fold the old identity's events into the successor store.
+            if (!forward) return;
+            answered = true;
+            tail.attempts += 1;
+            if (forward.uninspectedBelow === null) {
+              tail.scanAfter = Math.max(tail.scanAfter, forward.highest);
+              tail.scanBound = null;
+            } else {
+              tail.scanBound = forward.uninspectedBelow;
+            }
+            if (this.reconcileOwed.has(instanceId) && this.owedCommandLacksEvidence(instanceId)) {
+              const overlap = await this.readOwedRange(
+                instanceId,
+                instance.journalId,
+                Math.max(0, tail.overlapBelow - OWED_TAIL_OVERLAP),
+                tail.overlapBound ?? tail.overlapBelow,
+                OWED_TAIL_OVERLAP,
+                owns,
+              );
+              if (!overlap) return;
+              tail.overlapBound = overlap.uninspectedBelow;
+            }
+          } catch {
+            if (!owns()) return;
+            /* rejected read: keep the debt and retry at the base cadence */
+          }
+        }
+        if (!owns() || !this.reconcileOwed.has(instanceId)) return;
+        if (!(await settleEvidenced())) return;
+        if (!this.owedCommandLacksEvidence(instanceId)) {
+          settleOrClear();
+          return;
+        }
+        // An unanswered read (no instance resolution, or a rejected/404
+        // read in the unblock storm) retries at the base cadence without
+        // spending the read budget; a successful-but-empty read backs off
+        // by attempt. The wall deadline bounds both paths.
+        this.scheduleOwedTail(instanceId, answered ? undefined : OWED_TAIL_BASE_BACKOFF_MS);
+      } finally {
+        // Only the owning identity's job clears its running marker; a
+        // retired job leaves the successor's (fresh) marker untouched.
+        if (this.identityEpoch === epoch && this.owedGeneration === gen) {
+          this.owedTailRunning.delete(instanceId);
+          // A same-identity pass that lost ownership (its debt generation was
+          // cleared, or the Outbox was replaced while it was queued or parked)
+          // re-arms the CURRENT debt's tail: that debt's own timer may have
+          // fired while this pass held the marker and been coalesced away.
+          // Never while the Outbox is null — a fresh pass would only reject
+          // again; installing the next Outbox re-arms (resumeOwedDebts).
+          if (lostOwnership && this.outbox) this.scheduleOwedTail(instanceId, OWED_TAIL_BASE_BACKOFF_MS);
+        }
+      }
+    });
+  }
+
+  /**
+   * Ruling AD exhaustion: the bounded tail never observed journal evidence.
+   * Move each still-outstanding owed row to the product's EXISTING
+   * not-confirmed state (outbox "unknown"), the same terminal projection the
+   * reconciling-GET deadline uses — 状态待确认 with its refresh action — then
+   * retire the debt. Never leaves "accepted" forever, never drops the row.
+   */
+  /**
+   * Ruling AD exhaustion: the bounded tail never observed journal evidence.
+   * Move each still-outstanding owed row to the product's EXISTING
+   * not-confirmed state (outbox "unknown"), the same terminal projection the
+   * reconciling-GET deadline uses — 状态待确认 with its refresh action.
+   *
+   * r2 item 3: the terminal transition must COMMIT before the obligation is
+   * retired. A storage abort leaves the durable row non-terminal; the bubble
+   * presents not-confirmed from memory and the caller runs a bounded storage
+   * retry. Returns false when ANY terminal write failed to commit (or the row
+   * was otherwise still present after a null patch). Never leaves "accepted"
+   * forever, never drops the row.
+   */
+  private async exhaustOwedDebt(
+    instanceId: Id,
+    debt: { commands: Set<Id>; observed: Set<Id> },
+    box: Outbox,
+    stillOurs: () => boolean,
+    only: Id[],
+  ): Promise<boolean> {
+    if (this.reconcileOwed.get(instanceId) !== debt || this.outbox !== box) return true;
+    // r7 item 3: a journal-confirmed command is never moved to not-confirmed
+    // here — its pending done write is owed (and retried) separately.
+    const evidenced = this.owedEvidenced(instanceId, debt);
+    let allCommitted = true;
+    // r8 item 2: only the commands whose own window expired.
+    for (const commandId of only) {
+      // r4 item 2: fence EVERY terminal write with the exact captured
+      // Outbox + debt ownership BEFORE the patch, never only after its await.
+      if (!stillOurs()) return true;
+      if (evidenced.has(commandId)) continue;
+      const rec = box.get(commandId);
+      if (!rec || rec.state === "done" || rec.state === "rejected" || rec.state === "unknown") continue;
+      // Present not-confirmed from memory BEFORE the write so even an aborting
+      // transaction never strands an accepted bubble.
+      this.owedPresentedUnknown.add(commandId);
+      this.syncBubbleFromOutbox(commandId);
+      const written = await this.safePatchOn(box, commandId, {
+        state: "unknown",
+        lastError: OWED_UNCONFIRMED_REASON,
+      });
+      // A retirement parked behind the patch await ends without touching the
+      // successor's state or debt.
+      if (!stillOurs()) return true;
+      if (written) {
+        this.owedPresentedUnknown.delete(commandId);
+        continue;
+      }
+      // null means the row vanished (another tab retracted it — fine) or the
+      // storage transaction aborted (the durable row is still there — the
+      // obligation survives).
+      const stillThere = box.get(commandId);
+      if (!stillThere) {
+        this.owedPresentedUnknown.delete(commandId);
+        continue;
+      }
+      allCommitted = false;
+    }
+    // The caller discharges the debt (or keeps its owed done writes).
+    return allCommitted;
+  }
+
+  /**
+   * r8 item 2: owed commands that still lack journal evidence (row present
+   * and not yet done/rejected/unknown) and whose OWN window — from when the
+   * command joined the debt — has spent its read budget or passed the wall
+   * deadline. A command recorded without a window falls back to the tail's
+   * start.
+   */
+  private owedExpiredCommands(
+    instanceId: Id,
+    debt: { commands: Set<Id>; observed: Set<Id>; windows: Map<Id, { at: number; attempts: number }> },
+    box: Outbox,
+    tail: OwedTailState,
+  ): Id[] {
+    const evidenced = this.owedEvidenced(instanceId, debt);
+    const now = Date.now();
+    return [...debt.commands].filter((commandId) => {
+      if (evidenced.has(commandId)) return false;
+      const rec = box.get(commandId);
+      if (!rec || rec.state === "done" || rec.state === "rejected" || rec.state === "unknown") return false;
+      const window = debt.windows.get(commandId) ?? { at: tail.firstAt, attempts: 0 };
+      return tail.attempts - window.attempts >= OWED_TAIL_MAX_ATTEMPTS || now - window.at >= OWED_TAIL_DEADLINE_MS;
     });
   }
 
   /**
    * Honour a post-delivery catch-up for an instance that NO follow currently
    * owns (the binding moved to another session) or whose owning attempt just
-   * failed/timed out. One bounded REST resume per instance on its own journal
-   * chain; never drives the global connection machine (it is bound elsewhere
-   * or the follow was just judged dead). Idempotent — safe to call when a
-   * follow later takes over.
+   * failed/timed out — the trigger fired by resume failures, failed follow
+   * reopens, bind-away and the watchdog.
    *
-   * The debt is deleted ONLY after a catch-up that actually reaches the
-   * journal whole (resumeAfterReconnect resolves): a read rejection /
-   * readonly-stale settlement keeps it so the next failure, watchdog, rebind
-   * or navigation trigger retries instead of leaving the accepted row stuck
-   * at 已受理 (c-reconnfu gate 6 item 2).
+   * Ruling AD3 (self-contained): this NEVER drives the mounted
+   * JournalClient — a resync there would apply the whole page (permission/
+   * model reducers, live dedupe) and its nested gap fill escapes identity
+   * retirement. It simply runs the SAME ownership-fenced, evidence-only
+   * bounded REST tail pass; coalescing is shared via {@link owedTailRunning}.
    */
   private runOwedReconcile(instanceId: Id) {
     if (!this.reconcileOwed.has(instanceId)) return;
-    // Coalesce: N drained rows / several failure triggers for one instance
-    // must collapse into ONE bounded read, not N jobs queued on the chain
-    // (gate 6 item 4a). The running read clears the debt on success; on
-    // failure the debt stays and the next trigger starts another read.
-    if (this.owedReconcileRunning.has(instanceId)) return;
-    this.owedReconcileRunning.add(instanceId);
-    void this.chainReconcile(instanceId, async () => {
-      try {
-        if (!this.reconcileOwed.has(instanceId)) return;
-        const instance =
-          this.state.instances.find((i) => i.id === instanceId) ??
-          (await api.instanceGet(instanceId).catch(() => null));
-        const client = instance ? this.journals.get(instance.journalId) : undefined;
-        if (!client) {
-          // Nothing mounted to fold; keep the debt for the mount/trigger that
-          // can actually catch this instance up.
-          return;
-        }
-        try {
-          await client.resumeAfterReconnect();
-        } catch {
-          /* bounded REST catch-up failed: keep the debt for the next trigger */
-          return;
-        }
-        this.reconcileOwed.delete(instanceId);
-        this.settleFromJournal(instanceId, this.state.events[instanceId] ?? []);
-      } finally {
-        this.owedReconcileRunning.delete(instanceId);
-      }
-    });
+    this.runOwedTailPass(instanceId);
   }
 
   /** Reopen the follow socket for an already-mounted instance and resync. */
@@ -3947,20 +4703,23 @@ class HubStore {
         await client.resumeAfterReconnect({ isCurrent: () => this.ownsTarget(token) });
         if (!this.ownsTarget(token)) return;
         // This follow just did the authoritative catch-up the drained send was
-        // waiting on; its debt is honoured. Fold the journal now. A throw from
-        // either step skips the delete and rejects the job: resumeConnection's
-        // catch (gate 6 item 2) runs the REST fallback for the still-owed row.
-        this.reconcileOwed.delete(instanceId);
+        // waiting on. Fold the journal, then discharge debt ONLY for commands
+        // the fold actually observed (Ruling AD): an empty resync certifies
+        // live but must not delete outstanding debt — the bounded tail takes
+        // over. A throw from either step skips the fold and rejects the job:
+        // resumeConnection's catch (gate 6 item 2) runs the REST fallback for
+        // the still-owed row.
         this.settleFromJournal(instanceId, this.state.events[instanceId] ?? []);
+        this.reevaluateOwedDebt(instanceId);
       } else {
         // A fresh follow mounts AND catches the journal up; follow() applies
         // the same ownership discipline (its entry chooses/revalidates the
         // current target). Re-check before folding the debt: a superseded
-        // mount must not delete another target's reconciliation state.
+        // mount must not touch another target's reconciliation state.
         await this.follow(instanceId);
         if (!this.ownsTarget(token)) return;
-        this.reconcileOwed.delete(instanceId);
         this.settleFromJournal(instanceId, this.state.events[instanceId] ?? []);
+        this.reevaluateOwedDebt(instanceId);
       }
     });
   }
@@ -4223,31 +4982,64 @@ class HubStore {
       if (!box.pendingFor(instanceId).length) {
         const drainJournalId =
           this.state.instances.find((i) => i.id === instanceId)?.journalId ?? null;
+        // r3 item 1: capture the issuing epoch/box BEFORE queueing. The
+        // post-drain resync below receives it as isCurrent, which drops ITS
+        // OWN tail read when parked across logout; a nested gap fill that read
+        // starts is fenced by generation only (see the catch-up comment).
+        const drainEpoch = this.identityEpoch;
+        const drainGen = this.owedGeneration;
+        const drainStillOurs = () =>
+          this.identityEpoch === drainEpoch && this.owedGeneration === drainGen && this.outbox === box;
         await this.chainReconcile(instanceId, async () => {
+          // r4 item 2: this callback may have been QUEUED before an auth
+          // retirement (chained promises outlive logout — only timers are
+          // torn down). Reject the retired job at ENTRY, before recording
+          // debt, reading or settling anything.
+          if (!drainStillOurs()) return;
+          // Ruling AD: record PER-COMMAND catch-up debt for every accepted
+          // (Hub-accepted, journal-unconfirmed) "sent" row of this instance
+          // BEFORE any read. An empty resync certifies live but proves nothing
+          // about these commands; it must not delete the debt. Held/queued
+          // rows never reached the Node (their own re-POST owns them),
+          // "reconciling" rows are converged by their bounded command-GET
+          // loop, and rejected rows are terminal — none are owed here.
+          const owedCommands = box
+            .unresolved()
+            .filter((r) => r.instanceId === instanceId && r.state === "sent")
+            .map((r) => r.commandId);
+          // Only stamp debt when there is a Hub-accepted row still missing
+          // journal evidence (merge with any debt a prior drain recorded).
+          if (owedCommands.length) this.recordOwed(instanceId, owedCommands);
           // Decide ownership WHEN THIS JOB RUNS, not when the drain enqueued
           // it: a live→recovering flip while we waited behind an earlier slow
           // catch-up must be observed here (fix-5 item 2). If THIS instance's
           // follow currently owns recovery, its reopenFollow resync is
-          // authoritative — record the debt and skip the redundant REST read
-          // (which would otherwise queue ahead of the socket reopen past the
-          // 20 s watchdog). Otherwise run the bounded REST catch-up now.
-          if (this.followOwnsCatchupNow(instanceId, drainJournalId)) {
-            this.recordOwed(instanceId);
-          } else {
+          // authoritative — skip the redundant read (which would otherwise
+          // queue ahead of the socket reopen past the 20 s watchdog); that
+          // fold re-checks the debt. Otherwise run the mounted JournalClient's
+          // ordinary post-delivery resync now: resumeAfterReconnect, the
+          // pre-existing main path (this branch only added the isCurrent
+          // fence). It is NOT part of the self-contained debt machinery — it
+          // folds the page through the client like any resync, and only the
+          // debt recorded above plus the re-check below involve the debt
+          // tail. Its nested gap fill (journal.ts fillGap) still checks
+          // generation only, so a gap read parked across logout + a successor
+          // login can apply the retired page; fencing that belongs to the
+          // follow/journal ownership-fencing follow-up, not here.
+          if (!this.followOwnsCatchupNow(instanceId, drainJournalId)) {
             const client = drainJournalId ? this.journals.get(drainJournalId) : undefined;
             try {
-              await client?.resumeAfterReconnect();
-              // Successful catch-up honours any earlier debt this instance
-              // carried (e.g. a drained row from before it was rebound away).
-              this.reconcileOwed.delete(instanceId);
+              await client?.resumeAfterReconnect({ isCurrent: drainStillOurs });
             } catch {
-              // The REST catch-up failed while no follow owns recovery: stamp
-              // convergence debt so the next failure/rebind/navigation trigger
-              // retries instead of dropping it.
-              this.recordOwed(instanceId);
+              // A rejected catch-up leaves the recorded debt in place; the
+              // re-check below arms its bounded tail.
             }
           }
+          if (!drainStillOurs()) return;
           this.settleFromJournal(instanceId, this.state.events[instanceId] ?? []);
+          // Evidence clears each owed command; anything still unobserved is
+          // chased by the bounded tail (or lands at 状态待确认 on deadline).
+          this.reevaluateOwedDebt(instanceId);
         });
         // The screen refresh rides the list scheduler (single-flight +
         // NODE_BUSY back-off) with COALESCING: a slow /screen while sends keep
@@ -4489,6 +5281,26 @@ class HubStore {
       return null;
     } finally {
       this.syncBubbleFromOutbox(commandId);
+    }
+  }
+
+  /**
+   * r4 item 2: patch a SPECIFIC captured Outbox (not the possibly-replaced
+   * current one), so a retired debt job can never write a terminal transition
+   * onto a successor identity's box. The in-memory presentation is refreshed
+   * only when that box is still current.
+   */
+  private async safePatchOn(
+    box: Outbox,
+    commandId: Id,
+    patch: Partial<OutboxRecord>,
+  ): Promise<OutboxRecord | null> {
+    try {
+      return await box.patch(commandId, patch);
+    } catch {
+      return null;
+    } finally {
+      if (this.outbox === box) this.syncBubbleFromOutbox(commandId);
     }
   }
 
@@ -4757,6 +5569,7 @@ class HubStore {
     const attachments = live?.attachments?.length
       ? live.attachments
       : ((r.attachments ?? []) as BubbleAttachment[]);
+    const presentedUnknown = this.owedPresentedUnknown.has(r.commandId) && r.state !== "done" && r.state !== "rejected";
     return {
       clientRequestId: r.clientRequestId,
       instanceId: r.instanceId,
@@ -4767,14 +5580,16 @@ class HubStore {
       state:
         r.state === "done"
           ? "settled"
-          : r.state === "rejected" || r.state === "unknown"
+          : r.state === "rejected" || r.state === "unknown" || presentedUnknown
             ? "unknown"
             : // pending/inflight = queued; "sent"/"held" already reached the
               // Hub and render as an accepted (delivered, not 待确认) row.
               r.state === "pending" || r.state === "inflight"
               ? "queued"
               : "accepted",
-      outboxState: r.state,
+      // r2 item 3: a terminal exhaustion write that failed to commit still
+      // presents the existing not-confirmed state from memory.
+      outboxState: presentedUnknown ? "unknown" : r.state,
       // The rejection reason rides along on the rejected row so 未送达 can
       // show the Node/Hub's own neutral explanation inline.
       ...(r.state === "rejected" && r.lastError ? { outboxError: r.lastError } : {}),
@@ -4786,7 +5601,14 @@ class HubStore {
 
   private syncBubbleFromOutbox(commandId: Id) {
     const rec = this.outbox?.get(commandId);
-    if (!rec) return;
+    if (!rec) {
+      this.owedPresentedUnknown.delete(commandId);
+      return;
+    }
+    // A terminal durable row supersedes the in-memory not-confirmed marker.
+    if (rec.state === "done" || rec.state === "rejected" || rec.state === "unknown") {
+      this.owedPresentedUnknown.delete(commandId);
+    }
     const next = this.bubbleFromOutbox(rec);
     this.emit({
       bubbles: this.state.bubbles.map((b) => (b.clientRequestId === rec.clientRequestId ? next : b)),
@@ -4812,7 +5634,12 @@ class HubStore {
         if (ev.kind !== "message") continue;
         const commandId = (ev.payload as { commandId?: Id }).commandId;
         const rec = commandId ? this.outbox.get(commandId) : null;
-        if (commandId && rec && rec.state !== "done" && rec.state !== "rejected" && rec.state !== "unknown") {
+        // r3 item 4: a journal-confirmed row that had already reached the
+        // not-confirmed "unknown" state (late historical confirmation, e.g.
+        // observed by a seed/debt read after an earlier exhaustion) is STILL
+        // promoted to durable done — like live settlement — so an offline
+        // reload cannot resurrect it as 状态待确认.
+        if (commandId && rec && rec.state !== "done" && rec.state !== "rejected") {
           // Journal evidence always retires the durable row, independent of
           // which epoch issued it; progress itself is gated inside the helper.
           void this.outbox.patch(commandId, { state: "done", serverState: "journal-settled" });
@@ -5152,6 +5979,13 @@ class HubStore {
     // in the cold mock path, a peer event); if the epoch moved after the last
     // check, write/publish nothing.
     if (this.extEpoch !== ext) return "retired";
+    // r6 item 1: a credential that establishes a DIFFERENT device must not
+    // adopt the predecessor's catch-up debts (ordinary succession bumps no
+    // identity epoch). Retire them exactly as the retirement teardown does,
+    // before the successor's Outbox can install. A same-device re-login keeps
+    // them, and a failed request never reaches here (its catch restores the
+    // predecessor's Outbox with the debts intact).
+    if (previousDeviceId !== session.deviceId) this.retireOwedDebts();
     writeSession(session, { mock: api.mock });
     // Gate 49 items 5/6: when the credential establishes a DIFFERENT identity,
     // do not republish the predecessor's instance rows under the new session:
@@ -5781,6 +6615,12 @@ class HubStore {
           ? { ...this.state.summaries, [instanceId]: historyPhrase }
           : this.state.summaries,
       });
+      // Ruling AD: the mount seed READ is itself journal evidence. Fold
+      // restored optimistic bubbles against it (a command already journaled
+      // when the follow mounts settles here, not only via live frames) and
+      // re-check outstanding catch-up debt.
+      this.settleFromJournal(instanceId, history);
+      this.reevaluateOwedDebt(instanceId);
       // §9.1: the Hub record usually already carries the latest effective level;
       // replay history effort edges too so a reconnect before refresh is honest.
       // live=false: hydrate effective only, never settle pending/refusal.
@@ -5876,6 +6716,10 @@ class HubStore {
             screens: screenPatch ?? this.state.screens,
             summaries,
           });
+          // Ruling AD: every live journal batch re-checks outstanding
+          // catch-up debt — the owed command's entry clears it; anything
+          // still missing keeps its bounded tail driver armed.
+          this.reevaluateOwedDebt(instanceId);
         },
         onPrepend: (older) => {
           const current = this.state.events[instanceId] ?? [];

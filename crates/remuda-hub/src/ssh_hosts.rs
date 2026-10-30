@@ -490,8 +490,28 @@ async fn supervise(state: AppState, host: ManagedHost) {
         let started = Instant::now();
         let mut generation = None;
         let result = connect_once(&state, &host, &record, &client, &mut generation).await;
+        // r13 item 3: requeue/finish any pre-grant run dispatched on EXACTLY
+        // this ended session, even when it has already been superseded (a
+        // replaced daemon closing still owns the runs it dispatched). Landing
+        // rows keep occupancy and are settled separately.
+        if let Some(generation) = generation {
+            crate::gatequeue::recover_ended_session(&state, &host.id, generation).await;
+        }
         if let Some(generation) = generation
             && !state.nodes.remove_generation(&host.id, generation).await
+        {
+            return;
+        }
+        // r41 item 1: a hello superseded by a newer link never installed and
+        // owns nothing; like a stale teardown above, it must not take the host
+        // offline or tear down the newer link's relay state.
+        if generation.is_none()
+            && result.as_ref().err().is_some_and(|error| {
+                matches!(
+                    error.downcast_ref::<crate::error::HubError>(),
+                    Some(crate::error::HubError::LinkSuperseded)
+                )
+            })
         {
             return;
         }
@@ -594,6 +614,8 @@ async fn bridge_stdio_session<T: NodeTransport>(
     let pending = crate::transport::new_pending_rpcs();
     let mut host_id = None;
     let mut hello_done = false;
+    // r16 item 6: capture the hello-time takeover flag for post-hello rebind.
+    let mut hello_displaced_live = false;
     let mut params = hello["params"].clone();
     params["label"] = json!(record.label);
     params["transport"] = json!("ssh-stdio");
@@ -607,6 +629,7 @@ async fn bridge_stdio_session<T: NodeTransport>(
         &mut host_id,
         &mut hello_done,
         generation,
+        &mut hello_displaced_live,
         "node.hello",
         params,
         &out_tx,
@@ -636,7 +659,12 @@ async fn bridge_stdio_session<T: NodeTransport>(
     // an SSH-managed daemon keeps a stale unbinding mark until ITS process
     // restarts. Both spawn after the reply so their frames cannot overtake
     // it on the bounded out_rx channel.
-    crate::ws::spawn_post_hello_tasks(state, managed.id.clone());
+    crate::ws::spawn_post_hello_tasks(
+        state,
+        managed.id.clone(),
+        generation.unwrap_or(0),
+        hello_displaced_live,
+    );
     state
         .store
         .ssh_status(managed.id.clone(), "online", None)
@@ -661,7 +689,7 @@ async fn bridge_stdio_session<T: NodeTransport>(
                     continue;
                 }
                 let method = frame["method"].as_str().unwrap_or("");
-                let result = crate::ws::handle_node_method(state, &session_token, &mut host_id, &mut hello_done, generation, method, frame["params"].clone(), &out_tx, &pending).await;
+                let result = crate::ws::handle_node_method(state, &session_token, &mut host_id, &mut hello_done, generation, &mut hello_displaced_live, method, frame["params"].clone(), &out_tx, &pending).await;
                 if let Some(id) = frame.get("id").filter(|id| !id.is_null()) {
                     let reply = match result { Ok(Some(value)) => crate::error::rpc_ok(id.clone(), value), Ok(None) => continue, Err(error) => crate::error::rpc_error(id.clone(), -32000, &error.to_string()) };
                     tokio::time::timeout(Duration::from_secs(15), carrier.send_json(&reply)).await??;
@@ -964,6 +992,8 @@ mod tests {
                 host.clone(),
                 "workspace.unregister".into(),
                 json!({"path": ROOT, "workspaceId": WSP}),
+                None,
+                None,
                 None,
                 None,
             )
@@ -1299,6 +1329,89 @@ mod tests {
             .unwrap();
         assert_eq!(row.state, "invalidated");
         assert!(!row.blocking);
+        store.close().await;
+    }
+
+    /// ma-lineage r5 item 1(c): a daemon inventory that reports an instance
+    /// RUNNING revives a host-lost/ambiguous terminal row: lifecycle returns
+    /// to running and ended_at / last_error are cleared (D-019 same-epoch
+    /// process is alive).
+    #[tokio::test]
+    async fn daemon_inventory_running_report_revives_a_host_lost_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let host = new_id("hst").unwrap();
+        store
+            .insert_managed_host(
+                host.clone(),
+                AddSshHost {
+                    target: "lineage-revive".into(),
+                    label: "lineage-revive".into(),
+                    labels: vec![],
+                    remuda_binary_policy: BinaryPolicy::RequireInstalled,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .ssh_status(host.clone(), "online", None)
+            .await
+            .unwrap();
+        let instance = store
+            .insert_instance(
+                host.clone(),
+                None,
+                "claude".into(),
+                "claude-sdk".into(),
+                None,
+                json!({}),
+            )
+            .await
+            .unwrap();
+        let host_lost_id = instance.instance_id.clone();
+        store
+            .run_named("host-lost", move |conn| {
+                conn.execute(
+                    "UPDATE instances
+                        SET lifecycle = 'exited', activity = 'idle',
+                            connectivity = 'disconnected',
+                            last_error = 'host-contact-lost',
+                            ended_at = NULL
+                      WHERE id = ?1",
+                    [host_lost_id.as_str()],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        store
+            .reconcile_daemon_instances(
+                host.clone(),
+                vec![json!({
+                    "id": instance.instance_id,
+                    "hostId": host,
+                    "lifecycle": "running",
+                    "activity": "idle"
+                })],
+            )
+            .await
+            .unwrap();
+
+        let row = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.lifecycle, "running",
+            "daemon running report revives the row"
+        );
+        assert_eq!(row.connectivity, "connected");
+        assert!(
+            row.last_error.is_none(),
+            "host-lost marker cleared: {row:?}"
+        );
         store.close().await;
     }
 }

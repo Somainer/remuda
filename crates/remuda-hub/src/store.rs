@@ -95,6 +95,23 @@ pub enum StoreError {
     /// A passkey with the same credential id is already registered.
     #[error("duplicate credential")]
     DuplicateCredential,
+    /// D-057 §7.3: the commit-time initiator check refused this write — the
+    /// initiator's instance was fenced or superseded, the lineage paused, or
+    /// the authenticating device row no longer exists. Maps to 409 `fenced`.
+    #[error("fenced")]
+    Fenced,
+    /// r15 item 6: the persisted gate carrier boot epoch is missing or older
+    /// than a session identity retained in the database (a cloned/partially
+    /// restored/rolled-back data dir). The Hub refuses to mint session ids
+    /// rather than risk repeating one.
+    #[error("gate session boot epoch regressed: {0}")]
+    GateEpochRegressed(String),
+    /// r23 item 2: runtime enforcement of the final serialized-byte cap on a
+    /// gate evidence object. The truncator must guarantee the bound before
+    /// insert; reaching the store over the cap is a fail-closed bug, never a
+    /// reason to persist the oversized row.
+    #[error("gate evidence object exceeds the {size}-byte cap (max {max})")]
+    EvidenceTooLarge { size: usize, max: usize },
     /// An injected test fault (`test-faults` feature only).
     #[cfg(any(test, feature = "test-faults"))]
     #[error("injected store fault: {0}")]
@@ -255,6 +272,84 @@ pub struct Store {
     readers: Arc<ReaderPool>,
     /// Joins the writer thread after the last clone drops its channel sender.
     _join: Arc<StoreJoin>,
+    // The ma-initiator commit-time race seams below and the ma-lineage
+    // `faults` flags are cfg-gated out of every non-fault build: the
+    // production `remuda-hub` lib carries no seam field, arming function or
+    // call site. The crate's own dev-dependency enables `test-faults`, so
+    // `cargo test` sees them all.
+    /// Test-only seam: when armed, the NEXT `queue_command` writer job marks
+    /// the named instance fenced (and bumps its lineage generation) BEFORE
+    /// running `check_initiator`, deterministically reproducing a fence F that
+    /// commits between request authentication and the write. Drained after
+    /// one fire.
+    #[cfg(any(test, feature = "test-faults"))]
+    test_fence_before_queue: Arc<std::sync::Mutex<Option<String>>>,
+    /// Test-only seam, device-specific companion: when armed the NEXT
+    /// `queue_command` writer job deletes that device row before the authority
+    /// check (the fence F also deletes predecessor devices).
+    #[cfg(any(test, feature = "test-faults"))]
+    test_delete_device_before_queue: Arc<std::sync::Mutex<Option<String>>>,
+    /// Test-only seam shared by gate-claim and node-op admission: arm a fence
+    /// applied at the top of the NEXT such writer job.
+    #[cfg(any(test, feature = "test-faults"))]
+    test_fence_before_authority: Arc<std::sync::Mutex<Option<String>>>,
+    /// Test-only seam: arm a fence applied at the top of the NEXT
+    /// `mutate_task` writer job only (task bind post-lease commit race).
+    #[cfg(any(test, feature = "test-faults"))]
+    test_fence_before_task_mutate: Arc<std::sync::Mutex<Option<String>>>,
+    /// Test-only seam: a claim/finish transition that the NEXT
+    /// `request_gate_job_cancel` writer job applies before its own row read
+    /// (cancel handler pre-read vs. writer-observed state race).
+    #[cfg(any(test, feature = "test-faults"))]
+    test_gate_cancel_race: Arc<std::sync::Mutex<Option<crate::gatequeue::TestGateCancelRace>>>,
+    /// Test-only seam: a fence applied at the top of the NEXT
+    /// `patch_project_with_route` writer job (atomic project PATCH).
+    #[cfg(any(test, feature = "test-faults"))]
+    test_fence_before_project_patch: Arc<std::sync::Mutex<Option<String>>>,
+    /// Test-only seam: a fence applied inside the NEXT
+    /// `mark_forward_intent` writer job, immediately before its stamped
+    /// initiator re-check — the window between create-command admission and
+    /// the forward-intent mark (ma-initiator r6 item 1).
+    #[cfg(any(test, feature = "test-faults"))]
+    test_fence_before_forward_intent: Arc<std::sync::Mutex<Option<String>>>,
+    /// Test-only seam: the NEXT `mutate_gate_job` writer job commits a
+    /// Running -> Canceling transition on the named job BEFORE loading its
+    /// doc — a cancel request committing strictly between a result's
+    /// pre-read and its writer (ma-initiator r6 item 5).
+    #[cfg(any(test, feature = "test-faults"))]
+    test_cancel_before_gate_mutate: Arc<std::sync::Mutex<Option<String>>>,
+    /// Test-only seam: the NEXT `mutate_gate_job` writer job commits a
+    /// Canceling -> Canceled transition on the named job BEFORE loading its
+    /// doc — the terminal write of a duplicate result's first arrival or of
+    /// the cancel-grace finisher landing between a result's pre-read and its
+    /// writer (ma-initiator r7 item 1).
+    #[cfg(any(test, feature = "test-faults"))]
+    test_finish_before_gate_mutate:
+        Arc<std::sync::Mutex<Option<(String, crate::gatequeue::TestGateFinishBeforeWrite)>>>,
+    /// Test-only one-shot: the NEXT `insert_gate_log` writer deletes the old
+    /// row and then fails its insert (ma-initiator r9 item 3), proving the
+    /// atomic transaction rolls the delete back. r21 item 5: a counter so one
+    /// arm can fail the next N inserts (the finished event AND the RPC reply),
+    /// exercising the deferred-settlement retry without a third delivery.
+    #[cfg(any(test, feature = "test-faults"))]
+    gate_log_insert_fault: Arc<std::sync::atomic::AtomicUsize>,
+    /// Test-only cumulative count of failed `insert_gate_log` writes actually
+    /// consumed since the last arming (r22 item 8): distinguishes "n deliveries
+    /// each failed" from "fewer failures + later successes" — the remaining
+    /// budget alone reads zero in both cases.
+    #[cfg(any(test, feature = "test-faults"))]
+    gate_log_insert_faults_consumed: Arc<std::sync::atomic::AtomicUsize>,
+    /// Test-only barriers at the apply_result boundaries (r10 item 5).
+    #[cfg(any(test, feature = "test-faults"))]
+    gate_apply_barrier: Arc<crate::gatequeue::GateApplyBarrier>,
+    /// r18 item 7 test-only: park after evidence persist, before settlement.
+    #[cfg(any(test, feature = "test-faults"))]
+    gate_after_persist_barrier: Arc<crate::gatequeue::SimpleBarrier>,
+    /// r27 item 2 test-only: park a legacy `/resolve` while its final Landing
+    /// probe is outstanding, keyed by job id, so a race test can commit an
+    /// evidence-deferral transition before abort admission.
+    #[cfg(any(test, feature = "test-faults"))]
+    gate_resolve_probe_barrier: Arc<crate::gatequeue::SimpleBarrier>,
     /// Per-Store test fault flags (`test-faults` feature only). Shared via
     /// [`Arc`] so every clone of the store arms the SAME flags.
     #[cfg(any(test, feature = "test-faults"))]
@@ -1741,6 +1836,14 @@ pub struct CommandRecord {
     /// Protocol §2.5 settlement projection, present only once settled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settlement: Option<CommandSettlement>,
+    /// D-057 §7.1: Hub-stamped initiator of an Agent-initiated command; null
+    /// for Human/Bot commands. Projected to the wire and forwarded to Nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initiator: Option<remuda_protocol::Initiator>,
+    /// D-057 §7.1: authenticating device id. Hub-only ledger column: never
+    /// serialized to clients and never sent to Nodes.
+    #[serde(skip)]
+    pub initiator_device_id: Option<String>,
     /// Original payload.
     pub payload: Value,
     /// Optional caller idempotency key.
@@ -2370,6 +2473,34 @@ impl Store {
                 thread: Mutex::new(Some(thread)),
             }),
             #[cfg(any(test, feature = "test-faults"))]
+            test_fence_before_queue: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(any(test, feature = "test-faults"))]
+            test_delete_device_before_queue: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(any(test, feature = "test-faults"))]
+            test_fence_before_authority: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(any(test, feature = "test-faults"))]
+            test_fence_before_task_mutate: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(any(test, feature = "test-faults"))]
+            test_gate_cancel_race: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(any(test, feature = "test-faults"))]
+            test_fence_before_project_patch: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(any(test, feature = "test-faults"))]
+            test_fence_before_forward_intent: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(any(test, feature = "test-faults"))]
+            test_cancel_before_gate_mutate: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(any(test, feature = "test-faults"))]
+            test_finish_before_gate_mutate: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(any(test, feature = "test-faults"))]
+            gate_log_insert_fault: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "test-faults"))]
+            gate_log_insert_faults_consumed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "test-faults"))]
+            gate_apply_barrier: Arc::new(crate::gatequeue::GateApplyBarrier::new()),
+            #[cfg(any(test, feature = "test-faults"))]
+            gate_after_persist_barrier: Arc::new(crate::gatequeue::SimpleBarrier::new()),
+            #[cfg(any(test, feature = "test-faults"))]
+            gate_resolve_probe_barrier: Arc::new(crate::gatequeue::SimpleBarrier::new()),
+            #[cfg(any(test, feature = "test-faults"))]
             faults: Arc::new(test_faults::FaultFlags::default()),
         })
     }
@@ -2412,6 +2543,321 @@ impl Store {
         let out = rx.await.map_err(|_| StoreError::Closed)?;
         note_slow(name, "write", queued.elapsed());
         out
+    }
+
+    /// Test-only: mark `instance_id` fenced and bump its lineage generation,
+    /// the same authority effects the fence transaction F produces (minus F's
+    /// cancellations, which land in ma-fence). Used by the initiator suite to
+    /// put an instance in the post-fence state without the F machinery.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_fence_instance(&self, instance_id: String) -> Result<(), StoreError> {
+        self.run_named("test_fence_instance", move |conn| {
+            test_apply_fence(conn, &instance_id)
+        })
+        .await
+    }
+
+    /// Test-only: arm the fence-between-authentication-and-commit seam.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_arm_fence_before_queue(&self, instance_id: String) {
+        *self
+            .test_fence_before_queue
+            .lock()
+            .expect("fence seam lock") = Some(instance_id);
+    }
+
+    /// Test-only: arm the device-deletion-between-authentication-and-commit
+    /// seam.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_arm_delete_device_before_queue(&self, device_id: String) {
+        *self
+            .test_delete_device_before_queue
+            .lock()
+            .expect("device seam lock") = Some(device_id);
+    }
+
+    /// Test-only: delete one device row (the fence F also removes predecessor
+    /// Agent devices).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_delete_device(&self, device_id: String) -> Result<(), StoreError> {
+        self.run_named("test_delete_device", move |conn| {
+            conn.execute("DELETE FROM devices WHERE id = ?1", params![device_id])?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Test-only: arm a fence that the NEXT `claim_gate_job` or
+    /// `admit_node_op` writer job applies immediately before its authority
+    /// check — a deterministic F between enqueue/admission and the next
+    /// admission. Drained after one fire.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_arm_fence_before_authority_check(&self, instance_id: String) {
+        *self
+            .test_fence_before_authority
+            .lock()
+            .expect("authority seam lock") = Some(instance_id);
+    }
+
+    /// Test-only: drain (at most) the armed authority-check fence. Called
+    /// inside the claim/admission writer jobs.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub(crate) fn take_test_authority_fence(&self) -> Option<String> {
+        self.test_fence_before_authority
+            .lock()
+            .expect("authority seam lock")
+            .take()
+    }
+
+    /// Test-only: arm a fence that the NEXT `mutate_task` writer job applies
+    /// immediately before its authority check (task bind post-lease race).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_arm_fence_before_task_mutate(&self, instance_id: String) {
+        *self
+            .test_fence_before_task_mutate
+            .lock()
+            .expect("task mutate seam lock") = Some(instance_id);
+    }
+
+    /// Test-only: drain (at most) the armed task-mutate fence.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub(crate) fn take_test_task_mutate_fence(&self) -> Option<String> {
+        self.test_fence_before_task_mutate
+            .lock()
+            .expect("task mutate seam lock")
+            .take()
+    }
+
+    /// Test-only: arm the gate-cancel writer race: the NEXT
+    /// `request_gate_job_cancel` writer job applies `race` to the row before
+    /// its own read, reproducing the tick/finish committing between the
+    /// handler's pre-read and the writer.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_arm_gate_cancel_race(&self, race: crate::gatequeue::TestGateCancelRace) {
+        *self
+            .test_gate_cancel_race
+            .lock()
+            .expect("gate cancel race seam lock") = Some(race);
+    }
+
+    /// Test-only: drain (at most) the armed gate-cancel writer race.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub(crate) fn take_test_gate_cancel_race(
+        &self,
+    ) -> Option<crate::gatequeue::TestGateCancelRace> {
+        self.test_gate_cancel_race
+            .lock()
+            .expect("gate cancel race seam lock")
+            .take()
+    }
+
+    /// Test-only: arm a fence applied inside the NEXT
+    /// `patch_project_with_route` writer job, immediately before its
+    /// authority check (atomic project PATCH: doc + route override share one
+    /// job, so the fence refuses both).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_arm_fence_before_project_patch(&self, instance_id: String) {
+        *self
+            .test_fence_before_project_patch
+            .lock()
+            .expect("project patch seam lock") = Some(instance_id);
+    }
+
+    /// Test-only: arm a cancel (Running -> Canceling) that the NEXT
+    /// `mutate_gate_job` writer job for `job_id` commits before loading the
+    /// job doc — the window between `apply_result`'s pre-read and its writer.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_arm_cancel_before_gate_mutate(&self, job_id: String) {
+        *self
+            .test_cancel_before_gate_mutate
+            .lock()
+            .expect("gate mutate cancel seam lock") = Some(job_id);
+    }
+
+    /// Test-only: drain (at most) the armed pre-mutate cancel.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub(crate) fn take_test_cancel_before_gate_mutate(&self) -> Option<String> {
+        self.test_cancel_before_gate_mutate
+            .lock()
+            .expect("gate mutate cancel seam lock")
+            .take()
+    }
+
+    /// Test-only: arm a terminal finish (Canceling -> Canceled) that the
+    /// NEXT `mutate_gate_job` writer job for `job_id` commits before loading
+    /// the job doc — the duplicate-verdict/grace-finisher write landing
+    /// between `apply_result`'s pre-read and its writer.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_arm_finish_before_gate_mutate(
+        &self,
+        job_id: String,
+        kind: crate::gatequeue::TestGateFinishBeforeWrite,
+    ) {
+        *self
+            .test_finish_before_gate_mutate
+            .lock()
+            .expect("gate mutate finish seam lock") = Some((job_id, kind));
+    }
+
+    /// Test-only: drain (at most) the armed pre-mutate finish.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn take_test_finish_before_gate_mutate(
+        &self,
+    ) -> Option<(String, crate::gatequeue::TestGateFinishBeforeWrite)> {
+        self.test_finish_before_gate_mutate
+            .lock()
+            .expect("gate mutate finish seam lock")
+            .take()
+    }
+
+    /// Test-only: arm the one-shot `insert_gate_log` post-delete insert
+    /// failure (ma-initiator r9 item 3).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_arm_gate_log_insert_fault(&self) {
+        self.gate_log_insert_faults_consumed
+            .store(0, std::sync::atomic::Ordering::Release);
+        self.gate_log_insert_fault
+            .store(1, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Test-only: fail the next `n` `insert_gate_log` writes, then recover —
+    /// r21 item 5 (the finished notification AND the RPC reply both hit a
+    /// transient failure; under R9 the unconsumed verdict is re-supplied, not
+    /// retried by the Hub). Resets the cumulative failed-write counter.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_arm_gate_log_insert_faults(&self, n: usize) {
+        self.gate_log_insert_faults_consumed
+            .store(0, std::sync::atomic::Ordering::Release);
+        self.gate_log_insert_fault
+            .store(n, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Test-only: fail EVERY `insert_gate_log` write until
+    /// [`Self::test_clear_gate_log_insert_fault`] — holds the evidence
+    /// deferral open so a test can assert the standing-down state.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_arm_gate_log_insert_fault_sticky(&self) {
+        self.gate_log_insert_faults_consumed
+            .store(0, std::sync::atomic::Ordering::Release);
+        self.gate_log_insert_fault
+            .store(usize::MAX, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Test-only: recover storage after a sticky fault.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_clear_gate_log_insert_fault(&self) {
+        self.gate_log_insert_fault
+            .store(0, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Test-only: how many armed `insert_gate_log` failures remain (`usize::MAX`
+    /// is a sticky fault).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_gate_log_insert_faults_remaining(&self) -> usize {
+        self.gate_log_insert_fault
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Test-only: cumulative number of FAILED `insert_gate_log` writes consumed
+    /// since the last arming (r22 item 8) — proves each of the two dual
+    /// deliveries reached and failed its OWN insert rather than a later success
+    /// masking a missing failure.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_gate_log_insert_faults_consumed(&self) -> usize {
+        self.gate_log_insert_faults_consumed
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Test-only access to the apply_result boundary barrier.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn gate_apply_barrier(&self) -> &crate::gatequeue::GateApplyBarrier {
+        &self.gate_apply_barrier
+    }
+
+    /// r18 item 7: post-evidence-persist barrier (test-only).
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn gate_after_persist_barrier(&self) -> &crate::gatequeue::SimpleBarrier {
+        &self.gate_after_persist_barrier
+    }
+
+    /// r27 item 2: per-job barrier parking a legacy `/resolve` while its final
+    /// Landing probe is outstanding (test-only).
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn gate_resolve_probe_barrier(&self) -> &crate::gatequeue::SimpleBarrier {
+        &self.gate_resolve_probe_barrier
+    }
+
+    /// Test-only: consume one armed insert fault (the counter counts down;
+    /// `true` while failures remain, `false` once storage has "recovered").
+    #[cfg(any(test, feature = "test-faults"))]
+    pub(crate) fn take_gate_log_insert_fault(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        loop {
+            let remaining = self.gate_log_insert_fault.load(Ordering::Acquire);
+            if remaining == 0 {
+                return false;
+            }
+            if self
+                .gate_log_insert_fault
+                .compare_exchange(
+                    remaining,
+                    if remaining == usize::MAX {
+                        usize::MAX
+                    } else {
+                        remaining - 1
+                    },
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                // One failed write was actually consumed (r22 item 8).
+                self.gate_log_insert_faults_consumed
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                return true;
+            }
+        }
+    }
+
+    /// Test-only: drain (at most) the armed project-patch fence.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub(crate) fn take_test_project_patch_fence(&self) -> Option<String> {
+        self.test_fence_before_project_patch
+            .lock()
+            .expect("project patch seam lock")
+            .take()
+    }
+
+    /// Test-only: arm a fence applied inside the NEXT `mark_forward_intent`
+    /// writer job, immediately before its stamped-initiator re-check. This is
+    /// the window after the create command was admitted but before (or in)
+    /// the forward-intent mark — the row is `requested`, holds its slot and
+    /// any continuity lineage seat, and no frame has reached a Node.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_arm_fence_before_forward_intent(&self, instance_id: String) {
+        *self
+            .test_fence_before_forward_intent
+            .lock()
+            .expect("forward intent seam lock") = Some(instance_id);
     }
 
     /// Run a read on the read-only pool instead of the writer thread.
@@ -2866,16 +3312,41 @@ impl Store {
     /// Mark a host offline when its WS drops.
     pub async fn mark_host_offline(&self, host_id: String) -> Result<(), StoreError> {
         self.run_named("mark_host_offline", move |conn| {
-            conn.execute(
-                "UPDATE hosts SET state = 'offline', offline_since = ?2 WHERE id = ?1 AND state = 'online'",
-                params![&host_id, now_rfc3339()],
-            )?;
-            conn.execute(
-                "UPDATE instances SET connectivity = 'disconnected', updated_at = ?1
-                 WHERE host_id = ?2 AND connectivity != 'disconnected'",
-                params![now_rfc3339(), host_id],
-            )?;
+            mark_host_offline_rows(conn, &host_id)?;
             Ok(())
+        })
+        .await
+    }
+
+    /// [`Self::mark_host_offline`] for the teardown of ONE registered link:
+    /// applies only while `hosts.link_generation` still equals the durable
+    /// generation that link registered with. A replaced socket's teardown can
+    /// run after the new hello already marked the host online; the new hello
+    /// bumps the generation before it marks the host online, so this late
+    /// write is then a no-op instead of leaving a live host offline. Returns
+    /// whether the host was marked.
+    pub async fn mark_host_offline_for_link(
+        &self,
+        host_id: String,
+        link_generation: i64,
+    ) -> Result<bool, StoreError> {
+        self.run_named("mark_host_offline_for_link", move |conn| {
+            // Read-then-write: IMMEDIATE so the generation check and the
+            // offline write commit as one unit against a concurrent bump.
+            let tx = immediate_tx(conn)?;
+            let current: Option<i64> = tx
+                .query_row(
+                    "SELECT link_generation FROM hosts WHERE id = ?1",
+                    params![host_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if current != Some(link_generation) {
+                return Ok(false);
+            }
+            mark_host_offline_rows(&tx, &host_id)?;
+            tx.commit()?;
+            Ok(true)
         })
         .await
     }
@@ -3147,7 +3618,59 @@ impl Store {
         .await
     }
 
-    /// Permanently delete an Instance and everything the Hub keeps for it.
+    /// Delete an instance the Hub never accepted (a fenced/never-forwarded
+    /// `instance.create` row) and its Hub-side cascade, WITHOUT the
+    /// terminal-lifecycle/current-chapter gates [`Self::delete_instance`]
+    /// enforces. A never-forwarded create must leave no chapter behind:
+    /// no Node ever saw it, so no tombstone is written either (F only
+    /// tombstones chapters that actually existed on a Node).
+    pub async fn purge_requested_instance(&self, instance_id: String) -> Result<(), StoreError> {
+        self.run_named("purge_requested_instance", move |conn| {
+            // All seven cascade statements are one IMMEDIATE transaction: a
+            // SQLite I/O error or crash mid-purge must not leave half the
+            // chapter behind (an orphaned row/slot/lineage seat).
+            let tx = immediate_tx(conn)?;
+            tx.execute(
+                "DELETE FROM journal WHERE instance_id = ?1",
+                params![&instance_id],
+            )?;
+            tx.execute(
+                "DELETE FROM commands WHERE instance_id = ?1",
+                params![&instance_id],
+            )?;
+            tx.execute(
+                "DELETE FROM interactions WHERE instance_id = ?1",
+                params![&instance_id],
+            )?;
+            tx.execute(
+                "DELETE FROM fleet_members WHERE instance_id = ?1",
+                params![&instance_id],
+            )?;
+            tx.execute(
+                "UPDATE worktree_leases SET holder_instance_id = NULL, updated_at = ?2
+                 WHERE holder_instance_id = ?1",
+                params![&instance_id, now_rfc3339()],
+            )?;
+            // A continuity chapter (any grant or a restart policy) also holds
+            // a `lineages` row — its reservation of the lineage seat. A
+            // never-accepted chapter has no successors or journal, so the row
+            // goes with the instance; leaving it would strand a `starting`
+            // lineage pointing at a purged chapter (and keep its seat
+            // counted). The instance row still exists at this point; the
+            // lineage id is read from it.
+            tx.execute(
+                "DELETE FROM lineages
+                  WHERE lineage_id = (SELECT lineage_id FROM instances WHERE id = ?1)",
+                params![&instance_id],
+            )?;
+            tx.execute("DELETE FROM instances WHERE id = ?1", params![&instance_id])?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Delete an instance the Hub never accepted
     ///
     /// Only a stopped Instance can be deleted; the caller is responsible for
     /// stopping it first (`force`). Returns `None` when the row is already
@@ -4315,11 +4838,16 @@ impl Store {
             title,
             spec,
             InstanceDelegation::default(),
+            // Non-delegated inserts are operator/internal paths.
+            crate::agent_scope::CallerAuthority::internal(),
         )
         .await
     }
 
     /// Insert with explicit delegation-tree state; design §2.5.
+    ///
+    /// D-057 §7.3: an Agent child create carries the caller's authority pair,
+    /// checked in this writer job before the instance row exists.
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_instance_delegated(
         &self,
@@ -4330,8 +4858,11 @@ impl Store {
         title: Option<String>,
         spec: Value,
         delegation: InstanceDelegation,
+        authority: crate::agent_scope::CallerAuthority,
     ) -> Result<InstanceRecord, StoreError> {
         self.run_named("insert_instance_delegated", move |conn| {
+            let (initiator, device_id) = authority.as_check();
+            check_initiator(conn, initiator, device_id)?;
             let host =
                 load_host(conn, &host_id)?.ok_or_else(|| StoreError::Id("unknown host".into()))?;
             let running: i64 = conn.query_row(
@@ -4854,6 +5385,10 @@ impl Store {
     /// COALESCE. The pinned value is always ≤ the hosts value (a hello only
     /// ever increments), so a row can never be hidden by a smaller-than-hosts
     /// stamp.
+    ///
+    /// D-057 §7.3: when `initiator` is set the commit-time authority check
+    /// runs inside this writer job, so a request authenticated before a fence
+    /// cannot be admitted after it.
     #[allow(clippy::too_many_arguments)]
     pub async fn queue_command(
         &self,
@@ -4864,8 +5399,38 @@ impl Store {
         payload: Value,
         idempotency_key: Option<String>,
         pinned_link_generation: Option<i64>,
+        initiator: Option<remuda_protocol::Initiator>,
+        initiator_device_id: Option<String>,
     ) -> Result<(CommandRecord, bool), StoreError> {
+        // Drain the test-only fence seam at enqueue time; it is applied at the
+        // top of the writer job below.
+        #[cfg(any(test, feature = "test-faults"))]
+        let armed_fence = self
+            .test_fence_before_queue
+            .lock()
+            .expect("fence seam lock")
+            .take();
+        #[cfg(any(test, feature = "test-faults"))]
+        let armed_device_delete = self
+            .test_delete_device_before_queue
+            .lock()
+            .expect("device seam lock")
+            .take();
         self.run_named("queue_command", move |conn| {
+            // Test-only seam: a fence armed by the test lands inside THIS
+            // writer job, immediately before the authority check — a
+            // deterministic F-between-authentication-and-commit.
+            #[cfg(any(test, feature = "test-faults"))]
+            if let Some(fenced_instance) = armed_fence {
+                test_apply_fence(conn, &fenced_instance)?;
+            }
+            #[cfg(any(test, feature = "test-faults"))]
+            if let Some(device_id) = armed_device_delete {
+                conn.execute("DELETE FROM devices WHERE id = ?1", params![device_id])?;
+            }
+            // D-057 §7.3: re-check authority inside the writer, before any
+            // row exists. On Fenced the job errors and writes nothing.
+            check_initiator(conn, initiator.as_ref(), initiator_device_id.as_deref())?;
             if let Some(key) = idempotency_key.as_ref()
                 && let Some(existing) = load_command_by_key(conn, key)?
             {
@@ -4922,9 +5487,12 @@ impl Store {
             conn.execute(
                 "INSERT INTO commands
                     (id, instance_id, host_id, operation, state, resolution, forwarded,
-                     payload_json, idempotency_key, created_at, updated_at, link_generation)
+                     payload_json, idempotency_key, created_at, updated_at, link_generation,
+                     initiator_instance_id, initiator_lineage_id, initiator_generation,
+                     initiator_device_id)
                  VALUES (?1, ?2, ?3, ?4, 'queued', 'clear', 0, ?5, ?6, ?7, ?7,
-                         COALESCE(?8, (SELECT link_generation FROM hosts WHERE id = ?3)))",
+                         COALESCE(?8, (SELECT link_generation FROM hosts WHERE id = ?3)),
+                         ?9, ?10, ?11, ?12)",
                 params![
                     command_id,
                     instance_id,
@@ -4933,7 +5501,11 @@ impl Store {
                     payload.to_string(),
                     idempotency_key,
                     now,
-                    pinned_link_generation
+                    pinned_link_generation,
+                    initiator.as_ref().map(|i| i.instance_id.clone()),
+                    initiator.as_ref().map(|i| i.lineage_id.clone()),
+                    initiator.as_ref().map(|i| i.generation),
+                    initiator_device_id,
                 ],
             )?;
             let row = load_command(conn, &command_id)?
@@ -4959,15 +5531,38 @@ impl Store {
     /// transport and generation together; the row already carries the
     /// INSERT-time stamp ([`Self::queue_command`]), which this refreshes for a
     /// bump between INSERT and the forwarding attempt.
+    ///
+    /// D-057 §7.3: re-checks the initiator and device id STAMPED ON THE ROW,
+    /// inside the writer job. A same-id replay of a held row by a since-fenced
+    /// initiator is refused here, before any frame is written to a Node.
     pub async fn mark_forward_intent(
         &self,
         command_id: String,
         link_generation: i64,
     ) -> Result<bool, StoreError> {
+        // Drain the test-only fence seam before entering the writer job; the
+        // fence is applied at the top of the job below.
+        #[cfg(any(test, feature = "test-faults"))]
+        let armed_fence = self
+            .test_fence_before_forward_intent
+            .lock()
+            .expect("forward intent seam lock")
+            .take();
         self.run_named("mark_forward_intent", move |conn| {
+            // Test-only seam (ma-initiator r6 item 1): a fence landing after
+            // create-command admission but before the forward-intent mark.
+            #[cfg(any(test, feature = "test-faults"))]
+            if let Some(fenced_instance) = armed_fence {
+                test_apply_fence(conn, &fenced_instance)?;
+            }
             let Some(row) = load_command(conn, &command_id)? else {
                 return Err(StoreError::Id("unknown command".into()));
             };
+            check_initiator(
+                conn,
+                row.initiator.as_ref(),
+                row.initiator_device_id.as_deref(),
+            )?;
             if row.forwarded {
                 return Ok(false);
             }
@@ -5324,7 +5919,9 @@ impl Store {
                 "SELECT id, instance_id, host_id, operation, state, resolution, forwarded,
                         payload_json, idempotency_key, created_at, updated_at,
                         settlement_outcome, settlement_reason,
-                        settlement_http_status, settlement_http_body
+                        settlement_http_status, settlement_http_body,
+                        initiator_instance_id, initiator_lineage_id, initiator_generation,
+                        initiator_device_id
                  FROM commands
                  WHERE host_id = ?1
                    AND operation = 'workspace.unregister'
@@ -5356,7 +5953,9 @@ impl Store {
                 "SELECT id, instance_id, host_id, operation, state, resolution, forwarded,
                         payload_json, idempotency_key, created_at, updated_at,
                         settlement_outcome, settlement_reason,
-                        settlement_http_status, settlement_http_body
+                        settlement_http_status, settlement_http_body,
+                        initiator_instance_id, initiator_lineage_id, initiator_generation,
+                        initiator_device_id
                  FROM commands
                  WHERE instance_id = ?1
                  ORDER BY created_at DESC, id DESC
@@ -6811,7 +7410,11 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
             -- recorded on (c-dirpicker r10 item 1); NULL for rows written
             -- before the column existed, which the reconnect sweep treats as
             -- belonging to a dead pre-upgrade link.
-            link_generation INTEGER
+            link_generation INTEGER,
+            initiator_instance_id TEXT,
+            initiator_lineage_id TEXT,
+            initiator_generation INTEGER,
+            initiator_device_id TEXT
         );
         CREATE TABLE IF NOT EXISTS journal (
             instance_id TEXT NOT NULL,
@@ -7080,6 +7683,13 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     ensure_column(&conn, "instances", "chapter_cause", "TEXT")?;
     ensure_column(&conn, "instances", "fenced_at", "TEXT")?;
     ensure_column(&conn, "instances", "restart_json", "TEXT")?;
+    // D-057 §7.1 (ma-initiator): every Agent-initiated command row carries
+    // the Hub-stamped initiator and the authenticating device id. The device
+    // id stays Hub-only and is never sent to Nodes. NULL for Human/Bot work.
+    ensure_column(&conn, "commands", "initiator_instance_id", "TEXT")?;
+    ensure_column(&conn, "commands", "initiator_lineage_id", "TEXT")?;
+    ensure_column(&conn, "commands", "initiator_generation", "INTEGER")?;
+    ensure_column(&conn, "commands", "initiator_device_id", "TEXT")?;
     // ma-lineage round 2: an immutable timestamp for the chapter's real end
     // event (a transition into exited/failed/closed), kept separate from the
     // mutable `updated_at`. Written once by [`stamp_ended_at`].
@@ -7270,6 +7880,7 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     crate::supply::migrate(&conn)?;
     crate::workers::migrate(&conn)?;
     crate::gatequeue::migrate(&conn)?;
+    crate::node_ops::migrate(&conn)?;
     // c-usagefu r14 item 1 (Ruling M1): a failed usage migration must never
     // brick Hub startup. The migration is one transaction and rolls back to
     // the previously-openable shape on any error; log it and open. Usage
@@ -8146,6 +8757,62 @@ mod tests {
         presented == hash
     }
 
+    /// r40: a replaced link's late teardown never takes a host offline once a
+    /// newer hello has adopted a link; the current link's teardown still does.
+    #[tokio::test]
+    async fn a_replaced_links_offline_write_is_a_noop_after_a_newer_link_adopts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let host = new_id("hst").unwrap();
+        store
+            .authenticate_host(
+                HostAuthRequest {
+                    presented: enroll_token(&store, "enroll-relink").await,
+                    hello_host_id: Some(host.clone()),
+                    label: Some("relink-test".into()),
+                    node_version: None,
+                },
+                verify_eq,
+                |_| Ok("test-hash".into()),
+            )
+            .await
+            .unwrap();
+        let instance = seed_acknowledged_instance(&store, &host).await.instance_id;
+        // Link A registers with generation 1; link B's hello bumps to 2 and
+        // marks the host online before A's teardown gets to write.
+        let link_a = store.bump_host_link_generation(host.clone()).await.unwrap();
+        let link_b = store.bump_host_link_generation(host.clone()).await.unwrap();
+        assert!(link_b > link_a);
+        store
+            .apply_inventory(host.clone(), Default::default(), None)
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .mark_host_offline_for_link(host.clone(), link_a)
+                .await
+                .unwrap(),
+            "the replaced link's teardown must not apply"
+        );
+        let row = store.get_instance(instance.clone()).await.unwrap().unwrap();
+        assert_eq!(row.connectivity, "connected");
+        assert_eq!(
+            store.expire_lost_hosts(0).await.unwrap().0,
+            0,
+            "the host stayed online"
+        );
+        // The current link's own teardown still takes the host offline.
+        assert!(
+            store
+                .mark_host_offline_for_link(host.clone(), link_b)
+                .await
+                .unwrap()
+        );
+        let row = store.get_instance(instance).await.unwrap().unwrap();
+        assert_eq!(row.connectivity, "disconnected");
+        store.close().await;
+    }
+
     #[tokio::test]
     async fn host_lost_obeys_offline_grace_and_reconnect_and_preserves_history() {
         let dir = tempfile::tempdir().unwrap();
@@ -8250,6 +8917,8 @@ mod tests {
                 host_id.clone(),
                 "instance.create".into(),
                 json!({"instanceId": instance.instance_id}),
+                None,
+                None,
                 None,
                 None,
             )
@@ -8389,6 +9058,8 @@ mod tests {
                 json!({"instanceId": instance.instance_id}),
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .expect("command");
@@ -8484,6 +9155,8 @@ mod tests {
                 host_id.clone(),
                 "instance.send".into(),
                 json!({"instanceId": instance.instance_id}),
+                None,
+                None,
                 None,
                 None,
             )
@@ -8599,6 +9272,8 @@ mod tests {
                 json!({"instanceId": instance.instance_id}),
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .expect("command");
@@ -8656,6 +9331,8 @@ mod tests {
                 host_id.clone(),
                 "instance.send".into(),
                 json!({"instanceId": instance.instance_id}),
+                None,
+                None,
                 None,
                 None,
             )
@@ -8725,6 +9402,8 @@ mod tests {
                         host_id.clone(),
                         "instance.send".into(),
                         json!({"instanceId": instance.instance_id}),
+                        None,
+                        None,
                         None,
                         None,
                     )
@@ -9045,6 +9724,8 @@ mod tests {
                 payload.clone(),
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -9237,6 +9918,8 @@ mod tests {
                     host.clone(),
                     "instance.configure".into(),
                     payload.clone(),
+                    None,
+                    None,
                     None,
                     None,
                 )
@@ -14244,6 +14927,8 @@ mod tests {
                     json!({"path": "/srv/dup", "workspaceId": "wsp_dup"}),
                     None,
                     None,
+                    None,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -14957,12 +15642,101 @@ fn load_journal_row(
     .map_err(StoreError::from)
 }
 
+/// D-057 §7.3: the single commit-time authority check, run INSIDE the writer
+/// job that admits an Agent-initiated mutation. Passes for `None` (Human/Bot
+/// callers and Hub-internal cleanup). Otherwise it requires all of:
+/// - the initiator's instance exists and is not fenced;
+/// - its stamped generation equals the lineage's live generation;
+/// - the lineage is not paused;
+/// - when a device id is given, that exact device row still exists and is
+///   either bound to the initiator's instance (launch credential / MCP token)
+///   or is the unbound Human device that narrowed to it
+///   (`x-remuda-instance-id`). Hub-internal successor initiators pass `None`
+///   and skip the device clause.
+///
+/// Any failure is [`StoreError::Fenced`] (409 `fenced`); the surrounding
+/// writer job writes nothing because the error rolls the transaction back.
+pub(crate) fn check_initiator(
+    conn: &Connection,
+    initiator: Option<&remuda_protocol::Initiator>,
+    device_id: Option<&str>,
+) -> Result<(), StoreError> {
+    let Some(initiator) = initiator else {
+        return Ok(());
+    };
+    let authority: Option<(Option<String>, i64, Option<String>)> = conn
+        .query_row(
+            "SELECT i.fenced_at, COALESCE(l.generation, i.generation), l.state
+             FROM instances i
+             LEFT JOIN lineages l ON l.lineage_id = i.lineage_id
+             WHERE i.id = ?1",
+            params![initiator.instance_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((fenced_at, live_generation, lineage_state)) = authority else {
+        return Err(StoreError::Fenced);
+    };
+    if fenced_at.is_some()
+        || live_generation != initiator.generation
+        || lineage_state.as_deref() == Some("paused")
+    {
+        return Err(StoreError::Fenced);
+    }
+    if let Some(device_id) = device_id {
+        let device: Option<(String, Option<String>)> = conn
+            .query_row(
+                "SELECT kind, instance_id FROM devices WHERE id = ?1",
+                params![device_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let device_ok = match device {
+            // The launch credential or an MCP token bound to this instance.
+            Some((_, Some(bound))) => bound == initiator.instance_id,
+            // An UNBOUND device that narrowed with x-remuda-instance-id:
+            // caller() only allows narrowing when the presented token is not
+            // itself bound, so the row is Human or Bot (the CLI's
+            // REMUDA_INSTANCE_ID Bot path). Both may act for the chapter via
+            // narrowing; only an unbound device can narrow at all.
+            Some((_kind, None)) => true,
+            None => false,
+        };
+        if !device_ok {
+            return Err(StoreError::Fenced);
+        }
+    }
+    Ok(())
+}
+
+/// Test-only: apply the authority effects of a fence to one instance — marks
+/// the chapter fenced and bumps its lineage's live generation into `paused`.
+/// The cancellations and device deletions of the real F land in ma-fence.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-faults"))]
+pub(crate) fn test_apply_fence(conn: &Connection, instance_id: &str) -> Result<(), StoreError> {
+    let now = now_rfc3339();
+    conn.execute(
+        "UPDATE instances SET fenced_at = ?1, updated_at = ?1 WHERE id = ?2",
+        params![now, instance_id],
+    )?;
+    conn.execute(
+        "UPDATE lineages
+            SET generation = generation + 1, state = 'paused', paused_at = ?1, updated_at = ?1
+          WHERE lineage_id = (SELECT lineage_id FROM instances WHERE id = ?2)",
+        params![now, instance_id],
+    )?;
+    Ok(())
+}
+
 fn load_command(conn: &Connection, id: &str) -> Result<Option<CommandRecord>, StoreError> {
     conn.query_row(
         "SELECT id, instance_id, host_id, operation, state, resolution, forwarded,
                 payload_json, idempotency_key, created_at, updated_at,
                 settlement_outcome, settlement_reason,
-                settlement_http_status, settlement_http_body
+                settlement_http_status, settlement_http_body,
+                initiator_instance_id, initiator_lineage_id, initiator_generation,
+                initiator_device_id
          FROM commands WHERE id = ?1",
         params![id],
         command_from_row,
@@ -14976,7 +15750,9 @@ fn load_command_by_key(conn: &Connection, key: &str) -> Result<Option<CommandRec
         "SELECT id, instance_id, host_id, operation, state, resolution, forwarded,
                 payload_json, idempotency_key, created_at, updated_at,
                 settlement_outcome, settlement_reason,
-                settlement_http_status, settlement_http_body
+                settlement_http_status, settlement_http_body,
+                initiator_instance_id, initiator_lineage_id, initiator_generation,
+                initiator_device_id
          FROM commands WHERE idempotency_key = ?1",
         params![key],
         command_from_row,
@@ -15495,6 +16271,21 @@ fn owner_instance_ended(conn: &Connection, instance_id: &str) -> Result<bool, St
 /// resolve that upgrade). IMMEDIATE waits on the busy timeout instead.
 pub(crate) fn immediate_tx(conn: &mut Connection) -> rusqlite::Result<rusqlite::Transaction<'_>> {
     conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+}
+
+/// The host-offline rows: the host leaves `online` (stamping `offline_since`
+/// for the host-lost grace) and its instances read disconnected.
+fn mark_host_offline_rows(conn: &Connection, host_id: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE hosts SET state = 'offline', offline_since = ?2 WHERE id = ?1 AND state = 'online'",
+        params![host_id, now_rfc3339()],
+    )?;
+    conn.execute(
+        "UPDATE instances SET connectivity = 'disconnected', updated_at = ?1
+         WHERE host_id = ?2 AND connectivity != 'disconnected'",
+        params![now_rfc3339(), host_id],
+    )?;
+    Ok(())
 }
 
 /// c-cardsettle: invalidate every still-`pending` interaction owned by
@@ -16047,6 +16838,25 @@ fn command_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandRecord> 
     let settlement_reason: Option<String> = row.get(12)?;
     let settlement_http_status: Option<i64> = row.get(13)?;
     let settlement_http_body: Option<String> = row.get(14)?;
+    // D-057 §7.1: the three initiator columns are all NULL (legacy/Human/Bot
+    // rows) or all set together.
+    let initiator_instance_id: Option<String> = row.get(15)?;
+    let initiator_lineage_id: Option<String> = row.get(16)?;
+    let initiator_generation: Option<i64> = row.get(17)?;
+    let initiator = match (
+        initiator_instance_id,
+        initiator_lineage_id,
+        initiator_generation,
+    ) {
+        (Some(instance_id), Some(lineage_id), Some(generation)) => {
+            Some(remuda_protocol::Initiator {
+                instance_id,
+                lineage_id,
+                generation,
+            })
+        }
+        _ => None,
+    };
     Ok(CommandRecord {
         command_id: row.get(0)?,
         instance_id: row.get(1)?,
@@ -16063,6 +16873,8 @@ fn command_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandRecord> 
         settlement_reason,
         settlement_http_status,
         settlement_http_body,
+        initiator,
+        initiator_device_id: row.get(18)?,
         payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
         idempotency_key: row.get(8)?,
         created_at: row.get(9)?,

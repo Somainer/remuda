@@ -32,7 +32,38 @@ pub(super) async fn run(config: Config, args: Args, mut shutdown: Shutdown) -> R
         transport: "ssh-stdio".into(),
         data_dir: config.data_dir.clone(),
     };
-    let control = DaemonControl::new()?;
+    // r15 item 7: the DURABLE control (fence + persisted controller
+    // generation in `<data_dir>/controller-generation`) is wired through every
+    // production constructor so a real restart starts above every generation a
+    // prior process handed out.
+    //
+    // The host inventory is collected ONCE here (bounded, off the async
+    // runtime) and handed to the control: previously it was `None`, so EVERY
+    // bridge handshake re-ran the full PATH/CLI probe set before sending the
+    // Hub-facing node.hello — a detached daemon appeared to "hang after its
+    // bridge handshake" (the hello waited on minutes-long probes on a
+    // constrained box). With the snapshot shared, controller handshakes send
+    // the hello immediately while still racing takeover on the read arm.
+    let inventory = {
+        let data_dir = config.data_dir.clone();
+        let labels = config.node.labels.clone();
+        let max_instances = config.node.max_instances;
+        let herdr_socket = config
+            .node
+            .herdr_socket
+            .clone()
+            .or_else(|| Some(data_dir.join("herdr")));
+        tokio::task::spawn_blocking(move || {
+            remuda_node::collect(&remuda_node::CollectRequest {
+                labels,
+                max_instances,
+                herdr_socket,
+            })
+        })
+        .await
+        .expect("inventory collection task")
+    };
+    let control = DaemonControl::open(config.data_dir.clone(), Some(inventory))?;
     let (stop, stopped) = watch::channel(false);
     let outbound_config = config.clone();
     let outbound_runtime = runtime.clone();

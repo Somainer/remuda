@@ -294,7 +294,7 @@ pub(crate) struct ReturnWorktreeBody {
     task_id: String,
 }
 
-const WORKTREE_RPC_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const WORKTREE_RPC_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// `GET /healthz`
 ///
@@ -970,6 +970,10 @@ async fn stop_before_delete(
             instance.host_id.clone(),
             "instance.close".into(),
             json!({ "instanceId": instance.instance_id, "origin": "human" }),
+            None,
+            None,
+            // Hub-internal cleanup before an operator delete (main-agent.md
+            // §7.1): never fenced.
             None,
             None,
         )
@@ -1804,6 +1808,8 @@ pub async fn create_instance(
         }
         binding_claim = Some((host_id, workspace_id, dir_key, claim));
     }
+    let (create_initiator, create_device_id) =
+        crate::agent_scope::initiator_and_device(&state, &device).await?;
     let spawn_result = crate::placement::spawn_on_host(
         &state,
         &host,
@@ -1817,6 +1823,8 @@ pub async fn create_instance(
             operation: "instance.create",
             idempotency_key: None,
             delegation,
+            initiator: create_initiator,
+            initiator_device_id: create_device_id,
         },
     )
     .await;
@@ -2097,6 +2105,10 @@ pub async fn resume_instance(
             operation: "instance.resume",
             idempotency_key: Some(idempotency_key),
             delegation: crate::store::InstanceDelegation::default(),
+            // Operator-only resume route (D-026); worker respawn uses the
+            // internal helper, not this path.
+            initiator: None,
+            initiator_device_id: None,
         },
     )
     .await?;
@@ -2433,6 +2445,9 @@ async fn resume_lineage(
                 json!({ "instanceId": fenced.instance_id, "origin": "human" }),
                 None,
                 None,
+                // Hub-internal cleanup inside a continuation resume.
+                None,
+                None,
             )
             .await?;
         let _ = forward_if_online(state, close, true).await;
@@ -2751,6 +2766,9 @@ pub async fn post_command(
     // in-flight 409. Commands without a client id cannot be replayed before
     // the response reveals the minted id, so they need no marker.
     let mut dispatch = body.command_id.as_deref().map(begin_dispatch);
+    // D-057 §7.1: Hub-stamped from the authenticated device, never the body.
+    let (initiator, initiator_device_id) =
+        crate::agent_scope::initiator_and_device(&state, &device).await?;
     let (command, created) = state
         .store
         .queue_command(
@@ -2761,6 +2779,8 @@ pub async fn post_command(
             payload,
             body.idempotency_key,
             None,
+            initiator,
+            initiator_device_id,
         )
         .await
         .map_err(map_store)?;
@@ -3686,9 +3706,10 @@ pub async fn lease_worktree(
     Json(body): Json<LeaseWorktreeBody>,
 ) -> Result<Json<Value>, HubError> {
     require_origin(&headers, &state.config)?;
-    require_device(&state.store, &headers).await?;
+    let device = require_device(&state.store, &headers).await?;
     validate_worktree_key(&path.name)?;
     let host = pick_worktree_host(&state, body.host_id.as_deref()).await?;
+    let auth = crate::node_ops::NodeOpAuth::for_device(&state, &device).await?;
     let outcome = lease_on_host(
         &state,
         &host.host_id,
@@ -3696,6 +3717,7 @@ pub async fn lease_worktree(
         &path.name,
         body.base.as_deref(),
         &body.task_id,
+        &auth,
     )
     .await?;
     Ok(Json(outcome.result))
@@ -3723,6 +3745,7 @@ pub(crate) async fn lease_on_host(
     path_name: &str,
     base: Option<&str>,
     task_id: &str,
+    auth: &crate::node_ops::NodeOpAuth,
 ) -> Result<LeaseOutcome, HubError> {
     validate_worktree_key(path_name)?;
     let task = parse_task_id(task_id)?;
@@ -3738,7 +3761,17 @@ pub(crate) async fn lease_on_host(
     if let Some(base) = base.map(str::trim).filter(|raw| !raw.is_empty()) {
         params["base"] = json!(base);
     }
-    let result = call_node(state, host_id, "worktree.lease", params).await?;
+    let result = crate::node_ops::call_admitted(
+        state,
+        host_id,
+        "worktree.lease",
+        Some(path_name.to_owned()),
+        format!("wtl_{}", uuid::Uuid::now_v7()),
+        params,
+        WORKTREE_RPC_TIMEOUT,
+        auth,
+    )
+    .await?;
     // The pool is full and no clean slot exists: the Node refuses explicitly
     // instead of rerouting, and the Hub projects the 429 vocabulary (D-035).
     if result.get("deferred").and_then(Value::as_bool) == Some(true) {
@@ -3821,6 +3854,9 @@ pub(crate) async fn lease_on_host(
 pub(crate) fn lease_refusal(error: HubError) -> HubError {
     match error {
         HubError::SupplyDeferred { .. } => error,
+        // D-057 §7.3: a fence landing before lease admission is an authority
+        // refusal, not a directory conflict — keep the 409 `fenced` shape.
+        HubError::Fenced => error,
         other => HubError::Conflict(format!("directory binding blocked: {other}")),
     }
 }
@@ -3836,19 +3872,30 @@ pub async fn return_worktree(
     Json(body): Json<ReturnWorktreeBody>,
 ) -> Result<Json<Value>, HubError> {
     require_origin(&headers, &state.config)?;
-    require_device(&state.store, &headers).await?;
+    let device = require_device(&state.store, &headers).await?;
     validate_worktree_key(&path.name)?;
     let task = parse_task_id(&body.task_id)?;
     let host = pick_worktree_host(&state, body.host_id.as_deref()).await?;
     let node_name = node_worktree_name(&path.name);
     let workspace_id = body.workspace_id.unwrap_or_default();
+    let auth = crate::node_ops::NodeOpAuth::for_device(&state, &device).await?;
     let params = json!({
         "hostId": host.host_id,
         "workspaceId": workspace_id,
         "name": node_name,
         "taskId": task.as_id().as_str(),
     });
-    let result = call_node(&state, &host.host_id, "worktree.return", params).await?;
+    let result = crate::node_ops::call_admitted(
+        &state,
+        &host.host_id,
+        "worktree.return",
+        Some(node_name.to_owned()),
+        format!("wtr_{}", uuid::Uuid::now_v7()),
+        params,
+        WORKTREE_RPC_TIMEOUT,
+        &auth,
+    )
+    .await?;
     let dir_key = result
         .get("dirKey")
         .and_then(Value::as_str)
@@ -4178,7 +4225,8 @@ pub(crate) async fn forward_if_online(
             let first = state
                 .store
                 .mark_forward_intent(command.command_id.clone(), link_generation)
-                .await?;
+                .await
+                .map_err(map_store)?;
             if !first {
                 // Durably forwarded/advanced already: a committed row. A
                 // follower could only have joined the slot before this point
@@ -4220,6 +4268,14 @@ pub(crate) async fn forward_if_online(
         .as_object_mut()
         .ok_or_else(|| HubError::BadRequest("command payload must be an object".into()))?;
     object.insert("commandId".into(), json!(command.command_id));
+    // D-057 §7.1: forward the Hub-stamped initiator (never the device id).
+    // Older Hubs sent no initiator; the Node treats its absence as before.
+    if let Some(initiator) = &command.initiator {
+        object.insert(
+            "initiator".into(),
+            serde_json::to_value(initiator).unwrap_or(Value::Null),
+        );
+    }
     if matches!(
         command.operation.as_str(),
         "instance.create" | "instance.resume"
@@ -4624,6 +4680,7 @@ pub(crate) fn map_store(err: crate::store::StoreError) -> HubError {
             HubError::Conflict(msg.clone())
         }
         crate::store::StoreError::Conflict(msg) => HubError::Conflict(msg.clone()),
+        crate::store::StoreError::Fenced => HubError::Fenced,
         crate::store::StoreError::Forbidden(_) => HubError::Forbidden,
         crate::store::StoreError::Id(msg) => HubError::BadRequest(msg.clone()),
         other => HubError::Store(other.clone_as_internal()),
@@ -4658,6 +4715,8 @@ mod forward_slot_tests {
             settlement_http_status: None,
             settlement_http_body: None,
             settlement: None,
+            initiator: None,
+            initiator_device_id: None,
         }
     }
 

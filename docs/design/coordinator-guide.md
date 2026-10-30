@@ -221,10 +221,161 @@ If a gate fails, the branch goes back to its agent with the failing output —
 don't fix a worker's crate inside the merge. Independent branches merge in
 any order; when two agents touched one file, land the smaller diff first.
 
+### Gate queue: Landing, cancel and restart semantics
+
+The Hub gate queue owns a small explicit state machine per job:
+
+```
+queued → running → (only via gate.landGrant) → landing → landed
+                    │                              └→ failed
+                    │                              └→ queued (land CAS lost: base moved)
+                    ├→ passed   (verify job)
+                    ├→ failed
+                    └→ canceling → canceled
+```
+
+- **Canceling is not grantable.** The verify→land grant is a conditional
+  `running → landing` writer that matches *only* a `running` row at the exact
+  `(job, attempt generation, host, authenticated carrier session)`. A
+  `canceling` row never matches, so a cancel that commits first always wins
+  and nothing is pushed. After the grant the row is `landing`; a later cancel
+  returns 409 "landing in progress" and the granted push runs to completion.
+- **Session fencing.** Every Node carrier connection mints a **process-wide,
+  monotonically non-reused** session id (not a per-host counter that resets to 1
+  after a disconnect). At dispatch the Hub records that session on the row.
+  The socket's own authenticated session — never a value a frame claims — is
+  required at every authority gate:
+  - the pre-execute `gate.authorize` fence;
+  - `gate.landGrant`, in both the `running → landing` arm and the
+    idempotent "already landing" re-answer;
+  - and the verdict that *settles* a `landing` row — both the `finished`
+    `gate.event` and the `gate.run` RPC reply carry their socket session, and the
+    Landing writer (plus the evidence log transaction) only accepts a verdict whose
+    session equals the persisted granted session.
+
+  A superseded-but-still-open socket is refused `session-superseded` even though
+  it stays connected: it can neither authorize, re-grant, nor finish-settle a
+  granted Landing. On the Node, a WSS reconnect revokes run authority for the
+  reconnect window and rebinds to the new hello; the durable daemon bumps a
+  controller generation on takeover. A Node with **no registered carrier
+  authorizer always refuses** — missing authority is permission. When a carrier
+  session ends, pre-grant `running` jobs dispatched on that session re-enter the
+  queue (or finish `canceled`), keyed to the ended session so a takeover
+  (old socket still open) does not yank a run that is verifying.
+- **Landing is in-flight, not terminal.** Until its outcome is established a
+  `landing` row keeps its lane checkout and the project's single land slot: the
+  scheduler counts it for lane-busy and land-serialization, and it stays in
+  the active view. The rule for settling is: **landed** only when the exact
+  granted merge is confirmed on the remote base; **failed** only when the push is
+  provably not pushed AND the land process group is dead; **uncertain**
+  otherwise it stays `landing` and occupied. A `gate.run` RPC error/timeout
+  against a `landing` row never fails it, and losing the RPC or the carrier
+  after the grant schedules an immediate bounded read-only reconciliation while the
+  row stays Landing.
+- **Restart preserves Landing; it is reconciled only after carriers
+  reconnect.** Startup does not settle Landing rows at all — before the listener
+  binds there is no carrier registry to probe with, so guessing a verdict there is
+  wrong (a push that reached origin before exit could be called failed, a still
+  running push could be re-run). Landing rows keep their lane/host occupancy
+  across the restart. Once a lane host reconnects (or on a periodic tick), a
+  self-serializing, throttled reconciler does a read-only `gate.resolveLanding`
+  probe — `git fetch` + `merge-base --is-ancestor` of the **exact granted merge**
+  against the remote base: present → settle `landed` (journal `gate.landed`,
+  run `--then`, drop pins); absent → the row STAYS `landing` — see the R1–R4
+  outcome rules below; it is never force-settled failed merely because a window
+  elapsed. Nothing is ever re-dispatched or re-pushed by the reconciler.
+- **Outcome rules (R1–R4, 2026-10-13): an unestablished outcome is never a
+  verdict.**
+  - **R1 — unknown is never failure.** An expired recovery window does NOT
+    settle a Landing failed. A row whose outcome cannot be established that
+    old stays `landing` and holding occupancy; it is surfaced to the operator
+    (job API + a `gate.landing-unknown` journal entry) and is resolvable only
+    by an explicit operator action (R4) or by an established remote fact.
+  - **R2 — authority is current.** Only the CURRENT granted session/attempt
+    (host, authenticated carrier socket generation, and `(attempts, merge)` on
+    the writer) may settle a Landing. A probe/verdict from an older generation
+    never settles a newer attempt; a Finished from a session the Hub no longer
+    considers current is stood down; only the live current session settles.
+    Every Landing settlement/evidence writer takes a per-host authority guard:
+    a carrier hello (takeover) or socket teardown holds the guard exclusively
+    for its lifetime, so a verdict cannot commit between a pre-check and a
+    socket replacement — the decision either happens entirely before the new
+    session registers or the probe/verdict is stood down by the commit-time
+    predicate (which now also matches the authenticated host id). Evidence
+    writes (`insert_gate_log`) reject a null-session Landing verdict and
+    refuse another session/host for the same row.
+  - **R3 — session ids never repeat, even across Hub restarts.** The carrier
+    session id is `(boot_epoch << 32) | per-boot counter`; the boot epoch is a
+    persisted monotonic counter in the Hub SQLite DB allocated in ONE immediate
+    transaction on boot. The Hub refuses to start (it does not mint sessions)
+    when the epoch row is missing alongside retained carrier sessions, or is
+    older than the highest retained session epoch — a cloned/partially restored
+    data dir cannot mint a repeated id. A same-boot carrier reconnect
+    re-binds the host's in-flight Landing rows to the fresh session before the
+    forced post-hello probe (that reconnect is the same boot's continuation of
+    authority; rows from an older boot keep their stale binding and reconcile
+    by the persisted id). The Node durable daemon keeps its own persisted
+    controller generation in its data dir, so a new process hands out an id
+    above every id the prior process issued; the product `remuda node daemon`
+    builds this durable control (not an in-memory one) and pre-collects its host
+    inventory once at startup, so a bridge handshake sends its Hub hello
+    immediately.
+  - **R4 — a failed/absent/requeue verdict needs an established fact.** A
+    non-`landed` outcome requires either provable absence of the granted merge
+    on remote main AND a verified-dead land process group (the Node durably
+    fences its land group at grant and attests `absent` only after
+    TERM→bounded-wait→whole-group-KILL and an ESRCH group check), or the
+    explicit operator-resolution endpoint. Resolution is operator-only: agent
+    callers are refused 403. The request must name the exact granted attempt
+    (`expectedAttempts`), grant epoch (`expectedSessionEpoch`) and merge
+    (`expectedMergeSha`), include a mandatory non-empty `rationale`, and the
+    writer validates the whole tuple before committing — a stale frame naming a
+    newer attempt or merge cannot discard the row. The rationale is persisted
+    on the row. With a live carrier the endpoint first takes one final
+    read-only probe under the authority guard; an established `landed` fact
+    wins over the operator decision.
+  - **R5 — fail closed on unestablished evidence (2026-10-13).** Every
+    evidence read is either Established or Unknown. A failed command (a failed
+    `git fetch`/`merge-base`/`ref`/rev-parse, a missing or unreadable durable
+    fence ledger, missing `/proc` process identity) is Unknown, never a
+    negative fact. On the Node: the granted-land durable fence is written
+    before the land child is released (child-start barrier on the child's
+    stdin), a fencing failure fails the launch locally (nothing pushed); a
+    stale/unknown cancel or abort never signals another attempt's group; a
+    startup fence that cannot read positive leader identity keeps the record
+    (Unknown ownership) and signals only on a positive start-time match;
+    group termination always runs the full TERM→bounded-wait→whole-group-KILL
+    and claims death only by a kernel ESRCH, and the `/proc` enumeration is
+    test-gated with a portable start identity (`ps lstart` fallback) so a
+    missing `/proc` (e.g. macOS) never makes the scan return an empty list.
+    The merge CLI reports a failed land push as `uncertain` (exit 4) whenever
+    any recovery read fails, keeps its reachability pin until an established
+    landed/absent fact, and a waiting land child blocks on an
+    `REMUDA_START_BARRIER_FD` release byte (EOF/error exits before touching git).
+  A failed land push (`merge --land`) fetches origin FIRST and only reports a
+  failure when the exact merge is absent AND the remote ref is unchanged; a
+  push whose acknowledgement was lost is resolved against the remote before
+  any verdict and a merge that landed with the lost ack is reported `landed`,
+  never failed or base-moved.
+- **Land timeout is synchronous and reported uncertain.** If a granted land child
+  overruns its budget, the Node terminates its **whole process group** before
+  returning: SIGTERM the group, boundedly wait through the whole TERM grace for
+  a TERM-ignoring leader (readiness is proven by a marker written only after
+  the trap is installed, not a fixed sleep), SIGKILL the whole group
+  unconditionally, then reap the leader and verify the group is gone by ESRCH.
+  Death is claimed only on the kernel answer; a missing/transient `/proc`
+  scan is diagnostic-only and never shortens the kill. The verdict is
+  `uncertain`, never `failed`: even with the group dead, the remote may already
+  have accepted the ref, so the Hub leaves the row Landing and establishes the
+  outcome via the remote reconciliation above. The land child's stderr is
+  drained concurrently for its whole life, so a large remote rejection cannot
+  block the pipe.
+
 Several agents sharing one worktree is a different situation, covered by
 [CONTRIBUTING.md](../../CONTRIBUTING.md) "Staged-content verification":
 stage only your files, then prove the *index* builds with
 `git stash push --keep-index` around the gates.
+
 
 ## Secret scan
 

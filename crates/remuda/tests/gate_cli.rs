@@ -82,6 +82,35 @@ async fn spawn_hub() -> Result<Hub> {
             };
             let params = frame.get("params").cloned().unwrap_or(json!({}));
             match method {
+                // r11: the Node asks the Hub for authority before executing
+                // and before landing; the fake Hub authorizes/grants.
+                "gate.authorize" => {
+                    let reply = json!({"jsonrpc":"2.0","id":id,"result":{
+                        "authorized": true,
+                        "generation": params["generation"].clone(),
+                    }});
+                    if node
+                        .send(Message::Text(reply.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                "gate.landGrant" => {
+                    let reply = json!({"jsonrpc":"2.0","id":id,"result":{
+                        "granted": true,
+                        "generation": params["generation"].clone(),
+                        "landingInProgress": false,
+                    }});
+                    if node
+                        .send(Message::Text(reply.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
                 "gate.run" => {
                     let job = params["jobId"].as_str().unwrap_or("").to_string();
                     let mode = params["mode"].as_str().unwrap_or("verify");
@@ -93,7 +122,7 @@ async fn spawn_hub() -> Result<Hub> {
                         let event = json!({
                             "jsonrpc": "2.0", "id": format!("evt-{seq}"),
                             "method": "gate.event",
-                            "params": {"jobId": job, "kind": "step",
+                            "params": {"jobId": job, "generation": 1, "kind": "step",
                                 "step": {"name": step.0, "status": step.1,
                                           "durationMs": step.2, "attempts": 1}},
                         });
@@ -108,6 +137,7 @@ async fn spawn_hub() -> Result<Hub> {
                     let result = if failed {
                         json!({
                             "jobId": job,
+                            "generation": 1,
                             "status": "failed",
                             "error": "gate failed or returned an incomplete step report",
                             "failedStep": "cargo-test",
@@ -143,7 +173,9 @@ async fn spawn_hub() -> Result<Hub> {
                             ("passed", "3333333333333333333333333333333333333333")
                         };
                         json!({
-                            "jobId": job, "status": status,
+                            "jobId": job,
+                            "generation": 1,
+                            "status": status,
                             "mergeSha": sha,
                             "baseSha": "1111111111111111111111111111111111111111",
                             "headSha": "2222222222222222222222222222222222222222",

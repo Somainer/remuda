@@ -62,6 +62,7 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
                     &instance_id,
                     InstanceCommandRequest {
                         origin: crate::origin::wire_origin(&params),
+                        initiator: crate::origin::wire_initiator(&params),
                         command_id: command_id_of(&params),
                         operation: CommandAction::Configure,
                         prompt: None,
@@ -92,6 +93,7 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
                     &instance_id,
                     InstanceCommandRequest {
                         origin: crate::origin::wire_origin(&params),
+                        initiator: crate::origin::wire_initiator(&params),
                         command_id: command_id_of(&params),
                         operation: CommandAction::Send,
                         prompt: Some(prompt_of(&params).unwrap_or_default()),
@@ -127,6 +129,7 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
                     &instance_id,
                     InstanceCommandRequest {
                         origin: crate::origin::wire_origin(&params),
+                        initiator: crate::origin::wire_initiator(&params),
                         command_id: command_id_of(&params),
                         operation: CommandAction::Cancel,
                         prompt: None,
@@ -160,6 +163,7 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
                     &instance_id,
                     InstanceCommandRequest {
                         origin: crate::origin::wire_origin(&params),
+                        initiator: crate::origin::wire_initiator(&params),
                         command_id: command_id_of(&params),
                         operation: CommandAction::RespondInteraction,
                         prompt: None,
@@ -300,6 +304,7 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
     };
     let mut request = CreateInstanceRequest {
         origin: crate::origin::wire_origin(params),
+        initiator: crate::origin::wire_initiator(params),
         agent_credential: params
             .get("agentCredential")
             .cloned()

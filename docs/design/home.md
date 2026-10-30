@@ -415,6 +415,7 @@ D-061 修订了 ui-spec §2.5「AskUserQuestion 不在列表里填完」：上�
 - **存储（`seen-hub`）：** 新表 `instance_views(instance_id, scope, seen_seq, seen_at)`。`scope` 目前只有 owner 一个取值。`seen_seq` 只增不减。
 - **写入：** `POST /v1/instances/{id}/seen {durableSeq}`，幂等，结果是 `seen_seq = max(seen_seq, durableSeq)`。只接受 Human 设备的凭据：seen 是 owner 的注意力状态，Agent 不能替 owner 写。
 - **投影：** `GET /v1/instances` 的每一行增加 `unseen: boolean`。当实例最近一个结束的根回合，其结束位置晚于 `seen_seq` 时，`unseen` 为真。这个回合成功时，行进入 §3 的第 2 档 ◉；失败时，行在队列里作为回合失败卡（§4.5）。
+- **容差（2 s）：** 回合结束与一次 seen 写入可能擦肩：客户端在回合结束的同一次轮询里写下的 `durableSeq` 可能略早于回合结束位置。判定 `unseen` 时，如果一次 seen 写入发生在回合结束之后、并且与回合结束相隔不超过 2 s，就视为覆盖该回合，即使它的位置略早于回合结束。除此之外位置仍是权威：相隔超过 2 s 的旧 seen 写入不享受容差，回合一律产生 ◉，绝不因为「大概看过」而吞掉。2 s 是产品常数，和 §8 的其他常数一样，受 gate 约束的测试用注入时钟断言。
 - **什么时候标为已看：**
   - 在页面可见时打开 `/s/:id` 的任一视图；
   - `/s/:id` 正在显示时回合结束；

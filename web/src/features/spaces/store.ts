@@ -30,6 +30,13 @@ export type SpacePrefs = {
   collapsed: boolean;
   groupCollapsed: Record<string, boolean>;
   exitedOpen: Record<string, boolean>;
+  /**
+   * Home fold state (P0-2), per device. A project id maps to whether its idle
+   * rows are unfolded; `quietOpen` is the shared 「安静的项目」 disclosure.
+   * Absent means folded — idle rows and quiet projects start closed.
+   */
+  idleOpen: Record<string, boolean>;
+  quietOpen: boolean;
   names: Record<string, string>;
   order: string[];
   selectedSpaceId?: string;
@@ -38,7 +45,7 @@ export type SpacePrefs = {
 };
 
 export function defaultSpacePrefs(): SpacePrefs {
-  return { version: 1, collapsed: false, groupCollapsed: {}, exitedOpen: {}, names: {}, order: [],
+  return { version: 1, collapsed: false, groupCollapsed: {}, exitedOpen: {}, idleOpen: {}, quietOpen: false, names: {}, order: [],
     selectedTabs: {}, closedTabs: {} };
 }
 
@@ -164,6 +171,8 @@ export function parseSpacePrefs(raw: string | null): SpacePrefs {
       collapsed: value.collapsed === true,
       groupCollapsed: booleanMap(value.groupCollapsed),
       exitedOpen: booleanMap(value.exitedOpen),
+      idleOpen: booleanMap(value.idleOpen),
+      quietOpen: value.quietOpen === true,
       names: stringMap(value.names),
       order: strings(value.order),
       selectedSpaceId: typeof value.selectedSpaceId === "string" ? value.selectedSpaceId : undefined,
@@ -217,6 +226,10 @@ export function createSpaceStore(storage = browserStorage()) {
     },
     toggleGroup(spaceId: string) { update({ groupCollapsed: { ...prefs.groupCollapsed, [spaceId]: !prefs.groupCollapsed[spaceId] } }); },
     toggleExited(spaceId: string) { update({ exitedOpen: { ...prefs.exitedOpen, [spaceId]: !prefs.exitedOpen[spaceId] } }); },
+    /** Unfolds or refolds one project's idle rows on the home ledger. */
+    toggleIdle(spaceId: string) { update({ idleOpen: { ...prefs.idleOpen, [spaceId]: !prefs.idleOpen[spaceId] } }); },
+    /** Unfolds or refolds the shared 「安静的项目」 group. */
+    toggleQuiet() { update({ quietOpen: !prefs.quietOpen }); },
     selectSpace(selectedSpaceId: string) { update({ selectedSpaceId }); },
     /** Opening a session from the sidebar or a deep link always restores its tab. */
     selectTab(spaceId: string, instanceId: string) {

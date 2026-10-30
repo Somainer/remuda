@@ -111,6 +111,7 @@ describe("device space preferences", () => {
       exitedOpen: { a: true, b: 1 }, names: { a: " A ", b: 4 }, order: ["a", "a", null, 4, "b"], selectedSpaceId: 5,
       selectedTabs: { a: "one", b: {} }, closedTabs: { a: ["one", "one", false], b: null } }));
     expect(prefs).toEqual({ version: 1, collapsed: false, groupCollapsed: { a: true }, exitedOpen: { a: true },
+      idleOpen: {}, quietOpen: false,
       names: { a: "A" }, order: ["a", "b"], selectedSpaceId: undefined, selectedTabs: { a: "one" },
       closedTabs: { a: [{ id: "one", resurface: true }], b: [] } });
     // A device that closed tabs before this release keeps them closed, and its
@@ -128,6 +129,24 @@ describe("device space preferences", () => {
     store.setCollapsed(true);
     store.selectTab(alpha, "a");
     expect(store.getSnapshot()).toMatchObject({ collapsed: true, selectedTabs: { [alpha]: "a" } });
+  });
+
+  it("remembers which project's idle rows are open and whether the quiet bucket is open", () => {
+    const store = createSpaceStore(localStorage);
+    expect(store.getSnapshot().quietOpen).toBe(false);
+    expect(store.getSnapshot().idleOpen).toEqual({});
+    store.toggleIdle(alpha);
+    store.toggleQuiet();
+    // A second toggle of the same project folds it again.
+    store.toggleIdle(beta);
+    store.toggleIdle(beta);
+    const again = createSpaceStore(localStorage).getSnapshot();
+    expect(again.idleOpen).toEqual({ [alpha]: true, [beta]: false });
+    expect(again.quietOpen).toBe(true);
+    // A stored record from before the fold fields parses as folded.
+    expect(parseSpacePrefs(JSON.stringify({ version: 1 }))).toMatchObject({ idleOpen: {}, quietOpen: false });
+    expect(parseSpacePrefs(JSON.stringify({ version: 1, idleOpen: { [alpha]: true, bad: "yes" }, quietOpen: true })))
+      .toMatchObject({ idleOpen: { [alpha]: true }, quietOpen: true });
   });
 });
 

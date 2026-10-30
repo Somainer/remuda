@@ -1,4 +1,7 @@
-import { render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
+
+const HELD = "[data-order-held='1']";
+const RELEASED = "[data-order-held='0']";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -479,7 +482,7 @@ describe("SessionList rows: next step, wire disclosure and overflow sheet", () =
 
   it("keeps each row's wire toggle aria-expanded in sync when two rows are open", async () => {
     const user = userEvent.setup();
-    hub.instances = [session("ins_a", { activity: known("idle") }), session("ins_b", { activity: known("idle") })];
+    hub.instances = [session("ins_a", { activity: known("working") }), session("ins_b", { activity: known("working") })];
     renderList();
     const cards = screen.getAllByTestId("board-card");
     const cardA = cards.find((card) => card.querySelector(`a[href="/s/ins_a"]`))!;
@@ -738,5 +741,301 @@ describe("SessionList relative-time clock (c-perffu r2)", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("desktop buckets", () => {
+  it("maps every rank to exactly one bucket", async () => {
+    const { HOME_RANKS } = await import("../mobile/homeRows");
+    const { SESSION_GROUPS } = await import("./sessionGroups");
+    for (const rank of HOME_RANKS) {
+      const matches = SESSION_GROUPS.filter((group) => group.match(rank));
+      expect(matches, `rank ${rank} belongs to exactly one bucket`).toHaveLength(1);
+    }
+    // The second rank is its own section: it can no longer fall on the floor.
+    expect(SESSION_GROUPS.find((group) => group.match("done-unseen"))?.title).toBe("完成未看");
+    const order = SESSION_GROUPS.map((group) => group.id);
+    expect(order).toEqual(["blocked", "unseen", "working", "recent", "exited"]);
+  });
+});
+
+describe("SessionList hold scope", () => {
+  it("does not freeze when focus is in the search box, so typing still filters", async () => {
+    titles.ins_alpha = "alpha run";
+    titles.ins_beta = "beta run";
+    renderList("", {
+      instances: [
+        session("ins_alpha", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+        session("ins_beta", { activity: known("idle"), updatedAt: "2026-09-19T08:00:00.000Z" }),
+      ],
+    });
+    const search = screen.getByTestId("session-search") as HTMLInputElement;
+    // Focus arrives from outside the list (a shortcut), then the user types.
+    act(() => {
+      search.focus();
+    });
+    expect(document.querySelector(HELD)).toBeNull();
+
+    await userEvent.type(search, "alpha");
+    // The list filters live: the non-matching row is gone.
+    expect(screen.queryByText("beta run")).toBeNull();
+    expect(screen.getByText("alpha run")).toBeTruthy();
+  });
+});
+
+describe("SessionList hold", () => {
+  function cards() {
+    return screen.queryAllByTestId("board-card").map((card) => card.getAttribute("data-instance-id"));
+  }
+  const tree = (instances: Instance[]) => (
+    <MemoryRouter initialEntries={["/sessions"]}>
+      <SessionList variant="full" instances={instances} title="demo-root" space={spaceA} />
+    </MemoryRouter>
+  );
+
+  it("keeps a held row in its bucket when its rank changes, then re-ranks on release", () => {
+    const first = [
+      session("ins_held", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+      session("ins_peer", { activity: known("working"), updatedAt: "2026-09-19T08:00:00.000Z" }),
+    ];
+    const { rerender } = renderList("", { instances: first });
+    expect(cards()).toEqual(["ins_held", "ins_peer"]);
+
+    const held = document.querySelector('[data-instance-id="ins_held"]')!;
+    fireEvent.pointerDown(held);
+    expect(document.querySelector(HELD)).not.toBeNull();
+
+    // The peer becomes blocked: its section would be created above the held
+    // row and the held row would fall under the pointer.
+    rerender(
+      tree([
+        session("ins_held", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+        session("ins_peer", { activity: known("waiting-interaction"), updatedAt: "2026-09-19T12:00:00.000Z" }),
+      ]),
+    );
+    expect(cards()).toEqual(["ins_held", "ins_peer"]);
+    expect(document.querySelector('[data-instance-id="ins_peer"]')).toHaveAttribute("data-rank", "blocked");
+
+    fireEvent.pointerUp(document.body);
+    expect(cards()).toEqual(["ins_peer", "ins_held"]);
+    expect(screen.getByTestId("session-group-blocked")).toBeTruthy();
+  });
+
+  it("keeps the held row in its painted bucket when it would move to 最近", () => {
+    const { rerender } = renderList("", {
+      instances: [
+        session("ins_held", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+        session("ins_peer", { activity: known("idle"), updatedAt: "2026-09-19T08:00:00.000Z" }),
+      ],
+    });
+    const held = document.querySelector('[data-instance-id="ins_held"]')!;
+    fireEvent.pointerDown(held);
+    expect(screen.getByTestId("session-group-working").contains(held)).toBe(true);
+
+    rerender(
+      tree([
+        session("ins_held", { activity: known("idle"), updatedAt: "2026-09-19T11:00:00.000Z" }),
+        session("ins_peer", { activity: known("idle"), updatedAt: "2026-09-19T08:00:00.000Z" }),
+      ]),
+    );
+    // Still painted under 进行中, with its new content.
+    expect(screen.getByTestId("session-group-working").contains(held)).toBe(true);
+    expect(held).toHaveAttribute("data-rank", "idle");
+
+    fireEvent.pointerUp(document.body);
+    // Re-query: the row is remounted under its new bucket.
+    const moved = document.querySelector('[data-instance-id="ins_held"]')!;
+    expect(screen.getByTestId("session-group-recent").contains(moved)).toBe(true);
+    expect(screen.queryByTestId("session-group-working")).toBeNull();
+  });
+
+  it("releases the focus hold when focus leaves the row for the toolbar", () => {
+    renderList("", {
+      instances: [
+        session("ins_held", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+      ],
+    });
+    const checkbox = document.querySelector<HTMLInputElement>(
+      '[data-instance-id="ins_held"] input[type="checkbox"]',
+    )!;
+    act(() => {
+      checkbox.focus();
+    });
+    expect(document.querySelector(HELD)).not.toBeNull();
+
+    act(() => {
+      screen.getByTestId("session-search").focus();
+    });
+    expect(document.querySelector(RELEASED)).not.toBeNull();
+  });
+
+  it("closes the action Sheet when its row goes stale", async () => {
+    const store = await import("../../lib/store");
+    const { rerender } = renderList("", {
+      instances: [
+        session("ins_held", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+        session("ins_peer", { activity: known("working"), updatedAt: "2026-09-19T08:00:00.000Z" }),
+      ],
+    });
+    await userEvent.click(screen.getAllByTestId("board-more")[0]);
+    expect(screen.getByTestId("board-actions-panel")).toBeTruthy();
+
+    rerender(
+      tree([session("ins_peer", { activity: known("working"), updatedAt: "2026-09-19T08:00:00.000Z" })]),
+    );
+    // The sheet goes with the row it belonged to, so nothing can send to it —
+    // and closing it releases the hold, so the stale row drops.
+    expect(screen.queryByTestId("board-actions-panel")).toBeNull();
+    expect(document.querySelector('[data-instance-id="ins_held"]')).toBeNull();
+    expect(store.hubStore.send).not.toHaveBeenCalled();
+    expect(store.hubStore.close).not.toHaveBeenCalled();
+  });
+
+  it("makes 去处理 inert on a stale placeholder", () => {
+    hub.interactions = [approvalInteraction("int_1", "ins_held", "echo hi")];
+    const { rerender } = renderList("", {
+      instances: [
+        session("ins_held", { activity: known("waiting-interaction"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+        session("ins_peer", { activity: known("working"), updatedAt: "2026-09-19T08:00:00.000Z" }),
+      ],
+    });
+    const go = document.querySelector('[data-instance-id="ins_held"] [data-testid="board-go-handle"]')!;
+    expect(go.getAttribute("aria-disabled")).toBeNull();
+
+    fireEvent.pointerDown(document.querySelector('[data-instance-id="ins_held"]')!);
+    rerender(
+      tree([session("ins_peer", { activity: known("working"), updatedAt: "2026-09-19T08:00:00.000Z" })]),
+    );
+    const staleGo = document.querySelector('[data-instance-id="ins_held"] [data-testid="board-go-handle"]')!;
+    expect(staleGo).toHaveAttribute("aria-disabled", "true");
+    expect(staleGo).toHaveAttribute("tabindex", "-1");
+    fireEvent.pointerUp(document.body);
+    hub.interactions = [];
+  });
+
+  it("re-establishes the focus hold when focus moves inside the row after a timeout", () => {
+    vi.useFakeTimers();
+    try {
+      renderList("", {
+        instances: [
+          session("ins_held", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+          session("ins_peer", { activity: known("working"), updatedAt: "2026-09-19T08:00:00.000Z" }),
+        ],
+      });
+      const checkbox = document.querySelector<HTMLInputElement>(
+        '[data-instance-id="ins_held"] input[type="checkbox"]',
+      )!;
+      act(() => {
+        checkbox.focus();
+      });
+      expect(document.querySelector(HELD)).not.toBeNull();
+
+      // The idle timeout releases it while focus stays put...
+      act(() => {
+        vi.advanceTimersByTime(10_000);
+      });
+      expect(document.querySelector(RELEASED)).not.toBeNull();
+
+      // ...and the next focus change inside the row holds again.
+      const more = document.querySelector<HTMLElement>('[data-instance-id="ins_held"] [data-testid="board-more"]')!;
+      act(() => {
+        more.focus();
+      });
+      expect(document.querySelector(HELD)).not.toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("holds on keyboard focus anywhere in a row, not just the ⋯ trigger", () => {
+    renderList("", {
+      instances: [
+        session("ins_held", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+        session("ins_peer", { activity: known("working"), updatedAt: "2026-09-19T08:00:00.000Z" }),
+      ],
+    });
+    const checkbox = document.querySelector('[data-instance-id="ins_held"] input[type="checkbox"]')!;
+    act(() => {
+      (checkbox as HTMLInputElement).focus();
+    });
+    expect(document.querySelector(HELD)).not.toBeNull();
+  });
+
+  it("survives pointer and click activity inside the open Sheet", async () => {
+    const { rerender } = renderList("", {
+      instances: [
+        session("ins_held", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+        session("ins_peer", { activity: known("working"), updatedAt: "2026-09-19T08:00:00.000Z" }),
+      ],
+    });
+    await userEvent.click(screen.getAllByTestId("board-more")[0]);
+    expect(document.querySelector(HELD)).not.toBeNull();
+
+    // Press, release and click inside the Sheet: none of it may release the hold.
+    const prompt = screen.getByTestId("board-actions-panel").querySelector("input")!;
+    fireEvent.pointerDown(prompt);
+    fireEvent.pointerUp(prompt);
+    await userEvent.click(prompt);
+    fireEvent.click(document.body);
+    expect(document.querySelector(HELD)).not.toBeNull();
+
+    rerender(
+      tree([
+        session("ins_held", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+        session("ins_peer", { activity: known("waiting-interaction"), updatedAt: "2026-09-19T12:00:00.000Z" }),
+      ]),
+    );
+    expect(cards()).toEqual(["ins_held", "ins_peer"]);
+
+    await userEvent.click(screen.getByTestId("board-actions-close"));
+    expect(document.querySelector(RELEASED)).not.toBeNull();
+    expect(cards()).toEqual(["ins_peer", "ins_held"]);
+  });
+
+  it("keeps a vanished held row as an inert placeholder until release", () => {
+    const { rerender } = renderList("", {
+      instances: [
+        session("ins_held", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+        session("ins_peer", { activity: known("working"), updatedAt: "2026-09-19T08:00:00.000Z" }),
+      ],
+    });
+    const held = document.querySelector('[data-instance-id="ins_held"]')!;
+    fireEvent.pointerDown(held);
+    expect(document.querySelector(HELD)).not.toBeNull();
+
+    // Another device deletes it mid-hold.
+    rerender(
+      tree([session("ins_peer", { activity: known("working"), updatedAt: "2026-09-19T08:00:00.000Z" })]),
+    );
+    const stale = document.querySelector('[data-instance-id="ins_held"]')!;
+    expect(stale).toHaveAttribute("data-stale", "1");
+    expect(stale.querySelector('[data-testid="session-row"]')).toHaveAttribute("aria-disabled", "true");
+    expect(stale.querySelector('[data-testid="board-more"]')).toBeDisabled();
+    expect(stale.querySelector('[data-testid="board-select"]')).toBeDisabled();
+
+    fireEvent.pointerUp(document.body);
+    expect(document.querySelector('[data-instance-id="ins_held"]')).toBeNull();
+  });
+
+  it("holds while the action Sheet is open", async () => {
+    const { rerender } = renderList("", {
+      instances: [
+        session("ins_a", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+        session("ins_b", { activity: known("working"), updatedAt: "2026-09-19T08:00:00.000Z" }),
+      ],
+    });
+    expect(cards()).toEqual(["ins_a", "ins_b"]);
+
+    await userEvent.click(screen.getAllByTestId("board-more")[0]);
+    expect(document.querySelector(HELD)).not.toBeNull();
+
+    rerender(
+      tree([
+        session("ins_a", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+        session("ins_b", { activity: known("waiting-interaction"), updatedAt: "2026-09-19T12:00:00.000Z" }),
+      ]),
+    );
+    // The open Sheet still owns the painted order.
+    expect(cards()).toEqual(["ins_a", "ins_b"]);
   });
 });

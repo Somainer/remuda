@@ -453,9 +453,16 @@ export function buildHomeRows(
   return rows;
 }
 
-function rowTime(row: HomeRow): number {
+function rowTime(row: Pick<RankRow, "updatedAt">): number {
   return Date.parse(row.updatedAt) || 0;
 }
+
+/**
+ * The fields the shared comparator reads. `HomeRow` satisfies it, and so does
+ * the small row the desktop list builds from an instance — that list has no
+ * context ring or body sentence of its own.
+ */
+export type RankRow = Pick<HomeRow, "id" | "rank" | "title" | "updatedAt">;
 
 /**
  * The one comparator both surfaces use. Rank first (blocked above done-unseen
@@ -463,7 +470,7 @@ function rowTime(row: HomeRow): number {
  * newest change first inside a rank. `list` ordering is the device preference
  * that sorts by title instead of time, still inside the rank.
  */
-export function compareRanked(a: HomeRow, b: HomeRow, order: HomeOrder = "clock"): number {
+export function compareRanked(a: RankRow, b: RankRow, order: HomeOrder = "clock"): number {
   const byRank = rankOrder(a.rank) - rankOrder(b.rank);
   if (byRank !== 0) return byRank;
   if (order === "list") return a.title.localeCompare(b.title) || a.id.localeCompare(b.id);

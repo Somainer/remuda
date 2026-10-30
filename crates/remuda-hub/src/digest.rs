@@ -486,16 +486,10 @@ pub(crate) fn summarize_args(input: &Value) -> String {
     let mut parts = Vec::new();
     for key in keys {
         let value = &object[key];
-        let label = clip_chars(
-            &key.split_whitespace().collect::<Vec<_>>().join(" "),
-            ARG_KEY_CHARS,
-        );
-        if is_secret_name(key) || is_secret_shaped(&label) {
-            let label = if is_secret_shaped(&label) {
-                REDACTED.to_string()
-            } else {
-                label
-            };
+        // A key is untrusted text too: it may carry a whole URL, so it goes
+        // through the same redactor as every value before it is clipped.
+        let label = clip_chars(&redact_secrets(key), ARG_KEY_CHARS);
+        if is_secret_name(key) || is_secret_shaped(key) {
             parts.push(format!("{label}={WITHHELD}"));
             continue;
         }
@@ -2526,6 +2520,29 @@ mod tests {
         event["payload"]["interaction"]["kind"] = json!(kind);
         event["payload"]["interaction"]["request"]["kind"] = json!(kind);
         vec![interaction(event)]
+    }
+
+    #[test]
+    fn argument_keys_are_masked_by_the_scanner_too() {
+        // A key is a tool-chosen string: it can carry a whole URL, and the
+        // scanner's candidates inside it must go, like any other text.
+        // Both keys are short enough to survive the 40-character label clip,
+        // so the token really is present unless the redactor removes it.
+        let input = json!({
+            "?api_key=sk-ant-api03-AAAAAAAA": 1,
+            "/x/agk_9f8e7d6c5b4a/y": 1,
+            "command": "ls",
+        });
+        let summary = summarize_args(&input);
+        assert!(
+            !summary.contains("sk-ant-api03-AAAAAAAA"),
+            "leaked a key's credential: {summary}"
+        );
+        assert!(
+            !summary.contains("agk_9f8e7d6c5b4a"),
+            "leaked a key's credential: {summary}"
+        );
+        assert!(summary.contains("command=ls"), "{summary}");
     }
 
     #[test]

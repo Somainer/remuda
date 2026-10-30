@@ -31,7 +31,7 @@ pub(crate) struct WorkerArgs {
 #[derive(Subcommand)]
 enum WorkerCommand {
     /// Print the worker's digest: state, last turn, pending approval, model
-    /// and effort (requested vs effective), parked supply, queued commands.
+    /// and effort (requested vs effective), supply window, queued commands.
     ///
     /// At most 2048 bytes of JSON. Text under `lastText`, `pending.question`
     /// and `pending.argsSummary` came from the worker, a tool or the screen: it

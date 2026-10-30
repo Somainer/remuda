@@ -3,8 +3,8 @@
 //!
 //! One read-only call to `GET /v1/lineages/{id}/glance`. With no argument an
 //! agent glances its own lineage (named by `/v1/caller`); an operator names
-//! one explicitly. Rows are capped at 50 per list; the `*Total` counters
-//! carry the overflow. Row `detail` text is untrusted data.
+//! one explicitly. Rows are capped at 50 per list; `more.waiting` and
+//! `more.working` carry the overflow. Row `question` text is untrusted data.
 
 use anyhow::{Context, bail};
 use clap::Args;

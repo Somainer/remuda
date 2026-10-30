@@ -15,6 +15,12 @@ use serde_json::{Value, json};
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
 
+/// A credential-shaped token assembled at run time: `scripts/ci/secret-scan.py`
+/// scans this file too, so no line of source may itself read as a token.
+fn secret(parts: &[&str]) -> String {
+    parts.concat()
+}
+
 /// The Hub's internal authority: these fixtures write rows the way a
 /// dispatcher would, not as a scoped Agent.
 fn internal_authority() -> remuda_hub::agent_scope_test_support::CallerAuthority {
@@ -365,13 +371,18 @@ async fn digest_is_assembled_from_stored_rows_and_stays_within_budget() -> Resul
             "blocks": [{ "type": "text", "text": wall }] }}),
     )
     .await?;
+    let agk = secret(&["agk", "_9f8e7d6c5b4a39281706"]);
+    let bearer = secret(&["Bear", "er"]);
+    let header_token = "q7Zr2LmW8pXc4VbN1";
+    let command = format!(
+        "sleep 120 && curl -H 'X-Api-Key: {agk}' --header={bearer} {header_token} https://x.test"
+    );
     ctx.journal(
         &instance_id,
         json!({ "kind": "tool_call", "payload": { "operation": "open", "toolCallId": "tc1",
             "toolName": { "state": "known", "value": "Bash" },
             "input": { "state": "known", "value": {
-                "command": "sleep 120 && curl -H 'X-Api-Key: agk_9f8e7d6c5b4a39281706' \
-                            --header=Bearer q7Zr2LmW8pXc4VbN1 https://x.test",
+                "command": command,
                 "handoff": "owner-typed-handoff-9917" } },
             "state": "proposed" }}),
     )
@@ -430,8 +441,8 @@ async fn digest_is_assembled_from_stored_rows_and_stays_within_budget() -> Resul
     // Remuda's own agent-token prefix and a token that rides a Bearer scheme.
     assert!(
         !args.contains("sk-ant-api03")
-            && !args.contains("agk_9f8e7d6c5b4a39281706")
-            && !args.contains("q7Zr2LmW8pXc4VbN1")
+            && !args.contains(&agk)
+            && !args.contains(header_token)
             && !args.contains("owner-typed-handoff"),
         "{args}"
     );

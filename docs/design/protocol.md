@@ -220,6 +220,7 @@ stateDiagram-v2
 | `lastError?` | `string` | 可省略的 driver/原生诊断文本，通常随 `lifecycle=failed` 写入；只是展示用摘要，不是状态、不是终态证据，也不能替代 `exit` 或 Run 的 `terminalEvidence` |
 | `mode?` / `promotedAt?` | `native\|promoted` / `Timestamp` | 该 Instance 如何到达当前 `kind`。`promoted` 表示 `terminal` + `shell-pty` 实例的 PTY 前台被已知 agent CLI 接管（D-025）：`kind` 改为该 agent，`driver` 仍是 `shell-pty`，`promotedAt` 记录检测时刻。降级回 `terminal` 时 `mode` 复位为 `native` 且清空 `promotedAt`。只有 driver 的 `agent_promoted` / `agent_demoted` native lifecycle 能改这两个字段，同名 `agent_detected` diagnostic 只进 journal |
 | `launchedBy?` | `remuda\|user` | **谁敲的这条命令**（D-028 §1.0 规则 4）。只记录出身，**不表示能力等级**：user 启动的 session 与 remuda 启动的享有完全相同的信号与能力。D-028 之前写入的行没有这个字段，读取时由 `mode` / `promotedAt` 推导——`promoted` 意味着一个 login shell 的前台被 agent CLI 接管，那条命令只可能是人敲的，因此推导为 `user`，其余为 `remuda`。它与 `mode` 并存而不取代它：`mode` 回答「kind 是不是提升来的」，`launchedBy` 回答「谁启动的」 |
+| `unseen?` / `seenSeq?` / `turnEndSeq?` | `boolean` / `U64` / `U64` | 完成未看（seen-hub，H6，见本节末「完成未看」）。`turnEndSeq` 是最近一次结算回合结束的 journal seq，`seenSeq` 是 owner 已看到的 seq，`unseen = turnEndSeq > seenSeq`。按 owner 记，所有 owner 设备读到同一个值 |
 
 ~~~mermaid
 stateDiagram-v2
@@ -256,6 +257,16 @@ stateDiagram-v2
 promoted 实例还要再分一层：前台 agent 消失是 **demote**（D-025，shell 还活着，实例不终结），只有 shell 自己退出才是实例 `exited`。停进程若无法确认进程组已消失，记 `stop-incomplete` 诊断，**不谎报 exited**。
 
 一个 Instance 表示一个原生 session 及其进程托管关系，允许同一原生 session 在不同时刻使用替换进程；不允许两个活进程同时写它。`ready` 不保证空闲。`failed` 是确定启动失败，不把断线升级成失败。原生已在执行但无法 attach 时保持 unknown 或 observed-only；不能悄悄启动第二份。
+
+**完成未看（seen-hub，H6）。** 首页的 ◉ 由 Hub 投影，按 owner 记，手机和桌面读到同一个值：
+
+- **回合结束**：一条 journal 行把 `activity` 从 `working` / `blocked` / `draining` 推到 `idle`，即根回合结算（成功或错误都算）。判据是这次转移，不是 idle 观测本身，所以重复的 idle 状态不会重新点亮 ◉。最近一次的 seq 记为 `turnEndSeq`，只增不减，与该行在同一事务落盘。
+- **已看**：`POST /v1/instances/{id}/seen {durableSeq, visible?}`，存于 `instance_views(instance_id, scope, seen_seq, seen_at)`，今天 `scope` 只有 `owner`（保留该列给以后的作用域）。只增不减：更低的 seq 不会让 seen 后退；超过 journal 的 seq 截到该实例的 `durableSeq`，不能提前「看过」还没发生的回合。只有 Human 设备可报：Agent 凭证被 agent 路由策略拒绝，Bot 设备由 handler 返回 403。
+- **判定**：`unseen = turnEndSeq > seenSeq`，从未报告过的 `seenSeq` 视为低于 0。
+- **可见容差**：会话页在屏幕上时，客户端带 `visible: true` 报告并每 4 s 续约；Hub 为每台设备持有 10 s 的可见租约（与首页「10 s 无成功刷新即过期」同一窗口），只在内存里，Hub 重启后由下一次续约补上。页面隐藏或离开时带 `visible: false` 释放本设备的租约，其他设备的租约不受影响；关掉标签页没来得及释放的，租约到期即失效。回合结束那一行落盘时，只要有任一 owner 设备持有租约，Hub 就在同一事务里把 seen 推进到这一行，所以看着它结束的回合在任何设备上都不会显示 ◉，一个轮询周期也不会。不带 `visible` 的报告（例如在列表上「全部看过」）只推进 seen，不持有租约。
+- **恢复与章节**：D-026 resume 出的子实例和 D-057 的后继章节都是新的实例 id，没有 seen 行，也没有回合结束，要等自己的回合结束之后才可能变成 unseen。前任保留自己的 seen 状态；首页只在活着的 idle 行上显示 ◉，所以已退出或已被隔离（fenced）的前任不会把 ◉ 带到首页。
+- **广播**：seen seq 前进，或回合结束改变了 seen 状态时，Hub 在 `/v1/follow` 总线上发一个 `instance.seen` 事件（字段同路由的响应：`instanceId`、`unseen`、`seenSeq`、`seenAt`、`turnEndSeq`）。它与工作区的 `host.updated` 走同一条路：帧的 `instanceId` 为空串，只有不过滤的全局 follower 收到，每会话的 journal 流不会把它当成 journal 行。漏收的由下一次实例轮询补齐。
+- **升级**：迁移是 `PRAGMA user_version` 的第 4 档。升级前已有的行没有 `turnEndSeq`，一律读作已看，升级不会让首页一下子满是 ◉。
 
 ### 2.4 Run
 

@@ -74,6 +74,7 @@ mod proxy;
 mod push_http;
 mod rate_limit;
 mod registry;
+mod seen;
 pub mod ssh_hosts;
 mod store;
 mod store_tickets;
@@ -303,7 +304,9 @@ pub mod store_test_support {
     use serde_json::{Value, json};
     use std::collections::BTreeSet;
 
-    pub use crate::store::{APPEND_CHUNK_MAX, JOURNAL_WINDOW_BYTES, JOURNAL_WINDOW_ROWS, Store};
+    pub use crate::store::{
+        APPEND_CHUNK_MAX, JOURNAL_WINDOW_BYTES, JOURNAL_WINDOW_ROWS, SCHEMA_USER_VERSION, Store,
+    };
 
     /// D-057 §7.3 commit-time check error (the initiator suite matches on it).
     pub use crate::store::StoreError;

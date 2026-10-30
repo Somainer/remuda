@@ -1106,7 +1106,8 @@ async fn hub_backup_then_restore_round_trips_memory() -> Result<()> {
             [],
         )?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        assert_eq!(version, 4);
+        // The bundle carries the schema the Hub runs: the top of the ladder.
+        assert_eq!(version, remuda_hub::store_test_support::SCHEMA_USER_VERSION);
     }
 
     let ctx = Ctx::spawn_in(restored_dir, "hub").await?;
@@ -1194,7 +1195,13 @@ async fn the_memory_step_upgrades_the_current_main_schema() -> Result<()> {
     {
         let db = rusqlite::Connection::open(dir.path().join("hub/hub.sqlite"))?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        assert_eq!(version, 4, "one step past main, no gaps");
+        // No gaps: the memory step bumps past main's schema, and every later
+        // step of the one ladder bumps again to the top.
+        assert_eq!(
+            version,
+            remuda_hub::store_test_support::SCHEMA_USER_VERSION,
+            "the ladder's top rung"
+        );
         let objects: Vec<String> = db
             .prepare(
                 "SELECT name FROM sqlite_master

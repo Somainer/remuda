@@ -855,6 +855,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/instances/{id}/seen": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Mark an instance seen by the owner (done-unseen)
+         * @description seen-hub: the owner saw this instance up to durableSeq. Seen is tracked per owner (scope owner), so phone and desktop agree. Monotonic: a lower seq never moves seen back. When the seen seq advances, the Hub publishes an instance.seen event on the /v1/follow bus to unfiltered followers. Human devices only: Agent credentials are refused by the agent-route policy and Bot devices by the handler.
+         */
+        post: operations["instanceSeen"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/instances/{id}/subagents/{agentId}/transcript": {
         parameters: {
             query?: never;
@@ -2553,6 +2573,8 @@ export interface components {
             readonly restart?: components["schemas"]["RestartPolicy"] | null;
             /** @description Exited instance whose conversation this instance continues (D-026). */
             readonly resumedFrom?: string | null;
+            /** @description seen-hub: highest journal seq the owner has seen (decimal). Monotonic. Absent until the first POST /v1/instances/{id}/seen. */
+            readonly seenSeq?: string;
             /**
              * @description Signal tier confirmed by the Node for the current native session. Absent until a tier has been observed.
              * @enum {string|null}
@@ -2561,6 +2583,10 @@ export interface components {
             title?: string | null;
             /** @description Requested launch renderer. Actual mode is reported by tty snapshot altScreen. */
             readonly tui?: components["schemas"]["TuiMode"];
+            /** @description seen-hub: journal seq (decimal) of the latest settled turn end, i.e. the latest row that moved activity from working, blocked or draining to idle. Absent before any turn end; a resumed instance or a new lineage chapter starts without one (home.md §7). */
+            readonly turnEndSeq?: string;
+            /** @description seen-hub (home done-unseen): true when the latest settled turn end (turnEndSeq) is newer than the owner's seen seq. Owner-scoped, so every owner device reads the same value. A turn end that lands while an owner client reported the session visible is folded seen in the same write and never reads true. Always sent by this Hub; read an absent value as false. */
+            readonly unseen?: boolean;
             updatedAt?: string;
             /** @description Additive per-session token/context rollup (context-usage-1), Hub-computed from the journal's usage observations and refreshed every turn. Absent until the harness has reported at least one usage event; every counter is null until the adapter reports that channel (never a fabricated zero). */
             readonly usageRollup?: components["schemas"]["InstanceUsageRollup"];
@@ -3292,6 +3318,22 @@ export interface components {
             replayed?: boolean;
         } & {
             [key: string]: unknown;
+        };
+        SeenRequest: {
+            /** @description Highest journal seq the client has shown for this instance, as the decimal string the Hub serializes (a JSON integer is also accepted). Clamped to the instance's durable seq; a value at or below the current seen seq changes nothing. */
+            durableSeq: string | number;
+            /** @description true while the client is showing the session: holds a short per-device visibility lease (10 s, renewed by repeating the report) so a turn that ends meanwhile is folded seen instead of becoming unseen. false releases this device's lease when it stops showing the session. Omit for a report that is not about the screen, such as marking a row seen from a list. */
+            visible?: boolean;
+        };
+        SeenView: {
+            instanceId: string;
+            /** @description When the seen seq last advanced. */
+            seenAt?: string;
+            /** @description Owner's seen seq after this report (decimal). */
+            seenSeq?: string;
+            /** @description Latest settled turn end (decimal); absent before any. */
+            turnEndSeq?: string;
+            unseen: boolean;
         };
         SshHostCreate: {
             label: string;
@@ -5384,6 +5426,36 @@ export interface operations {
                     };
                 };
             };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
+    instanceSeen: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SeenRequest"];
+            };
+        };
+        responses: {
+            /** @description Seen state after the report */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SeenView"];
+                };
+            };
+            400: components["responses"]["Error"];
             401: components["responses"]["Error"];
             403: components["responses"]["Error"];
             404: components["responses"]["Error"];

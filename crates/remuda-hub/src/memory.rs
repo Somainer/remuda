@@ -608,7 +608,7 @@ fn check_owner_authored(writer: &MemoryWriter, slugs: &[&str]) -> Result<(), Mem
     if !matches!(writer, MemoryWriter::Agent { .. }) {
         return Ok(());
     }
-    if slugs.iter().any(|slug| *slug == OWNER_AUTHORED_SLUG) {
+    if slugs.contains(&OWNER_AUTHORED_SLUG) {
         return Err(MemoryError::Hub(
             HubError::ForbiddenReason(format!(
                 "memory entry {OWNER_AUTHORED_SLUG:?} is owner-authored"

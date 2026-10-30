@@ -323,6 +323,7 @@ async fn agent_scoped_mcp_create_skips_host_listing_but_capability_refuses() -> 
             None,
             project,
             delegation,
+            remuda_hub::agent_scope_test_support::CallerAuthority::internal(),
         )
         .await
         .map_err(|error| anyhow!("seed instance: {error}"))?;

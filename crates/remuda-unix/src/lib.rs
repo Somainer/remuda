@@ -1,0 +1,48 @@
+//! Safe wrappers around the small set of libc process primitives the Node and
+//! the merge CLI need that the pinned nix 0.28 does not expose on every
+//! supported platform.
+//!
+//! r20 item 1 / coordinator ruling R8(c): the non-reaping exit observer MUST
+//! compile and work on BOTH Linux and macOS. nix 0.28 gates `waitid`/`Id` off
+//! Apple targets, so they do not link there; `libc::waitid` with
+//! `WEXITED | WNOHANG | WNOWAIT` is in POSIX.1-2008 and is supported by glibc,
+//! musl and Apple libSystem. This crate is the single place that makes the
+//! `unsafe` calls; every wrapper keeps a strict "observation vs inference"
+//! discipline so callers can never signal a process group they did not observe
+//! exit.
+#![deny(missing_docs)]
+
+#[cfg(unix)]
+mod imp;
+
+#[cfg(unix)]
+pub use imp::ObservedChildExit;
+
+#[cfg(unix)]
+pub use imp::observe_exit_without_reaping;
+
+#[cfg(unix)]
+mod owner;
+
+#[cfg(unix)]
+mod recovery_git;
+
+/// R11 hardening for every recovery git invocation (replacement/graft/prompt
+/// env, no-maintenance/no-submodule/no-hooks config, fetch flags).
+#[cfg(unix)]
+pub use recovery_git::{RECOVERY_FETCH_FLAGS, RecoveryGit};
+
+/// Test-only spawn recorder proving the real recovery paths use [`RecoveryGit`].
+#[cfg(all(unix, any(test, feature = "test-faults")))]
+pub use recovery_git::{RecordedGit, RecordingGuard, set_git_spawn_recorder};
+
+/// THE OWNER CONTRACT single-owner subprocess runner (Node recovery and the
+/// merge CLI recovery).
+#[cfg(unix)]
+pub use owner::OwnedRun;
+
+#[cfg(unix)]
+pub use owner::clean_surviving_group_until;
+
+#[cfg(unix)]
+pub use owner::run_owned_process;

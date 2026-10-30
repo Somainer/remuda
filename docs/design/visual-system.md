@@ -340,6 +340,14 @@ tokenGuard 断言两条：
 | `.btnDanger` | 透明底，1px `--danger-border`，`--danger-fg` 字；hover 底为 `--danger-bg`。不做红色填充按钮 |
 | 禁用 | opacity .45 |
 
+**单行规则（D-061，2026-10-30）**：按钮文字永远只占一行。
+
+- **适用范围：** `.btn`、`.btnPrimary`、`.btnGhost`、`.btnDanger`、`.segItem`，以及导航标签（侧栏导航项、PhoneNav 标签）。
+- **CSS：** 统一加 `white-space: nowrap; overflow: hidden; text-overflow: ellipsis`。
+- **被截断时：** 完整标签放进 `title`；图标按钮放进 `aria-label`。
+- **禁止：** 把按钮撑成两行，或者用缩小字号的办法塞下长标签。
+- **验收**（任务 `home-polish`）：e2e 在 390、1280、1440 三个宽度，深浅两态下，断言 `/m` 与 `/sessions` 上每个按钮的渲染高度都等于单行高度（`--control-h` 或对应的 `-sm` / `-lg` 档），长中文标题也不溢出。
+
 **`.iconBtn`**：可见 32×32，字形 16px。coarse 下加 `::after` 热区 44×44，相邻 iconBtn 间距 ≥ 12px（32 + 12 = 44，热区不重叠）。
 
 **授权范围与路径目标的例外（D-061 r2）**：标签本身说明授权范围或文件系统目标的按钮（审批卡选项、带路径的操作）**不受单行省略约束**——它们必须完整可读，放不下时换行或独占一整行（compact 审批卡每个选项一行），绝不省略；CSS 上是 `.btnAllowWrap`（`white-space: normal; overflow: visible; text-overflow: clip`），而不是 `.btn` 的 nowrap + ellipsis。其余按钮保持 nowrap + 省略号；凡是被截断的标签，完整文字必须同时在 `title` 里（只有图标的按钮放 `aria-label`）。
@@ -381,6 +389,7 @@ tokenGuard 断言两条：
 | 状态 | 画法 |
 |---|---|
 | working | `--link` 实心点 |
+| done-unseen（D-061） | `--link` 1.5px 空心环，中心加 3px `--link` 实心点（◉）。和 working（实心点）、idle（`--fg-muted` 空心环）靠形状区分，不靠颜色；不用绿色 |
 | starting | `--fg-faint`，dim 脉冲 |
 | idle | `--fg-muted` 空心环 |
 | exited | `--fg-faint` 小方块 |

@@ -11,6 +11,10 @@ use axum::{
 use remuda_protocol::InputOrigin;
 use serde_json::{Value, json};
 
+/// D-057 §7.1 / main-agent.md §7.1: the Hub-stamped initiator type lives in
+/// the shared protocol crate so Nodes persist the same shape.
+pub use remuda_protocol::Initiator;
+
 /// Terminal aliases all resolve to a raw shell on the Node.
 pub fn shell_driver(driver: &str) -> bool {
     matches!(driver, "shell-pty" | "shell" | "terminal")
@@ -29,7 +33,28 @@ pub fn origin(device: &Device) -> InputOrigin {
 
 /// A caller header can narrow a Human/Bot token; it cannot promote a scoped token.
 pub async fn caller(state: &AppState, headers: &HeaderMap) -> Result<Device, HubError> {
-    let mut device = auth::require_device(&state.store, headers).await?;
+    let device = auth::require_device(&state.store, headers).await?;
+    narrow(state, headers, device).await
+}
+
+/// The authenticated device and the caller it narrows to, for a boundary
+/// that must decide on how the credential authenticated as well as on whom
+/// it acts for (D-060 memory refuses a Bot credential whatever it names).
+pub async fn authenticated_caller(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(Device, Device), HubError> {
+    let authenticated = auth::require_device(&state.store, headers).await?;
+    let narrowed = narrow(state, headers, authenticated.clone()).await?;
+    Ok((authenticated, narrowed))
+}
+
+/// Apply `x-remuda-instance-id` to an authenticated device.
+async fn narrow(
+    state: &AppState,
+    headers: &HeaderMap,
+    mut device: Device,
+) -> Result<Device, HubError> {
     if let Some(raw) = headers.get("x-remuda-instance-id") {
         let id = raw.to_str().map_err(|_| HubError::Forbidden)?;
         if device
@@ -40,7 +65,7 @@ pub async fn caller(state: &AppState, headers: &HeaderMap) -> Result<Device, Hub
             return Err(HubError::Forbidden);
         }
         if state.store.get_instance(id.to_string()).await?.is_none() {
-            return Err(HubError::Forbidden);
+            return Err(HubError::stale_caller());
         }
         device.kind = "agent".into();
         device.instance_id = Some(id.into());
@@ -48,15 +73,89 @@ pub async fn caller(state: &AppState, headers: &HeaderMap) -> Result<Device, Hub
     Ok(device)
 }
 
+/// D-057 §7.1: resolve the Hub-stamped initiator for an authenticated device.
+/// `None` for Human/Bot callers (no bound instance). For an Agent device — an
+/// agent credential, or a Human token narrowed with `x-remuda-instance-id` —
+/// returns the bound chapter's `{instanceId, lineageId, generation}`. The
+/// authenticating device id is carried alongside by the caller (Hub-only).
+pub async fn initiator_for(
+    state: &AppState,
+    device: &Device,
+) -> Result<Option<Initiator>, HubError> {
+    let Some(instance_id) = device.instance_id.as_deref() else {
+        return Ok(None);
+    };
+    let instance = state
+        .store
+        .get_instance(instance_id.to_string())
+        .await?
+        .ok_or(HubError::Forbidden)?;
+    Ok(Some(Initiator {
+        instance_id: instance.instance_id,
+        lineage_id: instance.lineage_id,
+        generation: instance.generation,
+    }))
+}
+
+/// The stamped pair every Agent-admitted writer job carries: the initiator
+/// and the authenticating device id (Hub-only). `(None, None)` for Human/Bot
+/// callers. Hub-internal successor work constructs the initiator without a
+/// device id by hand.
+pub async fn initiator_and_device(
+    state: &AppState,
+    device: &Device,
+) -> Result<(Option<Initiator>, Option<String>), HubError> {
+    match initiator_for(state, device).await? {
+        Some(initiator) => Ok((Some(initiator), Some(device.id.clone()))),
+        None => Ok((None, None)),
+    }
+}
+
+/// Owned authority pair handed to a store writer job. `None` pair for
+/// Human/Bot requests and Hub-internal cleanup; Hub-internal successor work
+/// carries an initiator with no device id.
+#[derive(Clone, Debug, Default)]
+pub struct CallerAuthority {
+    /// Hub-stamped initiator, when the caller is an Agent.
+    pub initiator: Option<Initiator>,
+    /// Authenticating device id; absent for Human/Bot and successor work.
+    pub device_id: Option<String>,
+}
+
+impl CallerAuthority {
+    /// Resolve the authority from an authenticated device.
+    pub async fn for_device(state: &AppState, device: &Device) -> Result<Self, HubError> {
+        let (initiator, device_id) = initiator_and_device(state, device).await?;
+        Ok(Self {
+            initiator,
+            device_id,
+        })
+    }
+
+    /// Hub-internal work: no initiator, never fenced.
+    #[must_use]
+    pub fn internal() -> Self {
+        Self::default()
+    }
+
+    /// References for the in-job `check_initiator`.
+    pub(crate) fn as_check(&self) -> (Option<&Initiator>, Option<&str>) {
+        (self.initiator.as_ref(), self.device_id.as_deref())
+    }
+}
+
 pub fn stamp(payload: &mut Value, device: &Device) {
     payload["origin"] = json!(origin(device));
     if let Some(input) = payload.get_mut("input").and_then(Value::as_object_mut) {
         input.insert("origin".into(), json!(origin(device)));
     }
-    // Never accept caller-selected provenance or a credential in JSON.
+    // Never accept caller-selected provenance, a credential, or an initiator
+    // in JSON. D-057 §7.1: the initiator is Hub-stamped from auth, not the body.
     if let Some(object) = payload.as_object_mut() {
         object.remove("agentCredential");
         object.remove("actor");
+        object.remove("initiator");
+        object.remove("initiatorDeviceId");
     }
 }
 
@@ -77,7 +176,7 @@ pub async fn owns(state: &AppState, device: &Device, target: &str) -> Result<boo
 pub async fn require_operator(state: &AppState, headers: &HeaderMap) -> Result<Device, HubError> {
     let device = caller(state, headers).await?;
     if origin(&device) == InputOrigin::Agent {
-        return Err(HubError::Forbidden);
+        return Err(HubError::operator_only());
     }
     Ok(device)
 }
@@ -98,7 +197,7 @@ pub async fn caller_project_scope(
         .store
         .get_instance(id.into())
         .await?
-        .ok_or(HubError::Forbidden)?;
+        .ok_or_else(HubError::stale_caller)?;
     Ok(instance.scope)
 }
 
@@ -119,7 +218,7 @@ pub async fn require_grant(
         .store
         .get_instance(id.into())
         .await?
-        .ok_or(HubError::Forbidden)?;
+        .ok_or_else(HubError::stale_caller)?;
     let wire = serde_json::to_value(grant)
         .ok()
         .and_then(|value| value.as_str().map(str::to_string))
@@ -127,7 +226,7 @@ pub async fn require_grant(
     if instance.grants.iter().any(|held| held == &wire) {
         Ok(())
     } else {
-        Err(HubError::Forbidden)
+        Err(HubError::missing_grant(&wire))
     }
 }
 
@@ -139,7 +238,7 @@ pub async fn require_instance_read(
 ) -> Result<(), HubError> {
     let device = caller(state, headers).await?;
     if origin(&device) == InputOrigin::Agent && !owns(state, &device, instance_id).await? {
-        return Err(HubError::Forbidden);
+        return Err(HubError::not_owner());
     }
     Ok(())
 }
@@ -172,6 +271,31 @@ fn attachment_read(path: &str) -> bool {
 fn lineage_read_target(path: &str) -> Option<&str> {
     let rest = path.strip_prefix("/v1/lineages/")?;
     (!rest.is_empty() && !rest.contains('/')).then_some(rest)
+}
+
+/// D-060 memory routes an Agent may reach, returning the path's lineage id.
+/// The middleware admits them only for the caller's own lineage; the handlers
+/// re-check that, and the store admits a write only from the lineage's
+/// current chapter. `…/memory/restore` and `/v1/memory/derived` are
+/// owner-only and never match.
+fn memory_target<'a>(method: &axum::http::Method, path: &'a str) -> Option<&'a str> {
+    use axum::http::Method;
+    let rest = path.strip_prefix("/v1/lineages/")?;
+    let (id, tail) = rest.split_once('/')?;
+    if id.is_empty() {
+        return None;
+    }
+    let admitted = match tail {
+        "memory" => *method == Method::GET || *method == Method::POST,
+        "memory/index" | "memory/search" => *method == Method::GET,
+        "memory/consolidate" => *method == Method::POST,
+        _ => {
+            tail.strip_prefix("memory/entries/")
+                .is_some_and(|slug| !slug.is_empty() && !slug.contains('/'))
+                && (*method == Method::GET || *method == Method::PUT || *method == Method::DELETE)
+        }
+    };
+    admitted.then_some(id)
 }
 
 /// Whether an Agent device's bound instance belongs to `lineage_id`.
@@ -304,7 +428,7 @@ pub async fn same_host(state: &AppState, device: &Device, host: &str) -> Result<
         .store
         .get_instance(caller.into())
         .await?
-        .ok_or(HubError::Forbidden)?;
+        .ok_or_else(HubError::stale_caller)?;
     Ok(instance.host_id == host)
 }
 
@@ -316,7 +440,10 @@ pub fn restrict_permission(device: &Device, spec: &mut Value) -> Result<(), HubE
     if origin(device) == InputOrigin::Agent
         && !matches!(spec["permissionMode"].as_str(), Some("manual" | "plan"))
     {
-        return Err(HubError::Forbidden);
+        return Err(HubError::operator_field(
+            "Agent launches may only use permissionMode `manual` or `plan`; do not retry the \
+             same spec — relaunch with one of those, or ask the owner to launch it",
+        ));
     }
     Ok(())
 }
@@ -337,7 +464,10 @@ pub fn restrict_launch_overrides(device: &Device, spec: &Value) -> Result<(), Hu
         .as_str()
         .is_some_and(|value| !value.trim().is_empty());
     if has_args || has_binary {
-        return Err(HubError::Forbidden);
+        return Err(HubError::operator_field(
+            "Agent seats cannot set `args` or `binaryPath`; do not retry with them — remove \
+             both from the spec, or ask the owner to launch it",
+        ));
     }
     Ok(())
 }
@@ -365,9 +495,9 @@ pub async fn prepare_create(
             .store
             .get_instance(caller_id.into())
             .await?
-            .ok_or(HubError::Forbidden)?;
+            .ok_or_else(HubError::stale_caller)?;
         if !caller_instance.scope.allows_host(host) {
-            return Err(HubError::Forbidden);
+            return Err(HubError::out_of_scope());
         }
         if let Some(workspace) = spec
             .get("workspaceId")
@@ -375,7 +505,7 @@ pub async fn prepare_create(
             .filter(|value| !value.is_empty())
             && !caller_instance.scope.allows_workspace(workspace)
         {
-            return Err(HubError::Forbidden);
+            return Err(HubError::out_of_scope());
         }
         if !same_host(state, device, host).await?
             || shell_driver(driver)
@@ -407,7 +537,7 @@ pub async fn authorize_command(
             operation,
             "instance.send" | "instance.cancel" | "instance.close" | "tty.write" | "instance.keys"
         ) {
-            return Err(HubError::Forbidden);
+            return Err(HubError::operator_only());
         }
         // D-031 follow-up (host-search-1): an Agent may message an instance
         // inside its own project scope with no per-message human approval; the
@@ -481,7 +611,7 @@ pub async fn require_approval(
         .store
         .get_instance(id.clone())
         .await?
-        .ok_or(HubError::Forbidden)?;
+        .ok_or_else(HubError::stale_caller)?;
     let caller = crate::agent_approvals::ApprovalCaller {
         device_id: device.id.clone(),
         instance_id: id.parse().map_err(|_| HubError::Forbidden)?,
@@ -757,8 +887,15 @@ pub async fn restrict_agent_routes(
                         .strip_prefix("/v1/projects/")
                         .is_some_and(|rest| rest.ends_with("/members")))
                         || task_write_target(request.method(), path)));
-            if !read && !write {
-                return Err(HubError::Forbidden);
+            // D-060: the caller's own lineage memory (reads and writes).
+            let memory = match memory_target(request.method(), path) {
+                Some(id) => agent_owns_lineage(&state, &device, id).await?,
+                None => false,
+            };
+            if !read && !write && !memory {
+                // cb-errors: the same 403 for a route an Agent may not use,
+                // carrying its reason and next step.
+                return Err(HubError::agent_route());
             }
         }
     }
@@ -837,6 +974,45 @@ mod tests {
         assert_eq!(payload["input"]["origin"], "agent");
         assert!(payload.get("actor").is_none());
         assert!(payload.get("agentCredential").is_none());
+    }
+
+    #[test]
+    fn memory_target_admits_only_the_agent_memory_shapes() {
+        use axum::http::Method;
+        for (method, path) in [
+            (Method::GET, "/v1/lineages/ins_l/memory"),
+            (Method::POST, "/v1/lineages/ins_l/memory"),
+            (Method::GET, "/v1/lineages/ins_l/memory/index"),
+            (Method::GET, "/v1/lineages/ins_l/memory/search"),
+            (Method::POST, "/v1/lineages/ins_l/memory/consolidate"),
+            (Method::GET, "/v1/lineages/ins_l/memory/entries/a-slug"),
+            (Method::PUT, "/v1/lineages/ins_l/memory/entries/a-slug"),
+            (Method::DELETE, "/v1/lineages/ins_l/memory/entries/a-slug"),
+        ] {
+            assert_eq!(
+                memory_target(&method, path),
+                Some("ins_l"),
+                "{method} {path}"
+            );
+        }
+        for (method, path) in [
+            // Owner-only.
+            (Method::POST, "/v1/lineages/ins_l/memory/restore"),
+            (Method::GET, "/v1/memory/derived"),
+            // Wrong methods.
+            (Method::DELETE, "/v1/lineages/ins_l/memory"),
+            (Method::POST, "/v1/lineages/ins_l/memory/index"),
+            (Method::GET, "/v1/lineages/ins_l/memory/consolidate"),
+            (Method::POST, "/v1/lineages/ins_l/memory/entries/a-slug"),
+            // Not memory, or malformed.
+            (Method::GET, "/v1/lineages/ins_l"),
+            (Method::GET, "/v1/lineages//memory"),
+            (Method::GET, "/v1/lineages/ins_l/memory/entries/"),
+            (Method::GET, "/v1/lineages/ins_l/memory/entries/a/b"),
+            (Method::GET, "/v1/lineages/ins_l/memoryx"),
+        ] {
+            assert_eq!(memory_target(&method, path), None, "{method} {path}");
+        }
     }
 
     /// The middleware only lets the two D-028 shapes through; anything else

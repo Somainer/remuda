@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -465,6 +466,62 @@ struct NodeSlot {
     link: Arc<dyn NodeTransport>,
 }
 
+/// Test-only one-shot park: the parked side reports arrival, then waits for
+/// release (a dropped release sender also releases it).
+#[cfg(any(test, feature = "test-faults"))]
+pub(crate) struct TestPark {
+    parked: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(any(test, feature = "test-faults"))]
+impl TestPark {
+    /// A park plus the test's (parked, release) handles.
+    pub(crate) fn new() -> (
+        Self,
+        (
+            tokio::sync::oneshot::Receiver<()>,
+            tokio::sync::oneshot::Sender<()>,
+        ),
+    ) {
+        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        (
+            Self {
+                parked: parked_tx,
+                release: release_rx,
+            },
+            (parked_rx, release_tx),
+        )
+    }
+
+    /// Report arrival, then wait for release.
+    pub(crate) async fn wait(self) {
+        let _ = self.parked.send(());
+        let _ = self.release.await;
+    }
+}
+
+/// Test-only teardown park: the park plus the sender told when the parked
+/// teardown has finished.
+#[cfg(any(test, feature = "test-faults"))]
+type TeardownPark = (TestPark, tokio::sync::oneshot::Sender<()>);
+
+/// Result of registering a carrier session.
+pub(crate) struct InsertedSession {
+    /// The NON-REUSED authenticated session identity minted for this socket.
+    /// A new, globally-unique value is handed out on every registration, even
+    /// when the host had fully disappeared in between (so it can never equal a
+    /// superseded socket's identity).
+    pub(crate) generation: u64,
+    /// True when an older LIVE socket still occupied the slot at insert — a
+    /// socket-level takeover rather than a reconnect after a full disconnect.
+    /// The detached post-hello Landing decision uses this (under the per-host
+    /// guard) instead of re-querying the map, so an old socket tearing down
+    /// after the hello cannot change the answer (r16 item 6).
+    pub(crate) displaced_live: bool,
+}
+
 /// A live (transport, durable link generation) pair pinned at the start of one
 /// forwarding attempt. The stamp, prepare and commit all go through THIS
 /// handle: with a half-open previous link still registered when the new
@@ -497,12 +554,144 @@ impl PinnedNodeCall {
 }
 
 /// Connected Node transports, keyed by host id.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ConnectedNodes {
     inner: Arc<Mutex<HashMap<String, NodeSlot>>>,
+    /// Per-host authority lock. A Landing settlement/evidence/grant WRITER
+    /// takes a shared (read) guard from its current-session pre-check through
+    /// its store commit; a session replacement (hello insert / socket teardown)
+    /// takes the exclusive (write) guard around changing the host's live
+    /// session. They therefore serialize: either the writer commits while its
+    /// session is still current, or the replacement completes first and the
+    /// writer's commit predicate matches nothing (r15 item 3, R2).
+    authority: Arc<Mutex<HashMap<String, Arc<tokio::sync::RwLock<()>>>>>,
+    /// Hosts whose CURRENT session was installed while an older socket was
+    /// still live (a socket-level takeover). Maps host → the TAKEOVER
+    /// generation (the newer session). It is cleared only when THAT
+    /// generation is removed under the per-host guard; a stale OLDER socket
+    /// tearing down later must never clear it (r16 item 6). It denies the new
+    /// socket inheritance of the old session's Landing grants (a genuine
+    /// reconnect after a full disconnect leaves the map empty).
+    live_takeover: Arc<Mutex<HashMap<String, u64>>>,
+    /// Highest durable link generation installed per host in this Hub process
+    /// (r41 item 1). Installation is monotonic in it: a hello whose bumped
+    /// generation is lower was superseded by a newer hello while it awaited
+    /// and must never replace the newer slot. Kept after the slot is removed,
+    /// so a superseded hello also cannot install after the newer link closed.
+    installed_link: Arc<Mutex<HashMap<String, i64>>>,
+    /// Test-only: one-shot per-host park a hello waits on just before it
+    /// installs (r41 item 1 ordering regression).
+    #[cfg(any(test, feature = "test-faults"))]
+    install_parks: Arc<Mutex<HashMap<String, TestPark>>>,
+    /// Test-only: one-shot per-host park a socket teardown waits on before its
+    /// gate-session recovery step, plus the sender told when that teardown
+    /// finishes (r41 item 2 ordering regression).
+    #[cfg(any(test, feature = "test-faults"))]
+    teardown_parks: Arc<Mutex<HashMap<String, TeardownPark>>>,
+    /// Test-only: notified once per host when a session replacement (insert)
+    /// has to WAIT for an in-flight Landing authority decision to commit — the
+    /// deterministic witness that takeover and verdict-writer are serialized
+    /// (r15 item 3).
+    #[cfg(any(test, feature = "test-faults"))]
+    authority_contention: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
+    /// Boot epoch minted in the Hub DB and incremented at EVERY Hub boot. A
+    /// session identity is `(boot_epoch << 32) | per-boot counter`, so an id
+    /// handed out by a previous Hub process can NEVER be minted again after a
+    /// restart (r14 R3): the in-memory counter resetting to 1 used to hand a
+    /// new socket the same identity a superseded socket persisted on a Landing.
+    boot_epoch: u64,
+    next_session: Arc<AtomicU32>,
 }
 
 impl ConnectedNodes {
+    /// Boot identity: allocate the next persisted boot epoch (monotonic across
+    /// Hub restarts on the same data dir) and start this process's per-boot
+    /// session counter at zero.
+    ///
+    /// r15 item 6 — fail closed: a missing/regressed epoch or a DB allocation
+    /// failure returns an error so the Hub refuses to start instead of minting
+    /// possibly-repeated session ids with a silently reset epoch.
+    pub(crate) async fn boot(
+        store: &crate::store::Store,
+    ) -> Result<Self, crate::store::StoreError> {
+        let boot_epoch = store.next_gate_session_boot_epoch().await?;
+        tracing::info!(boot_epoch, "gate carrier session boot epoch allocated");
+        Ok(Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            authority: Arc::new(Mutex::new(HashMap::new())),
+            live_takeover: Arc::new(Mutex::new(HashMap::new())),
+            installed_link: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(any(test, feature = "test-faults"))]
+            install_parks: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(any(test, feature = "test-faults"))]
+            teardown_parks: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(any(test, feature = "test-faults"))]
+            authority_contention: Arc::new(Mutex::new(HashMap::new())),
+            boot_epoch,
+            next_session: Arc::new(AtomicU32::new(0)),
+        })
+    }
+
+    /// This Hub process's boot epoch (high 32 bits of every session id).
+    pub(crate) fn boot_epoch(&self) -> u64 {
+        self.boot_epoch
+    }
+
+    /// Test-only: an empty registry with a fixed boot epoch.
+    #[cfg(test)]
+    fn for_tests(boot_epoch: u64) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            authority: Arc::new(Mutex::new(HashMap::new())),
+            live_takeover: Arc::new(Mutex::new(HashMap::new())),
+            installed_link: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(any(test, feature = "test-faults"))]
+            install_parks: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(any(test, feature = "test-faults"))]
+            teardown_parks: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(any(test, feature = "test-faults"))]
+            authority_contention: Arc::new(Mutex::new(HashMap::new())),
+            boot_epoch,
+            next_session: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    /// The per-host authority lock (r15 item 3). Shared guards pin the live
+    /// session across a writer's pre-check → commit stretch; the exclusive
+    /// guard is held while a hello/takedown replaces the session.
+    pub(crate) async fn host_authority(&self, host_id: &str) -> Arc<tokio::sync::RwLock<()>> {
+        let mut authority = self.authority.lock().await;
+        authority
+            .entry(host_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(())))
+            .clone()
+    }
+
+    /// True when the host's current session was installed over an older LIVE
+    /// socket AND `generation` is exactly that takeover generation — the check
+    /// a post-hello Landing decision makes under the per-host guard.
+    pub(crate) async fn host_had_live_takeover(&self, host_id: &str, generation: u64) -> bool {
+        self.live_takeover.lock().await.get(host_id) == Some(&generation)
+    }
+
+    /// Clear the takeover mark by GENERATION under the already-held per-host
+    /// authority guard. Only the removal of the matching CURRENT session clears
+    /// it: a stale OLDER socket tearing down after a newer hello must not wipe
+    /// the mark (r16 item 6). Returns true when the mark was cleared here.
+    pub(crate) async fn clear_live_takeover_generation_locked(
+        &self,
+        host_id: &str,
+        generation: u64,
+    ) -> bool {
+        let mut live_takeover = self.live_takeover.lock().await;
+        if live_takeover.get(host_id) == Some(&generation) {
+            live_takeover.remove(host_id);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Call a JSON-RPC method on a connected Node. `Ok(None)` = not connected.
     pub async fn call(
         &self,
@@ -547,53 +736,248 @@ impl ConnectedNodes {
             })
     }
 
-    /// Record a live session. Returns a generation used to retire only this session.
-    pub async fn insert(&self, host_id: String, link: Arc<dyn NodeTransport>) -> u64 {
-        // Test seam: no real hello bumped a durable generation for a directly
-        // mounted scripted transport, so the slot carries 0.
-        self.insert_with_generation(host_id, link, 0).await
+    /// Record a live session. Mints a fresh, never-reused session identity
+    /// (process-wide monotonic) and reports whether it superseded a still-live
+    /// session for the same host. The returned generation retires only this
+    /// session in [`Self::remove_generation`].
+    ///
+    /// Test seam: no real hello bumped a durable link generation for a
+    /// directly mounted scripted transport, so the slot carries 0 and the
+    /// mount is never refused as superseded.
+    pub(crate) async fn insert(
+        &self,
+        host_id: String,
+        link: Arc<dyn NodeTransport>,
+    ) -> InsertedSession {
+        let _authority = self.install_guard(&host_id).await;
+        self.insert_locked(host_id, link, 0).await
     }
 
     /// Record a live session together with the durable per-host link generation
-    /// the adopting hello just stamped (c-dirpicker r11 item 2). Returns the
-    /// registry SESSION generation used to retire this exact WS session.
-    pub async fn insert_with_generation(
+    /// the adopting hello just stamped (c-dirpicker r11 item 2). Session
+    /// identity and takeover reporting are as in [`Self::insert`].
+    ///
+    /// r41 item 1: monotonic in `link_generation`. `None` = superseded: a
+    /// newer hello already installed a higher generation for this host, so
+    /// this (older) hello must not replace it; the caller closes its socket.
+    /// An equal or higher generation installs with the r16 takeover semantics.
+    pub(crate) async fn insert_with_generation(
         &self,
         host_id: String,
         link: Arc<dyn NodeTransport>,
         link_generation: i64,
-    ) -> u64 {
+    ) -> Option<InsertedSession> {
+        // The check and the install both run under the per-host exclusive
+        // authority guard every install takes, so they cannot interleave with
+        // another hello's install for this host.
+        let _authority = self.install_guard(&host_id).await;
+        {
+            let mut installed = self.installed_link.lock().await;
+            if installed
+                .get(&host_id)
+                .is_some_and(|newest| *newest > link_generation)
+            {
+                return None;
+            }
+            installed.insert(host_id.clone(), link_generation);
+        }
+        Some(self.insert_locked(host_id, link, link_generation).await)
+    }
+
+    /// The exclusive per-host authority guard an install holds (r15 item 3):
+    /// a Landing writer that passed its current-session pre-check commits
+    /// before the new socket becomes current, and vice versa.
+    async fn install_guard(&self, host_id: &str) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        let lock = self.host_authority(host_id).await;
+        // Fast path under no contention; when a reader (a parked settlement)
+        // holds the guard, notify test waiters BEFORE awaiting.
+        if let Ok(guard) = lock.clone().try_write_owned() {
+            return guard;
+        }
+        #[cfg(any(test, feature = "test-faults"))]
+        {
+            let notify = self.authority_write_notify(host_id).await;
+            notify.notify_waiters();
+        }
+        lock.write_owned().await
+    }
+
+    /// Test-only: arm a one-shot park for the next hello of `host_id`, just
+    /// before it installs. Returns (parked, release): `parked` fires once the
+    /// hello waits there; sending (or dropping) `release` lets it continue.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn arm_install_park(
+        &self,
+        host_id: &str,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (park, handles) = TestPark::new();
+        self.install_parks
+            .lock()
+            .await
+            .insert(host_id.to_owned(), park);
+        handles
+    }
+
+    /// Test-only: arm a one-shot park for the next socket teardown of
+    /// `host_id`, before its gate-session recovery step. Returns (parked,
+    /// release, done): `done` fires when that teardown has finished.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn arm_teardown_recovery_park(
+        &self,
+        host_id: &str,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let (park, (parked, release)) = TestPark::new();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        self.teardown_parks
+            .lock()
+            .await
+            .insert(host_id.to_owned(), (park, done_tx));
+        (parked, release, done_rx)
+    }
+
+    /// Test-only: wait on an armed teardown park for `host_id`; returns the
+    /// sender to fire once the teardown finishes (`None` if none was armed).
+    #[cfg(any(test, feature = "test-faults"))]
+    pub(crate) async fn park_teardown_recovery(
+        &self,
+        host_id: &str,
+    ) -> Option<tokio::sync::oneshot::Sender<()>> {
+        let armed = self.teardown_parks.lock().await.remove(host_id);
+        let (park, done) = armed?;
+        park.wait().await;
+        Some(done)
+    }
+
+    /// Test-only: wait on an armed install park for `host_id` (no-op if none).
+    #[cfg(any(test, feature = "test-faults"))]
+    pub(crate) async fn park_before_install(&self, host_id: &str) {
+        let park = self.install_parks.lock().await.remove(host_id);
+        if let Some(park) = park {
+            park.wait().await;
+        }
+    }
+
+    /// Register the new session with the authority guard already held.
+    async fn insert_locked(
+        &self,
+        host_id: String,
+        link: Arc<dyn NodeTransport>,
+        link_generation: i64,
+    ) -> InsertedSession {
         let mut inner = self.inner.lock().await;
-        let generation = inner
-            .get(&host_id)
-            .map(|slot| slot.generation.wrapping_add(1))
-            .unwrap_or(1);
+        let counter = self.next_session.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+        // Pack the persisted boot epoch and this boot's monotonic counter so the
+        // id is unique across Hub restarts as well as within one boot (r14 R3).
+        let generation = self.boot_epoch << 32 | u64::from(counter);
+        // A registration while another live session occupies the slot is a
+        // socket-level takeover (the old socket has not torn down). Record it
+        // so post-hello Landing handling does not rebind A's grants to B; a
+        // registration into an empty slot (genuine reconnect) leaves it clear.
+        let displaced_live = inner.contains_key(&host_id);
         inner.insert(
-            host_id,
+            host_id.clone(),
             NodeSlot {
                 generation,
                 link_generation,
                 link,
             },
         );
-        generation
+        if displaced_live {
+            // Keyed by the NEW (takeover) generation; only that session's
+            // guarded removal clears it (r16 item 6).
+            self.live_takeover.lock().await.insert(host_id, generation);
+        }
+        InsertedSession {
+            generation,
+            displaced_live,
+        }
+    }
+
+    /// Test-only: latch for "an insert is waiting on this host's authority
+    /// guard".
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn authority_write_notify(&self, host_id: &str) -> Arc<tokio::sync::Notify> {
+        let mut contention = self.authority_contention.lock().await;
+        contention
+            .entry(host_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
+            .clone()
+    }
+
+    /// True iff `session` is the CURRENT live session registered for this host.
+    /// A superseded-but-still-open socket holds a stale generation and fails
+    /// this check even though it remains connected at the TCP layer.
+    pub async fn is_current_session(&self, host_id: &str, session: u64) -> bool {
+        self.inner
+            .lock()
+            .await
+            .get(host_id)
+            .is_some_and(|slot| slot.generation == session)
     }
 
     /// Drop the live session (does not kill the native Node process).
     pub async fn remove(&self, host_id: &str) {
-        self.inner.lock().await.remove(host_id);
+        // Exclusive with in-flight authority decisions, like insert (r15 item 3).
+        let _authority = self.host_authority(host_id).await.write_owned().await;
+        let removed_generation = {
+            let mut inner = self.inner.lock().await;
+            let generation = inner.get(host_id).map(|slot| slot.generation);
+            if generation.is_some() {
+                inner.remove(host_id);
+            }
+            generation
+        };
+        // Clear the takeover mark only if it names the session actually
+        // removed (r16 item 6).
+        if let Some(generation) = removed_generation {
+            self.clear_live_takeover_generation_locked(host_id, generation)
+                .await;
+        }
     }
 
     /// Drop the session only if `generation` is still current (stale WS must not offline a live host).
     pub async fn remove_generation(&self, host_id: &str, generation: u64) -> bool {
-        let mut inner = self.inner.lock().await;
-        match inner.get(host_id) {
-            Some(slot) if slot.generation == generation => {
-                inner.remove(host_id);
-                true
+        self.remove_generation_link(host_id, generation)
+            .await
+            .is_some()
+    }
+
+    /// [`Self::remove_generation`], also returning the durable link generation
+    /// the removed session registered with (`None` = nothing removed). The
+    /// teardown uses it so its offline write applies only while the host is
+    /// still on that link.
+    pub async fn remove_generation_link(&self, host_id: &str, generation: u64) -> Option<i64> {
+        let _authority = self.host_authority(host_id).await.write_owned().await;
+        let removed = {
+            let mut inner = self.inner.lock().await;
+            match inner.get(host_id) {
+                Some(slot) if slot.generation == generation => {
+                    let link_generation = slot.link_generation;
+                    inner.remove(host_id);
+                    Some(link_generation)
+                }
+                _ => None,
             }
-            _ => false,
+        };
+        if removed.is_some() {
+            // The guard is still held; clear the mark only when it was this
+            // exact generation. A stale older socket's remove_generation(old)
+            // matched nothing and never reaches here, so it cannot clear a
+            // newer takeover mark (r16 item 6).
+            self.clear_live_takeover_generation_locked(host_id, generation)
+                .await;
         }
+        removed
     }
 
     /// Carrier for a connected host, if any.
@@ -603,6 +987,17 @@ impl ConnectedNodes {
             .await
             .get(host_id)
             .map(|slot| slot.link.kind())
+    }
+
+    /// The authenticated session generation currently registered for a host
+    /// (minted per hello, incremented on every reconnect). r12 item 2 binds a
+    /// gate dispatch and its land grant to exactly this session.
+    pub async fn generation_of(&self, host_id: &str) -> Option<u64> {
+        self.inner
+            .lock()
+            .await
+            .get(host_id)
+            .map(|slot| slot.generation)
     }
 
     /// Test support: take the registry lock and hold it until `release`
@@ -625,6 +1020,113 @@ impl ConnectedNodes {
     /// Host ids with a live Node session.
     pub async fn host_ids(&self) -> Vec<String> {
         self.inner.lock().await.keys().cloned().collect()
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn dead_link() -> Arc<dyn NodeTransport> {
+        Arc::new(ScriptedTransport::new(None))
+    }
+
+    /// r13 item 3: session identities are per-boot monotonic and are NEVER
+    /// reused after a host fully disconnects. r14 R3 packs a PERSISTED boot
+    /// epoch into the high bits, so identities cannot repeat across Hub restarts
+    /// either (covered end to end by the restart integration test).
+    #[tokio::test]
+    async fn session_identities_are_never_reused_after_removal() {
+        let nodes = ConnectedNodes::for_tests(1);
+        let a = nodes.insert("h".into(), dead_link()).await.generation;
+        assert!(nodes.is_current_session("h", a).await);
+
+        // Full disconnect: the host slot is removed.
+        assert!(nodes.remove_generation("h", a).await);
+        assert!(!nodes.is_current_session("h", a).await);
+
+        // A brand-new socket for the same host must NOT draw `a` again.
+        let b = nodes.insert("h".into(), dead_link()).await.generation;
+        assert_ne!(a, b, "session identity reused after removal");
+        assert!(nodes.is_current_session("h", b).await);
+        assert!(
+            !nodes.is_current_session("h", a).await,
+            "old session revived"
+        );
+
+        // Takeover while the first socket is still open: a third session
+        // supersedes b; b is no longer current even though it never closed.
+        let c = nodes.insert("h".into(), dead_link()).await.generation;
+        assert_ne!(b, c);
+        assert!(nodes.is_current_session("h", c).await);
+        assert!(!nodes.is_current_session("h", b).await);
+        assert!(!nodes.is_current_session("h", a).await);
+
+        // Different hosts draw independent values from the same global counter.
+        let d = nodes.insert("other".into(), dead_link()).await.generation;
+        assert_ne!(c, d);
+    }
+
+    /// r16 item 6: the live-takeover mark is keyed by the TAKEOVER generation
+    /// and survives a STALE older socket tearing down AFTER the new hello.
+    /// Regression for the old unconditional `clear_live_takeover(host)` in the
+    /// teardown path: A displaced B while still live; A then ended; the old code
+    /// wiped the host's mark, after which B was treated as a genuine reconnect
+    /// and inherited A's in-flight Landing grants.
+    #[tokio::test]
+    async fn a_stale_socket_teardown_does_not_clear_a_newer_takeover_mark() {
+        let nodes = ConnectedNodes::for_tests(1);
+        // A connects.
+        let a = nodes.insert("h".into(), dead_link()).await.generation;
+        assert!(nodes.is_current_session("h", a).await);
+        // B takes over while A is still live: the takeover mark names B.
+        let inserted_b = nodes.insert("h".into(), dead_link()).await;
+        let b = inserted_b.generation;
+        assert!(inserted_b.displaced_live, "B displaced a live A");
+        assert_ne!(a, b);
+        assert!(
+            nodes.host_had_live_takeover("h", b).await,
+            "B is the recorded live takeover"
+        );
+
+        // The OLD socket A tears down AFTER B's hello. Its guarded removal is
+        // stale and must NOT clear B's takeover mark.
+        let stale = nodes.remove_generation("h", a).await;
+        assert!(!stale, "A is no longer current; its removal is stale");
+        assert!(
+            nodes.host_had_live_takeover("h", b).await,
+            "A's stale teardown must not clear B's takeover mark"
+        );
+        assert!(
+            nodes.is_current_session("h", b).await,
+            "B is still the live session after A's teardown"
+        );
+
+        // A FULL disconnect of B (the marked generation) clears the mark again.
+        assert!(nodes.remove_generation("h", b).await);
+        assert!(!nodes.host_had_live_takeover("h", b).await);
+        assert!(!nodes.is_current_session("h", b).await);
+    }
+
+    /// r16 item 6: a genuine reconnect into an EMPTY slot is not a takeover and
+    /// therefore rebinds (displaced_live=false), and its teardown leaves no
+    /// stale mark.
+    #[tokio::test]
+    async fn a_genuine_reconnect_after_full_disconnect_is_not_a_takeover() {
+        let nodes = ConnectedNodes::for_tests(1);
+        let a = nodes.insert("h".into(), dead_link()).await.generation;
+        assert!(nodes.remove_generation("h", a).await);
+        let inserted_b = nodes.insert("h".into(), dead_link()).await;
+        assert!(
+            !inserted_b.displaced_live,
+            "reconnect into an empty slot is not a takeover"
+        );
+        assert!(
+            !nodes
+                .host_had_live_takeover("h", inserted_b.generation)
+                .await
+        );
     }
 }
 

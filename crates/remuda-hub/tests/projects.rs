@@ -1017,9 +1017,159 @@ async fn delegation_cycle_is_rejected_even_if_columns_are_tampered() -> Result<(
             json!({"parentInstanceId": ids[0], "projectId": project_id}),
             remuda_hub::store_test_support::leaf_delegation(&project_id)
                 .map_err(anyhow::Error::msg)?,
+            remuda_hub::agent_scope_test_support::CallerAuthority::internal(),
         )
         .await;
     let err = err.expect_err("cycle must be rejected");
     assert!(err.to_string().contains("cycle"), "{err}");
+    Ok(())
+}
+
+/// c-cberrors: a refusal keeps its status, `code` and `error` text and gains a
+/// stable `reason` plus a `next` step.
+async fn refusal(response: reqwest::Response, status: u16) -> Result<Value> {
+    anyhow::ensure!(response.status() == status, "status {}", response.status());
+    Ok(response.json().await?)
+}
+
+#[tokio::test]
+async fn refusals_carry_reason_and_next_without_changing_old_fields() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let (project_id, _seat, coordinator_id, worker_id) = make_chain(&ctx).await?;
+    let worker_token = ctx.agent_token_for(&worker_id).await?;
+
+    // Missing grant: the leaf worker holds no `dispatch`.
+    let body = refusal(
+        ctx.create_instance_with(
+            &worker_token,
+            json!({"role":"worker","projectId":project_id,"prompt":"x"}),
+        )
+        .await?,
+        403,
+    )
+    .await?;
+    assert_eq!(body["code"], "FORBIDDEN");
+    assert_eq!(body["error"], "forbidden");
+    assert_eq!(body["reason"], "grant-required");
+    assert_eq!(body["next"]["action"], "ask-owner");
+    assert_eq!(body["next"]["grant"], "dispatch");
+    assert!(
+        body["next"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("`dispatch`"),
+        "{body}"
+    );
+
+    // A route the Agent middleware never admits (it refuses before the
+    // handler's own operator check can answer operator-only).
+    let body = refusal(
+        ctx.http
+            .post(format!("{}/v1/projects", ctx.base()))
+            .bearer_auth(&worker_token)
+            .json(&json!({"name":"sneaky"}))
+            .send()
+            .await?,
+        403,
+    )
+    .await?;
+    assert_eq!(body["code"], "FORBIDDEN");
+    assert_eq!(body["reason"], "agent-route");
+    assert_eq!(body["next"]["action"], "ask-owner");
+
+    // Outside the delegation scope: a coordinator boxed to host A may not
+    // place a child on host B.
+    let boxed: Value = ctx
+        .create_instance_with(
+            &ctx.human,
+            json!({
+                "role": "project-coordinator",
+                "scope": {"hostIds": [ctx.host_a]},
+                "prompt": "boxed"
+            }),
+        )
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let boxed_id = boxed["instance"]["instanceId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let boxed_token = ctx.agent_token_for(&boxed_id).await?;
+    let body = refusal(
+        ctx.create_instance_with(
+            &boxed_token,
+            json!({"role":"worker","hostId":ctx.host_b,"prompt":"elsewhere"}),
+        )
+        .await?,
+        403,
+    )
+    .await?;
+    assert_eq!(body["code"], "FORBIDDEN");
+    assert_eq!(body["reason"], "out-of-scope");
+    assert_eq!(body["next"]["action"], "ask-owner");
+    // The hint promises only what the Hub can do: scope is fixed at launch,
+    // so it must not tell the seat to ask for the scope to be widened.
+    let hint = body["next"]["hint"].as_str().unwrap();
+    assert!(hint.contains("scope"));
+    assert!(hint.contains("fixed when a seat is launched"), "{hint}");
+    assert!(!hint.contains("widen"), "{hint}");
+
+    // Needs a D-017 approval: 409, the approval is pending, do not resubmit.
+    let coordinator_token = ctx.agent_token_for(&coordinator_id).await?;
+    let pending = ctx
+        .http
+        .post(format!("{}/v1/instances", ctx.base()))
+        .bearer_auth(&coordinator_token)
+        .header("x-remuda-require-approval", "true")
+        .json(&json!({"role":"worker","projectId":project_id,"driver":"claude-pty","prompt":"ask"}))
+        .send()
+        .await?;
+    let body = refusal(pending, 409).await?;
+    assert_eq!(body["code"], "HUMAN_APPROVAL_REQUIRED");
+    assert_eq!(body["reason"], "approval-required");
+    assert!(body["interactionId"].is_string());
+    assert_eq!(body["next"]["action"], "await-approval");
+    assert_eq!(body["next"]["interactionId"], body["interactionId"]);
+
+    // A made-up approval id is refused with its own reason.
+    let body = refusal(
+        ctx.http
+            .post(format!("{}/v1/instances", ctx.base()))
+            .bearer_auth(&coordinator_token)
+            .header("x-remuda-require-approval", "true")
+            .header(
+                "x-remuda-approval-id",
+                remuda_protocol::InteractionId::new().as_id().to_string(),
+            )
+            .json(&json!({"role":"worker","projectId":project_id,"driver":"claude-pty","prompt":"ask"}))
+            .send()
+            .await?,
+        403,
+    )
+    .await?;
+    assert_eq!(body["reason"], "approval-invalid");
+    assert_eq!(body["next"]["action"], "fix-request");
+
+    // Stale caller: the instance row behind a still-valid credential is gone.
+    let db = rusqlite::Connection::open(ctx._dir.path().join("hub").join("hub.sqlite"))?;
+    db.execute_batch("PRAGMA foreign_keys=OFF")?;
+    db.execute(
+        "DELETE FROM instances WHERE id = ?1",
+        rusqlite::params![worker_id],
+    )?;
+    drop(db);
+    let body = refusal(
+        ctx.create_instance_with(
+            &worker_token,
+            json!({"role":"worker","projectId":project_id,"prompt":"x"}),
+        )
+        .await?,
+        403,
+    )
+    .await?;
+    assert_eq!(body["code"], "FORBIDDEN");
+    assert_eq!(body["reason"], "stale-caller");
     Ok(())
 }

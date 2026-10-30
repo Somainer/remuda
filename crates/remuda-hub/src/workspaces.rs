@@ -627,6 +627,9 @@ async fn mutate(
             payload,
             None,
             Some(pinned.link_generation()),
+            // Operator-only workspace registration: never an Agent initiator.
+            None,
+            None,
         )
         .await?;
     // r12 item 1 test seam: park AFTER the INSERT, before the mark, so the
@@ -1443,6 +1446,8 @@ mod tests {
                 json!({"path": "/srv/old", "workspaceId": "wsp_old"}),
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1464,6 +1469,8 @@ mod tests {
                 host.clone(),
                 "workspace.unregister".into(),
                 json!({"path": "/srv/legacy", "workspaceId": "wsp_legacy"}),
+                None,
+                None,
                 None,
                 None,
             )
@@ -1489,6 +1496,8 @@ mod tests {
                 host.clone(),
                 "workspace.unregister".into(),
                 json!({"path": "/srv/new", "workspaceId": "wsp_new"}),
+                None,
+                None,
                 None,
                 None,
             )
@@ -1618,6 +1627,8 @@ mod tests {
                 json!({"path": "/srv/fresh", "workspaceId": "wsp_fresh"}),
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1654,6 +1665,8 @@ mod tests {
                 host.clone(),
                 "workspace.unregister".into(),
                 json!({"path": "/srv/legacy2", "workspaceId": "wsp_legacy2"}),
+                None,
+                None,
                 None,
                 None,
             )
@@ -1725,6 +1738,8 @@ mod tests {
                 host.clone(),
                 "workspace.unregister".into(),
                 json!({"path": "/srv/window", "workspaceId": "wsp_window"}),
+                None,
+                None,
                 None,
                 None,
             )

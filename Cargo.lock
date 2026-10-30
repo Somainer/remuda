@@ -3180,6 +3180,7 @@ dependencies = [
  "remuda-signal",
  "remuda-ssh",
  "remuda-testing",
+ "remuda-unix",
  "rusqlite",
  "serde",
  "serde_json",
@@ -3407,6 +3408,7 @@ dependencies = [
  "remuda-protocol",
  "remuda-signal",
  "remuda-testing",
+ "remuda-unix",
  "reqwest",
  "rusqlite",
  "serde",
@@ -3547,6 +3549,13 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "remuda-unix"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

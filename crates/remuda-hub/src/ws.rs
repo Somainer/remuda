@@ -430,6 +430,11 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
     let mut host_id: Option<String> = None;
     let mut hello_done = false;
     let mut session_generation: Option<u64> = None;
+    // Set by the hello handler: whether THIS hello displaced a still-live older
+    // socket (a takeover). Captured at hello time so the detached post-hello
+    // Landing decision cannot be changed by an old socket tearing down later
+    // (r16 item 6).
+    let mut hello_displaced_live = false;
 
     loop {
         tokio::select! {
@@ -481,7 +486,19 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
                     }
                     break;
                 }
-                match handle_node_method(&state, &token, &mut host_id, &mut hello_done, &mut session_generation, method, params, &out_tx, &pending).await {
+                match handle_node_method(
+                    &state,
+                    &token,
+                    &mut host_id,
+                    &mut hello_done,
+                    &mut session_generation,
+                    &mut hello_displaced_live,
+                    method,
+                    params,
+                    &out_tx,
+                    &pending,
+                )
+                .await {
                     // Normal replies ride the same FIFO as handler-emitted
                     // frames (object.pull streams its chunks just before this
                     // reply), so they are queued rather than written straight
@@ -503,8 +520,14 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
                         // carriers go through this one helper.
                         if is_hello
                             && let Some(h) = host_id.clone()
+                            && let Some(generation) = session_generation
                         {
-                            spawn_post_hello_tasks(&state, h);
+                            spawn_post_hello_tasks(
+                                &state,
+                                h,
+                                generation,
+                                hello_displaced_live,
+                            );
                         }
                     }
                     Ok(None) => {}
@@ -520,7 +543,9 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
                                 ))
                                 .await;
                         }
-                        if matches!(err, HubError::Unauthenticated) {
+                        // A superseded hello (r41 item 1) is terminal too: the
+                        // newer link owns the host.
+                        if matches!(err, HubError::Unauthenticated | HubError::LinkSuperseded) {
                             break;
                         }
                     }
@@ -529,30 +554,89 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
         }
     }
 
-    // Drain every waiter first: calls in flight when the socket ends must not
-    // sit until their timeout (and must never leak as dead map entries).
-    fail_all_pending(&pending);
-
     if let Some(host_id) = host_id {
         // Resolve session staleness first: if a newer link for this host has
         // already registered (a reconnect that superseded this socket), its
         // teardown must not wipe the contexts the live link just installed and
         // block instances that are reachable again.
-        let stale = match session_generation {
-            Some(generation) => state.nodes.remove_generation(&host_id, generation).await,
+        // `removed_link`: the durable link generation of this socket's own
+        // session when its teardown removed it (r40, see below).
+        let (stale, removed_link) = match session_generation {
+            Some(generation) => match state
+                .nodes
+                .remove_generation_link(&host_id, generation)
+                .await
+            {
+                Some(link) => (true, Some(link)),
+                None => (false, None),
+            },
             None => {
                 state.nodes.remove(&host_id).await;
-                true
+                (true, None)
             }
         };
+        // r16 item 6: no unconditional clear here. The live-takeover mark is
+        // keyed by the TAKEOVER generation and cleared under the per-host guard
+        // ONLY by remove_generation removing that exact current session (which
+        // ran above). A stale older socket's guarded removal changes nothing, so
+        // the new session never inherits A's Landing grant when A tears down
+        // after the new hello.
         if stale {
             // D-048: tear down relay streams this link owned. A vanished proxy
             // host ends streams with via-host-offline and blocks routed
             // instances; a vanished worker host cancels the upstream legs.
+            //
+            // r41 item 2: this runs IMMEDIATELY after the stale decision (main's
+            // adjacency), before any other await of this teardown: the relay
+            // teardown is host-keyed, so the later it runs, the wider the window
+            // in which a replacement hello reinstalls egress contexts that it
+            // would then revoke.
             state.api_relay.on_link_lost(&state, &host_id).await;
-            let _ = state.store.mark_host_offline(host_id).await;
+            // r40: the staleness above was decided before the awaits in
+            // between, so a replacement Node's hello may already have marked
+            // the host online. Write offline only while the host is still on
+            // the link this session registered; a newer hello bumped it first.
+            let _ = match removed_link {
+                Some(link) => state
+                    .store
+                    .mark_host_offline_for_link(host_id.clone(), link)
+                    .await
+                    .map(|_| ()),
+                None => state.store.mark_host_offline(host_id.clone()).await,
+            };
+        }
+        // r13 item 3: this authenticated session is over. Whatever its
+        // staleness, any pre-grant gate run dispatched on EXACTLY it has lost
+        // the only carrier allowed to run it; requeue/finish those rows so a
+        // replacement session (or a later reconnect) can retry instead of the
+        // job sitting Running forever. Landing rows keep occupancy and are
+        // settled by the bounded Landing reconciliation.
+        //
+        // r41 item 2: recovery runs only after the relay teardown and the
+        // offline write above, never between the stale decision and them.
+        //
+        // Test-only: a regression parks the teardown here (and is told when
+        // it finishes) to complete a replacement hello in this window.
+        #[cfg(any(test, feature = "test-faults"))]
+        let teardown_done = state.nodes.park_teardown_recovery(&host_id).await;
+        if let Some(generation) = session_generation {
+            crate::gatequeue::recover_ended_session(&state, &host_id, generation).await;
+        }
+        #[cfg(any(test, feature = "test-faults"))]
+        if let Some(done) = teardown_done {
+            let _ = done.send(());
         }
     }
+
+    // Then drain every waiter: calls in flight when the socket ends must not
+    // sit until their timeout (and must never leak as dead map entries).
+    // r41 item 2: this runs AFTER the session recovery above, not before the
+    // teardown. A gate.run waiter dropped here fails its dispatch task with
+    // "node rpc dropped"; draining first let that failure mark the run failed
+    // before recover_ended_session requeued it (the relay teardown now runs
+    // first, which widened that race). After recovery the run is already
+    // requeued and the per-generation failure guard leaves it alone.
+    fail_all_pending(&pending);
 }
 
 /// Spawn the D-048 B.2 post-hello re-push of a host's api.egress contexts.
@@ -587,9 +671,57 @@ pub(crate) fn spawn_egress_reinstall(state: &AppState, host_id: String) {
 /// link generation the hello just bumped (see
 /// [`crate::workspaces::abort_unsettled_unregisters_on_reconnect`]), not by
 /// the clock, so no reconnect instant is plumbed here.
-pub(crate) fn spawn_post_hello_tasks(state: &AppState, host_id: String) {
+/// `generation` and `displaced_live` are the values captured AT HELLO (not
+/// re-queried later), so a stale older socket that tears down after this hello
+/// cannot change the Landing-rebind decision (r16 item 6).
+pub(crate) fn spawn_post_hello_tasks(
+    state: &AppState,
+    host_id: String,
+    generation: u64,
+    displaced_live: bool,
+) {
     spawn_egress_reinstall(state, host_id.clone());
-    crate::workspaces::spawn_unregister_abort_sweep(state, host_id);
+    crate::workspaces::spawn_unregister_abort_sweep(state, host_id.clone());
+    // r13 item 1: now that this carrier is registered, immediately reconcile
+    // (read-only, forced) any Landing row pinned to this host against the exact
+    // granted merge — covering a Hub restart where the push reached origin
+    // before exit, and a push still in flight (which stays Landing until the
+    // remote confirms). Detached like the sweeps so it never blocks the read
+    // loop; the periodic reconciler retries anything still uncertain.
+    let state = state.clone();
+    tokio::spawn(async move {
+        // r15 item 8 / r16 item 6: a GENUINE reconnect (the old socket tore
+        // down before this hello — displaced_live captured at hello) is the
+        // boot's continuation of authority, so rebind same-boot in-flight
+        // Landings to THIS session before the forced probe. A live socket
+        // takeover (an older socket still registered) never inherits A's
+        // grant. The rebind is a GUARDED COMPARE-AND-SET under the per-host
+        // authority lock: if an even newer hello made the captured generation
+        // non-current before this detached task ran, this task stands down and
+        // leaves the rows to the live session.
+        if !displaced_live {
+            let boot = state.nodes.boot_epoch();
+            let guard = state
+                .nodes
+                .host_authority(&host_id)
+                .await
+                .read_owned()
+                .await;
+            if state.nodes.is_current_session(&host_id, generation).await
+                && !state
+                    .nodes
+                    .host_had_live_takeover(&host_id, generation)
+                    .await
+            {
+                let _ = state
+                    .store
+                    .rebind_same_boot_landing_sessions(&host_id, generation, boot)
+                    .await;
+            }
+            drop(guard);
+        }
+        crate::gatequeue::reconcile_landings(&state, Some(&host_id)).await;
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -599,6 +731,7 @@ pub(crate) async fn handle_node_method(
     host_id: &mut Option<String>,
     hello_done: &mut bool,
     session_generation: &mut Option<u64>,
+    hello_displaced_live: &mut bool,
     method: &str,
     params: Value,
     out_tx: &mpsc::Sender<Value>,
@@ -665,6 +798,31 @@ pub(crate) async fn handle_node_method(
             };
             *host_id = Some(host.host_id.clone());
             *hello_done = true;
+            // c-dirpicker r10 item 1: adopt the new link generation BEFORE the
+            // transport is registered. Commands can only be forwarded once
+            // the registry slot below exists, so every DELETE issued on this
+            // new link stamps the new generation and the post-hello sweep
+            // attributes it to the live link; unregister intents the dead
+            // previous link left behind carry the old value and are aborted.
+            // Durable and monotonic, so hub restarts and backward wall-clock
+            // steps neither reuse nor move a generation.
+            //
+            // r11 item 2: the bumped value is stored IN the registry slot
+            // together with the transport. `ConnectedNodes::pin` hands the pair
+            // out atomically, so a forwarding attempt stamps and rides the very
+            // same link even while a half-open previous session is still
+            // registered during this hello window.
+            //
+            // r40: the bump also precedes `apply_inventory`, which marks the
+            // host online. A replaced socket's teardown may still be running
+            // (its staleness was decided before this hello); its offline write
+            // applies only while the host is still on the link that socket
+            // registered (`mark_host_offline_for_link`), so once this bump has
+            // landed it can no longer overwrite this hello's online state.
+            let link_generation = state
+                .store
+                .bump_host_link_generation(host.host_id.clone())
+                .await?;
             let mut inventory = inventory::from_node_params(&params);
             if inventory.transport.is_none() {
                 inventory.transport = Some(TransportKind::OutboundWss);
@@ -693,25 +851,11 @@ pub(crate) async fn handle_node_method(
                     .await?;
             }
             reconcile_lost_instances(state, &host.host_id, &params).await?;
-            // c-dirpicker r10 item 1: adopt the new link generation BEFORE the
-            // transport is registered. Commands can only be forwarded once
-            // the registry slot below exists, so every DELETE issued on this
-            // new link stamps the new generation and the post-hello sweep
-            // attributes it to the live link; unregister intents the dead
-            // previous link left behind carry the old value and are aborted.
-            // Durable and monotonic, so hub restarts and backward wall-clock
-            // steps neither reuse nor move a generation.
-            //
-            // r11 item 2: the bumped value is stored IN the registry slot
-            // together with the transport. `ConnectedNodes::pin` hands the pair
-            // out atomically, so a forwarding attempt stamps and rides the very
-            // same link even while a half-open previous session is still
-            // registered during this hello window.
-            let link_generation = state
-                .store
-                .bump_host_link_generation(host.host_id.clone())
-                .await?;
-            let generation = state
+            // Test-only: a regression parks this hello here, after its
+            // generation bump and inventory awaits, to reorder two hellos.
+            #[cfg(any(test, feature = "test-faults"))]
+            state.nodes.park_before_install(&host.host_id).await;
+            let Some(inserted) = state
                 .nodes
                 .insert_with_generation(
                     host.host_id.clone(),
@@ -723,8 +867,27 @@ pub(crate) async fn handle_node_method(
                     ),
                     link_generation,
                 )
-                .await;
-            *session_generation = Some(generation);
+                .await
+            else {
+                // r41 item 1: a newer hello bumped past this one and already
+                // installed while this hello awaited; installing now would put
+                // the OLDER link over it (and its later close could then never
+                // take the host offline). This socket owns nothing: clear the
+                // host binding so its teardown touches neither the registry
+                // nor the host row, and close it.
+                tracing::warn!(
+                    host_id = %host.host_id,
+                    link_generation,
+                    "node hello superseded by a newer link; closing the older socket"
+                );
+                *host_id = None;
+                *hello_done = false;
+                return Err(HubError::LinkSuperseded);
+            };
+            *session_generation = Some(inserted.generation);
+            // r16 item 6: capture the hello-time takeover flag for the detached
+            // post-hello Landing decision (never re-queried after).
+            *hello_displaced_live = inserted.displaced_live;
             let watermarks = state
                 .store
                 .list_instance_watermarks(host.host_id.clone())
@@ -870,6 +1033,9 @@ pub(crate) async fn handle_node_method(
                 for appended in appended_chunk {
                     if !appended.replayed {
                         publish_journal(&state.bus, &appended.record);
+                        if let Some(view) = &appended.seen {
+                            publish_seen(&state.bus, view);
+                        }
                         crate::alerts::observe(state, &appended.record);
                         crate::usage_store::observe_journal(state, &appended.record).await;
                         crate::supply::observe_journal_text(state, &appended.record).await;
@@ -1008,9 +1174,172 @@ pub(crate) async fn handle_node_method(
             // Batch 6 co-lanes: streamed lane-runner events. The frame rides
             // the Node's authenticated session; the queue re-checks that the
             // job's lane host matches.
-            let host_id = host_id.as_ref().ok_or(HubError::Unauthenticated)?;
-            crate::gatequeue::on_event(state, host_id.as_str(), params).await?;
+            //
+            // A NOTIFICATION: apply off the socket read loop so a long/barriered
+            // apply_result never blocks the pump from reading the gate.run RPC
+            // reply (or other frames) that share this one socket. The same
+            // on_event entry point and host check still run; only the verdict
+            // application is detached. Ack immediately.
+            let state = state.clone();
+            let host = host_id.as_ref().ok_or(HubError::Unauthenticated)?.clone();
+            // r13 item 4: the authenticated session this event rode, so a
+            // Finished verdict from a replacement carrier cannot settle a
+            // Landing granted to the superseded session.
+            let event_session = *session_generation;
+            tokio::spawn(async move {
+                if let Err(error) =
+                    crate::gatequeue::on_event(&state, host.as_str(), event_session, params).await
+                {
+                    tracing::warn!(%error, "gate.event apply failed");
+                }
+            });
             Ok(Some(json!({ "ok": true })))
+        }
+        "gate.authorize" => {
+            // Node→Hub fencing check before a claimed dispatch executes:
+            // the Hub is the authority on whether this (job, generation) is
+            // still the live Running attempt. Any non-Running or mismatched
+            // generation is refused; force-with-lease only guards the git
+            // ref, not cancel authority. The socket's OWN authenticated
+            // session (r12 item 2), not a client-claimed epoch, must match
+            // the session the dispatch was sent on.
+            let host_id = host_id.as_ref().ok_or(HubError::Unauthenticated)?;
+            let typed: remuda_protocol::GateAuthorizeParams = serde_json::from_value(params)
+                .map_err(|error| {
+                    HubError::BadRequest(format!("invalid gate.authorize params: {error}"))
+                })?;
+            // The requesting socket must be the host's CURRENT authenticated
+            // session. A superseded socket (a replacement carrier connected
+            // while this one stayed open) is refused here even though it is
+            // still readable — its authority was revoked at takeover.
+            // r15 item 3: the read guard pins the live session across the check
+            // AND the store commit, serializing with a hello that replaces it.
+            let socket_session = session_generation.unwrap_or(0);
+            if socket_session == 0 {
+                let result = serde_json::to_value(remuda_protocol::GateAuthorizeResult {
+                    authorized: false,
+                    generation: typed.generation,
+                    state: Some("session-superseded".into()),
+                })
+                .map_err(|error| HubError::Internal(error.to_string()))?;
+                return Ok(Some(result));
+            }
+            let _authority = state
+                .nodes
+                .host_authority(host_id.as_str())
+                .await
+                .read_owned()
+                .await;
+            if !state
+                .nodes
+                .is_current_session(host_id.as_str(), socket_session)
+                .await
+            {
+                let result = serde_json::to_value(remuda_protocol::GateAuthorizeResult {
+                    authorized: false,
+                    generation: typed.generation,
+                    state: Some("session-superseded".into()),
+                })
+                .map_err(|error| HubError::Internal(error.to_string()))?;
+                return Ok(Some(result));
+            }
+            let auth = state
+                .store
+                .gate_dispatch_authorized(
+                    &typed.job_id,
+                    host_id.as_str(),
+                    typed.generation,
+                    socket_session,
+                )
+                .await
+                .map_err(crate::http::map_store)?;
+            let result = serde_json::to_value(remuda_protocol::GateAuthorizeResult {
+                authorized: auth.authorized,
+                generation: typed.generation,
+                state: auth.state,
+            })
+            .map_err(|error| HubError::Internal(error.to_string()))?;
+            Ok(Some(result))
+        }
+        "gate.landGrant" => {
+            // Node→Hub fence at the verify→land boundary: serializes with
+            // cancel so a cancel first wins; a granted Landing then runs to
+            // completion. Bound to the socket's OWN authenticated carrier
+            // session (r12 item 2): a paused/old frame that reaches a
+            // replacement session after a reconnect is refused even when the
+            // job/generation/host still match.
+            let host_id = host_id.as_ref().ok_or(HubError::Unauthenticated)?;
+            let typed: remuda_protocol::GateLandGrantParams = serde_json::from_value(params)
+                .map_err(|error| {
+                    HubError::BadRequest(format!("invalid gate.landGrant params: {error}"))
+                })?;
+            // The host is taken from the authenticated carrier, never from the
+            // frame. A non-null frame host is only validated for equality (a
+            // stdio carrier legitimately sends null); a claimed mismatch is
+            // refused rather than silently authorized.
+            if let Some(claimed) = typed.host_id.as_deref()
+                && claimed != host_id.as_str()
+            {
+                return Err(HubError::Forbidden);
+            }
+            // Revoked-session fence: only the host's CURRENT carrier session may
+            // take a grant. A paused frame on a socket a replacement carrier
+            // superseded is refused even when job/generation/host still match,
+            // in BOTH the already-Landing and the Running → Landing branches.
+            // r15 item 3: the read guard pins the session through the store
+            // commit so a takeover cannot land between the check and the
+            // Running → Landing writer.
+            let socket_session = session_generation.unwrap_or(0);
+            if socket_session == 0 {
+                let result = serde_json::to_value(remuda_protocol::GateLandGrantResult {
+                    granted: false,
+                    generation: typed.generation,
+                    state: Some("session-superseded".into()),
+                    landing_in_progress: false,
+                })
+                .map_err(|error| HubError::Internal(error.to_string()))?;
+                return Ok(Some(result));
+            }
+            let _authority = state
+                .nodes
+                .host_authority(host_id.as_str())
+                .await
+                .read_owned()
+                .await;
+            if !state
+                .nodes
+                .is_current_session(host_id.as_str(), socket_session)
+                .await
+            {
+                let result = serde_json::to_value(remuda_protocol::GateLandGrantResult {
+                    granted: false,
+                    generation: typed.generation,
+                    state: Some("session-superseded".into()),
+                    landing_in_progress: false,
+                })
+                .map_err(|error| HubError::Internal(error.to_string()))?;
+                return Ok(Some(result));
+            }
+            let grant = state
+                .store
+                .gate_land_grant(
+                    &typed.job_id,
+                    host_id.as_str(),
+                    typed.generation,
+                    &typed.session_epoch,
+                    &typed.merge_sha,
+                    socket_session,
+                )
+                .await
+                .map_err(crate::http::map_store)?;
+            let result = serde_json::to_value(remuda_protocol::GateLandGrantResult {
+                granted: grant.granted,
+                generation: typed.generation,
+                state: grant.state,
+                landing_in_progress: grant.landing_in_progress,
+            })
+            .map_err(|error| HubError::Internal(error.to_string()))?;
+            Ok(Some(result))
         }
         "instance.create"
         | "instance.send"
@@ -1414,12 +1743,16 @@ async fn fail_workers_holding(
         );
         state
             .store
-            .mutate_worker(worker.meta.id.as_id().to_string(), |row| {
-                row.state = WorkerState::Blocked {
-                    reason: NODE_EPOCH_CHANGED.to_string(),
-                };
-                Ok(())
-            })
+            .mutate_worker(
+                worker.meta.id.as_id().to_string(),
+                |row| {
+                    row.state = WorkerState::Blocked {
+                        reason: NODE_EPOCH_CHANGED.to_string(),
+                    };
+                    Ok(())
+                },
+                crate::agent_scope::CallerAuthority::internal(),
+            )
             .await?;
     }
     Ok(())
@@ -1537,6 +1870,28 @@ fn publish_journal(bus: &Bus, record: &JournalRecord) {
         record.seq,
         record.event.clone(),
     ));
+}
+
+/// seen-hub: publish an owner seen-state change on the follow bus.
+///
+/// Rides the journal bus the way workspace `host.updated` does: addressed to
+/// instance `""`, so only unfiltered (global) followers receive it and a
+/// per-session follower never mistakes it for a journal row. The frame's
+/// `seq` is the seen seq (0 before the first report); the instance id travels
+/// inside the event. Missed frames converge on the next instance poll.
+pub(crate) fn publish_seen(bus: &Bus, view: &crate::seen::SeenView) {
+    let seq = view
+        .seen_seq
+        .as_deref()
+        .and_then(|seq| seq.parse().ok())
+        .unwrap_or(0);
+    let mut event = json!({ "type": "instance.seen" });
+    if let (Some(object), Ok(Value::Object(fields))) =
+        (event.as_object_mut(), serde_json::to_value(view))
+    {
+        object.extend(fields);
+    }
+    bus.publish(FollowEvent::json("", seq, event));
 }
 
 fn hello_result(host: &HostRecord, node_token: Option<String>) -> Result<Value, HubError> {

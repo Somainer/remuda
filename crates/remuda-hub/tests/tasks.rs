@@ -706,6 +706,7 @@ async fn scoped_agents_are_enforced_on_task_routes() -> Result<()> {
             json!({ "projectId": project_a }),
             remuda_hub::store_test_support::leaf_delegation(&project_a)
                 .map_err(anyhow::Error::msg)?,
+            remuda_hub::agent_scope_test_support::CallerAuthority::internal(),
         )
         .await?;
     let worker_token =

@@ -6,6 +6,7 @@
  * hot zone is the shared ::after idiom (visual-system §3.4), not a taller box.
  */
 .banner {
+  position: relative;
   box-sizing: border-box;
   display: flex;
   align-items: center;
@@ -25,6 +26,19 @@
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The stable live-region message; the visible countdown is aria-hidden. */
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
   white-space: nowrap;
 }
 

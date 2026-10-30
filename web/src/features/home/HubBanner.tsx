@@ -40,8 +40,15 @@ export function HubBanner() {
       ? "–"
       : `${Math.max(0, Math.floor((now - lastOkAt) / 1_000))} 秒前`;
   return (
-    <div className={css.banner} data-testid="hub-banner" role="status">
-      <span className={css.text}>连不上 Hub · 上次更新 {agoLabel} ·</span>
+    <div className={css.banner} data-testid="hub-banner">
+      {/* The visible countdown changes every second; announcing that would
+          flood a screen reader. The stable message is the live region. */}
+      <span className={css.srOnly} role="status">
+        连不上 Hub
+      </span>
+      <span className={css.text} aria-hidden="true">
+        连不上 Hub · 上次更新 {agoLabel} ·
+      </span>
       <button
         type="button"
         className={css.retry}

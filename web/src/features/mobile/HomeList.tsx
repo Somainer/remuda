@@ -397,7 +397,9 @@ export const HomeList = memo(function HomeList() {
                   aria-pressed={order === "clock"}
                   onClick={() => setOrder("clock")}
                 >
-                  时钟
+                  <span className={ui.segLabel} title="时钟">
+                    时钟
+                  </span>
                 </button>
                 <button
                   type="button"
@@ -406,7 +408,9 @@ export const HomeList = memo(function HomeList() {
                   aria-pressed={order === "list"}
                   onClick={() => setOrder("list")}
                 >
-                  列表
+                  <span className={ui.segLabel} title="列表">
+                    列表
+                  </span>
                 </button>
               </div>
             </div>

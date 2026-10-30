@@ -40,10 +40,18 @@
   display: inline-flex;
 }
 
+/* P0-9 single-line rule: the four bar labels never wrap or spill into the
+   neighbouring cell. The cell is minmax(0, 1fr), so a label that does not fit
+   ellipsizes inside its own cell; the fixed vocabulary (会话/收件箱/新建/更多)
+   means it never has to. */
 .label {
+  max-width: 100%;
   font-size: var(--text-meta);
   font-weight: 500;
   line-height: var(--lh-meta);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .badge {

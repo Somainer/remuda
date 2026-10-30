@@ -1678,11 +1678,21 @@ async fn fake_node(
                             interaction_id.as_id().as_str(),
                         )
                     } else if prompt.contains("hook-approval") {
-                        fake_hook_approval(
+                        let mut card = fake_hook_approval(
                             &instance_id,
                             host_id.as_id().as_str(),
                             interaction_id.as_id().as_str(),
-                        )
+                        );
+                        // c-hpolish r3: a permission-suggestion label wide
+                        // enough that a phone-width card must wrap it rather
+                        // than clip it. Opt-in, so the existing hook-approval
+                        // specs keep the exact three-label fixture.
+                        if prompt.contains("long-option") {
+                            card["request"]["options"][1]["label"] = json!(
+                                "始终允许本次会话内对该工作目录下所有文件的编辑与写入操作 (acceptEdits)"
+                            );
+                        }
+                        card
                     } else {
                         fake_approval(
                             &instance_id,

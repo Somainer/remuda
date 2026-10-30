@@ -111,7 +111,9 @@ function KindSegment({
           onClick={() => onChange(option.id)}
           onKeyDown={(event) => onKeyDown(event, index)}
         >
-          {option.label}
+          <span className={ui.segLabel} title={option.label}>
+            {option.label}
+          </span>
         </button>
       ))}
     </div>

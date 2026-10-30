@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -820,6 +820,20 @@ describe("SessionList hold", () => {
     const moved = document.querySelector('[data-instance-id="ins_held"]')!;
     expect(screen.getByTestId("session-group-recent").contains(moved)).toBe(true);
     expect(screen.queryByTestId("session-group-working")).toBeNull();
+  });
+
+  it("holds on keyboard focus anywhere in a row, not just the ⋯ trigger", () => {
+    renderList("", {
+      instances: [
+        session("ins_held", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+        session("ins_peer", { activity: known("working"), updatedAt: "2026-09-19T08:00:00.000Z" }),
+      ],
+    });
+    const checkbox = document.querySelector('[data-instance-id="ins_held"] input[type="checkbox"]')!;
+    act(() => {
+      (checkbox as HTMLInputElement).focus();
+    });
+    expect(document.querySelector("[data-held='1']")).not.toBeNull();
   });
 
   it("holds while the action Sheet is open", async () => {

@@ -302,7 +302,8 @@ async fn digest_is_assembled_from_stored_rows_and_stays_within_budget() -> Resul
         json!({ "kind": "tool_call", "payload": { "operation": "open", "toolCallId": "tc1",
             "toolName": { "state": "known", "value": "Bash" },
             "input": { "state": "known", "value": {
-                "command": "sleep 120 && curl -H 'Authorization: Bearer sk-ant-api03-AAAAAAAAAAAAAAAAAAAA' https://x.test",
+                "command": "sleep 120 && curl -H 'X-Api-Key: agk_9f8e7d6c5b4a39281706' \
+                            --header=Bearer q7Zr2LmW8pXc4VbN1 https://x.test",
                 "handoff": "owner-typed-handoff-9917" } },
             "state": "proposed" }}),
     )
@@ -355,8 +356,13 @@ async fn digest_is_assembled_from_stored_rows_and_stays_within_budget() -> Resul
     assert_eq!(digest["pending"]["question"], "Run a long command?");
     let args = digest["pending"]["argsSummary"].as_str().context("args")?;
     assert!(args.starts_with("command=sleep 120"), "{args}");
+    // The same candidate set scripts/ci/secret-scan.py flags, including
+    // Remuda's own agent-token prefix and a token that rides a Bearer scheme.
     assert!(
-        !args.contains("sk-ant-api03") && !args.contains("owner-typed-handoff"),
+        !args.contains("sk-ant-api03")
+            && !args.contains("agk_9f8e7d6c5b4a39281706")
+            && !args.contains("q7Zr2LmW8pXc4VbN1")
+            && !args.contains("owner-typed-handoff"),
         "{args}"
     );
     assert!(args.contains("handoff=[withheld]"), "{args}");

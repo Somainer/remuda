@@ -102,9 +102,16 @@ fn is_secret_name(name: &str) -> bool {
 
 /// Whether a bare word has the shape of a credential: a well-known provider
 /// prefix, a JWT, a PEM marker, a long hex string or a long opaque run.
+///
+/// The prefix table must cover every token-prefix rule in
+/// `scripts/ci/secret-scan.py` (D-060: "the same set of candidates"); the
+/// parity test below reads the script and fails when one is missing. Prefixes
+/// match case-insensitively: a redactor errs toward withholding.
 fn is_secret_shaped(token: &str) -> bool {
     let token = token.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-');
     const PREFIXES: &[&str] = &[
+        // Remuda's own agent token, and the shapes the repo scanner knows.
+        "agk_",
         "sk-",
         "sk_live_",
         "sk_test_",
@@ -117,6 +124,7 @@ fn is_secret_shaped(token: &str) -> bool {
         "ghr_",
         "github_pat_",
         "glpat-",
+        "xai-",
         "xoxb-",
         "xoxa-",
         "xoxp-",
@@ -131,10 +139,12 @@ fn is_secret_shaped(token: &str) -> bool {
         "shpat_",
         "dop_v1_",
     ];
-    if PREFIXES
-        .iter()
-        .any(|prefix| token.starts_with(prefix) && token.len() >= prefix.len() + 8)
-    {
+    if PREFIXES.iter().any(|prefix| {
+        token
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+            && token.len() >= prefix.len() + 8
+    }) {
         return true;
     }
     if token.starts_with("eyJ") && token.len() >= 30 {
@@ -252,6 +262,20 @@ fn scrub_word(word: &str, scrub: &mut Scrub) -> Option<String> {
                     return Some(word.to_string());
                 }
                 return Some(format!("{name}={}", mask_value(value, scrub)));
+            }
+            // `--header=Bearer <token>` and `--header=Authorization: Bearer`:
+            // this word names the scheme or the header, and the credential is
+            // the NEXT word. Returning here without re-arming the scrubber
+            // would leave that token to the shape heuristic alone.
+            let value_bare = value.trim_matches(|c: char| matches!(c, '"' | '\''));
+            let names_a_secret_header = value_bare
+                .strip_suffix(':')
+                .is_some_and(|header| looks_like_name(header) && is_secret_name(header));
+            if value_bare.eq_ignore_ascii_case("bearer")
+                || value_bare.eq_ignore_ascii_case("basic")
+                || names_a_secret_header
+            {
+                scrub.next_secret = true;
             }
             return Some(format!("{name}={}", scrub_plain(value)));
         }
@@ -1793,6 +1817,106 @@ mod tests {
             !redacted.contains("MIIEvQ") && redacted.contains("after"),
             "{redacted}"
         );
+    }
+
+    /// The digest must exclude the same candidates `scripts/ci/secret-scan.py`
+    /// flags. Read the script's own prefix table, so a rule added there fails
+    /// here until the redactor covers it.
+    #[test]
+    fn the_redactor_covers_every_secret_scan_prefix() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../scripts/ci/secret-scan.py"),
+        )
+        .expect("scripts/ci/secret-scan.py is part of the repo");
+        let mut literals: Vec<(String, String)> = Vec::new();
+        for line in source.lines() {
+            let Some(rest) = line.trim().strip_prefix("P_") else {
+                continue;
+            };
+            let Some((name, expression)) = rest.split_once(" = ") else {
+                continue;
+            };
+            let mut value = String::new();
+            for part in expression.split(" + ") {
+                let Some(literal) = part
+                    .trim()
+                    .strip_prefix('"')
+                    .and_then(|p| p.strip_suffix('"'))
+                else {
+                    value.clear();
+                    break;
+                };
+                value.push_str(literal);
+            }
+            if !value.is_empty() {
+                literals.push((name.to_string(), value));
+            }
+        }
+        assert!(
+            literals.len() >= 10,
+            "parsed only {} prefixes from secret-scan.py",
+            literals.len()
+        );
+        const TOKEN: &str = "q7Zr2LmW8pXc4VbN1";
+        for (name, literal) in literals {
+            let text = match literal.as_str() {
+                "Bearer " => format!("curl -H 'Authorization: Bearer {TOKEN}'"),
+                "BEGIN PRIVATE KEY" => {
+                    format!("-----{literal}----- MIIEvQIBADANBg -----END PRIVATE KEY-----")
+                }
+                // A `NAME=` rule: the credential follows the name directly.
+                _ if literal.ends_with('=') => format!("{literal}{TOKEN}"),
+                // A bare-name rule: the credential follows a `=`/`:` separator.
+                _ if !(literal.ends_with('_') || literal.ends_with('-')) => {
+                    format!("{literal}={TOKEN}")
+                }
+                // A token-prefix rule: the credential starts with the prefix.
+                _ => format!("echo {literal}{TOKEN}"),
+            };
+            let redacted = redact_secrets(&text);
+            assert!(
+                !redacted.contains(TOKEN) && !redacted.contains("MIIEvQIBADANBg"),
+                "{name} ({literal}) leaked through the redactor: {redacted}"
+            );
+        }
+    }
+
+    #[test]
+    fn argv_secrets_after_a_bearer_header_or_by_their_own_prefix_are_withheld() {
+        // Remuda's own agent token and the xAI key shape: lowercase/digit
+        // bodies of any length slip past the opaque heuristic, so the prefix
+        // must be recognized on its own. The scan matches them in any case.
+        for secret in [
+            "agk_9f8e7d6c5b4a39281706",
+            "AGK_9F8E7D6C5B4A39281706",
+            "xai-9f8e7d6c5b4a39281706",
+            "XAI-9F8E7D6C5B4A39281706",
+        ] {
+            let summary = summarize_args(&json!({ "command": format!("echo {secret}") }));
+            assert!(
+                !summary.contains(&secret[4..]),
+                "leaked {secret}: {summary}"
+            );
+            let summary = summarize_args(&json!({ "command": format!("export K={secret}") }));
+            assert!(
+                !summary.contains(&secret[4..]),
+                "leaked {secret}: {summary}"
+            );
+        }
+        // `--header=Bearer <token>`: the credential is the NEXT word, so the
+        // `=` branch must re-arm the redactor instead of returning early.
+        for text in [
+            "curl --header=Bearer q7Zr2LmW8pXc4VbN1 https://example.test",
+            "curl -H 'Authorization: Bearer q7Zr2LmW8pXc4VbN1' https://example.test",
+            "curl --header=Authorization: Bearer q7Zr2LmW8pXc4VbN1 https://example.test",
+        ] {
+            let summary = summarize_args(&json!({ "command": text }));
+            assert!(
+                !summary.contains("q7Zr2LmW8pXc4VbN1"),
+                "leaked the header token: {summary}"
+            );
+        }
     }
 
     #[test]

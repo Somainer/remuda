@@ -20,6 +20,7 @@ pub mod instance;
 mod instance_interaction;
 pub mod journal_diff;
 pub mod mcp;
+mod memory;
 pub mod merge;
 pub mod node;
 mod own;
@@ -66,6 +67,7 @@ commands! {
     Project(project::ProjectArgs),
     Task(task::TaskArgs),
     Own(own::OwnArgs),
+    Memory(memory::MemoryArgs),
     Profile(profile::ProfileArgs),
     Dispatch(dispatch::DispatchArgs),
     Gate(gate::GateArgs),

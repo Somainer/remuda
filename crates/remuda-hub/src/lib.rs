@@ -59,6 +59,7 @@ pub mod usage_store_test_support {
 }
 mod inventory;
 mod maintenance;
+mod memory;
 mod model_catalog;
 /// Built-in model catalog revision (tests compare the served catalog against it).
 pub use model_catalog::CATALOG_REVISION;
@@ -367,6 +368,18 @@ pub mod store_test_support {
             enforce_tree: true,
             restart: None,
         })
+    }
+
+    /// A seat's delegation: no grants, a restart policy, so the insert
+    /// creates a continuity lineage row with itself as the current chapter.
+    pub fn continuity_delegation() -> InstanceDelegation {
+        InstanceDelegation {
+            restart: Some(crate::store::RestartPolicy {
+                on_process_loss: true,
+                max_per_hour: 3,
+            }),
+            ..InstanceDelegation::default()
+        }
     }
 
     /// Open a Hub DB and enroll one host, returning the store and its host id.
@@ -2053,6 +2066,7 @@ pub fn router(state: AppState) -> Router {
         .merge(placement::routes())
         .merge(projects::routes())
         .merge(tasks::routes())
+        .merge(memory::routes())
         .merge(fleet::routes())
         .merge(devices::routes())
         .merge(passkeys::routes())

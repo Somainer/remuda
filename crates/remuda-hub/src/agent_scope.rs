@@ -33,7 +33,28 @@ pub fn origin(device: &Device) -> InputOrigin {
 
 /// A caller header can narrow a Human/Bot token; it cannot promote a scoped token.
 pub async fn caller(state: &AppState, headers: &HeaderMap) -> Result<Device, HubError> {
-    let mut device = auth::require_device(&state.store, headers).await?;
+    let device = auth::require_device(&state.store, headers).await?;
+    narrow(state, headers, device).await
+}
+
+/// The authenticated device and the caller it narrows to, for a boundary
+/// that must decide on how the credential authenticated as well as on whom
+/// it acts for (D-060 memory refuses a Bot credential whatever it names).
+pub async fn authenticated_caller(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(Device, Device), HubError> {
+    let authenticated = auth::require_device(&state.store, headers).await?;
+    let narrowed = narrow(state, headers, authenticated.clone()).await?;
+    Ok((authenticated, narrowed))
+}
+
+/// Apply `x-remuda-instance-id` to an authenticated device.
+async fn narrow(
+    state: &AppState,
+    headers: &HeaderMap,
+    mut device: Device,
+) -> Result<Device, HubError> {
     if let Some(raw) = headers.get("x-remuda-instance-id") {
         let id = raw.to_str().map_err(|_| HubError::Forbidden)?;
         if device
@@ -250,6 +271,33 @@ fn attachment_read(path: &str) -> bool {
 fn lineage_read_target(path: &str) -> Option<&str> {
     let rest = path.strip_prefix("/v1/lineages/")?;
     (!rest.is_empty() && !rest.contains('/')).then_some(rest)
+}
+
+
+
+/// D-060 memory routes an Agent may reach, returning the path's lineage id.
+/// The middleware admits them only for the caller's own lineage; the handlers
+/// re-check that, and the store admits a write only from the lineage's
+/// current chapter. `…/memory/restore` and `/v1/memory/derived` are
+/// owner-only and never match.
+fn memory_target<'a>(method: &axum::http::Method, path: &'a str) -> Option<&'a str> {
+    use axum::http::Method;
+    let rest = path.strip_prefix("/v1/lineages/")?;
+    let (id, tail) = rest.split_once('/')?;
+    if id.is_empty() {
+        return None;
+    }
+    let admitted = match tail {
+        "memory" => *method == Method::GET || *method == Method::POST,
+        "memory/index" | "memory/search" => *method == Method::GET,
+        "memory/consolidate" => *method == Method::POST,
+        _ => {
+            tail.strip_prefix("memory/entries/")
+                .is_some_and(|slug| !slug.is_empty() && !slug.contains('/'))
+                && (*method == Method::GET || *method == Method::PUT || *method == Method::DELETE)
+        }
+    };
+    admitted.then_some(id)
 }
 
 /// `GET /v1/lineages/{id}/glance` (cb-digest): the lineage read predicate,
@@ -905,7 +953,14 @@ pub async fn restrict_agent_routes(
                         .strip_prefix("/v1/projects/")
                         .is_some_and(|rest| rest.ends_with("/members")))
                         || task_write_target(request.method(), path)));
-            if !read && !write {
+            // D-060: the caller's own lineage memory (reads and writes).
+            let memory = match memory_target(request.method(), path) {
+                Some(id) => agent_owns_lineage(&state, &device, id).await?,
+                None => false,
+            };
+            if !read && !write && !memory {
+                // cb-errors: the same 403 for a route an Agent may not use,
+                // carrying its reason and next step.
                 return Err(HubError::agent_route());
             }
         }
@@ -985,6 +1040,45 @@ mod tests {
         assert_eq!(payload["input"]["origin"], "agent");
         assert!(payload.get("actor").is_none());
         assert!(payload.get("agentCredential").is_none());
+    }
+
+    #[test]
+    fn memory_target_admits_only_the_agent_memory_shapes() {
+        use axum::http::Method;
+        for (method, path) in [
+            (Method::GET, "/v1/lineages/ins_l/memory"),
+            (Method::POST, "/v1/lineages/ins_l/memory"),
+            (Method::GET, "/v1/lineages/ins_l/memory/index"),
+            (Method::GET, "/v1/lineages/ins_l/memory/search"),
+            (Method::POST, "/v1/lineages/ins_l/memory/consolidate"),
+            (Method::GET, "/v1/lineages/ins_l/memory/entries/a-slug"),
+            (Method::PUT, "/v1/lineages/ins_l/memory/entries/a-slug"),
+            (Method::DELETE, "/v1/lineages/ins_l/memory/entries/a-slug"),
+        ] {
+            assert_eq!(
+                memory_target(&method, path),
+                Some("ins_l"),
+                "{method} {path}"
+            );
+        }
+        for (method, path) in [
+            // Owner-only.
+            (Method::POST, "/v1/lineages/ins_l/memory/restore"),
+            (Method::GET, "/v1/memory/derived"),
+            // Wrong methods.
+            (Method::DELETE, "/v1/lineages/ins_l/memory"),
+            (Method::POST, "/v1/lineages/ins_l/memory/index"),
+            (Method::GET, "/v1/lineages/ins_l/memory/consolidate"),
+            (Method::POST, "/v1/lineages/ins_l/memory/entries/a-slug"),
+            // Not memory, or malformed.
+            (Method::GET, "/v1/lineages/ins_l"),
+            (Method::GET, "/v1/lineages//memory"),
+            (Method::GET, "/v1/lineages/ins_l/memory/entries/"),
+            (Method::GET, "/v1/lineages/ins_l/memory/entries/a/b"),
+            (Method::GET, "/v1/lineages/ins_l/memoryx"),
+        ] {
+            assert_eq!(memory_target(&method, path), None, "{method} {path}");
+        }
     }
 
     /// The middleware only lets the two D-028 shapes through; anything else

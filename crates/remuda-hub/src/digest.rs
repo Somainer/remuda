@@ -22,7 +22,7 @@
 //! secrets and input-handoff values, and is bounded.
 
 use crate::AppState;
-use crate::agent_scope::{caller, caller_project_scope, origin, owns, require_grant};
+use crate::agent_scope::{caller_project_scope, origin, owns, require_grant};
 use crate::auth::require_origin;
 use crate::error::HubError;
 use crate::http::map_store;
@@ -1798,11 +1798,10 @@ async fn digest_caller(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<(crate::store::Device, remuda_protocol::InstanceScope), HubError> {
-    let authenticated = crate::auth::require_device(&state.store, headers).await?;
+    let (authenticated, device) = crate::agent_scope::authenticated_caller(state, headers).await?;
     if authenticated.kind == "bot" && headers.contains_key("x-remuda-instance-id") {
         return Err(HubError::Forbidden);
     }
-    let device = caller(state, headers).await?;
     require_grant(state, &device, remuda_protocol::GrantVerb::Dispatch).await?;
     let scope = caller_project_scope(state, &device).await?;
     Ok((device, scope))

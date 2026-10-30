@@ -577,15 +577,18 @@ fn pending_parts(record: &InteractionRecord, open: &[OpenTool]) -> PendingParts 
     let matched = tool_call_id
         .and_then(|id| open.iter().find(|tool| tool.id == id))
         // An approval journalled without a tool id still names its tool in the
-        // title; match the newest open call of that name.
+        // title, but not which call is waiting: accept the fallback only when
+        // exactly one open call carries that name. With two same-named calls
+        // open, quoting either one's arguments could describe the wrong
+        // command at the moment someone decides.
         .or_else(|| {
-            (kind == "approval")
-                .then(|| {
-                    open.iter()
-                        .rev()
-                        .find(|tool| !tool.name.is_empty() && tool.name == title)
-                })
-                .flatten()
+            (kind == "approval").then(|| {
+                let mut matches = open
+                    .iter()
+                    .filter(|tool| !tool.name.is_empty() && tool.name == title);
+                let only = matches.next()?;
+                matches.next().is_none().then_some(only)
+            })?
         });
     let (question, tool, args) = match kind {
         "question" => {
@@ -1763,6 +1766,15 @@ mod tests {
         }}})
     }
 
+    /// An approval whose request carries no `toolCallId` (the PTY path).
+    fn approval_without_tool_id(title: &str) -> Value {
+        json!({ "kind": "interaction.requested", "payload": { "interaction": {
+            "id": "int_fixture", "kind": "approval", "state": "pending", "blocking": true,
+            "request": { "kind": "approval", "title": title, "description": "run it?",
+                         "options": [] }
+        }}})
+    }
+
     fn tool_call(id: &str, name: &str, input: Value) -> Value {
         json!({ "kind": "tool_call", "observedAt": "2026-10-29T01:05:30.000Z", "payload": {
             "operation": "open", "toolCallId": id,
@@ -2249,6 +2261,39 @@ mod tests {
         event["payload"]["interaction"]["kind"] = json!(kind);
         event["payload"]["interaction"]["request"]["kind"] = json!(kind);
         vec![interaction(event)]
+    }
+
+    #[test]
+    fn an_approval_that_names_only_its_tool_uses_no_ambiguous_call() {
+        let worker = worker(json!({ "state": "working" }));
+        // Two open Bash calls, and an approval that carries no toolCallId: the
+        // title names the tool but not which call is waiting, so quoting
+        // either call's arguments would describe the wrong command.
+        let journal = vec![
+            tool_call("tc1", "Bash", json!({ "command": "rm -rf important" })),
+            tool_call("tc2", "Bash", json!({ "command": "ls" })),
+            approval_without_tool_id("Bash"),
+        ];
+        let pending_rows = vec![interaction(approval_without_tool_id("Bash"))];
+        let digest = digest_of(&facts(&worker, None, &journal, &pending_rows, &[], None));
+        let pending = digest.pending.expect("pending");
+        assert_eq!(pending.tool.as_deref(), Some("Bash"));
+        assert!(
+            pending.args_summary.is_none(),
+            "the approval could be for either call: {:?}",
+            pending.args_summary
+        );
+
+        // Exactly one open call of that name is unambiguous.
+        let journal = vec![
+            tool_call("tc1", "Bash", json!({ "command": "ls" })),
+            approval_without_tool_id("Bash"),
+        ];
+        let digest = digest_of(&facts(&worker, None, &journal, &pending_rows, &[], None));
+        assert_eq!(
+            digest.pending.expect("pending").args_summary.as_deref(),
+            Some("command=ls")
+        );
     }
 
     #[test]

@@ -7337,6 +7337,10 @@ pub(crate) const SEEN_SCHEMA_RUNG: i64 = 5;
 /// schema tests through [`crate::store_test_support`], never used by the Hub.
 pub const SCHEMA_USER_VERSION: i64 = SEEN_SCHEMA_RUNG;
 
+/// One ladder, no gaps: the seen rung sits above the D-060 memory rung, which
+/// sits above the ma-lineage backfills.
+const _: () = assert!(SEEN_SCHEMA_RUNG > crate::memory::MEMORY_SCHEMA_VERSION);
+
 /// Writer-side connection opener: sets WAL, the busy timeout, and runs the
 /// schema batch below.
 ///

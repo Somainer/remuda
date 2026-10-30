@@ -528,7 +528,7 @@ mod tests {
     /// at the top with both schemas present.
     #[tokio::test]
     async fn a_version_three_database_runs_memory_then_seen() {
-        use crate::store::{SCHEMA_USER_VERSION, SEEN_SCHEMA_RUNG};
+        use crate::store::SCHEMA_USER_VERSION;
         let dir = tempfile::tempdir().unwrap();
         let (store, _host) = crate::store_test_support::open_with_host(dir.path(), "seen-v3")
             .await
@@ -538,7 +538,7 @@ mod tests {
 
         // Rewind past BOTH rungs: neither schema, marker at 3.
         let db = rusqlite::Connection::open(dir.path().join("hub.sqlite")).unwrap();
-        db.execute_batch(&format!(
+        db.execute_batch(
             "DROP TABLE instance_views;
              ALTER TABLE instances DROP COLUMN turn_end_seq;
              DROP TRIGGER memory_entries_fts_insert;
@@ -547,12 +547,11 @@ mod tests {
              DROP TABLE memory_fts;
              DROP TABLE memory_slug_revisions;
              DROP TABLE memory_entries;
-             PRAGMA user_version = 3;"
-        ))
+             PRAGMA user_version = 3;",
+        )
         .unwrap();
         drop(db);
         assert_eq!(user_version(dir.path()), 3);
-        assert!(SEEN_SCHEMA_RUNG > crate::memory::MEMORY_SCHEMA_VERSION);
 
         let store = Store::open(dir.path()).unwrap();
         assert_memory_schema(dir.path(), "after the v3 ladder walk");

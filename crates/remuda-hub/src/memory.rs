@@ -754,19 +754,26 @@ fn insert_entry(
 /// Journal seq of the writer chapter's most recent `turn_started` row at
 /// write time. The Hub stamps it; it never comes from a request body. NULL for
 /// an owner write and for a chapter that has not started a turn.
+/// The writer chapter's most recent `turn_started` row.
+///
+/// Shaped as an ordered lookup, not `MAX(seq)`: SQLite walks the
+/// `(instance_id, seq)` primary key backwards from the newest row and stops at
+/// the first match, so the write path never reads the instance's whole
+/// journal. The plan is asserted by
+/// `the_turn_start_lookup_walks_the_journal_key`.
+const TURN_STARTED_SQL: &str = "SELECT seq FROM journal
+      WHERE instance_id = ?1
+        AND json_extract(payload_json, '$.payload.type') = 'native'
+        AND json_extract(payload_json, '$.payload.topic') = 'turn'
+        AND json_extract(payload_json, '$.payload.nativeName') = 'turn_started'
+      ORDER BY seq DESC LIMIT 1";
+
 fn turn_seq_for(conn: &Connection, writer: &MemoryWriter) -> rusqlite::Result<Option<i64>> {
     let Some(instance_id) = writer.instance() else {
         return Ok(None);
     };
-    conn.query_row(
-        "SELECT MAX(seq) FROM journal
-          WHERE instance_id = ?1
-            AND json_extract(payload_json, '$.payload.type') = 'native'
-            AND json_extract(payload_json, '$.payload.topic') = 'turn'
-            AND json_extract(payload_json, '$.payload.nativeName') = 'turn_started'",
-        params![instance_id],
-        |row| row.get::<_, Option<i64>>(0),
-    )
+    conn.query_row(TURN_STARTED_SQL, params![instance_id], |row| row.get(0))
+        .optional()
 }
 
 /// Append one `memory_write_log` row inside the write's own transaction, so a
@@ -3420,6 +3427,36 @@ mod tests {
     }
 
     // ─── cb-memory-ui: the per-write log and the turn reference ───────────
+
+    /// The write path's turn lookup must walk the journal's (instance_id, seq)
+    /// key newest-first instead of scanning the instance's journal.
+    #[tokio::test]
+    async fn the_turn_start_lookup_walks_the_journal_key() {
+        let fx = fixture().await;
+        let _ = fx.seat().await;
+        let plan: Vec<String> = fx
+            .store
+            .run_named("test.turn_start_plan", |conn| {
+                let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {TURN_STARTED_SQL}"))?;
+                let rows = stmt
+                    .query_map(params!["ins_plan"], |row| row.get::<_, String>(3))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("SEARCH journal USING") && line.contains("instance_id=?")),
+            "the lookup must seek the journal primary key: {plan:?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|line| line.trim_start().starts_with("SCAN journal")),
+            "the lookup must not scan the journal: {plan:?}"
+        );
+    }
 
     #[tokio::test]
     async fn an_agent_write_mid_turn_records_the_turn_started_seq() {

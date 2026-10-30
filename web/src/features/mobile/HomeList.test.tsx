@@ -6,7 +6,7 @@ import { mockDb } from "../../lib/mock";
 import type { Instance } from "../../types/instance";
 import { known, type Id } from "../../types/wire";
 import { HomeList } from "./HomeList";
-import { SPACES_PREFS_KEY, spaceStore } from "../spaces/store";
+import { SPACES_PREFS_KEY, spaceKey, spaceStore } from "../spaces/store";
 
 const hub = {
   hosts: [{ id: "host-a", label: "alpha" }],
@@ -200,5 +200,48 @@ describe("HomeList hold", () => {
     });
     expect(document.querySelector("[data-held='0']")).not.toBeNull();
     expect(ids()).toEqual(["/s/ins-peer", "/s/ins-focused"]);
+  });
+});
+
+describe("HomeList folds during a search", () => {
+  it("hides both fold toggles while the search box has text", async () => {
+    localStorage.setItem(
+      SPACES_PREFS_KEY,
+      JSON.stringify({
+        version: 1,
+        idleOpen: { [spaceKey("host-a", "wsp-a")]: true },
+        quietOpen: false,
+      }),
+    );
+    spaceStore.reload();
+    hub.instances = [
+      // A busy project with its idle rows open: the collapse control is shown.
+      row("ins-blocked", { activity: known("waiting-interaction") }),
+      row("ins-idle", { activity: known("idle") }),
+      // A second, quiet project carries the bucket toggle.
+      row("ins-beta-idle", {
+        hostId: "host-b",
+        workspaceId: "wsp-b",
+        activity: known("idle"),
+      }),
+    ];
+    hub.workspaces = [
+      { id: "wsp-a", hostId: "host-a", label: "alpha", rootPath: "/srv/alpha" },
+      { id: "wsp-b", hostId: "host-b", label: "beta", rootPath: "/srv/beta" },
+    ] as typeof hub.workspaces;
+    hub.hosts = [
+      { id: "host-a", label: "alpha" },
+      { id: "host-b", label: "beta" },
+    ] as typeof hub.hosts;
+    renderHome();
+    expect(await screen.findByTestId("home-idle-fold")).toBeTruthy();
+    expect(await screen.findByTestId("home-quiet-fold")).toBeTruthy();
+
+    await userEvent.type(screen.getByTestId("home-search"), "ins-");
+    // Search forces the folds open, so the controls that would close them are
+    // gone: a click there could not take effect and would only flip the saved
+    // preference for after the search.
+    await waitFor(() => expect(screen.queryByTestId("home-idle-fold")).toBeNull());
+    expect(screen.queryByTestId("home-quiet-fold")).toBeNull();
   });
 });

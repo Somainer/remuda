@@ -642,7 +642,7 @@ function HomeGroups({
             还有 {idle.length} 个空闲 ▾
           </button>
         ) : null}
-        {idleOpen && !group.quiet && idle.length > 0 ? (
+        {!searching && idleOpen && !group.quiet && idle.length > 0 ? (
           <button
             type="button"
             className={css.fold}
@@ -662,17 +662,20 @@ function HomeGroups({
       {busy.map(renderGroup)}
       {quiet.length > 0 ? (
         <div className={css.quiet} data-testid="home-quiet">
-          <button
-            type="button"
-            className={css.fold}
-            data-testid="home-quiet-fold"
-            aria-expanded={quietOpen}
-            onClick={() => {
-              if (!searching) spaceStore.toggleQuiet();
-            }}
-          >
-            安静的项目 · {quiet.length} {quietOpen ? "▴" : "▸"}
-          </button>
+          {/* Search forces every fold open, so the toggle is not offered: it
+              could not collapse anything and would only flip the saved
+              preference for after the search. */}
+          {searching ? null : (
+            <button
+              type="button"
+              className={css.fold}
+              data-testid="home-quiet-fold"
+              aria-expanded={quietOpen}
+              onClick={() => spaceStore.toggleQuiet()}
+            >
+              安静的项目 · {quiet.length} {quietOpen ? "▴" : "▸"}
+            </button>
+          )}
           {quietOpen ? quiet.map(renderGroup) : null}
         </div>
       ) : null}

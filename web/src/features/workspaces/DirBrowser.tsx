@@ -214,7 +214,11 @@ export function DirBrowser({ hostId, open, disabled, onClose, onRegistered }: Pr
           </Button>
           {crumbs.map((crumb, index) => (
             <span key={crumb.path} className={css.crumbWrap}>
-              <button type="button" className={css.crumb} data-testid="dir-browser-crumb"
+              {/* Every segment carries its absolute path as a title; the
+                  current (last) segment wraps so a long folder name keeps its
+                  identifying tail instead of ending in an ellipsis. */}
+              <button type="button" className={`${css.crumb} ${index === crumbs.length - 1 ? css.crumbTail : ""}`} data-testid="dir-browser-crumb"
+                title={crumb.path}
                 disabled={loading || busy || index === crumbs.length - 1}
                 onClick={() => load(crumb.path)}>
                 {index === 0 ? crumb.label : `/${crumb.label}`}

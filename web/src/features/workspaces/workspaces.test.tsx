@@ -11,6 +11,7 @@ import { WorkspaceRegistration } from "./WorkspaceRegistration";
 import { WorkspaceList } from "./WorkspaceList";
 import { workspaceCwd } from "./path";
 import type { HostDirsListing } from "./dirs";
+import css from "./workspaces.module.css";
 
 const workspace: Workspace = {
   id: "wsp_app", hostId: "hst_node", rootPath: "/home/dev/projects/app", label: "app",
@@ -421,9 +422,15 @@ it("keeps the current folder's path out of the primary button label", async () =
   render(<DirBrowser hostId={workspace.hostId} open onClose={vi.fn()} onRegistered={vi.fn()} />);
   const use = await screen.findByTestId("dir-browser-use");
   expect(use).toHaveTextContent(/^使用此文件夹$/);
-  // The full resolved path is still on screen, segment by segment.
+  // The full resolved path stays readable in the crumb strip: every segment
+  // carries its absolute path as a title, and the last (current) segment
+  // wraps instead of cutting the identifying tail.
   const crumbs = screen.getAllByTestId("dir-browser-crumb");
-  expect(crumbs.at(-1)).toHaveTextContent(longName);
+  expect(crumbs[0]).toHaveAttribute("title", "/home/dev");
+  const last = crumbs.at(-1)!;
+  expect(last).toHaveAttribute("title", `/home/dev/projects/${longName}`);
+  expect(last).toHaveClass(css.crumbTail);
+  expect(last).toHaveTextContent(`/${longName}`);
   // A path-bearing chip keeps the whole root as its accessible full text.
   const chip = screen.getByTestId("dir-browser-workspace");
   expect(chip).toHaveAttribute(

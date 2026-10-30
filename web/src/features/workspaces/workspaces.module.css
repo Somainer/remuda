@@ -147,6 +147,14 @@
   white-space: nowrap;
 }
 
+/* The current folder: wrap instead of an end ellipsis so a long segment's
+   identifying tail is always visible (D-061 r3). Its full path is in title. */
+.crumbTail {
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
 .crumb:not(:disabled):hover {
   background: var(--bg-hover, var(--bg-surface));
 }

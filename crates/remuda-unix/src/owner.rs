@@ -1,0 +1,839 @@
+//! THE OWNER CONTRACT (r21; rulings R6/R7/R8) — the single owner helper used
+//! by the Node's async land path ([`clean_surviving_group_until`]) and by EVERY
+//! recovery git subprocess in both the Node (`remuda-node/src/gate.rs`) and the
+//! merge CLI (`remuda/src/cmd/merge.rs`) through [`run_owned_process`].
+//!
+//! One process group has exactly ONE owner: the calling thread/task. The
+//! contract, in order, all of it bounded by ONE absolute deadline:
+//!
+//! 1. **Concurrent drains.** Reader threads drain stdout AND stderr for the
+//!    whole life of the child, CONCURRENTLY with step 2. Readers never reap.
+//! 2. **Observe, do not reap.** The leader's exit is observed WITHOUT reaping
+//!    (`waitid(WEXITED|WNOHANG|WNOWAIT)`, see
+//!    [`crate::observe_exit_without_reaping`]) until the per-command SOFT cap.
+//!    An observation error is never an exit. A leader still running at the cap
+//!    is SIGKILLed whole-group while unreaped; a normally exited leader gets
+//!    step 3.
+//! 3. **Clean while unreaped.** Surviving same-group members are signalled
+//!    (TERM, bounded settle, unconditional KILL) WHILE the unreaped zombie
+//!    leader still pins the pgid.
+//! 4. **Reap once.** The leader is reaped exactly once, bounded by the
+//!    ABSOLUTE deadline. A reap not accepted by the deadline moves to a
+//!    detached owner-side reaper and never blocks the response.
+//! 5. **Join both drains inside the deadline.** The two readers are joined
+//!    with the remaining budget. A reader still blocked at the deadline is
+//!    ABANDONED (dropping its handle detaches the thread); a failed or
+//!    incomplete drain of EITHER pipe is uncertainty — never a definitive
+//!    result.
+//!
+//! **Deadline exhaustion is LATCHED.** Once the absolute deadline has expired
+//! at ANY step (cleanup, reap, or a drain), the outcome is Unknown/uncertain
+//! even if every later step can finish immediately: a completion accepted
+//! after expiry does not un-expire the deadline. Reaps still outstanding move
+//! to the detached owner; blocked readers are abandoned.
+
+use std::process::{Child, Command, ExitStatus, Output};
+use std::time::{Duration, Instant};
+
+/// What an owned subprocess did relative to its absolute deadline.
+#[derive(Debug)]
+pub enum OwnedRun {
+    /// The leader exited before the soft cap AND the owner completed the whole
+    /// sequence (survivor kill, leader reap, BOTH pipe drains) before the
+    /// absolute deadline. The leader was reaped exactly once.
+    Completed(Output),
+    /// The leader was still running at the soft cap, the deadline latched
+    /// during cleanup/reap, or a pipe drain could not finish by the absolute
+    /// deadline. Callers treat this as Unknown.
+    TimedOut(Output),
+}
+
+impl OwnedRun {
+    /// Whether the run should be treated as Unknown.
+    pub fn timed_out(&self) -> bool {
+        matches!(self, OwnedRun::TimedOut(_))
+    }
+
+    /// Whether the leader reaped a successful status (TimedOut is never
+    /// success).
+    pub fn status_success(&self) -> bool {
+        match self {
+            OwnedRun::Completed(output) => output.status.success(),
+            OwnedRun::TimedOut(_) => false,
+        }
+    }
+
+    /// Consume the run into its (possibly partial) output.
+    pub fn into_output(self) -> Output {
+        match self {
+            OwnedRun::Completed(output) | OwnedRun::TimedOut(output) => output,
+        }
+    }
+}
+
+/// Owner poll granularity.
+const OWNED_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// SIGTERM settle for surviving same-group members before the unconditional
+/// KILL (clamped to the absolute deadline).
+const OWNED_TERM_GRACE: Duration = Duration::from_millis(750);
+/// After the unconditional SIGKILL, how long to wait for the group to clear.
+const OWNED_KILL_GRACE: Duration = Duration::from_millis(500);
+
+/// Remaining time until an absolute deadline (saturates at zero).
+fn remaining(deadline: Instant) -> Duration {
+    deadline
+        .checked_duration_since(Instant::now())
+        .unwrap_or(Duration::ZERO)
+}
+
+/// Drain one child pipe to EOF on a reader thread that never reaps the leader
+/// (the owner is the sole reaper).
+///
+/// r22 item 3: drains RAW BYTES and reports the outcome explicitly — a read
+/// error is `Err`, never an empty/partial success, so the owner can fail
+/// closed (Unknown) instead of building a definitive result on a truncated
+/// drain. Decoding/interpretation is the caller's job and is lossy.
+fn drain_pipe<R: std::io::Read + Send + 'static>(
+    pipe: Option<R>,
+) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        match pipe {
+            Some(mut pipe) => pipe.read_to_end(&mut buf).map(|_| buf),
+            None => Ok(buf),
+        }
+    })
+}
+
+/// Join a draining reader ONLY while the ABSOLUTE deadline has time left.
+///
+/// Returns:
+/// * `Some(Ok(bytes))` — the reader reached EOF before the deadline,
+/// * `Some(Err(_))` — it joined in time but reported a RAW read error, or the
+///   join itself failed (a panicked reader): a FAILED drain, which the owner
+///   treats as uncertainty (r22 item 3),
+/// * `None` — the deadline elapsed first; the thread is ABANDONED (dropping
+///   the `JoinHandle` detaches it) and any bytes it eventually produces are
+///   not accepted.
+///
+/// r21 item 3: the deadline is checked BEFORE completion — a reader that
+/// finishes AFTER the deadline expired (while the owner was still inside an
+/// earlier cleanup/reap step) must not be accepted as an in-time drain.
+fn join_drained_until(
+    handle: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    deadline: std::time::Instant,
+) -> Option<std::io::Result<Vec<u8>>> {
+    loop {
+        if std::time::Instant::now() >= deadline {
+            drop(handle);
+            return None;
+        }
+        if handle.is_finished() {
+            // A panicked reader is a FAILED drain, not empty successful bytes.
+            return Some(handle.join().unwrap_or_else(|_| {
+                Err(std::io::Error::other(
+                    "owned-process pipe reader thread panicked before EOF",
+                ))
+            }));
+        }
+        std::thread::sleep(OWNED_POLL_INTERVAL.min(remaining(deadline)));
+    }
+}
+
+/// Linux: whether a non-zombie member OTHER than the unreaped leader is still
+/// in `pgid` (`/proc`, timing only — never a death proof). Other platforms
+/// cannot enumerate, so they answer "no other members": TERM is sent
+/// regardless and the unconditional KILL still reaches every group member.
+#[cfg(target_os = "linux")]
+fn other_members_alive(leader_pgid: i32) -> bool {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<i32>() else {
+            continue;
+        };
+        if pid == leader_pgid {
+            continue;
+        }
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        let Some(after_comm) = stat.rsplit_once(')').map(|(_, rest)| rest) else {
+            continue;
+        };
+        let fields: Vec<&str> = after_comm.split_whitespace().collect();
+        let state = fields.first().copied().unwrap_or("");
+        let pgrp = fields.get(2).and_then(|v| v.parse::<i32>().ok());
+        if pgrp == Some(leader_pgid) && state != "Z" {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(not(target_os = "linux"))]
+fn other_members_alive(_leader_pgid: i32) -> bool {
+    false
+}
+
+/// Send `signal` to the whole process group whose leader is `leader_pgid`
+/// (`kill(-pgid, sig)`).
+fn kill_group(leader_pgid: i32, signal: libc::c_int) {
+    // SAFETY: a negative first argument addresses the process group
+    // `leader_pgid` (which this owner spawned with `process_group(0)` and whose
+    // unreaped leader keeps it alive); `signal` is a valid libc signal number.
+    // An ESRCH (group already gone) or EPERM is ignored: the unconditional
+    // KILL and the bounded member enumeration are what bound completion, not
+    // this return.
+    let _ = unsafe { libc::kill(-leader_pgid, signal) };
+}
+
+/// R8(b) contract step 3 — normal-completion cleanup while the leader is an
+/// UNREAPED zombie: TERM the whole group, boundedly wait for OTHER members to
+/// disappear, then SIGKILL unconditionally and wait again. Every wait is
+/// clamped to the SAME absolute deadline.
+pub fn clean_surviving_group_until(leader_pgid: i32, deadline: Instant) {
+    let clamp = |grace: Duration| std::cmp::min(Instant::now() + grace, deadline);
+    kill_group(leader_pgid, libc::SIGTERM);
+    let term_until = clamp(OWNED_TERM_GRACE);
+    while Instant::now() < term_until && other_members_alive(leader_pgid) {
+        std::thread::sleep(OWNED_POLL_INTERVAL.min(remaining(term_until)));
+    }
+    // Unconditional KILL: never leave a SIGTERM-ignoring transport descendant
+    // free to keep a pipe (or a connection) open.
+    kill_group(leader_pgid, libc::SIGKILL);
+    let kill_until = clamp(OWNED_KILL_GRACE);
+    while Instant::now() < kill_until && other_members_alive(leader_pgid) {
+        std::thread::sleep(OWNED_POLL_INTERVAL.min(remaining(kill_until)));
+    }
+}
+
+/// Reap the leader by polling, never blocking, never accepting a completion at
+/// or after the absolute deadline. The exit was observed (or the group
+/// KILLed), so the zombie is normally collected immediately.
+fn reap_bounded(child: &mut Child, deadline: Instant) -> Option<ExitStatus> {
+    loop {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            return Some(status);
+        }
+        std::thread::sleep(OWNED_POLL_INTERVAL.min(remaining(deadline)));
+    }
+}
+
+/// Hand an unreaped child to a DETACHED owner thread: the eventual reap stays
+/// inside this owner process and never blocks the response.
+fn detach_reaper(mut child: Child) {
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+}
+
+/// Error returned when the absolute deadline latched before the reap could be
+/// accepted (callers map this to Unknown).
+fn deadline_error() -> std::io::Error {
+    std::io::Error::other(
+        "owned process group did not finish (cleanup/reap/pipe) before the absolute deadline; \
+         outcome unknown",
+    )
+}
+
+/// R6/R7/R8(b) single-owner subprocess runner implementing THE OWNER CONTRACT
+/// at the top of this module. `cap` is the per-command SOFT bound (a
+/// still-running leader is whole-group SIGKILLed there); `deadline` is the
+/// recovery-wide ABSOLUTE bound and governs every subsequent wait.
+///
+/// Anything not finished by the absolute deadline returns `TimedOut` (leader
+/// reaped but a drain incomplete) or an error (the corpse moves to a detached
+/// reaper); callers map both to Unknown.
+pub fn run_owned_process(
+    mut command: Command,
+    cap: Duration,
+    deadline: Instant,
+) -> std::io::Result<OwnedRun> {
+    use std::os::unix::process::CommandExt;
+
+    command.process_group(0);
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // r33 item 2: observe the command at the real spawn boundary when a test
+    // recorder is installed (argv/env, including the R11 hardening prefix).
+    #[cfg(any(test, feature = "test-faults"))]
+    crate::recovery_git::record_spawn(&command);
+    let mut child = command.spawn()?;
+    let leader_pid = child.id() as i32;
+    // Step 1: readers drain both pipes for the whole sequence.
+    let out_handle = drain_pipe(child.stdout.take());
+    let err_handle = drain_pipe(child.stderr.take());
+    let group_deadline = std::cmp::min(Instant::now() + cap, deadline);
+
+    // Step 2: non-reaping exit observation until the soft cap. Observation
+    // errors are NOT exits — keep polling.
+    let mut leader_exited = false;
+    loop {
+        if matches!(
+            crate::observe_exit_without_reaping(leader_pid as u32),
+            Ok(crate::ObservedChildExit::Exited)
+        ) {
+            leader_exited = true;
+            break;
+        }
+        if Instant::now() >= group_deadline {
+            break;
+        }
+        std::thread::sleep(OWNED_POLL_INTERVAL.min(remaining(group_deadline)));
+    }
+
+    #[cfg(test)]
+    test_support::maybe_hold_after_exit_observed();
+
+    if leader_exited {
+        // Step 3: kill surviving group members while the unreaped leader pins
+        // the pgid.
+        clean_surviving_group_until(leader_pid, deadline);
+    } else {
+        // Still running at the soft cap: SIGKILL the WHOLE group while the
+        // leader is unreaped.
+        kill_group(leader_pid, libc::SIGKILL);
+    }
+
+    // LATCH (r21 item 3): if the absolute deadline has expired at this point,
+    // NOTHING that follows may produce a definitive result — even a zombie
+    // ready to reap and readers already finished. The corpse goes to the
+    // detached owner and the readers are abandoned.
+    if Instant::now() >= deadline {
+        detach_reaper(child);
+        drop(out_handle);
+        drop(err_handle);
+        return Err(deadline_error());
+    }
+
+    // Step 4: reap exactly once, bounded by the absolute deadline.
+    let Some(status) = reap_bounded(&mut child, deadline) else {
+        detach_reaper(child);
+        drop(out_handle);
+        drop(err_handle);
+        return Err(deadline_error());
+    };
+
+    // Latch again: expiry during the reap downgrades even an instantly
+    // available drain completion to Unknown.
+    if Instant::now() >= deadline {
+        drop(out_handle);
+        drop(err_handle);
+        return Ok(OwnedRun::TimedOut(Output {
+            status,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }));
+    }
+
+    // Step 5: join both drains with the remaining budget. `Some(Ok)` is a
+    // complete EOF drain; `None` is an abandoned (deadline-blocked) reader and
+    // `Some(Err)` is a raw read/join failure — the last two are uncertainty
+    // (r22 item 3), never a Completed result.
+    let stdout = join_drained_until(out_handle, deadline);
+    let stderr = join_drained_until(err_handle, deadline);
+    let mut drains_done = matches!(stdout, Some(Ok(_))) && matches!(stderr, Some(Ok(_)));
+
+    // r22 item 4 deterministic seam: park at FINAL drain acceptance (after
+    // both joins returned) so a test can expire the original deadline with
+    // both drains already finished.
+    #[cfg(test)]
+    test_support::maybe_hold_after_drains();
+
+    // r22 item 4 LATCH: the two `join_drained_until` checks are each a
+    // check-then-poll, so after the SECOND one the owner can deschedule and
+    // the deadline expire before the Completed decision. Re-check the clock
+    // immediately BEFORE accepting a definitive outcome — completion observed
+    // after expiry is Unknown even when both joins returned Some(Ok).
+    if drains_done && Instant::now() >= deadline {
+        drains_done = false;
+    }
+    let output = Output {
+        status,
+        stdout: stdout.and_then(|result| result.ok()).unwrap_or_default(),
+        stderr: stderr.and_then(|result| result.ok()).unwrap_or_default(),
+    };
+    if leader_exited && drains_done {
+        Ok(OwnedRun::Completed(output))
+    } else {
+        // A blocked reader was abandoned, or the leader had to be KILLed at
+        // the cap: the caller maps this to Unknown.
+        Ok(OwnedRun::TimedOut(output))
+    }
+}
+
+/// Platform-independent test seam (r21 items 3/7): a deterministic hold
+/// BETWEEN the exit observation and survivor cleanup/reap/drains. Tests arm it
+/// so the whole remainder starts only AFTER the absolute deadline, exercising
+/// the latched-expiry rule without /proc timing, TERM-ignoring descendants, or
+/// unsynchronised background shells.
+#[cfg(test)]
+mod test_support {
+    use std::sync::{Condvar, Mutex};
+
+    /// r22 item 7: state for a ONE-SHOT owner hold. All three flags live behind
+    /// the SAME mutex the condvar waits on, so a release notification can never
+    /// be lost: the releaser must hold the lock when it flips `released`, and
+    /// the waiter re-checks `released` under that lock before/after waiting
+    /// (the old atomic-based exit hold had the releaser notify WITHOUT the
+    /// lock, so a notification between the atomic read and `wait` parked the
+    /// owner forever). `entered` is the acknowledgement a test waits on to
+    /// prove the owner has actually parked before it releases. Resetting to
+    /// all-false on release SCOPES the hold to the single owner invocation that
+    /// consumed it — a concurrent owner can never re-park on a stale arming.
+    struct Hold {
+        armed: bool,
+        entered: bool,
+        released: bool,
+    }
+
+    impl Hold {
+        const fn new() -> Self {
+            Self {
+                armed: false,
+                entered: false,
+                released: false,
+            }
+        }
+    }
+
+    // ── hold between exit observation and cleanup/reap/drains ──────────────
+    static EXIT_STATE: Mutex<Hold> = Mutex::new(Hold::new());
+    static EXIT_CONDVAR: Condvar = Condvar::new();
+
+    /// Park the owner after the exit-observation phase until released.
+    pub(super) fn maybe_hold_after_exit_observed() {
+        let mut guard = EXIT_STATE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if !guard.armed {
+            return;
+        }
+        guard.entered = true;
+        EXIT_CONDVAR.notify_all();
+        while !guard.released {
+            guard = EXIT_CONDVAR
+                .wait(guard)
+                .unwrap_or_else(|poison| poison.into_inner());
+        }
+        // One-shot: only the invocation that consumed the hold parked.
+        *guard = Hold::new();
+    }
+
+    /// Arm the post-exit hold (resets the entered/released state).
+    pub fn arm_after_exit_hold() {
+        let mut guard = EXIT_STATE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        *guard = Hold {
+            armed: true,
+            entered: false,
+            released: false,
+        };
+        EXIT_CONDVAR.notify_all();
+    }
+
+    /// Block until the owner has parked in the post-exit hold.
+    pub fn wait_after_exit_entered() {
+        let mut guard = EXIT_STATE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        while !guard.entered {
+            guard = EXIT_CONDVAR
+                .wait(guard)
+                .unwrap_or_else(|poison| poison.into_inner());
+        }
+    }
+
+    /// Release an owner parked in [`maybe_hold_after_exit_observed`]. The flag
+    /// is flipped and the notification sent while HOLDING the lock, so the
+    /// waiter cannot miss it.
+    pub fn release_after_exit_hold() {
+        let mut guard = EXIT_STATE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        guard.released = true;
+        EXIT_CONDVAR.notify_all();
+    }
+
+    // ── hold at FINAL drain acceptance (r22 item 4) ────────────────────────
+    // Same one-shot, entered-acknowledged, lossless shape as the exit hold.
+    static DRAIN_STATE: Mutex<Hold> = Mutex::new(Hold::new());
+    static DRAIN_CONDVAR: Condvar = Condvar::new();
+
+    /// Park the owner AFTER both drain joins, before the final deadline latch
+    /// and the Completed decision.
+    pub(super) fn maybe_hold_after_drains() {
+        let mut guard = DRAIN_STATE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if !guard.armed {
+            return;
+        }
+        guard.entered = true;
+        DRAIN_CONDVAR.notify_all();
+        while !guard.released {
+            guard = DRAIN_CONDVAR
+                .wait(guard)
+                .unwrap_or_else(|poison| poison.into_inner());
+        }
+        // One-shot: only the invocation that consumed the hold parked.
+        *guard = Hold::new();
+    }
+
+    /// Arm the post-drain hold.
+    pub fn arm_after_drains_hold() {
+        let mut guard = DRAIN_STATE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        *guard = Hold {
+            armed: true,
+            entered: false,
+            released: false,
+        };
+        DRAIN_CONDVAR.notify_all();
+    }
+
+    /// Block until the owner has entered the post-drain hold.
+    pub fn wait_after_drains_entered() {
+        let mut guard = DRAIN_STATE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        while !guard.entered {
+            guard = DRAIN_CONDVAR
+                .wait(guard)
+                .unwrap_or_else(|poison| poison.into_inner());
+        }
+    }
+
+    /// Release the parked owner.
+    pub fn release_after_drains_hold() {
+        let mut guard = DRAIN_STATE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        guard.released = true;
+        DRAIN_CONDVAR.notify_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OwnedRun, drain_pipe, join_drained_until, run_owned_process, test_support};
+    use std::process::Command;
+    use std::sync::{Mutex, MutexGuard};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    /// The owner test seams are PROCESS-GLOBAL static state and park whichever
+    /// owner thread enters while armed. Serialize every test that spawns an
+    /// owned process, so a concurrent foreign `run_owned_process` can never
+    /// enter (and re-arm) a hold another test armed. The two pure-reader tests
+    /// below do not spawn and need no guard.
+    static OWNER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn owner_test_guard() -> MutexGuard<'static, ()> {
+        OWNER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// A child that exits before the soft cap yields Completed with its own
+    /// exit status and drained bytes; its leader was reaped exactly once.
+    #[test]
+    fn a_quick_child_completes() {
+        let _guard = owner_test_guard();
+        let mut command = Command::new("sh");
+        command.args(["-c", "echo hi; exit 0"]);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let run = run_owned_process(command, Duration::from_secs(5), deadline).unwrap();
+        match run {
+            OwnedRun::Completed(output) => {
+                assert!(output.status.success());
+                assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hi");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// A `Read` that yields one chunk of bytes and then fails, modelling a raw
+    /// pipe read error (r22 item 3).
+    struct PartialFailingReader {
+        chunk: Option<Vec<u8>>,
+    }
+
+    impl std::io::Read for PartialFailingReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if let Some(chunk) = self.chunk.take() {
+                let n = chunk.len().min(buf.len());
+                buf[..n].copy_from_slice(&chunk[..n]);
+                Ok(n)
+            } else {
+                Err(std::io::Error::other("synthetic pipe read failure"))
+            }
+        }
+    }
+
+    /// r22 item 3: a RAW read error is an explicit `Err` from the drain, not an
+    /// empty/partial successful drain.
+    #[test]
+    fn a_failing_pipe_reports_an_error_not_an_empty_drain() {
+        let reader = PartialFailingReader {
+            chunk: Some(b"partial".to_vec()),
+        };
+        let handle = drain_pipe(Some(reader));
+        let joined = handle.join().expect("reader thread panicked");
+        assert!(
+            joined.is_err(),
+            "a failed read must surface as an error, got {joined:?}"
+        );
+    }
+
+    /// r22 item 3: `join_drained_until` propagates a finished reader's error as
+    /// `Some(Err)` — the owner classifies that as an incomplete drain — while a
+    /// successful drain is `Some(Ok(bytes))`.
+    #[test]
+    fn a_finished_failed_drain_is_some_err_and_a_good_drain_is_some_ok() {
+        let failing = drain_pipe(Some(PartialFailingReader {
+            chunk: Some(b"x".to_vec()),
+        }));
+        let outcome = join_drained_until(failing, Instant::now() + Duration::from_secs(2));
+        match outcome {
+            Some(Err(_)) => {}
+            other => panic!("a failed drain must be Some(Err), got {other:?}"),
+        }
+
+        let good = drain_pipe(Some(std::io::Cursor::new(b"complete".as_slice())));
+        let outcome = join_drained_until(good, Instant::now() + Duration::from_secs(2));
+        match outcome {
+            Some(Ok(bytes)) => assert_eq!(bytes, b"complete"),
+            other => panic!("a full EOF drain must be Some(Ok), got {other:?}"),
+        }
+    }
+
+    /// r22 item 4 — the FINAL latch: both pipe drains complete successfully
+    /// (an immediately-exiting child closes both pipes), but the owner is held
+    /// AFTER the joins until the absolute deadline expires. The post-join
+    /// check-then-poll could otherwise accept the already-finished drains as a
+    /// Completed result; completion after expiry must be TimedOut (Unknown).
+    #[test]
+    fn drains_completed_after_the_deadline_are_latched_timed_out() {
+        let _guard = owner_test_guard();
+        test_support::arm_after_drains_hold();
+        let command = Command::new("true");
+        // `true` has no surviving members, so cleanup/reap/drains finish in a
+        // few milliseconds; the deadline only has to outlive THAT, then expire
+        // while the owner is parked at the post-drain hold.
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        let owner =
+            thread::spawn(move || run_owned_process(command, Duration::from_secs(10), deadline));
+        test_support::wait_after_drains_entered();
+        // Both drains joined while parked; let the ORIGINAL deadline expire.
+        thread::sleep(Duration::from_millis(2200));
+        let before_release = Instant::now();
+        test_support::release_after_drains_hold();
+        let run = owner
+            .join()
+            .expect("owner thread panicked")
+            .expect("the corpse was reaped in time");
+        assert!(
+            run.timed_out(),
+            "drains accepted only after the absolute deadline must be Unknown, got {run:?}"
+        );
+        assert!(
+            before_release.elapsed() < Duration::from_secs(2),
+            "the latched owner must return promptly after release"
+        );
+    }
+
+    /// A still-running leader at the soft cap is SIGKILLed whole-group while
+    /// unreaped and the run is TimedOut (signal 9), well inside the absolute
+    /// deadline. Portable: the assertion is on the leader's status, not on
+    /// process enumeration.
+    #[test]
+    fn a_leader_past_the_soft_cap_is_killed_and_times_out() {
+        let _guard = owner_test_guard();
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec sleep 47.03"]);
+        let started = Instant::now();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let run = run_owned_process(command, Duration::from_millis(300), deadline).unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        let output = match run {
+            OwnedRun::TimedOut(output) => output,
+            other => panic!("expected TimedOut, got {other:?}"),
+        };
+        assert_eq!(output.status.signal(), Some(9), "{:?}", output.status);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// r20 item 5: the leader EXITS FIRST (nonzero) while a same-group
+    /// grandchild survives with inherited stdout/stderr. The owner observes
+    /// without reaping, kills the survivor while the unreaped leader pins the
+    /// pgid, reaps and returns the LEADER's status as Completed, bounded —
+    /// never waiting on the grandchild's sleep. Portable core assertions; the
+    /// no-leftover-process check is Linux (/proc) only.
+    #[test]
+    fn normal_exit_cleans_survivors_and_keeps_the_leader_status() {
+        let _guard = owner_test_guard();
+        let mut command = Command::new("sh");
+        command.args(["-c", "(sleep 47.04) & exit 42"]);
+        let started = Instant::now();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let run = run_owned_process(command, Duration::from_secs(2), deadline).unwrap();
+        let output = match run {
+            OwnedRun::Completed(output) => output,
+            other => panic!("expected Completed after survivor cleanup, got {other:?}"),
+        };
+        assert_eq!(output.status.code(), Some(42));
+        assert!(started.elapsed() < Duration::from_secs(4));
+        #[cfg(target_os = "linux")]
+        {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let left = live_marker_processes("sleep 47.04");
+                if left == 0 || Instant::now() >= deadline {
+                    assert_eq!(left, 0, "the surviving grandchild outlived the owner");
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    /// r21 items 3/7, r22 item 7 — THE LATCH: a child that exits immediately
+    /// with no pipe holders is held AFTER the exit observation until the
+    /// absolute deadline has expired. Cleanup, the reap and both drains can then
+    /// finish INSTANTLY, but completion after expiry must be Unknown: an error
+    /// (the corpse moves to the detached reaper), never Completed. Platform
+    /// independent — no descendant, no pipe pressure, no /proc.
+    ///
+    /// r22 item 7: parking is confirmed by the hold's ENTERED acknowledgement
+    /// (`wait_after_exit_entered`) rather than a fixed sleep, and the release
+    /// is lossless (predicate and notification share one mutex), so the owner
+    /// can never miss the release and hang at `owner.join()`.
+    #[test]
+    fn completion_after_the_deadline_is_latched_unknown() {
+        let _guard = owner_test_guard();
+        test_support::arm_after_exit_hold();
+        let command = Command::new("true");
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let expire_at = deadline + Duration::from_millis(200);
+        let owner =
+            thread::spawn(move || run_owned_process(command, Duration::from_secs(10), deadline));
+        // Deterministically wait until the owner has actually parked in the
+        // post-exit hold — not a guessed sleep.
+        test_support::wait_after_exit_entered();
+        // Parked before cleanup; now let the ORIGINAL absolute deadline expire.
+        while Instant::now() < expire_at {
+            thread::sleep(Duration::from_millis(10));
+        }
+        test_support::release_after_exit_hold();
+        let started = Instant::now();
+        let result = owner.join().expect(
+            "the owner missed its release notification (lost-wakeup) and is parked forever",
+        );
+        assert!(
+            result.is_err(),
+            "a reap/drain sequence completed only after the absolute deadline must be Unknown, \
+             got {result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the latched owner must return promptly after release"
+        );
+    }
+
+    /// r22 item 7: the post-exit hold's release can never be lost. The arm →
+    /// parked → released cycle is driven many times; the ENTERED
+    /// acknowledgement proves the owner has reached the condvar wait before the
+    /// release flips the predicate. A notification that raced the wait (the
+    /// old atomic-predicate / lock-free-notify shape) would leave the owner
+    /// parked and the bounded channel receive below would time out.
+    #[test]
+    fn the_exit_hold_never_loses_its_release() {
+        let _guard = owner_test_guard();
+        for _ in 0..100 {
+            test_support::arm_after_exit_hold();
+            let (sent, got) = std::sync::mpsc::channel();
+            let owner = thread::spawn(move || {
+                test_support::maybe_hold_after_exit_observed();
+                let _ = sent.send(());
+            });
+            test_support::wait_after_exit_entered();
+            test_support::release_after_exit_hold();
+            got.recv_timeout(Duration::from_secs(5)).expect(
+                "the parked owner missed its release notification (lost wakeup) and is stuck",
+            );
+            owner.join().expect("owner thread panicked");
+        }
+    }
+
+    /// r22 item 7: the seam is one-shot and scoped. With no arming it never
+    /// parks an unrelated owner invocation; after a full cycle the state resets
+    /// so a LATER invocation also returns immediately (never re-parks on the
+    /// stale arming that caught the intended invocation).
+    #[test]
+    fn the_exit_hold_is_unarmed_by_default_and_one_shot_after_release() {
+        let _guard = owner_test_guard();
+        // No arming: an unrelated owner invocation passes straight through.
+        test_support::maybe_hold_after_exit_observed();
+
+        // One full armed/parked/released cycle.
+        test_support::arm_after_exit_hold();
+        let (sent, got) = std::sync::mpsc::channel();
+        let owner = thread::spawn(move || {
+            test_support::maybe_hold_after_exit_observed();
+            let _ = sent.send(());
+        });
+        test_support::wait_after_exit_entered();
+        test_support::release_after_exit_hold();
+        got.recv_timeout(Duration::from_secs(5))
+            .expect("the armed owner did not return after release");
+        owner.join().expect("owner thread panicked");
+
+        // The arming was consumed by that one invocation; a later invocation
+        // must not park on it.
+        test_support::maybe_hold_after_exit_observed();
+    }
+
+    /// Count LIVE (non-zombie) processes whose /proc/<pid>/cmdline carries the
+    /// marker (Linux assertions only).
+    #[cfg(target_os = "linux")]
+    fn live_marker_processes(marker: &str) -> usize {
+        std::fs::read_dir("/proc")
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+                    .filter_map(|name| name.parse::<i32>().ok())
+                    .filter(|pid| {
+                        let base = std::path::Path::new("/proc").join(pid.to_string());
+                        let Ok(cmd) = std::fs::read_to_string(base.join("cmdline")) else {
+                            return false;
+                        };
+                        if !cmd.replace('\0', " ").contains(marker) {
+                            return false;
+                        }
+                        if let Ok(stat) = std::fs::read_to_string(base.join("stat"))
+                            && let Some(after) = stat.rsplit_once(')').map(|(_, r)| r)
+                        {
+                            let state = after.split_whitespace().next().unwrap_or("");
+                            return state != "Z";
+                        }
+                        true
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+}

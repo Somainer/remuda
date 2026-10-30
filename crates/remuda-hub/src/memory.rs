@@ -1760,6 +1760,9 @@ mod tests {
                         }),
                         ..InstanceDelegation::default()
                     },
+                    // Hub-internal seeding work, as main's own store-insert
+                    // tests use: no Agent initiator, never fenced.
+                    crate::agent_scope::CallerAuthority::internal(),
                 )
                 .await
                 .unwrap()

@@ -1483,6 +1483,8 @@ mod abort {
                 json!({"path": root, "workspaceId": WORKSPACE}),
                 None,
                 None,
+                None,
+                None,
             )
             .await?;
         store
@@ -1558,6 +1560,8 @@ mod abort {
                 fixture.host.clone(),
                 "workspace.unregister".into(),
                 json!({"path": root, "workspaceId": WORKSPACE}),
+                None,
+                None,
                 None,
                 None,
             )
@@ -2410,6 +2414,8 @@ async fn instance_create_reaches_the_link_installed_between_mark_and_send() -> R
             host.clone(),
             "instance.create".into(),
             payload,
+            None,
+            None,
             None,
             None,
         )

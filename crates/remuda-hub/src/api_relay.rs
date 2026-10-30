@@ -1313,16 +1313,20 @@ impl ApiRelay {
                 }
                 let _ = state
                     .store
-                    .mutate_worker(worker.meta.id.as_id().to_string(), |row| {
-                        row.meta.revision = remuda_protocol::U64(row.meta.revision.0 + 1);
-                        row.meta.updated_at =
-                            remuda_protocol::Timestamp::try_from(crate::config::now_rfc3339())
-                                .map_err(|_| StoreError::Id("bad timestamp".into()))?;
-                        row.state = remuda_protocol::WorkerState::Blocked {
-                            reason: API_ROUTE_DOWN.into(),
-                        };
-                        Ok(())
-                    })
+                    .mutate_worker(
+                        worker.meta.id.as_id().to_string(),
+                        |row| {
+                            row.meta.revision = remuda_protocol::U64(row.meta.revision.0 + 1);
+                            row.meta.updated_at =
+                                remuda_protocol::Timestamp::try_from(crate::config::now_rfc3339())
+                                    .map_err(|_| StoreError::Id("bad timestamp".into()))?;
+                            row.state = remuda_protocol::WorkerState::Blocked {
+                                reason: API_ROUTE_DOWN.into(),
+                            };
+                            Ok(())
+                        },
+                        crate::agent_scope::CallerAuthority::internal(),
+                    )
                     .await;
             }
             crate::ws::publish_hub_diagnostic(

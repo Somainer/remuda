@@ -48,6 +48,9 @@ impl Hub {
                 None,
                 serde_json::json!({"origin": "human"}),
                 remuda_hub::store_test_support::continuity_delegation(),
+                // Hub-internal seeding work, as main's own store-insert tests
+                // use: no Agent initiator, never fenced.
+                remuda_hub::agent_scope_test_support::CallerAuthority::internal(),
             )
             .await?
             .instance_id;

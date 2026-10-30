@@ -9,6 +9,7 @@ members = [
     "crates/remuda-screen",
     "crates/remuda-driver",
     "crates/remuda-signal",
+    "crates/remuda-unix",
     "crates/remuda-journal",
     "crates/remuda-push",
     "crates/remuda-node",
@@ -59,6 +60,7 @@ remuda-herdr = { path = "crates/remuda-herdr" }
 remuda-screen = { path = "crates/remuda-screen" }
 remuda-driver = { path = "crates/remuda-driver" }
 remuda-signal = { path = "crates/remuda-signal" }
+remuda-unix = { path = "crates/remuda-unix" }
 remuda-journal = { path = "crates/remuda-journal" }
 remuda-push = { path = "crates/remuda-push" }
 remuda-rules = { path = "crates/remuda-rules" }

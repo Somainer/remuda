@@ -1,7 +1,8 @@
 import { formatListTime } from "../../lib/format";
 import { projectStatus } from "../../lib/status";
 import { endReason, type EndTone } from "../../lib/endReason";
-import type { Instance, UiStatus } from "../../types/instance";
+import type { Activity, Instance, Kind, Lifecycle, UiStatus } from "../../types/instance";
+import { knowledgeValue } from "../../types/command";
 import type { Interaction } from "../../types/interaction";
 import type { Observation } from "../../types/observation";
 import type { Task } from "../../types/generated";
@@ -52,11 +53,182 @@ export function writeHomeOrder(order: HomeOrder, storage?: OrderStorage): void {
   }
 }
 
+/**
+ * The one ordering both `/m` and the desktop SessionList share (home.md §3.1).
+ * Lower sorts first. `done-unseen` is a reserved slot: the per-owner `unseen`
+ * flag does not exist until `seen-hub` lands, so nothing projects into it and
+ * its position stays empty. `awaiting-wake` is a live idle session that still
+ * has a child in the blocked, working or starting rank (a loop or a sub-agent
+ * that will wake it); the future-wake half of that rule waits for `home-wakes`.
+ */
+export type HomeRank =
+  | "blocked"
+  | "done-unseen"
+  | "working"
+  | "awaiting-wake"
+  | "starting"
+  | "idle"
+  | "exited";
+
+/** Fixed order. Index is the sort key; never reorder these names. */
+export const HOME_RANKS: readonly HomeRank[] = [
+  "blocked",
+  "done-unseen",
+  "working",
+  "awaiting-wake",
+  "starting",
+  "idle",
+  "exited",
+];
+
+/**
+ * Not yet a running process, or the Hub is still deciding what it is. A live
+ * process is `ready` or `running`; those two fall through to the activity rows.
+ */
+const STARTING_LIFECYCLE: readonly Lifecycle[] = [
+  "requested",
+  "preparing",
+  "starting",
+  "unknown",
+  "reconciling",
+];
+/** The process is gone or on its way out. */
+const ENDED_LIFECYCLE: readonly Lifecycle[] = ["exited", "failed", "closing"];
+
+/**
+ * What the rank table reads off one instance. `childLive` is true when one of
+ * this session's children itself ranks blocked, working or starting.
+ */
+export type RankInput = {
+  lifecycle: Lifecycle;
+  /** The known activity, or null when the Hub has not reported one. */
+  activity: Activity | null;
+  childLive?: boolean;
+  /**
+   * Per-owner "finished and not yet opened" flag. Absent until `seen-hub`
+   * lands, so the done-unseen rank stays empty (home.md §3.1, §10).
+   */
+  unseen?: boolean;
+  /** A settled root turn that failed. Such a turn is a queue card, never ◉. */
+  lastTurnError?: boolean;
+};
+
+/**
+ * The ordered first-match table (home.md §3.1). First hit wins, and the table
+ * is total: after the starting and ended rows, only a live lifecycle remains,
+ * so every `(lifecycle, activity)` pair lands on exactly one rank.
+ *
+ * Connectivity is deliberately NOT an input. A host that drops offline draws a
+ * dashed dot and says 状态待确认, but the row keeps the rank its lifecycle and
+ * activity give it — a blocked row does not fall out of rank 1.
+ */
+export function rankOf(input: RankInput): HomeRank {
+  const { lifecycle, activity } = input;
+  // a — waiting on a person, whatever the lifecycle.
+  if (activity === "waiting-interaction") return "blocked";
+  // b — not running yet, or the Hub has not settled the lifecycle.
+  if (STARTING_LIFECYCLE.includes(lifecycle)) return "starting";
+  // c — gone.
+  if (ENDED_LIFECYCLE.includes(lifecycle)) return "exited";
+  // d — a live turn in progress.
+  if (activity === "working" || activity === "draining") return "working";
+  if (activity === "idle") {
+    // e — a successful turn the owner has not opened. A FAILED turn is a queue
+    // card (§4.5), so it never takes the done-unseen rank.
+    if (input.unseen === true && input.lastTurnError !== true) return "done-unseen";
+    // f — idle, but a child is still going, or a wake is scheduled.
+    if (input.childLive === true) return "awaiting-wake";
+    // g — plain idle.
+    return "idle";
+  }
+  // h — live, but the activity is unknown. Treated as working, not idle.
+  return "working";
+}
+
+/**
+ * Ranks a session from its own fields. `childLive` is the only extra fact, and
+ * it only lifts an otherwise-idle live session into `awaiting-wake`.
+ */
+export function rank(instance: Instance, childLive = false): HomeRank {
+  return rankOf({
+    lifecycle: instance.lifecycle,
+    activity: knowledgeValue(instance.activity) ?? null,
+    childLive,
+    // seen-hub: the owner has not opened the last settled turn. An older Hub
+    // omits the flag, which reads as false.
+    unseen: instance.unseen === true,
+    lastTurnError: Boolean(instance.lastTurnError?.text?.trim()),
+  });
+}
+
+/**
+ * True when this instance's own rank is one that wakes its parent (home.md
+ * §3.1 f): blocked, working or starting. The child's connectivity is not
+ * consulted — a child on a dropped host still ranks what its lifecycle and
+ * activity say.
+ */
+export function childIsLive(child: Instance): boolean {
+  const homeRank = rank(child);
+  return homeRank === "blocked" || homeRank === "working" || homeRank === "starting";
+}
+
+/**
+ * Parent instance ids that have at least one child in rank 1, 3 or 5, for the
+ * `awaiting-wake` rule. Both surfaces derive their child set from this one
+ * helper so the rule cannot drift between them.
+ */
+export function liveChildParents(instances: readonly Instance[]): Set<string> {
+  const parents = new Set<string>();
+  for (const instance of instances) {
+    const parentId = instance.parent?.instanceId;
+    if (parentId && childIsLive(instance)) parents.add(parentId);
+  }
+  return parents;
+}
+
+/** Sort key for {@link rank}. `done-unseen` sits between blocked and working. */
+export function rankOrder(homeRank: HomeRank): number {
+  return HOME_RANKS.indexOf(homeRank);
+}
+
+/**
+ * Status word on line 1. Only the three ranks whose section does not already
+ * say the state get one: blocked, done-unseen (reserved, never reached today)
+ * and awaiting-wake. Every other rank leaves the slot empty.
+ */
+export function rankStateWord(homeRank: HomeRank): string | null {
+  if (homeRank === "blocked") return "待处理";
+  if (homeRank === "done-unseen") return "完成未看";
+  if (homeRank === "awaiting-wake") return "待唤醒";
+  return null;
+}
+
+/**
+ * A row that folds away inside a busy project. Only idle rows do: an exited
+ * row belongs to the existing 已退出/已归档 fold (home.md §3.2), which this
+ * surface does not have yet, so it stays visible rather than being hidden
+ * behind an 「空闲」 label that would be wrong for it.
+ */
+export function rankFolds(homeRank: HomeRank): boolean {
+  return homeRank === "idle";
+}
+
+/** A row a person may need to act on: ranks 1–5. Exited and idle are not. */
+export function rankIsActive(homeRank: HomeRank): boolean {
+  return homeRank !== "idle" && homeRank !== "exited";
+}
+
 export type HomeRow = {
   id: string;
   instance: Instance;
   title: string;
   status: UiStatus;
+  /** The shared rank both surfaces sort by. */
+  rank: HomeRank;
+  /** Harness kind for the line-1 glyph (the existing HarnessGlyph). */
+  kind: Kind;
+  /** Line-1 state word; null unless the rank is blocked, done-unseen or awaiting-wake. */
+  stateWord: string | null;
   /** The one body sentence: nextStep() verbatim — ended rows speak the shared
    *  endReason label, never the raw lastError (c-homeend). */
   body: string;
@@ -92,6 +264,27 @@ export type HomeGroup = {
   branch: string | null;
   /** Always the buildSpaces() count, even while a search hides some rows. */
   blockedCount: number;
+  /**
+   * Header dot counts over every row the group holds, folded rows included.
+   * Each rank keeps the glyph home.md §3.1 assigns it: ⚠ blocked, ◉ done-unseen,
+   * ● working, ○ awaiting-wake and idle, a pulsing dot for starting, ■ exited.
+   * A zero count is omitted by the renderer.
+   */
+  dots: {
+    blocked: number;
+    unseen: number;
+    working: number;
+    wake: number;
+    starting: number;
+    idle: number;
+    exited: number;
+  };
+  /**
+   * True when the group has no row in ranks 1–5 (no blocked, done-unseen,
+   * working, awaiting-wake or starting session). Only idle and exited rows
+   * remain, so the whole project folds into 「安静的项目」.
+   */
+  quiet: boolean;
   rows: HomeRow[];
 };
 
@@ -108,6 +301,11 @@ export type HomeRowsInput = {
   screenOf?: (instanceId: string) => RowScreen;
   summaryOf?: (instanceId: string) => string | undefined;
   eventsOf?: (instanceId: string) => Observation[] | undefined;
+  /**
+   * True when this session has a child that is still running. The only input
+   * that lifts an idle row into the awaiting-wake rank; absent means no child.
+   */
+  childLiveOf?: (instanceId: string) => boolean;
   /** Clock injection for the relative-time label; defaults to Date.now(). */
   nowMs?: number;
 };
@@ -201,6 +399,7 @@ export function buildHomeRows(
     | "screenOf"
     | "summaryOf"
     | "eventsOf"
+    | "childLiveOf"
     | "nowMs"
   >,
 ): Map<string, HomeRow> {
@@ -233,6 +432,7 @@ export function buildHomeRows(
       const canResume =
         status === "exited" &&
         instance.capabilities.capabilities.resume?.state === "supported";
+      const homeRank = rank(instance, input.childLiveOf?.(instance.id) === true);
       const end = endReason(instance);
       const ended = end !== null && status !== "unknown" ? end : null;
       // D-057 OA6 (ma-sdk-state r2 item 7): a live row's retryable turn error
@@ -259,6 +459,9 @@ export function buildHomeRows(
         instance,
         title: input.titleOf(instance.id) || "会话",
         status,
+        rank: homeRank,
+        kind: instance.kind,
+        stateWord: rankStateWord(homeRank),
         body: body.text,
         bodyIsError: body.isError,
         bodyTone: ended?.tone ?? null,
@@ -275,19 +478,27 @@ export function buildHomeRows(
   return rows;
 }
 
-function rowTime(row: HomeRow): number {
+function rowTime(row: Pick<RankRow, "updatedAt">): number {
   return Date.parse(row.updatedAt) || 0;
 }
 
 /**
- * Blocked rows are pinned to the top of every group in every ordering
- * (ui-spec §2.1 待处理置顶). Clock = most recent change first; list = title.
+ * The fields the shared comparator reads. `HomeRow` satisfies it, and so does
+ * the small row the desktop list builds from an instance — that list has no
+ * context ring or body sentence of its own.
  */
-function compareRows(a: HomeRow, b: HomeRow, order: HomeOrder): number {
-  if (a.blocked !== b.blocked) return a.blocked ? -1 : 1;
-  if (order === "list") {
-    return a.title.localeCompare(b.title) || a.id.localeCompare(b.id);
-  }
+export type RankRow = Pick<HomeRow, "id" | "rank" | "title" | "updatedAt">;
+
+/**
+ * The one comparator both surfaces use. Rank first (blocked above done-unseen
+ * above working above awaiting-wake above starting above idle above exited),
+ * newest change first inside a rank. The 列表 device preference is NOT read
+ * here: home.md §3.1 makes recency within a rank part of the ordering, so the
+ * preference only reorders groups (`compareGroups`), never rows.
+ */
+export function compareRanked(a: RankRow, b: RankRow): number {
+  const byRank = rankOrder(a.rank) - rankOrder(b.rank);
+  if (byRank !== 0) return byRank;
   return rowTime(b) - rowTime(a) || a.id.localeCompare(b.id);
 }
 
@@ -302,10 +513,28 @@ function compareGroups(a: HomeGroup, b: HomeGroup, order: HomeOrder): number {
   return latest(b) - latest(a) || a.id.localeCompare(b.id);
 }
 
+function groupDots(rows: readonly HomeRow[]): HomeGroup["dots"] {
+  const dots = { blocked: 0, unseen: 0, working: 0, wake: 0, starting: 0, idle: 0, exited: 0 };
+  for (const row of rows) {
+    if (row.rank === "blocked") dots.blocked += 1;
+    else if (row.rank === "done-unseen") dots.unseen += 1;
+    else if (row.rank === "working") dots.working += 1;
+    else if (row.rank === "awaiting-wake") dots.wake += 1;
+    else if (row.rank === "starting") dots.starting += 1;
+    else if (row.rank === "exited") dots.exited += 1;
+    else dots.idle += 1;
+  }
+  return dots;
+}
+
 /**
  * Query filtering, per-group row shaping and ordering over pre-derived rows.
  * Cheap to run on every keystroke — `nextStep()`/error derivation is not in
  * here (see `buildHomeRows`).
+ *
+ * Rows come back in rank order (newest first within a rank). The caller folds
+ * idle/exited rows and whole quiet projects; this function only marks them.
+ * A non-empty query is a search, and a search returns every match unfolded.
  */
 export function arrangeHomeGroups(input: {
   spaces: Space[];
@@ -342,13 +571,16 @@ export function arrangeHomeGroups(input: {
       if (row) rows.push(row);
     }
     if (!rows.length) continue;
-    rows.sort((a, b) => compareRows(a, b, input.order));
+    rows.sort((a, b) => compareRanked(a, b));
+    const quiet = rows.every((row) => !rankIsActive(row.rank));
     groups.push({
       id: space.id,
       project: space.name,
       hostName: input.hostNameOf(space.hostId),
       branch: input.branchOf?.(space.id) ?? null,
       blockedCount: space.blockedCount,
+      dots: groupDots(rows),
+      quiet,
       rows,
     });
   }
@@ -388,7 +620,7 @@ export function homeRowsSignature(
   const rowPart = [...rows.values()]
     .map(
       (row) =>
-        `${row.id}|${row.status}|${row.title}|${row.body}|${row.bodyIsError ? 1 : 0}|${row.bodyTone ?? "-"}|${row.bodyDetail ?? "-"}|${row.contextPct ?? "-"}|${row.contextPctApproximate ? "a" : "x"}|${row.blocked ? 1 : 0}|${row.canResume ? 1 : 0}|${row.timeLabel}`,
+        `${row.id}|${row.status}|${row.rank}|${row.kind}|${row.stateWord ?? "-"}|${row.title}|${row.updatedAt}|${row.body}|${row.bodyIsError ? 1 : 0}|${row.bodyTone ?? "-"}|${row.bodyDetail ?? "-"}|${row.contextPct ?? "-"}|${row.contextPctApproximate ? "a" : "x"}|${row.blocked ? 1 : 0}|${row.canResume ? 1 : 0}|${row.timeLabel}`,
     )
     .join("\n");
   // Prefs/closed tabs and workspace membership change WHICH instances a space

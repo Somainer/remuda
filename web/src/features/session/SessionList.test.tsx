@@ -740,3 +740,18 @@ describe("SessionList relative-time clock (c-perffu r2)", () => {
     }
   });
 });
+
+describe("desktop buckets", () => {
+  it("maps every rank to exactly one bucket", async () => {
+    const { HOME_RANKS } = await import("../mobile/homeRows");
+    const { SESSION_GROUPS } = await import("./SessionList");
+    for (const rank of HOME_RANKS) {
+      const matches = SESSION_GROUPS.filter((group) => group.match(rank));
+      expect(matches, `rank ${rank} belongs to exactly one bucket`).toHaveLength(1);
+    }
+    // The second rank is its own section: it can no longer fall on the floor.
+    expect(SESSION_GROUPS.find((group) => group.match("done-unseen"))?.title).toBe("完成未看");
+    const order = SESSION_GROUPS.map((group) => group.id);
+    expect(order).toEqual(["blocked", "unseen", "working", "recent", "exited"]);
+  });
+});

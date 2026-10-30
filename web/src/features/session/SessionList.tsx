@@ -42,8 +42,15 @@ import {
 } from "./sessionFilters";
 import css from "./SessionList.module.css";
 
-const GROUPS: { id: string; title: string; match: (rank: HomeRank) => boolean }[] = [
+/**
+ * The desktop status buckets, in paint order. Every `HomeRank` belongs to
+ * exactly one bucket (a test walks HOME_RANKS): a rank with no bucket would
+ * silently drop its session from /sessions.
+ */
+export const SESSION_GROUPS: { id: string; title: string; match: (rank: HomeRank) => boolean }[] = [
   { id: "blocked", title: "待处理", match: (rank) => rank === "blocked" },
+  // seen-hub: a settled turn the owner has not opened yet.
+  { id: "unseen", title: "完成未看", match: (rank) => rank === "done-unseen" },
   { id: "working", title: "进行中", match: (rank) => rank === "working" || rank === "awaiting-wake" || rank === "starting" },
   { id: "recent", title: "最近", match: (rank) => rank === "idle" },
   // D-028 §8 方案 A: node-epoch-changed settles the row as exited; it leaves
@@ -614,7 +621,7 @@ export function SessionList({
           </div>
         </div>
       ) : null}
-      {GROUPS.map((group) => {
+      {SESSION_GROUPS.map((group) => {
         const rankOf = (instance: Instance) => rank(instance, childLiveIds.has(instance.id));
         const items = ranked.filter((instance) => group.match(rankOf(instance)));
         if (!items.length) return null;

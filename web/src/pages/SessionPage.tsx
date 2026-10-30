@@ -12,7 +12,7 @@ import {
   type ReactNode,
 } from "react";
 import { Navigate, useLocation, useNavigate, useParams } from "react-router-dom";
-import { FileText, Info, ListCollapse, MessageSquarePlus, Rows3, ScrollText, Search } from "lucide-react";
+import { BrainCircuit, FileText, Info, ListCollapse, MessageSquarePlus, Rows3, ScrollText, Search } from "lucide-react";
 import { ConnectionIndicator } from "../components/ConnectionIndicator";
 import { EndedBar } from "../chrome/EndedBar";
 import { SessionHeader, useWideDesktop } from "../chrome/SessionHeader";
@@ -723,6 +723,15 @@ function SessionPageBody({
     checked: hub.compact,
     data: { "data-mode": hub.compact ? "compact" : "full" },
     onSelect: () => hubStore.setCompact(!hub.compact),
+  });
+  // D-060 (cb-memory-ui): the memory page entry point. A ⋯ item every width,
+  // so the Main seat reaches the same route later without new routing.
+  moreItems.push({
+    key: "memory",
+    testId: "memory-open",
+    label: "记忆",
+    icon: BrainCircuit,
+    onSelect: () => navigate(`/s/${instance.id}/memory`),
   });
   if (showViewExtras && !filesInline) {
     moreItems.push({

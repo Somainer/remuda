@@ -366,6 +366,11 @@ export function mapInstance(rec: components["schemas"]["InstanceRecord"]): Insta
     // D-050 task membership (instances.task_id); additive, absent on
     // unbound sessions and older rows.
     taskId: typeof extra.taskId === "string" && extra.taskId ? extra.taskId : null,
+    // D-057 §5: the memory page addresses the lineage, not the chapter.
+    lineageId:
+      typeof (rec as { lineageId?: unknown }).lineageId === "string"
+        ? ((rec as { lineageId: string }).lineageId as Id)
+        : undefined,
     delegation: typeof rec.delegation === "string" ? rec.delegation : extra.delegation ?? null,
     providerProfileId:
       typeof rec.providerProfileId === "string" ? rec.providerProfileId : extra.providerProfileId ?? null,

@@ -33,6 +33,12 @@ export type Instance = EntityMeta & {
    * Additive wire field — the Hub already serves it on InstanceRecord.
    */
   taskId?: Id | null;
+  /**
+   * D-057 §5: the continuity lineage this chapter belongs to (its own id for
+   * a plain instance). D-060 memory is addressed by lineage, so the memory
+   * page resolves it from here instead of assuming the chapter id.
+   */
+  lineageId?: Id;
   kind: Kind;
   driver: DriverKind;
   lifecycle: Lifecycle;

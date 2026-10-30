@@ -499,3 +499,43 @@
 .heldRowActions {
   composes: heldRowActions from "./composer.module.css";
 }
+
+/* D-060 (cb-memory-ui): 「已记住：<title>」 rows under a turn's reply. Quiet:
+   a muted list, one line per slug, tap opens the entry on the memory page. */
+.remembered {
+  list-style: none;
+  margin: var(--space-2) 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.rememberedRow {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  max-width: 100%;
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--divider);
+  border-radius: var(--radius-pill);
+  background: var(--bg-inset);
+  color: var(--fg-muted);
+  font-size: var(--text-2xs);
+  line-height: var(--lh-meta);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+.rememberedRow:hover {
+  color: var(--fg-body);
+  background: var(--bg-hover);
+}
+
+.rememberedRow:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}

@@ -27,6 +27,7 @@ import { allModelPinMismatches } from "../features/session/modelEffective";
 import { RunDetails } from "../features/session/RunDetails";
 import { claudeDefaultTier, contextPercent } from "../features/session/effort";
 import { Transcript, type TranscriptHandle } from "../features/session/Transcript";
+import { rememberedByReply, useRememberedWrites } from "../features/session/remembered";
 import { LiveStatusStrip } from "../features/session/live/LiveStatusStrip";
 import { useTurnDecision } from "../features/session/useTurnDecision";
 import { SessionNotifications } from "../features/session/notifications/SessionNotifications";
@@ -438,6 +439,21 @@ function SessionPageBody({
   const ended = instance ? endReason(instance) : null;
   const status = ended ? "exited" : instance ? projectStatus(instance) : "unknown";
   const events = hub.events ?? NO_EVENTS;
+  // D-060 (cb-memory-ui): the chapter's write log rides the transcript's
+  // refresh (its tail seq), and the rows are placed under the reply of the
+  // turn that wrote them. One fetch per journal batch; no per-row timer.
+  const rememberedWrites = useRememberedWrites(
+    instanceId,
+    events.length ? String(events.at(-1)?.seq ?? instance?.durableSeq ?? "0") : instance?.durableSeq,
+  );
+  const rememberedRows = useMemo(
+    () => rememberedByReply(events, rememberedWrites),
+    [events, rememberedWrites],
+  );
+  const openMemory = useCallback(
+    (slug: string) => navigate(`/s/${instanceId}/memory?slug=${encodeURIComponent(slug)}`),
+    [navigate, instanceId],
+  );
   const pending = hub.pending;
   // The turn-end decision folds every channel (hook latch, screen, transcript
   // tail, pending interactions), not the hook latch alone — so a turn whose
@@ -876,6 +892,8 @@ function SessionPageBody({
             earlierFloor={hub.earlierFloor}
             journalStatus={journalStatus}
             steerHeld={steerHeldControl(instance.kind, composerPhase, instance.capabilities)}
+            remembered={rememberedRows}
+            onOpenMemory={openMemory}
             onSteerHeld={async (_iid, id) => {
               const landed = await hubStore.steerHeld(instance.id, id);
               // 已打断 is a receipt for an interrupt that actually landed.

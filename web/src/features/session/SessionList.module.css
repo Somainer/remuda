@@ -758,6 +758,12 @@
   font-size: 14px;
 }
 
+/* home.md §8: stale = the cached cards grey out until the next successful
+   refresh. A foreground grace is explicitly not stale. */
+.rows[data-dimmed="1"] {
+  opacity: 0.55;
+}
+
 .compactTop {
   height: 48px;
   flex: none;

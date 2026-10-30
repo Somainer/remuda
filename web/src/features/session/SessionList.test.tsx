@@ -39,9 +39,21 @@ const hub = {
   connection: "live",
 };
 
+/** The store's freshness projection (home.md §8) as the list sees it. */
+const health = { lastOkAt: Date.now() as number | null, failingSince: null as number | null, settledSeq: 0 };
+const healthListeners = new Set<() => void>();
+
 vi.mock("../../lib/store", () => ({
   useHub: () => hub,
   hubStore: {
+    subscribe: () => () => {},
+    getSnapshot: () => hub,
+    getRefreshHealth: () => health,
+    subscribeRefreshHealth: (listener: () => void) => {
+      healthListeners.add(listener);
+      return () => healthListeners.delete(listener);
+    },
+    refresh: vi.fn(async () => undefined),
     titleOf: (id: string) => titles[id] ?? id,
     summaryOf: (id: string) => summaries[id] ?? "",
     hostName: (id: string) => hostNames[id] ?? id,
@@ -124,6 +136,8 @@ function renderList(search = "", options: { instances?: Instance[]; space?: type
 
 beforeEach(() => {
   mobileViewport = false;
+  health.lastOkAt = Date.now();
+  health.failingSince = null;
   hub.hosts = [host("host-a", "alpha"), host("host-b", "beta")];
   hub.workspaces = [workspace("wsp-a", "host-a", "demo-root", "/home/dev/demo-root")];
   hub.instances = [session("ins_a"), session("ins_b", { activity: known("waiting-interaction") })];
@@ -1037,5 +1051,36 @@ describe("SessionList hold", () => {
     );
     // The open Sheet still owns the painted order.
     expect(cards()).toEqual(["ins_a", "ins_b"]);
+  });
+});
+
+describe("SessionList §8 freshness states", () => {
+  it("paints three skeleton cards before the first snapshot, never the empty state", () => {
+    health.lastOkAt = null;
+    renderList("", { instances: [] });
+    const skeleton = screen.getByTestId("session-skeleton");
+    expect(skeleton).toHaveAttribute("aria-busy", "true");
+    expect(skeleton.children).toHaveLength(3);
+    expect(screen.queryByText("还没有会话")).toBeNull();
+    expect(screen.queryByTestId("home-empty")).toBeNull();
+  });
+
+  it("greys the cached cards while stale", () => {
+    health.lastOkAt = Date.now() - 20_000;
+    renderList();
+    const rows = screen.getByTestId("session-list").querySelector("[data-freshness]");
+    expect(rows).toHaveAttribute("data-freshness", "stale");
+    expect(rows).toHaveAttribute("data-dimmed", "1");
+  });
+
+  it("does not grey them during a foreground grace", () => {
+    health.lastOkAt = Date.now() - 20_000;
+    renderList();
+    act(() => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    const rows = screen.getByTestId("session-list").querySelector("[data-freshness]");
+    expect(rows).toHaveAttribute("data-freshness", "grace");
+    expect(rows).not.toHaveAttribute("data-dimmed");
   });
 });

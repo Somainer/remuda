@@ -62,7 +62,9 @@ export function SessionsPage({ dimmed = false }: { dimmed?: boolean }) {
           </>
         ) : null}
         <div className={css.list}>
-          {hub.hosts.length === 0 && hub.instances.length === 0 ? (
+          {/* home.md §8: no empty state before the first Hub snapshot — the
+              list below paints its skeleton until then. */}
+          {hub.ready && hub.hosts.length === 0 && hub.instances.length === 0 ? (
             <div className={css.placeholder}>无主机。请添加主机。</div>
           ) : null}
           <SessionList

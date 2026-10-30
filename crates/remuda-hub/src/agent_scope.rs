@@ -11,6 +11,10 @@ use axum::{
 use remuda_protocol::InputOrigin;
 use serde_json::{Value, json};
 
+/// D-057 §7.1 / main-agent.md §7.1: the Hub-stamped initiator type lives in
+/// the shared protocol crate so Nodes persist the same shape.
+pub use remuda_protocol::Initiator;
+
 /// Terminal aliases all resolve to a raw shell on the Node.
 pub fn shell_driver(driver: &str) -> bool {
     matches!(driver, "shell-pty" | "shell" | "terminal")
@@ -48,15 +52,89 @@ pub async fn caller(state: &AppState, headers: &HeaderMap) -> Result<Device, Hub
     Ok(device)
 }
 
+/// D-057 §7.1: resolve the Hub-stamped initiator for an authenticated device.
+/// `None` for Human/Bot callers (no bound instance). For an Agent device — an
+/// agent credential, or a Human token narrowed with `x-remuda-instance-id` —
+/// returns the bound chapter's `{instanceId, lineageId, generation}`. The
+/// authenticating device id is carried alongside by the caller (Hub-only).
+pub async fn initiator_for(
+    state: &AppState,
+    device: &Device,
+) -> Result<Option<Initiator>, HubError> {
+    let Some(instance_id) = device.instance_id.as_deref() else {
+        return Ok(None);
+    };
+    let instance = state
+        .store
+        .get_instance(instance_id.to_string())
+        .await?
+        .ok_or(HubError::Forbidden)?;
+    Ok(Some(Initiator {
+        instance_id: instance.instance_id,
+        lineage_id: instance.lineage_id,
+        generation: instance.generation,
+    }))
+}
+
+/// The stamped pair every Agent-admitted writer job carries: the initiator
+/// and the authenticating device id (Hub-only). `(None, None)` for Human/Bot
+/// callers. Hub-internal successor work constructs the initiator without a
+/// device id by hand.
+pub async fn initiator_and_device(
+    state: &AppState,
+    device: &Device,
+) -> Result<(Option<Initiator>, Option<String>), HubError> {
+    match initiator_for(state, device).await? {
+        Some(initiator) => Ok((Some(initiator), Some(device.id.clone()))),
+        None => Ok((None, None)),
+    }
+}
+
+/// Owned authority pair handed to a store writer job. `None` pair for
+/// Human/Bot requests and Hub-internal cleanup; Hub-internal successor work
+/// carries an initiator with no device id.
+#[derive(Clone, Debug, Default)]
+pub struct CallerAuthority {
+    /// Hub-stamped initiator, when the caller is an Agent.
+    pub initiator: Option<Initiator>,
+    /// Authenticating device id; absent for Human/Bot and successor work.
+    pub device_id: Option<String>,
+}
+
+impl CallerAuthority {
+    /// Resolve the authority from an authenticated device.
+    pub async fn for_device(state: &AppState, device: &Device) -> Result<Self, HubError> {
+        let (initiator, device_id) = initiator_and_device(state, device).await?;
+        Ok(Self {
+            initiator,
+            device_id,
+        })
+    }
+
+    /// Hub-internal work: no initiator, never fenced.
+    #[must_use]
+    pub fn internal() -> Self {
+        Self::default()
+    }
+
+    /// References for the in-job `check_initiator`.
+    pub(crate) fn as_check(&self) -> (Option<&Initiator>, Option<&str>) {
+        (self.initiator.as_ref(), self.device_id.as_deref())
+    }
+}
+
 pub fn stamp(payload: &mut Value, device: &Device) {
     payload["origin"] = json!(origin(device));
     if let Some(input) = payload.get_mut("input").and_then(Value::as_object_mut) {
         input.insert("origin".into(), json!(origin(device)));
     }
-    // Never accept caller-selected provenance or a credential in JSON.
+    // Never accept caller-selected provenance, a credential, or an initiator
+    // in JSON. D-057 §7.1: the initiator is Hub-stamped from auth, not the body.
     if let Some(object) = payload.as_object_mut() {
         object.remove("agentCredential");
         object.remove("actor");
+        object.remove("initiator");
+        object.remove("initiatorDeviceId");
     }
 }
 

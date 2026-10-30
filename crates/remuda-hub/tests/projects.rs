@@ -1017,6 +1017,7 @@ async fn delegation_cycle_is_rejected_even_if_columns_are_tampered() -> Result<(
             json!({"parentInstanceId": ids[0], "projectId": project_id}),
             remuda_hub::store_test_support::leaf_delegation(&project_id)
                 .map_err(anyhow::Error::msg)?,
+            remuda_hub::agent_scope_test_support::CallerAuthority::internal(),
         )
         .await;
     let err = err.expect_err("cycle must be rejected");

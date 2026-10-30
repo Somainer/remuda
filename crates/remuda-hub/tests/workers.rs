@@ -649,10 +649,14 @@ async fn dispatch_warns_when_honored_pin_differs_from_project_workhorse() {
         .hub
         .store()
         .expect("store")
-        .patch_project(project_id.to_string(), |project| {
-            project.model_roles.workhorse = Some(SYNTH_MODELS.into());
-            Ok(())
-        })
+        .patch_project(
+            project_id.to_string(),
+            |project| {
+                project.model_roles.workhorse = Some(SYNTH_MODELS.into());
+                Ok(())
+            },
+            remuda_hub::agent_scope_test_support::CallerAuthority::internal(),
+        )
         .await
         .expect("patch project");
     assert_eq!(
@@ -799,6 +803,7 @@ async fn agent_origin_create_with_computer_use_is_refused_before_approval_and_pl
             None,
             json!({ "projectId": project_id }),
             delegation,
+            remuda_hub::agent_scope_test_support::CallerAuthority::internal(),
         )
         .await
         .expect("seed instance");

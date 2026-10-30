@@ -15,7 +15,9 @@
 //! watch→act from the Hub alone (design goal 4).
 
 use crate::AppState;
-use crate::agent_scope::{caller, caller_project_scope, require_grant};
+use crate::agent_scope::{
+    Initiator, caller, caller_project_scope, initiator_and_device, require_grant,
+};
 use crate::auth::require_origin;
 use crate::error::HubError;
 use crate::http::map_store;
@@ -577,22 +579,27 @@ async fn observe_one(
 
     let row = state
         .store
-        .mutate_worker(worker.meta.id.as_id().to_string(), move |row| {
-            if let Some(next) = next_state {
-                row.state = next;
-            }
-            row.watch = Some(watch);
-            // A launch divergence writes the observed id; a later
-            // slash/remuda switch clears it. Both arms run only once the
-            // instance row was read this pass, so a row that could not be read
-            // leaves the recorded value untouched.
-            if model_effective.is_some() {
-                row.model_effective = model_effective;
-            } else if clear_model_effective {
-                row.model_effective = None;
-            }
-            Ok(())
-        })
+        .mutate_worker(
+            worker.meta.id.as_id().to_string(),
+            move |row| {
+                if let Some(next) = next_state {
+                    row.state = next;
+                }
+                row.watch = Some(watch);
+                // A launch divergence writes the observed id; a later
+                // slash/remuda switch clears it. Both arms run only once the
+                // instance row was read this pass, so a row that could not be
+                // read leaves the recorded value untouched.
+                if model_effective.is_some() {
+                    row.model_effective = model_effective;
+                } else if clear_model_effective {
+                    row.model_effective = None;
+                }
+                Ok(())
+            },
+            // Observation projection: Hub-internal, no initiator.
+            crate::agent_scope::CallerAuthority::internal(),
+        )
         .await
         .map_err(map_store)?
         .ok_or(HubError::NotFound)?;
@@ -764,6 +771,7 @@ async fn nudge_worker(
     let device = caller(&state, &headers).await?;
     require_grant(&state, &device, remuda_protocol::GrantVerb::Dispatch).await?;
     let scope = caller_project_scope(&state, &device).await?;
+    let (nudge_initiator, nudge_device_id) = initiator_and_device(&state, &device).await?;
     let worker = resolve_worker(&state, &id, &scope).await?;
     if !worker.state.is_active() {
         return Err(HubError::Conflict("worker is retired".into()));
@@ -799,17 +807,33 @@ async fn nudge_worker(
         }
     }
 
-    let command = deliver_note_file(&state, &worker, &device.id, &text, "nudge.md").await?;
+    let command = deliver_note_file(
+        &state,
+        &worker,
+        &device.id,
+        &text,
+        "nudge.md",
+        nudge_initiator.clone(),
+        nudge_device_id.clone(),
+    )
+    .await?;
     let now = crate::config::now_rfc3339();
     let updated = state
         .store
-        .mutate_worker(worker.meta.id.as_id().to_string(), move |row| {
-            row.last_nudge_at = Some(
-                remuda_protocol::Timestamp::try_from(now)
-                    .map_err(|err| StoreError::Id(err.to_string()))?,
-            );
-            Ok(())
-        })
+        .mutate_worker(
+            worker.meta.id.as_id().to_string(),
+            move |row| {
+                row.last_nudge_at = Some(
+                    remuda_protocol::Timestamp::try_from(now)
+                        .map_err(|err| StoreError::Id(err.to_string()))?,
+                );
+                Ok(())
+            },
+            crate::agent_scope::CallerAuthority {
+                initiator: nudge_initiator,
+                device_id: nudge_device_id,
+            },
+        )
         .await
         .map_err(map_store)?
         .ok_or(HubError::NotFound)?;
@@ -835,6 +859,8 @@ async fn deliver_note_file(
     device_id: &str,
     text: &str,
     name: &str,
+    initiator: Option<Initiator>,
+    initiator_device_id: Option<String>,
 ) -> Result<Value, HubError> {
     let instance_id = worker
         .instance_id
@@ -859,6 +885,8 @@ async fn deliver_note_file(
             payload,
             None,
             None,
+            initiator,
+            initiator_device_id,
         )
         .await
         .map_err(map_store)?;
@@ -884,6 +912,7 @@ async fn answer_worker(
     let device = caller(&state, &headers).await?;
     require_grant(&state, &device, remuda_protocol::GrantVerb::Dispatch).await?;
     let scope = caller_project_scope(&state, &device).await?;
+    let (answer_initiator, answer_device_id) = initiator_and_device(&state, &device).await?;
     let worker = resolve_worker(&state, &id, &scope).await?;
     if !worker.state.is_active() {
         return Err(HubError::Conflict("worker is retired".into()));
@@ -899,6 +928,8 @@ async fn answer_worker(
         worker.host_id.as_id().as_str(),
         encoded.names.clone(),
         encoded.data_base64.clone(),
+        answer_initiator,
+        answer_device_id,
     )
     .await?;
     state
@@ -924,6 +955,8 @@ async fn write_keys(
     host_id: &str,
     names: Vec<String>,
     data_base64: String,
+    initiator: Option<Initiator>,
+    initiator_device_id: Option<String>,
 ) -> Result<Value, HubError> {
     let (command, _) = state
         .store
@@ -940,6 +973,8 @@ async fn write_keys(
             }),
             None,
             None,
+            initiator,
+            initiator_device_id,
         )
         .await
         .map_err(map_store)?;
@@ -1030,6 +1065,7 @@ async fn switch_worker_model(
     let device = caller(&state, &headers).await?;
     require_grant(&state, &device, remuda_protocol::GrantVerb::Dispatch).await?;
     let scope = caller_project_scope(&state, &device).await?;
+    let (switch_initiator, switch_device_id) = initiator_and_device(&state, &device).await?;
     let worker = resolve_worker(&state, &id, &scope).await?;
     if !worker.state.is_active() {
         return Err(HubError::Conflict("worker is retired".into()));
@@ -1066,6 +1102,8 @@ async fn switch_worker_model(
         &host_id,
         esc.names.clone(),
         esc.data_base64.clone(),
+        switch_initiator.clone(),
+        switch_device_id.clone(),
     )
     .await?;
     tokio::time::sleep(KEY_SETTLE).await;
@@ -1075,6 +1113,8 @@ async fn switch_worker_model(
         &host_id,
         esc.names.clone(),
         esc.data_base64.clone(),
+        switch_initiator.clone(),
+        switch_device_id.clone(),
     )
     .await?;
     tokio::time::sleep(KEY_SETTLE).await;
@@ -1085,6 +1125,8 @@ async fn switch_worker_model(
         &host_id,
         typed.names,
         typed.data_base64,
+        switch_initiator.clone(),
+        switch_device_id.clone(),
     )
     .await?;
     tokio::time::sleep(MODEL_SETTLE).await;
@@ -1101,6 +1143,8 @@ async fn switch_worker_model(
             &host_id,
             enter.names,
             enter.data_base64,
+            switch_initiator.clone(),
+            switch_device_id.clone(),
         )
         .await?;
         tokio::time::sleep(KEY_SETTLE).await;
@@ -1110,6 +1154,8 @@ async fn switch_worker_model(
             &device.id,
             "Continue where you left off.",
             "nudge.md",
+            switch_initiator.clone(),
+            switch_device_id.clone(),
         )
         .await;
     }
@@ -1132,18 +1178,28 @@ async fn switch_worker_model(
     let previous_model = worker.model.clone();
     let updated = state
         .store
-        .mutate_worker(worker.meta.id.as_id().to_string(), move |row| {
-            if applied {
-                row.model = Some(recorded_model.clone());
-                if confirmed {
-                    row.last_nudge_at = Some(
-                        remuda_protocol::Timestamp::try_from(now)
-                            .map_err(|err| StoreError::Id(err.to_string()))?,
-                    );
+        .mutate_worker(
+            worker.meta.id.as_id().to_string(),
+            move |row| {
+                if applied {
+                    row.model = Some(recorded_model.clone());
+                    if confirmed {
+                        row.last_nudge_at = Some(
+                            remuda_protocol::Timestamp::try_from(now)
+                                .map_err(|err| StoreError::Id(err.to_string()))?,
+                        );
+                    }
                 }
-            }
-            Ok(())
-        })
+                Ok(())
+            },
+            // switch_initiator was consumed by the note delivery; the model
+            // The note delivery consumed the authority clones; the model
+            // write is the same caller's act.
+            crate::agent_scope::CallerAuthority {
+                initiator: switch_initiator,
+                device_id: switch_device_id,
+            },
+        )
         .await
         .map_err(map_store)?
         .ok_or(HubError::NotFound)?;
@@ -1239,6 +1295,8 @@ async fn resume_worker(
     let device = caller(&state, &headers).await?;
     require_grant(&state, &device, remuda_protocol::GrantVerb::Dispatch).await?;
     let scope = caller_project_scope(&state, &device).await?;
+    // D-057 §7.1: the re-delivered handback is authored on the caller's behalf.
+    let (resume_initiator, resume_device_id) = initiator_and_device(&state, &device).await?;
     let worker = resolve_worker(&state, &id, &scope).await?;
     if !worker.state.is_active() {
         return Err(HubError::Conflict("worker is retired".into()));
@@ -1287,6 +1345,8 @@ async fn resume_worker(
             payload,
             None,
             None,
+            resume_initiator.clone(),
+            resume_device_id.clone(),
         )
         .await
         .map_err(map_store)?;
@@ -1300,27 +1360,34 @@ async fn resume_worker(
     let now = crate::config::now_rfc3339();
     let row = state
         .store
-        .mutate_worker(worker.meta.id.as_id().to_string(), {
-            let old_instance_id = old_instance_id.clone();
-            let new_instance_id = new_instance_id.clone();
-            let object_id = object_id.clone();
-            move |row| {
-                row.resumed_from = Some(old_instance_id.parse().map_err(
-                    |err: remuda_protocol::WireValueError| StoreError::Id(err.to_string()),
-                )?);
-                row.instance_id = Some(new_instance_id.parse().map_err(
-                    |err: remuda_protocol::WireValueError| StoreError::Id(err.to_string()),
-                )?);
-                row.brief_object_id = Some(object_id);
-                row.state = WorkerState::Working;
-                row.watch = None;
-                row.last_nudge_at = Some(
-                    remuda_protocol::Timestamp::try_from(now.clone())
-                        .map_err(|err| StoreError::Id(err.to_string()))?,
-                );
-                Ok(())
-            }
-        })
+        .mutate_worker(
+            worker.meta.id.as_id().to_string(),
+            {
+                let old_instance_id = old_instance_id.clone();
+                let new_instance_id = new_instance_id.clone();
+                let object_id = object_id.clone();
+                move |row| {
+                    row.resumed_from = Some(old_instance_id.parse().map_err(
+                        |err: remuda_protocol::WireValueError| StoreError::Id(err.to_string()),
+                    )?);
+                    row.instance_id = Some(new_instance_id.parse().map_err(
+                        |err: remuda_protocol::WireValueError| StoreError::Id(err.to_string()),
+                    )?);
+                    row.brief_object_id = Some(object_id);
+                    row.state = WorkerState::Working;
+                    row.watch = None;
+                    row.last_nudge_at = Some(
+                        remuda_protocol::Timestamp::try_from(now.clone())
+                            .map_err(|err| StoreError::Id(err.to_string()))?,
+                    );
+                    Ok(())
+                }
+            },
+            crate::agent_scope::CallerAuthority {
+                initiator: resume_initiator,
+                device_id: resume_device_id,
+            },
+        )
         .await
         .map_err(map_store)?
         .ok_or(HubError::NotFound)?;
@@ -1499,6 +1566,9 @@ async fn relaunch_instance(
         enforce_tree: true,
         restart: None,
     };
+    // D-057 §7.1: a respawn the Hub authors on the caller's behalf carries
+    // that caller's initiator and device id.
+    let (respawn_initiator, respawn_device_id) = initiator_and_device(state, &device).await?;
     let (instance, _command) = crate::placement::spawn_on_host(
         state,
         &host,
@@ -1512,6 +1582,8 @@ async fn relaunch_instance(
             operation: "instance.create",
             idempotency_key: None,
             delegation: delegation_tree,
+            initiator: respawn_initiator,
+            initiator_device_id: respawn_device_id,
         },
     )
     .await?;
@@ -1587,10 +1659,14 @@ async fn replace_worker(
         .to_string();
     let updated = state
         .store
-        .mutate_worker(new_id.clone(), move |row| {
-            row.replace_count = Some(U64(previous_count + 1));
-            Ok(())
-        })
+        .mutate_worker(
+            new_id.clone(),
+            move |row| {
+                row.replace_count = Some(U64(previous_count + 1));
+                Ok(())
+            },
+            crate::agent_scope::CallerAuthority::for_device(&state, &device).await?,
+        )
         .await
         .map_err(map_store)?
         .ok_or(HubError::NotFound)?;
@@ -1624,6 +1700,8 @@ async fn stop_worker(
     let device = caller(&state, &headers).await?;
     require_grant(&state, &device, remuda_protocol::GrantVerb::Dispatch).await?;
     let scope = caller_project_scope(&state, &device).await?;
+    // D-057 §7.1: worker stop the Hub authors carries the caller's initiator.
+    let (stop_initiator, stop_device_id) = initiator_and_device(&state, &device).await?;
     let worker = resolve_worker(&state, &id, &scope).await?;
     let mut command = Value::Null;
     if let Some(instance_id) = &worker.instance_id {
@@ -1637,6 +1715,8 @@ async fn stop_worker(
                 json!({ "instanceId": instance_id.as_id() }),
                 None,
                 None,
+                stop_initiator,
+                stop_device_id,
             )
             .await
             .map_err(map_store)?;

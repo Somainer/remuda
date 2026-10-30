@@ -127,9 +127,19 @@ pub enum HubError {
     /// Idempotency key reused with a different payload.
     #[error("{0}")]
     Conflict(String),
+    /// D-057 §7.3: an Agent-initiated write failed the commit-time authority
+    /// check — the initiator was fenced/paused or its device row is gone.
+    /// Maps to the existing 409 shape with reason code `fenced`; nothing was
+    /// written.
+    #[error("initiator fenced")]
+    Fenced,
     /// Interaction deadline already passed.
     #[error("interaction expired")]
     Expired,
+    /// A Node hello lost to a newer hello for the same host: the newer link
+    /// is installed and this socket is closed without installing (r41 item 1).
+    #[error("node link superseded by a newer hello")]
+    LinkSuperseded,
     /// A different commandId already committed the unique answer.
     #[error("interaction already answered")]
     Superseded {
@@ -363,6 +373,8 @@ impl HubError {
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::Fenced => StatusCode::CONFLICT,
+            Self::LinkSuperseded => StatusCode::CONFLICT,
             Self::Expired => StatusCode::GONE,
             Self::Superseded { .. } => StatusCode::CONFLICT,
             Self::Unsatisfiable { .. } | Self::ProviderNotConfigured { .. } => {
@@ -400,6 +412,8 @@ impl HubError {
             Self::NotFound => "NOT_FOUND",
             Self::BadRequest(_) => "BAD_REQUEST",
             Self::Conflict(_) => "COMMAND_ID_CONFLICT",
+            Self::Fenced => "fenced",
+            Self::LinkSuperseded => "LINK_SUPERSEDED",
             Self::Expired => "INTERACTION_EXPIRED",
             Self::Superseded { .. } => "INTERACTION_SUPERSEDED",
             Self::Unsatisfiable { .. } => "PLACEMENT_UNSATISFIABLE",

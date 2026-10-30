@@ -1690,7 +1690,9 @@ impl Store {
             let id = worker.meta.id.as_id().to_string();
             let now = crate::config::now_rfc3339();
             let mut worker = worker;
-            stamp_done_at(&mut worker, &now);
+            // An insert has no prior state to transition from: keep whatever
+            // stamp the caller supplied, and never invent one.
+            settle_done_at(&mut worker, &now, true);
             let doc = serde_json::to_string(&worker)?;
             conn.execute(
                 "INSERT INTO worker_roster
@@ -1802,9 +1804,10 @@ impl Store {
             let Some(mut worker) = load_worker(conn, &id)? else {
                 return Ok(None);
             };
+            let was_done = matches!(worker.state, remuda_protocol::WorkerState::Done { .. });
             mutate(&mut worker)?;
             let now = crate::config::now_rfc3339();
-            stamp_done_at(&mut worker, &now);
+            settle_done_at(&mut worker, &now, was_done);
             worker.meta.revision = U64(worker.meta.revision.0 + 1);
             worker.meta.updated_at = remuda_protocol::Timestamp::try_from(now.clone())
                 .map_err(|err| StoreError::Id(err.to_string()))?;
@@ -1821,12 +1824,16 @@ impl Store {
     }
 }
 
-/// Keep `doneAt` honest across roster writes: a worker entering `done` is
-/// stamped once, a DONE worker rewritten by a later watch pass keeps the day
-/// it actually reported, and any other state clears the stamp.
-fn stamp_done_at(worker: &mut WorkerRoster, now: &str) {
+/// Keep `doneAt` honest across roster writes.
+///
+/// `was_done` is the state *before* this write. A real transition into `done`
+/// is stamped once; a row that was already DONE keeps its stamp — including a
+/// missing one, which is what rows persisted before `doneAt` existed read
+/// back as, and a watch pass that merely re-observes them must not turn last
+/// week's completion into today's. Any other state clears the stamp.
+fn settle_done_at(worker: &mut WorkerRoster, now: &str, was_done: bool) {
     if matches!(worker.state, remuda_protocol::WorkerState::Done { .. }) {
-        if worker.done_at.is_none() {
+        if !was_done && worker.done_at.is_none() {
             worker.done_at = remuda_protocol::Timestamp::try_from(now.to_string()).ok();
         }
     } else {

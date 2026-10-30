@@ -473,6 +473,39 @@ async fn an_off_wire_pending_kind_keeps_the_response_within_budget() -> Result<(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_legacy_done_row_is_not_stamped_by_a_later_observation() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("digest-legacy").await?;
+    let (coordinator, token) = ctx.coordinator(&project).await?;
+    // The shape of a row persisted before `doneAt` existed: done, no stamp.
+    let (legacy, _) = ctx.done_worker(&token, &project, "c-legacy", None).await?;
+    let store = ctx.hub.store().context("store")?;
+    let before = store.get_worker(legacy.clone()).await?.context("row")?;
+    assert!(
+        before.done_at.is_none(),
+        "inserting a DONE row must not invent a transition"
+    );
+    // A watch pass rewrites every active row; that is not a completion.
+    store
+        .mutate_worker(legacy.clone(), |_| Ok(()))
+        .await
+        .context("re-observe")?;
+    let after = store.get_worker(legacy).await?.context("row")?;
+    assert!(
+        after.done_at.is_none(),
+        "a legacy row keeps its missing stamp: {:?}",
+        after.done_at
+    );
+    let glance = json_of(
+        &ctx.get(&token, &format!("/v1/lineages/{coordinator}/glance"))
+            .await?
+            .1,
+    );
+    assert_eq!(glance["doneToday"], 0, "{glance}");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pending_interactions_are_loaded_for_the_given_instances_only() -> Result<()> {
     let ctx = Ctx::spawn().await?;
     let project = ctx.project("pending-a").await?;
@@ -572,8 +605,18 @@ async fn done_today_counts_the_day_a_worker_reported_done_not_its_last_write() -
             Some("2020-01-02T03:04:05.000Z"),
         )
         .await?;
-    // Reported DONE today, with the stamp written by the transition.
-    let (fresh, _) = ctx.done_worker(&token, &project, "c-fresh", None).await?;
+    // Reported DONE today, through a real transition: that is what stamps it.
+    let (fresh, _) = ctx.worker_under(&token, &project, "c-fresh", None).await?;
+    let store = ctx.hub.store().context("store")?;
+    store
+        .mutate_worker(fresh.clone(), |row| {
+            row.state = remuda_protocol::WorkerState::Done {
+                sha: "0a10ebf351aa".into(),
+            };
+            Ok(())
+        })
+        .await
+        .context("report done")?;
     let glance_path = format!("/v1/lineages/{coordinator}/glance");
 
     let glance = json_of(&ctx.get(&token, &glance_path).await?.1);

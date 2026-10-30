@@ -378,15 +378,37 @@ fn scanner_rules() -> &'static [SpanRule] {
     &RULES
 }
 
+/// Byte index just past the character starting at `index`.
+fn after_char(text: &str, index: usize) -> usize {
+    index
+        + text
+            .get(index..)
+            .and_then(|rest| rest.chars().next())
+            .map_or(1, char::len_utf8)
+}
+
 /// Mask every scanner match in `text`, in place.
+///
+/// Each rule is searched from an explicit cursor rather than with
+/// `captures_iter`: when the leftmost match is rejected by the lookbehind (the
+/// `sk-` inside `task-`), the real token starts a few characters later in the
+/// same run, and the iterator would have consumed it. On a rejection the
+/// search resumes one character after the match start.
 fn mask_scanner_spans(text: &str) -> String {
     let mut spans: Vec<(usize, usize)> = Vec::new();
     for rule in scanner_rules() {
-        for capture in rule.regex.captures_iter(text) {
+        let mut cursor = 0;
+        while cursor <= text.len() {
+            let Some(capture) = rule.regex.captures_at(text, cursor) else {
+                break;
+            };
+            let whole = capture.get(0).expect("capture group 0 is always present");
             let Some(found) = capture.get(rule.group) else {
+                cursor = whole.end();
                 continue;
             };
             if found.start() == found.end() {
+                cursor = whole.end();
                 continue;
             }
             if rule.boundary {
@@ -396,10 +418,12 @@ fn mask_scanner_spans(text: &str) -> String {
                     .next_back()
                     .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
                 if continues_word {
+                    cursor = after_char(text, found.start());
                     continue;
                 }
             }
             spans.push((found.start(), found.end()));
+            cursor = whole.end();
         }
     }
     if spans.is_empty() {
@@ -2271,6 +2295,15 @@ mod tests {
             let redacted = redact_secrets(text);
             assert!(!redacted.contains(secret), "leaked {secret}: {redacted}");
         }
+        // A boundary-rejected leftmost match must not shadow a real token
+        // later in the same word: the `sk-` inside `task-` is rejected, the one
+        // after it is not, and scripts/ci/secret-scan.py flags it.
+        let shadowed = "task-sk-abcdefghijklmnop";
+        assert!(
+            !redact_secrets(shadowed).contains("sk-abcdefghijklmnop"),
+            "{}",
+            redact_secrets(shadowed)
+        );
         // A prefix that continues a word is not a candidate: the scanner's
         // `sk-` rule needs `(?<![A-Za-z0-9_])` before it, and `k`/`_` are in
         // that class. (Checked against scripts/ci/secret-scan.py itself: it
@@ -2373,7 +2406,14 @@ mod tests {
                 }
                 _ => format!("https://x.test/v1/{literal}{TOKEN}/x"),
             };
-            for text in [plain, embedded] {
+            // A prefix rule can be shadowed by an earlier, boundary-rejected
+            // match of the same text (`task-` contains `sk-`).
+            let shadowed = (literal.ends_with('_') || literal.ends_with('-'))
+                .then(|| format!("task-{literal}{TOKEN}"));
+            for text in [Some(plain), Some(embedded), shadowed]
+                .into_iter()
+                .flatten()
+            {
                 let redacted = redact_secrets(&text);
                 assert!(
                     !redacted.contains(TOKEN) && !redacted.contains("MIIEvQIBADANBg"),

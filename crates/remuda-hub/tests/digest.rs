@@ -10,7 +10,7 @@
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
 use remuda_hub::{HubConfig, spawn};
-use remuda_protocol::{HostId, WORKER_DIGEST_MAX_BYTES};
+use remuda_protocol::{HostId, LINEAGE_GLANCE_ROW_CAP, WORKER_DIGEST_MAX_BYTES};
 use serde_json::{Value, json};
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
@@ -469,6 +469,92 @@ async fn an_off_wire_pending_kind_keeps_the_response_within_budget() -> Result<(
     );
     let digest = json_of(&bytes);
     assert_eq!(digest["pending"]["kind"], "unknown");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_interactions_are_loaded_for_the_given_instances_only() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("pending-a").await?;
+    let other = ctx.project("pending-b").await?;
+    let (_coordinator_a, token_a) = ctx.coordinator(&project).await?;
+    let (_coordinator_b, token_b) = ctx.coordinator(&other).await?;
+    let (_worker_a, instance_a) = ctx.worker_under(&token_a, &project, "c-pa", None).await?;
+    let (_worker_b, instance_b) = ctx.worker_under(&token_b, &other, "c-pb", None).await?;
+    for (instance, id) in [(&instance_a, "int_pa"), (&instance_b, "int_pb")] {
+        ctx.journal(
+            instance,
+            json!({ "kind": "interaction.requested", "payload": { "interaction": {
+                "id": id, "kind": "approval", "state": "pending", "blocking": true,
+                "request": { "kind": "approval", "title": "Bash", "description": "ok?",
+                             "options": [] } }}}),
+        )
+        .await?;
+    }
+    let store = ctx.hub.store().context("store")?;
+    // One lineage's instance: only its pending row comes back.
+    let only_a = store
+        .list_pending_interactions_for_instances(vec![instance_a.clone()])
+        .await?;
+    assert_eq!(only_a.len(), 1);
+    assert_eq!(only_a[0].instance_id, instance_a);
+    // Both: two rows. None: no query at all.
+    let both = store
+        .list_pending_interactions_for_instances(vec![instance_a, instance_b])
+        .await?;
+    assert_eq!(both.len(), 2);
+    assert!(
+        store
+            .list_pending_interactions_for_instances(Vec::new())
+            .await?
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_glance_counts_every_worker_past_the_row_load_cap() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("glance-many").await?;
+    let (coordinator, token) = ctx.coordinator(&project).await?;
+    let (_worker, instance) = ctx.worker_under(&token, &project, "c-many", None).await?;
+    // The fake host caps live instances, so the extra roster rows share this
+    // instance: what is under test is the row load, not instance fan-out.
+    const EXTRA: usize = 505;
+    let store = ctx.hub.store().context("store")?;
+    for index in 0..EXTRA {
+        let roster_id = remuda_protocol::WorkerRosterId::new().as_id().to_string();
+        let worker: remuda_protocol::WorkerRoster = serde_json::from_value(json!({
+            "id": roster_id, "revision": "1",
+            "createdAt": "2026-10-29T01:00:00.000Z", "updatedAt": "2026-10-29T01:00:00.000Z",
+            "projectId": project, "name": format!("w{index:03}"), "instanceId": instance,
+            "hostId": ctx.host, "workspaceId": ctx.workspace, "harness": "claude",
+            "driver": "claude-sdk", "model": "claude-sonnet-5-5",
+            "branch": format!("wt/w{index:03}/b-digest-md"),
+            "worktreePath": format!("/w/w{index:03}"),
+            "state": { "state": "working" },
+        }))?;
+        store
+            .insert_worker(worker, "digest-test".into())
+            .await
+            .context("insert worker")?;
+    }
+    let glance = json_of(
+        &ctx.get(&token, &format!("/v1/lineages/{coordinator}/glance"))
+            .await?
+            .1,
+    );
+    let total = EXTRA + 1;
+    assert_eq!(
+        glance["working"].as_array().map(Vec::len),
+        Some(LINEAGE_GLANCE_ROW_CAP),
+        "each list stays capped"
+    );
+    assert_eq!(
+        glance["more"]["working"].as_u64(),
+        Some((total - LINEAGE_GLANCE_ROW_CAP) as u64),
+        "the overflow counts every worker, not just the loaded page: {glance}"
+    );
     Ok(())
 }
 

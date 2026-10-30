@@ -47,9 +47,6 @@ use time::OffsetDateTime;
 const JOURNAL_TAIL_EVENTS: i64 = 256;
 /// Recent commands scanned for the queued count and a pending configure.
 const COMMAND_WINDOW: usize = 200;
-/// Workers a glance loads before classifying (a lineage fans out to a handful;
-/// this bounds a pathological roster).
-const GLANCE_LOAD_CAP: i64 = 500;
 /// Per-value cap inside the pending-tool argument summary.
 const ARG_VALUE_CHARS: usize = 160;
 /// Per-key cap inside the pending-tool argument summary.
@@ -1464,13 +1461,12 @@ impl Store {
                           JOIN instances p
                             ON p.id = json_extract(i.spec_json, '$.parentInstanceId')
                          WHERE i.id = json_extract(w.doc_json, '$.instanceId')) = ?1
-                 ORDER BY w.updated_at DESC
-                 LIMIT ?2",
+                 ORDER BY w.updated_at DESC",
             )?;
+            // Every row is classified: `more` must count the whole lineage, and
+            // a page cap here would silently under-report the overflow.
             let rows = stmt
-                .query_map(params![lineage_id, GLANCE_LOAD_CAP], |row| {
-                    row.get::<_, String>(0)
-                })?
+                .query_map(params![lineage_id], |row| row.get::<_, String>(0))?
                 .collect::<Result<Vec<_>, _>>()?;
             rows.iter()
                 .map(|raw| serde_json::from_str(raw).map_err(crate::store::StoreError::from))
@@ -1656,21 +1652,20 @@ async fn lineage_glance(
         .list_lineage_workers(lineage_id.clone())
         .await
         .map_err(map_store)?;
-    let pending = state
-        .store
-        .list_interactions(None, None, None, true)
-        .await
-        .map_err(map_store)?;
-    let wanted: std::collections::HashSet<&str> = workers
+    // Only this lineage's pending rows, filtered in SQL: the glance must not
+    // read every pending interaction in the Hub.
+    let wanted: Vec<String> = workers
         .iter()
         .filter_map(|worker| worker.instance_id.as_ref())
-        .map(|id| id.as_id().as_str())
+        .map(|id| id.as_id().to_string())
         .collect();
+    let pending = state
+        .store
+        .list_pending_interactions_for_instances(wanted)
+        .await
+        .map_err(map_store)?;
     let mut pending_by_instance: HashMap<String, (String, Option<String>)> = HashMap::new();
-    for row in pending
-        .iter()
-        .filter(|row| wanted.contains(row.instance_id.as_str()))
-    {
+    for row in pending.iter() {
         pending_by_instance
             .entry(row.instance_id.clone())
             .or_insert_with(|| {

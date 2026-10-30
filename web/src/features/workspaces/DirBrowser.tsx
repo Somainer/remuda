@@ -3,6 +3,7 @@ import { Button } from "../../components/Button";
 import { Modal } from "../../components/Modal";
 import { api } from "../../lib/api";
 import { hubStore } from "../../lib/store";
+import ui from "../../styles/ui.module.css";
 import type { HostDirsListing } from "./dirs";
 import type { Workspace } from "../../types/workspace";
 import css from "./workspaces.module.css";
@@ -199,6 +200,7 @@ export function DirBrowser({ hostId, open, disabled, onClose, onRegistered }: Pr
           ) : null}
           {listing?.workspaces.map((root) => (
             <Button key={root} type="button" variant="ghost" data-testid="dir-browser-workspace"
+              className={ui.btnAllowWrap} title={root}
               disabled={loading || busy} onClick={() => load(root)}>
               {root}
             </Button>
@@ -288,7 +290,9 @@ export function DirBrowser({ hostId, open, disabled, onClose, onRegistered }: Pr
             <Button type="button" variant="primary" data-testid="dir-browser-use"
               disabled={busy || disabled || !listing || loading}
               onClick={() => listing && void registerPath(listing.path)}>
-              {busy ? "添加中…" : `使用此文件夹${listing ? `：${listing.path}` : ""}`}
+              {/* The folder path stays in the crumb strip above; putting it in
+                  the button clipped its tail at phone width (D-061 r2). */}
+              {busy ? "添加中…" : "使用此文件夹"}
             </Button>
           )}
         </div>

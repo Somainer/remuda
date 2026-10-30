@@ -9,6 +9,7 @@ import { mockDb } from "../../lib/mock";
 import type { Instance } from "../../types/instance";
 import { known, type Id } from "../../types/wire";
 import { detectPlatform, setPlatformForTest } from "../../lib/platform";
+import { setClock } from "../../lib/clock";
 import { SessionList } from "./SessionList";
 
 // jsdom has no matchMedia; the workbench viewport hook needs one to pick the
@@ -1055,6 +1056,18 @@ describe("SessionList hold", () => {
 });
 
 describe("SessionList §8 freshness states", () => {
+  // §8 tasks are asserted on the injected clock: the stale window is a
+  // product constant, never a wall-clock threshold.
+  const NOW = 5_000_000;
+  let restoreClock: () => void;
+  beforeEach(() => {
+    restoreClock = setClock(() => NOW);
+    health.lastOkAt = NOW;
+  });
+  afterEach(() => {
+    restoreClock();
+  });
+
   it("paints three skeleton cards before the first snapshot, never the empty state", () => {
     health.lastOkAt = null;
     renderList("", { instances: [] });
@@ -1066,7 +1079,7 @@ describe("SessionList §8 freshness states", () => {
   });
 
   it("greys the cached cards while stale", () => {
-    health.lastOkAt = Date.now() - 20_000;
+    health.lastOkAt = NOW - 20_000;
     renderList();
     const rows = screen.getByTestId("session-list").querySelector("[data-freshness]");
     expect(rows).toHaveAttribute("data-freshness", "stale");
@@ -1074,7 +1087,7 @@ describe("SessionList §8 freshness states", () => {
   });
 
   it("does not grey them during a foreground grace", () => {
-    health.lastOkAt = Date.now() - 20_000;
+    health.lastOkAt = NOW - 20_000;
     renderList();
     act(() => {
       document.dispatchEvent(new Event("visibilitychange"));

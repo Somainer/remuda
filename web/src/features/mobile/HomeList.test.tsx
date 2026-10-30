@@ -23,12 +23,13 @@ const HELD = "[data-order-held='1']";
 const RELEASED = "[data-order-held='0']";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { mockDb } from "../../lib/mock";
 import type { Instance } from "../../types/instance";
 import { known, type Id } from "../../types/wire";
 import { HomeList } from "./HomeList";
 import { SPACES_PREFS_KEY, spaceKey, spaceStore } from "../spaces/store";
+import { setClock } from "../../lib/clock";
 
 const hub = {
   hosts: [{ id: "host-a", label: "alpha" }],
@@ -515,6 +516,18 @@ describe("HomeList hold against the painted structure", () => {
 });
 
 describe("HomeList §8 freshness states", () => {
+  // §8 tasks are asserted on the injected clock: the stale window is a
+  // product constant, never a wall-clock threshold.
+  const NOW = 5_000_000;
+  let restoreClock: () => void;
+  beforeEach(() => {
+    restoreClock = setClock(() => NOW);
+    health.lastOkAt = NOW;
+  });
+  afterEach(() => {
+    restoreClock();
+  });
+
   it("paints three skeleton rows before the first snapshot and never an empty state", async () => {
     health.lastOkAt = null;
     hub.instances = [];
@@ -551,7 +564,7 @@ describe("HomeList §8 freshness states", () => {
   });
 
   it("greys the cached rows while stale, and a foreground grace lifts the grey until the first refresh settles", async () => {
-    health.lastOkAt = Date.now() - 20_000;
+    health.lastOkAt = NOW - 20_000;
     hub.instances = [row("ins-a", { activity: known("waiting-interaction") })];
     renderHome();
     await screen.findByTestId("home-row");
@@ -566,7 +579,7 @@ describe("HomeList §8 freshness states", () => {
     expect(region()).toHaveAttribute("data-freshness", "grace");
     expect(region()).not.toHaveAttribute("data-dimmed");
     act(() => {
-      publishHealth({ failingSince: Date.now() });
+      publishHealth({ failingSince: NOW });
     });
     expect(region()).toHaveAttribute("data-freshness", "stale");
     expect(region()).toHaveAttribute("data-dimmed", "1");

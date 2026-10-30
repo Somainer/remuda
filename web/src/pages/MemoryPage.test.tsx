@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { api } from "../lib/api";
@@ -173,5 +173,30 @@ describe("a plain session without a lineage row", () => {
     expect(screen.queryByTestId("memory-new")).toBeNull();
     expect(screen.queryByTestId("memory-search")).toBeNull();
     expect(createMemory).not.toHaveBeenCalled();
+  });
+});
+
+describe("a delete whose revision went stale", () => {
+  it("reloads and reopens the editor at the fresh revision", async () => {
+    const row = entry({ slug: "pref", title: "Terse", revision: 1 });
+    listMemory.mockResolvedValue([row]);
+    getMemory.mockImplementation(async (_lineage, slug) => {
+      if (slug === "pref") return entry({ slug: "pref", title: "Terse", revision: 2, body: "fresh" });
+      throw new HubHttpError(404, "NOT_FOUND", "missing");
+    });
+    deleteMemory.mockRejectedValue(new HubHttpError(409, "MEMORY_REVISION_CONFLICT", "stale"));
+
+    renderPage("/s/ins_x/memory");
+    const rowButton = await screen.findByTestId("memory-row");
+    fireEvent.click(rowButton);
+    fireEvent.click(screen.getByTestId("memory-editor-delete"));
+    fireEvent.click(screen.getByTestId("memory-delete-confirm-yes"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("memory-editor-error")).toHaveTextContent("已被更新"),
+    );
+    expect(within(screen.getByTestId("memory-editor")).getByText("rev 2")).toBeTruthy();
+    // The list was reloaded so the row shows the fresh revision too.
+    await waitFor(() => expect(listMemory.mock.calls.length).toBeGreaterThan(1));
   });
 });

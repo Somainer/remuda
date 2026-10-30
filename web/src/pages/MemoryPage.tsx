@@ -466,6 +466,30 @@ export function MemoryPage() {
       await reload(lineageId, q);
     } catch (error) {
       setConfirmDelete(null);
+      if (isRevisionConflict(error) && lineageId) {
+        // The row moved while the confirmation was open: reload the list and
+        // reopen the editor at the FRESH revision instead of repeating the
+        // same 409 on the next delete.
+        try {
+          const server = await getMemory(lineageId, confirmDelete.slug);
+          await reload(lineageId, q);
+          setEditorError("这条记忆在你确认前已被更新，已载入最新版本；请重新确认删除。");
+          setEditor({
+            slug: server.slug,
+            creating: false,
+            revision: server.revision,
+            draft: draftOf(server),
+          });
+        } catch (readError) {
+          if (readError instanceof HubHttpError && readError.status === 404) {
+            await reload(lineageId, q);
+            setEditor(null);
+          } else {
+            setEditorError(saveErrorText(readError));
+          }
+        }
+        return;
+      }
       setEditorError(saveErrorText(error));
       setEditor({
         slug: confirmDelete.slug,

@@ -961,6 +961,14 @@ pub struct WorkerRoster {
     pub task_id: Option<TaskId>,
     /// Lifecycle state.
     pub state: WorkerState,
+    /// When the worker last entered `done`, stamped by the Hub at the
+    /// transition and cleared on any other state.
+    ///
+    /// Kept apart from `updatedAt` because every watch pass rewrites the row:
+    /// "today's DONE count" must answer when the work landed, not when the
+    /// owner last looked at it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub done_at: Option<crate::Timestamp>,
     /// Latest `remuda watch` screen classification (5b); absent until the
     /// worker is first observed. Point-in-time observation, distinct from the
     /// durable lifecycle `state`: idle-api-error/stalled/gone never move the

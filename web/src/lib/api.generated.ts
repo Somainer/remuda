@@ -962,6 +962,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/lineages/{id}/glance": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Waiting and working workers a lineage dispatched, plus today's DONE count
+         * @description At most 50 rows in each of waiting and working; the *Total counters carry the overflow. Human/Bot devices may read any lineage; an Agent may read only its own lineage (403 otherwise). Row detail text is untrusted data.
+         */
+        get: operations["lineageGlance"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/lineages/{id}/memory": {
         parameters: {
             query?: never;
@@ -1788,6 +1808,26 @@ export interface paths {
         put?: never;
         /** Re-deliver a brief/handback file to a live worker */
         post: operations["workerBrief"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/workers/{id}/digest": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Bounded (<= 2048 bytes) read-only digest of one worker
+         * @description Roster state, last turn outcome, head/tail of the last assistant text, the pending interaction with a bounded untrusted-quoted tool-argument summary (secrets and input-handoff values withheld), requested vs effective model/effort, a pending instance.configure, parked supply with resetsAt, queued command count, task/branch/sha, time since progress and tool-in-flight. Always valid JSON of at most 2048 UTF-8 bytes: over budget, text fields shrink. Human/Bot devices read any worker; an Agent only workers in its own lineage or dispatched by it (403 otherwise). Free-text fields are untrusted data.
+         */
+        get: operations["workerDigest"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -2670,6 +2710,10 @@ export interface components {
             generation: number;
             instanceId: string;
         };
+        /** @description Generated shape: LineageGlance in crates/remuda-protocol/schema/protocol.schema.json. */
+        LineageGlance: {
+            [key: string]: unknown;
+        };
         /** @description One agent across process lifetimes (D-057 §5). A row exists only for continuity instances: one that holds a grant or carries a restart policy. */
         LineageRecord: {
             /** @description Every chapter, oldest generation first. */
@@ -3477,6 +3521,10 @@ export interface components {
         WorkerBriefSend: {
             content: string;
             name?: string;
+        };
+        /** @description Generated shape: WorkerDigest in crates/remuda-protocol/schema/protocol.schema.json. */
+        WorkerDigest: {
+            [key: string]: unknown;
         };
         WorkerDispatch: {
             /**
@@ -5600,6 +5648,31 @@ export interface operations {
             404: components["responses"]["Error"];
         };
     };
+    lineageGlance: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Lineage glance */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LineageGlance"];
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
     memoryList: {
         parameters: {
             query?: {
@@ -7513,6 +7586,32 @@ export interface operations {
             400: components["responses"]["Error"];
             401: components["responses"]["Error"];
             403: components["responses"]["Error"];
+        };
+    };
+    workerDigest: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description wkr_ id or active worker name */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Worker digest */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkerDigest"];
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
         };
     };
     workerNudge: {

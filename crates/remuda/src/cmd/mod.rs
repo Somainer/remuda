@@ -9,6 +9,7 @@ pub mod dispatcher;
 pub mod doctor;
 pub mod fleet;
 mod gate;
+mod glance;
 pub mod hook;
 mod host;
 mod hostcap;
@@ -72,6 +73,7 @@ commands! {
     Gate(gate::GateArgs),
     Land(gate::LandArgs),
     Watch(watch::WatchArgs),
+    Glance(glance::GlanceArgs),
     Worker(worker::WorkerArgs),
     Report(report::ReportArgs),
     Retire(retire::RetireArgs),

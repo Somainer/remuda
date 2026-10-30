@@ -6,6 +6,7 @@
 mod macros;
 mod binary;
 mod capabilities;
+mod digest;
 mod effort;
 mod entities;
 mod enums;
@@ -36,6 +37,7 @@ mod worker;
 
 pub use binary::*;
 pub use capabilities::*;
+pub use digest::*;
 pub use effort::*;
 pub use entities::*;
 pub use enums::*;

@@ -10826,6 +10826,316 @@
       ],
       "type": "object"
     },
+    "MemoryEntry": {
+      "description": "One memory entry of one lineage.",
+      "properties": {
+        "archivedAt": {
+          "description": "Set when the lineage retired; archived entries leave the index and\nsearch until the owner restores them.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "body": {
+          "description": "Entry body; read on demand, never in the index.",
+          "type": "string"
+        },
+        "createdAt": {
+          "description": "First write.",
+          "type": "string"
+        },
+        "description": {
+          "description": "One-line description; the index shows it.",
+          "type": "string"
+        },
+        "lineageId": {
+          "description": "Owning lineage (its first chapter's instance id).",
+          "type": "string"
+        },
+        "origin": {
+          "$ref": "#/$defs/MemoryOrigin",
+          "description": "How the caller of the last write authenticated."
+        },
+        "revision": {
+          "description": "Revision: the next one for this slug on every write, never reused —\na slug recreated after a delete continues after its last revision, so\na stale `expectedRevision` never matches a replacement. 1 for a slug\nnever used before. Updates and deletes carry it back as\n`expectedRevision`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "slug": {
+          "description": "Stable handle, unique within the lineage (archived entries included).",
+          "type": "string"
+        },
+        "sourceRefs": {
+          "default": [],
+          "description": "Journal rows the entry was derived from.",
+          "items": {
+            "$ref": "#/$defs/MemorySourceRef"
+          },
+          "type": "array"
+        },
+        "title": {
+          "description": "One-line title.",
+          "type": "string"
+        },
+        "type": {
+          "$ref": "#/$defs/MemoryType",
+          "description": "Entry type."
+        },
+        "updatedAt": {
+          "description": "Last write.",
+          "type": "string"
+        },
+        "writerInstance": {
+          "description": "Chapter that made the last write; absent for an owner write.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "lineageId",
+        "slug",
+        "type",
+        "title",
+        "description",
+        "body",
+        "revision",
+        "origin",
+        "sourceRefs",
+        "createdAt",
+        "updatedAt"
+      ],
+      "type": "object"
+    },
+    "MemoryIndex": {
+      "description": "The Hub-rendered index: one line per live entry (archived entries too\nwhen asked for, marked `(archived)`), stable-ordered by type then slug.",
+      "properties": {
+        "bytes": {
+          "description": "Rendered size in bytes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "count": {
+          "description": "Number of entries in the index.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "lineageId": {
+          "description": "Lineage.",
+          "type": "string"
+        },
+        "text": {
+          "description": "Rendered text, one `- [type] slug: title — description` line per\nentry; an archived entry's line ends ` (archived)`.",
+          "type": "string"
+        },
+        "warnings": {
+          "default": [],
+          "description": "The index soft limit, when crossed.",
+          "items": {
+            "$ref": "#/$defs/MemorySizeWarning"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "lineageId",
+        "text",
+        "count",
+        "bytes",
+        "warnings"
+      ],
+      "type": "object"
+    },
+    "MemoryLimit": {
+      "description": "MemoryLimit wire values; `protocol.md` §8.",
+      "oneOf": [
+        {
+          "const": "entry-soft",
+          "description": "Wire value `entry-soft`.",
+          "type": "string"
+        },
+        {
+          "const": "index-soft",
+          "description": "Wire value `index-soft`.",
+          "type": "string"
+        }
+      ]
+    },
+    "MemoryMatch": {
+      "description": "MemoryMatch wire values; `protocol.md` §8.",
+      "oneOf": [
+        {
+          "const": "fts",
+          "description": "Wire value `fts`.",
+          "type": "string"
+        },
+        {
+          "const": "like",
+          "description": "Wire value `like`.",
+          "type": "string"
+        }
+      ]
+    },
+    "MemoryOrigin": {
+      "description": "MemoryOrigin wire values; `protocol.md` §8.",
+      "oneOf": [
+        {
+          "const": "human",
+          "description": "Wire value `human`.",
+          "type": "string"
+        },
+        {
+          "const": "agent",
+          "description": "Wire value `agent`.",
+          "type": "string"
+        }
+      ]
+    },
+    "MemorySearchHit": {
+      "description": "One search hit.",
+      "properties": {
+        "entry": {
+          "$ref": "#/$defs/MemoryEntry",
+          "description": "The matching entry."
+        },
+        "matchedBy": {
+          "$ref": "#/$defs/MemoryMatch",
+          "description": "`fts` for a full-text (bm25-ranked) hit, `like` for a substring hit\nthe tokenizer could not see (for example a short CJK query)."
+        },
+        "score": {
+          "description": "bm25 score of an `fts` hit (lower is better).",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "entry",
+        "matchedBy"
+      ],
+      "type": "object"
+    },
+    "MemorySizeWarning": {
+      "description": "A soft limit a write crossed, with the actual numbers.",
+      "properties": {
+        "bytes": {
+          "description": "Actual size in bytes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "limit": {
+          "$ref": "#/$defs/MemoryLimit",
+          "description": "Which limit."
+        },
+        "maxBytes": {
+          "description": "The limit in bytes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "limit",
+        "bytes",
+        "maxBytes"
+      ],
+      "type": "object"
+    },
+    "MemorySourceRef": {
+      "description": "A journal row an entry was derived from. Lets a later journal-redaction\npass find every entry that repeats a redacted row.",
+      "properties": {
+        "instanceId": {
+          "description": "Instance whose journal holds the row (`ins_…`).",
+          "type": "string"
+        },
+        "seq": {
+          "description": "Journal sequence number of the row.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "instanceId",
+        "seq"
+      ],
+      "type": "object"
+    },
+    "MemoryType": {
+      "description": "MemoryType wire values; `protocol.md` §8.",
+      "oneOf": [
+        {
+          "const": "user",
+          "description": "Wire value `user`.",
+          "type": "string"
+        },
+        {
+          "const": "feedback",
+          "description": "Wire value `feedback`.",
+          "type": "string"
+        },
+        {
+          "const": "project",
+          "description": "Wire value `project`.",
+          "type": "string"
+        },
+        {
+          "const": "reference",
+          "description": "Wire value `reference`.",
+          "type": "string"
+        }
+      ]
+    },
+    "MemoryWriteResult": {
+      "description": "Result of a create, update or consolidate.",
+      "properties": {
+        "entry": {
+          "$ref": "#/$defs/MemoryEntry",
+          "description": "The entry as committed."
+        },
+        "entryBytes": {
+          "description": "Size of the committed entry: title + description + body, UTF-8 bytes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "indexBytes": {
+          "description": "Size of the lineage's rendered index after the write.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "removed": {
+          "description": "Entries the write removed (consolidate only).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "warnings": {
+          "default": [],
+          "description": "Soft limits crossed by this write.",
+          "items": {
+            "$ref": "#/$defs/MemorySizeWarning"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "entry",
+        "entryBytes",
+        "indexBytes",
+        "warnings"
+      ],
+      "type": "object"
+    },
     "MessageOrigin": {
       "description": "MessageOrigin wire values; `protocol.md` §5.2.",
       "oneOf": [

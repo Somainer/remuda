@@ -3793,6 +3793,9 @@ impl Store {
                     params![&instance.lineage_id],
                 )?;
             }
+            // D-060: a retired lineage's memory is archived, not deleted; the
+            // owner can restore it.
+            crate::memory::archive_lineage(&tx, &instance.lineage_id, &now)?;
             tx.commit()?;
             Ok(Some(DeletedInstance { settlement }))
         })
@@ -7696,11 +7699,13 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     ensure_column(&conn, "instances", "ended_at", "TEXT")?;
     // ma-lineage r4 item 3 + r6 item 7 + r7 item 5(e): the ended_at
     // backfills run ONCE per schema PRAGMA marker, not on every Store::open
-    // for every evidence-less terminal row (that set only grows).
-    let backfill_version: i64 = conn
+    // for every evidence-less terminal row (that set only grows). This is the
+    // Hub's one `user_version` ladder: each step runs once, in order, and
+    // leaves the marker at its own number.
+    let schema_version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap_or(0);
-    if backfill_version < 2 {
+    if schema_version < 2 {
         // r6 item 3(b) ONE-TIME legacy fallback (guarded by PRAGMA
         // user_version): evidence-less historical rows that already reached a
         // live lifecycle, and LEGACY 'host-lost'-marked rows (the pre-r7
@@ -7726,7 +7731,7 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
         )?;
         conn.execute_batch("PRAGMA user_version = 2;")?;
     }
-    if backfill_version < 3 {
+    if schema_version < 3 {
         // ma-lineage r4 item 3: backfill `ended_at` from durable,
         // classifier-qualified process-end EVENTS in each row's journal —
         // never blindly from updated_at. A later return-to-live event after
@@ -7741,6 +7746,15 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
         backfill_ended_at_from_journal(&conn)
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         conn.execute_batch("PRAGMA user_version = 3;")?;
+    }
+    if schema_version < crate::memory::MEMORY_SCHEMA_VERSION {
+        // D-060 (cb-memory-core): the per-entry memory table, its FTS5 index
+        // and the triggers that keep the index in the row's transaction. The
+        // tables and the marker commit together.
+        let tx = conn.unchecked_transaction()?;
+        crate::memory::migrate(&tx)?;
+        tx.pragma_update(None, "user_version", crate::memory::MEMORY_SCHEMA_VERSION)?;
+        tx.commit()?;
     }
     // Rows written before the column existed are each their own lineage.
     conn.execute(
@@ -11720,7 +11734,9 @@ mod tests {
             db.query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap()
         };
-        assert_eq!(version, 3);
+        // The marker sits at the top of the one ladder (the D-060 memory
+        // step follows the ended_at backfills).
+        assert_eq!(version, crate::memory::MEMORY_SCHEMA_VERSION);
         // Another open changes neither row (one-time migration).
         store.close().await;
         let _store = Store::open(dir.path()).expect("store");

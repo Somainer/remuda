@@ -45,7 +45,8 @@ use remuda_protocol::{
     InputOrigin, MEMORY_ENTRY_HARD_BYTES, MEMORY_ENTRY_SOFT_BYTES, MEMORY_INDEX_SOFT_BYTES,
     MemoryEntry, MemoryIndex, MemoryLimit, MemoryMatch, MemoryOrigin, MemorySearchHit,
     MemorySizeWarning, MemorySourceRef, MemoryTurnRef, MemoryType, MemoryWriteItem, MemoryWriteOp,
-    MemoryWriteResult, memory_entry_bytes, memory_index_line, validate_memory_slug,
+    MemoryWritePage, MemoryWriteResult, memory_entry_bytes, memory_index_line,
+    validate_memory_slug,
 };
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::Deserialize;
@@ -624,6 +625,31 @@ fn check_owner_authored(writer: &MemoryWriter, slugs: &[&str]) -> Result<(), Mem
         ));
     }
     Ok(())
+}
+
+/// Decode one `memory_write_log` row as `(row id, item)`; the id drives the
+/// feed's cursor.
+fn write_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, MemoryWriteItem)> {
+    let raw_op: String = row.get(4)?;
+    let op = match raw_op.as_str() {
+        "write" => MemoryWriteOp::Write,
+        "consolidate" => MemoryWriteOp::Consolidate,
+        "delete" => MemoryWriteOp::Delete,
+        other => return Err(conversion(4, format!("unknown memory write op {other:?}"))),
+    };
+    let revision: i64 = row.get(3)?;
+    let turn_seq: Option<i64> = row.get(5)?;
+    Ok((
+        row.get(0)?,
+        MemoryWriteItem {
+            slug: row.get(1)?,
+            title: row.get(2)?,
+            revision: revision.max(0) as u64,
+            op,
+            turn_seq: turn_seq.map(|seq| seq.max(0) as u64),
+            written_at: row.get(6)?,
+        },
+    ))
 }
 
 /// One index row: type, slug, title, description, archived.
@@ -1517,58 +1543,62 @@ impl Store {
             .await?)
     }
 
-    /// Every memory write this chapter made, oldest first — the transcript's
+    /// One page of this chapter's memory write log — the transcript's
     /// "Remembered: <title>" rows. Rows survive a later rewrite or delete of
-    /// their entry, and `afterSeq` narrows them to writes after a given
-    /// `turn_started` seq.
+    /// their entry.
+    ///
+    /// Pages are keyed by the log row id, not the turn seq: a single turn can
+    /// log more than one page. Without a cursor the page is the NEWEST rows
+    /// (a transcript needs its recent turns); with one, the rows after it.
     pub(crate) async fn memory_writes(
         &self,
         instance_id: String,
-        after_seq: Option<u64>,
-    ) -> Result<Vec<MemoryWriteItem>, StoreError> {
+        after_id: Option<u64>,
+    ) -> Result<MemoryWritePage, StoreError> {
         self.read("memory_writes", move |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT slug, title, revision, op, turn_seq, written_at
-                   FROM memory_write_log
-                  WHERE writer_instance = ?1
-                    AND (?2 IS NULL OR turn_seq > ?2)
-                  ORDER BY id
-                  LIMIT ?3",
-            )?;
-            let rows = stmt
-                .query_map(
-                    params![
-                        instance_id,
-                        after_seq.and_then(|seq| i64::try_from(seq).ok()),
-                        MAX_MEMORY_WRITES as i64
-                    ],
-                    |row| {
-                        let raw_op: String = row.get(3)?;
-                        let op = match raw_op.as_str() {
-                            "write" => MemoryWriteOp::Write,
-                            "consolidate" => MemoryWriteOp::Consolidate,
-                            "delete" => MemoryWriteOp::Delete,
-                            other => {
-                                return Err(conversion(
-                                    3,
-                                    format!("unknown memory write op {other:?}"),
-                                ));
-                            }
-                        };
-                        let revision: i64 = row.get(2)?;
-                        let turn_seq: Option<i64> = row.get(4)?;
-                        Ok(MemoryWriteItem {
-                            slug: row.get(0)?,
-                            title: row.get(1)?,
-                            revision: revision.max(0) as u64,
-                            op,
-                            turn_seq: turn_seq.map(|seq| seq.max(0) as u64),
-                            written_at: row.get(5)?,
-                        })
-                    },
-                )?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
+            let cursor = after_id.and_then(|id| i64::try_from(id).ok());
+            let rows = match cursor {
+                Some(cursor) => conn
+                    .prepare(
+                        "SELECT id, slug, title, revision, op, turn_seq, written_at
+                           FROM memory_write_log
+                          WHERE writer_instance = ?1 AND id > ?2
+                          ORDER BY id
+                          LIMIT ?3",
+                    )?
+                    .query_map(
+                        params![instance_id, cursor, MAX_MEMORY_WRITES as i64],
+                        write_row,
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?,
+                None => {
+                    // Newest page: read backwards, then put it back in
+                    // display order (the feed is oldest first).
+                    let mut rows = conn
+                        .prepare(
+                            "SELECT id, slug, title, revision, op, turn_seq, written_at
+                               FROM memory_write_log
+                              WHERE writer_instance = ?1
+                              ORDER BY id DESC
+                              LIMIT ?2",
+                        )?
+                        .query_map(params![instance_id, MAX_MEMORY_WRITES as i64], write_row)?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    rows.reverse();
+                    rows
+                }
+            };
+            let next_after_id = rows
+                .last()
+                .map(|(id, _)| *id)
+                .or(cursor)
+                .unwrap_or(0)
+                .max(0) as u64;
+            let items = rows.into_iter().map(|(_, item)| item).collect();
+            Ok(MemoryWritePage {
+                items,
+                next_after_id,
+            })
         })
         .await
     }
@@ -1969,13 +1999,15 @@ async fn derived(
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MemoryWritesQuery {
-    /// Return only rows whose `turnSeq` is greater than this.
+    /// Return only log rows whose id is greater than this (the previous
+    /// page's `nextAfterId`).
     #[serde(default)]
-    after_seq: Option<u64>,
+    after_id: Option<u64>,
 }
 
-/// `GET /v1/instances/{id}/memory-writes` — one writer chapter's memory write
-/// log, oldest first.
+/// `GET /v1/instances/{id}/memory-writes` — one page of a writer chapter's
+/// memory write log. Without `afterId` the page is the newest rows; with it,
+/// the rows after that row id. Rows are oldest first within the page.
 ///
 /// Human and Bot callers only. The agent-route middleware refuses an Agent
 /// credential (this path is on no agent allowlist), and the handler re-checks,
@@ -1985,7 +2017,7 @@ async fn memory_writes(
     headers: HeaderMap,
     Path(instance_id): Path<String>,
     Query(query): Query<MemoryWritesQuery>,
-) -> Result<Json<Value>, HubError> {
+) -> Result<Json<MemoryWritePage>, HubError> {
     require_origin(&headers, &state.config)?;
     let device = caller(&state, &headers).await?;
     if origin(&device) == InputOrigin::Agent {
@@ -2000,12 +2032,12 @@ async fn memory_writes(
     {
         return Err(HubError::NotFound);
     }
-    let items = state
+    let page = state
         .store
-        .memory_writes(instance_id, query.after_seq)
+        .memory_writes(instance_id, query.after_id)
         .await
         .map_err(crate::http::map_store)?;
-    Ok(Json(json!({ "items": items })))
+    Ok(Json(page))
 }
 
 // ─── Test seam ─────────────────────────────────────────────────────────────
@@ -3495,17 +3527,18 @@ mod tests {
 
         // The chapter's feed returns it; afterSeq is exclusive on the turn.
         let feed = fx.store.memory_writes(lineage.clone(), None).await.unwrap();
-        assert_eq!(feed.len(), 1);
-        assert_eq!(feed[0].slug, "pref");
-        assert_eq!(feed[0].turn_seq, Some(started as u64));
-        assert_eq!(feed[0].op, MemoryWriteOp::Write);
+        assert_eq!(feed.items.len(), 1);
+        assert_eq!(feed.items[0].slug, "pref");
+        assert_eq!(feed.items[0].turn_seq, Some(started as u64));
+        assert_eq!(feed.items[0].op, MemoryWriteOp::Write);
         assert!(
             fx.store
-                .memory_writes(lineage, Some(started as u64))
+                .memory_writes(lineage, Some(feed.next_after_id))
                 .await
                 .unwrap()
+                .items
                 .is_empty(),
-            "afterSeq is exclusive"
+            "afterId is exclusive"
         );
     }
 
@@ -3536,6 +3569,7 @@ mod tests {
                 .memory_writes(lineage, None)
                 .await
                 .unwrap()
+                .items
                 .is_empty(),
             "an owner row is on no chapter's feed"
         );
@@ -3577,7 +3611,10 @@ mod tests {
         assert_eq!(rows[1].5, Some(started));
         let feed = fx.store.memory_writes(lineage, None).await.unwrap();
         assert_eq!(
-            feed.iter().map(|row| row.revision).collect::<Vec<_>>(),
+            feed.items
+                .iter()
+                .map(|row| row.revision)
+                .collect::<Vec<_>>(),
             [1, 2]
         );
     }
@@ -3653,7 +3690,12 @@ mod tests {
                 .is_some()
         );
         assert_eq!(
-            fx.store.memory_writes(lineage, None).await.unwrap().len(),
+            fx.store
+                .memory_writes(lineage, None)
+                .await
+                .unwrap()
+                .items
+                .len(),
             1
         );
     }
@@ -3884,7 +3926,15 @@ mod tests {
             .await
             .unwrap();
         assert!(written.entry.turn_ref.is_some());
-        assert_eq!(store.memory_writes(instance, None).await.unwrap().len(), 1);
+        assert_eq!(
+            store
+                .memory_writes(instance, None)
+                .await
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
         store.close().await;
 
         // Re-opening at the top rung does not re-run it.

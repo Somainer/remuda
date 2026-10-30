@@ -827,7 +827,7 @@ export interface paths {
         };
         /**
          * List a writer chapter's memory writes
-         * @description One writer chapter's memory write log, oldest first. A row survives a later rewrite or delete of its entry, so the transcript can show every turn that wrote memory. count is capped at 500 rows. Human and Bot callers only: an Agent credential is refused (403).
+         * @description One page of a writer chapter's memory write log (latest page when no cursor is given; oldest first within the page), keyed by log row id so a single turn with more rows than a page still advances. A row survives a later rewrite or delete of its entry, so the transcript can show every turn that wrote memory. Human and Bot callers only: an Agent credential is refused (403).
          */
         get: operations["memoryWrites"];
         put?: never;
@@ -2927,9 +2927,11 @@ export interface components {
          * @enum {string}
          */
         MemoryWriteOp: "write" | "consolidate" | "delete";
-        /** @description Memory write log rows. */
+        /** @description One page of a writer chapter's memory write log. Without a cursor this is the newest page; rows are oldest first within it. */
         MemoryWritePage: {
             items: components["schemas"]["MemoryWriteItem"][];
+            /** @description Row id to pass back as afterId; the newest row id in the page, or the cursor itself when the page is empty. */
+            nextAfterId: number;
         };
         /** @description A committed create, update or consolidate. */
         MemoryWriteResult: {
@@ -5466,8 +5468,8 @@ export interface operations {
     memoryWrites: {
         parameters: {
             query?: {
-                /** @description Return only rows whose turnSeq is greater than this. */
-                afterSeq?: number;
+                /** @description Return only log rows whose id is greater than this (the previous page's nextAfterId). */
+                afterId?: number;
             };
             header?: never;
             path: {

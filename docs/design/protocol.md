@@ -2028,10 +2028,11 @@ POST   /v1/lineages/{id}/memory/consolidate
   body {sources: [{slug, expectedRevision}], target: {slug, type, title, description, body}}
   -> 200 {entry: MemoryEntry, removed: [slug]}      one writer job, all or nothing
 
-GET    /v1/instances/{id}/memory-writes?afterSeq=<n>
+GET    /v1/instances/{id}/memory-writes?afterId=<n>
   -> 200 {items: [{slug, title, revision, op: write|consolidate|delete,
-                   turnSeq, writtenAt}]}
-     one writer chapter's append-only write log, oldest first; afterSeq is exclusive
+                   turnSeq, writtenAt}], nextAfterId}
+     one page of a writer chapter's append-only write log, oldest first within the
+     page; without a cursor the NEWEST page; afterId is exclusive on the log row id
      Human and Bot callers only; an Agent token gets 403
 
 MemoryEntry = {lineageId, slug, type, title, description, body, revision,

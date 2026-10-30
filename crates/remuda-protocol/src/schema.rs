@@ -275,6 +275,7 @@ pub fn schema_document() -> Value {
         MemoryType,
         MemoryWriteItem,
         MemoryWriteOp,
+        MemoryWritePage,
         MemoryWriteResult,
         MessagePayload,
         MessageOrigin,

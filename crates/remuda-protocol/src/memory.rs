@@ -84,6 +84,22 @@ pub struct MemoryTurnRef {
     pub seq: u64,
 }
 
+/// One page of a writer instance's append-only memory write log.
+///
+/// Rows are ordered oldest first within the page. Without a cursor the page is
+/// the NEWEST page (a recent transcript needs its recent turns);
+/// `next_after_id` is the row id to poll from, so a single turn with more rows
+/// than a page still advances.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryWritePage {
+    /// Rows in this page, oldest first.
+    pub items: Vec<MemoryWriteItem>,
+    /// Row id to pass back as `afterId`; the newest row id in the page, or the
+    /// cursor itself when the page is empty.
+    pub next_after_id: u64,
+}
+
 /// One row of a writer instance's append-only memory write log (D-060).
 ///
 /// A row survives a later rewrite or delete of the entry, because every turn

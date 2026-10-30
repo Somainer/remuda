@@ -13,6 +13,7 @@ export type MemoryEntry = components["schemas"]["MemoryEntry"];
 export type MemorySearchHit = components["schemas"]["MemorySearchHit"];
 export type MemoryWriteResult = components["schemas"]["MemoryWriteResult"];
 export type MemoryWriteItem = components["schemas"]["MemoryWriteItem"];
+export type MemoryWritePage = components["schemas"]["MemoryWritePage"];
 export type MemoryType = components["schemas"]["MemoryType"];
 export type MemorySizeWarning = components["schemas"]["MemorySizeWarning"];
 
@@ -117,18 +118,23 @@ export async function restoreMemory(lineageId: string, slugs: string[]): Promise
 }
 
 /**
- * One writer chapter's append-only write log, oldest first. `afterSeq` is
- * exclusive on the turn; omit it for the whole log.
+ * One page of a writer chapter's append-only write log, oldest first within
+ * the page. Without `afterId` the Hub returns the NEWEST page; pass the
+ * previous page's `nextAfterId` to continue. Pages are keyed by log row id, so
+ * a turn with more rows than a page still advances.
  */
 export async function listMemoryWrites(
   instanceId: string,
-  afterSeq?: number,
+  afterId?: number,
   signal?: AbortSignal,
-): Promise<MemoryWriteItem[]> {
-  const query = afterSeq === undefined ? "" : `?afterSeq=${afterSeq}`;
-  const page = await rest<{ items?: MemoryWriteItem[] }>(
+): Promise<MemoryWritePage> {
+  const query = afterId === undefined ? "" : `?afterId=${afterId}`;
+  const page = await rest<Partial<MemoryWritePage>>(
     `/v1/instances/${encodeURIComponent(instanceId)}/memory-writes${query}`,
     signal ? { signal } : {},
   );
-  return Array.isArray(page?.items) ? page.items : [];
+  return {
+    items: Array.isArray(page?.items) ? page.items : [],
+    nextAfterId: typeof page?.nextAfterId === "number" ? page.nextAfterId : 0,
+  };
 }

@@ -11524,6 +11524,29 @@
         }
       ]
     },
+    "MemoryWritePage": {
+      "description": "One page of a writer instance's append-only memory write log.\n\nRows are ordered oldest first within the page. Without a cursor the page is\nthe NEWEST page (a recent transcript needs its recent turns);\n`next_after_id` is the row id to poll from, so a single turn with more rows\nthan a page still advances.",
+      "properties": {
+        "items": {
+          "description": "Rows in this page, oldest first.",
+          "items": {
+            "$ref": "#/$defs/MemoryWriteItem"
+          },
+          "type": "array"
+        },
+        "nextAfterId": {
+          "description": "Row id to pass back as `afterId`; the newest row id in the page, or the\ncursor itself when the page is empty.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "items",
+        "nextAfterId"
+      ],
+      "type": "object"
+    },
     "MemoryWriteResult": {
       "description": "Result of a create, update or consolidate.",
       "properties": {

@@ -5500,17 +5500,23 @@
       },
       "MemoryWritePage": {
         "additionalProperties": false,
-        "description": "Memory write log rows.",
+        "description": "One page of a writer chapter's memory write log. Without a cursor this is the newest page; rows are oldest first within it.",
         "properties": {
           "items": {
             "items": {
               "$ref": "#/components/schemas/MemoryWriteItem"
             },
             "type": "array"
+          },
+          "nextAfterId": {
+            "description": "Row id to pass back as afterId; the newest row id in the page, or the cursor itself when the page is empty.",
+            "minimum": 0,
+            "type": "integer"
           }
         },
         "required": [
-          "items"
+          "items",
+          "nextAfterId"
         ],
         "type": "object"
       },
@@ -7695,16 +7701,16 @@
     },
     "/v1/instances/{id}/memory-writes": {
       "get": {
-        "description": "One writer chapter's memory write log, oldest first. A row survives a later rewrite or delete of its entry, so the transcript can show every turn that wrote memory. count is capped at 500 rows. Human and Bot callers only: an Agent credential is refused (403).",
+        "description": "One page of a writer chapter's memory write log (latest page when no cursor is given; oldest first within the page), keyed by log row id so a single turn with more rows than a page still advances. A row survives a later rewrite or delete of its entry, so the transcript can show every turn that wrote memory. Human and Bot callers only: an Agent credential is refused (403).",
         "operationId": "memoryWrites",
         "parameters": [
           {
             "$ref": "#/components/parameters/IdPath"
           },
           {
-            "description": "Return only rows whose turnSeq is greater than this.",
+            "description": "Return only log rows whose id is greater than this (the previous page's nextAfterId).",
             "in": "query",
-            "name": "afterSeq",
+            "name": "afterId",
             "required": false,
             "schema": {
               "minimum": 0,

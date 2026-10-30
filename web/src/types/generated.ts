@@ -2600,6 +2600,13 @@ export type MemoryWriteItem = ({
 /** MemoryWriteOp wire values; `protocol.md` §8. */
 export type MemoryWriteOp = ("write" | "consolidate" | "delete");
 
+/** One page of a writer instance's append-only memory write log.  Rows are ordered oldest first within the page. Without a cursor the page is the NEWEST page (a recent transcript needs its recent turns); `next_after_id` is the row id to poll from, so a single turn with more rows than a page still advances. */
+export type MemoryWritePage = ({
+  "items": ((MemoryWriteItem)[]);
+  "nextAfterId": (number);
+  [key: string]: unknown;
+});
+
 /** Result of a create, update or consolidate. */
 export type MemoryWriteResult = ({
   "entry": MemoryEntry;

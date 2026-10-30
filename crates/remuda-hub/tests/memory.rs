@@ -1353,11 +1353,12 @@ async fn an_agent_write_mid_turn_records_the_turn_and_the_feed_returns_it() -> R
     assert_eq!(items[0]["turnSeq"], json!(started));
     assert!(items[0]["writtenAt"].as_str().is_some());
 
-    // afterSeq is exclusive on the turn.
+    // afterId is exclusive on the log row id.
+    let next = feed["nextAfterId"].as_u64().expect("nextAfterId");
     let after = ctx
         .ok(
             "GET",
-            &format!("/v1/instances/{lineage}/memory-writes?afterSeq={started}"),
+            &format!("/v1/instances/{lineage}/memory-writes?afterId={next}"),
             &ctx.human,
             None,
         )
@@ -1466,5 +1467,99 @@ async fn an_owner_write_has_a_null_turn_and_two_writes_keep_both_rows() -> Resul
         [("pref", 2), ("other", 1), ("merged", 1)],
         "{feed}"
     );
+    Ok(())
+}
+
+// ─── cb-memory-ui r2: row-id paging for the write feed ────────────────────
+
+#[tokio::test]
+async fn the_write_feed_starts_at_the_newest_page_and_pages_by_row_id() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let lineage = ctx.seat().await?;
+    let seat = ctx.agent(&lineage).await?;
+    let started = ctx.start_turn(&lineage).await?;
+    // One turn with more rows than the page bound: the cursor must still
+    // advance, which a turn-seq cursor cannot do. The rows are seeded
+    // straight into the log (the write path is covered elsewhere); 501 REST
+    // creates would take a minute for no extra coverage.
+    {
+        let db = rusqlite::Connection::open(ctx.dir.path().join("hub/hub.sqlite"))?;
+        let tx = db.unchecked_transaction()?;
+        for index in 0..501 {
+            tx.execute(
+                "INSERT INTO memory_write_log
+                    (lineage_id, slug, revision, title, op, origin, writer_instance,
+                     turn_seq, written_at)
+                 VALUES (?1, ?2, 1, ?3, 'write', 'agent', ?4, ?5,
+                         '2026-10-30T00:00:00.000Z')",
+                rusqlite::params![
+                    lineage,
+                    format!("bulk-{index:03}"),
+                    format!("Title bulk-{index:03}"),
+                    lineage,
+                    started
+                ],
+            )?;
+        }
+        tx.commit()?;
+    }
+    let page = ctx.writes(&lineage, &ctx.human).await?;
+    let items = page["items"].as_array().expect("items");
+    assert_eq!(items.len(), 500, "the newest page keeps the 500-row bound");
+    assert_eq!(
+        items[0]["slug"], "bulk-001",
+        "without a cursor the feed starts at the NEWEST page (the oldest row is outside it)"
+    );
+    assert_eq!(items[499]["slug"], "bulk-500");
+    let next = page["nextAfterId"]
+        .as_u64()
+        .expect("the page names the row-id cursor to continue from");
+    assert_eq!(next, 501, "the cursor is the newest log row id");
+
+    {
+        let db = rusqlite::Connection::open(ctx.dir.path().join("hub/hub.sqlite"))?;
+        db.execute(
+            "INSERT INTO memory_write_log
+                (lineage_id, slug, revision, title, op, origin, writer_instance,
+                 turn_seq, written_at)
+             VALUES (?1, 'after-page', 1, 'Title after-page', 'write', 'agent', ?1, ?2,
+                     '2026-10-30T00:00:01.000Z')",
+            rusqlite::params![lineage, started],
+        )?;
+    }
+    let tail = ctx
+        .ok(
+            "GET",
+            &format!("/v1/instances/{lineage}/memory-writes?afterId={next}"),
+            &ctx.human,
+            None,
+        )
+        .await?;
+    let tail_items = tail["items"].as_array().unwrap();
+    assert_eq!(tail_items.len(), 1, "the row after the cursor is reachable");
+    assert_eq!(tail_items[0]["slug"], "after-page");
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_write_feed_includes_rows_without_a_turn() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let lineage = ctx.seat().await?;
+    let seat = ctx.agent(&lineage).await?;
+    // No turn_started yet: both rows have a NULL turn_seq, and they must not
+    // vanish behind a turn-based cursor.
+    for slug in ["pre-turn-1", "pre-turn-2"] {
+        ctx.ok(
+            "POST",
+            &mem(&lineage, ""),
+            &seat,
+            Some(entry(slug, "project", "x")),
+        )
+        .await?;
+    }
+    let page = ctx.writes(&lineage, &ctx.human).await?;
+    let items = page["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert!(items.iter().all(|row| row["turnSeq"].is_null()), "{page}");
     Ok(())
 }

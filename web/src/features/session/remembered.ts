@@ -153,9 +153,11 @@ export function rememberedByReply(
  * The chapter's write log, refreshed with the transcript: `refreshKey` is the
  * transcript's tail seq, so one journal batch yields at most one request.
  *
- * `afterSeq` is the last turn seq minus one, so later writes of the SAME turn
- * (which share its turnSeq) are re-read and merged by slug/revision rather
- * than missed behind an exclusive cursor.
+ * Pages are keyed by log row id. The first request has no cursor and the Hub
+ * answers with the NEWEST page (the turns a transcript is showing); every
+ * later request continues from `nextAfterId`, so a single turn with more rows
+ * than a page still advances and rows with a NULL turn seq are never stranded
+ * behind a turn cursor.
  */
 export function useRememberedWrites(instanceId: string, refreshKey: string | undefined): MemoryWriteItem[] {
   const [writes, setWrites] = useState<MemoryWriteItem[]>([]);
@@ -174,13 +176,14 @@ export function useRememberedWrites(instanceId: string, refreshKey: string | und
     const controller = new AbortController();
     void (async () => {
       try {
-        const after = cursor.current === null ? undefined : Math.max(0, cursor.current - 1);
-        const items = await listMemoryWrites(instanceId, after, controller.signal);
+        const page = await listMemoryWrites(instanceId, cursor.current ?? undefined, controller.signal);
         if (controller.signal.aborted) return;
         setWrites((current) => {
+          // One row per slug per turn, newest revision: a rewrite or delete
+          // later in the same turn replaces the earlier row.
           const merged = new Map<string, MemoryWriteItem>();
           const key = (row: MemoryWriteItem) => `${row.turnSeq ?? "none"}:${row.slug}`;
-          for (const row of [...current, ...items]) {
+          for (const row of [...current, ...page.items]) {
             const previous = merged.get(key(row));
             if (
               !previous ||
@@ -192,13 +195,7 @@ export function useRememberedWrites(instanceId: string, refreshKey: string | und
           }
           return [...merged.values()];
         });
-        const turns = items
-          .map((row) => row.turnSeq)
-          .filter((seq): seq is number => typeof seq === "number");
-        if (turns.length) {
-          const latest = Math.max(...turns);
-          cursor.current = cursor.current === null ? latest : Math.max(cursor.current, latest);
-        }
+        cursor.current = Math.max(cursor.current ?? 0, page.nextAfterId);
       } catch {
         // Quiet: the transcript's next refresh retries; a missing row is a
         // display gap, never an error banner over the conversation.

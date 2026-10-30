@@ -163,6 +163,19 @@ async function expectNoHorizontalOverflow(page: Page) {
   ).toBeLessThanOrEqual(overflow.client + 1);
 }
 
+/** A dialog's inner content must not spill sideways either (the phone viewport
+ *  is narrower than the panel's 520px design width). */
+async function expectNoDialogOverflow(locator: Parameters<typeof expect>[0]) {
+  const overflow = await locator.evaluate((el: Element) => ({
+    scroll: el.scrollWidth,
+    client: el.clientWidth,
+  }));
+  expect(
+    overflow.scroll,
+    `dialog overflows horizontally: ${overflow.scroll} > ${overflow.client}`,
+  ).toBeLessThanOrEqual(overflow.client + 1);
+}
+
 test.beforeEach(async ({ page }) => {
   await login(page, "e2e-memory-ui");
 });
@@ -240,6 +253,7 @@ for (const theme of THEMES) {
     // stays inside the visual band (it must never sit under the keyboard).
     await page.getByTestId("memory-row").filter({ hasText: "称呼" }).first().click();
     await expect(page.getByTestId("memory-editor")).toBeVisible();
+    await expectNoDialogOverflow(page.getByTestId("memory-editor"));
     await page.getByTestId("memory-editor-body").fill("叫我老王。边界条件也用中文写清楚。更新一版。");
     if (phone) {
       await page.getByTestId("memory-editor-body").evaluate((el) => el.scrollIntoView({ block: "center" }));
@@ -304,6 +318,7 @@ for (const theme of THEMES) {
 
     await page.getByTestId("memory-editor-save").click();
     await expect(page.getByTestId("memory-conflict")).toBeVisible({ timeout: 20_000 });
+    await expectNoDialogOverflow(page.getByTestId("memory-conflict"));
     await expect(page.getByTestId("memory-conflict-server")).toHaveText("服务器第二版");
     await expect(page.getByTestId("memory-conflict-mine")).toHaveText("我的第二版");
     await shot(page, `memory-ui-${label(phone)}-${theme}-conflict.png`, phone);
@@ -421,6 +436,7 @@ test("390 WebKit iPhone 13: memory page, and the keyboard never covers the edito
 
         await page.getByTestId("memory-row").first().click();
         await expect(page.getByTestId("memory-editor")).toBeVisible();
+        await expectNoDialogOverflow(page.getByTestId("memory-editor"));
         await page.getByTestId("memory-editor-body").evaluate((el) => el.scrollIntoView({ block: "center" }));
         await page.getByTestId("memory-editor-body").focus();
         await raiseKeyboard(page);

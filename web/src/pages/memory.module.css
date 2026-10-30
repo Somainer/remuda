@@ -211,7 +211,7 @@
 
 /* ── editor ───────────────────────────────────────────────────────────── */
 
-.aboutInput {
+.textarea.aboutInput {
   min-height: 5lh;
 }
 
@@ -220,7 +220,8 @@
   flex-direction: column;
   gap: var(--space-3);
   min-width: 0;
-  width: min(560px, 92vw);
+  width: 100%;
+  max-width: 560px;
   max-height: min(80vh, 100%);
   overflow: auto;
 }
@@ -284,7 +285,8 @@
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
-  width: min(720px, 94vw);
+  width: 100%;
+  max-width: 720px;
   max-height: min(84vh, 100%);
   overflow: auto;
   min-width: 0;
@@ -328,7 +330,8 @@
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
-  width: min(420px, 90vw);
+  width: 100%;
+  max-width: 420px;
 }
 
 .confirmText {

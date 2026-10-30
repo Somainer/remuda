@@ -352,27 +352,37 @@ export function SessionList({
   });
 
   // Nothing is known before the first snapshot: the desktop skeleton below
-  // owns the surface, and no empty state may flash on a cold start (§8).
+  // owns the surface, and no empty state may flash on a cold start (§8). The
+  // banner stays mounted above every list state, empty ones included.
   if (!firstSnapshot) {
     if (empty === "no-hosts") {
       return (
-        <p className={css.empty} data-testid="session-list" data-empty="no-hosts">
-          无主机。<Link to="/hosts">添加主机</Link>
-        </p>
+        <>
+          <HubBanner />
+          <p className={css.empty} data-testid="session-list" data-empty="no-hosts">
+            无主机。<Link to="/hosts">添加主机</Link>
+          </p>
+        </>
       );
     }
     if (empty === "no-workspaces") {
       return (
-        <p className={css.empty} data-testid="session-list" data-empty="no-workspaces">
-          主机已连接，但还没有注册工作目录。<Link to="/hosts">注册工作目录</Link>
-        </p>
+        <>
+          <HubBanner />
+          <p className={css.empty} data-testid="session-list" data-empty="no-workspaces">
+            主机已连接，但还没有注册工作目录。<Link to="/hosts">注册工作目录</Link>
+          </p>
+        </>
       );
     }
     if (empty === "no-sessions") {
       return (
-        <div className={css.empty} data-testid="session-list" data-empty="no-sessions">
-          <NoSessions newHref={newHref} />
-        </div>
+        <>
+          <HubBanner />
+          <div className={css.empty} data-testid="session-list" data-empty="no-sessions">
+            <NoSessions newHref={newHref} />
+          </div>
+        </>
       );
     }
   }
@@ -700,8 +710,8 @@ export function SessionList({
           }
         }}
       >
-      // §8: before the first snapshot the board paints three skeleton cards
-      // and no empty state (cold start must not flash 「还没有会话」).
+      {/* §8: before the first snapshot the board paints three skeleton cards
+          and no empty state (a cold start cannot flash one). */}
       {firstSnapshot ? <SkeletonRows variant="desktop" testId="session-skeleton" /> : sections.map((group) => {
         const items = group.instances;
         if (!items.length) return null;

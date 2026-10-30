@@ -20,7 +20,7 @@ process.env.REMUDA_E2E_BACKEND = "hub";
 
 export default defineConfig({
   testDir: "./tests/e2e",
-  testMatch: /m-realdevice\.hub\.spec\.ts|memory-ui\.hub\.spec\.ts/,
+  testMatch: /m-realdevice\.hub\.spec\.ts/,
   fullyParallel: false,
   workers: 1,
   forbidOnly: Boolean(process.env.CI),

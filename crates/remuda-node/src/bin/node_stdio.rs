@@ -227,6 +227,7 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
         data_dir: data_dir.clone(),
         drivers: LocalDrivers::Native(native),
     })?;
+    let daemon_data_dir = data_dir.clone();
     let opts = StdioOptions {
         labels,
         max_instances: args.max_instances,
@@ -240,7 +241,7 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
     node.reconcile_herdr().await?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let result = tokio::select! {
-        result = remuda_node::run_daemon_runtime_listener(node.clone(), opts, remuda_node::DaemonControl::new()?, listener.as_ref().context("daemon listener missing")?) => result.map_err(Into::into),
+        result = remuda_node::run_daemon_runtime_listener(node.clone(), opts, remuda_node::DaemonControl::open(daemon_data_dir, None)?, listener.as_ref().context("daemon listener missing")?) => result.map_err(Into::into),
         _ = terminate.recv() => Ok(()),
         result = tokio::signal::ctrl_c() => result.map_err(Into::into),
     };

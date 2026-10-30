@@ -194,6 +194,7 @@ async fn failed_node_construction_rolls_back_registry_adoption() {
 
 fn codex_request(binary: PathBuf) -> CreateInstanceRequest {
     CreateInstanceRequest {
+        initiator: None,
         origin: remuda_protocol::InputOrigin::Human,
         agent_credential: None,
         command_id: None,
@@ -388,6 +389,7 @@ async fn close_instance(node: &DevNode, id: &remuda_protocol::InstanceId) {
     node.submit_command(
         id,
         remuda_node::InstanceCommandRequest {
+            initiator: None,
             origin: remuda_protocol::InputOrigin::Human,
             command_id: None,
             operation: remuda_node::CommandAction::Close,

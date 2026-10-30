@@ -829,7 +829,13 @@ async fn seed_hub_worker(
         supply_decision: None,
         reclaimed_bytes: None,
     };
-    let row = store.insert_worker(worker, "seed-device".into()).await?;
+    let row = store
+        .insert_worker(
+            worker,
+            "seed-device".into(),
+            remuda_hub::agent_scope_test_support::CallerAuthority::internal(),
+        )
+        .await?;
     Ok(row.meta.id.as_id().to_string())
 }
 
@@ -1205,12 +1211,16 @@ async fn a_done_worker_keeps_its_sha_when_its_instance_is_lost() -> Result<()> {
     // The first worker has already reported its sha; the second is mid-turn.
     hub.store()
         .context("store")?
-        .mutate_worker(done_worker.clone(), |row| {
-            row.state = WorkerState::Done {
-                sha: "0123456789abcdef".into(),
-            };
-            Ok(())
-        })
+        .mutate_worker(
+            done_worker.clone(),
+            |row| {
+                row.state = WorkerState::Done {
+                    sha: "0123456789abcdef".into(),
+                };
+                Ok(())
+            },
+            remuda_hub::agent_scope_test_support::CallerAuthority::internal(),
+        )
         .await?;
     node.close(None).await?;
     drop(node);

@@ -338,6 +338,7 @@ export type Command = ({
   "expiresAt": (Timestamp | (null));
   "forwardIntent": Knowledge6;
   "id": CommandId;
+  "initiator"?: (Initiator | (null));
   "nodeReceipt": Knowledge10;
   "operation": CommandOperation;
   "origin": CommandOrigin;
@@ -988,8 +989,31 @@ export type ForwardIntent = ({
   [key: string]: unknown;
 });
 
+/** `gate.abortLanding` params (Hub→Node): the landing the Hub settled without a landed push (established absent or operator-resolved). */
+export type GateAbortLandingParams = ({
+  "generation": (number);
+  "jobId": (string);
+  [key: string]: unknown;
+});
+
+/** `gate.authorize` params (Node→Hub): asked by the lane Node before a claimed dispatch starts executing, so a canceled/stale generation can never reach `git fetch` / `--land`. */
+export type GateAuthorizeParams = ({
+  "generation": (number);
+  "jobId": (string);
+  [key: string]: unknown;
+});
+
+/** `gate.authorize` result. */
+export type GateAuthorizeResult = ({
+  "authorized": (boolean);
+  "generation": (number);
+  "state"?: (string | null);
+  [key: string]: unknown;
+});
+
 /** `gate.cancel` params. */
 export type GateCancelParams = ({
+  "generation": (number);
   "jobId": (string);
   [key: string]: unknown;
 });
@@ -1031,7 +1055,22 @@ export type GateEventParams = (({
   "result": GateRunResult;
   [key: string]: unknown;
 })) & ({
+  "generation": (number);
   "jobId": (string);
+  [key: string]: unknown;
+});
+
+/** r23 (coordinator clarification of R9) / r25 item 1: a persisted UNCERTAIN condition for a definitive verdict whose SUPPLIED run log could not be persisted.  The Node delivers each verdict exactly twice (the `finished` event and the `gate.run` reply) and retains/redelivers NOTHING, so once both deliveries have deferred there is no replay that could heal the job. The Hub runs no persistence-retry scheduler (R9); instead it records this explicit condition, leaves the job in its pre-settlement state (Running / Canceling / Landing) STILL holding its lane or land-slot occupancy, surfaces it to the operator feed, and waits for either an explicit operator resolution or an idempotent later redelivery of the same verdict. Elapsed time alone never settles it (R5 fail closed).  r25 — THE COMPLETE PARKING RULE: an evidence-uncertain job is PARKED.   * It keeps scheduler occupancy in EVERY occupancy calculation (both the     busy-lane set and the project's single land slot) whether it is Running     or Canceling.   * It is never re-dispatched or claimed while the condition stands     (carrier/session recovery, Hub-restart reconciliation and the scheduler     all leave it in place with its lane/host and dispatch pin retained).   * It is cleared ONLY by an authorized settlement (an identical     redelivery that persists, the live verdict writer's own settlement, an     established Landed/Absent remote-fact settlement) or an exact-tuple     operator resolution (the request's (attempt, epoch, merge) tuple must     equal BOTH the live row and the condition's binding).   * For a Landing, an operator override (Failed/Requeue) is allowed ONLY     after the read-only remote-main probe AUTHORITATIVELY establishes     absence (fresh fetch, merge not on remote, land group verified dead).     Unknown or missing probe authority — fetch/RPC error, carrier offline,     shallow history, an Unknown response — keeps the Landing, the condition     and the occupancy and returns a conflict.   * An established Landed fact always wins over any operator override. */
+export type GateEvidenceUncertain = ({
+  "deliveriesDeferred": (number);
+  "epoch"?: (string | null);
+  "firstAt": Timestamp;
+  "generation": (number);
+  "mergeSha"?: (string | null);
+  "reason": (string);
+  "status": (string);
+  "suppliedDigest": (string);
+  "updatedAt": Timestamp;
   [key: string]: unknown;
 });
 
@@ -1043,13 +1082,17 @@ export type GateJob = ({
   "cancelRequestedAt"?: (Timestamp | (null));
   "currentMainSha"?: (string | null);
   "error"?: (string | null);
+  "evidenceUncertain"?: (GateEvidenceUncertain | (null));
   "failedStep"?: (string | null);
   "finishedAt"?: (Timestamp | (null));
   "headSha"?: (string | null);
   "homeLandInFlight"?: (boolean);
   "hostId"?: (HostId | (null));
   "id": GateJobId;
+  "initiator"?: (Initiator | (null));
   "keepLogs": (boolean);
+  "landingOutcomeUnknown"?: (boolean);
+  "landingSessionEpoch"?: (string | null);
   "laneId"?: (string | null);
   "logObjectId"?: (string | null);
   "mergeRef"?: (string | null);
@@ -1071,7 +1114,26 @@ export type GateJob = ({
 export type GateJobId = (string);
 
 /** Gate job lifecycle: queued → running → passed|failed|landed, with cancel. */
-export type GateJobState = ("queued" | "running" | "passed" | "failed" | "landed" | "canceling" | "canceled");
+export type GateJobState = ("queued" | "running" | "landing" | "passed" | "failed" | "landed" | "canceling" | "canceled");
+
+/** `gate.landGrant` params (Node→Hub) at the verify→land boundary. */
+export type GateLandGrantParams = ({
+  "generation": (number);
+  "hostId": (string | null);
+  "jobId": (string);
+  "mergeSha": (string);
+  "sessionEpoch": (string);
+  [key: string]: unknown;
+});
+
+/** Result of a land-grant request. */
+export type GateLandGrantResult = ({
+  "generation": (number);
+  "granted": (boolean);
+  "landingInProgress": (boolean);
+  "state"?: (string | null);
+  [key: string]: unknown;
+});
 
 /** `gate.land` params: the home host obtains a lane's verified merge commit and compare-and-swap pushes it to the project's base branch.  This is the `pushFrom: home` half of D-034: the lane host holds no push credential for the project remote, so a passing verify is landed by the host that does. For this slice the merge commit arrives by `git fetch` of `mergeRef` over `fetchRemote`; a Node RPC streaming the packfile is the better shape later, so `fetchRemote` stays the only lane-reachability input and nothing else assumes ssh. */
 export type GateLandParams = ({
@@ -1105,6 +1167,25 @@ export type GateMode = ("verify" | "land");
 /** Which host pushes `main` for a land job. */
 export type GatePushFrom = ("lane" | "home");
 
+/** `gate.resolveLanding` params: a read-only probe after a Hub restart left a job `landing`. */
+export type GateResolveLandingParams = ({
+  "baseBranch": (string);
+  "generation"?: (number | null);
+  "jobId": (string);
+  "mergeSha": (string);
+  "repoPath": (string);
+  [key: string]: unknown;
+});
+
+/** `gate.resolveLanding` verdict. * `landed` — the remote base already contains the granted merge; * `absent` — a fresh fetch succeeded, the merge is NOT on the remote base,   AND the lane attests the land process group that could still push for this   job is verified gone (no live run, no outstanding fence record), so the   push is provably not coming; * `unknown` — the outcome cannot be established (host unreachable, fetch   failed, the merge is not yet an ancestor while a land group may still be   alive). The Hub must never turn `unknown` into a verdict. */
+export type GateResolveLandingResult = ({
+  "baseSha"?: (string | null);
+  "error"?: (string | null);
+  "jobId": (string);
+  "status": (string);
+  [key: string]: unknown;
+});
+
 /** Bounded failure evidence for one gate run, stored by the Hub as an `obj_…` log object (never inlined into the job row). For a failed run the Node populates it for the failed step; with `--keep-logs` a green run gets a `kept` log of the whole-run tail. */
 export type GateRunLog = ({
   "attempts": (number);
@@ -1127,6 +1208,8 @@ export type GateRunParams = ({
   [key: string]: (string);
 });
   "gateTimeoutSecs": (number);
+  "generation": (number);
+  "initiator"?: (Initiator | (null));
   "jobId": (string);
   "keepLogs": (boolean);
   "laneId": (string);
@@ -1152,6 +1235,7 @@ export type GateRunResult = ({
   "currentMainSha"?: (string | null);
   "error"?: (string | null);
   "failedStep"?: (string | null);
+  "generation": (number);
   "headSha"?: (string | null);
   "jobId": (string);
   "mergeRef"?: (string | null);
@@ -1491,6 +1575,14 @@ export type HostTransport = ({
 export type HostTransportMode = ("outbound-wss" | "ssh-tunnel");
 
 export type Id = (string);
+
+/** The chapter instance a mutation was initiated by, with its place in the lineage. `{instanceId, lineageId, generation}` — D-057 §7.1.  The generation is the chapter generation stamped at authentication time. A fence bumps the lineage's live generation, so the commit-time check can refuse a request authenticated before the fence (main-agent.md §7.3). */
+export type Initiator = ({
+  "generation": (number);
+  "instanceId": (string);
+  "lineageId": (string);
+  [key: string]: unknown;
+});
 
 /** InputAccounting wire values; `protocol.md` §5.5. */
 export type InputAccounting = ("total-including-cache" | "uncached" | "provider-specific" | "unknown");

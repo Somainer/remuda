@@ -33,6 +33,7 @@ fn native_config(data: &std::path::Path) -> ServeConfig {
 
 fn create_req(kind: AgentKind, driver: DriverKind) -> CreateInstanceRequest {
     CreateInstanceRequest {
+        initiator: None,
         origin: remuda_protocol::InputOrigin::Human,
         agent_credential: None,
         command_id: None,

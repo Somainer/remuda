@@ -11,6 +11,10 @@ use axum::{
 use remuda_protocol::InputOrigin;
 use serde_json::{Value, json};
 
+/// D-057 §7.1 / main-agent.md §7.1: the Hub-stamped initiator type lives in
+/// the shared protocol crate so Nodes persist the same shape.
+pub use remuda_protocol::Initiator;
+
 /// Terminal aliases all resolve to a raw shell on the Node.
 pub fn shell_driver(driver: &str) -> bool {
     matches!(driver, "shell-pty" | "shell" | "terminal")
@@ -40,7 +44,7 @@ pub async fn caller(state: &AppState, headers: &HeaderMap) -> Result<Device, Hub
             return Err(HubError::Forbidden);
         }
         if state.store.get_instance(id.to_string()).await?.is_none() {
-            return Err(HubError::Forbidden);
+            return Err(HubError::stale_caller());
         }
         device.kind = "agent".into();
         device.instance_id = Some(id.into());
@@ -48,15 +52,89 @@ pub async fn caller(state: &AppState, headers: &HeaderMap) -> Result<Device, Hub
     Ok(device)
 }
 
+/// D-057 §7.1: resolve the Hub-stamped initiator for an authenticated device.
+/// `None` for Human/Bot callers (no bound instance). For an Agent device — an
+/// agent credential, or a Human token narrowed with `x-remuda-instance-id` —
+/// returns the bound chapter's `{instanceId, lineageId, generation}`. The
+/// authenticating device id is carried alongside by the caller (Hub-only).
+pub async fn initiator_for(
+    state: &AppState,
+    device: &Device,
+) -> Result<Option<Initiator>, HubError> {
+    let Some(instance_id) = device.instance_id.as_deref() else {
+        return Ok(None);
+    };
+    let instance = state
+        .store
+        .get_instance(instance_id.to_string())
+        .await?
+        .ok_or(HubError::Forbidden)?;
+    Ok(Some(Initiator {
+        instance_id: instance.instance_id,
+        lineage_id: instance.lineage_id,
+        generation: instance.generation,
+    }))
+}
+
+/// The stamped pair every Agent-admitted writer job carries: the initiator
+/// and the authenticating device id (Hub-only). `(None, None)` for Human/Bot
+/// callers. Hub-internal successor work constructs the initiator without a
+/// device id by hand.
+pub async fn initiator_and_device(
+    state: &AppState,
+    device: &Device,
+) -> Result<(Option<Initiator>, Option<String>), HubError> {
+    match initiator_for(state, device).await? {
+        Some(initiator) => Ok((Some(initiator), Some(device.id.clone()))),
+        None => Ok((None, None)),
+    }
+}
+
+/// Owned authority pair handed to a store writer job. `None` pair for
+/// Human/Bot requests and Hub-internal cleanup; Hub-internal successor work
+/// carries an initiator with no device id.
+#[derive(Clone, Debug, Default)]
+pub struct CallerAuthority {
+    /// Hub-stamped initiator, when the caller is an Agent.
+    pub initiator: Option<Initiator>,
+    /// Authenticating device id; absent for Human/Bot and successor work.
+    pub device_id: Option<String>,
+}
+
+impl CallerAuthority {
+    /// Resolve the authority from an authenticated device.
+    pub async fn for_device(state: &AppState, device: &Device) -> Result<Self, HubError> {
+        let (initiator, device_id) = initiator_and_device(state, device).await?;
+        Ok(Self {
+            initiator,
+            device_id,
+        })
+    }
+
+    /// Hub-internal work: no initiator, never fenced.
+    #[must_use]
+    pub fn internal() -> Self {
+        Self::default()
+    }
+
+    /// References for the in-job `check_initiator`.
+    pub(crate) fn as_check(&self) -> (Option<&Initiator>, Option<&str>) {
+        (self.initiator.as_ref(), self.device_id.as_deref())
+    }
+}
+
 pub fn stamp(payload: &mut Value, device: &Device) {
     payload["origin"] = json!(origin(device));
     if let Some(input) = payload.get_mut("input").and_then(Value::as_object_mut) {
         input.insert("origin".into(), json!(origin(device)));
     }
-    // Never accept caller-selected provenance or a credential in JSON.
+    // Never accept caller-selected provenance, a credential, or an initiator
+    // in JSON. D-057 §7.1: the initiator is Hub-stamped from auth, not the body.
     if let Some(object) = payload.as_object_mut() {
         object.remove("agentCredential");
         object.remove("actor");
+        object.remove("initiator");
+        object.remove("initiatorDeviceId");
     }
 }
 
@@ -77,7 +155,7 @@ pub async fn owns(state: &AppState, device: &Device, target: &str) -> Result<boo
 pub async fn require_operator(state: &AppState, headers: &HeaderMap) -> Result<Device, HubError> {
     let device = caller(state, headers).await?;
     if origin(&device) == InputOrigin::Agent {
-        return Err(HubError::Forbidden);
+        return Err(HubError::operator_only());
     }
     Ok(device)
 }
@@ -98,7 +176,7 @@ pub async fn caller_project_scope(
         .store
         .get_instance(id.into())
         .await?
-        .ok_or(HubError::Forbidden)?;
+        .ok_or_else(HubError::stale_caller)?;
     Ok(instance.scope)
 }
 
@@ -119,7 +197,7 @@ pub async fn require_grant(
         .store
         .get_instance(id.into())
         .await?
-        .ok_or(HubError::Forbidden)?;
+        .ok_or_else(HubError::stale_caller)?;
     let wire = serde_json::to_value(grant)
         .ok()
         .and_then(|value| value.as_str().map(str::to_string))
@@ -127,7 +205,7 @@ pub async fn require_grant(
     if instance.grants.iter().any(|held| held == &wire) {
         Ok(())
     } else {
-        Err(HubError::Forbidden)
+        Err(HubError::missing_grant(&wire))
     }
 }
 
@@ -139,7 +217,7 @@ pub async fn require_instance_read(
 ) -> Result<(), HubError> {
     let device = caller(state, headers).await?;
     if origin(&device) == InputOrigin::Agent && !owns(state, &device, instance_id).await? {
-        return Err(HubError::Forbidden);
+        return Err(HubError::not_owner());
     }
     Ok(())
 }
@@ -304,7 +382,7 @@ pub async fn same_host(state: &AppState, device: &Device, host: &str) -> Result<
         .store
         .get_instance(caller.into())
         .await?
-        .ok_or(HubError::Forbidden)?;
+        .ok_or_else(HubError::stale_caller)?;
     Ok(instance.host_id == host)
 }
 
@@ -316,7 +394,10 @@ pub fn restrict_permission(device: &Device, spec: &mut Value) -> Result<(), HubE
     if origin(device) == InputOrigin::Agent
         && !matches!(spec["permissionMode"].as_str(), Some("manual" | "plan"))
     {
-        return Err(HubError::Forbidden);
+        return Err(HubError::operator_field(
+            "Agent launches may only use permissionMode `manual` or `plan`; do not retry the \
+             same spec — relaunch with one of those, or ask the owner to launch it",
+        ));
     }
     Ok(())
 }
@@ -337,7 +418,10 @@ pub fn restrict_launch_overrides(device: &Device, spec: &Value) -> Result<(), Hu
         .as_str()
         .is_some_and(|value| !value.trim().is_empty());
     if has_args || has_binary {
-        return Err(HubError::Forbidden);
+        return Err(HubError::operator_field(
+            "Agent seats cannot set `args` or `binaryPath`; do not retry with them — remove \
+             both from the spec, or ask the owner to launch it",
+        ));
     }
     Ok(())
 }
@@ -365,9 +449,9 @@ pub async fn prepare_create(
             .store
             .get_instance(caller_id.into())
             .await?
-            .ok_or(HubError::Forbidden)?;
+            .ok_or_else(HubError::stale_caller)?;
         if !caller_instance.scope.allows_host(host) {
-            return Err(HubError::Forbidden);
+            return Err(HubError::out_of_scope());
         }
         if let Some(workspace) = spec
             .get("workspaceId")
@@ -375,7 +459,7 @@ pub async fn prepare_create(
             .filter(|value| !value.is_empty())
             && !caller_instance.scope.allows_workspace(workspace)
         {
-            return Err(HubError::Forbidden);
+            return Err(HubError::out_of_scope());
         }
         if !same_host(state, device, host).await?
             || shell_driver(driver)
@@ -407,7 +491,7 @@ pub async fn authorize_command(
             operation,
             "instance.send" | "instance.cancel" | "instance.close" | "tty.write" | "instance.keys"
         ) {
-            return Err(HubError::Forbidden);
+            return Err(HubError::operator_only());
         }
         // D-031 follow-up (host-search-1): an Agent may message an instance
         // inside its own project scope with no per-message human approval; the
@@ -481,7 +565,7 @@ pub async fn require_approval(
         .store
         .get_instance(id.clone())
         .await?
-        .ok_or(HubError::Forbidden)?;
+        .ok_or_else(HubError::stale_caller)?;
     let caller = crate::agent_approvals::ApprovalCaller {
         device_id: device.id.clone(),
         instance_id: id.parse().map_err(|_| HubError::Forbidden)?,
@@ -758,7 +842,7 @@ pub async fn restrict_agent_routes(
                         .is_some_and(|rest| rest.ends_with("/members")))
                         || task_write_target(request.method(), path)));
             if !read && !write {
-                return Err(HubError::Forbidden);
+                return Err(HubError::agent_route());
             }
         }
     }

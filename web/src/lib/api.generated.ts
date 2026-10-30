@@ -1171,6 +1171,56 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/projects/{id}/gate/jobs/{jobId}/resolve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description prj_… id */
+                id: string;
+                /** @description gjb_… id */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Operator-resolve a Landing whose outcome cannot be established
+         * @description Only a job still `landing` with landingOutcomeUnknown=true accepts a resolution: `failed` settles it Failed; `requeue` re-enters the queue. The Hub also tells the lane to terminate the granted land process group (r14 R1).
+         */
+        post: operations["projectGateJobResolve"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{id}/gate/jobs/{jobId}/resolve-evidence": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description prj_… id */
+                id: string;
+                /** @description gjb_… id */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Operator-resolve a definitive verdict whose evidence could not be persisted
+         * @description Only a job in a pre-settlement state (queued/running/canceling/landing) carrying evidenceUncertain accepts a resolution: both the finished notification and the gate.run reply failed to persist the supplied run log, the Node retains no copy and redelivers nothing, and the Hub runs no retry scheduler. `failed` settles it Failed; `requeue` releases the lane/land occupancy and re-enters the queue. The request must pin the exact parked (attempt, grant epoch, merge) tuple the live row carries; a delayed resolution aimed at an attempt the row has since left is refused with 409 (epoch/merge are required and non-empty for a Landing, omitted for a pre-grant verify). Before failing or requeuing a Landing the Hub runs its read-only remote-main probe, and an established landed fact settles Landed instead. The job keeps its occupancy until this resolution or an idempotent later redelivery settles it. Agent callers are refused.
+         */
+        post: operations["projectGateJobResolveEvidence"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/projects/{id}/members": {
         parameters: {
             query?: never;
@@ -1870,6 +1920,7 @@ export interface components {
             forwarded: boolean;
             hostId: string;
             idempotencyKey: string | null;
+            initiator?: components["schemas"]["Initiator"] | null;
             instanceId: string | null;
             operation: string;
             payload: {
@@ -2137,6 +2188,16 @@ export interface components {
         HostWorkspacePath: {
             /** @description Absolute path on the Node, within its configured workspace roots */
             path: string;
+        };
+        /** @description D-057 §7.1: the Hub-stamped initiator of an Agent-initiated mutation, derived from the authenticating device's bound instance and forwarded to Nodes. The authenticating device id stays Hub-only and is not part of this shape. Absent for Human/Bot callers. */
+        Initiator: {
+            /**
+             * Format: int64
+             * @description Chapter generation at authentication time; a fence bumps the lineage's live generation.
+             */
+            generation: number;
+            instanceId: string;
+            lineageId: string;
         };
         InstanceCommands: {
             commands: components["schemas"]["CommandRecord"][];
@@ -4017,6 +4078,8 @@ export interface operations {
                             hostId?: string | null;
                             id?: string;
                             keepLogs?: boolean;
+                            landingOutcomeUnknown?: boolean;
+                            landingSessionEpoch?: string | null;
                             laneId?: string | null;
                             logObjectId?: string | null;
                             mergeSha?: string | null;
@@ -4028,7 +4091,7 @@ export interface operations {
                             requestedBy?: string;
                             startedAt?: string | null;
                             /** @enum {string} */
-                            state?: "queued" | "running" | "passed" | "failed" | "landed" | "canceling" | "canceled";
+                            state?: "queued" | "running" | "landing" | "passed" | "failed" | "landed" | "canceling" | "canceled";
                             steps?: {
                                 [key: string]: unknown;
                             }[];
@@ -5519,6 +5582,8 @@ export interface operations {
                             hostId?: string | null;
                             id?: string;
                             keepLogs?: boolean;
+                            landingOutcomeUnknown?: boolean;
+                            landingSessionEpoch?: string | null;
                             laneId?: string | null;
                             logObjectId?: string | null;
                             mergeSha?: string | null;
@@ -5530,7 +5595,7 @@ export interface operations {
                             requestedBy?: string;
                             startedAt?: string | null;
                             /** @enum {string} */
-                            state?: "queued" | "running" | "passed" | "failed" | "landed" | "canceling" | "canceled";
+                            state?: "queued" | "running" | "landing" | "passed" | "failed" | "landed" | "canceling" | "canceled";
                             steps?: {
                                 [key: string]: unknown;
                             }[];
@@ -5588,6 +5653,8 @@ export interface operations {
                         hostId?: string | null;
                         id?: string;
                         keepLogs?: boolean;
+                        landingOutcomeUnknown?: boolean;
+                        landingSessionEpoch?: string | null;
                         laneId?: string | null;
                         logObjectId?: string | null;
                         mergeSha?: string | null;
@@ -5599,7 +5666,7 @@ export interface operations {
                         requestedBy?: string;
                         startedAt?: string | null;
                         /** @enum {string} */
-                        state?: "queued" | "running" | "passed" | "failed" | "landed" | "canceling" | "canceled";
+                        state?: "queued" | "running" | "landing" | "passed" | "failed" | "landed" | "canceling" | "canceled";
                         steps?: {
                             [key: string]: unknown;
                         }[];
@@ -5645,6 +5712,8 @@ export interface operations {
                         hostId?: string | null;
                         id?: string;
                         keepLogs?: boolean;
+                        landingOutcomeUnknown?: boolean;
+                        landingSessionEpoch?: string | null;
                         laneId?: string | null;
                         logObjectId?: string | null;
                         mergeSha?: string | null;
@@ -5656,7 +5725,7 @@ export interface operations {
                         requestedBy?: string;
                         startedAt?: string | null;
                         /** @enum {string} */
-                        state?: "queued" | "running" | "passed" | "failed" | "landed" | "canceling" | "canceled";
+                        state?: "queued" | "running" | "landing" | "passed" | "failed" | "landed" | "canceling" | "canceled";
                         steps?: {
                             [key: string]: unknown;
                         }[];
@@ -5707,6 +5776,8 @@ export interface operations {
                         hostId?: string | null;
                         id?: string;
                         keepLogs?: boolean;
+                        landingOutcomeUnknown?: boolean;
+                        landingSessionEpoch?: string | null;
                         laneId?: string | null;
                         logObjectId?: string | null;
                         mergeSha?: string | null;
@@ -5718,13 +5789,105 @@ export interface operations {
                         requestedBy?: string;
                         startedAt?: string | null;
                         /** @enum {string} */
-                        state?: "queued" | "running" | "passed" | "failed" | "landed" | "canceling" | "canceled";
+                        state?: "queued" | "running" | "landing" | "passed" | "failed" | "landed" | "canceling" | "canceled";
                         steps?: {
                             [key: string]: unknown;
                         }[];
                         /** @enum {string} */
                         web?: "auto" | "always" | "never";
                     } & {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            409: components["responses"]["Error"];
+        };
+    };
+    projectGateJobResolve: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description prj_… id */
+                id: string;
+                /** @description gjb_… id */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @enum {string} */
+                    resolution: "failed" | "requeue";
+                } & {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description Settled job */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            409: components["responses"]["Error"];
+        };
+    };
+    projectGateJobResolveEvidence: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description prj_… id */
+                id: string;
+                /** @description gjb_… id */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /**
+                     * Format: uint32
+                     * @description The attempt ordinal (the live row's attempts) the operator saw parked as evidence-uncertain.
+                     */
+                    expectedAttempts: number;
+                    /** @description The exact merge sha of the parked tuple; required and non-empty for a Landing resolution, omitted/null for a pre-grant verify. */
+                    expectedMergeSha?: string | null;
+                    /** @description The Running-to-Landing grant epoch of the parked tuple; required and non-empty for a Landing resolution, omitted/null for a pre-grant verify. */
+                    expectedSessionEpoch?: string | null;
+                    /** @description Mandatory non-empty human rationale, persisted on the row. */
+                    rationale: string;
+                    /** @enum {string} */
+                    resolution: "failed" | "requeue";
+                } & {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description Settled job */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
                         [key: string]: unknown;
                     };
                 };

@@ -417,23 +417,54 @@ test.afterAll(async ({ browser }) => {
   await deleteCreatedInstances(browser);
 });
 
+/** Labels a delivered row must never show: waiting, unconfirmed or rejected. */
+const UNDELIVERED_LABELS = ["状态待确认", "已发送，等待确认", "等待发送", "待发送（离线）", "未送达"];
+
 /**
- * Wait for the optimistic bubble to be replaced by the authoritative journal
- * transcript row carrying the SAME commandId (what "delivered" renders as once
- * the journal joins), and assert no waiting/unconfirmed chip is left behind.
+ * Wait for THIS command's user row to render as delivered, and assert no
+ * waiting/unconfirmed chip is left behind. Delivered is EITHER the
+ * authoritative journal transcript row carrying the SAME commandId (the
+ * assembler joined it and hid the optimistic bubble), OR the optimistic
+ * bubble in its SETTLED state: a catch-up debt read can settle the command
+ * before the live journal node arrives, and the bubble then stays on screen
+ * until that node joins (outboxdebt r7 item 1) — read like the :720 bubble
+ * before its join, with the delivered label 已受理. Either way exactly ONE
+ * user row carries the commandId.
  */
 async function expectDelivered(page: Page, commandId: string | null) {
-  const authoritative = page.locator(
+  // The transcript row of either form (the optimistic bubble's own row also
+  // carries its commandId).
+  const userRow = page.locator(
     `[data-testid="transcript-row"][data-role="user"][data-command-id="${commandId}"]`,
   );
-  await expect(authoritative).toHaveCount(1, { timeout: 30_000 });
+  await expect(userRow).toHaveCount(1, { timeout: 30_000 });
   const bubble = page.locator(
     `[data-testid="optimistic-bubble"][data-command-id="${commandId}"]`,
   );
-  // The optimistic chip for THIS row is gone (the authoritative row carries
-  // no waiting/unconfirmed label; other scripted commands on the page may
-  // independently show their own status and are not asserted here).
-  await expect(bubble).toHaveCount(0);
+  // Presence, status and label come from ONE DOM evaluation, so the journal
+  // node joining between two separate reads cannot race the check.
+  const observeBubble = () =>
+    bubble.evaluateAll((nodes) =>
+      nodes.length === 0
+        ? { state: "joined", text: "" }
+        : { state: nodes[0]!.getAttribute("data-status") ?? "", text: nodes[0]!.textContent ?? "" },
+    );
+  let delivered = { state: "", text: "" };
+  await expect
+    .poll(async () => (delivered = await observeBubble()).state, { timeout: 30_000 })
+    .toMatch(/^(joined|settled)$/);
+  // Still exactly one row: a joined node never renders next to its bubble.
+  await expect(userRow).toHaveCount(1);
+  if (delivered.state === "settled") {
+    // The settled bubble observed above shows the delivered label (like
+    // :720) and no waiting/unconfirmed one — asserted on that same snapshot.
+    expect(delivered.text).toContain("已受理");
+    for (const label of UNDELIVERED_LABELS) expect(delivered.text).not.toContain(label);
+  }
+  // The row for THIS command never shows a waiting/unconfirmed label (other
+  // scripted commands on the page may independently show their own status
+  // and are not asserted here).
+  for (const label of UNDELIVERED_LABELS) await expect(userRow).not.toContainText(label);
 }
 
 test("offline sends are queued and delivered exactly once after reconnect", async ({ page }) => {

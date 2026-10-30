@@ -273,8 +273,6 @@ fn lineage_read_target(path: &str) -> Option<&str> {
     (!rest.is_empty() && !rest.contains('/')).then_some(rest)
 }
 
-
-
 /// D-060 memory routes an Agent may reach, returning the path's lineage id.
 /// The middleware admits them only for the caller's own lineage; the handlers
 /// re-check that, and the store admits a write only from the lineage's

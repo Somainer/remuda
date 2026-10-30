@@ -1017,7 +1017,7 @@ export interface paths {
         put?: never;
         /**
          * Create a memory entry
-         * @description Create one entry at the slug's next revision (1 for a slug never used before; a recreated slug continues after its last revision); 409 MEMORY_SLUG_EXISTS when the slug exists (archived included). Soft limits (entry 2048 bytes, index 4096 bytes) come back as warnings with the actual numbers; above 8192 bytes the entry is refused (413). Human devices create memory only for an existing lineage (404 for a retired one) and may update, delete and consolidate (into one of the inputs) any lineage's retained entries, a retired lineage's included. An Agent writes only its own lineage and only from the lineage's current, unfenced chapter (403 otherwise). Bot devices are refused.
+         * @description Create one entry at the slug's next revision (1 for a slug never used before; a recreated slug continues after its last revision); 409 MEMORY_SLUG_EXISTS when the slug exists (archived included). Soft limits (entry 2048 bytes, index 4096 bytes) come back as warnings with the actual numbers; above 8192 bytes the entry is refused (413). Human devices create memory only for an existing lineage (404 for a retired one) and may update, delete and consolidate (into one of the inputs) any lineage's retained entries, a retired lineage's included. An Agent writes only its own lineage and only from the lineage's current, unfenced chapter (403 otherwise). Bot devices are refused. An Agent write to `about-me` (create, update, delete, or a consolidate that names it as input or target) is refused 403 with reason `owner-authored`.
          */
         post: operations["memoryCreate"];
         delete?: never;
@@ -1037,7 +1037,7 @@ export interface paths {
         put?: never;
         /**
          * Consolidate memory entries (CAS on every input)
-         * @description Atomically replace 2-32 entries with one: every source carries its expectedRevision, and any stale one is 409 MEMORY_REVISION_CONFLICT listing each conflict, with nothing changed. The new entry may reuse a source's slug (its revision then continues) or take a new one (409 when that slug exists elsewhere); it keeps every source's sourceRefs. Human devices create memory only for an existing lineage (404 for a retired one) and may update, delete and consolidate (into one of the inputs) any lineage's retained entries, a retired lineage's included. An Agent writes only its own lineage and only from the lineage's current, unfenced chapter (403 otherwise). Bot devices are refused.
+         * @description Atomically replace 2-32 entries with one: every source carries its expectedRevision, and any stale one is 409 MEMORY_REVISION_CONFLICT listing each conflict, with nothing changed. The new entry may reuse a source's slug (its revision then continues) or take a new one (409 when that slug exists elsewhere); it keeps every source's sourceRefs. Human devices create memory only for an existing lineage (404 for a retired one) and may update, delete and consolidate (into one of the inputs) any lineage's retained entries, a retired lineage's included. An Agent writes only its own lineage and only from the lineage's current, unfenced chapter (403 otherwise). Bot devices are refused. An Agent write to `about-me` (create, update, delete, or a consolidate that names it as input or target) is refused 403 with reason `owner-authored`.
          */
         post: operations["memoryConsolidate"];
         delete?: never;
@@ -1060,13 +1060,13 @@ export interface paths {
         get: operations["memoryGet"];
         /**
          * Update a memory entry (revision CAS)
-         * @description Revision compare-and-set update: expectedRevision is required, and a stale one is 409 MEMORY_REVISION_CONFLICT with currentRevision. Omitted fields keep their values; sourceRefs are appended. An archived entry is 409 MEMORY_ARCHIVED until restored. Human devices create memory only for an existing lineage (404 for a retired one) and may update, delete and consolidate (into one of the inputs) any lineage's retained entries, a retired lineage's included. An Agent writes only its own lineage and only from the lineage's current, unfenced chapter (403 otherwise). Bot devices are refused.
+         * @description Revision compare-and-set update: expectedRevision is required, and a stale one is 409 MEMORY_REVISION_CONFLICT with currentRevision. Omitted fields keep their values; sourceRefs are appended. An archived entry is 409 MEMORY_ARCHIVED until restored. Human devices create memory only for an existing lineage (404 for a retired one) and may update, delete and consolidate (into one of the inputs) any lineage's retained entries, a retired lineage's included. An Agent writes only its own lineage and only from the lineage's current, unfenced chapter (403 otherwise). Bot devices are refused. An Agent write to `about-me` (create, update, delete, or a consolidate that names it as input or target) is refused 403 with reason `owner-authored`.
          */
         put: operations["memoryUpdate"];
         post?: never;
         /**
          * Delete a memory entry (revision CAS)
-         * @description Revision compare-and-set delete: the expectedRevision query parameter is required; a stale one is 409 MEMORY_REVISION_CONFLICT. Human devices create memory only for an existing lineage (404 for a retired one) and may update, delete and consolidate (into one of the inputs) any lineage's retained entries, a retired lineage's included. An Agent writes only its own lineage and only from the lineage's current, unfenced chapter (403 otherwise). Bot devices are refused.
+         * @description Revision compare-and-set delete: the expectedRevision query parameter is required; a stale one is 409 MEMORY_REVISION_CONFLICT. Human devices create memory only for an existing lineage (404 for a retired one) and may update, delete and consolidate (into one of the inputs) any lineage's retained entries, a retired lineage's included. An Agent writes only its own lineage and only from the lineage's current, unfenced chapter (403 otherwise). Bot devices are refused. An Agent write to `about-me` (create, update, delete, or a consolidate that names it as input or target) is refused 403 with reason `owner-authored`.
          */
         delete: operations["memoryDelete"];
         options?: never;

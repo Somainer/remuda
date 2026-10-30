@@ -1309,6 +1309,20 @@ async fn an_agent_write_mid_turn_records_the_turn_and_the_feed_returns_it() -> R
         "the Hub stamps its own journal seq, never the body's"
     );
 
+    // D-060 §8.4: the owner-authored entry is refused to a seat, with its
+    // stable reason.
+    let refused = ctx
+        .call(
+            "POST",
+            &mem(&lineage, ""),
+            &seat,
+            None,
+            Some(entry("about-me", "user", "from the seat")),
+        )
+        .await?;
+    assert_eq!(refused.status, 403, "{}", refused.body);
+    assert_eq!(refused.body["reason"], "owner-authored");
+
     let feed = ctx.writes(&lineage, &ctx.human).await?;
     assert_eq!(
         feed["items"][0]["turnSeq"],

@@ -33,7 +33,7 @@ use crate::AppState;
 use crate::agent_scope::{authenticated_caller, caller, origin};
 use crate::auth::require_origin;
 use crate::config::now_rfc3339;
-use crate::error::HubError;
+use crate::error::{HubError, NextStep, action};
 use crate::store::{Device, Store, StoreError, immediate_tx};
 use axum::Json;
 use axum::Router;
@@ -71,6 +71,9 @@ const DEFAULT_SEARCH_LIMIT: usize = 10;
 const MAX_SEARCH_LIMIT: usize = 100;
 /// Rows returned by one memory-writes poll.
 const MAX_MEMORY_WRITES: usize = 500;
+/// The one entry only the owner authors (D-060 §8.4): a seat reads it, never
+/// writes it.
+pub(crate) const OWNER_AUTHORED_SLUG: &str = "about-me";
 
 const ENTRY_COLUMNS: &str = "lineage_id, slug, type, title, description, body, revision, \
      origin, source_refs_json, writer_instance, created_at, updated_at, archived_at, turn_seq";
@@ -598,6 +601,31 @@ fn authorize_write(
     }
 }
 
+/// Refuse an Agent write that would create, replace, merge or remove the
+/// owner-authored entry. The owner is unaffected: `about-me` is theirs to
+/// write from the PWA, and a seat only reads it (D-060 §8.4).
+fn check_owner_authored(writer: &MemoryWriter, slugs: &[&str]) -> Result<(), MemoryError> {
+    if !matches!(writer, MemoryWriter::Agent { .. }) {
+        return Ok(());
+    }
+    if slugs.iter().any(|slug| *slug == OWNER_AUTHORED_SLUG) {
+        return Err(MemoryError::Hub(
+            HubError::ForbiddenReason(format!(
+                "memory entry {OWNER_AUTHORED_SLUG:?} is owner-authored"
+            ))
+            .with_next(
+                "owner-authored",
+                NextStep::new(
+                    action::FIX_REQUEST,
+                    "about-me is written only by the owner from the PWA; do not retry \
+                     — report what the owner should record",
+                ),
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// One index row: type, slug, title, description, archived.
 type IndexRow = (MemoryType, String, String, String, bool);
 
@@ -844,6 +872,7 @@ fn create_tx(
 ) -> Result<MemoryWriteResult, MemoryError> {
     let tx = immediate_tx(conn)?;
     authorize_write(&tx, lineage_id, writer, WriteKind::Create)?;
+    check_owner_authored(writer, &[&input.slug])?;
     if let Some(existing) = load_entry(&tx, lineage_id, &input.slug)? {
         return Err(MemoryError::SlugExists {
             slug: existing.slug,
@@ -885,6 +914,7 @@ fn update_tx(
 ) -> Result<MemoryWriteResult, MemoryError> {
     let tx = immediate_tx(conn)?;
     authorize_write(&tx, lineage_id, writer, WriteKind::Modify)?;
+    check_owner_authored(writer, &[slug])?;
     let current = require_entry(&tx, lineage_id, slug)?;
     if current.archived_at.is_some() {
         return Err(MemoryError::Archived(slug.to_string()));
@@ -953,6 +983,7 @@ fn delete_tx(
 ) -> Result<MemoryEntry, MemoryError> {
     let tx = immediate_tx(conn)?;
     authorize_write(&tx, lineage_id, writer, WriteKind::Modify)?;
+    check_owner_authored(writer, &[slug])?;
     let current = require_entry(&tx, lineage_id, slug)?;
     check_revision(&current, expected)?;
     let turn_seq = turn_seq_for(&tx, writer)?;
@@ -996,6 +1027,11 @@ fn consolidate_tx(
         WriteKind::Create
     };
     authorize_write(&tx, lineage_id, writer, kind)?;
+    // Merging away an input or producing the target are both writes; neither
+    // may touch the owner-authored entry from a seat.
+    let mut touched: Vec<&str> = sources.iter().map(|(slug, _)| slug.as_str()).collect();
+    touched.push(input.slug.as_str());
+    check_owner_authored(writer, &touched)?;
     let mut inputs = Vec::with_capacity(sources.len());
     let mut stale = Vec::new();
     for (slug, expected) in sources {
@@ -3583,6 +3619,134 @@ mod tests {
             fx.store.memory_writes(lineage, None).await.unwrap().len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn an_agent_cannot_write_the_owner_authored_entry() {
+        let fx = fixture().await;
+        let lineage = fx.seat().await;
+        let writer = agent(&lineage);
+        let owner_authored = |error: &MemoryError| {
+            matches!(
+                error,
+                MemoryError::Hub(HubError::Actionable { reason, .. })
+                    if *reason == "owner-authored"
+            )
+        };
+        // Create.
+        let error = fx
+            .store
+            .memory_create(
+                lineage.clone(),
+                writer.clone(),
+                input(OWNER_AUTHORED_SLUG, MemoryType::User, "mine now"),
+            )
+            .await
+            .unwrap_err();
+        assert!(owner_authored(&error), "{error:?}");
+        // The owner writes it, and a seat can read it.
+        fx.store
+            .memory_create(
+                lineage.clone(),
+                MemoryWriter::Owner,
+                input(OWNER_AUTHORED_SLUG, MemoryType::User, "I am the owner"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fx.store
+                .memory_get(lineage.clone(), OWNER_AUTHORED_SLUG.into())
+                .await
+                .unwrap()
+                .unwrap()
+                .body,
+            "I am the owner"
+        );
+        // Update and delete.
+        let patch = MemoryPatch {
+            body: Some("from the seat".into()),
+            ..MemoryPatch::default()
+        };
+        let error = fx
+            .store
+            .memory_update(
+                lineage.clone(),
+                OWNER_AUTHORED_SLUG.into(),
+                writer.clone(),
+                patch.clone(),
+                1,
+            )
+            .await
+            .unwrap_err();
+        assert!(owner_authored(&error), "{error:?}");
+        let error = fx
+            .store
+            .memory_delete(
+                lineage.clone(),
+                OWNER_AUTHORED_SLUG.into(),
+                writer.clone(),
+                1,
+            )
+            .await
+            .unwrap_err();
+        assert!(owner_authored(&error), "{error:?}");
+        // Consolidate: producing the slug, and consuming it.
+        for slug in ["other", "other2"] {
+            fx.store
+                .memory_create(
+                    lineage.clone(),
+                    MemoryWriter::Owner,
+                    input(slug, MemoryType::Project, ""),
+                )
+                .await
+                .unwrap();
+        }
+        let error = fx
+            .store
+            .memory_consolidate(
+                lineage.clone(),
+                writer.clone(),
+                vec![("other".into(), 1), ("other2".into(), 1)],
+                input(OWNER_AUTHORED_SLUG, MemoryType::User, "merged in"),
+            )
+            .await
+            .unwrap_err();
+        assert!(owner_authored(&error), "{error:?}");
+        let error = fx
+            .store
+            .memory_consolidate(
+                lineage.clone(),
+                writer.clone(),
+                vec![("other".into(), 1), (OWNER_AUTHORED_SLUG.into(), 1)],
+                input("merged", MemoryType::User, "merged"),
+            )
+            .await
+            .unwrap_err();
+        assert!(owner_authored(&error), "{error:?}");
+
+        // Nothing above changed the entry, and the owner still writes it.
+        let kept = fx
+            .store
+            .memory_get(lineage.clone(), OWNER_AUTHORED_SLUG.into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.revision, 1);
+        assert_eq!(kept.body, "I am the owner");
+        let updated = fx
+            .store
+            .memory_update(
+                lineage,
+                OWNER_AUTHORED_SLUG.into(),
+                MemoryWriter::Owner,
+                patch,
+                1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.entry.revision, 2);
+        assert_eq!(updated.entry.body, "from the seat");
+        assert_eq!(updated.entry.origin, MemoryOrigin::Human);
     }
 
     /// The rung runs on a POPULATED version-5 database (the seen rung's top):

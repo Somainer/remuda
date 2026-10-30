@@ -170,4 +170,35 @@ describe("HomeList hold", () => {
     // Released, blocked outranks working, so the changed worker moves above.
     expect(ids()).toEqual(["/s/ins-other", "/s/ins-held"]);
   });
+
+  it("also freezes while focus sits in a row's control, and re-ranks when it leaves", () => {
+    hub.instances = [
+      row("ins-focused", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+      row("ins-peer", { activity: known("working"), updatedAt: "2026-09-19T08:00:00.000Z" }),
+    ];
+    renderHome();
+    expect(ids()).toEqual(["/s/ins-focused", "/s/ins-peer"]);
+
+    const link = screen.getByText("title ins-focused").closest("a")!;
+    act(() => {
+      link.focus();
+    });
+    expect(document.querySelector("[data-held='1']")).not.toBeNull();
+
+    act(() => {
+      hub.instances = [
+        row("ins-focused", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+        row("ins-peer", { activity: known("waiting-interaction"), updatedAt: "2026-09-19T12:00:00.000Z" }),
+      ];
+      for (const listener of listeners) listener();
+    });
+    // The peer outranks the focused row, but the frozen order holds.
+    expect(ids()).toEqual(["/s/ins-focused", "/s/ins-peer"]);
+
+    act(() => {
+      link.blur();
+    });
+    expect(document.querySelector("[data-held='0']")).not.toBeNull();
+    expect(ids()).toEqual(["/s/ins-peer", "/s/ins-focused"]);
+  });
 });

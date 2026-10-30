@@ -432,19 +432,7 @@ export const HomeList = memo(function HomeList() {
             />
           ) : null}
           {renderedGroups.length > 0 ? (
-            <div
-              className={css.groups}
-              data-held={frozenRows ? "1" : "0"}
-              // Focus inside a row's own control freezes the order too (home.md
-              // §3.3). Only a focus that arrives from outside the list counts, so
-              // tabbing between two controls does not stack holds.
-              onFocus={(event) => {
-                if (!event.currentTarget.contains(event.relatedTarget as Node | null)) holdStart();
-              }}
-              onBlur={(event) => {
-                if (!event.currentTarget.contains(event.relatedTarget as Node | null)) holdEnd();
-              }}
-            >
+            <div className={css.groups} data-held={frozenRows ? "1" : "0"}>
               <HomeGroups
                 groups={renderedGroups}
                 query={query}
@@ -524,6 +512,15 @@ function HomeRowView({
       onPointerDown={onHoldStart}
       onPointerUp={onHoldEnd}
       onPointerCancel={onHoldEnd}
+      // Focus inside this row's own control freezes the order too (home.md
+      // §3.3). Only focus arriving from outside the row counts, so tabbing
+      // between two controls of the same row does not stack holds.
+      onFocus={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) onHoldStart();
+      }}
+      onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) onHoldEnd();
+      }}
     >
       <Link className={css.rowMain} to={`/s/${row.id}`} data-testid="home-row-link">
         <span className={css.dot}>

@@ -2271,9 +2271,11 @@ mod tests {
             let redacted = redact_secrets(text);
             assert!(!redacted.contains(secret), "leaked {secret}: {redacted}");
         }
-        // The lookbehind boundary is respected: a prefix inside a word is not a
-        // scanner hit, and ordinary prose survives.
-        let plain = "task-sk-learn-notes and disk-space-check";
+        // A prefix that continues a word is not a candidate: the scanner's
+        // `sk-` rule needs `(?<![A-Za-z0-9_])` before it, and `k`/`_` are in
+        // that class. (Checked against scripts/ci/secret-scan.py itself: it
+        // spares both, as it spares `disk-space-check`.)
+        let plain = "tasksk-learn-notes and task_sk-learn-notes and disk-space-check";
         assert_eq!(redact_secrets(plain), plain);
     }
 

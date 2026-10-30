@@ -154,9 +154,9 @@ export function rank(instance: Instance, childLive = false): HomeRank {
     lifecycle: instance.lifecycle,
     activity: knowledgeValue(instance.activity) ?? null,
     childLive,
-    // `unseen` arrives with seen-hub. Until then the field is absent and the
-    // done-unseen rank stays empty, which is what §3.1 requires.
-    unseen: false,
+    // seen-hub: the owner has not opened the last settled turn. An older Hub
+    // omits the flag, which reads as false.
+    unseen: instance.unseen === true,
     lastTurnError: Boolean(instance.lastTurnError?.text?.trim()),
   });
 }

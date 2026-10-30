@@ -14,6 +14,7 @@ import {
 } from "../spaces/store";
 import {
   HOME_ORDER_KEY,
+  HOME_RANKS,
   arrangeHomeGroups,
   buildHomeGroups,
   buildHomeRows,
@@ -22,6 +23,7 @@ import {
   homeRowsSignature,
   rank,
   rankFolds,
+  rankOf,
   rankOrder,
   readHomeOrder,
   writeHomeOrder,
@@ -289,6 +291,33 @@ describe("rank(): the seven ranks, newest first within a rank", () => {
     const groups = build(named([session("ins-idle"), session("ins-exited", { lifecycle: "exited" })]));
     expect(groups[0].quiet).toBe(true);
     expect(groups[0].rows.every((row) => row.rank === "idle" || row.rank === "exited")).toBe(true);
+  });
+
+  it("reads the owner's unseen flag into done-unseen and keeps a failed turn out of it", () => {
+    const idle = (patch: Partial<Instance>) =>
+      session("s", { lifecycle: "running", activity: known("idle"), ...patch });
+    // seen-hub: the owner has not opened the last settled turn.
+    expect(rank(idle({ unseen: true }))).toBe("done-unseen");
+    // §3.1 e: a FAILED turn is a queue card, never ◉.
+    expect(rank(idle({ unseen: true, lastTurnError: { at: "t", text: "boom" } }))).toBe("idle");
+    expect(rank(idle({ unseen: false }))).toBe("idle");
+    // Only a live, idle session can take the slot.
+    expect(rank(idle({ unseen: true, lifecycle: "starting" }))).toBe("starting");
+    expect(rank(idle({ unseen: true, activity: known("working") }))).toBe("working");
+    expect(rank(idle({ unseen: true, lifecycle: "exited" }))).toBe("exited");
+  });
+
+  it("produces all seven ranks from the table", () => {
+    const produced = [
+      rankOf({ lifecycle: "running", activity: "waiting-interaction" }),
+      rankOf({ lifecycle: "running", activity: "idle", unseen: true }),
+      rankOf({ lifecycle: "running", activity: "working" }),
+      rankOf({ lifecycle: "running", activity: "idle", childLive: true }),
+      rankOf({ lifecycle: "starting", activity: null }),
+      rankOf({ lifecycle: "running", activity: "idle" }),
+      rankOf({ lifecycle: "exited", activity: null }),
+    ];
+    expect(produced).toEqual([...HOME_RANKS]);
   });
 
   it("puts the new rank fields into the display signature", () => {

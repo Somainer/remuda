@@ -700,22 +700,23 @@ fn pending_parts(record: &InteractionRecord, open: &[OpenTool]) -> PendingParts 
         .and_then(Value::as_str)
         .unwrap_or_default();
     let tool_call_id = request.get("toolCallId").and_then(Value::as_str);
-    let matched = tool_call_id
-        .and_then(|id| open.iter().find(|tool| tool.id == id))
-        // An approval journalled without a tool id still names its tool in the
-        // title, but not which call is waiting: accept the fallback only when
-        // exactly one open call carries that name. With two same-named calls
-        // open, quoting either one's arguments could describe the wrong
-        // command at the moment someone decides.
-        .or_else(|| {
-            (kind == "approval").then(|| {
-                let mut matches = open
-                    .iter()
-                    .filter(|tool| !tool.name.is_empty() && tool.name == title);
-                let only = matches.next()?;
-                matches.next().is_none().then_some(only)
-            })?
-        });
+    let matched = match tool_call_id {
+        // The approval names its call: only that call. An id that is not in
+        // the tail is unknown, not an invitation to quote a look-alike.
+        Some(id) => open.iter().find(|tool| tool.id == id),
+        // No id at all (the PTY path): the title names the tool, and the
+        // fallback is safe only when exactly one open call carries that name.
+        // With two same-named calls open, quoting either one's arguments could
+        // describe the wrong command at the moment someone decides.
+        None if kind == "approval" => {
+            let mut matches = open
+                .iter()
+                .filter(|tool| !tool.name.is_empty() && tool.name == title);
+            let only = matches.next();
+            only.filter(|_| matches.next().is_none())
+        }
+        None => None,
+    };
     let (question, tool, args) = match kind {
         "question" => {
             let fields: Vec<String> = request
@@ -2515,6 +2516,27 @@ mod tests {
         let summary = summarize_args(&Value::Object(map));
         assert!(summary.matches("key").count() <= ARG_MAX_KEYS, "{summary}");
         assert!(summary.contains("+29 more"), "{summary}");
+    }
+
+    #[test]
+    fn an_unmatched_tool_id_does_not_borrow_another_calls_arguments() {
+        let worker = worker(json!({ "state": "working" }));
+        // The approval names tc1, which has scrolled out of the journal tail;
+        // exactly one same-named call (tc2) is still open. Falling back to it
+        // would quote a different command at decision time.
+        let journal = vec![
+            tool_call("tc2", "Bash", json!({ "command": "ls" })),
+            approval_event("tc1", "Bash"),
+        ];
+        let pending = vec![interaction(approval_event("tc1", "Bash"))];
+        let digest = digest_of(&facts(&worker, None, &journal, &pending, &[], None));
+        let pending = digest.pending.expect("pending");
+        assert_eq!(pending.tool.as_deref(), Some("Bash"));
+        assert!(
+            pending.args_summary.is_none(),
+            "the named call is not in the tail: {:?}",
+            pending.args_summary
+        );
     }
 
     #[test]

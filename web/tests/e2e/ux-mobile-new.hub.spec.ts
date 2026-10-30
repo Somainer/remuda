@@ -340,18 +340,6 @@ test.describe("mobile new session (390px)", () => {
     await page.getByRole("link", { name: "返回" }).click();
     await expect(page).toHaveURL(/\/m$/);
     await expect(page.getByTestId("home-list")).toBeVisible();
-    // Exited rows fold away: a project with nothing active collapses into
-    // 「安静的项目」, and inside a busy project they sit behind 「还有 N 个空闲」.
-    // Open every fold so this test's own rows are in the DOM.
-    for (const fold of await page.getByTestId("home-quiet-fold").all()) {
-      if (await fold.isVisible().catch(() => false)) await fold.click().catch(() => {});
-    }
-    for (const fold of await page.getByTestId("home-idle-fold").all()) {
-      const text = (await fold.textContent().catch(() => "")) ?? "";
-      if (text.includes("还有") && (await fold.isVisible().catch(() => false))) {
-        await fold.click().catch(() => {});
-      }
-    }
     // This space also holds other suites' rows; assert at least all 14 of
     // ours are rendered, scoped by the ids this test created. The phone home
     // row carries no instance-id attribute, so match the row link's href.

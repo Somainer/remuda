@@ -115,24 +115,24 @@ test.describe("390px phone home", () => {
     await expect(home).toBeVisible();
 
     // One project group: name + live git branch (changes proxy). The header
-    // carries dot counts, not a "N 待处理" word: ⚠ is the blocked row, ■ is the
-    // exited row folded behind it.
+    // carries dot counts, not a "N 待处理" word: ⚠ is the blocked row, ■ the
+    // exited one.
     const group = page.getByTestId("home-group").filter({ hasText: "remuda-e2e" });
     await expect(group).toBeVisible();
     await expect(group).toContainText("feat/workbench-g2", { timeout: 15_000 });
     await expect(group.getByTestId("home-group-dots")).toHaveText("⚠1 ■1");
     expect(await page.getByTestId("home-group").count()).toBe(1);
 
-    // Blocked row stays visible at the top. The exited row is idle, so it sits
-    // behind 「还有 N 个空闲」 until that fold opens.
-    const fold = group.getByTestId("home-idle-fold");
-    await expect(fold).toContainText("还有 1 个空闲");
-    const blockedRow = group.getByTestId("home-row");
-    await expect(blockedRow).toHaveCount(1);
+    // Blocked row is pinned first even though the exited session was created
+    // later. Only idle rows fold, so the exited row stays visible.
+    const rows = group.getByTestId("home-row");
+    await expect(rows).toHaveCount(2);
+    const blockedRow = rows.first();
     await expect(blockedRow).toHaveAttribute("data-status", "blocked");
     await expect(blockedRow).toHaveAttribute("data-rank", "blocked");
     await expect(blockedRow).toHaveAttribute("data-blocked", "1");
     await expect(blockedRow.getByTestId("home-row-state")).toHaveText("待处理");
+    expect(await rows.nth(1).getAttribute("data-status")).toBe("exited");
 
     // Row = dot + title + one next-step sentence verbatim + context ring.
     await expect(blockedRow.getByTestId("home-row-body")).toHaveText("echo e2e");
@@ -140,9 +140,6 @@ test.describe("390px phone home", () => {
     await expect(blockedRow.getByTestId("context-ring")).toHaveAttribute("data-pct", "50");
     await expect(blockedRow.getByTestId("context-ring-pct")).toHaveText("50%");
 
-    await fold.click();
-    const rows = group.getByTestId("home-row");
-    await expect(rows).toHaveCount(2);
     const exitedRow = rows.filter({ hasText: exitedTitle });
     await expect(exitedRow).toHaveAttribute("data-status", "exited");
     const exitedBody = exitedRow.getByTestId("home-row-body");
@@ -203,6 +200,7 @@ test.describe("390px phone home", () => {
     await createSession(page, "MHOME_ORDER_A mhome-blocked approval gate");
     await createSession(page, "MHOME_ORDER_Z mhome-exit agent");
     await page.goto("/m");
+    await expect(page.getByTestId("home-row")).toHaveCount(2, { timeout: 10_000 });
     await page.getByTestId("home-order-list").click();
     await expect(page.getByTestId("home-order-list")).toHaveAttribute("aria-pressed", "true");
     expect(await page.evaluate(() => localStorage.getItem("remuda.mobile.home.order.v1"))).toBe("list");

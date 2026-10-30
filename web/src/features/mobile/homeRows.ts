@@ -178,9 +178,19 @@ export function rankStateWord(homeRank: HomeRank): string | null {
   return null;
 }
 
-/** A row that folds away when its project group is busy. */
+/**
+ * A row that folds away inside a busy project. Only idle rows do: an exited
+ * row belongs to the existing 已退出/已归档 fold (home.md §3.2), which this
+ * surface does not have yet, so it stays visible rather than being hidden
+ * behind an 「空闲」 label that would be wrong for it.
+ */
 export function rankFolds(homeRank: HomeRank): boolean {
-  return homeRank === "idle" || homeRank === "exited";
+  return homeRank === "idle";
+}
+
+/** A row a person may need to act on: ranks 1–5. Exited and idle are not. */
+export function rankIsActive(homeRank: HomeRank): boolean {
+  return homeRank !== "idle" && homeRank !== "exited";
 }
 
 export type HomeRow = {
@@ -245,9 +255,9 @@ export type HomeGroup = {
     exited: number;
   };
   /**
-   * True when the group has no row a person needs to see right now (no
-   * blocked, working, awaiting-wake or starting session). Those projects fold
-   * together into 「安静的项目」.
+   * True when the group has no row in ranks 1–5 (no blocked, done-unseen,
+   * working, awaiting-wake or starting session). Only idle and exited rows
+   * remain, so the whole project folds into 「安静的项目」.
    */
   quiet: boolean;
   rows: HomeRow[];
@@ -530,7 +540,7 @@ export function arrangeHomeGroups(input: {
     }
     if (!rows.length) continue;
     rows.sort((a, b) => compareRanked(a, b, input.order));
-    const quiet = rows.every((row) => rankFolds(row.rank));
+    const quiet = rows.every((row) => !rankIsActive(row.rank));
     groups.push({
       id: space.id,
       project: space.name,

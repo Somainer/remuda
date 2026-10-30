@@ -21,6 +21,7 @@ import {
   homeTurnError,
   homeRowsSignature,
   rank,
+  rankFolds,
   rankOrder,
   readHomeOrder,
   writeHomeOrder,
@@ -276,6 +277,18 @@ describe("rank(): the seven ranks, newest first within a rank", () => {
     const quiet = build(named([session("ins-idle"), session("ins-exited", { lifecycle: "exited" })]));
     expect(quiet[0].quiet).toBe(true);
     expect(quiet[0].dots).toEqual({ blocked: 0, unseen: 0, working: 0, wake: 0, starting: 0, idle: 1, exited: 1 });
+  });
+
+  it("folds only idle rows, and a project of idle plus exited rows is still quiet", () => {
+    expect(rankFolds("idle")).toBe(true);
+    // Exited rows keep their own 已退出 fold (home.md §3.2); until that exists
+    // here they stay visible rather than hiding under an 空闲 label.
+    expect(rankFolds("exited")).toBe(false);
+    expect(rankFolds("blocked")).toBe(false);
+    expect(rankFolds("starting")).toBe(false);
+    const groups = build(named([session("ins-idle"), session("ins-exited", { lifecycle: "exited" })]));
+    expect(groups[0].quiet).toBe(true);
+    expect(groups[0].rows.every((row) => row.rank === "idle" || row.rank === "exited")).toBe(true);
   });
 
   it("puts the new rank fields into the display signature", () => {

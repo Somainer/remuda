@@ -1,6 +1,7 @@
 import { useSyncExternalStore } from "react";
 import { profileRegion } from "./profileFlags";
 import { structuralEqual } from "./structuralEqual";
+import { nowMs } from "./clock";
 
 /** Bounded journal tail the list reads per live instance to project its phrase. */
 const SUMMARY_TAIL = 64;
@@ -715,6 +716,33 @@ function normalizedWordIsBareUltracode(word: string): boolean {
  */
 export type ConnectionUi = "live" | "stale" | "offline" | "recovering" | "reconnecting";
 export type Toast = { id: string; text: string } | null;
+
+/**
+ * Freshness of the cached list (home.md §8). The store owns the two
+ * timestamps; `useHomeFreshness()` turns them plus the connection state into
+ * fresh / stale / grace / unknown.
+ */
+export type RefreshHealth = {
+  /**
+   * Clock ms of the last SUCCESSFUL list read (a bootstrap snapshot or a
+   * refresh whose instance and interaction reads both resolved); null before
+   * the first snapshot.
+   */
+  lastOkAt: number | null;
+  /**
+   * Clock ms the current run of consecutive failed refreshes began; null when
+   * the last settled refresh succeeded. A successful refresh clears it.
+   */
+  failingSince: number | null;
+  /**
+   * Monotonic count of settled refreshes (success or failure). The foreground
+   * grace ends on the first SETTLE after the page became visible, which is not
+   * observable from the two timestamps alone: a failure that joins an already
+   * failing run does not move `failingSince`.
+   */
+  settledSeq: number;
+};
+
 export type LocalBubble = {
   /**
    * Local request identity, generated before the POST. It is **never** a
@@ -1188,6 +1216,15 @@ function classifyCommandLike(
 class HubStore {
   private state: HubState = initial;
   private listeners = new Set<Listener>();
+  /**
+   * home.md §8: refresh outcomes behind the home freshness rules. Kept OFF
+   * HubState on purpose — stamping every 2 s poll into the snapshot would
+   * replace its identity and commit every quiet-poll consumer, including the
+   * `commit:HomeList` contract. Only {@link subscribeRefreshHealth} listeners
+   * hear these.
+   */
+  private refreshHealth: RefreshHealth = { lastOkAt: null, failingSince: null, settledSeq: 0 };
+  private refreshHealthListeners = new Set<Listener>();
   private journals = new Map<Id, JournalClient>();
   private subs = new Map<Id, Id>();
   /**
@@ -2066,6 +2103,57 @@ class HubStore {
   };
 
   getSnapshot = () => this.state;
+
+  /**
+   * Home freshness source (home.md §8). The returned object is replaced only
+   * when a timestamp actually moves, so a subscription that re-reads on every
+   * store notification can compare identities cheaply.
+   */
+  getRefreshHealth = (): RefreshHealth => this.refreshHealth;
+
+  /** Deltas of {@link getRefreshHealth}; notified on every refresh settle. */
+  subscribeRefreshHealth = (listener: Listener) => {
+    this.refreshHealthListeners.add(listener);
+    return () => {
+      this.refreshHealthListeners.delete(listener);
+    };
+  };
+
+  private publishRefreshHealth(patch: Partial<RefreshHealth>) {
+    const next = { ...this.refreshHealth, ...patch };
+    const current = this.refreshHealth;
+    if (
+      next.lastOkAt === current.lastOkAt &&
+      next.failingSince === current.failingSince &&
+      next.settledSeq === current.settledSeq
+    ) {
+      return;
+    }
+    this.refreshHealth = next;
+    for (const listener of this.refreshHealthListeners) listener();
+  }
+
+  /**
+   * A successful list read: a bootstrap snapshot or a settled refresh. Ends
+   * the current failure run and stamps the time the 10 s freshness window is
+   * measured from.
+   */
+  private noteSnapshotSucceeded() {
+    this.publishRefreshHealth({ lastOkAt: nowMs(), failingSince: null });
+  }
+
+  /** A failed refresh. Only the FIRST failure of a run opens the 5 s banner
+   *  debounce — later failures keep its original start. */
+  private noteRefreshFailed() {
+    if (this.refreshHealth.failingSince != null) return;
+    this.publishRefreshHealth({ failingSince: nowMs() });
+  }
+
+  /** One settled refresh (success or failure) — the foreground grace ends on
+   *  the first of these after the page became visible. */
+  private noteRefreshSettled() {
+    this.publishRefreshHealth({ settledSeq: this.refreshHealth.settledSeq + 1 });
+  }
 
   private emit(patch: Partial<HubState>) {
     // c-effortread r13 item 2/3, r14 item 2: current activity evidence (live
@@ -3684,6 +3772,13 @@ class HubStore {
    * (e.g. the question-alert watcher) can be driven without a live Hub. */
   setSlicesForTest(slices: Partial<HubState>): void {
     this.emit(slices);
+  }
+
+  /** Test-only: record the first-snapshot freshness a real bootstrap would
+   *  have stamped, for page tests that build the store through follow()
+   *  instead of a list read (home.md §8). */
+  markSnapshotForTest(): void {
+    this.noteSnapshotSucceeded();
   }
 
   /**
@@ -5819,6 +5914,11 @@ class HubStore {
       const install = await this.initConnection(false, extAtBoot);
       if (!extLive()) return "retired";
       if (install === "obsolete") return "retired";
+      // home.md §8: the first snapshot. Stamped AFTER the connection install
+      // so the freshness rules never see a snapshot that is not yet on a live
+      // link (the initial emit above happens while the link is still
+      // recovering; stamping there would flash one stale render).
+      this.noteSnapshotSucceeded();
       this.startPoll();
       // c-unboundresume r4 item 1: dead-code eliminated in the normal
       // production build; present in DEV and the e2e artifact.
@@ -6132,6 +6232,9 @@ class HubStore {
     ++this.bootGen;
     this.pinnedCreates.clear();
     this.polledEffort.clear();
+    // home.md §8: the old identity's freshness dies with it — the next login
+    // must not read as fresh off a timestamp it never earned.
+    this.publishRefreshHealth({ lastOkAt: null, failingSince: null });
     // Tear down the connection machine and its follow bookkeeping (init
     // recreates them at the next bootstrap); the durable outbox itself stays.
     this.disposeConnectionForAuthChange();
@@ -6266,6 +6369,10 @@ class HubStore {
     try {
       const [instances, interactions] = await Promise.all([api.instanceList(), api.interactionList()]);
       if (epoch !== this.bootGen) return;
+      // home.md §8: a refresh whose list and interaction reads both resolved
+      // is the successful read the 10 s freshness window and the banner
+      // debounce are measured from.
+      this.noteSnapshotSucceeded();
       // An older in-flight poll that returns a still-pending row must not
       // revert a locally committed review; merge with the same seq/outstanding
       // pin discipline as the instance list.
@@ -6334,6 +6441,12 @@ class HubStore {
       // every authenticated path (close/cancel/create/resume re-enter it) and
       // must not add journal polling; the mounted SessionList hydrates phrases
       // for the rows it renders via hydrateRowSummaries().
+    } catch (err) {
+      // home.md §8: a failed refresh opens (or continues) the consecutive
+      // failure run behind the 5 s banner, then rethrows to the caller's
+      // existing error path. A response retired by a logout is neither.
+      if (epoch === this.bootGen) this.noteRefreshFailed();
+      throw err;
     } finally {
       // The stale request always releases its own outstanding slot; it is the
       // epoch guard around the reap below that keeps it from moving pins — no
@@ -6343,6 +6456,9 @@ class HubStore {
         this.reapConfirmedPins(this.pinnedCreates);
         this.reapConfirmedPins(this.settledInteractions);
       }
+      // Any settlement — including a retired response — ends the foreground
+      // grace; the grace belongs to the page, not to one identity.
+      this.noteRefreshSettled();
     }
   }
 

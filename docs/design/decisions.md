@@ -39,6 +39,7 @@
 | D-058 | 2026-10-05 | **新建任务的目录浏览器与「移除目录」占用门（c-dirpicker）**：新增 Node RPC `host.dirs.list`（只列目录、lstat 不跟随 symlink、限定 `workspace_roots` allowlist、隐藏目录默认关、4096 条目/16384 扫描上限并回 `truncated`，给 home/roots/已注册根/allowlist 边界 parent）与 Hub `GET /v1/hosts/{id}/dirs` 代理（Human-only，Bot/Agent 403，未知主机 404，离线 409）；前端「+ 添加目录」改为浏览器 Modal（面包屑+过滤+隐藏开关+使用此文件夹），手敲绝对路径保留为高级选项，注册仍走既有两阶段 `workspace.register`；unregister 增加占用门——Hub 在排队命令前按 live 会话（进程结束证据 exited/failed 均算结束）与未归档且非 done/failed 的绑定任务计数 409 拒绝，Node 在 prepare 做同一 live-session 门（canonical 别名同样挡住，幂等 prepare 重放豁免），只解绑不删文件、已结束会话保留历史；前端移除先确认、理由内联。非目标：文件浏览仍归 `host.files.*`，不做递归/提权浏览，不自动结束会话或归档任务。 | coordinator（c-dirpicker） | [ui-spec.md §2.4/§2.6](./ui-spec.md)；D-023；[files-view-contract.md](./files-view-contract.md) |
 | D-059 | 2026-10-07 | **回答栅栏（answer fence）proposed——待所有者拍板：让「回答/按键能否到达一个仍在运行的进程」可验证。** 三个彼此独立的串行域（SQLite writer、出站 registry/link FIFO、每个进程的内存状态）的检查与生效分处不同域上，局部加固给不出统一顺序；本决策把三者收进同一顺序：所有者令牌（host+实例+nodeEpoch+processGeneration，由 Node 盖在 journal 上，客户端提示永不参与授权）、单一 writer 派发口（`Store::dispatch_answer` 无 await、claim 先于入队落盘）、出站写闸（回答帧在交给 socket 前对在飞 attempt 做 CAS，线性化点从入队移到「写出决定」）、Node 每实例 `RunGate`（放行与按键持共享读锁，进程结束分类器的证据取独占锁，按键 `tty.write`/`instance.keys` 同受 AF-K 栅栏）、durable link 身份单一来源 + hello 有序采纳（`hello_seq`，只有当前采纳的 link 能登记）、卡状态机（`invalidated`/`unknown` 是关闭态而非吸收态，可被 Node journal 证据细化为 `answer-committed`/`expired`）、commandId 即身份（无 TTL，对账器重驱）、单 Hub 进程硬前提（`hub.lock` fail-closed）、**无 Node 证据时时钟清扫只投影非终态的「联系丢失/未知」、绝不自主结束实例**（Hub 停机不计失联；结束只来自共享进程结束分类器）。只在**进程结束证据**出现时栅栏才收紧（对齐 D-057 OA6：turn/subagent/workflow/configure/diagnostic 失败都不触发，判定交 c-cardsettle 的共享进程结束分类器）。实现切片已列但未排期，c-cardsettle（终态结清、settlement 总线）与 hub.lock 是前置。 | coordinator（c-answerfence，proposed docs-only） | 本 ADR；D-055、D-057 OA6、[hub-topology §3](./hub-topology.md)、[protocol.md §2.5/§2.6/§5.6/§6.1/§7.2/§9.1](./protocol.md)；依赖 c-cardsettle |
 | D-060 | 2026-10-29 | **主 agent 的伙伴层（部分 adopted）：记忆按条目存于 Hub、来源只记录不设闸、事实与唤醒的送达约束、用量上限后的续跑。** 所有者 2026-10-29 拍板三项：(R1) 记忆改为 Hub 的 `memory_entries` 条目表（每条 revision CAS、FTS5 加 LIKE 兜底、秘密 lint、纳入 hub-backup、只接受当前章节写入），现在就做、不依赖 F，血缘退役时归档不删除，取代 main-agent.md §12 原「第三阶段整份文档」；(R2) `rootTurn {commandId, origin, continuation}` 由 Hub 从回合记录推出，只用于审计和显示、永远不是闸，作为 ma-initiator 之后的独立切片 `cb-rootturn`，由事实触发的回合仍可发起 D-017 审批并在 `/approvals` 标为 "agent-initiated"，正式否决 autonomous 回合白名单与记忆内容的策略 lint；(R3) 用量上限：reset 事实一定发送，`autoContinue` 按实例、默认关、agent 可在 dispatch 时打开，两次实质进展之间最多续跑 3 次，任何 Human 或 Agent 输入都取消等待。仍为 proposed 的部分：结构不变量「Hub 执行的任何东西都不从记忆读取」并有测试证明；章节启动只注入记忆索引；inbox 的九条送达约束（稳定 dedupeKey、持久 occurrence 上限、run generation 入键、无订阅者退回所有者推送、不给自己章节发事实、暂停时 hold、先写可见行再发送、Hub 口吻、工具在途的 stall 阈值）；wake run 状态机（interrupted 不重放、错过只补一次）、超时必填的 `check`、无人值守信封与 `owner notify`；不超过 2 KB 的 worker digest 与血缘 glance；自我关闭守卫；错误体只增不改的 `reason`/`next`；能力台账 [agent-parity.md](./agent-parity.md)。待所有者决定 Q1–Q6（about-me 归属、跨 host 迁移、飞书主路由、记忆整理、跟随自己会话、证据位图）各附推荐默认 | coordinator（c-cbadr，docs-only）；R1–R3 由所有者拍板 | 本 ADR；[main-agent.md §3.6/§10–§15/§17](./main-agent.md)、[agent-parity.md](./agent-parity.md)、[protocol.md §8.4/§9.1](./protocol.md)；D-017、D-050、D-051、D-055、D-057；参考 Cindy（Apache-2.0） |
+| D-061 | 2026-10-30 | **首页分诊优先（部分 adopted）：全页唯一的「需要你」队列、Main 卡加「问 Main」、共享 `rank()`、按 owner 的完成未看。** 所有者 2026-10-30 拍板：主轴 A（`/m` 与 `/sessions` 各有一个「需要你」队列并可一键作答，Main 是顶部一张卡加底部一条输入条，PhoneNav 保持 4 槽，h1 仍是「会话」）；`ma-main-ui` 现在排期；完成未看（◉）按 owner 记，取代 ui-spec §3.1 的按设备 last-read 与投影字段 `unread?`；glance 取 owner 范围；角标与「需要你」= 在等 owner 的交互 + 没有交互的 owner 阻塞任务，Main 的提问只算一次，完成未看、通知、回合失败不计；首页可用 chip 回答单字段、单选、≤4 个选项、非 sensitive 的问题（修订 ui-spec §2.5）；「小界面授权更少」（首页权限卡只给允许一次与拒绝、计划卡只给审阅计划、永不批量批准；人类界面规则，不约束 Main）；桌面列表的裸 enter/esc/ctrl+c 移到终端页、停止要确认；快捷提问只在输入聚焦时出现；不做 Hub 早报模板与外部邮件/IM；队列为空时一行问候。规格展开为 [home.md](./home.md)：`rank()` 七档（blocked > 完成未看 > working > 待唤醒 > starting > idle > exited，档内新的在前）、交互期间不重排、空闲折叠；新鲜度（2 s 轮询，10 s 无成功 refresh 或连接非 live 即过期，回前台到首次 refresh 之间不判过期，横幅只在连续失败满 5 s 后出现）；未知计数隐藏不画 0；**`/sessions` 上的 SpacesPanel 默认折叠到「空间 ▸」开关后面**（修订 D-053）；`/m` 底部「问 Main」输入条与 PhoneNav 合为一条停靠带（ui-spec §4.7 唯一例外）；推送落点改为 `/sessions?focus=`。新路由（seen、owner glance、notices list/ack、lineage wakes list/delete、interactions 的 `routedTo`）见正文路由表；docs-only | 所有者（主轴与默认值，2026-10-30）+ coordinator（c-hdocs，docs-only） | 本 ADR；[home.md](./home.md)；[ui-spec.md §1.2/§1.4/§2.1/§2.5/§3.1/§3.3/§4.5/§4.7/§6](./ui-spec.md)；[visual-system.md §8.1/§8.6](./visual-system.md)；[main-agent.md §9](./main-agent.md)；[ui-screenshots.md](./ui-screenshots.md)；D-017、D-038、D-049、D-050、D-051、D-053、D-055、D-057、D-060 |
 
 ## Cargo workspace 布局（coordinator 定，bootstrap 与计划以此为准）
 
@@ -2097,3 +2098,260 @@ Cindy（提交 `cba8e45342`；只借机制，按机制列出仓库路径）：
 - 提交点读取调用者模式：`apps/desktop/src/main/maker-ipc/botDelegationService.ts`。自我关闭守卫：`apps/desktop/src/main/maker-ipc/botCanonicalReplacementGuard.ts`。审批卡上的原话：`apps/desktop/src/shared/forwardedRequest.ts`。
 - 能力台账：`docs/product-rules/agent-user-parity.md`。
 - 否决项的出处：`docs/product-rules/teammate-authority.md`、`docs/product-rules/cindy-bots-runtime.md`、`docs/product-rules/cloud-companions.md`、`apps/desktop/src/main/goal-host/controller.ts`。
+
+## D-061
+
+**2026-10-30 · 首页分诊优先：全页唯一的「需要你」队列、Main 卡加「问 Main」、共享 `rank()`、按 owner 的完成未看**
+
+| 日期 | 2026-10-30 |
+|---|---|
+| 状态 | **部分 adopted**。「所有者裁定」表里的 12 条由所有者 2026-10-30 拍板。其余条目是这些裁定的机械展开：布局、阈值、路由形状写成了 [home.md](./home.md)，状态为 **proposed**，待所有者批准本 ADR；所有者改判的条目由一次 docs 提交改写。docs-only，不含代码。 |
+| 相关 | D-017（Agent 的一次性人工审批）、D-024（Space 键）、D-038（行内容）、D-049（`/m` 路由树与角标）、D-050（任务层）、D-051（委托决策）、D-052（单壳收件箱）、D-053（视觉与 SpacesPanel 位置）、D-055（commandId 重放）、D-057（Main）、D-060（伙伴层：digest/glance、owner notify、wake-up）；[home.md](./home.md)（机械权威）；[ui-spec.md](./ui-spec.md) §1.2、§1.3、§1.4、§2.1、§2.5、§3.1、§3.3、§4.5、§4.7、§6；[visual-system.md](./visual-system.md) §8.1、§8.6；[main-agent.md §9](./main-agent.md#9-chat-surface)；[ui-screenshots.md](./ui-screenshots.md) |
+| 依据 | 所有者 2026-10-29 收到的首页调研（私有材料，不入库），以及下文「背景」对 origin/main `c27e0eac` 的逐项核对。入库内容只借调研的结论，不引用其中任何外部产品的文案、图标或截图 |
+
+### 背景
+
+origin/main（`c27e0eac`）的首页现状：
+- **`/m` 首页**是分组台账（`web/src/features/mobile/HomeList.tsx`）。台账上方是 D-050 的任务层（`HomeTaskLayer`，由 `buildHomeTaskLayer` 推出），它的第一组是任务口径的「需要你」：会话上有待处理人工交互的任务，或 `blockedReason` 非空的任务（`web/src/features/tasks/taskRows.ts`）。这一组只是行，不能直接作答。
+- **收件箱**（`/m/inbox`、桌面 `/approvals`）是另一个页面，口径是交互：只列交互，没有任务层。
+- **两者的关系：** 首页上的任务注意力组和收件箱范围不同。同一件事可能在两处各出现一次，也可能只在其中一处出现；首页上则没有一个统一、可作答的「需要你」。
+- **排序与折叠：** 排序只把 blocked 顶到最前（`homeRows.ts` 的比较函数），其余行全部渲染，没有空闲折叠。
+- **可作答的卡：** 首页上没有。可作答的卡只在两个地方出现：
+  - 收件箱渲染 `DecisionCard`：桌面用 `mode="desktop"`，compact 用 `mode="compact"`（`web/src/features/approvals/InboxShell.tsx`；组件在 `ApprovalCard.tsx`，`InboxMode` 只有这两个值）；
+  - 会话页渲染可操作的 `ApprovalCard`（`web/src/pages/SessionPage.tsx`）。
+  - 收件箱的 compact 卡会把计划审阅的选项内联画出来（`ApprovalCard.tsx`），所以不能直接搬到首页：首页变体必须去掉这些选项。
+- **Main：** 「Main 置顶行」只存在于规格（ui-spec §2.1、§4.7），`ma-main-ui` 直到这次裁定之前都没有排期。
+- **完成未看：** 没有实现。ui-spec §3.1 规定的「按用户+设备的 last-read seq」与投影字段 `unread?` 从未实现。
+- **角标：**
+  - 页面打开时已经同步角标：`syncAppBadge`（`web/src/lib/push.ts`）由 `web/src/app/Root.tsx` 启动；
+  - SW 的 `push` 处理（`web/sw.src.js`）不读 `payload.badge`，所以 App 关着时角标不变；
+  - ui-spec §4.5「全库无 `setAppBadge` 调用」已经过时。
+- **推送落点：** 交互推送的 URL 由 Hub 写死为 `/approvals?focus={id}`（`crates/remuda-hub/src/alerts.rs`）。
+- **新鲜度：**
+  - 轮询周期 2 s（`web/src/lib/store.ts` 的 `startPoll`），回到前台时做一次完整 refresh（`web/src/app/PhoneShell.tsx`）；
+  - 首页没有连接指示；
+  - 空态只判断「没有分组」，所以冷启动时可能闪出「暂无会话」。
+- **按钮：** `.btn` 没有 `white-space: nowrap`。
+- **会话遥控：** 桌面会话列表的遥控 sheet 能发裸 enter / esc / ctrl+c，停止不需要确认。
+
+缺口有三个：
+- 没有前门（Main 加输入框）；
+- 没有一眼能看懂的计数和主机可达状态；
+- 首页上没有能直接处理的「需要你」卡。
+
+### 所有者裁定（2026-10-30，约束本决策）
+
+| # | 裁定 | 落在 |
+|---|---|---|
+| R1 | 主轴 A，分诊优先。`/m` 与 `/sessions` 各有一个「需要你」队列（全页唯一），一键作答。另有：顶部的 Main 卡、底部的「问 Main」输入条、共享的 rank 与空闲折叠、计数行、主机条、新鲜度规则。PhoneNav 保持 4 槽 | 决策 1–3、7–9；home.md §0–§4 |
+| R2 | `ma-main-ui` 现在排期 | 决策 7；home.md §13 |
+| R3 | 完成未看（◉）按 owner 记，不按设备记。ui-spec §3.1 与投影字段随之修改 | 决策 6；home.md §7 |
+| R4 | glance 取 owner 范围：Main 子树，并上 owner 自己开的会话 | 决策 4；home.md §5.3 |
+| R5 | 角标与「需要你」= 真正在等 owner 的交互，加上没有交互的 owner 阻塞任务。Main 的提问只算一次。完成未看、通知、回合失败都不计入 | 决策 4；home.md §5.1 |
+| R6 | 首页可以用 chip 回答单字段、单选、非 sensitive、选项不超过 4 个的问题 | 决策 5；ui-spec §2.5 |
+| R7 | 小界面授权更少：首页权限卡只给「允许一次」和「拒绝」，计划卡只给「审阅计划」，永不批量批准。这是人类界面的规则，不约束 Main | 决策 5；home.md §4.3 |
+| R8 | 桌面列表的裸 enter / esc / ctrl+c 移到终端页，停止要确认 | 决策 11 |
+| R9 | 快捷提问 chip 只在输入条获得焦点时出现 | 决策 7；home.md §6.3 |
+| R10 | Hub 不内置早报模板 | 决策 13 |
+| R11 | 不接入外部邮件或 IM 来源 | 决策 13 |
+| R12 | 队列为空时显示一行问候，h1 仍是「会话」 | 决策 4；home.md §5.2 |
+
+### 决策
+
+1. **首页 = 分诊优先（R1）。**
+   - `/m`（compact）与 `/sessions`（桌面）是同一套首页的两种布局（home.md §2）。
+   - 从上到下依次是：计数行、主机条、Main 卡、「需要你」队列、刚完成、台账，以及「问 Main」输入条。
+   - 每个元素都写明数据来源：一条现有路由，或者一个具名的计划任务（home.md §1）。计划任务没落地的元素不渲染，不画占位。
+
+2. **全页唯一的「需要你」队列（R1、R5）。**
+   - **组成，自上而下：**
+     - Main 的提问（置顶）；
+     - 其余待处理交互（派生规则与顺序同收件箱）；
+     - 「任务待你」：未归档、`blockedReason` 非空、并且它的会话都没有待处理交互的任务；
+     - 「告诉你」卡；
+     - 回合失败卡（`lastTurnError`）。
+   - **计入 N 的只有前三类。**
+   - **去重：** 台账不再单独渲染任务层的「需要你」组；一个任务的会话已有交互卡时，不再显示任务卡。`/board` 与任务列表里的「需要你」组不变。
+   - **数量上限与展开：** 手机显示 3 张，桌面显示 4 张，其余折成「还有 N 条 ▾」，点开后在首页**原地展开**（手机和桌面相同）。
+     - 溢出不跳到收件箱：收件箱只列交互，没有任务层，显示不了「任务待你」、「告诉你」和回合失败卡。
+     - 「去收件箱 ›」是 header 上一个独立的链接，只管交互，指向最早一条交互；队列里没有交互时不渲染这个链接。
+   - **搜索时整个队列隐藏。**
+   - **失败卡离队：** `seen-hub` 之前，回合失败卡在实例恢复、关闭或下一回合开始时离队，另有一个本设备的「知道了」；之后改为「被看过就离开」（home.md §4.5）。
+
+3. **一个 `rank()`（R1）。**
+   - 七档：blocked > 完成未看 > working > 待唤醒 > starting > idle > exited，档内新的在前。
+   - 档位从现有投影 `projectStatus`（`web/src/lib/status.ts`）推出，是一张自上而下、先命中先得的全表（home.md §3.1）：
+     - 每个 `(lifecycle, activity)` 组合恰好得到一个档；
+     - 空闲一族（完成未看、待唤醒、idle）对 `ready` 和 `running` 一视同仁，因为跑完回合、进程仍在的实例报告的是 `running` + `idle`；
+     - `failed`、`closing`、`exited` 落在 exited；`unknown`、`reconciling` 落在 starting，除非已知在等人；`draining` 落在 working；
+     - 与状态点只有两处偏离：`connectivity` 不参与档位；lifecycle 未知时按 starting 排。
+   - `/m` 台账、桌面 `SessionList` 与「工作中」共用这一个定义。
+   - 每个项目组里，空闲行折成「还有 N 个空闲 ▾」；没有活跃行的项目折进「安静的项目 · N」；搜索时全部展开。
+   - 组头用点计数（`⚠1 ●2 ◉1 ○4`，单行）。
+   - 触摸、sheet、菜单和行内焦点期间不重排（home.md §3）。
+
+4. **计数口径（R4、R5、R12）。**
+   - **N = A + B。** A 是 `status=pending`、没有过期、并且（`routed-to` 之后）`routedTo=owner` 的交互数。B 是「任务待你」的张数。
+   - **应用图标角标 = N**，页面打开时和 PWA 关闭时用同一个口径。这一条取代 ui-spec v0.2.4 的「OS 角标与收件箱队列同源」。导航上「收件箱」的数字仍然是 A。
+   - **计数行：** 手机 `需要你 · 完成未看 · 工作中`；桌面再加「今日完成」。
+   - **段的取舍：** 没有真实来源的段隐藏；首个快照前每段显示「–」；已知为 0 的段省略；绝不显示一个未知的 0（ui-spec §3.3）。
+   - **队列为空时**，第一段换成按时段的问候加「都处理完了」。h1 仍是「会话」。
+   - **owner glance**（`GET /v1/owner/glance`）落地后，计数、今日完成与每行 headline 改读它，并删除首页逐行读 journal 的 2.5 s 轮询。
+
+5. **小界面授权更少，以及简单单选例外（R6、R7）。**
+   - 首页卡片是 `DecisionCard` 的新模式 `mode="home"`（`ApprovalCard.tsx`，`InboxMode` 加一个值）。权限卡只渲染 `effect` 为 `deny` 和 `allow-once` 的两个选项；计划卡只给「审阅计划」；sensitive 与 elicitation 只给「去会话」；任何界面都没有批量批准。
+   - 满足以下全部条件的问题，可以在首页用 chip 回答，chip 之外另给「其他…」：单字段、`input=single-select`、选项不超过 4 个、`sensitive=false`。这一条修订 ui-spec §2.5「AskUserQuestion 不在列表里填完」；收件箱行为不变。
+   - 这是人类界面的规则。Main 受 grant 与 D-017、D-051(a) 约束：approval 只由人回答。
+
+6. **完成未看按 owner 记（R3）。**
+   - 新表 `instance_views(instance_id, scope, seen_seq, seen_at)`，`seen_seq` 只增不减。
+   - 写入路由是 `POST /v1/instances/{id}/seen {durableSeq}`，只接受 Human 设备的凭据。
+   - `GET /v1/instances` 的每一行增加 `unseen`。
+   - 以下情况标为已看：打开 `/s/:id`；`/s/:id` 正在显示时回合结束；行菜单「标为已看」；「全部看过」。
+   - 恢复出来的实例与后继章节都没有 seen 行。
+   - 这一条取代 ui-spec §3.1 的「last-read seq 按用户+设备存在 Hub」和 §2.1 的投影字段 `unread?`；两者都从未实现。
+   - ◉ 是 `--link` 环加中心实心点，不用绿色（visual-system §8.6）。
+
+7. **Main 卡加「问 Main」（R1、R2、R9）。**
+   - 首页上的 Main 是一张卡加一条输入条。它不是 tab，不占导航槽，也不再是列表置顶行；这一条取代 D-057 在 ui-spec §2.1、§4.7 的「Main 置顶行」版式，解析规则不变（main-agent.md §9）。
+   - **卡片内容：**
+     - 第 1 行是状态短语；
+     - 第 2 行是最近一条回复的首行，刚发送时换成发送回显；
+     - 有 wake 时多一行「下次」。
+   - **输入条：** 手机上是 56px compact Composer，与 PhoneNav 合成一条底部停靠带；桌面是内联输入，⌘↵ 发送。
+   - **发送失败与恢复：**
+     - 结果未知时用 `GET /v1/instances/{id}/commands/{commandId}` 对账，绝不自动重发；
+     - 发给已被取代的章节、被拒收时，按钮变成「发送给当前 Main」，并使用新的 commandId（D-055）；
+     - 血缘暂停时，发送键变成「恢复」。
+   - **快捷提问 chip** 只在聚焦时出现，只带真实计数，点击只填入输入框。
+   - **共用解析：** `ma-main-ui` 与首页卡共用同一处 Main 解析。
+
+8. **新鲜度（home.md §8）。**
+   - 轮询周期 2 s。
+   - **过期：** 连接不是 live，或者 10 s 内没有成功的 refresh。
+   - **前台宽限期：** 从回到前台到之后第一次 refresh 结束为止，不判过期，按钮保持可点，由 409/410 兜底。
+   - **过期时**，队列按钮置灰，计数行变灰并显示「更新于 T」。
+   - **横幅：** 只在连续失败满 5 s 后出现。
+   - **首个快照之前**只显示骨架，绝不显示空态。
+   - **测试：** 这些阈值是产品常数。受 gate 约束的测试用注入时钟断言它们，不用墙钟毫秒阈值。
+
+9. **布局与断点（home.md §2）。**
+   - **手机：** 页头与计数行一起吸顶，合计 80px。主机条 28px，随页面滚动。底部停靠带是 ui-spec §4.7「一条顶栏加一条底栏」唯一的例外。
+   - **桌面：**
+     - ≥1440 是三栏，右栏 360px；
+     - 1280–1439 右栏收起，Main 卡与输入移到主列顶部；
+     - 768–1279 同 1280，本设备没有显式侧栏偏好时，侧栏初始为图标列（与 ⌘B 收起态相同）。
+
+10. **首页上的 SpacesPanel 默认折叠到「空间 ▸」开关后面。**
+    - 在 `/sessions` 上，SpacesPanel 不再常驻为索引列，默认折叠在主机条最右端的「空间 ▸」开关后面；
+    - 展开后，≥1024 是索引列，<1024 是覆盖层，组件与 testid 不变；
+    - 展开状态按设备存在 SpacePrefs。
+    - 这条修订 D-053 的「面板不再有自己的折叠开关」（ui-spec §1.4），只作用于 `/sessions`，`/board` 的索引列不变（ui-spec §1.3、§1.4）。
+
+11. **裸按键移到终端页，停止要确认（R8）。**
+    - 桌面会话遥控 sheet 去掉 enter / esc / ctrl+c，这些按键只在 `/s/:id/tty` 提供；
+    - 行菜单只保留：标为已看、中断、重命名、复制目录、复制恢复命令、在此项目新建、关闭…；
+    - 「停止」与「关闭…」都要确认，确认框写明会话名和主机名。
+    - 这一条修订 ui-spec §2.1 的 D-038 行内遥控条目；既有命令路径不变。
+
+12. **推送落点与关闭态角标。**
+    - 交互推送的 `data.url` 改为与视口无关的 `/sessions?focus=<interactionId>`：手机经重定向（query 原样保留）落到 `/m?focus=`，两边都高亮对应的卡。
+    - SW 的 `push` 处理读 `payload.badge`，有值时设置角标，为 0 时清除。
+    - Hub 的 `with_badge` 计数对齐决策 4 的 N。
+
+13. **不做（R10、R11 与「否决方案」）。** 以下都不做：
+    - Hub 内置早报模板；
+    - 外部邮件或 IM 来源；
+    - 大号问候区与预设提问卡墙；
+    - 手机上单独的「工作中」段；
+    - 首页上的 allow-session、内联批准计划和批量批准；
+    - 伪造的未读点。
+
+### 新路由与字段
+
+下表的路由与字段都还没有实现，由所列任务实现。凡是归属 D-060 切片的路由，都要先看该切片的 brief：还没派出的，把路由并进该切片；已经派出的，另开一个紧随其后的 hub 子任务。Agent 来源的访问默认按 `restrict_agent_routes` 不放行，除非下表另有说明。
+
+| 路由 / 字段 | 形状 | 首页用途 | 实现任务 | 是否 D-060 计划任务 |
+|---|---|---|---|---|
+| `POST /v1/instances/{id}/seen` | 请求体 `{durableSeq}`；幂等，`seen_seq = max(seen_seq, durableSeq)`；只接受 Human 设备凭据 | 标为已看、全部看过、失败卡离队 | `seen-hub` | **否**：新的 Hub 路由，不依赖 D-060 |
+| `GET /v1/instances` 每行的 `unseen` | `boolean`：最近一个结束的根回合的结束位置晚于 owner 的 `seen_seq` | ◉、刚完成、完成未看计数、失败卡离队 | `seen-hub` | **否** |
+| `GET /v1/owner/glance` | owner 范围（Main 子树并上 owner 亲手开的会话）：决策 4 的各段计数、当日完成数、每行一句确定性 headline（取自 worker digest 字段）；等待与工作中各不超过 50 行 | 计数行、今日完成、headline；替代逐行 journal 轮询 | `home-glance-d060`（hub 部分并进 `cb-digest`，或在其后另开） | **是**，D-060 `cb-digest` 的扩展。D-060 只规划了 `GET /v1/lineages/{id}/glance` 与 worker digest |
+| `GET /v1/owner/notices?unacked=1` | 还没确认的 `remuda owner notify` 列表（标题、正文、时间、去重键、来源章节） | 「告诉你」卡 | `home-to-you`（hub 部分并进 `cb-owner-notify`，或在其后另开） | **是**，D-060 `cb-owner-notify` 的读路由。D-060 只规划了写入、去重与卡片 |
+| `POST /v1/owner/notices/{id}/ack` | owner 范围的确认，所有设备一起生效；幂等 | 「知道了」 | 同上 | **是**，同上 |
+| `GET /v1/lineages/{id}/wakes` | wake 列表：`wakeId`、`name`、`trigger`、`nextFireAt`（可为 null，UI 显示「—」）、`notify`、`state`、`missed` | ⑩ 定时行与「今天」卡；rank 第 4 档 | `home-wakes`（hub 部分并进 `cb-wake-engine`，或在其后另开） | **是**，D-060 `cb-wake-engine`：`remuda wake list` 的 HTTP 形状。Agent 来源按该切片的规则访问自己血缘的 wake |
+| `DELETE /v1/lineages/{id}/wakes/{wakeId}` | 取消一个 wake；幂等 | ⑩ sheet 里逐条取消 | 同上 | **是**，`remuda wake rm` |
+| `GET /v1/interactions` 每项的 `routedTo` | `"owner"` 或 `"main"`。由 Hub 按 main-agent.md §8.1 的同一路由谓词给出；approval 永远是 `"owner"` | 转给 Main 的提问不进队列、不计入角标；`with_badge` 与 `deriveInboxQueue` 也按它过滤 | `routed-to` | **否**：依赖 D-051 委托与 D-057 §8.1，不属于 D-060 |
+
+现有路由上的行为变化（不是新路由）：
+- `crates/remuda-hub/src/alerts.rs` 里交互推送的 URL 改为 `/sessions?focus=`（`home-queue`）；
+- `with_badge` 计数加上 B（`home-queue`），并收窄到 `routedTo=owner`（`routed-to`）。
+
+### 保证与不保证
+
+**保证：**
+- 首页上只有一个「需要你」。
+- 角标与「需要你」在页面打开和 PWA 关闭两条路径上用同一个口径；这在 `home-queue` 与 `home-polish` 落地后成立。
+- 首页永远不提供 allow-session、计划批准或批量批准；approval 只由人回答。
+- 没有真实来源的数字不显示，也不显示成 0。
+- seen 按 owner 记，只增不减，手机和桌面结果一致。
+- 回到前台、首次 refresh 结束之前，按钮不会因为「可能过期」被禁用。
+
+**不保证：**
+- **`routed-to` 落地之前，** 转给 Main 的 worker 提问仍然进入「需要你」，存在重复计数（home.md §10）。
+- **`seen-hub` 落地之前，** 失败卡的「知道了」只在本设备生效。
+- **前台宽限期里的点击**可能撞上并发冲突，由 409/410 显示「已在其他设备处理」。
+- **不支持 Badging API 的平台**上什么也不做，不用通知条数冒充角标。
+- **home.md §12.1 的授权动作**能否在某个 Claude Code 版本的 `auto` 模式下稳定地弹出授权，以 RC 的首次探测为准；探测失败时按 home.md §12.1 的回退执行，并写明原因。
+
+### 否决方案
+
+- **单独的 Main tab，PhoneNav 改成 5 槽，台账挪到 `/m/sessions`。** 这会把前门和分诊拆成两个页面，所以选了主轴 A。
+- **视角切换加三栏顶带。** 信息重复，并且手机上放不下。
+- **seen 按设备记，再加一个「跨设备取最新值」的视图。** 两台设备会对同一件事给出不同的 ◉，结果不一致；R3 已改为按 owner 记。
+- **Hub 内置早报模板，错过 30 分钟就跳过。** 违背「Hub 不选节奏」（main-agent.md §11、D-060 决策 7）；由 Main 用 `remuda wake add` 自己设。
+- **Hub 用小模型生成一句话摘要。** Hub 没有模型客户端；D-060 worker digest 的确定性字段已经够用。
+- **把外部邮件和 IM 合进收件箱。** R11；外部事实只能以 Main 结论的形式变成「告诉你」卡。
+- **手机上单独的「工作中」段。** 和 rank 后的台账、收件箱的「进行中 · 最近」重复；只在桌面右栏保留。
+- **下拉刷新。** iOS 独立 PWA 没有原生下拉刷新；2 s 轮询加回前台 refresh 已经够用，异常时横幅给「重试」。
+- **反复推送同一个 tag 来模拟常驻状态。** iOS Web Push 的每一条都必须可见；计数行和角标承担这个职责。
+- **首页上的 allow-session、内联批准计划、批量批准。** R7。
+- **只有通知条数时用它冒充角标数。** ui-spec §4.5「降级必须诚实」。
+
+### 实施切片
+
+顺序与范围以 [home.md §13](./home.md) 为准。这里只列依赖：
+- **只用现有路由：** `home-rank-fold` → `home-freshness` → `home-glance-strip` → `home-queue` → `home-evidence`。`home-polish` 与它们并行，不碰 `HomeList.tsx`。
+- **完成未看：** `seen-hub` → `seen-web`；`seen-web` 也在 `home-queue` 之后。
+- **Main 前门：** `ma-main-ui`（R2）→ `home-main-card` → `home-main-extras`；`home-main-card` 之后，并且 D-051 委托上线后，是 `routed-to`。
+- **D-060 伙伴层：**
+  - `cb-digest` → `home-glance-d060`；
+  - `cb-owner-notify` → `home-to-you`；
+  - `cb-wake-engine` 与 `cb-owner-notify` → `home-wakes`。
+- **每个面向用户的切片都做真实条件检查**（home.md §12）：
+  - 复用现有的 WebKit iPhone 配置；
+  - 视口 390、1280、1440，浅色与深色两态；
+  - 后端是 worker 自己的 Hub 与 Node，至少一个 `auto` 模式下的真实 claude-sdk worker；
+  - 截图不进 git。
+
+### 依据（origin/main `c27e0eac`）
+
+- **Web：**
+  - `web/src/features/mobile/HomeList.tsx`（任务层、2.5 s 逐行 journal 轮询、空态）、`homeRows.ts`（比较函数、`homeRowsSignature`、`buildHomeTaskLayer`）；
+  - `web/src/features/tasks/taskRows.ts`（`blockedReason` 与「需要你」组）；
+  - `web/src/features/approvals/ApprovalCard.tsx`（`DecisionCard`、`InboxMode`、`ApprovalCard`）、`InboxShell.tsx`；`web/src/pages/SessionPage.tsx`（会话页的 `ApprovalCard`）；`web/src/features/tasks/taskRows.ts`（任务注意力组的口径）；
+  - `web/src/components/PtyQuestionAnswers.tsx`（只检查 `fields.length`）；
+  - `web/src/types/interaction.ts`（`QuestionField.input`、`sensitive`，`DecisionOption.effect`）；
+  - `web/src/lib/store.ts`（`startPoll` 2 s）、`push.ts`（`syncAppBadge`、`startAppBadgeSync`）、`mobileRoute.ts`；
+  - `web/src/app/Root.tsx`、`PhoneShell.tsx`（回前台 refresh）；
+  - `web/sw.src.js`（`push` 处理）；
+  - `web/src/styles/ui.module.css`（`.btn`）；
+  - `web/src/lib/api.generated.ts`（实例的 `lastTurnError`、`parentInstanceId`）。
+- **Hub：**
+  - `crates/remuda-hub/src/alerts.rs`（交互推送 URL、`with_badge(pending)`）；
+  - `crates/remuda-hub/src/instances.rs`（`/v1/instances`、`/v1/instances/{id}/commands/{commandId}`）；
+  - `crates/remuda-hub/src/agent_scope.rs`（`restrict_agent_routes`）。
+- **文档：**
+  - ui-spec §2.1、§2.5、§3.1、§4.5、§4.7；
+  - main-agent.md §8.1、§9、§11、§15；
+  - D-060 决策 7、9；
+  - [permission-modes-1](./evidence/permission-modes-1.md)、[askq-pretooluse-1](./evidence/askq-pretooluse-1.md)。

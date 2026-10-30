@@ -22,7 +22,7 @@ export type MainPhase =
   | "starting"
   | "restarting"
   | "paused"
-  | "stopped"
+  | "ended"
   | "host-offline"
   | "unknown";
 
@@ -31,7 +31,7 @@ export type MainStatus = {
   dot: UiStatus;
   /** Line-1 phrase after 「Main · 」. */
   phrase: string;
-  /** amber = needs you / host away; muted = paused or stopped. */
+  /** amber = needs you / host away; muted = paused or ended. */
   tone: "normal" | "attention" | "muted";
   /** True when the only way forward is Resume: the send button becomes 恢复. */
   resumable: boolean;
@@ -161,17 +161,18 @@ export function mainStatus(input: MainStatusInput): MainStatus {
   if (!entry.live && lineage && lineage.generation > entry.generation) {
     // The lineage already holds a successor the instance list has not shown
     // yet (a resume from another device, a restart): it is starting, not
-    // stopped, and resuming again would open yet another chapter.
+    // ended, and resuming again would open yet another chapter.
     return { ...base, phase: "starting", dot: "starting", phrase: "正在启动下一章", tone: "normal" };
   }
   if (!entry.live) {
-    // No live chapter and no paused-by record: the chapter ended (a Pause
-    // before ma-fence records it, or a process end with no supervisor yet).
-    // Only Resume continues the lineage; the label names no actor.
+    // The current chapter ended (a Pause, or a process end with no supervisor
+    // yet) and no successor exists. Until the Hub records who paused it
+    // (ma-fence), the label stays neutral: 已结束, never 已停止 — Stop cancels a
+    // turn and never ends a chapter. Only Resume continues the lineage.
     const chapter = lineage?.chapters.find((row) => row.instanceId === instance.id);
     const at = chapter?.endedAt ?? instance.updatedAt;
     const when = at ? ` · ${formatListTime(at, nowMs)}` : "";
-    return { ...base, phase: "stopped", dot: "exited", phrase: `已停止${when}`, tone: "muted", resumable: true };
+    return { ...base, phase: "ended", dot: "exited", phrase: `已结束${when}`, tone: "muted", resumable: true };
   }
   const offline =
     hostIsOffline(host) || lineage?.state === "host-offline" || instance.connectivity === "disconnected";
@@ -243,7 +244,7 @@ export function lineageStateLabel(
   lineage: LineageRecord | null | undefined,
   status: MainStatus,
 ): string | null {
-  if (status.phase === "paused" || status.phase === "stopped") return status.phrase;
+  if (status.phase === "paused" || status.phase === "ended") return status.phrase;
   if (status.phase === "host-offline") {
     const since = status.phrase.includes("·") ? status.phrase.split(" · ").at(-1) : null;
     return since ? `主机离线，已 ${since}` : "主机离线";

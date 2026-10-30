@@ -542,6 +542,8 @@ function SessionPageBody({
   const endedBar = ended ? (
     <WorkbenchEndedBar
       currentMainHref={currentMainHref}
+      // The current Main chapter: the Main bar's 恢复 is the one resume.
+      resumeInMainBar={mainLineage && !currentMainHref}
       reason={ended}
       nodeRestarted={nodeRestarted}
       heldCount={heldBubbles.length}

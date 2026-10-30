@@ -78,10 +78,11 @@ describe("mainStatus line-1 phrase", () => {
     expect(s.resumable).toBe(false);
   });
 
-  it("an ended chapter with no paused-by record reads 已停止, names no actor, and offers 恢复", () => {
-    const s = status(entry({ lifecycle: "exited" }, false), { lineage: lineage({ state: "starting" }) });
-    expect(s.phase).toBe("stopped");
-    expect(s.phrase.startsWith("已停止")).toBe(true);
+  it("an ended current chapter with no paused-by record reads 已结束 · T, names no actor, and offers 恢复 (r3 item 1)", () => {
+    const s = status(entry({ lifecycle: "exited", updatedAt: "2026-10-30T11:59:40Z" }, false), { lineage: lineage({ state: "starting" }) });
+    expect(s.phase).toBe("ended");
+    expect(s.phrase).toBe("已结束 · 刚刚");
+    expect(s.phrase).not.toContain("停止");
     expect(s.phrase).not.toContain("你");
     expect(s.resumable).toBe(true);
   });

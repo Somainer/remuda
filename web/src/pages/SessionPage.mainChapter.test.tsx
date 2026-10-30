@@ -89,3 +89,22 @@ it("a plain ended session keeps its resume", () => {
   expect(screen.getByTestId("resume-control")).toBeInTheDocument();
   expect(screen.queryByTestId("ended-open-current-main")).toBeNull();
 });
+
+it("the current Main chapter after Pause has exactly one resume control and reads 已结束 (r3 item 1)", () => {
+  // Pause closed the only chapter: it ended and no successor exists. The Hub
+  // records no paused-by yet (ma-fence), so the label stays neutral.
+  const paused = { ...chapter1, fencedAt: null, updatedAt: "2026-10-30T09:00:00Z" } as Instance;
+  vi.mocked(store.hubStore.getSnapshot).mockReturnValue({
+    ...store.hubStore.getSnapshot(),
+    instances: [paused],
+    events: { [paused.id]: [] },
+  });
+  renderPage(paused.id);
+  expect(screen.getByTestId("ended-bar")).toBeInTheDocument();
+  expect(screen.getAllByTestId("main-resume")).toHaveLength(1);
+  expect(screen.queryByTestId("resume-control")).toBeNull();
+  expect(screen.queryByText("继续（结构化）")).toBeNull();
+  expect(screen.queryByTestId("resume-terminal")).toBeNull();
+  expect(screen.getByTestId("main-status-lineage").textContent).toMatch(/^已结束/);
+  expect(screen.getByTestId("main-session-bar").textContent).not.toContain("已停止");
+});

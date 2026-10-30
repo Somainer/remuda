@@ -168,7 +168,8 @@ describe("MainCard", () => {
     const user = userEvent.setup();
     main = { ...main!, instance: chapter({ lifecycle: "exited" }), live: false };
     renderCard();
-    expect(screen.getByTestId("main-card-status").textContent).toMatch(/^已停止/);
+    expect(screen.getByTestId("main-card-status").textContent).toMatch(/^已结束/);
+    expect(screen.getByTestId("composer-input").getAttribute("placeholder")).toBe("Main 已结束 · 点 恢复 继续");
     expect(screen.queryByTestId("composer-send")).toBeNull();
     await user.type(screen.getByTestId("composer-input"), "draft stays");
     await user.click(screen.getByTestId("main-ask-resume"));

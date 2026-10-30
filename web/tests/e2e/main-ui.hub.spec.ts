@@ -128,7 +128,7 @@ test.describe("desktop Main entry", () => {
     await shot(page, "main-ui-1440.png");
   });
 
-  test("an ended Main reads 已停止, 恢复 continues the lineage in chapter 2 with a divider", async ({ page }) => {
+  test("an ended Main reads 已结束 with one 恢复, which continues the lineage in chapter 2 with a divider", async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 800 });
     await login(page);
     const firstId = await seatMain(page, "main-ui mhome-exit chapter one");
@@ -138,10 +138,15 @@ test.describe("desktop Main entry", () => {
     await expect(bar.getByTestId("main-status-chapter")).toHaveText("第 1 章");
     await expect(bar.getByTestId("main-resume")).toBeVisible({ timeout: 20_000 });
     await expect(bar.getByTestId("main-pause")).toHaveCount(0);
+    // The Main bar's 恢复 is the only resume on the current chapter (r3 item 1).
+    await expect(page.getByTestId("ended-bar")).toBeVisible();
+    await expect(page.getByTestId("resume-control")).toHaveCount(0);
+    await expect(page.getByTestId("main-resume")).toHaveCount(1);
+    await expect(bar.getByTestId("main-status-lineage")).toHaveText(/^已结束/);
 
     await page.goto("/sessions");
     const card = page.getByTestId("main-card");
-    await expect(card.getByTestId("main-card-status")).toHaveText(/^已停止/, { timeout: 20_000 });
+    await expect(card.getByTestId("main-card-status")).toHaveText(/^已结束/, { timeout: 20_000 });
     await expect(card.getByTestId("composer-send")).toHaveCount(0);
     await card.getByTestId("main-ask-resume").click();
     // The resolution moves to the successor chapter; the input is 发送 again.

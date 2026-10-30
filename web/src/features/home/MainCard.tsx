@@ -150,7 +150,7 @@ export function MainAskDock() {
 
 /**
  * The 问 Main input: the compact Composer as one 56px row. Sends go to the
- * resolved chapter through the D-055 outbox; while Main is paused or stopped
+ * resolved chapter through the D-055 outbox; while Main is paused or ended
  * the send button is 恢复; a host-offline / Hub-offline placeholder says the
  * message will queue.
  */
@@ -173,7 +173,9 @@ function AskMain({ entry }: { entry: MainEntry }) {
     }
   };
   const placeholder = status.resumable
-    ? "Main 已暂停 · 点 恢复 继续"
+    ? status.phase === "paused"
+      ? "Main 已暂停 · 点 恢复 继续"
+      : "Main 已结束 · 点 恢复 继续"
     : status.hostOffline
       ? "主机离线 · 消息会排队，上线后送达"
       : !online

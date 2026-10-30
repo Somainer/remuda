@@ -49,6 +49,7 @@ fn native_config(root: &Path, binary: &Path, scenario: &Path) -> ServeConfig {
 
 fn create_req(binary: &Path, home: &Path) -> CreateInstanceRequest {
     CreateInstanceRequest {
+        initiator: None,
         origin: remuda_protocol::InputOrigin::Human,
         agent_credential: None,
         command_id: None,

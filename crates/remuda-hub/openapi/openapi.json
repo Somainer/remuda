@@ -297,6 +297,16 @@
               "null"
             ]
           },
+          "initiator": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Initiator"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "instanceId": {
             "type": [
               "string",
@@ -1054,6 +1064,28 @@
         },
         "required": [
           "path"
+        ],
+        "type": "object"
+      },
+      "Initiator": {
+        "description": "D-057 §7.1: the Hub-stamped initiator of an Agent-initiated mutation, derived from the authenticating device's bound instance and forwarded to Nodes. The authenticating device id stays Hub-only and is not part of this shape. Absent for Human/Bot callers.",
+        "properties": {
+          "generation": {
+            "description": "Chapter generation at authentication time; a fence bumps the lineage's live generation.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "instanceId": {
+            "type": "string"
+          },
+          "lineageId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "generation",
+          "instanceId",
+          "lineageId"
         ],
         "type": "object"
       },
@@ -9973,6 +10005,7 @@
                             "enum": [
                               "queued",
                               "running",
+                              "landing",
                               "passed",
                               "failed",
                               "landed",
@@ -10013,6 +10046,15 @@
                               "string",
                               "null"
                             ]
+                          },
+                          "landingSessionEpoch": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "landingOutcomeUnknown": {
+                            "type": "boolean"
                           },
                           "error": {
                             "type": [
@@ -10265,6 +10307,7 @@
                             "enum": [
                               "queued",
                               "running",
+                              "landing",
                               "passed",
                               "failed",
                               "landed",
@@ -10305,6 +10348,15 @@
                               "string",
                               "null"
                             ]
+                          },
+                          "landingSessionEpoch": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "landingOutcomeUnknown": {
+                            "type": "boolean"
                           },
                           "error": {
                             "type": [
@@ -10456,6 +10508,7 @@
                       "enum": [
                         "queued",
                         "running",
+                        "landing",
                         "passed",
                         "failed",
                         "landed",
@@ -10496,6 +10549,15 @@
                         "string",
                         "null"
                       ]
+                    },
+                    "landingSessionEpoch": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "landingOutcomeUnknown": {
+                      "type": "boolean"
                     },
                     "error": {
                       "type": [
@@ -10621,6 +10683,7 @@
                       "enum": [
                         "queued",
                         "running",
+                        "landing",
                         "passed",
                         "failed",
                         "landed",
@@ -10661,6 +10724,15 @@
                         "string",
                         "null"
                       ]
+                    },
+                    "landingSessionEpoch": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "landingOutcomeUnknown": {
+                      "type": "boolean"
                     },
                     "error": {
                       "type": [
@@ -10794,6 +10866,7 @@
                       "enum": [
                         "queued",
                         "running",
+                        "landing",
                         "passed",
                         "failed",
                         "landed",
@@ -10835,6 +10908,15 @@
                         "null"
                       ]
                     },
+                    "landingSessionEpoch": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "landingOutcomeUnknown": {
+                      "type": "boolean"
+                    },
                     "error": {
                       "type": [
                         "string",
@@ -10869,6 +10951,191 @@
           },
           "400": {
             "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/projects/{id}/gate/jobs/{jobId}/resolve-evidence": {
+      "parameters": [
+        {
+          "description": "prj_… id",
+          "in": "path",
+          "name": "id",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "description": "gjb_… id",
+          "in": "path",
+          "name": "jobId",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "projectGateJobResolveEvidence",
+        "tags": [
+          "gate"
+        ],
+        "summary": "Operator-resolve a definitive verdict whose evidence could not be persisted",
+        "description": "Only a job in a pre-settlement state (queued/running/canceling/landing) carrying evidenceUncertain accepts a resolution: both the finished notification and the gate.run reply failed to persist the supplied run log, the Node retains no copy and redelivers nothing, and the Hub runs no retry scheduler. `failed` settles it Failed; `requeue` releases the lane/land occupancy and re-enters the queue. The request must pin the exact parked (attempt, grant epoch, merge) tuple the live row carries; a delayed resolution aimed at an attempt the row has since left is refused with 409 (epoch/merge are required and non-empty for a Landing, omitted for a pre-grant verify). Before failing or requeuing a Landing the Hub runs its read-only remote-main probe, and an established landed fact settles Landed instead. The job keeps its occupancy until this resolution or an idempotent later redelivery settles it. Agent callers are refused.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true,
+                "required": [
+                  "resolution",
+                  "expectedAttempts",
+                  "rationale"
+                ],
+                "properties": {
+                  "resolution": {
+                    "type": "string",
+                    "enum": [
+                      "failed",
+                      "requeue"
+                    ]
+                  },
+                  "expectedAttempts": {
+                    "type": "integer",
+                    "format": "uint32",
+                    "minimum": 0,
+                    "description": "The attempt ordinal (the live row's attempts) the operator saw parked as evidence-uncertain."
+                  },
+                  "expectedSessionEpoch": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "description": "The Running-to-Landing grant epoch of the parked tuple; required and non-empty for a Landing resolution, omitted/null for a pre-grant verify."
+                  },
+                  "expectedMergeSha": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "description": "The exact merge sha of the parked tuple; required and non-empty for a Landing resolution, omitted/null for a pre-grant verify."
+                  },
+                  "rationale": {
+                    "type": "string",
+                    "description": "Mandatory non-empty human rationale, persisted on the row."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Settled job",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/projects/{id}/gate/jobs/{jobId}/resolve": {
+      "parameters": [
+        {
+          "description": "prj_… id",
+          "in": "path",
+          "name": "id",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "description": "gjb_… id",
+          "in": "path",
+          "name": "jobId",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "projectGateJobResolve",
+        "tags": [
+          "gate"
+        ],
+        "summary": "Operator-resolve a Landing whose outcome cannot be established",
+        "description": "Only a job still `landing` with landingOutcomeUnknown=true accepts a resolution: `failed` settles it Failed; `requeue` re-enters the queue. The Hub also tells the lane to terminate the granted land process group (r14 R1).",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true,
+                "required": [
+                  "resolution"
+                ],
+                "properties": {
+                  "resolution": {
+                    "type": "string",
+                    "enum": [
+                      "failed",
+                      "requeue"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Settled job",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
           },
           "401": {
             "$ref": "#/components/responses/Error"

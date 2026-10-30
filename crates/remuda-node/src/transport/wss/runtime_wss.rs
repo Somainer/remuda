@@ -27,6 +27,11 @@ pub(crate) struct RuntimeLink {
     /// tail instead of re-parsing confirmed bytes. Optimisation only — an
     /// absent cursor replays from the floor (see [`crate::journal_flush`]).
     pub cursors: Arc<Mutex<crate::journal_flush::FlushCursor>>,
+    /// r12 item 2: gate-authority request channel and the live carrier-session
+    /// epoch, kept here so a reconnect can revoke the old run authority and
+    /// rebind a fresh authorizer to the replacement session.
+    pub gate_auth_tx: mpsc::Sender<super::GateAuthJob>,
+    pub gate_epoch: super::SessionEpoch,
 }
 
 impl RuntimeLink {
@@ -39,6 +44,8 @@ impl RuntimeLink {
             watermarks: self.watermarks.clone(),
             pumps: self.pumps.clone(),
             cursors: self.cursors.clone(),
+            gate_auth_tx: self.gate_auth_tx.clone(),
+            gate_epoch: self.gate_epoch.clone(),
         }
     }
 }
@@ -398,6 +405,7 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
     };
     let mut request = CreateInstanceRequest {
         origin: crate::origin::wire_origin(params),
+        initiator: crate::origin::wire_initiator(params),
         agent_credential: params
             .get("agentCredential")
             .cloned()
@@ -496,6 +504,7 @@ async fn send_from_params(node: &DevNode, params: Value) -> Result<(InstanceId, 
             &instance_id,
             InstanceCommandRequest {
                 origin: crate::origin::wire_origin(&params),
+                initiator: crate::origin::wire_initiator(&params),
                 command_id,
                 operation: CommandAction::Send,
                 prompt: Some(prompt),
@@ -543,6 +552,7 @@ async fn cancel_from_params(
             &instance_id,
             InstanceCommandRequest {
                 origin: crate::origin::wire_origin(&params),
+                initiator: crate::origin::wire_initiator(&params),
                 command_id,
                 operation: CommandAction::Cancel,
                 prompt: None,
@@ -586,6 +596,7 @@ async fn close_from_params(
             &instance_id,
             InstanceCommandRequest {
                 origin: crate::origin::wire_origin(&params),
+                initiator: crate::origin::wire_initiator(&params),
                 command_id,
                 operation: CommandAction::Close,
                 prompt: None,
@@ -654,6 +665,7 @@ async fn keys_from_params(node: &DevNode, params: Value) -> Result<(InstanceId, 
             &instance_id,
             InstanceCommandRequest {
                 origin: crate::origin::wire_origin(&params),
+                initiator: crate::origin::wire_initiator(&params),
                 command_id,
                 operation: CommandAction::WriteTty,
                 prompt: None,
@@ -709,6 +721,7 @@ async fn respond_from_params(
             &instance_id,
             InstanceCommandRequest {
                 origin: crate::origin::wire_origin(&params),
+                initiator: crate::origin::wire_initiator(&params),
                 command_id,
                 operation: CommandAction::RespondInteraction,
                 prompt: None,
@@ -1153,6 +1166,7 @@ mod tests {
         let watermarks = Arc::new(Mutex::new(HashMap::new()));
         record_watermark(&watermarks, &key, None, seq - 1);
         let (journal, mut jobs, _) = super::super::journal_channel(4);
+        let (gate_auth_tx, _gate_auth_rx) = mpsc::channel::<super::super::GateAuthJob>(8);
         let runtime = RuntimeLink {
             controller: None,
             hub_url: "http://127.0.0.1:1".into(),
@@ -1161,6 +1175,8 @@ mod tests {
             watermarks: watermarks.clone(),
             pumps: Arc::new(Mutex::new(HashSet::new())),
             cursors: Arc::new(Mutex::new(crate::journal_flush::FlushCursor::new())),
+            gate_auth_tx,
+            gate_epoch: Arc::new(Mutex::new(None)),
         };
         let (live, receiver) = broadcast::channel(2);
         let instance_id = created.instance.meta.id;
@@ -1339,6 +1355,8 @@ mod tests {
         let (journal, jobs, _) = super::super::journal_channel(4);
         // Keep the receiver alive for the link's lifetime.
         std::mem::forget(jobs);
+        let (gate_auth_tx, gate_auth_rx) = mpsc::channel::<super::super::GateAuthJob>(8);
+        std::mem::forget(gate_auth_rx);
         RuntimeLink {
             controller: None,
             hub_url: "http://127.0.0.1:1".into(),
@@ -1347,6 +1365,8 @@ mod tests {
             watermarks: Arc::new(Mutex::new(HashMap::new())),
             pumps: Arc::new(Mutex::new(HashSet::new())),
             cursors: Arc::new(Mutex::new(crate::journal_flush::FlushCursor::new())),
+            gate_auth_tx,
+            gate_epoch: Arc::new(Mutex::new(None)),
         }
     }
 

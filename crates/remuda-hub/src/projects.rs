@@ -250,13 +250,21 @@ async fn create_project(
     project.policy.enforced = Default::default();
     let created = state
         .store
-        .insert_project(project, device.id.clone())
+        .insert_project(
+            project,
+            device.id.clone(),
+            crate::agent_scope::CallerAuthority::for_device(&state, &device).await?,
+        )
         .await
         .map_err(map_store)?;
     let route_doc = route_override_doc(body.api_via.as_deref(), body.api_route.as_deref())?;
     state
         .store
-        .set_project_route_override(created.meta.id.as_id().to_string(), route_doc)
+        .set_project_route_override(
+            created.meta.id.as_id().to_string(),
+            route_doc,
+            crate::agent_scope::CallerAuthority::internal(),
+        )
         .await
         .map_err(map_store)?;
     state
@@ -314,8 +322,12 @@ async fn set_project(
         None
     };
     // D-047 project-layer override. `apiVia: null` clears; a bare `apiRoute`
-    // without a stored or supplied `apiVia` is a 400.
-    if body.api_via.is_some() || body.api_route.is_some() {
+    // without a stored or supplied `apiVia` is a 400. The override write is
+    // folded INTO the patch writer job below (one authority check, one
+    // commit): a fenced PATCH must never commit one half and refuse the
+    // other.
+    let route_touched = body.api_via.is_some() || body.api_route.is_some();
+    let route_next = if route_touched {
         let existing = state
             .store
             .get_project_route_override(id.clone())
@@ -341,70 +353,72 @@ async fn set_project(
                 Some(doc)
             }
             Some(None) => None,
-            None if body.api_route.is_some() => {
+            None => {
                 return Err(HubError::BadRequest(
                     "apiRoute requires apiVia on the same or a previous update".into(),
                 ));
             }
-            None => existing,
         };
-        state
-            .store
-            .set_project_route_override(id.clone(), next)
-            .await
-            .map_err(map_store)?;
-    }
+        Some(next)
+    } else {
+        None
+    };
     let updated = state
         .store
-        .patch_project(id.clone(), move |project| {
-            if let Some(name) = body.name {
-                if name.trim().is_empty() {
-                    return Err(StoreError::Id("project name required".into()));
+        .patch_project_with_route(
+            id.clone(),
+            route_next,
+            move |project| {
+                if let Some(name) = body.name {
+                    if name.trim().is_empty() {
+                        return Err(StoreError::Id("project name required".into()));
+                    }
+                    project.name = name.trim().to_string();
                 }
-                project.name = name.trim().to_string();
-            }
-            if let Some(home) = body.home_host {
-                project.home_host = home
-                    .map(|raw| {
-                        remuda_protocol::HostId::try_from(raw)
-                            .map_err(|err| StoreError::Id(format!("homeHost: {err}")))
-                    })
-                    .transpose()?;
-            }
-            if let Some(remote) = body.repo_remote {
-                project.repo_remote = remote;
-            }
-            if let Some(branch) = body.default_base_branch {
-                project.default_base_branch = branch;
-            }
-            if let Some(pattern) = body.branch_pattern {
-                project.branch_pattern = pattern;
-            }
-            if let Some(provider) = body.provider {
-                project.provider = provider;
-            }
-            if let Some(effort) = body.default_effort {
-                project.default_effort = effort;
-            }
-            if let Some(posture) = body.permission_posture {
-                project.permission_posture = posture;
-            }
-            if let Some(policy) = body.policy {
-                // D-031: keep the stored enforced switches; only configurable
-                // policy is mutable after creation.
-                project.policy.configurable = policy.configurable;
-            }
-            if let Some(placement) = body.placement {
-                project.placement = placement;
-            }
-            if let Some(gate) = body.gate {
-                project.gate = gate;
-            }
-            if let Some(hosts) = hosts {
-                project.hosts = hosts;
-            }
-            Ok(())
-        })
+                if let Some(home) = body.home_host {
+                    project.home_host = home
+                        .map(|raw| {
+                            remuda_protocol::HostId::try_from(raw)
+                                .map_err(|err| StoreError::Id(format!("homeHost: {err}")))
+                        })
+                        .transpose()?;
+                }
+                if let Some(remote) = body.repo_remote {
+                    project.repo_remote = remote;
+                }
+                if let Some(branch) = body.default_base_branch {
+                    project.default_base_branch = branch;
+                }
+                if let Some(pattern) = body.branch_pattern {
+                    project.branch_pattern = pattern;
+                }
+                if let Some(provider) = body.provider {
+                    project.provider = provider;
+                }
+                if let Some(effort) = body.default_effort {
+                    project.default_effort = effort;
+                }
+                if let Some(posture) = body.permission_posture {
+                    project.permission_posture = posture;
+                }
+                if let Some(policy) = body.policy {
+                    // D-031: keep the stored enforced switches; only configurable
+                    // policy is mutable after creation.
+                    project.policy.configurable = policy.configurable;
+                }
+                if let Some(placement) = body.placement {
+                    project.placement = placement;
+                }
+                if let Some(gate) = body.gate {
+                    project.gate = gate;
+                }
+                if let Some(hosts) = hosts {
+                    project.hosts = hosts;
+                }
+                Ok(())
+            },
+            crate::agent_scope::CallerAuthority::for_device(&state, &device).await?,
+        )
         .await
         .map_err(map_store)?
         .ok_or(HubError::NotFound)?;
@@ -464,15 +478,20 @@ async fn add_member(
     .expect("one resolved member");
     let updated = state
         .store
-        .patch_project(id.clone(), move |project| {
-            if project.members.iter().any(|existing| {
-                existing.host_id == member.host_id && existing.workspace_id == member.workspace_id
-            }) {
-                return Err(StoreError::Id("member already exists".into()));
-            }
-            project.members.push(member);
-            Ok(())
-        })
+        .patch_project(
+            id.clone(),
+            move |project| {
+                if project.members.iter().any(|existing| {
+                    existing.host_id == member.host_id
+                        && existing.workspace_id == member.workspace_id
+                }) {
+                    return Err(StoreError::Id("member already exists".into()));
+                }
+                project.members.push(member);
+                Ok(())
+            },
+            crate::agent_scope::CallerAuthority::for_device(&state, &device).await?,
+        )
         .await
         .map_err(map_store)?
         .ok_or(HubError::NotFound)?;
@@ -503,16 +522,20 @@ async fn remove_member(
         .map_err(|err| HubError::BadRequest(format!("workspaceId: {err}")))?;
     let updated = state
         .store
-        .patch_project(id.clone(), move |project| {
-            let before = project.members.len();
-            project
-                .members
-                .retain(|member| !(member.host_id == host && member.workspace_id == workspace));
-            if project.members.len() == before {
-                return Err(StoreError::Id("member not found".into()));
-            }
-            Ok(())
-        })
+        .patch_project(
+            id.clone(),
+            move |project| {
+                let before = project.members.len();
+                project
+                    .members
+                    .retain(|member| !(member.host_id == host && member.workspace_id == workspace));
+                if project.members.len() == before {
+                    return Err(StoreError::Id("member not found".into()));
+                }
+                Ok(())
+            },
+            crate::agent_scope::CallerAuthority::for_device(&state, &device).await?,
+        )
         .await
         .map_err(map_store)?
         .ok_or(HubError::NotFound)?;
@@ -628,8 +651,11 @@ impl Store {
         &self,
         project: Project,
         created_by: String,
+        authority: crate::agent_scope::CallerAuthority,
     ) -> Result<Project, StoreError> {
         self.run_named("insert_project", move |conn| {
+            let (initiator, device_id) = authority.as_check();
+            crate::store::check_initiator(conn, initiator, device_id)?;
             let id = project.meta.id.as_id().to_string();
             let now = crate::config::now_rfc3339();
             let doc = serde_json::to_string(&project)?;
@@ -672,12 +698,47 @@ impl Store {
         &self,
         project_id: String,
         mutate: F,
+        authority: crate::agent_scope::CallerAuthority,
     ) -> Result<Option<Project>, StoreError>
     where
         F: FnOnce(&mut Project) -> Result<(), StoreError> + Send + 'static,
     {
-        self.run_named("patch_project", move |conn| {
-            let Some(mut project) = load_project(conn, &project_id)? else {
+        self.patch_project_with_route(project_id, None, mutate, authority)
+            .await
+    }
+
+    /// D-057 §7.3: patch the project doc AND its route override in ONE writer
+    /// job behind one authority check. A PATCH that carries both kinds of
+    /// fields must be atomic — with separate writer jobs a fence landing
+    /// between them committed one half and refused the other. `route`:
+    /// `None` leaves the side table untouched; `Some(None)` clears it;
+    /// `Some(Some(doc))` upserts it.
+    #[allow(clippy::option_option)]
+    pub async fn patch_project_with_route<F>(
+        &self,
+        project_id: String,
+        route: Option<Option<Value>>,
+        mutate: F,
+        authority: crate::agent_scope::CallerAuthority,
+    ) -> Result<Option<Project>, StoreError>
+    where
+        F: FnOnce(&mut Project) -> Result<(), StoreError> + Send + 'static,
+    {
+        #[cfg(any(test, feature = "test-faults"))]
+        let armed_fence = self.take_test_project_patch_fence();
+        self.run_named("patch_project_with_route", move |conn| {
+            // The doc UPDATE and the route-override upsert/delete are ONE
+            // IMMEDIATE transaction: an I/O error or crash between them must
+            // not leave a project doc without its override (or an override
+            // for a doc that never updated).
+            let tx = crate::store::immediate_tx(conn)?;
+            #[cfg(any(test, feature = "test-faults"))]
+            if let Some(fenced_instance) = armed_fence {
+                crate::store::test_apply_fence(&tx, &fenced_instance)?;
+            }
+            let (initiator, device_id) = authority.as_check();
+            crate::store::check_initiator(&tx, initiator, device_id)?;
+            let Some(mut project) = load_project(&tx, &project_id)? else {
                 return Ok(None);
             };
             mutate(&mut project)?;
@@ -687,12 +748,32 @@ impl Store {
                 remuda_protocol::Timestamp::try_from(now.clone())
                     .map_err(|err| StoreError::Id(format!("bad timestamp: {err}")))?;
             let doc = serde_json::to_string(&project)?;
-            conn.execute(
+            tx.execute(
                 "UPDATE projects SET doc_json = ?1, name = ?2, revision = revision + 1, updated_at = ?3
                  WHERE id = ?4",
                 params![doc, project.name, now, project_id],
             )?;
-            load_project(conn, &project_id)
+            if let Some(route) = route {
+                match route {
+                    Some(doc) => {
+                        tx.execute(
+                            "INSERT INTO project_route_overrides (project_id, doc_json)
+                             VALUES (?1, ?2)
+                             ON CONFLICT(project_id) DO UPDATE SET doc_json = excluded.doc_json",
+                            params![project_id, doc.to_string()],
+                        )?;
+                    }
+                    None => {
+                        tx.execute(
+                            "DELETE FROM project_route_overrides WHERE project_id = ?1",
+                            params![project_id],
+                        )?;
+                    }
+                }
+            }
+            let updated = load_project(&tx, &project_id)?;
+            tx.commit()?;
+            Ok(updated)
         })
         .await
     }
@@ -720,23 +801,28 @@ impl Store {
         &self,
         project_id: String,
         doc: Option<Value>,
+        authority: crate::agent_scope::CallerAuthority,
     ) -> Result<(), StoreError> {
-        self.run_named("set_project_route_override", move |conn| match doc {
-            Some(doc) => {
-                conn.execute(
-                    "INSERT INTO project_route_overrides (project_id, doc_json)
+        self.run_named("set_project_route_override", move |conn| {
+            let (initiator, device_id) = authority.as_check();
+            crate::store::check_initiator(conn, initiator, device_id)?;
+            match doc {
+                Some(doc) => {
+                    conn.execute(
+                        "INSERT INTO project_route_overrides (project_id, doc_json)
                      VALUES (?1, ?2)
                      ON CONFLICT(project_id) DO UPDATE SET doc_json = excluded.doc_json",
-                    params![project_id, doc.to_string()],
-                )?;
-                Ok(())
-            }
-            None => {
-                conn.execute(
-                    "DELETE FROM project_route_overrides WHERE project_id = ?1",
-                    params![project_id],
-                )?;
-                Ok(())
+                        params![project_id, doc.to_string()],
+                    )?;
+                    Ok(())
+                }
+                None => {
+                    conn.execute(
+                        "DELETE FROM project_route_overrides WHERE project_id = ?1",
+                        params![project_id],
+                    )?;
+                    Ok(())
+                }
             }
         })
         .await

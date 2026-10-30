@@ -1563,3 +1563,38 @@ async fn the_write_feed_includes_rows_without_a_turn() -> Result<()> {
     assert!(items.iter().all(|row| row["turnSeq"].is_null()), "{page}");
     Ok(())
 }
+
+#[tokio::test]
+async fn an_after_id_above_the_i64_range_is_saturated() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let lineage = ctx.seat().await?;
+    let seat = ctx.agent(&lineage).await?;
+    ctx.ok(
+        "POST",
+        &mem(&lineage, ""),
+        &seat,
+        Some(entry("cursor-row", "project", "x")),
+    )
+    .await?;
+    // A legal u64 "after everything" sentinel must not wrap to "no cursor"
+    // and replay the whole log.
+    let page = ctx
+        .ok(
+            "GET",
+            &format!("/v1/instances/{lineage}/memory-writes?afterId=18446744073709551615"),
+            &ctx.human,
+            None,
+        )
+        .await?;
+    assert_eq!(
+        page["items"],
+        json!([]),
+        "an above-everything cursor returns the empty tail, not the log"
+    );
+    assert_eq!(
+        page["nextAfterId"].as_u64(),
+        Some(i64::MAX as u64),
+        "the cursor saturates instead of being dropped"
+    );
+    Ok(())
+}

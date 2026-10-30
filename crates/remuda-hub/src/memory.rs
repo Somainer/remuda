@@ -1556,7 +1556,9 @@ impl Store {
         after_id: Option<u64>,
     ) -> Result<MemoryWritePage, StoreError> {
         self.read("memory_writes", move |conn| {
-            let cursor = after_id.and_then(|id| i64::try_from(id).ok());
+            // Saturate: a legal u64 "after everything" cursor must mean the
+            // empty tail, never fall back to "no cursor" and replay the log.
+            let cursor = after_id.map(|id| i64::try_from(id).unwrap_or(i64::MAX));
             let rows = match cursor {
                 Some(cursor) => conn
                     .prepare(

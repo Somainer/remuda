@@ -1501,6 +1501,31 @@ fn glance_working(worker: &WorkerRoster, now: i64) -> GlanceWorking {
     }
 }
 
+/// The wire kind and display title of a stored pending interaction.
+fn pending_label(kind: &str, payload: Option<&Value>) -> (String, Option<String>) {
+    let interaction = payload
+        .and_then(|payload| {
+            payload
+                .pointer("/payload/interaction")
+                .or_else(|| payload.get("interaction"))
+        })
+        .unwrap_or(&Value::Null);
+    let request = interaction.get("request").unwrap_or(&Value::Null);
+    let raw_kind = request
+        .get("kind")
+        .and_then(Value::as_str)
+        .or_else(|| interaction.get("kind").and_then(Value::as_str))
+        .unwrap_or(kind);
+    // The stored kind is a Node's untyped JSON: report the wire vocabulary
+    // only, exactly as the digest does.
+    let kind = clip_chars(pending_kind(raw_kind), PENDING_KIND_CHARS);
+    let title = request
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    (kind, title)
+}
+
 /// Why a waiting worker needs someone: its pending interaction first, then a
 /// blocked lifecycle, then the point-in-time watch classification.
 ///
@@ -1508,14 +1533,10 @@ fn glance_working(worker: &WorkerRoster, now: i64) -> GlanceWorking {
 /// predicate; this only names the reason for display.
 fn waiting_reason(
     worker: &WorkerRoster,
-    pending_by_instance: &HashMap<String, (String, Option<String>)>,
+    pending: Option<(String, Option<String>)>,
 ) -> (String, Option<String>) {
-    let pending = worker
-        .instance_id
-        .as_ref()
-        .and_then(|id| pending_by_instance.get(id.as_id().as_str()));
     if let Some((kind, question)) = pending {
-        return (kind.clone(), question.clone());
+        return (kind, question);
     }
     if let WorkerState::Blocked { reason } = &worker.state {
         return ("blocked".to_string(), Some(reason.clone()));
@@ -1528,9 +1549,10 @@ fn waiting_reason(
         Some(WorkerWatchStatus::Stalled) => ("stalled".to_string(), None),
         Some(WorkerWatchStatus::Gone { reason }) => ("gone".to_string(), Some(reason.clone())),
         Some(WorkerWatchStatus::Failed { reason }) => ("failed".to_string(), Some(reason.clone())),
-        // The SQL predicate put this row on the waiting page, so one of the
-        // three reasons holds; this arm is unreachable in practice.
-        _ => ("blocked".to_string(), None),
+        // The page predicate and the pending columns came from one statement,
+        // so a row here always has one of the three reasons. If it somehow does
+        // not, say nothing rather than claiming it is blocked.
+        _ => ("unknown".to_string(), None),
     }
 }
 
@@ -1561,13 +1583,23 @@ fn assemble_glance(
     }
 }
 
+/// One row of a glance page: the worker and its first pending interaction, as
+/// the same statement saw them.
+pub(crate) struct GlanceRow {
+    pub worker: WorkerRoster,
+    /// `interactions.kind` of that pending row.
+    pub pending_kind: Option<String>,
+    /// That row's stored payload (the display title lives here).
+    pub pending_payload: Option<Value>,
+}
+
 /// One lineage's glance rows: the two group totals plus one capped page of
 /// each, classified in SQL so a glance costs the page, not the roster.
 pub(crate) struct GlanceRows {
     pub waiting_total: u32,
     pub working_total: u32,
-    pub waiting: Vec<WorkerRoster>,
-    pub working: Vec<WorkerRoster>,
+    pub waiting: Vec<GlanceRow>,
+    pub working: Vec<GlanceRow>,
 }
 
 /// Active roster rows of a lineage that need someone.
@@ -1594,6 +1626,13 @@ const GLANCE_ACTIVE_SQL: &str = " FROM worker_roster w
 impl Store {
     /// The lineage's two group totals and one page of each.
     ///
+    /// The two COUNTs and both pages run inside one read transaction, and each
+    /// page row carries its own pending interaction from the same statement.
+    /// A poll that lands while an approval is being answered therefore reports
+    /// one consistent picture: a worker cannot be counted in one group and
+    /// listed in the other, and a waiting row always has the pending row its
+    /// classification saw, so the display kind never has to guess.
+    ///
     /// Deterministic order (`updated_at`, then id) so a page is stable across
     /// polls; `more` in the response is the total minus the page.
     pub(crate) async fn lineage_glance_rows(
@@ -1602,34 +1641,64 @@ impl Store {
         page: usize,
     ) -> Result<GlanceRows, crate::store::StoreError> {
         self.read("lineage_glance_rows", move |conn| {
+            // Deferred BEGIN over the &Connection, like `read_journal`: the tx
+            // rolls back on any error, so the pooled connection is never left
+            // inside a transaction.
+            let tx = conn.unchecked_transaction()?;
             let count = |filter: &str| -> Result<u32, crate::store::StoreError> {
                 let sql = format!("SELECT COUNT(*) {GLANCE_ACTIVE_SQL}{filter}");
-                let count: i64 = conn.query_row(&sql, params![&lineage_id], |row| row.get(0))?;
+                let count: i64 = tx.query_row(&sql, params![&lineage_id], |row| row.get(0))?;
                 Ok(u32::try_from(count).unwrap_or(u32::MAX))
             };
-            let rows = |filter: &str| -> Result<Vec<WorkerRoster>, crate::store::StoreError> {
+            let rows = |filter: &str| -> Result<Vec<GlanceRow>, crate::store::StoreError> {
+                // The pending label rides the page statement: a second read
+                // could see a different snapshot and mislabel the row.
                 let sql = format!(
-                    "SELECT w.doc_json {GLANCE_ACTIVE_SQL}{filter}
-                         ORDER BY w.updated_at DESC, w.id ASC LIMIT ?2"
+                    "SELECT w.doc_json,
+                            (SELECT i2.kind FROM interactions i2
+                              WHERE i2.state = 'pending'
+                                AND i2.instance_id = json_extract(w.doc_json, '$.instanceId')
+                              ORDER BY i2.created_at LIMIT 1),
+                            (SELECT i2.payload_json FROM interactions i2
+                              WHERE i2.state = 'pending'
+                                AND i2.instance_id = json_extract(w.doc_json, '$.instanceId')
+                              ORDER BY i2.created_at LIMIT 1)
+                     {GLANCE_ACTIVE_SQL}{filter}
+                     ORDER BY w.updated_at DESC, w.id ASC LIMIT ?2"
                 );
-                let mut stmt = conn.prepare(&sql)?;
-                let docs = stmt
+                let mut stmt = tx.prepare(&sql)?;
+                let found = stmt
                     .query_map(params![&lineage_id, page as i64], |row| {
-                        row.get::<_, String>(0)
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
                     })?
                     .collect::<Result<Vec<_>, _>>()?;
-                docs.iter()
-                    .map(|raw| serde_json::from_str(raw).map_err(crate::store::StoreError::from))
+                found
+                    .into_iter()
+                    .map(|(doc, kind, payload)| {
+                        Ok(GlanceRow {
+                            worker: serde_json::from_str(&doc)?,
+                            pending_kind: kind,
+                            pending_payload: payload
+                                .as_deref()
+                                .and_then(|raw| serde_json::from_str(raw).ok()),
+                        })
+                    })
                     .collect()
             };
             let waiting_filter = format!(" AND ({GLANCE_WAITING_PREDICATE})");
             let working_filter = format!(" AND NOT ({GLANCE_WAITING_PREDICATE})");
-            Ok(GlanceRows {
+            let out = GlanceRows {
                 waiting_total: count(&waiting_filter)?,
                 working_total: count(&working_filter)?,
                 waiting: rows(&waiting_filter)?,
                 working: rows(&working_filter)?,
-            })
+            };
+            tx.commit()?;
+            Ok(out)
         })
         .await
     }
@@ -1813,45 +1882,18 @@ async fn lineage_glance(
         .lineage_glance_rows(lineage_id.clone(), LINEAGE_GLANCE_ROW_CAP)
         .await
         .map_err(map_store)?;
-    // Only the page's pending rows, filtered in SQL.
-    let wanted: Vec<String> = rows
+    // Each waiting row already carries the pending interaction the page
+    // statement classified it by: no second read, no second snapshot.
+    let pending_labels: HashMap<usize, (String, Option<String>)> = rows
         .waiting
         .iter()
-        .chain(rows.working.iter())
-        .filter_map(|worker| worker.instance_id.as_ref())
-        .map(|id| id.as_id().to_string())
+        .enumerate()
+        .filter_map(|(index, row)| {
+            row.pending_kind
+                .as_deref()
+                .map(|kind| (index, pending_label(kind, row.pending_payload.as_ref())))
+        })
         .collect();
-    let pending = state
-        .store
-        .list_pending_interactions_for_instances(wanted)
-        .await
-        .map_err(map_store)?;
-    let mut pending_by_instance: HashMap<String, (String, Option<String>)> = HashMap::new();
-    for row in pending.iter() {
-        pending_by_instance
-            .entry(row.instance_id.clone())
-            .or_insert_with(|| {
-                let interaction = row
-                    .payload
-                    .pointer("/payload/interaction")
-                    .or_else(|| row.payload.get("interaction"))
-                    .unwrap_or(&row.payload);
-                let request = interaction.get("request").unwrap_or(&Value::Null);
-                let kind = request
-                    .get("kind")
-                    .and_then(Value::as_str)
-                    .or_else(|| interaction.get("kind").and_then(Value::as_str))
-                    .unwrap_or(&row.kind);
-                // The stored kind is a Node's untyped JSON: report the wire
-                // vocabulary only, exactly as the digest does.
-                let kind = clip_chars(pending_kind(kind), PENDING_KIND_CHARS);
-                let title = request
-                    .get("title")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-                (kind.to_string(), title)
-            });
-    }
     let done_today = state
         .store
         .count_lineage_done_since(lineage_id.clone(), crate::config::rfc3339(day_start))
@@ -1861,15 +1903,16 @@ async fn lineage_glance(
     let waiting = rows
         .waiting
         .iter()
-        .map(|worker| {
-            let (kind, question) = waiting_reason(worker, &pending_by_instance);
-            glance_waiting(worker, &kind, question, now_unix)
+        .enumerate()
+        .map(|(index, row)| {
+            let (kind, question) = waiting_reason(&row.worker, pending_labels.get(&index).cloned());
+            glance_waiting(&row.worker, &kind, question, now_unix)
         })
         .collect();
     let working = rows
         .working
         .iter()
-        .map(|worker| glance_working(worker, now_unix))
+        .map(|row| glance_working(&row.worker, now_unix))
         .collect();
     Ok(Json(assemble_glance(
         lineage_id,
@@ -2908,17 +2951,15 @@ mod tests {
         // The displayed reason prefers a pending interaction, then a blocked
         // lifecycle, then the watch classification.
         let row = worker(json!({ "state": "blocked", "reason": "need input" }));
-        let mut pending = HashMap::new();
-        pending.insert(
-            row.instance_id.as_ref().unwrap().as_id().to_string(),
-            ("approval".to_string(), Some("Bash".to_string())),
+        let (kind, question) = waiting_reason(
+            &row,
+            Some(("approval".to_string(), Some("Bash".to_string()))),
         );
-        let (kind, question) = waiting_reason(&row, &pending);
         assert_eq!(
             (kind.as_str(), question.as_deref()),
             ("approval", Some("Bash"))
         );
-        let (kind, question) = waiting_reason(&row, &HashMap::new());
+        let (kind, question) = waiting_reason(&row, None);
         assert_eq!(
             (kind.as_str(), question.as_deref()),
             ("blocked", Some("need input"))
@@ -2936,8 +2977,12 @@ mod tests {
             last_screen_digest: None,
             last_activity_at: None,
         });
-        let (kind, question) = waiting_reason(&stalled, &HashMap::new());
+        let (kind, question) = waiting_reason(&stalled, None);
         assert_eq!((kind.as_str(), question.is_none()), ("stalled", true));
+        // Nothing to report is not the same as blocked.
+        let plain_working = worker(json!({ "state": "working" }));
+        let (kind, question) = waiting_reason(&plain_working, None);
+        assert_eq!((kind.as_str(), question), ("unknown", None));
         // The row's question is untrusted text, clipped and redacted.
         let waiting = glance_waiting(
             &row,

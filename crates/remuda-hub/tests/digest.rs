@@ -586,42 +586,62 @@ async fn a_glance_classifies_blocked_and_terminal_watch_workers_as_waiting() -> 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pending_interactions_are_loaded_for_the_given_instances_only() -> Result<()> {
+async fn a_glance_takes_its_pending_label_from_the_page_statement() -> Result<()> {
     let ctx = Ctx::spawn().await?;
-    let project = ctx.project("pending-a").await?;
-    let other = ctx.project("pending-b").await?;
-    let (_coordinator_a, token_a) = ctx.coordinator(&project).await?;
-    let (_coordinator_b, token_b) = ctx.coordinator(&other).await?;
-    let (_worker_a, instance_a) = ctx.worker_under(&token_a, &project, "c-pa", None).await?;
-    let (_worker_b, instance_b) = ctx.worker_under(&token_b, &other, "c-pb", None).await?;
-    for (instance, id) in [(&instance_a, "int_pa"), (&instance_b, "int_pb")] {
-        ctx.journal(
-            instance,
-            json!({ "kind": "interaction.requested", "payload": { "interaction": {
-                "id": id, "kind": "approval", "state": "pending", "blocking": true,
-                "request": { "kind": "approval", "title": "Bash", "description": "ok?",
-                             "options": [] } }}}),
-        )
+    let project = ctx.project("glance-label").await?;
+    let other = ctx.project("glance-foreign").await?;
+    let (coordinator, token) = ctx.coordinator(&project).await?;
+    let (other_coordinator, other_token) = ctx.coordinator(&other).await?;
+    let (_worker, instance) = ctx
+        .worker_under(&token, &project, "c-question", None)
         .await?;
-    }
-    let store = ctx.hub.store().context("store")?;
-    // One lineage's instance: only its pending row comes back.
-    let only_a = store
-        .list_pending_interactions_for_instances(vec![instance_a.clone()])
+    let (_foreign, foreign_instance) = ctx
+        .worker_under(&other_token, &other, "c-foreign", None)
         .await?;
-    assert_eq!(only_a.len(), 1);
-    assert_eq!(only_a[0].instance_id, instance_a);
-    // Both: two rows. None: no query at all.
-    let both = store
-        .list_pending_interactions_for_instances(vec![instance_a, instance_b])
-        .await?;
-    assert_eq!(both.len(), 2);
-    assert!(
-        store
-            .list_pending_interactions_for_instances(Vec::new())
+    // A pending question on our worker, and a pending approval in another
+    // lineage: each glance must report its own, with the label the page saw.
+    ctx.journal(
+        &instance,
+        json!({ "kind": "interaction.requested", "payload": { "interaction": {
+            "id": "int_q", "kind": "question", "state": "pending", "blocking": true,
+            "request": { "kind": "question", "title": "Which branch?", "fields": [] } }}}),
+    )
+    .await?;
+    ctx.journal(
+        &foreign_instance,
+        json!({ "kind": "interaction.requested", "payload": { "interaction": {
+            "id": "int_f", "kind": "approval", "state": "pending", "blocking": true,
+            "request": { "kind": "approval", "title": "Bash", "description": "ok?",
+                         "options": [] } }}}),
+    )
+    .await?;
+
+    let glance = json_of(
+        &ctx.get(&token, &format!("/v1/lineages/{coordinator}/glance"))
             .await?
-            .is_empty()
+            .1,
     );
+    assert_eq!(
+        glance["waiting"].as_array().map(Vec::len),
+        Some(1),
+        "{glance}"
+    );
+    assert_eq!(glance["waiting"][0]["name"], "c-question");
+    assert_eq!(glance["waiting"][0]["kind"], "question");
+    assert_eq!(glance["waiting"][0]["question"], "Which branch?");
+    assert_eq!(glance["working"].as_array().map(Vec::len), Some(0));
+
+    // The other lineage reports its own pending approval.
+    let other_glance = json_of(
+        &ctx.get(
+            &other_token,
+            &format!("/v1/lineages/{other_coordinator}/glance"),
+        )
+        .await?
+        .1,
+    );
+    assert_eq!(other_glance["waiting"][0]["name"], "c-foreign");
+    assert_eq!(other_glance["waiting"][0]["kind"], "approval");
     Ok(())
 }
 

@@ -5559,37 +5559,6 @@ impl Store {
         .await
     }
 
-    /// Pending interactions on `instance_ids` only.
-    ///
-    /// The lineage glance needs its own rows; loading every pending row in the
-    /// Hub would scale its cost with the fleet instead of the lineage.
-    pub async fn list_pending_interactions_for_instances(
-        &self,
-        instance_ids: Vec<String>,
-    ) -> Result<Vec<InteractionRecord>, StoreError> {
-        if instance_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        self.read("list_pending_interactions_for_instances", move |conn| {
-            let placeholders = vec!["?"; instance_ids.len()].join(",");
-            let sql = format!(
-                "SELECT id, instance_id, host_id, kind, state, blocking, payload_json, \
-                 created_at, updated_at FROM interactions \
-                 WHERE state = 'pending' AND instance_id IN ({placeholders}) \
-                 ORDER BY created_at"
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let params_refs: Vec<&dyn rusqlite::types::ToSql> = instance_ids
-                .iter()
-                .map(|id| id as &dyn rusqlite::types::ToSql)
-                .collect();
-            let rows = stmt.query_map(params_refs.as_slice(), interaction_from_row)?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(StoreError::from)
-        })
-        .await
-    }
-
     /// How long a non-pending interaction stays visible in the operator
     /// inbox's departed/ended presentation after it settled (c-cardsettle).
     /// Pending rows are returned regardless of age; this bounds only the

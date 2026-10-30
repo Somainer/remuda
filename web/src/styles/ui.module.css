@@ -6,11 +6,20 @@
 /* Buttons (§8.1). One primary per view region.                      */
 /* ---------------------------------------------------------------- */
 
+/* P0-9 single-line rule (§8.1): a button label is one line, every width.
+   `min-width: 0` lets a text button shrink inside a flex/grid parent instead
+   of forcing its min-content width onto the row; the label then ellipsizes
+   (spans, see below) or clips (a bare text node, which cannot be targeted by
+   a selector) rather than wrapping. Long labels are still the wrong answer:
+   shorten the label, or keep the glyph and move the words to an accessible
+   name. */
 .btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: var(--space-2);
+  min-width: 0;
+  max-width: 100%;
   min-height: var(--control-h);
   padding: 0 var(--space-3);
   border: 1px solid var(--border);
@@ -20,16 +29,49 @@
   font-size: var(--text-ui);
   font-weight: 500;
   line-height: var(--lh-ui);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   transition:
     background-color var(--dur-1) var(--ease-out),
     border-color var(--dur-1) var(--ease-out),
     color var(--dur-1) var(--ease-out);
 }
 
+/* A label wrapped in an element (icon + text buttons do this) gets a real
+   ellipsis: the flex container cannot ellipsize its own anonymous text item,
+   but a flex-item span can. `min-width: 0` keeps it from pinning the button
+   to the label's min-content width. */
+.btn > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* D-061 r2 exemption: a label that states an authorization scope or a
+   filesystem target (approval options, path-bearing actions) must always be
+   readable, so it wraps — or takes a whole row — instead of truncating.
+   Composed by the approval option buttons, which are the reason this exists. */
+.btnAllowWrap {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  overflow-wrap: anywhere;
+}
+
+.btnAllowWrap > span {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+}
+
 .btn:hover:not(:disabled) {
   border-color: var(--border-control);
 }
 
+/* Composes .btn above: the single-line rule (nowrap, bounded width, ellipsis)
+   applies unchanged to the primary fill. */
 .btnPrimary {
   composes: btn;
   background: var(--primary-fill);
@@ -130,6 +172,12 @@
   background: var(--bg-inset);
 }
 
+/* D-061 single-line rule: a segment label is one line, ellipsized when the
+   item is narrower than its text. The ellipsis lives on the label span, not
+   on `.segItem`, because the item's coarse-pointer hit band is its own
+   `::after` — `overflow: hidden` on the item would clip that band back to
+   the 26px visible box (m-home/uo1 assert the 44px zone). `seg` stays
+   inline-flex, so the band remains the item's own zone. */
 .segItem {
   position: relative;
   display: inline-flex;
@@ -160,6 +208,15 @@
   background: var(--bg-raised);
   color: var(--fg-strong);
   box-shadow: inset 0 0 0 1px var(--border-control);
+}
+
+/* The item's one text line. Never wraps; ellipsizes if a caller constrains
+   the item below the label's width, and the full label stays in its title. */
+.segLabel {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ---------------------------------------------------------------- */

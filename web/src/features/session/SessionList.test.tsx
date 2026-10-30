@@ -479,7 +479,7 @@ describe("SessionList rows: next step, wire disclosure and overflow sheet", () =
 
   it("keeps each row's wire toggle aria-expanded in sync when two rows are open", async () => {
     const user = userEvent.setup();
-    hub.instances = [session("ins_a", { activity: known("idle") }), session("ins_b", { activity: known("idle") })];
+    hub.instances = [session("ins_a", { activity: known("working") }), session("ins_b", { activity: known("working") })];
     renderList();
     const cards = screen.getAllByTestId("board-card");
     const cardA = cards.find((card) => card.querySelector(`a[href="/s/ins_a"]`))!;

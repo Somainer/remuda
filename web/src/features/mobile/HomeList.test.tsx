@@ -1,10 +1,12 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, act } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { mockDb } from "../../lib/mock";
 import type { Instance } from "../../types/instance";
 import { known, type Id } from "../../types/wire";
 import { HomeList } from "./HomeList";
+import { SPACES_PREFS_KEY, spaceStore } from "../spaces/store";
 
 const hub = {
   hosts: [{ id: "host-a", label: "alpha" }],
@@ -28,7 +30,7 @@ vi.mock("../../lib/store", () => ({
       listeners.add(listener);
       return () => listeners.delete(listener);
     },
-    getSnapshot: () => hub,
+    getSnapshot: () => ({ ...hub, instances: hub.instances.slice() }),
     titleOf: (id: string) => `title ${id}`,
     hostName: () => "alpha",
     usageRollupOf: () => null,
@@ -51,15 +53,21 @@ vi.mock("../tasks/TaskList", () => ({
 }));
 
 function exited(id: string): Instance {
+  return row(id, { lifecycle: "exited" });
+}
+
+function row(id: string, patch: Partial<Instance> = {}): Instance {
   return {
     ...mockDb.instances[0],
     id,
     hostId: "host-a",
     workspaceId: "wsp-a",
-    lifecycle: "exited",
+    lifecycle: "ready",
     connectivity: "connected",
     activity: known("idle"),
     parent: null,
+    updatedAt: "2026-09-19T10:00:00.000Z",
+    ...patch,
   } as Instance;
 }
 
@@ -71,8 +79,15 @@ function renderHome() {
   );
 }
 
+/** An exited-only project folds into 「安静的项目」 until the bucket is opened. */
+async function openQuiet() {
+  await userEvent.click(await screen.findByTestId("home-quiet-fold"));
+}
+
 beforeEach(() => {
   resumeMock.mockReset();
+  localStorage.removeItem(SPACES_PREFS_KEY);
+  spaceStore.reload();
 });
 
 describe("HomeList resume", () => {
@@ -80,6 +95,7 @@ describe("HomeList resume", () => {
     hub.instances = [exited("ins-exited-fail")];
     resumeMock.mockResolvedValue(null);
     renderHome();
+    await openQuiet();
 
     const button = await screen.findByTestId("home-resume");
     expect(button).toHaveTextContent("恢复");
@@ -102,11 +118,56 @@ describe("HomeList resume", () => {
       }),
     );
     renderHome();
+    await openQuiet();
     const button = await screen.findByTestId("home-resume");
     button.click();
     await waitFor(() => expect(button).toBeDisabled());
     expect(button).toHaveTextContent("恢复中…");
     resolveResume("ins-child-new");
     await waitFor(() => expect(screen.queryByTestId("home-resume-error")).toBeNull());
+  });
+});
+
+describe("HomeList hold", () => {
+  function ids() {
+    return screen.getAllByTestId("home-row").map((row) => row.querySelector("a")?.getAttribute("href"));
+  }
+
+  it("keeps a held row where it is while another worker changes state, then re-ranks on release", () => {
+    hub.instances = [
+      row("ins-held", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+      row("ins-other", { activity: known("working"), updatedAt: "2026-09-19T08:00:00.000Z" }),
+    ];
+    renderHome();
+
+    // Both are working, so neither folds. The newer one leads, and it is the
+    // row a later change could displace.
+    expect(ids()).toEqual(["/s/ins-held", "/s/ins-other"]);
+
+    const held = screen.getByText("title ins-held").closest("article")!;
+    act(() => {
+      held.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+    });
+    expect(document.querySelector("[data-held='1']")).not.toBeNull();
+
+    // The other worker becomes blocked, which outranks the held row. The finger
+    // is still down, so the held row keeps its place.
+    act(() => {
+      hub.instances = [
+        row("ins-held", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+        row("ins-other", { activity: known("waiting-interaction"), updatedAt: "2026-09-19T12:00:00.000Z" }),
+      ];
+      for (const listener of listeners) listener();
+    });
+    expect(ids()).toEqual(["/s/ins-held", "/s/ins-other"]);
+    // The row's own text does update while it is held.
+    expect(screen.getByText("title ins-other").closest("article")).toHaveAttribute("data-rank", "blocked");
+
+    act(() => {
+      held.dispatchEvent(new PointerEvent("pointerup", { bubbles: true }));
+    });
+    expect(document.querySelector("[data-held='0']")).not.toBeNull();
+    // Released, blocked outranks working, so the changed worker moves above.
+    expect(ids()).toEqual(["/s/ins-other", "/s/ins-held"]);
   });
 });

@@ -7,7 +7,7 @@ import type { Instance } from "../../types/instance";
 import type { Interaction } from "../../types/interaction";
 import { hubStore } from "../../lib/store";
 import type { HubState } from "../../lib/store";
-import { uiMode } from "../../lib/status";
+import { uiMode, projectStatus } from "../../lib/status";
 import {
   buildSpaces,
   selectedSpace,
@@ -23,12 +23,14 @@ import {
   buildHomeRows,
   buildHomeTaskLayer,
   homeRowsSignature,
+  rankFolds,
   readHomeOrder,
   writeHomeOrder,
   type HomeGroup,
   type HomeOrder,
   type HomeRow,
 } from "./homeRows";
+import { HarnessGlyph } from "../spaces/SpacesPanel";
 import { TaskGroups, useTaskLedger } from "../tasks/TaskList";
 import { SpacesDrawer } from "../spaces/SpacesMobile";
 import { ContextRing } from "./ContextRing";
@@ -74,6 +76,17 @@ function selectHome(snapshot: HubState, prefs: SpacePrefs, nowMs: number): HomeS
   }
   const spaces = buildSpaces(snapshot.workspaces, snapshot.instances, prefs);
   const pending = snapshot.interactions.filter((interaction) => interaction.state === "pending");
+  // An idle session with a still-running child ranks as awaiting-wake. Children
+  // themselves are not home rows.
+  const childLiveIds = new Set<string>();
+  for (const instance of snapshot.instances) {
+    const parentId = instance.parent?.instanceId;
+    if (!parentId) continue;
+    const status = projectStatus(instance);
+    if (status === "blocked" || status === "working" || status === "starting") {
+      childLiveIds.add(parentId);
+    }
+  }
   const rows = buildHomeRows({
     spaces,
     interactions: pending,
@@ -82,6 +95,7 @@ function selectHome(snapshot: HubState, prefs: SpacePrefs, nowMs: number): HomeS
     screenOf: (instanceId) => snapshot.screens[instanceId],
     summaryOf: (instanceId) => hubStore.summaryOf(instanceId as Id),
     eventsOf: (instanceId) => snapshot.events[instanceId],
+    childLiveOf: (instanceId) => childLiveIds.has(instanceId),
     nowMs,
   });
   const hostNameOf = (hostId?: string) => hubStore.hostName((hostId ?? "") as Id);
@@ -166,6 +180,23 @@ export const HomeList = memo(function HomeList() {
   const [resumeStates, setResumeStates] = useState<Record<string, ResumeState>>({});
   const [drawerOpen, setDrawerOpen] = useState(false);
   const drawerOpener = useRef<HTMLButtonElement>(null);
+  // How many holds are active (a finger down, the spaces sheet, a hover menu).
+  // The list re-ranks only when the count returns to zero.
+  const holdCount = useRef(0);
+  // Row ids per group, captured at the moment the first hold begins.
+  const [frozenRows, setFrozenRows] = useState<Map<string, string[]> | null>(null);
+
+  function holdStart() {
+    holdCount.current += 1;
+    setFrozenRows((current) => {
+      if (current) return current;
+      return new Map(groupsRef.current.map((group) => [group.id, group.rows.map((row) => row.id)]));
+    });
+  }
+  function holdEnd() {
+    holdCount.current = Math.max(0, holdCount.current - 1);
+    if (holdCount.current === 0) setFrozenRows(null);
+  }
 
   const active = useMemo(() => selectedSpace(spaces, prefs), [spaces, prefs]);
 
@@ -273,6 +304,26 @@ export const HomeList = memo(function HomeList() {
       }),
     [spaces, rows, query, order, branches],
   );
+  // The latest painted groups, read by the hold handlers so a press freezes
+  // the order that is on screen rather than a stale render.
+  const groupsRef = useRef(groups);
+  groupsRef.current = groups;
+
+  // A finger, an open sheet or an open hover menu freezes the row order inside
+  // every group. A row's text still updates; only its position waits. Rows that
+  // appear mid-hold append, rows that vanish drop out, and releasing re-ranks.
+  const renderedGroups = useMemo<HomeGroup[]>(() => {
+    if (!frozenRows) return groups;
+    return groups.map((group) => {
+      const order = frozenRows.get(group.id);
+      if (!order) return group;
+      const byId = new Map(group.rows.map((row) => [row.id, row]));
+      const rows = order.map((id) => byId.get(id)).filter((row): row is HomeRow => row != null);
+      for (const row of group.rows) if (!order.includes(row.id)) rows.push(row);
+      const same = rows.length === group.rows.length && rows.every((row, index) => row === group.rows[index]);
+      return same ? group : { ...group, rows };
+    });
+  }, [groups, frozenRows]);
 
   // D-050 task layer stacked above the project+branch session groups:
   // 需要你 first, tasks nested by parent, SE-nn keys, archive folded. Tapping
@@ -323,7 +374,10 @@ export const HomeList = memo(function HomeList() {
                 aria-expanded={drawerOpen}
                 aria-label="切换空间"
                 title={active?.name ?? "空间"}
-                onClick={() => setDrawerOpen(true)}
+                onClick={() => {
+                  setDrawerOpen(true);
+                  holdStart();
+                }}
               >
                 <span className={css.spaceBtnName}>{active?.name ?? "空间"}</span>
                 <span className={css.spaceBtnCaret} aria-hidden="true">
@@ -370,92 +424,36 @@ export const HomeList = memo(function HomeList() {
               prefs={prefs}
               instanceId={undefined}
               onSelect={selectSpace}
-              onClose={() => setDrawerOpen(false)}
+              onClose={() => {
+                setDrawerOpen(false);
+                holdEnd();
+              }}
               openerRef={drawerOpener}
             />
           ) : null}
-          {groups.length > 0 ? (
-            <div className={css.groups}>
-              {groups.map((group) => (
-                <section
-                  key={group.id}
-                  className={css.group}
-                  data-testid="home-group"
-                  data-blocked={group.blockedCount}
-                >
-                  <header className={css.groupHead}>
-                    <span className={css.groupProject} title={`${group.project} · ${group.hostName}`}>
-                      {group.project}
-                    </span>
-                    {group.branch ? <span className={css.groupBranch}>{group.branch}</span> : null}
-                    <span
-                      className={css.groupBlocked}
-                      data-zero={group.blockedCount === 0 ? "1" : "0"}
-                    >
-                      {group.blockedCount} 待处理
-                    </span>
-                  </header>
-                  {group.rows.map((row) => {
-                    const resumeState = resumeStates[row.id];
-                    return (
-                      <article
-                        key={row.id}
-                        className={css.row}
-                        data-testid="home-row"
-                        data-status={row.status}
-                        data-blocked={row.blocked ? "1" : "0"}
-                      >
-                        <Link className={css.rowMain} to={`/s/${row.id}`} data-testid="home-row-link">
-                          <span className={css.dot}>
-                            <StateDot status={row.status} />
-                          </span>
-                          <span className={css.rowText}>
-                            <span className={css.rowTitle} title={row.title}>
-                              {row.title}
-                            </span>
-                          <span
-                            className={css.rowBody}
-                            data-testid="home-row-body"
-                            data-error={row.bodyIsError ? "1" : "0"}
-                            data-tone={row.bodyTone ?? undefined}
-                            title={
-                              row.bodyDetail && row.bodyDetail !== row.body
-                                ? `${row.body}\n${row.bodyDetail}`
-                                : row.body
-                            }
-                          >
-                            {row.body}
-                          </span>
-                        </span>
-                        <span className={css.rowTime} title={row.updatedAt}>
-                          {row.timeLabel}
-                        </span>
-                        <ContextRing pct={row.contextPct} approximate={row.contextPctApproximate} />
-                      </Link>
-                      {row.canResume ? (
-                        <button
-                          type="button"
-                          className={`${ui.btn} ${css.resume}`}
-                          data-testid="home-resume"
-                          disabled={resumeState?.busy === true}
-                          onClick={(event) => {
-                            event.preventDefault();
-                            void onResume(row.id);
-                          }}
-                        >
-                          {resumeState?.busy ? "恢复中…" : "恢复"}
-                        </button>
-                      ) : null}
-                      {resumeState?.error ? (
-                        <p className={css.rowError} role="status" data-testid="home-resume-error">
-                          {resumeState.error}
-                        </p>
-                      ) : null}
-                    </article>
-                  );
-                })}
-              </section>
-            ))}
+          {renderedGroups.length > 0 ? (
+            <div
+              className={css.groups}
+              data-held={frozenRows ? "1" : "0"}
+              // Focus inside a row's own control freezes the order too (home.md
+              // §3.3). Only a focus that arrives from outside the list counts, so
+              // tabbing between two controls does not stack holds.
+              onFocus={(event) => {
+                if (!event.currentTarget.contains(event.relatedTarget as Node | null)) holdStart();
+              }}
+              onBlur={(event) => {
+                if (!event.currentTarget.contains(event.relatedTarget as Node | null)) holdEnd();
+              }}
+            >
+              <HomeGroups
+                groups={renderedGroups}
+                query={query}
+                prefs={prefs}
+                resumeStates={resumeStates}
+                onResume={(instanceId) => void onResume(instanceId)}
+                onHoldStart={holdStart}
+                onHoldEnd={holdEnd}
+              />
             </div>
           ) : null}
         </>
@@ -469,7 +467,7 @@ export const HomeList = memo(function HomeList() {
         spaces={spaces}
         branches={branches}
         query={query}
-        sessionEmpty={groups.length === 0}
+        sessionEmpty={renderedGroups.length === 0}
       />
     </div>
   );
@@ -481,6 +479,214 @@ function localStorageAccess(): Storage | null {
   } catch {
     return null;
   }
+}
+
+/** Header dot counts, one glyph per rank (home.md §3.1): ⚠ blocked, ● working,
+ *  ◉ done-unseen, ○ awaiting-wake and idle, a pulsing dot for starting, ■ exited.
+ *  A zero count is omitted — an unknown number is never shown as 0. */
+function GroupDots({ dots }: { dots: HomeGroup["dots"] }) {
+  const parts = [
+    dots.blocked > 0 ? `⚠${dots.blocked}` : "",
+    dots.working > 0 ? `●${dots.working}` : "",
+    dots.unseen > 0 ? `◉${dots.unseen}` : "",
+    dots.wake + dots.idle > 0 ? `○${dots.wake + dots.idle}` : "",
+    dots.starting > 0 ? `◌${dots.starting}` : "",
+    dots.exited > 0 ? `■${dots.exited}` : "",
+  ].filter(Boolean);
+  if (!parts.length) return null;
+  return (
+    <span className={css.groupDots} data-testid="home-group-dots">
+      {parts.join(" ")}
+    </span>
+  );
+}
+
+function HomeRowView({
+  row,
+  resumeState,
+  onResume,
+  onHoldStart,
+  onHoldEnd,
+}: {
+  row: HomeRow;
+  resumeState: ResumeState | undefined;
+  onResume: (instanceId: string) => void;
+  onHoldStart: () => void;
+  onHoldEnd: () => void;
+}) {
+  return (
+    <article
+      className={css.row}
+      data-testid="home-row"
+      data-status={row.status}
+      data-rank={row.rank}
+      data-blocked={row.blocked ? "1" : "0"}
+      onPointerDown={onHoldStart}
+      onPointerUp={onHoldEnd}
+      onPointerCancel={onHoldEnd}
+    >
+      <Link className={css.rowMain} to={`/s/${row.id}`} data-testid="home-row-link">
+        <span className={css.dot}>
+          <StateDot status={row.status} />
+        </span>
+        <span className={css.rowText}>
+          <span className={css.rowLine1}>
+            <span className={css.rowTitle} title={row.title}>
+              {row.title}
+            </span>
+            <HarnessGlyph kind={row.kind} />
+            {row.stateWord ? (
+              <span className={css.rowState} data-testid="home-row-state">
+                {row.stateWord}
+              </span>
+            ) : null}
+            <span className={css.rowTime} title={row.updatedAt}>
+              {row.timeLabel}
+            </span>
+          </span>
+          <span
+            className={css.rowBody}
+            data-testid="home-row-body"
+            data-error={row.bodyIsError ? "1" : "0"}
+            data-tone={row.bodyTone ?? undefined}
+            title={
+              row.bodyDetail && row.bodyDetail !== row.body ? `${row.body}\n${row.bodyDetail}` : row.body
+            }
+          >
+            {row.body}
+          </span>
+        </span>
+        <ContextRing pct={row.contextPct} approximate={row.contextPctApproximate} />
+      </Link>
+      {row.canResume ? (
+        <button
+          type="button"
+          className={`${ui.btn} ${css.resume}`}
+          data-testid="home-resume"
+          disabled={resumeState?.busy === true}
+          onClick={(event) => {
+            event.preventDefault();
+            onResume(row.id);
+          }}
+        >
+          {resumeState?.busy ? "恢复中…" : "恢复"}
+        </button>
+      ) : null}
+      {resumeState?.error ? (
+        <p className={css.rowError} role="status" data-testid="home-resume-error">
+          {resumeState.error}
+        </p>
+      ) : null}
+    </article>
+  );
+}
+
+/**
+ * Project groups with the two folds: idle rows inside a busy project, and
+ * whole projects that have nothing active. A non-empty search forces both
+ * open. Fold state is the device's SpacePrefs.
+ */
+function HomeGroups({
+  groups,
+  query,
+  prefs,
+  resumeStates,
+  onResume,
+  onHoldStart,
+  onHoldEnd,
+}: {
+  groups: HomeGroup[];
+  query: string;
+  prefs: SpacePrefs;
+  resumeStates: Record<string, ResumeState>;
+  onResume: (instanceId: string) => void;
+  onHoldStart: () => void;
+  onHoldEnd: () => void;
+}) {
+  const searching = query.trim().length > 0;
+  const busy = groups.filter((group) => !group.quiet);
+  const quiet = groups.filter((group) => group.quiet);
+  const quietOpen = searching || prefs.quietOpen;
+
+  function renderGroup(group: HomeGroup) {
+    const idle = group.rows.filter((row) => rankFolds(row.rank));
+    const active = group.rows.filter((row) => !rankFolds(row.rank));
+    const idleOpen = searching || prefs.idleOpen[group.id] === true;
+    // A project whose every row folds still shows those rows once the quiet
+    // bucket itself is open — folding them again would hide the project.
+    const showIdle = idleOpen || group.quiet;
+    return (
+      <section
+        key={group.id}
+        className={css.group}
+        data-testid="home-group"
+        data-quiet={group.quiet ? "1" : "0"}
+        data-blocked={group.blockedCount}
+      >
+        <header className={css.groupHead}>
+          <span className={css.groupProject} title={`${group.project} · ${group.hostName}`}>
+            {group.project}
+          </span>
+          {group.branch ? <span className={css.groupBranch}>{group.branch}</span> : null}
+          <GroupDots dots={group.dots} />
+        </header>
+        {(showIdle ? group.rows : active).map((row) => (
+          <HomeRowView
+            key={row.id}
+            row={row}
+            resumeState={resumeStates[row.id]}
+            onResume={onResume}
+            onHoldStart={onHoldStart}
+            onHoldEnd={onHoldEnd}
+          />
+        ))}
+        {!showIdle && idle.length > 0 ? (
+          <button
+            type="button"
+            className={css.fold}
+            data-testid="home-idle-fold"
+            aria-expanded={false}
+            onClick={() => spaceStore.toggleIdle(group.id)}
+          >
+            还有 {idle.length} 个空闲 ▾
+          </button>
+        ) : null}
+        {idleOpen && !group.quiet && idle.length > 0 ? (
+          <button
+            type="button"
+            className={css.fold}
+            data-testid="home-idle-fold"
+            aria-expanded
+            onClick={() => spaceStore.toggleIdle(group.id)}
+          >
+            收起空闲 ▴
+          </button>
+        ) : null}
+      </section>
+    );
+  }
+
+  return (
+    <>
+      {busy.map(renderGroup)}
+      {quiet.length > 0 ? (
+        <div className={css.quiet} data-testid="home-quiet">
+          <button
+            type="button"
+            className={css.fold}
+            data-testid="home-quiet-fold"
+            aria-expanded={quietOpen}
+            onClick={() => {
+              if (!searching) spaceStore.toggleQuiet();
+            }}
+          >
+            安静的项目 · {quiet.length} {quietOpen ? "▴" : "▸"}
+          </button>
+          {quietOpen ? quiet.map(renderGroup) : null}
+        </div>
+      ) : null}
+    </>
+  );
 }
 
 /**

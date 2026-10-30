@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent, type MouseEvent } from "react";
 import { Link, useLocation, useSearchParams } from "react-router-dom";
 import type { Id } from "../../types/wire";
-import type { Instance, Kind, UiStatus } from "../../types/instance";
+import type { Instance } from "../../types/instance";
 import type { Interaction } from "../../types/interaction";
 import { knowledgeValue } from "../../types/command";
 import { Sheet } from "../../components/Sheet";
@@ -18,6 +18,8 @@ import { switchSlots } from "../../lib/sessionSlots";
 import { isEmberEffort } from "./effort";
 import { nextStep } from "./nextStep";
 import { LaunchedByMark } from "./LaunchedBy";
+import { HarnessGlyph } from "../spaces/SpacesPanel";
+import { compareRanked, rank, rankStateWord, type HomeRank } from "../mobile/homeRows";
 import {
   applyFilters,
   availableConditions,
@@ -40,27 +42,19 @@ import {
 } from "./sessionFilters";
 import css from "./SessionList.module.css";
 
-const GROUPS: { id: string; title: string; match: (s: UiStatus) => boolean }[] = [
-  { id: "blocked", title: "待处理", match: (s) => s === "blocked" },
-  { id: "working", title: "进行中", match: (s) => s === "working" || s === "starting" },
-  { id: "recent", title: "最近", match: (s) => s === "idle" || s === "unknown" },
+const GROUPS: { id: string; title: string; match: (rank: HomeRank) => boolean }[] = [
+  { id: "blocked", title: "待处理", match: (rank) => rank === "blocked" },
+  { id: "working", title: "进行中", match: (rank) => rank === "working" || rank === "awaiting-wake" || rank === "starting" },
+  { id: "recent", title: "最近", match: (rank) => rank === "idle" },
   // D-028 §8 方案 A: node-epoch-changed settles the row as exited; it leaves
   // the live groups and lands here, next to its Resume button.
-  { id: "exited", title: "已退出", match: (s) => s === "exited" },
+  { id: "exited", title: "已退出", match: (rank) => rank === "exited" },
 ];
 
 function exitLabel(instance: Instance): string | null {
   if (instance.exit.state !== "known") return null;
   const code = instance.exit.value.code;
   return code == null ? "exit" : `exit ${code}`;
-}
-
-function kindClass(kind: Kind): string {
-  if (kind === "codex") return css.kindCodex;
-  if (kind === "grok") return css.kindGrok;
-  if (kind === "agy") return css.kindAgy;
-  if (kind === "terminal") return css.kindClaude;
-  return css.kindClaude;
 }
 
 function stopRow(event: MouseEvent | FormEvent) {
@@ -139,6 +133,22 @@ export function SessionList({
   // trigger that opened it (useFocusTrap contract).
   const [actionFor, setActionFor] = useState<Id | null>(null);
   const actionReturnRef = useRef<HTMLButtonElement | null>(null);
+  // A finger on a row, or the open hover menu, freezes the painted order.
+  // The list re-ranks only once every hold has released.
+  const holdCount = useRef(0);
+  const [frozenIds, setFrozenIds] = useState<readonly Id[] | null>(null);
+  const filteredRef = useRef(filtered);
+  filteredRef.current = filtered;
+
+  function holdStart() {
+    holdCount.current += 1;
+    setFrozenIds((current) => current ?? filteredRef.current.map((instance) => instance.id));
+  }
+  function holdEnd() {
+    holdCount.current = Math.max(0, holdCount.current - 1);
+    if (holdCount.current === 0) setFrozenIds(null);
+  }
+
   // Ids of rows whose wire disclosure is open (multiple rows may be open at
   // once; drives the side triggers' aria-expanded).
   const [wireOpenIds, setWireOpenIds] = useState<readonly Id[]>([]);
@@ -190,6 +200,39 @@ export function SessionList({
   }, [spaceId, prunedKey]);
   // The notice belongs to the Space that triggered it; a later Space retires it.
   const notice = droppedNotice.spaceId === spaceId ? droppedNotice.chips : [];
+
+  // Children that are still running lift their idle parent into awaiting-wake.
+  const childLiveIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const instance of hub.instances) {
+      const parentId = instance.parent?.instanceId;
+      if (!parentId) continue;
+      const status = projectStatus(instance);
+      if (status === "blocked" || status === "working" || status === "starting") ids.add(parentId);
+    }
+    return ids;
+  }, [hub.instances]);
+
+  const ranked = useMemo(() => {
+    const byId = new Map(filtered.map((instance) => [instance.id, instance]));
+    const ordered = (frozenIds ?? filtered.map((instance) => instance.id))
+      .map((id) => byId.get(id))
+      .filter((instance): instance is Instance => instance != null);
+    if (frozenIds) {
+      for (const instance of filtered) if (!frozenIds.includes(instance.id)) ordered.push(instance);
+    }
+    const rowOf = (instance: Instance) => ({
+      id: instance.id,
+      rank: rank(instance, childLiveIds.has(instance.id)),
+      title: hubStore.titleOf(instance.id),
+      updatedAt: instance.updatedAt,
+    });
+    // A hold paints the captured order; releasing sorts through the shared rank.
+    if (frozenIds) return ordered;
+    return [...ordered].sort((a, b) => compareRanked(rowOf(a), rowOf(b)));
+    // hubStore.titleOf reads the same snapshot this render already subscribed to.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filtered, frozenIds, childLiveIds]);
 
   // Rows currently on screen (IntersectionObserver), so the screen poll can
   // prefer them. The viewport root stays correct inside an overflow
@@ -580,8 +623,12 @@ export function SessionList({
         </div>
       ) : null}
       {GROUPS.map((group) => {
-        const items = filtered.filter((i) => group.match(projectStatus(i)));
+        const rankOf = (instance: Instance) => rank(instance, childLiveIds.has(instance.id));
+        const items = ranked.filter((instance) => group.match(rankOf(instance)));
         if (!items.length) return null;
+        // Desktop groups are status buckets, not project groups, so an idle fold
+        // here would hide the only row whenever every session is idle. Project
+        // folding stays on the phone home; this list only shares rank().
         return (
           <section key={group.id} data-testid={`session-group-${group.id}`}>
             <div className={css.group}>
@@ -593,6 +640,8 @@ export function SessionList({
             </div>
             {items.map((instance) => {
               const status = projectStatus(instance);
+              const homeRank = rank(instance, childLiveIds.has(instance.id));
+              const stateWord = rankStateWord(homeRank);
               const pending: Interaction | undefined = hub.interactions.find(
                 (i) => i.instanceId === instance.id && i.state === "pending",
               );
@@ -616,8 +665,12 @@ export function SessionList({
                   data-testid="board-card"
                   data-instance-id={instance.id}
                   data-status={status}
+                  data-rank={homeRank}
                   data-lifecycle={instance.lifecycle}
                   data-kind={instance.kind}
+                  onPointerDown={holdStart}
+                  onPointerUp={holdEnd}
+                  onPointerCancel={holdEnd}
                 >
                   <label className={css.check}>
                     <input
@@ -642,7 +695,13 @@ export function SessionList({
                       <span className={`${css.name} ${status === "starting" || status === "exited" || status === "unknown" ? css.nameMute : ""}`}>
                         {title}
                       </span>
-                      <span className={`${css.kind} ${kindClass(instance.kind)}`}>{instance.kind}</span>
+                      <HarnessGlyph kind={instance.kind} />
+                      {stateWord ? (
+                        <span className={css.stateWord} data-testid="session-row-state">
+                          {stateWord}
+                        </span>
+                      ) : null}
+                      <span className={css.time}>{status === "unknown" ? "—" : formatListTime(instance.updatedAt, nowMs)}</span>
                       <LaunchedByMark launchedBy={instance.launchedBy} />
                       {screen?.done ? (
                         <span className={css.done} data-testid="board-done">
@@ -682,7 +741,6 @@ export function SessionList({
                     </Link>
                   ) : null}
                   <div className={css.rowSide}>
-                    <span className={css.time}>{status === "unknown" ? "—" : formatListTime(instance.updatedAt, nowMs)}</span>
                     {/* Wire disclosure trigger: toggles the controlled
                         session-wire details without mutating the DOM. */}
                     <button
@@ -711,6 +769,10 @@ export function SessionList({
                       aria-expanded={sheetOpen}
                       aria-controls={sheetOpen ? "board-actions-panel" : undefined}
                       aria-label="会话遥控"
+                      onMouseEnter={holdStart}
+                      onMouseLeave={holdEnd}
+                      onFocus={holdStart}
+                      onBlur={holdEnd}
                       onClick={(event) => {
                         event.stopPropagation();
                         actionReturnRef.current = event.currentTarget;

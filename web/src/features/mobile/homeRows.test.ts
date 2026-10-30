@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { mockDb } from "../../lib/mock";
-import { known, type Id } from "../../types/wire";
+import { known, unknownKnowledge, type Id } from "../../types/wire";
 import type { Instance } from "../../types/instance";
 import type { Interaction } from "../../types/interaction";
 import type { Observation } from "../../types/observation";
@@ -20,6 +20,8 @@ import {
   homeError,
   homeTurnError,
   homeRowsSignature,
+  rank,
+  rankOrder,
   readHomeOrder,
   writeHomeOrder,
 } from "./homeRows";
@@ -127,6 +129,171 @@ describe("buildHomeGroups grouping", () => {
     expect(spaces[0].blockedCount).toBe(1);
     expect(groups[0].blockedCount).toBe(spaces[0].blockedCount);
     expect(groups[0].blockedCount).toBe(1);
+  });
+});
+
+describe("rank(): the seven ranks, newest first within a rank", () => {
+  it("orders blocked, then the reserved done-unseen slot, then working, awaiting-wake, starting, idle, exited", () => {
+    expect(rankOrder("blocked")).toBeLessThan(rankOrder("done-unseen"));
+    expect(rankOrder("done-unseen")).toBeLessThan(rankOrder("working"));
+    expect(rankOrder("working")).toBeLessThan(rankOrder("awaiting-wake"));
+    expect(rankOrder("awaiting-wake")).toBeLessThan(rankOrder("starting"));
+    expect(rankOrder("starting")).toBeLessThan(rankOrder("idle"));
+    expect(rankOrder("idle")).toBeLessThan(rankOrder("exited"));
+    // Nothing projects into done-unseen until the per-owner seen route exists,
+    // so a live idle session — and one whose last turn failed — both stay idle.
+    expect(rank(session("s", { activity: known("waiting-interaction") }))).toBe("blocked");
+    expect(rank(session("s", { activity: known("working") }))).toBe("working");
+    expect(rank(session("s", { activity: known("draining") }))).toBe("working");
+    expect(rank(session("s", { lifecycle: "starting" }))).toBe("starting");
+    expect(rank(session("s", { activity: known("idle") }))).toBe("idle");
+    expect(rank(session("s", { lifecycle: "exited" }))).toBe("exited");
+    expect(rank(session("s", { lifecycle: "failed" }))).toBe("exited");
+    expect(rank(session("s", { lifecycle: "closing" }))).toBe("exited");
+    // A failed turn is a queue card, never the done-unseen rank (home.md §3.1 e).
+    expect(rank(session("s", { lastTurnError: { at: "t", text: "boom" } }))).toBe("idle");
+  });
+
+  it("reads lifecycle and activity directly, so connectivity never changes the rank", () => {
+    // A blocked row on a host that dropped offline keeps rank 1 (home.md §3.1):
+    // the dot goes dashed and the body says 状态待确认, but the row stays put.
+    const blockedOffline = session("s", {
+      activity: known("waiting-interaction"),
+      connectivity: "disconnected",
+    });
+    expect(rank(blockedOffline)).toBe("blocked");
+    // An unknown or reconciling lifecycle ranks with starting, not idle or exited.
+    expect(rank(session("s", { lifecycle: "unknown" }))).toBe("starting");
+    expect(rank(session("s", { lifecycle: "reconciling" }))).toBe("starting");
+    expect(rank(session("s", { lifecycle: "requested" }))).toBe("starting");
+    // Live but with no reported activity ranks as working (row h), not idle.
+    expect(rank(session("s", { activity: unknownKnowledge("no activity reported") }))).toBe("working");
+    // waiting-interaction wins over every lifecycle, including one that ended.
+    expect(rank(session("s", { lifecycle: "exited", activity: known("waiting-interaction") }))).toBe(
+      "blocked",
+    );
+  });
+
+  it("lifts only an idle live session with a live child into awaiting-wake", () => {
+    const idle = session("s", { activity: known("idle") });
+    expect(rank(idle, true)).toBe("awaiting-wake");
+    // A child does not lift a session that is already working, blocked, ended,
+    // or still starting — the child rule sits below all of those rows.
+    expect(rank(session("s", { activity: known("working") }), true)).toBe("working");
+    expect(rank(session("s", { activity: known("waiting-interaction") }), true)).toBe("blocked");
+    expect(rank(session("s", { lifecycle: "exited" }), true)).toBe("exited");
+    expect(rank(session("s", { lifecycle: "starting" }), true)).toBe("starting");
+    // Unknown connectivity used to fall through to idle and get lifted. It no
+    // longer does: the lifecycle decides, and an unknown lifecycle is starting.
+    expect(rank(session("s", { lifecycle: "unknown", connectivity: "disconnected" }), true)).toBe(
+      "starting",
+    );
+  });
+
+  it("sorts every rank above the next and keeps the newest change first inside one rank", () => {
+    const child = { instanceId: "ins-parent" as Id, runId: "r" as Id, commandId: "c" as Id };
+    const instances = named([
+      session("ins-exited-new", { lifecycle: "exited", updatedAt: "2026-09-19T18:00:00.000Z" }),
+      session("ins-idle-old", { updatedAt: "2026-09-19T09:00:00.000Z" }),
+      session("ins-idle-new", { updatedAt: "2026-09-19T11:00:00.000Z" }),
+      session("ins-starting", { lifecycle: "starting", updatedAt: "2026-09-19T07:00:00.000Z" }),
+      session("ins-wake", { updatedAt: "2026-09-19T06:00:00.000Z" }),
+      session("ins-child", {
+        parent: child,
+        hostId: "host-alpha",
+        workspaceId: "wsp-alpha",
+        activity: known("working"),
+        updatedAt: "2026-09-19T06:00:00.000Z",
+      }),
+      session("ins-working-old", { activity: known("working"), updatedAt: "2026-09-19T08:00:00.000Z" }),
+      session("ins-working-new", { activity: known("working"), updatedAt: "2026-09-19T16:00:00.000Z" }),
+      session("ins-blocked", {
+        activity: known("waiting-interaction"),
+        updatedAt: "2026-09-19T01:00:00.000Z",
+      }),
+    ]);
+    const spaces = buildSpaces(workspaces, instances, defaultSpacePrefs());
+    const groups = buildHomeGroups({
+      spaces,
+      interactions: [],
+      order: "clock",
+      query: "",
+      titleOf: (id) => titles[id] ?? id,
+      hostNameOf: () => "alpha-host",
+      rollupOf: () => null,
+      childLiveOf: (id) => id === "ins-wake",
+    });
+    expect(groups[0].rows.map((row) => row.id)).toEqual([
+      "ins-blocked",
+      "ins-working-new",
+      "ins-working-old",
+      "ins-child",
+      "ins-wake",
+      "ins-starting",
+      "ins-idle-new",
+      "ins-idle-old",
+      "ins-exited-new",
+    ]);
+    expect(groups[0].rows.map((row) => row.rank)).toEqual([
+      "blocked",
+      "working",
+      "working",
+      "working",
+      "awaiting-wake",
+      "starting",
+      "idle",
+      "idle",
+      "exited",
+    ]);
+  });
+
+  it("writes the state word only for blocked, done-unseen and awaiting-wake", () => {
+    const groups = build(
+      named([
+        session("ins-blocked", { activity: known("waiting-interaction") }),
+        session("ins-working", { activity: known("working") }),
+        session("ins-idle"),
+      ]),
+    );
+    const words = Object.fromEntries(groups[0].rows.map((row) => [row.rank, row.stateWord]));
+    expect(words.blocked).toBe("待处理");
+    expect(words.working).toBeNull();
+    expect(words.idle).toBeNull();
+  });
+
+  it("counts header dots and marks a project quiet only when nothing is active", () => {
+    const live = build(
+      named([
+        session("ins-blocked", { activity: known("waiting-interaction") }),
+        session("ins-working", { activity: known("working") }),
+        session("ins-starting", { lifecycle: "starting" }),
+        session("ins-idle"),
+        session("ins-exited", { lifecycle: "exited" }),
+      ]),
+    );
+    expect(live[0].dots).toEqual({ blocked: 1, unseen: 0, working: 1, wake: 0, starting: 1, idle: 1, exited: 1 });
+    expect(live[0].quiet).toBe(false);
+    const quiet = build(named([session("ins-idle"), session("ins-exited", { lifecycle: "exited" })]));
+    expect(quiet[0].quiet).toBe(true);
+    expect(quiet[0].dots).toEqual({ blocked: 0, unseen: 0, working: 0, wake: 0, starting: 0, idle: 1, exited: 1 });
+  });
+
+  it("puts the new rank fields into the display signature", () => {
+    const idle = session("ins-wake");
+    const spaces = buildSpaces(workspaces, [idle], defaultSpacePrefs());
+    const titleOf = () => "wake title";
+    const hostNameOf = () => "alpha-host";
+    const sig = (childLive: boolean) => {
+      const rows = buildHomeRows({
+        spaces,
+        interactions: [],
+        titleOf,
+        rollupOf: () => null,
+        childLiveOf: () => childLive,
+      });
+      return homeRowsSignature(rows, [], spaces, hostNameOf);
+    };
+    expect(sig(true)).not.toBe(sig(false));
   });
 });
 

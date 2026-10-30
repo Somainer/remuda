@@ -161,15 +161,35 @@
   white-space: nowrap;
 }
 
-.groupBlocked {
+/* Dot counts share the header's one line with the project title. The title
+   truncates; the counts never wrap onto a second line (P0-2, 390px). */
+.groupDots {
   flex: none;
-  color: var(--attention-fg);
+  color: var(--fg-muted);
   font-size: var(--text-meta);
+  font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
 
-.groupBlocked[data-zero="1"] {
+/* The fold row (idle rows, quiet projects) is a full-width text button. */
+.fold {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 44px;
+  padding: var(--space-2) var(--gutter);
+  border: 0;
+  background: transparent;
   color: var(--fg-muted);
+  font-family: var(--font-ui);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+  text-align: left;
+  white-space: nowrap;
+}
+
+.quiet {
+  border-bottom: 1px solid var(--divider);
 }
 
 /* The row is one flex line: main link + the 恢复 action can never wrap under
@@ -215,7 +235,18 @@
   gap: 2px;
 }
 
+/* Line 1: title · harness glyph · state word · time, one line. The title is
+   the only part allowed to truncate. */
+.rowLine1 {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
 .rowTitle {
+  flex: 0 1 auto;
+  min-width: 0;
   font-size: var(--text-ui);
   font-weight: 500;
   line-height: var(--lh-ui);
@@ -225,12 +256,32 @@
   text-overflow: ellipsis;
 }
 
+.rowState {
+  flex: none;
+  color: var(--attention-fg);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+  white-space: nowrap;
+}
+
+/* Line 2 is the next-step sentence, at most two lines. An ended row keeps the
+   one-line ellipsis the resume button sits beside: a second wrapped line would
+   push 恢复 onto its own band (c-homeend, 390px). */
 .rowBody {
   font-size: var(--text-meta);
   line-height: var(--lh-meta);
   color: var(--fg-muted);
-  white-space: nowrap;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
   overflow: hidden;
+}
+
+.rowBody[data-tone="failed"],
+.rowBody[data-tone="interrupted"],
+.rowBody[data-tone="ended"] {
+  display: block;
+  white-space: nowrap;
   text-overflow: ellipsis;
 }
 
@@ -252,6 +303,7 @@
 
 .rowTime {
   flex: none;
+  margin-left: auto;
   color: var(--fg-faint);
   font-size: var(--text-meta);
   line-height: var(--lh-meta);

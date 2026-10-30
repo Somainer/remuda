@@ -316,6 +316,10 @@ test.describe("mobile new session (390px)", () => {
     // HomeList rather than the desktop SessionList.
     await expect(page).toHaveURL(/\/m$/);
     await expect(page.getByTestId("home-list")).toBeVisible();
+    // Exited-only projects fold into 「安静的项目」. Open it so the rows this
+    // test created are actually in the DOM.
+    const quietFold = page.getByTestId("home-quiet-fold");
+    if ((await quietFold.count()) > 0) await quietFold.click();
     // UO-3: the /m chips row is gone — switching Space opens the drawer.
     await page.getByTestId("spaces-drawer-open").click();
     await expect(page.getByTestId("spaces-drawer")).toBeVisible();

@@ -15,6 +15,12 @@ use serde_json::{Value, json};
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
 
+/// The Hub's internal authority: these fixtures write rows the way a
+/// dispatcher would, not as a scoped Agent.
+fn internal_authority() -> remuda_hub::agent_scope_test_support::CallerAuthority {
+    remuda_hub::agent_scope_test_support::CallerAuthority::internal()
+}
+
 struct FakeNode {
     task: tokio::task::JoinHandle<()>,
 }
@@ -258,7 +264,7 @@ impl Ctx {
         self.hub
             .store()
             .context("store")?
-            .insert_worker(worker, "digest-test".into())
+            .insert_worker(worker, "digest-test".into(), internal_authority())
             .await?;
         Ok((roster_id, instance_id))
     }
@@ -301,7 +307,7 @@ impl Ctx {
         self.hub
             .store()
             .context("store")?
-            .insert_worker(worker, "digest-test".into())
+            .insert_worker(worker, "digest-test".into(), internal_authority())
             .await?;
         Ok((roster_id, instance_id))
     }
@@ -389,6 +395,8 @@ async fn digest_is_assembled_from_stored_rows_and_stays_within_budget() -> Resul
             ctx.host.clone(),
             "instance.configure".into(),
             json!({ "effort": { "name": "high", "requestId": "effreq-digest" } }),
+            None,
+            None,
             None,
             None,
         )
@@ -497,7 +505,7 @@ async fn a_legacy_done_row_is_not_stamped_by_a_later_observation() -> Result<()>
     );
     // A watch pass rewrites every active row; that is not a completion.
     store
-        .mutate_worker(legacy.clone(), |_| Ok(()))
+        .mutate_worker(legacy.clone(), |_| Ok(()), internal_authority())
         .await
         .context("re-observe")?;
     let after = store.get_worker(legacy).await?.context("row")?;
@@ -529,29 +537,37 @@ async fn a_glance_classifies_blocked_and_terminal_watch_workers_as_waiting() -> 
     let (fine, _) = ctx.worker_under(&token, &project, "c-fine", None).await?;
     let store = ctx.hub.store().context("store")?;
     store
-        .mutate_worker(blocked, |row| {
-            row.state = remuda_protocol::WorkerState::Blocked {
-                reason: "need input".into(),
-            };
-            Ok(())
-        })
+        .mutate_worker(
+            blocked,
+            |row| {
+                row.state = remuda_protocol::WorkerState::Blocked {
+                    reason: "need input".into(),
+                };
+                Ok(())
+            },
+            internal_authority(),
+        )
         .await
         .context("block")?;
     let observed_at = remuda_protocol::Timestamp::try_from("2026-10-29T01:05:00.000Z".to_string())
         .expect("timestamp");
     store
-        .mutate_worker(stalled, move |row| {
-            row.watch = Some(remuda_protocol::WorkerWatch {
-                status: remuda_protocol::WorkerWatchStatus::Stalled,
-                observed_at: observed_at.clone(),
-                detail: None,
-                last_done_sha: None,
-                last_blocked: None,
-                last_screen_digest: None,
-                last_activity_at: None,
-            });
-            Ok(())
-        })
+        .mutate_worker(
+            stalled,
+            move |row| {
+                row.watch = Some(remuda_protocol::WorkerWatch {
+                    status: remuda_protocol::WorkerWatchStatus::Stalled,
+                    observed_at: observed_at.clone(),
+                    detail: None,
+                    last_done_sha: None,
+                    last_blocked: None,
+                    last_screen_digest: None,
+                    last_activity_at: None,
+                });
+                Ok(())
+            },
+            internal_authority(),
+        )
         .await
         .context("stall")?;
     let glance = json_of(
@@ -668,7 +684,7 @@ async fn the_glance_counts_every_worker_past_the_row_load_cap() -> Result<()> {
             "state": { "state": "working" },
         }))?;
         store
-            .insert_worker(worker, "digest-test".into())
+            .insert_worker(worker, "digest-test".into(), internal_authority())
             .await
             .context("insert worker")?;
     }
@@ -709,12 +725,16 @@ async fn done_today_counts_the_day_a_worker_reported_done_not_its_last_write() -
     let (fresh, _) = ctx.worker_under(&token, &project, "c-fresh", None).await?;
     let store = ctx.hub.store().context("store")?;
     store
-        .mutate_worker(fresh.clone(), |row| {
-            row.state = remuda_protocol::WorkerState::Done {
-                sha: "0a10ebf351aa".into(),
-            };
-            Ok(())
-        })
+        .mutate_worker(
+            fresh.clone(),
+            |row| {
+                row.state = remuda_protocol::WorkerState::Done {
+                    sha: "0a10ebf351aa".into(),
+                };
+                Ok(())
+            },
+            internal_authority(),
+        )
         .await
         .context("report done")?;
     let glance_path = format!("/v1/lineages/{coordinator}/glance");
@@ -730,7 +750,7 @@ async fn done_today_counts_the_day_a_worker_reported_done_not_its_last_write() -
     let store = ctx.hub.store().context("store")?;
     for id in [&stale, &fresh] {
         store
-            .mutate_worker(id.to_string(), |_| Ok(()))
+            .mutate_worker(id.to_string(), |_| Ok(()), internal_authority())
             .await
             .context("re-observe")?;
     }
@@ -742,19 +762,27 @@ async fn done_today_counts_the_day_a_worker_reported_done_not_its_last_write() -
 
     // A worker that leaves DONE and reports again today counts again.
     store
-        .mutate_worker(stale.clone(), |row| {
-            row.state = remuda_protocol::WorkerState::Working;
-            Ok(())
-        })
+        .mutate_worker(
+            stale.clone(),
+            |row| {
+                row.state = remuda_protocol::WorkerState::Working;
+                Ok(())
+            },
+            internal_authority(),
+        )
         .await
         .context("reopen")?;
     store
-        .mutate_worker(stale, |row| {
-            row.state = remuda_protocol::WorkerState::Done {
-                sha: "0a10ebf351aa".into(),
-            };
-            Ok(())
-        })
+        .mutate_worker(
+            stale,
+            |row| {
+                row.state = remuda_protocol::WorkerState::Done {
+                    sha: "0a10ebf351aa".into(),
+                };
+                Ok(())
+            },
+            internal_authority(),
+        )
         .await
         .context("re-done")?;
     let glance = json_of(&ctx.get(&token, &glance_path).await?.1);

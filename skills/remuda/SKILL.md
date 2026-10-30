@@ -160,9 +160,12 @@ the facts it needs, the files it owns and the acceptance.
 read before you decide (D-055); a blind retry can apply the same action twice.
 Use only the reads an Agent has today (`docs/design/agent-parity.md`): after
 a timed-out `remuda memory write`, `remuda memory read <slug>` shows whether
-it landed; after a send, `remuda instance read … --source journal` shows the
-result, because an Agent cannot read a command receipt yet. Where no read
-exists, say so plainly instead of inventing one.
+it landed; after a send to an instance you own, `remuda instance read …
+--source journal` shows the result, because an Agent cannot read a command
+receipt yet. For a target you do not own, an Agent has neither a command
+receipt nor a journal read today, so treat the outcome as unknown and ask the
+owner instead of re-sending. Where no read exists, say so plainly instead of
+inventing one.
 
 ## Drivers and kinds
 

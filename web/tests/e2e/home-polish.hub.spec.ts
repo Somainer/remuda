@@ -161,14 +161,16 @@ type Offender = { testid: string; text: string; lines: string; box: string };
 /**
  * Every rendered button must paint each text node on one line box. Nodes of a
  * hidden subtree report no rects and are skipped; icon-only buttons have no
- * text node and cannot wrap.
+ * text node and cannot wrap. The btnAllowWrap exemption (authorization
+ * scopes / path targets) is allowed to wrap and is skipped here.
  */
 async function singleLineOffenders(page: Page): Promise<Offender[]> {
   return page.evaluate(() => {
-    const SELECTOR = 'button, [role="button"], a[data-testid^="phone-nav-"]';
+    const SELECTOR = 'button, [role="button"], a[data-testid^="phone-nav-"], a[class*="btn" i]';
     const offenders: { testid: string; text: string; lines: string; box: string }[] = [];
     for (const el of Array.from(new Set(document.querySelectorAll(SELECTOR)))) {
       if (el.getAttribute("aria-hidden") === "true") continue;
+      if (Array.from(el.classList).some((name) => name.includes("btnAllowWrap"))) continue;
       const style = getComputedStyle(el);
       if (style.display === "none" || style.visibility === "hidden") continue;
       const box = el.getBoundingClientRect();
@@ -219,25 +221,32 @@ async function expectNoHorizontalOverflow(page: Page): Promise<void> {
 type TruncatedUnlabeled = { testid: string; text: string };
 
 /**
- * D-061: a button that IS truncated (nowrap/ellipsis buttons and their label
- * spans) must carry the full label in `title` or `aria-label`. Buttons that
- * wrap (`white-space: normal`) are the authorization-scope / path-target
- * exemption and never truncate horizontally, so they are out of this check.
+ * D-061: a button that IS truncated must carry the full label in `title` or
+ * `aria-label`. The exemption (btnAllowWrap — authorization scopes and
+ * filesystem targets) wraps instead of truncating, so it is skipped.
+ *
+ * Coverage (r3): button-like anchors count too (`a[class*="btn"]` catches
+ * `.btn` links and composed classes), and every inner label span is measured
+ * on its own — a PhoneNav `.label` clips while its wrapping `.item` container
+ * does not.
  */
 async function truncatedWithoutFullLabel(page: Page): Promise<TruncatedUnlabeled[]> {
   return page.evaluate(() => {
-    const SELECTOR = 'button, [role="button"], a[data-testid^="phone-nav-"]';
+    const SELECTOR =
+      'button, [role="button"], a[data-testid^="phone-nav-"], a[class*="btn" i]';
     const norm = (value: string) => value.replace(/\s+/g, " ").trim();
+    const exempt = (el: Element) =>
+      Array.from(el.classList).some((name) => name.includes("btnAllowWrap"));
     const out: { testid: string; text: string }[] = [];
     for (const el of Array.from(new Set(document.querySelectorAll(SELECTOR)))) {
       const style = getComputedStyle(el);
       if (style.display === "none" || style.visibility === "hidden") continue;
       const box = el.getBoundingClientRect();
       if (box.width < 1 || box.height < 1) continue;
-      if (style.whiteSpace !== "nowrap") continue; // the wrap exemption
+      if (exempt(el)) continue; // the authorization-scope / path-target exemption
       const clipped: string[] = [];
       if (el.scrollWidth > el.clientWidth + 1) clipped.push(norm(el.textContent ?? ""));
-      for (const span of Array.from(el.querySelectorAll(":scope > span"))) {
+      for (const span of Array.from(el.querySelectorAll("span"))) {
         if (span.scrollWidth > span.clientWidth + 1) clipped.push(norm(span.textContent ?? ""));
       }
       if (clipped.length === 0) continue;
@@ -511,5 +520,55 @@ test("390 light: the session-pinned approval card wraps a long scope label", asy
   } finally {
     await context.close();
     await prepared!.request.delete(`/v1/instances/${instanceId}?force=1`).catch(() => undefined);
+  }
+});
+
+/**
+ * D-061 r3: the truncation scan must see what the product actually renders —
+ * link-buttons (e.g. the `去回答` anchor, `openLink`) and labels that clip on
+ * an inner span while their container wraps (the PhoneNav `.label`). This is
+ * a self-test of the assertion: two synthetic controls stand in for a case
+ * the fixture pages do not currently produce.
+ */
+test("the truncation scan sees link-buttons and inner label spans", async ({ browser }) => {
+  const baseURL = test.info().project.use.baseURL;
+  expect(baseURL, "project baseURL").toBeTruthy();
+  const prepared = await prepare(browser, baseURL!);
+  test.skip(!prepared, "needs the in-process fake Node (e2e-fake-node)");
+
+  const context = await browser.newContext({
+    ...devices["iPhone 13"],
+    baseURL: baseURL!,
+    storageState: prepared!.storage,
+  });
+  try {
+    const page = await context.newPage();
+    await page.goto("/m");
+    await expect(page.getByTestId("home-list")).toBeVisible({ timeout: 20_000 });
+    await page.evaluate(() => {
+      const host = document.createElement("div");
+      host.id = "synthetic-truncation";
+      host.style.cssText = "position:fixed;left:0;top:0;width:140px;z-index:99999";
+      host.innerHTML = [
+        '<a class="fakeBtn" data-testid="synthetic-link-btn" href="/m"',
+        ' style="display:inline-block;max-width:60px;overflow:hidden;white-space:nowrap;',
+        'text-overflow:ellipsis">一个很长的链接按钮文字</a>',
+        '<button type="button" data-testid="synthetic-spanned"',
+        ' style="display:inline-flex;white-space:normal;max-width:60px">',
+        '<span style="display:inline-block;max-width:40px;overflow:hidden;white-space:nowrap;',
+        'text-overflow:ellipsis">另一个很长的内部标签</span></button>',
+      ].join("");
+      document.body.append(host);
+    });
+    const offenders = await truncatedWithoutFullLabel(page);
+    const ids = offenders.map((entry) => entry.testid);
+    expect(ids, "a truncated anchor styled as a button is caught").toContain("synthetic-link-btn");
+    expect(ids, "a truncated label span inside a wrapping container is caught").toContain(
+      "synthetic-spanned",
+    );
+    await page.evaluate(() => document.getElementById("synthetic-truncation")?.remove());
+    expect(await truncatedWithoutFullLabel(page), "nothing synthetic is left").toEqual([]);
+  } finally {
+    await context.close();
   }
 });

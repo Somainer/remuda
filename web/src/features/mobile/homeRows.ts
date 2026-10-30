@@ -161,6 +161,31 @@ export function rank(instance: Instance, childLive = false): HomeRank {
   });
 }
 
+/**
+ * True when this instance's own rank is one that wakes its parent (home.md
+ * §3.1 f): blocked, working or starting. The child's connectivity is not
+ * consulted — a child on a dropped host still ranks what its lifecycle and
+ * activity say.
+ */
+export function childIsLive(child: Instance): boolean {
+  const homeRank = rank(child);
+  return homeRank === "blocked" || homeRank === "working" || homeRank === "starting";
+}
+
+/**
+ * Parent instance ids that have at least one child in rank 1, 3 or 5, for the
+ * `awaiting-wake` rule. Both surfaces derive their child set from this one
+ * helper so the rule cannot drift between them.
+ */
+export function liveChildParents(instances: readonly Instance[]): Set<string> {
+  const parents = new Set<string>();
+  for (const instance of instances) {
+    const parentId = instance.parent?.instanceId;
+    if (parentId && childIsLive(instance)) parents.add(parentId);
+  }
+  return parents;
+}
+
 /** Sort key for {@link rank}. `done-unseen` sits between blocked and working. */
 export function rankOrder(homeRank: HomeRank): number {
   return HOME_RANKS.indexOf(homeRank);

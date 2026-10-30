@@ -19,7 +19,7 @@ import { isEmberEffort } from "./effort";
 import { nextStep } from "./nextStep";
 import { LaunchedByMark } from "./LaunchedBy";
 import { HarnessGlyph } from "../spaces/SpacesPanel";
-import { compareRanked, rank, rankStateWord, type HomeRank } from "../mobile/homeRows";
+import { compareRanked, liveChildParents, rank, rankStateWord, type HomeRank } from "../mobile/homeRows";
 import {
   applyFilters,
   availableConditions,
@@ -202,16 +202,8 @@ export function SessionList({
   const notice = droppedNotice.spaceId === spaceId ? droppedNotice.chips : [];
 
   // Children that are still running lift their idle parent into awaiting-wake.
-  const childLiveIds = useMemo(() => {
-    const ids = new Set<string>();
-    for (const instance of hub.instances) {
-      const parentId = instance.parent?.instanceId;
-      if (!parentId) continue;
-      const status = projectStatus(instance);
-      if (status === "blocked" || status === "working" || status === "starting") ids.add(parentId);
-    }
-    return ids;
-  }, [hub.instances]);
+  // The child's own rank decides (blocked/working/starting), not connectivity.
+  const childLiveIds = useMemo(() => liveChildParents(hub.instances), [hub.instances]);
 
   const ranked = useMemo(() => {
     const byId = new Map(filtered.map((instance) => [instance.id, instance]));

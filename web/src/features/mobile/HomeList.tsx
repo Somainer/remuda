@@ -7,7 +7,7 @@ import type { Instance } from "../../types/instance";
 import type { Interaction } from "../../types/interaction";
 import { hubStore } from "../../lib/store";
 import type { HubState } from "../../lib/store";
-import { uiMode, projectStatus } from "../../lib/status";
+import { uiMode } from "../../lib/status";
 import {
   buildSpaces,
   selectedSpace,
@@ -23,6 +23,7 @@ import {
   buildHomeRows,
   buildHomeTaskLayer,
   homeRowsSignature,
+  liveChildParents,
   rankFolds,
   readHomeOrder,
   writeHomeOrder,
@@ -77,16 +78,9 @@ function selectHome(snapshot: HubState, prefs: SpacePrefs, nowMs: number): HomeS
   const spaces = buildSpaces(snapshot.workspaces, snapshot.instances, prefs);
   const pending = snapshot.interactions.filter((interaction) => interaction.state === "pending");
   // An idle session with a still-running child ranks as awaiting-wake. Children
-  // themselves are not home rows.
-  const childLiveIds = new Set<string>();
-  for (const instance of snapshot.instances) {
-    const parentId = instance.parent?.instanceId;
-    if (!parentId) continue;
-    const status = projectStatus(instance);
-    if (status === "blocked" || status === "working" || status === "starting") {
-      childLiveIds.add(parentId);
-    }
-  }
+  // themselves are not home rows. The child's own rank decides, so a child that
+  // is starting (or blocked) on a dropped host still counts.
+  const childLiveIds = liveChildParents(snapshot.instances);
   const rows = buildHomeRows({
     spaces,
     interactions: pending,

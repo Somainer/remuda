@@ -21,6 +21,8 @@ import {
   homeError,
   homeTurnError,
   homeRowsSignature,
+  childIsLive,
+  liveChildParents,
   rank,
   rankFolds,
   rankOf,
@@ -175,6 +177,32 @@ describe("rank(): the seven ranks, newest first within a rank", () => {
     expect(rank(session("s", { lifecycle: "exited", activity: known("waiting-interaction") }))).toBe(
       "blocked",
     );
+  });
+
+  it("counts a child as live from its own rank, not from its connectivity", () => {
+    const child = (patch: Partial<Instance>) =>
+      session("ins-child", {
+        parent: { instanceId: "ins-parent" as Id, runId: "r" as Id, commandId: "c" as Id },
+        ...patch,
+      });
+    // §3.1 f: a child in rank 1, 3 or 5 wakes its parent, whatever its host's
+    // connectivity — an unknown lifecycle ranks starting, not "not running".
+    expect(childIsLive(child({ lifecycle: "unknown", connectivity: "disconnected" }))).toBe(true);
+    expect(childIsLive(child({ activity: known("waiting-interaction"), connectivity: "disconnected" }))).toBe(
+      true,
+    );
+    expect(childIsLive(child({ activity: known("working") }))).toBe(true);
+    // Ranks 2, 4, 6 and 7 do not.
+    expect(childIsLive(child({ activity: known("idle"), unseen: true }))).toBe(false);
+    expect(childIsLive(child({ activity: known("idle"), lifecycle: "exited" }))).toBe(false);
+    expect(childIsLive(child({ activity: known("idle") }))).toBe(false);
+
+    const parents = liveChildParents([
+      session("ins-parent"),
+      child({ lifecycle: "unknown", connectivity: "disconnected" }),
+      session("ins-lonely"),
+    ]);
+    expect([...parents]).toEqual(["ins-parent"]);
   });
 
   it("lifts only an idle live session with a live child into awaiting-wake", () => {

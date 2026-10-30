@@ -112,6 +112,8 @@ export function MemoryPage() {
   // a search that does not match it must never make it look absent.
   const [aboutEntry, setAboutEntry] = useState<MemoryEntry | null>(null);
   const [aboutLoaded, setAboutLoaded] = useState(false);
+  const [aboutBaseRevision, setAboutBaseRevision] = useState<number | null>(null);
+  const [aboutCleanBody, setAboutCleanBody] = useState("");
   const [aboutDraft, setAboutDraft] = useState("");
   const [aboutError, setAboutError] = useState<string | null>(null);
   const [aboutWarnings, setAboutWarnings] = useState<string[]>([]);
@@ -232,9 +234,61 @@ export function MemoryPage() {
     void loadAbout(lineageId);
   }, [entries, loading, lineageId, lineageKnown, loadAbout]);
 
+  /** Adopt a server copy outright: clean draft, known base revision. */
+  const adoptAbout = useCallback((entry: MemoryEntry | null) => {
+    setAboutEntry(entry);
+    setAboutLoaded(true);
+    setAboutBaseRevision(entry?.revision ?? null);
+    setAboutCleanBody(entry?.body ?? "");
+    setAboutDraft(entry?.body ?? "");
+  }, []);
+
+  // Draft sync: the server copy only wins while the textarea is CLEAN. A dirty
+  // draft survives list reloads and search changes; if the server revision
+  // moved under it, the owner chooses in the conflict dialog instead of
+  // losing the text.
   useEffect(() => {
-    if (aboutLoaded) setAboutDraft(aboutEntry?.body ?? "");
-  }, [aboutLoaded, aboutEntry]);
+    if (!aboutLoaded) return;
+    const server = aboutEntry;
+    if (!server) {
+      if (aboutBaseRevision === null) {
+        setAboutDraft("");
+        setAboutCleanBody("");
+      }
+      return;
+    }
+    if (server.archivedAt != null) {
+      setAboutDraft(server.body);
+      setAboutCleanBody(server.body);
+      setAboutBaseRevision(server.revision);
+      return;
+    }
+    const dirty = aboutDraft !== aboutCleanBody;
+    const moved = aboutBaseRevision !== null && server.revision !== aboutBaseRevision;
+    if (!dirty) {
+      if (aboutDraft !== server.body) setAboutDraft(server.body);
+      setAboutCleanBody(server.body);
+      setAboutBaseRevision(server.revision);
+      return;
+    }
+    if (moved) {
+      setConflict((current) =>
+        current
+          ? current
+          : {
+              mine: {
+                type: "user",
+                title: ABOUT_ME_TITLE,
+                description: ABOUT_ME_DESCRIPTION,
+                body: aboutDraft,
+              },
+              server,
+              kind: "about",
+            },
+      );
+    }
+    // Dirty at the same revision: keep the owner's text.
+  }, [aboutLoaded, aboutEntry, aboutDraft, aboutCleanBody, aboutBaseRevision]);
 
   // A 「已记住」 row links here with ?slug=: scroll to it and mark it once.
   useEffect(() => {
@@ -322,8 +376,7 @@ export function MemoryPage() {
       const { server, kind } = conflict;
       setConflict(null);
       if (kind === "about") {
-        setAboutEntry(server);
-        setAboutDraft(server.body);
+        adoptAbout(server);
         setAboutError("已载入服务器上的最新版本。");
         return;
       }
@@ -352,8 +405,7 @@ export function MemoryPage() {
       await reload(lineageId, q);
       const warnings = warningText(result.warnings);
       if (kind === "about") {
-        setAboutEntry(result.entry);
-        setAboutDraft(result.entry.body);
+        adoptAbout(result.entry);
         setAboutError(null);
         setAboutWarnings(warnings);
         return;
@@ -429,8 +481,7 @@ export function MemoryPage() {
             description: ABOUT_ME_DESCRIPTION,
             body: aboutDraft,
           });
-      setAboutEntry(result.entry);
-      setAboutDraft(result.entry.body);
+      adoptAbout(result.entry);
       setAboutWarnings(warningText(result.warnings));
       await reload(lineageId, q);
     } catch (error) {

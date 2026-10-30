@@ -22,13 +22,11 @@ vi.mock("../features/memory/api", async (importOriginal) => {
     updateMemory: vi.fn(),
     deleteMemory: vi.fn(),
     restoreMemory: vi.fn(),
-    lineageExists: vi.fn(),
     listMemoryWrites: vi.fn(),
   };
 });
 
 const instanceGet = vi.mocked(api.instanceGet);
-const lineageExists = vi.mocked(memoryApi.lineageExists);
 const listMemory = vi.mocked(memoryApi.listMemory);
 const searchMemory = vi.mocked(memoryApi.searchMemory);
 const getMemory = vi.mocked(memoryApi.getMemory);
@@ -66,7 +64,6 @@ function renderPage(initialEntry: string) {
 beforeEach(() => {
   vi.clearAllMocks();
   instanceGet.mockResolvedValue({ id: "ins_x", lineageId: "ins_l" } as never);
-  lineageExists.mockResolvedValue(true);
   listMemory.mockResolvedValue([]);
   searchMemory.mockResolvedValue([]);
   getMemory.mockRejectedValue(new HubHttpError(404, "NOT_FOUND", "missing"));
@@ -110,5 +107,51 @@ describe("about-me is loaded on its own", () => {
       }),
     );
     expect(createMemory).not.toHaveBeenCalled();
+  });
+});
+
+describe("an unsaved about-me draft survives reloads", () => {
+  it("keeps the typed text when the list reloads under the same revision", async () => {
+    const about = entry({ slug: "about-me", body: "saved body", revision: 1 });
+    listMemory.mockResolvedValue([about, entry({ slug: "other" })]);
+    getMemory.mockResolvedValue(about);
+
+    renderPage("/s/ins_x/memory");
+    const textarea = (await screen.findByTestId("memory-about-body")) as HTMLTextAreaElement;
+    await waitFor(() => expect(textarea.value).toBe("saved body"));
+    fireEvent.change(textarea, { target: { value: "my unsaved draft" } });
+
+    // A search reloads the list (and refreshes the standalone about copy).
+    fireEvent.change(await screen.findByTestId("memory-search"), { target: { value: "边界" } });
+    await waitFor(() => expect(searchMemory).toHaveBeenCalled());
+
+    expect(textarea.value).toBe("my unsaved draft");
+    expect(screen.queryByTestId("memory-conflict")).toBeNull();
+    // A save after the reload still targets the loaded base revision.
+    fireEvent.click(screen.getByTestId("memory-about-save"));
+    await waitFor(() =>
+      expect(updateMemory).toHaveBeenCalledWith("ins_l", "about-me", 1, {
+        body: "my unsaved draft",
+      }),
+    );
+  });
+
+  it("offers the conflict choice when the server moved under a dirty draft", async () => {
+    const first = entry({ slug: "about-me", body: "theirs v1", revision: 1 });
+    const moved = entry({ slug: "about-me", body: "theirs v2", revision: 2 });
+    listMemory.mockResolvedValue([first]);
+    let serverVersion = first;
+    getMemory.mockImplementation(async () => serverVersion);
+
+    renderPage("/s/ins_x/memory");
+    const textarea = (await screen.findByTestId("memory-about-body")) as HTMLTextAreaElement;
+    await waitFor(() => expect(textarea.value).toBe("theirs v1"));
+    fireEvent.change(textarea, { target: { value: "mine" } });
+    serverVersion = moved;
+
+    fireEvent.change(await screen.findByTestId("memory-search"), { target: { value: "边界" } });
+    await waitFor(() => expect(screen.getByTestId("memory-conflict")).toBeTruthy());
+    expect(screen.getByTestId("memory-conflict-server")).toHaveTextContent("theirs v2");
+    expect(screen.getByTestId("memory-conflict-mine")).toHaveTextContent("mine");
   });
 });

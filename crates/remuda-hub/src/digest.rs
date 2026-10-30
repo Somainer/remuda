@@ -674,15 +674,16 @@ fn supply_facts(profile: &ProviderRecord, model: &str, now: i64) -> Option<Suppl
 // ── rendering under the byte budget ────────────────────────────────────────
 
 /// Raw (already redacted) text slots and their current character caps.
+///
+/// Only text the document actually carries is a slot: `shrunk` names a field
+/// whose rendered text is shorter than its source, so a value the renderer
+/// never emits must not consume a slot.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Slot {
     Head,
     Tail,
     Question,
     Args,
-    WatchDetail,
-    TurnError,
-    Reason,
     Branch,
     Name,
     Tool,
@@ -692,20 +693,17 @@ enum Slot {
     EffortEff,
     Task,
     Sha,
+    ProjectId,
     WorkerId,
     InstanceId,
-    ProjectId,
 }
 
-const SLOTS: [(Slot, usize, usize); 17] = [
+const SLOTS: [(Slot, usize, usize); 14] = [
     // (slot, initial char cap, shrink weight): prose shrinks before ids.
     (Slot::Head, 420, 3),
     (Slot::Tail, 260, 3),
     (Slot::Question, 240, 3),
     (Slot::Args, 320, 2),
-    (Slot::WatchDetail, 120, 3),
-    (Slot::TurnError, 140, 3),
-    (Slot::Reason, 120, 3),
     (Slot::Branch, 96, 1),
     (Slot::Name, 64, 1),
     (Slot::Tool, 48, 1),
@@ -733,10 +731,8 @@ struct Parts {
     name: String,
     instance_id: Option<String>,
     roster: String,
-    reason: Option<String>,
     watch: Option<String>,
-    watch_detail: Option<String>,
-    turn: Option<(String, Option<String>, Option<String>)>,
+    turn: Option<(String, Option<String>)>,
     last_text: Option<String>,
     pending: Option<PendingParts>,
     model_req: Option<String>,
@@ -760,9 +756,6 @@ impl Parts {
             Slot::Head | Slot::Tail => self.last_text.as_deref(),
             Slot::Question => self.pending.as_ref().map(|p| p.question.as_str()),
             Slot::Args => self.pending.as_ref().and_then(|p| p.args.as_deref()),
-            Slot::WatchDetail => self.watch_detail.as_deref(),
-            Slot::TurnError => self.turn.as_ref().and_then(|t| t.2.as_deref()),
-            Slot::Reason => self.reason.as_deref(),
             Slot::Branch => Some(&self.branch),
             Slot::Name => Some(&self.name),
             Slot::Tool => self.pending.as_ref().and_then(|p| p.tool.as_deref()),
@@ -778,18 +771,11 @@ impl Parts {
         }
     }
 
-    /// Characters a slot occupies at `cap` (excerpts count their own share).
+    /// Characters a slot occupies at `cap` (an excerpt is bounded by its cap
+    /// and by the text length; head and tail never overlap).
     fn used(&self, slot: Slot, cap: usize) -> usize {
-        match slot {
-            // Head and tail are excerpts of one text; they never overlap, so
-            // each is bounded by its own cap and by the text length.
-            Slot::Head | Slot::Tail => self
-                .raw(slot)
-                .map_or(0, |text| text.chars().count().min(cap)),
-            _ => self
-                .raw(slot)
-                .map_or(0, |text| text.chars().count().min(cap)),
-        }
+        self.raw(slot)
+            .map_or(0, |text| text.chars().count().min(cap))
     }
 }
 
@@ -817,43 +803,121 @@ fn req_clip(parts: &Parts, caps: &Caps, slot: Slot) -> String {
     clip_chars(parts.raw(slot).unwrap_or_default(), caps.get(slot))
 }
 
-/// The wire name of a slot, for the `shrunk` list.
-fn slot_field(slot: Slot) -> &'static str {
-    match slot {
-        Slot::Head | Slot::Tail => "lastText",
-        Slot::Question => "question",
-        Slot::Args => "argsSummary",
-        Slot::WatchDetail => "watch",
-        Slot::TurnError => "turn",
-        Slot::Reason => "reason",
-        Slot::Branch => "branch",
-        Slot::Name => "name",
-        Slot::Tool => "tool",
-        Slot::ModelReq | Slot::ModelEff => "model",
-        Slot::EffortReq | Slot::EffortEff => "effort",
-        Slot::Task => "taskId",
-        Slot::Sha => "sha",
-        Slot::ProjectId => "projectId",
-        Slot::WorkerId => "workerId",
-        Slot::InstanceId => "instanceId",
+/// Whether a field's rendered text is shorter than its source.
+fn cut(raw: Option<&str>, shown: Option<&str>) -> bool {
+    match (raw, shown) {
+        (None, _) => false,
+        (Some(raw), None) => !raw.is_empty(),
+        (Some(raw), Some(shown)) => shown.chars().count() < raw.chars().count(),
     }
 }
 
-/// Fields whose rendered text is shorter than the source, in shrink order.
-fn shrunk_fields(parts: &Parts, caps: &Caps) -> Vec<String> {
-    let mut fields = Vec::new();
-    for (slot, _, _) in SLOTS {
-        let Some(raw) = parts.raw(slot) else {
-            continue;
-        };
-        if raw.chars().count() > caps.get(slot) {
-            let field = slot_field(slot);
-            if !fields.iter().any(|seen| seen == field) {
-                fields.push(field.to_string());
+/// Fields whose rendered text is shorter than the source, in wire order.
+///
+/// Derived from what the document actually says, not from the caps: a medium
+/// `lastText` reassembles whole from head + tail, so it was not shortened, and
+/// a value the renderer never emits cannot be listed at all.
+fn shrunk_fields(digest: &WorkerDigest, parts: &Parts) -> Vec<String> {
+    let mut shrunk: Vec<&'static str> = Vec::new();
+    {
+        let mut note = |field: &'static str, raw: Option<&str>, shown: Option<&str>| {
+            if cut(raw, shown) && !shrunk.contains(&field) {
+                shrunk.push(field);
             }
-        }
+        };
+        let text = parts.last_text.as_deref();
+        let shown = digest
+            .last_text
+            .as_ref()
+            .map(|text| format!("{}{}", text.head, text.tail));
+        note("lastText", text, shown.as_deref());
+        let pending = parts.pending.as_ref();
+        note(
+            "question",
+            pending.map(|p| p.question.as_str()),
+            digest.pending.as_ref().map(|p| p.question.as_str()),
+        );
+        note(
+            "argsSummary",
+            pending.and_then(|p| p.args.as_deref()),
+            digest
+                .pending
+                .as_ref()
+                .and_then(|p| p.args_summary.as_deref()),
+        );
+        note(
+            "tool",
+            pending.and_then(|p| p.tool.as_deref()),
+            digest.pending.as_ref().and_then(|p| p.tool.as_deref()),
+        );
+        note(
+            "branch",
+            Some(parts.branch.as_str()),
+            Some(digest.branch.as_str()),
+        );
+        note(
+            "name",
+            Some(parts.name.as_str()),
+            Some(digest.name.as_str()),
+        );
+        note("taskId", parts.task.as_deref(), digest.task_id.as_deref());
+        note("sha", parts.sha.as_deref(), digest.sha.as_deref());
+        note(
+            "projectId",
+            parts.project_id.as_deref(),
+            digest.project_id.as_deref(),
+        );
+        note(
+            "workerId",
+            Some(parts.worker_id.as_str()),
+            Some(digest.worker_id.as_str()),
+        );
+        note(
+            "instanceId",
+            parts.instance_id.as_deref(),
+            digest.instance_id.as_deref(),
+        );
+        note(
+            "model",
+            parts.model_req.as_deref(),
+            digest.model.requested.as_deref(),
+        );
+        note(
+            "model",
+            parts.model_eff.as_deref(),
+            digest.model.effective.as_deref(),
+        );
+        note(
+            "effort",
+            parts.effort_req.as_deref(),
+            digest.model.effort.requested.as_deref(),
+        );
+        note(
+            "effort",
+            parts.effort_eff.as_deref(),
+            digest.model.effort.effective.as_deref(),
+        );
+        note(
+            "turn",
+            parts.turn.as_ref().map(|turn| turn.0.as_str()),
+            digest.turn.as_ref().map(|turn| turn.result.as_str()),
+        );
+        note(
+            "configure",
+            parts.configure.as_ref().and_then(|(_, id)| id.as_deref()),
+            digest
+                .model
+                .configure
+                .as_ref()
+                .and_then(|configure| configure.request_id.as_deref()),
+        );
+        note(
+            "supply",
+            parts.supply.as_ref().and_then(|s| s.window_id.as_deref()),
+            digest.supply.as_ref().and_then(|s| s.window_id.as_deref()),
+        );
     }
-    fields
+    shrunk.into_iter().map(str::to_string).collect()
 }
 
 fn render(parts: &Parts, caps: &Caps) -> WorkerDigest {
@@ -876,7 +940,7 @@ fn render(parts: &Parts, caps: &Caps) -> WorkerDigest {
         };
         DigestText { head, tail }
     });
-    WorkerDigest {
+    let mut digest = WorkerDigest {
         v: 1,
         worker_id: parts.worker_id.clone(),
         instance_id: parts.instance_id.clone(),
@@ -889,7 +953,7 @@ fn render(parts: &Parts, caps: &Caps) -> WorkerDigest {
             state: parts.roster.clone(),
             watch: parts.watch.clone(),
         },
-        turn: parts.turn.as_ref().map(|(status, at, _)| DigestTurn {
+        turn: parts.turn.as_ref().map(|(status, at)| DigestTurn {
             result: clip_chars(status, 32),
             ended_at: at.clone(),
         }),
@@ -922,8 +986,10 @@ fn render(parts: &Parts, caps: &Caps) -> WorkerDigest {
         queued: parts.queued,
         since_progress_secs: parts.idle_secs,
         tool_in_flight: parts.tool_in_flight,
-        shrunk: shrunk_fields(parts, caps),
-    }
+        shrunk: Vec::new(),
+    };
+    digest.shrunk = shrunk_fields(&digest, parts);
+    digest
 }
 
 fn encoded_len(digest: &WorkerDigest) -> usize {
@@ -932,10 +998,8 @@ fn encoded_len(digest: &WorkerDigest) -> usize {
 
 /// The smallest document that still names its worker: the last resort when
 /// shrinking every text slot to nothing is not enough.
-/// The smallest document that still names its worker: the last resort when
-/// shrinking every text slot to nothing is not enough.
 fn skeleton(parts: &Parts) -> WorkerDigest {
-    WorkerDigest {
+    let mut digest = WorkerDigest {
         v: 1,
         worker_id: parts.worker_id.chars().take(64).collect(),
         instance_id: None,
@@ -961,8 +1025,10 @@ fn skeleton(parts: &Parts) -> WorkerDigest {
         queued: parts.queued,
         since_progress_secs: parts.idle_secs,
         tool_in_flight: parts.tool_in_flight,
-        shrunk: vec!["workerId".to_string()],
-    }
+        shrunk: Vec::new(),
+    };
+    digest.shrunk = shrunk_fields(&digest, parts);
+    digest
 }
 
 /// Render `parts` into at most [`WORKER_DIGEST_MAX_BYTES`] bytes of valid JSON.
@@ -1037,10 +1103,11 @@ fn build_parts(facts: &Facts<'_>) -> Parts {
         now,
     } = *facts;
     let tail = scan_tail(journal);
-    let (roster, reason, done_sha) = match &worker.state {
-        WorkerState::Blocked { reason } => (worker.state.kind(), Some(reason.clone()), None),
-        WorkerState::Done { sha } => (worker.state.kind(), None, Some(sha.clone())),
-        other => (other.kind(), None, None),
+    // Only the state KIND is serialized: a blocked reason and a watch detail
+    // stay on the row for `remuda watch`, never in this bounded document.
+    let (roster, done_sha) = match &worker.state {
+        WorkerState::Done { sha } => (worker.state.kind(), Some(sha.clone())),
+        other => (other.kind(), None),
     };
     let sha = done_sha.or_else(|| worker.watch.as_ref().and_then(|w| w.last_done_sha.clone()));
     let watch = worker.watch.as_ref();
@@ -1107,27 +1174,14 @@ fn build_parts(facts: &Facts<'_>) -> Parts {
         .as_deref()
         .and_then(parse_unix)
         .or_else(|| instance.and_then(|row| parse_unix(&row.updated_at)));
-    let turn_error = instance
-        .and_then(|row| row.last_turn_error.as_ref())
-        .map(|marker| redact_secrets(&marker.text));
 
     Parts {
         worker_id: worker.meta.id.as_id().to_string(),
         name: worker.name.clone(),
         instance_id: worker.instance_id.as_ref().map(|id| id.as_id().to_string()),
         roster: roster.to_string(),
-        reason: reason.map(|text| redact_secrets(&text)),
         watch: watch.map(|w| watch_label(&w.status).to_string()),
-        watch_detail: watch
-            .and_then(|w| w.detail.as_deref())
-            .map(redact_secrets)
-            .filter(|text| !text.is_empty()),
-        turn: tail.turn.map(|(status, at)| {
-            // A result observed in the journal wins; the instance marker
-            // supplies the failure text the result event does not carry.
-            let error = (status == "error").then(|| turn_error.clone()).flatten();
-            (status, at, error)
-        }),
+        turn: tail.turn,
         last_text: tail
             .last_text
             .as_deref()
@@ -1750,9 +1804,23 @@ mod tests {
         let worker = worker(json!({ "state": "working" }));
         let parts = build_parts(&facts(&worker, None, &[], &[], &[], None));
         let digest = skeleton(&parts);
-        assert_eq!(digest.shrunk, vec!["workerId".to_string()]);
-        assert!(assert_valid_and_bounded(&digest) < 400);
         assert_eq!(digest.worker_id, parts.worker_id);
+        // The id and the name survive whole, so they are not listed; the
+        // fields the skeleton dropped are, because their content did go.
+        assert!(
+            !digest.shrunk.contains(&"workerId".to_string())
+                && !digest.shrunk.contains(&"name".to_string()),
+            "{:?}",
+            digest.shrunk
+        );
+        for field in ["branch", "projectId", "instanceId", "model"] {
+            assert!(
+                digest.shrunk.contains(&field.to_string()),
+                "the skeleton dropped {field}: {:?}",
+                digest.shrunk
+            );
+        }
+        assert!(assert_valid_and_bounded(&digest) < 400);
     }
 
     #[test]
@@ -1771,6 +1839,65 @@ mod tests {
         let digest = digest_of(&facts(&worker, None, &journal, &[], &[], None));
         let text = digest.last_text.expect("text");
         assert_eq!(format!("{}{}", text.head, text.tail), medium);
+    }
+
+    #[test]
+    fn shrunk_names_only_fields_whose_text_was_actually_cut() {
+        let row = worker(json!({ "state": "working" }));
+        // 600 characters reassemble fully from head (420) + tail (260): nothing
+        // was cut, so the document must not claim it was.
+        let medium: String = (0..600)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
+        let journal = vec![assistant_text("m1", "open", &medium)];
+        let digest = digest_of(&facts(&row, None, &journal, &[], &[], None));
+        let text = digest.last_text.as_ref().expect("text");
+        assert_eq!(format!("{}{}", text.head, text.tail), medium);
+        assert!(digest.shrunk.is_empty(), "nothing was cut: {digest:?}");
+
+        // A long blocked reason and a long watch detail are never serialized,
+        // so they cannot be reported as shortened either.
+        let blocked_row = worker(json!({ "state": "blocked", "reason": "r".repeat(500) }));
+        let blocked = digest_of(&facts(&blocked_row, None, &[], &[], &[], None));
+        assert!(
+            blocked.shrunk.is_empty(),
+            "unserialized text must not be listed: {blocked:?}"
+        );
+        let mut watched_row = worker(json!({ "state": "working" }));
+        watched_row.watch = Some(remuda_protocol::WorkerWatch {
+            status: remuda_protocol::WorkerWatchStatus::Working,
+            observed_at: remuda_protocol::Timestamp::try_from(
+                "2026-10-29T01:05:00.000Z".to_string(),
+            )
+            .expect("timestamp"),
+            detail: Some("d".repeat(500)),
+            last_done_sha: None,
+            last_blocked: None,
+            last_screen_digest: None,
+            last_activity_at: None,
+        });
+        let watched = digest_of(&facts(&watched_row, None, &[], &[], &[], None));
+        assert!(
+            watched.shrunk.is_empty(),
+            "an unrendered watch detail must not be listed: {watched:?}"
+        );
+
+        // The skeleton drops real content, so it names exactly what went, and
+        // never a field it kept intact.
+        let journal = vec![assistant_text("m1", "open", "hello")];
+        let parts = build_parts(&facts(&row, None, &journal, &[], &[], None));
+        let skeleton = skeleton(&parts);
+        assert_eq!(skeleton.worker_id, parts.worker_id);
+        assert!(
+            !skeleton.shrunk.contains(&"workerId".to_string()),
+            "the worker id was kept whole: {:?}",
+            skeleton.shrunk
+        );
+        assert!(
+            skeleton.shrunk.contains(&"lastText".to_string()),
+            "the skeleton dropped the text: {:?}",
+            skeleton.shrunk
+        );
     }
 
     #[test]

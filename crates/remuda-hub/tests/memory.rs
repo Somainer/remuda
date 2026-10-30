@@ -1476,7 +1476,6 @@ async fn an_owner_write_has_a_null_turn_and_two_writes_keep_both_rows() -> Resul
 async fn the_write_feed_starts_at_the_newest_page_and_pages_by_row_id() -> Result<()> {
     let ctx = Ctx::spawn().await?;
     let lineage = ctx.seat().await?;
-    let seat = ctx.agent(&lineage).await?;
     let started = ctx.start_turn(&lineage).await?;
     // One turn with more rows than the page bound: the cursor must still
     // advance, which a turn-seq cursor cannot do. The rows are seeded

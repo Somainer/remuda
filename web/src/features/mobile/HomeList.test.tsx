@@ -245,3 +245,130 @@ describe("HomeList folds during a search", () => {
     expect(screen.queryByTestId("home-quiet-fold")).toBeNull();
   });
 });
+
+describe("HomeList hold against the painted structure", () => {
+  function ids() {
+    return screen.queryAllByTestId("home-row").map((row) => row.querySelector("a")?.getAttribute("href"));
+  }
+  function setInstances(instances: Instance[]) {
+    act(() => {
+      hub.instances = instances;
+      for (const listener of listeners) listener();
+    });
+  }
+
+  it("keeps a held row on screen when it turns idle and its project would fold away", () => {
+    const working = row("ins-held", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" });
+    const idle = row("ins-idle", { activity: known("idle"), updatedAt: "2026-09-19T08:00:00.000Z" });
+    hub.instances = [working, idle];
+    renderHome();
+    // The idle row is folded; the working one is the only painted row.
+    expect(ids()).toEqual(["/s/ins-held"]);
+    expect(screen.getByTestId("home-idle-fold")).toHaveTextContent("还有 1 个空闲");
+
+    const held = screen.getByText("title ins-held").closest("article")!;
+    act(() => {
+      held.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+    });
+    expect(document.querySelector("[data-held='1']")).not.toBeNull();
+
+    // The turn ends: every row in the project is idle now, so the project
+    // would fold into 安静的项目 and the held row would disappear.
+    setInstances([
+      row("ins-held", { activity: known("idle"), updatedAt: "2026-09-19T11:00:00.000Z" }),
+      row("ins-idle", { activity: known("idle"), updatedAt: "2026-09-19T08:00:00.000Z" }),
+    ]);
+    expect(ids()).toEqual(["/s/ins-held"]);
+    expect(screen.getByText("title ins-held").closest("article")).toHaveAttribute("data-rank", "idle");
+
+    act(() => {
+      held.dispatchEvent(new PointerEvent("pointerup", { bubbles: true }));
+    });
+    // Released: the project is quiet, so both rows move into the bucket.
+    expect(ids()).toEqual([]);
+    expect(screen.getByTestId("home-quiet-fold")).toHaveTextContent("安静的项目 · 1");
+  });
+
+  it("keeps a held row when another project becomes the freshest one", () => {
+    hub.workspaces = [
+      { id: "wsp-a", hostId: "host-a", label: "alpha", rootPath: "/srv/alpha" },
+      { id: "wsp-b", hostId: "host-b", label: "beta", rootPath: "/srv/beta" },
+    ] as typeof hub.workspaces;
+    hub.hosts = [
+      { id: "host-a", label: "alpha" },
+      { id: "host-b", label: "beta" },
+    ] as typeof hub.hosts;
+    const alpha = row("ins-alpha", { activity: known("working"), updatedAt: "2026-09-19T10:00:00.000Z" });
+    const beta = row("ins-beta", {
+      hostId: "host-b",
+      workspaceId: "wsp-b",
+      activity: known("working"),
+      updatedAt: "2026-09-19T09:00:00.000Z",
+    });
+    hub.instances = [alpha, beta];
+    renderHome();
+    const projects = () =>
+      screen.getAllByTestId("home-group").map((group) => group.querySelector("span")?.textContent);
+    expect(projects()).toEqual(["alpha", "beta"]);
+
+    const held = screen.getByText("title ins-alpha").closest("article")!;
+    act(() => {
+      held.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+    });
+    // Beta's worker reports a change: clock order would put beta first.
+    setInstances([
+      row("ins-alpha", { activity: known("working"), updatedAt: "2026-09-19T10:00:00.000Z" }),
+      row("ins-beta", {
+        hostId: "host-b",
+        workspaceId: "wsp-b",
+        activity: known("working"),
+        updatedAt: "2026-09-19T12:00:00.000Z",
+      }),
+    ]);
+    expect(projects()).toEqual(["alpha", "beta"]);
+
+    act(() => {
+      held.dispatchEvent(new PointerEvent("pointerup", { bubbles: true }));
+    });
+    expect(projects()).toEqual(["beta", "alpha"]);
+  });
+
+  it("releases when the pointerup lands outside the list", () => {
+    hub.instances = [row("ins-held", { activity: known("working") })];
+    renderHome();
+    const held = screen.getByText("title ins-held").closest("article")!;
+    act(() => {
+      held.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+    });
+    expect(document.querySelector("[data-held='1']")).not.toBeNull();
+
+    act(() => {
+      document.body.dispatchEvent(new PointerEvent("pointerup", { bubbles: true }));
+    });
+    expect(document.querySelector("[data-held='0']")).not.toBeNull();
+  });
+
+  it("does not stay held when the focused row disappears", () => {
+    vi.useFakeTimers();
+    try {
+      hub.instances = [row("ins-held", { activity: known("working") })];
+      renderHome();
+      act(() => {
+        screen.getByText("title ins-held").closest("a")!.focus();
+      });
+      expect(document.querySelector("[data-held='1']")).not.toBeNull();
+
+      // The row is filtered away while it holds focus: no blur ever fires.
+      act(() => {
+        hub.instances = [row("ins-other", { activity: known("working") })];
+        for (const listener of listeners) listener();
+      });
+      act(() => {
+        vi.advanceTimersByTime(10_000);
+      });
+      expect(document.querySelector("[data-held='0']")).not.toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

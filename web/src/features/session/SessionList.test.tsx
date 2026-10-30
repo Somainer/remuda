@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -744,7 +744,7 @@ describe("SessionList relative-time clock (c-perffu r2)", () => {
 describe("desktop buckets", () => {
   it("maps every rank to exactly one bucket", async () => {
     const { HOME_RANKS } = await import("../mobile/homeRows");
-    const { SESSION_GROUPS } = await import("./SessionList");
+    const { SESSION_GROUPS } = await import("./sessionGroups");
     for (const rank of HOME_RANKS) {
       const matches = SESSION_GROUPS.filter((group) => group.match(rank));
       expect(matches, `rank ${rank} belongs to exactly one bucket`).toHaveLength(1);
@@ -753,5 +753,94 @@ describe("desktop buckets", () => {
     expect(SESSION_GROUPS.find((group) => group.match("done-unseen"))?.title).toBe("完成未看");
     const order = SESSION_GROUPS.map((group) => group.id);
     expect(order).toEqual(["blocked", "unseen", "working", "recent", "exited"]);
+  });
+});
+
+describe("SessionList hold", () => {
+  function cards() {
+    return screen.queryAllByTestId("board-card").map((card) => card.getAttribute("data-instance-id"));
+  }
+  const tree = (instances: Instance[]) => (
+    <MemoryRouter initialEntries={["/sessions"]}>
+      <SessionList variant="full" instances={instances} title="demo-root" space={spaceA} />
+    </MemoryRouter>
+  );
+
+  it("keeps a held row in its bucket when its rank changes, then re-ranks on release", () => {
+    const first = [
+      session("ins_held", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+      session("ins_peer", { activity: known("working"), updatedAt: "2026-09-19T08:00:00.000Z" }),
+    ];
+    const { rerender } = renderList("", { instances: first });
+    expect(cards()).toEqual(["ins_held", "ins_peer"]);
+
+    const held = document.querySelector('[data-instance-id="ins_held"]')!;
+    fireEvent.pointerDown(held);
+    expect(document.querySelector("[data-held='1']")).not.toBeNull();
+
+    // The peer becomes blocked: its section would be created above the held
+    // row and the held row would fall under the pointer.
+    rerender(
+      tree([
+        session("ins_held", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+        session("ins_peer", { activity: known("waiting-interaction"), updatedAt: "2026-09-19T12:00:00.000Z" }),
+      ]),
+    );
+    expect(cards()).toEqual(["ins_held", "ins_peer"]);
+    expect(document.querySelector('[data-instance-id="ins_peer"]')).toHaveAttribute("data-rank", "blocked");
+
+    fireEvent.pointerUp(document.body);
+    expect(cards()).toEqual(["ins_peer", "ins_held"]);
+    expect(screen.getByTestId("session-group-blocked")).toBeTruthy();
+  });
+
+  it("keeps the held row in its painted bucket when it would move to 最近", () => {
+    const { rerender } = renderList("", {
+      instances: [
+        session("ins_held", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+        session("ins_peer", { activity: known("idle"), updatedAt: "2026-09-19T08:00:00.000Z" }),
+      ],
+    });
+    const held = document.querySelector('[data-instance-id="ins_held"]')!;
+    fireEvent.pointerDown(held);
+    expect(screen.getByTestId("session-group-working").contains(held)).toBe(true);
+
+    rerender(
+      tree([
+        session("ins_held", { activity: known("idle"), updatedAt: "2026-09-19T11:00:00.000Z" }),
+        session("ins_peer", { activity: known("idle"), updatedAt: "2026-09-19T08:00:00.000Z" }),
+      ]),
+    );
+    // Still painted under 进行中, with its new content.
+    expect(screen.getByTestId("session-group-working").contains(held)).toBe(true);
+    expect(held).toHaveAttribute("data-rank", "idle");
+
+    fireEvent.pointerUp(document.body);
+    // Re-query: the row is remounted under its new bucket.
+    const moved = document.querySelector('[data-instance-id="ins_held"]')!;
+    expect(screen.getByTestId("session-group-recent").contains(moved)).toBe(true);
+    expect(screen.queryByTestId("session-group-working")).toBeNull();
+  });
+
+  it("holds while the action Sheet is open", async () => {
+    const { rerender } = renderList("", {
+      instances: [
+        session("ins_a", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+        session("ins_b", { activity: known("working"), updatedAt: "2026-09-19T08:00:00.000Z" }),
+      ],
+    });
+    expect(cards()).toEqual(["ins_a", "ins_b"]);
+
+    await userEvent.click(screen.getAllByTestId("board-more")[0]);
+    expect(document.querySelector("[data-held='1']")).not.toBeNull();
+
+    rerender(
+      tree([
+        session("ins_a", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+        session("ins_b", { activity: known("waiting-interaction"), updatedAt: "2026-09-19T12:00:00.000Z" }),
+      ]),
+    );
+    // The open Sheet still owns the painted order.
+    expect(cards()).toEqual(["ins_a", "ins_b"]);
   });
 });

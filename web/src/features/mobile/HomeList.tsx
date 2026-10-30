@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { StateDot } from "../../components/StateDot";
 import { CommitProbe } from "../../components/CommitProbe";
@@ -6,6 +6,7 @@ import type { Id } from "../../types/wire";
 import type { Instance } from "../../types/instance";
 import type { Interaction } from "../../types/interaction";
 import { hubStore } from "../../lib/store";
+import { useHeldOrder } from "../../lib/useHeldOrder";
 import type { HubState } from "../../lib/store";
 import { uiMode } from "../../lib/status";
 import {
@@ -174,23 +175,6 @@ export const HomeList = memo(function HomeList() {
   const [resumeStates, setResumeStates] = useState<Record<string, ResumeState>>({});
   const [drawerOpen, setDrawerOpen] = useState(false);
   const drawerOpener = useRef<HTMLButtonElement>(null);
-  // How many holds are active (a finger down, the spaces sheet, a hover menu).
-  // The list re-ranks only when the count returns to zero.
-  const holdCount = useRef(0);
-  // Row ids per group, captured at the moment the first hold begins.
-  const [frozenRows, setFrozenRows] = useState<Map<string, string[]> | null>(null);
-
-  function holdStart() {
-    holdCount.current += 1;
-    setFrozenRows((current) => {
-      if (current) return current;
-      return new Map(groupsRef.current.map((group) => [group.id, group.rows.map((row) => row.id)]));
-    });
-  }
-  function holdEnd() {
-    holdCount.current = Math.max(0, holdCount.current - 1);
-    if (holdCount.current === 0) setFrozenRows(null);
-  }
 
   const active = useMemo(() => selectedSpace(spaces, prefs), [spaces, prefs]);
 
@@ -298,26 +282,45 @@ export const HomeList = memo(function HomeList() {
       }),
     [spaces, rows, query, order, branches],
   );
-  // The latest painted groups, read by the hold handlers so a press freezes
-  // the order that is on screen rather than a stale render.
-  const groupsRef = useRef(groups);
-  groupsRef.current = groups;
+  // What the list is painting right now: group order, each group's busy/quiet
+  // bucket, and which rows sit behind its idle fold. This is the structure a
+  // hold freezes (home.md §3.3).
+  const searching = query.trim().length > 0;
+  const painted = useMemo<PhoneSnapshot>(
+    () => ({ groups, fold: foldStateOf(groups, prefs, searching), quietOpen: searching || prefs.quietOpen }),
+    [groups, prefs, searching],
+  );
+  // The committed structure, read when a hold begins: a press must freeze what
+  // is on screen, not a render that has not painted yet.
+  const paintedRef = useRef(painted);
+  useEffect(() => {
+    paintedRef.current = painted;
+  }, [painted]);
 
-  // A finger, an open sheet or an open hover menu freezes the row order inside
-  // every group. A row's text still updates; only its position waits. Rows that
-  // appear mid-hold append, rows that vanish drop out, and releasing re-ranks.
+  const { start: beginHold, release: holdEnd, held, snapshot } = useHeldOrder<PhoneSnapshot>();
+  const holdStart = useCallback(() => beginHold(() => paintedRef.current), [beginHold]);
+
+  // The spaces sheet is a hold source of its own (home.md §3.3): opening it
+  // freezes the list and closing it releases, derived from the state rather
+  // than counted in the click handlers.
+  useEffect(() => {
+    if (drawerOpen) holdStart();
+    else holdEnd();
+  }, [drawerOpen, holdStart, holdEnd]);
+
+  // While held, the snapshot owns the structure; live data only replaces each
+  // row's content by id. A row that vanished keeps its last painted content as
+  // a placeholder, and a row that appeared waits for the release.
   const renderedGroups = useMemo<HomeGroup[]>(() => {
-    if (!frozenRows) return groups;
-    return groups.map((group) => {
-      const order = frozenRows.get(group.id);
-      if (!order) return group;
-      const byId = new Map(group.rows.map((row) => [row.id, row]));
-      const rows = order.map((id) => byId.get(id)).filter((row): row is HomeRow => row != null);
-      for (const row of group.rows) if (!order.includes(row.id)) rows.push(row);
-      const same = rows.length === group.rows.length && rows.every((row, index) => row === group.rows[index]);
-      return same ? group : { ...group, rows };
-    });
-  }, [groups, frozenRows]);
+    if (!snapshot) return groups;
+    const live = new Map(groups.flatMap((group) => group.rows.map((row) => [row.id, row] as const)));
+    return snapshot.groups.map((group) => ({
+      ...group,
+      rows: group.rows.map((row) => live.get(row.id) ?? row),
+    }));
+  }, [groups, snapshot]);
+  const renderedFold = snapshot ? snapshot.fold : painted.fold;
+  const renderedQuietOpen = snapshot ? snapshot.quietOpen : painted.quietOpen;
 
   // D-050 task layer stacked above the project+branch session groups:
   // 需要你 first, tasks nested by parent, SE-nn keys, archive folded. Tapping
@@ -368,10 +371,7 @@ export const HomeList = memo(function HomeList() {
                 aria-expanded={drawerOpen}
                 aria-label="切换空间"
                 title={active?.name ?? "空间"}
-                onClick={() => {
-                  setDrawerOpen(true);
-                  holdStart();
-                }}
+                onClick={() => setDrawerOpen(true)}
               >
                 <span className={css.spaceBtnName}>{active?.name ?? "空间"}</span>
                 <span className={css.spaceBtnCaret} aria-hidden="true">
@@ -418,23 +418,31 @@ export const HomeList = memo(function HomeList() {
               prefs={prefs}
               instanceId={undefined}
               onSelect={selectSpace}
-              onClose={() => {
-                setDrawerOpen(false);
-                holdEnd();
-              }}
+              onClose={() => setDrawerOpen(false)}
               openerRef={drawerOpener}
             />
           ) : null}
           {renderedGroups.length > 0 ? (
-            <div className={css.groups} data-held={frozenRows ? "1" : "0"}>
+            <div
+              className={css.groups}
+              data-held={held ? "1" : "0"}
+              // A finger anywhere in the list, or keyboard focus inside it,
+              // freezes the painted structure until the interaction ends.
+              onPointerDown={holdStart}
+              onFocus={(event) => {
+                if (!event.currentTarget.contains(event.relatedTarget as Node | null)) holdStart();
+              }}
+              onBlur={(event) => {
+                if (!event.currentTarget.contains(event.relatedTarget as Node | null)) holdEnd();
+              }}
+            >
               <HomeGroups
                 groups={renderedGroups}
                 query={query}
-                prefs={prefs}
+                fold={renderedFold}
+                quietOpen={renderedQuietOpen}
                 resumeStates={resumeStates}
                 onResume={(instanceId) => void onResume(instanceId)}
-                onHoldStart={holdStart}
-                onHoldEnd={holdEnd}
               />
             </div>
           ) : null}
@@ -487,14 +495,10 @@ function HomeRowView({
   row,
   resumeState,
   onResume,
-  onHoldStart,
-  onHoldEnd,
 }: {
   row: HomeRow;
   resumeState: ResumeState | undefined;
   onResume: (instanceId: string) => void;
-  onHoldStart: () => void;
-  onHoldEnd: () => void;
 }) {
   return (
     <article
@@ -503,18 +507,6 @@ function HomeRowView({
       data-status={row.status}
       data-rank={row.rank}
       data-blocked={row.blocked ? "1" : "0"}
-      onPointerDown={onHoldStart}
-      onPointerUp={onHoldEnd}
-      onPointerCancel={onHoldEnd}
-      // Focus inside this row's own control freezes the order too (home.md
-      // §3.3). Only focus arriving from outside the row counts, so tabbing
-      // between two controls of the same row does not stack holds.
-      onFocus={(event) => {
-        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) onHoldStart();
-      }}
-      onBlur={(event) => {
-        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) onHoldEnd();
-      }}
     >
       <Link className={css.rowMain} to={`/s/${row.id}`} data-testid="home-row-link">
         <span className={css.dot}>
@@ -572,40 +564,62 @@ function HomeRowView({
   );
 }
 
-/**
- * Project groups with the two folds: idle rows inside a busy project, and
- * whole projects that have nothing active. A non-empty search forces both
- * open. Fold state is the device's SpacePrefs.
- */
-function HomeGroups({
-  groups,
-  query,
-  prefs,
-  resumeStates,
-  onResume,
-  onHoldStart,
-  onHoldEnd,
-}: {
-  groups: HomeGroup[];
-  query: string;
-  prefs: SpacePrefs;
-  resumeStates: Record<string, ResumeState>;
-  onResume: (instanceId: string) => void;
-  onHoldStart: () => void;
-  onHoldEnd: () => void;
-}) {
-  const searching = query.trim().length > 0;
-  const busy = groups.filter((group) => !group.quiet);
-  const quiet = groups.filter((group) => group.quiet);
-  const quietOpen = searching || prefs.quietOpen;
+/** Which rows a group hides, and how many idle rows it holds. */
+type FoldState = Record<string, { folded: string[]; idleCount: number }>;
 
-  function renderGroup(group: HomeGroup) {
-    const idle = group.rows.filter((row) => rankFolds(row.rank));
-    const active = group.rows.filter((row) => !rankFolds(row.rank));
+/** The painted phone structure a hold freezes (home.md §3.3). */
+type PhoneSnapshot = {
+  groups: HomeGroup[];
+  fold: FoldState;
+  quietOpen: boolean;
+};
+
+/** The fold state the current prefs and search imply. */
+function foldStateOf(
+  groups: readonly HomeGroup[],
+  prefs: SpacePrefs,
+  searching: boolean,
+): FoldState {
+  const state: FoldState = {};
+  for (const group of groups) {
+    const idle = group.rows.filter((row) => rankFolds(row.rank)).map((row) => row.id);
     const idleOpen = searching || prefs.idleOpen[group.id] === true;
     // A project whose every row folds still shows those rows once the quiet
     // bucket itself is open — folding them again would hide the project.
     const showIdle = idleOpen || group.quiet;
+    state[group.id] = { folded: showIdle ? [] : idle, idleCount: idle.length };
+  }
+  return state;
+}
+
+/**
+ * Project groups with the two folds: idle rows inside a busy project, and
+ * whole projects that have nothing active. A non-empty search forces both
+ * open. Fold state is the device's SpacePrefs, or the state frozen by a hold.
+ */
+function HomeGroups({
+  groups,
+  query,
+  fold,
+  quietOpen,
+  resumeStates,
+  onResume,
+}: {
+  groups: HomeGroup[];
+  query: string;
+  fold: FoldState;
+  quietOpen: boolean;
+  resumeStates: Record<string, ResumeState>;
+  onResume: (instanceId: string) => void;
+}) {
+  const searching = query.trim().length > 0;
+  const busy = groups.filter((group) => !group.quiet);
+  const quiet = groups.filter((group) => group.quiet);
+
+  function renderGroup(group: HomeGroup) {
+    const { folded, idleCount } = fold[group.id] ?? { folded: [], idleCount: 0 };
+    const hidden = new Set(folded);
+    const visible = group.rows.filter((row) => !hidden.has(row.id));
     return (
       <section
         key={group.id}
@@ -621,17 +635,15 @@ function HomeGroups({
           {group.branch ? <span className={css.groupBranch}>{group.branch}</span> : null}
           <GroupDots dots={group.dots} />
         </header>
-        {(showIdle ? group.rows : active).map((row) => (
+        {visible.map((row) => (
           <HomeRowView
             key={row.id}
             row={row}
             resumeState={resumeStates[row.id]}
             onResume={onResume}
-            onHoldStart={onHoldStart}
-            onHoldEnd={onHoldEnd}
           />
         ))}
-        {!showIdle && idle.length > 0 ? (
+        {folded.length > 0 ? (
           <button
             type="button"
             className={css.fold}
@@ -639,10 +651,10 @@ function HomeGroups({
             aria-expanded={false}
             onClick={() => spaceStore.toggleIdle(group.id)}
           >
-            还有 {idle.length} 个空闲 ▾
+            还有 {folded.length} 个空闲 ▾
           </button>
         ) : null}
-        {!searching && idleOpen && !group.quiet && idle.length > 0 ? (
+        {!searching && folded.length === 0 && !group.quiet && idleCount > 0 ? (
           <button
             type="button"
             className={css.fold}

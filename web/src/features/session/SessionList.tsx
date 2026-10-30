@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent, type MouseEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type MouseEvent } from "react";
 import { Link, useLocation, useSearchParams } from "react-router-dom";
 import type { Id } from "../../types/wire";
 import type { Instance } from "../../types/instance";
@@ -19,7 +19,8 @@ import { isEmberEffort } from "./effort";
 import { nextStep } from "./nextStep";
 import { LaunchedByMark } from "./LaunchedBy";
 import { HarnessGlyph } from "../spaces/SpacesPanel";
-import { compareRanked, liveChildParents, rank, rankStateWord, type HomeRank } from "../mobile/homeRows";
+import { compareRanked, liveChildParents, rank, rankStateWord } from "../mobile/homeRows";
+import { useHeldOrder } from "../../lib/useHeldOrder";
 import {
   applyFilters,
   availableConditions,
@@ -41,22 +42,13 @@ import {
   type SelectedChip,
 } from "./sessionFilters";
 import css from "./SessionList.module.css";
+import { SESSION_GROUPS } from "./sessionGroups";
 
-/**
- * The desktop status buckets, in paint order. Every `HomeRank` belongs to
- * exactly one bucket (a test walks HOME_RANKS): a rank with no bucket would
- * silently drop its session from /sessions.
- */
-export const SESSION_GROUPS: { id: string; title: string; match: (rank: HomeRank) => boolean }[] = [
-  { id: "blocked", title: "待处理", match: (rank) => rank === "blocked" },
-  // seen-hub: a settled turn the owner has not opened yet.
-  { id: "unseen", title: "完成未看", match: (rank) => rank === "done-unseen" },
-  { id: "working", title: "进行中", match: (rank) => rank === "working" || rank === "awaiting-wake" || rank === "starting" },
-  { id: "recent", title: "最近", match: (rank) => rank === "idle" },
-  // D-028 §8 方案 A: node-epoch-changed settles the row as exited; it leaves
-  // the live groups and lands here, next to its Resume button.
-  { id: "exited", title: "已退出", match: (rank) => rank === "exited" },
-];
+
+/** The painted desktop structure a hold freezes: buckets and row order. */
+type DesktopSnapshot = {
+  sections: { key: string; title: string; instances: Instance[] }[];
+};
 
 function exitLabel(instance: Instance): string | null {
   if (instance.exit.state !== "known") return null;
@@ -140,21 +132,11 @@ export function SessionList({
   // trigger that opened it (useFocusTrap contract).
   const [actionFor, setActionFor] = useState<Id | null>(null);
   const actionReturnRef = useRef<HTMLButtonElement | null>(null);
-  // A finger on a row, or the open hover menu, freezes the painted order.
-  // The list re-ranks only once every hold has released.
-  const holdCount = useRef(0);
-  const [frozenIds, setFrozenIds] = useState<readonly Id[] | null>(null);
-  const filteredRef = useRef(filtered);
-  filteredRef.current = filtered;
-
-  function holdStart() {
-    holdCount.current += 1;
-    setFrozenIds((current) => current ?? filteredRef.current.map((instance) => instance.id));
-  }
-  function holdEnd() {
-    holdCount.current = Math.max(0, holdCount.current - 1);
-    if (holdCount.current === 0) setFrozenIds(null);
-  }
+  // One hold: a finger in the list, keyboard focus in a row, or the open
+  // action Sheet. It freezes the painted buckets and row order; content still
+  // updates by instance id, and the list re-ranks once, on release.
+  const { start: beginHold, release: holdEnd, held, snapshot: holdSnapshot } =
+    useHeldOrder<DesktopSnapshot>();
 
   // Ids of rows whose wire disclosure is open (multiple rows may be open at
   // once; drives the side triggers' aria-expanded).
@@ -213,25 +195,53 @@ export function SessionList({
   const childLiveIds = useMemo(() => liveChildParents(hub.instances), [hub.instances]);
 
   const ranked = useMemo(() => {
-    const byId = new Map(filtered.map((instance) => [instance.id, instance]));
-    const ordered = (frozenIds ?? filtered.map((instance) => instance.id))
-      .map((id) => byId.get(id))
-      .filter((instance): instance is Instance => instance != null);
-    if (frozenIds) {
-      for (const instance of filtered) if (!frozenIds.includes(instance.id)) ordered.push(instance);
-    }
     const rowOf = (instance: Instance) => ({
       id: instance.id,
       rank: rank(instance, childLiveIds.has(instance.id)),
       title: hubStore.titleOf(instance.id),
       updatedAt: instance.updatedAt,
     });
-    // A hold paints the captured order; releasing sorts through the shared rank.
-    if (frozenIds) return ordered;
-    return [...ordered].sort((a, b) => compareRanked(rowOf(a), rowOf(b)));
+    return [...filtered].sort((a, b) => compareRanked(rowOf(a), rowOf(b)));
     // hubStore.titleOf reads the same snapshot this render already subscribed to.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filtered, frozenIds, childLiveIds]);
+  }, [filtered, childLiveIds]);
+
+  // The buckets as painted: each row's section is decided once, from its rank
+  // at paint time, so a hold has a structure to freeze (home.md §3.3).
+  const painted = useMemo<DesktopSnapshot>(() => {
+    const of = (instance: Instance) => rank(instance, childLiveIds.has(instance.id));
+    return {
+      sections: SESSION_GROUPS.map((group) => ({
+        key: group.id,
+        title: group.title,
+        instances: ranked.filter((instance) => group.match(of(instance))),
+      })).filter((section) => section.instances.length > 0),
+    };
+  }, [ranked, childLiveIds]);
+  const paintedRef = useRef(painted);
+  useEffect(() => {
+    paintedRef.current = painted;
+  }, [painted]);
+  const holdStart = useCallback(() => beginHold(() => paintedRef.current), [beginHold]);
+
+  // The open action Sheet holds the list too, derived from its state rather
+  // than counted across hover/focus handlers.
+  useEffect(() => {
+    if (actionFor !== null) holdStart();
+    else holdEnd();
+  }, [actionFor, holdStart, holdEnd]);
+
+  // While held, the snapshot owns the buckets and the order; live data only
+  // replaces each row by id. A row that vanished keeps its last painted
+  // instance, and a row that appeared waits for the release.
+  const sections = useMemo(() => {
+    if (!holdSnapshot) return painted.sections;
+    const live = new Map(filtered.map((instance) => [instance.id, instance] as const));
+    return holdSnapshot.sections.map((section) => ({
+      ...section,
+      instances: section.instances.map((instance) => live.get(instance.id) ?? instance),
+    }));
+  }, [painted.sections, holdSnapshot, filtered]);
 
   // Rows currently on screen (IntersectionObserver), so the screen poll can
   // prefer them. The viewport root stays correct inside an overflow
@@ -366,7 +376,21 @@ export function SessionList({
   }
 
   return (
-    <div className={css.root} data-testid="session-list" ref={listRootRef}>
+    <div
+      className={css.root}
+      data-testid="session-list"
+      data-held={held ? "1" : "0"}
+      ref={listRootRef}
+      // A finger anywhere in the list, or keyboard focus inside a row, freezes
+      // the painted buckets and order until the interaction ends.
+      onPointerDown={holdStart}
+      onFocus={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) holdStart();
+      }}
+      onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) holdEnd();
+      }}
+    >
       <header className={css.top}>
         <div className={css.title}>{title}</div>
         <div className={css.count}>
@@ -621,20 +645,19 @@ export function SessionList({
           </div>
         </div>
       ) : null}
-      {SESSION_GROUPS.map((group) => {
-        const rankOf = (instance: Instance) => rank(instance, childLiveIds.has(instance.id));
-        const items = ranked.filter((instance) => group.match(rankOf(instance)));
+      {sections.map((group) => {
+        const items = group.instances;
         if (!items.length) return null;
         // Desktop groups are status buckets, not project groups, so an idle fold
         // here would hide the only row whenever every session is idle. Project
         // folding stays on the phone home; this list only shares rank().
         return (
-          <section key={group.id} data-testid={`session-group-${group.id}`}>
+          <section key={group.key} data-testid={`session-group-${group.key}`}>
             <div className={css.group}>
-              <div className={`${css.groupTitle} ${group.id === "blocked" ? css.groupTitleBlocked : ""}`}>{group.title}</div>
+              <div className={`${css.groupTitle} ${group.key === "blocked" ? css.groupTitleBlocked : ""}`}>{group.title}</div>
               <div className={css.groupMeta}>
                 {items.length}
-                {group.id === "blocked" ? " · 置顶，不进折叠组" : group.id === "recent" ? " · 子 agent 不在此列" : ""}
+                {group.key === "blocked" ? " · 置顶，不进折叠组" : group.key === "recent" ? " · 子 agent 不在此列" : ""}
               </div>
             </div>
             {items.map((instance) => {
@@ -667,9 +690,6 @@ export function SessionList({
                   data-rank={homeRank}
                   data-lifecycle={instance.lifecycle}
                   data-kind={instance.kind}
-                  onPointerDown={holdStart}
-                  onPointerUp={holdEnd}
-                  onPointerCancel={holdEnd}
                 >
                   <label className={css.check}>
                     <input
@@ -768,10 +788,6 @@ export function SessionList({
                       aria-expanded={sheetOpen}
                       aria-controls={sheetOpen ? "board-actions-panel" : undefined}
                       aria-label="会话遥控"
-                      onMouseEnter={holdStart}
-                      onMouseLeave={holdEnd}
-                      onFocus={holdStart}
-                      onBlur={holdEnd}
                       onClick={(event) => {
                         event.stopPropagation();
                         actionReturnRef.current = event.currentTarget;

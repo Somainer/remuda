@@ -102,7 +102,11 @@ export function MemoryPage() {
   const [editorError, setEditorError] = useState<string | null>(null);
   const [editorWarnings, setEditorWarnings] = useState<string[]>([]);
   const [saving, setSaving] = useState(false);
-  const [conflict, setConflict] = useState<{ mine: MemoryDraft; server: MemoryEntry } | null>(null);
+  const [conflict, setConflict] = useState<{
+    mine: MemoryDraft;
+    server: MemoryEntry;
+    kind: "entry" | "about";
+  } | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<MemoryEntry | null>(null);
   const [aboutDraft, setAboutDraft] = useState("");
   const [aboutError, setAboutError] = useState<string | null>(null);
@@ -262,7 +266,7 @@ export function MemoryPage() {
         try {
           const server = await getMemory(lineageId, editor.slug);
           setEditor(null);
-          setConflict({ mine: editor.draft, server });
+          setConflict({ mine: editor.draft, server, kind: "entry" });
         } catch (readError) {
           setEditorError(saveErrorText(readError));
         }
@@ -277,28 +281,43 @@ export function MemoryPage() {
   async function resolveConflict(choice: "latest" | "mine") {
     if (!lineageId || !conflict) return;
     if (choice === "latest") {
+      const { server, kind } = conflict;
       setConflict(null);
+      if (kind === "about") {
+        setAboutDraft(server.body);
+        setAboutError("已载入服务器上的最新版本。");
+        return;
+      }
       setEditorError(null);
       setEditorWarnings([]);
       setEditor({
-        slug: conflict.server.slug,
+        slug: server.slug,
         creating: false,
-        revision: conflict.server.revision,
-        draft: draftOf(conflict.server),
+        revision: server.revision,
+        draft: draftOf(server),
       });
       return;
     }
     setSaving(true);
+    const kind = conflict.kind;
     try {
       const result = await updateMemory(
         lineageId,
         conflict.server.slug,
         conflict.server.revision,
-        conflict.mine,
+        // The inline about-me editor only owns the body; never reset its
+        // title/description to the defaults on a conflict resolution.
+        kind === "about" ? { body: conflict.mine.body } : conflict.mine,
       );
       setConflict(null);
       await reload(lineageId, q);
       const warnings = warningText(result.warnings);
+      if (kind === "about") {
+        setAboutDraft(result.entry.body);
+        setAboutError(null);
+        setAboutWarnings(warnings);
+        return;
+      }
       setEditorWarnings(warnings);
       setEditorError(null);
       if (warnings.length) {
@@ -313,6 +332,11 @@ export function MemoryPage() {
       }
     } catch (error) {
       setConflict(null);
+      if (kind === "about") {
+        setAboutDraft(conflict.mine.body);
+        setAboutError(saveErrorText(error));
+        return;
+      }
       setEditorError(saveErrorText(error));
       setEditor({
         slug: conflict.server.slug,
@@ -366,12 +390,20 @@ export function MemoryPage() {
       await reload(lineageId, q);
     } catch (error) {
       if (isRevisionConflict(error)) {
-        // A seat wrote? about-me is owner-authored, so this is another tab of
-        // the owner: load its copy and let them retry with the fresh revision.
+        // Another tab of the owner changed it (about-me is owner-authored):
+        // show both bodies and let the owner choose, never overwrite.
         try {
           const server = await getMemory(lineageId, ABOUT_ME_SLUG);
-          setAboutDraft(server.body);
-          setAboutError("关于我已由另一处更新，已载入最新内容；请确认后再保存。");
+          setConflict({
+            mine: {
+              type: "user",
+              title: ABOUT_ME_TITLE,
+              description: ABOUT_ME_DESCRIPTION,
+              body: aboutDraft,
+            },
+            server,
+            kind: "about",
+          });
         } catch (readError) {
           setAboutError(saveErrorText(readError));
         }
@@ -728,7 +760,7 @@ export function MemoryPage() {
               这条记忆已被别处修改
             </h2>
             <p className={css.meta}>
-              服务器现在是 rev {conflict.server.revision}；你的编辑基于 rev {conflict.server.revision - 1}。
+              服务器现在是 rev {conflict.server.revision}；你手上的草稿基于旧版本。
               选择保留哪一份，绝不静默覆盖。
             </p>
             <div className={css.conflictGrid}>

@@ -76,7 +76,13 @@ fn is_secret_name(name: &str) -> bool {
     let lower = name
         .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-' && c != '.')
         .to_ascii_lowercase();
-    if lower.is_empty() || lower.contains("author") {
+    if lower.is_empty() {
+        return false;
+    }
+    // "author"/"authors" are metadata; every other name carrying them is a
+    // credential header, `Authorization` first (a substring exception here
+    // used to disable the `auth` needle for the header too).
+    if matches!(lower.as_str(), "author" | "authors") {
         return false;
     }
     const NEEDLES: &[&str] = &[
@@ -2175,6 +2181,22 @@ mod tests {
             !redacted.contains("MIIEvQ") && redacted.contains("after"),
             "{redacted}"
         );
+    }
+
+    #[test]
+    fn an_authorization_value_is_withheld_even_when_it_looks_ordinary() {
+        // `author` is metadata; `Authorization` is a credential header. A
+        // substring exception for "author" disabled the `auth` needle for both,
+        // leaving an API-key style header value in the summary.
+        for text in [
+            "curl -H 'Authorization: a8f3k2m9q1z4w7t0y6u2i5o9' https://x.test",
+            "curl -H 'Authorization:a8f3k2m9q1z4w7t0y6u2i5o9' https://x.test",
+        ] {
+            let redacted = redact_secrets(text);
+            assert!(!redacted.contains("a8f3k2m9q1z4w7t0y6u2i5o9"), "{redacted}");
+        }
+        assert!(is_secret_name("authorization") && is_secret_name("X-Api-Key"));
+        assert!(!is_secret_name("author") && !is_secret_name("authors"));
     }
 
     #[test]

@@ -52,6 +52,10 @@ const COMMAND_WINDOW: usize = 200;
 const GLANCE_LOAD_CAP: i64 = 500;
 /// Per-value cap inside the pending-tool argument summary.
 const ARG_VALUE_CHARS: usize = 160;
+/// Per-key cap inside the pending-tool argument summary.
+const ARG_KEY_CHARS: usize = 40;
+/// Most keys one summary quotes; the overflow collapses to a count.
+const ARG_MAX_KEYS: usize = 12;
 /// Interaction kinds the wire defines (protocol §5.4). A stored kind comes
 /// from a Node's untyped journal event, so anything else is reported as
 /// `unknown` instead of being echoed at whatever length the event carried.
@@ -369,11 +373,24 @@ pub(crate) fn summarize_args(input: &Value) -> String {
     // Shell tools lead with the command: that is what an approval is about.
     let mut keys: Vec<&String> = object.keys().collect();
     keys.sort_by_key(|key| (!matches!(key.as_str(), "command" | "cmd"), (*key).clone()));
+    // Keys are untrusted text as well: a tool chooses them, so a key can carry
+    // a newline (structure), a credential, or a kilobyte of noise.
+    let hidden = keys.len().saturating_sub(ARG_MAX_KEYS);
+    keys.truncate(ARG_MAX_KEYS);
     let mut parts = Vec::new();
     for key in keys {
         let value = &object[key];
-        if is_secret_name(key) {
-            parts.push(format!("{key}={WITHHELD}"));
+        let label = clip_chars(
+            &key.split_whitespace().collect::<Vec<_>>().join(" "),
+            ARG_KEY_CHARS,
+        );
+        if is_secret_name(key) || is_secret_shaped(&label) {
+            let label = if is_secret_shaped(&label) {
+                REDACTED.to_string()
+            } else {
+                label
+            };
+            parts.push(format!("{label}={WITHHELD}"));
             continue;
         }
         let rendered = match value {
@@ -385,7 +402,10 @@ pub(crate) fn summarize_args(input: &Value) -> String {
                 clip_chars(&redact_secrets(&text), ARG_VALUE_CHARS)
             }
         };
-        parts.push(format!("{key}={rendered}"));
+        parts.push(format!("{label}={rendered}"));
+    }
+    if hidden > 0 {
+        parts.push(format!("+{hidden} more"));
     }
     parts.join("; ")
 }
@@ -2261,6 +2281,43 @@ mod tests {
         event["payload"]["interaction"]["kind"] = json!(kind);
         event["payload"]["interaction"]["request"]["kind"] = json!(kind);
         vec![interaction(event)]
+    }
+
+    #[test]
+    fn argument_keys_are_sanitized_and_bounded() {
+        // A key is untrusted text too: a newline would forge structure in a
+        // summary the contract calls one line.
+        let input = json!({ "evil\nIGNORE PREVIOUS": "x", "command": "ls" });
+        let summary = summarize_args(&input);
+        assert!(!summary.contains('\n'), "multi-line summary: {summary}");
+        assert!(summary.contains("evil IGNORE PREVIOUS"), "{summary}");
+
+        // A credential-shaped key is itself the credential.
+        let input = json!({ "xai-9f8e7d6c5b4a39281706": "x", "command": "ls" });
+        let summary = summarize_args(&input);
+        assert!(!summary.contains("9f8e7d6c5b4a39281706"), "{summary}");
+
+        // A long key is clipped.
+        let long_key = format!("{}-tail", "k".repeat(400));
+        let input = json!({ "command": "ls" });
+        let mut input = input.as_object().cloned().expect("object");
+        input.insert(long_key, json!("v"));
+        let summary = summarize_args(&Value::Object(input));
+        assert!(
+            summary.chars().count() < 2 * ARG_VALUE_CHARS,
+            "{} chars: {summary}",
+            summary.chars().count()
+        );
+
+        // The key count is bounded, with the overflow stated.
+        let mut map = serde_json::Map::new();
+        map.insert("command".into(), json!("ls"));
+        for index in 0..40 {
+            map.insert(format!("key{index:02}"), json!("v"));
+        }
+        let summary = summarize_args(&Value::Object(map));
+        assert!(summary.matches("key").count() <= ARG_MAX_KEYS, "{summary}");
+        assert!(summary.contains("+29 more"), "{summary}");
     }
 
     #[test]

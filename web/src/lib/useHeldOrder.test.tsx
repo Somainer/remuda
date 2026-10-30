@@ -43,7 +43,8 @@ describe("useHeldOrder", () => {
     const detached = removed.mock.calls.map(([type]) => type);
     expect(detached).toEqual(expect.arrayContaining(["pointerdown", "pointermove", "keydown", "focusin"]));
 
-    // The 10 s timer would have fired after unmount: it must have been cleared.
+    // No timer survives the unmount: nothing can fire into a dead component.
+    expect(vi.getTimerCount()).toBe(0);
     act(() => {
       vi.advanceTimersByTime(HOLD_IDLE_RELEASE_MS * 3);
     });

@@ -818,6 +818,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/instances/{id}/memory-writes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List a writer chapter's memory writes
+         * @description One writer chapter's memory write log, oldest first. A row survives a later rewrite or delete of its entry, so the transcript can show every turn that wrote memory. count is capped at 500 rows. Human and Bot callers only: an Agent credential is refused (403).
+         */
+        get: operations["memoryWrites"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/instances/{id}/resume": {
         parameters: {
             query?: never;
@@ -2797,6 +2817,8 @@ export interface components {
             sourceRefs: components["schemas"]["MemorySourceRef"][];
             /** @description One-line title. */
             title: string;
+            /** @description Turn of the last write, from the writer chapter's journal; null for an owner write or before that chapter's first turn. */
+            turnRef: components["schemas"]["MemoryTurnRef"] | null;
             type: components["schemas"]["MemoryType"];
             /** @description Last write. */
             updatedAt: string;
@@ -2862,6 +2884,13 @@ export interface components {
             /** @description Journal sequence number. */
             seq: number;
         };
+        /** @description The turn a memory write happened in: the writing chapter and the journal seq of its most recent `turn_started` row at write time (D-060). */
+        MemoryTurnRef: {
+            /** @description Chapter that was writing. */
+            instanceId: string;
+            /** @description Journal seq of the writer's latest turn_started row. */
+            seq: number;
+        };
         /**
          * @description Memory entry type (index order).
          * @enum {string}
@@ -2877,6 +2906,30 @@ export interface components {
             sourceRefs?: components["schemas"]["MemorySourceRef"][];
             title?: string;
             type?: components["schemas"]["MemoryType"];
+        };
+        /** @description One row of a writer chapter's append-only memory write log (D-060). */
+        MemoryWriteItem: {
+            op: components["schemas"]["MemoryWriteOp"];
+            /** @description Revision this write produced; for a consolidate input, the revision it consumed. */
+            revision: number;
+            /** @description Entry handle. */
+            slug: string;
+            /** @description Title at write time; kept after a later rewrite or delete. */
+            title: string;
+            /** @description Turn the write happened in; null for an owner write or before the chapter's first turn. */
+            turnSeq: number | null;
+            /** @description Time of the write. */
+            writtenAt: string;
+        };
+        /**
+         * MemoryWriteOp
+         * @description What one memory write did to its slug.
+         * @enum {string}
+         */
+        MemoryWriteOp: "write" | "consolidate" | "delete";
+        /** @description Memory write log rows. */
+        MemoryWritePage: {
+            items: components["schemas"]["MemoryWriteItem"][];
         };
         /** @description A committed create, update or consolidate. */
         MemoryWriteResult: {
@@ -5403,6 +5456,34 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["InstanceMcpToken"];
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
+    memoryWrites: {
+        parameters: {
+            query?: {
+                /** @description Return only rows whose turnSeq is greater than this. */
+                afterSeq?: number;
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Write log rows */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryWritePage"];
                 };
             };
             401: components["responses"]["Error"];

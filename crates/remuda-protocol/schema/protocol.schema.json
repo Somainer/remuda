@@ -11210,6 +11210,18 @@
           "description": "One-line title.",
           "type": "string"
         },
+        "turnRef": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MemoryTurnRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Turn of the last write, from the writer chapter's journal; null for an\nowner write or a write before that chapter's first turn. Always\nserialized so clients see an explicit null."
+        },
         "type": {
           "$ref": "#/$defs/MemoryType",
           "description": "Entry type."
@@ -11236,6 +11248,7 @@
         "revision",
         "origin",
         "sourceRefs",
+        "turnRef",
         "createdAt",
         "updatedAt"
       ],
@@ -11400,6 +11413,26 @@
       ],
       "type": "object"
     },
+    "MemoryTurnRef": {
+      "description": "The turn a write happened in: the chapter that wrote it and the journal\nseq of that chapter's most recent `turn_started` row at write time.\n\nStamped from the Hub's own journal, never from the request body. Absent for\nan owner (PWA) write and for a write before the chapter's first turn.",
+      "properties": {
+        "instanceId": {
+          "description": "Chapter that was writing (`ins_…`).",
+          "type": "string"
+        },
+        "seq": {
+          "description": "Journal seq of the writer's latest `turn_started` row.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "instanceId",
+        "seq"
+      ],
+      "type": "object"
+    },
     "MemoryType": {
       "description": "MemoryType wire values; `protocol.md` §8.",
       "oneOf": [
@@ -11421,6 +11454,72 @@
         {
           "const": "reference",
           "description": "Wire value `reference`.",
+          "type": "string"
+        }
+      ]
+    },
+    "MemoryWriteItem": {
+      "description": "One row of a writer instance's append-only memory write log (D-060).\n\nA row survives a later rewrite or delete of the entry, because every turn\nthat wrote memory shows its row under the reply.",
+      "properties": {
+        "op": {
+          "$ref": "#/$defs/MemoryWriteOp",
+          "description": "What the write did."
+        },
+        "revision": {
+          "description": "Revision this write produced; for a consolidate input, the revision\nit consumed.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "slug": {
+          "description": "Entry handle.",
+          "type": "string"
+        },
+        "title": {
+          "description": "Title at write time (kept when the entry is later rewritten or\ndeleted).",
+          "type": "string"
+        },
+        "turnSeq": {
+          "default": null,
+          "description": "Turn the write happened in; null for an owner write or a write before\nthe chapter's first turn.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "writtenAt": {
+          "description": "Time of the write.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "slug",
+        "title",
+        "revision",
+        "op",
+        "turnSeq",
+        "writtenAt"
+      ],
+      "type": "object"
+    },
+    "MemoryWriteOp": {
+      "description": "MemoryWriteOp wire values; `protocol.md` §8.",
+      "oneOf": [
+        {
+          "const": "write",
+          "description": "Wire value `write`.",
+          "type": "string"
+        },
+        {
+          "const": "consolidate",
+          "description": "Wire value `consolidate`.",
+          "type": "string"
+        },
+        {
+          "const": "delete",
+          "description": "Wire value `delete`.",
           "type": "string"
         }
       ]

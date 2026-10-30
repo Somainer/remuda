@@ -30,7 +30,7 @@
 //! the same transaction as the row.
 
 use crate::AppState;
-use crate::agent_scope::{authenticated_caller, origin};
+use crate::agent_scope::{authenticated_caller, caller, origin};
 use crate::auth::require_origin;
 use crate::config::now_rfc3339;
 use crate::error::HubError;
@@ -44,8 +44,8 @@ use axum::routing::{get, post};
 use remuda_protocol::{
     InputOrigin, MEMORY_ENTRY_HARD_BYTES, MEMORY_ENTRY_SOFT_BYTES, MEMORY_INDEX_SOFT_BYTES,
     MemoryEntry, MemoryIndex, MemoryLimit, MemoryMatch, MemoryOrigin, MemorySearchHit,
-    MemorySizeWarning, MemorySourceRef, MemoryType, MemoryWriteResult, memory_entry_bytes,
-    memory_index_line, validate_memory_slug,
+    MemorySizeWarning, MemorySourceRef, MemoryTurnRef, MemoryType, MemoryWriteItem, MemoryWriteOp,
+    MemoryWriteResult, memory_entry_bytes, memory_index_line, validate_memory_slug,
 };
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::Deserialize;
@@ -53,6 +53,12 @@ use serde_json::{Value, json};
 
 /// The `PRAGMA user_version` step that creates the memory tables.
 pub(crate) const MEMORY_SCHEMA_VERSION: i64 = 4;
+
+/// The `PRAGMA user_version` step that adds the per-write log
+/// (`memory_write_log`) and the entry's `turn_seq` projection (D-060 item 4,
+/// cb-memory-ui). It sits above the seen rung; a rung that lands before this
+/// one takes its number, and this one renumbers when the branches merge.
+pub(crate) const MEMORY_WRITE_LOG_SCHEMA_VERSION: i64 = 6;
 
 /// Caller-supplied source references per write.
 const MAX_SOURCE_REFS: usize = 64;
@@ -63,14 +69,16 @@ const MAX_SEARCH_TERMS: usize = 8;
 /// Search hits returned by default / at most.
 const DEFAULT_SEARCH_LIMIT: usize = 10;
 const MAX_SEARCH_LIMIT: usize = 100;
+/// Rows returned by one memory-writes poll.
+const MAX_MEMORY_WRITES: usize = 500;
 
 const ENTRY_COLUMNS: &str = "lineage_id, slug, type, title, description, body, revision, \
-     origin, source_refs_json, writer_instance, created_at, updated_at, archived_at";
+     origin, source_refs_json, writer_instance, created_at, updated_at, archived_at, turn_seq";
 /// [`ENTRY_COLUMNS`] qualified with the `m` alias, for queries that join the
 /// FTS table (which has its own title/description/body columns).
 const ENTRY_COLUMNS_M: &str = "m.lineage_id, m.slug, m.type, m.title, m.description, m.body, \
      m.revision, m.origin, m.source_refs_json, m.writer_instance, m.created_at, m.updated_at, \
-     m.archived_at";
+     m.archived_at, m.turn_seq";
 
 // ─── Migration ─────────────────────────────────────────────────────────────
 
@@ -137,6 +145,39 @@ pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             VALUES (new.id, new.title, new.description, new.body);
         END;",
     )
+}
+
+/// `user_version` 6 (cb-memory-ui): the per-write log plus the entry's
+/// `turn_seq` projection.
+///
+/// `memory_write_log` is append-only and has no foreign key to
+/// `memory_entries`: a row outlives a later rewrite or delete of its entry,
+/// because every turn that wrote memory keeps its row (D-060). `title` is
+/// captured at write time for the same reason. `turn_seq` on the entry row is
+/// the latest write's turn; the log keeps every one.
+pub(crate) fn migrate_write_log(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS memory_write_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lineage_id TEXT NOT NULL,
+            slug TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            op TEXT NOT NULL,
+            origin TEXT NOT NULL,
+            writer_instance TEXT,
+            turn_seq INTEGER,
+            written_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS memory_write_log_writer
+            ON memory_write_log (writer_instance, turn_seq);
+        CREATE INDEX IF NOT EXISTS memory_write_log_slug
+            ON memory_write_log (lineage_id, slug, id);",
+    )?;
+    // The entry row names the latest write's turn so a read needs no join;
+    // `memory_write_log` remains the append-only record of every write.
+    crate::store::ensure_column(conn, "memory_entries", "turn_seq", "INTEGER")?;
+    Ok(())
 }
 
 /// Lineage retirement (the whole-lineage delete): archive, never delete, its
@@ -457,6 +498,15 @@ fn entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
     let source_refs = serde_json::from_str(&raw_refs)
         .map_err(|error| conversion(8, format!("source_refs_json: {error}")))?;
     let revision: i64 = row.get(6)?;
+    let writer_instance: Option<String> = row.get(9)?;
+    let turn_seq: Option<i64> = row.get(13)?;
+    let turn_ref = match (&writer_instance, turn_seq) {
+        (Some(instance_id), Some(seq)) if seq >= 0 => Some(MemoryTurnRef {
+            instance_id: instance_id.clone(),
+            seq: seq as u64,
+        }),
+        _ => None,
+    };
     Ok(MemoryEntry {
         lineage_id: row.get(0)?,
         slug: row.get(1)?,
@@ -467,7 +517,8 @@ fn entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
         revision: revision.max(0) as u64,
         origin,
         source_refs,
-        writer_instance: row.get(9)?,
+        writer_instance,
+        turn_ref,
         created_at: row.get(10)?,
         updated_at: row.get(11)?,
         archived_at: row.get(12)?,
@@ -637,20 +688,22 @@ fn write_result(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn insert_entry(
     conn: &Connection,
     lineage_id: &str,
     writer: &MemoryWriter,
     input: &MemoryInput,
     revision: u64,
+    turn_seq: Option<i64>,
     created_at: &str,
     now: &str,
 ) -> Result<(), MemoryError> {
     conn.execute(
         "INSERT INTO memory_entries
             (lineage_id, slug, type, title, description, body, revision, origin,
-             source_refs_json, writer_instance, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             source_refs_json, writer_instance, created_at, updated_at, turn_seq)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             lineage_id,
             input.slug,
@@ -664,6 +717,65 @@ fn insert_entry(
             writer.instance(),
             created_at,
             now,
+            turn_seq,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Journal seq of the writer chapter's most recent `turn_started` row at
+/// write time. The Hub stamps it; it never comes from a request body. NULL for
+/// an owner write and for a chapter that has not started a turn.
+fn turn_seq_for(conn: &Connection, writer: &MemoryWriter) -> rusqlite::Result<Option<i64>> {
+    let Some(instance_id) = writer.instance() else {
+        return Ok(None);
+    };
+    conn.query_row(
+        "SELECT MAX(seq) FROM journal
+          WHERE instance_id = ?1
+            AND json_extract(payload_json, '$.payload.type') = 'native'
+            AND json_extract(payload_json, '$.payload.topic') = 'turn'
+            AND json_extract(payload_json, '$.payload.nativeName') = 'turn_started'",
+        params![instance_id],
+        |row| row.get::<_, Option<i64>>(0),
+    )
+}
+
+/// Append one `memory_write_log` row inside the write's own transaction, so a
+/// commit either has both the entry change and its log row or neither. Log
+/// rows are append-only and never reference the entry row.
+#[allow(clippy::too_many_arguments)]
+fn log_write(
+    conn: &Connection,
+    lineage_id: &str,
+    slug: &str,
+    revision: u64,
+    title: &str,
+    op: MemoryWriteOp,
+    writer: &MemoryWriter,
+    turn_seq: Option<i64>,
+    written_at: &str,
+) -> rusqlite::Result<()> {
+    let op = match op {
+        MemoryWriteOp::Write => "write",
+        MemoryWriteOp::Consolidate => "consolidate",
+        MemoryWriteOp::Delete => "delete",
+    };
+    conn.execute(
+        "INSERT INTO memory_write_log
+            (lineage_id, slug, revision, title, op, origin, writer_instance,
+             turn_seq, written_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            lineage_id,
+            slug,
+            revision as i64,
+            title,
+            op,
+            writer.origin_str(),
+            writer.instance(),
+            turn_seq,
+            written_at,
         ],
     )?;
     Ok(())
@@ -741,8 +853,22 @@ fn create_tx(
     }
     let now = now_rfc3339();
     let revision = next_revision(&tx, lineage_id, &input.slug)?;
-    insert_entry(&tx, lineage_id, writer, input, revision, &now, &now)?;
+    let turn_seq = turn_seq_for(&tx, writer)?;
+    insert_entry(
+        &tx, lineage_id, writer, input, revision, turn_seq, &now, &now,
+    )?;
     record_revision(&tx, lineage_id, &input.slug, revision)?;
+    log_write(
+        &tx,
+        lineage_id,
+        &input.slug,
+        revision,
+        &input.title,
+        MemoryWriteOp::Write,
+        writer,
+        turn_seq,
+        &now,
+    )?;
     let entry = require_entry(&tx, lineage_id, &input.slug)?;
     let result = write_result(&tx, entry, Vec::new())?;
     tx.commit()?;
@@ -772,11 +898,12 @@ fn update_tx(
     let refs = merge_refs(&current.source_refs, &patch.source_refs);
     let now = now_rfc3339();
     let revision = next_revision(&tx, lineage_id, slug)?;
+    let turn_seq = turn_seq_for(&tx, writer)?;
     let changed = tx.execute(
         "UPDATE memory_entries
             SET type = ?3, title = ?4, description = ?5, body = ?6,
                 revision = ?12, origin = ?7, source_refs_json = ?8,
-                writer_instance = ?9, updated_at = ?10
+                writer_instance = ?9, updated_at = ?10, turn_seq = ?13
           WHERE lineage_id = ?1 AND slug = ?2 AND revision = ?11",
         params![
             lineage_id,
@@ -791,6 +918,7 @@ fn update_tx(
             now,
             expected as i64,
             revision as i64,
+            turn_seq,
         ],
     )?;
     if changed != 1 {
@@ -799,6 +927,17 @@ fn update_tx(
         )));
     }
     record_revision(&tx, lineage_id, slug, revision)?;
+    log_write(
+        &tx,
+        lineage_id,
+        slug,
+        revision,
+        &title,
+        MemoryWriteOp::Write,
+        writer,
+        turn_seq,
+        &now,
+    )?;
     let entry = require_entry(&tx, lineage_id, slug)?;
     let result = write_result(&tx, entry, Vec::new())?;
     tx.commit()?;
@@ -816,11 +955,26 @@ fn delete_tx(
     authorize_write(&tx, lineage_id, writer, WriteKind::Modify)?;
     let current = require_entry(&tx, lineage_id, slug)?;
     check_revision(&current, expected)?;
+    let turn_seq = turn_seq_for(&tx, writer)?;
+    let now = now_rfc3339();
     // The slug's revisions continue past this one if it is ever recreated.
     record_revision(&tx, lineage_id, slug, current.revision)?;
     tx.execute(
         "DELETE FROM memory_entries WHERE lineage_id = ?1 AND slug = ?2 AND revision = ?3",
         params![lineage_id, slug, expected as i64],
+    )?;
+    // The delete keeps its place in the log: every turn that wrote memory
+    // shows its row, including the turn that removed one.
+    log_write(
+        &tx,
+        lineage_id,
+        slug,
+        current.revision,
+        &current.title,
+        MemoryWriteOp::Delete,
+        writer,
+        turn_seq,
+        &now,
     )?;
     tx.commit()?;
     Ok(current)
@@ -885,6 +1039,8 @@ fn consolidate_tx(
         None => now_rfc3339(),
     };
     let mut removed = Vec::new();
+    let now = now_rfc3339();
+    let turn_seq = turn_seq_for(&tx, writer)?;
     for entry in &inputs {
         // Removed inputs keep their high-water revision, like a delete.
         record_revision(&tx, lineage_id, &entry.slug, entry.revision)?;
@@ -892,11 +1048,23 @@ fn consolidate_tx(
             "DELETE FROM memory_entries WHERE lineage_id = ?1 AND slug = ?2",
             params![lineage_id, entry.slug],
         )?;
+        // One row per input: the revision it consumed, under the title it had
+        // when it was merged away.
+        log_write(
+            &tx,
+            lineage_id,
+            &entry.slug,
+            entry.revision,
+            &entry.title,
+            MemoryWriteOp::Consolidate,
+            writer,
+            turn_seq,
+            &now,
+        )?;
         if entry.slug != input.slug {
             removed.push(entry.slug.clone());
         }
     }
-    let now = now_rfc3339();
     // A reused input continues its own sequence; a new target continues
     // after any revision the slug had before.
     let revision = next_revision(&tx, lineage_id, &input.slug)?;
@@ -906,10 +1074,23 @@ fn consolidate_tx(
         writer,
         &merged,
         revision,
+        turn_seq,
         &created_at,
         &now,
     )?;
     record_revision(&tx, lineage_id, &input.slug, revision)?;
+    // …plus the target itself, at the revision it produced.
+    log_write(
+        &tx,
+        lineage_id,
+        &input.slug,
+        revision,
+        &merged.title,
+        MemoryWriteOp::Consolidate,
+        writer,
+        turn_seq,
+        &now,
+    )?;
     let entry = require_entry(&tx, lineage_id, &input.slug)?;
     let result = write_result(&tx, entry, removed)?;
     tx.commit()?;
@@ -997,7 +1178,7 @@ fn fts_hits(
     ))?;
     stmt.query_map(
         params![fts_query(terms), lineage_id, include_archived, limit as i64],
-        |row| Ok((entry_from_row(row)?, row.get(13)?)),
+        |row| Ok((entry_from_row(row)?, row.get(14)?)),
     )?
     .collect()
 }
@@ -1293,6 +1474,62 @@ impl Store {
             .await?)
     }
 
+    /// Every memory write this chapter made, oldest first — the transcript's
+    /// "Remembered: <title>" rows. Rows survive a later rewrite or delete of
+    /// their entry, and `afterSeq` narrows them to writes after a given
+    /// `turn_started` seq.
+    pub(crate) async fn memory_writes(
+        &self,
+        instance_id: String,
+        after_seq: Option<u64>,
+    ) -> Result<Vec<MemoryWriteItem>, StoreError> {
+        self.read("memory_writes", move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT slug, title, revision, op, turn_seq, written_at
+                   FROM memory_write_log
+                  WHERE writer_instance = ?1
+                    AND (?2 IS NULL OR turn_seq > ?2)
+                  ORDER BY id
+                  LIMIT ?3",
+            )?;
+            let rows = stmt
+                .query_map(
+                    params![
+                        instance_id,
+                        after_seq.and_then(|seq| i64::try_from(seq).ok()),
+                        MAX_MEMORY_WRITES as i64
+                    ],
+                    |row| {
+                        let raw_op: String = row.get(3)?;
+                        let op = match raw_op.as_str() {
+                            "write" => MemoryWriteOp::Write,
+                            "consolidate" => MemoryWriteOp::Consolidate,
+                            "delete" => MemoryWriteOp::Delete,
+                            other => {
+                                return Err(conversion(
+                                    3,
+                                    format!("unknown memory write op {other:?}"),
+                                ));
+                            }
+                        };
+                        let revision: i64 = row.get(2)?;
+                        let turn_seq: Option<i64> = row.get(4)?;
+                        Ok(MemoryWriteItem {
+                            slug: row.get(0)?,
+                            title: row.get(1)?,
+                            revision: revision.max(0) as u64,
+                            op,
+                            turn_seq: turn_seq.map(|seq| seq.max(0) as u64),
+                            written_at: row.get(5)?,
+                        })
+                    },
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
     /// Every entry (any lineage, archived included) that names `instance_id`
     /// — and `seq`, when given — in its source refs. For journal redaction.
     pub(crate) async fn memory_derived_from(
@@ -1337,6 +1574,10 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/lineages/{id}/memory/consolidate", post(consolidate))
         .route("/v1/lineages/{id}/memory/restore", post(restore))
         .route("/v1/memory/derived", get(derived))
+        // The transcript's write rows: one writer chapter's log, Human/Bot
+        // callers only. Deliberately absent from `restrict_agent_routes`, so
+        // an Agent credential is refused before the handler.
+        .route("/v1/instances/{id}/memory-writes", get(memory_writes))
 }
 
 /// The caller at the memory boundary: the narrowed identity it acts as, after
@@ -1402,6 +1643,9 @@ fn required_revision(value: Option<u64>) -> Result<u64, MemoryError> {
     })
 }
 
+/// A create body. `origin`, `writerInstanceId` and `turnRef` are Hub-stamped:
+/// they are not fields here, so a body that names them is ignored (serde
+/// skips unknown fields) and can never forge them.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct EntryBody {
@@ -1679,6 +1923,48 @@ async fn derived(
     Ok(Json(json!({ "items": items })))
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MemoryWritesQuery {
+    /// Return only rows whose `turnSeq` is greater than this.
+    #[serde(default)]
+    after_seq: Option<u64>,
+}
+
+/// `GET /v1/instances/{id}/memory-writes` — one writer chapter's memory write
+/// log, oldest first.
+///
+/// Human and Bot callers only. The agent-route middleware refuses an Agent
+/// credential (this path is on no agent allowlist), and the handler re-checks,
+/// because memory belongs to the owner and the seat (D-060).
+async fn memory_writes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(instance_id): Path<String>,
+    Query(query): Query<MemoryWritesQuery>,
+) -> Result<Json<Value>, HubError> {
+    require_origin(&headers, &state.config)?;
+    let device = caller(&state, &headers).await?;
+    if origin(&device) == InputOrigin::Agent {
+        return Err(HubError::Forbidden);
+    }
+    if state
+        .store
+        .get_instance(instance_id.clone())
+        .await
+        .map_err(crate::http::map_store)?
+        .is_none()
+    {
+        return Err(HubError::NotFound);
+    }
+    let items = state
+        .store
+        .memory_writes(instance_id, query.after_seq)
+        .await
+        .map_err(crate::http::map_store)?;
+    Ok(Json(json!({ "items": items })))
+}
+
 // ─── Test seam ─────────────────────────────────────────────────────────────
 //
 // Kept below the routes: tests/openapi.rs scans each source file only up to
@@ -1836,6 +2122,61 @@ mod tests {
             instance_id: instance.into(),
             seq,
         }
+    }
+
+    /// The Node's `turn/turn_started` mirror, as `seen.rs`'s tests build it.
+    fn turn_started() -> Value {
+        json!({
+            "kind": "lifecycle",
+            "payload": {
+                "type": "native", "topic": "turn", "nativeName": "turn_started",
+                "nativeId": { "state": "known", "value": "sess-memlog" },
+                "status": { "state": "known", "value": "working" },
+                "relatedIds": {}, "dataRef": null, "severity": "info",
+                "affectsCompletion": false
+            }
+        })
+    }
+
+    /// Append one turn start; returns its journal seq.
+    async fn start_turn(fx: &Fixture, instance: &str) -> i64 {
+        fx.store
+            .append_journal(fx.host.clone(), instance.to_string(), None, turn_started())
+            .await
+            .expect("turn start")
+            .record
+            .seq
+    }
+
+    /// The lineage's `memory_write_log` rows, oldest first:
+    /// `(slug, title, revision, op, writer_instance, turn_seq)`.
+    async fn log_rows(
+        fx: &Fixture,
+        lineage: &str,
+    ) -> Vec<(String, String, i64, String, Option<String>, Option<i64>)> {
+        let lineage = lineage.to_string();
+        fx.store
+            .run_named("test.memory_write_log", move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT slug, title, revision, op, writer_instance, turn_seq
+                       FROM memory_write_log WHERE lineage_id = ?1 ORDER BY id",
+                )?;
+                let rows = stmt
+                    .query_map(params![lineage], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, Option<i64>>(5)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -3040,5 +3381,319 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, MemoryError::BadRequest(_)));
+    }
+
+    // ─── cb-memory-ui: the per-write log and the turn reference ───────────
+
+    #[tokio::test]
+    async fn an_agent_write_mid_turn_records_the_turn_started_seq() {
+        let fx = fixture().await;
+        let lineage = fx.seat().await;
+        let started = start_turn(&fx, &lineage).await;
+        let written = fx
+            .store
+            .memory_create(
+                lineage.clone(),
+                agent(&lineage),
+                input("pref", MemoryType::User, "body"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            written.entry.turn_ref,
+            Some(MemoryTurnRef {
+                instance_id: lineage.clone(),
+                seq: started as u64,
+            })
+        );
+        assert_eq!(
+            written.entry.writer_instance.as_deref(),
+            Some(lineage.as_str())
+        );
+
+        let rows = log_rows(&fx, &lineage).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].0, "pref");
+        assert_eq!(rows[0].1, "title pref");
+        assert_eq!(rows[0].2, 1);
+        assert_eq!(rows[0].3, "write");
+        assert_eq!(rows[0].4.as_deref(), Some(lineage.as_str()));
+        assert_eq!(rows[0].5, Some(started));
+
+        // The chapter's feed returns it; afterSeq is exclusive on the turn.
+        let feed = fx.store.memory_writes(lineage.clone(), None).await.unwrap();
+        assert_eq!(feed.len(), 1);
+        assert_eq!(feed[0].slug, "pref");
+        assert_eq!(feed[0].turn_seq, Some(started as u64));
+        assert_eq!(feed[0].op, MemoryWriteOp::Write);
+        assert!(
+            fx.store
+                .memory_writes(lineage, Some(started as u64))
+                .await
+                .unwrap()
+                .is_empty(),
+            "afterSeq is exclusive"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_owner_write_has_no_turn_seq() {
+        let fx = fixture().await;
+        let lineage = fx.seat().await;
+        // Even mid-turn, an owner (PWA) write is not in any chapter's turn.
+        start_turn(&fx, &lineage).await;
+        let written = fx
+            .store
+            .memory_create(
+                lineage.clone(),
+                MemoryWriter::Owner,
+                input("about-me", MemoryType::User, "I am"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(written.entry.turn_ref, None);
+        assert_eq!(written.entry.writer_instance, None);
+
+        let rows = log_rows(&fx, &lineage).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].4, None, "owner writes have no writer instance");
+        assert_eq!(rows[0].5, None, "and no turn seq");
+        assert!(
+            fx.store
+                .memory_writes(lineage, None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an owner row is on no chapter's feed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rewrite_keeps_both_log_rows() {
+        let fx = fixture().await;
+        let lineage = fx.seat().await;
+        let started = start_turn(&fx, &lineage).await;
+        fx.store
+            .memory_create(
+                lineage.clone(),
+                agent(&lineage),
+                input("pref", MemoryType::User, "first"),
+            )
+            .await
+            .unwrap();
+        let updated = fx
+            .store
+            .memory_update(
+                lineage.clone(),
+                "pref".into(),
+                agent(&lineage),
+                MemoryPatch {
+                    body: Some("second".into()),
+                    ..MemoryPatch::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.entry.revision, 2);
+
+        let rows = log_rows(&fx, &lineage).await;
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!((rows[0].0.as_str(), rows[0].2), ("pref", 1));
+        assert_eq!((rows[1].0.as_str(), rows[1].2), ("pref", 2));
+        assert_eq!(rows[1].5, Some(started));
+        let feed = fx.store.memory_writes(lineage, None).await.unwrap();
+        assert_eq!(
+            feed.iter().map(|row| row.revision).collect::<Vec<_>>(),
+            [1, 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn consolidate_logs_one_row_per_input_plus_the_target() {
+        let fx = fixture().await;
+        let lineage = fx.seat().await;
+        let started = start_turn(&fx, &lineage).await;
+        for slug in ["a", "b"] {
+            fx.store
+                .memory_create(
+                    lineage.clone(),
+                    agent(&lineage),
+                    input(slug, MemoryType::User, ""),
+                )
+                .await
+                .unwrap();
+        }
+        let merged = fx
+            .store
+            .memory_consolidate(
+                lineage.clone(),
+                agent(&lineage),
+                vec![("a".into(), 1), ("b".into(), 1)],
+                input("merged", MemoryType::User, "one"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(merged.entry.revision, 1);
+
+        let rows = log_rows(&fx, &lineage).await;
+        // Two creates, then the two inputs and the target.
+        assert_eq!(rows.len(), 5, "{rows:?}");
+        let consolidations: Vec<(&str, i64)> = rows
+            .iter()
+            .filter(|row| row.3 == "consolidate")
+            .map(|row| (row.0.as_str(), row.2))
+            .collect();
+        assert_eq!(consolidations, [("a", 1), ("b", 1), ("merged", 1)]);
+        assert!(rows.iter().all(|row| row.5 == Some(started)));
+    }
+
+    #[tokio::test]
+    async fn retiring_a_lineage_leaves_its_write_log_intact() {
+        let fx = fixture().await;
+        let lineage = fx.seat().await;
+        start_turn(&fx, &lineage).await;
+        fx.store
+            .memory_create(
+                lineage.clone(),
+                agent(&lineage),
+                input("pref", MemoryType::User, ""),
+            )
+            .await
+            .unwrap();
+        let archived = lineage.clone();
+        fx.store
+            .run_named("test.archive", move |conn| {
+                archive_lineage(conn, &archived, "2026-10-30T00:00:00.000Z")?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        // Retirement archives the entry but never touches the log.
+        assert!(
+            fx.store
+                .memory_get(lineage.clone(), "pref".into())
+                .await
+                .unwrap()
+                .unwrap()
+                .archived_at
+                .is_some()
+        );
+        assert_eq!(
+            fx.store.memory_writes(lineage, None).await.unwrap().len(),
+            1
+        );
+    }
+
+    /// The rung runs on a POPULATED version-5 database (the seen rung's top):
+    /// the table and the `turn_seq` column appear, old entries read as having
+    /// no turn, and the next write logs.
+    #[tokio::test]
+    async fn the_write_log_rung_upgrades_a_populated_version_five_database() {
+        use crate::store::{SCHEMA_USER_VERSION, SEEN_SCHEMA_RUNG};
+        let dir = tempfile::tempdir().unwrap();
+        let (store, host) = crate::store_test_support::open_with_host(dir.path(), "memlog-upgrade")
+            .await
+            .unwrap();
+        let instance = store
+            .insert_instance_delegated(
+                host.clone(),
+                None,
+                "claude".into(),
+                "claude-sdk".into(),
+                None,
+                json!({"origin": "human"}),
+                InstanceDelegation {
+                    restart: Some(RestartPolicy {
+                        on_process_loss: true,
+                        max_per_hour: 3,
+                    }),
+                    ..InstanceDelegation::default()
+                },
+                crate::agent_scope::CallerAuthority::internal(),
+            )
+            .await
+            .unwrap()
+            .instance_id;
+        store
+            .append_journal(host, instance.clone(), None, turn_started())
+            .await
+            .unwrap();
+        store
+            .memory_create(
+                instance.clone(),
+                agent(&instance),
+                input("kept", MemoryType::Project, "written before the upgrade"),
+            )
+            .await
+            .unwrap();
+        store.close().await;
+
+        // Rewind to the exact pre-rung shape: no log, no turn_seq column,
+        // marker at the seen rung. The entry row is populated.
+        let db = rusqlite::Connection::open(dir.path().join("hub.sqlite")).unwrap();
+        db.execute_batch(&format!(
+            "DROP TABLE memory_write_log;
+             ALTER TABLE memory_entries DROP COLUMN turn_seq;
+             PRAGMA user_version = {SEEN_SCHEMA_RUNG};"
+        ))
+        .unwrap();
+        assert_eq!(
+            db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SEEN_SCHEMA_RUNG
+        );
+        drop(db);
+
+        let store = Store::open(dir.path()).unwrap();
+        let version: i64 = {
+            let db = rusqlite::Connection::open(dir.path().join("hub.sqlite")).unwrap();
+            db.query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(version, SCHEMA_USER_VERSION);
+        assert!(
+            crate::store::column_exists(
+                &rusqlite::Connection::open(dir.path().join("hub.sqlite")).unwrap(),
+                "memory_entries",
+                "turn_seq"
+            )
+            .unwrap()
+        );
+        // The pre-upgrade entry survives, with no turn reference.
+        let entry = store
+            .memory_get(instance.clone(), "kept".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.turn_ref, None);
+        assert_eq!(entry.body, "written before the upgrade");
+        // The next write logs and carries the turn.
+        let written = store
+            .memory_update(
+                instance.clone(),
+                "kept".into(),
+                agent(&instance),
+                MemoryPatch {
+                    body: Some("after the upgrade".into()),
+                    ..MemoryPatch::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        assert!(written.entry.turn_ref.is_some());
+        assert_eq!(store.memory_writes(instance, None).await.unwrap().len(), 1);
+        store.close().await;
+
+        // Re-opening at the top rung does not re-run it.
+        let store = Store::open(dir.path()).unwrap();
+        let version: i64 = {
+            let db = rusqlite::Connection::open(dir.path().join("hub.sqlite")).unwrap();
+            db.query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(version, SCHEMA_USER_VERSION);
+        store.close().await;
     }
 }

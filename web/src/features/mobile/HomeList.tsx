@@ -6,7 +6,7 @@ import type { Id } from "../../types/wire";
 import type { Instance } from "../../types/instance";
 import type { Interaction } from "../../types/interaction";
 import { hubStore } from "../../lib/store";
-import { useHeldOrder, type HoldSource } from "../../lib/useHeldOrder";
+import { useHeldOrder } from "../../lib/useHeldOrder";
 import type { HubState } from "../../lib/store";
 import { uiMode } from "../../lib/status";
 import {
@@ -297,25 +297,16 @@ export const HomeList = memo(function HomeList() {
     paintedRef.current = painted;
   }, [painted]);
 
-  const { begin, end, held, snapshot, regionRef } = useHeldOrder<PhoneSnapshot>();
-  const startHold = useCallback(
-    (source: HoldSource) => begin(source, () => paintedRef.current),
-    [begin],
-  );
+  const { start: beginHold, release: holdEnd, held, snapshot } = useHeldOrder<PhoneSnapshot>();
+  const holdStart = useCallback(() => beginHold(() => paintedRef.current), [beginHold]);
 
-  // The spaces drawer is its own sticky source (home.md §3.3): opening it
-  // freezes the list and only closing it releases — taps inside the drawer
-  // must not.
+  // The spaces sheet is a hold source of its own (home.md §3.3): opening it
+  // freezes the list and closing it releases, derived from the state rather
+  // than counted in the click handlers.
   useEffect(() => {
-    if (drawerOpen) {
-      startHold("sheet");
-    } else {
-      // Closing the drawer releases its source and the focus it restored to
-      // the opener; a later Tab re-establishes the focus hold.
-      end("sheet");
-      end("focus");
-    }
-  }, [drawerOpen, startHold, end]);
+    if (drawerOpen) holdStart();
+    else holdEnd();
+  }, [drawerOpen, holdStart, holdEnd]);
 
   // While held, the snapshot owns the structure; live data only replaces each
   // row's content by id. A row that vanished keeps its last painted content as
@@ -328,15 +319,6 @@ export const HomeList = memo(function HomeList() {
       rows: group.rows.map((row) => live.get(row.id) ?? row),
     }));
   }, [groups, snapshot]);
-  // A row painted at hold start that has since left the live data: it keeps its
-  // place as a placeholder, with every control inert until release.
-  const staleIds = useMemo<ReadonlySet<string>>(() => {
-    if (!snapshot) return new Set<string>();
-    const live = new Set(groups.flatMap((group) => group.rows.map((row) => row.id)));
-    return new Set(
-      snapshot.groups.flatMap((group) => group.rows.map((row) => row.id)).filter((id) => !live.has(id)),
-    );
-  }, [snapshot, groups]);
   const renderedFold = snapshot ? snapshot.fold : painted.fold;
   const renderedQuietOpen = snapshot ? snapshot.quietOpen : painted.quietOpen;
 
@@ -447,20 +429,15 @@ export const HomeList = memo(function HomeList() {
           {renderedGroups.length > 0 ? (
             <div
               className={css.groups}
-              ref={regionRef}
-              data-order-held={held ? "1" : "0"}
-              // Only the rows freeze the order; the toolbar and search are
-              // outside this container.
-              onPointerDown={() => startHold("pointer")}
-              // Focus only freezes on a ROW control: the fold toggles live in
-              // this container too, and clicking one must take effect at once.
+              data-held={held ? "1" : "0"}
+              // A finger anywhere in the list, or keyboard focus inside it,
+              // freezes the painted structure until the interaction ends.
+              onPointerDown={holdStart}
               onFocus={(event) => {
-                if ((event.target as Element | null)?.closest('[data-testid="home-row"]')) {
-                  startHold("focus");
-                }
+                if (!event.currentTarget.contains(event.relatedTarget as Node | null)) holdStart();
               }}
               onBlur={(event) => {
-                if (!event.currentTarget.contains(event.relatedTarget as Node | null)) end("focus");
+                if (!event.currentTarget.contains(event.relatedTarget as Node | null)) holdEnd();
               }}
             >
               <HomeGroups
@@ -469,7 +446,6 @@ export const HomeList = memo(function HomeList() {
                 fold={renderedFold}
                 quietOpen={renderedQuietOpen}
                 resumeStates={resumeStates}
-                staleIds={staleIds}
                 onResume={(instanceId) => void onResume(instanceId)}
               />
             </div>
@@ -523,13 +499,10 @@ function HomeRowView({
   row,
   resumeState,
   onResume,
-  stale = false,
 }: {
   row: HomeRow;
   resumeState: ResumeState | undefined;
   onResume: (instanceId: string) => void;
-  /** Painted during a hold but gone from the live data: show it, let nothing fire. */
-  stale?: boolean;
 }) {
   return (
     <article
@@ -538,17 +511,8 @@ function HomeRowView({
       data-status={row.status}
       data-rank={row.rank}
       data-blocked={row.blocked ? "1" : "0"}
-      data-stale={stale ? "1" : undefined}
-      aria-disabled={stale || undefined}
     >
-      <Link
-        className={css.rowMain}
-        to={`/s/${row.id}`}
-        data-testid="home-row-link"
-        aria-disabled={stale || undefined}
-        tabIndex={stale ? -1 : undefined}
-        onClick={stale ? (event) => event.preventDefault() : undefined}
-      >
+      <Link className={css.rowMain} to={`/s/${row.id}`} data-testid="home-row-link">
         <span className={css.dot}>
           <StateDot status={row.status} />
         </span>
@@ -586,7 +550,7 @@ function HomeRowView({
           type="button"
           className={`${ui.btn} ${css.resume}`}
           data-testid="home-resume"
-          disabled={stale || resumeState?.busy === true}
+          disabled={resumeState?.busy === true}
           onClick={(event) => {
             event.preventDefault();
             onResume(row.id);
@@ -643,7 +607,6 @@ function HomeGroups({
   fold,
   quietOpen,
   resumeStates,
-  staleIds,
   onResume,
 }: {
   groups: HomeGroup[];
@@ -651,7 +614,6 @@ function HomeGroups({
   fold: FoldState;
   quietOpen: boolean;
   resumeStates: Record<string, ResumeState>;
-  staleIds: ReadonlySet<string>;
   onResume: (instanceId: string) => void;
 }) {
   const searching = query.trim().length > 0;
@@ -682,7 +644,6 @@ function HomeGroups({
             key={row.id}
             row={row}
             resumeState={resumeStates[row.id]}
-            stale={staleIds.has(row.id)}
             onResume={onResume}
           />
         ))}

@@ -1,10 +1,11 @@
 import { render, screen } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
-import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as store from "../lib/store";
 import { mockDb } from "../lib/mock";
 import type { Instance } from "../types/instance";
-import type { Id } from "../types/wire";
+import type { Observation } from "../types/observation";
+import { known, unknownKnowledge, type Id } from "../types/wire";
 import { SessionPage } from "./SessionPage";
 
 vi.mock("../lib/viewport", () => ({
@@ -107,4 +108,82 @@ it("the current Main chapter after Pause has exactly one resume control and read
   expect(screen.queryByTestId("resume-terminal")).toBeNull();
   expect(screen.getByTestId("main-status-lineage").textContent).toMatch(/^已结束/);
   expect(screen.getByTestId("main-session-bar").textContent).not.toContain("已停止");
+});
+
+/** A complete assistant message observation (the transcript reads it too). */
+function reply(instanceId: string, observedAt: string): Observation {
+  return {
+    schemaVersion: 1,
+    eventId: "evt_4" as Id,
+    journalId: `obj_${instanceId}` as Id,
+    instanceId: instanceId as Id,
+    runId: null,
+    hostId: "hst" as Id,
+    processGeneration: "1",
+    runGeneration: null,
+    seq: "4",
+    observedAt,
+    nativeAt: known(observedAt),
+    source: {
+      driverKind: "claude-print",
+      driverVersion: "1",
+      adapterVersion: "1",
+      channel: "stdout",
+      delivery: "replay",
+      nativeSessionId: unknownKnowledge("none"),
+      nativeTurnId: unknownKnowledge("none"),
+      nativeAgentId: unknownKnowledge("none"),
+      nativeItemId: unknownKnowledge("none"),
+      nativeEventId: unknownKnowledge("none"),
+      nativeRequestId: { type: "none" },
+    },
+    kind: "message",
+    completeness: "structured",
+    rawRef: null,
+    evidenceEventIds: [],
+    payload: {
+      nodeId: "n_4" as Id,
+      messageId: "m_4" as Id,
+      role: "assistant",
+      phase: "final",
+      revision: "1",
+      baseRevision: null,
+      operation: "open",
+      blocks: [{ type: "text", text: "好的" }],
+      targetBlock: null,
+      parentToolCallId: null,
+      nativeOrigin: known("assistant"),
+      status: "complete",
+    },
+  } as unknown as Observation;
+}
+
+describe("最近活动 (r3 item 2)", () => {
+  it("comes from the last message or turn observation, not the row's updatedAt", () => {
+    const tenMinutesAgo = new Date(Date.now() - 10 * 60_000).toISOString();
+    const working = { ...chapter2, updatedAt: new Date().toISOString() } as Instance;
+    vi.mocked(store.hubStore.getSnapshot).mockReturnValue({
+      ...store.hubStore.getSnapshot(),
+      instances: [chapter1, working],
+      events: {
+        [chapter1.id]: [],
+        [working.id]: [
+          reply(working.id, tenMinutesAgo),
+        ],
+      },
+    });
+    renderPage(working.id);
+    expect(screen.getByTestId("main-status-last-activity").textContent).toBe("最近活动 10m");
+  });
+
+  it("reads — while no activity is known", () => {
+    const working = { ...chapter2, updatedAt: new Date().toISOString() } as Instance;
+    vi.mocked(store.hubStore.getSnapshot).mockReturnValue({
+      ...store.hubStore.getSnapshot(),
+      instances: [chapter1, working],
+      events: { [chapter1.id]: [], [working.id]: [] },
+    });
+    renderPage(working.id);
+    expect(screen.getByTestId("main-status-last-activity").textContent).toBe("最近活动 —");
+  });
 });

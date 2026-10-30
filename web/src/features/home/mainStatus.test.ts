@@ -7,6 +7,7 @@ import type { Observation } from "../../types/observation";
 import { known, type Id } from "../../types/wire";
 import {
   firstLine,
+  lastActivityOf,
   lineagePausedBy,
   mainEcho,
   mainStatus,
@@ -176,6 +177,20 @@ function bubble(patch: Partial<LocalBubble>): LocalBubble {
     ...patch,
   };
 }
+
+describe("last activity (r3 item 2)", () => {
+  it("is the observedAt of the newest message or turn observation", () => {
+    const events = [
+      { seq: "1", kind: "message", observedAt: "2026-10-30T10:00:00Z", payload: { role: "user", text: "hi" } },
+      { seq: "2", kind: "lifecycle", observedAt: "2026-10-30T10:05:00Z", payload: { type: "native", topic: "turn" } },
+      { seq: "3", kind: "usage", observedAt: "2026-10-30T10:09:00Z", payload: {} },
+      { seq: "4", kind: "lifecycle", observedAt: "2026-10-30T10:10:00Z", payload: { type: "entity", state: "ready" } },
+    ] as unknown as Observation[];
+    expect(lastActivityOf(events)).toBe("2026-10-30T10:05:00Z");
+    expect(readMainTail(events).lastActivityAt).toBe("2026-10-30T10:05:00Z");
+    expect(lastActivityOf([])).toBeNull();
+  });
+});
 
 describe("mainEcho line 2", () => {
   const tailWithReply = readMainTail([message(3, "assistant", "\n第一行回复\n第二行")]);

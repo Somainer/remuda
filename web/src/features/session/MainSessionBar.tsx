@@ -7,9 +7,11 @@ import { useNowTick } from "../../lib/useNowTick";
 import type { Instance } from "../../types/instance";
 import type { Observation } from "../../types/observation";
 import type { Id, U64 } from "../../types/wire";
+import { useMainTail } from "../home/mainTail";
 import { useLineageSync } from "../home/useMain";
 import {
   causeLabel,
+  lastActivityOf,
   lineageFor,
   lineageStateLabel,
   mainStatus,
@@ -61,6 +63,13 @@ function MainSessionBarBody({ entry, instance, mobile }: { entry: MainEntry; ins
     summary: hub.summaries[current.id],
     nowMs,
   });
+  // 最近活动: the last message or turn observation, never the row's
+  // updatedAt (every journal append rewrites it). The current chapter's
+  // followed journal answers when this page follows it; otherwise the same
+  // bounded tail the home card reads.
+  const followed = hub.events[current.id];
+  const { tail } = useMainTail(entry, hub.instances, followed === undefined);
+  const lastActivityAt = followed ? lastActivityOf(followed) : (tail?.lastActivityAt ?? null);
   const [busy, setBusy] = useState<"stop" | "pause" | "resume" | null>(null);
   const [confirmPause, setConfirmPause] = useState(false);
   // This page is an earlier chapter: say so and link to the current one.
@@ -104,7 +113,7 @@ function MainSessionBarBody({ entry, instance, mobile }: { entry: MainEntry; ins
           </span>
         ) : null}
         <span className={css.item} data-testid="main-status-last-activity">
-          最近活动 {formatListTime(current.updatedAt, nowMs)}
+          最近活动 {lastActivityAt ? formatListTime(lastActivityAt, nowMs) : "—"}
         </span>
         {stateLabel ? (
           <span className={css.item} data-testid="main-status-lineage" data-tone={status.tone}>

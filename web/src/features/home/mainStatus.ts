@@ -264,6 +264,11 @@ export function lineageStateLabel(
 export type MainReply = { text: string; seq: string };
 
 export type MainTail = {
+  /**
+   * observedAt of the newest message or turn observation in the tail: Main's
+   * last real activity (the row's updatedAt moves on every journal append).
+   */
+  lastActivityAt: string | null;
   /** Newest assistant message of the tail, first non-empty line. */
   reply: MainReply | null;
   /** seq of the user message each commandId settled into, when in the tail. */
@@ -280,6 +285,24 @@ export function firstLine(text: string): string {
   return "";
 }
 
+/** A message, or a lifecycle observation on the turn topic. */
+function isActivity(event: Observation): boolean {
+  if (event.kind === "message") return true;
+  if (event.kind !== "lifecycle") return false;
+  return (event.payload as { topic?: unknown }).topic === "turn";
+}
+
+/** observedAt of the newest activity in a journal window (ascending); null when none. */
+export function lastActivityOf(events: readonly Observation[]): string | null {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i];
+    if (!isActivity(event)) continue;
+    const at = (event as { observedAt?: unknown }).observedAt;
+    if (typeof at === "string" && at) return at;
+  }
+  return null;
+}
+
 /** Fold a journal tail (ascending) into what line 2 needs. */
 export function readMainTail(events: readonly Observation[]): MainTail {
   const replies: MainReply[] = [];
@@ -294,7 +317,7 @@ export function readMainTail(events: readonly Observation[]): MainTail {
       userSeqByCommand.set(payload.commandId, String(event.seq));
     }
   }
-  return { reply: replies.at(-1) ?? null, userSeqByCommand, replies };
+  return { reply: replies.at(-1) ?? null, userSeqByCommand, replies, lastActivityAt: lastActivityOf(events) };
 }
 
 export type MainEcho =

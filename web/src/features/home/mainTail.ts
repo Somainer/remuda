@@ -74,6 +74,8 @@ function backoff(attempt: number): number {
 export function useMainTail(
   entry: MainEntry,
   rows: readonly Instance[],
+  /** False when the caller already follows the chapter's journal live. */
+  enabled = true,
 ): { tail: MainTail | null; carried: string | null; read: TailRead } {
   const instance = entry.instance;
   const lineageId = entry.lineageId;
@@ -91,7 +93,7 @@ export function useMainTail(
   const attempt = retry.key === key ? retry.n : 0;
 
   useEffect(() => {
-    if (!journalId) return;
+    if (!journalId || !enabled) return;
     let cancelled = false;
     let timer: number | undefined;
     readTail({ journalId: journalId as Id, durableSeq: seq as U64 })
@@ -114,7 +116,7 @@ export function useMainTail(
     };
     // entry.generation is fixed for a chapter id, which `key` already names.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [lineageId, id, journalId, seq, key, attempt]);
+  }, [lineageId, id, journalId, seq, key, attempt, enabled]);
 
   const tail = good && good.id === id ? good.tail : null;
   const carried = carriedReplies.get(lineageId)?.text ?? null;
@@ -126,7 +128,7 @@ export function useMainTail(
     .sort((a, b) => (b.generation ?? 1) - (a.generation ?? 1))
     .slice(0, EARLIER_CHAPTERS);
   const earlierKey = `${lineageId}|${id}|${earlier.map((row) => `${row.id}@${row.durableSeq}`).join(",")}`;
-  const needEarlier = currentRead === "ok" && !tail?.reply && carried === null && earlier.length > 0;
+  const needEarlier = enabled && currentRead === "ok" && !tail?.reply && carried === null && earlier.length > 0;
   const earlierAttempt = earlierRetry.key === earlierKey ? earlierRetry.n : 0;
 
   useEffect(() => {

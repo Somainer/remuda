@@ -316,16 +316,119 @@ fn scrub_word(word: &str, scrub: &mut Scrub) -> Option<String> {
     Some(scrub_plain(word))
 }
 
+/// One `scripts/ci/secret-scan.py` rule applied to a substring match.
+struct SpanRule {
+    regex: regex::Regex,
+    /// Capture group holding the credential (`0` = the whole match).
+    group: usize,
+    /// The scanner's `(?<![A-Za-z0-9_])` lookbehind on the match start.
+    boundary: bool,
+}
+
+/// The scanner's candidate set, as substring matches.
+///
+/// D-060 requires the same candidates as `scripts/ci/secret-scan.py`, and the
+/// scanner does not care about word boundaries: it matches a token inside a
+/// URL query or path exactly as it does a bare one. Rust's regex crate has no
+/// lookbehind, so the preceding character is checked by hand instead.
+fn scanner_rules() -> &'static [SpanRule] {
+    use std::sync::LazyLock;
+    static RULES: LazyLock<Vec<SpanRule>> = LazyLock::new(|| {
+        let rule = |pattern: &str, group: usize, boundary: bool| SpanRule {
+            regex: regex::Regex::new(pattern).expect("static scanner pattern"),
+            group,
+            boundary,
+        };
+        vec![
+            rule(r"(?i)agk_[A-Za-z0-9_\-]{8,}", 0, true),
+            rule(r"(?i)sk-[A-Za-z0-9_\-]{8,}", 0, true),
+            rule(r"(?i)xai-[A-Za-z0-9_\-]{8,}", 0, true),
+            rule(r"(?i)ghp_[A-Za-z0-9]{8,}", 0, true),
+            rule(r"(?i)github_pat_[A-Za-z0-9_]{8,}", 0, true),
+            rule(r"(?i)bearer\s+([A-Za-z0-9._\-+=/]{8,})", 1, false),
+            rule(
+                r#"(?i)anthropic_auth_token=["']?([A-Za-z0-9_\-]{8,})"#,
+                1,
+                false,
+            ),
+            rule(
+                r#"(?i)remuda_bootstrap_token=["']?([A-Za-z0-9_\-]{8,})"#,
+                1,
+                false,
+            ),
+            rule(r#"(?i)openai_api_key=["']?([A-Za-z0-9_\-]{8,})"#, 1, false),
+            rule(
+                r#"(?i)api_key\b\s*[=:]\s*["']?([A-Za-z0-9_\-]{8,})"#,
+                1,
+                false,
+            ),
+            rule(
+                r#"(?i)app_secret\b\s*[=:]\s*["']?([A-Za-z0-9_\-]{8,})"#,
+                1,
+                false,
+            ),
+        ]
+    });
+    &RULES
+}
+
+/// Mask every scanner match in `text`, in place.
+fn mask_scanner_spans(text: &str) -> String {
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for rule in scanner_rules() {
+        for capture in rule.regex.captures_iter(text) {
+            let Some(found) = capture.get(rule.group) else {
+                continue;
+            };
+            if found.start() == found.end() {
+                continue;
+            }
+            if rule.boundary {
+                // `(?<![A-Za-z0-9_])`: the match may not continue a word.
+                let continues_word = text[..found.start()]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+                if continues_word {
+                    continue;
+                }
+            }
+            spans.push((found.start(), found.end()));
+        }
+    }
+    if spans.is_empty() {
+        return text.to_string();
+    }
+    spans.sort_unstable();
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for (start, end) in spans {
+        if start < at {
+            continue;
+        }
+        out.push_str(&text[at..start]);
+        out.push_str(REDACTED);
+        at = end;
+    }
+    out.push_str(&text[at..]);
+    out
+}
+
 /// Collapse whitespace to single spaces and redact credential-shaped content.
 /// The result is one line, which also stops quoted data from forging
 /// structure in whatever prompt eventually embeds it.
+///
+/// The word pass below understands shell shapes (a secret flag's next word, a
+/// quoted value, a PEM block). The final pass re-scans the joined line with
+/// `scripts/ci/secret-scan.py`'s patterns, which match substrings: a key in a
+/// URL query or path must be withheld even though it is not its own word.
 pub(crate) fn redact_secrets(text: &str) -> String {
     let mut scrub = Scrub::default();
     let words: Vec<String> = text
         .split_whitespace()
         .filter_map(|word| scrub_word(word, &mut scrub))
         .collect();
-    words.join(" ")
+    mask_scanner_spans(&words.join(" "))
 }
 
 /// Unwrap a `Knowledge`-shaped value (`{"state":"known","value":…}`) or pass a
@@ -2074,9 +2177,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_credential_embedded_in_a_url_or_a_word_is_withheld() {
+        // The scanner matches substrings with a `(?<![A-Za-z0-9_])` lookbehind,
+        // not whole words: a key in a URL query or path is still a key.
+        let cases = [
+            (
+                "https://relay.test/v1?api_key=sk-ant-api03-AAAAAAAAAAAAAAAAAAAA",
+                "sk-ant-api03-AAAAAAAAAAAAAAAAAAAA",
+            ),
+            (
+                "https://relay.test/x/agk_9f8e7d6c5b4a39281706/y",
+                "agk_9f8e7d6c5b4a39281706",
+            ),
+            (
+                "https://relay.test/v1?h=1&token=xai-9f8e7d6c5b4a39281706",
+                "xai-9f8e7d6c5b4a39281706",
+            ),
+            (
+                "see(ghp_abcdefghijklmnopqrstuvwxyz0123456789)",
+                "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+            ),
+            (
+                "https://relay.test/v1?api_key=a8f3k2m9q1z4w7t0y6u2i5o9",
+                "a8f3k2m9q1z4w7t0y6u2i5o9",
+            ),
+        ];
+        for (text, secret) in cases {
+            let redacted = redact_secrets(text);
+            assert!(!redacted.contains(secret), "leaked {secret}: {redacted}");
+        }
+        // The lookbehind boundary is respected: a prefix inside a word is not a
+        // scanner hit, and ordinary prose survives.
+        let plain = "task-sk-learn-notes and disk-space-check";
+        assert_eq!(redact_secrets(plain), plain);
+    }
+
     /// The digest must exclude the same candidates `scripts/ci/secret-scan.py`
     /// flags. Read the script's own prefix table, so a rule added there fails
     /// here until the redactor covers it.
+    #[test]
+    fn the_digest_withholds_an_embedded_key_in_the_text_and_the_question() {
+        let worker = worker(json!({ "state": "working" }));
+        // lastText and pending.question are the same untrusted text: a key
+        // inside a URL must be withheld there too, not only in argsSummary.
+        let journal = vec![assistant_text(
+            "m1",
+            "open",
+            "see https://relay.test/v1?api_key=sk-ant-api03-AAAAAAAAAAAAAAAAAAAA",
+        )];
+        let digest = digest_of(&facts(&worker, None, &journal, &[], &[], None));
+        let text = digest.last_text.expect("text");
+        let shown = format!("{}{}", text.head, text.tail);
+        assert!(!shown.contains("sk-ant-api03"), "{shown}");
+
+        let mut event = approval_event("tc1", "Bash");
+        event["payload"]["interaction"]["request"]["description"] =
+            json!("open https://relay.test/x/agk_9f8e7d6c5b4a39281706/y then confirm");
+        let pending = vec![interaction(event)];
+        let journal = vec![tool_call("tc1", "Bash", json!({ "command": "ls" }))];
+        let digest = digest_of(&facts(&worker, None, &journal, &pending, &[], None));
+        let question = digest.pending.expect("pending").question;
+        assert!(!question.contains("9f8e7d6c5b4a39281706"), "{question}");
+        assert!(question.contains("confirm"), "{question}");
+    }
+
     #[test]
     fn the_redactor_covers_every_secret_scan_prefix() {
         let source = std::fs::read_to_string(
@@ -2115,7 +2280,9 @@ mod tests {
         );
         const TOKEN: &str = "q7Zr2LmW8pXc4VbN1";
         for (name, literal) in literals {
-            let text = match literal.as_str() {
+            // A bare occurrence, and the same token embedded in a URL: the
+            // scanner matches substrings, so both must be withheld.
+            let plain = match literal.as_str() {
                 "Bearer " => format!("curl -H 'Authorization: Bearer {TOKEN}'"),
                 "BEGIN PRIVATE KEY" => {
                     format!("-----{literal}----- MIIEvQIBADANBg -----END PRIVATE KEY-----")
@@ -2129,11 +2296,24 @@ mod tests {
                 // A token-prefix rule: the credential starts with the prefix.
                 _ => format!("echo {literal}{TOKEN}"),
             };
-            let redacted = redact_secrets(&text);
-            assert!(
-                !redacted.contains(TOKEN) && !redacted.contains("MIIEvQIBADANBg"),
-                "{name} ({literal}) leaked through the redactor: {redacted}"
-            );
+            let embedded = match literal.as_str() {
+                "Bearer " => format!("https://x.test/v1?h=\"Bearer {TOKEN}\"&z=1"),
+                "BEGIN PRIVATE KEY" => {
+                    format!("x-----{literal}-----MIIEvQIBADANBg-----END PRIVATE KEY-----y")
+                }
+                _ if literal.ends_with('=') => format!("https://x.test/v1?{literal}{TOKEN}&z=1"),
+                _ if !(literal.ends_with('_') || literal.ends_with('-')) => {
+                    format!("https://x.test/v1?{literal}={TOKEN}&z=1")
+                }
+                _ => format!("https://x.test/v1/{literal}{TOKEN}/x"),
+            };
+            for text in [plain, embedded] {
+                let redacted = redact_secrets(&text);
+                assert!(
+                    !redacted.contains(TOKEN) && !redacted.contains("MIIEvQIBADANBg"),
+                    "{name} ({literal}) leaked through the redactor: {redacted}"
+                );
+            }
         }
     }
 

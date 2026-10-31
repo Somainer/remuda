@@ -157,6 +157,7 @@ async fn live_tasktrack_fg_and_bg_agent() {
     let _ = fs::remove_file(&dump);
 
     let driver = ClaudePtyDriver::new(ClaudePtyOptions {
+        memory_context: None,
         profile: profile(),
         launch_dir: launch.clone(),
         native_home: isolated_native_home(),

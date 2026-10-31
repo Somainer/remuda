@@ -66,6 +66,7 @@ async fn capture_model_pin_evidence() {
 
     let created = node
         .create_instance(CreateInstanceRequest {
+            memory_context: None,
             initiator: None,
             origin: remuda_protocol::InputOrigin::Human,
             agent_credential: None,

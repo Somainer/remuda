@@ -371,7 +371,7 @@ fn assemble(parts: &ProbeParts, config: &CollectRequest, env: &ProbeEnv) -> Host
 /// an agent depends on a runtime flag rather than on a binary being present.
 /// An empty inventory means "not reported", and no caller reads it as
 /// "cannot" — [`super::transport::hubnode::hello_capabilities`] sends no
-/// capabilities at all in that case, never `{}`.
+/// `driverInventory` at all in that case, never `[]`.
 #[must_use]
 pub fn driver_inventory() -> Vec<DriverDescriptor> {
     let native = remuda_driver::shell_pty::native_carrier_enabled();

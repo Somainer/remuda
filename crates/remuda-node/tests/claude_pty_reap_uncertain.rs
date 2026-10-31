@@ -153,6 +153,7 @@ async fn run_reap_barrier(session_name: &str, model: StopModel) {
     let _fake = FakeHerdrServer::spawn(options).unwrap();
 
     let driver = ClaudePtyDriver::new(ClaudePtyOptions {
+        memory_context: None,
         instance_id: None,
         media_stager: None,
         profile: profile(),

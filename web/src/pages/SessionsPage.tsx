@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { SessionList } from "../features/session/SessionList";
+import { useHomeFreshness } from "../features/home/freshness";
 import { useHub } from "../lib/store";
 import { useWorkbenchViewport } from "../lib/viewport";
 import { SpacesPanel } from "../features/spaces/SpacesPanel";
@@ -15,6 +16,11 @@ import css from "./SessionsPage.module.css";
 export function SessionsPage({ dimmed = false }: { dimmed?: boolean }) {
   const hub = useHub();
   const { mobile } = useWorkbenchViewport();
+  // home.md §8: the same freshness signal the list uses. `ready` alone is not
+  // enough — the offline-reload path publishes ready:true with empty lists
+  // before any successful read, and must not be told it has no hosts.
+  const freshness = useHomeFreshness();
+  const firstSnapshot = freshness.state === "unknown";
   const { spaces, active, prefs, instanceId, newHref } = useSpaceWorkbench();
   // D-061 (home.md §2.2–2.4): ≥1440 adds the right column — Main card with
   // its inline input, then 工作中; 1280–1439 puts the Main card at the top of
@@ -71,8 +77,12 @@ export function SessionsPage({ dimmed = false }: { dimmed?: boolean }) {
           </>
         ) : null}
         <div className={css.list}>
+          {/* D-061 (home.md §2.2–2.4): the Main card heads the main column
+              at 1280–1439; at ≥1440 it lives in the right column instead. */}
           {showMain && !mainAside ? <MainCard placement="desktop" /> : null}
-          {hub.hosts.length === 0 && hub.instances.length === 0 ? (
+          {/* home.md §8: no empty state before the first Hub snapshot — the
+              list below paints its skeleton until then. */}
+          {!firstSnapshot && hub.ready && hub.hosts.length === 0 && hub.instances.length === 0 ? (
             <div className={css.placeholder}>无主机。请添加主机。</div>
           ) : null}
           <SessionList

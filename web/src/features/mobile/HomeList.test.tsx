@@ -23,12 +23,13 @@ const HELD = "[data-order-held='1']";
 const RELEASED = "[data-order-held='0']";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { mockDb } from "../../lib/mock";
 import type { Instance } from "../../types/instance";
 import { known, type Id } from "../../types/wire";
 import { HomeList } from "./HomeList";
 import { SPACES_PREFS_KEY, spaceKey, spaceStore } from "../spaces/store";
+import { setClock } from "../../lib/clock";
 
 const hub = {
   hosts: [{ id: "host-a", label: "alpha" }],
@@ -42,6 +43,15 @@ const hub = {
 
 const resumeMock = vi.fn();
 const listeners = new Set<() => void>();
+/** The store's freshness projection (home.md §8) as the component sees it. */
+const health = { lastOkAt: Date.now() as number | null, failingSince: null as number | null, settledSeq: 0 };
+const healthListeners = new Set<() => void>();
+const refreshMock = vi.fn(async () => undefined);
+
+function publishHealth(patch: Partial<typeof health>) {
+  Object.assign(health, patch);
+  for (const listener of healthListeners) listener();
+}
 
 vi.mock("../../lib/store", () => ({
   useHub: () => hub,
@@ -56,6 +66,12 @@ vi.mock("../../lib/store", () => ({
       return () => listeners.delete(listener);
     },
     getSnapshot: () => ({ ...hub, instances: hub.instances.slice() }),
+    getRefreshHealth: () => health,
+    subscribeRefreshHealth: (listener: () => void) => {
+      healthListeners.add(listener);
+      return () => healthListeners.delete(listener);
+    },
+    refresh: () => refreshMock(),
     titleOf: (id: string) => `title ${id}`,
     hostName: () => "alpha",
     usageRollupOf: () => null,
@@ -111,6 +127,9 @@ async function openQuiet() {
 
 beforeEach(() => {
   resumeMock.mockReset();
+  refreshMock.mockClear();
+  health.lastOkAt = Date.now();
+  health.failingSince = null;
   localStorage.removeItem(SPACES_PREFS_KEY);
   spaceStore.reload();
 });
@@ -495,5 +514,76 @@ describe("HomeList hold against the painted structure", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("HomeList §8 freshness states", () => {
+  // §8 tasks are asserted on the injected clock: the stale window is a
+  // product constant, never a wall-clock threshold.
+  const NOW = 5_000_000;
+  let restoreClock: () => void;
+  beforeEach(() => {
+    restoreClock = setClock(() => NOW);
+    health.lastOkAt = NOW;
+  });
+  afterEach(() => {
+    restoreClock();
+  });
+
+  it("paints three skeleton rows before the first snapshot and never an empty state", async () => {
+    health.lastOkAt = null;
+    hub.instances = [];
+    renderHome();
+    const skeleton = await screen.findByTestId("home-skeleton");
+    expect(skeleton).toHaveAttribute("aria-busy", "true");
+    expect(skeleton.children).toHaveLength(3);
+    // A cold start must never flash the designed empty state.
+    expect(screen.queryByTestId("home-empty")).toBeNull();
+    expect(screen.queryByText("还没有会话")).toBeNull();
+    expect(screen.queryByText("暂无会话")).toBeNull();
+  });
+
+  it("offers 新建会话 when the Space really has no sessions", async () => {
+    hub.instances = [];
+    renderHome();
+    const empty = await screen.findByTestId("home-empty");
+    expect(empty).toHaveTextContent("还没有会话");
+    expect(screen.getByTestId("home-empty-new")).toHaveTextContent("新建会话");
+    expect(screen.queryByTestId("home-skeleton")).toBeNull();
+  });
+
+  it("separates a search with no matches: 没有匹配的会话 with 清除搜索", async () => {
+    hub.instances = [row("ins-a")];
+    renderHome();
+    fireEvent.change(await screen.findByTestId("home-search"), {
+      target: { value: "nothing-matches-this" },
+    });
+    const empty = await screen.findByTestId("home-empty");
+    expect(empty).toHaveTextContent("没有匹配的会话");
+    fireEvent.click(screen.getByTestId("home-empty-clear"));
+    expect(screen.getByTestId("home-search")).toHaveValue("");
+    await waitFor(() => expect(screen.queryByTestId("home-empty")).toBeNull());
+  });
+
+  it("greys the cached rows while stale, and a foreground grace lifts the grey until the first refresh settles", async () => {
+    health.lastOkAt = NOW - 20_000;
+    hub.instances = [row("ins-a", { activity: known("waiting-interaction") })];
+    renderHome();
+    await screen.findByTestId("home-row");
+    const region = () =>
+      screen.getByTestId("home-list").querySelector<HTMLElement>("[data-freshness]");
+    expect(region()).toHaveAttribute("data-dimmed", "1");
+    // Back to the foreground: §8 forbids a stale verdict until the refresh
+    // that the shell fires on resume has settled, so the rows stay lit.
+    act(() => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    expect(region()).toHaveAttribute("data-freshness", "grace");
+    expect(region()).not.toHaveAttribute("data-dimmed");
+    act(() => {
+      publishHealth({ failingSince: NOW });
+    });
+    expect(region()).toHaveAttribute("data-freshness", "stale");
+    expect(region()).toHaveAttribute("data-dimmed", "1");
   });
 });

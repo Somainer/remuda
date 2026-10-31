@@ -95,6 +95,7 @@ pub fn agent_recipe(
     launch: &AgentLaunch,
     cwd: &str,
     resume: Option<&str>,
+    memory_context: Option<&crate::memory_context::MemoryContext>,
 ) -> DriverResult<LaunchRecipe> {
     if spec.driver != DriverKind::ShellPty {
         return Err(DriverError::InvalidLaunchSpec(
@@ -135,6 +136,7 @@ pub fn agent_recipe(
         native_home_managed: Some(launch.native_home_managed),
         settings_overlay_path: launch.settings_overlay.clone(),
         secret_policy: None,
+        memory_context,
     })
 }
 

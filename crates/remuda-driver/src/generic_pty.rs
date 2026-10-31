@@ -106,6 +106,9 @@ pub struct GenericPtyOptions {
     /// Census epoch of the Node that built this driver (c-usagefu r18 item 3);
     /// None outside a composed Node.
     pub node_epoch: Option<crate::adapters::codex_discovery::NodeEpoch>,
+    /// D-060: the Hub-stamped lineage memory. A raw PTY never takes it as a
+    /// flag; the driver puts it ahead of the first input it delivers.
+    pub memory_context: Option<crate::memory_context::MemoryContext>,
 }
 
 impl GenericPtyOptions {
@@ -134,6 +137,7 @@ impl GenericPtyOptions {
             instance_id: None,
             file_adapter_home: None,
             node_epoch: None,
+            memory_context: None,
         }
     }
 }
@@ -178,6 +182,8 @@ pub struct GenericPtyDriver {
     ready: watch::Sender<bool>,
     /// Kept so [`Self::ready`] stays open when no waiter has subscribed yet.
     _ready_rx: watch::Receiver<bool>,
+    /// D-060: the recipe's data block, until the first input is delivered.
+    memory_block: crate::memory_context::PendingDataBlock,
 }
 
 impl GenericPtyDriver {
@@ -192,6 +198,7 @@ impl GenericPtyDriver {
             closed: AtomicBool::new(false),
             ready,
             _ready_rx: ready_rx,
+            memory_block: Default::default(),
         }
     }
 
@@ -304,8 +311,10 @@ impl GenericPtyDriver {
             native_home_managed: None,
             settings_overlay_path: None,
             secret_policy: None,
+            memory_context: self.options.memory_context.as_ref(),
         };
         let mut recipe = materialize(&request)?;
+        self.memory_block.arm(&recipe);
         merge_yolo_argv(
             &mut recipe.argv,
             preset,
@@ -316,7 +325,7 @@ impl GenericPtyDriver {
         if let Some(flag) = preset.name_flag {
             ensure_name_flag(&mut recipe.argv, flag, &agent_name);
         }
-        refuse_bare(&recipe.argv)?;
+        refuse_bare(&recipe.argv, recipe.own_system_prompt())?;
         if preset.journals {
             recipe = inject_session_start_hook(&mut recipe, &self.options.launch_dir)?;
         }
@@ -450,7 +459,7 @@ impl GenericPtyDriver {
             },
         )
         .await?;
-        refuse_bare(&started.argv)?;
+        refuse_bare(&started.argv, recipe.own_system_prompt())?;
         let _ = started;
 
         let stream = client
@@ -821,9 +830,14 @@ impl Driver for GenericPtyDriver {
             DriverInput::Prompt(prompt) => crate::attachment::attachments_of(&prompt.blocks),
             _ => Vec::new(),
         };
-        let text = prompt_text(&input)?;
+        // D-060: the first input this driver delivers carries the data block
+        // ahead of it; the codex evidence below records what was typed.
+        let (text, with_block) = self.memory_block.compose(prompt_text(&input)?);
         let (client, agent_name) = self.live_client().await?;
         prompt_when_ready(&client, &agent_name, &text).await?;
+        if with_block {
+            self.memory_block.delivered();
+        }
         let inner = self.inner.lock().await;
         let live = inner.as_ref().ok_or(DriverError::ControlUnavailable)?;
         // Record the sent prompt for the codex file adapter: discovery may

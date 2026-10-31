@@ -3,6 +3,7 @@
 use crate::binary::{BinaryPin, pin_binary};
 use crate::error::{DriverError, DriverResult};
 use crate::flags::{reject_banned_env, validate_spec_args};
+use crate::memory_context::{APPEND_SYSTEM_PROMPT, MemoryContext, RecipeMemory};
 use crate::profile::{
     Delegation, ProviderHealth, ProviderKind, ProviderProfile, SecretRef, SecretRefPolicy,
 };
@@ -90,6 +91,9 @@ pub struct MaterializeRequest<'a> {
     /// `None` refuses a profile-supplied `helper:` ref outright. A helper Remuda
     /// writes itself is unaffected — that path and its 0700 mode are ours.
     pub secret_policy: Option<SecretRefPolicy>,
+    /// D-060: the Hub-stamped lineage memory for this chapter. The
+    /// materializer is its only writer; [`memory_plan`] picks the mechanism.
+    pub memory_context: Option<&'a MemoryContext>,
 }
 
 /// Node token-broker bind baked into a Claude `apiKeyHelper` script.
@@ -221,6 +225,7 @@ fn materialize_inner(
     let mut argv;
     let input_delivery;
     let session_id;
+    let memory;
 
     // D-028 §5.1: `shell-pty` is no longer a materializer dead end. Which
     // recipe it gets depends on `spec.kind`, because one driver now carries
@@ -284,6 +289,7 @@ fn materialize_inner(
             // D-056 (2): ultracode is refused below 2.1.203 or when the pinned
             // version cannot be read; the version comes from `--version`.
             crate::effort::ensure_claude_ultracode_version(&binary.version, request.spec.effort)?;
+            memory = memory_plan(request, true);
             argv = claude_argv(
                 request.spec.driver,
                 &ClaudeArgv {
@@ -294,6 +300,7 @@ fn materialize_inner(
                     effort: request.spec.effort,
                     session: &request.session,
                     extras: &extras,
+                    system_prompt: memory.as_ref().and_then(RecipeMemory::flag_text),
                 },
             )?;
             input_delivery = match request.spec.driver {
@@ -346,6 +353,7 @@ fn materialize_inner(
             argv.extend(extras);
             input_delivery = InputDelivery::Stdio;
             session_id = None;
+            memory = memory_plan(request, false);
             push_env(
                 &mut env_allowlist,
                 "CODEX_HOME",
@@ -377,6 +385,7 @@ fn materialize_inner(
             argv.extend(extras);
             input_delivery = InputDelivery::Stdio;
             session_id = None;
+            memory = memory_plan(request, false);
             push_env(
                 &mut env_allowlist,
                 "GROK_HOME",
@@ -413,6 +422,7 @@ fn materialize_inner(
             argv.extend(extras);
             input_delivery = InputDelivery::DeferredArgv;
             session_id = None;
+            memory = memory_plan(request, false);
             if inject_provider {
                 let secret = request.profile.secret_ref.as_ref().ok_or_else(|| {
                     DriverError::InvalidLaunchSpec(
@@ -431,6 +441,9 @@ fn materialize_inner(
             argv = extras;
             input_delivery = InputDelivery::Tty;
             session_id = None;
+            // A raw PTY whose binary need not be `claude`: never a flag in its
+            // argv, the data block for every agent kind.
+            memory = memory_plan(request, false);
             // Note: a granted codex on generic-pty is refused at the Node
             // factory — only shell-pty with hooks materializes the shadow
             // CODEX_HOME the grant requires, so no CODEX_HOME pin is emitted
@@ -442,6 +455,8 @@ fn materialize_inner(
             argv = extras;
             input_delivery = InputDelivery::Tty;
             session_id = None;
+            // `terminal` / `generic`: [`memory_plan`] gives them nothing.
+            memory = memory_plan(request, false);
         }
     }
 
@@ -508,6 +523,7 @@ fn materialize_inner(
             binary_override: binary_override.is_some(),
             approval_authority: approval,
         },
+        memory,
     };
     tracing::info!(
         launch_id = %recipe.launch_id,
@@ -696,6 +712,13 @@ fn materialize_shell_pty_agent(
     // either repeat it or use the other CLI's vocabulary.
     crate::effort::ensure_no_effort_in_extras(request.spec.kind, &extras)?;
     argv.extend(extras);
+    // D-060: kind `claude` on the native carrier never reaches `claude_argv`,
+    // so this path emits its own pair, after the caller-derived arguments.
+    let memory = memory_plan(request, request.spec.kind == AgentKind::Claude);
+    if let Some(text) = memory.as_ref().and_then(RecipeMemory::flag_text) {
+        argv.push(APPEND_SYSTEM_PROMPT.into());
+        argv.push(text.to_owned());
+    }
     // Per-harness permission axes: Codex's approval policy + sandbox mode,
     // Per-harness permission axes ride `permission.extra_flags` from
     // permission_plan: Codex's --ask-for-approval/--sandbox, Grok/agy yolo
@@ -793,7 +816,39 @@ fn materialize_shell_pty_agent(
                 other => other,
             },
         },
+        memory,
     })
+}
+
+/// D-060 (main-agent.md §12.3): how `memoryContext` rides this launch. The
+/// one place the mechanism is decided, for every materializer path.
+///
+/// - `flag_path` is true only where the materializer builds the Claude argv
+///   itself (`claude_argv`, and `materialize_shell_pty_agent` for kind
+///   `claude`). There the context becomes its own `--append-system-prompt`
+///   pair, and on EVERY process start, a native resume included: Claude does
+///   not persist the system prompt with the session, so the flag is per
+///   process and a resumed process without it would run without its index.
+/// - Every other agent launch gets the data block. The block is part of the
+///   conversation itself, and a native resume carries the conversation over,
+///   so it goes only into a fresh native session: sending it again on a
+///   resume would put a second copy of the index into the same transcript.
+/// - Kinds `terminal` and `generic` get neither: nothing that reads a first
+///   input as an agent runs there.
+fn memory_plan(request: &MaterializeRequest<'_>, flag_path: bool) -> Option<RecipeMemory> {
+    let context = request.memory_context?;
+    if !is_agent_kind(request.spec.kind) {
+        return None;
+    }
+    let rev = context.rev.0;
+    let text = context.text.clone();
+    if flag_path {
+        return Some(RecipeMemory::Flag { rev, text });
+    }
+    match request.session {
+        SessionAction::New { .. } => Some(RecipeMemory::DataBlock { rev, text }),
+        SessionAction::Resume { .. } => None,
+    }
 }
 
 fn validate_spec_profile(spec: &InstanceSpec, profile: &ProviderProfile) -> DriverResult<()> {
@@ -1351,6 +1406,8 @@ struct ClaudeArgv<'a> {
     effort: Option<remuda_protocol::EffortSelection>,
     session: &'a SessionAction,
     extras: &'a [String],
+    /// D-060: the materializer's own `--append-system-prompt` value.
+    system_prompt: Option<&'a str>,
 }
 
 fn claude_argv(driver: DriverKind, inputs: &ClaudeArgv<'_>) -> DriverResult<Vec<String>> {
@@ -1362,6 +1419,7 @@ fn claude_argv(driver: DriverKind, inputs: &ClaudeArgv<'_>) -> DriverResult<Vec<
         effort,
         session,
         extras,
+        system_prompt,
     } = *inputs;
     let mut argv = Vec::new();
     match driver {
@@ -1442,6 +1500,13 @@ fn claude_argv(driver: DriverKind, inputs: &ClaudeArgv<'_>) -> DriverResult<Vec<
         }
     }
     argv.extend(extras.iter().cloned());
+    // D-060: the materializer's own emission, once, after the caller-derived
+    // arguments (the extras scan above is unchanged). It lands as the last
+    // system-prompt section, so the prompt cache of everything before it holds.
+    if let Some(text) = system_prompt {
+        argv.push(APPEND_SYSTEM_PROMPT.into());
+        argv.push(text.to_owned());
+    }
     if argv.iter().any(|token| {
         matches!(
             token.as_str(),

@@ -104,6 +104,7 @@ async fn a_refused_optional_shell_exit_send_does_not_abort_the_close() {
     .unwrap();
 
     let driver = ClaudePtyDriver::new(ClaudePtyOptions {
+        memory_context: None,
         instance_id: None,
         media_stager: None,
         profile: profile(),

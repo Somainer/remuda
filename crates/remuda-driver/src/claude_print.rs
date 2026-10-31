@@ -99,6 +99,9 @@ pub struct ClaudePrintOptions {
     pub close_timeout: Duration,
     /// Host-validated `--settings` overlay. Contents are never logged.
     pub settings_overlay_path: Option<PathBuf>,
+    /// D-060: the Hub-stamped lineage memory; the materializer emits it as
+    /// its own `--append-system-prompt` pair on every process start.
+    pub memory_context: Option<crate::memory_context::MemoryContext>,
 }
 
 impl ClaudePrintOptions {
@@ -124,6 +127,7 @@ impl ClaudePrintOptions {
             close_timeout: Duration::from_secs(10),
             settings_overlay_path: None,
             media_stager: None,
+            memory_context: None,
         }
     }
 }
@@ -1149,10 +1153,11 @@ impl ClaudePrintDriver {
             native_home_managed: Some(!self.options.inherit_default_config),
             settings_overlay_path: self.options.settings_overlay_path.clone(),
             secret_policy: None,
+            memory_context: self.options.memory_context.as_ref(),
         };
         let mut recipe = materialize(&request)?;
         apply_bypass_flag(&mut recipe);
-        refuse_prohibited_argv(&recipe.argv)?;
+        refuse_prohibited_argv(&recipe.argv, recipe.own_system_prompt())?;
         let policy = policy_from_recipe(&recipe, &spec);
         let env = self.resolve_env(&spec, &recipe).await?;
         let mut command = Command::new(&recipe.binary.abs_path);
@@ -6997,14 +7002,19 @@ fn apply_bypass_flag(recipe: &mut LaunchRecipe) {
     }
 }
 
-fn refuse_prohibited_argv(argv: &[String]) -> DriverResult<()> {
-    if argv.iter().any(|token| {
+/// Finished-argv guard for claude-print and claude-sdk. `own` is the
+/// `--append-system-prompt` value the materializer recorded as its own
+/// emission (D-060): exactly that one pair is let through, every other
+/// occurrence is refused like any banned flag.
+fn refuse_prohibited_argv(argv: &[String], own: Option<&str>) -> DriverResult<()> {
+    let refused = crate::memory_context::first_refused(argv, own, |token| {
         crate::flags::is_banned_flag_token(token)
             || matches!(
-                token.as_str(),
+                token,
                 "--bare" | "--safe-mode" | "--no-session-persistence" | "--continue"
             )
-    }) {
+    });
+    if refused.is_some() {
         return Err(DriverError::NativeFeatureDisabled(
             "refusing prohibited flag on stream-json argv".into(),
         ));
@@ -9029,7 +9039,13 @@ pub mod review {
 
     /// Final argv check for `--bare` / `--no-session-persistence`.
     pub fn refuse_argv(argv: &[String]) -> DriverResult<()> {
-        refuse_prohibited_argv(argv)
+        refuse_prohibited_argv(argv, None)
+    }
+
+    /// [`Self::refuse_argv`] with the materializer's own recorded
+    /// `--append-system-prompt` value exempt (D-060).
+    pub fn refuse_argv_with_own(argv: &[String], own: Option<&str>) -> DriverResult<()> {
+        refuse_prohibited_argv(argv, own)
     }
 }
 

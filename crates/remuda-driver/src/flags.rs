@@ -3,7 +3,8 @@
 use crate::error::{DriverError, DriverResult};
 use remuda_protocol::DriverKind;
 
-/// Claude flags that must never be emitted or accepted from `InstanceSpec.args`.
+/// Claude flags that must never be accepted from `InstanceSpec.args`; the
+/// materializer itself emits `append-system-prompt` only from `memoryContext`.
 const BANNED: &[&str] = &[
     "bare",
     "safe-mode",

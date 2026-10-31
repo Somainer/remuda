@@ -55,6 +55,7 @@ fn request<'a>(
     binary: BinarySource,
 ) -> MaterializeRequest<'a> {
     MaterializeRequest {
+        memory_context: None,
         spec,
         profile,
         launch_dir: launch.to_path_buf(),

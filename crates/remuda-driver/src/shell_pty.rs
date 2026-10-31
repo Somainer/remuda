@@ -231,6 +231,11 @@ pub struct ShellPtyOptions {
     /// `None` only for a driver built outside a Node (tests,
     /// [`ShellPtyDriver::spawn`]), which mints one.
     pub instance_id: Option<InstanceId>,
+    /// D-060: the Hub-stamped lineage memory for an agent target. Kind
+    /// `claude` gets the materializer's own `--append-system-prompt` pair; the
+    /// other agent kinds get the data block ahead of their first input. A
+    /// login shell never uses it.
+    pub memory_context: Option<crate::memory_context::MemoryContext>,
     /// Fault injection: make `spawn_at` fail at the post-spawn adapter-setup
     /// decision — AFTER the child spawned and the switch workers started — so a
     /// test can drive the real launch path into its failure cleanup (reap the
@@ -275,6 +280,7 @@ impl ShellPtyOptions {
             agent: None,
             instance_id: None,
             node_epoch: None,
+            memory_context: None,
             #[cfg(any(test, feature = "test-stub"))]
             fail_after_spawn: false,
         }
@@ -527,6 +533,8 @@ pub struct ShellPtyDriver {
     /// Recipe from the last start, reused by [`Driver::close`] to journal what
     /// it stopped and by the Node to audit what was launched.
     recipe: std::sync::Mutex<Option<LaunchRecipe>>,
+    /// D-060: the last start's data block, until the first input is delivered.
+    memory_block: crate::memory_context::PendingDataBlock,
     /// Set once the exit waiter has concluded, so `close` on an already-dead
     /// process reports the real cause rather than "the ladder found nothing".
     exited: Arc<std::sync::Mutex<Option<ExitEvidence>>>,
@@ -665,6 +673,7 @@ impl ShellPtyDriver {
             codex_lifetime: Mutex::new(None),
             promoted_codex_lifetimes: Arc::new(std::sync::Mutex::new(Vec::new())),
             recipe: std::sync::Mutex::new(None),
+            memory_block: Default::default(),
             exited: Arc::new(std::sync::Mutex::new(None)),
             effort_bridge: Mutex::new(Arc::new(crate::effort::EffortBridge::new())),
             effort_queue: Mutex::new(Arc::new(crate::effort::EffortQueue::new())),
@@ -1725,6 +1734,7 @@ impl ShellPtyDriver {
             Arc::clone(&self.promoted),
             eof_rx,
         ));
+        self.memory_block.arm(&recipe);
         if let Ok(mut slot) = self.recipe.lock() {
             *slot = Some(recipe.clone());
         }
@@ -2241,6 +2251,12 @@ impl ShellPtyDriver {
         }
         if let (Ok(mut ours), Ok(theirs)) = (self.recipe.lock(), resumed.recipe.lock()) {
             ours.clone_from(&theirs);
+            // A native resume carries no data block (its recipe has none), so
+            // this also drops a block the previous run never delivered.
+            match theirs.as_ref() {
+                Some(recipe) => self.memory_block.arm(recipe),
+                None => self.memory_block.delivered(),
+            }
         }
         Ok(handle)
     }
@@ -2679,7 +2695,13 @@ fn recipe_for_blocking(
     if let Some(path) = settings_overlay {
         agent.settings_overlay = Some(path.to_path_buf());
     }
-    launch::agent_recipe(spec, &agent, cwd, resume.as_deref())
+    launch::agent_recipe(
+        spec,
+        &agent,
+        cwd,
+        resume.as_deref(),
+        options.memory_context.as_ref(),
+    )
 }
 
 /// Blocking half of hook session startup, callable off the async runtime.
@@ -3075,8 +3097,15 @@ impl Driver for ShellPtyDriver {
         // submit them.
         let promoted = self.session_kind().is_some();
         let state = self.state().await?;
+        // D-060: the first input this driver delivers carries the data block
+        // ahead of it (an agent target that is not kind `claude`, fresh
+        // session only); the codex evidence below records what was typed.
+        let (text, with_block) = self.memory_block.compose(text);
         let delivery = send::encode(&text, promoted, state.modes());
         state.write_bytes(&delivery.body).await?;
+        if with_block {
+            self.memory_block.delivered();
+        }
         let Some(submit) = delivery.submit else {
             return Ok(DriverAck::transport_written());
         };
@@ -4072,6 +4101,8 @@ fn shell_recipe(options: &ShellPtyOptions, cwd: &str) -> DriverResult<LaunchReci
             binary_override: false,
             approval_authority: ApprovalAuthority::NativeTty,
         },
+        // A login shell is never given the chapter's memory (D-060).
+        memory: None,
     })
 }
 

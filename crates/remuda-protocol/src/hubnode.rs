@@ -104,6 +104,49 @@ pub const METHOD_HOST_FILES_SEARCH: &str = "host.files.search";
 /// the Hub refuses Bot/Agent origins before proxying.
 pub const METHOD_HOST_DIRS_LIST: &str = "host.dirs.list";
 
+/// Hello `capabilities` key (D-060, cb-memory-inject): `true` when this Node
+/// carries a create/resume [`MemoryContext`] to its launch materializer.
+/// Create params do not reject unknown fields, so an older Node would drop the
+/// field silently; the Hub stamps it only for a Node that advertises this.
+pub const MEMORY_CONTEXT_CAPABILITY: &str = "memoryContext";
+
+/// `memoryContext` on forwarded `instance.create` / `instance.resume` params
+/// (D-060, main-agent.md §12.3): the lineage memory index plus about-me,
+/// rendered by the Hub at chapter start and framed as data.
+///
+/// Hub-stamped like `creatorPermissionMode`: a body-supplied copy is stripped,
+/// the Node reads it only from the top level of the params (never from
+/// `spec`), and it never travels in `InstanceSpec.args`. The Node launch
+/// materializer is its only writer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryContext {
+    /// The lineage memory revision the text was rendered at.
+    pub rev: U64,
+    /// Rendered index and about-me, already framed as data.
+    pub text: String,
+}
+
+/// Opening tag of the Hub-rendered [`MemoryContext::text`] frame.
+pub const MEMORY_CONTEXT_OPEN: &str = "<remuda-memory";
+/// Closing tag of the Hub-rendered [`MemoryContext::text`] frame.
+pub const MEMORY_CONTEXT_CLOSE: &str = "</remuda-memory>";
+
+/// `text` without a leading memory data block: what the sender typed after the
+/// block a data-block launch puts ahead of its first input. Text that does not
+/// open with the frame is returned unchanged.
+#[must_use]
+pub fn strip_memory_context_block(text: &str) -> &str {
+    let trimmed = text.trim_start();
+    if !trimmed.starts_with(MEMORY_CONTEXT_OPEN) {
+        return text;
+    }
+    match trimmed.find(MEMORY_CONTEXT_CLOSE) {
+        Some(end) => trimmed[end + MEMORY_CONTEXT_CLOSE.len()..].trim_start(),
+        None => text,
+    }
+}
+
 // ── api.* stream class (D-048, 2026-09-19) ─────────────────────────────────
 //
 // Model-API relay frames. All seven are **notifications**: they carry no

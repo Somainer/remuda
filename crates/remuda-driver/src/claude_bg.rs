@@ -77,6 +77,10 @@ pub struct ClaudeBgOptions {
     /// therefore makes the driver's own nodes unaddressable by anything the
     /// Node derives for the same session (c-wfdrill2 C). `None` outside a Node.
     pub instance_id: Option<InstanceId>,
+    /// D-060: the Hub-stamped lineage memory; the materializer emits it as
+    /// its own `--append-system-prompt` pair, which every `--bg` process
+    /// (first dispatch and each follow-up) carries.
+    pub memory_context: Option<crate::memory_context::MemoryContext>,
 }
 
 impl ClaudeBgOptions {
@@ -103,6 +107,7 @@ impl ClaudeBgOptions {
             inherit_default_config: false,
             settings_overlay_path: None,
             instance_id: None,
+            memory_context: None,
         }
     }
 }
@@ -259,6 +264,7 @@ impl ClaudeBgDriver {
             native_home_managed: Some(!self.options.inherit_default_config),
             settings_overlay_path: self.options.settings_overlay_path.clone(),
             secret_policy: None,
+            memory_context: self.options.memory_context.as_ref(),
         };
         let mut recipe = materialize(&request)?;
         recipe.argv = strip_named_flags(&recipe.argv, &["--session-id", "--cwd", "--continue"]);
@@ -268,7 +274,7 @@ impl ClaudeBgDriver {
         apply_tty_bypass_flag(&mut recipe);
         recipe = inject_session_start_hook(&mut recipe, &self.options.launch_dir)?;
         apply_tty_bypass_flag(&mut recipe);
-        refuse_bare(&recipe.argv)?;
+        refuse_bare(&recipe.argv, recipe.own_system_prompt())?;
         *self.last_recipe.lock().await = Some(recipe.clone());
         *self.last_spec.lock().await = Some(spec.clone());
 
@@ -318,7 +324,7 @@ impl ClaudeBgDriver {
         let mut argv = live.recipe.argv.clone();
         ensure_name_flag(&mut argv, &live.name);
         argv.push(prompt.to_string());
-        refuse_bare(&argv)?;
+        refuse_bare(&argv, live.recipe.own_system_prompt())?;
 
         let mut command = Command::new(&live.recipe.binary.abs_path);
         command
@@ -426,7 +432,7 @@ impl ClaudeBgDriver {
         }
         argv = argv_for_resume(&argv, &live.short_id);
         argv.push(prompt.to_string());
-        refuse_bare(&argv)?;
+        refuse_bare(&argv, live.recipe.own_system_prompt())?;
         let mut command = Command::new(&live.recipe.binary.abs_path);
         command
             .args(&argv)

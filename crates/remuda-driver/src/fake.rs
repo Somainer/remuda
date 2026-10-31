@@ -142,6 +142,7 @@ impl FakeDriver {
                 binary_override: false,
                 approval_authority: ApprovalAuthority::Unknown,
             },
+            memory: None,
         })
     }
 

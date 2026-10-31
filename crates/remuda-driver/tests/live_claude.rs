@@ -171,6 +171,7 @@ async fn live_claude_pty_start_prompt_idle_read_close() {
     fs::write(evidence_path(), "").unwrap();
 
     let driver = ClaudePtyDriver::new(ClaudePtyOptions {
+        memory_context: None,
         instance_id: None,
         media_stager: None,
         profile: profile(),
@@ -351,6 +352,7 @@ async fn live_claude_bg_start_prompt_idle_read_close() {
     fs::create_dir_all(&launch).unwrap();
 
     let driver = ClaudeBgDriver::new(ClaudeBgOptions {
+        memory_context: None,
         instance_id: None,
         profile: profile(),
         launch_dir: launch.clone(),

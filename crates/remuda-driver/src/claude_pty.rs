@@ -129,6 +129,9 @@ pub struct ClaudePtyOptions {
     /// (D-045 §6.2). `None` (default) degrades images to honest text blocks;
     /// bytes are never inlined into observations.
     pub media_stager: Option<Arc<dyn remuda_protocol::ToolMediaStager>>,
+    /// D-060: the Hub-stamped lineage memory; the materializer emits it as
+    /// its own `--append-system-prompt` pair on every process start.
+    pub memory_context: Option<crate::memory_context::MemoryContext>,
 }
 
 impl ClaudePtyOptions {
@@ -160,6 +163,7 @@ impl ClaudePtyOptions {
             host_claude_config: None,
             instance_id: None,
             media_stager: None,
+            memory_context: None,
         }
     }
 }
@@ -343,10 +347,11 @@ impl ClaudePtyDriver {
             native_home_managed: Some(!self.options.inherit_default_config),
             settings_overlay_path: self.options.settings_overlay_path.clone(),
             secret_policy: None,
+            memory_context: self.options.memory_context.as_ref(),
         };
         let mut recipe = materialize(&request)?;
         apply_tty_bypass_flag(&mut recipe);
-        refuse_bare(&recipe.argv)?;
+        refuse_bare(&recipe.argv, recipe.own_system_prompt())?;
         recipe = inject_session_start_hook(&mut recipe, &self.options.launch_dir)?;
         // A previous run's hook file cannot prove this carrier finished startup.
         match std::fs::remove_file(self.options.launch_dir.join("session-meta.json")) {
@@ -355,7 +360,7 @@ impl ClaudePtyDriver {
             Err(error) => return Err(error.into()),
         }
         apply_tty_bypass_flag(&mut recipe);
-        refuse_bare(&recipe.argv)?;
+        refuse_bare(&recipe.argv, recipe.own_system_prompt())?;
         // A scoped CLAUDE_CONFIG_DIR is fresh on first use, so the native CLI
         // would run its first-run wizard instead of mounting a composer: Herdr
         // calls that pane idle, no SessionStart hook fires, and a queued prompt
@@ -495,7 +500,7 @@ impl ClaudePtyDriver {
             },
         )
         .await?;
-        refuse_bare(&started.argv)?;
+        refuse_bare(&started.argv, recipe.own_system_prompt())?;
 
         let native_session = started
             .agent
@@ -2247,18 +2252,23 @@ fn blocks_to_text(blocks: &[ContentBlock]) -> DriverResult<String> {
     crate::attachment::text_with_path_mentions(blocks)
 }
 
-pub(crate) fn refuse_bare(argv: &[String]) -> DriverResult<()> {
-    if argv.iter().any(|token| {
+/// Finished-argv guard for claude-pty and claude-bg. `own` is the
+/// `--append-system-prompt` value the materializer recorded as its own
+/// emission (D-060): exactly that one pair is let through, every other
+/// occurrence is refused like any banned flag.
+pub(crate) fn refuse_bare(argv: &[String], own: Option<&str>) -> DriverResult<()> {
+    let refused = crate::memory_context::first_refused(argv, own, |token| {
         crate::flags::is_banned_flag_token(token)
             || matches!(
-                token.as_str(),
+                token,
                 "--bare" | "--safe-mode" | "--no-session-persistence" | "--continue"
             )
             || token.starts_with("--bare=")
             || token.starts_with("--safe-mode=")
             || token.starts_with("--no-session-persistence=")
             || token.starts_with("--continue=")
-    }) {
+    });
+    if refused.is_some() {
         return Err(DriverError::NativeFeatureDisabled(
             "refusing prohibited flag on claude-pty/bg argv".into(),
         ));
@@ -2897,9 +2907,9 @@ mod tests {
 
     #[test]
     fn refuse_bare_rejects_prohibited_tokens() {
-        assert!(refuse_bare(&["--model".into(), "haiku".into()]).is_ok());
-        assert!(refuse_bare(&["--bare".into()]).is_err());
-        assert!(refuse_bare(&["--continue".into()]).is_err());
+        assert!(refuse_bare(&["--model".into(), "haiku".into()], None).is_ok());
+        assert!(refuse_bare(&["--bare".into()], None).is_err());
+        assert!(refuse_bare(&["--continue".into()], None).is_err());
     }
 
     /// c-effortread r2: the deterministic effort edge id the transcript mapper
@@ -6034,7 +6044,13 @@ pub mod review {
 
     /// Final argv check for `--bare` / `--continue` / banned tokens.
     pub fn refuse_argv(argv: &[String]) -> DriverResult<()> {
-        refuse_bare(argv)
+        refuse_bare(argv, None)
+    }
+
+    /// [`Self::refuse_argv`] with the materializer's own recorded
+    /// `--append-system-prompt` value exempt (D-060).
+    pub fn refuse_argv_with_own(argv: &[String], own: Option<&str>) -> DriverResult<()> {
+        refuse_bare(argv, own)
     }
 
     /// Rebuild resume argv from a persisted recipe, keeping `--settings`.

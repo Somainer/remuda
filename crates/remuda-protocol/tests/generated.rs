@@ -91,6 +91,8 @@ fn public_wire_types_are_registered_for_generation() {
         "RegisteredWorkspace",
         "WorkspaceRegistryResult",
         "InstanceCreateParams",
+        // D-060: Hub-stamped field of InstanceCreateParams, same family.
+        "MemoryContext",
         "InstanceSendParams",
         "AttachmentRef",
         "AttachmentKind",

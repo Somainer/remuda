@@ -230,6 +230,13 @@ pub struct LaunchRecipe {
     pub technical_debt: Vec<String>,
     /// Redacted audit record.
     pub audit: LaunchAudit,
+    /// D-060: how this launch carries the chapter's `memoryContext` — the
+    /// materializer's own `--append-system-prompt` pair, or the data block
+    /// the driver puts ahead of its first input. Absent when the launch got
+    /// none (no context, kind `terminal`/`generic`, or a data-block path on a
+    /// native resume).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<crate::memory_context::RecipeMemory>,
 }
 
 impl LaunchRecipe {

@@ -27,6 +27,7 @@ pub mod hook_answer;
 pub mod interaction;
 pub mod launch;
 mod materializer;
+pub mod memory_context;
 pub mod model;
 pub mod model_discovery;
 pub mod permission;
@@ -98,6 +99,7 @@ pub use materializer::{
     BinarySource, LaunchOrigin, MaterializeRequest, SessionAction, TokenBrokerBind, materialize,
     materialize_with_token_broker, pinned_model_for, render_api_key_helper_script,
 };
+pub use memory_context::{APPEND_SYSTEM_PROMPT, MemoryContext, RecipeMemory};
 pub use presets::{KindPreset, PRESETS, merge_yolo_argv, preset_by_id, preset_for_spec};
 pub use process::current_process_identity;
 pub use profile::{

@@ -11,6 +11,7 @@ import { known, type Id } from "../../types/wire";
 import { detectPlatform, setPlatformForTest } from "../../lib/platform";
 import { setClock } from "../../lib/clock";
 import { SessionList } from "./SessionList";
+import { GLANCE_TARGETS } from "../home/glanceNav";
 
 // jsdom has no matchMedia; the workbench viewport hook needs one to pick the
 // popover (desktop) or the sheet (phone). Default to desktop; `viewport` flips it.
@@ -1095,5 +1096,35 @@ describe("SessionList §8 freshness states", () => {
     const rows = screen.getByTestId("session-list").querySelector("[data-freshness]");
     expect(rows).toHaveAttribute("data-freshness", "grace");
     expect(rows).not.toHaveAttribute("data-dimmed");
+  });
+});
+
+describe("① 需要你 anchor on the real list markup", () => {
+  it("matches the full-variant row (board-card with the shared rank), not the inner link", () => {
+    hub.instances = [
+      session("ins_blocked", { activity: known("waiting-interaction") }),
+      session("ins_idle", { activity: known("idle") }),
+    ];
+    const { container } = renderList();
+    const article = container.querySelector(GLANCE_TARGETS.needYouDesktop);
+    expect(article).not.toBeNull();
+    expect(article).toHaveAttribute("data-testid", "board-card");
+    expect(article).toHaveAttribute("data-instance-id", "ins_blocked");
+  });
+
+  it("still matches a blocked row whose host connection dropped (rank, not UiStatus)", () => {
+    hub.instances = [
+      session("ins_dropped", { activity: known("waiting-interaction"), connectivity: "disconnected" }),
+    ];
+    const { container } = renderList();
+    // The UiStatus projects unknown for a dropped host; rank 1 does not.
+    expect(screen.getByTestId("board-card")).toHaveAttribute("data-status", "unknown");
+    expect(container.querySelector(GLANCE_TARGETS.needYouDesktop)).not.toBeNull();
+  });
+
+  it("finds nothing when no row is blocked", () => {
+    hub.instances = [session("ins_idle", { activity: known("idle") })];
+    const { container } = renderList();
+    expect(container.querySelector(GLANCE_TARGETS.needYouDesktop)).toBeNull();
   });
 });

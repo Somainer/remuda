@@ -6,8 +6,15 @@
  * first blocked row (or, when only a task card is waiting, the task layer).
  */
 export const GLANCE_TARGETS = {
+  /** Phone: the row's data-blocked follows rank 1, not the UiStatus. */
   needYou: '[data-testid="home-row"][data-blocked="1"]',
-  needYouDesktop: '[data-testid="session-row"][data-status="blocked"]',
+  /**
+   * Desktop: `/sessions` renders SessionList variant="full", whose rows are
+   * `board-card` articles carrying the shared rank — `session-row` is only the
+   * inner link (and the compact variant's row), so the rank attribute is the
+   * one selector that matches what the page paints.
+   */
+  needYouDesktop: '[data-testid="board-card"][data-rank="blocked"]',
   tasks: '[data-testid="home-tasks"]',
 } as const;
 

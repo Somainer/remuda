@@ -72,11 +72,28 @@ async function forceDeleteAllInstances(page: Page) {
             instance.lifecycle !== "closed",
         )
         .map(async (instance) => {
-          const response = await fetch(
-            `/v1/instances/${instance.instanceId}?force=1`,
-            { method: "DELETE", credentials: "include" },
-          );
-          if (!response.ok) throw new Error(`force delete failed: ${response.status()}`);
+          const remove = () =>
+            fetch(`/v1/instances/${instance.instanceId}?force=1`, {
+              method: "DELETE",
+              credentials: "include",
+            });
+          let response = await remove();
+          // D-057 §6.3: the current chapter of an unpaused continuity
+          // lineage (a seat another spec left behind) is closed — paused —
+          // before it can be deleted.
+          if (response.status === 409) {
+            const refusal = (await response.json().catch(() => ({}))) as { reason?: string };
+            if (refusal.reason === "not-paused") {
+              await fetch(`/v1/instances/${instance.instanceId}/commands`, {
+                method: "POST",
+                credentials: "include",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ operation: "instance.close", payload: {} }),
+              });
+              response = await remove();
+            }
+          }
+          if (!response.ok) throw new Error(`force delete failed: ${response.status}`);
         }),
     );
   });

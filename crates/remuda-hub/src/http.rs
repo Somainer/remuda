@@ -4274,11 +4274,48 @@ pub(crate) async fn forward_if_online(
             serde_json::to_value(initiator).unwrap_or(Value::Null),
         );
     }
+    // D-060: `memoryContext` is Hub-generated, like `creatorPermissionMode`.
+    // A copy that arrived in a request body (at the top level or inside the
+    // spec) is stripped from every forwarded frame before the Hub's own is
+    // stamped below.
+    object.remove("memoryContext");
+    if let Some(spec) = object.get_mut("spec").and_then(Value::as_object_mut) {
+        spec.remove("memoryContext");
+    }
     if matches!(
         command.operation.as_str(),
         "instance.create" | "instance.resume"
     ) {
         let instance_id = command.instance_id.clone().ok_or(HubError::NotFound)?;
+        // D-060: the chapter-start render, or the lineage's record that this
+        // chapter's Node lacks `capabilities.memoryContext`.
+        match state
+            .store
+            .memory_chapter_start(instance_id.clone(), command.host_id.clone())
+            .await?
+        {
+            crate::memory::ChapterMemory::Stamp(context) => {
+                object.insert(
+                    "memoryContext".into(),
+                    serde_json::to_value(context)
+                        .map_err(|error| HubError::Internal(error.to_string()))?,
+                );
+            }
+            crate::memory::ChapterMemory::Withheld { rev, first: true } => {
+                crate::ws::publish_hub_diagnostic(
+                    state,
+                    &instance_id,
+                    "memory_index_withheld",
+                    &format!(
+                        "this chapter started without the lineage memory index (rev {rev}): \
+                         its Node does not advertise capabilities.memoryContext"
+                    ),
+                )
+                .await;
+            }
+            crate::memory::ChapterMemory::Withheld { .. }
+            | crate::memory::ChapterMemory::NotApplicable => {}
+        }
         let token = crate::agent_scope::instance_token(state.store.clone(), instance_id).await?;
         // Credential travels only on the authenticated carrier, never in the
         // persisted command, returned HTTP body, or launch recipe.

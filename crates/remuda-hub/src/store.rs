@@ -1006,6 +1006,15 @@ pub struct LineageChapter {
     /// When authority moved to the successor.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fenced_at: Option<String>,
+    /// D-060: how the chapter started with the lineage memory — `stamped`
+    /// (its Node got `memoryContext`) or `withheld` (its Node does not
+    /// advertise the capability, so it started without the index). Absent
+    /// for a chapter that has not been forwarded, or a non-agent kind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_index: Option<String>,
+    /// D-060: the lineage memory revision the chapter started at.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_start_rev: Option<i64>,
 }
 
 /// One chapter [`Store::deletion_plan`] reports: what a delete would remove,
@@ -5160,7 +5169,8 @@ impl Store {
     ) -> Result<Vec<LineageChapter>, StoreError> {
         self.read("list_lineage_chapters", move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, generation, chapter_cause, created_at, ended_at, fenced_at
+                "SELECT id, generation, chapter_cause, created_at, ended_at, fenced_at,
+                        memory_index, memory_start_rev
                  FROM instances
                  WHERE COALESCE(lineage_id, id) = ?1
                  ORDER BY generation ASC, created_at ASC",
@@ -5177,6 +5187,8 @@ impl Store {
                         // timestamp, never the mutable updated_at.
                         ended_at,
                         fenced_at: row.get(5)?,
+                        memory_index: row.get(6)?,
+                        memory_start_rev: row.get(7)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -7834,6 +7846,9 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
         );
         CREATE INDEX IF NOT EXISTS lineages_current ON lineages(current_instance_id);",
     )?;
+    // D-060 (cb-memory-inject): the lineage memory revision and the
+    // chapter's start record.
+    crate::memory::ensure_inject_columns(&conn)?;
     // D-057 §5 (ma-lineage round 2): rows written before ma-lineage got their
     // lineage_id stamped above but no lineage ROW, so a holder's resume fell
     // back to the plain D-026 path and dropped every continuity property.

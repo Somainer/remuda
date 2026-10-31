@@ -1845,6 +1845,18 @@
           },
           "instanceId": {
             "type": "string"
+          },
+          "memoryIndex": {
+            "description": "D-060: how the chapter started with the lineage memory: `stamped` (its Node received memoryContext) or `withheld` (its Node does not advertise capabilities.memoryContext, so the chapter started without the index). Absent before the chapter's create is forwarded and for non-agent kinds.",
+            "enum": [
+              "stamped",
+              "withheld"
+            ],
+            "type": "string"
+          },
+          "memoryStartRev": {
+            "description": "D-060: the lineage memory revision the chapter started at.",
+            "type": "integer"
           }
         },
         "required": [

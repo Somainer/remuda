@@ -28,6 +28,7 @@ import { mockDb } from "../../lib/mock";
 import type { Instance } from "../../types/instance";
 import { known, type Id } from "../../types/wire";
 import { HomeList } from "./HomeList";
+import { GLANCE_TARGETS } from "../home/glanceNav";
 import { SPACES_PREFS_KEY, spaceKey, spaceStore } from "../spaces/store";
 import { setClock } from "../../lib/clock";
 
@@ -585,5 +586,23 @@ describe("HomeList §8 freshness states", () => {
     });
     expect(region()).toHaveAttribute("data-freshness", "stale");
     expect(region()).toHaveAttribute("data-dimmed", "1");
+  });
+});
+
+describe("① 需要你 anchor on the phone ledger", () => {
+  it("marks the row by rank 1, so a dropped host still carries the anchor", async () => {
+    hub.instances = [
+      row("ins-dropped", {
+        activity: known("waiting-interaction"),
+        connectivity: "disconnected",
+      }),
+    ];
+    const { container } = renderHome();
+    const article = await screen.findByTestId("home-row");
+    // UiStatus projects unknown on a dropped host; the rank stays blocked.
+    expect(article).toHaveAttribute("data-status", "unknown");
+    expect(article).toHaveAttribute("data-rank", "blocked");
+    expect(article).toHaveAttribute("data-blocked", "1");
+    expect(container.querySelector(GLANCE_TARGETS.needYou)).toBe(article);
   });
 });

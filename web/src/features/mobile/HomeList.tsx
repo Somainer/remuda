@@ -604,7 +604,9 @@ function HomeRowView({
       data-testid="home-row"
       data-status={row.status}
       data-rank={row.rank}
-      data-blocked={row.blocked ? "1" : "0"}
+      // home.md §3.1 rank 1, not the UiStatus: a waiting row on a dropped
+      // host still owns the ① 需要你 anchor.
+      data-blocked={row.rank === "blocked" ? "1" : "0"}
       data-stale={stale ? "1" : undefined}
       aria-disabled={stale || undefined}
     >

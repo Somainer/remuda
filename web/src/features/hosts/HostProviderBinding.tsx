@@ -52,7 +52,9 @@ export function HostProviderBinding({ binding, profiles, disabled, onChange }: P
               onChange(id);
             }}
           >
-            {label}
+            <span className={ui.segLabel} title={label}>
+              {label}
+            </span>
           </button>
         ))}
       </div>

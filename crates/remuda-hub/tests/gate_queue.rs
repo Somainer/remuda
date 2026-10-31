@@ -31,6 +31,28 @@ struct RunSpec {
     reason: Option<&'static str>,
     run_log: Option<Value>,
     steps: Option<Value>,
+    /// Production lane-land path: before returning a `landed` verdict the
+    /// scripted Node asks the Hub for the Running → Landing grant over the
+    /// carrier (gate.landGrant), exactly as the real Node does. A refusal
+    /// makes the scripted run return `canceled` (the real Node never pushes).
+    land_grant: bool,
+    /// When set with `land_grant`, the run parks AFTER verify and BEFORE it
+    /// asks for the grant, while the test reconnects the carrier session.
+    hold_before_grant: bool,
+    /// When set with `land_grant`, after the grant the run returns an
+    /// `uncertain` verdict (its land group was killed on timeout; the remote may
+    /// still have the ref). The Hub must keep Landing and reconcile remotely.
+    uncertain_after_grant: bool,
+    /// When set with `land_grant`, the run parks AFTER the grant is granted
+    /// (the row is Landing) and before it returns the landed verdict, until
+    /// `landing_hold` is released — so a test can assert a second job is not
+    /// dispatched while the first still owns the lane/push.
+    hold_while_landing: bool,
+    /// When set with `land_grant`, after the grant is granted the Node sends a
+    /// JSON-RPC ERROR for the gate.run (the Node crashed after the grant before
+    /// its Finished/reply) but the SOCKET STAYS OPEN and keeps answering
+    /// read-only probes. Models an RPC loss with a still-connected carrier.
+    rpc_error_after_grant: bool,
 }
 
 impl Default for RunSpec {
@@ -49,6 +71,11 @@ impl Default for RunSpec {
             reason: None,
             run_log: None,
             steps: None,
+            land_grant: false,
+            hold_before_grant: false,
+            hold_while_landing: false,
+            rpc_error_after_grant: false,
+            uncertain_after_grant: false,
         }
     }
 }
@@ -72,6 +99,20 @@ struct ScriptState {
     land_started: Arc<Notify>,
     /// Observed gate.unpin params (ref cleanup).
     unpin_calls: Mutex<Vec<Value>>,
+    /// Observed gate.landGrant answers (the production Running → Landing fence).
+    grant_answers: Mutex<Vec<Value>>,
+    /// When set, a run that took the land grant parks here while Landing until
+    /// released; `landing_started` fires once it has parked.
+    landing_hold: Mutex<Option<Arc<Notify>>>,
+    landing_started: Arc<Notify>,
+    /// Configured answer to gate.resolveLanding (post-restart probe). Absent
+    /// → the scripted lane answers `unknown` (cannot confirm without a repo).
+    resolve_landing_reply: Mutex<Option<Value>>,
+    /// Observed gate.resolveLanding probes.
+    resolve_calls: Mutex<Vec<Value>>,
+    /// Node token returned by the first hello, used to open a reconnected
+    /// session for the SAME host (the enroll token is single-use).
+    node_token: Mutex<Option<String>>,
     /// Node→Hub request counter (ids must be unique).
     seq: Mutex<u64>,
 }
@@ -152,6 +193,9 @@ async fn enroll(
     .await?;
     let hello = recv_json(&mut node).await?;
     assert!(hello["result"]["nodeToken"].is_string(), "{hello}");
+    if let Some(token) = hello["result"]["nodeToken"].as_str() {
+        *script.node_token.lock().unwrap() = Some(token.to_owned());
+    }
 
     let script_for_task = script.clone();
     let task = tokio::spawn(async move {
@@ -168,9 +212,19 @@ async fn enroll(
             };
             let params = frame.get("params").cloned().unwrap_or(json!({}));
             let result = match method {
+                // r10: the lane Node must answer the Hub's pre-run
+                // gate.authorize fence (the WssGateAuthorizer asks over this
+                // same socket before execute). A scripted lane always speaks
+                // for its own dispatch here; the dedicated cancel tests use
+                // real/carrier-level seams for the refused paths.
+                "gate.authorize" => json!({
+                    "authorized": true,
+                    "generation": params["generation"].clone(),
+                }),
                 "gate.run" => {
+                    let rpc_id = id.clone();
                     script.arrivals.lock().unwrap().push(params.clone());
-                    run_one_inline(&script, &params, &mut node).await
+                    run_one_inline(&script, &params, &rpc_id, &mut node).await
                 }
                 "gate.cancel" => {
                     let job = params["jobId"].as_str().unwrap_or("").to_string();
@@ -207,6 +261,16 @@ async fn enroll(
                         format!("refs/remuda/gate/{job}.branch"),
                     ]})
                 }
+                "gate.resolveLanding" => {
+                    let job = params["jobId"].as_str().unwrap_or("").to_string();
+                    script.resolve_calls.lock().unwrap().push(params);
+                    script
+                        .resolve_landing_reply
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .unwrap_or_else(|| json!({"jobId": job, "status": "unknown"}))
+                }
                 _ => json!({"ok": true}),
             };
             let response = json!({"jsonrpc":"2.0","id":id,"result":result});
@@ -225,9 +289,66 @@ async fn enroll(
     })
 }
 
-fn result_json(job_id: &str, spec: &RunSpec) -> Value {
+/// Open a SECOND authenticated node socket for an already-enrolled host,
+/// simulating a carrier reconnect: the Hub mints a new session generation for
+/// the same host id. Returns the raw socket so the test can drive Node→Hub
+/// frames (e.g. a detached run's landGrant) on the replacement session.
+async fn open_node_session(
+    hub: &remuda_hub::RunningHub,
+    host_id: &str,
+    workspace_id: &str,
+    node_token: &str,
+) -> Result<LaneSocket> {
+    let mut request = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
+    request
+        .headers_mut()
+        .insert("Authorization", format!("Bearer {node_token}").parse()?);
+    let (mut node, _) = tokio_tungstenite::connect_async(request).await?;
+    node.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0", "id": "hello-b", "method": "runtime.hello",
+            "params": {"hostId": host_id, "nodeVersion": "0.1.0-test",
+                "label": format!("lane-{host_id}"),
+                "host": {"hostname": format!("{host_id}.local"), "maxInstances": 8,
+                    "labels": {}, "resources": {"cpuCount": 8},
+                    "workspaces": [
+                        {"workspaceId": workspace_id, "hostId": host_id,
+                         "root": format!("/tmp/{workspace_id}")}
+                    ],
+                    "workspaceRevision": 2}}
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    let hello = recv_json(&mut node).await?;
+    // A reconnect hello answers with a connectionId/lease (no fresh nodeToken);
+    // either proves the replacement session authenticated.
+    let connected =
+        hello["result"]["connectionId"].is_string() || hello["result"]["nodeToken"].is_string();
+    assert!(connected, "{hello}");
+    Ok(node)
+}
+
+/// Send a raw Node→Hub frame on a socket and await the reply correlated by id.
+async fn node_request(node: &mut LaneSocket, frame: Value) -> Result<Value> {
+    let wanted = frame["id"].as_str().unwrap_or("").to_string();
+    node.send(Message::Text(frame.to_string().into())).await?;
+    for _ in 0..8 {
+        let reply = recv_json(node).await?;
+        if reply.get("id").and_then(Value::as_str) == Some(wanted.as_str()) {
+            return Ok(reply.get("result").cloned().unwrap_or(json!({})));
+        }
+    }
+    anyhow::bail!("no reply for {wanted}")
+}
+
+fn result_json(job_id: &str, spec: &RunSpec, generation: u32) -> Value {
     let mut result = json!({
         "jobId": job_id,
+        // r10: echo the generation of the attempt that produced this verdict,
+        // so a requeued attempt-2 reply matches the current row.
+        "generation": generation,
         "status": spec.status,
         "baseSha": spec.base_sha,
         "mergeSha": spec.merge_sha,
@@ -266,7 +387,12 @@ type LaneSocket =
 /// Run a scripted gate job inline. While waiting, keep draining the socket so
 /// a concurrent `gate.cancel` for this job is observed (and any other RPC
 /// still gets its ack). Returns the gate.run result.
-async fn run_one_inline(script: &Arc<ScriptState>, params: &Value, node: &mut LaneSocket) -> Value {
+async fn run_one_inline(
+    script: &Arc<ScriptState>,
+    params: &Value,
+    rpc_id: &Value,
+    node: &mut LaneSocket,
+) -> Value {
     let job_id = params["jobId"].as_str().unwrap_or("").to_string();
     let branch = params["branch"].as_str().unwrap_or("").to_string();
     let spec = script.next_spec(&branch);
@@ -278,7 +404,10 @@ async fn run_one_inline(script: &Arc<ScriptState>, params: &Value, node: &mut La
             *seq += 1;
             format!("evt-{seq}")
         };
-        let mut event_params = json!({ "jobId": job_id });
+        let mut event_params = json!({
+            "jobId": job_id,
+            "generation": params["generation"].clone(),
+        });
         if let Some(object) = event.as_object() {
             for (key, value) in object {
                 event_params[key] = value.clone();
@@ -318,6 +447,17 @@ async fn run_one_inline(script: &Arc<ScriptState>, params: &Value, node: &mut La
                             if spec.wait_cancel {
                                 break;
                             }
+                        } else if method == "gate.authorize" {
+                            // The Hub fence can arrive while the (already
+                            // running) scripted gate.run drains the socket.
+                            let reply = json!({
+                                "jsonrpc": "2.0", "id": id,
+                                "result": {
+                                    "authorized": true,
+                                    "generation": in_params["generation"].clone(),
+                                },
+                            });
+                            let _ = node.send(Message::Text(reply.to_string().into())).await;
                         } else {
                             let reply = json!({"jsonrpc":"2.0","id":id,"result":{"ok":true}});
                             let _ = node.send(Message::Text(reply.to_string().into())).await;
@@ -328,7 +468,208 @@ async fn run_one_inline(script: &Arc<ScriptState>, params: &Value, node: &mut La
             }
         }
     }
-    result_json(&job_id, &spec)
+    let generation = params
+        .get("generation")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
+    // Optional park AFTER verify, BEFORE the land grant — the window in which
+    // the carrier can reconnect to a replacement session. Pumps the carrier so
+    // unrelated RPCs are still answered (the real RPC pump stays free while a
+    // detached run executes).
+    if spec.hold_before_grant {
+        script.landing_started.notify_waiters();
+        let gate = script.landing_hold.lock().unwrap().clone();
+        let parked = async {
+            if let Some(gate) = gate {
+                gate.notified().await;
+            }
+        };
+        tokio::pin!(parked);
+        loop {
+            tokio::select! {
+                _ = &mut parked => break,
+                frame = node.next() => {
+                    let Some(Ok(Message::Text(text))) = frame else { break };
+                    let frame: Value = serde_json::from_str(&text).unwrap_or(json!({}));
+                    let Some(fid) = frame.get("id").cloned() else { continue };
+                    let _ = node
+                        .send(Message::Text(
+                            json!({"jsonrpc":"2.0","id":fid,"result":{"ok":true}}).to_string().into(),
+                        ))
+                        .await;
+                }
+            }
+        }
+    }
+
+    // The real Node checks its generation-scoped cancel tombstone immediately
+    // before the grant; model that: if this job's cancel arrived while the
+    // run executed, never take the grant and return canceled (nothing pushed).
+    let canceled = script
+        .gate_cancels
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|frame| frame["jobId"] == json!(job_id));
+    let mut status = spec.status;
+    if canceled {
+        status = "canceled";
+    }
+    if spec.land_grant && !canceled {
+        let grant_id = {
+            let mut seq = script.seq.lock().unwrap();
+            *seq += 1;
+            format!("grant-{seq}")
+        };
+        let grant_frame = json!({
+            "jsonrpc": "2.0", "id": grant_id, "method": "gate.landGrant",
+            "params": {
+                "jobId": job_id,
+                "generation": generation,
+                "hostId": Value::Null,
+                "sessionEpoch": "sess-1",
+                "mergeSha": spec.merge_sha.unwrap_or(""),
+            },
+        });
+        node.send(Message::Text(grant_frame.to_string().into()))
+            .await
+            .unwrap();
+        // Bounded wait for the grant answer on this same socket, acks for any
+        // interleaved frame notwithstanding.
+        let answer = async {
+            loop {
+                let frame = tokio::time::timeout(Duration::from_secs(8), node.next())
+                    .await
+                    .expect("grant answer timed out")
+                    .expect("socket closed")
+                    .expect("text frame");
+                let frame: Value = match frame {
+                    Message::Text(text) => serde_json::from_str(&text).unwrap_or(json!({})),
+                    other => panic!("unexpected frame {other:?}"),
+                };
+                if frame.get("id").and_then(Value::as_str) == Some(grant_id.as_str()) {
+                    break frame.get("result").cloned().unwrap_or(json!({}));
+                }
+            }
+        }
+        .await;
+        script.grant_answers.lock().unwrap().push(answer.clone());
+        if answer.get("granted").and_then(Value::as_bool) != Some(true) {
+            // A refused grant means the real Node never pushes.
+            status = "canceled";
+        } else if spec.uncertain_after_grant {
+            // The land group was killed on timeout: report uncertain (the
+            // remote may already hold the ref). The socket stays up to answer
+            // the Hub's read-only reconcile probe.
+            status = "uncertain";
+        } else if spec.hold_while_landing {
+            // The row is now Landing; park before the landed verdict. Keep
+            // pumping the carrier while parked: a real Node's land child runs
+            // while its RPC pump is free, so a post-restart resolveLanding (or
+            // any other Hub RPC) must still be answered here.
+            script.landing_started.notify_waiters();
+            let gate = script.landing_hold.lock().unwrap().clone();
+            let parked = async {
+                if let Some(gate) = gate {
+                    gate.notified().await;
+                }
+            };
+            tokio::pin!(parked);
+            loop {
+                tokio::select! {
+                    _ = &mut parked => break,
+                    frame = node.next() => {
+                        let Some(Ok(Message::Text(text))) = frame else { break };
+                        let frame: Value = serde_json::from_str(&text).unwrap_or(json!({}));
+                        let Some(fid) = frame.get("id").cloned() else { continue };
+                        let method = frame.get("method").and_then(Value::as_str).unwrap_or("");
+                        let in_params = frame.get("params").cloned().unwrap_or(json!({}));
+                        let result = match method {
+                            "gate.resolveLanding" => {
+                                let job = in_params["jobId"]
+                                    .as_str()
+                                    .unwrap_or("")
+                                    .to_string();
+                                script.resolve_calls.lock().unwrap().push(in_params);
+                                script
+                                    .resolve_landing_reply
+                                    .lock()
+                                    .unwrap()
+                                    .clone()
+                                    .unwrap_or_else(|| {
+                                        json!({"jobId": job, "status": "unknown"})
+                                    })
+                            }
+                            _ => json!({"ok": true}),
+                        };
+                        let reply =
+                            json!({"jsonrpc":"2.0","id":fid,"result":result});
+                        if node.send(Message::Text(reply.to_string().into())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        } else if spec.rpc_error_after_grant {
+            // The Node received the grant and the row is Landing, but it dies
+            // before Finished: send a JSON-RPC ERROR for THIS gate.run while the
+            // socket stays open, then keep answering read-only probes forever
+            // (the carrier is still connected). Never returns a result.
+            script.landing_started.notify_waiters();
+            node.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0", "id": rpc_id,
+                    "error": {"code": -32001, "message": "node crashed after grant before reply"}
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+            loop {
+                let frame = match node.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        serde_json::from_str::<Value>(&text).unwrap_or(json!({}))
+                    }
+                    _ => break,
+                };
+                let Some(fid) = frame.get("id").cloned() else {
+                    continue;
+                };
+                let method = frame.get("method").and_then(Value::as_str).unwrap_or("");
+                let in_params = frame.get("params").cloned().unwrap_or(json!({}));
+                let result = match method {
+                    "gate.resolveLanding" => {
+                        let job = in_params["jobId"].as_str().unwrap_or("").to_string();
+                        script.resolve_calls.lock().unwrap().push(in_params);
+                        script
+                            .resolve_landing_reply
+                            .lock()
+                            .unwrap()
+                            .clone()
+                            .unwrap_or_else(|| json!({"jobId": job, "status": "unknown"}))
+                    }
+                    _ => json!({"ok": true}),
+                };
+                let reply = json!({"jsonrpc":"2.0","id":fid,"result":result});
+                if node
+                    .send(Message::Text(reply.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            unreachable!("the post-grant crash arm parks for the life of the socket");
+        }
+    }
+
+    let mut result = result_json(&job_id, &spec, generation as u32);
+    if status != spec.status {
+        result["status"] = json!(status);
+    }
+    result
 }
 
 // ── test harness ───────────────────────────────────────────────────────────
@@ -1571,5 +1912,683 @@ async fn unknown_lane_and_bad_inputs_are_rejected() -> Result<()> {
         )
         .await;
     assert_eq!(status, 400);
+    Ok(())
+}
+
+/// r12 item 1: a real pushFrom-lane land takes the Running → Landing GRANT
+/// over the carrier before it pushes, then settles `landed` with a
+/// `gate.landed` journal and drops its pinned refs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lane_land_takes_the_grant_and_settles_landed() -> Result<()> {
+    let ctx = Ctx::spawn(1).await?;
+    ctx.scripts[0].script(
+        "wt/land/grant",
+        RunSpec {
+            status: "landed",
+            merge_sha: Some("4444444444444444444444444444444444444444"),
+            merge_ref: Some("refs/remuda/gate/grant"),
+            land_grant: true,
+            ..RunSpec::default()
+        },
+    );
+    let job = ctx
+        .enqueue(json!({"branch":"wt/land/grant","mode":"land"}))
+        .await;
+    let id = job["id"].as_str().unwrap();
+    let landed = ctx.wait_state(id, &["landed", "failed", "canceled"]).await;
+    assert_eq!(landed["state"], "landed", "{landed}");
+
+    let answers = ctx.scripts[0].grant_answers.lock().unwrap().clone();
+    assert_eq!(answers.len(), 1, "one land grant request: {answers:?}");
+    assert_eq!(answers[0]["granted"], true, "{answers:?}");
+
+    let actions = ctx.hub.test_gate_audit_actions(id).await?;
+    assert!(
+        actions.iter().any(|action| action == "gate.landed"),
+        "gate.landed journaled: {actions:?}"
+    );
+    assert!(
+        !ctx.scripts[0].unpin_calls.lock().unwrap().is_empty(),
+        "pinned refs dropped after landing"
+    );
+    Ok(())
+}
+
+/// r12 item 1: while one land is Landing it still owns its lane and the
+/// project's single land slot — a second queued land is not dispatched onto
+/// the same checkout, and runs exactly once after the first lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_second_dispatch_while_the_first_is_landing() -> Result<()> {
+    let ctx = Ctx::spawn(1).await?;
+    let hold = Arc::new(Notify::new());
+    *ctx.scripts[0].landing_hold.lock().unwrap() = Some(hold.clone());
+    ctx.scripts[0].script(
+        "wt/land/first",
+        RunSpec {
+            status: "landed",
+            merge_sha: Some("5555555555555555555555555555555555555555"),
+            merge_ref: Some("refs/remuda/gate/first"),
+            land_grant: true,
+            hold_while_landing: true,
+            ..RunSpec::default()
+        },
+    );
+    ctx.scripts[0].script(
+        "wt/land/second",
+        RunSpec {
+            status: "landed",
+            merge_sha: Some("6666666666666666666666666666666666666666"),
+            merge_ref: Some("refs/remuda/gate/second"),
+            land_grant: true,
+            ..RunSpec::default()
+        },
+    );
+    let job1 = ctx
+        .enqueue(json!({"branch":"wt/land/first","mode":"land"}))
+        .await;
+    let id1 = job1["id"].as_str().unwrap().to_owned();
+    // Wait until job1 is genuinely Landing (grant held).
+    let landing = ctx.wait_state(&id1, &["landing"]).await;
+    assert_eq!(landing["state"], "landing", "{landing}");
+
+    let job2 = ctx
+        .enqueue(json!({"branch":"wt/land/second","mode":"land"}))
+        .await;
+    let id2 = job2["id"].as_str().unwrap().to_owned();
+
+    // Bounded negative window: job2 must not be dispatched while job1 is
+    // Landing, and job1 must have been dispatched exactly once.
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    {
+        let arrivals = ctx.scripts[0].arrivals.lock().unwrap();
+        let count_for = |wanted: &str| {
+            arrivals
+                .iter()
+                .filter(|a| a["jobId"].as_str() == Some(wanted))
+                .count()
+        };
+        assert_eq!(
+            count_for(&id2),
+            0,
+            "job2 dispatched during Landing: {arrivals:?}"
+        );
+        assert_eq!(
+            count_for(&id1),
+            1,
+            "job1 dispatched more than once: {arrivals:?}"
+        );
+    }
+
+    // Release the granted push; job1 lands, then job2 is dispatched and lands.
+    hold.notify_waiters();
+    let l1 = ctx.wait_state(&id1, &["landed", "failed"]).await;
+    assert_eq!(l1["state"], "landed", "{l1}");
+    let l2 = ctx.wait_state(&id2, &["landed", "failed"]).await;
+    assert_eq!(l2["state"], "landed", "{l2}");
+
+    let arrivals = ctx.scripts[0].arrivals.lock().unwrap();
+    let count_for = |wanted: &str| {
+        arrivals
+            .iter()
+            .filter(|a| a["jobId"].as_str() == Some(wanted))
+            .count()
+    };
+    assert_eq!(count_for(&id1), 1);
+    assert_eq!(
+        count_for(&id2),
+        1,
+        "job2 ran exactly once after Landing cleared"
+    );
+    Ok(())
+}
+
+/// r13 item 1 / r15 R1+R5: with the lane carrier connected but the exact
+/// granted merge NOT on the remote, a Landing row stays Landing when the bounded
+/// recovery window elapses and is SURFACED as outcome-unknown (flag + reason)
+/// instead of being force-settled failed by time. Elapsed time is never a
+/// verdict. Repeated reconciliation keeps probing without settling.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restart_landing_unconfirmed_stays_landing_and_is_surfaced_unknown() -> Result<()> {
+    let ctx = Ctx::spawn_with_config(
+        1,
+        |_| {},
+        |cfg| {
+            cfg.gate_landing_recovery_ms = 1;
+            // Probe count determinism: the periodic reconciler must not race
+            // this test's forced test_reconcile() probes (a 1ms background
+            // tick could fire before the first forced probe and make the exact
+            // count assertions nondeterministic under full-binary load). The
+            // periodic interval clamps to a 250 ms floor, so 10 min effectively
+            // parks it; every probe below comes from the forced seam.
+            cfg.gate_landing_probe_interval_ms = 600_000;
+        },
+    )
+    .await?;
+    let hold = Arc::new(Notify::new());
+    *ctx.scripts[0].landing_hold.lock().unwrap() = Some(hold.clone());
+    ctx.scripts[0].script(
+        "wt/land/restart-unknown",
+        RunSpec {
+            status: "landed",
+            merge_sha: Some("7777777777777777777777777777777777777777"),
+            land_grant: true,
+            hold_while_landing: true,
+            ..RunSpec::default()
+        },
+    );
+    let job = ctx
+        .enqueue(json!({"branch":"wt/land/restart-unknown","mode":"land"}))
+        .await;
+    let id = job["id"].as_str().unwrap().to_owned();
+    ctx.wait_state(&id, &["landing"]).await;
+    // Deterministic forced probe for the single lane host. test_reconcile()
+    // (force_host=None) is THROTTLED like the periodic tick, so it cannot be
+    // used to count probes; with the periodic tick parked above, every probe
+    // here comes from this forced seam.
+    let lane_host = ctx.hosts[0].clone();
+    ctx.hub.test_force_landing_reconcile(&lane_host).await;
+    for _ in 0..100 {
+        let doc = ctx.job(&id).await;
+        if doc["landingOutcomeUnknown"] == json!(true) {
+            assert_eq!(
+                doc["state"],
+                json!("landing"),
+                "R1: time never fails a Landing: {doc}"
+            );
+            assert!(
+                doc["reason"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("outcome unknown"),
+                "surfaced outcome-unknown reason: {}",
+                doc["reason"]
+            );
+            assert_eq!(ctx.scripts[0].resolve_calls.lock().unwrap().len(), 1);
+            // A second FORCED pass bypasses the throttle and probes again
+            // immediately — repeated reconciliation keeps probing without
+            // settling.
+            ctx.hub.test_force_landing_reconcile(&lane_host).await;
+            assert_eq!(ctx.scripts[0].resolve_calls.lock().unwrap().len(), 2);
+            assert_eq!(ctx.job(&id).await["state"], json!("landing"));
+            hold.notify_waiters();
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("expired unconfirmed Landing was never surfaced outcome-unknown");
+}
+
+/// r12 item 1: a Hub restart with a Landing row whose granted merge the lane
+/// confirms is already on the remote base settles `landed`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restart_landing_confirmed_on_remote_settles_landed() -> Result<()> {
+    let ctx = Ctx::spawn(1).await?;
+    let hold = Arc::new(Notify::new());
+    *ctx.scripts[0].landing_hold.lock().unwrap() = Some(hold.clone());
+    *ctx.scripts[0].resolve_landing_reply.lock().unwrap() = Some(json!({
+        "jobId": "ignored",
+        "status": "landed",
+        "baseSha": "8888888888888888888888888888888888888888"
+    }));
+    ctx.scripts[0].script(
+        "wt/land/restart-landed",
+        RunSpec {
+            status: "landed",
+            merge_sha: Some("8888888888888888888888888888888888888888"),
+            land_grant: true,
+            hold_while_landing: true,
+            ..RunSpec::default()
+        },
+    );
+    let job = ctx
+        .enqueue(json!({"branch":"wt/land/restart-landed","mode":"land"}))
+        .await;
+    let id = job["id"].as_str().unwrap().to_owned();
+    ctx.wait_state(&id, &["landing"]).await;
+
+    ctx.hub.test_reconcile().await;
+    let settled = ctx.wait_state(&id, &["landed", "failed"]).await;
+    assert_eq!(settled["state"], "landed", "{settled}");
+    let actions = ctx.hub.test_gate_audit_actions(&id).await?;
+    assert!(
+        actions.iter().any(|action| action == "gate.landed"),
+        "confirmed restart settlement journals gate.landed: {actions:?}"
+    );
+    hold.notify_waiters();
+    Ok(())
+}
+
+/// r35 item 1 (HIGH): the production Landing probe must pin the EXACT attempt
+/// generation on the REAL `gate.resolveLanding` RPC. While the owner is still
+/// registered the lane answers `unknown` and the Hub holds occupancy; once the
+/// owner has released with a verified-dead group the lane attests `absent`, the
+/// Hub requeues, and the SUCCESSOR attempt claims the same lane and is
+/// dispatched with generation 2 (no lane-busy failure). The r34 regression
+/// exercised only the Node's private liveness; this one rides the actual
+/// Hub→Node WebSocket RPC through production reconciliation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn landing_probe_pins_the_attempt_generation_and_absent_requeues_successor() -> Result<()> {
+    let ctx = Ctx::spawn_with_config(
+        1,
+        |_| {},
+        |cfg| {
+            // Expiry immediately; the periodic reconciler stays parked so only
+            // the forced seams probe deterministically.
+            cfg.gate_landing_recovery_ms = 1;
+            cfg.gate_landing_probe_interval_ms = 600_000;
+        },
+    )
+    .await?;
+    let merge_1 = "4444444444444444444444444444444444444444";
+    // Phase 1: the owner is still registered (slow finalization) → unknown.
+    *ctx.scripts[0].resolve_landing_reply.lock().unwrap() =
+        Some(json!({"jobId": "ignored", "status": "unknown"}));
+    ctx.scripts[0].script(
+        "wt/land/r35-gen-pin",
+        RunSpec {
+            // The granted land timed out: the verdict is uncertain, the socket
+            // stays up to answer read-only probes, and the run unregisters so
+            // the reconciliation RPCs are handled on the outer pump.
+            status: "landed",
+            merge_sha: Some(merge_1),
+            merge_ref: Some("refs/remuda/gate/r35-gen-pin"),
+            land_grant: true,
+            uncertain_after_grant: true,
+            ..RunSpec::default()
+        },
+    );
+    // Successor attempt: claims the lane, runs briefly, then reports a
+    // NON-lane-busy failure (terminal and deterministic for the test).
+    ctx.scripts[0].script(
+        "wt/land/r35-gen-pin",
+        RunSpec {
+            status: "failed",
+            error: Some("synthetic successor completion"),
+            reason: Some("synthetic successor completion"),
+            delay_ms: 1500,
+            ..RunSpec::default()
+        },
+    );
+    let job = ctx
+        .enqueue(json!({"branch":"wt/land/r35-gen-pin","mode":"land"}))
+        .await;
+    let id = job["id"].as_str().unwrap().to_owned();
+    ctx.wait_state(&id, &["landing"]).await;
+
+    // Forced probe while the owner is registered: the lane answers unknown.
+    let lane_host = ctx.hosts[0].clone();
+    ctx.hub.test_force_landing_reconcile(&lane_host).await;
+    for _ in 0..100 {
+        if !ctx.scripts[0].resolve_calls.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let first_probe = ctx.scripts[0].resolve_calls.lock().unwrap()[0].clone();
+    assert_eq!(
+        first_probe["generation"],
+        json!(1),
+        "the production probe must pin THIS attempt's generation: {first_probe}"
+    );
+    assert_eq!(first_probe["mergeSha"], json!(merge_1), "{first_probe}");
+    // Unknown never releases occupancy: the job stays Landing.
+    let parked = ctx.job(&id).await;
+    assert_eq!(parked["state"], json!("landing"), "{parked}");
+
+    // The owner releases the lane and the lane attests verified-dead absence.
+    *ctx.scripts[0].resolve_landing_reply.lock().unwrap() =
+        Some(json!({"jobId": "ignored", "status": "absent"}));
+    ctx.hub.test_force_landing_reconcile(&lane_host).await;
+
+    // Requeue → the scheduler claims the successor and dispatches gen 2.
+    for _ in 0..200 {
+        if ctx.scripts[0].arrivals.lock().unwrap().len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let arrivals = ctx.scripts[0].arrivals.lock().unwrap().clone();
+    assert_eq!(
+        arrivals.len(),
+        2,
+        "the successor must be dispatched: {arrivals:?}"
+    );
+    assert_eq!(arrivals[0]["generation"], json!(1), "{arrivals:?}");
+    assert_eq!(
+        arrivals[1]["generation"],
+        json!(2),
+        "the successor attempt rides generation 2: {arrivals:?}"
+    );
+    assert!(arrivals[1]["laneId"].is_string(), "{arrivals:?}");
+    assert_eq!(
+        arrivals[1]["laneId"], arrivals[0]["laneId"],
+        "the successor acquires the SAME lane the absent attempt held: {arrivals:?}"
+    );
+    let running = ctx.wait_state(&id, &["running"]).await;
+    assert_eq!(running["attempts"], json!(2), "{running}");
+    assert!(
+        running["laneId"].is_string(),
+        "the successor holds a lane: {running}"
+    );
+    let done = ctx.wait_state(&id, &["failed"]).await;
+    assert!(
+        !done["error"].as_str().unwrap_or("").contains("lane-busy")
+            && !done["reason"].as_str().unwrap_or("").contains("lane-busy"),
+        "the successor must not fail with lane-busy: {done}"
+    );
+    Ok(())
+}
+
+/// r12 item 2: the land grant is bound to the authenticated carrier SESSION the
+/// dispatch rode. Verification starts on session A; the carrier reconnects as
+/// session B before verification ends; the old run's grant on B is refused and
+/// no Landing/push occurs — even though job/generation/host still match.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn land_grant_riding_a_replacement_session_after_reconnect_is_refused() -> Result<()> {
+    let ctx = Ctx::spawn(1).await?;
+    // Latch created BEFORE the run parks, so the notify is never missed.
+    let parked = ctx.scripts[0].landing_started.notified();
+    let hold = Arc::new(Notify::new());
+    *ctx.scripts[0].landing_hold.lock().unwrap() = Some(hold.clone());
+    ctx.scripts[0].script(
+        "wt/land/rebind",
+        RunSpec {
+            status: "landed",
+            merge_sha: Some("9999999999999999999999999999999999999999"),
+            merge_ref: Some("refs/remuda/gate/rebind"),
+            land_grant: true,
+            hold_before_grant: true,
+            ..RunSpec::default()
+        },
+    );
+    let job = ctx
+        .enqueue(json!({"branch":"wt/land/rebind","mode":"land"}))
+        .await;
+    let id = job["id"].as_str().unwrap().to_owned();
+
+    // Wait until the run is parked mid-verify on session A, row still Running.
+    tokio::time::timeout(Duration::from_secs(8), parked)
+        .await
+        .expect("run never parked before the grant");
+    let running = ctx.job(&id).await;
+    assert_eq!(running["state"], "running", "{running}");
+    assert!(
+        running["landingSessionEpoch"].is_null(),
+        "not granted yet: {running}"
+    );
+
+    // Carrier reconnects: a SECOND authenticated socket for the same host
+    // becomes the live session (a new Hub session generation).
+    let token_b = ctx.scripts[0]
+        .node_token
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("enrolled node token");
+    let workspace_b = format!("ws-{}", uuid::Uuid::new_v4().simple());
+    let mut session_b = open_node_session(&ctx.hub, &ctx.hosts[0], &workspace_b, &token_b).await?;
+
+    // The old detached run asks for its grant on the replacement session.
+    let answer = node_request(
+        &mut session_b,
+        json!({
+            "jsonrpc": "2.0", "id": "rebind-grant", "method": "gate.landGrant",
+            "params": {
+                "jobId": id,
+                "generation": 1,
+                "hostId": ctx.hosts[0],
+                "sessionEpoch": "sess-2",
+                "mergeSha": "9999999999999999999999999999999999999999",
+            },
+        }),
+    )
+    .await?;
+    assert_eq!(
+        answer["granted"], false,
+        "grant on session B must be refused: {answer}"
+    );
+    assert_eq!(answer["state"], "running", "{answer}");
+
+    // The row never entered Landing, so the land child never ran and nothing
+    // was pushed.
+    let after = ctx.job(&id).await;
+    assert_eq!(after["state"], "running", "row must stay running: {after}");
+    assert!(after["landingSessionEpoch"].is_null(), "{after}");
+    assert!(
+        ctx.scripts[0].grant_answers.lock().unwrap().is_empty(),
+        "the parked run on A never reached its own grant"
+    );
+
+    // Release the park so teardown is clean (the parked run resumes).
+    hold.notify_waiters();
+    Ok(())
+}
+
+/// r12 item 10a (cancel during verification): a cancel that lands while a lane
+/// LAND run is still verifying must make the Node skip the verify→land grant
+/// entirely — no gate.landGrant, no push; the job settles canceled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_during_verification_never_takes_the_land_grant_or_pushes() -> Result<()> {
+    let ctx = Ctx::spawn(1).await?;
+    // wait_cancel parks the run mid-verify until its gate.cancel arrives.
+    ctx.scripts[0].script(
+        "wt/land/cancel-mid-verify",
+        RunSpec {
+            status: "landed",
+            merge_sha: Some("4444444444444444444444444444444444444444"),
+            merge_ref: Some("refs/remuda/gate/mid-verify"),
+            land_grant: true,
+            wait_cancel: true,
+            ..RunSpec::default()
+        },
+    );
+    let job = ctx
+        .enqueue(json!({"branch":"wt/land/cancel-mid-verify","mode":"land"}))
+        .await;
+    let id = job["id"].as_str().unwrap();
+    ctx.wait_state(id, &["running"]).await;
+
+    let (status, _) = ctx
+        .request(
+            "POST",
+            &format!("/v1/projects/{}/gate/jobs/{id}/cancel", ctx.project),
+            Some(json!({})),
+        )
+        .await;
+    assert!(status.is_success(), "cancel of a running verify is 2xx");
+
+    let done = ctx.wait_state(id, &["canceled", "failed"]).await;
+    assert_eq!(done["state"], "canceled", "{done}");
+    assert!(
+        ctx.scripts[0].grant_answers.lock().unwrap().is_empty(),
+        "a canceled verify must never ask for the land grant"
+    );
+    assert!(
+        ctx.scripts[0].land_calls.lock().unwrap().is_empty(),
+        "nothing can be pushed without a grant"
+    );
+    Ok(())
+}
+
+/// r12 item 10a (grant then cancel): once the land grant committed (row
+/// Landing), cancel returns 409 and the granted push runs to completion once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_after_the_grant_is_409_and_the_land_completes_once() -> Result<()> {
+    let ctx = Ctx::spawn(1).await?;
+    let parked = ctx.scripts[0].landing_started.notified();
+    let hold = Arc::new(Notify::new());
+    *ctx.scripts[0].landing_hold.lock().unwrap() = Some(hold.clone());
+    ctx.scripts[0].script(
+        "wt/land/grant-then-cancel",
+        RunSpec {
+            status: "landed",
+            merge_sha: Some("5555555555555555555555555555555555555555"),
+            merge_ref: Some("refs/remuda/gate/grant-then-cancel"),
+            land_grant: true,
+            hold_while_landing: true,
+            ..RunSpec::default()
+        },
+    );
+    let job = ctx
+        .enqueue(json!({"branch":"wt/land/grant-then-cancel","mode":"land"}))
+        .await;
+    let id = job["id"].as_str().unwrap();
+    tokio::time::timeout(Duration::from_secs(8), parked)
+        .await
+        .expect("run never parked after the grant");
+    let landing = ctx.wait_state(id, &["landing"]).await;
+    assert_eq!(landing["state"], "landing", "{landing}");
+
+    // Cancel after the grant: 409 landing-in-progress, row stays Landing.
+    let (status, body) = ctx
+        .request(
+            "POST",
+            &format!("/v1/projects/{}/gate/jobs/{id}/cancel", ctx.project),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, 409, "cancel after grant must be 409: {body}");
+    assert_eq!(ctx.job(id).await["state"], json!("landing"));
+
+    // Release the granted land; it completes and settles landed exactly once.
+    hold.notify_waiters();
+    let done = ctx.wait_state(id, &["landed", "failed"]).await;
+    assert_eq!(done["state"], "landed", "{done}");
+    assert_eq!(
+        ctx.scripts[0].arrivals.lock().unwrap().len(),
+        1,
+        "the job was dispatched once"
+    );
+    assert_eq!(
+        ctx.scripts[0].grant_answers.lock().unwrap().len(),
+        1,
+        "exactly one grant answer (the granted push runs once)"
+    );
+    Ok(())
+}
+
+/// r13 item 2: the Node crashes AFTER the grant but before its Finished/RPC
+/// reply, while the carrier SOCKET stays open. The gate.run RPC returns an
+/// error, but the Hub must not fail the Landing (the push may be done); it
+/// keeps occupancy and immediately schedules a BOUNDED read-only reconciliation
+/// on the still-connected lane. The periodic reconciler is throttled far beyond
+/// the test, so only the forced RPC-loss pass can settle it: the remote
+/// confirms the exact granted merge → landed once, never re-pushed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rpc_loss_after_grant_with_carrier_still_up_schedules_landing_reconcile() -> Result<()> {
+    let ctx = Ctx::spawn_with_config(
+        1,
+        |_| {},
+        |cfg| {
+            // Expiry is irrelevant (the merge IS on the remote), and the
+            // periodic reconciler must not rescue the row within the test.
+            cfg.gate_landing_recovery_ms = 1;
+            cfg.gate_landing_probe_interval_ms = 60_000;
+        },
+    )
+    .await?;
+    *ctx.scripts[0].resolve_landing_reply.lock().unwrap() = Some(json!({
+        "jobId": "ignored",
+        "status": "landed",
+        "baseSha": "6666666666666666666666666666666666666666"
+    }));
+    ctx.scripts[0].script(
+        "wt/land/rpc-lost-after-grant",
+        RunSpec {
+            status: "landed",
+            merge_sha: Some("6666666666666666666666666666666666666666"),
+            merge_ref: Some("refs/remuda/gate/rpc-lost"),
+            land_grant: true,
+            rpc_error_after_grant: true,
+            ..RunSpec::default()
+        },
+    );
+    let job = ctx
+        .enqueue(json!({"branch":"wt/land/rpc-lost-after-grant","mode":"land"}))
+        .await;
+    let id = job["id"].as_str().unwrap().to_owned();
+
+    // The forced post-RPC-loss reconcile probes the live carrier and settles.
+    let settled = ctx.wait_state(&id, &["landed", "failed"]).await;
+    assert_eq!(
+        settled["state"], "landed",
+        "RPC loss must not fail a Landing: {settled}"
+    );
+
+    // The reconcile was actually driven by the RPC loss (one read-only probe),
+    // and the journal records exactly one landing.
+    assert!(
+        !ctx.scripts[0].resolve_calls.lock().unwrap().is_empty(),
+        "the RPC loss must trigger a remote probe"
+    );
+    let actions = ctx.hub.test_gate_audit_actions(&id).await?;
+    assert_eq!(
+        actions.iter().filter(|a| *a == "gate.landed").count(),
+        1,
+        "{actions:?}"
+    );
+    // The run sent exactly one land grant (nothing was re-run/re-pushed).
+    assert_eq!(ctx.scripts[0].grant_answers.lock().unwrap().len(), 1);
+    Ok(())
+}
+
+/// r13 item 5: a granted land child that hit its budget reports `uncertain`
+/// after its process group was fully terminated. The Hub must NOT turn that
+/// into failed (the remote could already hold the ref): it keeps the Landing
+/// occupancy and the forced reconcile probes the live lane for the exact merge
+/// and settles landed. The periodic reconciler is throttled beyond the test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn uncertain_land_timeout_keeps_landing_and_reconciles_to_landed() -> Result<()> {
+    let ctx = Ctx::spawn_with_config(
+        1,
+        |_| {},
+        |cfg| {
+            cfg.gate_landing_recovery_ms = 1;
+            cfg.gate_landing_probe_interval_ms = 60_000;
+        },
+    )
+    .await?;
+    *ctx.scripts[0].resolve_landing_reply.lock().unwrap() = Some(json!({
+        "jobId": "ignored",
+        "status": "landed",
+        "baseSha": "5555555555555555555555555555555555555555"
+    }));
+    ctx.scripts[0].script(
+        "wt/land/uncertain-timeout",
+        RunSpec {
+            status: "landed",
+            merge_sha: Some("5555555555555555555555555555555555555555"),
+            merge_ref: Some("refs/remuda/gate/uncertain"),
+            land_grant: true,
+            uncertain_after_grant: true,
+            ..RunSpec::default()
+        },
+    );
+    let job = ctx
+        .enqueue(json!({"branch":"wt/land/uncertain-timeout","mode":"land"}))
+        .await;
+    let id = job["id"].as_str().unwrap().to_owned();
+
+    // The uncertain verdict must not settle failed; the forced probe lands it.
+    let settled = ctx.wait_state(&id, &["landed", "failed"]).await;
+    assert_eq!(
+        settled["state"], "landed",
+        "uncertain must reconcile, not fail: {settled}"
+    );
+    assert!(
+        !ctx.scripts[0].resolve_calls.lock().unwrap().is_empty(),
+        "the uncertain verdict must trigger a remote probe"
+    );
+    let actions = ctx.hub.test_gate_audit_actions(&id).await?;
+    assert_eq!(
+        actions.iter().filter(|a| *a == "gate.landed").count(),
+        1,
+        "{actions:?}"
+    );
+    assert_eq!(
+        actions.iter().filter(|a| *a == "gate.failed").count(),
+        0,
+        "{actions:?}"
+    );
     Ok(())
 }

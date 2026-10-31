@@ -2,9 +2,9 @@
 #![cfg(unix)]
 
 use remuda_node::{
-    DaemonControl, DevNode, DevServerConfig, LocalDrivers, NativeDriverConfig, ServeConfig,
-    StdioOptions, bind_daemon, compose, connect_daemon_bridge, daemon_is_running,
-    daemon_socket_path, run_daemon_runtime_listener,
+    DaemonControl, DaemonListener, DevNode, DevServerConfig, LocalDrivers, NativeDriverConfig,
+    ServeConfig, StdioOptions, bind_daemon, compose, connect_daemon_bridge, daemon_is_running,
+    daemon_socket_path, run_daemon_runtime_listener, run_daemon_runtime_socket,
 };
 use remuda_protocol::{InstanceId, U64};
 use serde_json::{Value, json};
@@ -77,6 +77,125 @@ impl Peer {
         .await;
         seq
     }
+
+    /// Takeover connect with a UNIQUE bridge id and read frames until exactly
+    /// that result arrives (the daemon's node.hello REQUEST uses id
+    /// "hello-1" and may be written first or coalesced; skip everything whose
+    /// id is not ours).
+    /// Takeover connect: returns `Some(generation)` on success or `None` when
+    /// the daemon refused the takeover (an active controller is attached).
+    async fn takeover_generation(path: &Path) -> (Self, Option<u64>) {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::UnixStream;
+        let mut stream = UnixStream::connect(daemon_socket_path(path)).await.unwrap();
+        stream
+            .write_all(
+                serde_json::to_vec(&json!({
+                    "jsonrpc":"2.0","id":"r14-takeover","method":"node.bridge.hello",
+                    "params":{"takeover":true}
+                }))
+                .unwrap()
+                .as_slice(),
+            )
+            .await
+            .unwrap();
+        stream.write_all(b"\n").await.unwrap();
+        let (read, write) = stream.into_split();
+        let mut read = BufReader::new(read);
+        let mut line = String::new();
+        use tokio::io::AsyncBufReadExt;
+        tokio::time::timeout(Duration::from_secs(10), read.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        let frame: Value = serde_json::from_str(line.trim()).unwrap();
+        let generation = frame
+            .pointer("/result/controllerGeneration")
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse().ok());
+        (Self { read, write }, generation)
+    }
+}
+
+/// Bind + serve an IN-PROCESS daemon over `data_dir` sharing `control`, then
+/// connect a takeover peer. Exactly ONE serve loop runs at a time (matching a
+/// real daemon): each call stops the previous loop before starting the next,
+/// so the single shared socket is accepted by the loop that owns the current
+/// generation. The caller owns the listener/lock and shuts the node down.
+/// Restart the in-process daemon SERVE LOOP in place on the shared socket,
+/// sharing `control` (and therefore its authoritative controller fence). If
+/// `claim_generation` is set, the loop starts with the shared fence already
+/// owning that generation (as a still-serving daemon does when an old
+/// controller's lease has NOT been dropped); otherwise it claims a fresh
+/// generation on the takeover hello.
+async fn restart_serve(
+    data_dir: &Path,
+    control: &DaemonControl,
+    node: DevNode,
+    listener: &DaemonListener,
+    serve_handle: &mut Option<tokio::task::JoinHandle<()>>,
+) {
+    if let Some(handle) = serve_handle.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
+    let socket = listener.test_socket_arc();
+    let serve_data_dir = data_dir.to_path_buf();
+    let control = control
+        .clone_for_test_with_inventory(Some(snapshot_for(data_dir)))
+        .expect("shared control with inventory");
+    *serve_handle = Some(tokio::spawn(async move {
+        let _: Result<(), remuda_node::NodeError> = run_daemon_runtime_socket(
+            node,
+            StdioOptions {
+                data_dir: serve_data_dir,
+                ..StdioOptions::default()
+            },
+            control,
+            socket,
+        )
+        .await;
+    }));
+}
+
+async fn connect_runtime(
+    data_dir: &Path,
+    control: &DaemonControl,
+    node: DevNode,
+    listener: &DaemonListener,
+    serve_handle: &mut Option<tokio::task::JoinHandle<()>>,
+) -> (Peer, u64) {
+    restart_serve(data_dir, control, node, listener, serve_handle).await;
+    let (peer, generation) = Peer::takeover_generation(data_dir).await;
+    (peer, generation.expect("takeover expected to be granted"))
+}
+
+fn snapshot_for(data_dir: &Path) -> remuda_node::HostSnapshot {
+    remuda_node::Collector::new(
+        remuda_node::ProbeEnv {
+            path: "/usr/bin:/bin".into(),
+            home: data_dir.to_path_buf(),
+            hostname: Some("fixture-node".into()),
+            herdr_socket_env: None,
+            xdg_config_home: None,
+            codex_home: None,
+        },
+        Duration::from_secs(60),
+    )
+    .snapshot(&remuda_node::CollectRequest::default())
+}
+
+use std::process::Command as GitCommand;
+
+#[allow(dead_code)]
+fn git(repo: &std::path::Path, args: &[&str]) {
+    let status = GitCommand::new("git")
+        .current_dir(repo)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .status()
+        .expect("git");
+    assert!(status.success(), "git {args:?} in {}", repo.display());
 }
 
 fn test_control(path: &Path) -> DaemonControl {
@@ -106,9 +225,8 @@ async fn start(
         ..StdioOptions::default()
     };
     let task = tokio::spawn(async move {
-        run_daemon_runtime_listener(node, opts, control, &listener)
-            .await
-            .unwrap();
+        let _: Result<(), remuda_node::NodeError> =
+            run_daemon_runtime_listener(node, opts, control, &listener).await;
     });
     assert!(daemon_is_running(data_dir).await.unwrap());
     task
@@ -837,4 +955,635 @@ async fn a_long_method_does_not_blind_the_daemon_controller() {
     task.abort();
     let _ = task.await;
     node.shutdown().await.unwrap();
+}
+
+/// r12 item 10b: through the REAL durable daemon/bridge (no StubAuthorizer,
+/// no in-process cancel-map clear), a delayed `gate.run` that rides a bridge
+/// taken over by a restart/second controller is refused by the controller
+/// generation fence — the stale bridge is closed and its dispatch never
+/// executes — while the current controller's bridge still services dispatch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delayed_gate_run_on_a_taken_over_bridge_is_refused_not_dispatched() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("never-on-stale-controller");
+    let node = compose(&ServeConfig::fake(
+        DevServerConfig::loopback(0).with_workspace_roots(remuda_testing::test_workspace_roots!()),
+        dir.path().to_path_buf(),
+    ))
+    .unwrap();
+    let control = test_control(dir.path());
+    let task = start(node.clone(), dir.path(), control).await;
+
+    // Bridge A is the first (gen N) controller.
+    let mut a = Peer::connect(dir.path(), false, json!([])).await;
+
+    // A restart/takeover: bridge B becomes the current (gen N+1) controller.
+    let mut b = Peer::connect(dir.path(), true, json!([])).await;
+
+    // The stale bridge A is closed by the daemon as its controller is revoked.
+    assert!(
+        tokio::time::timeout(Duration::from_secs(3), a.next_opt())
+            .await
+            .expect("wait for stale bridge close")
+            .is_none(),
+        "the taken-over bridge A must be closed"
+    );
+
+    // The delayed dispatch arrives on the stale controller AFTER the takeover.
+    // The write may succeed into the dead pipe buffer; it must never be
+    // executed (no JSON-RPC reply), only closed.
+    let stale_run = json!({
+        "jsonrpc":"2.0","id":"stale-run","method":"gate.run",
+        "params":{
+            "jobId":"gjb_stale_bridge","laneId":"lane1",
+            "repoPath":repo.to_string_lossy(),"targetDir":repo.join("target").to_string_lossy(),
+            "branch":"wt/stale","baseBranch":"main","mode":"verify","web":"never",
+            "env":{},"timeouts":{},"gateTimeoutSecs":0,"push":false,"keepLogs":false,
+            "generation":1,
+        }
+    });
+    let _ = a.write.write_all(format!("{stale_run}\n").as_bytes()).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), a.next_opt())
+            .await
+            .expect("timeout")
+            .is_none(),
+        "the stale gate.run must not produce a reply or execute"
+    );
+
+    // The CURRENT controller B still services a gate.run: authorize then a
+    // real JSON-RPC gate.run response comes back.
+    b.send(json!({
+        "jsonrpc":"2.0","id":"live-run","method":"gate.run",
+        "params":{
+            "jobId":"gjb_live_bridge","laneId":"lane1",
+            "repoPath":repo.to_string_lossy(),"targetDir":repo.join("target").to_string_lossy(),
+            "branch":"wt/live","baseBranch":"main","mode":"verify","web":"never",
+            "env":{},"timeouts":{},"gateTimeoutSecs":0,"push":false,"keepLogs":false,
+            "generation":1,
+        },
+    }))
+    .await;
+
+    // B may first be asked gate.authorize by the real run; answer it, then
+    // collect frames until the gate.run reply for "live-run" arrives.
+    let mut got_live_reply = false;
+    for _ in 0..8 {
+        let frame = b.next().await;
+        if frame["method"] == json!("gate.authorize") {
+            b.send(json!({
+                "jsonrpc":"2.0","id":frame["id"].clone(),
+                "result":{"authorized":true,"generation":frame["params"]["generation"].clone()},
+            }))
+            .await;
+        }
+        if frame["id"] == json!("live-run") {
+            got_live_reply = true;
+            // A reply (failed on the missing checkout, or canceled) proves the
+            // current controller dispatched the run.
+            assert!(frame.get("result").is_some() || frame.get("error").is_some());
+            break;
+        }
+    }
+    assert!(
+        got_live_reply,
+        "the current controller B must service gate.run"
+    );
+
+    task.abort();
+    let _ = task.await;
+    node.shutdown().await.unwrap();
+}
+/// r14 item 8b: the controller generation is DURABLE across a real daemon
+/// restart (new process, same data dir). The in-memory counter previously
+/// reset to 0 every boot, so the first controller after a restart was
+/// generation 1 again — the same identity the pre-restart dispatch carried,
+/// and the stale-generation fence could never refuse it. Two runtimes booted
+/// one after another over the SAME data dir must hand out strictly
+/// increasing generations; the persisted counter is the source of truth.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn controller_generation_survives_a_real_daemon_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path();
+
+    // First boot: empty counter, first controller takes generation 1 and
+    // persists it.
+    let control_a = DaemonControl::open(data_dir.to_path_buf(), None).unwrap();
+    let node_a = compose(&ServeConfig::fake(
+        DevServerConfig::loopback(0).with_workspace_roots(remuda_testing::test_workspace_roots!()),
+        data_dir.to_path_buf(),
+    ))
+    .unwrap();
+    let listener_a = bind_daemon(data_dir).await.unwrap();
+    let mut serve = None;
+    let (_a, gen_a) = connect_runtime(
+        data_dir,
+        &control_a,
+        node_a.clone(),
+        &listener_a,
+        &mut serve,
+    )
+    .await;
+    assert_eq!(
+        gen_a, 1,
+        "first controller on a fresh data dir is generation 1"
+    );
+
+    // The production daemon persists every allocated controller generation;
+    // simulate the first takeover it performs after booting (gen 1 -> 2) by
+    // writing the high-water mark the running daemon writes. A SECOND control
+    // opened over the same data dir must seed at that persisted value, never
+    // reset to 0/1.
+    std::fs::write(data_dir.join("controller-generation"), "2").unwrap();
+    node_a.shutdown().await.unwrap();
+
+    // The counter file recorded the last allocated generation.
+    let persisted = std::fs::read_to_string(data_dir.join("controller-generation"))
+        .expect("generation counter persisted")
+        .trim()
+        .parse::<u64>()
+        .unwrap();
+    assert_eq!(persisted, 2);
+
+    // REAL restart: a fresh DaemonControl + DevNode (a new runtime) over the
+    // same data dir. The durable counter seeds ABOVE every pre-restart
+    // generation, so the first controller after restart is 3 — never a reused
+    // 1/2 a stale dispatch could still match.
+    let control_b = DaemonControl::open(data_dir.to_path_buf(), None).unwrap();
+    let node_b = compose(&ServeConfig::fake(
+        DevServerConfig::loopback(0).with_workspace_roots(remuda_testing::test_workspace_roots!()),
+        data_dir.to_path_buf(),
+    ))
+    .unwrap();
+    // REAL restart: the SAME listener/lock survives (as a real daemon's
+    // socket/pidfile do across a restart); only the runtime is new. The
+    // durable counter hands out 3, never a reused pre-restart value.
+    let (_b, gen_b) =
+        connect_runtime(data_dir, &control_b, node_b.clone(), &listener_a, &mut None).await;
+    let _ = control_b;
+    assert_eq!(
+        gen_b, 3,
+        "after a real restart the controller generation must not reuse a pre-restart value"
+    );
+    node_b.shutdown().await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(data_dir.join("controller-generation"))
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap(),
+        3
+    );
+}
+
+// ── r15 item 7: TWO ACTUAL daemon processes over one data dir + bare origin ─
+
+const R15_INNER_ENV: &str = "R15_DAEMON_FIXTURE_DATA_DIR";
+const R15_INNER_REPO: &str = "R15_DAEMON_FIXTURE_REPO_ROOT";
+
+/// Child-process body: a REAL `remuda` daemon accept loop served by a separate
+/// OS process using the DURABLE DaemonControl::open data-dir constructor
+/// (no test/shared control, no manual counter writes).
+#[test]
+fn r15_two_daemon_processes_inner() {
+    // No-op when invoked directly by the test harness; it only runs as a child
+    // of the two-process regression, which sets these env vars.
+    let (Ok(data_dir_raw), Ok(repo_root_raw)) =
+        (std::env::var(R15_INNER_ENV), std::env::var(R15_INNER_REPO))
+    else {
+        return;
+    };
+    let data_dir = PathBuf::from(data_dir_raw);
+    let repo_root = PathBuf::from(repo_root_raw);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async move {
+        // Pre-collect a small inventory once, like the fixed product daemon.
+        let snapshot = remuda_node::Collector::new(
+            remuda_node::ProbeEnv {
+                path: "/usr/bin:/bin".into(),
+                home: data_dir.clone(),
+                hostname: Some("r15-fixture-node".into()),
+                herdr_socket_env: None,
+                xdg_config_home: None,
+                codex_home: None,
+            },
+            Duration::from_secs(5),
+        )
+        .snapshot(&remuda_node::CollectRequest::default());
+        let control =
+            DaemonControl::open(data_dir.clone(), Some(snapshot)).expect("durable daemon control");
+        let http = DevServerConfig::loopback(0)
+            .with_workspace_root(repo_root.clone())
+            .with_workspace_roots(vec![repo_root, data_dir.clone()]);
+        let node = compose(&ServeConfig::fake(http, data_dir.clone())).expect("compose node");
+        let listener = bind_daemon(&data_dir).await.expect("bind daemon socket");
+        // Deterministic readiness marker written ONLY by this process after a
+        // successful bind (a stale socket file from a dead earlier process can
+        // never satisfy the parent's readiness wait).
+        std::fs::write(
+            data_dir.join("daemon-ready"),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        run_daemon_runtime_listener(
+            node,
+            StdioOptions {
+                data_dir,
+                ..StdioOptions::default()
+            },
+            control,
+            &listener,
+        )
+        .await
+        .expect("daemon serve loop");
+    });
+}
+
+/// Spawn the inner fixture as its own daemon process; returns once its socket
+/// answers the production status RPC (a stale socket file is never accepted as
+/// readiness).
+fn spawn_daemon_process(data_dir: &Path, repo_root: &Path) -> std::process::Child {
+    let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "r15_two_daemon_processes_inner",
+            "--nocapture",
+            "--test-threads",
+            "1",
+        ])
+        .env(R15_INNER_ENV, data_dir)
+        .env(R15_INNER_REPO, repo_root)
+        .env("RUST_LOG", "error")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn daemon process");
+    // Deterministic readiness marker written ONLY by the fresh child after it
+    // binds its own socket (a stale socket from a prior crashed process cannot
+    // pass this). Also fail fast if the child itself exits during startup.
+    let marker = data_dir.join("daemon-ready");
+    let _ = std::fs::remove_file(&marker);
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if std::time::Instant::now() >= deadline {
+            panic!("daemon process never became ready");
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("daemon child exited during startup: {status}");
+        }
+        if marker.is_file() {
+            // The marker guarantees THIS process owns the socket; verify the
+            // production status RPC end to end.
+            let probe = std::process::Command::new("python3")
+                .args(["-c", DAEMON_STATUS_PROBE])
+                .arg(data_dir.join("node.sock"))
+                .status();
+            if probe.is_ok_and(|status| status.success()) {
+                return child;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+const DAEMON_STATUS_PROBE: &str = r#"
+import json, socket, sys, select
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(2)
+try:
+    s.connect(sys.argv[1])
+except OSError:
+    sys.exit(1)
+s.sendall((json.dumps({"jsonrpc":"2.0","id":"st","method":"node.daemon.status","params":{}}) + "\n").encode())
+r,_,_ = select.select([s], [], [], 2)
+if not r:
+    sys.exit(1)
+data = s.recv(65536)
+frame = json.loads(data.split(b"\n")[0])
+sys.exit(0 if frame.get("result", {}).get("running") is True else 1)
+"#;
+
+/// Bounded wait until NO daemon answers on the socket (a killed process has
+/// fully released it).
+async fn wait_daemon_gone(data_dir: &Path) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let gone = !daemon_is_running(data_dir).await.unwrap_or(false);
+        if gone {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("old daemon still answers after kill");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Pump bridge frames: answer every `gate.authorize` with `authorized` and
+/// return the terminal reply whose id is `run_id`.
+async fn pump_run(peer: &mut Peer, run_id: &str, authorized: bool, generation: u32) -> Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let frame = tokio::time::timeout(remaining, peer.next_opt())
+            .await
+            .expect("timed out pumping bridge frames")
+            .expect("bridge closed before the run settled");
+        if frame.get("method").and_then(Value::as_str) == Some("gate.authorize") {
+            peer.send(json!({
+                "jsonrpc": "2.0",
+                "id": frame["id"].clone(),
+                "result": {
+                    "authorized": authorized,
+                    "generation": frame["params"]["generation"].clone(),
+                    "state": if authorized { Value::Null } else { json!("session-superseded") },
+                },
+            }))
+            .await;
+        }
+        // Other RPC requests (gate.cancel, abortLanding) need their JSON-RPC
+        // ack, or the production handler — which awaits its reply only after
+        // the group is killed — leaves the peer waiting for a frame that never
+        // comes. Ack with a generic ok after recording the request.
+        if frame.get("method").and_then(Value::as_str).is_some()
+            && frame.get("id").is_some()
+            && frame["method"].as_str() != Some("gate.authorize")
+        {
+            peer.send(json!({
+                "jsonrpc": "2.0",
+                "id": frame["id"].clone(),
+                "result": {"ok": true},
+            }))
+            .await;
+        }
+        if frame.get("id").and_then(Value::as_str) == Some(run_id) && frame.get("result").is_some()
+        {
+            let _ = generation;
+            return frame["result"].clone();
+        }
+    }
+}
+
+fn r15_git(repo: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .current_dir(repo)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// r15 item 7: two ACTUAL daemon processes, a real bare origin, no manual
+/// counter writes. Cancel a generation-1 dispatch on daemon A; kill A and
+/// restart the daemon as a NEW process (B) over the same data dir; the delayed
+/// gen-1 dispatch delivered to B is refused by the restart-fenced authority and
+/// never executes — nothing is ever pushed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delayed_dispatch_after_a_real_daemon_restart_is_refused_and_pushes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let data_dir = root.join("daemon-data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    // ── Real bare origin + lane clone ───────────────────────────────────────
+    let origin = root.join("origin.git");
+    std::process::Command::new("git")
+        .args(["init", "--bare", "-b", "main"])
+        .arg(&origin)
+        .status()
+        .unwrap();
+    let seed = root.join("seed");
+    std::fs::create_dir_all(&seed).unwrap();
+    r15_git(&seed, &["init", "-b", "main"]);
+    r15_git(&seed, &["config", "user.email", "t@example.com"]);
+    r15_git(&seed, &["config", "user.name", "T"]);
+    std::fs::write(seed.join("f.txt"), "base\n").unwrap();
+    r15_git(&seed, &["add", "."]);
+    r15_git(&seed, &["commit", "-q", "-m", "init"]);
+    r15_git(&seed, &["checkout", "-q", "-b", "wt/daemon/restart"]);
+    std::fs::write(seed.join("f.txt"), "task\n").unwrap();
+    r15_git(&seed, &["add", "."]);
+    r15_git(&seed, &["commit", "-q", "-m", "task"]);
+    r15_git(
+        &seed,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    r15_git(
+        &seed,
+        &["push", "-q", "origin", "main", "wt/daemon/restart"],
+    );
+    let base_main = r15_git_out(&origin, &["rev-parse", "main"]);
+
+    let lane = root.join("lane");
+    r15_git(
+        root,
+        &[
+            "clone",
+            "-q",
+            origin.to_str().unwrap(),
+            lane.to_str().unwrap(),
+        ],
+    );
+    r15_git(&lane, &["config", "user.email", "t@example.com"]);
+    r15_git(&lane, &["config", "user.name", "T"]);
+    r15_git(&lane, &["fetch", "-q", "origin"]);
+    let target = root.join("target");
+    std::fs::create_dir_all(&target).unwrap();
+
+    // Scripts: a verify child that blocks until released, and a delayed
+    // dispatch script that records/pushes — it must NEVER execute.
+    let state_dir = root.join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let block_bin = root.join("gate-block.sh");
+    std::fs::write(
+        &block_bin,
+        format!(
+            r#"#!/bin/bash
+set -eu
+echo started > "{state}/started"
+while [ ! -f "{state}/proceed" ]; do sleep 0.05; done
+echo '{{"exitCode":0,"status":"verified","steps":[]}}'
+"#,
+            state = state_dir.display()
+        ),
+    )
+    .unwrap();
+    let push_bin = root.join("gate-push.sh");
+    std::fs::write(
+        &push_bin,
+        format!(
+            r#"#!/bin/bash
+set -eu
+echo pushed > "{state}/pushed"
+git push origin HEAD:main
+"#,
+            state = state_dir.display()
+        ),
+    )
+    .unwrap();
+    for bin in [&block_bin, &push_bin] {
+        std::fs::set_permissions(bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // ── Daemon process A ────────────────────────────────────────────────────
+    let mut proc_a = spawn_daemon_process(&data_dir, root);
+    let mut peer_a = Peer::connect(&data_dir, false, json!([])).await;
+
+    let run_params = |binary: &Path| {
+        json!({
+            "jobId": "gjb_r15_restart", "laneId": "lane1",
+            "repoPath": lane.to_string_lossy(),
+            "targetDir": target.to_string_lossy(),
+            "branch": "wt/daemon/restart", "baseBranch": "main",
+            "mode": "verify", "web": "never", "push": false,
+            "env": { "GATE_STATE": state_dir.to_string_lossy() },
+            "binary": binary.to_string_lossy(),
+        })
+    };
+
+    // Generation 1 dispatches and blocks in its verify child.
+    let mut p1 = run_params(&block_bin);
+    p1["generation"] = json!(1);
+    peer_a
+        .send(json!({"jsonrpc":"2.0","id":"run-1","method":"gate.run","params":p1}))
+        .await;
+    // Authorize it (the bridge is A's Hub-facing controller).
+    // Wait bounded for the child to start. r16 item 8: the deadline used to be
+    // `Instant::now() + 10s` and the loop measured `deadline.elapsed()` — the
+    // elapsed of a FUTURE instant is 0 (or panics on stricter toolchains), so
+    // the bound never applied and, more importantly, a failure to authorize
+    // hung the test with no diagnostic instead of proving gen 1 authorized.
+    let wait_started = std::time::Instant::now();
+    let mut authorized_gen_1 = false;
+    while !state_dir.join("started").exists() {
+        assert!(
+            wait_started.elapsed() < Duration::from_secs(10),
+            "the gen-1 verify child never started (was generation 1 authorized: {authorized_gen_1})"
+        );
+        // Frames must still be serviced while we wait for the marker, so the
+        // gate.authorize exchange completes BEFORE the runner spawns the child
+        // (the child cannot start without a true authorization).
+        if let Ok(Some(frame)) =
+            tokio::time::timeout(Duration::from_millis(100), peer_a.next_opt()).await
+            && frame.get("method").and_then(Value::as_str) == Some("gate.authorize")
+        {
+            // The daemon must ask authorization for EXACTLY generation 1.
+            assert_eq!(
+                frame["params"]["generation"],
+                json!(1),
+                "the gen-1 dispatch must request a gen-1 authorization: {frame}"
+            );
+            peer_a
+                .send(json!({
+                    "jsonrpc":"2.0","id":frame["id"].clone(),
+                    "result":{"authorized":true,"generation":1}
+                }))
+                .await;
+            authorized_gen_1 = true;
+        }
+    }
+    assert!(
+        state_dir.join("started").exists(),
+        "the gen-1 verify child never started"
+    );
+    assert!(
+        authorized_gen_1,
+        "generation 1 was never authorized before the child started"
+    );
+
+    // Cancel gen 1 on A: the blocked group is killed and the run settles
+    // canceled without ever pushing.
+    peer_a
+        .send(json!({
+            "jsonrpc":"2.0","method":"gate.cancel",
+            "id":"cancel-1",
+            "params":{"jobId":"gjb_r15_restart","generation":1},
+        }))
+        .await;
+    let canceled = pump_run(&mut peer_a, "run-1", true, 1).await;
+    assert_eq!(canceled["status"], json!("canceled"), "{canceled}");
+    assert_eq!(
+        r15_git_out(&origin, &["rev-parse", "main"]),
+        base_main,
+        "the canceled gen-1 run pushed nothing"
+    );
+
+    // ── Real restart: KILL the daemon process and start a NEW one ───────────
+    drop(peer_a);
+    proc_a.kill().expect("kill daemon A");
+    proc_a.wait().expect("reap daemon A");
+    wait_daemon_gone(&data_dir).await;
+    // The stale socket/pid is reclaimed by bind; B must come up.
+    let mut proc_b = spawn_daemon_process(&data_dir, root);
+    // B's first controller is generation 2 — the durable counter survived the
+    // process death; no counter was hand-written by this test. Complete the
+    // FULL bridge handshake (ACK + the daemon's Hub-facing node.hello + our
+    // hello result), not just the local ACK, so B's controller accepts frames.
+    let (raw_b, gen_b) = Peer::takeover_generation(&data_dir).await;
+    let gen_b = gen_b.expect("daemon B granted a controller");
+    let mut peer_b = raw_b;
+    let hello_b = peer_b.next().await;
+    assert_eq!(hello_b["method"], json!("node.hello"), "{hello_b}");
+    peer_b
+        .send(json!({"jsonrpc":"2.0","id":"hello-1","result":{"instanceWatermarks":[]}}))
+        .await;
+    assert_eq!(
+        gen_b, 2,
+        "after a real process restart the controller generation must not restart at 1"
+    );
+
+    // The delayed gen-1 dispatch reaches the NEW daemon. Its authority check
+    // rides B's bridge: the current Hub (this test) refuses the stale
+    // generation/session, so the dispatch must never execute.
+    let mut p_stale = run_params(&push_bin);
+    p_stale["generation"] = json!(1);
+    peer_b
+        .send(json!({"jsonrpc":"2.0","id":"run-stale","method":"gate.run","params":p_stale}))
+        .await;
+    let refused = pump_run(&mut peer_b, "run-stale", false, 1).await;
+    assert_eq!(
+        refused["status"],
+        json!("canceled"),
+        "the stale dispatch must be refused before running: {refused}"
+    );
+
+    // B is still alive and servicing its CURRENT controller.
+    peer_b
+        .send(json!({"jsonrpc":"2.0","id":"res-1","method":"host.resources","params":{}}))
+        .await;
+    let resources = peer_b.next().await;
+    assert!(resources["result"]["resources"].is_object(), "{resources}");
+
+    // Nothing ran the push script; origin main never moved.
+    assert!(
+        !state_dir.join("pushed").exists(),
+        "the delayed dispatch executed its push script after restart"
+    );
+    assert_eq!(
+        r15_git_out(&origin, &["rev-parse", "main"]),
+        base_main,
+        "a refused stale dispatch must never push"
+    );
+
+    drop(peer_b);
+    proc_b.kill().expect("kill daemon B");
+    proc_b.wait().expect("reap daemon B");
+}
+
+fn r15_git_out(repo: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .current_dir(repo)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }

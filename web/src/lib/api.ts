@@ -31,6 +31,7 @@ import {
   mockCreate,
   mockDb,
   mockDelete,
+  mockSeen,
   mockDeviceList,
   mockDeviceRevoke,
   mockFleetBroadcast,
@@ -67,6 +68,8 @@ import { coerceObservation, coerceObservationList } from "./hubJournal";
  * says; anything other than `purged` means the Node kept its data directory.
  */
 export type InstanceDeleted = components["schemas"]["InstanceDeleted"];
+/** seen-hub: owner seen state of one instance (route response and follow event). */
+export type SeenView = components["schemas"]["SeenView"];
 
 export const MOCK = import.meta.env.VITE_MOCK === "1";
 
@@ -354,6 +357,10 @@ export function mapInstance(rec: components["schemas"]["InstanceRecord"]): Insta
             text: extra.lastTurnError.text,
           }
         : undefined,
+    // seen-hub: owner done-unseen, wired as data only (the ◉ UI is separate).
+    unseen: rec.unseen === true,
+    seenSeq: typeof rec.seenSeq === "string" ? (rec.seenSeq as U64) : undefined,
+    turnEndSeq: typeof rec.turnEndSeq === "string" ? (rec.turnEndSeq as U64) : undefined,
     launchedBy,
     cwd: extra.cwd ?? rec.workspaceId ?? null,
     name: extra.name ?? rec.title ?? null,
@@ -738,6 +745,13 @@ export type HubApi = {
   lineageGet(lineageId: Id): Promise<LineageRecord>;
   /** `DELETE /v1/instances/{id}`; `force` stops a live Instance first. */
   instanceDelete(instanceId: Id, force?: boolean): Promise<InstanceDeleted>;
+  /**
+   * seen-hub: `POST /v1/instances/{id}/seen`. The owner saw the instance up to
+   * `durableSeq` (monotonic on the Hub). `visible: true` while the session is
+   * on screen (renew inside the Hub's 10 s lease), `false` when it leaves;
+   * omit for a report that is not about the screen.
+   */
+  instanceSeen(instanceId: Id, durableSeq: U64, visible?: boolean): Promise<SeenView>;
   instanceConfigure(instanceId: Id, permissionMode: string, extras?: InstanceConfigurePatch): Promise<CommandResult>;
   interactionList(q?: { instanceId?: Id; state?: string }): Promise<Interaction[]>;
   interactionGet(interactionId: Id): Promise<Interaction>;
@@ -764,7 +778,11 @@ export type HubApi = {
    * resolution reason verbatim (generation-ended for a process end, or a
    * non-process-end reason such as agent-demoted — r6 item 5).
    */
-  settlementSubscribe(onSettlement: (interactionId: Id, reason?: string) => void): () => void;
+  settlementSubscribe(
+    onSettlement: (interactionId: Id, reason?: string) => void,
+    /** seen-hub: owner seen-state changes riding the same global socket. */
+    onSeen?: (view: SeenView) => void,
+  ): () => void;
   providerList(q?: { hostId?: string }): Promise<{ items: HubProviderRow[]; nextCursor?: string | null }>;
   providerGet(id: string): Promise<HubProviderRow>;
   providerCreate(body: ProviderCreate): Promise<HubProviderRow>;
@@ -1239,6 +1257,9 @@ function createMockApi(): HubApi {
     },
     async instanceDelete(instanceId, force) {
       return mockDelete(instanceId, force);
+    },
+    async instanceSeen(instanceId, durableSeq) {
+      return mockSeen(instanceId, durableSeq);
     },
     async instanceConfigure(instanceId, permissionMode, extras) {
       return mockConfigure(instanceId, extras?.permissionMode ?? permissionMode, extras);
@@ -1828,6 +1849,17 @@ function createLiveApi(): HubApi {
         throw err;
       }
     },
+    async instanceSeen(instanceId, durableSeq, visible) {
+      const body: HubBody<"/v1/instances/{id}/seen", "post"> = visible === undefined
+        ? { durableSeq }
+        : { durableSeq, visible };
+      return rest<HubJson<"/v1/instances/{id}/seen", "post">>(`/v1/instances/${instanceId}/seen`, {
+        method: "POST",
+        body: JSON.stringify(body),
+        // A release is often sent while the page unloads; let it outlive the page.
+        ...(visible === false ? { keepalive: true } : {}),
+      });
+    },
     async instanceConfigure(instanceId, permissionMode, extras) {
       return command(instanceId, "instance.configure", {
         permissionMode: extras?.permissionMode ?? permissionMode,
@@ -1971,8 +2003,8 @@ function createLiveApi(): HubApi {
     hostWorkspaceSubscribe(onSnapshot, refresh) {
       return followWorkspaces(wsUrl("/v1/follow"), onSnapshot, refresh);
     },
-    settlementSubscribe(onSettlement) {
-      return followSettlements(wsUrl("/v1/follow"), onSettlement);
+    settlementSubscribe(onSettlement, onSeen) {
+      return followSettlements(wsUrl("/v1/follow"), onSettlement, onSeen);
     },
     eventsRead: async (args) => {
       const instanceId = instanceIdOf(args.journalId);

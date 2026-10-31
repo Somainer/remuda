@@ -855,6 +855,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/instances/{id}/seen": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Mark an instance seen by the owner (done-unseen)
+         * @description seen-hub: the owner saw this instance up to durableSeq. Seen is tracked per owner (scope owner), so phone and desktop agree. Monotonic: a lower seq never moves seen back. When the seen seq advances, the Hub publishes an instance.seen event on the /v1/follow bus to unfiltered followers. Human devices only: Agent credentials are refused by the agent-route policy and Bot devices by the handler.
+         */
+        post: operations["instanceSeen"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/instances/{id}/subagents/{agentId}/transcript": {
         parameters: {
             query?: never;
@@ -942,6 +962,158 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/lineages/{id}/glance": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Waiting and working workers a lineage dispatched, plus today's DONE count
+         * @description At most 50 rows in each of waiting and working; the *Total counters carry the overflow. Human/Bot devices may read any lineage; an Agent may read only its own lineage (403 otherwise). Row detail text is untrusted data.
+         */
+        get: operations["lineageGlance"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/lineages/{id}/memory": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List a lineage's memory entries
+         * @description D-060 memory entries of one lineage in index order (type, then slug). Archived entries only with includeArchived=true. Human devices read any lineage; an Agent reads only its own lineage (403 otherwise). Bot devices are refused.
+         */
+        get: operations["memoryList"];
+        put?: never;
+        /**
+         * Create a memory entry
+         * @description Create one entry at the slug's next revision (1 for a slug never used before; a recreated slug continues after its last revision); 409 MEMORY_SLUG_EXISTS when the slug exists (archived included). Soft limits (entry 2048 bytes, index 4096 bytes) come back as warnings with the actual numbers; above 8192 bytes the entry is refused (413). Human devices create memory only for an existing lineage (404 for a retired one) and may update, delete and consolidate (into one of the inputs) any lineage's retained entries, a retired lineage's included. An Agent writes only its own lineage and only from the lineage's current, unfenced chapter (403 otherwise). Bot devices are refused.
+         */
+        post: operations["memoryCreate"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/lineages/{id}/memory/consolidate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Consolidate memory entries (CAS on every input)
+         * @description Atomically replace 2-32 entries with one: every source carries its expectedRevision, and any stale one is 409 MEMORY_REVISION_CONFLICT listing each conflict, with nothing changed. The new entry may reuse a source's slug (its revision then continues) or take a new one (409 when that slug exists elsewhere); it keeps every source's sourceRefs. Human devices create memory only for an existing lineage (404 for a retired one) and may update, delete and consolidate (into one of the inputs) any lineage's retained entries, a retired lineage's included. An Agent writes only its own lineage and only from the lineage's current, unfenced chapter (403 otherwise). Bot devices are refused.
+         */
+        post: operations["memoryConsolidate"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/lineages/{id}/memory/entries/{slug}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read a memory entry
+         * @description One entry, archived or not. Human devices read any lineage; an Agent reads only its own lineage (403 otherwise). Bot devices are refused.
+         */
+        get: operations["memoryGet"];
+        /**
+         * Update a memory entry (revision CAS)
+         * @description Revision compare-and-set update: expectedRevision is required, and a stale one is 409 MEMORY_REVISION_CONFLICT with currentRevision. Omitted fields keep their values; sourceRefs are appended. An archived entry is 409 MEMORY_ARCHIVED until restored. Human devices create memory only for an existing lineage (404 for a retired one) and may update, delete and consolidate (into one of the inputs) any lineage's retained entries, a retired lineage's included. An Agent writes only its own lineage and only from the lineage's current, unfenced chapter (403 otherwise). Bot devices are refused.
+         */
+        put: operations["memoryUpdate"];
+        post?: never;
+        /**
+         * Delete a memory entry (revision CAS)
+         * @description Revision compare-and-set delete: the expectedRevision query parameter is required; a stale one is 409 MEMORY_REVISION_CONFLICT. Human devices create memory only for an existing lineage (404 for a retired one) and may update, delete and consolidate (into one of the inputs) any lineage's retained entries, a retired lineage's included. An Agent writes only its own lineage and only from the lineage's current, unfenced chapter (403 otherwise). Bot devices are refused.
+         */
+        delete: operations["memoryDelete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/lineages/{id}/memory/index": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Render a lineage's memory index
+         * @description The Hub-rendered index of the lineage's live entries (archived ones too with includeArchived=true, each line ending ` (archived)`): one `- [type] slug: title — description` line each, ordered by type then slug, with a warning above 4096 bytes. Human devices read any lineage; an Agent reads only its own lineage (403 otherwise). Bot devices are refused.
+         */
+        get: operations["memoryIndex"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/lineages/{id}/memory/restore": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Restore archived memory entries
+         * @description Owner (Human) only: clear archivedAt on the named entries, or on every archived entry of the lineage when slugs is omitted. Lineage retirement archives entries; it never deletes them.
+         */
+        post: operations["memoryRestore"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/lineages/{id}/memory/search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Search a lineage's memory
+         * @description FTS5 MATCH hits ranked by bm25, then LIKE hits the tokenizer cannot see (a run of CJK characters is one token, so a two-character query hits by substring). Every whitespace-separated term must match; a query of more than 8 terms is refused (400), never shortened. Human devices read any lineage; an Agent reads only its own lineage (403 otherwise). Bot devices are refused.
+         */
+        get: operations["memorySearch"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/login": {
         parameters: {
             query?: never;
@@ -953,6 +1125,26 @@ export interface paths {
         put?: never;
         /** Bootstrap token → device cookie */
         post: operations["login"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/memory/derived": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Find memory entries derived from a journal row
+         * @description Owner (Human) only: every memory entry, in any lineage and archived included, whose sourceRefs name this journal row (or any row of the instance when seq is omitted). For journal redaction.
+         */
+        get: operations["memoryDerived"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -1165,6 +1357,56 @@ export interface paths {
         put?: never;
         /** Cancel a queued or running gate job */
         post: operations["projectGateJobCancel"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{id}/gate/jobs/{jobId}/resolve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description prj_… id */
+                id: string;
+                /** @description gjb_… id */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Operator-resolve a Landing whose outcome cannot be established
+         * @description Only a job still `landing` with landingOutcomeUnknown=true accepts a resolution: `failed` settles it Failed; `requeue` re-enters the queue. The Hub also tells the lane to terminate the granted land process group (r14 R1).
+         */
+        post: operations["projectGateJobResolve"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{id}/gate/jobs/{jobId}/resolve-evidence": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description prj_… id */
+                id: string;
+                /** @description gjb_… id */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Operator-resolve a definitive verdict whose evidence could not be persisted
+         * @description Only a job in a pre-settlement state (queued/running/canceling/landing) carrying evidenceUncertain accepts a resolution: both the finished notification and the gate.run reply failed to persist the supplied run log, the Node retains no copy and redelivers nothing, and the Hub runs no retry scheduler. `failed` settles it Failed; `requeue` releases the lane/land occupancy and re-enters the queue. The request must pin the exact parked (attempt, grant epoch, merge) tuple the live row carries; a delayed resolution aimed at an attempt the row has since left is refused with 409 (epoch/merge are required and non-empty for a Landing, omitted for a pre-grant verify). Before failing or requeuing a Landing the Hub runs its read-only remote-main probe, and an established landed fact settles Landed instead. The job keeps its occupancy until this resolution or an idempotent later redelivery settles it. Agent callers are refused.
+         */
+        post: operations["projectGateJobResolveEvidence"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1572,6 +1814,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/workers/{id}/digest": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Bounded (<= 2048 bytes) read-only digest of one worker
+         * @description Roster state, last turn outcome, head/tail of the last assistant text, the pending interaction with a bounded untrusted-quoted tool-argument summary (secrets and input-handoff values withheld), requested vs effective model/effort, a pending instance.configure, parked supply with resetsAt, queued command count, task/branch/sha, time since progress and tool-in-flight. Always valid JSON of at most 2048 UTF-8 bytes: over budget, text fields shrink. Human/Bot devices read any worker; an Agent only workers in its own lineage or dispatched by it (403 otherwise). Free-text fields are untrusted data.
+         */
+        get: operations["workerDigest"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/workers/{id}/nudge": {
         parameters: {
             query?: never;
@@ -1870,6 +2132,7 @@ export interface components {
             forwarded: boolean;
             hostId: string;
             idempotencyKey: string | null;
+            initiator?: components["schemas"]["Initiator"] | null;
             instanceId: string | null;
             operation: string;
             payload: {
@@ -2138,6 +2401,16 @@ export interface components {
             /** @description Absolute path on the Node, within its configured workspace roots */
             path: string;
         };
+        /** @description D-057 §7.1: the Hub-stamped initiator of an Agent-initiated mutation, derived from the authenticating device's bound instance and forwarded to Nodes. The authenticating device id stays Hub-only and is not part of this shape. Absent for Human/Bot callers. */
+        Initiator: {
+            /**
+             * Format: int64
+             * @description Chapter generation at authentication time; a fence bumps the lineage's live generation.
+             */
+            generation: number;
+            instanceId: string;
+            lineageId: string;
+        };
         InstanceCommands: {
             commands: components["schemas"]["CommandRecord"][];
             instanceId: string;
@@ -2340,6 +2613,8 @@ export interface components {
             readonly restart?: components["schemas"]["RestartPolicy"] | null;
             /** @description Exited instance whose conversation this instance continues (D-026). */
             readonly resumedFrom?: string | null;
+            /** @description seen-hub: highest journal seq the owner has seen (decimal). Monotonic. Absent until the first POST /v1/instances/{id}/seen. */
+            readonly seenSeq?: string;
             /**
              * @description Signal tier confirmed by the Node for the current native session. Absent until a tier has been observed.
              * @enum {string|null}
@@ -2348,6 +2623,10 @@ export interface components {
             title?: string | null;
             /** @description Requested launch renderer. Actual mode is reported by tty snapshot altScreen. */
             readonly tui?: components["schemas"]["TuiMode"];
+            /** @description seen-hub: journal seq (decimal) of the latest settled turn end, i.e. the latest row that moved activity from working, blocked or draining to idle. Absent before any turn end; a resumed instance or a new lineage chapter starts without one (home.md §7). */
+            readonly turnEndSeq?: string;
+            /** @description seen-hub (home done-unseen): true when the latest settled turn end (turnEndSeq) is newer than the owner's seen seq. Owner-scoped, so every owner device reads the same value. A turn end that lands while an owner client reported the session visible is folded seen in the same write and never reads true. Always sent by this Hub; read an absent value as false. */
+            readonly unseen?: boolean;
             updatedAt?: string;
             /** @description Additive per-session token/context rollup (context-usage-1), Hub-computed from the journal's usage observations and refreshed every turn. Absent until the harness has reported at least one usage event; every counter is null until the adapter reports that channel (never a fabricated zero). */
             readonly usageRollup?: components["schemas"]["InstanceUsageRollup"];
@@ -2431,6 +2710,10 @@ export interface components {
             generation: number;
             instanceId: string;
         };
+        /** @description Generated shape: LineageGlance in crates/remuda-protocol/schema/protocol.schema.json. */
+        LineageGlance: {
+            [key: string]: unknown;
+        };
         /** @description One agent across process lifetimes (D-057 §5). A row exists only for continuity instances: one that holds a grant or carries a restart policy. */
         LineageRecord: {
             /** @description Every chapter, oldest generation first. */
@@ -2467,6 +2750,144 @@ export interface components {
             intent: string;
             taskId: string;
             title: string;
+        };
+        /** @description Replace 2-32 entries with one, CAS on every input. */
+        MemoryConsolidate: {
+            entry: components["schemas"]["MemoryCreate"];
+            sources: {
+                expectedRevision: number;
+                slug: string;
+            }[];
+        };
+        /** @description A new memory entry. */
+        MemoryCreate: {
+            body?: string;
+            /** @description One line. */
+            description: string;
+            /** @description 1-64 of a-z 0-9 . _ -, starting with a letter or digit. */
+            slug: string;
+            /** @description At most 64. */
+            sourceRefs?: components["schemas"]["MemorySourceRef"][];
+            /** @description One line. */
+            title: string;
+            type: components["schemas"]["MemoryType"];
+        };
+        /** @description The entry as deleted. */
+        MemoryDeleteResult: {
+            deleted: components["schemas"]["MemoryEntry"];
+        };
+        /** @description One memory entry of one lineage (D-060). */
+        MemoryEntry: {
+            /** @description Set when the lineage retired; absent while live. */
+            archivedAt?: string;
+            /** @description Entry body (read on demand; never in the index). */
+            body: string;
+            /** @description First write. */
+            createdAt: string;
+            /** @description One-line description shown in the index. */
+            description: string;
+            /** @description Owning lineage. */
+            lineageId: string;
+            origin: components["schemas"]["MemoryOrigin"];
+            /** @description The slug's next revision on every write, never reused: a slug recreated after a delete continues after its last revision. 1 for a slug never used before. */
+            revision: number;
+            /** @description Stable handle, unique within the lineage. */
+            slug: string;
+            /** @description Journal rows the entry was derived from. */
+            sourceRefs: components["schemas"]["MemorySourceRef"][];
+            /** @description One-line title. */
+            title: string;
+            type: components["schemas"]["MemoryType"];
+            /** @description Last write. */
+            updatedAt: string;
+            /** @description Chapter that made the last write; absent for an owner write. */
+            writerInstance?: string;
+        };
+        /** @description Memory entries. */
+        MemoryEntryPage: {
+            items: components["schemas"]["MemoryEntry"][];
+        };
+        /** @description The Hub-rendered index of a lineage's live entries (archived ones too on request). */
+        MemoryIndex: {
+            /** @description Rendered size in bytes. */
+            bytes: number;
+            /** @description Entries in the index. */
+            count: number;
+            lineageId: string;
+            /** @description One `- [type] slug: title — description` line per entry; an archived entry's line ends ` (archived)`. */
+            text: string;
+            warnings: components["schemas"]["MemorySizeWarning"][];
+        };
+        /**
+         * @description How the writing caller authenticated.
+         * @enum {string}
+         */
+        MemoryOrigin: "human" | "agent";
+        /** @description Entries to restore; every archived entry when omitted. */
+        MemoryRestore: {
+            slugs?: string[];
+        };
+        /** @description Slugs restored. */
+        MemoryRestoreResult: {
+            restored: string[];
+        };
+        /** @description One search hit. */
+        MemorySearchHit: {
+            entry: components["schemas"]["MemoryEntry"];
+            /**
+             * @description `fts` (bm25-ranked) or `like` (substring).
+             * @enum {string}
+             */
+            matchedBy: "fts" | "like";
+            /** @description bm25 score of an fts hit (lower is better). */
+            score?: number;
+        };
+        /** @description Search hits, fts first. */
+        MemorySearchPage: {
+            items: components["schemas"]["MemorySearchHit"][];
+        };
+        /** @description A soft limit a write crossed, with the actual numbers. */
+        MemorySizeWarning: {
+            /** @description Actual size in bytes. */
+            bytes: number;
+            /** @enum {string} */
+            limit: "entry-soft" | "index-soft";
+            /** @description The limit in bytes. */
+            maxBytes: number;
+        };
+        /** @description A journal row an entry was derived from. */
+        MemorySourceRef: {
+            /** @description Instance whose journal holds the row. */
+            instanceId: string;
+            /** @description Journal sequence number. */
+            seq: number;
+        };
+        /**
+         * @description Memory entry type (index order).
+         * @enum {string}
+         */
+        MemoryType: "user" | "feedback" | "project" | "reference";
+        /** @description A revision-CAS update; omitted fields keep their values. */
+        MemoryUpdate: {
+            body?: string;
+            description?: string;
+            /** @description Required: the revision being replaced. */
+            expectedRevision: number;
+            /** @description Appended to the entry's refs. */
+            sourceRefs?: components["schemas"]["MemorySourceRef"][];
+            title?: string;
+            type?: components["schemas"]["MemoryType"];
+        };
+        /** @description A committed create, update or consolidate. */
+        MemoryWriteResult: {
+            entry: components["schemas"]["MemoryEntry"];
+            /** @description title + description + body, UTF-8 bytes. */
+            entryBytes: number;
+            /** @description Rendered index size after the write. */
+            indexBytes: number;
+            /** @description Slugs a consolidate removed. */
+            removed?: string[];
+            warnings: components["schemas"]["MemorySizeWarning"][];
         };
         /** @description remuda own check: explicit paths or a pasted diff/stat/name-only listing. */
         OwnCheckRequest: {
@@ -2942,6 +3363,22 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        SeenRequest: {
+            /** @description Highest journal seq the client has shown for this instance, as the decimal string the Hub serializes (a JSON integer is also accepted). Clamped to the instance's durable seq; a value at or below the current seen seq changes nothing. */
+            durableSeq: string | number;
+            /** @description true while the client is showing the session: holds a short per-device visibility lease (10 s, renewed by repeating the report) so a turn that ends meanwhile is folded seen instead of becoming unseen. false releases this device's lease when it stops showing the session. Omit for a report that is not about the screen, such as marking a row seen from a list. */
+            visible?: boolean;
+        };
+        SeenView: {
+            instanceId: string;
+            /** @description When the seen seq last advanced. */
+            seenAt?: string;
+            /** @description Owner's seen seq after this report (decimal). */
+            seenSeq?: string;
+            /** @description Latest settled turn end (decimal); absent before any. */
+            turnEndSeq?: string;
+            unseen: boolean;
+        };
         SshHostCreate: {
             label: string;
             /** @description Placement labels such as egress:gateway or region=sg. */
@@ -3084,6 +3521,10 @@ export interface components {
         WorkerBriefSend: {
             content: string;
             name?: string;
+        };
+        /** @description Generated shape: WorkerDigest in crates/remuda-protocol/schema/protocol.schema.json. */
+        WorkerDigest: {
+            [key: string]: unknown;
         };
         WorkerDispatch: {
             /**
@@ -4017,6 +4458,8 @@ export interface operations {
                             hostId?: string | null;
                             id?: string;
                             keepLogs?: boolean;
+                            landingOutcomeUnknown?: boolean;
+                            landingSessionEpoch?: string | null;
                             laneId?: string | null;
                             logObjectId?: string | null;
                             mergeSha?: string | null;
@@ -4028,7 +4471,7 @@ export interface operations {
                             requestedBy?: string;
                             startedAt?: string | null;
                             /** @enum {string} */
-                            state?: "queued" | "running" | "passed" | "failed" | "landed" | "canceling" | "canceled";
+                            state?: "queued" | "running" | "landing" | "passed" | "failed" | "landed" | "canceling" | "canceled";
                             steps?: {
                                 [key: string]: unknown;
                             }[];
@@ -5036,6 +5479,36 @@ export interface operations {
             404: components["responses"]["Error"];
         };
     };
+    instanceSeen: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SeenRequest"];
+            };
+        };
+        responses: {
+            /** @description Seen state after the report */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SeenView"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
     instanceSubagentTranscript: {
         parameters: {
             query?: never;
@@ -5175,6 +5648,332 @@ export interface operations {
             404: components["responses"]["Error"];
         };
     };
+    lineageGlance: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Lineage glance */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LineageGlance"];
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
+    memoryList: {
+        parameters: {
+            query?: {
+                /** @description Only this type. */
+                type?: components["schemas"]["MemoryType"];
+                /** @description Include archived entries. */
+                includeArchived?: boolean;
+            };
+            header?: {
+                /** @description Narrow a device credential to an existing instance with Agent origin. Cannot promote or rebind a scoped credential. */
+                "x-remuda-instance-id"?: components["parameters"]["CallerInstance"];
+            };
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Entries */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryEntryPage"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+        };
+    };
+    memoryCreate: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Narrow a device credential to an existing instance with Agent origin. Cannot promote or rebind a scoped credential. */
+                "x-remuda-instance-id"?: components["parameters"]["CallerInstance"];
+            };
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MemoryCreate"];
+            };
+        };
+        responses: {
+            /** @description Committed entry */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryWriteResult"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            409: components["responses"]["Error"];
+            413: components["responses"]["Error"];
+        };
+    };
+    memoryConsolidate: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Narrow a device credential to an existing instance with Agent origin. Cannot promote or rebind a scoped credential. */
+                "x-remuda-instance-id"?: components["parameters"]["CallerInstance"];
+            };
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MemoryConsolidate"];
+            };
+        };
+        responses: {
+            /** @description Committed entry and removed slugs */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryWriteResult"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            409: components["responses"]["Error"];
+            413: components["responses"]["Error"];
+        };
+    };
+    memoryGet: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Narrow a device credential to an existing instance with Agent origin. Cannot promote or rebind a scoped credential. */
+                "x-remuda-instance-id"?: components["parameters"]["CallerInstance"];
+            };
+            path: {
+                id: components["parameters"]["IdPath"];
+                /** @description Entry slug (1-64 of a-z 0-9 . _ -). */
+                slug: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Entry */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryEntry"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
+    memoryUpdate: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Narrow a device credential to an existing instance with Agent origin. Cannot promote or rebind a scoped credential. */
+                "x-remuda-instance-id"?: components["parameters"]["CallerInstance"];
+            };
+            path: {
+                id: components["parameters"]["IdPath"];
+                /** @description Entry slug (1-64 of a-z 0-9 . _ -). */
+                slug: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MemoryUpdate"];
+            };
+        };
+        responses: {
+            /** @description Committed entry */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryWriteResult"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            409: components["responses"]["Error"];
+            413: components["responses"]["Error"];
+        };
+    };
+    memoryDelete: {
+        parameters: {
+            query: {
+                /** @description The revision being deleted. */
+                expectedRevision: number;
+            };
+            header?: {
+                /** @description Narrow a device credential to an existing instance with Agent origin. Cannot promote or rebind a scoped credential. */
+                "x-remuda-instance-id"?: components["parameters"]["CallerInstance"];
+            };
+            path: {
+                id: components["parameters"]["IdPath"];
+                /** @description Entry slug (1-64 of a-z 0-9 . _ -). */
+                slug: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted entry */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryDeleteResult"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            409: components["responses"]["Error"];
+        };
+    };
+    memoryIndex: {
+        parameters: {
+            query?: {
+                /** @description Include archived entries; their lines end ` (archived)`. The size warning is computed for what is rendered. */
+                includeArchived?: boolean;
+            };
+            header?: {
+                /** @description Narrow a device credential to an existing instance with Agent origin. Cannot promote or rebind a scoped credential. */
+                "x-remuda-instance-id"?: components["parameters"]["CallerInstance"];
+            };
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Rendered index */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryIndex"];
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+        };
+    };
+    memoryRestore: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MemoryRestore"];
+            };
+        };
+        responses: {
+            /** @description Restored slugs */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRestoreResult"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
+    memorySearch: {
+        parameters: {
+            query: {
+                /** @description Query text: at most 8 whitespace-separated terms, all of which must match. */
+                q: string;
+                /** @description Hits to return (default 10, at most 100). */
+                limit?: number;
+                /** @description Search archived entries too. */
+                includeArchived?: boolean;
+            };
+            header?: {
+                /** @description Narrow a device credential to an existing instance with Agent origin. Cannot promote or rebind a scoped credential. */
+                "x-remuda-instance-id"?: components["parameters"]["CallerInstance"];
+            };
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Hits */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemorySearchPage"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+        };
+    };
     login: {
         parameters: {
             query?: never;
@@ -5198,6 +5997,34 @@ export interface operations {
                 };
             };
             401: components["responses"]["Error"];
+        };
+    };
+    memoryDerived: {
+        parameters: {
+            query: {
+                /** @description Instance whose journal holds the row. */
+                instanceId: string;
+                /** @description Journal sequence number. */
+                seq?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Derived entries */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryEntryPage"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
         };
     };
     nodeSocket: {
@@ -5519,6 +6346,8 @@ export interface operations {
                             hostId?: string | null;
                             id?: string;
                             keepLogs?: boolean;
+                            landingOutcomeUnknown?: boolean;
+                            landingSessionEpoch?: string | null;
                             laneId?: string | null;
                             logObjectId?: string | null;
                             mergeSha?: string | null;
@@ -5530,7 +6359,7 @@ export interface operations {
                             requestedBy?: string;
                             startedAt?: string | null;
                             /** @enum {string} */
-                            state?: "queued" | "running" | "passed" | "failed" | "landed" | "canceling" | "canceled";
+                            state?: "queued" | "running" | "landing" | "passed" | "failed" | "landed" | "canceling" | "canceled";
                             steps?: {
                                 [key: string]: unknown;
                             }[];
@@ -5588,6 +6417,8 @@ export interface operations {
                         hostId?: string | null;
                         id?: string;
                         keepLogs?: boolean;
+                        landingOutcomeUnknown?: boolean;
+                        landingSessionEpoch?: string | null;
                         laneId?: string | null;
                         logObjectId?: string | null;
                         mergeSha?: string | null;
@@ -5599,7 +6430,7 @@ export interface operations {
                         requestedBy?: string;
                         startedAt?: string | null;
                         /** @enum {string} */
-                        state?: "queued" | "running" | "passed" | "failed" | "landed" | "canceling" | "canceled";
+                        state?: "queued" | "running" | "landing" | "passed" | "failed" | "landed" | "canceling" | "canceled";
                         steps?: {
                             [key: string]: unknown;
                         }[];
@@ -5645,6 +6476,8 @@ export interface operations {
                         hostId?: string | null;
                         id?: string;
                         keepLogs?: boolean;
+                        landingOutcomeUnknown?: boolean;
+                        landingSessionEpoch?: string | null;
                         laneId?: string | null;
                         logObjectId?: string | null;
                         mergeSha?: string | null;
@@ -5656,7 +6489,7 @@ export interface operations {
                         requestedBy?: string;
                         startedAt?: string | null;
                         /** @enum {string} */
-                        state?: "queued" | "running" | "passed" | "failed" | "landed" | "canceling" | "canceled";
+                        state?: "queued" | "running" | "landing" | "passed" | "failed" | "landed" | "canceling" | "canceled";
                         steps?: {
                             [key: string]: unknown;
                         }[];
@@ -5707,6 +6540,8 @@ export interface operations {
                         hostId?: string | null;
                         id?: string;
                         keepLogs?: boolean;
+                        landingOutcomeUnknown?: boolean;
+                        landingSessionEpoch?: string | null;
                         laneId?: string | null;
                         logObjectId?: string | null;
                         mergeSha?: string | null;
@@ -5718,13 +6553,105 @@ export interface operations {
                         requestedBy?: string;
                         startedAt?: string | null;
                         /** @enum {string} */
-                        state?: "queued" | "running" | "passed" | "failed" | "landed" | "canceling" | "canceled";
+                        state?: "queued" | "running" | "landing" | "passed" | "failed" | "landed" | "canceling" | "canceled";
                         steps?: {
                             [key: string]: unknown;
                         }[];
                         /** @enum {string} */
                         web?: "auto" | "always" | "never";
                     } & {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            409: components["responses"]["Error"];
+        };
+    };
+    projectGateJobResolve: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description prj_… id */
+                id: string;
+                /** @description gjb_… id */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @enum {string} */
+                    resolution: "failed" | "requeue";
+                } & {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description Settled job */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            409: components["responses"]["Error"];
+        };
+    };
+    projectGateJobResolveEvidence: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description prj_… id */
+                id: string;
+                /** @description gjb_… id */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /**
+                     * Format: uint32
+                     * @description The attempt ordinal (the live row's attempts) the operator saw parked as evidence-uncertain.
+                     */
+                    expectedAttempts: number;
+                    /** @description The exact merge sha of the parked tuple; required and non-empty for a Landing resolution, omitted/null for a pre-grant verify. */
+                    expectedMergeSha?: string | null;
+                    /** @description The Running-to-Landing grant epoch of the parked tuple; required and non-empty for a Landing resolution, omitted/null for a pre-grant verify. */
+                    expectedSessionEpoch?: string | null;
+                    /** @description Mandatory non-empty human rationale, persisted on the row. */
+                    rationale: string;
+                    /** @enum {string} */
+                    resolution: "failed" | "requeue";
+                } & {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description Settled job */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
                         [key: string]: unknown;
                     };
                 };
@@ -6659,6 +7586,32 @@ export interface operations {
             400: components["responses"]["Error"];
             401: components["responses"]["Error"];
             403: components["responses"]["Error"];
+        };
+    };
+    workerDigest: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description wkr_ id or active worker name */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Worker digest */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkerDigest"];
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
         };
     };
     workerNudge: {

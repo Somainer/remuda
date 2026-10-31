@@ -520,6 +520,11 @@ pub struct SpawnRequest {
     pub idempotency_key: Option<String>,
     /// Delegation-tree state (scope, grants, preset, task); §2.5.
     pub delegation: crate::store::InstanceDelegation,
+    /// D-057 §7.1: Hub-stamped initiator of the create/resume, carried on the
+    /// queued command and forwarded to the Node. None for Human/Bot callers.
+    pub initiator: Option<remuda_protocol::Initiator>,
+    /// Hub-only authenticating device id re-checked at commit.
+    pub initiator_device_id: Option<String>,
 }
 
 /// Hosts with `online` derived from a live Hub<->Node session, not SQLite state.
@@ -548,7 +553,11 @@ pub async fn spawn_on_host(
             host_id: host.host_id.clone(),
         });
     }
-    let instance = state
+    let spawn_authority = crate::agent_scope::CallerAuthority {
+        initiator: request.initiator.clone(),
+        device_id: request.initiator_device_id.clone(),
+    };
+    let instance = match state
         .store
         .insert_instance_delegated(
             host.host_id.clone(),
@@ -558,16 +567,25 @@ pub async fn spawn_on_host(
             request.title,
             request.spec.clone(),
             request.delegation,
+            spawn_authority,
         )
         .await
-        .map_err(crate::http::map_store)?;
+    {
+        Ok(instance) => instance,
+        // D-057 §7.3: the fence landed at the create admission itself — the
+        // write rolled back, nothing to unwind.
+        Err(crate::store::StoreError::Fenced) => {
+            return Err(crate::http::map_store(crate::store::StoreError::Fenced));
+        }
+        Err(error) => return Err(crate::http::map_store(error)),
+    };
     let payload = json!({
         "origin": request.spec.get("origin").cloned().unwrap_or(json!("agent")),
         "instanceId": instance.instance_id,
         "spec": request.spec,
         "initialInput": request.prompt.as_ref().map(|text| json!({ "type": "prompt", "text": text })),
     });
-    let (command, _) = state
+    let (command, _) = match state
         .store
         .queue_command(
             None,
@@ -577,9 +595,60 @@ pub async fn spawn_on_host(
             payload,
             request.idempotency_key,
             None,
+            request.initiator,
+            request.initiator_device_id,
         )
-        .await?;
-    let command = crate::http::forward_if_online(state, command, true).await?;
+        .await
+    {
+        Ok(command) => command,
+        // D-057 §7.3: the fence landed between the instance insert and the
+        // create command admission — purge the never-accepted chapter so an
+        // orphaned row never lingers (the write never reached a Node, so no
+        // tombstone: F tombstones only chapters that existed on a Node).
+        Err(crate::store::StoreError::Fenced) => {
+            if let Err(error) = state
+                .store
+                .purge_requested_instance(instance.instance_id.clone())
+                .await
+            {
+                tracing::warn!(
+                    instance_id = %instance.instance_id,
+                    %error,
+                    "fenced create: instance row purge failed"
+                );
+            }
+            return Err(crate::http::map_store(crate::store::StoreError::Fenced));
+        }
+        Err(error) => return Err(crate::http::map_store(error)),
+    };
+    let command = match crate::http::forward_if_online(state, command, true).await {
+        Ok(command) => command,
+        // ma-initiator r6 item 1: the fence landed in `mark_forward_intent` —
+        // its writer re-checked the stamped initiator and refused before any
+        // frame was written to a Node. The `requested` instance row (with its
+        // slot), a continuity child's `starting` lineages row (its lineage
+        // seat) and the queued create command are all still behind. Purging
+        // them here is mandatory: otherwise expire_stale_requested eventually
+        // settles the chapter `create_never_acknowledged` — a terminal for a
+        // chapter that never existed on any Node (OA6). This Fenced can only
+        // originate in the pre-send intent mark: every path after a frame was
+        // sent returns other errors (or Ok), never Fenced.
+        Err(HubError::Fenced) => {
+            if let Err(error) = state
+                .store
+                .purge_requested_instance(instance.instance_id.clone())
+                .await
+            {
+                tracing::warn!(
+                    instance_id = %instance.instance_id,
+                    %error,
+                    "fenced forward intent: requested-instance purge failed"
+                );
+            }
+            return Err(HubError::Fenced);
+        }
+        Err(error) => return Err(error),
+    };
     // D-048: once the instance exists and create was forwarded, install the
     // egress context (credential, base URL, headers) on the proxy Node for a
     // hub-relay route. The credential rides api.egress, never api.open; this

@@ -18,6 +18,7 @@ mod auth;
 mod bot;
 mod config;
 mod devices;
+mod digest;
 mod error;
 mod fleet;
 mod gatequeue;
@@ -33,6 +34,11 @@ pub use interactions::delegated_decisions_test_support;
 /// Test-only seam for the D-057 continuation-resume race.
 #[doc(hidden)]
 pub use store::lineage_test_support;
+/// Test support for the D-057 commit-time initiator authority.
+#[doc(hidden)]
+pub mod agent_scope_test_support {
+    pub use crate::agent_scope::CallerAuthority;
+}
 #[doc(hidden)]
 pub mod usage_store_test_support {
     use rusqlite::Connection;
@@ -53,9 +59,11 @@ pub mod usage_store_test_support {
 }
 mod inventory;
 mod maintenance;
+mod memory;
 mod model_catalog;
 /// Built-in model catalog revision (tests compare the served catalog against it).
 pub use model_catalog::CATALOG_REVISION;
+mod node_ops;
 mod objects;
 mod passkeys;
 mod placement;
@@ -67,6 +75,7 @@ mod proxy;
 mod push_http;
 mod rate_limit;
 mod registry;
+mod seen;
 pub mod ssh_hosts;
 mod store;
 mod store_tickets;
@@ -174,6 +183,9 @@ pub struct AppState {
     /// Round 6 item 3: test-only park points in the real unregister/task-bind
     /// handlers; empty (no-op) in production.
     pub(crate) race_barriers: crate::workspaces::RaceBarriers,
+    /// r27 item 2: per-job guards serializing legacy gate `/resolve`
+    /// validation/abort against verdict-applied evidence-deferral transitions.
+    pub(crate) gate_decision_guards: crate::gatequeue::GateDecisionGuards,
 }
 
 impl AppState {
@@ -293,7 +305,30 @@ pub mod store_test_support {
     use serde_json::{Value, json};
     use std::collections::BTreeSet;
 
-    pub use crate::store::{APPEND_CHUNK_MAX, JOURNAL_WINDOW_BYTES, JOURNAL_WINDOW_ROWS, Store};
+    pub use crate::store::{
+        APPEND_CHUNK_MAX, JOURNAL_WINDOW_BYTES, JOURNAL_WINDOW_ROWS, SCHEMA_USER_VERSION, Store,
+    };
+
+    /// D-057 §7.3 commit-time check error (the initiator suite matches on it).
+    pub use crate::store::StoreError;
+
+    /// Test-only gate-cancel writer-race seam (cancel handler pre-read vs.
+    /// the state observed inside the writer job).
+    #[cfg(any(test, feature = "test-faults"))]
+    pub use crate::gatequeue::TestGateCancelRace;
+
+    /// Test-only seam: which interloper settles a Canceling gate job inside
+    /// the next `mutate_gate_job` writer (duplicate verdict / grace expiry).
+    #[cfg(any(test, feature = "test-faults"))]
+    pub use crate::gatequeue::TestGateFinishBeforeWrite;
+
+    /// Test-only apply_result boundary barrier.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub use crate::gatequeue::GateApplyBarrier;
+
+    /// r18 item 7 test-only: post-evidence-persist barrier.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub use crate::gatequeue::SimpleBarrier;
 
     /// Durable usage-event row shape for tests that seed usage through the
     /// writer (see [`seed_usage_events`]).
@@ -336,6 +371,18 @@ pub mod store_test_support {
             enforce_tree: true,
             restart: None,
         })
+    }
+
+    /// A seat's delegation: no grants, a restart policy, so the insert
+    /// creates a continuity lineage row with itself as the current chapter.
+    pub fn continuity_delegation() -> InstanceDelegation {
+        InstanceDelegation {
+            restart: Some(crate::store::RestartPolicy {
+                on_process_loss: true,
+                max_per_hour: 3,
+            }),
+            ..InstanceDelegation::default()
+        }
     }
 
     /// Open a Hub DB and enroll one host, returning the store and its host id.
@@ -545,6 +592,14 @@ pub mod store_test_support {
             idempotency_key: Some("idem_sample".into()),
             created_at: "2026-09-18T00:00:00.000Z".into(),
             updated_at: "2026-09-18T00:00:01.000Z".into(),
+            // D-057 §7.1: Agent-initiated commands serialize the stamped
+            // initiator (the device id never leaves the Hub).
+            initiator: Some(remuda_protocol::Initiator {
+                instance_id: "ins_sample".into(),
+                lineage_id: "ins_sample".into(),
+                generation: 1,
+            }),
+            initiator_device_id: None,
         };
         serde_json::to_value(record).expect("command record serializes")
     }
@@ -649,6 +704,44 @@ impl RunningHub {
     #[must_use]
     pub fn store(&self) -> Option<&Store> {
         self.store.as_ref()
+    }
+
+    /// Test helper: the live AppState (drives production handlers directly).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    #[must_use]
+    pub fn test_state(&self) -> &AppState {
+        &self.state
+    }
+
+    /// Test helper: apply a gate verdict straight through the production
+    /// `apply_result` handler on a borrowed AppState (for 'static spawn tasks).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_apply_gate_result_static(
+        state: &AppState,
+        job_id: &str,
+        result: serde_json::Value,
+    ) {
+        let result: remuda_protocol::GateRunResult =
+            serde_json::from_value(result).expect("valid GateRunResult");
+        // Same session resolution as test_apply_gate_result: present the
+        // verdict on the session the live dispatch rode.
+        let session = state
+            .store
+            .gate_job_dispatch_session(job_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| u64::try_from(v).ok());
+        crate::gatequeue::apply_result(state, job_id, result, session).await;
+    }
+
+    /// Test helper: the boot epoch this Hub process allocated.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn boot_epoch_value(&self) -> u64 {
+        self.state.nodes.boot_epoch()
     }
 
     /// Test helper: an owned (`'static` + `Clone`) handle to the Hub state so
@@ -758,6 +851,35 @@ impl RunningHub {
             .await;
     }
 
+    /// Test helper (r41 item 1): park the next hello for `host_id` just before
+    /// it installs its registry slot. Returns (parked, release).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_arm_hello_install_park(
+        &self,
+        host_id: &str,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.state.nodes.arm_install_park(host_id).await
+    }
+
+    /// Test helper (r41 item 2): park the next socket teardown for `host_id`
+    /// before its gate-session recovery step. Returns (parked, release, done).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_arm_teardown_recovery_park(
+        &self,
+        host_id: &str,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        self.state.nodes.arm_teardown_recovery_park(host_id).await
+    }
+
     /// Test helper: block every Node-registry lookup (`kind_of`, `call`,
     /// `insert`) until `release` is sent (or dropped). Returns only once the
     /// lock is actually held, so a command POST parked afterwards is
@@ -796,12 +918,445 @@ impl RunningHub {
         self.state.nodes.remove(host_id).await;
     }
 
+    /// Test helper: the host's CURRENT authenticated carrier session, if any.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_node_session(&self, host_id: &str) -> Option<u64> {
+        self.state.nodes.generation_of(host_id).await
+    }
+
+    /// Test helper: set a Landing row's `landing_at` timestamp directly (RFC
+    /// 3339), so recovery-window expiry can be exercised without waiting.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_set_landing_at(&self, job_id: &str, at: &str) -> anyhow::Result<()> {
+        let at = at.to_owned();
+        let job_id = job_id.to_owned();
+        let store = self
+            .store()
+            .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?;
+        store
+            .run_named("test_set_landing_at", move |conn| {
+                conn.execute(
+                    "UPDATE gate_jobs SET landing_at = ?2 WHERE id = ?1",
+                    rusqlite::params![job_id, at],
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Test helper: park a Landing row in the outcome-unknown state exactly
+    /// like the expired-recovery path (flag + reason), without waiting out the
+    /// real recovery window.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_mark_landing_unknown(
+        &self,
+        job_id: &str,
+        note: &str,
+    ) -> anyhow::Result<serde_json::Value> {
+        use remuda_protocol::GateJobState;
+        let note = note.to_owned();
+        let store = self
+            .store()
+            .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?;
+        let updated = store
+            .mutate_gate_job(job_id, move |row, _conn| {
+                if row.state != GateJobState::Landing {
+                    return None;
+                }
+                if !row.landing_outcome_unknown {
+                    row.landing_outcome_unknown = true;
+                    row.reason = Some(note.clone());
+                }
+                Some(())
+            })
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("job is not Landing"))?;
+        Ok(serde_json::to_value(updated).expect("gate job serializes"))
+    }
+
+    /// Test helper: this Hub process's boot epoch.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_boot_epoch(&self) -> u64 {
+        self.state.nodes.boot_epoch()
+    }
+
+    /// Test helper: resolve once a carrier hello replacement for `host_id` is
+    /// BLOCKED on the per-host authority guard (an in-flight Landing verdict
+    /// writer is holding it). Deterministic witness for the r15 item 3
+    /// takeover/writer serialization.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_wait_node_authority_contended(&self, host_id: &str) {
+        let notify = self.state.nodes.authority_write_notify(host_id).await;
+        notify.notified().await;
+    }
+
     /// Test helper: run the restart reconcile pass against the live state, as
     /// `spawn` does on startup. Models a Hub restart re-entering reconcile
     /// without tearing down the process.
     #[doc(hidden)]
     pub async fn test_reconcile(&self) {
         crate::gatequeue::reconcile(&self.state).await;
+        // r13 item 1: Landing rows are no longer settled at startup; they are
+        // probed against the remote once a carrier is reachable. The fake lane
+        // in gate-queue tests stays connected, so run the same bounded pass the
+        // post-hello task runs (a row never probed has a NULL throttle stamp).
+        crate::gatequeue::reconcile_landings(&self.state, None).await;
+    }
+
+    /// Test-only: run a FORCED Landing reconciliation for one lane host,
+    /// bypassing the probe throttle — deterministic stand-in for the
+    /// post-hello forced pass (r16 flake fix).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_force_landing_reconcile(&self, host_id: &str) {
+        crate::gatequeue::reconcile_landings(&self.state, Some(host_id)).await;
+    }
+
+    /// Test-only: claim a queued gate job the way the scheduler tick would,
+    /// without needing a registered lane Node. Returns the claimed job.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_claim_gate_job(
+        &self,
+        job_id: &str,
+        lane_id: &str,
+        host_id: &str,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
+        let host: remuda_protocol::HostId = host_id
+            .parse()
+            .map_err(|err: remuda_protocol::WireValueError| anyhow::anyhow!("{err}"))?;
+        let claim = self
+            .store()
+            .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?
+            .claim_gate_job(job_id, lane_id.to_owned(), host)
+            .await
+            .map_err(|err| anyhow::anyhow!("{err}"))?;
+        Ok(match claim {
+            crate::gatequeue::GateJobClaim::Claimed(job) => {
+                Some(serde_json::to_value(job).expect("gate job serializes"))
+            }
+            crate::gatequeue::GateJobClaim::FencedCanceled(_)
+            | crate::gatequeue::GateJobClaim::NotReady => None,
+        })
+    }
+
+    /// Test-only: run one scheduler tick deterministically (no wait for the
+    /// 1s interval).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_gate_tick(&self) {
+        crate::gatequeue::tick(&self.state).await;
+    }
+
+    /// Test-only: apply a gate run verdict through the real `apply_result`
+    /// path (pre-read + writer job), for the cancel-vs-result race suite.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_apply_gate_result(
+        &self,
+        job_id: &str,
+        result: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let result: remuda_protocol::GateRunResult =
+            serde_json::from_value(result).map_err(|err| anyhow::anyhow!("{err}"))?;
+        // Represent the verdict as arriving on the session the row's live
+        // dispatch rode (the production RPC-callback identity). Tests that need
+        // a replacement carrier drive the raw gate.event/reply path instead.
+        let session = self
+            .state
+            .store
+            .gate_job_dispatch_session(job_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| u64::try_from(v).ok());
+        crate::gatequeue::apply_result(&self.state, job_id, result, session).await;
+        Ok(())
+    }
+
+    /// Test-only: the current stored gate job doc.
+    #[doc(hidden)]
+    pub async fn test_get_gate_job(
+        &self,
+        job_id: &str,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
+        let job = self
+            .store()
+            .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?
+            .get_gate_job(job_id)
+            .await
+            .map_err(|err| anyhow::anyhow!("{err}"))?;
+        Ok(job.map(|job| serde_json::to_value(job).expect("gate job serializes")))
+    }
+
+    /// Test-only: the Hub-only carrier session a gate job is currently
+    /// dispatched/granted to (r16 item 6).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_gate_dispatch_session(&self, job_id: &str) -> anyhow::Result<Option<i64>> {
+        Ok(self
+            .store()
+            .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?
+            .gate_job_dispatch_session(job_id)
+            .await?)
+    }
+
+    /// Test-only: bind a gate job's dispatch/grant session to an arbitrary
+    /// value (r16 item 7 — makes a snapshot settle writer refuse while the
+    /// remote probe still establishes landed).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_set_gate_dispatch_session_raw(
+        &self,
+        job_id: &str,
+        session: u64,
+    ) -> anyhow::Result<()> {
+        self.store()
+            .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?
+            .set_gate_dispatch_session(job_id, session)
+            .await?;
+        Ok(())
+    }
+
+    /// Test-only: the ordered audit-log actions recorded for one gate job id
+    /// (e.g. `gate.running`, `gate.landed`).
+    #[doc(hidden)]
+    pub async fn test_gate_audit_actions(&self, job_id: &str) -> anyhow::Result<Vec<String>> {
+        let rows = self
+            .store()
+            .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?
+            .audit_for(job_id.to_owned())
+            .await
+            .map_err(|err| anyhow::anyhow!("{err}"))?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                row.get("action")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+            })
+            .collect())
+    }
+
+    /// Test-only: run the production generation-gated evidence transaction
+    /// (`Store::insert_gate_log`) and return its object-id result (None when
+    /// the verdict generation no longer matches the row's attempt). Drives the
+    /// real writer, not a test copy (r12 item 8).
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn test_insert_gate_log(
+        &self,
+        project_id: &str,
+        job_id: &str,
+        bytes: Vec<u8>,
+        digest: String,
+        created_by: &str,
+        generation: u32,
+        session: Option<u64>,
+        host: Option<&str>,
+        merge_sha: Option<&str>,
+    ) -> anyhow::Result<Option<String>> {
+        self.store()
+            .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?
+            .insert_gate_log(
+                project_id,
+                job_id,
+                bytes,
+                digest,
+                created_by,
+                crate::gatequeue::LogAuth {
+                    generation,
+                    session,
+                    merge_sha: merge_sha.map(str::to_owned),
+                },
+                host,
+            )
+            .await
+            .map_err(|err| anyhow::anyhow!("{err}"))
+    }
+
+    /// Test-only: drive the production landing-probe writer with the exact
+    /// (attempts, merge, session) tuple the probe was taken for. Returns the
+    /// settled job JSON only when the live row still names that attempt (r14 R2).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_settle_landing_probe(
+        &self,
+        job_id: &str,
+        expected_attempts: u32,
+        expected_merge: String,
+        expected_session: Option<i64>,
+        expected_host: &str,
+        landed: bool,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
+        let store = self
+            .store()
+            .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?;
+        let mut snapshot = store
+            .get_gate_job(job_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("job missing"))?;
+        snapshot.attempts = expected_attempts;
+        snapshot.merge_sha = Some(expected_merge);
+        let settled = store
+            .settle_landing_probe(&snapshot, expected_session, expected_host, landed)
+            .await?;
+        Ok(settled.map(|job| serde_json::to_value(job).expect("gate job serializes")))
+    }
+
+    /// Test-only: take the Running → Landing grant for the live claimed attempt.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_gate_land_grant(
+        &self,
+        job_id: &str,
+        host_id: &str,
+        merge_sha: &str,
+        session: u64,
+    ) -> anyhow::Result<serde_json::Value> {
+        let store = self
+            .store()
+            .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?;
+        let job = store
+            .get_gate_job(job_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("job missing"))?;
+        let host: remuda_protocol::HostId = host_id
+            .parse()
+            .map_err(|err: remuda_protocol::WireValueError| anyhow::anyhow!("{err}"))?;
+        // The production dispatcher stamps the bound socket session before the
+        // grant frame is sent; mirror that so the grant tuple is complete.
+        let session_i64 = i64::try_from(session)?;
+        store
+            .set_gate_dispatch_session(job_id, session)
+            .await
+            .map_err(|err| anyhow::anyhow!("{err}"))?;
+        let answer = store
+            .gate_land_grant(
+                job_id,
+                host_id,
+                job.attempts,
+                "test-epoch",
+                merge_sha,
+                session,
+            )
+            .await
+            .map_err(|err| anyhow::anyhow!("{err}"))?;
+        let _ = host;
+        let _ = session_i64;
+        Ok(serde_json::json!({
+            "granted": answer.granted,
+            "landingInProgress": answer.landing_in_progress,
+            "state": answer.state,
+        }))
+    }
+
+    /// r18 item 8 test-only: call the STORE grant directly, bypassing the
+    /// RunningHub wrapper's u64→i64 prevalidation, to prove the STORE itself
+    /// refuses a non-positive-i64 session (epoch ≥ 2^31). Reverting the store's
+    /// `try_from` guard makes this call persist a 0 session and succeed.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_store_gate_land_grant_raw(
+        &self,
+        job_id: &str,
+        host_id: &str,
+        merge_sha: &str,
+        session: u64,
+    ) -> anyhow::Result<()> {
+        let store = self
+            .store()
+            .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?;
+        let attempts = store
+            .get_gate_job(job_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("job missing"))?
+            .attempts;
+        store
+            .gate_land_grant(job_id, host_id, attempts, "test-epoch", merge_sha, session)
+            .await
+            .map(|_| ())
+            .map_err(|err| anyhow::anyhow!("{err}"))
+    }
+
+    /// Test-only: run the §7.5 direct-op admission (check + `admitted` row)
+    /// without a live Node, for worker.provision/remove coverage while the
+    /// worker routes themselves stay Agent-403 (ma-admission opens them).
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn test_admit_node_op(
+        &self,
+        op_id: String,
+        host_id: String,
+        method: &'static str,
+        subject: Option<String>,
+        initiator: Option<remuda_protocol::Initiator>,
+        device_id: Option<String>,
+    ) -> anyhow::Result<()> {
+        self.store()
+            .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?
+            .admit_node_op(
+                op_id,
+                host_id,
+                method,
+                subject,
+                &crate::node_ops::NodeOpAuth {
+                    initiator,
+                    device_id,
+                },
+            )
+            .await
+            .map_err(|err| anyhow::anyhow!("{err}"))
+    }
+
+    /// Test-only: drive one admitted direct RPC through the full §7.5
+    /// boundary (admit → send-intent → call → settle). Returns `true` when a
+    /// frame was written, `false` when the host was not connected.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn test_call_node_op(
+        &self,
+        host_id: &str,
+        method: &'static str,
+        op_id: String,
+        initiator: Option<remuda_protocol::Initiator>,
+        device_id: Option<String>,
+    ) -> anyhow::Result<bool> {
+        let frame = crate::node_ops::call_admitted_frame(
+            &self.state,
+            host_id,
+            method,
+            None,
+            op_id.clone(),
+            serde_json::json!({}),
+            std::time::Duration::from_secs(5),
+            &crate::node_ops::NodeOpAuth {
+                initiator,
+                device_id,
+            },
+        )
+        .await?;
+        Ok(frame.is_some())
+    }
+
+    /// Test-only: read a node_ops row's (state, outcome_json) pair.
+    #[doc(hidden)]
+    pub async fn test_node_op_state(
+        &self,
+        op_id: &str,
+        host_id: &str,
+    ) -> anyhow::Result<Option<(String, Option<String>)>> {
+        self.store()
+            .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?
+            .test_get_node_op(op_id.to_owned(), host_id.to_owned())
+            .await
+            .map_err(|err| anyhow::anyhow!("{err}"))
     }
 
     /// Test helper (c-cardsettle r8 item 3 / r9 item 3): backdate settlement
@@ -1066,12 +1621,16 @@ impl RunningHub {
         let stamp = remuda_protocol::Timestamp::try_from(rfc3339.to_string())
             .map_err(|err| anyhow::anyhow!(err.to_string()))?;
         store
-            .mutate_worker(worker_id.to_string(), move |row| {
-                if let Some(watch) = row.watch.as_mut() {
-                    watch.last_activity_at = Some(stamp);
-                }
-                Ok(())
-            })
+            .mutate_worker(
+                worker_id.to_string(),
+                move |row| {
+                    if let Some(watch) = row.watch.as_mut() {
+                        watch.last_activity_at = Some(stamp);
+                    }
+                    Ok(())
+                },
+                crate::agent_scope::CallerAuthority::internal(),
+            )
             .await
             .map_err(|err| anyhow::anyhow!(err.to_string()))?;
         Ok(())
@@ -1343,7 +1902,9 @@ async fn spawn_inner(
         config: Arc::new(config.clone()),
         store: store.clone(),
         secrets: Arc::new(secrets),
-        nodes: crate::transport::ConnectedNodes::default(),
+        nodes: crate::transport::ConnectedNodes::boot(&store)
+            .await
+            .map_err(|err| anyhow::anyhow!("gate carrier boot epoch: {err}"))?,
         bus: Bus::with_capacity(config.follow_buffer_events),
         settlement_bus: {
             // Settlements are rare control notices; a small capacity is plenty
@@ -1373,6 +1934,7 @@ async fn spawn_inner(
         challenges: passkeys::ChallengeStore::default(),
         gate_ref_swept_at: Arc::new(std::sync::Mutex::new(None)),
         race_barriers: crate::workspaces::RaceBarriers::default(),
+        gate_decision_guards: crate::gatequeue::GateDecisionGuards::new(),
     };
     if let Err(err) = state
         .publish_settlement_unit(async {
@@ -1448,6 +2010,10 @@ async fn spawn_inner(
             }
         }
     });
+    // r13 items 1/2: bounded, occupancy-preserving reconciliation of granted
+    // Landing rows against the remote once carriers are reachable (independent
+    // of the 1 s schedule tick so a remote probe never stalls dispatch).
+    crate::gatequeue::spawn_landing_reconciler(&state);
     Ok(RunningHub {
         addr,
         bootstrap_token,
@@ -1503,6 +2069,7 @@ pub fn router(state: AppState) -> Router {
         .merge(placement::routes())
         .merge(projects::routes())
         .merge(tasks::routes())
+        .merge(memory::routes())
         .merge(fleet::routes())
         .merge(devices::routes())
         .merge(passkeys::routes())
@@ -1517,6 +2084,7 @@ pub fn router(state: AppState) -> Router {
         .merge(workers::routes())
         .merge(gatequeue::routes())
         .merge(worker_watch::routes())
+        .merge(digest::routes())
         .merge(bot::routes());
     if let Some(push) = state.push.clone() {
         app = app.nest_service("/push", push_http::nest(push, state.store.clone()));

@@ -298,6 +298,8 @@ impl Ctx {
             state: WorkerState::Done {
                 sha: "0123456789abcdef".into(),
             },
+            // Stamped by the store when the row enters `done`.
+            done_at: None,
             watch: None,
             last_nudge_at: None,
             resumed_from: None,
@@ -306,7 +308,11 @@ impl Ctx {
             reclaimed_bytes: None,
         };
         self.store()
-            .insert_worker(worker.clone(), "pool-human".into())
+            .insert_worker(
+                worker.clone(),
+                "pool-human".into(),
+                remuda_hub::agent_scope_test_support::CallerAuthority::internal(),
+            )
             .await
             .expect("insert worker")
     }

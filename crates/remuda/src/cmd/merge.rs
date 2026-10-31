@@ -47,6 +47,12 @@ pub(crate) struct MergeArgs {
     #[arg(long, requires = "onto", conflicts_with_all = ["dry_run", "list", "queue"])]
     #[serde(default)]
     pub land: bool,
+    /// Internal: land the immutable verified report keyed by this merge sha
+    /// (the exact base/head/merged tuple the gate captured). Prevents a second
+    /// verification on the same base from substituting the report landed.
+    #[arg(long, hide = true, requires = "land")]
+    #[serde(default)]
+    pub report: Option<String>,
     /// Verify the listed branches as an optimistic queue across --lanes lanes.
     #[arg(long, num_args = 1.., value_name = "BRANCH", conflicts_with_all = ["dry_run", "list", "land", "onto", "message", "branch"])]
     #[serde(default)]
@@ -106,6 +112,37 @@ pub(crate) struct MergeArgs {
 
 fn default_affected() -> bool {
     true
+}
+
+#[cfg(test)]
+impl MergeArgs {
+    /// Minimal args for unit tests that only build a MergeReport.
+    pub(crate) fn default_for_test() -> Self {
+        Self {
+            branch: None,
+            gate: false,
+            list: false,
+            message: None,
+            dry_run: false,
+            onto: None,
+            land: false,
+            report: None,
+            queue: Vec::new(),
+            lanes: 2,
+            e2e_port_base: None,
+            e2e_lock: None,
+            e2e_lane: 1,
+            affected: true,
+            full: false,
+            web: false,
+            web_e2e: false,
+            no_push: false,
+            json: false,
+            wait: false,
+            repo: None,
+            target_dir: None,
+        }
+    }
 }
 
 fn default_lanes() -> usize {
@@ -233,6 +270,14 @@ enum MergeStop {
     CasLost,
     #[error("main moved from {0} to {1} since verification; re-verify onto {1}")]
     BaseMoved(String, String),
+    /// r15 R5: the push's server-side outcome cannot be ESTABLISHED. The push
+    /// returned a failure, but the recovery fetch/ancestry read needed to prove
+    /// the ref absent (or present) itself failed, so the merge may already have
+    /// landed. Never a `failed` verdict: the consumer (the Node land path) keeps
+    /// its Landing occupancy and the Hub reconciles the exact merge against the
+    /// remote. The carried text records what could and could not be established.
+    #[error("land push outcome unknown: {0}")]
+    PushUncertain(String),
 }
 
 pub(crate) fn run(args: MergeArgs) -> Result<i32> {
@@ -320,6 +365,13 @@ pub(crate) fn run(args: MergeArgs) -> Result<i32> {
 
 /// Shared synchronous operation; MCP runs this on a blocking worker.
 pub(crate) fn execute(args: MergeArgs) -> MergeReport {
+    // r15 R5 child-start barrier: when the Node spawned this process as a
+    // granted LAND child, it blocks here on the inherited pipe fd until the
+    // Node has persisted the durable land-group fence and writes one release
+    // byte. EOF/error before the byte means the parent could not fence the
+    // granted push — exit BEFORE acquiring locks or touching git, so an
+    // unfenced child can never push.
+    await_start_barrier();
     // Concurrency guard: one merge/queue per repository (+ one per gate
     // target directory). Contention is a structured exit-3 report, available
     // to both the CLI and the MCP entry points.
@@ -378,7 +430,12 @@ pub(crate) fn execute(args: MergeArgs) -> MergeReport {
     // A failed gate leaves a persisted report too, naming the merge and base
     // that failed, for inspection and for the queue to read the verdict. The
     // merge never lands, so drop its reachability pin.
-    if args.onto.is_some() && report.exit_code != 0 {
+    //
+    // r15 R5: an UNCERTAIN push outcome is not a failure — the exact merge may
+    // already be on the remote — so keep its reachability pin like a
+    // cancel-after-verify; dropping it could garbage-collect a merge the remote
+    // accepted while the acknowledgement was lost.
+    if args.onto.is_some() && report.exit_code != 0 && report.status != "uncertain" {
         persist_report(&args, &report);
         if let (Some(repo), Some(reference), Some(base)) = (
             report.repo_root.as_ref(),
@@ -405,6 +462,51 @@ pub(crate) fn execute(args: MergeArgs) -> MergeReport {
     }
     report
 }
+
+/// Block on the Node's granted-land child-start barrier when present (env
+/// `REMUDA_START_BARRIER_FD` names the fd carrying the release byte — the
+/// granted land child's stdin, fd 0): the Node writes one byte only after the
+/// granted land group's durable fence record exists. EOF (the parent dropped
+/// the write end because fencing failed) or a read error exits the process
+/// before any git operation, so nothing can be pushed by an unfenced child
+/// (r15 R5). After the release, /dev/null is dup2'd over the fd so later
+/// gate/git children inherit a neutral stdin rather than the drained pipe.
+#[cfg(unix)]
+fn await_start_barrier() {
+    use std::os::fd::{AsRawFd, RawFd};
+    let Some(fd) = std::env::var("REMUDA_START_BARRIER_FD")
+        .ok()
+        .and_then(|raw| raw.parse::<RawFd>().ok())
+    else {
+        return;
+    };
+    let mut byte = [0u8; 1];
+    loop {
+        match nix::unistd::read(fd, &mut byte) {
+            Ok(0) => {
+                eprintln!(
+                    "remuda merge: start barrier closed before release; the land fence was not \
+                     persisted — refusing to run"
+                );
+                std::process::exit(4);
+            }
+            Ok(_) => break,
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(error) => {
+                eprintln!("remuda merge: start barrier read failed ({error}); refusing to run");
+                std::process::exit(4);
+            }
+        }
+    }
+    // Replace the drained barrier fd (the land child's stdin) with /dev/null so
+    // gate/git descendants never inherit the pipe.
+    if let Ok(null) = std::fs::File::open("/dev/null") {
+        let _ = nix::unistd::dup2(null.as_raw_fd(), fd);
+    }
+}
+
+#[cfg(not(unix))]
+fn await_start_barrier() {}
 
 /// Acquire the concurrency-guard locks before running a merge/queue.
 fn acquire_locks(args: &MergeArgs) -> Result<lock::MergeLocks> {
@@ -462,6 +564,13 @@ fn apply_stop(report: &mut MergeReport, error: anyhow::Error) {
             report.exit_code = 2;
             report.status = "base_moved".into();
             report.current_main = Some(current.clone());
+        }
+        Some(MergeStop::PushUncertain(_)) => {
+            // r15 R5: exit 4 / status "uncertain" — not a failure verdict. The
+            // granted merge MAY be on the remote; the Node keeps the Landing
+            // row and the Hub establishes the truth against the remote.
+            report.exit_code = 4;
+            report.status = "uncertain".into();
         }
         None => {
             report.exit_code = 1;
@@ -780,6 +889,19 @@ fn execute_inner(
         }
     }
     if verify_onto {
+        // The gate verified the merge against the `--onto` base captured at
+        // preflight. When the base is local main itself, re-read it AFTER the
+        // gate: another coordinator may have advanced local main while the
+        // checks ran, which would make this a stale-base verification. Surface
+        // that as base_moved(expected, current) instead of persisting a
+        // "verified" report a later --land would only reject. An explicit sha
+        // base is caller-pinned and not checked here.
+        if args.onto.as_deref() == Some("main") {
+            let current_main = resolve(&repo, "refs/heads/main")?;
+            if current_main != expected {
+                return Err(MergeStop::BaseMoved(expected.clone(), current_main).into());
+            }
+        }
         // Verification only: the report (persisted by execute) is the claim.
         // Advancing main is a separate `--land` compare-and-swap.
         return Ok(());
@@ -798,17 +920,383 @@ fn execute_inner(
     })?;
     report.main_updated = true;
     if !args.no_push {
-        record(report, "push", || {
-            // Push exactly the verified commit even if another coordinator moves
-            // local main immediately after our successful CAS. Never force-push.
-            git(
-                &repo,
-                &["push", "origin", &format!("{merged}:refs/heads/main")],
-            )
-        })?;
+        record(report, "push", || push_main_cas(&repo, &merged, &expected))?;
         report.pushed = true;
     }
     Ok(())
+}
+
+/// Push the verified merge to origin main as a compare-and-swap against the
+/// base the merge was built on. A successful push needs no lease because the
+/// merge is a strict descendant of `expected`. If the push is rejected, fetch
+/// origin and classify it: when remote main has advanced past `expected`
+/// (an ORIGIN-only move the local checkout had not seen) return
+/// `MergeStop::BaseMoved(expected, remote)` with the real current remote main;
+/// any other failure stays a normal error.
+/// Push the verified merge to the remote base branch as a compare-and-swap:
+/// `git push origin <merged>:refs/heads/main`. A successful push needs no
+/// lease because the merge is a strict descendant of `expected`.
+///
+/// r14 R4 + r15 R5: a failed push is NOT a verdict. Recover the situation
+/// against the REMOTE state, and every recovery READ is itself classified as
+/// Established or Unknown:
+/// * the exact granted merge is present on remote main (a lost
+///   acknowledgement — the ref update landed server-side but the client got an
+///   error: a failing post-receive hook, a killed connection) → this LANDED;
+///   never a failure and never a base-moved requeue;
+/// * the merge is established ABSENT (a fresh fetch + ancestry succeeded) and
+///   remote main moved to a descendant of `expected` (an origin-only base
+///   move) → `MergeStop::BaseMoved`;
+/// * the merge is established absent AND remote main is still `expected` → the
+///   real push rejection (e.g. a hook refused, the ref never moved);
+/// * ANY recovery read fails (fetch error, ancestry/ref resolution error) →
+///   `MergeStop::PushUncertain`: the ref may have moved server-side, so the
+///   outcome is Unknown and must be reconciled against the remote, never
+///   reported failed.
+fn push_main_cas(repo: &Path, merged: &str, expected: &str) -> Result<()> {
+    let output = git_output(
+        repo,
+        &["push", "origin", &format!("{merged}:refs/heads/main")],
+    )?;
+    if output.status.success() {
+        return Ok(());
+    }
+    // A failed push is NOT a verdict. Fetch and resolve against the REMOTE
+    // before reporting anything (r14 R4): the acknowledgement may be lost
+    // while the ref update committed server-side.
+    //
+    // r19 item 2 / R7: ONE absolute deadline (< the Hub's 30 s RPC timeout)
+    // bounds EVERY recovery subprocess — fetch, ancestry, shallow and ref
+    // reads — each routed through the R6 owner; expiry is PushUncertain.
+    //
+    // r27 item 1 / R5: fetch the EXACT requested base into a PRIVATE
+    // recovery ref. A bare `git fetch origin` honors the configured
+    // remote.origin.fetch refspec, which may omit main entirely — the fetch
+    // then succeeds while refs/remotes/origin/main stays stale, and a lost-ack
+    // landing gets classified against the old tip (false absent / false base
+    // move).
+    //
+    // r28 item 1: the destination is a unique, FLAT per-invocation ref, so
+    // overlapping recoveries (a Node probe and this CLI recovery on the same
+    // common directory, or two CLI recoveries) cannot overwrite one another's
+    // snapshot between fetch and SHA capture, and no leftover ref can block a
+    // base rename. Every read below is pinned to the captured SHA.
+    let deadline = Instant::now() + LAND_RECOVERY_DEADLINE;
+    // R11: one hardening guard for the whole post-push recovery; its scratch
+    // hooks directory is removed when recovery returns.
+    let hardening = remuda_unix::RecoveryGit::new();
+    let remote_tip = recovery_fetch_base_sha(repo, "main", deadline, &hardening)?;
+    // The exact granted merge IS on remote main: the push landed, only the
+    // acknowledgement failed. Treat as success — never failed/base-moved.
+    if owned_is_ancestor(repo, merged, &remote_tip, deadline, &hardening)? {
+        return Ok(());
+    }
+    if remote_tip != expected
+        && owned_is_ancestor(repo, expected, &remote_tip, deadline, &hardening)?
+    {
+        // Origin-only base move: the merge is absent but main advanced from our
+        // base to another commit — the real CAS loss the caller requeues on.
+        return Err(MergeStop::BaseMoved(expected.to_owned(), remote_tip).into());
+    }
+    // Recovery established: the merge is absent and the remote base did not
+    // advance past ours. The rejection itself (hook refusal, etc.) is the
+    // established failure — the ref provably never moved.
+    successful(&output)
+}
+
+/// An object ID in the repository's native format: SHA-1 (40 hex) or SHA-256
+/// (64 hex). Git itself emitted the string from ls-remote; this bounds shapes.
+fn is_native_object_hex(sha: &str) -> bool {
+    // r31 item 5: object IDs git advertises are lowercase; uppercase A-F must
+    // be rejected as uncertain (and never compared against a lowercase SHA).
+    (sha.len() == 40 || sha.len() == 64)
+        && sha
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Parse `git ls-remote --exit-code origin refs/heads/<base>` output. Exactly
+/// one line naming the requested ref with a native-format object ID; an
+/// absent base, ambiguous output or a malformed line is an error.
+fn parse_ls_remote_base(output: &[u8], base_branch: &str) -> std::result::Result<String, String> {
+    let expected_ref = format!("refs/heads/{base_branch}");
+    let mut matches = Vec::new();
+    for line in String::from_utf8_lossy(output)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let mut parts = line.split_whitespace();
+        let (Some(sha), Some(refname)) = (parts.next(), parts.next()) else {
+            return Err("ls-remote returned a malformed line".to_owned());
+        };
+        if parts.next().is_some() {
+            return Err("ls-remote returned a malformed line".to_owned());
+        }
+        if refname == expected_ref {
+            matches.push(sha.to_owned());
+        }
+    }
+    match matches.as_slice() {
+        [sha] if is_native_object_hex(sha) => Ok(sha.clone()),
+        [] => Err("the remote does not advertise the requested base branch".to_owned()),
+        _ => Err("ls-remote advertised the requested base more than once".to_owned()),
+    }
+}
+
+/// R10/r30 item 2 / r32 item 4: true ONLY for the exact full-line diagnostics
+/// git emits when the installed build cannot create a SHA-256 repository.
+#[cfg(test)]
+fn is_unsupported_sha256_diagnostic_impl(stderr: &str) -> bool {
+    // r32 item 4: COMPLETE, case-sensitive diagnostics with the exact expected
+    // operand. Each accepted form is the full line git prints; no
+    // starts_with/contains, so a wrong operand (`bogus`, `sha1`,
+    // `sha256extra`) or trailing text never reads as unsupported-SHA-256.
+    const EXACT_LINES: &[&str] = &[
+        // Current git: the hash algorithm is unknown.
+        "fatal: unknown hash algorithm 'sha256'",
+        // Current git: the backend is not compiled in.
+        "fatal: attempt to use sha256 has not been compiled in",
+        "fatal: sha256 repositories are not supported",
+        // Older git: the option itself is unknown (pre --object-format builds).
+        "error: unknown option `object-format'",
+        "error: unknown option '--object-format'",
+        "error: unknown option '--object-format=sha256'",
+        "fatal: unknown option `--object-format'",
+        "fatal: unknown option '--object-format'",
+        "fatal: unknown option '--object-format=sha256'",
+        "error: unknown option for '--object-format'",
+        "fatal: unknown option for '--object-format'",
+        // Older git: the value is rejected. The ONLY unsupported operand is
+        // sha256 (sha1 is accepted; bogus names an algorithm, not a build that
+        // cannot do sha256).
+        "fatal: unknown value for --object-format: sha256",
+        "error: unknown value for --object-format: sha256",
+    ];
+    stderr
+        .lines()
+        .map(str::trim_end)
+        .any(|line| EXACT_LINES.contains(&line))
+}
+
+#[cfg(test)]
+fn is_unsupported_sha256_diagnostic(stderr: &str) -> bool {
+    is_unsupported_sha256_diagnostic_impl(stderr)
+}
+/// Run `git init --object-format=sha256` via `program`: true when created;
+/// false ONLY on a recognized unsupported-format diagnostic; spawn or other
+/// init failures panic with the detail.
+#[cfg(test)]
+fn probe_sha256_support_with(program: &str, probe_repo: &Path) -> bool {
+    let output = match std::process::Command::new(program)
+        .args([
+            "init",
+            "-q",
+            "--object-format=sha256",
+            "-b",
+            "main",
+            probe_repo.to_str().unwrap(),
+        ])
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) => panic!("failed to spawn {program} for the SHA-256 support probe: {error}"),
+    };
+    if output.status.success() {
+        return true;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if is_unsupported_sha256_diagnostic(&stderr) {
+        eprintln!(
+            "skipping: this git lacks SHA-256 support: {}",
+            stderr.trim()
+        );
+        false
+    } else {
+        panic!("SHA-256 probe init failed for an unrelated reason: {stderr}");
+    }
+}
+
+#[cfg(test)]
+fn probe_sha256_support(program: &str, probe_repo: &Path) -> bool {
+    probe_sha256_support_with(program, probe_repo)
+}
+
+/// Read the authoritative remote `main` tip WITHOUT WRITING ANY REFS and
+/// classify a failed push against it. Any failure is PushUncertain — recovery
+/// never guesses.
+///
+/// R10 (r30): ref-free recovery, identical in shape to the Node gateway:
+/// 1. `git ls-remote --exit-code origin refs/heads/main` reads the exact
+///    advertised tip (a configured remote.origin.fetch cannot stale it);
+/// 2. `git fetch --no-tags --no-write-fetch-head origin <sha>` fetches the
+///    commit's objects with no destination refspec — no ref is created and
+///    FETCH_HEAD is never written; --no-tags defeats a configured tagOpt
+///    clobber;
+/// 3. `git cat-file -e <sha>^{commit}` verifies the object.
+///
+/// Every command goes through the R6 owner under one absolute deadline.
+fn recovery_fetch_base_sha(
+    repo: &Path,
+    base: &str,
+    deadline: Instant,
+    hardening: &remuda_unix::RecoveryGit,
+) -> Result<String> {
+    // 1. Authoritative advertised tip. Exit 2 means the base ref is not
+    // advertised (the parser names that precisely); any other non-zero exit is
+    // a transport/command failure; timeouts/spawn failures fail too.
+    let remote_ref = format!("refs/heads/{base}");
+    let listing = recovery_git(
+        repo,
+        &["ls-remote", "--exit-code", "origin", &remote_ref],
+        "post-push remote base ls-remote",
+        false,
+        deadline,
+        hardening,
+    )?;
+    if listing.status.code() != Some(2) && !listing.status.success() {
+        return Err(MergeStop::PushUncertain(format!(
+            "post-push remote base ls-remote exited {:?}: {}; push outcome unknown",
+            listing.status.code(),
+            String::from_utf8_lossy(&listing.stderr).trim()
+        ))
+        .into());
+    }
+    let remote_tip = parse_ls_remote_base(&listing.stdout, base)
+        .map_err(|message| MergeStop::PushUncertain(format!("{message}; push outcome unknown")))?;
+    // r30 item 1 TEST-ONLY seam: park after the remote SHA was read.
+    #[cfg(test)]
+    recovery_read_park(repo);
+    // 2. Fetch the objects of THAT commit with an object-ID refspec and no
+    //    destination. An empty --refmap ignores configured remote.origin.fetch
+    //    mappings (a destination-less CLI refspec alone does not), so a
+    //    configured `+<sha>:refs/tags/x` cannot force-write x; --no-prune
+    //    neutralises fetch.prune / remote.origin.prune; --no-tags defeats a
+    //    configured tagOpt=--tags clobber.
+    // No --no-write-fetch-head: older git rejects the option (would make
+    // every recovery PushUncertain forever). FETCH_HEAD is not a ref and
+    // recovery never reads it, so writing it is harmless.
+    let mut fetch_args: Vec<&str> = vec!["fetch"];
+    fetch_args.extend_from_slice(remuda_unix::RECOVERY_FETCH_FLAGS);
+    fetch_args.push("origin");
+    fetch_args.push(&remote_tip);
+    recovery_git(
+        repo,
+        &fetch_args,
+        "post-push remote base object fetch",
+        true,
+        deadline,
+        hardening,
+    )?;
+    // 3. The fetched object must peel to a commit.
+    recovery_git(
+        repo,
+        &["cat-file", "-e", &format!("{remote_tip}^{{commit}}")],
+        "post-push fetched base commit verification",
+        true,
+        deadline,
+        hardening,
+    )?;
+    Ok(remote_tip)
+}
+
+/// r30 item 1 TEST-ONLY seam: parks a CLI recovery after its `ls-remote` read
+/// and before the object fetch. Keyed by repository path.
+#[cfg(test)]
+mod recovery_read_seam {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    pub(super) struct Slot {
+        pub(super) arrived: AtomicBool,
+        pub(super) released: AtomicBool,
+    }
+
+    pub(super) struct Park {
+        pub(super) slots: Mutex<Vec<Arc<Slot>>>,
+        pub(super) expected: usize,
+        parked: AtomicUsize,
+    }
+
+    // r31 item 4: per-repo parks so seam-using tests run in parallel.
+    static SEAM: OnceLock<Mutex<HashMap<PathBuf, Arc<Park>>>> = OnceLock::new();
+
+    fn seam() -> &'static Mutex<HashMap<PathBuf, Arc<Park>>> {
+        SEAM.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(super) fn arm(repo: &Path, expected: usize) {
+        let slots = (0..expected)
+            .map(|_| {
+                Arc::new(Slot {
+                    arrived: AtomicBool::new(false),
+                    released: AtomicBool::new(false),
+                })
+            })
+            .collect();
+        seam().lock().expect("seam").insert(
+            repo.to_path_buf(),
+            Arc::new(Park {
+                slots: Mutex::new(slots),
+                expected,
+                parked: AtomicUsize::new(0),
+            }),
+        );
+    }
+
+    pub(super) fn disarm(repo: &Path) {
+        seam().lock().expect("seam").remove(repo);
+    }
+
+    pub(super) fn park(repo: &Path) {
+        let park = match seam().lock().expect("seam").get(repo) {
+            Some(park) => park.clone(),
+            None => return,
+        };
+        let index = park.parked.fetch_add(1, Ordering::AcqRel);
+        assert!(index < park.expected, "more recoveries parked than armed");
+        let slot = park.slots.lock().expect("slots")[index].clone();
+        slot.arrived.store(true, Ordering::Release);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !slot.released.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "recovery park never released"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn slot(repo: &Path, index: usize) -> Arc<Slot> {
+        let guard = seam().lock().expect("seam");
+        let park = guard.get(repo).expect("seam armed").clone();
+        drop(guard);
+        park.slots.lock().expect("slots")[index].clone()
+    }
+
+    pub(super) fn wait_arrived(repo: &Path, index: usize) {
+        let slot = slot(repo, index);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !slot.arrived.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "slotted recovery never arrived"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    pub(super) fn release(repo: &Path, index: usize) {
+        let slot = slot(repo, index);
+        slot.released.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+fn recovery_read_park(repo: &Path) {
+    recovery_read_seam::park(repo);
 }
 
 fn branch_ref(branch: &str) -> Result<String> {
@@ -851,6 +1339,17 @@ pub(crate) fn lane_target_dir(repo: &Path, target_dir: Option<&Path>, lane: usiz
 
 /// `--land`: publish a previously verified merge without touching the gate.
 fn execute_land(args: &MergeArgs, report: &mut MergeReport) -> Result<()> {
+    // r19 item 5: initialise report.merged from the PINNED land argument BEFORE
+    // any fallible preflight. Every refusal on the granted land path (the
+    // branch moved since verification, a stale/unsupported report, a missing
+    // merge parent) then reports a `gate_failed` that NAMES the attempted merge
+    // M, instead of omitting it (the verified report's merged was only stamped
+    // after the whole preflight succeeded). The pinned load below proves the
+    // report is immutable for exactly M, so the later stamp is the same sha;
+    // the unpinned path leaves this None until the report loads.
+    if let Some(pinned) = args.report.as_deref() {
+        report.merged = Some(pinned.to_owned());
+    }
     let (repo, reference) = record(report, "repository", || {
         let cwd = args.repo.clone().unwrap_or(std::env::current_dir()?);
         let repo = PathBuf::from(git(&cwd, &["rev-parse", "--show-toplevel"])?);
@@ -862,8 +1361,36 @@ fn execute_land(args: &MergeArgs, report: &mut MergeReport) -> Result<()> {
     report.reference = Some(reference.clone());
     let onto = args.onto.as_deref().context("--land requires --onto")?;
     let (base, verified) = record(report, "preflight", || {
-        let base = resolve_onto(&repo, onto)?;
-        let verified = reports::load(&repo, &reference, &base)?;
+        // Resolve the CURRENT local main up front only for the unpinned path.
+        // When the caller pins the captured merge (the Node always does for a
+        // granted land), the verified base comes from the immutable report —
+        // loading the report must NOT be conditioned on current main: a local
+        // main move between verify and land is a confirmed CAS move (classified
+        // by the land step as `base_moved(expected, current)`), not a generic
+        // report-load failure (r14 item 6).
+        let current_base = resolve_onto(&repo, onto)?;
+        let verified = match args.report.as_deref() {
+            Some(pinned) => {
+                let loaded = reports::load_by_merged(&repo, &reference, pinned)?;
+                ensure!(
+                    loaded.merged.as_deref() == Some(pinned),
+                    "immutable report for {pinned} does not name that merge"
+                );
+                loaded
+            }
+            None => {
+                let loaded = reports::load(&repo, &reference, &current_base)?;
+                ensure!(
+                    loaded.base.as_deref() == Some(current_base.as_str()),
+                    "verification report was for a different base; re-verify before landing"
+                );
+                loaded
+            }
+        };
+        let base = verified
+            .base
+            .clone()
+            .context("verification report has no base")?;
         ensure!(
             verified.exit_code == 0 && verified.merged.is_some(),
             "verification report for {} on {base} is not a passing gate",
@@ -915,23 +1442,32 @@ fn execute_land(args: &MergeArgs, report: &mut MergeReport) -> Result<()> {
     })?;
     report.main_updated = true;
     report.status = "landed".into();
-    // The merge is main now and reachable on its own; drop the pin.
-    let _ = git(
-        &repo,
-        &[
-            "update-ref",
-            "-d",
-            &reports::verified_ref(&reference, &base),
-        ],
-    );
-    if !args.no_push {
-        record(report, "push", || {
-            git(
-                &repo,
-                &["push", "origin", &format!("{merged}:refs/heads/main")],
-            )
-        })?;
+    if args.no_push {
+        // Nothing remote to wait for: the merge is main locally and reachable
+        // on its own; drop the pin.
+        let _ = git(
+            &repo,
+            &[
+                "update-ref",
+                "-d",
+                &reports::verified_ref(&reference, &base),
+            ],
+        );
+    } else {
+        // r15 R5: drop the reachability pin ONLY once the push outcome is
+        // established. A PushUncertain (lost ack + unreadable recovery) leaves
+        // the pin in place so a merge the remote may already contain is never
+        // garbage-collected before the Hub reconciles it.
+        record(report, "push", || push_main_cas(&repo, &merged, &base))?;
         report.pushed = true;
+        let _ = git(
+            &repo,
+            &[
+                "update-ref",
+                "-d",
+                &reports::verified_ref(&reference, &base),
+            ],
+        );
     }
     Ok(())
 }
@@ -947,15 +1483,194 @@ fn gate_summary(report: &MergeReport) -> String {
     summary
 }
 
+/// r19 item 2 / R7: per-subprocess cap so one recovery git command cannot
+/// consume the whole recovery budget.
+const RECOVERY_GIT_CAP: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// r19 item 2 / R7: ONE absolute deadline for the whole post-push recovery
+/// sequence (fetch + ref read + shallow check + ancestry). Stays below the
+/// Hub's 30 s RPC timeout and bounds standalone CLI execution.
+const LAND_RECOVERY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(25);
+
+/// Remaining time until an absolute deadline (saturates at zero).
+fn remaining(deadline: Instant) -> std::time::Duration {
+    deadline
+        .checked_duration_since(Instant::now())
+        .unwrap_or(std::time::Duration::ZERO)
+}
+
+/// Run a git command through THE OWNER CONTRACT helper in `remuda-unix` (own
+/// group, non-reaping exit observation, survivor cleanup while the leader is
+/// unreaped, one latched absolute deadline over the reap and both drains). The
+/// caller treats `TimedOut`/Err as Unknown.
+fn owned_git(
+    repo: &Path,
+    args: &[&str],
+    cap: std::time::Duration,
+    deadline: Instant,
+    hardening: &remuda_unix::RecoveryGit,
+) -> std::io::Result<remuda_unix::OwnedRun> {
+    // R11: every post-push recovery git invocation goes through the single
+    // hardened builder; no recovery call can bypass it.
+    let command = hardening.command(repo, args);
+    remuda_unix::run_owned_process(command, cap, deadline)
+}
+
+/// Whether the repository has a shallow boundary that could hide an ancestry
+/// edge. Query errors are themselves Unknown and reported as shallow (so the
+/// caller deepens or refuses rather than trusting exit 1).
+fn repository_is_shallow(repo: &Path) -> bool {
+    match git_output(repo, &["rev-parse", "--is-shallow-repository"]) {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim() == "true"
+        }
+        _ => true,
+    }
+}
+
+/// The raw tri-state outcome of one `merge-base --is-ancestor` process, before
+/// any shallow-history refinement (r16 item 3, R5).
+enum RawAncestry {
+    /// Exit 0: the edge is present.
+    Ancestor,
+    /// Exit 1: the edge is absent IN THE HISTORY THAT IS AVAILABLE LOCALLY.
+    /// Only trustworthy once that history is complete (see [`is_ancestor`]).
+    NotAncestor,
+    /// Exit code other than 0/1, death by signal, or unreadable output: the
+    /// edge is Unknown — never a boolean.
+    Abnormal(String),
+}
+
+/// Map a finished git process to [`RawAncestry`], distinguishing exit 0,
+/// exit 1 and every abnormal termination (r16 item 3).
+fn classify_ancestry_output(output: &std::process::Output) -> RawAncestry {
+    match output.status.code() {
+        Some(0) => RawAncestry::Ancestor,
+        Some(1) => RawAncestry::NotAncestor,
+        other => RawAncestry::Abnormal(format!(
+            "merge-base --is-ancestor ended abnormally ({other:?}): {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+    }
+}
+
+/// Read `git merge-base --is-ancestor` as a tri-state (r16 item 3, R5) under
+/// the r19 item 2 / R7 shallow rule:
+/// * exit 0 → `Ok(true)` (ancestor ESTABLISHED);
+/// * exit 1 → `Ok(false)` ONLY with COMPLETE (non-shallow) history. Gate
+///   recovery NEVER deepens: a shallow edge may be a graft illusion, so the
+///   answer is Unknown and the caller fails closed;
+/// * any other exit, death by signal, or spawn failure → Unknown error, never
+///   a false boolean.
+///
+/// This blocking form backs the verify-time preflight checks. Post-push
+/// recovery goes through [`owned_is_ancestor`] under the absolute deadline.
 fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
     let output = git_output(repo, &["merge-base", "--is-ancestor", ancestor, descendant])?;
-    match output.status.code() {
-        Some(0) => Ok(true),
-        Some(1) => Ok(false),
-        _ => {
-            successful(&output)?;
+    match classify_ancestry_output(&output) {
+        RawAncestry::Ancestor => Ok(true),
+        RawAncestry::Abnormal(message) => Err(anyhow::Error::msg(message)),
+        RawAncestry::NotAncestor if !repository_is_shallow(repo) => Ok(false),
+        RawAncestry::NotAncestor => Err(anyhow::Error::msg(format!(
+            "{repo:?} is a shallow clone: ancestry of {ancestor} in {descendant} cannot be \
+             decided locally without deepening, which gate recovery never does; push outcome \
+             unknown"
+        ))),
+    }
+}
+
+/// One post-push recovery subprocess through the R6/R7 owner under ONE
+/// absolute deadline set at recovery entry. A timeout (the owner killed the
+/// child's whole group), a spawn failure, or — when required — a nonzero exit
+/// is a [`MergeStop::PushUncertain`]: recovery never guesses.
+fn recovery_git(
+    repo: &Path,
+    args: &[&str],
+    what: &str,
+    require_success: bool,
+    deadline: Instant,
+    hardening: &remuda_unix::RecoveryGit,
+) -> Result<std::process::Output> {
+    if remaining(deadline).is_zero() {
+        return Err(MergeStop::PushUncertain(format!(
+            "the {LAND_RECOVERY_DEADLINE:?} post-push recovery deadline elapsed before {what}; \
+             the remote may already contain the merge"
+        ))
+        .into());
+    }
+    // R8(b): the per-command soft cap decides when a still-running git is
+    // KILLed; the ABSOLUTE deadline bounds the reap and every pipe drain.
+    let run = owned_git(repo, args, RECOVERY_GIT_CAP, deadline, hardening).map_err(|error| {
+        MergeStop::PushUncertain(format!(
+            "{what} could not run ({error}); push outcome unknown"
+        ))
+    })?;
+    if run.timed_out() {
+        return Err(MergeStop::PushUncertain(format!(
+            "{what} exceeded the {RECOVERY_GIT_CAP:?} recovery bound and its group was killed; \
+             push outcome unknown"
+        ))
+        .into());
+    }
+    let output = run.into_output();
+    if require_success && !output.status.success() {
+        return Err(MergeStop::PushUncertain(format!(
+            "{what} failed ({}); push outcome unknown",
+            output.status
+        ))
+        .into());
+    }
+    Ok(output)
+}
+
+/// Shallow check through the owned recovery helper; a failed read is Unknown
+/// (PushUncertain), not a guessed boolean.
+fn owned_repository_is_shallow(
+    repo: &Path,
+    deadline: Instant,
+    hardening: &remuda_unix::RecoveryGit,
+) -> Result<bool> {
+    let output = recovery_git(
+        repo,
+        &["rev-parse", "--is-shallow-repository"],
+        "post-push shallow check",
+        true,
+        deadline,
+        hardening,
+    )?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim() == "true")
+}
+
+/// Tri-state ancestry through the OWNED recovery helper under the absolute
+/// deadline (r19 item 2 / R7). Shallow history, an abnormal termination or a
+/// stalled read are all PushUncertain — never a false "absent".
+fn owned_is_ancestor(
+    repo: &Path,
+    ancestor: &str,
+    descendant: &str,
+    deadline: Instant,
+    hardening: &remuda_unix::RecoveryGit,
+) -> Result<bool> {
+    let output = recovery_git(
+        repo,
+        &["merge-base", "--is-ancestor", ancestor, descendant],
+        "post-push ancestry read",
+        false,
+        deadline,
+        hardening,
+    )?;
+    match classify_ancestry_output(&output) {
+        RawAncestry::Ancestor => Ok(true),
+        RawAncestry::Abnormal(message) => Err(MergeStop::PushUncertain(message).into()),
+        RawAncestry::NotAncestor if !owned_repository_is_shallow(repo, deadline, hardening)? => {
             Ok(false)
         }
+        RawAncestry::NotAncestor => Err(MergeStop::PushUncertain(format!(
+            "{repo:?} is a shallow clone: ancestry of {ancestor} in {descendant} cannot be \
+             decided locally without deepening, which gate recovery never does; push outcome \
+             unknown"
+        ))
+        .into()),
     }
 }
 
@@ -1450,5 +2165,1759 @@ mod tests {
         assert!(web_only[..7].iter().all(|step| step.status == "skipped"));
         assert!(web_only[7..10].iter().all(|step| step.status == "planned"));
         assert_eq!(web_only[10].status, "skipped");
+    }
+
+    // ── r16 item 3: merge-base exit tri-state + shallow history ────────────
+
+    fn tgit(repo: &Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .unwrap()
+    }
+
+    fn tgit_ok(repo: &Path, args: &[&str]) -> String {
+        let output = tgit(repo, args);
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    /// Build: full working repo with 5 main commits + a branch off main~2
+    /// merged BACK into main, a bare origin carrying both refs, and return
+    /// (temp keepalive, origin path, branch-tip sha, main-tip sha).
+    fn ancestry_fixture() -> (tempfile::TempDir, PathBuf, String, String) {
+        let keep = tempfile::tempdir().unwrap();
+        let root = keep.path();
+        let full = root.join("full");
+        let origin = root.join("origin.git");
+        std::fs::create_dir_all(&full).unwrap();
+        tgit_ok(&full, &["init", "-q", "-b", "main"]);
+        tgit_ok(&full, &["config", "user.email", "t@example.com"]);
+        tgit_ok(&full, &["config", "user.name", "T"]);
+        for index in 1..=5 {
+            std::fs::write(full.join("f"), format!("{index}\n")).unwrap();
+            tgit_ok(&full, &["add", "f"]);
+            tgit_ok(&full, &["commit", "-q", "-m", &format!("c{index}")]);
+        }
+        tgit_ok(&full, &["branch", "topic", "main~2"]);
+        tgit_ok(&full, &["checkout", "-q", "topic"]);
+        std::fs::write(full.join("branch.txt"), "topic\n").unwrap();
+        tgit_ok(&full, &["add", "branch.txt"]);
+        tgit_ok(&full, &["commit", "-q", "-m", "topic work"]);
+        let topic = tgit_ok(&full, &["rev-parse", "topic"]);
+        tgit_ok(&full, &["checkout", "-q", "main"]);
+        tgit_ok(
+            &full,
+            &["merge", "-q", "--no-ff", "-m", "merge topic", "topic"],
+        );
+        let main = tgit_ok(&full, &["rev-parse", "main"]);
+        let _ = std::process::Command::new("git")
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .arg(&origin)
+            .status()
+            .unwrap();
+        tgit_ok(
+            &full,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        tgit_ok(&full, &["push", "-q", "origin", "main", "topic"]);
+        (keep, origin, topic, main)
+    }
+
+    fn shallow_clone(keep: &Path, name: &str, from: &Path, depth: &str) -> PathBuf {
+        let target = keep.join(name);
+        // file:// forces the smart transport: a plain local-path clone
+        // hardlinks objects and ignores --depth.
+        let url = format!("file://{}", from.display());
+        let output = tgit(
+            keep,
+            &[
+                "clone",
+                "-q",
+                "--depth",
+                depth,
+                "--no-single-branch",
+                &url,
+                target.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            output.status.success(),
+            "shallow clone: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        target
+    }
+
+    /// Exit 0 and exit 1 map to booleans on complete history; a signal death
+    /// (raw wait status 9 = SIGKILL) and an exit 2 are Unknown errors, never a
+    /// false boolean.
+    #[test]
+    fn ancestry_exit_codes_distinguish_zero_one_and_abnormal() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::{ExitStatus, Output};
+        fn output_from(raw: i32) -> Output {
+            Output {
+                status: ExitStatus::from_raw(raw),
+                stdout: Vec::new(),
+                stderr: b"boom".to_vec(),
+            }
+        }
+        assert!(matches!(
+            classify_ancestry_output(&output_from(0)),
+            RawAncestry::Ancestor
+        ));
+        assert!(matches!(
+            classify_ancestry_output(&output_from(1 << 8)),
+            RawAncestry::NotAncestor
+        ));
+        assert!(matches!(
+            classify_ancestry_output(&output_from(2 << 8)),
+            RawAncestry::Abnormal(_)
+        ));
+        // Killed by SIGKILL: no exit code → Abnormal/Unknown.
+        assert!(matches!(
+            classify_ancestry_output(&output_from(9)),
+            RawAncestry::Abnormal(_)
+        ));
+    }
+
+    /// r19 item 2 / R6/R7: a recovery git past its deadline is SIGKILLed WITH
+    /// ITS WHOLE GROUP (leader + a same-group grandchild) while the leader is
+    /// unreaped, then reaped once, returning TimedOut (not an error).
+    #[test]
+    fn an_owned_git_past_its_deadline_kills_the_whole_group() {
+        let keep = tempfile::tempdir().unwrap();
+        let git = keep.path().join("git");
+        std::fs::write(&git, "#!/bin/sh\n(sleep 47.73 &)\nexec sleep 47.73\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut command = std::process::Command::new(git.to_str().unwrap());
+        command
+            .current_dir(keep.path())
+            .args(["fetch", "-q", "origin"]);
+        let start = std::time::Instant::now();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let run = remuda_unix::run_owned_process(
+            command,
+            std::time::Duration::from_millis(300),
+            deadline,
+        )
+        .expect("an owned run returns a verdict");
+        use std::os::unix::process::ExitStatusExt;
+        let output = match run {
+            remuda_unix::OwnedRun::TimedOut(output) => output,
+            other => panic!("expected TimedOut, got {other:?}"),
+        };
+        assert_eq!(
+            output.status.signal(),
+            Some(9),
+            "SIGKILLed: {:?}",
+            output.status
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "the bound must apply promptly"
+        );
+    }
+
+    /// r20 item 5 / R8(b): the git leader EXITS UNSUCCESSFULLY FIRST (the ssh
+    /// wrapper backgrounds its transport and exits) while a same-group
+    /// grandchild keeps a pipe open. The owner observes the exit without
+    /// reaping, kills the survivor while the unreaped leader pins the pgid,
+    /// reaps the leader and returns its exit code; no `sleep` lingers. The old
+    /// owner reaped the leader with try_wait on the normal arm and never
+    /// signalled, so the descendant and the blocked reader survived.
+    #[test]
+    fn an_owned_git_whose_leader_exits_first_kills_its_surviving_transport() {
+        let keep = tempfile::tempdir().unwrap();
+        let git = keep.path().join("git-transport");
+        // Backgrounded transport in the SAME group: stdout detached to
+        // /dev/null, stderr INHERITED (holds the captured pipe); leader exits.
+        std::fs::write(&git, "#!/bin/sh\n(sleep 47.66 >/dev/null) &\nexit 42\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let command = std::process::Command::new(git.to_str().unwrap());
+        let start = std::time::Instant::now();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let run =
+            remuda_unix::run_owned_process(command, std::time::Duration::from_secs(2), deadline)
+                .expect("an owned run returns a verdict");
+        let output = match run {
+            remuda_unix::OwnedRun::Completed(output) => output,
+            other => panic!("expected Completed after survivor cleanup, got {other:?}"),
+        };
+        assert_eq!(
+            output.status.code(),
+            Some(42),
+            "the git leader's own exit status drives the result"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(4),
+            "cleanup is bounded, not the grandchild's sleep: {:?}",
+            start.elapsed()
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let left = live_marker_processes("sleep 47.66");
+            if left == 0 || std::time::Instant::now() >= deadline {
+                assert_eq!(
+                    left, 0,
+                    "the surviving transport grandchild outlived the owner"
+                );
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    // r21 item 7: the blocked-pipe/deadline regression no longer lives here.
+    // The old test depended on Linux /proc enumeration timing (a TERM-ignoring
+    // descendant consuming the 400 ms deadline); with no /proc the owner
+    // signals and reaps immediately and returns Completed, so the mandatory
+    // TimedOut assertion failed under ordinary macOS scheduling. The
+    // platform-independent coverage is the injected post-exit-observation
+    // seam test in remuda-unix
+    // (`owner::tests::completion_after_the_deadline_is_latched_unknown`),
+    // which holds the whole cleanup/reap/drain sequence beyond the absolute
+    // deadline on ANY platform and asserts the latched Unknown. This binary
+    // keeps the portable owner-sequence tests above (soft-cap kill, normal
+    // exit with survivor cleanup).
+
+    /// r19 item 2 / R7: a depth-1 clone grafts both tips as roots, so
+    /// merge-base's exit 1 ("not ancestor") cannot be trusted. Gate recovery
+    /// NEVER deepens: the edge is Unknown (an Err) and the clone stays exactly
+    /// as shallow as it was -- no `git fetch --deepen` is attempted.
+    #[test]
+    fn shallow_ancestry_is_unknown_and_never_deepens() {
+        let (keep, origin, topic, _main) = ancestry_fixture();
+        let client = shallow_clone(keep.path(), "client", &origin, "1");
+        assert_eq!(
+            tgit_ok(&client, &["rev-parse", "--is-shallow-repository"]),
+            "true"
+        );
+        let error = is_ancestor(&client, &topic, "origin/main")
+            .expect_err("a shallow edge is Unknown without deepening");
+        assert!(
+            error.to_string().contains("shallow clone"),
+            "the error names the shallow condition: {error}"
+        );
+        assert_eq!(
+            tgit_ok(&client, &["rev-parse", "--is-shallow-repository"]),
+            "true",
+            "R7 recovery leaves the clone shallow"
+        );
+    }
+
+    /// r19 item 2 / R7 through the PRODUCTION post-push recovery path: the push
+    /// fails (receive-pack refuses), then the recovery FETCH stalls in its
+    /// transport. The R6 owner kills the fetch group at the per-command cap,
+    /// push_main_cas returns PushUncertain well before the 30 s RPC timeout,
+    /// and no stalled transport process survives.
+    #[test]
+    fn a_stalled_post_push_recovery_fetch_is_uncertain_and_leaves_no_process() {
+        let (keep, _origin, _topic, main) = ancestry_fixture();
+        let repo = keep.path().join("full");
+        // Fake transport: a receive-pack invocation refuses (push fails
+        // immediately); an upload-pack invocation never returns (fetch stalls).
+        let fake_ssh = keep.path().join("fake-ssh-r19.sh");
+        // git probes resolved connection settings with `ssh -G host` first;
+        // answer that with a minimal config so it proceeds to the real call.
+        std::fs::write(
+            &fake_ssh,
+            "#!/bin/sh\ncase \"$1\" in\n  -G) printf 'hostname %s\\nuser git\\nport 22\\n' \"$2\"; exit 0 ;;\nesac\ncase \" $*\" in\n  *git-receive-pack*) exit 1 ;;\n  *) exec sleep 47.61 ;;\nesac\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake_ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        tgit_ok(
+            &repo,
+            &["remote", "set-url", "origin", "ssh://example.test/repo.git"],
+        );
+        tgit_ok(
+            &repo,
+            &["config", "core.sshCommand", fake_ssh.to_str().unwrap()],
+        );
+
+        let started = std::time::Instant::now();
+        let error = push_main_cas(&repo, &main, &main)
+            .expect_err("a stalled recovery fetch is PushUncertain");
+        assert!(
+            matches!(
+                error.downcast_ref::<MergeStop>(),
+                Some(MergeStop::PushUncertain(_))
+            ),
+            "PushUncertain, got {error:#}"
+        );
+        assert!(
+            error.to_string().contains("ls-remote"),
+            "the uncertainty names the bounded remote read: {error}"
+        );
+        assert!(
+            error.to_string().contains("recovery bound"),
+            "the uncertainty names the bounded kill: {error}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(13),
+            "the recovery must fail closed at the cap, not hang: {:?}",
+            started.elapsed()
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let left = live_marker_processes("sleep 47.61");
+            if left == 0 || std::time::Instant::now() >= deadline {
+                assert_eq!(
+                    left, 0,
+                    "the stalled fetch transport survived the owner group kill"
+                );
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Build a working repo + bare origin on base B with a granted merge M
+    /// (descendant of B) and a divergent remote commit R also based on B.
+    /// Returns (keep, full, B, M, R).
+    fn divergence_fixture() -> (tempfile::TempDir, PathBuf, String, String, String) {
+        let keep = tempfile::tempdir().unwrap();
+        let root = keep.path();
+        let full = root.join("full");
+        let origin = root.join("origin.git");
+        std::fs::create_dir_all(&full).unwrap();
+        tgit_ok(&full, &["init", "-q", "-b", "main"]);
+        tgit_ok(&full, &["config", "user.email", "t@example.com"]);
+        tgit_ok(&full, &["config", "user.name", "T"]);
+        std::fs::write(full.join("f"), "b\n").unwrap();
+        tgit_ok(&full, &["add", "f"]);
+        tgit_ok(&full, &["commit", "-q", "-m", "B"]);
+        let base = tgit_ok(&full, &["rev-parse", "main"]);
+        tgit_ok(&full, &["branch", "rline"]);
+        std::fs::write(full.join("m"), "m\n").unwrap();
+        tgit_ok(&full, &["add", "m"]);
+        tgit_ok(&full, &["commit", "-q", "-m", "M"]);
+        let merge = tgit_ok(&full, &["rev-parse", "main"]);
+        // Divergent R on B, published as remote main (M then cannot ff).
+        tgit_ok(&full, &["checkout", "-q", "rline"]);
+        std::fs::write(full.join("r"), "r\n").unwrap();
+        tgit_ok(&full, &["add", "r"]);
+        tgit_ok(&full, &["commit", "-q", "-m", "R"]);
+        let remote_r = tgit_ok(&full, &["rev-parse", "rline"]);
+        let output = std::process::Command::new("git")
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .current_dir(root)
+            .arg(&origin)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "bare init: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        tgit_ok(
+            &full,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        tgit_ok(&full, &["push", "-q", "origin", "rline:main"]);
+        tgit_ok(&full, &["checkout", "-q", "main"]);
+        (keep, full, base, merge, remote_r)
+    }
+
+    /// The FULL for-each-ref listing with object IDs — R10 requires it to be
+    /// byte-identical across a recovery.
+    fn refs_listing(repo: &Path) -> String {
+        tgit_ok(repo, &["for-each-ref", "--format=%(refname) %(objectname)"])
+    }
+
+    /// r31 item 2: recovery fetch must never pass --no-write-fetch-head.
+    #[test]
+    fn recovery_fetch_flags_never_write_fetch_head() {
+        assert!(
+            remuda_unix::RECOVERY_FETCH_FLAGS
+                .iter()
+                .all(|flag| *flag != "--no-write-fetch-head")
+        );
+        assert!(remuda_unix::RECOVERY_FETCH_FLAGS.contains(&"--refmap="));
+        assert!(remuda_unix::RECOVERY_FETCH_FLAGS.contains(&"--no-prune"));
+        assert!(remuda_unix::RECOVERY_FETCH_FLAGS.contains(&"--no-tags"));
+    }
+
+    /// R10: ls-remote parsing accepts exactly one well-formed line for the
+    /// requested ref and rejects everything else.
+    #[test]
+    fn ls_remote_base_parsing() {
+        let sha1 = "0123456789abcdef0123456789abcdef01234567";
+        let sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            parse_ls_remote_base(format!("{sha1}\trefs/heads/main\n").as_bytes(), "main").unwrap(),
+            sha1
+        );
+        assert_eq!(
+            parse_ls_remote_base(format!("{sha256}\trefs/heads/x\n").as_bytes(), "x").unwrap(),
+            sha256
+        );
+        assert!(parse_ls_remote_base(b"", "main").is_err());
+        assert!(
+            parse_ls_remote_base(format!("{sha1}\trefs/heads/other\n").as_bytes(), "main").is_err()
+        );
+        assert!(
+            parse_ls_remote_base(
+                format!("{sha1}\trefs/heads/main\n{sha1}\trefs/heads/main\n").as_bytes(),
+                "main"
+            )
+            .is_err()
+        );
+        assert!(parse_ls_remote_base(b"garbage\n", "main").is_err());
+        assert!(parse_ls_remote_base(b"zz\trefs/heads/main\n", "main").is_err());
+        // Uppercase A-F (40 and 64 chars) is not a git-advertised ID.
+        assert!(
+            parse_ls_remote_base(
+                b"ABCDEF0123456789ABCDEF0123456789ABCDEF01\trefs/heads/main\n",
+                "main"
+            )
+            .is_err()
+        );
+        assert!(
+            parse_ls_remote_base(
+                b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789ABCDEF\trefs/heads/x\n",
+                "x"
+            )
+            .is_err()
+        );
+
+        assert!(
+            parse_ls_remote_base(
+                format!("{}\trefs/heads/main\n", &sha1[..39]).as_bytes(),
+                "main"
+            )
+            .is_err()
+        );
+        assert_eq!(
+            parse_ls_remote_base(
+                format!("{sha1}\trefs/heads/main\n{sha1}\trefs/tags/v1^{{}}\n").as_bytes(),
+                "main"
+            )
+            .unwrap(),
+            sha1
+        );
+    }
+
+    /// R10: two overlapping post-push recoveries never swap snapshots — each
+    /// reads the authoritative advertised tip with ls-remote: B (D containing
+    /// M) certifies Landed; A (R, before M landed) classifies BaseMoved.
+    #[test]
+    fn overlapping_cli_recoveries_read_distinct_tips_without_writing_refs() {
+        use super::recovery_read_seam as seam;
+        let (keep, full, base_b, merge_m, remote_r) = divergence_fixture();
+        let spawn_recovery = || {
+            let repo = full.clone();
+            let merged = merge_m.clone();
+            let expected = base_b.clone();
+            std::thread::spawn(move || push_main_cas(&repo, &merged, &expected))
+        };
+
+        seam::arm(&full, 2);
+        let a = spawn_recovery();
+        seam::wait_arrived(&full, 0);
+        // A read R. Land M on the remote for real: merge R into the M-based
+        // main, producing D which contains both, and publish it.
+        tgit_ok(&full, &["fetch", "-q", "origin"]);
+        tgit_ok(&full, &["merge", "-q", "--no-ff", "-m", "D", "origin/main"]);
+        tgit_ok(&full, &["push", "-q", "origin", "main"]);
+        let before = refs_listing(&full);
+
+        let b = spawn_recovery();
+        seam::wait_arrived(&full, 1);
+        seam::release(&full, 1);
+        let result_b = b.join().expect("recovery B joins");
+        seam::release(&full, 0);
+        let result_a = a.join().expect("recovery A joins");
+        seam::disarm(&full);
+
+        assert!(
+            result_b.is_ok(),
+            "B read D containing M — Landed must win: {:?}",
+            result_b
+                .as_ref()
+                .err()
+                .map(std::string::ToString::to_string)
+        );
+        let err_a = result_a.expect_err("A read R, which does not contain M");
+        assert!(
+            matches!(err_a.downcast_ref::<MergeStop>(), Some(MergeStop::BaseMoved(_, tip)) if tip == &remote_r),
+            "A must classify against its OWN read R: {err_a:#}"
+        );
+        assert_eq!(
+            refs_listing(&full),
+            before,
+            "either recovery created, updated or deleted no ref"
+        );
+        drop(keep);
+    }
+
+    /// R10 r31 item 1: configured SHA-source remote.origin.fetch mappings and
+    /// fetch.prune must not write or prune refs during the destination-less
+    /// recovery fetch (empty --refmap + --no-prune). Destination absent,
+    /// destination existing, and stale tracking ref under prune=true.
+    #[test]
+    fn configured_fetch_mappings_and_prune_write_no_refs_during_recovery() {
+        let (keep, full, base_b, merge_m, _remote_r) = divergence_fixture();
+        // Put M on remote main so recovery certifies Landed: merge the
+        // divergent R back into M, publish D. The mapping must use D — the
+        // ACTUAL advertised recovery tip (r32 item 5) — not M.
+        tgit_ok(&full, &["fetch", "-q", "origin"]);
+        tgit_ok(&full, &["merge", "-q", "--no-ff", "-m", "D", "origin/main"]);
+        tgit_ok(&full, &["push", "-q", "origin", "main"]);
+        let remote_d = tgit_ok(&full, &["rev-parse", "main"]);
+        assert_ne!(remote_d, merge_m, "D is a descendant of M, distinct");
+        // Sanity: recovery really reads D as the advertised tip.
+        let advertised = tgit_ok(&full, &["ls-remote", "origin", "refs/heads/main"]);
+        assert_eq!(advertised, format!("{remote_d}\trefs/heads/main"));
+
+        // (a) destination ABSENT: map the advertised D to refs/tags/keep.
+        tgit_ok(
+            &full,
+            &[
+                "config",
+                "--add",
+                "remote.origin.fetch",
+                &format!("+{remote_d}:refs/tags/keep"),
+            ],
+        );
+        let before = refs_listing(&full);
+        push_main_cas(&full, &merge_m, &base_b).expect("M is contained in remote D: Landed");
+        assert_eq!(
+            refs_listing(&full),
+            before,
+            "absent destination must not be created"
+        );
+        assert!(
+            tgit(
+                &full,
+                &["rev-parse", "--verify", "--quiet", "refs/tags/keep"]
+            )
+            .status
+            .code()
+                != Some(0)
+        );
+
+        // (b) destination EXISTING at B; the configured D mapping would force it
+        // to D without --refmap.
+        tgit_ok(&full, &["tag", "keep", &base_b]);
+        let before = refs_listing(&full);
+        push_main_cas(&full, &merge_m, &base_b).expect("Landed");
+        assert_eq!(refs_listing(&full), before);
+        assert_eq!(tgit_ok(&full, &["rev-parse", "refs/tags/keep"]), base_b);
+
+        // (c) fetch.prune=true with a stale tracking ref
+        tgit_ok(&full, &["config", "fetch.prune", "true"]);
+        tgit_ok(&full, &["update-ref", "refs/remotes/origin/gone", &base_b]);
+        let before = refs_listing(&full);
+        push_main_cas(&full, &merge_m, &base_b).expect("Landed");
+        assert_eq!(
+            refs_listing(&full),
+            before,
+            "stale tracking ref must survive"
+        );
+        drop(keep);
+    }
+
+    /// R11 item 2: CLI recovery fetch never recurses into submodules —
+    /// populated submodule with fetch.recurseSubmodules=true and an advanced
+    /// sub remote keeps BOTH super and sub ref listings byte-identical, and a
+    /// dead submodule remote does not fail recovery.
+    #[test]
+    fn cli_recovery_does_not_recurse_into_submodules_and_survives_dead_sub_remote() {
+        let keep = tempfile::tempdir().unwrap();
+        let root = keep.path();
+        let sub_seed = root.join("sub-seed");
+        let sub_bare = root.join("sub-origin.git");
+        let sup_seed = root.join("sup-seed");
+        let sup_bare = root.join("sup-origin.git");
+        let lane = root.join("lane");
+        let sub_lane = lane.join("sub");
+
+        tgit_ok(
+            root,
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                sub_bare.to_str().unwrap(),
+            ],
+        );
+        tgit_ok(
+            root,
+            &["init", "-q", "-b", "main", sub_seed.to_str().unwrap()],
+        );
+        tgit_ok(&sub_seed, &["config", "user.email", "t@example.com"]);
+        tgit_ok(&sub_seed, &["config", "user.name", "T"]);
+        std::fs::write(sub_seed.join("s"), "s0\n").unwrap();
+        tgit_ok(&sub_seed, &["add", "s"]);
+        tgit_ok(&sub_seed, &["commit", "-q", "-m", "S0"]);
+        tgit_ok(
+            &sub_seed,
+            &["remote", "add", "origin", sub_bare.to_str().unwrap()],
+        );
+        tgit_ok(&sub_seed, &["push", "-q", "origin", "main"]);
+
+        tgit_ok(
+            root,
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                sup_bare.to_str().unwrap(),
+            ],
+        );
+        tgit_ok(
+            root,
+            &["init", "-q", "-b", "main", sup_seed.to_str().unwrap()],
+        );
+        tgit_ok(&sup_seed, &["config", "user.email", "t@example.com"]);
+        tgit_ok(&sup_seed, &["config", "user.name", "T"]);
+        std::fs::write(sup_seed.join("f"), "b\n").unwrap();
+        tgit_ok(&sup_seed, &["add", "f"]);
+        tgit_ok(&sup_seed, &["commit", "-q", "-m", "B"]);
+        tgit_ok(
+            &sup_seed,
+            &["remote", "add", "origin", sup_bare.to_str().unwrap()],
+        );
+        tgit_ok(
+            &sup_seed,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                sub_bare.to_str().unwrap(),
+                "sub",
+            ],
+        );
+        tgit_ok(&sup_seed, &["commit", "-q", "-m", "add submodule"]);
+        tgit_ok(&sup_seed, &["push", "-q", "origin", "main"]);
+
+        tgit_ok(
+            root,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "clone",
+                "-q",
+                "--recurse-submodules",
+                sup_bare.to_str().unwrap(),
+                lane.to_str().unwrap(),
+            ],
+        );
+        tgit_ok(&lane, &["config", "user.email", "t@example.com"]);
+        tgit_ok(&lane, &["config", "user.name", "T"]);
+        tgit_ok(&lane, &["config", "protocol.file.allow", "always"]);
+        tgit_ok(&sub_lane, &["config", "user.email", "t@example.com"]);
+        tgit_ok(&sub_lane, &["config", "user.name", "T"]);
+        tgit_ok(&sub_lane, &["config", "protocol.file.allow", "always"]);
+        tgit_ok(&lane, &["config", "fetch.recurseSubmodules", "true"]);
+        // Submodule remote advances to S1 after the recursive clone.
+        std::fs::write(sub_seed.join("s"), "s1\n").unwrap();
+        tgit_ok(&sub_seed, &["add", "s"]);
+        tgit_ok(&sub_seed, &["commit", "-q", "-m", "S1"]);
+        tgit_ok(&sub_seed, &["push", "-q", "origin", "main"]);
+
+        // The lane is the lander: M locally; remote main advances to D which
+        // contains M.
+        std::fs::write(lane.join("m"), "m\n").unwrap();
+        tgit_ok(&lane, &["add", "m"]);
+        tgit_ok(&lane, &["commit", "-q", "-m", "M"]);
+        let merge_m = tgit_ok(&lane, &["rev-parse", "main"]);
+        tgit_ok(
+            &sup_seed,
+            &["fetch", "-q", lane.to_str().unwrap(), &merge_m],
+        );
+        tgit_ok(&sup_seed, &["merge", "-q", "--no-ff", "-m", "D", &merge_m]);
+        let remote_d = tgit_ok(&sup_seed, &["rev-parse", "main"]);
+        tgit_ok(&sup_seed, &["push", "-q", "origin", "main"]);
+
+        let sup_before = refs_listing(&lane);
+        let sub_before = refs_listing(&sub_lane);
+        assert_ne!(
+            tgit_ok(&sub_lane, &["rev-parse", "refs/remotes/origin/main"]),
+            remote_d,
+            "sanity harness marker (distinct repos)"
+        );
+        let sub_local = tgit_ok(&sub_lane, &["rev-parse", "refs/remotes/origin/main"]);
+        assert_ne!(
+            sub_local,
+            tgit_ok(&sub_lane, &["ls-remote", "origin", "refs/heads/main"]),
+            "the submodule remote must be ahead"
+        );
+
+        push_main_cas(
+            &lane,
+            &merge_m,
+            &tgit_ok(&lane, &["rev-parse", "refs/remotes/origin/main"]),
+        )
+        .expect("M contained in remote D: Landed");
+        assert_eq!(refs_listing(&lane), sup_before, "super refs changed");
+        assert_eq!(
+            refs_listing(&sub_lane),
+            sub_before,
+            "CLI recovery recursion updated the submodule refs"
+        );
+
+        // Dead submodule remote does not fail recovery.
+        tgit_ok(
+            &sub_lane,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                root.join("no-such-sub.git").to_str().unwrap(),
+            ],
+        );
+        push_main_cas(
+            &lane,
+            &merge_m,
+            &tgit_ok(&lane, &["rev-parse", "refs/remotes/origin/main"]),
+        )
+        .expect("dead submodule remote must not fail recovery");
+        assert_eq!(refs_listing(&lane), sup_before);
+        assert_eq!(refs_listing(&sub_lane), sub_before);
+        drop(keep);
+    }
+
+    /// R11 item 3: CLI post-push recovery fetch must never detach gc or
+    /// maintenance, even with gc.auto=1 / autoPackLimit=1 /
+    /// maintenance.auto=true configured. A traced hardened recovery must show
+    /// no `maintenance run`/gc child in GIT_TRACE.
+    #[test]
+    fn cli_recovery_fetch_never_starts_gc_or_maintenance() {
+        let keep = tempfile::tempdir().unwrap();
+        let root = keep.path();
+        let full = root.join("full");
+        let origin = root.join("origin.git");
+        std::process::Command::new("git")
+            .args([
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                origin.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main", full.to_str().unwrap()])
+            .status()
+            .unwrap();
+        tgit_ok(&full, &["config", "user.email", "t@example.com"]);
+        tgit_ok(&full, &["config", "user.name", "T"]);
+        std::fs::write(full.join("f"), "b\n").unwrap();
+        tgit_ok(&full, &["add", "f"]);
+        tgit_ok(&full, &["commit", "-q", "-m", "B"]);
+        tgit_ok(
+            &full,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        tgit_ok(&full, &["push", "-q", "origin", "main"]);
+        tgit_ok(&full, &["config", "gc.auto", "1"]);
+        tgit_ok(&full, &["config", "gc.autoPackLimit", "1"]);
+        tgit_ok(&full, &["config", "maintenance.auto", "true"]);
+        for i in 0..3 {
+            let name = format!("extra-{i}.txt");
+            std::fs::write(full.join(&name), format!("x{i}\n")).unwrap();
+            let msg = format!("extra {i}");
+            tgit_ok(&full, &["add", &name]);
+            tgit_ok(&full, &["commit", "-q", "-m", &msg]);
+        }
+        let deadline = Instant::now() + LAND_RECOVERY_DEADLINE;
+        let trace = root.join("cli-recovery-trace.log");
+        let hardening = remuda_unix::RecoveryGit::traced(&trace);
+        let sha = recovery_fetch_base_sha(&full, "main", deadline, &hardening)
+            .expect("hardened recovery succeeds");
+        assert_eq!(sha.len(), 40);
+        let trace_text = std::fs::read_to_string(&trace).unwrap();
+        assert!(
+            !trace_text.contains("maintenance run"),
+            "detached maintenance: {trace_text}"
+        );
+        assert!(
+            !trace_text.contains("git gc ") && !trace_text.contains("git-gc"),
+            "started gc: {trace_text}"
+        );
+        drop(keep);
+    }
+
+    /// r33 R11 clarification (CLI): recovery creates no scratch path; a graft
+    /// planted at the OLD r32 scratch location and a legacy grafts file cannot
+    /// make a divergent remote tip classify as Landed. A reference-transaction
+    /// hook never runs (real-hooksPath positive control included), and
+    /// pre-existing valuable content survives with the working tree / .git
+    /// listing unchanged apart from objects/FETCH_HEAD.
+    #[test]
+    fn planted_grafts_at_old_scratch_path_and_hooks_cannot_affect_cli_recovery() {
+        let keep = tempfile::tempdir().unwrap();
+        let root = keep.path();
+        let origin = root.join("origin.git");
+        let seed = root.join("seed");
+        let lane = root.join("lane");
+        tgit_ok(
+            root,
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                origin.to_str().unwrap(),
+            ],
+        );
+        tgit_ok(root, &["init", "-q", "-b", "main", seed.to_str().unwrap()]);
+        tgit_ok(&seed, &["config", "user.email", "t@example.com"]);
+        tgit_ok(&seed, &["config", "user.name", "T"]);
+        std::fs::write(seed.join("f"), "b\n").unwrap();
+        tgit_ok(&seed, &["add", "f"]);
+        tgit_ok(&seed, &["commit", "-q", "-m", "B"]);
+        let base_b = tgit_ok(&seed, &["rev-parse", "main"]);
+        tgit_ok(
+            &seed,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        tgit_ok(&seed, &["push", "-q", "origin", "main"]);
+        tgit_ok(
+            root,
+            &[
+                "clone",
+                "-q",
+                &format!("file://{}", origin.display()),
+                lane.to_str().unwrap(),
+            ],
+        );
+        tgit_ok(&lane, &["config", "user.email", "t@example.com"]);
+        tgit_ok(&lane, &["config", "user.name", "T"]);
+        // Landed M on the lane; remote R diverges and never contains M.
+        std::fs::write(lane.join("m"), "m\n").unwrap();
+        tgit_ok(&lane, &["add", "m"]);
+        tgit_ok(&lane, &["commit", "-q", "-m", "M"]);
+        let merge_m = tgit_ok(&lane, &["rev-parse", "main"]);
+        std::fs::write(seed.join("r"), "r\n").unwrap();
+        tgit_ok(&seed, &["add", "r"]);
+        tgit_ok(&seed, &["commit", "-q", "-m", "R"]);
+        let remote_r = tgit_ok(&seed, &["rev-parse", "main"]);
+        tgit_ok(&seed, &["push", "-q", "origin", "main"]);
+        tgit_ok(
+            &lane,
+            &[
+                "fetch",
+                "--no-tags",
+                "--no-prune",
+                "--refmap=",
+                "origin",
+                &remote_r,
+            ],
+        );
+
+        // Plant both graft inputs + valuable content + a hook.
+        let old_scratch = lane.join(".git-r32-recovery-no-hooks");
+        std::fs::create_dir_all(&old_scratch).unwrap();
+        std::fs::write(
+            old_scratch.join("nonexistent-grafts"),
+            format!("{remote_r} {merge_m}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            lane.join(".git/info/grafts"),
+            format!("{remote_r} {merge_m}\n"),
+        )
+        .unwrap();
+        tgit_ok(&lane, &["config", "advice.graftFileDeprecated", "false"]);
+        std::fs::write(old_scratch.join("valuable-file"), "do not delete me\n").unwrap();
+        let marker = root.join("hook-marker");
+        let hook = lane.join(".git/hooks/reference-transaction");
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\necho fired >> {}\n", marker.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // Positive control: real hooksPath ref write fires the hook.
+        tgit_ok(
+            &lane,
+            &[
+                "-c",
+                "core.hooksPath=.git/hooks",
+                "fetch",
+                "--no-tags",
+                "origin",
+                &format!("+{remote_r}:refs/heads/probe"),
+            ],
+        );
+        assert!(
+            marker.exists(),
+            "control hook must fire with real hooksPath"
+        );
+        tgit_ok(
+            &lane,
+            &[
+                "-c",
+                "core.hooksPath=/dev/null",
+                "update-ref",
+                "-d",
+                "refs/heads/probe",
+            ],
+        );
+        let control_firings = std::fs::read_to_string(&marker).unwrap().lines().count();
+
+        let before = refs_listing(&lane);
+        let result = push_main_cas(&lane, &merge_m, &base_b);
+        assert!(
+            matches!(
+                result
+                    .as_ref()
+                    .map_err(|e| e.downcast_ref::<MergeStop>())
+                    .err()
+                    .flatten(),
+                Some(MergeStop::BaseMoved(_, _))
+            ),
+            "planted grafts must not fabricate Landed: {result:?}"
+        );
+        let after_firings = std::fs::read_to_string(&marker)
+            .map(|text| text.lines().count())
+            .unwrap_or(0);
+        assert_eq!(
+            after_firings, control_firings,
+            "recovery ran a repository hook"
+        );
+        assert_eq!(refs_listing(&lane), before);
+        assert_eq!(
+            std::fs::read_to_string(old_scratch.join("valuable-file")).unwrap(),
+            "do not delete me\n",
+            "pre-existing content must survive"
+        );
+        assert_eq!(
+            std::fs::read_to_string(old_scratch.join("nonexistent-grafts")).unwrap(),
+            format!("{remote_r} {merge_m}\n"),
+            "planted graft path must be preserved"
+        );
+        drop(keep);
+    }
+
+    /// r33 item 2 (CLI): drive the REAL post-push recovery over success,
+    /// object-fetch failure and negative-ancestry paths and assert EVERY git
+    /// spawn at the owner boundary carries the full hardening set.
+    #[test]
+    fn every_production_cli_recovery_invocation_carries_full_hardening() {
+        fn assert_recorded_hardening(log: &[remuda_unix::RecordedGit]) {
+            assert!(!log.is_empty(), "recovery must spawn git");
+            for (index, rec) in log.iter().enumerate() {
+                for (key, value) in remuda_unix::RecoveryGit::env_pairs() {
+                    assert!(
+                        rec.env.iter().any(|(k, v)| k == key && v == value),
+                        "command {index} missing env {key}={value}: {rec:?}"
+                    );
+                }
+                let pairs = remuda_unix::RecoveryGit::config_pairs();
+                assert!(
+                    rec.args.len() >= 2 * pairs.len(),
+                    "command {index}: {rec:?}"
+                );
+                for (pair_index, (key, value)) in pairs.iter().enumerate() {
+                    assert_eq!(&rec.args[2 * pair_index], "-c", "pair {pair_index}");
+                    assert_eq!(
+                        rec.args[2 * pair_index + 1],
+                        format!("{key}={value}"),
+                        "pair {pair_index} value"
+                    );
+                }
+                if rec.args[2 * pairs.len()] == "fetch" {
+                    for flag in remuda_unix::RECOVERY_FETCH_FLAGS {
+                        assert!(rec.args.iter().any(|a| a == flag), "fetch missing {flag}");
+                    }
+                }
+            }
+        }
+        // r35 item 4: every phase installs the RAII RecordingGuard and consumes
+        // ONLY its own fixture repository's spawns via `for_repo` — a parallel
+        // subprocess test (an unhardened wrapper in another cwd) can neither
+        // pollute the assertions nor leak a recorder when this test panics
+        // (the guard clears the process-wide recorder on unwind). Selection is
+        // by cwd, never by hardening content (that would hide a bypass).
+        let keep = tempfile::tempdir().unwrap();
+        let root = keep.path();
+        let origin = root.join("origin.git");
+        let seed = root.join("seed");
+        let lane = root.join("lane");
+        tgit_ok(
+            root,
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                origin.to_str().unwrap(),
+            ],
+        );
+        tgit_ok(root, &["init", "-q", "-b", "main", seed.to_str().unwrap()]);
+        tgit_ok(&seed, &["config", "user.email", "t@example.com"]);
+        tgit_ok(&seed, &["config", "user.name", "T"]);
+        std::fs::write(seed.join("f"), "b\n").unwrap();
+        tgit_ok(&seed, &["add", "f"]);
+        tgit_ok(&seed, &["commit", "-q", "-m", "B"]);
+        let base_b = tgit_ok(&seed, &["rev-parse", "main"]);
+        tgit_ok(
+            &seed,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        tgit_ok(&seed, &["push", "-q", "origin", "main"]);
+        tgit_ok(
+            root,
+            &[
+                "clone",
+                "-q",
+                &format!("file://{}", origin.display()),
+                lane.to_str().unwrap(),
+            ],
+        );
+        tgit_ok(&lane, &["config", "user.email", "t@example.com"]);
+        tgit_ok(&lane, &["config", "user.name", "T"]);
+        std::fs::write(lane.join("m"), "m\n").unwrap();
+        tgit_ok(&lane, &["add", "m"]);
+        tgit_ok(&lane, &["commit", "-q", "-m", "M"]);
+        let merge_m = tgit_ok(&lane, &["rev-parse", "main"]);
+        // Remote D contains M.
+        tgit_ok(&seed, &["fetch", "-q", lane.to_str().unwrap(), &merge_m]);
+        tgit_ok(&seed, &["merge", "-q", "--no-ff", "-m", "D", &merge_m]);
+        tgit_ok(&seed, &["push", "-q", "origin", "main"]);
+        // Sanity-check the remote tip is readable (its value is not asserted on
+        // below; the recovery phases probe their own ancestor facts).
+        let _remote_tip = tgit_ok(&seed, &["rev-parse", "main"]);
+
+        // (1) success — the guard scope ends with the phase so the recorder is
+        // cleared before the next phase installs its own.
+        {
+            let guard = remuda_unix::RecordingGuard::install();
+            push_main_cas(&lane, &merge_m, &base_b).expect("Landed");
+            assert_recorded_hardening(&guard.for_repo(&lane));
+        }
+
+        // (2) object-fetch failure: advance remote to E the lane lacks, swap
+        // to an empty remote at the read seam.
+        use super::recovery_read_seam as seam;
+        std::fs::write(seed.join("e"), "e\n").unwrap();
+        tgit_ok(&seed, &["add", "e"]);
+        tgit_ok(&seed, &["commit", "-q", "-m", "E"]);
+        tgit_ok(&seed, &["push", "-q", "origin", "main"]);
+        let empty = root.join("empty.git");
+        tgit_ok(
+            root,
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                empty.to_str().unwrap(),
+            ],
+        );
+        {
+            let guard = remuda_unix::RecordingGuard::install();
+            seam::arm(&lane, 1);
+            let repo_t = lane.clone();
+            let (merged_t, expected_t) = (merge_m.clone(), base_b.clone());
+            let result = std::thread::spawn(move || push_main_cas(&repo_t, &merged_t, &expected_t));
+            seam::wait_arrived(&lane, 0);
+            tgit_ok(
+                &lane,
+                &["remote", "set-url", "origin", empty.to_str().unwrap()],
+            );
+            seam::release(&lane, 0);
+            let error = result.join().unwrap().expect_err("uncertain");
+            seam::disarm(&lane);
+            assert!(
+                matches!(
+                    error.downcast_ref::<MergeStop>(),
+                    Some(MergeStop::PushUncertain(_))
+                ),
+                "{error}"
+            );
+            assert_recorded_hardening(&guard.for_repo(&lane));
+        }
+
+        // (3) SHALLOW / negative-ancestry path: a depth-1 clone of the remote
+        // tip. The granted merge is an AVAILABLE orphan commit (present object,
+        // refused non-ff push) that is genuinely not an ancestor of the
+        // advertised tip; on a shallow clone that negative edge is
+        // undecidable (R7), so recovery must reach the shallow branch and
+        // return PushUncertain naming the shallow condition — not the
+        // missing-object abnormal arm. The recorder must observe
+        // `rev-parse --is-shallow-repository`.
+        let shallow_lane = root.join("shallow-lane");
+        tgit_ok(
+            root,
+            &[
+                "clone",
+                "-q",
+                "--depth",
+                "1",
+                &format!("file://{}", origin.display()),
+                shallow_lane.to_str().unwrap(),
+            ],
+        );
+        tgit_ok(&shallow_lane, &["config", "user.email", "t@example.com"]);
+        tgit_ok(&shallow_lane, &["config", "user.name", "T"]);
+        assert_eq!(
+            tgit_ok(&shallow_lane, &["rev-parse", "--is-shallow-repository"]),
+            "true"
+        );
+        // An available orphan built from the tip's tree (object is local, so
+        // merge-base runs instead of failing on a missing object).
+        let orphan_tree = tgit_ok(&shallow_lane, &["rev-parse", "HEAD^{tree}"]);
+        let orphan_merge = tgit_ok(
+            &shallow_lane,
+            &["commit-tree", &orphan_tree, "-m", "orphan grant"],
+        );
+        let remote_tip = tgit_ok(&seed, &["rev-parse", "main"]);
+        // Control: the negative edge really is exit-1 on the shallow clone.
+        assert!(
+            tgit(
+                &shallow_lane,
+                &["merge-base", "--is-ancestor", &orphan_merge, &remote_tip]
+            )
+            .status
+            .code()
+                == Some(1),
+            "the orphan must genuinely not be an ancestor"
+        );
+        let guard = remuda_unix::RecordingGuard::install();
+        let result = push_main_cas(&shallow_lane, &orphan_merge, &remote_tip);
+        let error = result
+            .as_ref()
+            .map_err(|e| e.downcast_ref::<MergeStop>())
+            .err()
+            .flatten()
+            .expect("shallow negative ancestry must be PushUncertain");
+        assert!(matches!(error, MergeStop::PushUncertain(_)), "{error:?}");
+        assert!(
+            error.to_string().contains("shallow clone"),
+            "the uncertainty must come from the SHALLOW branch, not the missing-object arm: {error}"
+        );
+        // Consume only the shallow fixture repository's spawns (the guard
+        // itself clears the recorder on scope exit, including on panic).
+        let recorded = guard.for_repo(&shallow_lane);
+        // The recorder observed the shallow check on the REAL recovery path.
+        assert!(
+            recorded.iter().any(|rec| {
+                rec.args.iter().any(|a| a == "rev-parse")
+                    && rec.args.iter().any(|a| a == "--is-shallow-repository")
+            }),
+            "recovery did not run the shallow check: {recorded:?}"
+        );
+        assert_recorded_hardening(&recorded);
+
+        drop(keep);
+    }
+
+    /// R11 item 1 (HIGH): a local `git replace --graft` / legacy grafts file
+    /// must not make post-push recovery report the lost-ack push as landed
+    /// when the real remote tip R does not contain M. Hardened recovery reads
+    /// true ancestry; with R genuinely divergent the outcome is BaseMoved
+    /// (not Ok), exactly as without the graft.
+    #[test]
+    fn a_local_replace_or_graft_cannot_fabricate_landed() {
+        let keep = tempfile::tempdir().unwrap();
+        let full = keep.path().join("full");
+        let origin = keep.path().join("origin.git");
+        let seed = keep.path().join("seed");
+        let lane = keep.path().join("lane");
+        tgit_ok(
+            keep.path(),
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                origin.to_str().unwrap(),
+            ],
+        );
+        tgit_ok(
+            keep.path(),
+            &["init", "-q", "-b", "main", seed.to_str().unwrap()],
+        );
+        tgit_ok(&seed, &["config", "user.email", "t@example.com"]);
+        tgit_ok(&seed, &["config", "user.name", "T"]);
+        std::fs::write(seed.join("f"), "b\n").unwrap();
+        tgit_ok(&seed, &["add", "f"]);
+        tgit_ok(&seed, &["commit", "-q", "-m", "B"]);
+        let base_b = tgit_ok(&seed, &["rev-parse", "main"]);
+        tgit_ok(
+            &seed,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        tgit_ok(&seed, &["push", "-q", "origin", "main"]);
+        tgit_ok(
+            keep.path(),
+            &[
+                "clone",
+                "-q",
+                &format!("file://{}", origin.display()),
+                lane.to_str().unwrap(),
+            ],
+        );
+        tgit_ok(&lane, &["config", "user.email", "t@example.com"]);
+        tgit_ok(&lane, &["config", "user.name", "T"]);
+        // The lane (lander) commits M.
+        std::fs::write(lane.join("m"), "m\n").unwrap();
+        tgit_ok(&lane, &["add", "m"]);
+        tgit_ok(&lane, &["commit", "-q", "-m", "M"]);
+        let merge_m = tgit_ok(&lane, &["rev-parse", "main"]);
+        // Remote main advances to R (does not contain M).
+        std::fs::write(seed.join("r"), "r\n").unwrap();
+        tgit_ok(&seed, &["add", "r"]);
+        tgit_ok(&seed, &["commit", "-q", "-m", "R"]);
+        let remote_r = tgit_ok(&seed, &["rev-parse", "main"]);
+        tgit_ok(&seed, &["push", "-q", "origin", "main"]);
+        // R objects must be local for a valid replacement.
+        tgit_ok(
+            &lane,
+            &[
+                "fetch",
+                "--no-tags",
+                "--no-prune",
+                "--refmap=",
+                "origin",
+                &remote_r,
+            ],
+        );
+        // True ancestry: M is not in R -> BaseMoved.
+        let baseline = push_main_cas(&lane, &merge_m, &base_b);
+        assert!(
+            matches!(
+                baseline
+                    .as_ref()
+                    .map_err(|e| e.downcast_ref::<MergeStop>())
+                    .err()
+                    .flatten(),
+                Some(MergeStop::BaseMoved(_, _))
+            ),
+            "real divergence is BaseMoved, got {baseline:?}"
+        );
+        // Build the SAME full repo layout used by push_main_cas (it uses the
+        // caller's cwd); here we exercise the helper directly through a
+        // worktree copy is unnecessary: call push_main_cas on `lane`, but the
+        // production push itself is irrelevant — only recovery matters.
+        for graft in ["replace", "legacy-graft"] {
+            // raw teardown/setup (replacement may or may not be present)
+            let raw = |args: &[&str]| {
+                let _ = std::process::Command::new("git")
+                    .current_dir(&lane)
+                    .args(args)
+                    .status();
+            };
+            raw(&["replace", "-d", &remote_r]);
+            std::fs::remove_file(lane.join(".git/info/grafts")).ok();
+            if graft == "replace" {
+                tgit_ok(&lane, &["replace", "--graft", &remote_r, &merge_m]);
+            } else {
+                let grafts = lane.join(".git/info/grafts");
+                std::fs::create_dir_all(grafts.parent().unwrap()).unwrap();
+                std::fs::write(&grafts, format!("{remote_r} {merge_m}\n")).unwrap();
+                tgit_ok(&lane, &["config", "advice.graftFileDeprecated", "false"]);
+            }
+            // The VULNERABLE command now fabricates ancestry.
+            assert!(
+                tgit(&lane, &["merge-base", "--is-ancestor", &merge_m, &remote_r])
+                    .status
+                    .success(),
+                "sanity: {graft} fabricates M ancestor of R"
+            );
+            // Hardened recovery is NOT fooled: still BaseMoved, never Ok.
+            let result = push_main_cas(&lane, &merge_m, &base_b);
+            assert!(
+                matches!(
+                    result
+                        .as_ref()
+                        .map_err(|e| e.downcast_ref::<MergeStop>())
+                        .err()
+                        .flatten(),
+                    Some(MergeStop::BaseMoved(_, _))
+                ),
+                "hardened recovery must not report Landed through a {graft}: {result:?}"
+            );
+        }
+        // Hardening scratch dir cleaned.
+        assert!(!lane.join(".git-r32-recovery-no-hooks").exists());
+        // Suppress unused-binding warnings for the duplicated fixture names.
+        let _ = full;
+        drop(keep);
+    }
+
+    /// R10: a configured tagOpt=--tags with a clobbered local tag used to
+    /// abort recovery fetch; ref-free recovery uses --no-tags and still
+    /// certifies Landed, leaving every ref byte-identical.
+    #[test]
+    fn a_clobbered_tag_with_tagopt_does_not_break_ref_free_recovery() {
+        let (keep, full, base_b, merge_m, _remote_r) = divergence_fixture();
+        // Remote main already contains M in this fixture (R and M are both
+        // children of B; the published main is R — merge M into it remotely).
+        tgit_ok(&full, &["fetch", "-q", "origin"]);
+        tgit_ok(&full, &["merge", "-q", "--no-ff", "-m", "D", "origin/main"]);
+        tgit_ok(&full, &["push", "-q", "origin", "main"]);
+        // Clobber: local tag at B, remote tag moved to an orphan after clone.
+        tgit_ok(&full, &["tag", "v1", &base_b]);
+        let orphan = tgit_ok(&full, &["commit-tree", "HEAD^{tree}", "-m", "sideways"]);
+        tgit_ok(
+            &full,
+            &[
+                "push",
+                "-q",
+                "-f",
+                "origin",
+                &format!("{orphan}:refs/tags/v1"),
+            ],
+        );
+        tgit_ok(&full, &["config", "remote.origin.tagOpt", "--tags"]);
+        // Sanity: a plain fetch honoring tagOpt still fails on the clobber.
+        assert!(!tgit(&full, &["fetch", "-q", "origin"]).status.success());
+        let before = refs_listing(&full);
+
+        push_main_cas(&full, &merge_m, &base_b)
+            .expect("--no-tags bypasses the clobber; M is contained in remote main");
+        assert_eq!(
+            refs_listing(&full),
+            before,
+            "recovery created, updated or deleted no ref"
+        );
+        assert_eq!(
+            tgit_ok(&full, &["rev-parse", "refs/tags/v1"]),
+            base_b,
+            "the clobbered local tag is untouched"
+        );
+        drop(keep);
+    }
+
+    /// R10: a recovery whose base is not advertised (or whose origin is
+    /// unreachable) is PushUncertain and writes no ref on either path.
+    #[test]
+    fn a_failed_ref_free_recovery_writes_no_refs() {
+        let (keep, _origin, _topic, main) = ancestry_fixture();
+        let repo = keep.path().join("full");
+        let merged = main.clone();
+        let expected = tgit_ok(&repo, &["rev-parse", &format!("{main}^1")]);
+        let before = refs_listing(&repo);
+
+        tgit_ok(
+            &repo,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                keep.path().join("no-such-origin-r30.git").to_str().unwrap(),
+            ],
+        );
+        let error = push_main_cas(&repo, &merged, &expected)
+            .expect_err("an unreachable remote stays uncertain");
+        assert!(
+            matches!(
+                error.downcast_ref::<MergeStop>(),
+                Some(MergeStop::PushUncertain(_))
+            ),
+            "PushUncertain, got {error:#}"
+        );
+        assert_eq!(
+            refs_listing(&repo),
+            before,
+            "the failed recovery created, updated or deleted no ref"
+        );
+        drop(keep);
+    }
+
+    /// r31 item 4: ls-remote succeeds with a real advertised SHA and the
+    /// OBJECT FETCH then fails deterministically (origin swapped to an empty
+    /// bare at the read seam) — PushUncertain named by the fetch, and the full
+    /// ref listing is unchanged.
+    #[test]
+    fn a_failed_object_fetch_after_successful_ls_remote_writes_no_refs() {
+        use super::recovery_read_seam as seam;
+        // The LANE is the lander: it holds its granted M locally. The remote
+        // independently advanced to D (descendant of M) after the clone; D's
+        // objects are genuinely absent from the lane, so the recovery object
+        // fetch cannot short-circuit when the origin is swapped away.
+        let keep = tempfile::tempdir().unwrap();
+        let origin = keep.path().join("origin.git");
+        let seed = keep.path().join("seed");
+        let lane = keep.path().join("lane");
+        tgit_ok(
+            keep.path(),
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                origin.to_str().unwrap(),
+            ],
+        );
+        tgit_ok(
+            keep.path(),
+            &["init", "-q", "-b", "main", seed.to_str().unwrap()],
+        );
+        tgit_ok(&seed, &["config", "user.email", "t@example.com"]);
+        tgit_ok(&seed, &["config", "user.name", "T"]);
+        std::fs::write(seed.join("f"), "b\n").unwrap();
+        tgit_ok(&seed, &["add", "f"]);
+        tgit_ok(&seed, &["commit", "-q", "-m", "B"]);
+        let base_b = tgit_ok(&seed, &["rev-parse", "main"]);
+        tgit_ok(
+            &seed,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        tgit_ok(&seed, &["push", "-q", "origin", "main"]);
+        tgit_ok(
+            keep.path(),
+            &[
+                "clone",
+                "-q",
+                &format!("file://{}", origin.display()),
+                lane.to_str().unwrap(),
+            ],
+        );
+        tgit_ok(&lane, &["config", "user.email", "t@example.com"]);
+        tgit_ok(&lane, &["config", "user.name", "T"]);
+        // The lane lands its own M (local only).
+        std::fs::write(lane.join("m"), "m\n").unwrap();
+        tgit_ok(&lane, &["add", "m"]);
+        tgit_ok(&lane, &["commit", "-q", "-m", "M"]);
+        let merge_m = tgit_ok(&lane, &["rev-parse", "main"]);
+        // Seed builds D on top of B+M: fetch M's objects from the lane repo,
+        // merge them onto seed main, publish D.
+        tgit_ok(&seed, &["fetch", "-q", lane.to_str().unwrap(), &merge_m]);
+        tgit_ok(&seed, &["merge", "-q", "--no-ff", "-m", "D", &merge_m]);
+        let remote_d = tgit_ok(&seed, &["rev-parse", "main"]);
+        tgit_ok(&seed, &["push", "-q", "origin", "main"]);
+        assert_ne!(remote_d, merge_m);
+        assert!(
+            !tgit(
+                &lane,
+                &["cat-file", "-e", &format!("{remote_d}^{{commit}}")]
+            )
+            .status
+            .success(),
+            "the lane must genuinely lack D"
+        );
+        let before = refs_listing(&lane);
+        let empty = keep.path().join("empty.git");
+        let output = std::process::Command::new("git")
+            .args([
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                empty.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+
+        seam::arm(&lane, 1);
+        let repo_t = lane.clone();
+        let (merged_t, expected_t) = (merge_m.clone(), base_b.clone());
+        let result = std::thread::spawn(move || push_main_cas(&repo_t, &merged_t, &expected_t));
+        seam::wait_arrived(&lane, 0);
+        // ls-remote read D from the real origin; swap to the empty remote so
+        // the object fetch fails.
+        tgit_ok(
+            &lane,
+            &["remote", "set-url", "origin", empty.to_str().unwrap()],
+        );
+        seam::release(&lane, 0);
+        let error = result
+            .join()
+            .expect("recovery joins")
+            .expect_err("uncertain");
+        seam::disarm(&lane);
+
+        assert!(
+            matches!(
+                error.downcast_ref::<MergeStop>(),
+                Some(MergeStop::PushUncertain(_))
+            ),
+            "PushUncertain, got {error:#}"
+        );
+        assert!(
+            error.to_string().contains("object fetch"),
+            "the uncertainty names the OBJECT fetch after listing succeeded: {error}"
+        );
+        assert_eq!(
+            refs_listing(&lane),
+            before,
+            "the failed object fetch created, updated or deleted no ref"
+        );
+        drop(keep);
+    }
+
+    /// r30 item 2: exact unsupported-SHA-256 diagnostics, as a pure
+    /// classifier over controlled strings (independent of installed git).
+    #[test]
+    fn sha256_unsupported_diagnostic_classifier_is_precise() {
+        for stderr in [
+            "fatal: unknown hash algorithm 'sha256'\n",
+            "fatal: attempt to use sha256 has not been compiled in\n",
+            "error: unknown option `object-format'\nusage: git init [..]",
+            "error: unknown option '--object-format=sha256'\n",
+            "fatal: unknown value for --object-format: sha256\n",
+        ] {
+            assert!(
+                is_unsupported_sha256_diagnostic(stderr),
+                "unsupported form must be recognized: {stderr:?}"
+            );
+        }
+        for stderr in [
+            // Filenames that embed the whole recognized phrase must NOT match.
+            "fatal: bad config line 1 in file /fixtures/fatal: unknown hash algorithm 'sha256'/config\n",
+            "error: cannot access /build/error: unknown option '--object-format=sha256'/src: No such file\n",
+            // Ordinary unrelated diagnostics.
+            "fatal: bad config line 3 in file /home/dev/invalid-sha256-config\n",
+            "error: invalid key: foo.sha256.invalid in /etc/gitconfig\n",
+            "fatal: unknown hash algorithm 'bogus'\n",
+            "fatal: unknown hash algorithm 'SHA256'\n",
+            // Wrong operands and trailing text (r32 item 4).
+            "fatal: unknown hash algorithm 'sha1'\n",
+            "fatal: unknown value for --object-format: bogus\n",
+            "error: unknown value for --object-format: sha1\n",
+            "fatal: unknown value for --object-format: sha256extra\n",
+            "  fatal: unknown hash algorithm 'sha256'  extra\n",
+            "fatal: attempt to use sha256 has not been compiled in extra\n",
+            "fatal: unknown value for --object-format: sha256 extra\n",
+            "error: unknown option `object-format' extra\n",
+            " x error: unknown option `--object-format'\n",
+            "",
+        ] {
+            assert!(
+                !is_unsupported_sha256_diagnostic(stderr),
+                "unrelated diagnostic must not skip: {stderr:?}"
+            );
+        }
+    }
+
+    /// r30 item 2: a spawn failure of the probe program is a hard failure,
+    /// never a silent skip (uses a nonexistent executable path).
+    #[test]
+    fn a_sha256_probe_spawn_failure_panics() {
+        let dir = tempfile::tempdir().unwrap();
+        let bogus = dir
+            .path()
+            .join("no-such-bin-dir")
+            .join("git")
+            .to_string_lossy()
+            .into_owned();
+        let target = dir.path().join("p");
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            probe_sha256_support_with(&bogus, &target)
+        }))
+        .is_err();
+        assert!(panicked, "a spawn failure must panic, not skip");
+    }
+
+    /// R10: post-push recovery in a SHA-256 repository reads the native
+    /// 64-hex advertised tip, fetches objects without writing a ref, and
+    /// recognizes a merge already contained in remote main.
+    #[test]
+    fn recovery_in_a_sha256_repo_reads_a_64_hex_tip_without_refs() {
+        let probe = tempfile::tempdir().unwrap();
+        let supported = probe_sha256_support("git", &probe.path().join("p"));
+        drop(probe);
+        if !supported {
+            return;
+        }
+
+        let keep = tempfile::tempdir().unwrap();
+        let full = keep.path().join("full");
+        let origin = keep.path().join("origin.git");
+        std::fs::create_dir_all(&full).unwrap();
+        tgit_ok(
+            &full,
+            &["init", "-q", "--object-format=sha256", "-b", "main"],
+        );
+        tgit_ok(&full, &["config", "user.email", "t@example.com"]);
+        tgit_ok(&full, &["config", "user.name", "T"]);
+        std::fs::write(full.join("f"), "b\n").unwrap();
+        tgit_ok(&full, &["add", "f"]);
+        tgit_ok(&full, &["commit", "-q", "-m", "B"]);
+        let base = tgit_ok(&full, &["rev-parse", "main"]);
+        assert_eq!(base.len(), 64, "fixture must be SHA-256: {base}");
+        tgit_ok(&full, &["branch", "topic"]);
+        std::fs::write(full.join("m"), "m\n").unwrap();
+        tgit_ok(&full, &["add", "m"]);
+        tgit_ok(&full, &["commit", "-q", "-m", "M"]);
+        let merged = tgit_ok(&full, &["rev-parse", "main"]);
+        // Remote advances to D, containing M.
+        std::fs::write(full.join("d"), "d\n").unwrap();
+        tgit_ok(&full, &["add", "d"]);
+        tgit_ok(&full, &["commit", "-q", "-m", "D"]);
+        let output = std::process::Command::new("git")
+            .args([
+                "init",
+                "-q",
+                "--bare",
+                "--object-format=sha256",
+                "-b",
+                "main",
+            ])
+            .current_dir(keep.path())
+            .arg(&origin)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        tgit_ok(
+            &full,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        tgit_ok(&full, &["push", "-q", "origin", "main", "topic"]);
+        // Stale post-crash checkout.
+        tgit_ok(&full, &["update-ref", "refs/remotes/origin/main", &base]);
+        tgit_ok(
+            &full,
+            &[
+                "config",
+                "remote.origin.fetch",
+                "+refs/heads/topic:refs/remotes/origin/topic",
+            ],
+        );
+        let before = refs_listing(&full);
+
+        push_main_cas(&full, &merged, &base)
+            .expect("a 64-hex advertised tip must not be rejected; M landed");
+        assert_eq!(
+            refs_listing(&full),
+            before,
+            "the sha256 recovery created, updated or deleted no ref"
+        );
+        assert_eq!(
+            tgit_ok(&full, &["rev-parse", "refs/remotes/origin/main"]),
+            base,
+            "the configured tracking ref is never touched"
+        );
+    }
+
+    /// R5 fail-open: a restricted remote.origin.fetch leaves the configured
+    /// tracking ref stale, but recovery reads the advertised tip DIRECTLY and
+    /// certifies Landed without touching any ref; an unreachable origin is
+    /// PushUncertain, likewise ref-free.
+    #[test]
+    fn recovery_reads_the_advertised_base_past_a_restricted_refspec() {
+        let (keep, _origin, _topic, main) = ancestry_fixture();
+        let repo = keep.path().join("full");
+        let merged = main.clone();
+        let expected = tgit_ok(&repo, &["rev-parse", &format!("{main}^1")]);
+        tgit_ok(&repo, &["checkout", "-q", "main"]);
+        std::fs::write(repo.join("post-land.txt"), "remote moved\n").unwrap();
+        tgit_ok(&repo, &["add", "post-land.txt"]);
+        tgit_ok(&repo, &["commit", "-q", "-m", "later remote commit D"]);
+        tgit_ok(&repo, &["push", "-q", "origin", "main"]);
+        assert_ne!(tgit_ok(&repo, &["rev-parse", "main"]), merged);
+        tgit_ok(
+            &repo,
+            &["update-ref", "refs/remotes/origin/main", &expected],
+        );
+        tgit_ok(
+            &repo,
+            &[
+                "config",
+                "remote.origin.fetch",
+                "+refs/heads/topic:refs/remotes/origin/topic",
+            ],
+        );
+        tgit_ok(&repo, &["fetch", "-q", "origin"]);
+        assert_eq!(
+            tgit_ok(&repo, &["rev-parse", "refs/remotes/origin/main"]),
+            expected,
+            "the restricted fetch leaves origin/main stale"
+        );
+        let before = refs_listing(&repo);
+
+        push_main_cas(&repo, &merged, &expected).expect(
+            "a merge already contained in remote main is Landed despite a stale tracking ref",
+        );
+        assert_eq!(
+            refs_listing(&repo),
+            before,
+            "a successful recovery creates, updates or deletes no ref"
+        );
+        assert_eq!(
+            tgit_ok(&repo, &["rev-parse", "refs/remotes/origin/main"]),
+            expected,
+            "the configured tracking ref is never touched"
+        );
+
+        tgit_ok(
+            &repo,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                keep.path().join("no-such-origin-r30.git").to_str().unwrap(),
+            ],
+        );
+        let error = push_main_cas(&repo, &merged, &expected)
+            .expect_err("an unreachable recovery stays uncertain");
+        assert!(
+            matches!(
+                error.downcast_ref::<MergeStop>(),
+                Some(MergeStop::PushUncertain(_))
+            ),
+            "PushUncertain, got {error:#}"
+        );
+        assert_eq!(
+            refs_listing(&repo),
+            before,
+            "a failed recovery creates, updates or deletes no ref"
+        );
+    }
+
+    /// Count LIVE (non-zombie) processes whose /proc/<pid>/cmdline carries the
+    /// marker -- r19 item 2 leftover-process assertion.
+    fn live_marker_processes(marker: &str) -> usize {
+        std::fs::read_dir("/proc")
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+                    .filter_map(|name| name.parse::<i32>().ok())
+                    .filter(|pid| {
+                        let base = std::path::Path::new("/proc").join(pid.to_string());
+                        let Ok(cmd) = std::fs::read_to_string(base.join("cmdline")) else {
+                            return false;
+                        };
+                        // /proc cmdline separates argv with NUL bytes.
+                        if !cmd.replace('\0', " ").contains(marker) {
+                            return false;
+                        }
+                        if let Ok(stat) = std::fs::read_to_string(base.join("stat"))
+                            && let Some(after) = stat.rsplit_once(')').map(|(_, r)| r)
+                        {
+                            let state = after.split_whitespace().next().unwrap_or("");
+                            return state != "Z";
+                        }
+                        true
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
     }
 }

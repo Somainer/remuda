@@ -59,6 +59,20 @@ export type Instance = EntityMeta & {
    * Status chrome may render `text`, never new controls.
    */
   lastTurnError?: { at: string; text: string };
+  /**
+   * seen-hub (home ◉): the latest settled turn end is newer than what the
+   * owner has seen. Owner-scoped, so every owner device reads the same value;
+   * absent from an older Hub (read as false). Recompute from the two seqs
+   * below with `seenUnseen` when merging.
+   */
+  unseen?: boolean;
+  /** Owner's seen seq; only grows. Absent until the first seen report. */
+  seenSeq?: U64;
+  /**
+   * Journal seq of the latest settled turn end; only grows. Absent before the
+   * first one (a resumed session or a new chapter starts without one).
+   */
+  turnEndSeq?: U64;
   activityEvidenceEventIds?: Id[];
   cwd?: string | null;
   name?: string | null;

@@ -1,0 +1,2365 @@
+import { afterEach, expect, it, vi } from "vitest";
+import type { CommandResult } from "../types/command";
+import type { Observation } from "../types/observation";
+import { OUTBOX_LS_KEY, type Outbox as OutboxInstance, type OutboxRecord } from "./outbox";
+
+/**
+ * Ruling AD (outboxdebt r1): catch-up debt for a drained (sent-while-offline)
+ * command is discharged ONLY BY EVIDENCE that the command reached the journal
+ * — the follow/journal client observes the journal entry for the command id.
+ * An empty resync certifies the connection live but must NOT delete the debt;
+ * a bounded debt-driven tail re-read keeps re-reading, and exhaustion moves
+ * the bubble to the existing 状态待确认 (outbox "unknown") state.
+ */
+const INSTANCE = "ins_outbox_debt";
+const JOURNAL = "obj_outbox_debt_journal";
+
+type Api = typeof import("./api").api;
+type Store = typeof import("./store").hubStore;
+
+function commandResult(commandId: string, state: CommandResult["command"]["state"]): CommandResult {
+  return {
+    relatedCommandIds: [],
+    command: {
+      commandId,
+      id: commandId,
+      revision: "1",
+      createdAt: "2026-10-18T00:00:00.000Z",
+      updatedAt: "2026-10-18T00:00:00.000Z",
+      actor: { principalId: "prn_1", type: "human", deviceId: "dev_1", instanceId: INSTANCE },
+      origin: "ui",
+      operation: "instance.send",
+      target: { hostId: "hst_1", instanceId: INSTANCE, runId: null },
+      payloadDigest: "sha256:00",
+      state,
+      dispatch: "intent-durable",
+      resolution: "clear",
+    },
+  };
+}
+
+const liveStores: Store[] = [];
+async function fresh(): Promise<{ api: Api; hubStore: Store }> {
+  vi.resetModules();
+  const [apiModule, storeModule] = await Promise.all([import("./api"), import("./store")]);
+  liveStores.push(storeModule.hubStore);
+  return { api: apiModule.api, hubStore: storeModule.hubStore };
+}
+
+type JournalPage = Awaited<ReturnType<Api["eventsRead"]>>;
+const EMPTY_PAGE: JournalPage = {
+  events: [],
+  durableSeq: "0",
+  windowFromSeq: null,
+  reachedAfterSeq: true,
+};
+
+function userMessagePage(commandId: string): JournalPage {
+  return {
+    events: [
+      {
+        kind: "message",
+        eventId: "evt_user_debt_1",
+        journalId: JOURNAL,
+        instanceId: INSTANCE,
+        seq: "1",
+        completeness: "structured",
+        payload: { role: "user", commandId },
+      } as unknown as Observation,
+    ],
+    durableSeq: "1",
+    windowFromSeq: "1",
+    reachedAfterSeq: true,
+  };
+}
+
+/**
+ * A journal row as a test fixture: `kind` + `payload` form the opaque event
+ * JSON the Node appended (the Hub's payload_json); seq and eventId are the
+ * Hub's own columns.
+ */
+type HubRow = { seq: number; eventId: string; kind: string; payload: Record<string, unknown> };
+// Hub read_journal caps (crates/remuda-hub/src/store.rs JOURNAL_WINDOW_ROWS / _BYTES).
+const HUB_WINDOW_ROWS = 2_000;
+const HUB_WINDOW_BYTES = 8 * 1024 * 1024;
+const utf8 = new TextEncoder();
+
+/** The stored event JSON of a row (payload_json, serde_json compact form). */
+function hubEventJson(row: HubRow): string {
+  return JSON.stringify({ kind: row.kind, payload: row.payload });
+}
+
+/**
+ * GET /v1/instances/{id}/journal answered exactly as the Hub's read_journal
+ * does: rows in (afterSeq, min(beforeSeq, durableSeq)] walked NEWEST first
+ * under the row cap and the byte cap — UTF-8 bytes of each row's stored
+ * event JSON (payload.len() in Rust), the newest row always kept — returned
+ * ascending as JournalRecord envelopes; fromSeq is the returned floor and
+ * reachedAfterSeq is true for an empty window or a floor of afterSeq + 1.
+ */
+function hubJournalResponse(input: RequestInfo | URL, rows: HubRow[], durableSeq: number): Response {
+  const url = new URL(String(input), "http://hub.test");
+  const after = Number(url.searchParams.get("afterSeq") ?? "0");
+  const beforeRaw = url.searchParams.get("beforeSeq");
+  const high = beforeRaw === null ? durableSeq : Math.min(Number(beforeRaw), durableSeq);
+  const window: { row: HubRow; json: string }[] = [];
+  let bytes = 0;
+  for (const row of rows.filter((r) => r.seq > after && r.seq <= high).sort((a, b) => b.seq - a.seq)) {
+    if (window.length >= HUB_WINDOW_ROWS) break;
+    const json = hubEventJson(row);
+    const size = utf8.encode(json).length;
+    if (window.length > 0 && bytes + size > HUB_WINDOW_BYTES) break;
+    bytes += size;
+    window.push({ row, json });
+  }
+  window.reverse();
+  const fromSeq = window[0]?.row.seq ?? null;
+  return new Response(
+    JSON.stringify({
+      instanceId: INSTANCE,
+      durableSeq: String(durableSeq),
+      fromSeq: fromSeq === null ? null : String(fromSeq),
+      reachedAfterSeq: fromSeq === null || fromSeq === after + 1,
+      events: window.map(({ row, json }) => ({
+        instanceId: INSTANCE,
+        seq: row.seq,
+        eventId: row.eventId,
+        event: JSON.parse(json) as unknown,
+        observedAt: "2026-10-29T00:00:00.000Z",
+      })),
+    }),
+    { status: 200, headers: { "content-type": "application/json" } },
+  );
+}
+
+async function mountFollow(api: Api, hubStore: Store, seedPage: JournalPage = EMPTY_PAGE) {
+  vi.spyOn(api, "instanceGet").mockResolvedValue({
+    id: INSTANCE,
+    journalId: JOURNAL,
+  } as Awaited<ReturnType<Api["instanceGet"]>>);
+  vi.spyOn(api, "eventsRead").mockResolvedValue(seedPage);
+  vi.spyOn(api, "instanceList").mockResolvedValue({
+    items: [
+      { id: INSTANCE, hostId: "hst_1", journalId: JOURNAL, revision: "1", durableSeq: "0", lifecycle: "running" } as Awaited<
+        ReturnType<Api["instanceList"]>
+      >["items"][number],
+    ],
+    nextCursor: null,
+  });
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as Awaited<ReturnType<Api["interactionList"]>>);
+  vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+  vi.spyOn(api, "eventsSubscribe").mockResolvedValue({
+    subscriptionId: "sub_outbox_debt",
+    journalId: JOURNAL,
+    durableSeq: "0",
+    windowFromSeq: null,
+    reachedAfterSeq: true,
+    getReadyState: () => 1,
+    snapshot: {
+      projectionVersion: "v1",
+      projectionEpoch: "epoch_outbox_debt",
+      asOfSeq: "0",
+      instance: {} as never,
+      runs: [],
+      commands: [],
+      pendingInteractions: [],
+      nodes: [],
+      history: { earliestRetainedSeq: "0", complete: true },
+    },
+  });
+  await hubStore.refresh();
+  await hubStore.follow(INSTANCE);
+}
+
+function debtOf(hubStore: Store): Map<string, unknown> {
+  return (hubStore as unknown as { reconcileOwed: Map<string, unknown> }).reconcileOwed;
+}
+
+/** The live-batch injector the follow subscription mock captured. */
+async function liveBatch(api: Api) {
+  const subscribe = vi.mocked(api.eventsSubscribe);
+  await vi.waitFor(() => expect(subscribe.mock.calls.length).toBeGreaterThan(0));
+  return subscribe.mock.calls[0]?.[2] as (batch: Record<string, unknown>) => void;
+}
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+  for (const store of liveStores.splice(0)) store.logout();
+  localStorage.removeItem(OUTBOX_LS_KEY);
+});
+
+it("an empty resync keeps the drained command's catch-up debt; the bubble resolves when the journal entry is finally read", async () => {
+  const { api, hubStore } = await fresh();
+  await mountFollow(api, hubStore);
+
+  // The POST is accepted (Hub forwarded it) but the Node's journal write is
+  // held: every journal read returns empty for now.
+  vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+    const commandId = _args[4] as string;
+    return Promise.resolve(commandResult(commandId, "accepted"));
+  });
+
+  await hubStore.send(INSTANCE, "offline across reload");
+  const bubble = () => hubStore.getSnapshot().bubbles[0]!;
+  await vi.waitFor(() => expect(bubble().outboxState).toBe("sent"));
+  const commandId = bubble().commandId!;
+
+  // The drain's catch-up ran on the mounted client: the seed read plus the
+  // post-delivery resync, both EMPTY (the Node has not journaled yet).
+  const read = vi.mocked(api.eventsRead);
+  await vi.waitFor(() => expect(read.mock.calls.length).toBeGreaterThanOrEqual(2));
+  const emptyReads = read.mock.calls.length;
+
+  // Ruling AD: an empty resync must NOT discharge the debt. The per-command
+  // debt survives even though the link is certified live.
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(true);
+  // The bounded debt-driven tail re-read keeps re-reading while evidence is
+  // missing (the old code never read again after the empty resync).
+  await vi.waitFor(() => expect(read.mock.calls.length).toBeGreaterThan(emptyReads), { timeout: 5_000 });
+  // …and the bubble honestly stays accepted — never settled without evidence.
+  expect(bubble().state).toBe("accepted");
+  expect(bubble().outboxState).toBe("sent");
+
+  // The Node's journal write lands (late bus publish missed / replay — only a
+  // durable read can observe it now): the next bounded tail read returns the
+  // user message carrying the command id.
+  vi.mocked(api.eventsRead).mockResolvedValue(userMessagePage(commandId));
+
+  await vi.waitFor(
+    () => {
+      const b = hubStore.getSnapshot().bubbles.find((x) => x.commandId === commandId)!;
+      expect(b.state).toBe("settled");
+      expect(b.outboxState).toBe("done");
+    },
+    { timeout: 5_000 },
+  );
+  // Evidence discharges the debt.
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+});
+
+it("bounded tail re-read exhaustion moves the accepted bubble to the existing 状态待确认 state, never leaves it accepted", async () => {
+  vi.useFakeTimers();
+  try {
+    const { api, hubStore } = await fresh();
+    await mountFollow(api, hubStore);
+    vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+      const commandId = _args[4] as string;
+      return Promise.resolve(commandResult(commandId, "accepted"));
+    });
+
+    await hubStore.send(INSTANCE, "node never journals");
+    // Pump the send + drain chain (POST resolves, empty resync certifies
+    // live, debt is recorded).
+    for (let i = 0; i < 20; i += 1) await vi.advanceTimersByTimeAsync(0);
+    const bubble = () => hubStore.getSnapshot().bubbles[0]!;
+    for (let i = 0; i < 20 && bubble().outboxState !== "sent"; i += 1) {
+      await vi.advanceTimersByTimeAsync(0);
+    }
+    expect(bubble().outboxState).toBe("sent");
+    expect(debtOf(hubStore).has(INSTANCE)).toBe(true);
+
+    // Journal evidence never arrives. Run the whole bounded backoff/deadline
+    // window; every tail read returns the same empty window.
+    const read = vi.mocked(api.eventsRead);
+    const readsBefore = read.mock.calls.length;
+    for (let t = 0; t < 40_000; t += 500) {
+      await vi.advanceTimersByTimeAsync(500);
+      for (let i = 0; i < 5; i += 1) await Promise.resolve();
+    }
+    expect(read.mock.calls.length).toBeGreaterThan(readsBefore);
+
+    // Exhaustion: the existing not-confirmed state (outbox "unknown" ->
+    // 状态待确认), never a permanent accepted bubble, never silently gone.
+    expect(bubble().outboxState).toBe("unknown");
+    expect(bubble().state).toBe("unknown");
+    const { projectCommandStatus } = await import("./commandStatus");
+    const row = projectCommandStatus({ hasServerCommandId: true, outboxState: "unknown" });
+    expect(row.label).toBe("状态待确认");
+    expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+
+    // The bound is a real stop: no further tail reads after exhaustion.
+    const readsAtExhaustion = read.mock.calls.length;
+    for (let t = 0; t < 10_000; t += 500) await vi.advanceTimersByTimeAsync(500);
+    expect(read.mock.calls.length).toBe(readsAtExhaustion);
+
+    hubStore.logout();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("a debt read BELOW the live cursor observes the missed command entry and settles the bubble", async () => {
+  // The e2e shape: the same turn's assistant frames advance the journal
+  // client's applied cursor past the missed user entry, and a normal
+  // resumeAfterReconnect read (generation-gated, cursor-anchored) can never
+  // fold it. The debt tail reads a window BELOW the cursor and settles by
+  // command id (AD3: without folding the entry into store events).
+  const { api, hubStore } = await fresh();
+  await mountFollow(api, hubStore);
+  vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+    const commandId = _args[4] as string;
+    return Promise.resolve(commandResult(commandId, "accepted"));
+  });
+
+  await hubStore.send(INSTANCE, "missed below cursor");
+  const bubble = () => hubStore.getSnapshot().bubbles[0]!;
+  await vi.waitFor(() => expect(bubble().outboxState).toBe("sent"));
+  const commandId = bubble().commandId!;
+
+  // The turn continues live: an assistant frame at seq 1 advances the
+  // client cursor (it is not the owed user message).
+  const onBatch = await liveBatch(api);
+  onBatch({
+    subscriptionId: "sub_outbox_debt",
+    journalId: JOURNAL,
+    fromSeq: "1",
+    toSeq: "1",
+    durableSeq: "1",
+    events: [
+      {
+        kind: "message",
+        eventId: "evt_assistant_1",
+        journalId: JOURNAL,
+        instanceId: INSTANCE,
+        seq: "1",
+        completeness: "structured",
+        payload: { role: "assistant", text: "working" },
+      } as unknown as Observation,
+    ],
+  });
+
+  // From now on the durable read sees the missed user entry; the debt read
+  // starts BELOW the applied cursor (afterSeq 0), so it still finds it.
+  vi.mocked(api.eventsRead).mockResolvedValue(userMessagePage(commandId));
+
+  await vi.waitFor(
+    () => {
+      const b = hubStore.getSnapshot().bubbles.find((x) => x.commandId === commandId)!;
+      expect(b.state).toBe("settled");
+      expect(b.outboxState).toBe("done");
+    },
+    { timeout: 5_000 },
+  );
+  // Ruling AD3: the live follow is the only writer of store events.
+  const folded = hubStore
+    .getSnapshot()
+    .events[INSTANCE]?.some((e) => (e.payload as { commandId?: string }).commandId === commandId);
+  expect(folded).toBe(false);
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+});
+
+it("a debt read released after logout and a new login folds nothing into the successor store", async () => {
+  // Ruling AD r2 item 1: identity/lifetime ownership. A tail read parked
+  // across an auth retirement must be dropped WHOLE when it resolves — no
+  // journal fold, no outbox transition on the successor identity.
+  const { api, hubStore } = await fresh();
+  await mountFollow(api, hubStore);
+  vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+    const commandId = _args[4] as string;
+    return Promise.resolve(commandResult(commandId, "accepted"));
+  });
+
+  // Seed reads (no afterSeq) and the drain's own resume read (1st afterSeq)
+  // resolve empty; every LATER afterSeq read (the debt tail) parks until
+  // released — simulating the response arriving after logout.
+  let afterSeqCalls = 0;
+  let heldCommandId = "";
+  let releaseHeld: (() => void) = () => undefined;
+  const held = new Promise<JournalPage>((resolve) => {
+    releaseHeld = () => resolve(userMessagePage(heldCommandId));
+  });
+  const read = vi.mocked(api.eventsRead);
+  read.mockImplementation(((args: { afterSeq?: string }) => {
+    if (!args.afterSeq) return Promise.resolve(EMPTY_PAGE);
+    afterSeqCalls += 1;
+    return afterSeqCalls <= 1 ? Promise.resolve(EMPTY_PAGE) : held;
+  }) as Api["eventsRead"]);
+
+  await hubStore.send(INSTANCE, "across an auth retirement");
+  const bubble = () => hubStore.getSnapshot().bubbles[0]!;
+  await vi.waitFor(() => expect(bubble().outboxState).toBe("sent"));
+  const commandId = bubble().commandId!;
+
+  // Debt recorded and its tail read parked (call #2).
+  await vi.waitFor(() => expect(afterSeqCalls).toBeGreaterThanOrEqual(2), { timeout: 5_000 });
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(true);
+
+  // Logout (epoch bump + outbox disposal), then a NEW login (new box,
+  // same successor identity, restored durable row).
+  hubStore.logout();
+  await (hubStore as unknown as { ensureOutboxForTest: () => Promise<unknown> }).ensureOutboxForTest();
+  expect(hubStore.getSnapshot().events[INSTANCE]).toBeUndefined();
+
+  // Release the OLD identity's response carrying the old journal entry.
+  heldCommandId = commandId;
+  releaseHeld();
+  for (let i = 0; i < 50; i += 1) await Promise.resolve();
+
+  // Nothing of the old identity folded into the successor store…
+  expect(hubStore.getSnapshot().events[INSTANCE]).toBeUndefined();
+  // …and the successor's durable row was never flipped done by the stale fold.
+  const successorRow = (
+    hubStore as unknown as { outbox: { get: (id: string) => { state: string } | undefined } | null }
+  ).outbox?.get(commandId);
+  expect(successorRow?.state).not.toBe("done");
+});
+
+it("the debt tail makes FORWARD progress through the real adapter with 128 loaded rows and the command at 129", async () => {
+  // r2 item 2: afterSeq "0" + limit 128 returns the same oldest 128 rows
+  // forever (the real adapter slices to limit, api.ts eventsRead); a command
+  // journaled at seq 129 must be reached by a FORWARD read, not by re-reading
+  // the overlap window. Drives the REAL api.eventsRead adapter via fetch.
+  const { api, hubStore } = await fresh();
+
+  let commandId = "";
+  const rows = Array.from({ length: 128 }, (_, i) => ({
+    seq: i + 1,
+    eventId: `evt_seed_${i + 1}`,
+    kind: "raw_tty",
+    payload: { text: `filler ${i + 1}` },
+  }));
+  let appended = false;
+
+  // The Hub's read_journal window semantics (hubJournalResponse).
+  const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+    const after = Number(new URL(String(input), "http://hub.test").searchParams.get("afterSeq") ?? "0");
+    const userRow129 = {
+      seq: 129,
+      eventId: "evt_user_129",
+      kind: "message",
+      payload: { role: "user", commandId },
+    };
+    const response = appended
+      ? hubJournalResponse(input, [...rows, userRow129], 129)
+      : hubJournalResponse(input, rows, 128);
+    // The drain's empty resume (afterSeq=128) races the node append: the
+    // command lands at seq 129 immediately AFTER that empty response.
+    if (after >= 128 && !appended) appended = true;
+    return response;
+  });
+  vi.stubGlobal("fetch", fetchMock);
+
+  // Everything except eventsRead is still mocked; eventsRead runs for real
+  // through rest()/coerceObservationList.
+  vi.spyOn(api, "instanceGet").mockResolvedValue({
+    id: INSTANCE,
+    journalId: JOURNAL,
+  } as Awaited<ReturnType<Api["instanceGet"]>>);
+  vi.spyOn(api, "instanceList").mockResolvedValue({
+    items: [
+      { id: INSTANCE, journalId: JOURNAL, revision: "1", durableSeq: "128", lifecycle: "running" } as Awaited<
+        ReturnType<Api["instanceList"]>
+      >["items"][number],
+    ],
+    nextCursor: null,
+  });
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as Awaited<ReturnType<Api["interactionList"]>>);
+  vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+  vi.spyOn(api, "eventsSubscribe").mockResolvedValue({
+    subscriptionId: "sub_outbox_debt_realread",
+    journalId: JOURNAL,
+    durableSeq: "128",
+    windowFromSeq: "1",
+    reachedAfterSeq: true,
+    getReadyState: () => 1,
+    snapshot: {
+      projectionVersion: "v1",
+      projectionEpoch: "epoch_outbox_debt_realread",
+      asOfSeq: "128",
+      instance: {} as never,
+      runs: [],
+      commands: [],
+      pendingInteractions: [],
+      nodes: [],
+      history: { earliestRetainedSeq: "1", complete: true },
+    },
+  });
+  vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+    commandId = _args[4] as string;
+    return Promise.resolve(commandResult(commandId, "accepted"));
+  });
+
+  await hubStore.refresh();
+  await hubStore.follow(INSTANCE);
+  // Seed folded 128 rows through the REAL adapter.
+  await vi.waitFor(() => expect(hubStore.getSnapshot().events[INSTANCE]).toHaveLength(128));
+
+  await hubStore.send(INSTANCE, "the one at 129");
+  const bubble = () => hubStore.getSnapshot().bubbles.find((b) => b.commandId === commandId)!;
+  await vi.waitFor(() => expect(bubble().outboxState).toBe("sent"));
+
+  // The forward tail read must reach seq 129 and settle the bubble (the old
+  // fixed overlap window never got past row 128).
+  await vi.waitFor(
+    () => {
+      expect(bubble().state).toBe("settled");
+      expect(bubble().outboxState).toBe("done");
+    },
+    { timeout: 6_000 },
+  );
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+}, 15_000);
+
+it("a storage-aborted terminal write keeps the debt, shows 状态待确认 in memory and retries to not-confirmed", async () => {
+  // r2 item 3: if the IndexedDB transaction writing "unknown" aborts,
+  // deleting the debt/timer would strand the accepted bubble forever. The
+  // obligation survives, the in-memory presentation is already
+  // not-confirmed, and a bounded storage retry commits it.
+  vi.useFakeTimers();
+  try {
+    const { api, hubStore } = await fresh();
+    await mountFollow(api, hubStore);
+    vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+      const commandId = _args[4] as string;
+      return Promise.resolve(commandResult(commandId, "accepted"));
+    });
+
+    await hubStore.send(INSTANCE, "storage aborts once");
+    for (let i = 0; i < 30; i += 1) await vi.advanceTimersByTimeAsync(0);
+    const bubble = () => hubStore.getSnapshot().bubbles[0]!;
+    for (let i = 0; i < 30 && bubble().outboxState !== "sent"; i += 1) {
+      await vi.advanceTimersByTimeAsync(0);
+    }
+    expect(bubble().outboxState).toBe("sent");
+    const commandId = bubble().commandId!;
+    expect(debtOf(hubStore).has(INSTANCE)).toBe(true);
+
+    // The terminal-state ("unknown") IndexedDB transaction aborts ONCE.
+    const outbox0 = (
+      hubStore as unknown as { outbox: { storage: { mergeUnlessDone: (id: string, p: unknown) => Promise<unknown> } } }
+    ).outbox;
+    const storage = outbox0.storage;
+    const realMerge = storage.mergeUnlessDone.bind(storage);
+    let aborted = false;
+    storage.mergeUnlessDone = vi.fn(async (id: string, patch: unknown) => {
+      if ((patch as { state?: string }).state === "unknown" && !aborted) {
+        aborted = true;
+        throw new Error("IDB_TRANSACTION_ABORTED");
+      }
+      return realMerge(id, patch);
+    });
+
+    // Run the read deadline (every read answered empty) until the FIRST
+    // terminal write aborts at exhaustion.
+    for (let t = 0; t < 60_000 && !aborted; t += 100) {
+      await vi.advanceTimersByTimeAsync(100);
+      for (let i = 0; i < 5; i += 1) await vi.advanceTimersByTimeAsync(0);
+    }
+    for (let i = 0; i < 30; i += 1) await vi.advanceTimersByTimeAsync(0);
+
+    // The abort happened…
+    expect(aborted).toBe(true);
+    // …the durable row is STILL "sent" (commit failed)…
+    const rowState = () =>
+      (hubStore as unknown as { outbox: { get: (id: string) => OutboxRecord | undefined } }).outbox.get(commandId)?.state;
+    expect(rowState()).toBe("sent");
+    // …but the obligation survived and the bubble already presents
+    // not-confirmed (never a permanent accepted).
+    expect(debtOf(hubStore).has(INSTANCE)).toBe(true);
+    expect(bubble().outboxState).toBe("unknown");
+    const { projectCommandStatus } = await import("./commandStatus");
+    expect(projectCommandStatus({ hasServerCommandId: true, outboxState: "unknown" }).label).toBe("状态待确认");
+
+    // The bounded storage retry fires and commits "unknown".
+    await vi.advanceTimersByTimeAsync(1_100);
+    for (let i = 0; i < 20; i += 1) await vi.advanceTimersByTimeAsync(0);
+    expect(rowState()).toBe("unknown");
+    expect(bubble().outboxState).toBe("unknown");
+    expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+
+    // No further tail work after the committed transition.
+    const reads = vi.mocked(api.eventsRead).mock.calls.length;
+    for (let t = 0; t < 10_000; t += 500) await vi.advanceTimersByTimeAsync(500);
+    expect(vi.mocked(api.eventsRead).mock.calls.length).toBe(reads);
+
+    hubStore.logout();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("r3 item 2: a model-B degraded verdict in a debt read is left for the live callback to apply", async () => {
+  // AD2: a debt forward read is EVIDENCE-ONLY. A current request's
+  // model-degraded verdict riding the same page must NOT be applied (or have
+  // its id consumed) by the debt path — only the owed user message settles;
+  // the SAME event arriving on the live callback then shows B's refusal.
+  const { api, hubStore } = await fresh();
+  await mountFollow(api, hubStore);
+  vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+    const commandId = _args[4] as string;
+    return Promise.resolve(commandResult(commandId, "accepted"));
+  });
+
+  // Optimistic in-flight model request B.
+  const h = hubStore as unknown as {
+    state: {
+      modelPending: Record<string, { id: string; queued: boolean } | undefined>;
+      models: Record<string, string | undefined>;
+    };
+  };
+  h.state.models[INSTANCE] = "model-B";
+  const noteModel = (
+    hubStore as unknown as { noteModelLifecycle: (id: string, ev: Observation) => void }
+  ).noteModelLifecycle.bind(hubStore) as (id: string, ev: Observation) => void;
+  const configureLifecycle = (seq: number, eventId: string, status: string): Observation =>
+    ({
+      eventId,
+      instanceId: INSTANCE,
+      journalId: JOURNAL,
+      seq: String(seq),
+      kind: "lifecycle",
+      observedAt: `2026-10-18T00:0${seq}:00Z`,
+      source: { channel: "runtime" },
+      payload: {
+        type: "native",
+        nativeName: "instance.configure",
+        nativeId: { state: "not-applicable" },
+        status: { state: "known", value: status },
+        relatedIds: {},
+      },
+    }) as unknown as Observation;
+  noteModel(INSTANCE, configureLifecycle(1, "evt_cfg_B", "model-queued:model-B"));
+  const pending = () => h.state.modelPending[INSTANCE];
+  expect(pending()?.id).toBe("model-B");
+
+  const degradedB = configureLifecycle(2, "evt_cfg_B_bad", "model-degraded:model-B:not-found");
+
+  await hubStore.send(INSTANCE, "owed while B pending");
+  const bubble = () => hubStore.getSnapshot().bubbles[0]!;
+  await vi.waitFor(() => expect(bubble().outboxState).toBe("sent"));
+  const commandId = bubble().commandId!;
+
+  // The forward debt read returns BOTH the owed command entry and B's
+  // verdict. Only settlement evidence is applied.
+  vi.mocked(api.eventsRead).mockResolvedValue({
+    events: [
+      degradedB,
+      {
+        kind: "message",
+        eventId: "evt_user_owed",
+        journalId: JOURNAL,
+        instanceId: INSTANCE,
+        seq: "3",
+        completeness: "structured",
+        payload: { role: "user", commandId },
+      } as unknown as Observation,
+    ],
+    durableSeq: "3",
+    windowFromSeq: "1",
+    reachedAfterSeq: true,
+  });
+  // Drive the bounded debt tail read directly (its earlier drain resync
+  // already consumed the empty seed/resync pages).
+  (
+    hubStore as unknown as { runOwedTailPass: (id: string) => void }
+  ).runOwedTailPass(INSTANCE);
+  for (let i = 0; i < 50; i += 1) await Promise.resolve();
+  // The debt read neither applied nor consumed B's verdict: B stays pending
+  // and the optimistic selection is untouched.
+  expect(bubble().state).toBe("settled");
+  expect(bubble().outboxState).toBe("done");
+  expect(pending()?.id).toBe("model-B");
+  expect(h.state.models[INSTANCE]).toBe("model-B");
+
+  // Now the SAME verdict arrives through the live callback (contiguously
+  // after a seq-1 assistant frame): it applies and shows the refusal —
+  // pending cleared, picker reverted.
+  const onBatch = await liveBatch(api);
+  onBatch({
+    subscriptionId: "sub_outbox_debt",
+    journalId: JOURNAL,
+    fromSeq: "1",
+    toSeq: "1",
+    durableSeq: "1",
+    events: [
+      {
+        kind: "message",
+        eventId: "evt_assistant_1",
+        journalId: JOURNAL,
+        instanceId: INSTANCE,
+        seq: "1",
+        completeness: "structured",
+        payload: { role: "assistant", text: "working" },
+      } as unknown as Observation,
+    ],
+  });
+  onBatch({
+    subscriptionId: "sub_outbox_debt",
+    journalId: JOURNAL,
+    fromSeq: "2",
+    toSeq: "2",
+    durableSeq: "2",
+    events: [degradedB],
+  });
+  expect(pending()).toBeUndefined();
+  expect(h.state.models[INSTANCE]).toBeUndefined();
+});
+
+it("r3 item 3: an old permission readback for A recovered by a debt read leaves request B pending", async () => {
+  // AD2: a debt read ignores every non-settlement event. An older permission
+  // readback for request A in the page must never settle request B.
+  const { api, hubStore } = await fresh();
+  await mountFollow(api, hubStore);
+  vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+    const commandId = _args[4] as string;
+    return Promise.resolve(commandResult(commandId, "accepted"));
+  });
+
+  const h = hubStore as unknown as {
+    state: { permissionPending: Record<string, { mode: string; queued: boolean } | undefined> };
+  };
+  h.state.permissionPending[INSTANCE] = { mode: "plan", queued: true };
+
+  // A's OLD effective-permission readback (kind "permission"), timestamped
+  // after any last loaded effective — the shape notePermissionObservation
+  // uses to settle a pending walk.
+  const oldPermissionA = {
+    eventId: "evt_perm_A_old",
+    instanceId: INSTANCE,
+    journalId: JOURNAL,
+    seq: "1",
+    kind: "permission",
+    observedAt: "2026-10-18T00:09:00Z",
+    source: { channel: "runtime" },
+    payload: {
+      effective: { mode: "default", source: "remuda", observedAt: "2026-10-18T00:09:00Z" },
+    },
+  } as unknown as Observation;
+
+  await hubStore.send(INSTANCE, "owed while permission B pending");
+  const bubble = () => hubStore.getSnapshot().bubbles[0]!;
+  await vi.waitFor(() => expect(bubble().outboxState).toBe("sent"));
+  const commandId = bubble().commandId!;
+
+  vi.mocked(api.eventsRead).mockResolvedValue({
+    events: [
+      oldPermissionA,
+      {
+        kind: "message",
+        eventId: "evt_user_owed_perm",
+        journalId: JOURNAL,
+        instanceId: INSTANCE,
+        seq: "2",
+        completeness: "structured",
+        payload: { role: "user", commandId },
+      } as unknown as Observation,
+    ],
+    durableSeq: "2",
+    windowFromSeq: "1",
+    reachedAfterSeq: true,
+  });
+  (
+    hubStore as unknown as { runOwedTailPass: (id: string) => void }
+  ).runOwedTailPass(INSTANCE);
+  for (let i = 0; i < 50; i += 1) await Promise.resolve();
+  expect(bubble().outboxState).toBe("done");
+  // A's old permission readback never settled B.
+  expect(h.state.permissionPending[INSTANCE]?.mode).toBe("plan");
+});
+
+it("r3 item 1: the FIRST post-drain resync held across logout and a real successor login applies nothing", async () => {
+  // The drain's inline JournalClient.resumeAfterReconnect must carry an
+  // ownership predicate. Without it (default always-true), a resync response
+  // parked across logout is applied AFTER a real successor login, restoring
+  // the retired identity's events and flipping the successor outbox row done.
+  const { api, hubStore } = await fresh();
+  await mountFollow(api, hubStore);
+  vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+  vi.spyOn(api, "hostList").mockResolvedValue({ items: [], nextCursor: null } as Awaited<
+    ReturnType<Api["hostList"]>
+  >);
+  vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as Awaited<ReturnType<Api["deviceList"]>>);
+  vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as Awaited<ReturnType<Api["passkeyList"]>>);
+  vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+  vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+  vi.spyOn(api, "login").mockResolvedValue({
+    deviceId: "dev_successor",
+    token: "tok_successor",
+    name: "successor",
+  } as Awaited<ReturnType<Api["login"]>>);
+  vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+    const commandId = _args[4] as string;
+    return Promise.resolve(commandResult(commandId, "accepted"));
+  });
+
+  // Seed reads (no afterSeq) resolve empty; every RESYNC read (afterSeq set)
+  // parks until released — the held FIRST post-drain resync.
+  const commandIdRef = { value: "" };
+  let releaseHeld: (() => void) | null = null;
+  const held = new Promise<JournalPage>((resolve) => {
+    releaseHeld = () => resolve(userMessagePage(commandIdRef.value));
+  });
+  vi.mocked(api.eventsRead).mockImplementation(((args: { afterSeq?: string }) =>
+    args.afterSeq ? held : Promise.resolve(EMPTY_PAGE)) as Api["eventsRead"]);
+
+  await hubStore.send(INSTANCE, "across a real re-login");
+  const bubble = () => hubStore.getSnapshot().bubbles[0]!;
+  await vi.waitFor(() => expect(bubble().outboxState).toBe("sent"));
+  commandIdRef.value = bubble().commandId!;
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(true);
+
+  // Logout (epoch bump, outbox/machine disposed, events wiped)…
+  hubStore.logout();
+  expect(hubStore.getSnapshot().events[INSTANCE]).toBeUndefined();
+  // …then a REAL public login establishing the successor identity (its
+  // bootstrap lists no instances, so it never follows INSTANCE itself).
+  vi.mocked(api.instanceList).mockResolvedValue({ items: [], nextCursor: null });
+  await expect(hubStore.login("bootstrap", "secret", "dev")).resolves.toBe("settled");
+  const successorRow = () =>
+    (
+      hubStore as unknown as { outbox: { get: (id: string) => OutboxRecord | undefined } | null }
+    ).outbox?.get(commandIdRef.value);
+  expect(successorRow()?.state).toBe("sent");
+
+  // Release the retired identity's parked resync carrying the old command.
+  releaseHeld!();
+  for (let i = 0; i < 50; i += 1) await Promise.resolve();
+
+  // Nothing leaked into the successor store…
+  expect(hubStore.getSnapshot().events[INSTANCE]).toBeUndefined();
+  // …and its durable row was never flipped done by the stale application.
+  expect(successorRow()?.state).toBe("sent");
+});
+
+it("r3 item 4: a journal-confirmed unknown row is promoted to durable done and stays settled across a reload", async () => {
+  // Exhaust -> unknown committed -> command journals later -> a fresh store
+  // (offline reload reconstruction) whose mount seed observes it must settle
+  // the restored bubble durably, not resurrect it as 状态待确认.
+  vi.useFakeTimers();
+  try {
+    const { api, hubStore } = await fresh();
+    await mountFollow(api, hubStore);
+    vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+      const commandId = _args[4] as string;
+      return Promise.resolve(commandResult(commandId, "accepted"));
+    });
+
+    await hubStore.send(INSTANCE, "late confirmation");
+    for (let i = 0; i < 30; i += 1) await vi.advanceTimersByTimeAsync(0);
+    const bubble = () => hubStore.getSnapshot().bubbles[0]!;
+    for (let i = 0; i < 30 && bubble().outboxState !== "sent"; i += 1) {
+      await vi.advanceTimersByTimeAsync(0);
+    }
+    expect(bubble().outboxState).toBe("sent");
+    const commandId = bubble().commandId!;
+
+    // Run the read deadline with every read empty -> exhaustion commits unknown.
+    for (let t = 0; t < 46_000; t += 250) await vi.advanceTimersByTimeAsync(250);
+    const rowOf = (s: Store) =>
+      (s as unknown as { outbox: { get: (id: string) => OutboxRecord | undefined } }).outbox?.get(commandId);
+    expect(rowOf(hubStore)?.state).toBe("unknown");
+
+    // The command journals later; a FRESH store reconstructs the outbox
+    // (localStorage backend survives module reset) and mounts with a seed
+    // carrying the confirmation — exactly an offline reload.
+    const second = await fresh();
+    const secondInternals = second.hubStore as unknown as {
+      ensureOutboxForTest: () => Promise<unknown>;
+      initConnection: (offline: boolean, epoch: number) => Promise<string>;
+      extEpoch: number;
+    };
+    await secondInternals.ensureOutboxForTest();
+    // Real offline-reload reconstruction: installs a machine AND restores the
+    // durable rows as optimistic bubbles.
+    await secondInternals.initConnection(true, secondInternals.extEpoch);
+    await mountFollow(second.api, second.hubStore, {
+      events: [
+        {
+          kind: "message",
+          eventId: "evt_late_user",
+          journalId: JOURNAL,
+          instanceId: INSTANCE,
+          seq: "1",
+          completeness: "structured",
+          payload: { role: "user", commandId },
+        } as unknown as Observation,
+      ],
+      durableSeq: "1",
+      windowFromSeq: "1",
+      reachedAfterSeq: true,
+    });
+    for (let i = 0; i < 200; i += 1) await vi.advanceTimersByTimeAsync(0);
+
+    const restored = () =>
+      second.hubStore.getSnapshot().bubbles.find((b) => b.commandId === commandId)!;
+    expect(restored().state).toBe("settled");
+    expect(restored().outboxState).toBe("done");
+    expect(rowOf(second.hubStore)?.state).toBe("done");
+    second.hubStore.logout();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("r4 item 2: a queued stale drain job retired at entry neither recreates debt nor touches the successor row", async () => {
+  // Distinct from the held-READ regression: here the drain job is QUEUED on
+  // the per-instance chain behind a blocker when logout happens. Chained
+  // promises survive logout (only timers are torn down), so the retired drain
+  // callback must reject itself at ENTRY before recording debt or settling.
+  const { api, hubStore } = await fresh();
+  await mountFollow(api, hubStore);
+  vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+  vi.spyOn(api, "hostList").mockResolvedValue({ items: [], nextCursor: null } as Awaited<
+    ReturnType<Api["hostList"]>
+  >);
+  vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as Awaited<ReturnType<Api["deviceList"]>>);
+  vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as Awaited<ReturnType<Api["passkeyList"]>>);
+  vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+  vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+  vi.spyOn(api, "login").mockResolvedValue({
+    deviceId: "dev_successor_r4",
+    token: "tok_successor_r4",
+    name: "successor",
+  } as Awaited<ReturnType<Api["login"]>>);
+  vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+    const commandId = _args[4] as string;
+    return Promise.resolve(commandResult(commandId, "accepted"));
+  });
+  // Resync reads answer empty immediately — the serialization that parks the
+  // drain callback comes from the chain blocker below, not a held request.
+  vi.mocked(api.eventsRead).mockResolvedValue(EMPTY_PAGE);
+
+  // Hold the instance's journal chain BEFORE the send so the post-drain job
+  // queues but never runs.
+  let releaseBlock: (() => void) | null = null;
+  (
+    hubStore as unknown as { chainReconcile: (id: string, job: () => Promise<unknown>) => Promise<unknown> }
+  ).chainReconcile(INSTANCE, () => new Promise<void>((resolve) => (releaseBlock = resolve)));
+
+  await hubStore.send(INSTANCE, "queued behind a blocker");
+  const bubble = () => hubStore.getSnapshot().bubbles[0]!;
+  await vi.waitFor(() => expect(bubble().outboxState).toBe("sent"));
+  const commandId = bubble().commandId!;
+  // The drain recorded its debt as part of delivery; clear it to model the
+  // retired state the queued job must not resurrect.
+  (hubStore as unknown as { reconcileOwed: Map<string, unknown> }).reconcileOwed.delete(INSTANCE);
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+
+  // Retire WHILE the drain callback is still queued, then a real successor
+  // login restores the persisted sent row under a new Outbox.
+  hubStore.logout();
+  vi.mocked(api.instanceList).mockResolvedValue({ items: [], nextCursor: null });
+  await expect(hubStore.login("bootstrap", "secret", "dev")).resolves.toBe("settled");
+  const successorRow = () =>
+    (
+      hubStore as unknown as { outbox: { get: (id: string) => OutboxRecord | undefined } | null }
+    ).outbox?.get(commandId);
+  expect(successorRow()?.state).toBe("sent");
+
+  // Release the blocker: the retired drain callback now enters.
+  releaseBlock!();
+  for (let i = 0; i < 80; i += 1) await Promise.resolve();
+
+  // It rejected itself at entry: no debt resurrected…
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+  // …and the successor's restored row is untouched.
+  expect(successorRow()?.state).toBe("sent");
+});
+
+it("r4 item 3: the debt fallback trigger applies evidence only and leaves permission request B pending", async () => {
+  // The ACTUAL fallback trigger: the bound follow's reopen FAILS inside the
+  // connection machine's resume action, whose catch runs the debt fallback.
+  // On 87712402 that fallback drove the mounted
+  // JournalClient.resumeAfterReconnect, whose onEvents ran the permission
+  // reducer on an OLD readback for A and cleared request B. AD3: it must be a
+  // self-contained evidence-only REST read.
+  const { api, hubStore } = await fresh();
+  await mountFollow(api, hubStore);
+  vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+    const commandId = _args[4] as string;
+    return Promise.resolve(commandResult(commandId, "accepted"));
+  });
+
+  // Permission request B is live-pending; seed an older effective observation.
+  const h = hubStore as unknown as {
+    state: {
+      permissionPending: Record<string, { mode: string; queued: boolean } | undefined>;
+      permissionEffective: Record<string, { mode: string; source: string; observedAt: string }>;
+    };
+  };
+  h.state.permissionEffective[INSTANCE] = { mode: "default", source: "remuda", observedAt: "2026-10-18T00:00:00Z" };
+  h.state.permissionPending[INSTANCE] = { mode: "plan", queued: true };
+
+  await hubStore.send(INSTANCE, "owed when permission B pending");
+  const bubble = () => hubStore.getSnapshot().bubbles[0]!;
+  await vi.waitFor(() => expect(bubble().outboxState).toBe("sent"));
+  const commandId = bubble().commandId!;
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(true);
+  const owed = hubStore as unknown as {
+    owedTail: Map<string, { timer: ReturnType<typeof setTimeout> | null }>;
+    connectionBoundTo: string | null;
+    resumeConnection: () => Promise<void>;
+  };
+  // Own the tail timer so ONLY the fallback trigger below can read.
+  await vi.waitFor(() => expect(owed.owedTail.get(INSTANCE)?.timer).not.toBeNull());
+  clearTimeout(owed.owedTail.get(INSTANCE)!.timer!);
+  owed.owedTail.get(INSTANCE)!.timer = null;
+  expect(owed.connectionBoundTo).toBe(INSTANCE);
+
+  // The fallback's read returns an OLD permission effective readback for A
+  // (newer than the seeded effective) AND the owed command entry.
+  vi.mocked(api.eventsRead).mockResolvedValue({
+    events: [
+      {
+        eventId: "evt_perm_A_r4",
+        instanceId: INSTANCE,
+        journalId: JOURNAL,
+        seq: "1",
+        kind: "permission",
+        observedAt: "2026-10-18T00:09:00Z",
+        source: { channel: "runtime" },
+        payload: { effective: { mode: "default", source: "remuda", observedAt: "2026-10-18T00:09:00Z" } },
+      } as unknown as Observation,
+      {
+        kind: "message",
+        eventId: "evt_user_fallback",
+        journalId: JOURNAL,
+        instanceId: INSTANCE,
+        seq: "2",
+        completeness: "structured",
+        payload: { role: "user", commandId },
+      } as unknown as Observation,
+    ],
+    durableSeq: "2",
+    windowFromSeq: "1",
+    reachedAfterSeq: true,
+  });
+
+  // The resume reopens the bound follow and the subscribe is refused (proxy
+  // refusing the upgrade): the resume rejects and its catch runs the fallback.
+  vi.mocked(api.eventsSubscribe).mockRejectedValue(new Error("follow upgrade refused"));
+  await expect(owed.resumeConnection()).rejects.toThrow("follow upgrade refused");
+  await vi.waitFor(() => expect(bubble().outboxState).toBe("done"));
+
+  // Owed command settled durably…
+  expect(bubble().outboxState).toBe("done");
+  // …but A's old permission readback never settled B.
+  expect(h.state.permissionPending[INSTANCE]?.mode).toBe("plan");
+  // And the page never entered the live journal-client state.
+  const evs = hubStore.getSnapshot().events[INSTANCE] ?? [];
+  expect(evs.some((e) => e.kind === "permission" && e.eventId === "evt_perm_A_r4")).toBe(false);
+});
+
+it("r4 item 4: the debt scan cursor advances through a full unrelated page to the owed command at 257", async () => {
+  // AD3 item 4: filtering a full unrelated page must not stall the scan. A
+  // separate debt cursor advances through every inspected page. Real API
+  // adapter over a fetch stub: frontier 128, unrelated 129-256, owed at 257.
+  const { api, hubStore } = await fresh();
+
+  const sentCommandIdRef = { value: "" };
+  const seedRows = Array.from({ length: 128 }, (_, i) => ({
+    seq: i + 1,
+    eventId: `evt_seed_${i + 1}`,
+    kind: "raw_tty",
+    payload: { text: `filler ${i + 1}` },
+  }));
+  const unrelatedRows = Array.from({ length: 128 }, (_, i) => ({
+    seq: i + 129,
+    eventId: `evt_noise_${i + 129}`,
+    kind: "raw_tty",
+    payload: { text: `unrelated ${i + 129}` },
+  }));
+  const all = [
+    ...seedRows,
+    ...unrelatedRows,
+    { seq: 257, eventId: "evt_user_257", kind: "message", payload: { role: "user" } },
+  ];
+
+  // The unrelated 129-256 burst and the owed 257 only become durable AFTER the
+  // drain's empty resync (the command journals late, like the real race).
+  let appended = false;
+  // The Hub's read_journal window semantics (hubJournalResponse).
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL) => {
+      const after = Number(new URL(String(input), "http://hub.test").searchParams.get("afterSeq") ?? "0");
+      const resolved: HubRow[] = (appended ? all : seedRows).map((r) =>
+        r.seq === 257 ? { ...r, payload: { role: "user", commandId: sentCommandIdRef.value } } : r,
+      );
+      const response = hubJournalResponse(input, resolved, appended ? 257 : 128);
+      if (after >= 128 && !appended) appended = true;
+      return response;
+    }),
+  );
+
+  vi.spyOn(api, "instanceGet").mockResolvedValue({ id: INSTANCE, journalId: JOURNAL } as never);
+  vi.spyOn(api, "instanceList").mockResolvedValue({
+    items: [{ id: INSTANCE, journalId: JOURNAL, revision: "1", durableSeq: "128", lifecycle: "running" } as never],
+    nextCursor: null,
+  });
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+  vi.spyOn(api, "eventsSubscribe").mockResolvedValue({
+    subscriptionId: "sub_debt_257",
+    journalId: JOURNAL,
+    durableSeq: "128",
+    windowFromSeq: "1",
+    reachedAfterSeq: true,
+    getReadyState: () => 1,
+    snapshot: {
+      projectionVersion: "v1",
+      projectionEpoch: "epoch_debt_257",
+      asOfSeq: "128",
+      instance: {} as never,
+      runs: [],
+      commands: [],
+      pendingInteractions: [],
+      nodes: [],
+      history: { earliestRetainedSeq: "1", complete: true },
+    },
+  });
+  let sentCommandId = "";
+  vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+    sentCommandId = _args[4] as string;
+    sentCommandIdRef.value = sentCommandId;
+    return Promise.resolve(commandResult(sentCommandId, "accepted"));
+  });
+  await hubStore.refresh();
+  await hubStore.follow(INSTANCE);
+  await vi.waitFor(() => expect(hubStore.getSnapshot().events[INSTANCE]).toHaveLength(128));
+  await hubStore.send(INSTANCE, "owed at 257");
+  const bubble = () => hubStore.getSnapshot().bubbles.find((b) => b.commandId === sentCommandId)!;
+  await vi.waitFor(() => expect(bubble().outboxState).toBe("sent"));
+
+  await vi.waitFor(
+    () => {
+      expect(bubble().state).toBe("settled");
+      expect(bubble().outboxState).toBe("done");
+    },
+    { timeout: 6_000 },
+  );
+  // AD3: nothing the debt read inspected entered store state — neither the
+  // unrelated 128 nor the owed node.
+  expect(hubStore.getSnapshot().events[INSTANCE]).toHaveLength(128);
+}, 15_000);
+
+it("r4 item 2: a queued tail pass whose debt generation was cleared still lets the NEXT debt's tail run", async () => {
+  // Liveness of the entry gate. A tail pass is queued behind a chain blocker
+  // for debt D1; live evidence clears D1 while it waits and a second drained
+  // send records a NEW debt D2 behind it. The stale pass must reject itself
+  // at entry WITHOUT keeping the per-instance running marker, or every later
+  // D2 tail pass is coalesced away and D2's row stays accepted forever.
+  const { api, hubStore } = await fresh();
+  await mountFollow(api, hubStore);
+  vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+    const commandId = _args[4] as string;
+    return Promise.resolve(commandResult(commandId, "accepted"));
+  });
+  const h = hubStore as unknown as {
+    chainReconcile: (id: string, job: () => Promise<unknown>) => Promise<unknown>;
+    runOwedTailPass: (id: string) => void;
+    owedTail: Map<string, { timer: unknown }>;
+  };
+
+  await hubStore.send(INSTANCE, "first owed");
+  const bubbleOf = (text: string) => hubStore.getSnapshot().bubbles.find((b) => b.text === text)!;
+  await vi.waitFor(() => expect(bubbleOf("first owed").outboxState).toBe("sent"));
+  await vi.waitFor(() => expect(debtOf(hubStore).has(INSTANCE)).toBe(true));
+  const firstId = bubbleOf("first owed").commandId!;
+  const firstDebt = debtOf(hubStore).get(INSTANCE);
+
+  // Park the journal chain, then queue a D1 tail pass behind it.
+  let releaseBlock: (() => void) | null = null;
+  void h.chainReconcile(INSTANCE, () => new Promise<void>((resolve) => (releaseBlock = resolve)));
+  h.runOwedTailPass(INSTANCE);
+
+  // Live evidence for the first command clears D1 while the pass waits. The
+  // fold's done patch is fire-and-forget, so the fold itself keeps the debt
+  // (r8 item 1); once the row is durably done, the next live frame's
+  // reevaluation finds nothing owed and discharges D1.
+  const onBatch = await liveBatch(api);
+  const liveMessage = (seq: number, eventId: string, payload: Record<string, unknown>) =>
+    ({
+      kind: "message",
+      eventId,
+      journalId: JOURNAL,
+      instanceId: INSTANCE,
+      seq: String(seq),
+      completeness: "structured",
+      payload,
+    }) as unknown as Observation;
+  onBatch({
+    subscriptionId: "sub_outbox_debt",
+    journalId: JOURNAL,
+    fromSeq: "1",
+    toSeq: "1",
+    durableSeq: "1",
+    events: [liveMessage(1, "evt_user_first_live", { role: "user", commandId: firstId })],
+  });
+  await vi.waitFor(() => expect(bubbleOf("first owed").outboxState).toBe("done"));
+  onBatch({
+    subscriptionId: "sub_outbox_debt",
+    journalId: JOURNAL,
+    fromSeq: "2",
+    toSeq: "2",
+    durableSeq: "2",
+    events: [liveMessage(2, "evt_assistant_after_first", { role: "assistant", text: "next" })],
+  });
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+
+  // A second drained send queues its post-drain job behind the stale pass.
+  await hubStore.send(INSTANCE, "second owed");
+  await vi.waitFor(() => expect(bubbleOf("second owed").outboxState).toBe("sent"));
+  const secondId = bubbleOf("second owed").commandId!;
+
+  // Release: the stale pass enters and rejects; the drain records D2 and its
+  // empty resync arms D2's tail timer.
+  releaseBlock!();
+  await vi.waitFor(() => {
+    const debt = debtOf(hubStore).get(INSTANCE);
+    expect(debt).toBeDefined();
+    expect(debt).not.toBe(firstDebt);
+    expect(h.owedTail.get(INSTANCE)?.timer).not.toBeNull();
+  });
+
+  // The Node's journal write for the second command is now durable; only a
+  // D2 tail pass can read it (the live socket missed it).
+  vi.mocked(api.eventsRead).mockResolvedValue({
+    events: [
+      {
+        kind: "message",
+        eventId: "evt_user_second_tail",
+        journalId: JOURNAL,
+        instanceId: INSTANCE,
+        seq: "2",
+        completeness: "structured",
+        payload: { role: "user", commandId: secondId },
+      } as unknown as Observation,
+    ],
+    durableSeq: "2",
+    windowFromSeq: "2",
+    reachedAfterSeq: true,
+  });
+  await vi.waitFor(
+    () => {
+      expect(bubbleOf("second owed").state).toBe("settled");
+      expect(bubbleOf("second owed").outboxState).toBe("done");
+    },
+    { timeout: 4_000 },
+  );
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+}, 15_000);
+
+it("r4 item 2: a queued stale drain then a queued past-deadline tail pass never terminalise the successor's rows", async () => {
+  // The review's exact trigger: the old identity owes a command, a pending
+  // journal job holds the chain, a second accepted drain queues behind it,
+  // then the tail pass queues. Logout + a public successor login restore the
+  // persisted sent rows under a new Outbox. Releasing the chain after the
+  // captured tail's deadline must neither recreate the debt (retired drain)
+  // nor patch the successor's rows to unknown (retired exhaustion).
+  const { api, hubStore } = await fresh();
+  await mountFollow(api, hubStore);
+  vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+  vi.spyOn(api, "hostList").mockResolvedValue({ items: [], nextCursor: null } as Awaited<
+    ReturnType<Api["hostList"]>
+  >);
+  vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as Awaited<ReturnType<Api["deviceList"]>>);
+  vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as Awaited<ReturnType<Api["passkeyList"]>>);
+  vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+  vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+  vi.spyOn(api, "login").mockResolvedValue({
+    deviceId: "dev_successor_r4_tail",
+    token: "tok_successor_r4_tail",
+    name: "successor",
+  } as Awaited<ReturnType<Api["login"]>>);
+  vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+    const commandId = _args[4] as string;
+    return Promise.resolve(commandResult(commandId, "accepted"));
+  });
+  const h = hubStore as unknown as {
+    chainReconcile: (id: string, job: () => Promise<unknown>) => Promise<unknown>;
+    reconcileChain: Map<string, Promise<unknown>>;
+    runOwedTailPass: (id: string) => void;
+    owedTail: Map<string, { timer: ReturnType<typeof setTimeout> | null; firstAt: number }>;
+    outbox: { get: (id: string) => OutboxRecord | undefined } | null;
+  };
+
+  await hubStore.send(INSTANCE, "old identity owed");
+  const bubbleOf = (text: string) => hubStore.getSnapshot().bubbles.find((b) => b.text === text)!;
+  await vi.waitFor(() => expect(bubbleOf("old identity owed").outboxState).toBe("sent"));
+  await vi.waitFor(() => expect(h.owedTail.get(INSTANCE)?.timer).not.toBeNull());
+  const firstId = bubbleOf("old identity owed").commandId!;
+  // Take over the tail timer so the pass is queued exactly once, in order.
+  const tail = h.owedTail.get(INSTANCE)!;
+  clearTimeout(tail.timer!);
+  tail.timer = null;
+
+  // A pending journal job holds the chain…
+  let releaseBlock: (() => void) | null = null;
+  void h.chainReconcile(INSTANCE, () => new Promise<void>((resolve) => (releaseBlock = resolve)));
+  const blocker = h.reconcileChain.get(INSTANCE);
+  // …another accepted drain queues behind it…
+  await hubStore.send(INSTANCE, "second accepted drain");
+  await vi.waitFor(() => expect(bubbleOf("second accepted drain").outboxState).toBe("sent"));
+  await vi.waitFor(() => expect(h.reconcileChain.get(INSTANCE)).not.toBe(blocker));
+  const secondId = bubbleOf("second accepted drain").commandId!;
+  // …followed by the tail timer's job, whose captured deadline has passed
+  // (every owed command's own window, r8 item 2).
+  h.runOwedTailPass(INSTANCE);
+  tail.firstAt = 0;
+  const windows = (debtOf(hubStore).get(INSTANCE) as { windows: Map<string, { at: number }> }).windows;
+  for (const window of windows.values()) window.at = 0;
+
+  hubStore.logout();
+  vi.mocked(api.instanceList).mockResolvedValue({ items: [], nextCursor: null });
+  await expect(hubStore.login("bootstrap", "secret", "dev")).resolves.toBe("settled");
+  expect(h.outbox?.get(firstId)?.state).toBe("sent");
+  expect(h.outbox?.get(secondId)?.state).toBe("sent");
+
+  releaseBlock!();
+  for (let i = 0; i < 120; i += 1) await Promise.resolve();
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  // Neither retired job wrote anything into the successor identity.
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+  expect(h.outbox?.get(firstId)?.state).toBe("sent");
+  expect(h.outbox?.get(secondId)?.state).toBe("sent");
+});
+
+it("r4 item 2: a tail pass rejected while the Outbox is mid-succession does not re-arm a timer loop", async () => {
+  // Ordinary credential succession disposes the Outbox WITHOUT bumping the
+  // identity epoch, so retained debt can meet a null Outbox. A pass rejected
+  // there must not re-arm itself every base backoff until the next Outbox.
+  const { api, hubStore } = await fresh();
+  await mountFollow(api, hubStore);
+  vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+    const commandId = _args[4] as string;
+    return Promise.resolve(commandResult(commandId, "accepted"));
+  });
+  const h = hubStore as unknown as {
+    applyAuthIdentityChange: () => void;
+    runOwedTailPass: (id: string) => void;
+    owedTail: Map<string, { timer: ReturnType<typeof setTimeout> | null }>;
+    owedTailRunning: Set<string>;
+    outbox: unknown;
+  };
+
+  await hubStore.send(INSTANCE, "owed across succession");
+  await vi.waitFor(() => expect(hubStore.getSnapshot().bubbles[0]?.outboxState).toBe("sent"));
+  await vi.waitFor(() => expect(h.owedTail.get(INSTANCE)?.timer).not.toBeNull());
+  const tail = h.owedTail.get(INSTANCE)!;
+  clearTimeout(tail.timer!);
+  tail.timer = null;
+
+  h.applyAuthIdentityChange();
+  expect(h.outbox).toBeNull();
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(true);
+
+  h.runOwedTailPass(INSTANCE);
+  for (let i = 0; i < 40; i += 1) await Promise.resolve();
+  expect(h.owedTailRunning.has(INSTANCE)).toBe(false);
+  expect(h.owedTail.get(INSTANCE)?.timer).toBeNull();
+});
+
+/**
+ * Real api.eventsRead adapter over {@link hubJournalResponse} with a 128-row
+ * loaded frontier. `tail(commandId)` becomes durable right AFTER the drain's
+ * empty post-delivery resync (the command journals late, like the real
+ * race), so only the debt tail can find the owed entry.
+ */
+async function sendOwedOverRealAdapter(tail: (commandId: string) => HubRow[]) {
+  const { api, hubStore } = await fresh();
+  const seed: HubRow[] = Array.from({ length: 128 }, (_, i) => ({
+    seq: i + 1,
+    eventId: `evt_seed_${i + 1}`,
+    kind: "raw_tty",
+    payload: { text: `filler ${i + 1}` },
+  }));
+  let commandId = "";
+  let appended: HubRow[] | null = null;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL) => {
+      const after = Number(new URL(String(input), "http://hub.test").searchParams.get("afterSeq") ?? "0");
+      const rows = appended ? [...seed, ...appended] : seed;
+      const response = hubJournalResponse(input, rows, rows[rows.length - 1]!.seq);
+      if (commandId && after >= 128 && !appended) appended = tail(commandId);
+      return response;
+    }),
+  );
+  vi.spyOn(api, "instanceGet").mockResolvedValue({ id: INSTANCE, journalId: JOURNAL } as never);
+  vi.spyOn(api, "instanceList").mockResolvedValue({
+    items: [{ id: INSTANCE, journalId: JOURNAL, revision: "1", durableSeq: "128", lifecycle: "running" } as never],
+    nextCursor: null,
+  });
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+  vi.spyOn(api, "eventsSubscribe").mockResolvedValue({
+    subscriptionId: "sub_debt_window",
+    journalId: JOURNAL,
+    durableSeq: "128",
+    windowFromSeq: "1",
+    reachedAfterSeq: true,
+    getReadyState: () => 1,
+    snapshot: {
+      projectionVersion: "v1",
+      projectionEpoch: "epoch_debt_window",
+      asOfSeq: "128",
+      instance: {} as never,
+      runs: [],
+      commands: [],
+      pendingInteractions: [],
+      nodes: [],
+      history: { earliestRetainedSeq: "1", complete: true },
+    },
+  });
+  vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+    commandId = _args[4] as string;
+    return Promise.resolve(commandResult(commandId, "accepted"));
+  });
+  await hubStore.refresh();
+  await hubStore.follow(INSTANCE);
+  await vi.waitFor(() => expect(hubStore.getSnapshot().events[INSTANCE]).toHaveLength(128));
+  await hubStore.send(INSTANCE, "owed behind a long tail");
+  const bubble = () => hubStore.getSnapshot().bubbles.find((b) => b.commandId === commandId)!;
+  await vi.waitFor(() => expect(bubble().outboxState).toBe("sent"));
+  return { hubStore, bubble };
+}
+
+it("r5 item 1: an owed command at F+1 settles although more than one Hub window of rows was journaled after it", async () => {
+  // Frontier 128, the owed command at 129, then 2100 unrelated rows: an
+  // unbounded read of (128, durable] gets the Hub's NEWEST 2000-row window
+  // (reachedAfterSeq false) and must never let the cursor jump past 129.
+  const { hubStore, bubble } = await sendOwedOverRealAdapter((commandId) => [
+    { seq: 129, eventId: "evt_user_129", kind: "message", payload: { role: "user", commandId } },
+    ...Array.from({ length: 2_100 }, (_, i) => ({
+      seq: i + 130,
+      eventId: `evt_noise_${i + 130}`,
+      kind: "raw_tty",
+      payload: { text: `unrelated ${i + 130}` },
+    })),
+  ]);
+  await vi.waitFor(
+    () => {
+      expect(bubble().state).toBe("settled");
+      expect(bubble().outboxState).toBe("done");
+    },
+    { timeout: 6_000 },
+  );
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+  // AD3: evidence only — neither the owed node nor the 2100 others entered state.
+  expect(hubStore.getSnapshot().events[INSTANCE]).toHaveLength(128);
+}, 15_000);
+
+it("r5 item 1: a byte-capped page short of the cursor is descended before the cursor moves past it", async () => {
+  // Two large rows after the owed command exceed the Hub's 8 MiB window, so
+  // even a bounded read (128, 256] returns only [131] with reachedAfterSeq
+  // false; the reader must descend below its floor to inspect 130 and 129.
+  const big = "x".repeat(Math.ceil(HUB_WINDOW_BYTES * 0.55));
+  const { hubStore, bubble } = await sendOwedOverRealAdapter((commandId) => [
+    { seq: 129, eventId: "evt_user_129", kind: "message", payload: { role: "user", commandId } },
+    { seq: 130, eventId: "evt_big_130", kind: "raw_tty", payload: { text: big } },
+    { seq: 131, eventId: "evt_big_131", kind: "raw_tty", payload: { text: big } },
+  ]);
+  await vi.waitFor(
+    () => {
+      expect(bubble().state).toBe("settled");
+      expect(bubble().outboxState).toBe("done");
+    },
+    { timeout: 6_000 },
+  );
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+  expect(hubStore.getSnapshot().events[INSTANCE]).toHaveLength(128);
+}, 15_000);
+
+it("r5 item 2: a debt whose tail was rejected during a failed credential login settles once the Outbox is re-installed", async () => {
+  // Ordinary credential succession disposes the Outbox WITHOUT bumping the
+  // identity epoch; the tail pass that fires in that null window is rejected
+  // and (rightly) does not loop. When the failed login restores the Outbox
+  // under the same identity, nothing else arrives — no journal traffic, live
+  // batch or drain — so the install itself must re-arm the owed tail.
+  const { api, hubStore } = await fresh();
+  await mountFollow(api, hubStore);
+  vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+    const commandId = _args[4] as string;
+    return Promise.resolve(commandResult(commandId, "accepted"));
+  });
+  let refuseLogin: ((err: Error) => void) | null = null;
+  vi.spyOn(api, "login").mockImplementation(
+    () => new Promise<never>((_resolve, reject) => (refuseLogin = reject)),
+  );
+  const h = hubStore as unknown as {
+    owedTail: Map<string, { timer: ReturnType<typeof setTimeout> | null }>;
+    owedTailRunning: Set<string>;
+    outbox: unknown;
+  };
+
+  await hubStore.send(INSTANCE, "owed across a failed login");
+  const bubble = () => hubStore.getSnapshot().bubbles[0]!;
+  await vi.waitFor(() => expect(bubble().outboxState).toBe("sent"));
+  await vi.waitFor(() => expect(h.owedTail.get(INSTANCE)?.timer).not.toBeNull());
+  const commandId = bubble().commandId!;
+
+  // The credential turn disposes the Outbox and parks on the request…
+  const login = hubStore.login("bootstrap", "secret", "dev").catch((err: unknown) => err);
+  await vi.waitFor(() => expect(h.outbox).toBeNull());
+  // …while the armed tail fires and is rejected without re-arming.
+  await vi.waitFor(
+    () => {
+      expect(h.owedTail.get(INSTANCE)?.timer).toBeNull();
+      expect(h.owedTailRunning.has(INSTANCE)).toBe(false);
+    },
+    { timeout: 3_000 },
+  );
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(true);
+
+  // The command's journal entry is durable now, but only a tail read can see it.
+  vi.mocked(api.eventsRead).mockResolvedValue(userMessagePage(commandId));
+  refuseLogin!(new Error("credential refused"));
+  expect(await login).toBeInstanceOf(Error);
+  await vi.waitFor(() => expect(h.outbox).not.toBeNull());
+
+  await vi.waitFor(
+    () => {
+      expect(bubble().state).toBe("settled");
+      expect(bubble().outboxState).toBe("done");
+    },
+    { timeout: 4_000 },
+  );
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+}, 15_000);
+
+it("r5 item 2: journal evidence folded while the Outbox is disposed retires the durable row once it is re-installed", async () => {
+  // The live entry for the owed command arrives in the credential turn's
+  // null-Outbox window: the fold cannot patch the durable row, so it must not
+  // discharge the debt either. The re-installed Outbox re-checks the debt
+  // against the evidence folded so far and retires the row to done.
+  const { api, hubStore } = await fresh();
+  await mountFollow(api, hubStore);
+  vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+    const commandId = _args[4] as string;
+    return Promise.resolve(commandResult(commandId, "accepted"));
+  });
+  let refuseLogin: ((err: Error) => void) | null = null;
+  vi.spyOn(api, "login").mockImplementation(
+    () => new Promise<never>((_resolve, reject) => (refuseLogin = reject)),
+  );
+  const h = hubStore as unknown as { outbox: { get: (id: string) => OutboxRecord | undefined } | null };
+
+  await hubStore.send(INSTANCE, "owed, confirmed during the gap");
+  const bubble = () => hubStore.getSnapshot().bubbles[0]!;
+  await vi.waitFor(() => expect(bubble().outboxState).toBe("sent"));
+  await vi.waitFor(() => expect(debtOf(hubStore).has(INSTANCE)).toBe(true));
+  const commandId = bubble().commandId!;
+
+  const login = hubStore.login("bootstrap", "secret", "dev").catch((err: unknown) => err);
+  await vi.waitFor(() => expect(h.outbox).toBeNull());
+  const onBatch = await liveBatch(api);
+  onBatch({
+    subscriptionId: "sub_outbox_debt",
+    journalId: JOURNAL,
+    fromSeq: "1",
+    toSeq: "1",
+    durableSeq: "1",
+    events: [
+      {
+        kind: "message",
+        eventId: "evt_user_gap_live",
+        journalId: JOURNAL,
+        instanceId: INSTANCE,
+        seq: "1",
+        completeness: "structured",
+        payload: { role: "user", commandId },
+      } as unknown as Observation,
+    ],
+  });
+  // No box to retire the row in: the debt is kept, not discharged.
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(true);
+
+  refuseLogin!(new Error("credential refused"));
+  expect(await login).toBeInstanceOf(Error);
+  await vi.waitFor(() => expect(h.outbox).not.toBeNull());
+  await vi.waitFor(() => {
+    expect(h.outbox?.get(commandId)?.state).toBe("done");
+    expect(bubble().outboxState).toBe("done");
+  });
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+}, 15_000);
+
+it("r6 item 1: a direct login that establishes a different device retires the predecessor's debts", async () => {
+  // Session A owes a sent command. A public login WITHOUT logout succeeds as
+  // device B: ordinary succession bumps no identity epoch, so B's Outbox
+  // install must not adopt A's debt, arm its tail, or settle A's row through
+  // either Outbox — even though the debt reader could find the evidence.
+  const SESSION_KEY = "runtime.device-session";
+  localStorage.setItem(SESSION_KEY, JSON.stringify({ deviceId: "dev_device_a", name: "desk-a" }));
+  try {
+    const { api, hubStore } = await fresh();
+    await mountFollow(api, hubStore);
+    vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+    vi.spyOn(api, "hostList").mockResolvedValue({ items: [], nextCursor: null } as Awaited<
+      ReturnType<Api["hostList"]>
+    >);
+    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as Awaited<ReturnType<Api["deviceList"]>>);
+    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as Awaited<ReturnType<Api["passkeyList"]>>);
+    vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+    vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+    vi.spyOn(api, "login").mockResolvedValue({
+      deviceId: "dev_device_b",
+      token: "tok_device_b",
+      name: "desk-b",
+    } as Awaited<ReturnType<Api["login"]>>);
+    vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+      const commandId = _args[4] as string;
+      return Promise.resolve(commandResult(commandId, "accepted"));
+    });
+    type Box = { get: (id: string) => OutboxRecord | undefined };
+    const h = hubStore as unknown as {
+      outbox: Box | null;
+      owedTail: Map<string, { timer: ReturnType<typeof setTimeout> | null }>;
+    };
+
+    await hubStore.send(INSTANCE, "owed by device A");
+    const bubble = () => hubStore.getSnapshot().bubbles[0]!;
+    await vi.waitFor(() => expect(bubble().outboxState).toBe("sent"));
+    await vi.waitFor(() => expect(h.owedTail.get(INSTANCE)?.timer).not.toBeNull());
+    const commandId = bubble().commandId!;
+    const boxA = h.outbox!;
+
+    // Only a DEBT read (always bounded with beforeSeq) can see A's command;
+    // every other read stays empty so no live/resync fold settles it.
+    vi.mocked(api.eventsRead).mockImplementation(async (args) =>
+      args.beforeSeq === undefined ? EMPTY_PAGE : userMessagePage(commandId),
+    );
+    vi.mocked(api.instanceList).mockResolvedValue({ items: [], nextCursor: null });
+    await expect(hubStore.login("bootstrap", "secret", "dev")).resolves.toBe("settled");
+    await vi.waitFor(() => expect(h.outbox).not.toBeNull());
+    expect(h.outbox).not.toBe(boxA);
+    const debtReadsAtLogin = vi.mocked(api.eventsRead).mock.calls.filter((c) => c[0].beforeSeq !== undefined).length;
+
+    // A's debt is retired with its tail; nothing was adopted by B.
+    expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+    expect(h.owedTail.has(INSTANCE)).toBe(false);
+
+    // Give any (wrongly) re-armed tail time to fire: no debt read, no patch.
+    await new Promise((resolve) => setTimeout(resolve, 1_200));
+    expect(vi.mocked(api.eventsRead).mock.calls.filter((c) => c[0].beforeSeq !== undefined).length).toBe(
+      debtReadsAtLogin,
+    );
+    expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+    expect(h.outbox?.get(commandId)?.state).toBe("sent");
+    expect(boxA.get(commandId)?.state).toBe("sent");
+  } finally {
+    localStorage.removeItem(SESSION_KEY);
+  }
+}, 15_000);
+
+it("r6 item 2: a debt read settles a command far above the frontier without moving it, so a later debt still finds F+5", async () => {
+  // Folded frontier F = 128. Command C is journaled at S = F + 100 and an
+  // earlier-journaled command D sits at F + 5. Rows above F reach ONLY debt
+  // reads (they are bounded with beforeSeq): the live stream missed them, so
+  // the seed and the drains' ordinary resyncs see the journal end at F.
+  // Ruling AD3: the debt read settles C without writing store events; had it
+  // folded C, the frontier would jump to S and the later debt for D would
+  // start its forward scan above D (the 64-row overlap stops at S - 64).
+  const { api, hubStore } = await fresh();
+  const F = 128;
+  const S = F + 100;
+  const ids = { c: "", d: "" };
+  const seed: HubRow[] = Array.from({ length: F }, (_, i) => ({
+    seq: i + 1,
+    eventId: `evt_seed_${i + 1}`,
+    kind: "raw_tty",
+    payload: { text: `filler ${i + 1}` },
+  }));
+  const appended = (): HubRow[] =>
+    Array.from({ length: S - F }, (_, i) => {
+      const seq = F + 1 + i;
+      if (seq === F + 5) return { seq, eventId: "evt_user_d", kind: "message", payload: { role: "user", commandId: ids.d } };
+      if (seq === S) return { seq, eventId: "evt_user_c", kind: "message", payload: { role: "user", commandId: ids.c } };
+      return { seq, eventId: `evt_noise_${seq}`, kind: "raw_tty", payload: { text: `unrelated ${seq}` } };
+    });
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL) => {
+      const debtRead = new URL(String(input), "http://hub.test").searchParams.has("beforeSeq");
+      return debtRead ? hubJournalResponse(input, [...seed, ...appended()], S) : hubJournalResponse(input, seed, F);
+    }),
+  );
+  vi.spyOn(api, "instanceGet").mockResolvedValue({ id: INSTANCE, journalId: JOURNAL } as never);
+  vi.spyOn(api, "instanceList").mockResolvedValue({
+    items: [{ id: INSTANCE, journalId: JOURNAL, revision: "1", durableSeq: String(F), lifecycle: "running" } as never],
+    nextCursor: null,
+  });
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+  vi.spyOn(api, "eventsSubscribe").mockResolvedValue({
+    subscriptionId: "sub_debt_frontier",
+    journalId: JOURNAL,
+    durableSeq: String(F),
+    windowFromSeq: "1",
+    reachedAfterSeq: true,
+    getReadyState: () => 1,
+    snapshot: {
+      projectionVersion: "v1",
+      projectionEpoch: "epoch_debt_frontier",
+      asOfSeq: String(F),
+      instance: {} as never,
+      runs: [],
+      commands: [],
+      pendingInteractions: [],
+      nodes: [],
+      history: { earliestRetainedSeq: "1", complete: true },
+    },
+  });
+  vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+    const commandId = _args[4] as string;
+    if (!ids.c) ids.c = commandId;
+    else ids.d = commandId;
+    return Promise.resolve(commandResult(commandId, "accepted"));
+  });
+  await hubStore.refresh();
+  await hubStore.follow(INSTANCE);
+  await vi.waitFor(() => expect(hubStore.getSnapshot().events[INSTANCE]).toHaveLength(F));
+  const bubbleOf = (commandId: string) => hubStore.getSnapshot().bubbles.find((b) => b.commandId === commandId)!;
+  const frontier = () => Math.max(...(hubStore.getSnapshot().events[INSTANCE] ?? []).map((e) => Number(e.seq)));
+
+  await hubStore.send(INSTANCE, "command C");
+  await vi.waitFor(() => expect(bubbleOf(ids.c)?.outboxState).toBe("sent"));
+  await vi.waitFor(
+    () => {
+      expect(bubbleOf(ids.c).state).toBe("settled");
+      expect(bubbleOf(ids.c).outboxState).toBe("done");
+    },
+    { timeout: 6_000 },
+  );
+  await vi.waitFor(() => expect(debtOf(hubStore).has(INSTANCE)).toBe(false));
+  // Store events are untouched: still exactly the folded 1..F.
+  expect(frontier()).toBe(F);
+  expect(hubStore.getSnapshot().events[INSTANCE]).toHaveLength(F);
+
+  // A second debt, recorded afterwards, for D at F + 5.
+  await hubStore.send(INSTANCE, "command D");
+  await vi.waitFor(() => expect(bubbleOf(ids.d)?.outboxState).toBe("sent"));
+  await vi.waitFor(
+    () => {
+      expect(bubbleOf(ids.d).state).toBe("settled");
+      expect(bubbleOf(ids.d).outboxState).toBe("done");
+    },
+    { timeout: 6_000 },
+  );
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+  expect(frontier()).toBe(F);
+}, 20_000);
+
+/**
+ * Make the FIRST `state: "done"` storage transaction of a storage accepted by
+ * `shouldAbort` abort. jsdom has no IndexedDB, so the store's Outbox runs on
+ * the localStorage backend; the spy sits on the store's own module instance
+ * (not the test file's static import), BELOW Outbox.patch, so the patch
+ * promise a caller fires and forgets really rejects. Returns the abort count.
+ */
+/**
+ * Collect unhandled promise rejections while `body` runs (the test runner's
+ * Node process; web tsconfig has no Node types, hence the narrow cast).
+ */
+async function collectUnhandled(body: (unhandled: unknown[]) => Promise<void>) {
+  const proc = (
+    globalThis as unknown as {
+      process: { on(event: string, fn: (reason: unknown) => void): void; off(event: string, fn: (reason: unknown) => void): void };
+    }
+  ).process;
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => unhandled.push(reason);
+  proc.on("unhandledRejection", onUnhandled);
+  try {
+    await body(unhandled);
+  } finally {
+    proc.off("unhandledRejection", onUnhandled);
+  }
+}
+
+async function abortFirstDoneWrite(shouldAbort: (storage: unknown) => boolean) {
+  const { LocalStorageOutboxStorage } = await import("./outbox");
+  const realMerge = LocalStorageOutboxStorage.prototype.mergeUnlessDone;
+  const state = { aborted: 0 };
+  vi.spyOn(LocalStorageOutboxStorage.prototype, "mergeUnlessDone").mockImplementation(function (
+    this: InstanceType<typeof LocalStorageOutboxStorage>,
+    commandId: string,
+    patch: Partial<OutboxRecord>,
+  ) {
+    if (patch.state === "done" && state.aborted === 0 && shouldAbort(this)) {
+      state.aborted += 1;
+      return Promise.reject(new Error("IDB_TRANSACTION_ABORTED"));
+    }
+    return realMerge.call(this, commandId, patch);
+  });
+  return state;
+}
+
+it("r6 item 3: the restored Outbox's aborted done transaction keeps the debt until the next pass commits it", async () => {
+  // r5 item 2's sequence (evidence folded while a failed login had the Outbox
+  // disposed) but the RESTORED Outbox's first done transaction aborts. The
+  // debt must survive the abort, the next pass must commit done, and nothing
+  // may surface as an unhandled rejection.
+  await collectUnhandled(async (unhandled) => {
+    const { api, hubStore } = await fresh();
+    await mountFollow(api, hubStore);
+    vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+      const commandId = _args[4] as string;
+      return Promise.resolve(commandResult(commandId, "accepted"));
+    });
+    let refuseLogin: ((err: Error) => void) | null = null;
+    vi.spyOn(api, "login").mockImplementation(
+      () => new Promise<never>((_resolve, reject) => (refuseLogin = reject)),
+    );
+    const h = hubStore as unknown as { outbox: { get: (id: string) => OutboxRecord | undefined } | null };
+
+    await hubStore.send(INSTANCE, "owed, confirmed during the gap, first commit aborts");
+    const bubble = () => hubStore.getSnapshot().bubbles[0]!;
+    await vi.waitFor(() => expect(bubble().outboxState).toBe("sent"));
+    await vi.waitFor(() => expect(debtOf(hubStore).has(INSTANCE)).toBe(true));
+    const commandId = bubble().commandId!;
+    const storageA = (h.outbox as unknown as { storage: unknown }).storage;
+
+    const login = hubStore.login("bootstrap", "secret", "dev").catch((err: unknown) => err);
+    await vi.waitFor(() => expect(h.outbox).toBeNull());
+    const onBatch = await liveBatch(api);
+    onBatch({
+      subscriptionId: "sub_outbox_debt",
+      journalId: JOURNAL,
+      fromSeq: "1",
+      toSeq: "1",
+      durableSeq: "1",
+      events: [
+        {
+          kind: "message",
+          eventId: "evt_user_gap_abort",
+          journalId: JOURNAL,
+          instanceId: INSTANCE,
+          seq: "1",
+          completeness: "structured",
+          payload: { role: "user", commandId },
+        } as unknown as Observation,
+      ],
+    });
+    const abort = await abortFirstDoneWrite((storage) => storage !== storageA);
+
+    refuseLogin!(new Error("credential refused"));
+    expect(await login).toBeInstanceOf(Error);
+    await vi.waitFor(() => expect(h.outbox).not.toBeNull());
+    await vi.waitFor(() => expect(abort.aborted).toBe(1), { timeout: 3_000 });
+    // The aborted commit did not discharge the obligation.
+    expect(debtOf(hubStore).has(INSTANCE)).toBe(true);
+    expect(h.outbox?.get(commandId)?.state).toBe("sent");
+
+    // The next pass commits done and only then retires the debt.
+    await vi.waitFor(
+      () => {
+        expect(h.outbox?.get(commandId)?.state).toBe("done");
+        expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+      },
+      { timeout: 3_000 },
+    );
+    expect(bubble().outboxState).toBe("done");
+    expect(unhandled).toEqual([]);
+  });
+}, 15_000);
+
+it("r6 item 3: a debt read's aborted done transaction keeps the debt until the next pass commits it", async () => {
+  // Same storage failure on the debt-read path: the tail read observes the
+  // owed entry, the done transaction aborts once; the evidence is held on the
+  // debt (the cursor moved past it) and the next pass commits it.
+  await collectUnhandled(async (unhandled) => {
+    const { api, hubStore } = await fresh();
+    await mountFollow(api, hubStore);
+    vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+      const commandId = _args[4] as string;
+      return Promise.resolve(commandResult(commandId, "accepted"));
+    });
+    const h = hubStore as unknown as { outbox: { get: (id: string) => OutboxRecord | undefined } | null };
+
+    await hubStore.send(INSTANCE, "owed, debt-read commit aborts once");
+    const bubble = () => hubStore.getSnapshot().bubbles[0]!;
+    await vi.waitFor(() => expect(bubble().outboxState).toBe("sent"));
+    await vi.waitFor(() => expect(debtOf(hubStore).has(INSTANCE)).toBe(true));
+    const commandId = bubble().commandId!;
+
+    const abort = await abortFirstDoneWrite(() => true);
+    vi.mocked(api.eventsRead).mockResolvedValue(userMessagePage(commandId));
+    await vi.waitFor(() => expect(abort.aborted).toBe(1), { timeout: 3_000 });
+    expect(debtOf(hubStore).has(INSTANCE)).toBe(true);
+    expect(h.outbox?.get(commandId)?.state).toBe("sent");
+
+    await vi.waitFor(
+      () => {
+        expect(h.outbox?.get(commandId)?.state).toBe("done");
+        expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+      },
+      { timeout: 3_000 },
+    );
+    expect(bubble().state).toBe("settled");
+    expect(bubble().outboxState).toBe("done");
+    expect(unhandled).toEqual([]);
+  });
+}, 15_000);
+
+/** One window the exact Hub stub serves for (after, before]. */
+async function stubWindow(rows: HubRow[], after: number, before: number) {
+  const response = hubJournalResponse(
+    `http://hub.test/v1/instances/${INSTANCE}/journal?afterSeq=${after}&beforeSeq=${before}`,
+    rows,
+    Math.max(...rows.map((r) => r.seq)),
+  );
+  const body = (await response.json()) as { fromSeq: string | null; reachedAfterSeq: boolean; events: { seq: number }[] };
+  return { seqs: body.events.map((e) => Number(e.seq)), fromSeq: body.fromSeq, reachedAfterSeq: body.reachedAfterSeq };
+}
+
+const textRow = (seq: number, text: string): HubRow => ({
+  seq,
+  eventId: `evt_text_${seq}`,
+  kind: "raw_tty",
+  payload: { text },
+});
+
+it("r6 item 4: the exact Hub stub caps a window by UTF-8 bytes of the stored event JSON", async () => {
+  // Multi-byte text: each big row is ~1.5M UTF-16 code units but ~4.5 MiB of
+  // UTF-8. A character count keeps 129..131 in one 8 MiB window; the Hub's
+  // byte count (payload.len()) keeps only the newest row and reports the cut.
+  const cjk = "汉".repeat(1_500_000);
+  const owedRow: HubRow = { seq: 129, eventId: "evt_user_129", kind: "message", payload: { role: "user", commandId: "cmd_x" } };
+  const multiByte = [owedRow, textRow(130, cjk), textRow(131, cjk)];
+  expect(hubEventJson(multiByte[1]!).length * 2).toBeLessThan(HUB_WINDOW_BYTES);
+  expect(await stubWindow(multiByte, 128, 256)).toEqual({ seqs: [131], fromSeq: "131", reachedAfterSeq: false });
+  expect(await stubWindow(multiByte, 128, 130)).toEqual({ seqs: [129, 130], fromSeq: "129", reachedAfterSeq: true });
+
+  // Exact boundary: a window whose rows sum to the cap EXACTLY keeps both
+  // (the Hub breaks only when adding a row would exceed it); one byte more cuts.
+  const newest = textRow(2, "a".repeat(1_000));
+  const overhead = utf8.encode(hubEventJson(textRow(1, ""))).length;
+  const fill = HUB_WINDOW_BYTES - utf8.encode(hubEventJson(newest)).length - overhead;
+  expect(await stubWindow([textRow(1, "a".repeat(fill)), newest], 0, 2)).toEqual({
+    seqs: [1, 2],
+    fromSeq: "1",
+    reachedAfterSeq: true,
+  });
+  expect(await stubWindow([textRow(1, "a".repeat(fill + 1)), newest], 0, 2)).toEqual({
+    seqs: [2],
+    fromSeq: "2",
+    reachedAfterSeq: false,
+  });
+
+  // A newest row larger than the whole budget is still served, alone.
+  const oversized = textRow(2, "b".repeat(HUB_WINDOW_BYTES + 1));
+  expect(await stubWindow([textRow(1, "small"), oversized], 0, 2)).toEqual({
+    seqs: [2],
+    fromSeq: "2",
+    reachedAfterSeq: false,
+  });
+}, 30_000);
+
+it("r6 item 4: a window the Hub byte-caps on multi-byte text is descended before the cursor moves past it", async () => {
+  // The store-level counterpart: the owed command at 129 sits below two rows
+  // of multi-byte text that a character count would have served together.
+  const cjk = "汉".repeat(1_500_000);
+  const { hubStore, bubble } = await sendOwedOverRealAdapter((commandId) => [
+    { seq: 129, eventId: "evt_user_129", kind: "message", payload: { role: "user", commandId } },
+    textRow(130, cjk),
+    textRow(131, cjk),
+  ]);
+  await vi.waitFor(
+    () => {
+      expect(bubble().state).toBe("settled");
+      expect(bubble().outboxState).toBe("done");
+    },
+    { timeout: 8_000 },
+  );
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+  expect(hubStore.getSnapshot().events[INSTANCE]).toHaveLength(128);
+}, 30_000);
+
+it("r7 item 1: a debt-only settlement keeps exactly one visible user row, and still one once the live node arrives", async () => {
+  // The page path, not store state: SessionPage's selectSession feeds the
+  // transcript assembler. A debt read settles the bubble WITHOUT writing the
+  // journal node into store events (AD3), so the settled bubble must stay in
+  // the transcript input until the authoritative user node joins it.
+  const { api, hubStore } = await fresh();
+  const { selectSession } = await import("../pages/SessionPage");
+  const { assembleTranscript } = await import("../features/session/assemble");
+  await mountFollow(api, hubStore);
+  vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+    const commandId = _args[4] as string;
+    return Promise.resolve(commandResult(commandId, "accepted"));
+  });
+  const userRows = () => {
+    const slice = selectSession(hubStore.getSnapshot(), INSTANCE);
+    return assembleTranscript(slice.events ?? [], slice.bubbles).filter(
+      (node) => node.type === "message" && node.role === "user",
+    );
+  };
+
+  await hubStore.send(INSTANCE, "settled by the debt read only");
+  const bubble = () => hubStore.getSnapshot().bubbles[0]!;
+  await vi.waitFor(() => expect(bubble().outboxState).toBe("sent"));
+  const commandId = bubble().commandId!;
+  expect(userRows()).toHaveLength(1);
+
+  // Only the debt reader sees the journaled entry; the live stream missed it.
+  vi.mocked(api.eventsRead).mockResolvedValue(userMessagePage(commandId));
+  await vi.waitFor(
+    () => {
+      expect(bubble().state).toBe("settled");
+      expect(bubble().outboxState).toBe("done");
+      expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+    },
+    { timeout: 5_000 },
+  );
+  expect(hubStore.getSnapshot().events[INSTANCE] ?? []).toHaveLength(0);
+  const afterDebt = userRows();
+  expect(afterDebt).toHaveLength(1);
+  expect(afterDebt[0]).toMatchObject({ commandId, status: "settled" });
+
+  // The live node arrives: the assembler joins it and hides the bubble.
+  const onBatch = await liveBatch(api);
+  onBatch({
+    subscriptionId: "sub_outbox_debt",
+    journalId: JOURNAL,
+    fromSeq: "1",
+    toSeq: "1",
+    durableSeq: "1",
+    events: [
+      {
+        kind: "message",
+        eventId: "evt_user_debt_1",
+        journalId: JOURNAL,
+        instanceId: INSTANCE,
+        seq: "1",
+        observedAt: "2026-10-30T00:00:01Z",
+        source: { channel: "runtime" },
+        completeness: "structured",
+        payload: {
+          role: "user",
+          commandId,
+          messageId: "msg_user_debt_1",
+          nodeId: "node_user_debt_1",
+          revision: "1",
+          baseRevision: null,
+          operation: "replace",
+          targetBlock: null,
+          status: "complete",
+          phase: "input",
+          origin: "human",
+          nativeOrigin: { state: "unknown" },
+          parentToolCallId: null,
+          blocks: [{ type: "text", text: "settled by the debt read only" }],
+        },
+      } as unknown as Observation,
+    ],
+  });
+  await vi.waitFor(() => expect(hubStore.getSnapshot().events[INSTANCE] ?? []).toHaveLength(1));
+  const afterLive = userRows();
+  expect(afterLive).toHaveLength(1);
+  expect(afterLive[0]).toMatchObject({ commandId });
+  expect((afterLive[0] as { local?: unknown }).local).toBeUndefined();
+}, 15_000);
+
+it("r7 item 2: an unrelated live batch between a failed debt done write and its retry does not cancel the retry", async () => {
+  // The debt read observes the sole owed command C; its done transaction
+  // aborts once and the pass schedules the retry. Before the retry an
+  // unrelated live frame arrives: the live reevaluation must not discharge
+  // the debt off C's evidence while C's durable row is still sent.
+  await collectUnhandled(async (unhandled) => {
+    const { api, hubStore } = await fresh();
+    await mountFollow(api, hubStore);
+    vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+      const commandId = _args[4] as string;
+      return Promise.resolve(commandResult(commandId, "accepted"));
+    });
+    const h = hubStore as unknown as { outbox: { get: (id: string) => OutboxRecord | undefined } | null };
+
+    await hubStore.send(INSTANCE, "owed, retry must survive a live frame");
+    const bubble = () => hubStore.getSnapshot().bubbles[0]!;
+    await vi.waitFor(() => expect(bubble().outboxState).toBe("sent"));
+    await vi.waitFor(() => expect(debtOf(hubStore).has(INSTANCE)).toBe(true));
+    const commandId = bubble().commandId!;
+
+    const abort = await abortFirstDoneWrite(() => true);
+    vi.mocked(api.eventsRead).mockResolvedValue(userMessagePage(commandId));
+    await vi.waitFor(() => expect(abort.aborted).toBe(1), { timeout: 3_000 });
+    expect(debtOf(hubStore).has(INSTANCE)).toBe(true);
+
+    // An unrelated live frame (an assistant message, not C) before the retry.
+    const onBatch = await liveBatch(api);
+    onBatch({
+      subscriptionId: "sub_outbox_debt",
+      journalId: JOURNAL,
+      fromSeq: "1",
+      toSeq: "1",
+      durableSeq: "1",
+      events: [
+        {
+          kind: "message",
+          eventId: "evt_assistant_unrelated",
+          journalId: JOURNAL,
+          instanceId: INSTANCE,
+          seq: "1",
+          completeness: "structured",
+          payload: { role: "assistant", text: "unrelated" },
+        } as unknown as Observation,
+      ],
+    });
+    await vi.waitFor(() => expect(hubStore.getSnapshot().events[INSTANCE] ?? []).toHaveLength(1));
+    // The live reevaluation kept the debt: C's done is still owed.
+    expect(debtOf(hubStore).has(INSTANCE)).toBe(true);
+    expect(h.outbox?.get(commandId)?.state).toBe("sent");
+
+    // The retry commits done and only then retires the debt.
+    await vi.waitFor(
+      () => {
+        expect(h.outbox?.get(commandId)?.state).toBe("done");
+        expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+      },
+      { timeout: 3_000 },
+    );
+    expect(unhandled).toEqual([]);
+  });
+}, 15_000);
+
+it("r7 item 3: persistent done-write failures for C never strand D — D reaches 状态待确认 at the deadline and C is shown not-confirmed", async () => {
+  // One merged debt owes C and D. A debt read observes only C, and EVERY
+  // durable done write for C fails. The settlement retries must not stop the
+  // deadline processing: D (never evidenced) reaches the existing bounded
+  // exhaustion, and C ends visibly not-confirmed with its obligation kept —
+  // never a silent accepted row, never an endless timer.
+  vi.useFakeTimers();
+  try {
+    await collectUnhandled(async (unhandled) => {
+      const { api, hubStore } = await fresh();
+      await mountFollow(api, hubStore);
+      vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+        const commandId = _args[4] as string;
+        return Promise.resolve(commandResult(commandId, "accepted"));
+      });
+      const h = hubStore as unknown as { outbox: { get: (id: string) => OutboxRecord | undefined } | null };
+      const pump = async () => {
+        for (let i = 0; i < 30; i += 1) await vi.advanceTimersByTimeAsync(0);
+      };
+      const bubbleOf = (text: string) => hubStore.getSnapshot().bubbles.find((b) => b.text === text)!;
+
+      await hubStore.send(INSTANCE, "command C");
+      await pump();
+      await hubStore.send(INSTANCE, "command D");
+      await pump();
+      expect(bubbleOf("command C").outboxState).toBe("sent");
+      expect(bubbleOf("command D").outboxState).toBe("sent");
+      const c = bubbleOf("command C").commandId!;
+      const d = bubbleOf("command D").commandId!;
+      expect((debtOf(hubStore).get(INSTANCE) as { commands: Set<string> }).commands).toEqual(new Set([c, d]));
+
+      // Every done write for C aborts; nothing else fails.
+      const { LocalStorageOutboxStorage } = await import("./outbox");
+      const realMerge = LocalStorageOutboxStorage.prototype.mergeUnlessDone;
+      let doneFailures = 0;
+      vi.spyOn(LocalStorageOutboxStorage.prototype, "mergeUnlessDone").mockImplementation(function (
+        this: InstanceType<typeof LocalStorageOutboxStorage>,
+        commandId: string,
+        patch: Partial<OutboxRecord>,
+      ) {
+        if (patch.state === "done" && commandId === c) {
+          doneFailures += 1;
+          return Promise.reject(new Error("IDB_TRANSACTION_ABORTED"));
+        }
+        return realMerge.call(this, commandId, patch);
+      });
+      // Only debt reads (bounded with beforeSeq) see C's entry; D never journals.
+      vi.mocked(api.eventsRead).mockImplementation(async (args) =>
+        args.beforeSeq === undefined ? EMPTY_PAGE : userMessagePage(c),
+      );
+
+      // Run past the 45 s deadline plus the settlement retry budget.
+      for (let t = 0; t < 60_000; t += 500) {
+        await vi.advanceTimersByTimeAsync(500);
+        for (let i = 0; i < 5; i += 1) await Promise.resolve();
+      }
+      await pump();
+
+      const { projectCommandStatus } = await import("./commandStatus");
+      const label = (outboxState: string | undefined) =>
+        projectCommandStatus({ hasServerCommandId: true, outboxState: outboxState as never }).label;
+      // D: the existing bounded exhaustion, durably.
+      expect(h.outbox?.get(d)?.state).toBe("unknown");
+      expect(bubbleOf("command D").state).toBe("unknown");
+      expect(label(bubbleOf("command D").outboxState)).toBe("状态待确认");
+      // C: journal-confirmed but its done never commits — retried, then shown
+      // not-confirmed with the obligation retained (never moved to unknown
+      // durably, never left as a silent accepted row).
+      expect(doneFailures).toBeGreaterThan(1);
+      expect(h.outbox?.get(c)?.state).toBe("sent");
+      expect(bubbleOf("command C").state).toBe("unknown");
+      expect(label(bubbleOf("command C").outboxState)).toBe("状态待确认");
+      expect(debtOf(hubStore).has(INSTANCE)).toBe(true);
+
+      // Bounded: no further reads or writes once both are settled visibly.
+      const reads = vi.mocked(api.eventsRead).mock.calls.length;
+      const failures = doneFailures;
+      for (let t = 0; t < 20_000; t += 500) await vi.advanceTimersByTimeAsync(500);
+      expect(vi.mocked(api.eventsRead).mock.calls.length).toBe(reads);
+      expect(doneFailures).toBe(failures);
+      expect(unhandled).toEqual([]);
+      hubStore.logout();
+    });
+  } finally {
+    vi.useRealTimers();
+  }
+}, 30_000);
+
+it("r8 item 1: a live-evidenced command whose fire-and-forget done rejects keeps the debt until the next pass commits it", async () => {
+  // The live fold fires `void outbox.patch(C, done)` and reevaluates the debt
+  // synchronously. C is in store events but its row is not durably done, so
+  // the debt must survive (it used to clear right there), and the awaited
+  // debt settlement commits the done when that live write is lost. The live
+  // settlement path is unchanged: its write is rejected here through a spy on
+  // Outbox.prototype.patch, whose own promise tracking keeps that unchanged
+  // fire-and-forget rejection from surfacing as an unhandled error.
+  const { api, hubStore } = await fresh();
+  await mountFollow(api, hubStore);
+  vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+    const commandId = _args[4] as string;
+    return Promise.resolve(commandResult(commandId, "accepted"));
+  });
+  const h = hubStore as unknown as { outbox: { get: (id: string) => OutboxRecord | undefined } | null };
+
+  await hubStore.send(INSTANCE, "live-evidenced, live done lost");
+  const bubble = () => hubStore.getSnapshot().bubbles[0]!;
+  await vi.waitFor(() => expect(bubble().outboxState).toBe("sent"));
+  await vi.waitFor(() => expect(debtOf(hubStore).has(INSTANCE)).toBe(true));
+  const commandId = bubble().commandId!;
+
+  const { Outbox } = await import("./outbox");
+  const realPatch = Outbox.prototype.patch;
+  let liveDoneRejected = 0;
+  vi.spyOn(Outbox.prototype, "patch").mockImplementation(function (
+    this: OutboxInstance,
+    id: string,
+    patch: Partial<OutboxRecord>,
+  ) {
+    if (patch.state === "done" && id === commandId && liveDoneRejected === 0) {
+      liveDoneRejected += 1;
+      return Promise.reject(new Error("IDB_TRANSACTION_ABORTED"));
+    }
+    return realPatch.call(this, id, patch);
+  });
+
+  const onBatch = await liveBatch(api);
+  onBatch({
+    subscriptionId: "sub_outbox_debt",
+    journalId: JOURNAL,
+    fromSeq: "1",
+    toSeq: "1",
+    durableSeq: "1",
+    events: [
+      {
+        kind: "message",
+        eventId: "evt_user_live_lost_done",
+        journalId: JOURNAL,
+        instanceId: INSTANCE,
+        seq: "1",
+        completeness: "structured",
+        payload: { role: "user", commandId },
+      } as unknown as Observation,
+    ],
+  });
+  expect(liveDoneRejected).toBe(1);
+  // The fold's own reevaluation kept the debt: C's row is still sent.
+  expect(debtOf(hubStore).has(INSTANCE)).toBe(true);
+  expect(h.outbox?.get(commandId)?.state).toBe("sent");
+
+  // The awaited debt settlement commits the done and only then discharges.
+  await vi.waitFor(
+    () => {
+      expect(h.outbox?.get(commandId)?.state).toBe("done");
+      expect(debtOf(hubStore).has(INSTANCE)).toBe(false);
+    },
+    { timeout: 3_000 },
+  );
+  expect(bubble().outboxState).toBe("done");
+}, 15_000);
+
+it("r8 item 2: a command merged into a retained debt after its window expired gets its own window and settles", async () => {
+  // r7 item 3's end state: C is journal-confirmed but every done write fails,
+  // so the debt is retained (no timer) long past C's 45 s window. A new
+  // command E then merges into that debt. E must get its own bounded window
+  // and journal reads — never exhausted to 状态待确认 off C's stale deadline.
+  vi.useFakeTimers();
+  try {
+    await collectUnhandled(async (unhandled) => {
+      const { api, hubStore } = await fresh();
+      await mountFollow(api, hubStore);
+      vi.spyOn(api, "instanceSend").mockImplementation((..._args) => {
+        const commandId = _args[4] as string;
+        return Promise.resolve(commandResult(commandId, "accepted"));
+      });
+      const h = hubStore as unknown as {
+        outbox: { get: (id: string) => OutboxRecord | undefined } | null;
+        owedTail: Map<string, { timer: unknown }>;
+      };
+      const pump = async () => {
+        for (let i = 0; i < 30; i += 1) await vi.advanceTimersByTimeAsync(0);
+      };
+      const run = async (ms: number) => {
+        for (let t = 0; t < ms; t += 500) {
+          await vi.advanceTimersByTimeAsync(500);
+          for (let i = 0; i < 5; i += 1) await Promise.resolve();
+        }
+        await pump();
+      };
+      const bubbleOf = (text: string) => hubStore.getSnapshot().bubbles.find((b) => b.text === text)!;
+      const userMessage = (seq: number, commandId: string): Observation =>
+        ({
+          kind: "message",
+          eventId: `evt_user_${seq}`,
+          journalId: JOURNAL,
+          instanceId: INSTANCE,
+          seq: String(seq),
+          completeness: "structured",
+          payload: { role: "user", commandId },
+        }) as unknown as Observation;
+
+      await hubStore.send(INSTANCE, "command C");
+      await pump();
+      const c = bubbleOf("command C").commandId!;
+      let e = "";
+      const { LocalStorageOutboxStorage } = await import("./outbox");
+      const realMerge = LocalStorageOutboxStorage.prototype.mergeUnlessDone;
+      let unknownWritesForE = 0;
+      vi.spyOn(LocalStorageOutboxStorage.prototype, "mergeUnlessDone").mockImplementation(function (
+        this: InstanceType<typeof LocalStorageOutboxStorage>,
+        commandId: string,
+        patch: Partial<OutboxRecord>,
+      ) {
+        if (patch.state === "done" && commandId === c) return Promise.reject(new Error("IDB_TRANSACTION_ABORTED"));
+        if (patch.state === "unknown" && commandId === e) unknownWritesForE += 1;
+        return realMerge.call(this, commandId, patch);
+      });
+      // Debt reads (bounded with beforeSeq) see C — and E once it journals.
+      vi.mocked(api.eventsRead).mockImplementation(async (args) => {
+        if (args.beforeSeq === undefined) return EMPTY_PAGE;
+        const events = [userMessage(1, c), ...(e ? [userMessage(2, e)] : [])];
+        return { events, durableSeq: String(events.length), windowFromSeq: "1", reachedAfterSeq: true };
+      });
+
+      // Reach the retained end state: C shown not-confirmed, debt kept, no timer.
+      await run(60_000);
+      expect(bubbleOf("command C").state).toBe("unknown");
+      expect(debtOf(hubStore).has(INSTANCE)).toBe(true);
+      expect(h.owedTail.get(INSTANCE)?.timer ?? null).toBeNull();
+
+      // E is accepted and merges into the retained debt.
+      await hubStore.send(INSTANCE, "command E");
+      await pump();
+      e = bubbleOf("command E").commandId!;
+      expect((debtOf(hubStore).get(INSTANCE) as { commands: Set<string> }).commands).toEqual(new Set([c, e]));
+      await run(10_000);
+
+      // E got journal reads in its own window and settled durably.
+      expect(h.outbox?.get(e)?.state).toBe("done");
+      expect(bubbleOf("command E").state).toBe("settled");
+      expect(unknownWritesForE).toBe(0);
+      expect(unhandled).toEqual([]);
+      hubStore.logout();
+    });
+  } finally {
+    vi.useRealTimers();
+  }
+}, 30_000);

@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent, type MouseEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type MouseEvent } from "react";
 import { Link, useLocation, useSearchParams } from "react-router-dom";
 import type { Id } from "../../types/wire";
-import type { Instance, Kind, UiStatus } from "../../types/instance";
+import type { Instance } from "../../types/instance";
 import type { Interaction } from "../../types/interaction";
 import { knowledgeValue } from "../../types/command";
 import { Sheet } from "../../components/Sheet";
@@ -18,6 +18,9 @@ import { switchSlots } from "../../lib/sessionSlots";
 import { isEmberEffort } from "./effort";
 import { nextStep } from "./nextStep";
 import { LaunchedByMark } from "./LaunchedBy";
+import { HarnessGlyph } from "../spaces/SpacesPanel";
+import { compareRanked, liveChildParents, rank, rankStateWord } from "../mobile/homeRows";
+import { useHeldOrder, type HoldSource } from "../../lib/useHeldOrder";
 import {
   applyFilters,
   availableConditions,
@@ -39,28 +42,18 @@ import {
   type SelectedChip,
 } from "./sessionFilters";
 import css from "./SessionList.module.css";
+import { SESSION_GROUPS } from "./sessionGroups";
 
-const GROUPS: { id: string; title: string; match: (s: UiStatus) => boolean }[] = [
-  { id: "blocked", title: "待处理", match: (s) => s === "blocked" },
-  { id: "working", title: "进行中", match: (s) => s === "working" || s === "starting" },
-  { id: "recent", title: "最近", match: (s) => s === "idle" || s === "unknown" },
-  // D-028 §8 方案 A: node-epoch-changed settles the row as exited; it leaves
-  // the live groups and lands here, next to its Resume button.
-  { id: "exited", title: "已退出", match: (s) => s === "exited" },
-];
+
+/** The painted desktop structure a hold freezes: buckets and row order. */
+type DesktopSnapshot = {
+  sections: { key: string; title: string; instances: Instance[] }[];
+};
 
 function exitLabel(instance: Instance): string | null {
   if (instance.exit.state !== "known") return null;
   const code = instance.exit.value.code;
   return code == null ? "exit" : `exit ${code}`;
-}
-
-function kindClass(kind: Kind): string {
-  if (kind === "codex") return css.kindCodex;
-  if (kind === "grok") return css.kindGrok;
-  if (kind === "agy") return css.kindAgy;
-  if (kind === "terminal") return css.kindClaude;
-  return css.kindClaude;
 }
 
 function stopRow(event: MouseEvent | FormEvent) {
@@ -139,6 +132,11 @@ export function SessionList({
   // trigger that opened it (useFocusTrap contract).
   const [actionFor, setActionFor] = useState<Id | null>(null);
   const actionReturnRef = useRef<HTMLButtonElement | null>(null);
+  // One hold: a finger in the list, keyboard focus in a row, or the open
+  // action Sheet. It freezes the painted buckets and row order; content still
+  // updates by instance id, and the list re-ranks once, on release.
+  const { begin, end, held, snapshot: holdSnapshot, regionRef } = useHeldOrder<DesktopSnapshot>();
+
   // Ids of rows whose wire disclosure is open (multiple rows may be open at
   // once; drives the side triggers' aria-expanded).
   const [wireOpenIds, setWireOpenIds] = useState<readonly Id[]>([]);
@@ -190,6 +188,87 @@ export function SessionList({
   }, [spaceId, prunedKey]);
   // The notice belongs to the Space that triggered it; a later Space retires it.
   const notice = droppedNotice.spaceId === spaceId ? droppedNotice.chips : [];
+
+  // Children that are still running lift their idle parent into awaiting-wake.
+  // The child's own rank decides (blocked/working/starting), not connectivity.
+  const childLiveIds = useMemo(() => liveChildParents(hub.instances), [hub.instances]);
+
+  const ranked = useMemo(() => {
+    const rowOf = (instance: Instance) => ({
+      id: instance.id,
+      rank: rank(instance, childLiveIds.has(instance.id)),
+      title: hubStore.titleOf(instance.id),
+      updatedAt: instance.updatedAt,
+    });
+    return [...filtered].sort((a, b) => compareRanked(rowOf(a), rowOf(b)));
+    // hubStore.titleOf reads the same snapshot this render already subscribed to.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filtered, childLiveIds]);
+
+  // The buckets as painted: each row's section is decided once, from its rank
+  // at paint time, so a hold has a structure to freeze (home.md §3.3).
+  const painted = useMemo<DesktopSnapshot>(() => {
+    const of = (instance: Instance) => rank(instance, childLiveIds.has(instance.id));
+    return {
+      sections: SESSION_GROUPS.map((group) => ({
+        key: group.id,
+        title: group.title,
+        instances: ranked.filter((instance) => group.match(of(instance))),
+      })).filter((section) => section.instances.length > 0),
+    };
+  }, [ranked, childLiveIds]);
+  const paintedRef = useRef(painted);
+  useEffect(() => {
+    paintedRef.current = painted;
+  }, [painted]);
+  const startHold = useCallback(
+    (source: HoldSource) => begin(source, () => paintedRef.current),
+    [begin],
+  );
+
+  // The open action Sheet is its own sticky source: pointer and keyboard
+  // activity inside it must not release the freeze, only closing it.
+  useEffect(() => {
+    if (actionFor !== null) {
+      startHold("sheet");
+    } else {
+      // Closing releases the Sheet's own source, and the focus source it
+      // restored to the ⋯ trigger: that focus is a side effect of closing,
+      // not a new interaction. A later Tab re-establishes it.
+      end("sheet");
+      end("focus");
+    }
+  }, [actionFor, startHold, end]);
+
+  // While held, the snapshot owns the buckets and the order; live data only
+  // replaces each row by id. A row that vanished keeps its last painted
+  // instance, and a row that appeared waits for the release.
+  const sections = useMemo(() => {
+    if (!holdSnapshot) return painted.sections;
+    const live = new Map(filtered.map((instance) => [instance.id, instance] as const));
+    return holdSnapshot.sections.map((section) => ({
+      ...section,
+      instances: section.instances.map((instance) => live.get(instance.id) ?? instance),
+    }));
+  }, [painted.sections, holdSnapshot, filtered]);
+
+  // A row painted at hold start that has since left the live data keeps its
+  // place as a placeholder, with its controls inert until release.
+  const staleIds = useMemo<ReadonlySet<string>>(() => {
+    if (!holdSnapshot) return new Set<string>();
+    const live = new Set(filtered.map((instance) => instance.id));
+    return new Set(
+      holdSnapshot.sections
+        .flatMap((section) => section.instances.map((instance) => instance.id))
+        .filter((id) => !live.has(id)),
+    );
+  }, [holdSnapshot, filtered]);
+
+  // The Sheet belongs to a row: if that row vanished mid-hold, close it so no
+  // control can send to a gone id. The normal release then runs.
+  useEffect(() => {
+    if (actionFor !== null && staleIds.has(actionFor)) setActionFor(null);
+  }, [actionFor, staleIds]);
 
   // Rows currently on screen (IntersectionObserver), so the screen poll can
   // prefer them. The viewport root stays correct inside an overflow
@@ -324,7 +403,11 @@ export function SessionList({
   }
 
   return (
-    <div className={css.root} data-testid="session-list" ref={listRootRef}>
+    <div
+      className={css.root}
+      data-testid="session-list"
+      ref={listRootRef}
+    >
       <header className={css.top}>
         <div className={css.title}>{title}</div>
         <div className={css.count}>
@@ -579,20 +662,47 @@ export function SessionList({
           </div>
         </div>
       ) : null}
-      {GROUPS.map((group) => {
-        const items = filtered.filter((i) => group.match(projectStatus(i)));
+      <div
+        className={css.rows}
+        ref={regionRef}
+        data-order-held={held ? "1" : "0"}
+        // Only the ROWS freeze the order: the toolbar, filters and search sit
+        // outside this region, so typing there keeps filtering live.
+        onPointerDown={() => startHold("pointer")}
+        // Focus only freezes on a ROW control; the toolbar is outside this
+        // region and a row's own controls are what the spec covers.
+        onFocus={(event) => {
+          if ((event.target as Element | null)?.closest('[data-testid="board-card"]')) {
+            startHold("focus");
+          }
+        }}
+        // Mirror the start predicate: focus leaving the row for anything else
+        // (the toolbar, a section heading) ends the hold.
+        onBlur={(event) => {
+          if (!(event.relatedTarget as Element | null)?.closest('[data-testid="board-card"]')) {
+            end("focus");
+          }
+        }}
+      >
+      {sections.map((group) => {
+        const items = group.instances;
         if (!items.length) return null;
+        // Desktop groups are status buckets, not project groups, so an idle fold
+        // here would hide the only row whenever every session is idle. Project
+        // folding stays on the phone home; this list only shares rank().
         return (
-          <section key={group.id} data-testid={`session-group-${group.id}`}>
+          <section key={group.key} data-testid={`session-group-${group.key}`}>
             <div className={css.group}>
-              <div className={`${css.groupTitle} ${group.id === "blocked" ? css.groupTitleBlocked : ""}`}>{group.title}</div>
+              <div className={`${css.groupTitle} ${group.key === "blocked" ? css.groupTitleBlocked : ""}`}>{group.title}</div>
               <div className={css.groupMeta}>
                 {items.length}
-                {group.id === "blocked" ? " · 置顶，不进折叠组" : group.id === "recent" ? " · 子 agent 不在此列" : ""}
+                {group.key === "blocked" ? " · 置顶，不进折叠组" : group.key === "recent" ? " · 子 agent 不在此列" : ""}
               </div>
             </div>
             {items.map((instance) => {
               const status = projectStatus(instance);
+              const homeRank = rank(instance, childLiveIds.has(instance.id));
+              const stateWord = rankStateWord(homeRank);
               const pending: Interaction | undefined = hub.interactions.find(
                 (i) => i.instanceId === instance.id && i.state === "pending",
               );
@@ -609,6 +719,7 @@ export function SessionList({
               const step = nextStep(instance, pending ?? null, screen, hubStore.summaryOf(instance.id));
               const exit = exitLabel(instance);
               const sheetOpen = actionFor === instance.id;
+              const stale = staleIds.has(instance.id);
               return (
                 <article
                   key={instance.id}
@@ -616,13 +727,17 @@ export function SessionList({
                   data-testid="board-card"
                   data-instance-id={instance.id}
                   data-status={status}
+                  data-rank={homeRank}
                   data-lifecycle={instance.lifecycle}
                   data-kind={instance.kind}
+                  data-stale={stale ? "1" : undefined}
+                  aria-disabled={stale || undefined}
                 >
                   <label className={css.check}>
                     <input
                       type="checkbox"
                       data-testid="board-select"
+                      disabled={stale}
                       checked={checked}
                       onChange={() => {
                         setSelected((cur) => (cur.includes(instance.id) ? cur.filter((id) => id !== instance.id) : [...cur, instance.id]));
@@ -633,6 +748,9 @@ export function SessionList({
                     to={to}
                     className={css.body}
                     data-testid="session-row"
+                    aria-disabled={stale || undefined}
+                    tabIndex={stale ? -1 : undefined}
+                    onClick={stale ? (event) => event.preventDefault() : undefined}
                     data-status={status}
                     data-kind={instance.kind}
                     aria-keyshortcuts={gestureEnabled && slot ? modifierAriaShortcut(slot, platform) : undefined}
@@ -642,7 +760,13 @@ export function SessionList({
                       <span className={`${css.name} ${status === "starting" || status === "exited" || status === "unknown" ? css.nameMute : ""}`}>
                         {title}
                       </span>
-                      <span className={`${css.kind} ${kindClass(instance.kind)}`}>{instance.kind}</span>
+                      <HarnessGlyph kind={instance.kind} />
+                      {stateWord ? (
+                        <span className={css.stateWord} data-testid="session-row-state">
+                          {stateWord}
+                        </span>
+                      ) : null}
+                      <span className={css.time}>{status === "unknown" ? "—" : formatListTime(instance.updatedAt, nowMs)}</span>
                       <LaunchedByMark launchedBy={instance.launchedBy} />
                       {screen?.done ? (
                         <span className={css.done} data-testid="board-done">
@@ -677,12 +801,14 @@ export function SessionList({
                       className={css.goHandle}
                       data-testid="board-go-handle"
                       to={`/approvals?focus=${encodeURIComponent(pending.id)}`}
+                      aria-disabled={stale || undefined}
+                      tabIndex={stale ? -1 : undefined}
+                      onClick={stale ? (event) => event.preventDefault() : undefined}
                     >
                       去处理
                     </Link>
                   ) : null}
                   <div className={css.rowSide}>
-                    <span className={css.time}>{status === "unknown" ? "—" : formatListTime(instance.updatedAt, nowMs)}</span>
                     {/* Wire disclosure trigger: toggles the controlled
                         session-wire details without mutating the DOM. */}
                     <button
@@ -707,6 +833,7 @@ export function SessionList({
                       type="button"
                       className={css.moreBtn}
                       data-testid="board-more"
+                      disabled={stale}
                       aria-haspopup="dialog"
                       aria-expanded={sheetOpen}
                       aria-controls={sheetOpen ? "board-actions-panel" : undefined}
@@ -953,6 +1080,7 @@ export function SessionList({
           </section>
         );
       })}
+      </div>
       {gestureEnabled && slots.length ? (
         <footer className={css.switchHint} data-testid="session-switch-hint" aria-hidden="true">
           按住 {platform.glyph} 快捷切换

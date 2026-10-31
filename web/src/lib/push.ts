@@ -23,8 +23,10 @@ export type PushStatus = {
   needsHomeScreen: boolean;
 };
 
-/** The Badging API (https://w3c.github.io/badging/), present only on some
- *  platforms (installed Chromium PWA, Android). Safari/iOS lacks it. */
+/** The Badging API (https://w3c.github.io/badging/). Availability is
+ *  feature-detected at every call site (syncAppBadge), never inferred from
+ *  the browser or platform: where the setter is missing the badge is a
+ *  complete no-op, so this type only names the optional methods. */
 type NavigatorBadging = Navigator & {
   setAppBadge?: (contents?: number) => Promise<void>;
   clearAppBadge?: () => Promise<void>;

@@ -22,5 +22,7 @@
   },
   "lineageId": "ins-turn-error-contract",
   "generation": 1,
+  "unseen": true,
+  "turnEndSeq": "2",
   "id": "ins-turn-error-contract"
 }

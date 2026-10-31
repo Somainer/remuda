@@ -1629,6 +1629,17 @@
           "$ref": "#/$defs/CommandId",
           "description": "`id`; protocol §1.1."
         },
+        "initiator": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Initiator"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "D-057 §7.1: Hub-stamped initiator carried on Agent-initiated commands.\nAbsent for Human/Bot-origin work and frames from older Hubs. The Node\npersists it on the ledger and journals it with command events."
+        },
         "nodeReceipt": {
           "$ref": "#/$defs/Knowledge10",
           "description": "`node_receipt`; protocol §2.5."
@@ -3125,6 +3136,195 @@
     "Digest": {
       "pattern": "^sha256:[0-9a-f]{64}$",
       "type": "string"
+    },
+    "DigestConfigure": {
+      "description": "An `instance.configure` command that has not settled.",
+      "properties": {
+        "requestId": {
+          "description": "The per-request id the effort switch carries, when it has one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "description": "Command state: `queued` or `accepted`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "state"
+      ],
+      "type": "object"
+    },
+    "DigestEffort": {
+      "description": "Requested and effective effort.",
+      "properties": {
+        "effective": {
+          "description": "What the harness was observed answering with.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "requested": {
+          "description": "What Remuda asked for (create or the latest configure).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "DigestModel": {
+      "description": "Requested vs effective model, with effort and a pending configure nested in.",
+      "properties": {
+        "configure": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DigestConfigure"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "An unsettled `instance.configure`."
+        },
+        "effective": {
+          "description": "The model id the harness was observed answering with.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "effort": {
+          "$ref": "#/$defs/DigestEffort",
+          "description": "Requested vs effective effort."
+        },
+        "requested": {
+          "description": "The model id Remuda asked for.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "effort"
+      ],
+      "type": "object"
+    },
+    "DigestPending": {
+      "description": "The interaction the worker is blocked on.",
+      "properties": {
+        "argsSummary": {
+          "description": "Bounded summary of the pending tool's arguments, quoted as UNTRUSTED\ndata. Secrets and input-handoff values are withheld; it is evidence\nfor a decision, never an instruction to follow.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "description": "`approval` / `question` / `plan-review` / `elicitation`.",
+          "type": "string"
+        },
+        "question": {
+          "description": "What is being asked (untrusted text).",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Name of the tool awaiting approval.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "question"
+      ],
+      "type": "object"
+    },
+    "DigestRoster": {
+      "description": "Roster state plus the latest observed classification.",
+      "properties": {
+        "state": {
+          "description": "Roster lifecycle: `dispatched` / `working` / `done` / `blocked` /\n`retired`.",
+          "type": "string"
+        },
+        "watch": {
+          "description": "Latest persisted `remuda watch` classification (`working` / `done` /\n`blocked` / `idle-api-error` / `stalled` / `gone` / `failed`). This\nroute never re-observes, so the classification may be stale.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "state"
+      ],
+      "type": "object"
+    },
+    "DigestSupply": {
+      "description": "Supply state of the profile the worker runs on, shown only when a window is\ncooling down.",
+      "properties": {
+        "resetsAt": {
+          "description": "Unix-epoch seconds at which that window resets.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "windowId": {
+          "description": "The window that is cooling down (`primary`, `weekly`, `model`, …).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "DigestText": {
+      "description": "Head and tail excerpts of the last assistant text (untrusted text).",
+      "properties": {
+        "head": {
+          "description": "First characters of the text.",
+          "type": "string"
+        },
+        "tail": {
+          "description": "Last characters of the text; empty when `head` already holds all of it.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "head",
+        "tail"
+      ],
+      "type": "object"
+    },
+    "DigestTurn": {
+      "description": "Outcome of the most recent root turn in the journal tail.",
+      "properties": {
+        "endedAt": {
+          "description": "When the result was observed (UTC RFC3339).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "result": {
+          "description": "The driver's turn-result status (`turn_done`, `error`, …).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "type": "object"
     },
     "DispatchState": {
       "description": "DispatchState wire values; `protocol.md` §2.5.",
@@ -4738,16 +4938,94 @@
       ],
       "type": "object"
     },
+    "GateAbortLandingParams": {
+      "description": "`gate.abortLanding` params (Hub→Node): the landing the Hub settled without\na landed push (established absent or operator-resolved).",
+      "properties": {
+        "generation": {
+          "default": 0,
+          "description": "Generation being settled, so the killed run's delayed verdict is\nrefused exactly like a canceled generation.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "jobId": {
+          "description": "Job whose granted land group must be terminated.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "jobId",
+        "generation"
+      ],
+      "type": "object"
+    },
+    "GateAuthorizeParams": {
+      "description": "`gate.authorize` params (Node→Hub): asked by the lane Node before a\nclaimed dispatch starts executing, so a canceled/stale generation can\nnever reach `git fetch` / `--land`.",
+      "properties": {
+        "generation": {
+          "default": 0,
+          "description": "Dispatch generation carried on the `gate.run` frame.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "jobId": {
+          "description": "Job the Node was asked to run.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "jobId",
+        "generation"
+      ],
+      "type": "object"
+    },
+    "GateAuthorizeResult": {
+      "description": "`gate.authorize` result.",
+      "properties": {
+        "authorized": {
+          "description": "True only while the Hub row is Running at exactly this generation.",
+          "type": "boolean"
+        },
+        "generation": {
+          "default": 0,
+          "description": "Echoed generation.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "state": {
+          "description": "Current Hub-side state when refused, for diagnostics.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "authorized",
+        "generation"
+      ],
+      "type": "object"
+    },
     "GateCancelParams": {
       "description": "`gate.cancel` params.",
       "properties": {
+        "generation": {
+          "default": 0,
+          "description": "Dispatch generation (the job's attempt ordinal) being canceled. A\n`gate.run` whose generation is at or below this is refused even if\nits frame is delayed past any delivery window; only a strictly\nnewer generation for the same job is allowed to run.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
         "jobId": {
           "description": "Job to cancel.",
           "type": "string"
         }
       },
       "required": [
-        "jobId"
+        "jobId",
+        "generation"
       ],
       "type": "object"
     },
@@ -4905,13 +5183,82 @@
         }
       ],
       "properties": {
+        "generation": {
+          "default": 0,
+          "description": "Attempt generation this event was produced by. The Hub ignores events\nwhose generation is not the persisted row's attempts, so a delayed\nattempt-1 step cannot overwrite attempt-2 evidence.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
         "jobId": {
           "description": "The job this event belongs to.",
           "type": "string"
         }
       },
       "required": [
-        "jobId"
+        "jobId",
+        "generation"
+      ],
+      "type": "object"
+    },
+    "GateEvidenceUncertain": {
+      "description": "r23 (coordinator clarification of R9) / r25 item 1: a persisted UNCERTAIN\ncondition for a definitive verdict whose SUPPLIED run log could not be\npersisted.\n\nThe Node delivers each verdict exactly twice (the `finished` event and the\n`gate.run` reply) and retains/redelivers NOTHING, so once both deliveries\nhave deferred there is no replay that could heal the job. The Hub runs no\npersistence-retry scheduler (R9); instead it records this explicit\ncondition, leaves the job in its pre-settlement state (Running / Canceling\n/ Landing) STILL holding its lane or land-slot occupancy, surfaces it to\nthe operator feed, and waits for either an explicit operator resolution or\nan idempotent later redelivery of the same verdict. Elapsed time alone\nnever settles it (R5 fail closed).\n\nr25 — THE COMPLETE PARKING RULE: an evidence-uncertain job is PARKED.\n  * It keeps scheduler occupancy in EVERY occupancy calculation (both the\n    busy-lane set and the project's single land slot) whether it is Running\n    or Canceling.\n  * It is never re-dispatched or claimed while the condition stands\n    (carrier/session recovery, Hub-restart reconciliation and the scheduler\n    all leave it in place with its lane/host and dispatch pin retained).\n  * It is cleared ONLY by an authorized settlement (an identical\n    redelivery that persists, the live verdict writer's own settlement, an\n    established Landed/Absent remote-fact settlement) or an exact-tuple\n    operator resolution (the request's (attempt, epoch, merge) tuple must\n    equal BOTH the live row and the condition's binding).\n  * For a Landing, an operator override (Failed/Requeue) is allowed ONLY\n    after the read-only remote-main probe AUTHORITATIVELY establishes\n    absence (fresh fetch, merge not on remote, land group verified dead).\n    Unknown or missing probe authority — fetch/RPC error, carrier offline,\n    shallow history, an Unknown response — keeps the Landing, the condition\n    and the occupancy and returns a conflict.\n  * An established Landed fact always wins over any operator override.",
+      "properties": {
+        "deliveriesDeferred": {
+          "description": "How many deliveries of this verdict were consumed and deferred. The\ncondition is surfaced to the operator once both original deliveries\nhave deferred; a single deferral stays pending because the dual\ndelivery may still heal it.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "epoch": {
+          "description": "r24 item 2: the Running → Landing grant epoch the job carried when the\nverdict deferred (`landingSessionEpoch`); `None` for a pre-grant\nverify. With [`Self::merge_sha`] this binds the condition to the FULL\n(attempt, epoch, merge) tuple, so a resolution aimed at an attempt the\nrow has advanced past is refused even when its ordinal still matches.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "firstAt": {
+          "$ref": "#/$defs/Timestamp",
+          "description": "When the first delivery deferred (RFC3339)."
+        },
+        "generation": {
+          "description": "Attempt generation of the deferred verdict (the live row's `attempts`\nwhile the condition holds).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "mergeSha": {
+          "description": "r24 item 2: the exact granted/verified merge sha the deferred verdict\nnamed (`mergeSha` at deferral); `None` for a pre-grant verify.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "description": "Human-readable reason persisted for the operator.",
+          "type": "string"
+        },
+        "status": {
+          "description": "The definitive verdict status the Node delivered but the Hub could not\nsettle (`failed` / `passed` / `landed` / …).",
+          "type": "string"
+        },
+        "suppliedDigest": {
+          "description": "sha256 of the supplied `GateRunLog` JSON that never persisted, so the\noperator (and a later identical redelivery) can recognize the verdict.",
+          "type": "string"
+        },
+        "updatedAt": {
+          "$ref": "#/$defs/Timestamp",
+          "description": "When the most recent delivery deferred (RFC3339)."
+        }
+      },
+      "required": [
+        "generation",
+        "status",
+        "suppliedDigest",
+        "deliveriesDeferred",
+        "firstAt",
+        "updatedAt",
+        "reason"
       ],
       "type": "object"
     },
@@ -4961,6 +5308,17 @@
             "null"
           ]
         },
+        "evidenceUncertain": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GateEvidenceUncertain"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "r23 R9 clarification: set while a definitive verdict's supplied run\nlog could not be persisted and no redelivery remains that could supply\nit again. The row keeps its pre-settlement state and its occupancy;\nonly an idempotent same-verdict redelivery (which clears it) or an\nexplicit operator resolution settles the job."
+        },
         "failedStep": {
           "description": "Name of the step that failed the last run (`cargo-test`, …).",
           "type": [
@@ -5005,10 +5363,32 @@
           "$ref": "#/$defs/GateJobId",
           "description": "`gjb_…` id."
         },
+        "initiator": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Initiator"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "D-057 §7.1: Hub-stamped initiator of an Agent-enqueued job; the gate\njob row is the `gate.run` admission record (main-agent.md §7.5)."
+        },
         "keepLogs": {
           "default": false,
           "description": "Retain the bounded run log even when the run passes (`--keep-logs`).",
           "type": "boolean"
+        },
+        "landingOutcomeUnknown": {
+          "description": "r14 R1 — true once a Landing has outlived its bounded recovery window\nWITHOUT an established outcome: the remote never confirmed the granted\nmerge and the lane cannot prove the push is dead (or a probe failed).\nThe row deliberately STAYS `landing`, keeps holding its lane/land\noccupancy, and is surfaced to the operator (this field + a journal\nentry). Only an established remote fact (exact merge on the remote, or\nprovably absent with the land process group verified dead) or an\nexplicit operator resolution settles it; elapsed time alone never does.",
+          "type": "boolean"
+        },
+        "landingSessionEpoch": {
+          "description": "Node session/epoch the land was granted for: binds the Landing row to\nthe carrier session whose dispatch was authorized, so a paused frame\ndelivered to a replacement session after a restart cannot land.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "laneId": {
           "description": "Pinned lane (chosen at dispatch when not given).",
@@ -5136,6 +5516,11 @@
           "type": "string"
         },
         {
+          "const": "landing",
+          "description": "Verify passed on the lane and the Hub granted the land; the\nirreversible push is in progress. A cancel arriving now reports\nlanding-in-progress instead of pretending to cancel.",
+          "type": "string"
+        },
+        {
           "const": "passed",
           "description": "Verify finished green; main was not advanced.",
           "type": "string"
@@ -5161,6 +5546,82 @@
           "type": "string"
         }
       ]
+    },
+    "GateLandGrantParams": {
+      "description": "`gate.landGrant` params (Node→Hub) at the verify→land boundary.",
+      "properties": {
+        "generation": {
+          "default": 0,
+          "description": "Attempt generation that verified.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "hostId": {
+          "default": null,
+          "description": "Host asking for the grant. The Hub does NOT trust this: it always uses\nthe host authenticated on the carrying socket. The field is optional\nand, when present, must equal the socket host (a mismatch is refused);\nit is null/absent on a stdio carrier, which has no host id to stamp.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "jobId": {
+          "description": "Job the Node is about to land.",
+          "type": "string"
+        },
+        "mergeSha": {
+          "default": "",
+          "description": "The verified merge commit this grant authorizes to push. Recorded on\nthe Landing row so a Hub restart during the push can later confirm\nwhether that exact merge reached the remote base.",
+          "type": "string"
+        },
+        "sessionEpoch": {
+          "default": "",
+          "description": "Node session/epoch this dispatch was authorized for: a paused frame\ndelivered to a replacement session must not match.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "jobId",
+        "generation",
+        "hostId",
+        "sessionEpoch",
+        "mergeSha"
+      ],
+      "type": "object"
+    },
+    "GateLandGrantResult": {
+      "description": "Result of a land-grant request.",
+      "properties": {
+        "generation": {
+          "default": 0,
+          "description": "Echoed generation.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "granted": {
+          "description": "True only when the Hub transitioned Running → Landing for this exact\ntuple; false means the push must not happen.",
+          "type": "boolean"
+        },
+        "landingInProgress": {
+          "default": false,
+          "description": "True when a cancel landed but the land was already granted: the cancel\nAPI surfaces \"landing in progress\" rather than a false cancellation.",
+          "type": "boolean"
+        },
+        "state": {
+          "description": "Hub row state when refused (`canceling` / `canceled` / …).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "granted",
+        "generation",
+        "landingInProgress"
+      ],
+      "type": "object"
     },
     "GateLandParams": {
       "description": "`gate.land` params: the home host obtains a lane's verified merge commit\nand compare-and-swap pushes it to the project's base branch.\n\nThis is the `pushFrom: home` half of D-034: the lane host holds no push\ncredential for the project remote, so a passing verify is landed by the\nhost that does. For this slice the merge commit arrives by `git fetch` of\n`mergeRef` over `fetchRemote`; a Node RPC streaming the packfile is the\nbetter shape later, so `fetchRemote` stays the only lane-reachability\ninput and nothing else assumes ssh.",
@@ -5301,6 +5762,76 @@
         }
       ]
     },
+    "GateResolveLandingParams": {
+      "description": "`gate.resolveLanding` params: a read-only probe after a Hub restart left a\njob `landing`.",
+      "properties": {
+        "baseBranch": {
+          "default": "main",
+          "description": "Base branch the CAS advanced (`main`).",
+          "type": "string"
+        },
+        "generation": {
+          "description": "r34 item 1: the attempt generation whose death/landing state is being\nprobed. Fence and death-certificate files are attempt-qualified\n(`land-<job>-g<gen>.json` / `dead-<job>-g<gen>.json`), so a probe\nattests facts ONLY about this exact attempt; an absent or different\ngeneration yields Unknown rather than accepting another attempt's\ncertificate. `None` stays conservative (Unknown for durable evidence).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "jobId": {
+          "description": "Job whose granted push is being resolved.",
+          "type": "string"
+        },
+        "mergeSha": {
+          "description": "The merge commit the grant was for; the remote base must contain it for\nthe outcome to count as landed.",
+          "type": "string"
+        },
+        "repoPath": {
+          "description": "Lane checkout the merge was pushed from.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "jobId",
+        "repoPath",
+        "baseBranch",
+        "mergeSha"
+      ],
+      "type": "object"
+    },
+    "GateResolveLandingResult": {
+      "description": "`gate.resolveLanding` verdict.\n* `landed` — the remote base already contains the granted merge;\n* `absent` — a fresh fetch succeeded, the merge is NOT on the remote base,\n  AND the lane attests the land process group that could still push for this\n  job is verified gone (no live run, no outstanding fence record), so the\n  push is provably not coming;\n* `unknown` — the outcome cannot be established (host unreachable, fetch\n  failed, the merge is not yet an ancestor while a land group may still be\n  alive). The Hub must never turn `unknown` into a verdict.",
+      "properties": {
+        "baseSha": {
+          "description": "Base-branch sha observed (when known).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "error": {
+          "description": "Why the outcome could not be confirmed (status `unknown`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "jobId": {
+          "description": "Job id echoed back.",
+          "type": "string"
+        },
+        "status": {
+          "description": "`landed` | `absent` | `unknown`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "jobId",
+        "status"
+      ],
+      "type": "object"
+    },
     "GateRunLog": {
       "description": "Bounded failure evidence for one gate run, stored by the Hub as an\n`obj_…` log object (never inlined into the job row). For a failed run the\nNode populates it for the failed step; with `--keep-logs` a green run gets\na `kept` log of the whole-run tail.",
       "properties": {
@@ -5398,6 +5929,24 @@
           "minimum": 0,
           "type": "integer"
         },
+        "generation": {
+          "default": 0,
+          "description": "Dispatch generation: the job's attempt ordinal at claim. The Node\nrecords it when `gate.cancel` is acked and refuses a run whose\ngeneration is at or below a canceled generation for the same job —\nhowever delayed that run frame is. Elapsed time never authorizes a\nstale dispatch; only a strictly newer generation supersedes a cancel.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "initiator": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Initiator"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "D-057 §7.5: Hub-stamped initiator carried on Agent-enqueued gate runs;\nthe opId is the `jobId`. Absent for Human/Bot jobs and older Hubs."
+        },
         "jobId": {
           "description": "Hub job id (`gjb_…`); key for cancel and for streamed events.",
           "type": "string"
@@ -5490,7 +6039,8 @@
         "gateTimeoutSecs",
         "push",
         "pushFrom",
-        "keepLogs"
+        "keepLogs",
+        "generation"
       ],
       "type": "object"
     },
@@ -5524,6 +6074,13 @@
             "string",
             "null"
           ]
+        },
+        "generation": {
+          "default": 0,
+          "description": "Attempt generation this verdict belongs to. The Hub rejects a verdict\nwhose generation is not the persisted row's attempts, so a delayed\nreply from an old attempt can never change a newer running attempt.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
         },
         "headSha": {
           "description": "Branch tip sha.",
@@ -5583,6 +6140,7 @@
       },
       "required": [
         "jobId",
+        "generation",
         "status",
         "steps"
       ],
@@ -5789,6 +6347,103 @@
           "type": "string"
         }
       ]
+    },
+    "GlanceMore": {
+      "description": "How many workers the glance lists left out because of the row cap.",
+      "properties": {
+        "waiting": {
+          "description": "Waiting workers beyond the [`LINEAGE_GLANCE_ROW_CAP`] returned rows.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "working": {
+          "description": "Working workers beyond the returned rows.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "waiting",
+        "working"
+      ],
+      "type": "object"
+    },
+    "GlanceWaiting": {
+      "description": "One waiting worker of a [`LineageGlance`].",
+      "properties": {
+        "instanceId": {
+          "description": "Instance (`ins_…`) running the harness, when one launched.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "description": "Why the worker waits: `approval` / `question` / `plan-review` /\n`elicitation` / `blocked` / `api-error` / `stalled` / `gone` / `failed`.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Worker name.",
+          "type": "string"
+        },
+        "question": {
+          "description": "What is being asked (untrusted text).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "since": {
+          "description": "Seconds since the roster row or its observation last moved.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "kind"
+      ],
+      "type": "object"
+    },
+    "GlanceWorking": {
+      "description": "One working worker of a [`LineageGlance`].",
+      "properties": {
+        "instanceId": {
+          "description": "Instance (`ins_…`) running the harness, when one launched.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Worker name.",
+          "type": "string"
+        },
+        "since": {
+          "description": "Seconds since the roster row or its observation last moved.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "taskId": {
+          "description": "Bound task (`tsk_…`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
     },
     "GrantVerb": {
       "description": "GrantVerb wire values; `protocol.md` §2.5.",
@@ -6830,6 +7485,30 @@
     "Id": {
       "pattern": "^(hst|wsp|wkt|ins|run|cmd|int|evt|dev|prn|pvp|cred|obj|sub|tty|launch|epoch|hook|prj|tsk|plc|wkr|gjb|wtl)_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
       "type": "string"
+    },
+    "Initiator": {
+      "description": "The chapter instance a mutation was initiated by, with its place in the\nlineage. `{instanceId, lineageId, generation}` — D-057 §7.1.\n\nThe generation is the chapter generation stamped at authentication time.\nA fence bumps the lineage's live generation, so the commit-time check can\nrefuse a request authenticated before the fence (main-agent.md §7.3).",
+      "properties": {
+        "generation": {
+          "description": "Chapter generation at authentication time.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "instanceId": {
+          "description": "The chapter instance that initiated the mutation.",
+          "type": "string"
+        },
+        "lineageId": {
+          "description": "Lineage the instance belongs to.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "instanceId",
+        "lineageId",
+        "generation"
+      ],
+      "type": "object"
     },
     "InputAccounting": {
       "description": "InputAccounting wire values; `protocol.md` §5.5.",
@@ -10324,6 +11003,52 @@
         }
       ]
     },
+    "LineageGlance": {
+      "description": "`GET /v1/lineages/{id}/glance`: the workers the lineage dispatched that\nare waiting on someone or working, plus today's completions.",
+      "properties": {
+        "doneToday": {
+          "description": "Workers that reported DONE since the start of the UTC day.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "generatedAt": {
+          "description": "When the glance was rendered (UTC RFC3339).",
+          "type": "string"
+        },
+        "lineageId": {
+          "description": "Lineage the glance is for.",
+          "type": "string"
+        },
+        "more": {
+          "$ref": "#/$defs/GlanceMore",
+          "description": "Rows beyond the caps."
+        },
+        "waiting": {
+          "description": "Workers that need attention, at most [`LINEAGE_GLANCE_ROW_CAP`].",
+          "items": {
+            "$ref": "#/$defs/GlanceWaiting"
+          },
+          "type": "array"
+        },
+        "working": {
+          "description": "Workers making progress, at most [`LINEAGE_GLANCE_ROW_CAP`].",
+          "items": {
+            "$ref": "#/$defs/GlanceWorking"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "lineageId",
+        "generatedAt",
+        "waiting",
+        "working",
+        "more",
+        "doneToday"
+      ],
+      "type": "object"
+    },
     "LiteralEnv": {
       "description": "LiteralEnv; `protocol.md` §4.1.",
       "properties": {
@@ -10430,6 +11155,316 @@
         "objectId",
         "mediaType",
         "name"
+      ],
+      "type": "object"
+    },
+    "MemoryEntry": {
+      "description": "One memory entry of one lineage.",
+      "properties": {
+        "archivedAt": {
+          "description": "Set when the lineage retired; archived entries leave the index and\nsearch until the owner restores them.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "body": {
+          "description": "Entry body; read on demand, never in the index.",
+          "type": "string"
+        },
+        "createdAt": {
+          "description": "First write.",
+          "type": "string"
+        },
+        "description": {
+          "description": "One-line description; the index shows it.",
+          "type": "string"
+        },
+        "lineageId": {
+          "description": "Owning lineage (its first chapter's instance id).",
+          "type": "string"
+        },
+        "origin": {
+          "$ref": "#/$defs/MemoryOrigin",
+          "description": "How the caller of the last write authenticated."
+        },
+        "revision": {
+          "description": "Revision: the next one for this slug on every write, never reused —\na slug recreated after a delete continues after its last revision, so\na stale `expectedRevision` never matches a replacement. 1 for a slug\nnever used before. Updates and deletes carry it back as\n`expectedRevision`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "slug": {
+          "description": "Stable handle, unique within the lineage (archived entries included).",
+          "type": "string"
+        },
+        "sourceRefs": {
+          "default": [],
+          "description": "Journal rows the entry was derived from.",
+          "items": {
+            "$ref": "#/$defs/MemorySourceRef"
+          },
+          "type": "array"
+        },
+        "title": {
+          "description": "One-line title.",
+          "type": "string"
+        },
+        "type": {
+          "$ref": "#/$defs/MemoryType",
+          "description": "Entry type."
+        },
+        "updatedAt": {
+          "description": "Last write.",
+          "type": "string"
+        },
+        "writerInstance": {
+          "description": "Chapter that made the last write; absent for an owner write.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "lineageId",
+        "slug",
+        "type",
+        "title",
+        "description",
+        "body",
+        "revision",
+        "origin",
+        "sourceRefs",
+        "createdAt",
+        "updatedAt"
+      ],
+      "type": "object"
+    },
+    "MemoryIndex": {
+      "description": "The Hub-rendered index: one line per live entry (archived entries too\nwhen asked for, marked `(archived)`), stable-ordered by type then slug.",
+      "properties": {
+        "bytes": {
+          "description": "Rendered size in bytes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "count": {
+          "description": "Number of entries in the index.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "lineageId": {
+          "description": "Lineage.",
+          "type": "string"
+        },
+        "text": {
+          "description": "Rendered text, one `- [type] slug: title — description` line per\nentry; an archived entry's line ends ` (archived)`.",
+          "type": "string"
+        },
+        "warnings": {
+          "default": [],
+          "description": "The index soft limit, when crossed.",
+          "items": {
+            "$ref": "#/$defs/MemorySizeWarning"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "lineageId",
+        "text",
+        "count",
+        "bytes",
+        "warnings"
+      ],
+      "type": "object"
+    },
+    "MemoryLimit": {
+      "description": "MemoryLimit wire values; `protocol.md` §8.",
+      "oneOf": [
+        {
+          "const": "entry-soft",
+          "description": "Wire value `entry-soft`.",
+          "type": "string"
+        },
+        {
+          "const": "index-soft",
+          "description": "Wire value `index-soft`.",
+          "type": "string"
+        }
+      ]
+    },
+    "MemoryMatch": {
+      "description": "MemoryMatch wire values; `protocol.md` §8.",
+      "oneOf": [
+        {
+          "const": "fts",
+          "description": "Wire value `fts`.",
+          "type": "string"
+        },
+        {
+          "const": "like",
+          "description": "Wire value `like`.",
+          "type": "string"
+        }
+      ]
+    },
+    "MemoryOrigin": {
+      "description": "MemoryOrigin wire values; `protocol.md` §8.",
+      "oneOf": [
+        {
+          "const": "human",
+          "description": "Wire value `human`.",
+          "type": "string"
+        },
+        {
+          "const": "agent",
+          "description": "Wire value `agent`.",
+          "type": "string"
+        }
+      ]
+    },
+    "MemorySearchHit": {
+      "description": "One search hit.",
+      "properties": {
+        "entry": {
+          "$ref": "#/$defs/MemoryEntry",
+          "description": "The matching entry."
+        },
+        "matchedBy": {
+          "$ref": "#/$defs/MemoryMatch",
+          "description": "`fts` for a full-text (bm25-ranked) hit, `like` for a substring hit\nthe tokenizer could not see (for example a short CJK query)."
+        },
+        "score": {
+          "description": "bm25 score of an `fts` hit (lower is better).",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "entry",
+        "matchedBy"
+      ],
+      "type": "object"
+    },
+    "MemorySizeWarning": {
+      "description": "A soft limit a write crossed, with the actual numbers.",
+      "properties": {
+        "bytes": {
+          "description": "Actual size in bytes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "limit": {
+          "$ref": "#/$defs/MemoryLimit",
+          "description": "Which limit."
+        },
+        "maxBytes": {
+          "description": "The limit in bytes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "limit",
+        "bytes",
+        "maxBytes"
+      ],
+      "type": "object"
+    },
+    "MemorySourceRef": {
+      "description": "A journal row an entry was derived from. Lets a later journal-redaction\npass find every entry that repeats a redacted row.",
+      "properties": {
+        "instanceId": {
+          "description": "Instance whose journal holds the row (`ins_…`).",
+          "type": "string"
+        },
+        "seq": {
+          "description": "Journal sequence number of the row.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "instanceId",
+        "seq"
+      ],
+      "type": "object"
+    },
+    "MemoryType": {
+      "description": "MemoryType wire values; `protocol.md` §8.",
+      "oneOf": [
+        {
+          "const": "user",
+          "description": "Wire value `user`.",
+          "type": "string"
+        },
+        {
+          "const": "feedback",
+          "description": "Wire value `feedback`.",
+          "type": "string"
+        },
+        {
+          "const": "project",
+          "description": "Wire value `project`.",
+          "type": "string"
+        },
+        {
+          "const": "reference",
+          "description": "Wire value `reference`.",
+          "type": "string"
+        }
+      ]
+    },
+    "MemoryWriteResult": {
+      "description": "Result of a create, update or consolidate.",
+      "properties": {
+        "entry": {
+          "$ref": "#/$defs/MemoryEntry",
+          "description": "The entry as committed."
+        },
+        "entryBytes": {
+          "description": "Size of the committed entry: title + description + body, UTF-8 bytes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "indexBytes": {
+          "description": "Size of the lineage's rendered index after the write.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "removed": {
+          "description": "Entries the write removed (consolidate only).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "warnings": {
+          "default": [],
+          "description": "Soft limits crossed by this write.",
+          "items": {
+            "$ref": "#/$defs/MemorySizeWarning"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "entry",
+        "entryBytes",
+        "indexBytes",
+        "warnings"
       ],
       "type": "object"
     },
@@ -20230,6 +21265,145 @@
         }
       ]
     },
+    "WorkerDigest": {
+      "description": "`GET /v1/workers/{id}/digest`: at most [`WORKER_DIGEST_MAX_BYTES`] bytes.\n\nOptional sections are omitted rather than sent as `null`. Every string that\noriginates from a worker, a tool or the screen is untrusted data.",
+      "properties": {
+        "branch": {
+          "description": "Worker branch.",
+          "type": "string"
+        },
+        "instanceId": {
+          "description": "Instance (`ins_…`) running the harness, when one launched.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "lastText": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DigestText"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Head and tail of the last assistant text."
+        },
+        "model": {
+          "$ref": "#/$defs/DigestModel",
+          "description": "Requested vs effective model, with effort and a pending configure."
+        },
+        "name": {
+          "description": "Worker name.",
+          "type": "string"
+        },
+        "pending": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DigestPending"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The interaction the worker is blocked on."
+        },
+        "projectId": {
+          "description": "Owning project (`prj_…`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "queued": {
+          "description": "Commands still queued for the instance.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "roster": {
+          "$ref": "#/$defs/DigestRoster",
+          "description": "Roster state and the observe classification."
+        },
+        "sha": {
+          "description": "Claimed DONE sha (a claim until `land`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "shrunk": {
+          "description": "Fields whose text was shortened to fit the byte budget. Empty when the\ndocument fit as rendered.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "sinceProgressSecs": {
+          "description": "Seconds since the last journal event (the last progress).",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "supply": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DigestSupply"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The cooling-down supply window."
+        },
+        "taskId": {
+          "description": "Bound task (`tsk_…`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "toolInFlight": {
+          "description": "Whether a tool call has started and not produced its final result.",
+          "type": "boolean"
+        },
+        "turn": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DigestTurn"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Last turn outcome, once a turn has finished in the journal tail."
+        },
+        "v": {
+          "description": "Digest schema version.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "workerId": {
+          "description": "Roster id (`wkr_…`).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "v",
+        "workerId",
+        "name",
+        "branch",
+        "roster",
+        "model",
+        "queued",
+        "toolInFlight"
+      ],
+      "type": "object"
+    },
     "WorkerProvisionParams": {
       "description": "`worker.provision` params: create the product-assigned worktree and the\nper-worker cargo target directory on the Node.\n\nThe Node owns the filesystem layout: the request names the worker and the\nbranch, but never absolute paths (security-review-2 M4, same rule as\n`worktree.create`). The Node creates the worktree under its managed\n`<repo>/../remuda-wt/<name>` root and the target dir under\n`<repo>/../remuda-target/<name>`.",
       "properties": {
@@ -20379,6 +21553,17 @@
         "createdAt": {
           "$ref": "#/$defs/Timestamp",
           "description": "`created_at`; protocol §1.1."
+        },
+        "doneAt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When the worker last entered `done`, stamped by the Hub at the\ntransition and cleared on any other state.\n\nKept apart from `updatedAt` because every watch pass rewrites the row:\n\"today's DONE count\" must answer when the work landed, not when the\nowner last looked at it."
         },
         "driver": {
           "description": "Carrier driver the agent **actually** launched on, as reported back by\nthe Node's create result (`shell-pty` / `claude-pty` / …).\n\nRecorded from the Node's answer rather than from the Hub's request: the\ntwo diverged silently once (a roster row said `claude-pty` while the Node\nran `claude-print`), which made every screen read and nudge on that\nworker inexplicable. Absent on rows written before this field existed.",

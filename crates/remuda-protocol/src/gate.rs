@@ -18,12 +18,32 @@ pub const METHOD_GATE_RUN: &str = "gate.run";
 pub const METHOD_GATE_CANCEL: &str = "gate.cancel";
 /// Node→Hub: one streamed job event (a finished step, a phase, log output …).
 pub const METHOD_GATE_EVENT: &str = "gate.event";
+/// Node→Hub: before a gate run does anything irreversible, the Node asks the
+/// Hub to confirm `(jobId, generation)` is still the live Running attempt.
+pub const METHOD_GATE_AUTHORIZE: &str = "gate.authorize";
+/// Node→Hub: at the verify→land boundary the Node asks the Hub to transition
+/// the row Running → Landing for exactly `(jobId, generation, host, epoch)`.
+/// A cancel that reaches the Hub before this is honored; once granted the
+/// land runs to completion and a later cancel reports landing-in-progress.
+pub const METHOD_GATE_LAND_GRANT: &str = "gate.landGrant";
 /// Hub→Node (home host): run the optional `remuda land --then` command.
 pub const METHOD_GATE_THEN: &str = "gate.then";
 /// Hub→Node (home host): fetch a lane's verified merge and CAS-push main.
 pub const METHOD_GATE_LAND: &str = "gate.land";
 /// Hub→Node (lane host): drop a job's persisted merge refs.
 pub const METHOD_GATE_UNPIN: &str = "gate.unpin";
+/// Hub→Node (lane host): after a Hub restart with a job left `landing`, ask
+/// the lane whether the granted merge is already an ancestor of the remote
+/// base branch (so the push in fact landed) or whether the outcome is unknown.
+/// Read-only: it never pushes.
+pub const METHOD_GATE_RESOLVE_LANDING: &str = "gate.resolveLanding";
+/// Hub→Node (lane host): the Hub established an absent/pushed-never outcome or
+/// an explicit operator resolution settled a Landing. Terminate the granted
+/// land process group (TERM → bounded wait → KILL → ESRCH) and release the
+/// lane run, so a re-queued attempt can use the lane and an operator-failed
+/// Landing cannot push after the fact. The generation is tombstoned like a
+/// cancel so the killed run's late verdict is refused (r14 R1).
+pub const METHOD_GATE_ABORT_LANDING: &str = "gate.abortLanding";
 
 /// Every Hub→Node gate RPC (stdio allowlist predicate helper).
 #[must_use]
@@ -35,6 +55,8 @@ pub fn is_gate_call(method: &str) -> bool {
             | METHOD_GATE_THEN
             | METHOD_GATE_LAND
             | METHOD_GATE_UNPIN
+            | METHOD_GATE_RESOLVE_LANDING
+            | METHOD_GATE_ABORT_LANDING
     )
 }
 
@@ -163,6 +185,10 @@ pub enum GateJobState {
     Queued,
     /// A Node is running the job.
     Running,
+    /// Verify passed on the lane and the Hub granted the land; the
+    /// irreversible push is in progress. A cancel arriving now reports
+    /// landing-in-progress instead of pretending to cancel.
+    Landing,
     /// Verify finished green; main was not advanced.
     Passed,
     /// Gate or landing failed.
@@ -182,6 +208,7 @@ impl GateJobState {
         match self {
             Self::Queued => "queued",
             Self::Running => "running",
+            Self::Landing => "landing",
             Self::Passed => "passed",
             Self::Failed => "failed",
             Self::Landed => "landed",
@@ -195,6 +222,7 @@ impl GateJobState {
         match value {
             "queued" => Some(Self::Queued),
             "running" => Some(Self::Running),
+            "landing" => Some(Self::Landing),
             "passed" => Some(Self::Passed),
             "failed" => Some(Self::Failed),
             "landed" => Some(Self::Landed),
@@ -273,6 +301,75 @@ pub struct GateRunLog {
     pub truncated: bool,
 }
 
+/// r23 (coordinator clarification of R9) / r25 item 1: a persisted UNCERTAIN
+/// condition for a definitive verdict whose SUPPLIED run log could not be
+/// persisted.
+///
+/// The Node delivers each verdict exactly twice (the `finished` event and the
+/// `gate.run` reply) and retains/redelivers NOTHING, so once both deliveries
+/// have deferred there is no replay that could heal the job. The Hub runs no
+/// persistence-retry scheduler (R9); instead it records this explicit
+/// condition, leaves the job in its pre-settlement state (Running / Canceling
+/// / Landing) STILL holding its lane or land-slot occupancy, surfaces it to
+/// the operator feed, and waits for either an explicit operator resolution or
+/// an idempotent later redelivery of the same verdict. Elapsed time alone
+/// never settles it (R5 fail closed).
+///
+/// r25 — THE COMPLETE PARKING RULE: an evidence-uncertain job is PARKED.
+///   * It keeps scheduler occupancy in EVERY occupancy calculation (both the
+///     busy-lane set and the project's single land slot) whether it is Running
+///     or Canceling.
+///   * It is never re-dispatched or claimed while the condition stands
+///     (carrier/session recovery, Hub-restart reconciliation and the scheduler
+///     all leave it in place with its lane/host and dispatch pin retained).
+///   * It is cleared ONLY by an authorized settlement (an identical
+///     redelivery that persists, the live verdict writer's own settlement, an
+///     established Landed/Absent remote-fact settlement) or an exact-tuple
+///     operator resolution (the request's (attempt, epoch, merge) tuple must
+///     equal BOTH the live row and the condition's binding).
+///   * For a Landing, an operator override (Failed/Requeue) is allowed ONLY
+///     after the read-only remote-main probe AUTHORITATIVELY establishes
+///     absence (fresh fetch, merge not on remote, land group verified dead).
+///     Unknown or missing probe authority — fetch/RPC error, carrier offline,
+///     shallow history, an Unknown response — keeps the Landing, the condition
+///     and the occupancy and returns a conflict.
+///   * An established Landed fact always wins over any operator override.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GateEvidenceUncertain {
+    /// Attempt generation of the deferred verdict (the live row's `attempts`
+    /// while the condition holds).
+    pub generation: u32,
+    /// r24 item 2: the Running → Landing grant epoch the job carried when the
+    /// verdict deferred (`landingSessionEpoch`); `None` for a pre-grant
+    /// verify. With [`Self::merge_sha`] this binds the condition to the FULL
+    /// (attempt, epoch, merge) tuple, so a resolution aimed at an attempt the
+    /// row has advanced past is refused even when its ordinal still matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<String>,
+    /// r24 item 2: the exact granted/verified merge sha the deferred verdict
+    /// named (`mergeSha` at deferral); `None` for a pre-grant verify.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_sha: Option<String>,
+    /// The definitive verdict status the Node delivered but the Hub could not
+    /// settle (`failed` / `passed` / `landed` / …).
+    pub status: String,
+    /// sha256 of the supplied `GateRunLog` JSON that never persisted, so the
+    /// operator (and a later identical redelivery) can recognize the verdict.
+    pub supplied_digest: String,
+    /// How many deliveries of this verdict were consumed and deferred. The
+    /// condition is surfaced to the operator once both original deliveries
+    /// have deferred; a single deferral stays pending because the dual
+    /// delivery may still heal it.
+    pub deliveries_deferred: u32,
+    /// When the first delivery deferred (RFC3339).
+    pub first_at: Timestamp,
+    /// When the most recent delivery deferred (RFC3339).
+    pub updated_at: Timestamp,
+    /// Human-readable reason persisted for the operator.
+    pub reason: String,
+}
+
 /// One queued gate/land job (Hub document; coordinator-hierarchy.md §8 row 6).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -292,6 +389,14 @@ pub struct GateJob {
     pub lane_id: Option<String>,
     /// Device that enqueued the job.
     pub requested_by: String,
+    /// D-057 §7.1: Hub-stamped initiator of an Agent-enqueued job; the gate
+    /// job row is the `gate.run` admission record (main-agent.md §7.5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initiator: Option<crate::Initiator>,
+    /// Hub-only authenticating device id, re-checked at claim. Never sent to
+    /// Nodes and never on the wire.
+    #[serde(default, skip_serializing)]
+    pub initiator_device_id: Option<String>,
     /// Lifecycle state.
     pub state: GateJobState,
     /// Step results streamed back from the lane Node.
@@ -319,6 +424,28 @@ pub struct GateJob {
     /// can take minutes and its own terminal write records the honest outcome.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub home_land_in_flight: bool,
+    /// Node session/epoch the land was granted for: binds the Landing row to
+    /// the carrier session whose dispatch was authorized, so a paused frame
+    /// delivered to a replacement session after a restart cannot land.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landing_session_epoch: Option<String>,
+    /// r14 R1 — true once a Landing has outlived its bounded recovery window
+    /// WITHOUT an established outcome: the remote never confirmed the granted
+    /// merge and the lane cannot prove the push is dead (or a probe failed).
+    /// The row deliberately STAYS `landing`, keeps holding its lane/land
+    /// occupancy, and is surfaced to the operator (this field + a journal
+    /// entry). Only an established remote fact (exact merge on the remote, or
+    /// provably absent with the land process group verified dead) or an
+    /// explicit operator resolution settles it; elapsed time alone never does.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub landing_outcome_unknown: bool,
+    /// r23 R9 clarification: set while a definitive verdict's supplied run
+    /// log could not be persisted and no redelivery remains that could supply
+    /// it again. The row keeps its pre-settlement state and its occupancy;
+    /// only an idempotent same-verdict redelivery (which clears it) or an
+    /// explicit operator resolution settles the job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_uncertain: Option<GateEvidenceUncertain>,
     /// Base (`main`) sha the merge was verified onto.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_sha: Option<String>,
@@ -402,6 +529,11 @@ pub enum GateEventKind {
 pub struct GateEventParams {
     /// The job this event belongs to.
     pub job_id: String,
+    /// Attempt generation this event was produced by. The Hub ignores events
+    /// whose generation is not the persisted row's attempts, so a delayed
+    /// attempt-1 step cannot overwrite attempt-2 evidence.
+    #[serde(default)]
+    pub generation: u32,
     /// Event payload.
     #[serde(flatten)]
     pub kind: GateEventKind,
@@ -466,6 +598,17 @@ pub struct GateRunParams {
     /// Test seam: override the merge binary (defaults to the Node's own exe).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary: Option<String>,
+    /// D-057 §7.5: Hub-stamped initiator carried on Agent-enqueued gate runs;
+    /// the opId is the `jobId`. Absent for Human/Bot jobs and older Hubs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initiator: Option<crate::Initiator>,
+    /// Dispatch generation: the job's attempt ordinal at claim. The Node
+    /// records it when `gate.cancel` is acked and refuses a run whose
+    /// generation is at or below a canceled generation for the same job —
+    /// however delayed that run frame is. Elapsed time never authorizes a
+    /// stale dispatch; only a strictly newer generation supersedes a cancel.
+    #[serde(default)]
+    pub generation: u32,
 }
 
 fn default_base_branch() -> String {
@@ -478,6 +621,11 @@ fn default_base_branch() -> String {
 pub struct GateRunResult {
     /// Job id echoed back.
     pub job_id: String,
+    /// Attempt generation this verdict belongs to. The Hub rejects a verdict
+    /// whose generation is not the persisted row's attempts, so a delayed
+    /// reply from an old attempt can never change a newer running attempt.
+    #[serde(default)]
+    pub generation: u32,
     /// `passed` | `landed` | `failed` | `canceled` | `base-moved` | `stale-tip` | `lane-busy`.
     pub status: String,
     /// Step results.
@@ -520,6 +668,97 @@ pub struct GateRunResult {
 pub struct GateCancelParams {
     /// Job to cancel.
     pub job_id: String,
+    /// Dispatch generation (the job's attempt ordinal) being canceled. A
+    /// `gate.run` whose generation is at or below this is refused even if
+    /// its frame is delayed past any delivery window; only a strictly
+    /// newer generation for the same job is allowed to run.
+    #[serde(default)]
+    pub generation: u32,
+}
+
+/// `gate.abortLanding` params (Hub→Node): the landing the Hub settled without
+/// a landed push (established absent or operator-resolved).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GateAbortLandingParams {
+    /// Job whose granted land group must be terminated.
+    pub job_id: String,
+    /// Generation being settled, so the killed run's delayed verdict is
+    /// refused exactly like a canceled generation.
+    #[serde(default)]
+    pub generation: u32,
+}
+
+/// `gate.authorize` params (Node→Hub): asked by the lane Node before a
+/// claimed dispatch starts executing, so a canceled/stale generation can
+/// never reach `git fetch` / `--land`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GateAuthorizeParams {
+    /// Job the Node was asked to run.
+    pub job_id: String,
+    /// Dispatch generation carried on the `gate.run` frame.
+    #[serde(default)]
+    pub generation: u32,
+}
+
+/// `gate.authorize` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GateAuthorizeResult {
+    /// True only while the Hub row is Running at exactly this generation.
+    pub authorized: bool,
+    /// Echoed generation.
+    #[serde(default)]
+    pub generation: u32,
+    /// Current Hub-side state when refused, for diagnostics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+}
+
+/// `gate.landGrant` params (Node→Hub) at the verify→land boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GateLandGrantParams {
+    /// Job the Node is about to land.
+    pub job_id: String,
+    /// Attempt generation that verified.
+    #[serde(default)]
+    pub generation: u32,
+    /// Host asking for the grant. The Hub does NOT trust this: it always uses
+    /// the host authenticated on the carrying socket. The field is optional
+    /// and, when present, must equal the socket host (a mismatch is refused);
+    /// it is null/absent on a stdio carrier, which has no host id to stamp.
+    #[serde(default, rename = "hostId")]
+    pub host_id: Option<String>,
+    /// Node session/epoch this dispatch was authorized for: a paused frame
+    /// delivered to a replacement session must not match.
+    #[serde(default)]
+    pub session_epoch: String,
+    /// The verified merge commit this grant authorizes to push. Recorded on
+    /// the Landing row so a Hub restart during the push can later confirm
+    /// whether that exact merge reached the remote base.
+    #[serde(default)]
+    pub merge_sha: String,
+}
+
+/// Result of a land-grant request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GateLandGrantResult {
+    /// True only when the Hub transitioned Running → Landing for this exact
+    /// tuple; false means the push must not happen.
+    pub granted: bool,
+    /// Echoed generation.
+    #[serde(default)]
+    pub generation: u32,
+    /// Hub row state when refused (`canceling` / `canceled` / …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    /// True when a cancel landed but the land was already granted: the cancel
+    /// API surfaces "landing in progress" rather than a false cancellation.
+    #[serde(default)]
+    pub landing_in_progress: bool,
 }
 
 /// `gate.then` params: post-land command on the project's home host.
@@ -645,6 +884,55 @@ pub struct GateUnpinResult {
     pub removed: Vec<String>,
 }
 
+/// `gate.resolveLanding` params: a read-only probe after a Hub restart left a
+/// job `landing`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GateResolveLandingParams {
+    /// Job whose granted push is being resolved.
+    pub job_id: String,
+    /// Lane checkout the merge was pushed from.
+    pub repo_path: String,
+    /// Base branch the CAS advanced (`main`).
+    #[serde(default = "default_base_branch")]
+    pub base_branch: String,
+    /// The merge commit the grant was for; the remote base must contain it for
+    /// the outcome to count as landed.
+    pub merge_sha: String,
+    /// r34 item 1: the attempt generation whose death/landing state is being
+    /// probed. Fence and death-certificate files are attempt-qualified
+    /// (`land-<job>-g<gen>.json` / `dead-<job>-g<gen>.json`), so a probe
+    /// attests facts ONLY about this exact attempt; an absent or different
+    /// generation yields Unknown rather than accepting another attempt's
+    /// certificate. `None` stays conservative (Unknown for durable evidence).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u32>,
+}
+
+/// `gate.resolveLanding` verdict.
+/// * `landed` — the remote base already contains the granted merge;
+/// * `absent` — a fresh fetch succeeded, the merge is NOT on the remote base,
+///   AND the lane attests the land process group that could still push for this
+///   job is verified gone (no live run, no outstanding fence record), so the
+///   push is provably not coming;
+/// * `unknown` — the outcome cannot be established (host unreachable, fetch
+///   failed, the merge is not yet an ancestor while a land group may still be
+///   alive). The Hub must never turn `unknown` into a verdict.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GateResolveLandingResult {
+    /// Job id echoed back.
+    pub job_id: String,
+    /// `landed` | `absent` | `unknown`.
+    pub status: String,
+    /// Base-branch sha observed (when known).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_sha: Option<String>,
+    /// Why the outcome could not be confirmed (status `unknown`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -676,6 +964,7 @@ mod tests {
     fn gate_event_is_internally_tagged_on_the_wire() {
         let event = GateEventParams {
             job_id: "gjb_x".into(),
+            generation: 1,
             kind: GateEventKind::Phase {
                 phase: "fetch".into(),
             },

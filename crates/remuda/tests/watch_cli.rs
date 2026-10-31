@@ -648,6 +648,57 @@ async fn screenless_done_from_journal_then_echo() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_digest_and_glance_print_bounded_json() -> Result<()> {
+    let hub = spawn_hub().await?;
+    let project = hub.setup_project("58690-58719").await?;
+    hub.dispatch(&project, "c-digest", "58690-58719").await;
+    let instance_id = hub.worker_instance_id(&project, "c-digest").await?;
+
+    // Digest by worker name: valid JSON, within the 2 KiB budget.
+    let output = hub.run(&["worker", "digest", "c-digest"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let digest: Value = serde_json::from_slice(&output.stdout)?;
+    let compact = serde_json::to_vec(&digest)?;
+    assert!(
+        compact.len() <= remuda_protocol::WORKER_DIGEST_MAX_BYTES,
+        "{} bytes",
+        compact.len()
+    );
+    assert_eq!(digest["v"], 1);
+    assert_eq!(digest["name"], "c-digest");
+    assert_eq!(digest["roster"]["state"], "working");
+    assert_eq!(digest["instanceId"], instance_id);
+
+    // An unknown worker is a nonzero exit, not an empty digest.
+    let output = hub.run(&["worker", "digest", "c-nobody"]);
+    assert!(!output.status.success());
+
+    // Glance of an explicit lineage prints the capped lists and the counter.
+    let output = hub.run(&["glance", &instance_id]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let glance: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(glance["lineageId"], instance_id);
+    assert_eq!(glance["more"]["waiting"], 0);
+    assert_eq!(glance["doneToday"], 0);
+    assert!(glance["waiting"].is_array() && glance["working"].is_array());
+
+    // With no argument the operator credential names no lineage: say so.
+    let output = hub.run(&["glance"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no lineage to glance"), "{stderr}");
+    Ok(())
+}
+
 #[test]
 fn help_lists_watch_worker_report() -> Result<()> {
     for (command, pieces) in [
@@ -661,8 +712,10 @@ fn help_lists_watch_worker_report() -> Result<()> {
                 "resume",
                 "replace",
                 "stop",
+                "digest",
             ][..],
         ),
+        ("glance", &["lineage"][..]),
         ("report", &["--for-owner", "--json", "--project"][..]),
     ] {
         let output = std::process::Command::new(bin())

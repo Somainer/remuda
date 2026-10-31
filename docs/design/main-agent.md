@@ -498,6 +498,16 @@ Not guaranteed:
 - That a host acknowledgement resolves every operation. After a Node or process crash, whether an operation ran can be unknowable; it then stays unknown.
 - Exactly-once outward writes: idempotency keys for dispatch, create, gate and land are Phase 3.
 
+### 7.9.1 Implementation notes (ma-fence, 2026-10-31)
+
+Where the text above left a choice open, the implementation (`crates/remuda-hub/src/fence.rs`, `crates/remuda-node/src/fence.rs`) took these:
+- **Generations stay consecutive.** Every F that fences a chapter advances G to G+1. Resume of a paused lineage fences nothing new (the pause's F already did), so it does not advance again: the CAS moves `paused` at G to `starting` and the successor takes generation G. Chapters therefore number 1, 2, 3, … and the restart notice's "chapter 3" is the chapter's generation.
+- **`paused{process-exit}` before the supervisor.** Until `ma-restart` records it, a current chapter with process-end evidence counts as paused for Resume and for `DELETE`; any other unpaused lineage gets 409 with `reason: "not-paused"`.
+- **The pause's close is Hub-internal.** F queues the `instance.close` of the current chapter in the same transaction, without an initiator (the close follows the fence; neither the send gate nor the Node fence refuses it), and forwards it once that host acknowledged the fence. The command id is the caller's.
+- **Fence record.** `fences` holds one row per F, `fence_deliveries` one row per host known at F, and `fence_ops` one row per unfinished operation of the fenced generation, keyed by `(fenceId, kind, opId)` and stamped with the op's own initiator generation. An op is recorded under exactly one fence, and an acknowledgement settles only `unknown` rows of the fence it names, so a late result about an old chapter never settles a newer one. A command row's own later settlement refines its `unknown` op on read (`completed` → ran, `rejected(fenced)` → cancelled-by-node); nothing else turns `unknown` into "not executed". `GET /v1/lineages/{id}` returns the fences with `pendingHosts` and every op's outcome.
+- **The unacknowledged window.** The hold is decided in the same writer job as the forward intent. Rows held this way are forwarded after the host's acknowledgements (an in-memory list; after a Hub restart they fall back to the same-id retry). A host without `lineageFence` keeps its delivery rows pending but is not held: it never receives continuity work (409 `node-lacks-fence`), and the rows are delivered once it advertises the capability.
+- **Node persistence.** The Node keeps fences, each instance's lineage and generation (from create/resume `lineage`), and the direct-operation log in `lineage-fences.sqlite` beside its workspace registry (the data dir), loaded before it serves anything. The dispatch claim that writes the durable `transport-written` marker and the fence's cancellation pass run under one lock, so a command is either written or cancelled, never both.
+
 ### 7.10 Test matrix (fake Nodes, gated suite, deterministic hooks, no millisecond thresholds)
 
 - **Held command.** A held command is cancelled by F, and a same-id replay after reconnect reaches nothing.

@@ -289,7 +289,9 @@ export function MemoryPage() {
       setAboutBaseRevision(server.revision);
       return;
     }
-    if (moved) {
+    // A dirty draft with no base (the copy arrived after typing began) is a
+    // conflict too: never let that draft overwrite a body it never saw.
+    if (moved || aboutBaseRevision === null) {
       setConflict((current) =>
         current
           ? current
@@ -708,12 +710,14 @@ export function MemoryPage() {
               <h2 className={css.sectionTitle} id="memory-about-title">
                 {ABOUT_ME_TITLE}
               </h2>
-              <span className={css.meta}>
-                {aboutMeArchived
-                  ? "已归档（只读）；恢复后可编辑"
-                  : aboutMe
-                    ? `rev ${aboutMe.revision} · 只有所有者能写`
-                    : "还没有；保存即创建"}
+              <span className={css.meta} data-testid="memory-about-status">
+                {!aboutLoaded
+                  ? "加载中…"
+                  : aboutMeArchived
+                    ? "已归档（只读）；恢复后可编辑"
+                    : aboutMe
+                      ? `rev ${aboutMe.revision} · 只有所有者能写`
+                      : "还没有；保存即创建"}
               </span>
             </div>
             {aboutMeArchived ? (
@@ -732,7 +736,14 @@ export function MemoryPage() {
                 <textarea
                   className={`${css.textarea} ${css.aboutInput}`}
                   value={aboutDraft}
-                  placeholder="写下关于你自己的信息，席位会在章节开始时读到索引。"
+                  // No typing before the standalone copy has loaded: a blind
+                  // draft could be saved over a body the owner never saw.
+                  disabled={!aboutLoaded}
+                  placeholder={
+                    aboutLoaded
+                      ? "写下关于你自己的信息，席位会在章节开始时读到索引。"
+                      : "正在读取关于我…"
+                  }
                   aria-label="关于我"
                   data-testid="memory-about-body"
                   onChange={(event) => setAboutDraft(event.target.value)}

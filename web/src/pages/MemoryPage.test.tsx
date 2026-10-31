@@ -258,3 +258,47 @@ describe("about-me saves the draft's base revision", () => {
     expect(screen.getByTestId("memory-conflict-mine")).toHaveTextContent("mine");
   });
 });
+
+describe("the about-me editor waits for the server copy", () => {
+  it("keeps the textarea disabled and the label neutral until the GET returns", async () => {
+    let resolveAbout!: (value: MemoryEntry) => void;
+    getMemory.mockImplementation(
+      () =>
+        new Promise<MemoryEntry>((resolve) => {
+          resolveAbout = resolve;
+        }) as never,
+    );
+
+    renderPage("/s/ins_x/memory");
+    const textarea = (await screen.findByTestId("memory-about-body")) as HTMLTextAreaElement;
+    expect(textarea).toBeDisabled();
+    const card = screen.getByTestId("memory-about");
+    expect(within(card).queryByText(/还没有；保存即创建/)).toBeNull();
+
+    resolveAbout(entry({ slug: "about-me", body: "server body", revision: 1 }));
+    await waitFor(() => expect(textarea).not.toBeDisabled());
+    await waitFor(() => expect(textarea.value).toBe("server body"));
+  });
+
+  it("offers the conflict when a server copy arrives under a blind dirty draft", async () => {
+    let server: MemoryEntry | null = null;
+    getMemory.mockImplementation(async () => {
+      if (!server) throw new HubHttpError(404, "NOT_FOUND", "missing");
+      return server;
+    });
+    listMemory.mockResolvedValue([]);
+
+    renderPage("/s/ins_x/memory");
+    const textarea = (await screen.findByTestId("memory-about-body")) as HTMLTextAreaElement;
+    await waitFor(() => expect(screen.getByTestId("memory-about-save")).not.toBeDisabled());
+    fireEvent.change(textarea, { target: { value: "blind draft" } });
+
+    // Another tab creates the entry while this one only ever saw "missing".
+    server = entry({ slug: "about-me", body: "server copy", revision: 1 });
+    fireEvent.change(await screen.findByTestId("memory-search"), { target: { value: "边界" } });
+
+    await screen.findByTestId("memory-conflict");
+    expect(screen.getByTestId("memory-conflict-server")).toHaveTextContent("server copy");
+    expect(screen.getByTestId("memory-conflict-mine")).toHaveTextContent("blind draft");
+  });
+});

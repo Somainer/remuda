@@ -39,6 +39,9 @@ export function HostStrip({
     };
   }, []);
 
+  // §9 ② loading = hidden: before the first snapshot there is nothing to say
+  // about hosts, and 「添加主机」 would be a guess (the list may still arrive).
+  if (freshness.state === "unknown") return null;
   const model = hostStrip(hub.hosts, nowMs);
   // A fresh verdict is the only one without a Hub chip; recovering and
   // unreachable both name what the operator would tap.

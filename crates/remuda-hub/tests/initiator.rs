@@ -8021,3 +8021,143 @@ async fn a_disconnected_carrier_still_marks_an_expired_landing_unknown() {
     assert_eq!(status, 200, "{resolved}");
     assert_eq!(resolved["state"], json!("failed"), "{resolved}");
 }
+
+// ── ma-fence (D-057 §7.10 "Gate"): the real fence transaction F ─────────
+
+/// Pause the coordinator (the existing close from a Human device): F
+/// without successor at admission.
+async fn pause_coordinator(ctx: &Ctx) {
+    let (status, body) = ctx
+        .send(
+            "POST",
+            &format!("/v1/instances/{}/commands", ctx.instance),
+            &ctx.human,
+            None,
+            Some(json!({"operation": "instance.close", "payload": {}})),
+        )
+        .await;
+    assert_eq!(status, 200, "pause: {body}");
+}
+
+async fn fence_op_outcome(ctx: &Ctx, op_id: &str) -> Option<String> {
+    let (status, record) = ctx
+        .send(
+            "GET",
+            &format!("/v1/lineages/{}", ctx.instance),
+            &ctx.human,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{record}");
+    record["fences"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|fence| fence["operations"].as_array().cloned().unwrap_or_default())
+        .find(|op| op["opId"] == op_id)
+        .and_then(|op| op["outcome"].as_str().map(str::to_owned))
+}
+
+/// §7.10 "Gate": F commits between the gate job's claim and its gate.run —
+/// the send gate withholds it, the lane never starts, the job is canceled
+/// `fenced` and the fence record says withheld.
+#[tokio::test]
+async fn ma_fence_a_fence_between_gate_claim_and_gate_run_never_starts_the_lane() {
+    let (ctx, mut node) = Ctx::boot().await.unwrap();
+    let job_id = queued_job(&ctx).await;
+    ctx.configure_gate_lane().await;
+    let handle = ctx.hub.test_handle();
+    let (reached, release) = handle.test_arm_fence_seam("gate-claimed", &ctx.host, &job_id);
+    let tick = tokio::spawn(async move { handle.test_gate_tick().await });
+    tokio::time::timeout(Duration::from_secs(10), reached.notified())
+        .await
+        .expect("the claim never reached the seam");
+    assert_eq!(
+        ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap()["state"],
+        json!("running"),
+        "claimed (Hub running) before F"
+    );
+    pause_coordinator(&ctx).await;
+    assert_eq!(
+        fence_op_outcome(&ctx, &job_id).await.as_deref(),
+        Some("unknown"),
+        "claimed without a Node start: potentially executed"
+    );
+    release.send(()).ok();
+    tick.await.unwrap();
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(doc["state"], json!("canceled"), "{doc}");
+    assert_eq!(doc["reason"], json!("fenced"), "{doc}");
+    assert_eq!(
+        fence_op_outcome(&ctx, &job_id).await.as_deref(),
+        Some("withheld")
+    );
+    node.assert_sentinel_follows(&ctx, &["gate.run"]).await;
+}
+
+/// §7.10 "Gate": a Node-started job (first phase event of its attempt)
+/// is recorded `running` by F and completes, including its land step.
+#[tokio::test]
+async fn ma_fence_a_node_started_land_job_completes_through_a_fence() {
+    let (ctx, node) = Ctx::boot().await.unwrap();
+    ctx.configure_gate_lane().await;
+    let hook = node
+        .arm_gate_run(json!({ "jobId": "placeholder", "status": "failed" }))
+        .await;
+    let job_id = queued_land_job(&ctx).await;
+    ctx.hub.test_gate_tick().await;
+    hook.wait_arrived().await;
+    node.send_raw(json!({
+        "jsonrpc": "2.0",
+        "method": "gate.event",
+        "params": {"jobId": job_id, "generation": 1, "kind": "phase", "phase": "fetch"}
+    }));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+            if doc["nodeStartedAt"].is_string() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("nodeStartedAt from the first phase event");
+
+    pause_coordinator(&ctx).await;
+    assert_eq!(
+        fence_op_outcome(&ctx, &job_id).await.as_deref(),
+        Some("running")
+    );
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(
+        doc["state"],
+        json!("running"),
+        "a Node-started job is not cancelled: {doc}"
+    );
+
+    // Its land step proceeds: the grant for the started job's own session,
+    // then the landed verdict.
+    let session = ctx.hub.test_node_session(&ctx.host).await.expect("carrier");
+    let merge = "dddddddddddddddddddddddddddddddddddddddd";
+    let grant = ctx
+        .hub
+        .test_gate_land_grant(&job_id, &ctx.host, merge, session)
+        .await
+        .unwrap();
+    assert_eq!(grant["granted"], json!(true), "{grant}");
+    let landed = json!({
+        "jobId": job_id, "generation": 1, "status": "landed", "mergeSha": merge,
+        "runLog": {"step": "*", "kind": "kept", "headline": "landed", "summary": [],
+            "tail": ["Finished land"], "capturedLines": 1, "truncated": false, "attempts": 1},
+    });
+    ctx.hub
+        .test_apply_gate_result(&job_id, landed)
+        .await
+        .unwrap();
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(doc["state"], json!("landed"), "{doc}");
+    assert_eq!(doc["mergeSha"], json!(merge), "{doc}");
+    hook.release();
+}

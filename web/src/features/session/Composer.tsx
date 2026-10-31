@@ -138,8 +138,20 @@ export function Composer({
   capabilities,
   interrupted: interruptedProp,
   onInterruptedChange,
+  variant = "session",
+  placeholder,
+  primaryOverride = null,
+  draftScope,
 }: {
+  /** The instance sends and uploads go to. */
   instanceId: string;
+  /**
+   * Where the draft and the staged attachments live; defaults to
+   * `instanceId`. The 问 Main input scopes them to the Main LINEAGE, so a
+   * chapter switch keeps both (staged files are re-uploaded to the new
+   * chapter, whose Hub objects are bound to it).
+   */
+  draftScope?: string;
   mobile: boolean;
   disabled?: boolean;
   sending?: boolean;
@@ -238,8 +250,29 @@ export function Composer({
    */
   interrupted?: boolean;
   onInterruptedChange?: (interrupted: boolean) => void;
+  /**
+   * "ask" is the home 问 Main input (ma-main-ui): the same compact 56px row on
+   * every width, without the session options trigger (permission / effort /
+   * context belong to the Main session page, not to a home input).
+   */
+  variant?: "session" | "ask";
+  /** Overrides the platform placeholder. */
+  placeholder?: string;
+  /**
+   * Replaces the send button with another primary action (Main paused → 恢复).
+   * While set, Enter and submit never send; the draft stays in the box.
+   */
+  primaryOverride?: {
+    label: string;
+    testId: string;
+    onClick: () => void;
+    disabled?: boolean;
+    title?: string;
+  } | null;
 }) {
-  const [text, setText] = useState(() => readDraft(instanceId));
+  const ask = variant === "ask";
+  const scope = draftScope ?? instanceId;
+  const [text, setText] = useState(() => readDraft(scope));
   const [menu, setMenu] = useState<MenuId>(null);
   // D-042: phone options sheet (attachments / harness / permission / effort),
   // and the Sheet that replaces both window.confirm calls.
@@ -267,7 +300,7 @@ export function Composer({
   // leaves must not dismiss it. Reset on every real dismiss path.
   const usagePinned = useRef(false);
   const rootRef = useRef<HTMLFormElement>(null);
-  const images = useAttachments(instanceId);
+  const images = useAttachments(instanceId, scope);
   const codeQuotes = useCodeQuotes((index) => insertCodeTokenRef.current?.(index));
   const inputRef = useRef<HTMLTextAreaElement>(null);
   // Synchronous mirror so rapid pastes and the drop handler see the text the
@@ -337,7 +370,7 @@ export function Composer({
     span.own = next;
     textRef.current = next;
     setText(next);
-    writeDraft(instanceId, next);
+    writeDraft(scope, next);
     // No focus() and no caret juggling: the textarea is not focused while the
     // mic owns the gesture (focusing would raise the on-screen keyboard,
     // §4.1), and a controlled value naturally rests the caret at its end.
@@ -649,6 +682,7 @@ export function Composer({
   }, [interrupted]);
 
   const canSubmit = () => {
+    if (primaryOverride) return false;
     const value = expandCodeQuotes(text.trim(), codeQuotes.quotes);
     if ((!value && images.attachments.length === 0) || disabled || sending) return false;
     if (images.uploading) return false;
@@ -668,7 +702,7 @@ export function Composer({
     const result = insertAnchorFor(kind, textRef.current, caret, index);
     textRef.current = result.text;
     setText(result.text);
-    writeDraft(instanceId, result.text);
+    writeDraft(scope, result.text);
     requestAnimationFrame(() => {
       const next = inputRef.current;
       if (!next) return;
@@ -690,7 +724,7 @@ export function Composer({
     const result = insertAttachmentAnchors(textRef.current, caret, anchors);
     textRef.current = result.text;
     setText(result.text);
-    writeDraft(instanceId, result.text);
+    writeDraft(scope, result.text);
     requestAnimationFrame(() => {
       const next = inputRef.current;
       if (!next) return;
@@ -714,7 +748,7 @@ export function Composer({
     const next = removeAndRenumberAttachment(textRef.current, index);
     textRef.current = next;
     setText(next);
-    writeDraft(instanceId, next);
+    writeDraft(scope, next);
   };
 
   /** Quote chip × : drop the quote and strip/renumber its [Code #n] token. */
@@ -723,7 +757,7 @@ export function Composer({
     const next = removeAndRenumberFor("Code", textRef.current, index);
     textRef.current = next;
     setText(next);
-    writeDraft(instanceId, next);
+    writeDraft(scope, next);
   };
 
   /** Chips whose [Image #n]/[File #n] token was edited out; still sent. */
@@ -743,7 +777,7 @@ export function Composer({
   );
 
   const clearBox = () => {
-    writeDraft(instanceId, "");
+    writeDraft(scope, "");
     setText("");
     images.handOff();
     codeQuotes.clear();
@@ -876,6 +910,14 @@ export function Composer({
     // The remaining shortcuts are desktop-keyboard semantics; on a phone
     // Enter types a newline and Cmd/Ctrl+Enter is not bound.
     if (mobile) return;
+    // 问 Main (home.md §6.3): ⌘/Ctrl+Enter sends; a plain Enter is a newline.
+    if (ask) {
+      if (event.key === "Enter" && (event.metaKey || event.ctrlKey) && !event.shiftKey) {
+        event.preventDefault();
+        void submitPrimary();
+      }
+      return;
+    }
     // Cmd/Ctrl+Enter while working = 插队: interrupt and send this first.
     if (
       event.key === "Enter"
@@ -1406,16 +1448,29 @@ export function Composer({
           {controls.interrupt.note ? <span className={css.controlSub}>{controls.interrupt.note}</span> : null}
         </button>
       ) : null}
-      <button
-        type="submit"
-        className={controls.primary.kind === "queue" ? css.queueBtn : css.send}
-        data-testid={primaryTestId}
-        data-mode={controls.primary.kind === "queue" ? "queue" : controls.primary.mode}
-        data-holder={controls.primary.kind === "queue" ? controls.primary.holder : undefined}
-        disabled={disabled || sending || images.uploading || (!text.trim() && images.attachments.length === 0)}
-      >
-        {primaryLabel}
-      </button>
+      {primaryOverride ? (
+        <button
+          type="button"
+          className={css.send}
+          data-testid={primaryOverride.testId}
+          disabled={primaryOverride.disabled}
+          title={primaryOverride.title}
+          onClick={primaryOverride.onClick}
+        >
+          {primaryOverride.label}
+        </button>
+      ) : (
+        <button
+          type="submit"
+          className={controls.primary.kind === "queue" ? css.queueBtn : css.send}
+          data-testid={primaryTestId}
+          data-mode={controls.primary.kind === "queue" ? "queue" : controls.primary.mode}
+          data-holder={controls.primary.kind === "queue" ? controls.primary.holder : undefined}
+          disabled={disabled || sending || images.uploading || (!text.trim() && images.attachments.length === 0)}
+        >
+          {primaryLabel}
+        </button>
+      )}
     </>
   );
   return (
@@ -1428,7 +1483,8 @@ export function Composer({
       data-effort-index={String(currentEffort.index)}
       data-ultracode={ultraOn ? "1" : "0"}
       data-model={model}
-      className={css.composerRoot}
+      data-variant={ask ? "ask" : undefined}
+      className={ask ? `${css.composerRoot} ${css.askRoot}` : css.composerRoot}
       onSubmit={(e) => {
         e.preventDefault();
         void submitPrimary();
@@ -1531,14 +1587,15 @@ export function Composer({
           // D-042: phones get a plain hint — Enter is newline there and ⌘
           // does not exist, so advertising desktop shortcuts would mislead.
           placeholder={
-            mobile
+            placeholder ??
+            (mobile
               ? "输入提示词…"
-              : "输入提示词…  Enter 排队 · ⌘/Ctrl+Enter 插队 · 工作中 Esc 打断 · IME 组字期间不送"
+              : "输入提示词…  Enter 排队 · ⌘/Ctrl+Enter 插队 · 工作中 Esc 打断 · IME 组字期间不送")
           }
           onChange={(e) => {
             textRef.current = e.target.value;
             setText(e.target.value);
-            writeDraft(instanceId, e.target.value);
+            writeDraft(scope, e.target.value);
           }}
           onPaste={(event) => {
             // Swallow the paste only when a file was actually taken: otherwise
@@ -1553,11 +1610,12 @@ export function Composer({
         />
         {voiceNode}
       </div>
-      <div className={css.controlBar} data-testid="composer-bar" data-collapsed={mobile ? "1" : "0"}>
-        {mobile ? (
+      <div className={css.controlBar} data-testid="composer-bar" data-collapsed={mobile || ask ? "1" : "0"}>
+        {mobile || ask ? (
           <>
-            {/* D-042: one trigger + input + primary; options live in sheet. */}
-            {mobileTriggerNode}
+            {/* D-042: one trigger + input + primary; options live in sheet.
+                The 问 Main input carries no options trigger at all. */}
+            {ask ? null : mobileTriggerNode}
             {voiceHintNode}
             {queueStatusNode}
             {interruptedNode}

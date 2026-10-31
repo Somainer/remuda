@@ -1,0 +1,167 @@
+/* @tokens strict */
+/*
+ * D-057 「Main 会话」 status line under the session header (ui-spec §2.2):
+ * chapter · lifecycle/activity · restarts in 24 h · last activity · lineage
+ * state, then Stop / Pause / Resume on the right; earlier chapters fold
+ * below behind dividers. One 36px line on desktop; it wraps on a phone.
+ */
+
+.bar {
+  flex: none;
+  border-bottom: 1px solid var(--divider);
+  background: var(--bg-surface);
+}
+
+.statusLine {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-3);
+  min-height: var(--control-h-lg);
+  padding: var(--space-1) var(--gutter);
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+}
+
+.lead {
+  color: var(--fg-strong);
+  font-size: var(--text-ui);
+  font-weight: 600;
+}
+
+.item {
+  white-space: nowrap;
+}
+
+.item[data-tone="attention"] {
+  color: var(--attention-fg);
+}
+
+.controls {
+  display: inline-flex;
+  gap: var(--space-2);
+  margin-left: auto;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  height: var(--control-h-sm);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--border-control);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  color: var(--fg-body);
+  font-family: var(--font-ui);
+  font-size: var(--text-meta);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.btn:disabled {
+  color: var(--fg-faint);
+}
+
+.btnPrimary {
+  border-color: var(--primary-fill);
+  background: var(--primary-fill);
+  color: var(--on-primary);
+}
+
+.chapters {
+  padding: 0 var(--gutter) var(--space-2);
+}
+
+.chaptersToggle {
+  height: var(--control-h-sm);
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--fg-muted);
+  font-family: var(--font-ui);
+  font-size: var(--text-meta);
+}
+
+.chapterList {
+  max-height: 40vh;
+  margin: 0;
+  padding: 0;
+  overflow: auto;
+  list-style: none;
+}
+
+.chapter {
+  padding: var(--space-1) 0;
+}
+
+.divider {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+}
+
+.dividerRule {
+  flex: 1 1 auto;
+  height: 1px;
+  background: var(--divider);
+}
+
+.dividerText {
+  flex: none;
+  white-space: nowrap;
+}
+
+.chapter[data-current="1"] .dividerText {
+  color: var(--fg-body);
+}
+
+.chapterLoad {
+  display: inline-flex;
+  align-items: center;
+  height: var(--control-h-sm);
+  margin-top: var(--space-1);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--border-control);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  color: var(--fg-body);
+  font-family: var(--font-ui);
+  font-size: var(--text-meta);
+  text-decoration: none;
+}
+
+.chapterMessages {
+  margin: var(--space-1) 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.chapterMessage {
+  display: flex;
+  gap: var(--space-2);
+  padding: var(--space-1) 0;
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+}
+
+.chapterRole {
+  flex: none;
+  width: var(--space-7);
+  color: var(--fg-muted);
+}
+
+.chapterText {
+  min-width: 0;
+  color: var(--fg-body);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.chapterEmpty {
+  color: var(--fg-faint);
+  font-size: var(--text-meta);
+}

@@ -7404,16 +7404,18 @@ fn open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
 
 /// The seen-hub rung of the `PRAGMA user_version` ladder in
 /// [`try_open_conn`] (`instance_views` + `instances.turn_end_seq`): 2 and 3
-/// are the ma-lineage ended_at backfills, 4 is the D-060 memory schema.
+/// are the ma-lineage ended_at backfills, 4 is the D-060 memory schema,
+/// 6 is the D-060 memory write log.
 pub(crate) const SEEN_SCHEMA_RUNG: i64 = 5;
 
 /// Top rung of the ladder; a fresh database climbs to it. Exposed to the
 /// schema tests through [`crate::store_test_support`], never used by the Hub.
-pub const SCHEMA_USER_VERSION: i64 = SEEN_SCHEMA_RUNG;
+pub const SCHEMA_USER_VERSION: i64 = crate::memory::MEMORY_WRITE_LOG_SCHEMA_VERSION;
 
 /// One ladder, no gaps: the seen rung sits above the D-060 memory rung, which
-/// sits above the ma-lineage backfills.
+/// sits above the ma-lineage backfills; the memory write log is the top.
 const _: () = assert!(SEEN_SCHEMA_RUNG > crate::memory::MEMORY_SCHEMA_VERSION);
+const _: () = assert!(SCHEMA_USER_VERSION > SEEN_SCHEMA_RUNG);
 
 /// Writer-side connection opener: sets WAL, the busy timeout, and runs the
 /// schema batch below.
@@ -7887,6 +7889,18 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
         let tx = conn.unchecked_transaction()?;
         crate::seen::migrate(&tx)?;
         tx.execute_batch(&format!("PRAGMA user_version = {SEEN_SCHEMA_RUNG};"))?;
+        tx.commit()?;
+    }
+    if schema_version < crate::memory::MEMORY_WRITE_LOG_SCHEMA_VERSION {
+        // D-060 (cb-memory-ui): the append-only per-write log plus the entry's
+        // `turn_seq` projection. One transaction with the marker.
+        let tx = conn.unchecked_transaction()?;
+        crate::memory::migrate_write_log(&tx)?;
+        tx.pragma_update(
+            None,
+            "user_version",
+            crate::memory::MEMORY_WRITE_LOG_SCHEMA_VERSION,
+        )?;
         tx.commit()?;
     }
     // Rows written before the column existed are each their own lineage.

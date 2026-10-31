@@ -1121,6 +1121,24 @@ async fn hub_backup_then_restore_round_trips_memory() -> Result<()> {
         )
         .await?;
     assert_eq!(after, before, "entries, revisions, origin and refs survive");
+    // cb-memory-ui: the write log rides the same SQLite file, so a restore
+    // round-trips every row too (the seat's two creates; the owner's update
+    // has no writer instance and is not on a chapter's feed).
+    let writes = ctx
+        .ok(
+            "GET",
+            &format!("/v1/instances/{lineage}/memory-writes"),
+            &ctx.human,
+            None,
+        )
+        .await?;
+    let slugs: Vec<&str> = writes["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["slug"].as_str().unwrap())
+        .collect();
+    assert_eq!(slugs, ["tone", "repo"], "{writes}");
     let index_after = ctx
         .ok("GET", &mem(&lineage, "/index"), &ctx.human, None)
         .await?;
@@ -1227,5 +1245,356 @@ async fn the_memory_step_upgrades_the_current_main_schema() -> Result<()> {
         .ok("GET", &mem(lineage, "/entries/upgraded"), &ctx.human, None)
         .await?;
     assert_eq!(entry["revision"], 1);
+    Ok(())
+}
+
+// ─── cb-memory-ui: the write log and the turn reference ───────────────────
+
+fn turn_started() -> Value {
+    json!({
+        "kind": "lifecycle",
+        "payload": {
+            "type": "native", "topic": "turn", "nativeName": "turn_started",
+            "nativeId": { "state": "known", "value": "sess-memui" },
+            "status": { "state": "known", "value": "working" },
+            "relatedIds": {}, "dataRef": null, "severity": "info",
+            "affectsCompletion": false
+        }
+    })
+}
+
+impl Ctx {
+    /// Append one `turn_started` to `instance`'s journal; returns its seq.
+    async fn start_turn(&self, instance: &str) -> Result<i64> {
+        let append = self
+            .hub
+            .store()
+            .context("store")?
+            .append_journal(HOST.into(), instance.into(), None, turn_started())
+            .await?;
+        Ok(append.record.seq)
+    }
+
+    /// `GET /v1/instances/{id}/memory-writes` as the given caller.
+    async fn writes(&self, instance: &str, token: &str) -> Result<Value> {
+        self.ok(
+            "GET",
+            &format!("/v1/instances/{instance}/memory-writes"),
+            token,
+            None,
+        )
+        .await
+    }
+}
+
+#[tokio::test]
+async fn an_agent_write_mid_turn_records_the_turn_and_the_feed_returns_it() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let lineage = ctx.seat().await?;
+    let seat = ctx.agent(&lineage).await?;
+    let started = ctx.start_turn(&lineage).await?;
+
+    // A body that tries to forge the Hub-stamped fields is ignored.
+    let mut forged = entry("pref", "user", "terse");
+    forged["origin"] = json!("human");
+    forged["writerInstanceId"] = json!("ins_forged");
+    forged["turnRef"] = json!({"instanceId": lineage, "seq": 999});
+    let written = ctx
+        .ok("POST", &mem(&lineage, ""), &seat, Some(forged))
+        .await?;
+    assert_eq!(written["entry"]["origin"], "agent");
+    assert_eq!(written["entry"]["writerInstance"], json!(lineage));
+    assert_eq!(
+        written["entry"]["turnRef"],
+        json!({"instanceId": lineage, "seq": started}),
+        "the Hub stamps its own journal seq, never the body's"
+    );
+
+    // D-060 §8.4: the owner-authored entry is refused to a seat, with its
+    // stable reason.
+    let refused = ctx
+        .call(
+            "POST",
+            &mem(&lineage, ""),
+            &seat,
+            None,
+            Some(entry("about-me", "user", "from the seat")),
+        )
+        .await?;
+    assert_eq!(refused.status, 403, "{}", refused.body);
+    assert_eq!(refused.body["reason"], "owner-authored");
+
+    let feed = ctx.writes(&lineage, &ctx.human).await?;
+    assert_eq!(
+        feed["items"][0]["turnSeq"],
+        json!(started),
+        "the owner reads the chapter's feed too"
+    );
+    let feed = ctx.writes(&lineage, &seat).await;
+    assert!(feed.is_err(), "an Agent token is refused");
+    let reply = ctx
+        .call(
+            "GET",
+            &format!("/v1/instances/{lineage}/memory-writes"),
+            &seat,
+            None,
+            None,
+        )
+        .await?;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+
+    let bot = ctx.hub.mint_bot_device_token("memory-writes-bot").await?;
+    let feed = ctx.writes(&lineage, &bot).await?;
+    let items = feed["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{feed}");
+    assert_eq!(items[0]["slug"], "pref");
+    assert_eq!(items[0]["title"], "Title pref");
+    assert_eq!(items[0]["revision"], 1);
+    assert_eq!(items[0]["op"], "write");
+    assert_eq!(items[0]["turnSeq"], json!(started));
+    assert!(items[0]["writtenAt"].as_str().is_some());
+
+    // afterId is exclusive on the log row id.
+    let next = feed["nextAfterId"].as_u64().expect("nextAfterId");
+    let after = ctx
+        .ok(
+            "GET",
+            &format!("/v1/instances/{lineage}/memory-writes?afterId={next}"),
+            &ctx.human,
+            None,
+        )
+        .await?;
+    assert_eq!(after["items"], json!([]));
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_owner_write_has_a_null_turn_and_two_writes_keep_both_rows() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let lineage = ctx.seat().await?;
+    let seat = ctx.agent(&lineage).await?;
+    ctx.start_turn(&lineage).await?;
+
+    // Owner write: no turn reference in the entry and a NULL row in the log.
+    let owner = ctx
+        .ok(
+            "POST",
+            &mem(&lineage, ""),
+            &ctx.human,
+            Some(entry("about-me", "user", "I am the owner")),
+        )
+        .await?;
+    assert!(
+        owner["entry"]["turnRef"].is_null(),
+        "an owner write has no turn: {}",
+        owner["entry"]
+    );
+    {
+        let db = rusqlite::Connection::open(ctx.dir.path().join("hub/hub.sqlite"))?;
+        let (writer, turn): (Option<String>, Option<i64>) = db.query_row(
+            "SELECT writer_instance, turn_seq FROM memory_write_log WHERE lineage_id = ?1",
+            [&lineage],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(writer, None);
+        assert_eq!(turn, None);
+    }
+
+    // Two agent writes of one slug: both log rows survive the rewrite.
+    ctx.ok(
+        "POST",
+        &mem(&lineage, ""),
+        &seat,
+        Some(entry("pref", "user", "first")),
+    )
+    .await?;
+    let updated = ctx
+        .ok(
+            "PUT",
+            &mem(&lineage, "/entries/pref"),
+            &seat,
+            Some(json!({"expectedRevision": 1, "body": "second"})),
+        )
+        .await?;
+    assert_eq!(updated["entry"]["revision"], 2);
+    let feed = ctx.writes(&lineage, &ctx.human).await?;
+    let revisions: Vec<i64> = feed["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["revision"].as_i64().unwrap())
+        .collect();
+    assert_eq!(revisions, [1, 2], "{feed}");
+
+    // Consolidate: one row per input plus the target.
+    ctx.ok(
+        "POST",
+        &mem(&lineage, ""),
+        &seat,
+        Some(entry("other", "project", "x")),
+    )
+    .await?;
+    ctx.ok(
+        "POST",
+        &mem(&lineage, "/consolidate"),
+        &seat,
+        Some(json!({
+            "sources": [
+                {"slug": "pref", "expectedRevision": 2},
+                {"slug": "other", "expectedRevision": 1},
+            ],
+            "entry": {
+                "slug": "merged", "type": "user",
+                "title": "Merged", "description": "one", "body": "y",
+            },
+        })),
+    )
+    .await?;
+    let feed = ctx.writes(&lineage, &ctx.human).await?;
+    let consolidations: Vec<(&str, i64)> = feed["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["op"] == "consolidate")
+        .map(|row| {
+            (
+                row["slug"].as_str().unwrap(),
+                row["revision"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        consolidations,
+        [("pref", 2), ("other", 1), ("merged", 1)],
+        "{feed}"
+    );
+    Ok(())
+}
+
+// ─── cb-memory-ui r2: row-id paging for the write feed ────────────────────
+
+#[tokio::test]
+async fn the_write_feed_starts_at_the_newest_page_and_pages_by_row_id() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let lineage = ctx.seat().await?;
+    let started = ctx.start_turn(&lineage).await?;
+    // One turn with more rows than the page bound: the cursor must still
+    // advance, which a turn-seq cursor cannot do. The rows are seeded
+    // straight into the log (the write path is covered elsewhere); 501 REST
+    // creates would take a minute for no extra coverage.
+    {
+        let db = rusqlite::Connection::open(ctx.dir.path().join("hub/hub.sqlite"))?;
+        let tx = db.unchecked_transaction()?;
+        for index in 0..501 {
+            tx.execute(
+                "INSERT INTO memory_write_log
+                    (lineage_id, slug, revision, title, op, origin, writer_instance,
+                     turn_seq, written_at)
+                 VALUES (?1, ?2, 1, ?3, 'write', 'agent', ?4, ?5,
+                         '2026-10-30T00:00:00.000Z')",
+                rusqlite::params![
+                    lineage,
+                    format!("bulk-{index:03}"),
+                    format!("Title bulk-{index:03}"),
+                    lineage,
+                    started
+                ],
+            )?;
+        }
+        tx.commit()?;
+    }
+    let page = ctx.writes(&lineage, &ctx.human).await?;
+    let items = page["items"].as_array().expect("items");
+    assert_eq!(items.len(), 500, "the newest page keeps the 500-row bound");
+    assert_eq!(
+        items[0]["slug"], "bulk-001",
+        "without a cursor the feed starts at the NEWEST page (the oldest row is outside it)"
+    );
+    assert_eq!(items[499]["slug"], "bulk-500");
+    let next = page["nextAfterId"]
+        .as_u64()
+        .expect("the page names the row-id cursor to continue from");
+    assert_eq!(next, 501, "the cursor is the newest log row id");
+
+    {
+        let db = rusqlite::Connection::open(ctx.dir.path().join("hub/hub.sqlite"))?;
+        db.execute(
+            "INSERT INTO memory_write_log
+                (lineage_id, slug, revision, title, op, origin, writer_instance,
+                 turn_seq, written_at)
+             VALUES (?1, 'after-page', 1, 'Title after-page', 'write', 'agent', ?1, ?2,
+                     '2026-10-30T00:00:01.000Z')",
+            rusqlite::params![lineage, started],
+        )?;
+    }
+    let tail = ctx
+        .ok(
+            "GET",
+            &format!("/v1/instances/{lineage}/memory-writes?afterId={next}"),
+            &ctx.human,
+            None,
+        )
+        .await?;
+    let tail_items = tail["items"].as_array().unwrap();
+    assert_eq!(tail_items.len(), 1, "the row after the cursor is reachable");
+    assert_eq!(tail_items[0]["slug"], "after-page");
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_write_feed_includes_rows_without_a_turn() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let lineage = ctx.seat().await?;
+    let seat = ctx.agent(&lineage).await?;
+    // No turn_started yet: both rows have a NULL turn_seq, and they must not
+    // vanish behind a turn-based cursor.
+    for slug in ["pre-turn-1", "pre-turn-2"] {
+        ctx.ok(
+            "POST",
+            &mem(&lineage, ""),
+            &seat,
+            Some(entry(slug, "project", "x")),
+        )
+        .await?;
+    }
+    let page = ctx.writes(&lineage, &ctx.human).await?;
+    let items = page["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert!(items.iter().all(|row| row["turnSeq"].is_null()), "{page}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_after_id_above_the_i64_range_is_saturated() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let lineage = ctx.seat().await?;
+    let seat = ctx.agent(&lineage).await?;
+    ctx.ok(
+        "POST",
+        &mem(&lineage, ""),
+        &seat,
+        Some(entry("cursor-row", "project", "x")),
+    )
+    .await?;
+    // A legal u64 "after everything" sentinel must not wrap to "no cursor"
+    // and replay the whole log.
+    let page = ctx
+        .ok(
+            "GET",
+            &format!("/v1/instances/{lineage}/memory-writes?afterId=18446744073709551615"),
+            &ctx.human,
+            None,
+        )
+        .await?;
+    assert_eq!(
+        page["items"],
+        json!([]),
+        "an above-everything cursor returns the empty tail, not the log"
+    );
+    assert_eq!(
+        page["nextAfterId"].as_u64(),
+        Some(i64::MAX as u64),
+        "the cursor saturates instead of being dropped"
+    );
     Ok(())
 }

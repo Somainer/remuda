@@ -1,0 +1,341 @@
+/* D-060 (cb-memory-ui): the session's memory page. One column every width;
+   long bodies wrap instead of widening the page. */
+
+.page {
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: var(--space-5) var(--gutter) 40px;
+}
+
+.inner {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  width: 100%;
+  max-width: 880px;
+  min-width: 0;
+}
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.search {
+  flex: 1 1 240px;
+  min-width: 0;
+  min-height: var(--control-h);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--fg-body);
+  font-size: var(--text-input);
+}
+
+.meta {
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+}
+
+.aboutCard {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  padding: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.aboutHead {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.sectionTitle {
+  margin: 0;
+  font-size: var(--text-label);
+  color: var(--fg-muted);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.list {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  overflow: hidden;
+}
+
+.row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  width: 100%;
+  min-width: 0;
+  padding: var(--space-3) var(--space-4);
+  border: 0;
+  border-top: 1px solid var(--divider);
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+}
+
+.row:first-child {
+  border-top: 0;
+}
+
+.row:hover {
+  background: var(--bg-hover);
+}
+
+.row:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
+.rowStatic {
+  cursor: default;
+}
+
+.rowHighlight {
+  background: var(--bg-selected);
+}
+
+.rowHead {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.rowTitle {
+  font-weight: 600;
+  color: var(--fg-strong);
+  font-size: var(--text-ui);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.tag {
+  flex: none;
+  font-size: var(--text-2xs);
+  color: var(--fg-muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  padding: 0 var(--space-2);
+}
+
+.desc {
+  margin: 0;
+  color: var(--fg-body);
+  font-size: var(--text-meta);
+  overflow-wrap: anywhere;
+}
+
+.bodyText {
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-read);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 9em;
+  overflow: hidden;
+}
+
+.bodyFull {
+  max-height: none;
+}
+
+.rowMeta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  color: var(--fg-faint);
+  font-size: var(--text-2xs);
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  align-items: center;
+}
+
+.empty {
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  padding: var(--space-3) 0;
+}
+
+.error {
+  color: var(--danger-fg);
+  font-size: var(--text-meta);
+  overflow-wrap: anywhere;
+}
+
+.warnings {
+  color: var(--attention-fg);
+  font-size: var(--text-meta);
+  margin: 0;
+}
+
+/* ── editor ───────────────────────────────────────────────────────────── */
+
+.textarea.aboutInput {
+  min-height: 5lh;
+}
+
+.editor {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
+  width: 100%;
+  max-width: 560px;
+  max-height: min(80vh, 100%);
+  overflow: auto;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.label {
+  font-size: var(--text-label);
+  color: var(--fg-muted);
+}
+
+.input,
+.select,
+.textarea {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--fg-body);
+  font-size: var(--text-input);
+  font-family: inherit;
+}
+
+.textarea {
+  min-height: 10lh;
+  resize: vertical;
+  line-height: var(--lh-read);
+}
+
+.editorHead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.editorTitle {
+  margin: 0;
+  font-size: var(--text-ui);
+  color: var(--fg-strong);
+}
+
+.editorActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  justify-content: flex-end;
+}
+
+/* ── conflict ─────────────────────────────────────────────────────────── */
+
+.conflict {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  width: 100%;
+  max-width: 720px;
+  max-height: min(84vh, 100%);
+  overflow: auto;
+  min-width: 0;
+}
+
+.conflictGrid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-3);
+}
+
+@media (min-width: 720px) {
+  .conflictGrid {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+}
+
+.conflictPane {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.conflictBody {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-inset);
+  color: var(--fg-body);
+  font-size: var(--text-meta);
+  line-height: var(--lh-read);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 40vh;
+  overflow: auto;
+}
+
+.confirm {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  width: 100%;
+  max-width: 420px;
+}
+
+.confirmText {
+  margin: 0;
+  color: var(--fg-body);
+  overflow-wrap: anywhere;
+}

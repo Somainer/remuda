@@ -96,3 +96,9 @@ html[data-keyboard="1"] [data-testid="code-quote-chips"] {
   flex-wrap: nowrap;
   overflow-x: auto;
 }
+
+/* D-061 /m bottom band: while the 问 Main input owns the soft keyboard the
+   PhoneNav steps aside, so the input rides the band's bottom edge. */
+html[data-keyboard="1"][data-keyboard-focus="composer"] [data-testid="phone-nav"] {
+  display: none !important;
+}

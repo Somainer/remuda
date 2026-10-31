@@ -1426,3 +1426,51 @@ it("shows the pending word when read-back is still available during a switch", (
   expect(chip).toHaveAttribute("data-effort-effective", "pending");
   expect(screen.getByTestId("model-effort-chip-label")).toHaveTextContent("max");
 });
+
+describe("Composer ask variant (ma-main-ui 问 Main)", () => {
+  it("renders the collapsed row on desktop with no options trigger", () => {
+    render(<Composer instanceId="ins_ask" mobile={false} variant="ask" placeholder="问 Main…" onSend={vi.fn()} />);
+    expect(screen.getByTestId("composer").getAttribute("data-variant")).toBe("ask");
+    expect(screen.getByTestId("composer-bar").getAttribute("data-collapsed")).toBe("1");
+    expect(screen.queryByTestId("model-effort-chip")).toBeNull();
+    expect(screen.queryByTestId("composer-options-trigger")).toBeNull();
+    expect(screen.queryByTestId("permission-chip")).toBeNull();
+    expect(screen.getByTestId("composer-input").getAttribute("placeholder")).toBe("问 Main…");
+  });
+
+  it("desktop ask sends on ⌘/Ctrl+Enter; a plain Enter is a newline", async () => {
+    const user = userEvent.setup();
+    const onSend = vi.fn();
+    render(<Composer instanceId="ins_ask_keys" mobile={false} variant="ask" onSend={onSend} />);
+    const area = screen.getByTestId("composer-input");
+    await user.type(area, "line1{Enter}line2");
+    expect(onSend).not.toHaveBeenCalled();
+    expect((area as HTMLTextAreaElement).value).toBe("line1\nline2");
+    await user.keyboard("{Control>}{Enter}{/Control}");
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(onSend.mock.calls[0][0]).toBe("line1\nline2");
+  });
+
+  it("a primary override replaces send, and Enter never sends while it is set", async () => {
+    const user = userEvent.setup();
+    const onSend = vi.fn();
+    const onResume = vi.fn();
+    render(
+      <Composer
+        instanceId="ins_ask_override"
+        mobile={false}
+        variant="ask"
+        onSend={onSend}
+        primaryOverride={{ label: "恢复", testId: "main-ask-resume", onClick: onResume }}
+      />,
+    );
+    expect(screen.queryByTestId("composer-send")).toBeNull();
+    const area = screen.getByTestId("composer-input");
+    await user.type(area, "draft{Enter}");
+    await user.keyboard("{Control>}{Enter}{/Control}");
+    expect(onSend).not.toHaveBeenCalled();
+    await user.click(screen.getByTestId("main-ask-resume"));
+    expect(onResume).toHaveBeenCalledTimes(1);
+    expect(onSend).not.toHaveBeenCalled();
+  });
+});

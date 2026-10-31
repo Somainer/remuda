@@ -33,12 +33,6 @@ export type Instance = EntityMeta & {
    * Additive wire field — the Hub already serves it on InstanceRecord.
    */
   taskId?: Id | null;
-  /**
-   * D-057 §5: the continuity lineage this chapter belongs to (its own id for
-   * a plain instance). D-060 memory is addressed by lineage, so the memory
-   * page resolves it from here instead of assuming the chapter id.
-   */
-  lineageId?: Id;
   kind: Kind;
   driver: DriverKind;
   lifecycle: Lifecycle;
@@ -157,6 +151,19 @@ export type Instance = EntityMeta & {
   launchedBy?: "remuda" | "user" | null;
   /** context-usage-1: additive per-session token/context rollup from the Hub; absent until the harness reports usage. */
   usageRollup?: UsageRollup | null;
+  /**
+   * D-057 §5 lineage projection, verbatim from InstanceRecord. A plain
+   * instance is its own lineage (`lineageId === id`, generation 1); absent on
+   * rows from Hubs older than ma-lineage.
+   */
+  lineageId?: Id;
+  generation?: number;
+  /** Why this chapter exists (`owner-resume`, later C1 causes); null on a first chapter. */
+  chapterCause?: string | null;
+  /** When authority moved to the successor chapter; null while current. */
+  fencedAt?: string | null;
+  /** Granted verbs (`dispatch` / `land` / `spend` / `address-owner`); empty = leaf. */
+  grants?: string[];
 };
 
 export type HostTransport = "outbound-wss" | "ssh-dev";

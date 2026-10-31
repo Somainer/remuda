@@ -15,6 +15,8 @@ import { Navigate, useLocation, useNavigate, useParams } from "react-router-dom"
 import { BrainCircuit, FileText, Info, ListCollapse, MessageSquarePlus, Rows3, ScrollText, Search } from "lucide-react";
 import { ConnectionIndicator } from "../components/ConnectionIndicator";
 import { EndedBar } from "../chrome/EndedBar";
+import { MainSessionBar } from "../features/session/MainSessionBar";
+import { useMainBarOffersResume } from "../features/home/useMain";
 import { SessionHeader, useWideDesktop } from "../chrome/SessionHeader";
 import { SessionMoreMenu, type MoreMenuItem } from "../chrome/SessionMoreMenu";
 import { ApprovalCard } from "../features/approvals/ApprovalCard";
@@ -51,7 +53,7 @@ import { endReason, NODE_EPOCH_CHANGED } from "../lib/endReason";
 import { bindingChipText, transcriptBinding } from "../lib/transcriptBinding";
 import { ptyYoloChipLabel } from "../lib/sessionOptions";
 import type { ResumeMode } from "../lib/api";
-import { hubStore, type HubState } from "../lib/store";
+import { hubStore, useMainEntry, type HubState } from "../lib/store";
 import { e2eSeamsEnabled } from "../lib/e2eSeams";
 import { usePublishedElementHeight } from "../lib/usePublishedElementHeight";
 import { useSeenReporter } from "../features/session/useSeenReporter";
@@ -327,6 +329,15 @@ function SessionPageBody({
   const [interrupted, setInterrupted] = useState(false);
   useEffect(() => setInterrupted(false), [instanceId]);
   const instance = hub.instance ?? resolveTtyLabInstance(instanceId);
+  // D-057 §9: a chapter of the Main lineage swaps the header's close-Stop for
+  // the Main controls (Stop = cancel the turn, Pause = close the chapter).
+  const mainEntry = useMainEntry();
+  const mainLineage =
+    mainEntry !== null && instance !== undefined && mainEntry.lineageId === (instance.lineageId ?? instance.id);
+  // The page of Main's CURRENT chapter, and whether its Main bar offers 恢复
+  // (the same status computation the bar reads).
+  const mainCurrentChapter = mainLineage && mainEntry !== null && mainEntry.instance.id === instance?.id;
+  const mainBarOffersResume = useMainBarOffersResume(mainCurrentChapter ? mainEntry : null);
   // t-annotations: a session of an archived task is a read-only preview — no
   // badge/entry point and anchor selection raises nothing.
   const sessionTask = useSessionTask(instanceId, (instance as { taskId?: string | null } | undefined)?.taskId);
@@ -575,8 +586,17 @@ function SessionPageBody({
     }
   };
   const canResume = instance.capabilities.capabilities.resume?.state === "supported";
+  // An earlier chapter of the Main lineage: Resume would act on the current
+  // chapter, not this one, so the bar links there instead (D-057 §9).
+  const currentMainHref =
+    mainLineage && mainEntry && mainEntry.instance.id !== instance.id ? `/s/${mainEntry.instance.id}` : null;
   const endedBar = ended ? (
     <WorkbenchEndedBar
+      currentMainHref={currentMainHref}
+      // The current Main chapter: the note points at the Main bar's 恢复 only
+      // when the bar offers it and a resume exists at all; otherwise the
+      // existing resume / fallback branches stay (r4 item 1).
+      resumeInMainBar={mainCurrentChapter && mainBarOffersResume && canResume}
       reason={ended}
       nodeRestarted={nodeRestarted}
       heldCount={heldBubbles.length}
@@ -822,7 +842,7 @@ function SessionPageBody({
         onView={(next) => navigate(`/s/${instance.id}/${next}`)}
         files={filesInline ? { active: resolvedView === "files", onToggle: toggleFiles } : null}
         onStop={
-          status === "exited"
+          status === "exited" || mainLineage
             ? null
             : () => {
                 void hubStore.close(instance.id);
@@ -832,6 +852,7 @@ function SessionPageBody({
           <SessionMoreMenu open={moreOpen} onOpenChange={setMoreOpen} sheet={mobile} items={moreItems} />
         }
       />
+      <MainSessionBar instance={instance} mobile={mobile} />
       <RunDetails count={diagnostics.length} open={runDetailsOpen} onClose={closeRunDetails}>
         {diagnosticRows}
       </RunDetails>

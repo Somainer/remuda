@@ -16,6 +16,17 @@ export type EndedBarProps = {
   resuming: boolean;
   onResume: (mode: ResumeMode) => void;
   newHref: string;
+  /**
+   * D-057 §9: set on an earlier chapter of the Main lineage. Resume there
+   * would act on a different chapter than the one on screen, so the bar links
+   * to the current Main instead of offering it.
+   */
+  currentMainHref?: string | null;
+  /**
+   * D-057 §9: set on the Main lineage's CURRENT chapter. The Main session bar
+   * holds its one 恢复; this bar offers no second resume.
+   */
+  resumeInMainBar?: boolean;
 };
 
 /**
@@ -31,6 +42,8 @@ export function EndedBar({
   resuming,
   onResume,
   newHref,
+  currentMainHref = null,
+  resumeInMainBar = false,
 }: EndedBarProps) {
   // A plain ending says nothing beyond 「会话已结束」; any other reason follows
   // it in its own tone (c-endreason: a restart is neutral, never failed).
@@ -59,7 +72,17 @@ export function EndedBar({
           有 {heldCount} 条排队消息未送出
         </p>
       ) : null}
-      {canResume ? (
+      {currentMainHref ? (
+        <div className={css.actions}>
+          <Link to={currentMainHref} className={`${ui.btnPrimary} ${css.btnLg}`} data-testid="ended-open-current-main">
+            打开当前 Main
+          </Link>
+        </div>
+      ) : resumeInMainBar ? (
+        <p className={css.note} data-testid="ended-resume-in-main-bar">
+          用上方 Main 栏的「恢复」继续
+        </p>
+      ) : canResume ? (
         <div className={css.actions} data-testid="resume-control">
           {/* D-026: resume continues the same native session on a NEW
               instance, so both targets navigate away from this one. */}

@@ -1,16 +1,16 @@
 /* @tokens strict */
 /*
  * /m phone home (D-049, ui-spec §4.7 / §2.1; UO-3). One sticky head — a 52px
- * title row (「会话」 + the Space button that opens SpacesDrawer) over a 52px
- * search/order row — then project + git branch groups of 64px rows: status
- * dot + title + one next-step/error sentence + relative time + remaining-
- * context ring. Compact-only: this module is never imported by a desktop
- * route. Role tokens only; hit areas follow pointer:coarse.
+ * title row (「会话」 + the Space button that opens SpacesDrawer) over the
+ * 28px ① count row (home.md §2.1: the sticky head is 80px at most) — then the
+ * scrolling search/order row and project + git branch groups of 64px rows.
+ * Compact-only: this module is never imported by a desktop route. Role
+ * tokens only; hit areas follow pointer:coarse.
  */
 
 .home {
-  /* The sticky head's height (52 + 52); group headers pin below it. */
-  --home-head: 104px;
+  /* The sticky head's height (52 title + 28 count); group headers pin below it. */
+  --home-head: 80px;
   flex: 1 1 auto;
   min-height: 0;
   display: flex;

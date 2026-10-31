@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { SessionList } from "../features/session/SessionList";
 import { useHomeFreshness } from "../features/home/freshness";
 import { useHub } from "../lib/store";
@@ -7,11 +8,18 @@ import { SpacesPanel } from "../features/spaces/SpacesPanel";
 import { spaceStore, type Space } from "../features/spaces/store";
 import { useSpaceWorkbench } from "../features/spaces/useSpaceWorkbench";
 import { PageHeader } from "../components/PageHeader";
+import { HomeGlance } from "../features/home/HomeGlance";
+import { GLANCE_TARGETS, scrollToFirst } from "../features/home/glanceNav";
 import { MainCard } from "../features/home/MainCard";
 import { WorkingList } from "../features/home/WorkingList";
 import { useMainAside } from "../features/home/useMain";
 import ui from "../styles/ui.module.css";
 import css from "./SessionsPage.module.css";
+
+/** The URL's `status` list, the same wire form `readConditions` parses. */
+function statusValues(params: URLSearchParams): string[] {
+  return (params.get("status") ?? "").split(",").filter(Boolean);
+}
 
 export function SessionsPage({ dimmed = false }: { dimmed?: boolean }) {
   const hub = useHub();
@@ -31,6 +39,21 @@ export function SessionsPage({ dimmed = false }: { dimmed?: boolean }) {
   // Below 1024 the index column folds into the header's 空间 button, which
   // opens the same panel as an overlay (one instance, same testids).
   const [indexOpen, setIndexOpen] = useState(false);
+  // §5.2: 工作中 on the count row narrows the SessionList to that rank via the
+  // list's own URL filter; a second tap removes it again.
+  const [params, setParams] = useSearchParams();
+  const workingFilter = statusValues(params).includes("working");
+
+  function toggleWorking() {
+    const next = new URLSearchParams(params);
+    const statuses = statusValues(params);
+    const updated = workingFilter
+      ? statuses.filter((value) => value !== "working")
+      : [...statuses, "working"];
+    if (updated.length) next.set("status", updated.join(","));
+    else next.delete("status");
+    setParams(next, { replace: true });
+  }
 
   useEffect(() => {
     if (!indexOpen) return;
@@ -55,15 +78,23 @@ export function SessionsPage({ dimmed = false }: { dimmed?: boolean }) {
           crumbs={[{ label: "会话" }]}
           title={active?.name ?? "全部空间"}
           actions={
-            <button
-              type="button"
-              className={`${ui.btnGhost} ${css.indexOpen}`}
-              data-testid="spaces-index-open"
-              aria-expanded={indexOpen}
-              onClick={() => setIndexOpen((v) => !v)}
-            >
-              空间
-            </button>
+            <>
+              <HomeGlance
+                placement="desktop"
+                workingFilter={workingFilter}
+                onNeedYou={() => scrollToFirst(GLANCE_TARGETS.needYouDesktop)}
+                onWorking={toggleWorking}
+              />
+              <button
+                type="button"
+                className={`${ui.btnGhost} ${css.indexOpen}`}
+                data-testid="spaces-index-open"
+                aria-expanded={indexOpen}
+                onClick={() => setIndexOpen((v) => !v)}
+              >
+                空间
+              </button>
+            </>
           }
         />
       ) : null}

@@ -7350,8 +7350,14 @@ mod initiator_persistence_test {
         node: &DevNode,
         with: bool,
     ) -> (CreateInstanceRequest, Option<remuda_protocol::Initiator>) {
-        let initiator = with.then(|| {
-            remuda_protocol::Initiator::new("ins_stamped".into(), "ins_stamped".into(), 2)
+        // cb-rootturn: the Hub stamps the root turn beside the initiator.
+        let initiator = with.then(|| remuda_protocol::Initiator {
+            root_turn: Some(remuda_protocol::RootTurn {
+                command_id: "cmd_owner".into(),
+                origin: remuda_protocol::InputOrigin::Human,
+                continuation: remuda_protocol::RootTurnContinuation::Fresh,
+            }),
+            ..remuda_protocol::Initiator::new("ins_stamped".into(), "ins_stamped".into(), 2)
         });
         let mut value = serde_json::json!({
             "kind": "claude",
@@ -7403,6 +7409,10 @@ mod initiator_persistence_test {
                         .pointer("/payload/entity/initiator/generation")
                         .and_then(serde_json::Value::as_i64)
                         == Some(2)
+                    && event.pointer("/payload/entity/initiator/rootTurn")
+                        == Some(&serde_json::json!({
+                            "commandId": "cmd_owner", "origin": "human", "continuation": "none"
+                        }))
             });
         assert!(
             accepted,

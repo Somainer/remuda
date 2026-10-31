@@ -39,12 +39,14 @@ export function HostStrip({
     };
   }, []);
 
-  // §9 ② loading = hidden: before the first snapshot there is nothing to say
-  // about hosts, and 「添加主机」 would be a guess (the list may still arrive).
-  if (freshness.state === "unknown") return null;
+  // §9 ② loading: the host list itself is unknown before the first snapshot,
+  // but the band (and its 「空间 ▸」 toggle) must stay — it shows 「–」 rather
+  // than guessing 添加主机 while the list may still be arriving.
+  const unknown = freshness.state === "unknown";
   const model = hostStrip(hub.hosts, nowMs);
   // A fresh verdict is the only one without a Hub chip; recovering and
-  // unreachable both name what the operator would tap.
+  // unreachable both name what the operator would tap. Nothing is claimed
+  // while the snapshot is still unknown.
   const hubDown = freshness.state === "stale";
   const hubLabel =
     hub.connection === "recovering" || hub.connection === "reconnecting"
@@ -52,13 +54,17 @@ export function HostStrip({
       : "Hub 连不上";
   // An unsupported Notification API offers nothing a tap could enable.
   const notificationsOff =
-    push !== null && push.permission !== "granted" && push.permission !== "unsupported";
+    !unknown && push !== null && push.permission !== "granted" && push.permission !== "unsupported";
   const notificationsHref = placement === "phone" ? "/m/inbox" : "/settings#notifications";
 
   return (
     <div className={css.strip} data-testid="host-strip" data-placement={placement}>
       <div className={css.chips}>
-        {model.total === 0 ? (
+        {unknown ? (
+          <span className={css.chip} data-testid="host-unknown" title="主机状态未知">
+            –
+          </span>
+        ) : model.total === 0 ? (
           <Link className={css.chip} data-testid="host-add" to="/hosts">
             添加主机 ›
           </Link>
@@ -86,7 +92,7 @@ export function HostStrip({
             </Link>
           ))
         )}
-        {hubDown ? (
+        {hubDown && !unknown ? (
           <span className={css.chip} data-testid="host-hub-chip" data-tone="attention">
             {hubLabel}
           </span>

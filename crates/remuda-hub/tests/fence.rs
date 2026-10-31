@@ -1245,6 +1245,71 @@ async fn a_self_close_pauses_as_self() -> Result<()> {
     Ok(())
 }
 
+/// D-060 decision 10, the D-017 branch of the self-close guard: a chapter
+/// whose own cross-host create waits on a human approval cannot close itself
+/// (409 `approval-in-flight`, nothing fenced or forwarded), while the owner's
+/// close of the same lineage still pauses it.
+#[tokio::test]
+async fn a_self_close_with_an_approval_in_flight_is_refused_and_the_owner_close_pauses()
+-> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.seat_host, true).await?;
+    let mut worker_node = FakeNode::connect(&ctx.hub, &ctx.worker_host, true).await?;
+    let (seat, token) = ctx.seat(&mut node).await?;
+    // The seat dispatches a worker to another (in-scope) host: D-017 asks a
+    // human first, so the seat now has an approval in flight.
+    let create = ctx
+        .http
+        .post(format!("{}/v1/instances", ctx.base()))
+        .bearer_auth(&token)
+        .json(&json!({
+            "hostId": ctx.worker_host, "kind": "claude", "driver": "claude-print",
+            "permissionMode": "manual", "prompt": "cross-host worker",
+        }))
+        .send()
+        .await?;
+    assert_eq!(create.status(), 409);
+    let body: Value = create.json().await?;
+    assert_eq!(body["reason"], json!("approval-required"), "{body}");
+    assert!(body["interactionId"].is_string(), "{body}");
+
+    let guarded = ctx.pause(&token, &seat).await?;
+    assert_eq!(guarded.status(), 409);
+    let body: Value = guarded.json().await?;
+    assert_eq!(body["reason"], json!("approval-in-flight"), "{body}");
+    let record = ctx.lineage(&seat).await?;
+    assert_eq!(record["state"], json!("starting"), "{record}");
+    assert_eq!(
+        record["fences"],
+        json!([]),
+        "a refused self-close fences nothing"
+    );
+    assert!(
+        node.drain()
+            .iter()
+            .all(|(method, _)| method != "lineage.fence" && method != "instance.close"),
+        "a refused self-close forwards nothing"
+    );
+
+    // The owner's close of the same lineage is not guarded.
+    let paused = ctx.pause(&ctx.human, &seat).await?;
+    assert_eq!(paused.status(), 200);
+    let (method, close) = node.next_work_frame().await?;
+    assert_eq!(method, "instance.close");
+    assert_eq!(close["instanceId"], json!(seat));
+    let record = ctx.lineage(&seat).await?;
+    assert_eq!(record["state"], json!("paused"));
+    assert_eq!(record["pausedBy"]["kind"], json!("device"));
+    assert!(
+        worker_node
+            .drain()
+            .iter()
+            .all(|(method, _)| method != "instance.create"),
+        "the unapproved worker was never created"
+    );
+    Ok(())
+}
+
 /// §7.10 "Hub restart between F and fence delivery": the fence is durable
 /// and delivered exactly once on the host's next hello.
 #[tokio::test]

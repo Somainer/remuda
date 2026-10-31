@@ -24,7 +24,7 @@ vi.mock("./freshness", () => ({
   HOME_FRESHNESS: { pollMs: 2_000, staleAfterMs: 10_000, bannerAfterMs: 5_000, receiptMs: 2_000 },
 }));
 
-vi.mock("../tasks/TaskList", () => ({
+vi.mock("../tasks/taskLedger", () => ({
   useTaskLedger: () => ({ tasks: [], projectName: () => undefined }),
 }));
 

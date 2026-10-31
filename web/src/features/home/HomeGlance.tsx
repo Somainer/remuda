@@ -4,7 +4,7 @@ import { thisDeviceId } from "../../lib/interactionStatus";
 import { hostIsOnline } from "../hosts/model";
 import { useInboxClockNow } from "../mobile/useInboxPendingCount";
 import { syncInboxDeadlineClock } from "../mobile/inboxClock";
-import { useTaskLedger } from "../tasks/TaskList";
+import { useTaskLedger } from "../tasks/taskLedger";
 import { useHomeFreshness } from "./freshness";
 import {
   formatGlanceCount,
@@ -33,16 +33,22 @@ export function HomeGlance({
   onNeedYou,
   onWorking,
   workingFilter = false,
+  projectId = null,
 }: {
   placement: "phone" | "desktop";
   onNeedYou: () => void;
   onWorking: () => void;
   /** The rank filter this segment currently applies, for aria-pressed. */
   workingFilter?: boolean;
+  /**
+   * The scope the phone ledger is already polling. Passing it makes this row
+   * share that ONE poller instead of opening a second /v1/tasks loop.
+   */
+  projectId?: string | null;
 }) {
   const hub = useHub();
   const freshness = useHomeFreshness();
-  const { tasks } = useTaskLedger();
+  const { tasks } = useTaskLedger(projectId);
   const deviceId = useMemo(() => thisDeviceId(), []);
   const nowMs = useInboxClockNow();
   useEffect(() => {

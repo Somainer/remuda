@@ -428,6 +428,7 @@ export const HomeList = memo(function HomeList() {
         </div>
         <HomeGlance
           placement="phone"
+          projectId={projectFilter}
           workingFilter={rankFilter === "working"}
           onNeedYou={() => scrollToFirst(GLANCE_TARGETS.needYou, GLANCE_TARGETS.tasks)}
           onWorking={() => setRankFilter((current) => (current === "working" ? null : "working"))}

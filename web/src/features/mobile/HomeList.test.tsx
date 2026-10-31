@@ -87,6 +87,10 @@ vi.mock("../files/filesApi", () => ({
   fetchChanges: vi.fn(() => Promise.reject(new Error("offline"))),
 }));
 
+vi.mock("../tasks/taskLedger", () => ({
+  useTaskLedger: () => ({ tasks: [], projectName: () => null }),
+}));
+
 vi.mock("../tasks/TaskList", () => ({
   // The task layer is a store/network concern, out of scope for these
   // component tests; the session rows under test never depend on it.

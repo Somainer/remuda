@@ -1529,11 +1529,7 @@ mod tests {
     #[test]
     fn fence_map_is_monotonic_and_fences_lower_generations() {
         let map = FenceState::default();
-        let initiator = |generation| Initiator {
-            instance_id: "ins_a".into(),
-            lineage_id: "ins_l".into(),
-            generation,
-        };
+        let initiator = |generation| Initiator::new("ins_a".into(), "ins_l".into(), generation);
         assert!(!map.is_fenced(&initiator(1)));
         map.raise("ins_l", 2);
         assert!(map.is_fenced(&initiator(1)));

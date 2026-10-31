@@ -19,11 +19,7 @@ const LINEAGE: &str = "ins_0190d8b2-6a1e-7c3b-9f21-4c5d6e7f8a01";
 const SEAT: &str = "ins_0190d8b2-6a1e-7c3b-9f21-4c5d6e7f8a02";
 
 fn seat(generation: i64) -> Initiator {
-    Initiator {
-        instance_id: SEAT.into(),
-        lineage_id: LINEAGE.into(),
-        generation,
-    }
+    Initiator::new(SEAT.into(), LINEAGE.into(), generation)
 }
 
 /// A PTY-like driver: `ready=false` is a busy turn (control unavailable),

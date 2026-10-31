@@ -456,11 +456,11 @@ fn initiator_of(ctx: &Ctx, seat: &str) -> Result<remuda_protocol::Initiator> {
         rusqlite::params![seat],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    Ok(remuda_protocol::Initiator {
-        instance_id: seat.to_owned(),
-        lineage_id: lineage,
+    Ok(remuda_protocol::Initiator::new(
+        seat.to_owned(),
+        lineage,
         generation,
-    })
+    ))
 }
 
 // ── Close becomes pause; paused_by; credentials ─────────────────────────

@@ -501,16 +501,20 @@ static PERSIST_GENERATION: StdMutex<()> = StdMutex::new(());
 /// written, so a slower writer can never move the mark backwards. Atomic: the
 /// value goes to a temp file in the data dir, is synced, and is renamed over
 /// the counter, so a crash leaves either the old or the new value, never a
-/// torn or empty file that would read as 0.
-fn persist_controller_generation(data_dir: &Path, generation: u64) {
+/// torn or empty file that would read as 0. Durable: the data dir is synced
+/// after the rename, so the new name survives a power loss too.
+///
+/// An error means the value may not survive a restart: the caller must not
+/// hand `generation` out (a restarted daemon could hand it out again).
+fn persist_controller_generation(data_dir: &Path, generation: u64) -> std::io::Result<()> {
     if data_dir.as_os_str().is_empty() {
-        return;
+        return Ok(());
     }
     let _serial = PERSIST_GENERATION
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if read_controller_generation(data_dir) >= generation {
-        return;
+        return Ok(());
     }
     let target = controller_generation_file(data_dir);
     let temp = data_dir.join(format!(
@@ -522,12 +526,13 @@ fn persist_controller_generation(data_dir: &Path, generation: u64) {
         let mut file = std::fs::File::create(&temp)?;
         file.write_all(generation.to_string().as_bytes())?;
         file.sync_all()?;
-        std::fs::rename(&temp, &target)
+        std::fs::rename(&temp, &target)?;
+        std::fs::File::open(data_dir)?.sync_all()
     })();
-    if let Err(error) = written {
+    if written.is_err() {
         let _ = std::fs::remove_file(&temp);
-        tracing::warn!(%error, "could not persist the controller generation");
     }
+    written
 }
 
 /// Read the optional `controllerGeneration` a bridge frame names (string or
@@ -790,25 +795,37 @@ async fn accept_controller(
             .lock()
             .map_err(|_| NodeError::StorePoisoned)?;
         if controller.active && frame.pointer("/params/takeover") != Some(&json!(true)) {
-            None
+            Err((
+                -32009,
+                "an active controller exists; hello takeover flag required".to_owned(),
+            ))
         } else {
-            controller.generation += 1;
-            controller.active = true;
-            shared.changed.send_replace(controller.generation);
-            persist_controller_generation(&shared.data_dir, controller.generation);
-            Some(controller.generation)
+            // Durable before it is handed out: a generation the counter does
+            // not hold could be handed out again after a restart. On failure
+            // nothing changes; the current controller keeps its generation.
+            let next = controller.generation + 1;
+            match persist_controller_generation(&shared.data_dir, next) {
+                Ok(()) => {
+                    controller.generation = next;
+                    controller.active = true;
+                    shared.changed.send_replace(next);
+                    Ok(next)
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "could not persist the controller generation");
+                    Err((
+                        -32603,
+                        format!("the controller generation could not be persisted: {error}"),
+                    ))
+                }
+            }
         }
     };
-    let Some(generation) = generation else {
-        return write_frame(
-            &mut write,
-            &hubnode::rpc_error(
-                id,
-                -32009,
-                "an active controller exists; hello takeover flag required",
-            ),
-        )
-        .await;
+    let generation = match generation {
+        Ok(generation) => generation,
+        Err((code, message)) => {
+            return write_frame(&mut write, &hubnode::rpc_error(id, code, &message)).await;
+        }
     };
     let _lease = LeaseGuard {
         shared: shared.clone(),

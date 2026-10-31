@@ -649,3 +649,32 @@ async fn an_authorization_decision_is_identical_with_and_without_root_turn() -> 
     );
     Ok(())
 }
+
+/// `/approvals` reads the root turn off the card a request opened, so the
+/// PWA can mark an agent-initiated request ("agent 自发").
+#[tokio::test]
+async fn an_approval_card_records_the_turn_that_asked() -> Result<()> {
+    let (ctx, mut node) = Ctx::boot().await?;
+    let (seat, token) = ctx.seat(&mut node, "main").await?;
+    let bot = ctx.hub.mint_bot_device_token("rootturn-bot").await?;
+    let command = ctx.send(&mut node, &bot, &seat, "nightly check").await;
+    ctx.turn_starts(&node, &seat, &command).await;
+    let (status, body) = ctx
+        .dispatch_request(&token, &[("x-remuda-require-approval", "true")])
+        .await;
+    assert_eq!(status, 409, "{body}");
+    let pending = ctx.get("/v1/interactions").await;
+    let card = pending["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|item| item["id"] == body["interactionId"])
+        .cloned()
+        .expect("card");
+    assert_eq!(
+        card["rootTurn"],
+        root_turn(&command, "bot", "none"),
+        "{card}"
+    );
+    Ok(())
+}

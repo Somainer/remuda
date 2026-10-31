@@ -1,5 +1,6 @@
 import { memo, useState } from "react";
 import { Link } from "react-router-dom";
+import { RootTurnTag } from "../../components/RootTurnTag";
 import { StateDot } from "../../components/StateDot";
 import type { UiStatus } from "../../types/instance";
 import type { Interaction, InteractionAnswer } from "../../types/interaction";
@@ -196,6 +197,7 @@ export const DecisionCard = memo(function DecisionCard({
         <span>
           / {view.workspaceLabel || "—"} / {view.instanceKind}
         </span>
+        <RootTurnTag rootTurn={item.rootTurn} surface="approvals" />
       </div>
 
       <StatusLine uiState={uiState} dot={statusDotOf(uiState)} />

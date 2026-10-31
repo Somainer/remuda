@@ -1,3 +1,4 @@
+import type { RootTurn } from "./generated";
 import type { NativeRequestKey } from "./nativeRef";
 import type { ActorRef, Digest, EntityMeta, Id, Knowledge, Timestamp, U64 } from "./wire";
 
@@ -96,4 +97,9 @@ export type Interaction = EntityMeta & {
     reason: "answered" | "native-cleared" | "native-cancelled" | "generation-ended" | "timed-out" | "agent-demoted";
     eventIds: Id[];
   }>;
+  /**
+   * cb-rootturn: the root turn an agent asked in, on the Hub's own one-shot
+   * approval cards. Display only; absent everywhere else.
+   */
+  rootTurn?: RootTurn | null;
 };

@@ -678,9 +678,12 @@ pub async fn require_approval(
         instance_id: id.parse().map_err(|_| HubError::Forbidden)?,
         host_id: instance.host_id.parse().map_err(|_| HubError::Forbidden)?,
     };
+    // cb-rootturn: recorded on a new card for display; never part of the
+    // grant's match (the caller and the exact request decide).
+    let root_turn = state.store.root_turn(id).await?;
     state
         .agent_approvals
-        .require(headers, &caller, request)
+        .require_recorded(headers, &caller, request, root_turn)
         .await
 }
 

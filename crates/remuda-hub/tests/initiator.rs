@@ -334,7 +334,8 @@ impl FakeNode {
         node.send(Message::Text(
             json!({
                 "jsonrpc":"2.0","id":"hello","method":"runtime.hello",
-                "params":{"hostId": host, "nodeVersion":"0.1.0-test", "host":{
+                "params":{"hostId": host, "nodeVersion":"0.1.0-test",
+                    "capabilities":{"lineageFence": true}, "host":{
                     "hostname":format!("{host}.local"),"maxInstances":8,
                     "resources":{"cpuCount":8,"cpuPct":5,"memPct":20,"loadAvg1":0.1,"diskFreeGb":120.0},
                     "cli":[{"kind":"claude","version":"0.0.0","absolutePath":"/usr/bin/claude","authState":"unknown"}],

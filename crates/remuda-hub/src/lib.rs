@@ -20,6 +20,7 @@ mod config;
 mod devices;
 mod digest;
 mod error;
+mod fence;
 mod fleet;
 mod gatequeue;
 mod host_dirs;
@@ -186,6 +187,9 @@ pub struct AppState {
     /// r27 item 2: per-job guards serializing legacy gate `/resolve`
     /// validation/abort against verdict-applied evidence-deferral transitions.
     pub(crate) gate_decision_guards: crate::gatequeue::GateDecisionGuards,
+    /// D-057 §7.4: the in-memory fence map the send gate reads, and per-host
+    /// fence delivery state.
+    pub(crate) fences: crate::fence::FenceState,
 }
 
 impl AppState {
@@ -617,6 +621,7 @@ pub mod store_test_support {
             SettlementOutcome::Rejected,
             SettlementOutcome::Cancelled,
             SettlementOutcome::Expired,
+            SettlementOutcome::Withheld,
         ]
         .into_iter()
         .map(|outcome| {
@@ -662,6 +667,65 @@ impl HubTestHandle {
     }
 
     /// Arm the forward_if_online pre-send barrier.
+    /// D-057 §7.10 seams: park a direct op between admission and send
+    /// intent (`node-op-admitted`, key op id) or a gate dispatch between its
+    /// claim and the send gate (`gate-claimed`, key job id). Returns
+    /// (reached, release).
+    pub fn test_arm_fence_seam(
+        &self,
+        phase: &str,
+        host_id: &str,
+        key: &str,
+    ) -> (
+        std::sync::Arc<tokio::sync::Notify>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let phase = match phase {
+            "node-op-admitted" => crate::workspaces::RacePhase::NodeOpAdmitted,
+            "gate-claimed" => crate::workspaces::RacePhase::GateClaimed,
+            "forward-intent-marked" => crate::workspaces::RacePhase::ForwardIntentMarked,
+            "forward-send" => crate::workspaces::RacePhase::ForwardSend,
+            other => panic!("unknown fence seam {other}"),
+        };
+        let reached: std::sync::Arc<tokio::sync::Notify> =
+            std::sync::Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        self.state.race_barriers.insert(
+            phase,
+            (host_id.to_owned(), key.to_owned()),
+            crate::workspaces::BarrierSlot {
+                reached: reached.clone(),
+                release: release_rx,
+            },
+        );
+        (reached, release_tx)
+    }
+
+    /// D-057 §7.10 send-gate seam: park `forward_if_online` for `command_id`
+    /// right after its forward intent committed and before the send gate
+    /// reads the fence map. Returns (reached, release).
+    pub fn test_arm_forward_intent_barrier(
+        &self,
+        host_id: &str,
+        command_id: &str,
+    ) -> (
+        std::sync::Arc<tokio::sync::Notify>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let reached: std::sync::Arc<tokio::sync::Notify> =
+            std::sync::Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        self.state.race_barriers.insert(
+            crate::workspaces::RacePhase::ForwardIntentMarked,
+            (host_id.to_owned(), command_id.to_owned()),
+            crate::workspaces::BarrierSlot {
+                reached: reached.clone(),
+                release: release_rx,
+            },
+        );
+        (reached, release_tx)
+    }
+
     pub fn test_arm_forward_send_barrier(
         &self,
         host_id: &str,
@@ -682,6 +746,81 @@ impl HubTestHandle {
             },
         );
         (reached, release_tx)
+    }
+
+    /// D-057 §7.8 test seam: a restart decision's F with successor, as the C1
+    /// supervisor (ma-restart) will run it — generation read, then the
+    /// `restart-read` continuation hook, then the CAS'd transaction. Returns
+    /// the successor id, or `None` when the CAS lost (another F won).
+    pub async fn test_restart_lineage(&self, lineage_id: &str) -> anyhow::Result<Option<String>> {
+        let lineage = self
+            .state
+            .store
+            .get_lineage(lineage_id.to_owned())
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("unknown lineage {lineage_id}"))?;
+        crate::store::run_continuation_hook("restart-read", lineage_id);
+        let current = self
+            .state
+            .store
+            .get_instance(lineage.current_instance_id.clone())
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("current chapter missing"))?;
+        let result = self
+            .state
+            .store
+            .continuation_resume(crate::store::ContinuationResumeRequest {
+                addressed_instance_id: current.instance_id.clone(),
+                expected_generation: lineage.generation,
+                host_id: current.host_id.clone(),
+                spec: current.spec_for_resume(),
+                operation: "instance.create".into(),
+                prompt: None,
+                origin: "human".into(),
+                title: current.title.clone(),
+                driver: current.driver.clone(),
+                actor: serde_json::json!({"by": "hub-supervisor"}),
+            })
+            .await?;
+        match result {
+            crate::store::ContinuationResumeResult::Resumed(resumed) => {
+                self.state.broadcast_settlement(&resumed.fence.settlement);
+                crate::fence::after_commit(&self.state, &resumed.fence, None).await;
+                Ok(Some(resumed.successor.instance_id))
+            }
+            crate::store::ContinuationResumeResult::Superseded { .. } => Ok(None),
+        }
+    }
+
+    /// One scheduler tick (claims + dispatches), on an owned handle.
+    pub async fn test_gate_tick(&self) {
+        crate::gatequeue::tick(&self.state).await;
+    }
+
+    /// [`RunningHub::test_call_node_op`] on an owned handle (spawnable).
+    pub async fn test_call_node_op(
+        &self,
+        host_id: &str,
+        method: &'static str,
+        op_id: String,
+        initiator: Option<remuda_protocol::Initiator>,
+        device_id: Option<String>,
+    ) -> anyhow::Result<bool> {
+        let frame = crate::node_ops::call_admitted_frame(
+            &self.state,
+            host_id,
+            method,
+            None,
+            op_id,
+            serde_json::json!({}),
+            std::time::Duration::from_secs(5),
+            &crate::node_ops::NodeOpAuth {
+                initiator,
+                device_id,
+            },
+        )
+        .await?;
+        Ok(frame.is_some())
     }
 
     /// Run one queued command through the real `forward_if_online` send path.
@@ -1935,7 +2074,11 @@ async fn spawn_inner(
         gate_ref_swept_at: Arc::new(std::sync::Mutex::new(None)),
         race_barriers: crate::workspaces::RaceBarriers::default(),
         gate_decision_guards: crate::gatequeue::GateDecisionGuards::new(),
+        fences: crate::fence::FenceState::default(),
     };
+    // D-057 §7.7: the send gate's map survives a Hub restart through the
+    // lineages table; deliveries are re-sent on hello and by the tick.
+    crate::fence::load_map(&state).await;
     if let Err(err) = state
         .publish_settlement_unit(async {
             Ok(state
@@ -2005,6 +2148,7 @@ async fn spawn_inner(
                         Err(err) => tracing::error!(error = %err, "host-lost sweep failed"),
                     }
                     expire_stale_requested(&reaper_state, config.requested_grace_ms).await;
+                    crate::fence::sweep_deliveries(&reaper_state).await;
                     crate::gatequeue::tick(&reaper_state).await;
                 }
             }

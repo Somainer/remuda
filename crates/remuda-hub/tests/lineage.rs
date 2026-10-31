@@ -117,7 +117,9 @@ impl FakeNode {
             .headers_mut()
             .insert("Authorization", format!("Bearer {bearer}").parse()?);
         let (mut node, _) = tokio_tungstenite::connect_async(request).await?;
-        let mut params = json!({ "hostId": host, "host": {
+        // D-057 §7.6: a fence-capable Node (the Hub refuses continuity work
+        // to one without the capability).
+        let mut params = json!({ "hostId": host, "capabilities": {"lineageFence": true}, "host": {
             "hostname":"lineage-node", "workspaces":[], "workspaceRevision":0,
             "herdr":{"path":"/usr/bin/herdr"},
             "cli":[{"kind":"claude","path":"/usr/bin/claude","auth":"logged_in"}]
@@ -161,7 +163,12 @@ impl FakeNode {
                                 };
                                 let Some(method) = frame["method"].as_str() else { continue };
                                 // Accept every Hub RPC: launches, closes, sends, answers.
-                                if frame_tx.send((method.to_owned(), frame["params"].clone())).is_err() {
+                                // A `lineage.fence` is acknowledged but kept off the
+                                // frame stream these suites assert on (the fence
+                                // suites inspect fences through the lineage record).
+                                if method != "lineage.fence"
+                                    && frame_tx.send((method.to_owned(), frame["params"].clone())).is_err()
+                                {
                                     break;
                                 }
                                 if node.send(Message::Text(json!({
@@ -399,13 +406,53 @@ impl Ctx {
         self.resume_mode(id, token, "structured").await
     }
 
+    /// Owner Resume. D-057 §6.5 (ma-fence): Resume is accepted only on a
+    /// paused lineage, so a `not-paused` refusal is answered the way the
+    /// owner would — Pause (close the current chapter), then Resume.
     async fn resume_mode(&self, id: &str, token: &str, mode: &str) -> Result<reqwest::Response> {
+        let resume = || async {
+            self.http
+                .post(format!("{}/v1/instances/{id}/resume", self.base()))
+                .bearer_auth(token)
+                .json(&json!({ "mode": mode }))
+                .send()
+                .await
+        };
+        let first = resume().await?;
+        if first.status() != reqwest::StatusCode::CONFLICT {
+            return Ok(first);
+        }
+        let body: Value = first.json().await?;
+        if body["reason"] != "not-paused" {
+            // Re-issue so the caller sees the original refusal as a response.
+            return Ok(resume().await?);
+        }
+        self.pause(id, token).await?;
+        Ok(resume().await?)
+    }
+
+    /// Resume without the pause-first retry, to assert the refusal itself.
+    async fn resume_raw(&self, id: &str, token: &str, mode: &str) -> Result<reqwest::Response> {
         Ok(self
             .http
             .post(format!("{}/v1/instances/{id}/resume", self.base()))
             .bearer_auth(token)
             .json(&json!({ "mode": mode }))
             .send()
+            .await?)
+    }
+
+    /// Pause: the existing close of the lineage's chapter (§6.5).
+    async fn pause(&self, id: &str, token: &str) -> Result<Value> {
+        Ok(self
+            .http
+            .post(format!("{}/v1/instances/{id}/commands", self.base()))
+            .bearer_auth(token)
+            .json(&json!({ "operation": "instance.close", "payload": {} }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
             .await?)
     }
 
@@ -1318,9 +1365,13 @@ async fn deleting_a_non_current_chapter_is_refused_and_current_deletes_lineage()
         "the predecessor chapter row is retained after refusal"
     );
 
-    // Delete the CURRENT chapter Y (it exited via report_session above): the
-    // whole lineage is removed in one transaction — X and Y both gone and no
-    // lineages row left to strand.
+    // D-057 §6.3 (ma-fence): the current chapter of an unpaused lineage must
+    // be closed (paused) before it can be deleted; the pause forwards its close.
+    ctx.pause(&y, &ctx.human).await?;
+    let (pause_close, _) = node.next_frame().await?;
+    assert_eq!(pause_close, "instance.close");
+    // Delete the CURRENT chapter Y: the whole lineage is removed in one
+    // transaction — X and Y both gone and no lineages row left to strand.
     let delete_y = ctx
         .http
         .delete(format!("{}/v1/instances/{y}?force=1", ctx.base()))
@@ -1464,6 +1515,11 @@ async fn whole_lineage_delete_purges_and_audits_every_chapter() -> Result<()> {
     let (method, _) = node.next_frame().await?;
     assert_eq!(method, "instance.resume");
 
+    // D-057 §6.3 (ma-fence): the current chapter of an unpaused lineage must
+    // be closed (paused) before it can be deleted; the pause forwards its close.
+    ctx.pause(&y, &ctx.human).await?;
+    let (pause_close, _) = node.next_frame().await?;
+    assert_eq!(pause_close, "instance.close");
     let delete_y = ctx
         .http
         .delete(format!("{}/v1/instances/{y}?force=1", ctx.base()))
@@ -1900,12 +1956,14 @@ async fn a_live_chapter_without_a_native_session_is_refused_and_an_ended_one_rel
     // Deliberately NO session report: the chapter is live but never produced a
     // native session id. (seat() already drained the forwarded create frame.)
 
-    let refused = ctx.resume(&x, &ctx.human).await?;
+    // ma-fence: an unpaused lineage refuses Resume outright (pause it first),
+    // before any session question arises; nothing is written either way.
+    let refused = ctx.resume_raw(&x, &ctx.human, "structured").await?;
     assert_eq!(refused.status(), 409);
     let body = refused.text().await?;
     assert!(
-        body.contains("native session"),
-        "the refusal must name the missing session: {body}"
+        body.contains("not-paused"),
+        "the refusal must say the lineage is not paused: {body}"
     );
     // No continuation write: still one chapter, generation 1, no fence.
     let lineage: Value = ctx
@@ -2745,6 +2803,7 @@ async fn two_concurrent_resumes_produce_one_successor() -> Result<()> {
             origin: "human".to_owned(),
             title: None,
             driver: "claude-sdk".to_owned(),
+            actor: serde_json::json!({"by": "test"}),
         };
         store1.continuation_resume(req).await
     });
@@ -2774,6 +2833,7 @@ async fn two_concurrent_resumes_produce_one_successor() -> Result<()> {
             origin: "human".to_owned(),
             title: None,
             driver: "claude-sdk".to_owned(),
+            actor: serde_json::json!({"by": "test"}),
         };
         store2.continuation_resume(req).await
     });
@@ -3122,7 +3182,9 @@ async fn a_successor_chapter_cannot_review_its_predecessors_plan() -> Result<()>
         rusqlite::params![plan_id],
         |row| row.get(0),
     )?;
-    assert_eq!(state, "pending", "the rejected answer must not commit");
+    // D-057 §7.2 step 8: the continuation's F superseded the predecessor's
+    // pending plan review; the refused answer committed nothing.
+    assert_eq!(state, "superseded", "the rejected answer must not commit");
 
     // The predecessor chapter itself could not self-review either (same
     // lineage, same rule) — the edge is membership, not instance identity.
@@ -3142,7 +3204,12 @@ async fn a_successor_chapter_cannot_review_its_predecessors_plan() -> Result<()>
         } }))
         .send()
         .await?;
-    assert_eq!(human_answer.status(), 200, "{}", human_answer.text().await?);
+    // D-057 §7.2 step 8: the continuation superseded the predecessor's plan
+    // review, so even the human's answer is refused (ask again in the live
+    // chapter if it still matters).
+    assert_eq!(human_answer.status(), 409);
+    let refused: Value = human_answer.json().await?;
+    assert_eq!(refused["reason"], json!("superseded"), "{refused}");
     let _ = y;
     Ok(())
 }

@@ -1046,7 +1046,10 @@ type LineageRow = (
     String,
 );
 
-fn load_lineage(conn: &Connection, lineage_id: &str) -> Result<Option<LineageRecord>, StoreError> {
+pub(crate) fn load_lineage(
+    conn: &Connection,
+    lineage_id: &str,
+) -> Result<Option<LineageRecord>, StoreError> {
     let row: Option<LineageRow> = conn
         .query_row(
             "SELECT lineage_id, current_instance_id, generation, state,
@@ -1514,6 +1517,21 @@ pub struct ContinuationResumeRequest {
     /// life stamped with the predecessor's driver waiting for the Node to
     /// correct it (ma-lineage r7 item 6a).
     pub driver: String,
+    /// Audit actor chain recorded by the fence (`{deviceId?, by}`).
+    pub actor: Value,
+}
+
+/// Result of [`Store::mark_forward_intent_gated`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForwardMark {
+    /// The intent committed; the caller writes the frame.
+    Marked,
+    /// A previous attempt already committed the intent.
+    AlreadyForwarded,
+    /// The host has unacknowledged fences: the row stays queued, no frame.
+    HeldForFence,
+    /// Continuity-lineage work for a Node without fence support.
+    NodeLacksFence,
 }
 
 /// Payload of the winning continuation transaction.
@@ -1523,6 +1541,8 @@ pub struct ContinuationResumed {
     pub fenced: Box<InstanceRecord>,
     pub successor: InstanceRecord,
     pub command: CommandRecord,
+    /// The fence F committed (D-057 §7.2), for the post-commit steps.
+    pub(crate) fence: Box<crate::fence::FenceCore>,
 }
 
 /// Outcome of [`Store::continuation_resume`].
@@ -1611,50 +1631,41 @@ fn continuation_resume_tx(
     let journal_id = new_id("obj").map_err(|e| StoreError::Id(e.to_string()))?;
     let command_id = new_id("cmd").map_err(|e| StoreError::Id(e.to_string()))?;
     let now = now_rfc3339();
-    let successor_generation = lineage.generation + 1;
-    // Compare-and-set on (generation, current chapter): a racing resume that
-    // observed the same lineage state matches zero rows.
-    let cas = tx.execute(
-        "UPDATE lineages
-            SET current_instance_id = ?1, generation = ?2, state = 'starting',
-                updated_at = ?3
-          WHERE lineage_id = ?4 AND generation = ?5 AND current_instance_id = ?6",
-        params![
-            successor_id,
-            successor_generation,
-            now,
-            lineage_id,
-            request.expected_generation,
-            current_id,
-        ],
-    )?;
-    if cas == 0 {
-        // The generation CAS lost: the lineage already advanced — possibly
-        // because the addressed chapter was already fenced and the live
-        // chapter moved on. Roll the (empty) transaction back and present the
-        // winner's current chapter as an idempotent replay. A resume addressed
-        // to the fenced chapter must therefore converge on the existing
-        // successor instead of fencing the live one (ma-lineage round 2).
-        drop(tx);
-        let lineage = load_lineage(conn, &lineage_id)?
-            .ok_or_else(|| StoreError::Id("lineage vanished after lost CAS".into()))?;
-        let current = load_instance(conn, &lineage.current_instance_id)?
-            .ok_or_else(|| StoreError::Id("current chapter vanished after lost CAS".into()))?;
-        return Ok(ContinuationResumeResult::Superseded {
-            current: Box::new(current),
-        });
-    }
-    // 1. Fence the CURRENT chapter — which is what the generation CAS just
-    // advanced from. The owner may have addressed an older fenced chapter;
-    // `current_id` is the lineage's current chapter regardless, so the live
-    // successor is what gets fenced and never a chapter fenced already.
-    tx.execute(
-        "UPDATE instances SET fenced_at = ?1, updated_at = ?2 WHERE id = ?3",
-        params![now, now, current_id],
-    )?;
-    // 2. Delete every device row bound to the predecessor: its launch
-    //    credential and any MCP token minted for it.
-    tx.execute("DELETE FROM devices WHERE instance_id = ?1", [&current_id])?;
+    // D-057 §7.2: F with successor. The generation CAS, fencing the current
+    // chapter (what the CAS advances from — never a chapter fenced already),
+    // deleting its credentials, cancelling/recording the fenced generation's
+    // work, superseding its interactions and the durable fence all commit in
+    // this one transaction with the successor below. A lost CAS writes
+    // nothing and presents the winner's chapter as an idempotent replay.
+    let fence = match crate::fence::fence_core(
+        &tx,
+        &crate::fence::FenceSpec {
+            lineage_id: lineage_id.clone(),
+            expected_generation: request.expected_generation,
+            from_states: &["starting", "running", "paused"],
+            mode: crate::fence::FenceMode::Successor {
+                successor_id: successor_id.clone(),
+            },
+            actor: request.actor.clone(),
+            authority: None,
+            self_close_guard: false,
+        },
+    )? {
+        crate::fence::FenceTx::Committed(core) => core,
+        crate::fence::FenceTx::CasLost
+        | crate::fence::FenceTx::StateRefused
+        | crate::fence::FenceTx::Guarded(_) => {
+            drop(tx);
+            let lineage = load_lineage(conn, &lineage_id)?
+                .ok_or_else(|| StoreError::Id("lineage vanished after lost CAS".into()))?;
+            let current = load_instance(conn, &lineage.current_instance_id)?
+                .ok_or_else(|| StoreError::Id("current chapter vanished after lost CAS".into()))?;
+            return Ok(ContinuationResumeResult::Superseded {
+                current: Box::new(current),
+            });
+        }
+    };
+    let successor_generation = fence.live_generation;
     let current = load_instance(&tx, &current_id)?
         .ok_or_else(|| StoreError::Id("current chapter missing".into()))?;
     // ma-lineage round 2: the seated permission mode is part of how the
@@ -1754,18 +1765,24 @@ fn continuation_resume_tx(
         "spec": request.spec,
         "initialInput": initial_input,
     });
+    // D-057 §7.1: Hub-internal work for a successor carries the successor's
+    // lineage and generation and no device id, so the send gate withholds it
+    // if the successor is itself fenced before the create leaves the Hub.
     tx.execute(
         "INSERT INTO commands
             (id, instance_id, host_id, operation, state, resolution, forwarded,
-             payload_json, idempotency_key, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, 'queued', 'clear', 0, ?5, NULL, ?6, ?6)",
+             payload_json, idempotency_key, created_at, updated_at,
+             initiator_instance_id, initiator_lineage_id, initiator_generation)
+         VALUES (?1, ?2, ?3, ?4, 'queued', 'clear', 0, ?5, NULL, ?6, ?6, ?2, ?7, ?8)",
         params![
             command_id,
             successor_id,
             current.host_id,
             request.operation,
             payload.to_string(),
-            now
+            now,
+            lineage_id,
+            successor_generation,
         ],
     )?;
     let fenced = load_instance(&tx, &current_id)?
@@ -1774,6 +1791,7 @@ fn continuation_resume_tx(
         .ok_or_else(|| StoreError::Id("successor insert missing".into()))?;
     let command = load_command(&tx, &command_id)?
         .ok_or_else(|| StoreError::Id("successor command missing".into()))?;
+    crate::fence::set_successor_command(&tx, &fence.fence_id, &command_id)?;
     tx.commit()?;
     Ok(ContinuationResumeResult::Resumed(Box::new(
         ContinuationResumed {
@@ -1781,6 +1799,7 @@ fn continuation_resume_tx(
             fenced: Box::new(fenced),
             successor,
             command,
+            fence,
         },
     )))
 }
@@ -5617,6 +5636,61 @@ impl Store {
         .await
     }
 
+    /// [`Self::mark_forward_intent`] for `forward_if_online` (D-057 §7.6), in
+    /// the same writer job: a fence-capable host with unacknowledged fences
+    /// holds the row (no intent, no write), and work a continuity lineage
+    /// initiated is refused for a host without fence support — the row
+    /// settles `rejected(node-lacks-fence)` with the 409 it answered.
+    pub(crate) async fn mark_forward_intent_gated(
+        &self,
+        command_id: String,
+        link_generation: i64,
+    ) -> Result<ForwardMark, StoreError> {
+        #[cfg(any(test, feature = "test-faults"))]
+        let armed_fence = self
+            .test_fence_before_forward_intent
+            .lock()
+            .expect("forward intent seam lock")
+            .take();
+        self.run_named("mark_forward_intent_gated", move |conn| {
+            #[cfg(any(test, feature = "test-faults"))]
+            if let Some(fenced_instance) = armed_fence {
+                test_apply_fence(conn, &fenced_instance)?;
+            }
+            let Some(row) = load_command(conn, &command_id)? else {
+                return Err(StoreError::Id("unknown command".into()));
+            };
+            check_initiator(
+                conn,
+                row.initiator.as_ref(),
+                row.initiator_device_id.as_deref(),
+            )?;
+            if row.forwarded {
+                return Ok(ForwardMark::AlreadyForwarded);
+            }
+            if crate::fence::host_gated(conn, &row.host_id)? {
+                return Ok(ForwardMark::HeldForFence);
+            }
+            if crate::fence::initiator_is_continuity(conn, row.initiator.as_ref())?
+                && !crate::fence::host_capable(conn, &row.host_id)?
+            {
+                return Ok(ForwardMark::NodeLacksFence);
+            }
+            let now = now_rfc3339();
+            conn.execute(
+                "UPDATE commands
+                    SET forwarded = 1,
+                        resolution = 'unknown',
+                        link_generation = ?1,
+                        updated_at = ?2
+                  WHERE id = ?3",
+                params![link_generation, now, command_id],
+            )?;
+            Ok(ForwardMark::Marked)
+        })
+        .await
+    }
+
     /// c-dirpicker r10 item 1: atomically adopt a new link for a host. Called
     /// by the authenticated `node.hello` path BEFORE the transport is
     /// registered: every command forwarded after this point (forwarding
@@ -6272,7 +6346,7 @@ impl Store {
                  UNION
                  SELECT id FROM interactions
                  WHERE id IN ({placeholders})
-                   AND state IN ('expired', 'invalidated', 'answer-committed', 'resolved')"
+                   AND state IN ('expired', 'invalidated', 'answer-committed', 'resolved', 'superseded')"
             );
             let params: Vec<&dyn rusqlite::types::ToSql> = ids
                 .iter()
@@ -7954,6 +8028,7 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     crate::workers::migrate(&conn)?;
     crate::gatequeue::migrate(&conn)?;
     crate::node_ops::migrate(&conn)?;
+    crate::fence::migrate(&conn)?;
     // c-usagefu r14 item 1 (Ruling M1): a failed usage migration must never
     // brick Hub startup. The migration is one transaction and rolls back to
     // the previously-openable shape on any error; log it and open. Usage
@@ -15349,7 +15424,10 @@ pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord
     }))
 }
 
-fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, StoreError> {
+pub(crate) fn load_instance(
+    conn: &Connection,
+    id: &str,
+) -> Result<Option<InstanceRecord>, StoreError> {
     conn.query_row(
         "SELECT id, host_id, workspace_id, kind, driver, lifecycle, activity, connectivity,
                 title, journal_id, durable_seq, created_at, updated_at, spec_json, last_error,
@@ -15829,7 +15907,10 @@ pub(crate) fn test_apply_fence(conn: &Connection, instance_id: &str) -> Result<(
     Ok(())
 }
 
-fn load_command(conn: &Connection, id: &str) -> Result<Option<CommandRecord>, StoreError> {
+pub(crate) fn load_command(
+    conn: &Connection,
+    id: &str,
+) -> Result<Option<CommandRecord>, StoreError> {
     conn.query_row(
         "SELECT id, instance_id, host_id, operation, state, resolution, forwarded,
                 payload_json, idempotency_key, created_at, updated_at,
@@ -16088,12 +16169,12 @@ fn apply_interaction_event(
                  VALUES (?1, ?2, ?3, ?4, 'pending', 1, ?5, ?6, ?6)
                  ON CONFLICT(id) DO UPDATE SET
                     payload_json = CASE
-                        WHEN interactions.state IN ('invalidated', 'expired')
+                        WHEN interactions.state IN ('invalidated', 'expired', 'superseded')
                             THEN interactions.payload_json
                         ELSE excluded.payload_json
                     END,
                     updated_at = CASE
-                        WHEN interactions.state IN ('invalidated', 'expired')
+                        WHEN interactions.state IN ('invalidated', 'expired', 'superseded')
                             THEN interactions.updated_at
                         ELSE excluded.updated_at
                     END,
@@ -16103,7 +16184,7 @@ fn apply_interaction_event(
             // A terminal interaction never puts the instance back to blocked.
             let already_terminal: bool = conn
                 .query_row(
-                    "SELECT state IN ('invalidated', 'expired') FROM interactions WHERE id = ?1",
+                    "SELECT state IN ('invalidated', 'expired', 'superseded') FROM interactions WHERE id = ?1",
                     params![id],
                     |row| row.get::<_, bool>(0),
                 )

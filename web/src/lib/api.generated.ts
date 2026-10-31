@@ -2142,7 +2142,7 @@ export interface components {
             resolution: "clear" | "reconciling" | "unknown";
             settlement?: {
                 /** @enum {string} */
-                outcome: "cancelled" | "completed" | "expired" | "rejected";
+                outcome: "cancelled" | "completed" | "expired" | "rejected" | "withheld";
                 reason?: string;
             } & {
                 [key: string]: unknown;
@@ -2710,6 +2710,37 @@ export interface components {
             generation: number;
             instanceId: string;
         };
+        /** @description One fence transaction F (D-057 §7.2). */
+        LineageFence: {
+            /** @description Actor chain: `{deviceId?, instanceId?, by}`. */
+            actor: Record<string, never> | null;
+            createdAt: string;
+            fenceId: string;
+            /** @description The generation F fenced (G). */
+            fencedGeneration: number;
+            /** @description The lineage's live generation after F (G+1). */
+            liveGeneration: number;
+            operations: components["schemas"]["LineageFenceOperation"][];
+            /** @description Hosts that have not acknowledged the fence yet. */
+            pendingHosts: string[];
+            predecessorInstanceId: string;
+            /** @enum {string} */
+            reason: "paused" | "superseded";
+            successorInstanceId?: string;
+        };
+        /** @description One operation of a fenced generation and its outcome (main-agent.md §7.4). `unknown` is never turned into "not executed" by inference. */
+        LineageFenceOperation: {
+            fenceId: string;
+            /** @description The op's own initiator generation. */
+            generation: number;
+            hostId?: string;
+            opId: string;
+            /** @enum {string} */
+            opKind: "command" | "node-op" | "gate-job";
+            operation?: string;
+            /** @enum {string} */
+            outcome: "cancelled-at-hub" | "withheld" | "unknown" | "running" | "ran" | "cancelled-by-node" | "refused-by-node";
+        };
         /** @description Generated shape: LineageGlance in crates/remuda-protocol/schema/protocol.schema.json. */
         LineageGlance: {
             [key: string]: unknown;
@@ -2718,11 +2749,15 @@ export interface components {
         LineageRecord: {
             /** @description Every chapter, oldest generation first. */
             chapters: components["schemas"]["LineageChapter"][];
+            /** @description D-057 §7.4: every fence of the lineage, oldest first, with the truthful outcome of each operation of the fenced generation that was unfinished at the fence. */
+            fences: components["schemas"]["LineageFence"][];
             /** @description The current chapter's generation. */
             generation: number;
             /** @description The first chapter's instance id. */
             lineageId: string;
-            /** @description Who paused the lineage (`device`/`self`/`ancestor`/`restart-cap`/`process-exit`); null while unpaused. */
+            /** @description When the lineage was paused (RFC3339); null while unpaused. */
+            pausedAt?: string | null;
+            /** @description Who paused the lineage: `{kind: device|self|ancestor|restart-cap|process-exit, deviceId?, instanceId?}`; null while unpaused. */
             pausedBy?: Record<string, never> | null;
             restart?: components["schemas"]["RestartPolicy"] | null;
             /**
@@ -4465,6 +4500,8 @@ export interface operations {
                             mergeSha?: string | null;
                             /** @enum {string} */
                             mode?: "verify" | "land";
+                            /** @description D-057 §7.5: when the lane Node admitted the run after its own fence check (first phase event of the current attempt). */
+                            nodeStartedAt?: string | null;
                             projectId?: string;
                             queuedAt?: string;
                             reason?: string | null;
@@ -6353,6 +6390,8 @@ export interface operations {
                             mergeSha?: string | null;
                             /** @enum {string} */
                             mode?: "verify" | "land";
+                            /** @description D-057 §7.5: when the lane Node admitted the run after its own fence check (first phase event of the current attempt). */
+                            nodeStartedAt?: string | null;
                             projectId?: string;
                             queuedAt?: string;
                             reason?: string | null;
@@ -6424,6 +6463,8 @@ export interface operations {
                         mergeSha?: string | null;
                         /** @enum {string} */
                         mode?: "verify" | "land";
+                        /** @description D-057 §7.5: when the lane Node admitted the run after its own fence check (first phase event of the current attempt). */
+                        nodeStartedAt?: string | null;
                         projectId?: string;
                         queuedAt?: string;
                         reason?: string | null;
@@ -6483,6 +6524,8 @@ export interface operations {
                         mergeSha?: string | null;
                         /** @enum {string} */
                         mode?: "verify" | "land";
+                        /** @description D-057 §7.5: when the lane Node admitted the run after its own fence check (first phase event of the current attempt). */
+                        nodeStartedAt?: string | null;
                         projectId?: string;
                         queuedAt?: string;
                         reason?: string | null;
@@ -6547,6 +6590,8 @@ export interface operations {
                         mergeSha?: string | null;
                         /** @enum {string} */
                         mode?: "verify" | "land";
+                        /** @description D-057 §7.5: when the lane Node admitted the run after its own fence check (first phase event of the current attempt). */
+                        nodeStartedAt?: string | null;
                         projectId?: string;
                         queuedAt?: string;
                         reason?: string | null;

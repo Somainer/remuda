@@ -680,6 +680,24 @@ pub(crate) fn spawn_post_hello_tasks(
     generation: u64,
     displaced_live: bool,
 ) {
+    // D-057 §7.6: the host's unacknowledged fences are the first frames
+    // after a hello, in creation order. Until they are acknowledged nothing
+    // else initiator-carrying is forwarded to it (the gated forward intent,
+    // host-offline for direct operations, no lane claims); the rest of the
+    // post-hello work follows the delivery.
+    let state = state.clone();
+    tokio::spawn(async move {
+        crate::fence::deliver_host(&state, &host_id).await;
+        spawn_post_hello_followups(&state, host_id, generation, displaced_live);
+    });
+}
+
+fn spawn_post_hello_followups(
+    state: &AppState,
+    host_id: String,
+    generation: u64,
+    displaced_live: bool,
+) {
     spawn_egress_reinstall(state, host_id.clone());
     crate::workspaces::spawn_unregister_abort_sweep(state, host_id.clone());
     // r13 item 1: now that this carrier is registered, immediately reconcile

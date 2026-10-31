@@ -217,6 +217,16 @@ impl AgentApprovals {
         })
     }
 
+    /// D-060 decision 10 (self-close guard): whether `instance_id` has a D-017
+    /// approval in flight — requested and not yet consumed by its retry,
+    /// whether still pending or already allowed.
+    pub async fn in_flight_for(&self, instance_id: &str) -> bool {
+        self.grants.lock().await.values().any(|grant| {
+            grant.expires > Instant::now()
+                && grant.caller.instance_id.as_id().as_str() == instance_id
+        })
+    }
+
     pub async fn list(&self, device: &crate::store::Device) -> Vec<Value> {
         self.broker.sweep_expired().await;
         self.grants

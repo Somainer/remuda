@@ -114,6 +114,14 @@ pub(crate) struct RaceBarriers {
     forward_queued: Arc<std::sync::Mutex<std::collections::HashMap<(String, String), BarrierSlot>>>,
     /// Parks forward_if_online right before the send lookup (r12 item 2).
     forward_send: Arc<std::sync::Mutex<std::collections::HashMap<(String, String), BarrierSlot>>>,
+    /// Parks forward_if_online after the intent mark, before the send gate.
+    forward_intent_marked:
+        Arc<std::sync::Mutex<std::collections::HashMap<(String, String), BarrierSlot>>>,
+    /// Parks a direct op between admission and send intent.
+    node_op_admitted:
+        Arc<std::sync::Mutex<std::collections::HashMap<(String, String), BarrierSlot>>>,
+    /// Parks a gate dispatch between claim and send gate.
+    gate_claimed: Arc<std::sync::Mutex<std::collections::HashMap<(String, String), BarrierSlot>>>,
 }
 
 impl RaceBarriers {
@@ -126,6 +134,9 @@ impl RaceBarriers {
             RacePhase::ForwardPinned => &self.forward_pinned,
             RacePhase::ForwardQueued => &self.forward_queued,
             RacePhase::ForwardSend => &self.forward_send,
+            RacePhase::ForwardIntentMarked => &self.forward_intent_marked,
+            RacePhase::NodeOpAdmitted => &self.node_op_admitted,
+            RacePhase::GateClaimed => &self.gate_claimed,
         };
         table.lock().unwrap().insert(key, slot);
     }
@@ -141,6 +152,9 @@ impl RaceBarriers {
                 RacePhase::ForwardPinned => &self.forward_pinned,
                 RacePhase::ForwardQueued => &self.forward_queued,
                 RacePhase::ForwardSend => &self.forward_send,
+                RacePhase::ForwardIntentMarked => &self.forward_intent_marked,
+                RacePhase::NodeOpAdmitted => &self.node_op_admitted,
+                RacePhase::GateClaimed => &self.gate_claimed,
             };
             table
                 .lock()
@@ -173,6 +187,15 @@ pub(crate) enum RacePhase {
     /// Parks forward_if_online right before the send-time transport lookup
     /// (r12 item 2); key is (host_id, command_id).
     ForwardSend,
+    /// D-057 §7.10: parks forward_if_online right after the forward intent
+    /// committed, before the send gate; key is (host_id, command_id).
+    ForwardIntentMarked,
+    /// D-057 §7.10: parks a direct op between its admission and its send
+    /// intent; key is (host_id, op_id).
+    NodeOpAdmitted,
+    /// D-057 §7.10: parks a gate dispatch between the claim and the send
+    /// gate; key is (lane host_id, job_id).
+    GateClaimed,
 }
 
 /// Stable substrings the Node's unregister prepare emits for occupancy/race

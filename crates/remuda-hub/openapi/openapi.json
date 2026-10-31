@@ -336,7 +336,8 @@
                   "cancelled",
                   "completed",
                   "expired",
-                  "rejected"
+                  "rejected",
+                  "withheld"
                 ],
                 "type": "string"
               },
@@ -1854,6 +1855,121 @@
         ],
         "type": "object"
       },
+      "LineageFence": {
+        "additionalProperties": false,
+        "description": "One fence transaction F (D-057 §7.2).",
+        "properties": {
+          "actor": {
+            "description": "Actor chain: `{deviceId?, instanceId?, by}`.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "createdAt": {
+            "type": "string"
+          },
+          "fenceId": {
+            "type": "string"
+          },
+          "fencedGeneration": {
+            "description": "The generation F fenced (G).",
+            "type": "integer"
+          },
+          "liveGeneration": {
+            "description": "The lineage's live generation after F (G+1).",
+            "type": "integer"
+          },
+          "operations": {
+            "items": {
+              "$ref": "#/components/schemas/LineageFenceOperation"
+            },
+            "type": "array"
+          },
+          "pendingHosts": {
+            "description": "Hosts that have not acknowledged the fence yet.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "predecessorInstanceId": {
+            "type": "string"
+          },
+          "reason": {
+            "enum": [
+              "paused",
+              "superseded"
+            ],
+            "type": "string"
+          },
+          "successorInstanceId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "fenceId",
+          "fencedGeneration",
+          "liveGeneration",
+          "reason",
+          "actor",
+          "predecessorInstanceId",
+          "createdAt",
+          "pendingHosts",
+          "operations"
+        ],
+        "type": "object"
+      },
+      "LineageFenceOperation": {
+        "additionalProperties": false,
+        "description": "One operation of a fenced generation and its outcome (main-agent.md §7.4). `unknown` is never turned into \"not executed\" by inference.",
+        "properties": {
+          "fenceId": {
+            "type": "string"
+          },
+          "generation": {
+            "description": "The op's own initiator generation.",
+            "type": "integer"
+          },
+          "hostId": {
+            "type": "string"
+          },
+          "opId": {
+            "type": "string"
+          },
+          "opKind": {
+            "enum": [
+              "command",
+              "node-op",
+              "gate-job"
+            ],
+            "type": "string"
+          },
+          "operation": {
+            "type": "string"
+          },
+          "outcome": {
+            "enum": [
+              "cancelled-at-hub",
+              "withheld",
+              "unknown",
+              "running",
+              "ran",
+              "cancelled-by-node",
+              "refused-by-node"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "fenceId",
+          "opKind",
+          "opId",
+          "generation",
+          "outcome"
+        ],
+        "type": "object"
+      },
       "LineageRecord": {
         "additionalProperties": false,
         "description": "One agent across process lifetimes (D-057 §5). A row exists only for continuity instances: one that holds a grant or carries a restart policy.",
@@ -1862,6 +1978,13 @@
             "description": "Every chapter, oldest generation first.",
             "items": {
               "$ref": "#/components/schemas/LineageChapter"
+            },
+            "type": "array"
+          },
+          "fences": {
+            "description": "D-057 §7.4: every fence of the lineage, oldest first, with the truthful outcome of each operation of the fenced generation that was unfinished at the fence.",
+            "items": {
+              "$ref": "#/components/schemas/LineageFence"
             },
             "type": "array"
           },
@@ -1874,9 +1997,16 @@
             "type": "string"
           },
           "pausedBy": {
-            "description": "Who paused the lineage (`device`/`self`/`ancestor`/`restart-cap`/`process-exit`); null while unpaused.",
+            "description": "Who paused the lineage: `{kind: device|self|ancestor|restart-cap|process-exit, deviceId?, instanceId?}`; null while unpaused.",
             "type": [
               "object",
+              "null"
+            ]
+          },
+          "pausedAt": {
+            "description": "When the lineage was paused (RFC3339); null while unpaused.",
+            "type": [
+              "string",
               "null"
             ]
           },
@@ -1905,7 +2035,8 @@
           "lineageId",
           "state",
           "generation",
-          "chapters"
+          "chapters",
+          "fences"
         ],
         "type": "object"
       },
@@ -11063,6 +11194,13 @@
                           "id": {
                             "type": "string"
                           },
+                          "nodeStartedAt": {
+                            "description": "D-057 §7.5: when the lane Node admitted the run after its own fence check (first phase event of the current attempt).",
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
                           "projectId": {
                             "type": "string"
                           },
@@ -11365,6 +11503,13 @@
                           "id": {
                             "type": "string"
                           },
+                          "nodeStartedAt": {
+                            "description": "D-057 §7.5: when the lane Node admitted the run after its own fence check (first phase event of the current attempt).",
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
                           "projectId": {
                             "type": "string"
                           },
@@ -11566,6 +11711,13 @@
                     "id": {
                       "type": "string"
                     },
+                    "nodeStartedAt": {
+                      "description": "D-057 §7.5: when the lane Node admitted the run after its own fence check (first phase event of the current attempt).",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
                     "projectId": {
                       "type": "string"
                     },
@@ -11740,6 +11892,13 @@
                   "properties": {
                     "id": {
                       "type": "string"
+                    },
+                    "nodeStartedAt": {
+                      "description": "D-057 §7.5: when the lane Node admitted the run after its own fence check (first phase event of the current attempt).",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     },
                     "projectId": {
                       "type": "string"
@@ -11923,6 +12082,13 @@
                   "properties": {
                     "id": {
                       "type": "string"
+                    },
+                    "nodeStartedAt": {
+                      "description": "D-057 §7.5: when the lane Node admitted the run after its own fence check (first phase event of the current attempt).",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     },
                     "projectId": {
                       "type": "string"

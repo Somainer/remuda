@@ -653,6 +653,14 @@ pub async fn answer_interaction(
         match stored.state.as_str() {
             "expired" => return Err(HubError::Expired),
             "invalidated" => return Err(HubError::NotFound),
+            // D-057 §7.2 step 8: a fence superseded it (the chapter that asked
+            // was paused or succeeded); answering it is refused.
+            "superseded" => {
+                return Err(HubError::lineage_conflict(
+                    "superseded",
+                    "the chapter that asked this was fenced; the interaction is superseded                      (ask again in the live chapter if it still matters)",
+                ));
+            }
             _ => {}
         }
     }

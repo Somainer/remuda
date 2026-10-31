@@ -8,11 +8,14 @@ import { expect, type Page } from "@playwright/test";
  */
 export async function openSpacesIndex(page: Page): Promise<void> {
   const panel = page.getByTestId("spaces-panel");
-  // The panel stays mounted (its QuickFind hotkey is page-wide); collapsed
-  // means hidden, not absent.
-  if (await panel.isVisible().catch(() => false)) return;
   const toggle = page.getByTestId("spaces-index-open");
+  // The panel stays mounted (its QuickFind hotkey is page-wide), so "in the
+  // DOM" is not "open". Wait for the desktop header to render, then let the
+  // toggle's aria-expanded decide — a visibility probe can race the mount and
+  // read a hidden-but-open panel as closed, which would CLOSE it here.
   await expect(toggle).toBeVisible();
-  await toggle.click();
+  if ((await toggle.getAttribute("aria-expanded")) !== "true") {
+    await toggle.click();
+  }
   await expect(panel).toBeVisible();
 }

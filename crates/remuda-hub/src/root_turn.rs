@@ -32,9 +32,20 @@
 //!   `origin: agent`, `continuation: hub`, until ma-restart adds a `hub`
 //!   origin.
 //!
+//! * after the process that ran the turn ended — terminal native session
+//!   evidence (`exited`, `failed`, `carrier_closed`), an instance lifecycle
+//!   into `starting`, `closing`, `exited` or `failed`, a native session id
+//!   other than the one the open turns ran on, or an instance row that is no
+//!   longer running — open turns are dropped and the latest input reads as
+//!   `origin: agent`, `continuation: unknown` until a new input arrives. A
+//!   relaunched process never inherits the owner's turn.
+//!
 //! Known limit: the ledger is as current as the journal the Hub has ingested.
 //! A call that races ahead of its own turn's `turn_started` is attributed from
-//! the previous state, which can only read as less human, never more.
+//! the previous state, and that state can only read as more human than the
+//! truth while the process that ran the owner's turn is still alive and its
+//! `result` has not been ingested yet: the call then belongs to the owner's
+//! turn, which has not ended.
 
 use remuda_protocol::{InputOrigin, RootTurn, RootTurnContinuation};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -99,10 +110,27 @@ struct Ledger {
     /// are exact.
     #[serde(default)]
     exact: bool,
+    /// Native session id the open turns run on (the structured carrier's
+    /// `nativeId`). A turn or session record naming another one is a new
+    /// process: the open turns cannot still be running.
+    #[serde(default)]
+    session: Option<String>,
+    /// The process that received `last` has ended and no input has arrived
+    /// since: whatever runs now was not started by that input.
+    #[serde(default)]
+    ended: bool,
 }
 
 impl Ledger {
     fn root_turn(&self) -> Option<RootTurn> {
+        if self.ended {
+            let last = self.last.as_ref()?;
+            return Some(RootTurn {
+                command_id: last.command_id.clone(),
+                origin: InputOrigin::Agent,
+                continuation: RootTurnContinuation::Unknown,
+            });
+        }
         if let Some(front) = self.open.first() {
             return Some(front.root_turn(RootTurnContinuation::Fresh));
         }
@@ -119,20 +147,71 @@ impl Ledger {
         }
         Some(last.root_turn(RootTurnContinuation::Unknown))
     }
+
+    /// The process the ledger's turns ran on is gone: nothing open survives
+    /// it, and its boundaries say nothing about the next process.
+    fn end_process(&mut self) {
+        self.open.clear();
+        self.exact = false;
+        self.ended = true;
+    }
+
+    /// Note the native session a turn or session record names. A different
+    /// session than the open turns ran on ends them. Returns whether the
+    /// ledger changed.
+    fn observe_session(&mut self, session: Option<&str>) -> bool {
+        let Some(session) = session.filter(|id| !id.is_empty()) else {
+            return false;
+        };
+        match self.session.as_deref() {
+            Some(known) if known == session => false,
+            Some(_) => {
+                self.end_process();
+                self.session = Some(session.to_owned());
+                true
+            }
+            None => {
+                self.session = Some(session.to_owned());
+                true
+            }
+        }
+    }
+}
+
+/// Native session statuses that say the process is gone.
+fn session_ended(status: Option<&str>) -> bool {
+    matches!(status, Some("exited" | "failed" | "carrier_closed"))
+}
+
+/// Instance lifecycle states that say the process running the turns is gone
+/// or being replaced.
+fn instance_ended(state: Option<&str>) -> bool {
+    matches!(state, Some("starting" | "closing" | "exited" | "failed"))
 }
 
 fn load(conn: &Connection, instance_id: &str) -> Result<Ledger, StoreError> {
-    let raw: Option<Option<String>> = conn
+    Ok(load_with_lifecycle(conn, instance_id)?.0)
+}
+
+/// The ledger and the instance row's lifecycle.
+fn load_with_lifecycle(
+    conn: &Connection,
+    instance_id: &str,
+) -> Result<(Ledger, Option<String>), StoreError> {
+    let raw: Option<(Option<String>, Option<String>)> = conn
         .query_row(
-            "SELECT root_turn_json FROM instances WHERE id = ?1",
+            "SELECT root_turn_json, lifecycle FROM instances WHERE id = ?1",
             params![instance_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    Ok(raw
-        .flatten()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default())
+    let (ledger, lifecycle) = raw.unwrap_or_default();
+    Ok((
+        ledger
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default(),
+        lifecycle,
+    ))
 }
 
 fn save(conn: &Connection, instance_id: &str, ledger: &Ledger) -> Result<(), StoreError> {
@@ -213,17 +292,41 @@ pub(crate) fn fold(conn: &Connection, instance_id: &str, event: &Value) -> Resul
                 return Ok(());
             };
             let mut ledger = load(conn, instance_id)?;
-            if ledger.last.as_ref() != Some(&input) {
+            if ledger.last.as_ref() != Some(&input) || ledger.ended {
                 ledger.last = Some(input);
+                ledger.ended = false;
                 save(conn, instance_id, &ledger)?;
             }
         }
         Some("lifecycle") => {
-            if payload.get("type").and_then(Value::as_str) != Some("native")
-                || payload.get("topic").and_then(Value::as_str) != Some("turn")
-            {
-                return Ok(());
+            let text = |pointer: &str| payload.pointer(pointer).and_then(Value::as_str);
+            match (text("/type"), text("/topic")) {
+                (Some("entity"), _) => {
+                    if text("/entityType") == Some("instance") && instance_ended(text("/state")) {
+                        let mut ledger = load(conn, instance_id)?;
+                        if !ledger.ended {
+                            ledger.end_process();
+                            save(conn, instance_id, &ledger)?;
+                        }
+                    }
+                    return Ok(());
+                }
+                (Some("native"), Some("session")) => {
+                    let mut ledger = load(conn, instance_id)?;
+                    let mut changed = ledger.observe_session(text("/nativeId/value"));
+                    if session_ended(text("/status/value")) && !ledger.ended {
+                        ledger.end_process();
+                        changed = true;
+                    }
+                    if changed {
+                        save(conn, instance_id, &ledger)?;
+                    }
+                    return Ok(());
+                }
+                (Some("native"), Some("turn")) => {}
+                _ => return Ok(()),
             }
+            let session = text("/nativeId/value");
             let related = |key: &str| {
                 payload
                     .pointer(&format!("/relatedIds/{key}"))
@@ -231,13 +334,19 @@ pub(crate) fn fold(conn: &Connection, instance_id: &str, event: &Value) -> Resul
             };
             match payload.get("nativeName").and_then(Value::as_str) {
                 Some("turn_started") => {
-                    let Some(command_id) = related("nativeClientMessageId") else {
-                        return Ok(());
-                    };
-                    let Some(input) = input_for(conn, instance_id, command_id)? else {
-                        return Ok(());
+                    let input = match related("nativeClientMessageId") {
+                        Some(command_id) => input_for(conn, instance_id, command_id)?,
+                        None => None,
                     };
                     let mut ledger = load(conn, instance_id)?;
+                    let changed = ledger.observe_session(session);
+                    let Some(input) = input else {
+                        if changed {
+                            save(conn, instance_id, &ledger)?;
+                        }
+                        return Ok(());
+                    };
+                    let command_id = input.command_id.clone();
                     if !ledger.open.iter().any(|open| open.command_id == command_id) {
                         if ledger.open.len() >= MAX_OPEN_TURNS {
                             ledger.open.remove(0);
@@ -246,15 +355,20 @@ pub(crate) fn fold(conn: &Connection, instance_id: &str, event: &Value) -> Resul
                     }
                     ledger.last = Some(input);
                     ledger.exact = true;
+                    ledger.ended = false;
                     save(conn, instance_id, &ledger)?;
                 }
                 Some("result") => {
                     let completed = related("completedTurn");
                     let settled = related("settledRootTurn") == Some("true");
+                    let mut ledger = load(conn, instance_id)?;
+                    let session_changed = ledger.observe_session(session);
                     if completed.is_none() && !settled {
+                        if session_changed {
+                            save(conn, instance_id, &ledger)?;
+                        }
                         return Ok(());
                     }
-                    let mut ledger = load(conn, instance_id)?;
                     let before = ledger.open.len();
                     if let Some(completed) = completed
                         && let Some(at) = ledger
@@ -267,7 +381,7 @@ pub(crate) fn fold(conn: &Connection, instance_id: &str, event: &Value) -> Resul
                     if settled {
                         ledger.open.clear();
                     }
-                    if ledger.open.len() != before {
+                    if ledger.open.len() != before || session_changed {
                         save(conn, instance_id, &ledger)?;
                     }
                 }
@@ -280,8 +394,15 @@ pub(crate) fn fold(conn: &Connection, instance_id: &str, event: &Value) -> Resul
 }
 
 /// The root turn `instance_id` is in now, as far as the Hub's records say.
+///
+/// An instance row that is no longer running (a Hub-side reconcile can move
+/// it without a journal row) reads as ended, like the journal evidence does.
 pub(crate) fn derive(conn: &Connection, instance_id: &str) -> Result<Option<RootTurn>, StoreError> {
-    Ok(load(conn, instance_id)?.root_turn())
+    let (mut ledger, lifecycle) = load_with_lifecycle(conn, instance_id)?;
+    if matches!(lifecycle.as_deref(), Some("closing" | "exited" | "failed")) {
+        ledger.end_process();
+    }
+    Ok(ledger.root_turn())
 }
 
 /// Serialize a root turn for a `*_json` column.
@@ -302,7 +423,7 @@ mod tests {
     fn db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "CREATE TABLE instances (id TEXT PRIMARY KEY);
+            "CREATE TABLE instances (id TEXT PRIMARY KEY, lifecycle TEXT);
              CREATE TABLE commands (id TEXT PRIMARY KEY, instance_id TEXT,
                  payload_json TEXT NOT NULL, initiator_instance_id TEXT);
              CREATE TABLE audit_log (id INTEGER PRIMARY KEY);
@@ -532,5 +653,129 @@ mod tests {
         replace["payload"]["operation"] = json!("replace");
         fold_all(&conn, &[subagent, replace]);
         assert_eq!(now(&conn), None);
+    }
+
+    /// A turn lifecycle on native session `session`, as the claude-sdk
+    /// mapper journals it (`nativeId` is the session id).
+    fn in_session(mut event: Value, session: &str) -> Value {
+        event["payload"]["nativeId"] = json!({"state": "known", "value": session});
+        event
+    }
+
+    fn session(status: &str, session: &str) -> Value {
+        json!({"kind": "lifecycle", "payload": {
+            "type": "native", "topic": "session", "nativeName": "session",
+            "nativeId": {"state": "known", "value": session},
+            "status": {"state": "known", "value": status}, "relatedIds": {}
+        }})
+    }
+
+    fn instance_state(state: &str) -> Value {
+        json!({"kind": "lifecycle", "payload": {
+            "type": "entity", "entityType": "instance", "state": state,
+            "reasonCode": "test"
+        }})
+    }
+
+    /// The owner's turn is open on session `s1`, exactly as the RC journal
+    /// orders it (the turn start lands before the session start).
+    fn owner_turn_open(conn: &Connection) {
+        command(conn, "cmd_owner", json!({"origin": "human"}), None);
+        fold_all(
+            conn,
+            &[
+                user_message("cmd_owner"),
+                in_session(started("cmd_owner"), "s1"),
+                session("started", "s1"),
+            ],
+        );
+        assert_eq!(
+            now(conn),
+            Some(rt(
+                "cmd_owner",
+                InputOrigin::Human,
+                RootTurnContinuation::Fresh
+            )),
+            "the session start of the same process keeps the owner's turn"
+        );
+    }
+
+    fn agent_unknown() -> Option<RootTurn> {
+        Some(rt(
+            "cmd_owner",
+            InputOrigin::Agent,
+            RootTurnContinuation::Unknown,
+        ))
+    }
+
+    /// r2 item 1: the process dies mid-turn (no result is journaled) and the
+    /// carrier relaunches it on the same instance. Whatever the relaunched
+    /// agent does next was not started by the owner.
+    #[test]
+    fn a_process_end_mid_turn_never_leaves_the_owner_turn_open() {
+        for death in [
+            session("exited", "s1"),
+            session("failed", "s1"),
+            session("carrier_closed", "s1"),
+            instance_state("exited"),
+            instance_state("failed"),
+            instance_state("starting"),
+        ] {
+            let conn = db();
+            owner_turn_open(&conn);
+            fold_all(&conn, &[death.clone()]);
+            assert_eq!(now(&conn), agent_unknown(), "after {death}");
+            // The relaunch (resuming the same native session) starts no
+            // input-bound turn: it is still not the owner's.
+            fold_all(&conn, &[instance_state("ready"), session("started", "s1")]);
+            assert_eq!(now(&conn), agent_unknown(), "relaunched after {death}");
+        }
+    }
+
+    /// r2 item 1: a native session change (a relaunch on a new session, with
+    /// no exit evidence journaled) clears the open turns.
+    #[test]
+    fn a_native_session_change_clears_the_open_turns() {
+        let conn = db();
+        owner_turn_open(&conn);
+        fold_all(&conn, &[session("started", "s2")]);
+        assert_eq!(now(&conn), agent_unknown());
+
+        // A turn the new process starts on its own, on the new session.
+        let conn = db();
+        owner_turn_open(&conn);
+        fold_all(&conn, &[in_session(turn("turn_started", json!({})), "s2")]);
+        assert_eq!(now(&conn), agent_unknown());
+
+        // A new input on the new session is attributed exactly again.
+        command(&conn, "cmd_next", json!({"origin": "human"}), None);
+        fold_all(
+            &conn,
+            &[
+                user_message("cmd_next"),
+                in_session(started("cmd_next"), "s2"),
+            ],
+        );
+        assert_eq!(
+            now(&conn),
+            Some(rt(
+                "cmd_next",
+                InputOrigin::Human,
+                RootTurnContinuation::Fresh
+            ))
+        );
+    }
+
+    /// r2 item 1: an instance row that is not running reads as ended even if
+    /// no lifecycle row reached the journal (a Hub-side reconcile).
+    #[test]
+    fn an_instance_row_that_is_not_running_reads_as_ended() {
+        let conn = db();
+        conn.execute("UPDATE instances SET lifecycle = 'ready'", [])
+            .unwrap();
+        owner_turn_open(&conn);
+        conn.execute("UPDATE instances SET lifecycle = 'exited'", [])
+            .unwrap();
+        assert_eq!(now(&conn), agent_unknown());
     }
 }

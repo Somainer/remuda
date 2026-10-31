@@ -2421,7 +2421,7 @@ export interface components {
             /** @description Absolute path on the Node, within its configured workspace roots */
             path: string;
         };
-        /** @description D-057 §7.1: the Hub-stamped initiator of an Agent-initiated mutation, derived from the authenticating device's bound instance and forwarded to Nodes. The authenticating device id stays Hub-only and is not part of this shape. Absent for Human/Bot callers. */
+        /** @description D-057 §7.1: the Hub-stamped initiator of an Agent-initiated mutation, derived from the authenticating device's bound instance and forwarded to Nodes. The authenticating device id stays Hub-only and is not part of this shape. Absent for Human/Bot callers. `rootTurn` records the turn the initiator acted in (cb-rootturn); absent when the Hub knows no turn. */
         Initiator: {
             /**
              * Format: int64
@@ -2430,6 +2430,7 @@ export interface components {
             generation: number;
             instanceId: string;
             lineageId: string;
+            rootTurn?: components["schemas"]["RootTurn"];
         };
         InstanceCommands: {
             commands: components["schemas"]["CommandRecord"][];
@@ -2846,6 +2847,7 @@ export interface components {
             origin: components["schemas"]["MemoryOrigin"];
             /** @description The slug's next revision on every write, never reused: a slug recreated after a delete continues after its last revision. 1 for a slug never used before. */
             revision: number;
+            rootTurn?: components["schemas"]["RootTurn"];
             /** @description Stable handle, unique within the lineage. */
             slug: string;
             /** @description Journal rows the entry was derived from. */
@@ -2876,7 +2878,7 @@ export interface components {
             warnings: components["schemas"]["MemorySizeWarning"][];
         };
         /**
-         * @description How the writing caller authenticated.
+         * @description Origin of the turn a write was made in: `human` for an owner write, or an Agent write in a turn an owner's input started (`rootTurn.origin`); `agent` otherwise.
          * @enum {string}
          */
         MemoryOrigin: "human" | "agent";
@@ -3452,6 +3454,21 @@ export interface components {
             replayed?: boolean;
         } & {
             [key: string]: unknown;
+        };
+        /** @description D-060 decision 1 (cb-rootturn): the root turn an Agent call was made in, derived by the Hub from its own command rows and turn records, never from a request body. A record for audit and display; no admission rule reads it. */
+        RootTurn: {
+            /** @description Hub command whose input started the turn, or whose intent a continuation continues. */
+            commandId: string;
+            /**
+             * @description `none`: the turn `commandId` started (exact carrier boundaries). `native`: the carrier started a turn with no new input. `hub`: the Hub authored the input. `unknown`: the carrier reports no turn boundaries; `commandId` is the latest input delivered.
+             * @enum {string}
+             */
+            continuation: "none" | "native" | "hub" | "unknown";
+            /**
+             * @description Who authored that input; `agent` for a continuation or a Hub-authored input.
+             * @enum {string}
+             */
+            origin: "human" | "bot" | "agent";
         };
         SeenRequest: {
             /** @description Highest journal seq the client has shown for this instance, as the decimal string the Hub serializes (a JSON integer is also accepted). Clamped to the instance's durable seq; a value at or below the current seen seq changes nothing. */

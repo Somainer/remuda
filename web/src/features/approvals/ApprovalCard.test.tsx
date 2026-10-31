@@ -345,3 +345,35 @@ describe("DecisionCard unified across desktop and compact", () => {
     expect(compact.getAllByTestId("interaction-deadline")).toHaveLength(1);
   });
 });
+
+/* cb-rootturn: the Hub records the root turn an agent asked in on its own
+   one-shot approval card; the card marks a request the owner did not start. */
+describe("DecisionCard root-turn tag", () => {
+  it("marks an approval asked in a turn the owner did not start as agent 自发", () => {
+    for (const mode of ["desktop", "compact"] as const) {
+      const item = cnItem({
+        rootTurn: { commandId: "cmd_fact", origin: "agent", continuation: "hub" },
+      });
+      const { unmount } = renderCard(viewFor(item), mode);
+      const tag = screen.getByTestId("root-turn-tag");
+      expect(tag).toHaveTextContent("agent 自发");
+      expect(tag).toHaveAttribute("data-continuation", "hub");
+      expect(tag.getAttribute("title")).toContain("仅作记录");
+      unmount();
+    }
+  });
+
+  it("shows no tag for an owner-started turn or an unknown turn", () => {
+    for (const rootTurn of [
+      { commandId: "cmd_owner", origin: "human", continuation: "none" } as const,
+      null,
+      undefined,
+    ]) {
+      const { unmount } = renderCard(viewFor(cnItem({ rootTurn })));
+      expect(screen.queryByTestId("root-turn-tag")).toBeNull();
+      // The decision itself is the same card either way.
+      expect(screen.getByRole("button", { name: "允许一次" })).toBeEnabled();
+      unmount();
+    }
+  });
+});

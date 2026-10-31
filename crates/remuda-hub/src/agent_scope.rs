@@ -78,6 +78,10 @@ async fn narrow(
 /// agent credential, or a Human token narrowed with `x-remuda-instance-id` —
 /// returns the bound chapter's `{instanceId, lineageId, generation}`. The
 /// authenticating device id is carried alongside by the caller (Hub-only).
+///
+/// D-060 decision 1 (cb-rootturn): the initiator also records the root turn
+/// the chapter is in, derived from the Hub's own turn records. It is a record
+/// for audit and display, never a gate: no check compares or reads it.
 pub async fn initiator_for(
     state: &AppState,
     device: &Device,
@@ -90,10 +94,12 @@ pub async fn initiator_for(
         .get_instance(instance_id.to_string())
         .await?
         .ok_or(HubError::Forbidden)?;
+    let root_turn = state.store.root_turn(instance.instance_id.clone()).await?;
     Ok(Some(Initiator {
         instance_id: instance.instance_id,
         lineage_id: instance.lineage_id,
         generation: instance.generation,
+        root_turn,
     }))
 }
 
@@ -672,9 +678,12 @@ pub async fn require_approval(
         instance_id: id.parse().map_err(|_| HubError::Forbidden)?,
         host_id: instance.host_id.parse().map_err(|_| HubError::Forbidden)?,
     };
+    // cb-rootturn: recorded on a new card for display; never part of the
+    // grant's match (the caller and the exact request decide).
+    let root_turn = state.store.root_turn(id).await?;
     state
         .agent_approvals
-        .require(headers, &caller, request)
+        .require_recorded(headers, &caller, request, root_turn)
         .await
 }
 

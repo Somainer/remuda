@@ -147,6 +147,11 @@ enum WorkflowOwner {
 struct RootTurn {
     /// Monotonic identity.
     seq: u64,
+    /// The client message id the prompt was written with (the Node passes
+    /// the Hub command id). Echoed as `completedTurn` on the result that
+    /// completes this turn, so the Hub can bound the root turn exactly
+    /// (cb-rootturn). Empty for turns opened without one.
+    client_message_id: String,
     /// `local_workflow` task ids this turn opened whose terminal
     /// `task_notification` has not been mapped yet. The turn cannot settle
     /// while this is non-empty, no matter what `result_index` says.
@@ -192,18 +197,32 @@ struct TurnBook {
     /// instead of staying working forever.
     deferred_settle: bool,
     next_seq: u64,
+    /// Client message id of the turn the latest `result` completed (popped),
+    /// taken by the result mapping (cb-rootturn).
+    completed: Option<String>,
 }
 
 impl TurnBook {
+    #[cfg(test)]
     fn begin_turn(&mut self) -> u64 {
+        self.begin_labeled_turn(String::new())
+    }
+
+    fn begin_labeled_turn(&mut self, client_message_id: String) -> u64 {
         let seq = self.next_seq;
         self.next_seq += 1;
         self.reserved = Some(seq);
         self.outstanding.push_back(RootTurn {
             seq,
+            client_message_id,
             open_workflows: HashSet::new(),
         });
         seq
+    }
+
+    /// The client message id of the turn the latest result completed, once.
+    fn take_completed(&mut self) -> Option<String> {
+        self.completed.take().filter(|id| !id.is_empty())
     }
 
     /// The reserved turn's write committed. Clear `reserved` AT commit (the
@@ -341,10 +360,12 @@ impl TurnBook {
             .outstanding
             .front()
             .is_some_and(|front| !front.open_workflows.is_empty());
+        self.completed = None;
         if front_open {
             return RootSettle::NotSettled;
         }
-        if self.outstanding.pop_front().is_some() {
+        if let Some(turn) = self.outstanding.pop_front() {
+            self.completed = Some(turn.client_message_id);
             // Defense in depth: workflows observed before any locally-written
             // turn (pure replay/hydration) live in the implicit bucket; they
             // still gate settlement even when a synthetic turn is popped.
@@ -2031,7 +2052,7 @@ async fn prepare_prompt_write(
     // below before the gate is released).
     let reservation = {
         let mut mapper = inner.mapper.lock().await;
-        let seq = mapper.begin_turn_reservation();
+        let seq = mapper.begin_turn_reservation(client_message_id.clone());
         TurnReservation::shared(seq, client_message_id)
     };
     // Armed for the whole pre-accept phase; take() at the accept boundary and
@@ -5710,6 +5731,12 @@ fn map_result(mapper: &mut Mapper, result: &ResultMessage) -> DriverResult<Vec<O
         }
         RootSettle::NotSettled => {}
     }
+    // cb-rootturn: name the locally-written turn this result completed, so
+    // the Hub can move its root-turn record off it even while a newer turn
+    // keeps the root working (Deferred) or a native follow-up is queued.
+    if let Some(client_message_id) = mapper.turns.take_completed() {
+        related.insert("completedTurn".into(), client_message_id);
+    }
     let session_id = mapper.session_id.clone();
     let mut out = vec![mapper.lifecycle_related(
         LifecycleTopic::Turn,
@@ -6364,8 +6391,8 @@ impl Mapper {
     /// Open the settlement book for a new root turn BEFORE its prompt write
     /// blocks (ma-sdk-state r5 item 1), emitting nothing. Returns the turn's
     /// seq so the publication ticket can clear the right reservation at commit.
-    fn begin_turn_reservation(&mut self) -> u64 {
-        self.turns.begin_turn()
+    fn begin_turn_reservation(&mut self, client_message_id: String) -> u64 {
+        self.turns.begin_labeled_turn(client_message_id)
     }
 
     /// The reserved turn's write committed; clear the in-flight reservation so
@@ -6430,7 +6457,7 @@ impl Mapper {
     /// begin-commit/turn_started_observation pair.
     #[cfg(any(test, feature = "test-stub"))]
     fn turn_started(&mut self, client_message_id: &str) -> DriverResult<Observation> {
-        let seq = self.turns.begin_turn();
+        let seq = self.turns.begin_labeled_turn(client_message_id.to_owned());
         // A start derived directly from the stream (replay/hydration) has no
         // in-flight write, so it holds no reservation.
         self.turns.turn_committed(seq);
@@ -7217,7 +7244,7 @@ impl StdoutMapper {
     /// Open the settlement book for a new root turn BEFORE its prompt write
     /// blocks (ma-sdk-state r4 item 1), without emitting anything.
     pub fn begin_turn(&mut self) {
-        self.mapper.begin_turn_reservation();
+        self.mapper.begin_turn_reservation(String::new());
     }
 
     /// Roll back the most recently opened turn when its prompt write fails
@@ -7248,6 +7275,13 @@ impl StdoutMapper {
     /// spawning a process (r3 item 4).
     pub fn turn_started(&mut self) -> DriverResult<Observation> {
         self.mapper.turn_started("")
+    }
+
+    /// [`Self::turn_started`] for a prompt written with `client_message_id`
+    /// (the Node passes the Hub command id); the result that completes the
+    /// turn echoes it as `completedTurn` (cb-rootturn).
+    pub fn turn_started_with(&mut self, client_message_id: &str) -> DriverResult<Observation> {
+        self.mapper.turn_started(client_message_id)
     }
 
     /// Attach the tool-media stager so image result blocks become object

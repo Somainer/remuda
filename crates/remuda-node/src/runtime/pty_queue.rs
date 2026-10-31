@@ -74,7 +74,7 @@ pub(super) async fn run(
                     interrupt_pending(store.as_ref(), &instance_id, &mut pending, "instance worker closed", prompts.as_ref())?;
                     return Err(NodeError::DriverUnavailable);
                 };
-                if let DriverRequest::Send { prompt, attachments: _, origin, mode } = queued.request {
+                if let DriverRequest::Send { prompt, attachments: _, origin, mode, command_id: _ } = queued.request {
                     if pending.len() == capacity {
                         let command = store.get_command(&queued.command_id)?;
                         prompts.cancel(&queued.command_id);
@@ -461,6 +461,7 @@ async fn deliver(
                         attachments,
                         origin: prompt.origin,
                         mode: prompt.mode,
+                        command_id: Some(prompt.command_id.clone()),
                     })
                     .await
             }

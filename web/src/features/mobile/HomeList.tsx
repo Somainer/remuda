@@ -38,6 +38,7 @@ import { TaskGroups, useTaskLedger } from "../tasks/TaskList";
 import { SpacesDrawer } from "../spaces/SpacesMobile";
 import { ContextRing } from "./ContextRing";
 import { useHomeFreshness } from "../home/freshness";
+import { HostStrip } from "../home/HostStrip";
 import { HubBanner } from "../home/HubBanner";
 import { HomeGlance } from "../home/HomeGlance";
 import { GLANCE_TARGETS, scrollToFirst } from "../home/glanceNav";
@@ -528,6 +529,8 @@ export const HomeList = memo(function HomeList() {
           (its countdown ticks once a second while failing) and flex-ordered
           right under the sticky head, above the task layer. */}
       <HubBanner />
+      {/* ② 主机条: 28px, scrolling with the page (home.md §1 ② / §2.1). */}
+      <HostStrip placement="phone" />
       {/* D-057 Main card + 问 Main (H8a): outside the probe so its own echo
           and tail reads never report commit:HomeList; flex order 0 keeps it
           right under the sticky head, below the banner. Renders nothing

@@ -9,6 +9,7 @@ import { spaceStore, type Space } from "../features/spaces/store";
 import { useSpaceWorkbench } from "../features/spaces/useSpaceWorkbench";
 import { PageHeader } from "../components/PageHeader";
 import { HomeGlance } from "../features/home/HomeGlance";
+import { HostStrip } from "../features/home/HostStrip";
 import { GLANCE_TARGETS, scrollToFirst } from "../features/home/glanceNav";
 import { MainCard } from "../features/home/MainCard";
 import { WorkingList } from "../features/home/WorkingList";
@@ -98,6 +99,8 @@ export function SessionsPage({ dimmed = false }: { dimmed?: boolean }) {
           }
         />
       ) : null}
+      {/* ② 主机条: the 32px band under the PageHeader (home.md §2.2). */}
+      {!mobile ? <HostStrip placement="desktop" /> : null}
       <div className={css.body}>
         {!mobile ? (
           <>

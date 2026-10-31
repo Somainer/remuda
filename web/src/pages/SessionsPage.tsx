@@ -7,6 +7,9 @@ import { SpacesPanel } from "../features/spaces/SpacesPanel";
 import { spaceStore, type Space } from "../features/spaces/store";
 import { useSpaceWorkbench } from "../features/spaces/useSpaceWorkbench";
 import { PageHeader } from "../components/PageHeader";
+import { MainCard } from "../features/home/MainCard";
+import { WorkingList } from "../features/home/WorkingList";
+import { useMainAside } from "../features/home/useMain";
 import ui from "../styles/ui.module.css";
 import css from "./SessionsPage.module.css";
 
@@ -19,6 +22,12 @@ export function SessionsPage({ dimmed = false }: { dimmed?: boolean }) {
   const freshness = useHomeFreshness();
   const firstSnapshot = freshness.state === "unknown";
   const { spaces, active, prefs, instanceId, newHref } = useSpaceWorkbench();
+  // D-061 (home.md §2.2–2.4): ≥1440 adds the right column — Main card with
+  // its inline input, then 工作中; 1280–1439 puts the Main card at the top of
+  // the main column. Never behind the dimmed /sessions/new sheet (one 问 Main
+  // input at a time).
+  const mainAside = useMainAside();
+  const showMain = !mobile && !dimmed;
   // Below 1024 the index column folds into the header's 空间 button, which
   // opens the same panel as an overlay (one instance, same testids).
   const [indexOpen, setIndexOpen] = useState(false);
@@ -68,6 +77,9 @@ export function SessionsPage({ dimmed = false }: { dimmed?: boolean }) {
           </>
         ) : null}
         <div className={css.list}>
+          {/* D-061 (home.md §2.2–2.4): the Main card heads the main column
+              at 1280–1439; at ≥1440 it lives in the right column instead. */}
+          {showMain && !mainAside ? <MainCard placement="desktop" /> : null}
           {/* home.md §8: no empty state before the first Hub snapshot — the
               list below paints its skeleton until then. */}
           {!firstSnapshot && hub.ready && hub.hosts.length === 0 && hub.instances.length === 0 ? (
@@ -82,7 +94,14 @@ export function SessionsPage({ dimmed = false }: { dimmed?: boolean }) {
             space={active ? { id: active.id, name: active.name, hostId: active.hostId, workspaceId: active.workspaceId } : undefined}
           />
         </div>
+        {showMain && mainAside ? (
+          <aside className={css.aside} aria-label="Main 与工作中" data-testid="sessions-aside">
+            <MainCard placement="desktop" />
+            <WorkingList />
+          </aside>
+        ) : null}
       </div>
     </div>
   );
 }
+

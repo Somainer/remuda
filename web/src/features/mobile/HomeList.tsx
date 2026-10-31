@@ -38,6 +38,7 @@ import { SpacesDrawer } from "../spaces/SpacesMobile";
 import { ContextRing } from "./ContextRing";
 import { useHomeFreshness } from "../home/freshness";
 import { HubBanner } from "../home/HubBanner";
+import { MainAskDock, MainCard } from "../home/MainCard";
 import { NoMatches, NoSessions, SkeletonRows } from "../home/HomeStates";
 import { newSessionPath } from "../spaces/store";
 import ui from "../../styles/ui.module.css";
@@ -498,6 +499,11 @@ export const HomeList = memo(function HomeList() {
           (its countdown ticks once a second while failing) and flex-ordered
           right under the sticky head, above the task layer. */}
       <HubBanner />
+      {/* D-057 Main card + 问 Main (H8a): outside the probe so its own echo
+          and tail reads never report commit:HomeList; flex order 0 keeps it
+          right under the sticky head, below the banner. Renders nothing
+          without a Main. */}
+      <MainCard placement="phone" />
       {/* Outside the probe: its 5s ledger poll never reports commit:HomeList.
           CSS order keeps it under the sticky head and above project groups. */}
       <HomeTaskLayer
@@ -512,6 +518,8 @@ export const HomeList = memo(function HomeList() {
         firstSnapshot={firstSnapshot}
         sessionEmpty={renderedGroups.length === 0}
       />
+      {/* D-061 ⑨: 问 Main docked at the bottom, above PhoneNav. */}
+      <MainAskDock />
     </div>
   );
 });

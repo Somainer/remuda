@@ -37,7 +37,7 @@ export function PhoneNav({ pending, newHref }: { pending: number; newHref: strin
 
   return (
     <>
-      <nav className={css.bar} aria-label="手机底栏">
+      <nav className={css.bar} aria-label="手机底栏" data-testid="phone-nav">
         {PHONE_NAV.map((item) => {
           const glyph = <Icon icon={GLYPHS[item.id]} size={20} />;
           if (item.id === "more") {

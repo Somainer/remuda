@@ -70,6 +70,7 @@ import {
   api,
   isScreenNodeBusy,
   type InstanceCreateSpec,
+  type LineageRecord,
   type PasskeyAttestationBody,
   type PasskeyView,
   type PtyKey,
@@ -908,6 +909,11 @@ export type HubState = {
   summaries: Record<string, string>;
   /** Number of outbox rows pending/inflight (offline banner). */
   outboxPending: number;
+  /**
+   * D-057 lineage projections (`GET /v1/lineages/{id}`) keyed by lineage id,
+   * read on demand by the Main surfaces (ma-main-ui). Absent = not read yet.
+   */
+  lineages: Record<string, LineageRecord>;
 };
 
 const initial: HubState = {
@@ -950,6 +956,7 @@ const initial: HubState = {
   /** Outbox rows still awaiting a definite Hub answer (D-055 banner count). */
   outboxPending: 0,
   summaries: {},
+  lineages: {},
 };
 
 type Listener = () => void;
@@ -8118,6 +8125,109 @@ class HubStore {
    * the returned id or the user stays on a transcript that cannot accept input
    * (D-026).
    */
+  /**
+   * D-057 §13: read one lineage projection into `lineages` (ma-main-ui). A
+   * failed read keeps the previous projection and never toasts; the Main
+   * surfaces only trust a projection that covers the chapter they resolved
+   * (features/home/mainStatus.ts), so a kept stale one falls back to what the
+   * instance rows prove.
+   *
+   * `view` names the chapter the caller resolved (its id). Reads coalesce
+   * only within one view: a refresh issued after a chapter switch never joins
+   * a GET that started before it. Answers apply in issue order per lineage,
+   * so a slow pre-switch answer can never overwrite a newer one.
+   */
+  refreshLineage(lineageId: Id, view = ""): Promise<LineageRecord | null> {
+    const key = `${lineageId} ${view}`;
+    const inFlight = this.lineageReads.get(key);
+    if (inFlight) return inFlight;
+    const read = this.readLineage(lineageId).finally(() => this.lineageReads.delete(key));
+    this.lineageReads.set(key, read);
+    return read;
+  }
+
+  private readonly lineageReads = new Map<string, Promise<LineageRecord | null>>();
+  /** Per lineage: the issue number of the last read whose answer applied. */
+  private readonly lineageApplied = new Map<Id, number>();
+  private lineageIssued = 0;
+
+  private async readLineage(lineageId: Id): Promise<LineageRecord | null> {
+    const epoch = this.bootGen;
+    const issued = ++this.lineageIssued;
+    try {
+      const record = await api.lineageGet(lineageId);
+      if (epoch !== this.bootGen) return null;
+      // A later-issued read already answered: this one is older news.
+      if ((this.lineageApplied.get(lineageId) ?? 0) > issued) return record;
+      this.lineageApplied.set(lineageId, issued);
+      const previous = this.state.lineages[lineageId];
+      if (!previous || !structuralEqual(previous, record)) {
+        this.emit({ lineages: { ...this.state.lineages, [lineageId]: record } });
+      }
+      return record;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * ma-main-ui: ONE authoritative read for a send whose outcome ended
+   * `unknown` (D-055 G2, `GET /v1/instances/{id}/commands/{commandId}`). It
+   * never re-POSTs and never mints a new id: a sent / held / rejected verdict
+   * replaces the unknown row through the same patches the bounded reconciler
+   * uses; anything else (unreadable, still reconciling) leaves it unknown.
+   */
+  async reconcileSend(commandId: Id): Promise<"sent" | "held" | "rejected" | "unknown"> {
+    const outbox = this.outbox;
+    const rec = outbox?.get(commandId) ?? null;
+    const bubble = this.state.bubbles.find((b) => b.commandId === commandId);
+    const instanceId = rec?.instanceId ?? bubble?.instanceId;
+    if (!instanceId) return "unknown";
+    let record: components["schemas"]["CommandRecord"];
+    try {
+      record = await api.instanceCommandStatus(instanceId, commandId);
+    } catch {
+      return "unknown";
+    }
+    const verdict = this.classifyCommandRecord(record);
+    if (verdict === "reconciling") return "unknown";
+    if (outbox && rec && this.outbox === outbox) {
+      if (verdict === "rejected") {
+        await this.reconcilePatch(commandId, {
+          state: "rejected",
+          serverState: record.state,
+          gotResponse: true,
+          lastError: record.settlement?.reason ?? "rejected by node",
+        });
+      } else if (verdict === "sent") {
+        await this.reconcilePatch(commandId, { state: "sent", gotResponse: true });
+        await this.recordAcceptedDelivery(instanceId, commandId, outbox);
+      } else {
+        // Held: the Hub has the row but its host is offline. Same-id delivery
+        // resumes through the existing held retry (Hub dedup keeps it once).
+        const wrote = await this.reconcilePatch(commandId, {
+          state: "held",
+          gotResponse: true,
+          attempts: rec.attempts,
+        });
+        if (wrote) this.scheduleHeldRetry(instanceId);
+      }
+      return verdict;
+    }
+    if (bubble) {
+      // No durable box (storage unavailable): project the verdict onto the
+      // bubble only; there is no row to retry.
+      this.emit({
+        bubbles: this.state.bubbles.map((b) =>
+          b.commandId === commandId
+            ? { ...b, state: verdict === "rejected" ? "unknown" : "accepted", outboxState: verdict }
+            : b,
+        ),
+      });
+    }
+    return verdict;
+  }
+
   async resume(instanceId: Id, mode: ResumeMode = "structured"): Promise<Id | null> {
     try {
       const result = await api.instanceResume(instanceId, mode);
@@ -9065,4 +9175,107 @@ export const hubStore = new HubStore();
 
 export function useHub(): HubState {
   return useSyncExternalStore(hubStore.subscribe, hubStore.getSnapshot, hubStore.getSnapshot);
+}
+
+/**
+ * D-057 §9 Main entry (ma-main-ui). ONE resolution shared by every Main
+ * surface — the desktop pinned row, the home Main card, the 问 Main input and
+ * the /s/:id status line — so they can never name different chapters.
+ *
+ * - `live`: the address-owner chapter that is still current (not fenced) and
+ *   not ended. A §5 contact-loss row (`host-contact-lost`, no end) is still
+ *   potentially running, so it stays live and the surfaces show host-offline.
+ * - otherwise the latest chapter of the most recent address-owner lineage,
+ *   which the surfaces label as paused/stopped.
+ * - `null` when no address-owner lineage exists: nothing Main renders.
+ */
+export type MainEntry = {
+  /** The chapter Main addresses (sends, Stop, Pause, Resume target it). */
+  instance: Instance;
+  lineageId: Id;
+  /** 1-based chapter number. */
+  generation: number;
+  /** True when `instance` is the live current chapter. */
+  live: boolean;
+  /** Chapter ids of the lineage the instance list holds, oldest first. */
+  chapterIds: Id[];
+};
+
+export const ADDRESS_OWNER_GRANT = "address-owner";
+
+const MAIN_TERMINAL = new Set<Instance["lifecycle"]>(["exited", "failed", "closing"]);
+
+function mainChapterLive(instance: Instance): boolean {
+  if (instance.fencedAt) return false;
+  if (!MAIN_TERMINAL.has(instance.lifecycle)) return true;
+  return instance.lastError === "host-contact-lost";
+}
+
+function chapterTime(instance: Instance): number {
+  const t = Date.parse(instance.updatedAt || instance.createdAt);
+  return Number.isFinite(t) ? t : 0;
+}
+
+export function resolveMain(instances: readonly Instance[]): MainEntry | null {
+  const seats = instances.filter((row) => row.grants?.includes(ADDRESS_OWNER_GRANT));
+  if (seats.length === 0) return null;
+  const lineageOf = (row: Instance) => (row.lineageId ?? row.id) as Id;
+  const generationOf = (row: Instance) => row.generation ?? 1;
+  // Newer generation first, then the more recently touched row.
+  const newer = (a: Instance, b: Instance) =>
+    generationOf(a) !== generationOf(b)
+      ? generationOf(a) > generationOf(b)
+        ? a
+        : b
+      : chapterTime(a) >= chapterTime(b)
+        ? a
+        : b;
+  const live = seats.filter(mainChapterLive);
+  let pick: Instance;
+  if (live.length > 0) {
+    // The Hub admits one active holder (§2.5); stay deterministic anyway.
+    pick = live.reduce(newer);
+  } else {
+    const latestByLineage = new Map<Id, Instance>();
+    for (const row of seats) {
+      const key = lineageOf(row);
+      const current = latestByLineage.get(key);
+      latestByLineage.set(key, current ? newer(current, row) : row);
+    }
+    pick = [...latestByLineage.values()].reduce((a, b) => (chapterTime(a) >= chapterTime(b) ? a : b));
+  }
+  const lineageId = lineageOf(pick);
+  const chapterIds = instances
+    .filter((row) => lineageOf(row) === lineageId)
+    .sort((a, b) => generationOf(a) - generationOf(b))
+    .map((row) => row.id);
+  return {
+    instance: pick,
+    lineageId,
+    generation: generationOf(pick),
+    live: live.includes(pick),
+    chapterIds,
+  };
+}
+
+let mainMemo: { instances: Instance[]; value: MainEntry | null } | null = null;
+
+/** {@link resolveMain} over the store snapshot, identity-stable per row set. */
+export function selectMain(state: HubState): MainEntry | null {
+  if (mainMemo && mainMemo.instances === state.instances) return mainMemo.value;
+  const next = resolveMain(state.instances);
+  const prev = mainMemo?.value ?? null;
+  const same =
+    prev !== null &&
+    next !== null &&
+    prev.instance === next.instance &&
+    prev.live === next.live &&
+    prev.chapterIds.join(",") === next.chapterIds.join(",");
+  mainMemo = { instances: state.instances, value: same ? prev : next };
+  return mainMemo.value;
+}
+
+export function useMainEntry(): MainEntry | null {
+  const read = () => selectMain(hubStore.getSnapshot());
+  return useSyncExternalStore(hubStore.subscribe, read, read);
 }

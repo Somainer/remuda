@@ -2729,6 +2729,13 @@ export interface components {
             fencedAt?: string | null;
             generation: number;
             instanceId: string;
+            /**
+             * @description D-060: how the chapter started with the lineage memory: `stamped` (its Node received memoryContext) or `withheld` (its Node does not advertise capabilities.memoryContext, so the chapter started without the index). Absent before the chapter's create is forwarded and for non-agent kinds.
+             * @enum {string}
+             */
+            memoryIndex?: "stamped" | "withheld";
+            /** @description D-060: the lineage memory revision the chapter started at. */
+            memoryStartRev?: number;
         };
         /** @description Generated shape: LineageGlance in crates/remuda-protocol/schema/protocol.schema.json. */
         LineageGlance: {

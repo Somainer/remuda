@@ -215,6 +215,10 @@ async function setupRealSession(
       emit: (patch: { ready: boolean; authed: boolean; connection: "live" }) => void;
     }
   ).emit({ ready: true, authed: true, connection: "live" });
+  // A live app also completed a list bootstrap before following; stamp its
+  // first-snapshot freshness so the list paints rows, not the pre-snapshot
+  // skeleton (home.md §8).
+  hubStore.markSnapshotForTest();
   const send = async (observation: Observation) => {
     await act(async () => {
       deliver({

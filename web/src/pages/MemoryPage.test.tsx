@@ -332,3 +332,19 @@ describe("an archived server copy leaves a dirty draft alone", () => {
     expect(restored.value).toBe("mine");
   });
 });
+
+describe("a delete target already removed elsewhere", () => {
+  it("refreshes the list and closes the editor instead of reopening it stale", async () => {
+    const row = entry({ slug: "gone", title: "Gone", revision: 1 });
+    listMemory.mockResolvedValue([row]);
+    deleteMemory.mockRejectedValue(new HubHttpError(404, "NOT_FOUND", "gone"));
+
+    renderPage("/s/ins_x/memory");
+    fireEvent.click(await screen.findByTestId("memory-row"));
+    fireEvent.click(screen.getByTestId("memory-editor-delete"));
+    fireEvent.click(screen.getByTestId("memory-delete-confirm-yes"));
+
+    await waitFor(() => expect(screen.queryByTestId("memory-editor")).toBeNull());
+    await waitFor(() => expect(listMemory.mock.calls.length).toBeGreaterThan(1));
+  });
+});

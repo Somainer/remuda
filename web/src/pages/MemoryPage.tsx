@@ -476,6 +476,13 @@ export function MemoryPage() {
       await reload(lineageId, q);
     } catch (error) {
       setConfirmDelete(null);
+      if (error instanceof HubHttpError && error.status === 404) {
+        // Already removed elsewhere: refresh the list and close the editor;
+        // never reopen it at a revision that no longer exists.
+        await reload(lineageId, q);
+        setEditor(null);
+        return;
+      }
       if (isRevisionConflict(error) && lineageId) {
         // The row moved while the confirmation was open: reload the list and
         // reopen the editor at the FRESH revision instead of repeating the

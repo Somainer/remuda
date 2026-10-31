@@ -20,6 +20,7 @@ import {
   HostDetailRoute,
   HostsRoute,
   InboxRoute,
+  MemoryRoute,
   NewSessionRoute,
   ProjectDetailRoute,
   ProjectsRoute,
@@ -79,6 +80,9 @@ export function AppRouter() {
           />
           <Route path="/s/:instanceId/files" element={<SessionRoute view="files" />} />
           <Route path="/s/:instanceId/events" element={<SessionRoute view="events" />} />
+          {/* D-060 (cb-memory-ui): the lineage's memory, under the session so
+              the Main seat gets it without new routing. */}
+          <Route path="/s/:instanceId/memory" element={<MemoryRoute />} />
           <Route path="/s/:instanceId/agents/:agentId" element={<SubagentRoute />} />
           <Route path="/hosts" element={<HostsRoute />} />
           <Route path="/hosts/:hostId" element={<HostDetailRoute />} />

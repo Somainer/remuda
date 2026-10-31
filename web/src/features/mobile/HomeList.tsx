@@ -36,7 +36,11 @@ import { HarnessGlyph } from "../spaces/SpacesPanel";
 import { TaskGroups, useTaskLedger } from "../tasks/TaskList";
 import { SpacesDrawer } from "../spaces/SpacesMobile";
 import { ContextRing } from "./ContextRing";
+import { useHomeFreshness } from "../home/freshness";
+import { HubBanner } from "../home/HubBanner";
 import { MainAskDock, MainCard } from "../home/MainCard";
+import { NoMatches, NoSessions, SkeletonRows } from "../home/HomeStates";
+import { newSessionPath } from "../spaces/store";
 import ui from "../../styles/ui.module.css";
 import css from "./home.module.css";
 
@@ -166,6 +170,11 @@ export const HomeList = memo(function HomeList() {
   const { spaces, instances, pending, rows } = selection;
   const prefs = useSpacesPrefs();
   const navigate = useNavigate();
+  // home.md §8: before the first successful Hub read the ledger is skeleton,
+  // never an empty state; while stale the cached rows are greyed. `grace` is
+  // deliberately NOT stale — a foregrounded list keeps its rows and actions.
+  const freshness = useHomeFreshness();
+  const firstSnapshot = freshness.state === "unknown";
   const [params] = useSearchParams();
   // The desktop board collapses to /m with its ?project= preserved
   // (resolveLanding keeps the query verbatim); honor it on the task layer.
@@ -450,6 +459,10 @@ export const HomeList = memo(function HomeList() {
               className={css.groups}
               ref={regionRef}
               data-order-held={held ? "1" : "0"}
+              data-freshness={freshness.state}
+              // Stale = the cached rows are grey; a foreground grace keeps
+              // them at full strength (home.md §8).
+              data-dimmed={freshness.state === "stale" ? "1" : undefined}
               // Only the rows freeze the order; the toolbar and search are
               // outside this container.
               onPointerDown={() => startHold("pointer")}
@@ -482,9 +495,14 @@ export const HomeList = memo(function HomeList() {
           ) : null}
         </>
       </CommitProbe>
+      {/* §8 横幅: after 5 s of consecutive refresh failures. Outside the probe
+          (its countdown ticks once a second while failing) and flex-ordered
+          right under the sticky head, above the task layer. */}
+      <HubBanner />
       {/* D-057 Main card + 问 Main (H8a): outside the probe so its own echo
           and tail reads never report commit:HomeList; flex order 0 keeps it
-          right under the sticky head. Renders nothing without a Main. */}
+          right under the sticky head, below the banner. Renders nothing
+          without a Main. */}
       <MainCard placement="phone" />
       {/* Outside the probe: its 5s ledger poll never reports commit:HomeList.
           CSS order keeps it under the sticky head and above project groups. */}
@@ -495,6 +513,9 @@ export const HomeList = memo(function HomeList() {
         spaces={spaces}
         branches={branches}
         query={query}
+        onClearSearch={() => setQuery("")}
+        newHref={newSessionPath(active)}
+        firstSnapshot={firstSnapshot}
         sessionEmpty={renderedGroups.length === 0}
       />
       {/* D-061 ⑨: 问 Main docked at the bottom, above PhoneNav. */}
@@ -763,6 +784,9 @@ function HomeTaskLayer({
   spaces,
   branches,
   query,
+  onClearSearch,
+  newHref,
+  firstSnapshot = false,
   sessionEmpty = false,
 }: {
   projectFilter: string | null;
@@ -771,6 +795,13 @@ function HomeTaskLayer({
   spaces: Space[];
   branches: Record<string, string>;
   query: string;
+  /** Clears the search field from the no-match empty state. */
+  onClearSearch: () => void;
+  /** Where 「新建会话」 goes from the empty state. */
+  newHref: string;
+  /** No Hub snapshot yet: the ledger already paints skeletons, never an
+      empty state (home.md §8). */
+  firstSnapshot?: boolean;
   /** True when the session group list rendered nothing: lets this layer own
       the one shared empty state without the parent subscribing to the ledger. */
   sessionEmpty?: boolean;
@@ -791,10 +822,14 @@ function HomeTaskLayer({
   );
   if (layer.length === 0) {
     if (!sessionEmpty) return null;
-    return (
-      <div className={css.empty} data-testid="home-empty">
-        {query.trim() ? "没有匹配的会话" : "暂无会话"}
-      </div>
+    // Before the first snapshot there is nothing to say and nothing to
+    // create from: paint the three skeleton rows §8 asks for, never
+    // 「还没有会话」 (a cold start must not flash an empty state).
+    if (firstSnapshot) return <SkeletonRows variant="phone" />;
+    return query.trim() ? (
+      <NoMatches onClear={onClearSearch} />
+    ) : (
+      <NoSessions newHref={newHref} />
     );
   }
   // A plain wrapper (not .groups): it keeps no bottom padding so it flows

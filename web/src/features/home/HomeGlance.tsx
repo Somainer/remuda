@@ -49,8 +49,9 @@ export function HomeGlance({
     syncInboxDeadlineClock(hub.interactions);
   }, [hub.interactions]);
 
-  // A pure helper on the badge path, so the count row and the PhoneNav badge
-  // agree by construction; a store re-notification with unchanged counts
+  // The §5.1 derivation lives in glance.ts so H2's queue header and the OS
+  // badge can read it later; the in-app badge is still A-only until
+  // home-queue adds B. A store re-notification with unchanged counts
   // re-derives the same numbers and paints identically.
   const counts = useMemo<GlanceCounts | null>(
     () =>

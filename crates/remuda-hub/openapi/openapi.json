@@ -1068,7 +1068,7 @@
         "type": "object"
       },
       "Initiator": {
-        "description": "D-057 §7.1: the Hub-stamped initiator of an Agent-initiated mutation, derived from the authenticating device's bound instance and forwarded to Nodes. The authenticating device id stays Hub-only and is not part of this shape. Absent for Human/Bot callers.",
+        "description": "D-057 §7.1: the Hub-stamped initiator of an Agent-initiated mutation, derived from the authenticating device's bound instance and forwarded to Nodes. The authenticating device id stays Hub-only and is not part of this shape. Absent for Human/Bot callers. `rootTurn` records the turn the initiator acted in (cb-rootturn); absent when the Hub knows no turn.",
         "properties": {
           "generation": {
             "description": "Chapter generation at authentication time; a fence bumps the lineage's live generation.",
@@ -1080,6 +1080,9 @@
           },
           "lineageId": {
             "type": "string"
+          },
+          "rootTurn": {
+            "$ref": "#/components/schemas/RootTurn"
           }
         },
         "required": [
@@ -5681,6 +5684,41 @@
         "required": [
           "instanceId",
           "unseen"
+        ],
+        "type": "object"
+      },
+      "RootTurn": {
+        "additionalProperties": false,
+        "description": "D-060 decision 1 (cb-rootturn): the root turn an Agent call was made in, derived by the Hub from its own command rows and turn records, never from a request body. A record for audit and display; no admission rule reads it.",
+        "properties": {
+          "commandId": {
+            "description": "Hub command whose input started the turn, or whose intent a continuation continues.",
+            "type": "string"
+          },
+          "continuation": {
+            "description": "`none`: the turn `commandId` started (exact carrier boundaries). `native`: the carrier started a turn with no new input. `hub`: the Hub authored the input. `unknown`: the carrier reports no turn boundaries; `commandId` is the latest input delivered.",
+            "enum": [
+              "none",
+              "native",
+              "hub",
+              "unknown"
+            ],
+            "type": "string"
+          },
+          "origin": {
+            "description": "Who authored that input; `agent` for a continuation or a Hub-authored input.",
+            "enum": [
+              "human",
+              "bot",
+              "agent"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "commandId",
+          "continuation",
+          "origin"
         ],
         "type": "object"
       }

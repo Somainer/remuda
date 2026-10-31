@@ -75,6 +75,7 @@ mod proxy;
 mod push_http;
 mod rate_limit;
 mod registry;
+mod root_turn;
 mod seen;
 pub mod ssh_hosts;
 mod store;
@@ -598,6 +599,11 @@ pub mod store_test_support {
                 instance_id: "ins_sample".into(),
                 lineage_id: "ins_sample".into(),
                 generation: 1,
+                root_turn: Some(remuda_protocol::RootTurn {
+                    command_id: "cmd_owner".into(),
+                    origin: remuda_protocol::InputOrigin::Human,
+                    continuation: remuda_protocol::RootTurnContinuation::Fresh,
+                }),
             }),
             initiator_device_id: None,
         };

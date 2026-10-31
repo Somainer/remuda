@@ -1667,6 +1667,7 @@ export type Initiator = ({
   "generation": (number);
   "instanceId": (string);
   "lineageId": (string);
+  "rootTurn"?: (RootTurn | (null));
   [key: string]: unknown;
 });
 
@@ -3888,6 +3889,17 @@ export type ResumeCursor = ({
 
 /** RetryAction wire values; `protocol.md` §9.1. */
 export type RetryAction = ("never" | "read-only" | "same-command-query" | "after-reconciliation" | "new-command");
+
+/** D-060 decision 1: the root turn an Agent call was made in.  `commandId` is the Hub command whose input started the turn (or, for a continuation, the input whose intent it continues). `origin` is who authored that input: an owner's send is `human`; a turn with no new input of its own, or one the Hub authored, is `agent` until ma-restart adds the `hub` origin. `continuation` says how exact the attribution is. */
+export type RootTurn = ({
+  "commandId": (string);
+  "continuation": RootTurnContinuation;
+  "origin": InputOrigin;
+  [key: string]: unknown;
+});
+
+/** RootTurnContinuation wire values; `protocol.md` §8.4. */
+export type RootTurnContinuation = ("none" | "native" | "hub" | "unknown");
 
 /** RpcError; `protocol.md` §9.1. */
 export type RpcError = ({

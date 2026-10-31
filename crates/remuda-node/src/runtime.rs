@@ -7350,10 +7350,8 @@ mod initiator_persistence_test {
         node: &DevNode,
         with: bool,
     ) -> (CreateInstanceRequest, Option<remuda_protocol::Initiator>) {
-        let initiator = with.then(|| remuda_protocol::Initiator {
-            instance_id: "ins_stamped".into(),
-            lineage_id: "ins_stamped".into(),
-            generation: 2,
+        let initiator = with.then(|| {
+            remuda_protocol::Initiator::new("ins_stamped".into(), "ins_stamped".into(), 2)
         });
         let mut value = serde_json::json!({
             "kind": "claude",

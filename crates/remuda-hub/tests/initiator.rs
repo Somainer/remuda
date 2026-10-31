@@ -894,11 +894,7 @@ impl Ctx {
             )
             .unwrap();
         (
-            remuda_protocol::Initiator {
-                instance_id: self.instance.clone(),
-                lineage_id,
-                generation,
-            },
+            remuda_protocol::Initiator::new(self.instance.clone(), lineage_id, generation),
             device_id,
         )
     }
@@ -6071,11 +6067,11 @@ async fn mark_forward_intent_rechecks_the_stamp_on_the_row() {
         )
         .await
         .unwrap();
-    let initiator = remuda_protocol::Initiator {
-        instance_id: instance.instance_id.clone(),
-        lineage_id: instance.lineage_id.clone(),
-        generation: instance.generation,
-    };
+    let initiator = remuda_protocol::Initiator::new(
+        instance.instance_id.clone(),
+        instance.lineage_id.clone(),
+        instance.generation,
+    );
     let launch_device = store
         .insert_device_as(
             "launch".into(),
@@ -6169,11 +6165,11 @@ async fn mark_forward_intent_rechecks_the_stamp_on_the_row() {
             // would write; use the current row's live generation here since
             // the test fence did not bump it — the point is the missing device
             // clause alone.
-            Some(remuda_protocol::Initiator {
-                instance_id: instance.instance_id,
-                lineage_id: instance.lineage_id,
-                generation: instance.generation,
-            }),
+            Some(remuda_protocol::Initiator::new(
+                instance.instance_id,
+                instance.lineage_id,
+                instance.generation,
+            )),
             None,
         )
         .await

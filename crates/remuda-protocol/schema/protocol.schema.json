@@ -7501,6 +7501,17 @@
         "lineageId": {
           "description": "Lineage the instance belongs to.",
           "type": "string"
+        },
+        "rootTurn": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RootTurn"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "D-060 decision 1 (cb-rootturn): the root turn the initiating instance\nwas in when the Hub admitted the call. Derived by the Hub from its own\nturn records, never read from a request body, and read by no admission\nrule: it is a record, never a gate (owner ruling R2). Absent when the\nHub knows no turn for the instance, and on initiators older Hubs sent.\n\nLenient on read: a value this build cannot parse (a newer origin or\ncontinuation) reads as absent rather than dropping the whole\ninitiator, which the Node's fence check depends on."
         }
       },
       "required": [
@@ -17231,6 +17242,54 @@
         {
           "const": "new-command",
           "description": "Wire value `new-command`.",
+          "type": "string"
+        }
+      ]
+    },
+    "RootTurn": {
+      "description": "D-060 decision 1: the root turn an Agent call was made in.\n\n`commandId` is the Hub command whose input started the turn (or, for a\ncontinuation, the input whose intent it continues). `origin` is who\nauthored that input: an owner's send is `human`; a turn with no new input\nof its own, or one the Hub authored, is `agent` until ma-restart adds the\n`hub` origin. `continuation` says how exact the attribution is.",
+      "properties": {
+        "commandId": {
+          "description": "Hub command id of the input that started (or is continued by) the turn.",
+          "type": "string"
+        },
+        "continuation": {
+          "$ref": "#/$defs/RootTurnContinuation",
+          "description": "Whether the turn is that input's own turn, or a continuation of it."
+        },
+        "origin": {
+          "$ref": "#/$defs/InputOrigin",
+          "description": "Who authored that input."
+        }
+      },
+      "required": [
+        "commandId",
+        "origin",
+        "continuation"
+      ],
+      "type": "object"
+    },
+    "RootTurnContinuation": {
+      "description": "RootTurnContinuation wire values; `protocol.md` §8.4.",
+      "oneOf": [
+        {
+          "const": "none",
+          "description": "Wire value `none`.",
+          "type": "string"
+        },
+        {
+          "const": "native",
+          "description": "Wire value `native`.",
+          "type": "string"
+        },
+        {
+          "const": "hub",
+          "description": "Wire value `hub`.",
+          "type": "string"
+        },
+        {
+          "const": "unknown",
+          "description": "Wire value `unknown`.",
           "type": "string"
         }
       ]

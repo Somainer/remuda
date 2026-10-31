@@ -3438,6 +3438,11 @@ impl Store {
     ///
     /// Deleting a session removes its journal, so the record of *who* deleted
     /// it has to live somewhere else. This table is that somewhere.
+    ///
+    /// cb-rootturn: an Agent credential's row also records its initiator,
+    /// with the root turn it acted in, beside the detail. Use
+    /// [`Store::append_audit_as`] when the caller's initiator is already
+    /// known (a Human token narrowed to an instance has no bound device).
     pub async fn append_audit(
         &self,
         device_id: String,
@@ -3445,19 +3450,53 @@ impl Store {
         subject: Option<String>,
         detail: Value,
     ) -> Result<(), StoreError> {
+        self.append_audit_as(device_id, action, subject, detail, None)
+            .await
+    }
+
+    /// [`Store::append_audit`] with the caller's stamped initiator. `None`
+    /// derives it from the device's bound instance, if it has one. The
+    /// initiator is a record only: nothing reads it back to decide anything.
+    pub async fn append_audit_as(
+        &self,
+        device_id: String,
+        action: String,
+        subject: Option<String>,
+        detail: Value,
+        initiator: Option<remuda_protocol::Initiator>,
+    ) -> Result<(), StoreError> {
         self.run_named("append_audit", move |conn| {
+            let initiator = match initiator {
+                Some(initiator) => Some(initiator),
+                None => bound_initiator(conn, &device_id)?,
+            };
             conn.execute(
-                "INSERT INTO audit_log (device_id, action, subject, detail_json, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO audit_log
+                    (device_id, action, subject, detail_json, created_at, initiator_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     device_id,
                     action,
                     subject,
                     detail.to_string(),
-                    now_rfc3339()
+                    now_rfc3339(),
+                    initiator.and_then(|initiator| serde_json::to_string(&initiator).ok()),
                 ],
             )?;
             Ok(())
+        })
+        .await
+    }
+
+    /// cb-rootturn: the root turn `instance_id` is in now, derived from the
+    /// Hub's command rows and the journal it has ingested. A record for
+    /// stamping initiators; never consulted by an admission rule.
+    pub async fn root_turn(
+        &self,
+        instance_id: String,
+    ) -> Result<Option<remuda_protocol::RootTurn>, StoreError> {
+        self.read("root_turn", move |conn| {
+            crate::root_turn::derive(conn, &instance_id)
         })
         .await
     }
@@ -3466,17 +3505,22 @@ impl Store {
     pub async fn audit_for(&self, subject: String) -> Result<Vec<Value>, StoreError> {
         self.run_named("audit_for", move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT device_id, action, subject, detail_json, created_at
+                "SELECT device_id, action, subject, detail_json, created_at, initiator_json
                  FROM audit_log WHERE subject = ?1 ORDER BY id",
             )?;
             let rows = stmt
                 .query_map(params![subject], |row| {
+                    let initiator = row
+                        .get::<_, Option<String>>(5)?
+                        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                        .unwrap_or(Value::Null);
                     Ok(json!({
                         "deviceId": row.get::<_, String>(0)?,
                         "action": row.get::<_, String>(1)?,
                         "subject": row.get::<_, Option<String>>(2)?,
                         "detail": serde_json::from_str::<Value>(&row.get::<_, String>(3)?)
                             .unwrap_or(Value::Null),
+                        "initiator": initiator,
                         "createdAt": row.get::<_, String>(4)?,
                     }))
                 })?
@@ -5525,10 +5569,10 @@ impl Store {
                     (id, instance_id, host_id, operation, state, resolution, forwarded,
                      payload_json, idempotency_key, created_at, updated_at, link_generation,
                      initiator_instance_id, initiator_lineage_id, initiator_generation,
-                     initiator_device_id)
+                     initiator_device_id, initiator_root_turn_json)
                  VALUES (?1, ?2, ?3, ?4, 'queued', 'clear', 0, ?5, ?6, ?7, ?7,
                          COALESCE(?8, (SELECT link_generation FROM hosts WHERE id = ?3)),
-                         ?9, ?10, ?11, ?12)",
+                         ?9, ?10, ?11, ?12, ?13)",
                 params![
                     command_id,
                     instance_id,
@@ -5542,6 +5586,9 @@ impl Store {
                     initiator.as_ref().map(|i| i.lineage_id.clone()),
                     initiator.as_ref().map(|i| i.generation),
                     initiator_device_id,
+                    crate::root_turn::to_column(
+                        initiator.as_ref().and_then(|i| i.root_turn.as_ref())
+                    ),
                 ],
             )?;
             let row = load_command(conn, &command_id)?
@@ -5957,7 +6004,7 @@ impl Store {
                         settlement_outcome, settlement_reason,
                         settlement_http_status, settlement_http_body,
                         initiator_instance_id, initiator_lineage_id, initiator_generation,
-                        initiator_device_id
+                        initiator_device_id, initiator_root_turn_json
                  FROM commands
                  WHERE host_id = ?1
                    AND operation = 'workspace.unregister'
@@ -5991,7 +6038,7 @@ impl Store {
                         settlement_outcome, settlement_reason,
                         settlement_http_status, settlement_http_body,
                         initiator_instance_id, initiator_lineage_id, initiator_generation,
-                        initiator_device_id
+                        initiator_device_id, initiator_root_turn_json
                  FROM commands
                  WHERE instance_id = ?1
                  ORDER BY created_at DESC, id DESC
@@ -7741,6 +7788,9 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     ensure_column(&conn, "commands", "initiator_lineage_id", "TEXT")?;
     ensure_column(&conn, "commands", "initiator_generation", "INTEGER")?;
     ensure_column(&conn, "commands", "initiator_device_id", "TEXT")?;
+    // D-060 decision 1 (cb-rootturn): the per-instance root-turn ledger and
+    // the root turn stamped beside the initiator on command and audit rows.
+    crate::root_turn::migrate(&conn)?;
     // ma-lineage round 2: an immutable timestamp for the chapter's real end
     // event (a transition into exited/failed/closed), kept separate from the
     // mutable `updated_at`. Written once by [`stamp_ended_at`].
@@ -15681,6 +15731,9 @@ fn append_loaded_event(
     apply_instance_projection(conn, instance_id, &event, seq, &now, &mut settlement)?;
     apply_native_session_projection(conn, instance_id, &event, &now)?;
     apply_command_projection(conn, host_id, instance_id, &event, &now)?;
+    // cb-rootturn: inputs and structured turn boundaries feed the instance's
+    // root-turn ledger in the same transaction as the row.
+    crate::root_turn::fold(conn, instance_id, &event)?;
     // r7 item 1: a fresh request on an already-ended owner is inserted
     // invalidated and its settlement notice is folded in with any settlement
     // this event's own terminal transition produced.
@@ -15715,6 +15768,35 @@ fn append_loaded_event(
         settlement,
         seen,
     })
+}
+
+/// cb-rootturn: the initiator an audit row records for a device bound to an
+/// instance (an Agent credential), with the root turn it is in. `None` for an
+/// unbound device or an instance row that is gone.
+fn bound_initiator(
+    conn: &Connection,
+    device_id: &str,
+) -> Result<Option<remuda_protocol::Initiator>, StoreError> {
+    let bound: Option<String> = conn
+        .query_row(
+            "SELECT instance_id FROM devices WHERE id = ?1",
+            params![device_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let Some(instance_id) = bound else {
+        return Ok(None);
+    };
+    let Some(instance) = load_instance(conn, &instance_id)? else {
+        return Ok(None);
+    };
+    Ok(Some(remuda_protocol::Initiator {
+        instance_id: instance.instance_id,
+        lineage_id: instance.lineage_id,
+        generation: instance.generation,
+        root_turn: crate::root_turn::derive(conn, &instance_id)?,
+    }))
 }
 
 fn load_journal_row(
@@ -15836,7 +15918,7 @@ fn load_command(conn: &Connection, id: &str) -> Result<Option<CommandRecord>, St
                 settlement_outcome, settlement_reason,
                 settlement_http_status, settlement_http_body,
                 initiator_instance_id, initiator_lineage_id, initiator_generation,
-                initiator_device_id
+                initiator_device_id, initiator_root_turn_json
          FROM commands WHERE id = ?1",
         params![id],
         command_from_row,
@@ -15852,7 +15934,7 @@ fn load_command_by_key(conn: &Connection, key: &str) -> Result<Option<CommandRec
                 settlement_outcome, settlement_reason,
                 settlement_http_status, settlement_http_body,
                 initiator_instance_id, initiator_lineage_id, initiator_generation,
-                initiator_device_id
+                initiator_device_id, initiator_root_turn_json
          FROM commands WHERE idempotency_key = ?1",
         params![key],
         command_from_row,
@@ -16960,6 +17042,7 @@ fn command_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandRecord> 
                 instance_id,
                 lineage_id,
                 generation,
+                root_turn: crate::root_turn::from_column(row.get(19)?),
             })
         }
         _ => None,

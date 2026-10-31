@@ -302,3 +302,33 @@ describe("the about-me editor waits for the server copy", () => {
     expect(screen.getByTestId("memory-conflict-mine")).toHaveTextContent("blind draft");
   });
 });
+
+describe("an archived server copy leaves a dirty draft alone", () => {
+  it("keeps the typed draft instead of overwriting it with the archived body", async () => {
+    const live = entry({ slug: "about-me", body: "v1", revision: 1 });
+    let server: MemoryEntry = live;
+    listMemory.mockResolvedValue([live]);
+    getMemory.mockImplementation(async () => server);
+
+    renderPage("/s/ins_x/memory");
+    const textarea = (await screen.findByTestId("memory-about-body")) as HTMLTextAreaElement;
+    await waitFor(() => expect(textarea.value).toBe("v1"));
+    fireEvent.change(textarea, { target: { value: "mine" } });
+
+    // The lineage retires while the draft is dirty.
+    server = entry({
+      slug: "about-me",
+      body: "server v2",
+      revision: 2,
+      archivedAt: "2026-10-30T00:00:00.000Z",
+    });
+    fireEvent.change(await screen.findByTestId("memory-search"), { target: { value: "a" } });
+    await waitFor(() => expect(screen.getByTestId("memory-about-archived")).toBeTruthy());
+
+    // Restored elsewhere: the live card must still hold the owner's draft.
+    server = entry({ slug: "about-me", body: "server v2", revision: 2 });
+    fireEvent.change(await screen.findByTestId("memory-search"), { target: { value: "b" } });
+    const restored = (await screen.findByTestId("memory-about-body")) as HTMLTextAreaElement;
+    expect(restored.value).toBe("mine");
+  });
+});

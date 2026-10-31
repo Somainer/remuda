@@ -276,8 +276,13 @@ export function MemoryPage() {
       return;
     }
     if (server.archivedAt != null) {
-      setAboutDraft(server.body);
-      setAboutCleanBody(server.body);
+      // Same dirty rule as a live copy: an archived body never overwrites
+      // text the owner typed. The base still tracks the server revision, so
+      // a later restore compares against the copy the draft has seen.
+      if (aboutDraft === aboutCleanBody) {
+        setAboutDraft(server.body);
+        setAboutCleanBody(server.body);
+      }
       setAboutBaseRevision(server.revision);
       return;
     }

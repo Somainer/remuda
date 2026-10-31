@@ -187,3 +187,58 @@ describe("最近活动 (r3 item 2)", () => {
     expect(screen.getByTestId("main-status-last-activity").textContent).toBe("最近活动 —");
   });
 });
+
+describe("the EndedBar note only points at a 恢复 the Main bar offers (r4 item 1)", () => {
+  function only(rows: Instance[], lineages: Record<string, unknown> = {}) {
+    vi.mocked(store.hubStore.getSnapshot).mockReturnValue({
+      ...store.hubStore.getSnapshot(),
+      instances: rows,
+      lineages: lineages as never,
+      events: Object.fromEntries(rows.map((row) => [row.id, []])),
+    });
+  }
+
+  it("host contact lost: the chapter may still run, the bar offers no 恢复, so no note and the bar's own resume path stays", () => {
+    const lost = { ...chapter1, fencedAt: null, lastError: "host-contact-lost" } as Instance;
+    only([lost]);
+    renderPage(lost.id);
+    expect(screen.getByTestId("ended-bar")).toBeInTheDocument();
+    expect(screen.queryByTestId("main-resume")).toBeNull();
+    expect(screen.queryByTestId("ended-resume-in-main-bar")).toBeNull();
+    expect(screen.getByTestId("resume-control")).toBeInTheDocument();
+  });
+
+  it("a successor the list has not shown yet: the bar reads 正在启动下一章 with no 恢复, so no note", () => {
+    const ended = { ...chapter1, fencedAt: null } as Instance;
+    only([ended], {
+      [ended.id]: {
+        lineageId: ended.id,
+        state: "starting",
+        generation: 2,
+        chapters: [
+          { instanceId: ended.id, generation: 1, createdAt: "2026-10-30T08:00:00Z" },
+          { instanceId: "ins_main_next", generation: 2, createdAt: "2026-10-30T09:00:00Z" },
+        ],
+      },
+    });
+    renderPage(ended.id);
+    expect(screen.queryByTestId("main-resume")).toBeNull();
+    expect(screen.queryByTestId("ended-resume-in-main-bar")).toBeNull();
+    expect(screen.getByTestId("resume-control")).toBeInTheDocument();
+  });
+
+  it("no resumable transcript: no note, and the 开新会话继承 cwd fallback is reachable", () => {
+    const noResume = {
+      ...chapter1,
+      fencedAt: null,
+      capabilities: {
+        ...chapter1.capabilities,
+        capabilities: { ...chapter1.capabilities.capabilities, resume: { state: "unsupported" } },
+      },
+    } as Instance;
+    only([noResume]);
+    renderPage(noResume.id);
+    expect(screen.queryByTestId("ended-resume-in-main-bar")).toBeNull();
+    expect(screen.getByText("开新会话继承 cwd")).toBeInTheDocument();
+  });
+});

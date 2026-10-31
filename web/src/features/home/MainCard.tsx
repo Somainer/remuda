@@ -7,9 +7,9 @@ import { hubStore, useHub, useMainEntry, type LocalBubble, type MainEntry } from
 import { useNowTick } from "../../lib/useNowTick";
 import type { Id } from "../../types/wire";
 import { Composer } from "../session/Composer";
-import { mainEcho, mainStatus, type MainEcho } from "./mainStatus";
+import { mainEcho, type MainEcho } from "./mainStatus";
 import { useMainTail } from "./mainTail";
-import { useCompactLayout, useLineageSync } from "./useMain";
+import { mainStatusFor, useCompactLayout, useLineageSync } from "./useMain";
 import css from "./mainCard.module.css";
 
 /** Everything the card and the 问 Main input read about the resolved Main. */
@@ -18,16 +18,7 @@ function useMainView(entry: MainEntry) {
   const nowMs = useNowTick();
   useLineageSync(entry);
   const instance = entry.instance;
-  const lineage = hub.lineages[entry.lineageId] ?? null;
-  const status = mainStatus({
-    entry,
-    lineage,
-    host: hub.hosts.find((row) => row.id === instance.hostId),
-    hostName: hubStore.hostName(instance.hostId),
-    asking: hub.interactions.some((row) => row.instanceId === instance.id && row.state === "pending"),
-    summary: hub.summaries[instance.id],
-    nowMs,
-  });
+  const status = mainStatusFor(hub, entry, nowMs);
   const online = hub.connection === "live";
   return { hub, instance, status, online };
 }

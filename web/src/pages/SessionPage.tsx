@@ -16,6 +16,7 @@ import { FileText, Info, ListCollapse, MessageSquarePlus, Rows3, ScrollText, Sea
 import { ConnectionIndicator } from "../components/ConnectionIndicator";
 import { EndedBar } from "../chrome/EndedBar";
 import { MainSessionBar } from "../features/session/MainSessionBar";
+import { useMainBarOffersResume } from "../features/home/useMain";
 import { SessionHeader, useWideDesktop } from "../chrome/SessionHeader";
 import { SessionMoreMenu, type MoreMenuItem } from "../chrome/SessionMoreMenu";
 import { ApprovalCard } from "../features/approvals/ApprovalCard";
@@ -332,6 +333,10 @@ function SessionPageBody({
   const mainEntry = useMainEntry();
   const mainLineage =
     mainEntry !== null && instance !== undefined && mainEntry.lineageId === (instance.lineageId ?? instance.id);
+  // The page of Main's CURRENT chapter, and whether its Main bar offers 恢复
+  // (the same status computation the bar reads).
+  const mainCurrentChapter = mainLineage && mainEntry !== null && mainEntry.instance.id === instance?.id;
+  const mainBarOffersResume = useMainBarOffersResume(mainCurrentChapter ? mainEntry : null);
   // t-annotations: a session of an archived task is a read-only preview — no
   // badge/entry point and anchor selection raises nothing.
   const sessionTask = useSessionTask(instanceId, (instance as { taskId?: string | null } | undefined)?.taskId);
@@ -572,8 +577,10 @@ function SessionPageBody({
   const endedBar = ended ? (
     <WorkbenchEndedBar
       currentMainHref={currentMainHref}
-      // The current Main chapter: the Main bar's 恢复 is the one resume.
-      resumeInMainBar={mainLineage && !currentMainHref}
+      // The current Main chapter: the note points at the Main bar's 恢复 only
+      // when the bar offers it and a resume exists at all; otherwise the
+      // existing resume / fallback branches stay (r4 item 1).
+      resumeInMainBar={mainCurrentChapter && mainBarOffersResume && canResume}
       reason={ended}
       nodeRestarted={nodeRestarted}
       heldCount={heldBubbles.length}

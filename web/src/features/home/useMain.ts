@@ -1,5 +1,6 @@
 import { useEffect, useSyncExternalStore } from "react";
-import { hubStore, type MainEntry } from "../../lib/store";
+import { hubStore, type HubState, type MainEntry } from "../../lib/store";
+import { mainStatus, type MainStatus } from "./mainStatus";
 import { COMPACT_WORKBENCH_QUERY } from "../../lib/viewport";
 import type { Id } from "../../types/wire";
 
@@ -68,4 +69,33 @@ export function useCompactLayout(): boolean {
     () => typeof window.matchMedia === "function" && window.matchMedia(COMPACT_WORKBENCH_QUERY).matches,
     () => false,
   );
+}
+
+/**
+ * The ONE Main status computation (D-057 §9): the home card, the Main session
+ * bar and the session page's EndedBar hand-off all read it, so they can never
+ * disagree on whether 恢复 is offered.
+ */
+export function mainStatusFor(state: HubState, entry: MainEntry, nowMs: number): MainStatus {
+  const instance = entry.instance;
+  return mainStatus({
+    entry,
+    lineage: state.lineages[entry.lineageId] ?? null,
+    host: state.hosts.find((row) => row.id === instance.hostId),
+    hostName: hubStore.hostName(instance.hostId),
+    asking: state.interactions.some((row) => row.instanceId === instance.id && row.state === "pending"),
+    summary: state.summaries[instance.id],
+    nowMs,
+  });
+}
+
+/**
+ * Whether the Main session bar offers 恢复 for `entry` — a boolean store
+ * selector, so the session page re-renders only when the answer flips (it
+ * never subscribes to the whole store). `resumable` does not depend on the
+ * clock; the time only shapes phrases.
+ */
+export function useMainBarOffersResume(entry: MainEntry | null): boolean {
+  const read = () => (entry ? mainStatusFor(hubStore.getSnapshot(), entry, Date.now()).resumable : false);
+  return useSyncExternalStore(hubStore.subscribe, read, read);
 }

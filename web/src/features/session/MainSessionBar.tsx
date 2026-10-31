@@ -8,13 +8,12 @@ import type { Instance } from "../../types/instance";
 import type { Observation } from "../../types/observation";
 import type { Id, U64 } from "../../types/wire";
 import { useMainTail } from "../home/mainTail";
-import { useLineageSync } from "../home/useMain";
+import { mainStatusFor, useLineageSync } from "../home/useMain";
 import {
   causeLabel,
   lastActivityOf,
   lineageFor,
   lineageStateLabel,
-  mainStatus,
   restartsIn24h,
   type MainStatus,
 } from "../home/mainStatus";
@@ -54,15 +53,7 @@ function MainSessionBarBody({ entry, instance, mobile }: { entry: MainEntry; ins
   // Only a projection read for this chapter speaks for it (r2 item 3).
   const lineage = lineageFor(hub.lineages[entry.lineageId], entry);
   const current = entry.instance;
-  const status = mainStatus({
-    entry,
-    lineage,
-    host: hub.hosts.find((row) => row.id === current.hostId),
-    hostName: hubStore.hostName(current.hostId),
-    asking: hub.interactions.some((row) => row.instanceId === current.id && row.state === "pending"),
-    summary: hub.summaries[current.id],
-    nowMs,
-  });
+  const status = mainStatusFor(hub, entry, nowMs);
   // 最近活动: the last message or turn observation, never the row's
   // updatedAt (every journal append rewrites it). The current chapter's
   // followed journal answers when this page follows it; otherwise the same

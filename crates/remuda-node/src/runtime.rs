@@ -7435,3 +7435,106 @@ mod initiator_persistence_test {
         assert!(json.get("initiator").is_none(), "skipped when absent");
     }
 }
+
+/// cb-rootturn r2 item 2: the worker that executes a send hands the driver
+/// the command that delivers it, so a structured carrier can write the
+/// prompt with the Hub command id as its `nativeClientMessageId`.
+#[cfg(test)]
+mod root_turn_command_id_test {
+    use super::*;
+    use crate::driver::{Driver, DriverFuture};
+    use remuda_protocol::{CommandId, DriverKind};
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    type Seen = Arc<Mutex<Vec<(String, Option<CommandId>)>>>;
+
+    /// Records the command id every `Send` reaches the driver with.
+    struct RecordingDriver {
+        seen: Seen,
+    }
+
+    impl Driver for RecordingDriver {
+        fn kind(&self) -> DriverKind {
+            DriverKind::ClaudePrint
+        }
+
+        fn execute(&self, request: DriverRequest) -> DriverFuture<'_> {
+            if let DriverRequest::Send {
+                prompt, command_id, ..
+            } = &request
+            {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push((prompt.clone(), command_id.clone()));
+            }
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    async fn seen_prompt(seen: &Seen, prompt: &str) -> Option<CommandId> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some((_, id)) = seen.lock().unwrap().iter().find(|(p, _)| p == prompt) {
+                    return id.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the driver never received {prompt:?}"))
+    }
+
+    #[tokio::test]
+    async fn the_driver_sees_the_delivering_command_id_for_create_and_send() {
+        let seen: Seen = Arc::default();
+        let config = crate::DevServerConfig::loopback(0)
+            .with_workspace_roots(remuda_testing::test_workspace_roots!());
+        let drivers = DriverRegistry::default();
+        drivers
+            .register(Arc::new(RecordingDriver {
+                seen: Arc::clone(&seen),
+            }))
+            .expect("register recording driver");
+        let node = DevNode::with_parts(&config, Arc::new(MemoryStore::new(64)), drivers)
+            .expect("compose node");
+
+        // The create's first prompt is delivered under the create command.
+        let created = node
+            .create_instance(
+                serde_json::from_value(serde_json::json!({
+                    "kind": "claude", "driver": "claude-print", "model": "fake",
+                    "prompt": "the first prompt",
+                }))
+                .expect("create request"),
+            )
+            .await
+            .expect("create");
+        assert_eq!(
+            seen_prompt(&seen, "the first prompt").await,
+            Some(created.command.command_id.clone()),
+            "the create's first prompt carries the create command id"
+        );
+
+        // A later send carries its own command id (the Hub's, when it sent it).
+        let hub_command = CommandId::new();
+        let sent = node
+            .submit_command(
+                &created.instance.meta.id,
+                serde_json::from_value(serde_json::json!({
+                    "operation": "send", "prompt": "a later send",
+                    "commandId": hub_command.as_id().as_str(),
+                }))
+                .expect("send request"),
+            )
+            .await
+            .expect("submit");
+        assert_eq!(sent.command.command_id, hub_command);
+        assert_eq!(
+            seen_prompt(&seen, "a later send").await,
+            Some(hub_command),
+            "a send carries the command id it was queued under"
+        );
+    }
+}

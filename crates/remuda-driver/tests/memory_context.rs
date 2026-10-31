@@ -439,3 +439,104 @@ async fn generic_pty_types_the_data_block_ahead_of_the_first_input_only() {
     );
     driver.close().await.expect("close");
 }
+
+/// Row 14 (`shell-pty`, `codex`) on the real PTY driver: the block is written
+/// ahead of the first input and never again, and a native resume of the same
+/// chapter's conversation writes none. The stand-in `codex` appends whatever
+/// the PTY delivers to a file, so the assertion is on the bytes the agent
+/// actually received.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shell_pty_writes_the_block_once_and_none_on_a_native_resume() {
+    use remuda_driver::shell_pty::{AgentLaunch, ShellPtyDriver, ShellPtyOptions};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("ws");
+    fs::create_dir_all(&workspace).unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let bin_dir = tmp.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let stub = install_executable(
+        &bin_dir,
+        "codex",
+        "#!/bin/sh\nexec cat >> \"$CBINJECT_TYPED\"\n",
+    );
+    let driver_for = |typed: &Path| {
+        let mut options = ShellPtyOptions::agent(
+            workspace.clone(),
+            AgentKind::Codex,
+            AgentLaunch {
+                profile: Box::new(ProviderProfile {
+                    kind: ProviderKind::OpenaiResponses,
+                    ..anthropic()
+                }),
+                launch_dir: tmp.path().join("launch"),
+                native_home: home.clone(),
+                binary: Some(stub.clone()),
+                origin: LaunchOrigin::Human,
+                native_home_managed: true,
+                settings_overlay: None,
+            },
+        );
+        options.emulator = false;
+        options.extra_env.insert(
+            "CBINJECT_TYPED".into(),
+            typed.to_string_lossy().into_owned(),
+        );
+        options.memory_context = Some(context());
+        ShellPtyDriver::new(options)
+    };
+    let mut requested = spec(DriverKind::ShellPty, AgentKind::Codex, &[]);
+    requested.cwd = workspace.to_string_lossy().into_owned();
+    let read_until = |path: &Path, needle: &str| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let text = fs::read_to_string(path).unwrap_or_default();
+            if text.contains(needle) || std::time::Instant::now() > deadline {
+                return text;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    };
+
+    // A fresh session: the block, then the first input; the second input bare.
+    let typed = tmp.path().join("fresh.txt");
+    let fresh = driver_for(&typed);
+    let handle = Driver::start(&fresh, requested.clone())
+        .await
+        .expect("start");
+    assert_eq!(handle.recipe().memory_data_block(), Some(INDEX));
+    fresh.send(prompt("first input")).await.expect("first send");
+    fresh
+        .send(prompt("second input"))
+        .await
+        .expect("second send");
+    let text = read_until(&typed, "second input");
+    assert!(text.trim_start().starts_with("<remuda-memory"), "{text:?}");
+    assert_eq!(text.matches("<remuda-memory").count(), 1, "{text:?}");
+    let block_end = text.find("</remuda-memory>").expect("closed block");
+    let first = text.find("first input").expect("first input");
+    assert!(block_end < first && first < text.find("second input").unwrap());
+    Driver::close(&fresh).await.expect("close");
+
+    // A native resume of that conversation: no block at all.
+    let typed = tmp.path().join("resumed.txt");
+    let resumed = driver_for(&typed);
+    let handle = Driver::start_resumed(
+        &resumed,
+        requested.clone(),
+        "01993ab0-0000-7000-8000-000000000009".into(),
+    )
+    .await
+    .expect("resume");
+    assert_eq!(handle.recipe().memory, None);
+    resumed
+        .send(prompt("after resume"))
+        .await
+        .expect("send after resume");
+    let text = read_until(&typed, "after resume");
+    assert!(text.contains("after resume"), "{text:?}");
+    assert!(!text.contains("<remuda-memory"), "{text:?}");
+    Driver::close(&resumed).await.expect("close");
+}

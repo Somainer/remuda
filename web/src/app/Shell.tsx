@@ -483,7 +483,7 @@ export function Shell() {
     }
   }, [activeSpaceId, activeInstanceId, knownInstance]);
 
-  useWorkbenchKeys({ mobile, onSessions, onNew, workbench });
+  useWorkbenchKeys({ mobile, onSessions, onNew, workbench, sidebarCollapsed: collapsed });
 
   useEffect(() => {
     const onVis = () => {

@@ -548,7 +548,9 @@ export const HomeList = memo(function HomeList() {
         onClearSearch={() => setQuery("")}
         newHref={newSessionPath(active)}
         firstSnapshot={firstSnapshot}
-        sessionEmpty={renderedGroups.length === 0}
+        // A rank filter that matches nothing is not "no sessions": keep the
+        // designed empty state for the unfiltered ledger only.
+        sessionEmpty={renderedGroups.length === 0 && rankFilter === null}
       />
       {/* D-061 ⑨: 问 Main docked at the bottom, above PhoneNav. */}
       <MainAskDock />

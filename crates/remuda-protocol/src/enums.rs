@@ -225,6 +225,10 @@ wire_enum!(SettlementOutcome, "2.5", {
     Rejected => "rejected",
     Cancelled => "cancelled",
     Expired => "expired",
+    // D-057 §7.4: the Hub's send gate stopped an admitted, forward-intended
+    // operation of a fenced initiator before its frame was written. Hub-only:
+    // a Node never settles a command with it.
+    Withheld => "withheld",
 });
 
 wire_enum!(InteractionKind, "2.6", {

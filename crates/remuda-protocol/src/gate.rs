@@ -407,9 +407,16 @@ pub struct GateJob {
     pub host_id: Option<HostId>,
     /// Queue ordering key (RFC3339 enqueue time).
     pub queued_at: Timestamp,
-    /// When the Node took the job.
+    /// When the Hub claimed the job for a lane (Hub `running` only means
+    /// claimed; see [`Self::node_started_at`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<Timestamp>,
+    /// D-057 §7.5: when the lane Node's gate runner admitted the run after its
+    /// own fence check, recorded from the job's first `phase` gate event of the
+    /// current attempt. A claimed job without it is potentially executed; one
+    /// with it reached its executor and completes through a fence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_started_at: Option<Timestamp>,
     /// When the job reached a terminal state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<Timestamp>,

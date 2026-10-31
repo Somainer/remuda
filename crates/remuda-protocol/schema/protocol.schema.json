@@ -4831,6 +4831,49 @@
       },
       "type": "object"
     },
+    "FenceOpOutcome": {
+      "description": "One operation outcome inside a fence acknowledgement.",
+      "properties": {
+        "opId": {
+          "description": "Command id, direct-operation id, or gate job id.",
+          "type": "string"
+        },
+        "outcome": {
+          "$ref": "#/$defs/FenceOutcome",
+          "description": "What the Node established."
+        }
+      },
+      "required": [
+        "opId",
+        "outcome"
+      ],
+      "type": "object"
+    },
+    "FenceOutcome": {
+      "description": "What the Node established about one operation it holds a record of\n(main-agent.md §7.4).",
+      "oneOf": [
+        {
+          "const": "cancelled",
+          "description": "Not yet delivered when the fence applied; the Node cancelled it.",
+          "type": "string"
+        },
+        {
+          "const": "ran",
+          "description": "It reached its executor before the fence applied.",
+          "type": "string"
+        },
+        {
+          "const": "refused",
+          "description": "It arrived after the fence applied and was refused at entry.",
+          "type": "string"
+        },
+        {
+          "const": "unknown",
+          "description": "The Node holds a record but cannot establish whether it reached its\nexecutor (typically a crash between durable intent and evidence).",
+          "type": "string"
+        }
+      ]
+    },
     "FileChange": {
       "description": "FileChange; `protocol.md` §5.2.",
       "properties": {
@@ -5422,6 +5465,17 @@
           "$ref": "#/$defs/GateMode",
           "description": "Verify vs verify-then-land."
         },
+        "nodeStartedAt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "D-057 §7.5: when the lane Node's gate runner admitted the run after its\nown fence check, recorded from the job's first `phase` gate event of the\ncurrent attempt. A claimed job without it is potentially executed; one\nwith it reached its executor and completes through a fence."
+        },
         "projectId": {
           "$ref": "#/$defs/ProjectId",
           "description": "Owning project."
@@ -5450,7 +5504,7 @@
               "type": "null"
             }
           ],
-          "description": "When the Node took the job."
+          "description": "When the Hub claimed the job for a lane (Hub `running` only means\nclaimed; see [`Self::node_started_at`])."
         },
         "state": {
           "$ref": "#/$defs/GateJobState",
@@ -11003,6 +11057,61 @@
         }
       ]
     },
+    "LineageFenceParams": {
+      "description": "`lineage.fence` params: `{fenceId, lineageId, liveGeneration}`.",
+      "properties": {
+        "fenceId": {
+          "description": "Durable Hub fence id; the Node persists the fence idempotently by it.",
+          "type": "string"
+        },
+        "lineageId": {
+          "description": "Lineage the fence applies to (its first chapter's id).",
+          "type": "string"
+        },
+        "liveGeneration": {
+          "description": "The lineage's live generation after the fence. Every instance and\ninitiator of the lineage below it is fenced.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "fenceId",
+        "lineageId",
+        "liveGeneration"
+      ],
+      "type": "object"
+    },
+    "LineageFenceResult": {
+      "description": "`lineage.fence` result. An operation it does not mention stays unknown.",
+      "properties": {
+        "closedInstanceIds": {
+          "default": [],
+          "description": "Local instances of the lineage below the live generation the Node\nclosed while applying this fence.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "fenceId": {
+          "default": "",
+          "description": "Echo of the applied fence id.",
+          "type": "string"
+        },
+        "outcomes": {
+          "default": [],
+          "description": "Per-operation outcomes for operations the Node holds a record of.",
+          "items": {
+            "$ref": "#/$defs/FenceOpOutcome"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "fenceId",
+        "closedInstanceIds",
+        "outcomes"
+      ],
+      "type": "object"
+    },
     "LineageGlance": {
       "description": "`GET /v1/lineages/{id}/glance`: the workers the lineage dispatched that\nare waiting on someone or working, plus today's completions.",
       "properties": {
@@ -11046,6 +11155,24 @@
         "working",
         "more",
         "doneToday"
+      ],
+      "type": "object"
+    },
+    "LineageRef": {
+      "description": "`lineage` on `instance.create` / `instance.resume` params: the instance's\nlineage and generation, so the Node can close it when a fence names a\nhigher live generation.",
+      "properties": {
+        "generation": {
+          "description": "The chapter's generation.",
+          "type": "string"
+        },
+        "id": {
+          "description": "Lineage id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "generation"
       ],
       "type": "object"
     },
@@ -18931,6 +19058,11 @@
         {
           "const": "expired",
           "description": "Wire value `expired`.",
+          "type": "string"
+        },
+        {
+          "const": "withheld",
+          "description": "Wire value `withheld`.",
           "type": "string"
         }
       ]

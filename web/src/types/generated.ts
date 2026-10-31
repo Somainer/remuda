@@ -1013,6 +1013,16 @@ export type ExpectedState = ({
   [key: string]: unknown;
 });
 
+/** One operation outcome inside a fence acknowledgement. */
+export type FenceOpOutcome = ({
+  "opId": (string);
+  "outcome": FenceOutcome;
+  [key: string]: unknown;
+});
+
+/** What the Node established about one operation it holds a record of (main-agent.md §7.4). */
+export type FenceOutcome = ("cancelled" | "ran" | "refused" | "unknown");
+
 /** FileChange; `protocol.md` §5.2. */
 export type FileChange = ({
   "application": ChangeApplication;
@@ -1158,6 +1168,7 @@ export type GateJob = ({
   "mergeRef"?: (string | null);
   "mergeSha"?: (string | null);
   "mode": GateMode;
+  "nodeStartedAt"?: (Timestamp | (null));
   "projectId": ProjectId;
   "queuedAt": Timestamp;
   "reason"?: (string | null);
@@ -2472,6 +2483,22 @@ export type LifecyclePayload = (EntityLifecycle & ({
 /** LifecycleTopic wire values; `protocol.md` §5.5. */
 export type LifecycleTopic = ("session" | "turn" | "hook" | "subagent" | "task" | "plan" | "configuration" | "permission" | "diagnostic" | "reconciliation");
 
+/** `lineage.fence` params: `{fenceId, lineageId, liveGeneration}`. */
+export type LineageFenceParams = ({
+  "fenceId": (string);
+  "lineageId": (string);
+  "liveGeneration": (string);
+  [key: string]: unknown;
+});
+
+/** `lineage.fence` result. An operation it does not mention stays unknown. */
+export type LineageFenceResult = ({
+  "closedInstanceIds": (((string))[]);
+  "fenceId": (string);
+  "outcomes": ((FenceOpOutcome)[]);
+  [key: string]: unknown;
+});
+
 /** `GET /v1/lineages/{id}/glance`: the workers the lineage dispatched that are waiting on someone or working, plus today's completions. */
 export type LineageGlance = ({
   "doneToday": (number);
@@ -2480,6 +2507,13 @@ export type LineageGlance = ({
   "more": GlanceMore;
   "waiting": ((GlanceWaiting)[]);
   "working": ((GlanceWorking)[]);
+  [key: string]: unknown;
+});
+
+/** `lineage` on `instance.create` / `instance.resume` params: the instance's lineage and generation, so the Node can close it when a fence names a higher live generation. */
+export type LineageRef = ({
+  "generation": (string);
+  "id": (string);
   [key: string]: unknown;
 });
 
@@ -4285,7 +4319,7 @@ export type Settlement = ({
 });
 
 /** SettlementOutcome wire values; `protocol.md` §2.5. */
-export type SettlementOutcome = ("completed" | "rejected" | "cancelled" | "expired");
+export type SettlementOutcome = ("completed" | "rejected" | "cancelled" | "expired" | "withheld");
 
 /** Severity wire values; `protocol.md` §5.5. */
 export type Severity = ("info" | "warning" | "error");

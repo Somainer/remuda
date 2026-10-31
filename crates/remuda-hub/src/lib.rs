@@ -907,7 +907,8 @@ impl RunningHub {
                             (id, label, token_hash, state, last_seen_at, node_version, cli_json,
                              capabilities_json, created_at, transport, labels_json, herdr_json,
                              resources_json, max_instances, hostname, token_prefix)
-                         VALUES (?1, ?1, 'x', 'online', ?2, '0.1.0-test', '[]', '{}', ?2,
+                         VALUES (?1, ?1, 'x', 'online', ?2, '0.1.0-test', '[]',
+                                 '{\"lineageFence\":true}', ?2,
                                  'outbound-wss', '[]', NULL, NULL, 8, 'scripted-node', NULL)",
                         rusqlite::params![host_id, now],
                     )?;
@@ -2148,7 +2149,12 @@ async fn spawn_inner(
                         Err(err) => tracing::error!(error = %err, "host-lost sweep failed"),
                     }
                     expire_stale_requested(&reaper_state, config.requested_grace_ms).await;
-                    crate::fence::sweep_deliveries(&reaper_state).await;
+                    // Off the loop: this select also polls the HTTP server,
+                    // so the sweep must never hold it up.
+                    let sweep_state = reaper_state.clone();
+                    tokio::spawn(async move {
+                        crate::fence::sweep_deliveries(&sweep_state).await;
+                    });
                     crate::gatequeue::tick(&reaper_state).await;
                 }
             }

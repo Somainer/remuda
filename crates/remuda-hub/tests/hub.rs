@@ -2000,6 +2000,9 @@ async fn agent_scoped_create_cannot_set_args_or_binary_path() -> Result<()> {
                 "hostId": host_id.as_id().as_str(),
                 "nodeVersion": "0.1.0",
                 "label": "local-development",
+                // The parent holds grants (a continuity lineage): its work
+                // needs a fence-capable Node (D-057 §7.6).
+                "capabilities": { "lineageFence": true },
                 "host": { "hostname": "local-development", "maxInstances": 8 }
             }
         })

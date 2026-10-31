@@ -1448,6 +1448,10 @@ pub(crate) async fn sweep_deliveries(state: &AppState) {
     let Ok(hosts) = state.store.gated_hosts().await else {
         return;
     };
+    if hosts.is_empty() {
+        // The common case touches neither the link registry nor any lock.
+        return;
+    }
     let live: HashSet<String> = state.nodes.host_ids().await.into_iter().collect();
     for host in hosts {
         if !live.contains(&host) {

@@ -78,6 +78,9 @@ async fn enroll_fake_node_with_cli(
                 "hostId": host_id,
                 "nodeVersion": "0.1.0-test",
                 "label": "fake-node",
+                // A fence-capable Node (D-057 §7.6): agent creates from a
+                // continuity seat are refused on one without it.
+                "capabilities": { "lineageFence": true },
                 "host": {
                     "hostname": "fake-node.local",
                     "labels": { "region": "sg" },

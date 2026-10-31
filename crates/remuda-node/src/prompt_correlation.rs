@@ -121,6 +121,10 @@ impl PromptCorrelator {
     /// prompt, or evidence arriving outside the window); the caller leaves
     /// `command_id` unset.
     pub fn match_prompt(&self, text: &str, channel: PromptChannel) -> Option<PromptMatch> {
+        // D-060: a data-block launch delivers its first input with the
+        // chapter's memory block ahead of it; the command registered only
+        // what its sender wrote.
+        let text = remuda_protocol::hubnode::strip_memory_context_block(text);
         if text.trim().is_empty() {
             return None;
         }
@@ -356,6 +360,18 @@ mod tests {
                 .match_prompt(&text, PromptChannel::Transcript)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_leading_memory_block_does_not_hide_the_command() {
+        let correlator = PromptCorrelator::new();
+        let (command_id, node_id, text) = entry(7);
+        correlator.register(command_id.clone(), node_id, text.clone());
+        let delivered = format!("<remuda-memory rev=\"3\">\nindex\n</remuda-memory>\n\n{text}");
+        let matched = correlator
+            .match_prompt(&delivered, PromptChannel::Transcript)
+            .expect("the block-prefixed first input is the command's prompt");
+        assert_eq!(matched.command_id, command_id);
     }
 
     #[test]

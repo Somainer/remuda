@@ -194,6 +194,7 @@ async fn failed_node_construction_rolls_back_registry_adoption() {
 
 fn codex_request(binary: PathBuf) -> CreateInstanceRequest {
     CreateInstanceRequest {
+        memory_context: None,
         initiator: None,
         origin: remuda_protocol::InputOrigin::Human,
         agent_credential: None,

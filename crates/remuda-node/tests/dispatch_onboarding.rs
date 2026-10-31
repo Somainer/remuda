@@ -174,6 +174,7 @@ fn run_child() {
         assert!(worktree.is_dir(), "provisioned worktree exists");
 
         let request = CreateInstanceRequest {
+            memory_context: None,
             initiator: None,
             origin: remuda_protocol::InputOrigin::Human,
             agent_credential: None,

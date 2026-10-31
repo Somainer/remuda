@@ -780,6 +780,9 @@ pub struct InstanceCreateParams {
     /// Target workspace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
+    /// Hub-stamped lineage memory (D-060); top level only, never in `spec`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_context: Option<MemoryContext>,
 }
 
 /// Kind of a staged attachment (D-027b, 2026-09-15).

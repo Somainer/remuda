@@ -1,5 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
 import { login } from "./hub-auth";
+import { openSpacesIndex } from "./spacesIndex";
 
 /**
  * P1-1 acceptance (`docs/design/workbench-ux-exploration.md` §5):
@@ -127,6 +128,8 @@ test("shortcut opens QuickFind and arrows + Enter land on the selected instance"
 
   await page.goto("/sessions");
   await expect(page.getByTestId("session-list")).toBeVisible();
+  // §2.5: the SpacesPanel (and its QuickFind trigger) starts collapsed.
+  await openSpacesIndex(page);
 
   // The entry point advertises the shortcut.
   await expect(page.getByTestId("quickfind-trigger")).toHaveAttribute("title", /⌘\/Ctrl\+K/);
@@ -158,6 +161,7 @@ test("Escape restores focus and keeps the active Space and URL unchanged", async
   await createSession(page, "QF Escape Keep", "quickfind escape prompt");
   await page.goto("/sessions");
   await expect(page.getByTestId("session-list")).toBeVisible();
+  await openSpacesIndex(page);
 
   const activeSpace = page.getByTestId("space-select").and(page.locator('[aria-pressed="true"]')).first();
   const spaceIdBefore = await activeSpace.getAttribute("data-space-id");

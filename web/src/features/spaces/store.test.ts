@@ -110,7 +110,8 @@ describe("device space preferences", () => {
     const prefs = parseSpacePrefs(JSON.stringify({ version: 1, collapsed: "yes", groupCollapsed: { a: true, b: "false" },
       exitedOpen: { a: true, b: 1 }, names: { a: " A ", b: 4 }, order: ["a", "a", null, 4, "b"], selectedSpaceId: 5,
       selectedTabs: { a: "one", b: {} }, closedTabs: { a: ["one", "one", false], b: null } }));
-    expect(prefs).toEqual({ version: 1, collapsed: false, groupCollapsed: { a: true }, exitedOpen: { a: true },
+    expect(prefs).toEqual({ version: 1, collapsed: false, collapsedSet: false, spacesOpen: false,
+      groupCollapsed: { a: true }, exitedOpen: { a: true },
       idleOpen: {}, quietOpen: false,
       names: { a: "A" }, order: ["a", "b"], selectedSpaceId: undefined, selectedTabs: { a: "one" },
       closedTabs: { a: [{ id: "one", resurface: true }], b: [] } });
@@ -129,6 +130,29 @@ describe("device space preferences", () => {
     store.setCollapsed(true);
     store.selectTab(alpha, "a");
     expect(store.getSnapshot()).toMatchObject({ collapsed: true, selectedTabs: { [alpha]: "a" } });
+  });
+
+  it("remembers the sidebar fold as an explicit choice and the 空间 index state per device (D-061 §2.4/§2.5)", () => {
+    const store = createSpaceStore(localStorage);
+    // No choice yet: the fold is the default, not a stored preference.
+    expect(store.getSnapshot()).toMatchObject({ collapsed: false, collapsedSet: false, spacesOpen: false });
+    // The index starts collapsed behind 「空间 ▸」; expanding is remembered.
+    store.setSpacesOpen(true);
+    expect(store.getSnapshot().spacesOpen).toBe(true);
+    expect(createSpaceStore(localStorage).getSnapshot().spacesOpen).toBe(true);
+    // Flipping the sidebar fold marks the preference explicit in both directions.
+    store.setCollapsed(false);
+    expect(createSpaceStore(localStorage).getSnapshot()).toMatchObject({ collapsed: false, collapsedSet: true });
+    store.setCollapsed(true);
+    expect(createSpaceStore(localStorage).getSnapshot()).toMatchObject({ collapsed: true, collapsedSet: true });
+    store.setSpacesOpen(false);
+    expect(createSpaceStore(localStorage).getSnapshot().spacesOpen).toBe(false);
+    // A device folded before this release keeps that fold as an explicit one.
+    expect(parseSpacePrefs(JSON.stringify({ version: 1, collapsed: true })))
+      .toMatchObject({ collapsed: true, collapsedSet: true });
+    // No explicit fold recorded: the device gets the width's initial state.
+    expect(parseSpacePrefs(JSON.stringify({ version: 1 })))
+      .toMatchObject({ collapsed: false, collapsedSet: false, spacesOpen: false });
   });
 
   it("remembers which project's idle rows are open and whether the quiet bucket is open", () => {

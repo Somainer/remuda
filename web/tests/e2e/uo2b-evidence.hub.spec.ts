@@ -1,3 +1,4 @@
+import { openSpacesIndex } from "./spacesIndex";
 import { expect, test, type Page } from "@playwright/test";
 import { writeFile, mkdir } from "node:fs/promises";
 import path from "node:path";
@@ -166,7 +167,9 @@ for (const width of WIDTHS) {
       await page.keyboard.press("Escape");
     } else {
       // Desktop: the Spaces index column on /sessions, with QuickFind.
+      // §2.5: it starts collapsed behind 「空间 ▸」; evidence shows it expanded.
       await page.goto("/sessions");
+      await openSpacesIndex(page);
       await expect(page.getByTestId("spaces-panel")).toBeVisible();
       for (const mode of MODES) await shoot(page, "index", mode, width);
 

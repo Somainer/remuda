@@ -22,7 +22,7 @@ import {
 import { ADMIN_NAV, PRIMARY_NAV, isSessionRoute, isUnder } from "../lib/nav";
 import { hubStore, useHub } from "../lib/store";
 import { formatDiagnostic, notify, notifyStore, toastAdapter, useLiveAnnouncement, useNotifications, type Notification, type NotifyInput } from "../lib/notify";
-import { useWorkbenchViewport } from "../lib/viewport";
+import { useNarrowDesktop, useWorkbenchViewport } from "../lib/viewport";
 import { e2eSeamsEnabled } from "../lib/e2eSeams";
 import { SpacesMobile } from "../features/spaces/SpacesMobile";
 import { SpaceTabs } from "../features/spaces/SpaceTabs";
@@ -448,6 +448,9 @@ export function Sidebar({
 export function Shell() {
   const hub = useHub();
   const { mobile } = useWorkbenchViewport();
+  // home.md §2.4: at 1024–1279 the sidebar opens as the 48px icon column
+  // until this device records its own fold choice.
+  const narrowDesktop = useNarrowDesktop();
   // D-050 §9: the sidebar's 项目 section scopes the task list and the board
   // (their surfaces read useProjectFilter). Loaded once per shell mount.
   const projectDirectory = useProjects();
@@ -467,7 +470,8 @@ export function Shell() {
   const activeSpaceId = workbench.active?.id;
   const activeInstanceId = workbench.instanceId;
   const knownInstance = hub.instances.some((i) => i.id === activeInstanceId);
-  const collapsed = !mobile && workbench.prefs.collapsed;
+  const collapsed = !mobile
+    && (workbench.prefs.collapsedSet ? workbench.prefs.collapsed : narrowDesktop);
   // /sessions (and the dimmed list behind /sessions/new) mounts SpacesPanel,
   // which owns QuickFind there; every other desktop route mounts it here.
   const quickFindOwned = layout === "sessions" || onNew;

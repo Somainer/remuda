@@ -27,7 +27,19 @@ export type DismissedTab = { id: string; resurface: boolean };
 
 export type SpacePrefs = {
   version: 1;
+  /** The sidebar's ⌘B fold as last chosen on this device. */
   collapsed: boolean;
+  /**
+   * Whether the operator ever flipped the sidebar fold on this device. Until
+   * they do, `/sessions` at 1024–1279 opens icon-only (home.md §2.4): the
+   * absence of a preference is not the same as "expanded".
+   */
+  collapsedSet: boolean;
+  /**
+   * §2.5: the SpacesPanel index is collapsed behind 「空间 ▸」 by default and
+   * remembers its expanded state per device.
+   */
+  spacesOpen: boolean;
   groupCollapsed: Record<string, boolean>;
   exitedOpen: Record<string, boolean>;
   /**
@@ -45,7 +57,8 @@ export type SpacePrefs = {
 };
 
 export function defaultSpacePrefs(): SpacePrefs {
-  return { version: 1, collapsed: false, groupCollapsed: {}, exitedOpen: {}, idleOpen: {}, quietOpen: false, names: {}, order: [],
+  return { version: 1, collapsed: false, collapsedSet: false, spacesOpen: false,
+    groupCollapsed: {}, exitedOpen: {}, idleOpen: {}, quietOpen: false, names: {}, order: [],
     selectedTabs: {}, closedTabs: {} };
 }
 
@@ -169,6 +182,10 @@ export function parseSpacePrefs(raw: string | null): SpacePrefs {
     return {
       version: 1,
       collapsed: value.collapsed === true,
+      // A stored `collapsed:true` could only come from a toggle (the old
+      // default was false), so legacy devices keep their fold as explicit.
+      collapsedSet: value.collapsedSet === true || value.collapsed === true,
+      spacesOpen: value.spacesOpen === true,
       groupCollapsed: booleanMap(value.groupCollapsed),
       exitedOpen: booleanMap(value.exitedOpen),
       idleOpen: booleanMap(value.idleOpen),
@@ -208,7 +225,9 @@ export function createSpaceStore(storage = browserStorage()) {
     getSnapshot: () => prefs,
     subscribe(listener: () => void) { listeners.add(listener); return () => { listeners.delete(listener); }; },
     reload() { prefs = read(); emit(); },
-    setCollapsed(collapsed: boolean) { update({ collapsed }); },
+    setCollapsed(collapsed: boolean) { update({ collapsed, collapsedSet: true }); },
+    /** §2.5: the 「空间 ▸」 toggle's per-device expanded state. */
+    setSpacesOpen(spacesOpen: boolean) { update({ spacesOpen }); },
     rename(spaceId: string, name: string) {
       const names = { ...prefs.names };
       if (name.trim()) names[spaceId] = name.trim();

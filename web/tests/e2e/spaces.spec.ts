@@ -3,6 +3,7 @@ import { setMode } from "./appearanceHelper";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { openSpacesIndex } from "./spacesIndex";
 
 // Committed evidence is refreshed only on request (REMUDA_EVIDENCE=1); every other run —
 // including the merge gate, whose verify-tree step rejects a dirty worktree — writes
@@ -23,6 +24,8 @@ function tab(page: Page, title: string) {
 async function toList(page: Page) {
   await page.getByRole("navigation", { name: "主导航" }).getByRole("link", { name: "会话" }).click();
   await expect(page).toHaveURL(/\/sessions$/);
+  // §2.5: the Space index starts collapsed behind 「空间 ▸」.
+  await openSpacesIndex(page);
 }
 
 /** UO-2a: the Space index lives on /sessions; tabs live on /s/*. */
@@ -87,6 +90,7 @@ test("mock spaces remember tabs, names, order and panel state across desktop and
   const sidebar = page.getByTestId("sidebar");
   // UO-2a: list routes carry the Space index, not the tab strip.
   await page.goto("/sessions");
+  await openSpacesIndex(page);
   await expect(panel).toBeVisible();
   await expect(strip).toHaveCount(0);
   await openFromList(page, "demo-root", "空闲会话");
@@ -280,6 +284,7 @@ test("the folded sidebar opens the whole 管理 menu and reaches /fleet by keybo
 test("a trailing-slash /sessions/ mounts one QuickFind", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.goto("/sessions/");
+  await openSpacesIndex(page);
   await expect(page.getByTestId("spaces-panel")).toBeVisible();
   await expect(page.getByTestId("quickfind-trigger")).toHaveCount(1);
   await page.getByTestId("quickfind-trigger").click();

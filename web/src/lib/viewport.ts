@@ -13,12 +13,37 @@ export const COMPACT_WORKBENCH_QUERY =
 export const COARSE_POINTER_QUERY = "(pointer: coarse) and (hover: none)";
 
 /**
+ * home.md §2.4: 1024–1279 opens the sidebar as the 48px icon column unless
+ * the device has an explicit fold preference. Below 1024 the layout is still
+ * desktop (≥768), but the rule names this band only.
+ */
+export const NARROW_DESKTOP_QUERY = "(min-width: 1024px) and (max-width: 1279px)";
+
+/**
  * c-mfix round 2: only treat the band as keyboard-compact once it lost at
  * least this many px of height. Both acceptance keyboards clear it (iPhone 15
  * 336 / iPhone SE 260); transient scroll rubber-banding and small browser-chrome
  * moves do not.
  */
 const KEYBOARD_MIN_HEIGHT_PX = 120;
+
+/** Reactive narrow-desktop band (1024–1279). */
+export function useNarrowDesktop(): boolean {
+  const [narrow, setNarrow] = useState(() =>
+    typeof window === "undefined" || typeof window.matchMedia !== "function"
+      ? false
+      : window.matchMedia(NARROW_DESKTOP_QUERY).matches,
+  );
+  useEffect(() => {
+    if (typeof window.matchMedia !== "function") return;
+    const media = window.matchMedia(NARROW_DESKTOP_QUERY);
+    const update = () => setNarrow(media.matches);
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+  return narrow;
+}
 
 export function useWorkbenchViewport() {
   const [mobile, setMobile] = useState(() =>

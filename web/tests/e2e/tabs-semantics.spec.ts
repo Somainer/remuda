@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { openSpacesIndex } from "./spacesIndex";
 import { setMode } from "./appearanceHelper";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
@@ -82,6 +83,7 @@ test.describe("desktop", () => {
     page.on("pageerror", (error) => errors.push(error.message));
     await page.setViewportSize({ width: 1440, height: 900 });
     await page.goto("/sessions");
+    await openSpacesIndex(page);
     const panel = page.getByTestId("spaces-panel");
     const strip = page.getByTestId("space-tabs");
     // UO-2a: list routes carry the Space index and no tab strip; the strip is
@@ -174,6 +176,7 @@ test.describe("desktop", () => {
   test("overflow cues stay pinned to the strip edges and the active tab survives narrowing", async ({ page }) => {
     await page.setViewportSize({ width: 1440, height: 900 });
     await page.goto("/sessions");
+    await openSpacesIndex(page);
     const strip = page.getByTestId("space-tabs");
     // UO-2a: the strip only exists on /s/*. Enter via the list so the Vite dev
     // server has served the whole route graph before the strip is queried.
@@ -322,6 +325,7 @@ test.describe("desktop", () => {
 
     await page.setViewportSize({ width: 1440, height: 900 });
     await page.goto("/sessions");
+    await openSpacesIndex(page);
     await checkHeader(page, false, "desktop");
 
     // A touch-enabled 1024×1366 tablet still renders the desktop Spaces
@@ -335,6 +339,7 @@ test.describe("desktop", () => {
     const tabletPage = await tablet.newPage();
     try {
       await tabletPage.goto("/sessions");
+      await openSpacesIndex(tabletPage);
       await checkHeader(tabletPage, true, "coarse tablet");
     } finally {
       await tablet.close();

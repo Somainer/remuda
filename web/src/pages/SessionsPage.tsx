@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 import { useSearchParams } from "react-router-dom";
 import { SessionList } from "../features/session/SessionList";
 import { useHomeFreshness } from "../features/home/freshness";
@@ -14,7 +14,6 @@ import { GLANCE_TARGETS, scrollToFirst } from "../features/home/glanceNav";
 import { MainCard } from "../features/home/MainCard";
 import { WorkingList } from "../features/home/WorkingList";
 import { useMainAside } from "../features/home/useMain";
-import ui from "../styles/ui.module.css";
 import css from "./SessionsPage.module.css";
 
 /** The URL's `status` list, the same wire form `readConditions` parses. */
@@ -37,9 +36,10 @@ export function SessionsPage({ dimmed = false }: { dimmed?: boolean }) {
   // input at a time).
   const mainAside = useMainAside();
   const showMain = !mobile && !dimmed;
-  // Below 1024 the index column folds into the header's 空间 button, which
-  // opens the same panel as an overlay (one instance, same testids).
-  const [indexOpen, setIndexOpen] = useState(false);
+  // §2.5 (D-061): the SpacesPanel starts collapsed behind 「空间 ▸」 at the
+  // host band's right end. Expanding is a per-device preference: ≥1024 the
+  // panel is the index column, below 1024 the same component is an overlay.
+  const indexOpen = prefs.spacesOpen;
   // §5.2: 工作中 on the count row narrows the SessionList to that rank via the
   // list's own URL filter; a second tap removes it again.
   const [params, setParams] = useSearchParams();
@@ -59,17 +59,21 @@ export function SessionsPage({ dimmed = false }: { dimmed?: boolean }) {
   useEffect(() => {
     if (!indexOpen) return;
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setIndexOpen(false);
+      if (event.key === "Escape") spaceStore.setSpacesOpen(false);
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
   }, [indexOpen]);
 
   // Picking a Space on the list route keeps the list route: the column is an
-  // index of this page, not a jump to the Space's last tab.
+  // index of this page, not a jump to the Space's last tab. Below 1024 the
+  // panel is an overlay and closes after the pick; the column stays open.
   function select(space: Space) {
     spaceStore.selectSpace(space.id);
-    setIndexOpen(false);
+    if (typeof window !== "undefined" && typeof window.matchMedia === "function"
+      && window.matchMedia("(max-width: 1023px)").matches) {
+      spaceStore.setSpacesOpen(false);
+    }
   }
 
   return (
@@ -79,32 +83,43 @@ export function SessionsPage({ dimmed = false }: { dimmed?: boolean }) {
           crumbs={[{ label: "会话" }]}
           title={active?.name ?? "全部空间"}
           actions={
-            <>
-              <HomeGlance
-                placement="desktop"
-                workingFilter={workingFilter}
-                onNeedYou={() => scrollToFirst(GLANCE_TARGETS.needYouDesktop)}
-                onWorking={toggleWorking}
-              />
-              <button
-                type="button"
-                className={`${ui.btnGhost} ${css.indexOpen}`}
-                data-testid="spaces-index-open"
-                aria-expanded={indexOpen}
-                onClick={() => setIndexOpen((v) => !v)}
-              >
-                空间
-              </button>
-            </>
+            <HomeGlance
+              placement="desktop"
+              workingFilter={workingFilter}
+              onNeedYou={() => scrollToFirst(GLANCE_TARGETS.needYouDesktop)}
+              onWorking={toggleWorking}
+            />
           }
         />
       ) : null}
-      {/* ② 主机条: the 32px band under the PageHeader (home.md §2.2). */}
-      {!mobile ? <HostStrip placement="desktop" /> : null}
+      {/* ② 主机条: the 32px band under the PageHeader (home.md §2.2), with the
+          §2.5 「空间 ▸」 toggle at its right end. */}
+      {!mobile ? (
+        <HostStrip
+          placement="desktop"
+          trailing={
+            <button
+              type="button"
+              className={css.indexToggle}
+              data-testid="spaces-index-open"
+              aria-expanded={indexOpen}
+              onClick={() => spaceStore.setSpacesOpen(!indexOpen)}
+            >
+              空间 <span aria-hidden="true">{indexOpen ? "▾" : "▸"}</span>
+            </button>
+          }
+        />
+      ) : null}
       <div className={css.body}>
         {!mobile ? (
           <>
-            {indexOpen ? <div className={css.scrim} data-testid="spaces-index-scrim" onClick={() => setIndexOpen(false)} /> : null}
+            {indexOpen ? (
+              <div
+                className={css.scrim}
+                data-testid="spaces-index-scrim"
+                onClick={() => spaceStore.setSpacesOpen(false)}
+              />
+            ) : null}
             <aside className={css.index} data-open={indexOpen ? "1" : undefined} aria-label="空间">
               <SpacesPanel spaces={spaces} active={active} prefs={prefs} instanceId={instanceId} collapsed={false} onSelect={select} />
             </aside>

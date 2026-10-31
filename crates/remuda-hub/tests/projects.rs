@@ -57,6 +57,9 @@ async fn enroll_node(
                 "hostId": host_id,
                 "nodeVersion": "0.1.0-test",
                 "label": format!("fake-{host_id}"),
+                // Coordinators hold grants (continuity lineages): their work
+                // needs a fence-capable Node (D-057 §7.6).
+                "capabilities": { "lineageFence": true },
                 "host": {
                     "hostname": format!("{host_id}.local"),
                     "labels": labels_obj,

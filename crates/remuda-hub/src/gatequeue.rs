@@ -1854,7 +1854,6 @@ async fn schedule(state: &AppState) -> Result<(), HubError> {
                 &project_id,
                 &busy_lanes,
                 state,
-                job.initiator.as_ref(),
             )
             .await
             else {
@@ -1885,7 +1884,6 @@ async fn pick_lane<'a>(
     project_id: &str,
     busy: &std::collections::HashSet<String>,
     state: &AppState,
-    initiator: Option<&remuda_protocol::Initiator>,
 ) -> Option<&'a remuda_protocol::ProjectGateLane> {
     for lane in lanes {
         if let Some(wanted) = explicit
@@ -1903,17 +1901,6 @@ async fn pick_lane<'a>(
             .await
             .is_none()
         {
-            continue;
-        }
-        // D-057 §7.5/§7.6: no claim on a host with unacknowledged fences, and
-        // no continuity-lineage job on a Node without fence support.
-        if !matches!(
-            state
-                .store
-                .fence_host_refusal(lane.host_id.as_id().as_str().to_owned(), initiator.cloned())
-                .await,
-            Ok(None)
-        ) {
             continue;
         }
         return Some(lane);
@@ -4943,6 +4930,14 @@ impl Store {
                 return Ok(GateJobClaim::NotReady);
             };
             if job.state != GateJobState::Queued {
+                return Ok(GateJobClaim::NotReady);
+            }
+            // D-057 §7.5/§7.6, atomic with the claim: no claim on a lane whose
+            // host owes fence acknowledgements, and no continuity-lineage job
+            // on a Node without fence support. The row stays queued.
+            if crate::fence::host_refusal(conn, claim_host.as_id().as_str(), job.initiator.as_ref())?
+                .is_some()
+            {
                 return Ok(GateJobClaim::NotReady);
             }
             // r25 item 1 — EVIDENCE-UNCERTAIN RULE: a parked job is never

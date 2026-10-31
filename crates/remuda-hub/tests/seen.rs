@@ -96,7 +96,8 @@ impl FakeNode {
         ws.send(Message::Text(
             json!({
                 "jsonrpc":"2.0","id":"hello","method":"node.hello",
-                "params": { "hostId": host, "host": {
+                // A fence-capable Node: the Main seat is a continuity lineage.
+                "params": { "hostId": host, "capabilities": {"lineageFence": true}, "host": {
                     "hostname":"seen-node","workspaces":[], "workspaceRevision":0,
                     "herdr":{"path":"/usr/bin/herdr"},
                     "cli":[{"kind":"claude","path":"/usr/bin/claude","auth":"logged-in"}]
@@ -779,6 +780,16 @@ async fn a_resumed_child_and_a_main_chapter_start_clean() -> Result<()> {
     node.append(&main, main_worker.send()).await;
     node.append(&main, main_worker.finish()).await;
     assert_eq!(ctx.row(&ctx.phone, &main).await["unseen"], json!(true));
+    // D-057 §6.5: Resume runs on a paused lineage — Pause (close) first.
+    let (status, paused) = ctx
+        .http(
+            &ctx.phone,
+            "POST",
+            &format!("/v1/instances/{main}/commands"),
+            Some(r#"{"operation":"instance.close","payload":{}}"#),
+        )
+        .await;
+    assert_eq!(status, 200, "{paused}");
     let chapter2 = ctx.resume(&main).await;
     let fenced = ctx.row(&ctx.phone, &main).await;
     let chapter2_row = ctx.row(&ctx.desk, &chapter2).await;

@@ -320,6 +320,7 @@ previous chapter: remuda instance read ins_…
 - Every Hub mutation admitted for an Agent caller carries the authenticated **initiator** `{instanceId, lineageId, generation}`. `stamp()` derives it from the authenticating device's bound instance, never from the request body. A body-supplied `initiator` is stripped, as `actor` is today.
 - Beside it, the Hub records the **authenticating device id**. The device id stays on the Hub; it is not sent to Nodes.
 - Both are stored on command rows, gate jobs and direct-operation rows (§7.5).
+- **Root turn** (D-060 decision 1, `cb-rootturn`). The initiator also carries `rootTurn {commandId, origin, continuation}`: the root turn the instance was in when the Hub admitted the call. The Hub derives it from its own command rows and the journal it has ingested (protocol.md, "根回合记录"), never from a request body. It is written on command rows, audit rows (an Agent's child dispatch writes `instance.dispatch`), the forwarded Node frame and the Node's command journal rows, gate jobs, the Hub's one-shot approval cards and memory writes. It is never a gate: no admission, grant, approval or fence rule reads it, and a test proves the same calls get the same decisions with and without it.
 - The initiator (without the device id) is forwarded in Node params, persisted by the Node and journaled.
 - A Human token narrowed to an instance with `x-remuda-instance-id` is an Agent caller for that instance. Its device is the Human device.
 
@@ -741,7 +742,7 @@ The entry model follows Cindy's memory store (`packages/maker-core/src/memory/ty
 - **The seat** writes with its own Agent credential through the CLI. Only the lineage's current chapter may write; once F lands, the writer job checks `check_initiator` (§7.3).
 - **The owner** writes from the PWA (§12.3).
 - **`about-me`** is one entry the owner writes; the agent reads it (open question Q1 in D-060, recommended default).
-- **Origin.** Every write records the origin of the turn it was made in, plus the writing instance and the turn reference. Until `cb-rootturn` lands that origin is the caller's `InputOrigin`; afterwards it is `rootTurn.origin`. The owner can then tell a preference written in a turn they started from one written in a turn that worker text triggered.
+- **Origin.** Every write records the origin of the turn it was made in, plus the writing instance and the turn reference. For an Agent write that origin is `rootTurn.origin` (`cb-rootturn`), and the entry also carries the `rootTurn`; when the Hub knows no turn it falls back to the caller's `InputOrigin`. The owner can then tell a preference written in a turn they started from one written in a turn that worker text triggered.
 - **Rules the skill teaches** (`cb-skill`): store on the first clear statement; write statements, not commands to yourself; a `feedback` entry carries **Why** and **How to apply**; use absolute dates; store no logs, code facts or git history; check the index before writing, to avoid duplicates. The Hub enforces none of these: they are guidance, not policy.
 
 ### 12.3 Reading

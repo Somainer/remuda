@@ -75,6 +75,8 @@ export function HomeGlance({
     hour: new Date().getHours(),
     hostsOnline,
     hostsTotal: hub.hosts.length,
+    // Keep the segment on screen while it is the only way to clear the filter.
+    workingFilter,
   });
   // §8: stale greys the whole row and names the last successful update. A
   // foreground grace is explicitly NOT stale.

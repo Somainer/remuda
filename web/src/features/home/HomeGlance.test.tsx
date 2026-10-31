@@ -82,6 +82,19 @@ describe("HomeGlance", () => {
     expect(screen.queryByTestId("glance-working")).toBeNull();
   });
 
+  it("keeps a zero 工作中 segment clickable while its filter is active", async () => {
+    fake.state = hub();
+    fake.freshness = { state: "fresh", lastOkAt: 1, failingSince: null };
+    const onWorking = vi.fn();
+    const user = userEvent.setup();
+    render(<HomeGlance placement="phone" onNeedYou={noop} onWorking={onWorking} workingFilter />);
+    const working = screen.getByTestId("glance-working");
+    expect(working).toHaveTextContent("0 工作中");
+    expect(working).toHaveAttribute("aria-pressed", "true");
+    await user.click(working);
+    expect(onWorking).toHaveBeenCalledTimes(1);
+  });
+
   it("toggles the working filter segment and reports its state", async () => {
     fake.state = hub({ instances: [instance()] });
     fake.freshness = { state: "fresh", lastOkAt: 1, failingSince: null };

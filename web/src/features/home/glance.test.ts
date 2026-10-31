@@ -292,6 +292,18 @@ describe("glancePieces: §5.2 段的取舍", () => {
     ).toBe("晚上好 · 都处理完了 · 3/4 主机在线");
   });
 
+  it("keeps the 工作中 segment alive while its filter is active, even at zero", () => {
+    expect(
+      glanceText(
+        glancePieces({ counts: { needYou: 0, working: 0 }, hour: 9, hostsOnline: 3, hostsTotal: 4, workingFilter: true }),
+      ),
+    ).toBe("早上好 · 都处理完了 · ●0 工作中");
+    // Without the filter the known-zero segment stays hidden (§5.2).
+    expect(
+      glanceText(glancePieces({ counts: { needYou: 0, working: 0 }, hour: 9, hostsOnline: 3, hostsTotal: 4 })),
+    ).toBe("早上好 · 都处理完了 · 3/4 主机在线");
+  });
+
   it("drops the host tail when no host is registered at all", () => {
     expect(glanceText(glancePieces({ counts: { needYou: 0, working: 0 }, hour: 9, hostsOnline: 0, hostsTotal: 0 })))
       .toBe("早上好 · 都处理完了");

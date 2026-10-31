@@ -120,6 +120,12 @@ export type GlanceLineInput = {
   hour: number;
   hostsOnline: number;
   hostsTotal: number;
+  /**
+   * The 工作中 rank filter is applied. A known-zero segment is normally hidden
+   * (§5.2), but the active filter needs its control on screen to be cleared —
+   * so it stays, at 0, until the second tap.
+   */
+  workingFilter?: boolean;
 };
 
 /**
@@ -140,7 +146,7 @@ export function glancePieces(input: GlanceLineInput): GlancePiece[] {
   const pieces: GlancePiece[] = [];
   if (needYou > 0) pieces.push({ key: "needYou", count: needYou });
   else pieces.push({ key: "greeting", text: greetingForHour(input.hour) });
-  if (working > 0) pieces.push({ key: "working", count: working });
+  if (working > 0 || input.workingFilter === true) pieces.push({ key: "working", count: working });
   else if (needYou === 0 && input.hostsTotal > 0) {
     pieces.push({ key: "hosts", text: `${input.hostsOnline}/${input.hostsTotal} 主机在线` });
   }

@@ -1,4 +1,12 @@
-import { devices, expect, test, type Browser, type BrowserContext, type Page } from "@playwright/test";
+import {
+  devices,
+  expect,
+  test,
+  type Browser,
+  type BrowserContext,
+  type Page,
+  type Route,
+} from "@playwright/test";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,7 +17,10 @@ import { login } from "./hub-auth";
  *
  * Asserted here, against the in-process fake Node:
  *  - before the first successful list read both surfaces paint SKELETON rows,
- *    never the designed empty state (a cold start must not flash it);
+ *    never the designed empty state (a cold start must not flash it). The
+ *    state is produced the supported way — an offline reload, where the list
+ *    reads fail and the cached-session bootstrap publishes ready without any
+ *    successful snapshot;
  *  - a search that matches nothing gets the second empty state (没有匹配的会话
  *    + 清除搜索), and 清除搜索 really clears the field;
  *  - an unreachable Hub (context.setOffline) raises the 32 px banner after its
@@ -45,21 +56,25 @@ async function needsFakeNode(page: Page): Promise<boolean> {
 }
 
 /**
- * Hold the first list reads so the pre-snapshot paint can be observed. The
- * routes stay installed after release, where they simply pass through.
+ * Put the document into the real pre-snapshot state — the supported offline
+ * reload. After login the list reads FAIL, so bootstrap takes its
+ * cached-session path and publishes `ready:true, authed:true` with no
+ * successful list read (`lastOkAt === null`); AuthGate mounts the route and
+ * the lists paint their skeletons.
+ *
+ * Deliberately NOT a held read: a held bootstrap leaves AuthGate on
+ * 「加载中…」 until the 10 s REST deadline aborts the fetch, and only then does
+ * the same cached-session path run — a slow, accidental version of this state.
  */
-async function holdListReads(page: Page): Promise<() => void> {
-  let release!: () => void;
-  const gate = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  const handler = async (route: Parameters<Parameters<Page["route"]>[1]>[0]) => {
-    await gate;
-    await route.continue().catch(() => undefined);
-  };
-  await page.route("**/v1/instances", handler);
-  await page.route("**/v1/interactions", handler);
-  return release;
+async function failListReads(page: Page): Promise<void> {
+  const fail = (route: Route) => route.abort("failed").catch(() => undefined);
+  await page.route("**/v1/instances", fail);
+  await page.route("**/v1/interactions", fail);
+}
+
+async function allowListReads(page: Page): Promise<void> {
+  await page.unroute("**/v1/instances");
+  await page.unroute("**/v1/interactions");
 }
 
 async function phoneContext(browser: Browser, baseURL: string): Promise<BrowserContext> {
@@ -77,16 +92,25 @@ test.describe("home freshness (phone)", () => {
     const context = await phoneContext(browser, baseURL!);
     try {
       const page = await context.newPage();
-      const release = await holdListReads(page);
       await page.goto("/m");
-      // First paint: placeholder rows, not 「还没有会话」/「暂无会话」.
+      if (!(await needsFakeNode(page))) test.skip(true, "needs the in-process fake Node");
+      // Reload with the list reads failing: the cached-session bootstrap
+      // publishes ready with no successful snapshot, which is the state the
+      // skeleton exists for.
+      await failListReads(page);
+      await page.goto("/m");
       const skeleton = page.getByTestId("home-skeleton");
       await expect(skeleton).toBeVisible({ timeout: 20_000 });
+      // The gated route is mounted (not AuthGate's 加载中…), and no designed
+      // empty state may stand in for the missing snapshot.
+      await expect(page.getByTestId("auth-loading")).toHaveCount(0);
+      await expect(page.getByTestId("home-list")).toBeVisible();
       await expect(page.getByTestId("home-empty")).toHaveCount(0);
       await expect(page.getByText("还没有会话")).toHaveCount(0);
       await expect(page.getByText("暂无会话")).toHaveCount(0);
       await shot(page, "home-freshness-skeleton-390.png");
-      release();
+      // Let the next poll succeed: the skeleton gives way.
+      await allowListReads(page);
       await expect(skeleton).toHaveCount(0, { timeout: 20_000 });
 
       // The second empty state, distinct from the first: a search with no
@@ -148,13 +172,17 @@ test.describe("home freshness (desktop)", () => {
       await login(page, "e2e-hfresh-desktop");
       if (!(await needsFakeNode(page))) test.skip(true, "needs the in-process fake Node");
 
-      const release = await holdListReads(page);
+      await failListReads(page);
       await page.goto("/sessions");
       const skeleton = page.getByTestId("session-skeleton");
       await expect(skeleton).toBeVisible({ timeout: 20_000 });
+      await expect(page.getByTestId("auth-loading")).toHaveCount(0);
       await expect(page.getByText("还没有会话")).toHaveCount(0);
+      // /sessions must not paint its own "no hosts" placeholder off a failed
+      // bootstrap either (the offline-reload path has ready:true, hosts []).
+      await expect(page.getByText("无主机。请添加主机。")).toHaveCount(0);
       await shot(page, "home-freshness-skeleton-1280.png");
-      release();
+      await allowListReads(page);
       await expect(skeleton).toHaveCount(0, { timeout: 20_000 });
 
       await context.setOffline(true);

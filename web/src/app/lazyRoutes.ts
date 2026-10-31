@@ -19,6 +19,10 @@ export const SessionRoute = createLazyRoute<{ view?: "auto" | "structured" | "tt
   () => import("../pages/SessionPage"),
   "SessionPage",
 );
+export const MemoryRoute = createLazyRoute(
+  () => import("../pages/MemoryPage"),
+  "MemoryPage",
+);
 export const ApprovalsRoute = createLazyRoute(() => import("../pages/ApprovalsPage"), "ApprovalsPage");
 export const HostsRoute = createLazyRoute(() => import("../pages/HostsPage"), "HostsPage");
 export const HostDetailRoute = createLazyRoute(() => import("../pages/HostsPage"), "HostDetailPage");

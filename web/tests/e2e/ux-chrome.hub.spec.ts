@@ -286,6 +286,8 @@ test("390px: the chips strip folds, Stop and the switch stay reachable, and ever
         "density-toggle",
         "files-toggle",
         "events-toggle",
+        // D-060 memory page: a navigation item next to 文件/原始事件.
+        "memory-open",
         "annotation-add",
       ]);
       // §2.2 item 7: the one annotation entry point, live for this session.
@@ -397,6 +399,7 @@ test("1440px: diagnostics open from ⋯ into a per-device run-details panel whil
     "collapse-all",
     "density-toggle",
     "events-toggle",
+    "memory-open",
     "annotation-add",
   ]);
   await expect(popover.getByTestId("annotation-add")).toBeEnabled();

@@ -1,6 +1,7 @@
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import { RootTurnTag, rootTurnTagText } from "./RootTurnTag";
+import { RootTurnTag } from "./RootTurnTag";
+import { rootTurnTagText } from "./rootTurnTag";
 
 describe("rootTurnTagText", () => {
   it("labels only a turn the owner did not start, per surface", () => {

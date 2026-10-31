@@ -678,3 +678,42 @@ async fn an_approval_card_records_the_turn_that_asked() -> Result<()> {
     );
     Ok(())
 }
+
+/// A gate job an Agent enqueues records the root turn on its initiator, in
+/// the job document the Hub persists and serves.
+#[tokio::test]
+async fn a_gate_job_records_the_root_turn_it_was_enqueued_in() -> Result<()> {
+    let (ctx, mut node) = Ctx::boot().await?;
+    let (seat, token) = ctx.seat(&mut node, "main").await?;
+    let (status, project) = ctx
+        .post(
+            &ctx.human,
+            "/v1/projects",
+            &[],
+            json!({"name": "rootturn-project"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{project}");
+    let project = project["id"].as_str().context("project id")?.to_owned();
+    let owner = ctx.owner_turn(&mut node, &seat).await;
+    let (status, job) = ctx
+        .post(
+            &token,
+            &format!("/v1/projects/{project}/gate"),
+            &[],
+            json!({"branch": "wt/rootturn/verify", "mode": "verify"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{job}");
+    let expected = root_turn(&owner, "human", "none");
+    assert_eq!(job["initiator"]["rootTurn"], expected, "{job}");
+    let jobs = ctx.get(&format!("/v1/projects/{project}/gate")).await;
+    let stored = jobs["jobs"]
+        .as_array()
+        .or_else(|| jobs["items"].as_array())
+        .and_then(|rows| rows.iter().find(|row| row["id"] == job["id"]))
+        .cloned()
+        .with_context(|| format!("job in listing: {jobs}"))?;
+    assert_eq!(stored["initiator"]["rootTurn"], expected, "{stored}");
+    Ok(())
+}

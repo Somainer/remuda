@@ -723,7 +723,7 @@ mod tests {
         ] {
             let conn = db();
             owner_turn_open(&conn);
-            fold_all(&conn, &[death.clone()]);
+            fold_all(&conn, std::slice::from_ref(&death));
             assert_eq!(now(&conn), agent_unknown(), "after {death}");
             // The relaunch (resuming the same native session) starts no
             // input-bound turn: it is still not the owner's.

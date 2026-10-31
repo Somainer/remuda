@@ -55,9 +55,10 @@ impl MemoryType {
     }
 }
 
-// How the writing caller authenticated. The root turn that caused an Agent
-// write (`rootTurn`, cb-rootturn) is recorded beside it later; this field
-// never changes meaning when that lands.
+// The origin of the turn a write was made in (cb-rootturn, protocol §8.4):
+// `human` when the owner wrote it, or when an Agent wrote it in a turn an
+// owner's input started; `agent` otherwise. The full `rootTurn` is recorded
+// beside it, and the writing chapter stays in `writerInstance`.
 wire_enum!(MemoryOrigin, "8", {
     Human => "human",
     Agent => "agent",
@@ -99,8 +100,15 @@ pub struct MemoryEntry {
     /// never used before. Updates and deletes carry it back as
     /// `expectedRevision`.
     pub revision: u64,
-    /// How the caller of the last write authenticated.
+    /// Origin of the turn the last write was made in: `rootTurn.origin` for
+    /// an Agent write in a known turn (`human` only when an owner's input
+    /// started it), else how the writer authenticated.
     pub origin: MemoryOrigin,
+    /// cb-rootturn: the root turn an Agent's last write was made in, derived
+    /// by the Hub. Absent for an owner write and for a turn the Hub does not
+    /// know.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_turn: Option<crate::RootTurn>,
     /// Journal rows the entry was derived from.
     #[serde(default)]
     pub source_refs: Vec<MemorySourceRef>,
@@ -283,6 +291,7 @@ mod tests {
             body: String::new(),
             revision: 1,
             origin: MemoryOrigin::Human,
+            root_turn: None,
             source_refs: vec![],
             writer_instance: None,
             created_at: "c".into(),

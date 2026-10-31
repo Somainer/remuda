@@ -2525,6 +2525,7 @@ export type MemoryEntry = ({
   "lineageId": (string);
   "origin": MemoryOrigin;
   "revision": (number);
+  "rootTurn"?: (RootTurn | (null));
   "slug": (string);
   "sourceRefs": ((MemorySourceRef)[]);
   "title": (string);

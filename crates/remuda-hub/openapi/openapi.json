@@ -5231,7 +5231,7 @@
         "type": "string"
       },
       "MemoryOrigin": {
-        "description": "How the writing caller authenticated.",
+        "description": "Origin of the turn a write was made in: `human` for an owner write, or an Agent write in a turn an owner's input started (`rootTurn.origin`); `agent` otherwise.",
         "enum": [
           "human",
           "agent"
@@ -5315,6 +5315,9 @@
           "writerInstance": {
             "description": "Chapter that made the last write; absent for an owner write.",
             "type": "string"
+          },
+          "rootTurn": {
+            "$ref": "#/components/schemas/RootTurn"
           }
         },
         "required": [

@@ -11197,13 +11197,24 @@
         },
         "origin": {
           "$ref": "#/$defs/MemoryOrigin",
-          "description": "How the caller of the last write authenticated."
+          "description": "Origin of the turn the last write was made in: `rootTurn.origin` for\nan Agent write in a known turn (`human` only when an owner's input\nstarted it), else how the writer authenticated."
         },
         "revision": {
           "description": "Revision: the next one for this slug on every write, never reused —\na slug recreated after a delete continues after its last revision, so\na stale `expectedRevision` never matches a replacement. 1 for a slug\nnever used before. Updates and deletes carry it back as\n`expectedRevision`.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "rootTurn": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RootTurn"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "cb-rootturn: the root turn an Agent's last write was made in, derived\nby the Hub. Absent for an owner write and for a turn the Hub does not\nknow."
         },
         "slug": {
           "description": "Stable handle, unique within the lineage (archived entries included).",

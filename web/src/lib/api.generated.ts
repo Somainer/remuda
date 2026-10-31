@@ -2792,6 +2792,7 @@ export interface components {
             origin: components["schemas"]["MemoryOrigin"];
             /** @description The slug's next revision on every write, never reused: a slug recreated after a delete continues after its last revision. 1 for a slug never used before. */
             revision: number;
+            rootTurn?: components["schemas"]["RootTurn"];
             /** @description Stable handle, unique within the lineage. */
             slug: string;
             /** @description Journal rows the entry was derived from. */
@@ -2820,7 +2821,7 @@ export interface components {
             warnings: components["schemas"]["MemorySizeWarning"][];
         };
         /**
-         * @description How the writing caller authenticated.
+         * @description Origin of the turn a write was made in: `human` for an owner write, or an Agent write in a turn an owner's input started (`rootTurn.origin`); `agent` otherwise.
          * @enum {string}
          */
         MemoryOrigin: "human" | "agent";

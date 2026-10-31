@@ -2527,6 +2527,7 @@ export type MemoryEntry = ({
   "slug": (string);
   "sourceRefs": ((MemorySourceRef)[]);
   "title": (string);
+  "turnRef": (MemoryTurnRef | (null));
   "type": MemoryType;
   "updatedAt": (string);
   "writerInstance"?: (string | null);
@@ -2575,8 +2576,36 @@ export type MemorySourceRef = ({
   [key: string]: unknown;
 });
 
+/** The turn a write happened in: the chapter that wrote it and the journal seq of that chapter's most recent `turn_started` row at write time.  Stamped from the Hub's own journal, never from the request body. Absent for an owner (PWA) write and for a write before the chapter's first turn. */
+export type MemoryTurnRef = ({
+  "instanceId": (string);
+  "seq": (number);
+  [key: string]: unknown;
+});
+
 /** MemoryType wire values; `protocol.md` §8. */
 export type MemoryType = ("user" | "feedback" | "project" | "reference");
+
+/** One row of a writer instance's append-only memory write log (D-060).  A row survives a later rewrite or delete of the entry, because every turn that wrote memory shows its row under the reply. */
+export type MemoryWriteItem = ({
+  "op": MemoryWriteOp;
+  "revision": (number);
+  "slug": (string);
+  "title": (string);
+  "turnSeq": (number | null);
+  "writtenAt": (string);
+  [key: string]: unknown;
+});
+
+/** MemoryWriteOp wire values; `protocol.md` §8. */
+export type MemoryWriteOp = ("write" | "consolidate" | "delete");
+
+/** One page of a writer instance's append-only memory write log.  Rows are ordered oldest first within the page. Without a cursor the page is the NEWEST page (a recent transcript needs its recent turns); `next_after_id` is the row id to poll from, so a single turn with more rows than a page still advances. */
+export type MemoryWritePage = ({
+  "items": ((MemoryWriteItem)[]);
+  "nextAfterId": (number);
+  [key: string]: unknown;
+});
 
 /** Result of a create, update or consolidate. */
 export type MemoryWriteResult = ({

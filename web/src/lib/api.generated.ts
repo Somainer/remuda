@@ -818,6 +818,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/instances/{id}/memory-writes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List a writer chapter's memory writes
+         * @description One page of a writer chapter's memory write log (latest page when no cursor is given; oldest first within the page), keyed by log row id so a single turn with more rows than a page still advances. A row survives a later rewrite or delete of its entry, so the transcript can show every turn that wrote memory. Human and Bot callers only: an Agent credential is refused (403).
+         */
+        get: operations["memoryWrites"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/instances/{id}/resume": {
         parameters: {
             query?: never;
@@ -997,7 +1017,7 @@ export interface paths {
         put?: never;
         /**
          * Create a memory entry
-         * @description Create one entry at the slug's next revision (1 for a slug never used before; a recreated slug continues after its last revision); 409 MEMORY_SLUG_EXISTS when the slug exists (archived included). Soft limits (entry 2048 bytes, index 4096 bytes) come back as warnings with the actual numbers; above 8192 bytes the entry is refused (413). Human devices create memory only for an existing lineage (404 for a retired one) and may update, delete and consolidate (into one of the inputs) any lineage's retained entries, a retired lineage's included. An Agent writes only its own lineage and only from the lineage's current, unfenced chapter (403 otherwise). Bot devices are refused.
+         * @description Create one entry at the slug's next revision (1 for a slug never used before; a recreated slug continues after its last revision); 409 MEMORY_SLUG_EXISTS when the slug exists (archived included). Soft limits (entry 2048 bytes, index 4096 bytes) come back as warnings with the actual numbers; above 8192 bytes the entry is refused (413). Human devices create memory only for an existing lineage (404 for a retired one) and may update, delete and consolidate (into one of the inputs) any lineage's retained entries, a retired lineage's included. An Agent writes only its own lineage and only from the lineage's current, unfenced chapter (403 otherwise). Bot devices are refused. An Agent write to `about-me` (create, update, delete, or a consolidate that names it as input or target) is refused 403 with reason `owner-authored`.
          */
         post: operations["memoryCreate"];
         delete?: never;
@@ -1017,7 +1037,7 @@ export interface paths {
         put?: never;
         /**
          * Consolidate memory entries (CAS on every input)
-         * @description Atomically replace 2-32 entries with one: every source carries its expectedRevision, and any stale one is 409 MEMORY_REVISION_CONFLICT listing each conflict, with nothing changed. The new entry may reuse a source's slug (its revision then continues) or take a new one (409 when that slug exists elsewhere); it keeps every source's sourceRefs. Human devices create memory only for an existing lineage (404 for a retired one) and may update, delete and consolidate (into one of the inputs) any lineage's retained entries, a retired lineage's included. An Agent writes only its own lineage and only from the lineage's current, unfenced chapter (403 otherwise). Bot devices are refused.
+         * @description Atomically replace 2-32 entries with one: every source carries its expectedRevision, and any stale one is 409 MEMORY_REVISION_CONFLICT listing each conflict, with nothing changed. The new entry may reuse a source's slug (its revision then continues) or take a new one (409 when that slug exists elsewhere); it keeps every source's sourceRefs. Human devices create memory only for an existing lineage (404 for a retired one) and may update, delete and consolidate (into one of the inputs) any lineage's retained entries, a retired lineage's included. An Agent writes only its own lineage and only from the lineage's current, unfenced chapter (403 otherwise). Bot devices are refused. An Agent write to `about-me` (create, update, delete, or a consolidate that names it as input or target) is refused 403 with reason `owner-authored`.
          */
         post: operations["memoryConsolidate"];
         delete?: never;
@@ -1040,13 +1060,13 @@ export interface paths {
         get: operations["memoryGet"];
         /**
          * Update a memory entry (revision CAS)
-         * @description Revision compare-and-set update: expectedRevision is required, and a stale one is 409 MEMORY_REVISION_CONFLICT with currentRevision. Omitted fields keep their values; sourceRefs are appended. An archived entry is 409 MEMORY_ARCHIVED until restored. Human devices create memory only for an existing lineage (404 for a retired one) and may update, delete and consolidate (into one of the inputs) any lineage's retained entries, a retired lineage's included. An Agent writes only its own lineage and only from the lineage's current, unfenced chapter (403 otherwise). Bot devices are refused.
+         * @description Revision compare-and-set update: expectedRevision is required, and a stale one is 409 MEMORY_REVISION_CONFLICT with currentRevision. Omitted fields keep their values; sourceRefs are appended. An archived entry is 409 MEMORY_ARCHIVED until restored. Human devices create memory only for an existing lineage (404 for a retired one) and may update, delete and consolidate (into one of the inputs) any lineage's retained entries, a retired lineage's included. An Agent writes only its own lineage and only from the lineage's current, unfenced chapter (403 otherwise). Bot devices are refused. An Agent write to `about-me` (create, update, delete, or a consolidate that names it as input or target) is refused 403 with reason `owner-authored`.
          */
         put: operations["memoryUpdate"];
         post?: never;
         /**
          * Delete a memory entry (revision CAS)
-         * @description Revision compare-and-set delete: the expectedRevision query parameter is required; a stale one is 409 MEMORY_REVISION_CONFLICT. Human devices create memory only for an existing lineage (404 for a retired one) and may update, delete and consolidate (into one of the inputs) any lineage's retained entries, a retired lineage's included. An Agent writes only its own lineage and only from the lineage's current, unfenced chapter (403 otherwise). Bot devices are refused.
+         * @description Revision compare-and-set delete: the expectedRevision query parameter is required; a stale one is 409 MEMORY_REVISION_CONFLICT. Human devices create memory only for an existing lineage (404 for a retired one) and may update, delete and consolidate (into one of the inputs) any lineage's retained entries, a retired lineage's included. An Agent writes only its own lineage and only from the lineage's current, unfenced chapter (403 otherwise). Bot devices are refused. An Agent write to `about-me` (create, update, delete, or a consolidate that names it as input or target) is refused 403 with reason `owner-authored`.
          */
         delete: operations["memoryDelete"];
         options?: never;
@@ -2797,6 +2817,8 @@ export interface components {
             sourceRefs: components["schemas"]["MemorySourceRef"][];
             /** @description One-line title. */
             title: string;
+            /** @description Turn of the last write, from the writer chapter's journal; null for an owner write or before that chapter's first turn. */
+            turnRef: components["schemas"]["MemoryTurnRef"] | null;
             type: components["schemas"]["MemoryType"];
             /** @description Last write. */
             updatedAt: string;
@@ -2862,6 +2884,13 @@ export interface components {
             /** @description Journal sequence number. */
             seq: number;
         };
+        /** @description The turn a memory write happened in: the writing chapter and the journal seq of its most recent `turn_started` row at write time (D-060). */
+        MemoryTurnRef: {
+            /** @description Chapter that was writing. */
+            instanceId: string;
+            /** @description Journal seq of the writer's latest turn_started row. */
+            seq: number;
+        };
         /**
          * @description Memory entry type (index order).
          * @enum {string}
@@ -2877,6 +2906,32 @@ export interface components {
             sourceRefs?: components["schemas"]["MemorySourceRef"][];
             title?: string;
             type?: components["schemas"]["MemoryType"];
+        };
+        /** @description One row of a writer chapter's append-only memory write log (D-060). */
+        MemoryWriteItem: {
+            op: components["schemas"]["MemoryWriteOp"];
+            /** @description Revision this write produced; for a consolidate input, the revision it consumed. */
+            revision: number;
+            /** @description Entry handle. */
+            slug: string;
+            /** @description Title at write time; kept after a later rewrite or delete. */
+            title: string;
+            /** @description Turn the write happened in; null for an owner write or before the chapter's first turn. */
+            turnSeq: number | null;
+            /** @description Time of the write. */
+            writtenAt: string;
+        };
+        /**
+         * MemoryWriteOp
+         * @description What one memory write did to its slug.
+         * @enum {string}
+         */
+        MemoryWriteOp: "write" | "consolidate" | "delete";
+        /** @description One page of a writer chapter's memory write log. Without a cursor this is the newest page; rows are oldest first within it. */
+        MemoryWritePage: {
+            items: components["schemas"]["MemoryWriteItem"][];
+            /** @description Row id to pass back as afterId; the newest row id in the page, or the cursor itself when the page is empty. */
+            nextAfterId: number;
         };
         /** @description A committed create, update or consolidate. */
         MemoryWriteResult: {
@@ -5403,6 +5458,34 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["InstanceMcpToken"];
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
+    memoryWrites: {
+        parameters: {
+            query?: {
+                /** @description Return only log rows whose id is greater than this (the previous page's nextAfterId). */
+                afterId?: number;
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Write log rows */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryWritePage"];
                 };
             };
             401: components["responses"]["Error"];

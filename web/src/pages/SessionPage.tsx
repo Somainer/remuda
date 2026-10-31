@@ -12,7 +12,7 @@ import {
   type ReactNode,
 } from "react";
 import { Navigate, useLocation, useNavigate, useParams } from "react-router-dom";
-import { FileText, Info, ListCollapse, MessageSquarePlus, Rows3, ScrollText, Search } from "lucide-react";
+import { BrainCircuit, FileText, Info, ListCollapse, MessageSquarePlus, Rows3, ScrollText, Search } from "lucide-react";
 import { ConnectionIndicator } from "../components/ConnectionIndicator";
 import { EndedBar } from "../chrome/EndedBar";
 import { MainSessionBar } from "../features/session/MainSessionBar";
@@ -29,6 +29,7 @@ import { allModelPinMismatches } from "../features/session/modelEffective";
 import { RunDetails } from "../features/session/RunDetails";
 import { claudeDefaultTier, contextPercent } from "../features/session/effort";
 import { Transcript, type TranscriptHandle } from "../features/session/Transcript";
+import { rememberedByReply, useRememberedWrites } from "../features/session/remembered";
 import { LiveStatusStrip } from "../features/session/live/LiveStatusStrip";
 import { useTurnDecision } from "../features/session/useTurnDecision";
 import { SessionNotifications } from "../features/session/notifications/SessionNotifications";
@@ -449,6 +450,21 @@ function SessionPageBody({
   const ended = instance ? endReason(instance) : null;
   const status = ended ? "exited" : instance ? projectStatus(instance) : "unknown";
   const events = hub.events ?? NO_EVENTS;
+  // D-060 (cb-memory-ui): the chapter's write log rides the transcript's
+  // refresh (its tail seq), and the rows are placed under the reply of the
+  // turn that wrote them. One fetch per journal batch; no per-row timer.
+  const rememberedWrites = useRememberedWrites(
+    instanceId,
+    events.length ? String(events.at(-1)?.seq ?? instance?.durableSeq ?? "0") : instance?.durableSeq,
+  );
+  const rememberedRows = useMemo(
+    () => rememberedByReply(events, rememberedWrites),
+    [events, rememberedWrites],
+  );
+  const openMemory = useCallback(
+    (slug: string) => navigate(`/s/${instanceId}/memory?slug=${encodeURIComponent(slug)}`),
+    [navigate, instanceId],
+  );
   const pending = hub.pending;
   // The turn-end decision folds every channel (hook latch, screen, transcript
   // tail, pending interactions), not the hook latch alone — so a turn whose
@@ -764,6 +780,16 @@ function SessionPageBody({
       onSelect: () => navigate(resolvedView === "events" ? backTo : `/s/${instance.id}/events`),
     });
   }
+  // D-060 (cb-memory-ui): the memory page entry point, grouped with the other
+  // navigation entries (文件 / 原始事件) and before the annotation action. A ⋯
+  // item at every width, so the Main seat reuses the same route later.
+  moreItems.push({
+    key: "memory",
+    testId: "memory-open",
+    label: "记忆",
+    icon: BrainCircuit,
+    onSelect: () => navigate(`/s/${instance.id}/memory`),
+  });
   // §2.2 item 7: the only annotation entry point. An archived task's session
   // is a read-only preview, so the item stays visible but inert; terminal
   // segments offer no annotations at all.
@@ -888,6 +914,8 @@ function SessionPageBody({
             earlierFloor={hub.earlierFloor}
             journalStatus={journalStatus}
             steerHeld={steerHeldControl(instance.kind, composerPhase, instance.capabilities)}
+            remembered={rememberedRows}
+            onOpenMemory={openMemory}
             onSteerHeld={async (_iid, id) => {
               const landed = await hubStore.steerHeld(instance.id, id);
               // 已打断 is a receipt for an interrupt that actually landed.

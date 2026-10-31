@@ -79,6 +79,9 @@
 }
 
 .toolbar {
+  /* home.md §2.1: ② sits directly under ①; this row comes after ② and before
+     the ledger, scrolling with the page. */
+  order: 2;
   display: flex;
   align-items: center;
   gap: var(--space-3);
@@ -112,7 +115,7 @@
    band. The class is composed on the element (ui.seg), so no bespoke styles. */
 
 .groups {
-  order: 2;
+  order: 3;
   flex: 1 1 auto;
   padding-bottom: var(--space-5);
 }

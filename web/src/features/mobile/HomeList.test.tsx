@@ -610,3 +610,16 @@ describe("① 需要你 anchor on the phone ledger", () => {
     expect(container.querySelector(GLANCE_TARGETS.needYou)).toBe(article);
   });
 });
+
+describe("phone home order (§2.1)", () => {
+  it("puts ② directly after the sticky head and the search/order row after it", async () => {
+    hub.instances = [row("ins-work", { activity: known("working") })];
+    renderHome();
+    const head = await screen.findByTestId("home-head");
+    const strip = await screen.findByTestId("host-strip");
+    const toolbar = await screen.findByTestId("home-search");
+    // Document order is the contract the CSS orders follow: head → ② → toolbar.
+    expect(head.compareDocumentPosition(strip) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(strip.compareDocumentPosition(toolbar) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+});

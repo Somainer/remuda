@@ -434,46 +434,11 @@ export const HomeList = memo(function HomeList() {
           onWorking={() => setRankFilter((current) => (current === "working" ? null : "working"))}
         />
       </header>
-      {/* The probe wraps ONLY the session list surface (search row + project
-          groups). The D-050 task layer sits outside it: its own 5s ledger
-          poll commits the task subtree, never `commit:HomeList`. */}
+      {/* The probe wraps ONLY the project groups: the toolbar, ①, ②, the task
+          layer and the Main card are outside it, so their own updates never
+          report `commit:HomeList`. */}
       <CommitProbe name="HomeList">
         <>
-          <div className={css.toolbar}>
-            <input
-              className={css.search}
-              data-testid="home-search"
-              type="search"
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              placeholder="搜索 会话 / 项目 / 主机"
-              aria-label="搜索会话、项目或主机"
-            />
-            <div className={ui.seg} role="group" aria-label="排序方式" data-testid="home-order">
-              <button
-                type="button"
-                className={ui.segItem}
-                data-testid="home-order-clock"
-                aria-pressed={order === "clock"}
-                onClick={() => setOrder("clock")}
-              >
-                <span className={ui.segLabel} title="时钟">
-                  时钟
-                </span>
-              </button>
-              <button
-                type="button"
-                className={ui.segItem}
-                data-testid="home-order-list"
-                aria-pressed={order === "list"}
-                onClick={() => setOrder("list")}
-              >
-                <span className={ui.segLabel} title="列表">
-                  列表
-                </span>
-              </button>
-            </div>
-          </div>
           {drawerOpen ? (
             <SpacesDrawer
               spaces={spaces}
@@ -532,6 +497,43 @@ export const HomeList = memo(function HomeList() {
       <HubBanner />
       {/* ② 主机条: 28px, scrolling with the page (home.md §1 ② / §2.1). */}
       <HostStrip placement="phone" />
+      {/* Search + ordering scroll with the list (§2.1: ② sits directly under
+          ①, this row comes after it). */}
+      <div className={css.toolbar}>
+        <input
+          className={css.search}
+          data-testid="home-search"
+          type="search"
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          placeholder="搜索 会话 / 项目 / 主机"
+          aria-label="搜索会话、项目或主机"
+        />
+        <div className={ui.seg} role="group" aria-label="排序方式" data-testid="home-order">
+          <button
+            type="button"
+            className={ui.segItem}
+            data-testid="home-order-clock"
+            aria-pressed={order === "clock"}
+            onClick={() => setOrder("clock")}
+          >
+            <span className={ui.segLabel} title="时钟">
+              时钟
+            </span>
+          </button>
+          <button
+            type="button"
+            className={ui.segItem}
+            data-testid="home-order-list"
+            aria-pressed={order === "list"}
+            onClick={() => setOrder("list")}
+          >
+            <span className={ui.segLabel} title="列表">
+              列表
+            </span>
+          </button>
+        </div>
+      </div>
       {/* D-057 Main card + 问 Main (H8a): outside the probe so its own echo
           and tail reads never report commit:HomeList; flex order 0 keeps it
           right under the sticky head, below the banner. Renders nothing

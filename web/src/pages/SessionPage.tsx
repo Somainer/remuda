@@ -740,15 +740,6 @@ function SessionPageBody({
     data: { "data-mode": hub.compact ? "compact" : "full" },
     onSelect: () => hubStore.setCompact(!hub.compact),
   });
-  // D-060 (cb-memory-ui): the memory page entry point. A ⋯ item every width,
-  // so the Main seat reaches the same route later without new routing.
-  moreItems.push({
-    key: "memory",
-    testId: "memory-open",
-    label: "记忆",
-    icon: BrainCircuit,
-    onSelect: () => navigate(`/s/${instance.id}/memory`),
-  });
   if (showViewExtras && !filesInline) {
     moreItems.push({
       key: "files",
@@ -769,6 +760,16 @@ function SessionPageBody({
       onSelect: () => navigate(resolvedView === "events" ? backTo : `/s/${instance.id}/events`),
     });
   }
+  // D-060 (cb-memory-ui): the memory page entry point, grouped with the other
+  // navigation entries (文件 / 原始事件) and before the annotation action. A ⋯
+  // item at every width, so the Main seat reuses the same route later.
+  moreItems.push({
+    key: "memory",
+    testId: "memory-open",
+    label: "记忆",
+    icon: BrainCircuit,
+    onSelect: () => navigate(`/s/${instance.id}/memory`),
+  });
   // §2.2 item 7: the only annotation entry point. An archived task's session
   // is a read-only preview, so the item stays visible but inert; terminal
   // segments offer no annotations at all.

@@ -117,6 +117,13 @@
   padding-bottom: var(--space-5);
 }
 
+/* home.md §8: stale = the cached ledger turns grey until the next successful
+   refresh. A foreground grace is not stale and keeps full strength; the rows
+   stay operable either way (§8 only holds the stale-only actions of ④). */
+.groups[data-dimmed="1"] {
+  opacity: 0.55;
+}
+
 /* The D-050 task layer renders outside the commit:HomeList probe subtree but
    stays in the same visual position: under the sticky head, above the project
    groups (flex order; the head is order 0). */

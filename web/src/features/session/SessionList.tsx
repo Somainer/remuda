@@ -20,6 +20,9 @@ import { nextStep } from "./nextStep";
 import { LaunchedByMark } from "./LaunchedBy";
 import { HarnessGlyph } from "../spaces/SpacesPanel";
 import { compareRanked, liveChildParents, rank, rankStateWord } from "../mobile/homeRows";
+import { useHomeFreshness } from "../home/freshness";
+import { HubBanner } from "../home/HubBanner";
+import { NoSessions, SkeletonRows } from "../home/HomeStates";
 import { useHeldOrder, type HoldSource } from "../../lib/useHeldOrder";
 import {
   applyFilters,
@@ -78,6 +81,10 @@ export function SessionList({
   const hub = useHub();
   const location = useLocation();
   const { mobile } = useWorkbenchViewport();
+  // home.md §8: no snapshot yet = skeleton, never an empty state; stale =
+  // the cached rows are grey (a foreground grace is explicitly not stale).
+  const freshness = useHomeFreshness();
+  const firstSnapshot = freshness.state === "unknown";
   // Display-only clock for the relative time labels: quiet polls no longer
   // emit on equal payloads, so labels advance on this local tick instead.
   const nowMs = useNowTick();
@@ -344,26 +351,40 @@ export function SessionList({
     conditions,
   });
 
-  if (empty === "no-hosts") {
-    return (
-      <p className={css.empty} data-testid="session-list" data-empty="no-hosts">
-        无主机。<Link to="/hosts">添加主机</Link>
-      </p>
-    );
-  }
-  if (empty === "no-workspaces") {
-    return (
-      <p className={css.empty} data-testid="session-list" data-empty="no-workspaces">
-        主机已连接，但还没有注册工作目录。<Link to="/hosts">注册工作目录</Link>
-      </p>
-    );
-  }
-  if (empty === "no-sessions") {
-    return (
-      <p className={css.empty} data-testid="session-list" data-empty="no-sessions">
-        {title} 还没有会话。<Link to={newHref}>新建会话</Link>
-      </p>
-    );
+  // Nothing is known before the first snapshot: the desktop skeleton below
+  // owns the surface, and no empty state may flash on a cold start (§8). The
+  // banner stays mounted above every list state, empty ones included.
+  if (!firstSnapshot) {
+    if (empty === "no-hosts") {
+      return (
+        <>
+          <HubBanner />
+          <p className={css.empty} data-testid="session-list" data-empty="no-hosts">
+            无主机。<Link to="/hosts">添加主机</Link>
+          </p>
+        </>
+      );
+    }
+    if (empty === "no-workspaces") {
+      return (
+        <>
+          <HubBanner />
+          <p className={css.empty} data-testid="session-list" data-empty="no-workspaces">
+            主机已连接，但还没有注册工作目录。<Link to="/hosts">注册工作目录</Link>
+          </p>
+        </>
+      );
+    }
+    if (empty === "no-sessions") {
+      return (
+        <>
+          <HubBanner />
+          <div className={css.empty} data-testid="session-list" data-empty="no-sessions">
+            <NoSessions newHref={newHref} />
+          </div>
+        </>
+      );
+    }
   }
 
   if (variant === "compact") {
@@ -433,6 +454,8 @@ export function SessionList({
           ＋ 新建
         </Link>
       </header>
+      {/* §8 横幅: consecutive refresh failures past 5 s, above the toolbar. */}
+      <HubBanner />
       <div className={css.toolbar}>
         <div className={css.toolbarTop}>
           <label className={css.search}>
@@ -634,7 +657,7 @@ export function SessionList({
           </form>
         ) : null}
       </div>
-      {empty === "no-matches" ? (
+      {!firstSnapshot && empty === "no-matches" ? (
         <div className={css.noMatches} data-testid="session-no-matches" data-empty="no-matches">
           <p className={css.noMatchesTitle}>没有会话符合当前筛选条件。</p>
           <p className={css.noMatchesBody}>
@@ -666,6 +689,9 @@ export function SessionList({
         className={css.rows}
         ref={regionRef}
         data-order-held={held ? "1" : "0"}
+        data-freshness={freshness.state}
+        // Stale = the cached cards are grey until the next success (§8).
+        data-dimmed={freshness.state === "stale" ? "1" : undefined}
         // Only the ROWS freeze the order: the toolbar, filters and search sit
         // outside this region, so typing there keeps filtering live.
         onPointerDown={() => startHold("pointer")}
@@ -684,7 +710,9 @@ export function SessionList({
           }
         }}
       >
-      {sections.map((group) => {
+      {/* §8: before the first snapshot the board paints three skeleton cards
+          and no empty state (a cold start cannot flash one). */}
+      {firstSnapshot ? <SkeletonRows variant="desktop" testId="session-skeleton" /> : sections.map((group) => {
         const items = group.instances;
         if (!items.length) return null;
         // Desktop groups are status buckets, not project groups, so an idle fold

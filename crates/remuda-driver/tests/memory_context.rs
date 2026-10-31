@@ -233,6 +233,85 @@ fn caller_supplied_system_prompt_flags_are_still_refused_on_the_node() {
     }
 }
 
+/// Claude 2.1.265+ reuses the system prompt a conversation recorded on its
+/// first request on every `--resume`; a native resume therefore turns that
+/// off (the switch exists from 2.1.257) so the new chapter's pair is the one
+/// sent. A fresh session, and a build that cannot parse the switch, get none.
+#[test]
+fn a_native_resume_renders_its_own_system_prompt() {
+    let context = context();
+    let resume = || SessionAction::Resume {
+        session_id: "01993ab0-0000-7000-8000-000000000009".into(),
+    };
+    let with_version = |driver: DriverKind, session: SessionAction, version: &str| {
+        let tmp = tempfile::tempdir().unwrap();
+        let binary = install_executable(tmp.path(), "claude", "#!/bin/sh\n");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let spec = spec(driver, AgentKind::Claude, &[]);
+        let profile = anthropic();
+        materialize(&MaterializeRequest {
+            spec: &spec,
+            profile: &profile,
+            launch_dir: tmp.path().join("launch"),
+            native_home: home,
+            session,
+            launch_id: Id::new("launch").unwrap(),
+            binary: BinarySource::Pinned(BinaryPin {
+                abs_path: binary.to_string_lossy().into_owned(),
+                version: version.into(),
+                sha256: hash_file(&binary).unwrap(),
+            }),
+            setting_sources: None,
+            origin: LaunchOrigin::Human,
+            native_home_managed: None,
+            settings_overlay_path: None,
+            secret_policy: None,
+            memory_context: Some(&context),
+        })
+        .unwrap()
+        .argv
+    };
+    let snapshot_off = |argv: &[String]| {
+        argv.windows(4).any(|window| {
+            window[0] == "--system-prompt-snapshot"
+                && window[1] == "off"
+                && window[2] == APPEND_SYSTEM_PROMPT
+                && window[3] == INDEX
+        })
+    };
+    for driver in [
+        DriverKind::ClaudePrint,
+        DriverKind::ClaudeSdk,
+        DriverKind::ClaudePty,
+        DriverKind::ShellPty,
+    ] {
+        let argv = with_version(driver, resume(), "2.1.291 (Claude Code)");
+        assert!(snapshot_off(&argv), "{driver:?}: {argv:?}");
+        for (session, version) in [
+            (fresh(), "2.1.291 (Claude Code)"),
+            (resume(), "2.1.256 (Claude Code)"),
+            (resume(), "stub"),
+        ] {
+            let argv = with_version(driver, session, version);
+            assert!(
+                !argv.iter().any(|token| token == "--system-prompt-snapshot"),
+                "{driver:?} {version}: {argv:?}"
+            );
+            assert!(argv.iter().any(|token| token == APPEND_SYSTEM_PROMPT));
+        }
+    }
+    // A caller cannot pass the switch itself.
+    let refused = recipe(
+        DriverKind::ClaudeSdk,
+        AgentKind::Claude,
+        &["--system-prompt-snapshot", "on"],
+        Some(&context),
+        fresh(),
+    );
+    assert!(matches!(refused, Err(DriverError::InvalidLaunchSpec(_))));
+}
+
 #[test]
 fn the_shell_pty_claude_pair_is_emitted_after_the_caller_arguments() {
     let context = context();

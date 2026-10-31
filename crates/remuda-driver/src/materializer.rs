@@ -3,7 +3,10 @@
 use crate::binary::{BinaryPin, pin_binary};
 use crate::error::{DriverError, DriverResult};
 use crate::flags::{reject_banned_env, validate_spec_args};
-use crate::memory_context::{APPEND_SYSTEM_PROMPT, MemoryContext, RecipeMemory};
+use crate::memory_context::{
+    APPEND_SYSTEM_PROMPT, MemoryContext, RecipeMemory, SYSTEM_PROMPT_SNAPSHOT,
+    snapshot_switch_supported,
+};
 use crate::profile::{
     Delegation, ProviderHealth, ProviderKind, ProviderProfile, SecretRef, SecretRefPolicy,
 };
@@ -289,7 +292,7 @@ fn materialize_inner(
             // D-056 (2): ultracode is refused below 2.1.203 or when the pinned
             // version cannot be read; the version comes from `--version`.
             crate::effort::ensure_claude_ultracode_version(&binary.version, request.spec.effort)?;
-            memory = memory_plan(request, true);
+            memory = memory_plan(request, true, &binary.version);
             argv = claude_argv(
                 request.spec.driver,
                 &ClaudeArgv {
@@ -301,6 +304,7 @@ fn materialize_inner(
                     session: &request.session,
                     extras: &extras,
                     system_prompt: memory.as_ref().and_then(RecipeMemory::flag_text),
+                    fresh_prompt: memory.as_ref().is_some_and(RecipeMemory::fresh_prompt),
                 },
             )?;
             input_delivery = match request.spec.driver {
@@ -353,7 +357,7 @@ fn materialize_inner(
             argv.extend(extras);
             input_delivery = InputDelivery::Stdio;
             session_id = None;
-            memory = memory_plan(request, false);
+            memory = memory_plan(request, false, &binary.version);
             push_env(
                 &mut env_allowlist,
                 "CODEX_HOME",
@@ -385,7 +389,7 @@ fn materialize_inner(
             argv.extend(extras);
             input_delivery = InputDelivery::Stdio;
             session_id = None;
-            memory = memory_plan(request, false);
+            memory = memory_plan(request, false, &binary.version);
             push_env(
                 &mut env_allowlist,
                 "GROK_HOME",
@@ -422,7 +426,7 @@ fn materialize_inner(
             argv.extend(extras);
             input_delivery = InputDelivery::DeferredArgv;
             session_id = None;
-            memory = memory_plan(request, false);
+            memory = memory_plan(request, false, &binary.version);
             if inject_provider {
                 let secret = request.profile.secret_ref.as_ref().ok_or_else(|| {
                     DriverError::InvalidLaunchSpec(
@@ -443,7 +447,7 @@ fn materialize_inner(
             session_id = None;
             // A raw PTY whose binary need not be `claude`: never a flag in its
             // argv, the data block for every agent kind.
-            memory = memory_plan(request, false);
+            memory = memory_plan(request, false, &binary.version);
             // Note: a granted codex on generic-pty is refused at the Node
             // factory — only shell-pty with hooks materializes the shadow
             // CODEX_HOME the grant requires, so no CODEX_HOME pin is emitted
@@ -456,7 +460,7 @@ fn materialize_inner(
             input_delivery = InputDelivery::Tty;
             session_id = None;
             // `terminal` / `generic`: [`memory_plan`] gives them nothing.
-            memory = memory_plan(request, false);
+            memory = memory_plan(request, false, &binary.version);
         }
     }
 
@@ -714,8 +718,16 @@ fn materialize_shell_pty_agent(
     argv.extend(extras);
     // D-060: kind `claude` on the native carrier never reaches `claude_argv`,
     // so this path emits its own pair, after the caller-derived arguments.
-    let memory = memory_plan(request, request.spec.kind == AgentKind::Claude);
+    let memory = memory_plan(
+        request,
+        request.spec.kind == AgentKind::Claude,
+        &binary.version,
+    );
     if let Some(text) = memory.as_ref().and_then(RecipeMemory::flag_text) {
+        if memory.as_ref().is_some_and(RecipeMemory::fresh_prompt) {
+            argv.push(SYSTEM_PROMPT_SNAPSHOT.into());
+            argv.push("off".into());
+        }
         argv.push(APPEND_SYSTEM_PROMPT.into());
         argv.push(text.to_owned());
     }
@@ -826,16 +838,29 @@ fn materialize_shell_pty_agent(
 /// - `flag_path` is true only where the materializer builds the Claude argv
 ///   itself (`claude_argv`, and `materialize_shell_pty_agent` for kind
 ///   `claude`). There the context becomes its own `--append-system-prompt`
-///   pair, and on EVERY process start, a native resume included: Claude does
-///   not persist the system prompt with the session, so the flag is per
-///   process and a resumed process without it would run without its index.
+///   pair, and on EVERY process start, a native resume included: the system
+///   prompt is per process (it is not part of the conversation the session
+///   persists), so a resumed process that was not given the flag would run
+///   without its chapter's index.
+///   Claude 2.1.265+ does keep a record of it, though: by default the prompt
+///   rendered on a conversation's first request is reused verbatim on every
+///   later request and `--resume`, whatever `--append-system-prompt` text a
+///   later launch passes. A native resume therefore also emits
+///   `--system-prompt-snapshot off` (from 2.1.257, `pinned_version` permitting)
+///   so the resumed process sends its own pair rather than the first
+///   chapter's record; a fresh session keeps recording on, which pins the
+///   chapter's prompt for the prompt cache.
 /// - Every other agent launch gets the data block. The block is part of the
 ///   conversation itself, and a native resume carries the conversation over,
 ///   so it goes only into a fresh native session: sending it again on a
 ///   resume would put a second copy of the index into the same transcript.
 /// - Kinds `terminal` and `generic` get neither: nothing that reads a first
 ///   input as an agent runs there.
-fn memory_plan(request: &MaterializeRequest<'_>, flag_path: bool) -> Option<RecipeMemory> {
+fn memory_plan(
+    request: &MaterializeRequest<'_>,
+    flag_path: bool,
+    pinned_version: &str,
+) -> Option<RecipeMemory> {
     let context = request.memory_context?;
     if !is_agent_kind(request.spec.kind) {
         return None;
@@ -843,7 +868,13 @@ fn memory_plan(request: &MaterializeRequest<'_>, flag_path: bool) -> Option<Reci
     let rev = context.rev.0;
     let text = context.text.clone();
     if flag_path {
-        return Some(RecipeMemory::Flag { rev, text });
+        let fresh_prompt = matches!(request.session, SessionAction::Resume { .. })
+            && snapshot_switch_supported(pinned_version);
+        return Some(RecipeMemory::Flag {
+            rev,
+            text,
+            fresh_prompt,
+        });
     }
     match request.session {
         SessionAction::New { .. } => Some(RecipeMemory::DataBlock { rev, text }),
@@ -1408,6 +1439,8 @@ struct ClaudeArgv<'a> {
     extras: &'a [String],
     /// D-060: the materializer's own `--append-system-prompt` value.
     system_prompt: Option<&'a str>,
+    /// D-060: precede it with `--system-prompt-snapshot off` (native resume).
+    fresh_prompt: bool,
 }
 
 fn claude_argv(driver: DriverKind, inputs: &ClaudeArgv<'_>) -> DriverResult<Vec<String>> {
@@ -1420,6 +1453,7 @@ fn claude_argv(driver: DriverKind, inputs: &ClaudeArgv<'_>) -> DriverResult<Vec<
         session,
         extras,
         system_prompt,
+        fresh_prompt,
     } = *inputs;
     let mut argv = Vec::new();
     match driver {
@@ -1504,6 +1538,10 @@ fn claude_argv(driver: DriverKind, inputs: &ClaudeArgv<'_>) -> DriverResult<Vec<
     // arguments (the extras scan above is unchanged). It lands as the last
     // system-prompt section, so the prompt cache of everything before it holds.
     if let Some(text) = system_prompt {
+        if fresh_prompt {
+            argv.push(SYSTEM_PROMPT_SNAPSHOT.into());
+            argv.push("off".into());
+        }
         argv.push(APPEND_SYSTEM_PROMPT.into());
         argv.push(text.to_owned());
     }

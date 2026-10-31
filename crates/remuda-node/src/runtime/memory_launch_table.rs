@@ -224,9 +224,17 @@ fn memory_launch_table_mechanism_per_row() {
                     recipe.memory,
                     Some(RecipeMemory::Flag {
                         rev: 7,
-                        text: INDEX.into()
+                        text: INDEX.into(),
+                        fresh_prompt: false,
                     }),
                     "row {row}"
+                );
+                assert!(
+                    !recipe
+                        .argv
+                        .iter()
+                        .any(|token| token == "--system-prompt-snapshot"),
+                    "row {row}: a fresh session keeps Claude's prompt recording"
                 );
                 assert_eq!(recipe.own_system_prompt(), Some(INDEX), "row {row}");
             }
@@ -258,9 +266,11 @@ fn memory_launch_table_mechanism_per_row() {
     }
 }
 
-/// The flag is per process (Claude keeps no system prompt with the session),
-/// so a native resume emits it again; the data block is part of the
-/// conversation a resume carries over, so it is never sent twice.
+/// The flag is per process, so a native resume emits it again — with
+/// `--system-prompt-snapshot off`, because Claude 2.1.265+ would otherwise
+/// reuse the prompt the conversation recorded on its first request; the data
+/// block is part of the conversation a resume carries over, so it is never
+/// sent twice.
 #[test]
 fn a_native_resume_gets_the_flag_again_but_no_second_data_block() {
     for (driver, kind, mechanism) in TABLE {
@@ -270,8 +280,21 @@ fn a_native_resume_gets_the_flag_again_but_no_second_data_block() {
         let recipe = materialize(driver, kind, &[], true);
         match mechanism {
             Flag => {
-                assert_eq!(flag_pairs(&recipe.argv).len(), 1, "{driver:?}/{kind:?}");
+                let pairs = flag_pairs(&recipe.argv);
+                assert_eq!(pairs.len(), 1, "{driver:?}/{kind:?}");
                 assert_eq!(recipe.own_system_prompt(), Some(INDEX));
+                assert!(
+                    recipe
+                        .memory
+                        .as_ref()
+                        .is_some_and(RecipeMemory::fresh_prompt)
+                );
+                assert_eq!(
+                    recipe.argv[pairs[0] - 2..pairs[0]],
+                    ["--system-prompt-snapshot", "off"],
+                    "{driver:?}/{kind:?}: {:?}",
+                    recipe.argv
+                );
             }
             DataBlock => {
                 assert!(flag_pairs(&recipe.argv).is_empty(), "{driver:?}/{kind:?}");

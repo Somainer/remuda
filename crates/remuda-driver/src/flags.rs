@@ -45,6 +45,9 @@ const RESERVED: &[&str] = &[
     "background",
     "dangerously-skip-permissions",
     "allow-dangerously-skip-permissions",
+    // D-060: emitted with the materializer's own `--append-system-prompt`
+    // on a native resume.
+    "system-prompt-snapshot",
 ];
 
 /// Extra flags `spec.args` may append after the template, per CLI family.

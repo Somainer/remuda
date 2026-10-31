@@ -25,6 +25,36 @@ use std::sync::Mutex;
 /// The one flag the materializer emits for `memoryContext`.
 pub const APPEND_SYSTEM_PROMPT: &str = "--append-system-prompt";
 
+/// Claude's system-prompt recording switch. Since 2.1.265 Claude records the
+/// system prompt on a conversation's first request and reuses that record on
+/// every later request and `--resume`, ignoring different
+/// `--append-system-prompt` text until the conversation is compacted; `off`
+/// renders the prompt fresh on every request. Exists from 2.1.257.
+pub const SYSTEM_PROMPT_SNAPSHOT: &str = "--system-prompt-snapshot";
+
+/// First Claude Code release that parses [`SYSTEM_PROMPT_SNAPSHOT`].
+const SNAPSHOT_SWITCH_SINCE: (u32, u32, u32) = (2, 1, 257);
+
+/// Whether the pinned Claude build (`--version`'s first line, e.g.
+/// `2.1.291 (Claude Code)`) parses [`SYSTEM_PROMPT_SNAPSHOT`]. A version that
+/// cannot be read is treated as one that does not: an unknown flag would
+/// fail the launch.
+#[must_use]
+pub fn snapshot_switch_supported(pinned_version: &str) -> bool {
+    let head: String = pinned_version
+        .trim()
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    let mut parts = head.split('.').map(str::parse::<u32>);
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(Ok(major)), Some(Ok(minor)), Some(Ok(patch))) => {
+            (major, minor, patch) >= SNAPSHOT_SWITCH_SINCE
+        }
+        _ => false,
+    }
+}
+
 /// How a launch carries the chapter's memory, recorded on the recipe.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mechanism", rename_all = "kebab-case")]
@@ -35,6 +65,11 @@ pub enum RecipeMemory {
         rev: u64,
         /// The flag's value, exactly as emitted.
         text: String,
+        /// A native resume also emitted `--system-prompt-snapshot off`, so
+        /// this process renders its own system prompt instead of reusing the
+        /// one the conversation recorded on its first request.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        fresh_prompt: bool,
     },
     /// Framed data the driver delivers ahead of the first input.
     DataBlock {
@@ -53,6 +88,18 @@ impl RecipeMemory {
             Self::Flag { text, .. } => Some(text),
             Self::DataBlock { .. } => None,
         }
+    }
+
+    /// Whether a flag recipe also turned Claude's prompt recording off.
+    #[must_use]
+    pub fn fresh_prompt(&self) -> bool {
+        matches!(
+            self,
+            Self::Flag {
+                fresh_prompt: true,
+                ..
+            }
+        )
     }
 
     /// The first-input block, for a data-block recipe.
@@ -201,15 +248,26 @@ mod tests {
     }
 
     #[test]
+    fn the_snapshot_switch_exists_from_2_1_257() {
+        assert!(snapshot_switch_supported("2.1.291 (Claude Code)"));
+        assert!(snapshot_switch_supported("2.1.257"));
+        assert!(snapshot_switch_supported("2.2.0"));
+        assert!(!snapshot_switch_supported("2.1.256 (Claude Code)"));
+        assert!(!snapshot_switch_supported("stub"));
+        assert!(!snapshot_switch_supported(""));
+    }
+
+    #[test]
     fn the_block_precedes_only_the_first_written_input() {
         let pending = PendingDataBlock::default();
-        let mut recipe_memory = Some(RecipeMemory::DataBlock {
+        let block = RecipeMemory::DataBlock {
             rev: 3,
             text: "BLOCK".into(),
-        });
-        let block = recipe_memory.take().unwrap();
+        };
+        assert_eq!(block.flag_text(), None);
         *pending.slot() = block.data_block().map(str::to_owned);
-        // A failed write keeps it for the retry.
+        // Composing does not consume it: a write that fails keeps it for the
+        // retry.
         assert_eq!(pending.compose("hi".into()), ("BLOCK\n\nhi".into(), true));
         assert_eq!(pending.compose("hi".into()), ("BLOCK\n\nhi".into(), true));
         pending.delivered();

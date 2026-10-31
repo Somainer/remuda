@@ -1076,7 +1076,7 @@ async fn controller_generation_survives_a_real_daemon_restart() {
     .unwrap();
     let listener_a = bind_daemon(data_dir).await.unwrap();
     let mut serve = None;
-    let (_a, gen_a) = connect_runtime(
+    let (peer_a, gen_a) = connect_runtime(
         data_dir,
         &control_a,
         node_a.clone(),
@@ -1089,13 +1089,24 @@ async fn controller_generation_survives_a_real_daemon_restart() {
         "first controller on a fresh data dir is generation 1"
     );
 
+    // Runtime A is gone before anything else touches the counter: its accept
+    // loop is aborted and awaited (otherwise it shares the listener with B and
+    // can serve B's takeover from A's in-memory counter), its controller peer
+    // and its control are dropped, and its node is shut down.
+    if let Some(handle) = serve.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
+    drop(peer_a);
+    drop(control_a);
+    node_a.shutdown().await.unwrap();
+
     // The production daemon persists every allocated controller generation;
     // simulate the first takeover it performs after booting (gen 1 -> 2) by
     // writing the high-water mark the running daemon writes. A SECOND control
     // opened over the same data dir must seed at that persisted value, never
     // reset to 0/1.
     std::fs::write(data_dir.join("controller-generation"), "2").unwrap();
-    node_a.shutdown().await.unwrap();
 
     // The counter file recorded the last allocated generation.
     let persisted = std::fs::read_to_string(data_dir.join("controller-generation"))

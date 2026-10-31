@@ -491,11 +491,43 @@ fn read_controller_generation(data_dir: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// Serialises the read-compare-rename below between every control in this
+/// process (tests open several controls over one data dir).
+static PERSIST_GENERATION: StdMutex<()> = StdMutex::new(());
+
+/// Durably record `generation` as the counter's high-water mark.
+///
+/// Monotonic: a value at or below what the file already holds is never
+/// written, so a slower writer can never move the mark backwards. Atomic: the
+/// value goes to a temp file in the data dir, is synced, and is renamed over
+/// the counter, so a crash leaves either the old or the new value, never a
+/// torn or empty file that would read as 0.
 fn persist_controller_generation(data_dir: &Path, generation: u64) {
     if data_dir.as_os_str().is_empty() {
         return;
     }
-    let _ = std::fs::write(controller_generation_file(data_dir), generation.to_string());
+    let _serial = PERSIST_GENERATION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if read_controller_generation(data_dir) >= generation {
+        return;
+    }
+    let target = controller_generation_file(data_dir);
+    let temp = data_dir.join(format!(
+        "controller-generation.tmp.{}.{generation}",
+        std::process::id()
+    ));
+    let written = (|| -> std::io::Result<()> {
+        use std::io::Write as _;
+        let mut file = std::fs::File::create(&temp)?;
+        file.write_all(generation.to_string().as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&temp, &target)
+    })();
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&temp);
+        tracing::warn!(%error, "could not persist the controller generation");
+    }
 }
 
 /// Read the optional `controllerGeneration` a bridge frame names (string or

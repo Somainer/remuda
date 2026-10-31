@@ -1948,16 +1948,13 @@ async fn an_offline_running_lineage_reports_host_offline_and_a_live_one_running(
 // --- 9. Live chapter without a session is refused, not relaunched blank ---
 
 #[tokio::test]
-async fn a_live_chapter_without_a_native_session_is_refused_and_an_ended_one_relaunches()
--> Result<()> {
+async fn an_unpaused_lineage_refuses_resume_as_not_paused() -> Result<()> {
     let ctx = Ctx::boot().await?;
     let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
     let (x, _token) = ctx.seat(&mut node, None).await?;
-    // Deliberately NO session report: the chapter is live but never produced a
-    // native session id. (seat() already drained the forwarded create frame.)
 
     // ma-fence: an unpaused lineage refuses Resume outright (pause it first),
-    // before any session question arises; nothing is written either way.
+    // before any session question arises; nothing is written.
     let refused = ctx.resume_raw(&x, &ctx.human, "structured").await?;
     assert_eq!(refused.status(), 409);
     let body = refused.text().await?;
@@ -1977,10 +1974,87 @@ async fn a_live_chapter_without_a_native_session_is_refused_and_an_ended_one_rel
         .await?;
     assert_eq!(lineage["generation"], json!(1));
     assert_eq!(lineage["chapters"].as_array().unwrap().len(), 1);
+    assert_eq!(lineage["fences"], json!([]), "a refusal writes no fence");
     let x_view = ctx.get_instance(&x, &ctx.human).await?;
     assert!(x_view["fencedAt"].is_null());
-    let drained = tokio::time::timeout(Duration::from_millis(150), node.next_frame()).await;
-    assert!(drained.is_err(), "a refusal forwards no close/create");
+    assert!(
+        node.has_no_pending_frames().await,
+        "a refusal forwards no close/create"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_live_chapter_without_a_native_session_is_refused_and_an_ended_one_relaunches()
+-> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    // Deliberately NO session report: the chapter is live but never produced a
+    // native session id. (seat() already drained the forwarded create frame.)
+
+    // Pause first (§6.5), so the refusal below is the session rule and not
+    // `not-paused`. The pause forwards its close; the fake Node never reports
+    // the process end, so the chapter has no process-end evidence.
+    ctx.pause(&x, &ctx.human).await?;
+    let (pause_close, _) = node.next_frame().await?;
+    assert_eq!(pause_close, "instance.close");
+    let lineage_of = || async {
+        anyhow::Ok(
+            ctx.http
+                .get(format!("{}/v1/lineages/{x}", ctx.base()))
+                .bearer_auth(&ctx.human)
+                .send()
+                .await?
+                .error_for_status()?
+                .json::<Value>()
+                .await?,
+        )
+    };
+    let paused = lineage_of().await?;
+    assert_eq!(paused["state"], json!("paused"));
+    let paused_x = ctx.get_instance(&x, &ctx.human).await?;
+
+    let refused = ctx.resume_raw(&x, &ctx.human, "structured").await?;
+    assert_eq!(refused.status(), 409);
+    let body = refused.text().await?;
+    assert!(
+        body.contains("native session"),
+        "the refusal must name the missing session: {body}"
+    );
+    // No continuation write: still one chapter, the generation the pause left,
+    // and no fence row beyond the pause's own.
+    let after = lineage_of().await?;
+    assert_eq!(after["generation"], paused["generation"]);
+    assert_eq!(after["chapters"].as_array().unwrap().len(), 1);
+    let fence_ids = |lineage: &Value| -> Vec<Value> {
+        lineage["fences"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|fence| fence["fenceId"].clone())
+            .collect()
+    };
+    assert_eq!(
+        fence_ids(&after),
+        fence_ids(&paused),
+        "a refusal writes no fence row"
+    );
+    assert!(
+        after["fences"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|fence| fence["successorInstanceId"].is_null()),
+        "no fence names a successor: {after}"
+    );
+    let x_view = ctx.get_instance(&x, &ctx.human).await?;
+    assert_eq!(x_view["fencedAt"], paused_x["fencedAt"]);
+    assert_eq!(x_view["generation"], paused_x["generation"]);
+    assert!(
+        node.has_no_pending_frames().await,
+        "a refusal forwards no close/create"
+    );
 
     // Once there is real process-end evidence, the origin-spec fresh launch is
     // the correct recovery and succeeds (r2-9 is about the LIVE case).

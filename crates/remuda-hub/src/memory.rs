@@ -80,12 +80,13 @@ const MAX_MEMORY_WRITES: usize = 500;
 pub(crate) const OWNER_AUTHORED_SLUG: &str = "about-me";
 
 const ENTRY_COLUMNS: &str = "lineage_id, slug, type, title, description, body, revision, \
-     origin, source_refs_json, writer_instance, created_at, updated_at, archived_at, turn_seq";
+     origin, source_refs_json, writer_instance, created_at, updated_at, archived_at, turn_seq, \
+     root_turn_json";
 /// [`ENTRY_COLUMNS`] qualified with the `m` alias, for queries that join the
 /// FTS table (which has its own title/description/body columns).
 const ENTRY_COLUMNS_M: &str = "m.lineage_id, m.slug, m.type, m.title, m.description, m.body, \
      m.revision, m.origin, m.source_refs_json, m.writer_instance, m.created_at, m.updated_at, \
-     m.archived_at, m.turn_seq";
+     m.archived_at, m.turn_seq, m.root_turn_json";
 
 // ─── Migration ─────────────────────────────────────────────────────────────
 
@@ -94,8 +95,8 @@ const ENTRY_COLUMNS_M: &str = "m.lineage_id, m.slug, m.type, m.title, m.descript
 /// `id` is an INTEGER PRIMARY KEY so the FTS rowid survives VACUUM (a plain
 /// rowid may be renumbered), and AUTOINCREMENT so a deleted row's id is never
 /// issued again: nothing outside one transaction may mistake a new row for an
-/// old one. `root_turn_json` is reserved for the root turn
-/// that caused an Agent write (cb-rootturn) and stays NULL until then.
+/// old one. `root_turn_json` holds the root turn an Agent write was made in
+/// (cb-rootturn); NULL for owner writes and unknown turns.
 /// `type` and `origin` carry no CHECK: SQLite cannot alter one, and both are
 /// validated before every write.
 ///
@@ -630,17 +631,22 @@ pub(crate) enum MemoryWriter {
 }
 
 impl MemoryWriter {
-    fn origin(&self) -> MemoryOrigin {
+    /// cb-rootturn (protocol §8.4): the origin and root turn a write records.
+    /// An owner write is `human` with no root turn. An Agent write takes its
+    /// origin from the root turn it was made in — `human` only when an
+    /// owner's input started that turn — and falls back to `agent` when the
+    /// Hub knows no turn. Derived in the write transaction; a record only.
+    fn stamp(&self, conn: &Connection) -> Result<(&'static str, Option<String>), MemoryError> {
         match self {
-            Self::Owner => MemoryOrigin::Human,
-            Self::Agent { .. } => MemoryOrigin::Agent,
-        }
-    }
-
-    fn origin_str(&self) -> &'static str {
-        match self.origin() {
-            MemoryOrigin::Human => "human",
-            MemoryOrigin::Agent => "agent",
+            Self::Owner => Ok(("human", None)),
+            Self::Agent { instance_id } => {
+                let root_turn = crate::root_turn::derive(conn, instance_id)?;
+                let origin = match root_turn.as_ref().map(|turn| turn.origin) {
+                    Some(InputOrigin::Human) => "human",
+                    _ => "agent",
+                };
+                Ok((origin, crate::root_turn::to_column(root_turn.as_ref())))
+            }
         }
     }
 
@@ -793,6 +799,7 @@ fn entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
         body: row.get(5)?,
         revision: revision.max(0) as u64,
         origin,
+        root_turn: crate::root_turn::from_column(row.get(14)?),
         source_refs,
         writer_instance,
         turn_ref,
@@ -1026,11 +1033,13 @@ fn insert_entry(
     created_at: &str,
     now: &str,
 ) -> Result<(), MemoryError> {
+    let (origin, root_turn) = writer.stamp(conn)?;
     conn.execute(
         "INSERT INTO memory_entries
             (lineage_id, slug, type, title, description, body, revision, origin,
-             source_refs_json, writer_instance, created_at, updated_at, turn_seq)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+             source_refs_json, writer_instance, created_at, updated_at, turn_seq,
+             root_turn_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             lineage_id,
             input.slug,
@@ -1039,12 +1048,13 @@ fn insert_entry(
             input.description,
             input.body,
             revision as i64,
-            writer.origin_str(),
+            origin,
             refs_json(&input.source_refs)?,
             writer.instance(),
             created_at,
             now,
             turn_seq,
+            root_turn,
         ],
     )?;
     Ok(())
@@ -1089,7 +1099,9 @@ fn log_write(
     writer: &MemoryWriter,
     turn_seq: Option<i64>,
     written_at: &str,
-) -> rusqlite::Result<()> {
+) -> Result<(), MemoryError> {
+    // cb-rootturn: the log row records the same origin the entry does.
+    let (origin, _) = writer.stamp(conn)?;
     let op = match op {
         MemoryWriteOp::Write => "write",
         MemoryWriteOp::Consolidate => "consolidate",
@@ -1106,7 +1118,7 @@ fn log_write(
             revision as i64,
             title,
             op,
-            writer.origin_str(),
+            origin,
             writer.instance(),
             turn_seq,
             written_at,
@@ -1235,12 +1247,13 @@ fn update_tx(
     let refs = merge_refs(&current.source_refs, &patch.source_refs);
     let now = now_rfc3339();
     let revision = next_revision(&tx, lineage_id, slug)?;
+    let (origin, root_turn) = writer.stamp(&tx)?;
     let turn_seq = turn_seq_for(&tx, writer)?;
     let changed = tx.execute(
         "UPDATE memory_entries
             SET type = ?3, title = ?4, description = ?5, body = ?6,
                 revision = ?12, origin = ?7, source_refs_json = ?8,
-                writer_instance = ?9, updated_at = ?10, turn_seq = ?13
+                writer_instance = ?9, updated_at = ?10, turn_seq = ?13, root_turn_json = ?14
           WHERE lineage_id = ?1 AND slug = ?2 AND revision = ?11",
         params![
             lineage_id,
@@ -1249,13 +1262,14 @@ fn update_tx(
             title,
             description,
             body,
-            writer.origin_str(),
+            origin,
             refs_json(&refs)?,
             writer.instance(),
             now,
             expected as i64,
             revision as i64,
             turn_seq,
+            root_turn,
         ],
     )?;
     if changed != 1 {
@@ -1527,7 +1541,7 @@ fn fts_hits(
     ))?;
     stmt.query_map(
         params![fts_query(terms), lineage_id, include_archived, limit as i64],
-        |row| Ok((entry_from_row(row)?, row.get(14)?)),
+        |row| Ok((entry_from_row(row)?, row.get(15)?)),
     )?
     .collect()
 }
@@ -2513,6 +2527,131 @@ mod tests {
             instance_id: instance.into(),
             seq,
         }
+    }
+
+    /// cb-rootturn: an owner's send starts a root turn on the seat (its
+    /// command row, the user message naming it, the structured carrier's
+    /// turn start), exactly as the journal carries them.
+    async fn owner_turn(fx: &Fixture, seat: &str) -> String {
+        let (command, _) = fx
+            .store
+            .queue_command(
+                None,
+                Some(seat.to_string()),
+                fx.host.clone(),
+                "instance.send".into(),
+                json!({"origin": "human", "input": {"type": "prompt", "text": "remember X"}}),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let id = command.command_id;
+        for event in [
+            json!({"kind": "message", "payload": {
+                "operation": "open", "messageId": format!("msg_{id}"), "role": "user",
+                "parentToolCallId": null, "commandId": id,
+                "blocks": [{"type": "text", "text": "remember X"}]}}),
+            json!({"kind": "lifecycle", "payload": {
+                "type": "native", "topic": "turn", "nativeName": "turn_started",
+                "status": {"state": "known", "value": "working"},
+                "relatedIds": {"nativeClientMessageId": id}}}),
+        ] {
+            fx.store
+                .append_journal(fx.host.clone(), seat.to_string(), None, event)
+                .await
+                .unwrap();
+        }
+        id
+    }
+
+    #[tokio::test]
+    async fn an_agent_write_in_an_owner_turn_records_the_owner_root_turn() {
+        let fx = fixture().await;
+        let lineage = fx.seat().await;
+        // No turn known yet: the write's origin is how the writer
+        // authenticated.
+        let before = fx
+            .store
+            .memory_create(
+                lineage.clone(),
+                agent(&lineage),
+                input("before", MemoryType::Project, "x"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(before.entry.origin, MemoryOrigin::Agent);
+        assert_eq!(before.entry.root_turn, None);
+
+        let command = owner_turn(&fx, &lineage).await;
+        let written = fx
+            .store
+            .memory_create(
+                lineage.clone(),
+                agent(&lineage),
+                input("pref", MemoryType::Feedback, "Why: the owner said so"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            written.entry.root_turn,
+            Some(remuda_protocol::RootTurn {
+                command_id: command.clone(),
+                origin: InputOrigin::Human,
+                continuation: remuda_protocol::RootTurnContinuation::Fresh,
+            })
+        );
+        assert_eq!(written.entry.origin, MemoryOrigin::Human);
+        assert_eq!(
+            written.entry.writer_instance.as_deref(),
+            Some(lineage.as_str()),
+            "the writer stays the agent chapter"
+        );
+
+        // An update in the same turn keeps the same stamp; an owner write
+        // clears it.
+        let updated = fx
+            .store
+            .memory_update(
+                lineage.clone(),
+                "pref".into(),
+                agent(&lineage),
+                MemoryPatch {
+                    body: Some("Why: still".into()),
+                    ..MemoryPatch::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.entry.origin, MemoryOrigin::Human);
+        assert_eq!(
+            updated
+                .entry
+                .root_turn
+                .as_ref()
+                .map(|turn| turn.command_id.as_str()),
+            Some(command.as_str())
+        );
+        let owner = fx
+            .store
+            .memory_update(
+                lineage.clone(),
+                "pref".into(),
+                MemoryWriter::Owner,
+                MemoryPatch {
+                    body: Some("Why: edited".into()),
+                    ..MemoryPatch::default()
+                },
+                2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(owner.entry.origin, MemoryOrigin::Human);
+        assert_eq!(owner.entry.root_turn, None);
+        assert_eq!(owner.entry.writer_instance, None);
     }
 
     /// The Node's `turn/turn_started` mirror, as `seen.rs`'s tests build it.

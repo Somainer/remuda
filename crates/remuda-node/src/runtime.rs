@@ -2130,6 +2130,7 @@ async fn materialize_instance(
                     attachments: Vec::new(),
                     origin: crate::origin::input_origin(create_command.origin),
                     mode: remuda_protocol::PromptMode::NewTurn,
+                    command_id: None,
                 },
                 close_after: false,
                 attachment_refs: Vec::new(),
@@ -2368,7 +2369,13 @@ async fn execute_queued(
             .await
             .map(|_| Vec::new())
             .map_err(|error| crate::DriverError::Failed(error.to_string())),
-        request => driver.execute(request.clone()).await,
+        request => {
+            let mut request = request.clone();
+            if let DriverRequest::Send { command_id, .. } = &mut request {
+                *command_id = Some(queued.command_id.clone());
+            }
+            driver.execute(request).await
+        }
     };
     match execution {
         Ok(emissions) => {
@@ -2953,6 +2960,7 @@ fn command_parts(
                     mode: request
                         .prompt_mode
                         .unwrap_or(remuda_protocol::PromptMode::NewTurn),
+                    command_id: None,
                 },
                 false,
             ))
@@ -4616,6 +4624,7 @@ mod tests {
             attachments: Vec::new(),
             origin: InputOrigin::Human,
             mode: PromptMode::NewTurn,
+            command_id: None,
         };
 
         // ── Structured sdk carrier ──────────────────────────────────────────
@@ -7343,10 +7352,14 @@ mod initiator_persistence_test {
         node: &DevNode,
         with: bool,
     ) -> (CreateInstanceRequest, Option<remuda_protocol::Initiator>) {
+        // cb-rootturn: the Hub stamps the root turn beside the initiator.
         let initiator = with.then(|| remuda_protocol::Initiator {
-            instance_id: "ins_stamped".into(),
-            lineage_id: "ins_stamped".into(),
-            generation: 2,
+            root_turn: Some(remuda_protocol::RootTurn {
+                command_id: "cmd_owner".into(),
+                origin: remuda_protocol::InputOrigin::Human,
+                continuation: remuda_protocol::RootTurnContinuation::Fresh,
+            }),
+            ..remuda_protocol::Initiator::new("ins_stamped".into(), "ins_stamped".into(), 2)
         });
         let mut value = serde_json::json!({
             "kind": "claude",
@@ -7398,6 +7411,10 @@ mod initiator_persistence_test {
                         .pointer("/payload/entity/initiator/generation")
                         .and_then(serde_json::Value::as_i64)
                         == Some(2)
+                    && event.pointer("/payload/entity/initiator/rootTurn")
+                        == Some(&serde_json::json!({
+                            "commandId": "cmd_owner", "origin": "human", "continuation": "none"
+                        }))
             });
         assert!(
             accepted,
@@ -7418,5 +7435,108 @@ mod initiator_persistence_test {
         assert_eq!(ledger.initiator, None);
         let json = serde_json::to_value(&ledger).expect("ledger json");
         assert!(json.get("initiator").is_none(), "skipped when absent");
+    }
+}
+
+/// cb-rootturn r2 item 2: the worker that executes a send hands the driver
+/// the command that delivers it, so a structured carrier can write the
+/// prompt with the Hub command id as its `nativeClientMessageId`.
+#[cfg(test)]
+mod root_turn_command_id_test {
+    use super::*;
+    use crate::driver::{Driver, DriverFuture};
+    use remuda_protocol::{CommandId, DriverKind};
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    type Seen = Arc<Mutex<Vec<(String, Option<CommandId>)>>>;
+
+    /// Records the command id every `Send` reaches the driver with.
+    struct RecordingDriver {
+        seen: Seen,
+    }
+
+    impl Driver for RecordingDriver {
+        fn kind(&self) -> DriverKind {
+            DriverKind::ClaudePrint
+        }
+
+        fn execute(&self, request: DriverRequest) -> DriverFuture<'_> {
+            if let DriverRequest::Send {
+                prompt, command_id, ..
+            } = &request
+            {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push((prompt.clone(), command_id.clone()));
+            }
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    async fn seen_prompt(seen: &Seen, prompt: &str) -> Option<CommandId> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some((_, id)) = seen.lock().unwrap().iter().find(|(p, _)| p == prompt) {
+                    return id.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the driver never received {prompt:?}"))
+    }
+
+    #[tokio::test]
+    async fn the_driver_sees_the_delivering_command_id_for_create_and_send() {
+        let seen: Seen = Arc::default();
+        let config = crate::DevServerConfig::loopback(0)
+            .with_workspace_roots(remuda_testing::test_workspace_roots!());
+        let drivers = DriverRegistry::default();
+        drivers
+            .register(Arc::new(RecordingDriver {
+                seen: Arc::clone(&seen),
+            }))
+            .expect("register recording driver");
+        let node = DevNode::with_parts(&config, Arc::new(MemoryStore::new(64)), drivers)
+            .expect("compose node");
+
+        // The create's first prompt is delivered under the create command.
+        let created = node
+            .create_instance(
+                serde_json::from_value(serde_json::json!({
+                    "kind": "claude", "driver": "claude-print", "model": "fake",
+                    "prompt": "the first prompt",
+                }))
+                .expect("create request"),
+            )
+            .await
+            .expect("create");
+        assert_eq!(
+            seen_prompt(&seen, "the first prompt").await,
+            Some(created.command.command_id.clone()),
+            "the create's first prompt carries the create command id"
+        );
+
+        // A later send carries its own command id (the Hub's, when it sent it).
+        let hub_command = CommandId::new();
+        let sent = node
+            .submit_command(
+                &created.instance.meta.id,
+                serde_json::from_value(serde_json::json!({
+                    "operation": "send", "prompt": "a later send",
+                    "commandId": hub_command.as_id().as_str(),
+                }))
+                .expect("send request"),
+            )
+            .await
+            .expect("submit");
+        assert_eq!(sent.command.command_id, hub_command);
+        assert_eq!(
+            seen_prompt(&seen, "a later send").await,
+            Some(hub_command),
+            "a send carries the command id it was queued under"
+        );
     }
 }

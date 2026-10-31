@@ -1810,6 +1810,7 @@ pub async fn create_instance(
     }
     let (create_initiator, create_device_id) =
         crate::agent_scope::initiator_and_device(&state, &device).await?;
+    let audit_initiator = create_initiator.clone();
     let spawn_result = crate::placement::spawn_on_host(
         &state,
         &host,
@@ -1861,6 +1862,29 @@ pub async fn create_instance(
                 "attach-lock claim was superseded before promotion; the directory holder stays with the winning launch"
             );
         }
+    }
+    // cb-rootturn: an Agent's dispatch of a child instance leaves an audit
+    // row with its stamped initiator, including the root turn it acted in.
+    // A record only, written after the create committed; a failure here is
+    // logged and never fails the dispatch.
+    if let Some(initiator) = audit_initiator
+        && let Err(error) = state
+            .store
+            .append_audit_as(
+                device.id.clone(),
+                "instance.dispatch".into(),
+                Some(instance.instance_id.clone()),
+                json!({
+                    "hostId": host.host_id,
+                    "driver": instance.driver,
+                    "parentInstanceId": initiator.instance_id,
+                    "commandId": command.command_id,
+                }),
+                Some(initiator),
+            )
+            .await
+    {
+        tracing::warn!(%error, instance_id = %instance.instance_id, "dispatch audit write failed");
     }
     // §5.6 placement ledger: the same reasons[]/rejected[] JSON that goes to
     // the bot card and the audit trail.

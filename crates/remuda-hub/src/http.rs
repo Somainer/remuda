@@ -2788,33 +2788,16 @@ pub async fn post_command(
     if let Some(command_id) = body.command_id.as_deref()
         && let Some(existing) = state.store.get_command(command_id.to_owned()).await?
     {
-        if !retry_matches_row(&existing, &body.operation, &instance_id, &payload) {
-            return Err(HubError::Conflict(
-                "commandId reused with a different payload".into(),
-            ));
-        }
-        // The idempotency key is part of the command's identity: a replay may
-        // omit the key, but a key it carries must be the exact key already
-        // stored with this command — an unused key still names a *different*
-        // request and is a 409, not a silent rebinding.
-        if !replay_key_matches(
-            body.idempotency_key.as_deref(),
-            existing.idempotency_key.as_deref(),
-        ) {
-            return Err(HubError::Conflict(
-                "commandId replayed with a different idempotency key".into(),
-            ));
-        }
-        let command = replay_existing_command(
+        return replay_same_id(
             &state,
             &device,
             &instance,
             &body.operation,
+            body.idempotency_key.as_deref(),
             existing,
             &mut payload,
         )
-        .await?;
-        return Ok(Json(json!({ "command": command, "replayed": true })));
+        .await;
     }
     // D-057 §6.5/§7.2 (ma-fence): a chapter superseded by its successor
     // takes no more input. Refused here, before any row exists, so nothing
@@ -2849,7 +2832,8 @@ pub async fn post_command(
             .get_lineage(instance.lineage_id.clone())
             .await?
             .is_some()
-        && let Some(command) = crate::fence::pause_on_close(
+    {
+        if let Some(command) = crate::fence::pause_on_close(
             &state,
             &device,
             &instance.lineage_id,
@@ -2857,10 +2841,27 @@ pub async fn post_command(
             payload.clone(),
         )
         .await?
-    {
-        return Ok(Json(
-            json!({ "command": command, "replayed": false, "paused": true }),
-        ));
+        {
+            return Ok(Json(
+                json!({ "command": command, "replayed": false, "paused": true }),
+            ));
+        }
+        // A same-id close that raced this one past the retry check above
+        // paused the lineage first: this request is its retry.
+        if let Some(command_id) = body.command_id.as_deref()
+            && let Some(existing) = state.store.get_command(command_id.to_owned()).await?
+        {
+            return replay_same_id(
+                &state,
+                &device,
+                &instance,
+                &body.operation,
+                body.idempotency_key.as_deref(),
+                existing,
+                &mut payload,
+            )
+            .await;
+        }
     }
     if body.operation == "instance.send" {
         crate::objects::validate_send_attachments(&state, &device, &instance, &mut payload).await?;
@@ -2959,6 +2960,69 @@ pub async fn post_command(
         .await;
     }
     Ok(Json(json!({ "command": command, "replayed": false })))
+}
+
+/// Answer a same-id client retry of the stored `existing` row: a replay of
+/// it when the retry denotes the same command, else 409.
+async fn replay_same_id(
+    state: &AppState,
+    device: &crate::store::Device,
+    instance: &crate::store::InstanceRecord,
+    operation: &str,
+    idempotency_key: Option<&str>,
+    existing: CommandRecord,
+    payload: &mut Value,
+) -> Result<Json<Value>, HubError> {
+    let (retry_instance, retry_payload) =
+        retry_target(state, &existing, operation, instance, payload).await?;
+    if !retry_matches_row(&existing, operation, &retry_instance, &retry_payload) {
+        return Err(HubError::Conflict(
+            "commandId reused with a different payload".into(),
+        ));
+    }
+    // The idempotency key is part of the command's identity: a replay may
+    // omit the key, but a key it carries must be the exact key already
+    // stored with this command — an unused key still names a *different*
+    // request and is a 409, not a silent rebinding.
+    if !replay_key_matches(idempotency_key, existing.idempotency_key.as_deref()) {
+        return Err(HubError::Conflict(
+            "commandId replayed with a different idempotency key".into(),
+        ));
+    }
+    let command =
+        replay_existing_command(state, device, instance, operation, existing, payload).await?;
+    Ok(Json(json!({ "command": command, "replayed": true })))
+}
+
+/// The instance and payload a same-id retry is compared as (D-057 §6.5).
+///
+/// A close of an older chapter of an unpaused continuity lineage is a pause:
+/// F stores its close against the lineage's then-current chapter, row
+/// instance and payload `instanceId` both retargeted. The retry still names
+/// the chapter it addressed, and is the same command when the row's chapter
+/// belongs to the addressed chapter's lineage — so it is compared as
+/// addressed to the row's chapter. Every other retry compares as addressed.
+async fn retry_target(
+    state: &AppState,
+    row: &CommandRecord,
+    operation: &str,
+    addressed: &crate::store::InstanceRecord,
+    payload: &Value,
+) -> Result<(String, Value), HubError> {
+    if operation == "instance.close"
+        && row.operation == operation
+        && let Some(row_instance) = row.instance_id.as_deref()
+        && row_instance != addressed.instance_id
+        && let Some(chapter) = state.store.get_instance(row_instance.to_owned()).await?
+        && chapter.lineage_id == addressed.lineage_id
+    {
+        let mut payload = payload.clone();
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("instanceId".into(), json!(row_instance));
+        }
+        return Ok((row_instance.to_owned(), payload));
+    }
+    Ok((addressed.instance_id.clone(), payload.clone()))
 }
 
 /// Key identity for a same-id replay: omitting the key is allowed; a present

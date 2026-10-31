@@ -640,6 +640,105 @@ async fn resume_only_from_paused_and_a_send_to_the_superseded_chapter_never_leav
     Ok(())
 }
 
+/// A lineage whose first chapter (the seat) is superseded by a running
+/// owner-resumed successor; returns (older chapter, current chapter).
+async fn resumed_lineage(ctx: &Ctx, node: &mut FakeNode) -> Result<(String, String)> {
+    let (seat, _token) = ctx.seat(node).await?;
+    ctx.report_session(node, &seat).await?;
+    ctx.pause(&ctx.human, &seat).await?.error_for_status()?;
+    let (method, _) = node.next_work_frame().await?;
+    assert_eq!(method, "instance.close");
+    let resumed: Value = ctx
+        .http
+        .post(format!("{}/v1/instances/{seat}/resume", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .json(&json!({}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let successor = resumed["instance"]["instanceId"]
+        .as_str()
+        .context("successor")?
+        .to_owned();
+    let (method, _) = node.next_work_frame().await?;
+    assert_eq!(method, "instance.resume");
+    Ok((seat, successor))
+}
+
+/// The fields a replay must hand back unchanged from the original close.
+fn same_close(replay: &Value, original: &Value) {
+    for field in ["commandId", "instanceId", "hostId", "operation", "payload"] {
+        assert_eq!(
+            replay["command"][field], original["command"][field],
+            "{field}: replay {replay} vs original {original}"
+        );
+    }
+}
+
+/// §6.5/§7.8: a Human close addressed to an older chapter pauses the lineage
+/// through its current chapter (the row names the current chapter). The
+/// identical same-id retry — still naming the older chapter — replays that
+/// close instead of answering a commandId conflict; a different payload under
+/// the same id is still one.
+#[tokio::test]
+async fn a_same_id_retry_of_a_close_addressed_to_an_older_chapter_replays_it() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.seat_host, true).await?;
+    let (older, current) = resumed_lineage(&ctx, &mut node).await?;
+
+    let close_id = cmd_id();
+    let request = json!({"operation": "instance.close", "commandId": close_id, "payload": {}});
+    let first = ctx.command(&ctx.human, &older, request.clone()).await?;
+    assert_eq!(first.status(), 200);
+    let first: Value = first.json().await?;
+    assert_eq!(first["paused"], json!(true), "{first}");
+    assert_eq!(first["command"]["commandId"], json!(close_id));
+    assert_eq!(
+        first["command"]["instanceId"],
+        json!(current),
+        "the close applies to the current chapter"
+    );
+    let (method, params) = node.next_work_frame().await?;
+    assert_eq!(method, "instance.close");
+    assert_eq!(params["instanceId"], json!(current));
+
+    let retry = ctx.command(&ctx.human, &older, request).await?;
+    assert_eq!(
+        retry.status(),
+        200,
+        "an identical retry is a replay, not a commandId conflict"
+    );
+    let retry: Value = retry.json().await?;
+    assert_eq!(retry["replayed"], json!(true), "{retry}");
+    same_close(&retry, &first);
+    let record = ctx.lineage(&older).await?;
+    assert_eq!(record["state"], json!("paused"));
+    assert_eq!(
+        record["fences"].as_array().map(Vec::len),
+        Some(2),
+        "the replay fenced nothing again: {record}"
+    );
+    assert!(
+        node.drain()
+            .iter()
+            .all(|(method, _)| method != "instance.close"),
+        "the replay forwarded no second close"
+    );
+
+    let different = ctx
+        .command(
+            &ctx.human,
+            &older,
+            json!({"operation": "instance.close", "commandId": close_id,
+                   "payload": {"reason": "other"}}),
+        )
+        .await?;
+    assert_eq!(different.status(), 409, "a different payload is a conflict");
+    Ok(())
+}
+
 // ── §7.10 rows ──────────────────────────────────────────────────────────
 
 /// §7.10 "Held command": a seat command held for an offline worker host is
@@ -1705,6 +1804,90 @@ async fn close_vs_restart(restart_first: bool) -> Result<()> {
             .expect_err("fenced");
         assert!(error.to_string().contains("fenced"), "{error}");
     }
+    Ok(())
+}
+
+/// §6.5 concurrent form of the same-id close retry: two identical closes
+/// addressed to an older chapter both pass the retry check before either
+/// row exists; the one whose F loses the race re-reads a paused lineage and
+/// replays the winner's close instead of answering a commandId conflict.
+/// The winner parks inside F (`fence-read`, holding the publish lock); the
+/// loser parks after its own generation read (`pause-read`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn racing_identical_closes_of_an_older_chapter_answer_a_close_and_its_replay() -> Result<()> {
+    let _serial = RACE_HOOK.lock().await;
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.seat_host, true).await?;
+    let (older, current) = resumed_lineage(&ctx, &mut node).await?;
+    let winner = Arc::new(Gate::default());
+    let loser = Arc::new(Gate::default());
+    {
+        let (winner, loser, lineage) = (Arc::clone(&winner), Arc::clone(&loser), older.clone());
+        let fence_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pause_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        remuda_hub::lineage_test_support::set_hook(Some(Arc::new(move |point, id| {
+            if id != lineage {
+                return;
+            }
+            let arrivals = match point {
+                "fence-read" => &fence_reads,
+                "pause-read" => &pause_reads,
+                _ => return,
+            };
+            let arrival = arrivals.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match (point, arrival) {
+                ("fence-read", 0) => winner.arrive(),
+                ("pause-read", 1) => loser.arrive(),
+                _ => {}
+            }
+        })));
+    }
+    let close_id = cmd_id();
+    let post = || {
+        let http = ctx.http.clone();
+        let url = format!("{}/v1/instances/{older}/commands", ctx.base());
+        let human = ctx.human.clone();
+        let body = json!({"operation": "instance.close", "commandId": close_id, "payload": {}});
+        tokio::spawn(async move { http.post(url).bearer_auth(human).json(&body).send().await })
+    };
+    let raced = async {
+        let first = post();
+        winner.reached().await?;
+        let second = post();
+        loser.reached().await?;
+        winner.release();
+        let first = first.await??;
+        loser.release();
+        anyhow::Ok((first, second.await??))
+    }
+    .await;
+    // Never leave a request parked on a runtime thread, whatever happened.
+    winner.release();
+    loser.release();
+    remuda_hub::lineage_test_support::set_hook(None);
+    let (first, second) = raced?;
+
+    assert_eq!(first.status(), 200);
+    let first: Value = first.json().await?;
+    assert_eq!(first["paused"], json!(true), "{first}");
+    assert_eq!(first["command"]["instanceId"], json!(current));
+    assert_eq!(
+        second.status(),
+        200,
+        "the race loser replays the close, not a commandId conflict"
+    );
+    let second: Value = second.json().await?;
+    assert_eq!(second["replayed"], json!(true), "{second}");
+    same_close(&second, &first);
+    let (method, params) = node.next_work_frame().await?;
+    assert_eq!(method, "instance.close");
+    assert_eq!(params["instanceId"], json!(current));
+    let record = ctx.lineage(&older).await?;
+    assert_eq!(
+        record["fences"].as_array().map(Vec::len),
+        Some(2),
+        "{record}"
+    );
     Ok(())
 }
 

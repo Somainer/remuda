@@ -1287,6 +1287,10 @@ pub(crate) async fn pause_on_close(
         if lineage.state == "paused" {
             return Ok(None);
         }
+        // Deterministic race hook: after the generation read, before F
+        // queues behind the settlement-publish lock.
+        #[cfg(any(test, feature = "test-faults"))]
+        crate::store::run_continuation_hook("pause-read", lineage_id);
         let current = lineage.current_instance_id.clone();
         let (paused_by, self_close) = match &initiator {
             Some(init) if init.instance_id == current => (

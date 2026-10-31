@@ -827,17 +827,27 @@ pub(crate) async fn handle_node_method(
             if inventory.transport.is_none() {
                 inventory.transport = Some(TransportKind::OutboundWss);
             }
-            // A hello describes the new link whole: a Node whose hello carries
-            // no `capabilities` advertises none, so a blob an earlier (newer)
-            // Node build left on the row must not keep claiming, e.g.,
-            // `memoryContext` (D-060). Heartbeats keep the merge-if-present rule.
-            let hello_capabilities = params
-                .get("capabilities")
-                .cloned()
-                .unwrap_or_else(|| json!({}));
+            // D-060: a hello with no `capabilities` comes from a Node that does
+            // not carry `memoryContext`, so a claim an earlier (newer) Node
+            // build left on the row must not survive it. Only that key goes:
+            // the inventory claims (`driverInventory`, `apiRelay`) stay as
+            // stored, as before, until a heartbeat refreshes them.
+            if params.get("capabilities").is_none() {
+                state
+                    .store
+                    .forget_host_capability(
+                        host.host_id.clone(),
+                        remuda_protocol::hubnode::MEMORY_CONTEXT_CAPABILITY,
+                    )
+                    .await?;
+            }
             let host = state
                 .store
-                .apply_inventory(host.host_id.clone(), inventory, Some(hello_capabilities))
+                .apply_inventory(
+                    host.host_id.clone(),
+                    inventory,
+                    params.get("capabilities").cloned(),
+                )
                 .await?;
             crate::workspaces::observe_inventory(state, &host.host_id, &params).await?;
             // c-dirpicker r8 item 1: the abort sweep for unsettled unregisters

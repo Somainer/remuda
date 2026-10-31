@@ -4728,6 +4728,26 @@ impl Store {
         .await
     }
 
+    /// D-060: drop one key from the host's stored capabilities blob, keeping
+    /// every other claim. A hello without `capabilities` must not keep an
+    /// earlier build's `memoryContext`, while its inventory claims
+    /// (`driverInventory`, `apiRelay`) stay until a heartbeat refreshes them.
+    pub async fn forget_host_capability(
+        &self,
+        host_id: String,
+        key: &'static str,
+    ) -> Result<(), StoreError> {
+        self.run_named("forget_host_capability", move |conn| {
+            conn.execute(
+                "UPDATE hosts SET capabilities_json = json_remove(capabilities_json, ?2)
+                  WHERE id = ?1 AND json_valid(capabilities_json)",
+                params![host_id, format!("$.{key}")],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     /// Heartbeat / hello: lastSeen + optional inventory (D-013).
     pub async fn apply_inventory(
         &self,

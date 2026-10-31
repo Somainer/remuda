@@ -22,6 +22,8 @@ struct FakeNode {
     frames: tokio::sync::mpsc::UnboundedReceiver<(String, Value)>,
     appends: tokio::sync::mpsc::UnboundedSender<(String, Value)>,
     task: tokio::task::JoinHandle<()>,
+    /// The persistent bearer the hello returned (enroll tokens are single-use).
+    node_token: Option<String>,
 }
 
 impl FakeNode {
@@ -32,6 +34,17 @@ impl FakeNode {
         capabilities: Option<Value>,
     ) -> Result<Self> {
         let enroll = hub.mint_enroll_token(5).await?;
+        Self::connect_with(hub, host, &enroll, capabilities).await
+    }
+
+    /// Hello presenting `bearer` (an enroll token, or a prior hello's
+    /// `nodeToken` to reconnect the same host).
+    async fn connect_with(
+        hub: &remuda_hub::RunningHub,
+        host: &str,
+        enroll: &str,
+        capabilities: Option<Value>,
+    ) -> Result<Self> {
         let mut request = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
         request
             .headers_mut()
@@ -54,6 +67,7 @@ impl FakeNode {
         let hello: Value =
             serde_json::from_str(&node.next().await.context("hello")??.into_text()?)?;
         anyhow::ensure!(hello.get("result").is_some(), "hello failed: {hello}");
+        let node_token = hello["result"]["nodeToken"].as_str().map(str::to_owned);
         let (frame_tx, frames) = tokio::sync::mpsc::unbounded_channel();
         let (appends, mut append_rx) = tokio::sync::mpsc::unbounded_channel::<(String, Value)>();
         let task = tokio::spawn(async move {
@@ -92,6 +106,7 @@ impl FakeNode {
             frames,
             appends,
             task,
+            node_token,
         })
     }
 
@@ -418,6 +433,42 @@ async fn a_node_without_the_capability_gets_no_stamp_and_the_lineage_records_it(
     assert!(
         journal.to_string().contains("memory_index_withheld"),
         "the chapter's journal says why it has no index: {journal}"
+    );
+    Ok(())
+}
+
+/// A hello without `capabilities` (an older Node build on the same host)
+/// clears only the stored `memoryContext` claim: the inventory claims stay
+/// until a heartbeat refreshes them, and the next chapter is withheld.
+#[tokio::test]
+async fn a_capability_less_hello_clears_only_the_memory_context_claim() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let inventory = json!([{"kind": "shell-pty", "launchable": true}]);
+    let capable = FakeNode::connect(
+        &ctx.hub,
+        &ctx.host,
+        Some(json!({"memoryContext": true, "driverInventory": inventory, "apiRelay": true})),
+    )
+    .await?;
+    let host = ctx.get(&format!("/v1/hosts/{}", ctx.host)).await?;
+    assert_eq!(host["capabilities"]["memoryContext"], json!(true), "{host}");
+    let token = capable.node_token.clone().context("nodeToken")?;
+    drop(capable);
+
+    let mut older = FakeNode::connect_with(&ctx.hub, &ctx.host, &token, None).await?;
+    let host = ctx.get(&format!("/v1/hosts/{}", ctx.host)).await?;
+    let capabilities = &host["capabilities"];
+    assert!(capabilities.get("memoryContext").is_none(), "{host}");
+    assert_eq!(capabilities["driverInventory"], inventory, "{host}");
+    assert_eq!(capabilities["apiRelay"], json!(true), "{host}");
+
+    let (seat, params) = ctx
+        .seat(&mut older, "claude", "claude-sdk", json!({}))
+        .await?;
+    assert!(params.get("memoryContext").is_none(), "{params}");
+    assert_eq!(
+        ctx.chapter(&seat, &seat).await?["memoryIndex"],
+        json!("withheld")
     );
     Ok(())
 }

@@ -55,10 +55,12 @@ function MainSessionBarBody({ entry, instance, mobile }: { entry: MainEntry; ins
   const current = entry.instance;
   const status = mainStatusFor(hub, entry, nowMs);
   // 最近活动: the last message or turn observation, never the row's
-  // updatedAt (every journal append rewrites it). The current chapter's
-  // followed journal answers when this page follows it; otherwise the same
-  // bounded tail the home card reads.
-  const followed = hub.events[current.id];
+  // updatedAt (every journal append rewrites it). Only the current chapter's
+  // OWN page follows that journal, and only once its follow has seeded; any
+  // other page (an earlier chapter) reads the same bounded tail the home card
+  // reads. hub.events is never pruned, so an array left from an earlier visit
+  // is not evidence that this page follows it (r4 item 2).
+  const followed = instance.id === current.id ? hub.events[current.id] : undefined;
   const { tail } = useMainTail(entry, hub.instances, followed === undefined);
   const lastActivityAt = followed ? lastActivityOf(followed) : (tail?.lastActivityAt ?? null);
   const [busy, setBusy] = useState<"stop" | "pause" | "resume" | null>(null);

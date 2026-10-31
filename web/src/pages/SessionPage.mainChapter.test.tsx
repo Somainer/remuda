@@ -1,6 +1,7 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { api } from "../lib/api";
 import * as store from "../lib/store";
 import { mockDb } from "../lib/mock";
 import type { Instance } from "../types/instance";
@@ -240,5 +241,61 @@ describe("the EndedBar note only points at a 恢复 the Main bar offers (r4 item
     renderPage(noResume.id);
     expect(screen.queryByTestId("ended-resume-in-main-bar")).toBeNull();
     expect(screen.getByText("开新会话继承 cwd")).toBeInTheDocument();
+  });
+});
+
+describe("最近活动 on an earlier chapter's page reads the bounded tail (r4 item 2)", () => {
+  const minutesAgo = (n: number) => new Date(Date.now() - n * 60_000).toISOString();
+  const g1 = { ...chapter1, journalId: "obj_main_g1" as Id } as Instance;
+  const g2 = { ...chapter2, journalId: "obj_main_g2" as Id, durableSeq: "4", updatedAt: new Date().toISOString() } as Instance;
+
+  function tailWith(observedAt: string) {
+    return vi.spyOn(api, "eventsRead").mockImplementation(async ({ journalId }) => ({
+      events: journalId === g2.journalId ? [reply(g2.id, observedAt)] : [],
+      durableSeq: "4" as never,
+      windowFromSeq: "4" as never,
+      reachedAfterSeq: true,
+    }));
+  }
+
+  it("after visiting the current chapter, the earlier chapter's page does not freeze on its events", async () => {
+    // Visiting chapter 2 left its followed journal in the store (never
+    // pruned): its last message is 10 minutes old.
+    vi.mocked(store.hubStore.getSnapshot).mockReturnValue({
+      ...store.hubStore.getSnapshot(),
+      instances: [g1, g2],
+      events: { [g1.id]: [], [g2.id]: [reply(g2.id, minutesAgo(10))] },
+    });
+    const current = renderPage(g2.id);
+    expect(screen.getByTestId("main-status-last-activity").textContent).toBe("最近活动 10m");
+    current.unmount();
+    // Main kept working: its journal now has a message from 1 minute ago.
+    const read = tailWith(minutesAgo(1));
+    renderPage(g1.id);
+    await waitFor(() => expect(screen.getByTestId("main-status-last-activity").textContent).toBe("最近活动 1m"));
+    expect(read).toHaveBeenCalledWith(expect.objectContaining({ journalId: g2.journalId }));
+  });
+
+  it("the tail path: — until the current chapter's tail answers, then its last activity", async () => {
+    vi.mocked(store.hubStore.getSnapshot).mockReturnValue({
+      ...store.hubStore.getSnapshot(),
+      instances: [g1, g2],
+      events: { [g1.id]: [] },
+    });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    vi.spyOn(api, "eventsRead").mockImplementation(async ({ journalId }) => {
+      await gate;
+      return {
+        events: journalId === g2.journalId ? [reply(g2.id, minutesAgo(3))] : [],
+        durableSeq: "4" as never,
+        windowFromSeq: "4" as never,
+        reachedAfterSeq: true,
+      };
+    });
+    renderPage(g1.id);
+    expect(screen.getByTestId("main-status-last-activity").textContent).toBe("最近活动 —");
+    release();
+    await waitFor(() => expect(screen.getByTestId("main-status-last-activity").textContent).toBe("最近活动 3m"));
   });
 });

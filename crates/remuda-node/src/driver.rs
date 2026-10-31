@@ -59,6 +59,12 @@ pub enum DriverRequest {
         /// any queued prompts. The PTY bytes are the same; the mode drives the
         /// queue's delivery gate and the journal, not the keystrokes.
         mode: remuda_protocol::PromptMode,
+        /// The Node command delivering this input (the Hub command id when the
+        /// Hub sent it). Filled in by the worker that executes the command; a
+        /// structured carrier writes the prompt with it as its client message
+        /// id, so the turn it starts and the result that completes it name the
+        /// command (cb-rootturn).
+        command_id: Option<remuda_protocol::CommandId>,
     },
     /// Cancel the current fake turn.
     Cancel,

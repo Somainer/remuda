@@ -2128,6 +2128,7 @@ async fn materialize_instance(
                     attachments: Vec::new(),
                     origin: crate::origin::input_origin(create_command.origin),
                     mode: remuda_protocol::PromptMode::NewTurn,
+                    command_id: None,
                 },
                 close_after: false,
                 attachment_refs: Vec::new(),
@@ -2366,7 +2367,13 @@ async fn execute_queued(
             .await
             .map(|_| Vec::new())
             .map_err(|error| crate::DriverError::Failed(error.to_string())),
-        request => driver.execute(request.clone()).await,
+        request => {
+            let mut request = request.clone();
+            if let DriverRequest::Send { command_id, .. } = &mut request {
+                *command_id = Some(queued.command_id.clone());
+            }
+            driver.execute(request).await
+        }
     };
     match execution {
         Ok(emissions) => {
@@ -2951,6 +2958,7 @@ fn command_parts(
                     mode: request
                         .prompt_mode
                         .unwrap_or(remuda_protocol::PromptMode::NewTurn),
+                    command_id: None,
                 },
                 false,
             ))
@@ -4614,6 +4622,7 @@ mod tests {
             attachments: Vec::new(),
             origin: InputOrigin::Human,
             mode: PromptMode::NewTurn,
+            command_id: None,
         };
 
         // ── Structured sdk carrier ──────────────────────────────────────────

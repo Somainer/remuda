@@ -609,3 +609,60 @@ fn a_failed_newer_write_releases_the_older_turn_deferred_settle() {
         "the deferred settle is one-shot"
     );
 }
+
+/// cb-rootturn: every result that completes a locally-written turn names that
+/// turn's client message id as `completedTurn`, including a result deferred
+/// behind a newer outstanding turn, so the Hub can bound each root turn
+/// exactly. A workflow's intermediate result completes nothing and names
+/// nothing.
+#[test]
+fn a_completing_result_names_the_turn_it_completed() {
+    let result = |index: u64| {
+        serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "result": "done",
+            "stop_reason": "end_turn",
+            "session_id": SESSION,
+            "result_index": index
+        })
+    };
+    let result_of = |obs: Vec<Observation>| {
+        obs.into_iter()
+            .find_map(|o| match o.body {
+                ObservationPayload::Lifecycle(p) => match *p {
+                    LifecyclePayload::Native(n) if n.native_name == "result" => Some(*n),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("a result lifecycle")
+    };
+    let mut mapper = StdoutMapper::new(DriverKind::ClaudeSdk, SESSION);
+    mapper.turn_started_with("cmd_first").expect("first start");
+    mapper
+        .turn_started_with("cmd_second")
+        .expect("second start");
+
+    let first = result_of(mapper.map(result(0)).expect("map first result"));
+    assert_eq!(
+        first.related_ids.get("completedTurn").map(String::as_str),
+        Some("cmd_first")
+    );
+    assert!(
+        !settles_root_turn(&first),
+        "the newer outstanding turn keeps the root working"
+    );
+
+    let second = result_of(mapper.map(result(1)).expect("map second result"));
+    assert_eq!(
+        second.related_ids.get("completedTurn").map(String::as_str),
+        Some("cmd_second")
+    );
+    assert!(settles_root_turn(&second));
+
+    // A result with no locally-written turn (a native follow-up) names none.
+    let follow_up = result_of(mapper.map(result(2)).expect("map follow-up result"));
+    assert!(!follow_up.related_ids.contains_key("completedTurn"));
+}

@@ -949,9 +949,16 @@ impl Driver for NativeAdapter {
                     attachments,
                     origin,
                     mode,
+                    command_id,
                 } => {
                     self.native
-                        .send(prompt_input(prompt, &attachments, origin, mode))
+                        .send(prompt_input(
+                            prompt,
+                            &attachments,
+                            origin,
+                            mode,
+                            command_id.as_ref(),
+                        ))
                         .await
                         .map_err(map_driver_error)?;
                 }
@@ -1062,11 +1069,17 @@ impl Driver for NativeAdapter {
 /// driver that can only mention a path (the PTY family) needs the same path
 /// as text. The text block stays last so the prompt reads naturally after the
 /// attachments.
+///
+/// cb-rootturn: the delivering command id, when known, is the prompt's client
+/// message id. A structured carrier echoes it on the `turn_started` it opens
+/// and on the `result` that completes the turn (`completedTurn`), which is how
+/// the Hub bounds the root turn exactly. Without one a fresh id is minted.
 fn prompt_input(
     prompt: String,
     attachments: &[crate::attachments::MaterializedAttachment],
     origin: InputOrigin,
     mode: PromptMode,
+    command_id: Option<&remuda_protocol::CommandId>,
 ) -> DriverInput {
     let mut blocks = crate::attachments::content_blocks(attachments);
     blocks.push(ContentBlock::Text(Box::new(TextBlock { text: prompt })));
@@ -1074,7 +1087,10 @@ fn prompt_input(
         mode,
         blocks,
         origin,
-        native_client_message_id: uuid::Uuid::now_v7().to_string(),
+        native_client_message_id: command_id.map_or_else(
+            || uuid::Uuid::now_v7().to_string(),
+            |id| id.as_id().as_str().to_owned(),
+        ),
     }))
 }
 
@@ -2108,6 +2124,23 @@ mod tests {
         }
     }
 
+    /// cb-rootturn: the delivering command id becomes the client message id
+    /// the structured carrier echoes on its turn lifecycles.
+    #[test]
+    fn native_prompt_carries_the_delivering_command_id() {
+        let command = remuda_protocol::CommandId::new();
+        let DriverInput::Prompt(prompt) = prompt_input(
+            "new input".into(),
+            &[],
+            InputOrigin::Human,
+            remuda_protocol::PromptMode::NewTurn,
+            Some(&command),
+        ) else {
+            panic!("prompt expected")
+        };
+        assert_eq!(prompt.native_client_message_id, command.as_id().as_str());
+    }
+
     #[test]
     fn native_prompt_preserves_each_submitting_origin() {
         for origin in [InputOrigin::Human, InputOrigin::Bot, InputOrigin::Agent] {
@@ -2116,6 +2149,7 @@ mod tests {
                 &[],
                 origin,
                 remuda_protocol::PromptMode::NewTurn,
+                None,
             ) else {
                 panic!("prompt expected")
             };
@@ -2143,6 +2177,7 @@ mod tests {
             std::slice::from_ref(&attachment),
             InputOrigin::Human,
             remuda_protocol::PromptMode::NewTurn,
+            None,
         ) else {
             panic!("prompt expected")
         };
@@ -2198,6 +2233,7 @@ mod tests {
             std::slice::from_ref(&attachment),
             InputOrigin::Human,
             remuda_protocol::PromptMode::NewTurn,
+            None,
         ) else {
             panic!("prompt expected")
         };

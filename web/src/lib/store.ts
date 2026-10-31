@@ -1653,6 +1653,11 @@ class HubStore {
       // null at capture — is already stale when the next identity's
       // machine installs.
       this.identityEpoch += 1;
+      // home.md §8: the retired identity's freshness dies with it — the next
+      // login must not read as fresh (or as failing) off stamps it never
+      // earned. This is the one retirement helper every external identity
+      // change passes through (logout, peer-tab event, bootstrap 401).
+      this.publishRefreshHealth({ lastOkAt: null, failingSince: null });
       // The peer tab removed persisted storage itself; also forget the cached
       // in-memory session in THIS tab so readSession()/hasDeviceSession()
       // cannot resurrect the old identity.
@@ -6239,9 +6244,8 @@ class HubStore {
     ++this.bootGen;
     this.pinnedCreates.clear();
     this.polledEffort.clear();
-    // home.md §8: the old identity's freshness dies with it — the next login
-    // must not read as fresh off a timestamp it never earned.
-    this.publishRefreshHealth({ lastOkAt: null, failingSince: null });
+    // The freshness stamps are reset by externalIdentityRetire() below, the
+    // one retirement path (peers and 401s included).
     // Tear down the connection machine and its follow bookkeeping (init
     // recreates them at the next bootstrap); the durable outbox itself stays.
     this.disposeConnectionForAuthChange();

@@ -47,12 +47,34 @@ async function shot(page: Page, name: string) {
   await page.screenshot({ path: path.join(shotDir, name), animations: "disabled" });
 }
 
-/** The fake Node is this spec's trigger; a Hub without it skips, not fails. */
+/**
+ * The fake Node is this spec's trigger; a Hub without it skips, not fails.
+ *
+ * The fake Node enrolls shortly after the Hub boots, so a single read taken
+ * right after navigation can miss it and silently skip every case. Poll
+ * briefly first: a real absence still resolves to a skip, only 15 s later.
+ */
 async function needsFakeNode(page: Page): Promise<boolean> {
-  const response = await page.request.get("/v1/hosts");
-  if (!response.ok()) return false;
-  const body = (await response.json()) as { items?: { label?: string }[] };
-  return (body.items ?? []).some((row) => row.label === "e2e-fake-node");
+  const present = await expect
+    .poll(
+      async () => {
+        try {
+          const response = await page.request.get("/v1/hosts");
+          if (!response.ok()) return false;
+          const body = (await response.json()) as { items?: { label?: string }[] };
+          return (body.items ?? []).some((row) => row.label === "e2e-fake-node");
+        } catch {
+          return false;
+        }
+      },
+      { timeout: 15_000, intervals: [250, 500, 1_000] },
+    )
+    .toBe(true)
+    .then(
+      () => true,
+      () => false,
+    );
+  return present;
 }
 
 /**

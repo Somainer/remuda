@@ -84,3 +84,23 @@ it("notifies freshness subscribers without touching the list snapshot identity",
   expect(hubStore.getSnapshot()).toBe(snapshot);
   off();
 });
+
+it("clears both freshness stamps when the identity is retired", async () => {
+  mockRead();
+  clock = 5_000;
+  await hubStore.refresh();
+  expect(hubStore.getRefreshHealth()).toMatchObject({ lastOkAt: 5_000, failingSince: null });
+  vi.spyOn(api, "deviceRevoke").mockResolvedValue(undefined as never);
+  hubStore.logout();
+  // The next login starts unknown: neither a stale success nor an open
+  // failure run carries over (§8).
+  expect(hubStore.getRefreshHealth()).toMatchObject({ lastOkAt: null, failingSince: null });
+
+  // The same holds for a retirement that never reached a success: the
+  // failure run belongs to the old identity too.
+  vi.spyOn(api, "instanceList").mockRejectedValue(new Error("down"));
+  await expect(hubStore.refresh()).rejects.toThrow("down");
+  expect(hubStore.getRefreshHealth().failingSince).not.toBeNull();
+  hubStore.logout();
+  expect(hubStore.getRefreshHealth()).toMatchObject({ lastOkAt: null, failingSince: null });
+});

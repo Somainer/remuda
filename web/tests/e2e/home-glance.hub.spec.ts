@@ -217,17 +217,17 @@ test.describe("desktop 1280", () => {
       const toggle = page.getByTestId("spaces-index-open");
       await expect(toggle).toHaveAttribute("aria-expanded", "false");
       await expect(toggle).toContainText("空间");
-      await expect(page.getByTestId("spaces-panel")).toHaveCount(0);
+      await expect(page.getByTestId("spaces-panel")).toBeHidden();
       await toggle.click();
       await expect(page.getByTestId("spaces-panel")).toBeVisible();
       await expect(toggle).toHaveAttribute("aria-expanded", "true");
       await shot(page, "home-glance-1280-index.png");
       // The same toggle closes it, and the remembered state is per device.
       await toggle.click();
-      await expect(page.getByTestId("spaces-panel")).toHaveCount(0);
+      await expect(page.getByTestId("spaces-panel")).toBeHidden();
       await page.reload();
       await expect(page.getByTestId("session-list")).toBeVisible({ timeout: 20_000 });
-      await expect(page.getByTestId("spaces-panel")).toHaveCount(0);
+      await expect(page.getByTestId("spaces-panel")).toBeHidden();
 
       await setMode(page, "light");
       await shot(page, "home-glance-1280-light.png");

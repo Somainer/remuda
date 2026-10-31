@@ -8,7 +8,9 @@ import { expect, type Page } from "@playwright/test";
  */
 export async function openSpacesIndex(page: Page): Promise<void> {
   const panel = page.getByTestId("spaces-panel");
-  if (await panel.count()) return;
+  // The panel stays mounted (its QuickFind hotkey is page-wide); collapsed
+  // means hidden, not absent.
+  if (await panel.isVisible().catch(() => false)) return;
   const toggle = page.getByTestId("spaces-index-open");
   await expect(toggle).toBeVisible();
   await toggle.click();

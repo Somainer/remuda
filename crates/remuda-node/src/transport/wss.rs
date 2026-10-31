@@ -1343,9 +1343,7 @@ fn encode_hello_params(
         host: host
             .clone()
             .and_then(|value| serde_json::from_value(value).ok()),
-        capabilities: host
-            .as_ref()
-            .and_then(crate::transport::hubnode::hello_capabilities),
+        capabilities: Some(crate::transport::hubnode::node_capabilities(host.as_ref())),
         cli: Some(config.cli.clone()),
     });
     if let Some(object) = params.as_object_mut() {
@@ -1381,10 +1379,9 @@ fn encode_heartbeat_params(
             .clone()
             .and_then(|host| serde_json::from_value(host).ok()),
         cli: Some(config.cli.clone()),
-        capabilities: config
-            .host
-            .as_ref()
-            .and_then(crate::transport::hubnode::hello_capabilities),
+        capabilities: Some(crate::transport::hubnode::node_capabilities(
+            config.host.as_ref(),
+        )),
         instance_watermarks: journal_watermarks(watermarks),
     })
 }
@@ -1783,8 +1780,9 @@ mod tests {
     }
 
     #[test]
-    fn wss_hello_without_inventory_sends_no_capabilities_rather_than_an_empty_claim() {
-        // Absence must read as "not reported", never as "cannot launch".
+    fn wss_hello_without_inventory_sends_no_inventory_rather_than_an_empty_claim() {
+        // Absence must read as "not reported", never as "cannot launch". The
+        // build's own lineageFence support is still advertised.
         let epoch = Id::new("epoch").expect("epoch");
         let host_id = remuda_protocol::HostId::new();
         let mut config = WssConfig::loopback(
@@ -1794,17 +1792,17 @@ mod tests {
         );
         config.host = Some(json!({ "hostname": "lab" }));
         let value = encode_hello_params(&config, &epoch, &HashMap::new());
-        assert!(value["capabilities"].is_null());
+        assert_eq!(value["capabilities"], json!({"lineageFence": true}));
 
         // No host at all (loopback config before inventory collection) still
-        // sends no capabilities.
+        // sends no inventory.
         let bare = WssConfig::loopback(
             "127.0.0.1:1".parse().expect("addr"),
             "tok",
             host_id.as_id().as_str().to_owned(),
         );
         let value = encode_hello_params(&bare, &epoch, &HashMap::new());
-        assert!(value["capabilities"].is_null());
+        assert_eq!(value["capabilities"], json!({"lineageFence": true}));
     }
 
     #[test]

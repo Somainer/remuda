@@ -878,15 +878,24 @@ fn resume_cursors(watermarks: &HashMap<String, SeqWatermark>) -> Vec<Value> {
 /// "an older Node", which must not be rendered as a positive claim.
 #[must_use]
 pub fn hello_capabilities(host: &Value) -> Option<Value> {
-    host.get("driverInventory")
+    Some(node_capabilities(Some(host)))
+}
+
+/// The hello/heartbeat `capabilities` blob. `lineageFence` (D-057 §7.6) is a
+/// property of this build and is always advertised; `driverInventory` (and
+/// the relay flag that rides with it) only when the inventory was collected —
+/// its absence reads "not reported", never "cannot launch".
+#[must_use]
+pub fn node_capabilities(host: Option<&Value>) -> Value {
+    let mut capabilities = json!({ remuda_protocol::LINEAGE_FENCE_CAPABILITY: true });
+    if let Some(inventory) = host
+        .and_then(|host| host.get("driverInventory"))
         .filter(|inventory| !inventory.is_null())
-        .map(|inventory| {
-            json!({
-                "driverInventory": inventory,
-                "apiRelay": true,
-                remuda_protocol::LINEAGE_FENCE_CAPABILITY: true,
-            })
-        })
+    {
+        capabilities["driverInventory"] = inventory.clone();
+        capabilities["apiRelay"] = json!(true);
+    }
+    capabilities
 }
 
 /// Build stdio hello params from a nested host inventory value.
@@ -1096,7 +1105,8 @@ mod tests {
             None,
             None,
         );
-        assert!(params["capabilities"].is_null());
+        // No inventory claim; only the build's own lineage-fence support.
+        assert_eq!(params["capabilities"], json!({"lineageFence": true}));
     }
 
     #[test]

@@ -39,12 +39,17 @@ export function HubBanner() {
     lastOkAt === null
       ? "–"
       : `${Math.max(0, Math.floor((now - lastOkAt) / 1_000))} 秒前`;
+  // The live region must carry the last-update age too, but at a coarse
+  // cadence: minutes, so a screen reader hears one announcement per minute
+  // instead of one per countdown tick.
+  const announce =
+    lastOkAt === null
+      ? "连不上 Hub · 上次更新未知"
+      : `连不上 Hub · 上次更新 ${Math.max(0, Math.floor((now - lastOkAt) / 60_000))} 分钟前`;
   return (
     <div className={css.banner} data-testid="hub-banner">
-      {/* The visible countdown changes every second; announcing that would
-          flood a screen reader. The stable message is the live region. */}
       <span className={css.srOnly} role="status">
-        连不上 Hub
+        {announce}
       </span>
       <span className={css.text} aria-hidden="true">
         连不上 Hub · 上次更新 {agoLabel} ·

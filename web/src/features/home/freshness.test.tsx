@@ -163,6 +163,22 @@ describe("home freshness", () => {
     expect(screen.queryByTestId("hub-banner")).toBeNull();
   });
 
+  it("the live region announces the last-update age once a minute, not every second", async () => {
+    fake.health = { lastOkAt: clock - 5_000, failingSince: null, settledSeq: 1 };
+    render(<Probe />);
+    settle({ failingSince: clock });
+    await advance(HOME_FRESHNESS.bannerAfterMs);
+    const status = screen.getByRole("status");
+    expect(status).toHaveTextContent("连不上 Hub");
+    // 10 s behind at this point — the same information the visual text shows,
+    // at the coarse granularity the announcement uses.
+    expect(status).toHaveTextContent("上次更新 0 分钟前");
+    await advance(49_000);
+    expect(status).toHaveTextContent("上次更新 0 分钟前");
+    await advance(1_000);
+    expect(status).toHaveTextContent("上次更新 1 分钟前");
+  });
+
   it("a foreground grace is not stale until the first refresh after it settles", async () => {
     // Cached rows from 20 s ago: stale on the open.
     fake.health = { lastOkAt: clock - 20_000, failingSince: null, settledSeq: 1 };

@@ -17,8 +17,9 @@ import { login } from "./hub-auth";
  * including a simulated soft keyboard around the home search input.
  *
  * Covered:
- *  - at 390 the /m chrome is exactly two 52px header rows plus the 56px (+
- *    safe area) PhoneNav: no spaces chips row and no tab strip;
+ *  - at 390 the /m chrome is one 52px title row plus the 28px ① count row
+ *    (sticky, 80px in total) plus the 56px (+ safe area) PhoneNav: no spaces
+ *    chips row and no tab strip;
  *  - the header's Space button opens the shared SpacesDrawer;
  *  - desktop /m still redirects to /sessions;
  *  - a fine pointer at 390 keeps desktop density (44px follows touch, not
@@ -119,7 +120,7 @@ async function cleanup(context: BrowserContext): Promise<void> {
   }
 }
 
-test("390 iPhone: /m chrome is 52+52 with no chips row and no tab strip, and PhoneNav is 56", async ({
+test("390 iPhone: /m chrome is a 52+28 sticky head with no chips row and no tab strip, and PhoneNav is 56", async ({
   browser,
 }) => {
   const context = await phoneContext(browser);
@@ -147,22 +148,25 @@ test("390 iPhone: /m chrome is 52+52 with no chips row and no tab strip, and Pho
     await expect(head).toBeVisible();
     const headBox = await head.boundingBox();
     expect(headBox).toBeTruthy();
-    expect(Math.round(headBox!.height), "home head is 52 + 52").toBe(104);
-    // The header's two div rows are the title row and the toolbar (the order
-    // control's own div is nested inside the toolbar).
+    // home.md §2.1: the sticky head is the 52px title row over the 28px ①
+    // count row — 80px at most. The search/order row scrolls with the page.
+    expect(Math.round(headBox!.height), "home head is 52 + 28").toBe(80);
     const titleRow = head.locator("div").first();
     const titleRowBox = await titleRow.boundingBox();
     expect(titleRowBox).toBeTruthy();
     expect(Math.round(titleRowBox!.height), "title row height").toBe(52);
-    const toolbarBox = await page.getByTestId("home-search").boundingBox();
-    expect(toolbarBox).toBeTruthy();
-    // The search sits in the second 52px band: below the title row's bottom
-    // edge and never past the head's 104px total.
-    expect(toolbarBox!.y, "search starts inside the second band").toBeGreaterThanOrEqual(
+    const glanceBox = await page.getByTestId("home-glance").boundingBox();
+    expect(glanceBox).toBeTruthy();
+    expect(Math.round(glanceBox!.height), "① is the 28px count row").toBe(28);
+    expect(glanceBox!.y, "① sits under the title row").toBeGreaterThanOrEqual(
       titleRowBox!.y + 52 - 0.5,
     );
-    expect(toolbarBox!.y + toolbarBox!.height).toBeLessThanOrEqual(
-      titleRowBox!.y + 104 + 0.5,
+    const toolbarBox = await page.getByTestId("home-search").boundingBox();
+    expect(toolbarBox).toBeTruthy();
+    // The search row is no longer sticky: it starts at or below the head's
+    // 80px bottom and scrolls away with the list.
+    expect(toolbarBox!.y, "search starts below the sticky head").toBeGreaterThanOrEqual(
+      titleRowBox!.y + 80 - 0.5,
     );
 
     const search = page.getByTestId("home-search");
@@ -315,7 +319,7 @@ test("soft keyboard keeps the home head and search inside the visible band", asy
     expect(geometry.searchBottom, "search inside the visible band").toBeLessThanOrEqual(
       band.bottom + 0.5,
     );
-    expect(geometry.searchTop).toBeGreaterThanOrEqual(geometry.headTop! + 52 - 0.5);
+    expect(geometry.searchTop).toBeGreaterThanOrEqual(geometry.headTop! + 80 - 0.5);
   } finally {
     await context.close();
   }
@@ -353,7 +357,7 @@ test("both appearances resolve role tokens at 390 and 1440", async ({ browser })
     await expectOneScopedRow(page, token);
     const scopedRow = page.getByTestId("home-row");
     await expect(scopedRow).toHaveAttribute("data-status", "blocked", { timeout: 15_000 });
-    // Dismiss the install hint so the committed frames show only the 52+52
+    // Dismiss the install hint so the committed frames show only the 52+28
     // head and the row (the banner is surface chrome above the home, not it).
     const dismiss = page.getByRole("button", { name: "知道了" });
     if (await dismiss.isVisible().catch(() => false)) await dismiss.click();

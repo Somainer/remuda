@@ -4192,6 +4192,32 @@ pub async fn get_instance_command(
     Ok(Json(command))
 }
 
+/// Put `line` ahead of an `instance.send` input, in whichever shape the
+/// sender used (`input.text`, a bare `input` string, `input.blocks`, or the
+/// flattened `prompt`), so the Node delivers it as the input's first line.
+fn prefix_input_line(params: &mut serde_json::Map<String, Value>, line: &str) {
+    let prefixed = |text: &str| format!("{line}\n{text}");
+    if let Some(input) = params.get_mut("input") {
+        if let Some(text) = input.get("text").and_then(Value::as_str) {
+            let text = prefixed(text);
+            input["text"] = json!(text);
+            return;
+        }
+        if let Some(text) = input.as_str() {
+            *input = json!(prefixed(text));
+            return;
+        }
+        if let Some(blocks) = input.get_mut("blocks").and_then(Value::as_array_mut) {
+            blocks.insert(0, json!({ "type": "text", "text": line }));
+            return;
+        }
+    }
+    if let Some(text) = params.get("prompt").and_then(Value::as_str) {
+        let text = prefixed(text);
+        params.insert("prompt".into(), json!(text));
+    }
+}
+
 pub(crate) async fn forward_if_online(
     state: &AppState,
     command: CommandRecord,
@@ -4281,6 +4307,14 @@ pub(crate) async fn forward_if_online(
     object.remove("memoryContext");
     if let Some(spec) = object.get_mut("spec").and_then(Value::as_object_mut) {
         spec.remove("memoryContext");
+    }
+    if command.operation == "instance.send"
+        && let Some(rev) = state
+            .store
+            .memory_change_rev(command.command_id.clone())
+            .await?
+    {
+        prefix_input_line(object, &crate::memory::change_line(rev));
     }
     if matches!(
         command.operation.as_str(),

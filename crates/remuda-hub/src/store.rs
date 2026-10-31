@@ -5556,6 +5556,14 @@ impl Store {
                     initiator_device_id,
                 ],
             )?;
+            // D-060 (cb-memory-inject): the first input queued to a chapter
+            // after its lineage memory moved carries the "memory changed"
+            // line; decided here, where every input kind is queued.
+            if operation == "instance.send"
+                && let Some(instance) = instance_id.as_deref()
+            {
+                crate::memory::claim_change_line(conn, instance, &command_id)?;
+            }
             let row = load_command(conn, &command_id)?
                 .ok_or_else(|| StoreError::Id("command insert missing".into()))?;
             Ok((row, true))
@@ -7846,8 +7854,8 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
         );
         CREATE INDEX IF NOT EXISTS lineages_current ON lineages(current_instance_id);",
     )?;
-    // D-060 (cb-memory-inject): the lineage memory revision and the
-    // chapter's start record.
+    // D-060 (cb-memory-inject): the lineage memory revision, the chapter's
+    // start record and the per-command change line.
     crate::memory::ensure_inject_columns(&conn)?;
     // D-057 §5 (ma-lineage round 2): rows written before ma-lineage got their
     // lineage_id stamped above but no lineage ROW, so a holder's resume fell

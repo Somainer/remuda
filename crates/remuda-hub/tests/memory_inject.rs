@@ -4,8 +4,9 @@
 //! the forwarded create/resume params as `memoryContext {rev, text}`; only for
 //! a Node that advertises `capabilities.memoryContext`, never from a request
 //! body, and never for kinds `terminal`/`generic`. Each chapter records its
-//! start revision. Every case drives the Hub over HTTP with a scripted fake
-//! Node that records the frames it receives.
+//! start revision; the first input queued after the lineage memory moves
+//! carries one change line. Every case drives the Hub over HTTP with a
+//! scripted fake Node that records the frames it receives.
 
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
@@ -436,6 +437,52 @@ async fn terminal_and_generic_kinds_get_no_memory_context() -> Result<()> {
         let send = node.next("instance.send").await?;
         assert_eq!(send["input"]["text"], json!("ls"), "{kind}: {send}");
     }
+    Ok(())
+}
+
+/// The first input queued after the lineage memory moves carries one change
+/// line naming the newest revision; later inputs at the same revision do not.
+#[tokio::test]
+async fn the_memory_changed_line_rides_one_input_per_new_rev() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host, capable()).await?;
+    let (seat, _) = ctx
+        .seat(&mut node, "claude", "claude-sdk", json!({}))
+        .await?;
+
+    ctx.send(&seat, "before any change").await?;
+    assert_eq!(
+        node.next("instance.send").await?["input"]["text"],
+        json!("before any change")
+    );
+
+    ctx.write(&seat, "lang", "语言偏好", "回复用中文", "body")
+        .await?;
+    ctx.send(&seat, "first after rev 1").await?;
+    assert_eq!(
+        node.next("instance.send").await?["input"]["text"],
+        json!("记忆自本章开始已变更（rev 1）\nfirst after rev 1")
+    );
+    ctx.send(&seat, "second after rev 1").await?;
+    assert_eq!(
+        node.next("instance.send").await?["input"]["text"],
+        json!("second after rev 1")
+    );
+
+    // Two more writes before the next input: one line, the newest revision.
+    ctx.write(&seat, "tone", "语气", "简洁", "body").await?;
+    ctx.write(&seat, "about-me", "关于我", "维护者", "body")
+        .await?;
+    ctx.send(&seat, "after rev 3").await?;
+    assert_eq!(
+        node.next("instance.send").await?["input"]["text"],
+        json!("记忆自本章开始已变更（rev 3）\nafter rev 3")
+    );
+    ctx.send(&seat, "still rev 3").await?;
+    assert_eq!(
+        node.next("instance.send").await?["input"]["text"],
+        json!("still rev 3")
+    );
     Ok(())
 }
 

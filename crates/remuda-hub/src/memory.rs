@@ -163,7 +163,8 @@ pub(crate) fn archive_lineage(
 // `memoryContext {rev, text}`. `rev` is the lineage memory revision: every
 // memory write transaction bumps it, so "memory changed since this chapter
 // started" is one integer comparison. A chapter records the revision it
-// started at and the newest one it has been told about.
+// started at and the newest one it has been told about; the first input
+// queued after the lineage moves past that carries one change line.
 
 /// The owner-written entry the chapter-start render includes in full.
 pub(crate) const ABOUT_ME_SLUG: &str = "about-me";
@@ -173,7 +174,7 @@ pub(crate) const ABOUT_ME_SLUG: &str = "about-me";
 /// a pathological index is cut at a whole line with a pointer to search.
 const MEMORY_CONTEXT_MAX_BYTES: usize = 32 * 1024;
 
-/// `lineages.memory_rev` and the chapter columns.
+/// `lineages.memory_rev`, the chapter columns and the per-command change line.
 /// Idempotent DDL on every open, beside the `lineages` table it extends.
 pub(crate) fn ensure_inject_columns(conn: &Connection) -> rusqlite::Result<()> {
     use crate::store::ensure_column;
@@ -190,6 +191,8 @@ pub(crate) fn ensure_inject_columns(conn: &Connection) -> rusqlite::Result<()> {
     // The stamped context, so a re-forward of the same create carries the
     // same revision and text the chapter's start revision names.
     ensure_column(conn, "instances", "memory_context_json", "TEXT")?;
+    // The lineage revision whose change line this input carries.
+    ensure_column(conn, "commands", "memory_change_rev", "INTEGER")?;
     Ok(())
 }
 
@@ -201,6 +204,11 @@ fn bump_memory_rev(conn: &Connection, lineage_id: &str) -> rusqlite::Result<()> 
         params![lineage_id],
     )?;
     Ok(())
+}
+
+/// The one change line, as the chapter reads it.
+pub(crate) fn change_line(rev: u64) -> String {
+    format!("记忆自本章开始已变更（rev {rev}）")
 }
 
 /// What a chapter's create/resume forward carries.
@@ -378,6 +386,46 @@ fn chapter_start_tx(
     };
     tx.commit()?;
     Ok(outcome)
+}
+
+/// D-060: the "memory changed" line for an input being queued to
+/// `instance_id`, decided in the command's own insert job: when the lineage
+/// memory has moved past the newest revision this chapter has seen, this
+/// command carries the line and the chapter has now seen that revision. So
+/// the line rides exactly one input per new revision, whatever the input's
+/// kind (owner, agent, bot or Hub), because every one is queued here.
+pub(crate) fn claim_change_line(
+    conn: &mut Connection,
+    instance_id: &str,
+    command_id: &str,
+) -> rusqlite::Result<Option<u64>> {
+    let sp = conn.savepoint()?;
+    let row: Option<(Option<i64>, i64)> = sp
+        .query_row(
+            "SELECT i.memory_seen_rev, l.memory_rev
+               FROM instances i
+               JOIN lineages l ON l.lineage_id = COALESCE(i.lineage_id, i.id)
+              WHERE i.id = ?1",
+            params![instance_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((Some(seen), current)) = row else {
+        return Ok(None);
+    };
+    if current <= seen {
+        return Ok(None);
+    }
+    sp.execute(
+        "UPDATE instances SET memory_seen_rev = ?2 WHERE id = ?1",
+        params![instance_id, current],
+    )?;
+    sp.execute(
+        "UPDATE commands SET memory_change_rev = ?2 WHERE id = ?1",
+        params![command_id, current],
+    )?;
+    sp.commit()?;
+    Ok(Some(current.max(0) as u64))
 }
 
 // ─── Errors ────────────────────────────────────────────────────────────────
@@ -1497,6 +1545,24 @@ impl Store {
     ) -> Result<ChapterMemory, StoreError> {
         self.run_named("memory_chapter_start", move |conn| {
             chapter_start_tx(conn, &instance_id, &host_id)
+        })
+        .await
+    }
+
+    /// The lineage revision whose change line `command_id` carries, if any.
+    pub(crate) async fn memory_change_rev(
+        &self,
+        command_id: String,
+    ) -> Result<Option<u64>, StoreError> {
+        self.read("memory_change_rev", move |conn| {
+            let rev: Option<Option<i64>> = conn
+                .query_row(
+                    "SELECT memory_change_rev FROM commands WHERE id = ?1",
+                    params![command_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(rev.flatten().map(|rev| rev.max(0) as u64))
         })
         .await
     }

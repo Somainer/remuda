@@ -23,6 +23,7 @@ import {
   arrangeHomeGroups,
   buildHomeRows,
   buildHomeTaskLayer,
+  groupDots,
   homeRowsSignature,
   liveChildParents,
   rankFolds,
@@ -305,7 +306,11 @@ export const HomeList = memo(function HomeList() {
   const rankFiltered = useMemo<HomeGroup[]>(() => {
     if (rankFilter === null) return groups;
     return groups
-      .map((group) => ({ ...group, rows: group.rows.filter((row) => row.rank === rankFilter) }))
+      .map((group) => {
+        const rows = group.rows.filter((row) => row.rank === rankFilter);
+        // The header counts what is on screen, not what the filter hides.
+        return { ...group, rows, dots: groupDots(rows) };
+      })
       .filter((group) => group.rows.length > 0);
   }, [groups, rankFilter]);
   // What the list is painting right now: group order, each group's busy/quiet

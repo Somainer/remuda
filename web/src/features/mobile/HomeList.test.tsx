@@ -623,3 +623,23 @@ describe("phone home order (§2.1)", () => {
     expect(strip.compareDocumentPosition(toolbar) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 });
+
+describe("① 工作中 filter and the group header", () => {
+  it("recomputes the dots from the filtered rows and clears on the second tap", async () => {
+    hub.instances = [
+      row("ins-blocked", { activity: known("waiting-interaction") }),
+      row("ins-work", { activity: known("working") }),
+    ];
+    renderHome();
+    const dots = await screen.findByTestId("home-group-dots");
+    expect(dots).toHaveTextContent("⚠1 ●1");
+    const segment = await screen.findByTestId("glance-working");
+    await userEvent.click(segment);
+    expect(screen.getAllByTestId("home-row").map((el) => el.getAttribute("data-rank"))).toEqual(["working"]);
+    expect(screen.getByTestId("home-group-dots")).toHaveTextContent("●1");
+    expect(screen.getByTestId("home-group-dots")).not.toHaveTextContent("⚠");
+    await userEvent.click(screen.getByTestId("glance-working"));
+    expect(screen.getAllByTestId("home-row")).toHaveLength(2);
+    expect(screen.getByTestId("home-group-dots")).toHaveTextContent("⚠1 ●1");
+  });
+});

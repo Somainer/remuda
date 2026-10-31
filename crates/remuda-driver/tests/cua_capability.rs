@@ -64,6 +64,7 @@ fn request<'a>(
     binary: &'a Path,
 ) -> MaterializeRequest<'a> {
     MaterializeRequest {
+        memory_context: None,
         spec,
         profile: Box::leak(Box::new(profile())),
         launch_dir: launch.to_path_buf(),
@@ -322,6 +323,7 @@ fn granted_skill_tree_in_a_shared_home_is_native_store_lifetime() {
     grant(&mut spec);
 
     let recipe = materialize(&MaterializeRequest {
+        memory_context: None,
         spec: &spec,
         profile: Box::leak(Box::new(profile())),
         launch_dir: launch.clone(),

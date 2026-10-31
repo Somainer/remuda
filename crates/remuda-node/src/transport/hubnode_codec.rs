@@ -361,6 +361,7 @@ async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeErr
             prompt: None,
             host_id: None,
             workspace_id: None,
+            memory_context: None,
         });
     let spec = parsed.spec.clone().unwrap_or_else(|| params.clone());
     let mut spec_for_request = spec.clone();
@@ -439,6 +440,7 @@ async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeErr
             capabilities: Default::default(),
             api_route: None,
             api_relay_endpoint: None,
+            memory_context: None,
         },
     };
     // Honour the requested product or refuse it. An unrecognized kind/driver is
@@ -472,6 +474,8 @@ async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeErr
     }
     request.origin = crate::origin::wire_origin(&params);
     request.initiator = crate::origin::wire_initiator(&params);
+    // D-060: top-level `memoryContext` only, never the spec's.
+    request.take_memory_context(&params);
     request.agent_credential = params
         .get("agentCredential")
         .cloned()
@@ -873,21 +877,24 @@ fn resume_cursors(watermarks: &HashMap<String, SeqWatermark>) -> Vec<Value> {
 ///
 /// `apiRelay: true` (D-047) rides alongside it: this is the capability the Hub
 /// checks before routing a `via` session to a host, refusing
-/// `api-via-unsupported` rather than downgrading. The blob stays absent
-/// entirely when this Node cannot even report an inventory — absence reads as
-/// "an older Node", which must not be rendered as a positive claim.
+/// `api-via-unsupported` rather than downgrading.
 #[must_use]
 pub fn hello_capabilities(host: &Value) -> Option<Value> {
     Some(node_capabilities(Some(host)))
 }
 
-/// The hello/heartbeat `capabilities` blob. `lineageFence` (D-057 §7.6) is a
-/// property of this build and is always advertised; `driverInventory` (and
+/// The hello/heartbeat `capabilities` blob. `lineageFence` (D-057 §7.6) and
+/// `memoryContext` (D-060) are properties of this build and are always
+/// advertised: the Hub stamps a chapter's memory on create/resume only for a
+/// Node that says it carries it to the materializer. `driverInventory` (and
 /// the relay flag that rides with it) only when the inventory was collected —
 /// its absence reads "not reported", never "cannot launch".
 #[must_use]
 pub fn node_capabilities(host: Option<&Value>) -> Value {
-    let mut capabilities = json!({ remuda_protocol::LINEAGE_FENCE_CAPABILITY: true });
+    let mut capabilities = json!({
+        remuda_protocol::LINEAGE_FENCE_CAPABILITY: true,
+        remuda_protocol::hubnode::MEMORY_CONTEXT_CAPABILITY: true,
+    });
     if let Some(inventory) = host
         .and_then(|host| host.get("driverInventory"))
         .filter(|inventory| !inventory.is_null())
@@ -1089,7 +1096,7 @@ mod tests {
     }
 
     #[test]
-    fn a_host_with_no_inventory_reports_no_capabilities_rather_than_an_empty_claim() {
+    fn a_host_with_no_inventory_reports_no_inventory_rather_than_an_empty_claim() {
         // Absence must read as "not reported", never as "cannot launch": a
         // Node too old to describe itself should not have its silence rendered
         // as a refusal.
@@ -1105,8 +1112,12 @@ mod tests {
             None,
             None,
         );
-        // No inventory claim; only the build's own lineage-fence support.
-        assert_eq!(params["capabilities"], json!({"lineageFence": true}));
+        // No inventory claim; only this build's own lineage-fence and
+        // memory-context support.
+        assert_eq!(
+            params["capabilities"],
+            json!({"lineageFence": true, "memoryContext": true})
+        );
     }
 
     #[test]

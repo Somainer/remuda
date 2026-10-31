@@ -1323,7 +1323,7 @@ fn encode_hello_params(
 ) -> Value {
     // Insert the raw host value after the typed conversion: it carries
     // `driverInventory`, which `NodeHostInventory` does not model, and
-    // `hello_capabilities` echoes it verbatim into `capabilities`. This is the
+    // `node_capabilities` echoes it verbatim into `capabilities`. This is the
     // outbound-WSS twin of the stdio hello — the demo regression was that only
     // stdio advertised the inventory, so `remuda dev` never sent it.
     let host = config.host.clone();
@@ -1782,7 +1782,8 @@ mod tests {
     #[test]
     fn wss_hello_without_inventory_sends_no_inventory_rather_than_an_empty_claim() {
         // Absence must read as "not reported", never as "cannot launch". The
-        // build's own lineageFence support is still advertised.
+        // build's own lineageFence and memoryContext support is still
+        // advertised.
         let epoch = Id::new("epoch").expect("epoch");
         let host_id = remuda_protocol::HostId::new();
         let mut config = WssConfig::loopback(
@@ -1792,17 +1793,23 @@ mod tests {
         );
         config.host = Some(json!({ "hostname": "lab" }));
         let value = encode_hello_params(&config, &epoch, &HashMap::new());
-        assert_eq!(value["capabilities"], json!({"lineageFence": true}));
+        assert_eq!(
+            value["capabilities"],
+            json!({"lineageFence": true, "memoryContext": true})
+        );
 
         // No host at all (loopback config before inventory collection) still
-        // sends no inventory.
+        // claims no inventory; only this build's own capabilities.
         let bare = WssConfig::loopback(
             "127.0.0.1:1".parse().expect("addr"),
             "tok",
             host_id.as_id().as_str().to_owned(),
         );
         let value = encode_hello_params(&bare, &epoch, &HashMap::new());
-        assert_eq!(value["capabilities"], json!({"lineageFence": true}));
+        assert_eq!(
+            value["capabilities"],
+            json!({"lineageFence": true, "memoryContext": true})
+        );
     }
 
     #[test]

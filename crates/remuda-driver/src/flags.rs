@@ -3,7 +3,8 @@
 use crate::error::{DriverError, DriverResult};
 use remuda_protocol::DriverKind;
 
-/// Claude flags that must never be emitted or accepted from `InstanceSpec.args`.
+/// Claude flags that must never be accepted from `InstanceSpec.args`; the
+/// materializer itself emits `append-system-prompt` only from `memoryContext`.
 const BANNED: &[&str] = &[
     "bare",
     "safe-mode",
@@ -44,6 +45,9 @@ const RESERVED: &[&str] = &[
     "background",
     "dangerously-skip-permissions",
     "allow-dangerously-skip-permissions",
+    // D-060: emitted with the materializer's own `--append-system-prompt`
+    // on a native resume.
+    "system-prompt-snapshot",
 ];
 
 /// Extra flags `spec.args` may append after the template, per CLI family.

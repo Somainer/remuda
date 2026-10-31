@@ -1964,6 +1964,7 @@ registry 锁外加独立 DB claim（跨域，reconcile 先于 slot 切换提交�
    | 18 | `shell-pty` | `generic` | `DriverKind::ShellPty`（:439），登录 shell | 不适用 |
 
    - 章节中途记忆有变化时不重启，只在下一条输入或下一个事实批次之前加一行「记忆自本章开始已变更（rev N）」。原生 resume 不重复注入。
+   - **2026-10-31 补（cb-memory-inject，协调员裁定采纳）。** Claude Code 2.1.265 起默认把会话第一次请求的系统提示记录下来，并在之后每次请求和 `--resume` 时原样复用，后来启动传的 `--append-system-prompt` 不生效（实测 2.1.291：先 ALPHA 再 resume 传 BRAVO，答 ALPHA）。所以原生 resume 时物化器在自己那一对之前再发 `--system-prompt-snapshot off`，仅限钉住版本 ≥ 2.1.257（该开关的起始版本）；全新会话不发；`system-prompt-snapshot` 列入 `RESERVED`。另：调用方两词写法 `--append-system-prompt <值>` 今天就在 argv 解析阶段被拒（`InvalidLaunchSpec`，位置参数），只有 flag 本身（单独或 `=` 连写）得到 `NativeFeatureDisabled`；两者都不改。细节见 [main-agent.md §12.3](./main-agent.md#123-reading)。
    - 回复下方显示「已记住：<title>」。为此 Hub 在写入时记下写入实例和回合引用，所有回合都显示。
 
 5. **skill（`cb-skill`；ma-skill 派出时并入）。**

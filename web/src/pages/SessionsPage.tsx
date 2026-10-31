@@ -16,9 +16,9 @@ import { WorkingList } from "../features/home/WorkingList";
 import { useMainAside } from "../features/home/useMain";
 import css from "./SessionsPage.module.css";
 
-/** The URL's `status` list, the same wire form `readConditions` parses. */
-function statusValues(params: URLSearchParams): string[] {
-  return (params.get("status") ?? "").split(",").filter(Boolean);
+/** The URL's `rank` list (home.md §5.2 ① tap); the list's filter model reads it. */
+function rankValues(params: URLSearchParams): string[] {
+  return (params.get("rank") ?? "").split(",").filter(Boolean);
 }
 
 export function SessionsPage({ dimmed = false }: { dimmed?: boolean }) {
@@ -40,19 +40,20 @@ export function SessionsPage({ dimmed = false }: { dimmed?: boolean }) {
   // host band's right end. Expanding is a per-device preference: ≥1024 the
   // panel is the index column, below 1024 the same component is an overlay.
   const indexOpen = prefs.spacesOpen;
-  // §5.2: 工作中 on the count row narrows the SessionList to that rank via the
-  // list's own URL filter; a second tap removes it again.
+  // §5.2: 工作中 on the count row narrows the SessionList to that RANK (the
+  // same rank() the count uses — not the connectivity-dependent UiStatus); a
+  // second tap removes it again.
   const [params, setParams] = useSearchParams();
-  const workingFilter = statusValues(params).includes("working");
+  const workingFilter = rankValues(params).includes("working");
 
   function toggleWorking() {
     const next = new URLSearchParams(params);
-    const statuses = statusValues(params);
+    const ranks = rankValues(params);
     const updated = workingFilter
-      ? statuses.filter((value) => value !== "working")
-      : [...statuses, "working"];
-    if (updated.length) next.set("status", updated.join(","));
-    else next.delete("status");
+      ? ranks.filter((value) => value !== "working")
+      : [...ranks, "working"];
+    if (updated.length) next.set("rank", updated.join(","));
+    else next.delete("rank");
     setParams(next, { replace: true });
   }
 

@@ -1128,3 +1128,17 @@ describe("① 需要你 anchor on the real list markup", () => {
     expect(container.querySelector(GLANCE_TARGETS.needYouDesktop)).toBeNull();
   });
 });
+
+describe("① rank filter on the list", () => {
+  it("narrows to the count's rank, keeping a working row whose host dropped", () => {
+    hub.instances = [
+      session("ins_work", { activity: known("working"), connectivity: "disconnected" }),
+      session("ins_idle", { activity: known("idle") }),
+    ];
+    renderList("?rank=working");
+    const cards = screen.getAllByTestId("board-card");
+    expect(cards.map((card) => card.getAttribute("data-instance-id"))).toEqual(["ins_work"]);
+    // The filter is a removable chip, so it cannot outlive its control.
+    expect(screen.getByTestId("session-chip")).toHaveTextContent("工作中");
+  });
+});

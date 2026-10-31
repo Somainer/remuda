@@ -2792,6 +2792,30 @@ pub async fn post_command(
         .await?;
         return Ok(Json(json!({ "command": command, "replayed": true })));
     }
+    // D-057 §6.5/§7.2 (ma-fence): a chapter superseded by its successor
+    // takes no more input. Refused here, before any row exists, so nothing
+    // reaches its Node. Close and cancel stay allowed (a close applies to the
+    // lineage), and the paused lineage's own last chapter is not superseded.
+    if instance.fenced_at.is_some()
+        && matches!(
+            body.operation.as_str(),
+            "instance.send"
+                | "tty.write"
+                | "instance.keys"
+                | "instance.configure"
+                | "instance.respond"
+        )
+        && let Some(lineage) = state.store.get_lineage(instance.lineage_id.clone()).await?
+        && lineage.current_instance_id != instance_id
+    {
+        return Err(HubError::lineage_conflict(
+            "superseded",
+            format!(
+                "instance {instance_id} was superseded; address the lineage's current chapter {}",
+                lineage.current_instance_id
+            ),
+        ));
+    }
     // D-057 §6.3/§6.5 (ma-fence): a close of any chapter of an unpaused
     // continuity lineage is a pause — F without successor at admission, then
     // the close of the current chapter is forwarded.

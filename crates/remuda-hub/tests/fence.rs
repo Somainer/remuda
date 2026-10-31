@@ -586,9 +586,23 @@ async fn resume_only_from_paused_and_a_send_to_the_superseded_chapter_never_leav
     assert_eq!(record["state"], json!("starting"));
     assert!(record["pausedBy"].is_null());
 
-    // A human message addressed to the superseded chapter (the PWA's stale
-    // tab) is a plain send to a closed chapter; a message stamped by the
-    // superseded chapter's own authority is refused at admission.
+    // A message addressed to the superseded chapter (a stale tab) is refused
+    // at admission: no command row, no frame.
+    let stale_send = cmd_id();
+    let refused = ctx
+        .send(&ctx.human, &seat, &stale_send, "TO-OLD-CHAPTER")
+        .await?;
+    assert_eq!(refused.status(), 409);
+    let body: Value = refused.json().await?;
+    assert_eq!(body["reason"], json!("superseded"), "{body}");
+    let rows: i64 = ctx.db()?.query_row(
+        "SELECT COUNT(*) FROM commands WHERE id = ?1",
+        rusqlite::params![stale_send],
+        |row| row.get(0),
+    )?;
+    assert_eq!(rows, 0, "nothing was queued for the superseded chapter");
+    // A message stamped by the superseded chapter's own authority is
+    // refused at admission too.
     let stale = initiator_of(&ctx, &seat)?;
     let db = ctx.db()?;
     let live: i64 = db.query_row(

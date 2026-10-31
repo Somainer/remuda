@@ -675,6 +675,8 @@ async fn handle_stdio_frame(
             || crate::worker::is_worker_method(request.method.as_str())
             || crate::gate::is_gate_method(request.method.as_str())
             || crate::workspace_scm::is_scm_method(request.method.as_str())
+            // D-057 §7.6: the lineage fence applies over every carrier.
+            || request.method == remuda_protocol::METHOD_LINEAGE_FENCE
             // Read-only operator filesystem features: the workspace file
             // view and the c-dirpicker directory browser. Without this row an
             // ssh-stdio enrolled host answers both "stdio runtime does not
@@ -1038,6 +1040,7 @@ pub(crate) fn rpc_code(error: &NodeError) -> i64 {
         NodeError::DriverUnavailable => -32002,
         NodeError::InteractionExpired => -32005,
         NodeError::InteractionSuperseded { .. } => -32004,
+        NodeError::Fenced => i64::from(remuda_protocol::ErrorCode::OwnerFenced.rpc_code()),
         _ => -32603,
     }
 }

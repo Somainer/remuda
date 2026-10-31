@@ -335,6 +335,7 @@ async fn catch_up(runtime: &RuntimeLink, instance_id: &InstanceId) -> Result<(),
 }
 
 fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRequest, NodeError> {
+    node.admit_create(params)?;
     let parsed: InstanceCreateParams =
         serde_json::from_value(params.clone()).or_else(|_| serde_json::from_value(json!({})))?;
     let spec = parsed.spec.as_ref().unwrap_or(params);

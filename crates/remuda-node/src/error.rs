@@ -40,6 +40,10 @@ pub enum NodeError {
         /// Winning command identity.
         winner: String,
     },
+    /// D-057 §7.6: the work's initiator is fenced on this Node (protocol §9
+    /// `OWNER_FENCED`, reason `fenced`); nothing ran.
+    #[error("fenced: the initiator's lineage moved past its generation")]
+    Fenced,
     /// Shared in-memory state was poisoned by a panic.
     #[error("local store lock poisoned")]
     StorePoisoned,

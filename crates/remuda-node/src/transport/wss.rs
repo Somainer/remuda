@@ -1219,6 +1219,15 @@ async fn handle_incoming(
     if let Some(method) = method {
         let id = frame.get("id").cloned().unwrap_or(Value::Null);
         let params = frame.get("params").cloned().unwrap_or(json!({}));
+        // D-057 §7.6: frames run on their own tasks, so a fence is persisted
+        // and raised INLINE, before any frame read after it is spawned: a
+        // command behind the fence frame is refused, never raced.
+        if method == remuda_protocol::METHOD_LINEAGE_FENCE
+            && let Some(runtime) = runtime
+            && let Err(error) = runtime.node.persist_fence_frame(&params)
+        {
+            tracing::warn!(%error, "could not persist a lineage fence inline");
+        }
         if let Some(runtime) = runtime {
             runtime_wss::dispatch_in_background(
                 runtime,
@@ -1297,6 +1306,7 @@ fn rpc_node_error(id: Value, error: &NodeError) -> Value {
         NodeError::DriverUnavailable => -32002,
         NodeError::InteractionExpired => -32005,
         NodeError::InteractionSuperseded { .. } => -32004,
+        NodeError::Fenced => i64::from(remuda_protocol::ErrorCode::OwnerFenced.rpc_code()),
         _ => -32603,
     };
     rpc_error(id, code, &error.to_string())

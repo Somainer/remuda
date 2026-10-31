@@ -37,6 +37,7 @@ pub(super) async fn run(
     carrier: Option<crate::carrier_recovery::CarrierSupervisor>,
     loader: super::AttachmentLoader,
     prompts: Arc<crate::prompt_correlation::PromptCorrelator>,
+    fences: Arc<crate::fence::NodeFences>,
 ) -> Result<(), NodeError> {
     let capacity = receiver.max_capacity();
     let mut pending = VecDeque::new();
@@ -132,7 +133,7 @@ pub(super) async fn run(
                     if matches!(queued.request, DriverRequest::Cancel | DriverRequest::Close) {
                         interrupt_pending(store.as_ref(), &instance_id, &mut pending, "queued input cancelled", prompts.as_ref())?;
                     }
-                    execute_queued(store.clone(), &instance_id, driver.clone(), queued, interactions.clone(), carrier.clone(), loader.clone(), Arc::clone(&prompts)).await?;
+                    execute_queued(store.clone(), &instance_id, driver.clone(), queued, interactions.clone(), carrier.clone(), loader.clone(), Arc::clone(&prompts), Arc::clone(&fences)).await?;
                     if close_after && store.get_instance(&instance_id)?.lifecycle == InstanceLifecycle::Exited {
                         // The Instance is exited, so nothing may still hold a
                         // pane in the operator's Herdr session. The driver's
@@ -186,7 +187,7 @@ pub(super) async fn run(
                     && ((turn_still_busy && !budget_passed) || dialog_open);
                 if !steer_gated
                     && let Some(prompt) = pending.front_mut()
-                    && deliver(store.as_ref(), &instance_id, driver.as_ref(), &interactions, prompt, carrier.as_ref(), &loader, prompts.as_ref()).await?
+                    && deliver(store.as_ref(), &instance_id, driver.as_ref(), &interactions, prompt, carrier.as_ref(), &loader, prompts.as_ref(), &fences).await?
                 {
                     if prompt.mode == remuda_protocol::PromptMode::Steer {
                         steer_deadline = None;
@@ -409,6 +410,7 @@ async fn deliver(
     carrier: Option<&crate::carrier_recovery::CarrierSupervisor>,
     loader: &super::AttachmentLoader,
     prompts: &crate::prompt_correlation::PromptCorrelator,
+    fences: &crate::fence::NodeFences,
 ) -> Result<bool, NodeError> {
     // D-027: bytes are pulled only when the prompt reaches the front of the
     // queue, so a slow Hub object store delays this prompt and nothing else.
@@ -448,6 +450,18 @@ async fn deliver(
             }
             Ok(Err(error)) => Err(error),
             Ok(Ok(_)) => {
+                // D-057 §7.4/§7.6: PTY delivery re-checks the fence right
+                // before writing. A prompt a fence cancelled (or whose
+                // initiator is now fenced) never reaches the worker; a
+                // claimed one carries its durable `transport-written` marker
+                // first, so a crash during the write reads `unknown`.
+                if super::super::fence::claim(store, fences, &prompt.command_id)?
+                    == super::super::fence::Claim::Fenced
+                {
+                    update_message(store, instance_id, prompt, ContentStatus::Interrupted)?;
+                    prompts.cancel(&prompt.command_id);
+                    return Ok(true);
+                }
                 store.set_instance_state(
                     instance_id,
                     None,

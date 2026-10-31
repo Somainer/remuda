@@ -77,6 +77,9 @@ impl AttachmentLoader {
 
 pub(crate) struct DevNodeInner {
     pub(crate) store: Arc<dyn LocalStore>,
+    /// D-057 §7.6 persisted lineage fences, instance lineages and the
+    /// direct-operation log.
+    pub(crate) fences: Arc<crate::fence::NodeFences>,
     drivers: DriverRegistry,
     pub(crate) interactions: Arc<InteractionRuntime>,
     senders: RwLock<BTreeMap<InstanceId, mpsc::Sender<QueuedCommand>>>,
@@ -117,7 +120,7 @@ pub(crate) struct DevNodeInner {
     host: Host,
     workspace: Workspace,
     pub(crate) workspace_registry: std::sync::RwLock<crate::workspace::WorkspaceRegistry>,
-    projection_epoch: Id,
+    pub(crate) projection_epoch: Id,
     tty: TtyRegistry,
     /// Batch 6 lane gate runner state (lane locks, live jobs, event uplink).
     pub(crate) gate: std::sync::Arc<crate::gate::GateRegistry>,
@@ -256,9 +259,16 @@ impl DevNode {
                 NodeError::InvalidConfig("initial workspace registry is empty".into())
             })?;
         let interactions = InteractionRuntime::spawn(Arc::clone(&store))?;
+        // Fences persist beside the workspace registry (the data dir in
+        // production); a Node without one keeps them in memory.
+        let fences = match &config.workspace_registry {
+            Some(dir) => Arc::new(crate::fence::NodeFences::open(dir)?),
+            None => Arc::new(crate::fence::NodeFences::in_memory()),
+        };
         let node = Self {
             inner: Arc::new(DevNodeInner {
                 store,
+                fences,
                 drivers,
                 interactions,
                 senders: RwLock::new(BTreeMap::new()),
@@ -643,6 +653,21 @@ impl DevNode {
     /// with one or two workers, enough of these park the carrier loop itself,
     /// `gate.cancel` included.
     pub(crate) async fn worktree_rpc_capped(
+        &self,
+        method: &str,
+        params: &Value,
+    ) -> Result<Value, NodeError> {
+        // D-057 §7.5: `worktree.lease` / `worktree.return` carry an initiator
+        // when an Agent reached them; refuse a fenced one before any effect.
+        self.direct_op(
+            method,
+            params,
+            self.worktree_rpc_uncapped_entry(method, params),
+        )
+        .await
+    }
+
+    async fn worktree_rpc_uncapped_entry(
         &self,
         method: &str,
         params: &Value,
@@ -1139,6 +1164,11 @@ impl DevNode {
         {
             return Err(NodeError::InvalidRequest("Node is shutting down".into()));
         }
+        // D-057 §7.6: `insert_command` refuses a fenced initiator before
+        // anything is recorded.
+        self.inner
+            .fences
+            .refuse_fenced(request.initiator.as_ref())?;
         let instance = self.inner.store.get_instance(instance_id)?;
         // D-027: attachment bytes are pulled by the instance worker *after* the
         // command is durably accepted, so a slow Hub object fetch cannot delay
@@ -1320,6 +1350,18 @@ impl DevNode {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, NodeError> {
+        if method == "interaction.answer" {
+            // D-057 §7.5: entry check and durable op log before the answer
+            // reaches the first-answer-wins CAS.
+            let logged = params.clone();
+            return self
+                .direct_op(
+                    method,
+                    &logged,
+                    self.inner.interactions.dispatch_rpc(method, params),
+                )
+                .await;
+        }
         self.inner.interactions.dispatch_rpc(method, params).await
     }
 
@@ -1345,6 +1387,7 @@ impl DevNode {
         let worker_instance = instance_id.clone();
         let carrier = self.carrier_supervisor();
         let pumps = Arc::clone(&self.inner.pumps);
+        let fences = Arc::clone(&self.inner.fences);
         let api_relay = Arc::clone(&self.inner.api_relay);
         let node = Arc::downgrade(&self.inner);
         let worker = tokio::spawn(async move {
@@ -1412,6 +1455,7 @@ impl DevNode {
                 objects,
                 carrier,
                 pumps,
+                fences,
             ))
             .catch_unwind()
             .await;
@@ -1466,6 +1510,7 @@ impl DevNode {
         // An adopted instance starts with no live prompt correlations: pending
         // registrations are in-memory and die with the Node that owned them.
         let prompts = Arc::new(crate::prompt_correlation::PromptCorrelator::new());
+        let fences = Arc::clone(&self.inner.fences);
         let node = Arc::downgrade(&self.inner);
         let worker = tokio::spawn(async move {
             if let Err(error) = instance_worker(
@@ -1477,6 +1522,7 @@ impl DevNode {
                 carrier,
                 loader,
                 prompts,
+                fences,
             )
             .await
             {
@@ -1994,6 +2040,7 @@ async fn materialize_instance(
     // the bug being fixed, and handing this worker a Node handle to fix it
     // would be a second way to do the same thing.
     pumps: Arc<tokio::sync::Mutex<BTreeMap<InstanceId, tokio::task::JoinHandle<()>>>>,
+    fences: Arc<crate::fence::NodeFences>,
 ) -> Result<(), NodeError> {
     // C2: per-instance registry joining command-delivered prompts onto the
     // hook/transcript observations that confirm them.
@@ -2106,6 +2153,7 @@ async fn materialize_instance(
             carrier,
             loader,
             Arc::clone(&prompts),
+            Arc::clone(&fences),
         )
         .await;
         tty.stop(&instance_id).await;
@@ -2136,6 +2184,7 @@ async fn materialize_instance(
             carrier.clone(),
             loader.clone(),
             Arc::clone(&prompts),
+            Arc::clone(&fences),
         )
         .await?;
     }
@@ -2149,6 +2198,7 @@ async fn materialize_instance(
         carrier,
         loader,
         prompts,
+        fences,
     )
     .await;
     tty.stop(&instance_id).await;
@@ -2213,6 +2263,7 @@ async fn instance_worker(
     carrier: Option<crate::carrier_recovery::CarrierSupervisor>,
     loader: AttachmentLoader,
     prompts: Arc<crate::prompt_correlation::PromptCorrelator>,
+    fences: Arc<crate::fence::NodeFences>,
 ) -> Result<(), NodeError> {
     if pty_queue::is_pty(driver.kind()) {
         return pty_queue::run(
@@ -2225,6 +2276,7 @@ async fn instance_worker(
             carrier,
             loader,
             prompts,
+            fences,
         )
         .await;
     }
@@ -2239,6 +2291,7 @@ async fn instance_worker(
             carrier.clone(),
             loader.clone(),
             Arc::clone(&prompts),
+            Arc::clone(&fences),
         )
         .await?;
         if close_after {
@@ -2257,6 +2310,7 @@ async fn execute_queued(
     carrier: Option<crate::carrier_recovery::CarrierSupervisor>,
     loader: AttachmentLoader,
     prompts: Arc<crate::prompt_correlation::PromptCorrelator>,
+    fences: Arc<crate::fence::NodeFences>,
 ) -> Result<(), NodeError> {
     // D-027: pull bytes in the worker, after the command was durably accepted.
     // A fetch failure settles just this command (rejected, not dispatched)
@@ -2286,6 +2340,14 @@ async fn execute_queued(
     } else {
         queued
     };
+    // D-057 §7.4/§7.6: the fence re-check right before delivery. A fenced
+    // initiator's command never reaches the driver; a claimed one carries its
+    // durable `transport-written` marker first.
+    if crate::fence::claim(store.as_ref(), &fences, &queued.command_id)?
+        == crate::fence::Claim::Fenced
+    {
+        return Ok(());
+    }
     let mut command = store.get_command(&queued.command_id)?;
     if let DriverRequest::Send {
         prompt,
@@ -3264,7 +3326,7 @@ fn settle_without_driver(
     append_command_lifecycle(store, instance_id, command, "settled")
 }
 
-fn reject_before_dispatch(
+pub(crate) fn reject_before_dispatch(
     store: &dyn LocalStore,
     instance_id: &InstanceId,
     mut command: Command,

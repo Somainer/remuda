@@ -217,6 +217,9 @@ pub async fn dispatch_frame(
     params: Value,
     frame: MethodFrame,
 ) -> Result<Value, NodeError> {
+    if method == remuda_protocol::METHOD_LINEAGE_FENCE {
+        return node.apply_lineage_fence(&params).await;
+    }
     if crate::workspace::is_workspace_method(method) {
         return node.workspace_rpc(method, params);
     }
@@ -346,6 +349,7 @@ pub fn persist_hello_result(data_dir: &std::path::Path, frame: &Value) -> Result
 }
 
 async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeError> {
+    node.admit_create(&params)?;
     let parsed: InstanceCreateParams =
         serde_json::from_value(params.clone()).unwrap_or(InstanceCreateParams {
             instance_id: None,
@@ -876,7 +880,13 @@ fn resume_cursors(watermarks: &HashMap<String, SeqWatermark>) -> Vec<Value> {
 pub fn hello_capabilities(host: &Value) -> Option<Value> {
     host.get("driverInventory")
         .filter(|inventory| !inventory.is_null())
-        .map(|inventory| json!({ "driverInventory": inventory, "apiRelay": true }))
+        .map(|inventory| {
+            json!({
+                "driverInventory": inventory,
+                "apiRelay": true,
+                remuda_protocol::LINEAGE_FENCE_CAPABILITY: true,
+            })
+        })
 }
 
 /// Build stdio hello params from a nested host inventory value.

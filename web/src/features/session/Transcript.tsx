@@ -41,6 +41,7 @@ import { dismissWorkflow, readDismissedWorkflows, undismissWorkflow } from "./wo
 import { findMatches, resolveSelection, type SearchMatch } from "./transcriptSearch";
 import type { SteerHeldControl } from "../composer/state";
 import type { MessageOrigin } from "../../types/generated";
+import type { MemoryWriteItem } from "../memory/api";
 import { COMPACT_WORKBENCH_QUERY } from "../../lib/viewport";
 import { profileRegion, profilingEnabled, reportProbe } from "../../lib/profileFlags";
 
@@ -219,6 +220,17 @@ export type TranscriptProps = {
   /** c-steer 插队发送 action for a held row; defaults to the store. */
   onSteerHeld?: SteerHeldHandler;
   /**
+   * D-060 (cb-memory-ui): memory writes per reply node id, from
+   * `rememberedByReply`. Each assistant reply whose turn wrote memory shows
+   * one 「已记住：<title>」 row (「已删除」 for a delete).
+   */
+  remembered?: ReadonlyMap<string, readonly MemoryWriteItem[]>;
+  /**
+   * Open the memory page for a slug. Absent outside a router: the row then
+   * navigates the browser itself.
+   */
+  onOpenMemory?: (slug: string) => void;
+  /**
    * Whether the transcript draws its own action strip (全部折叠 / 搜索正文 /
    * 注入内容). A page that moves these actions into its header passes false
    * and drives them through TranscriptHandle instead.
@@ -277,6 +289,8 @@ function TranscriptInner({
   routeInstanceId,
   steerHeld,
   onSteerHeld,
+  remembered,
+  onOpenMemory,
   toolbar = true,
   earlierFloor,
   handleRef,
@@ -2067,6 +2081,8 @@ function TranscriptInner({
                 // instance-state flip from re-committing every visible row.
                 steerHeld={node.type === "message" && node.local?.held ? stableSteerHeld : undefined}
                 onSteerHeld={stableOnSteerHeld}
+                remembered={remembered?.get(node.id)}
+                onOpenMemory={onOpenMemory}
                 steering={steeringRef.current}
                 expandTick={node.type === "compact" && compactHit?.compactId === node.id ? expandTick : 0}
                 hitChildId={
@@ -2122,6 +2138,8 @@ type TranscriptRowProps = {
   instanceId: string;
   steerHeld?: SteerHeldControl;
   onSteerHeld?: SteerHeldHandler;
+  remembered?: readonly MemoryWriteItem[];
+  onOpenMemory?: (slug: string) => void;
   steering: Set<string>;
   dismissedWorkflows: ReadonlySet<string>;
   onToggleWorkflowDismiss: (workflowId: string, dismiss: boolean) => void;
@@ -2184,6 +2202,8 @@ function sameRowProps(prev: TranscriptRowProps, next: TranscriptRowProps): boole
     && prev.instanceId === next.instanceId
     && prev.steerHeld === next.steerHeld
     && prev.onSteerHeld === next.onSteerHeld
+    && prev.remembered === next.remembered
+    && prev.onOpenMemory === next.onOpenMemory
     && prev.steering === next.steering
     && prev.onToggleWorkflowDismiss === next.onToggleWorkflowDismiss
     && prev.onToggleToolExpand === next.onToggleToolExpand
@@ -2216,6 +2236,8 @@ const TranscriptRow = memo(function TranscriptRow({
   instanceId,
   steerHeld,
   onSteerHeld,
+  remembered,
+  onOpenMemory,
   steering,
   dismissedWorkflows,
   onToggleWorkflowDismiss,
@@ -2254,6 +2276,8 @@ const TranscriptRow = memo(function TranscriptRow({
     instanceId,
     steerHeld,
     onSteerHeld,
+    remembered,
+    onOpenMemory,
     steering,
     dismissedWorkflows,
     onToggleWorkflowDismiss,
@@ -2384,6 +2408,8 @@ function renderNode(
     instanceId?: string;
     steerHeld?: SteerHeldControl;
     onSteerHeld?: SteerHeldHandler;
+    remembered?: readonly MemoryWriteItem[];
+    onOpenMemory?: (slug: string) => void;
     steering: Set<string>;
     dismissedWorkflows: ReadonlySet<string>;
     onToggleWorkflowDismiss: (workflowId: string, dismiss: boolean) => void;
@@ -2559,6 +2585,34 @@ function renderNode(
           <button className={ui.chip} onClick={() => void hubStore.send(node.local!.instanceId, node.local!.text)}>
             仍要再送一条？
           </button>
+        ) : null}
+        {/* D-060 (cb-memory-ui): the quiet rows for this turn's memory writes,
+            joined by the Hub-stamped turn seq. One row per slug (newest
+            revision), and a delete reads 已删除. */}
+        {node.role === "assistant" && opts.remembered?.length ? (
+          <ul className={css.remembered} data-testid="remembered-rows">
+            {opts.remembered.map((row) => {
+              const href = `/s/${opts.instanceId ?? ""}/memory?slug=${encodeURIComponent(row.slug)}`;
+              return (
+                <li key={`${row.slug}:${row.revision}`}>
+                  <button
+                    type="button"
+                    className={css.rememberedRow}
+                    data-testid="remembered-row"
+                    data-slug={row.slug}
+                    data-op={row.op}
+                    data-revision={row.revision}
+                    onClick={() => {
+                      if (opts.onOpenMemory) opts.onOpenMemory(row.slug);
+                      else if (typeof window !== "undefined") window.location.assign(href);
+                    }}
+                  >
+                    {row.op === "delete" ? `已删除：${row.title}` : `已记住：${row.title}`}
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
         ) : null}
       </section>
     );

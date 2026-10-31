@@ -64,6 +64,68 @@ wire_enum!(MemoryOrigin, "8", {
     Agent => "agent",
 });
 
+// What one memory write did to its slug.
+wire_enum!(MemoryWriteOp, "8", {
+    Write => "write",
+    Consolidate => "consolidate",
+    Delete => "delete",
+});
+
+/// The turn a write happened in: the chapter that wrote it and the journal
+/// seq of that chapter's most recent `turn_started` row at write time.
+///
+/// Stamped from the Hub's own journal, never from the request body. Absent for
+/// an owner (PWA) write and for a write before the chapter's first turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryTurnRef {
+    /// Chapter that was writing (`ins_…`).
+    pub instance_id: String,
+    /// Journal seq of the writer's latest `turn_started` row.
+    pub seq: u64,
+}
+
+/// One page of a writer instance's append-only memory write log.
+///
+/// Rows are ordered oldest first within the page. Without a cursor the page is
+/// the NEWEST page (a recent transcript needs its recent turns);
+/// `next_after_id` is the row id to poll from, so a single turn with more rows
+/// than a page still advances.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryWritePage {
+    /// Rows in this page, oldest first.
+    pub items: Vec<MemoryWriteItem>,
+    /// Row id to pass back as `afterId`; the newest row id in the page, or the
+    /// cursor itself when the page is empty.
+    pub next_after_id: u64,
+}
+
+/// One row of a writer instance's append-only memory write log (D-060).
+///
+/// A row survives a later rewrite or delete of the entry, because every turn
+/// that wrote memory shows its row under the reply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryWriteItem {
+    /// Entry handle.
+    pub slug: String,
+    /// Title at write time (kept when the entry is later rewritten or
+    /// deleted).
+    pub title: String,
+    /// Revision this write produced; for a consolidate input, the revision
+    /// it consumed.
+    pub revision: u64,
+    /// What the write did.
+    pub op: MemoryWriteOp,
+    /// Turn the write happened in; null for an owner write or a write before
+    /// the chapter's first turn.
+    #[serde(default)]
+    pub turn_seq: Option<u64>,
+    /// Time of the write.
+    pub written_at: String,
+}
+
 /// A journal row an entry was derived from. Lets a later journal-redaction
 /// pass find every entry that repeats a redacted row.
 #[derive(
@@ -115,6 +177,11 @@ pub struct MemoryEntry {
     /// Chapter that made the last write; absent for an owner write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub writer_instance: Option<String>,
+    /// Turn of the last write, from the writer chapter's journal; null for an
+    /// owner write or a write before that chapter's first turn. Always
+    /// serialized so clients see an explicit null.
+    #[serde(default)]
+    pub turn_ref: Option<MemoryTurnRef>,
     /// First write.
     pub created_at: String,
     /// Last write.
@@ -294,6 +361,7 @@ mod tests {
             root_turn: None,
             source_refs: vec![],
             writer_instance: None,
+            turn_ref: None,
             created_at: "c".into(),
             updated_at: "u".into(),
             archived_at: None,
@@ -303,6 +371,9 @@ mod tests {
         assert_eq!(value["origin"], "human");
         assert!(value.get("writerInstance").is_none());
         assert!(value.get("archivedAt").is_none());
+        // turnRef is always present: an explicit null is the wire shape.
+        assert!(value.as_object().unwrap().contains_key("turnRef"));
+        assert!(value["turnRef"].is_null());
         assert_eq!(value["sourceRefs"], serde_json::json!([]));
     }
 }

@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { SessionList } from "../features/session/SessionList";
+import { useHomeFreshness } from "../features/home/freshness";
 import { useHub } from "../lib/store";
 import { useWorkbenchViewport } from "../lib/viewport";
 import { SpacesPanel } from "../features/spaces/SpacesPanel";
@@ -12,6 +13,11 @@ import css from "./SessionsPage.module.css";
 export function SessionsPage({ dimmed = false }: { dimmed?: boolean }) {
   const hub = useHub();
   const { mobile } = useWorkbenchViewport();
+  // home.md §8: the same freshness signal the list uses. `ready` alone is not
+  // enough — the offline-reload path publishes ready:true with empty lists
+  // before any successful read, and must not be told it has no hosts.
+  const freshness = useHomeFreshness();
+  const firstSnapshot = freshness.state === "unknown";
   const { spaces, active, prefs, instanceId, newHref } = useSpaceWorkbench();
   // Below 1024 the index column folds into the header's 空间 button, which
   // opens the same panel as an overlay (one instance, same testids).
@@ -64,7 +70,7 @@ export function SessionsPage({ dimmed = false }: { dimmed?: boolean }) {
         <div className={css.list}>
           {/* home.md §8: no empty state before the first Hub snapshot — the
               list below paints its skeleton until then. */}
-          {hub.ready && hub.hosts.length === 0 && hub.instances.length === 0 ? (
+          {!firstSnapshot && hub.ready && hub.hosts.length === 0 && hub.instances.length === 0 ? (
             <div className={css.placeholder}>无主机。请添加主机。</div>
           ) : null}
           <SessionList

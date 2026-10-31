@@ -13,6 +13,9 @@
   gap: var(--space-2);
   height: 32px;
   padding: 0 var(--gutter);
+  /* The coarse-pointer hot zone below must never paint or tap outside the
+     32px band. */
+  overflow: hidden;
   border-bottom: 1px solid var(--attention-border);
   background: var(--attention-bg);
   color: var(--fg-body);
@@ -45,7 +48,10 @@
 .retry {
   position: relative;
   flex: none;
-  height: var(--control-h-sm);
+  /* Fixed 28px in BOTH pointer modes: --control-h-sm is 36px under
+     pointer: coarse, which would overflow the 32px band on an iPhone. */
+  height: 28px;
+  max-height: 28px;
   margin: 0;
   padding: 0 var(--space-2);
   border: 1px solid var(--attention-border);

@@ -146,6 +146,33 @@ test.describe("home freshness (phone)", () => {
       await expect(banner).toContainText("连不上 Hub");
       await expect(banner).toContainText("上次更新");
       await expect(page.getByTestId("hub-banner-retry")).toHaveText("重试");
+      // §8 fixes the band at 32 px; the retry must fit INSIDE it on this
+      // coarse-pointer iPhone (--control-h-sm is 36px under pointer: coarse,
+      // so a --control-h-sm button used to protrude 2px past the band).
+      const geometry = await page.evaluate(() => {
+        const band = document.querySelector('[data-testid="hub-banner"]')!;
+        const retry = document.querySelector('[data-testid="hub-banner-retry"]')!;
+        const b = band.getBoundingClientRect();
+        const r = retry.getBoundingClientRect();
+        return {
+          bandHeight: b.height,
+          retryHeight: r.height,
+          above: r.top - b.top,
+          below: b.bottom - r.bottom,
+          coarse: window.matchMedia("(pointer: coarse)").matches,
+        };
+      });
+      expect(geometry.coarse, "iPhone 13 is a coarse pointer").toBe(true);
+      expect(geometry.bandHeight).toBe(32);
+      expect(geometry.retryHeight, "retry fits the 32px band").toBeLessThanOrEqual(28);
+      expect(geometry.above, "retry starts inside the band").toBeGreaterThanOrEqual(0);
+      expect(geometry.below, "retry ends inside the band").toBeGreaterThanOrEqual(0);
+      // The coarse hot zone is clipped to the band, never painted outside it.
+      const clipped = await page.evaluate(() => {
+        const band = document.querySelector('[data-testid="hub-banner"]')!;
+        return getComputedStyle(band).overflow;
+      });
+      expect(clipped).toBe("hidden");
       await shot(page, "home-freshness-banner-390.png");
 
       // Any successful refresh resets the failure run and hides the banner.

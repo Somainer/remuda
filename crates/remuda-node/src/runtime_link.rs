@@ -232,6 +232,7 @@ async fn flush(
 }
 
 fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRequest, NodeError> {
+    node.admit_create(params)?;
     let spec = params.get("spec").unwrap_or(params);
     let instance_id = params
         .get("instanceId")

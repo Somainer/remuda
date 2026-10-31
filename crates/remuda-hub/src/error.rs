@@ -133,6 +133,18 @@ pub enum HubError {
     /// written.
     #[error("initiator fenced")]
     Fenced,
+    /// D-057 §6.3/§7.6 (ma-fence): a lineage-state or fence-capability
+    /// refusal. 409 with a stable lowercase `reason` (`not-paused`,
+    /// `pending-interaction`, `approval-in-flight`, `superseded`,
+    /// `node-lacks-fence`) and the code `LINEAGE_CONFLICT`, or
+    /// `node-lacks-fence` for the capability refusal (protocol.md §9).
+    #[error("{message}")]
+    LineageConflict {
+        /// Stable lowercase reason.
+        reason: &'static str,
+        /// Human-readable detail.
+        message: String,
+    },
     /// Interaction deadline already passed.
     #[error("interaction expired")]
     Expired,
@@ -228,6 +240,25 @@ pub enum HubError {
 }
 
 impl HubError {
+    /// A D-057 lineage-state refusal (409 `LINEAGE_CONFLICT` + `reason`).
+    pub(crate) fn lineage_conflict(reason: &'static str, message: impl Into<String>) -> Self {
+        Self::LineageConflict {
+            reason,
+            message: message.into(),
+        }
+    }
+
+    /// D-057 §7.6: work a continuity lineage initiated, addressed to a Node
+    /// that did not advertise `lineageFence` (409, reason `node-lacks-fence`).
+    pub(crate) fn node_lacks_fence(host_id: &str) -> Self {
+        Self::LineageConflict {
+            reason: remuda_protocol::NODE_LACKS_FENCE_REASON,
+            message: format!(
+                "host {host_id} does not support lineage fences; upgrade its Node first"
+            ),
+        }
+    }
+
     /// Construct a D-047 delivery refusal.
     pub fn api_via(code: remuda_protocol::ApiViaRefusal, message: impl Into<String>) -> Self {
         Self::ApiViaRefusal {
@@ -374,6 +405,7 @@ impl HubError {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Fenced => StatusCode::CONFLICT,
+            Self::LineageConflict { .. } => StatusCode::CONFLICT,
             Self::LinkSuperseded => StatusCode::CONFLICT,
             Self::Expired => StatusCode::GONE,
             Self::Superseded { .. } => StatusCode::CONFLICT,
@@ -413,6 +445,12 @@ impl HubError {
             Self::BadRequest(_) => "BAD_REQUEST",
             Self::Conflict(_) => "COMMAND_ID_CONFLICT",
             Self::Fenced => "fenced",
+            Self::LineageConflict { reason, .. }
+                if *reason == remuda_protocol::NODE_LACKS_FENCE_REASON =>
+            {
+                remuda_protocol::NODE_LACKS_FENCE_REASON
+            }
+            Self::LineageConflict { .. } => "LINEAGE_CONFLICT",
             Self::LinkSuperseded => "LINK_SUPERSEDED",
             Self::Expired => "INTERACTION_EXPIRED",
             Self::Superseded { .. } => "INTERACTION_SUPERSEDED",
@@ -498,6 +536,11 @@ impl HubError {
             && let Some(obj) = body.as_object_mut()
         {
             obj.insert("hostId".into(), json!(host_id));
+        }
+        if let Self::LineageConflict { reason, .. } = &self
+            && let Some(obj) = body.as_object_mut()
+        {
+            obj.insert("reason".into(), json!(reason));
         }
         if let Self::NodeBusy { retry_after_ms } = &self
             && let Some(obj) = body.as_object_mut()

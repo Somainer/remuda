@@ -184,9 +184,35 @@ async fn a_resumed_claude_sdk_successor_drives_two_real_fake_harness_turns() {
         view["nativeSessionId"].is_string() && view["activity"] == json!("idle")
     })
     .await;
-    let session_id = x_view["nativeSessionId"].as_str().unwrap().to_owned();
+    assert!(x_view["nativeSessionId"].is_string());
 
-    // Continuation resume: fence X, launch Y with --resume in ONE transaction.
+    // D-057 §6.5 (ma-fence): Pause first — the existing close of X runs F
+    // without successor; the real Node applies the fence and closes X.
+    let (status, body) = http(
+        hub.addr,
+        "POST",
+        &format!("/v1/instances/{x}/commands"),
+        &cookie,
+        Some(r#"{"operation":"instance.close","payload":{}}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "pause: {body}");
+    wait_for(hub.addr, &cookie, &format!("/v1/lineages/{x}"), |record| {
+        record["state"] == json!("paused") && record["fences"][0]["pendingHosts"] == json!([])
+    })
+    .await;
+    // The session the continuation resumes is X's as recorded once the
+    // fenced process exited (the harness reports its final session on exit).
+    let session_id = wait_for(hub.addr, &cookie, &format!("/v1/instances/{x}"), |view| {
+        view["nativeSessionId"].is_string() && view["lifecycle"] == json!("exited")
+    })
+    .await["nativeSessionId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Continuation resume from paused: launch Y with --resume in ONE
+    // transaction (X was fenced by the pause).
     let (status, body) = http(
         hub.addr,
         "POST",

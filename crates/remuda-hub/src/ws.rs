@@ -680,6 +680,17 @@ pub(crate) fn spawn_post_hello_tasks(
     generation: u64,
     displaced_live: bool,
 ) {
+    // D-057 §7.6: deliver the host's unacknowledged fences, in creation
+    // order, before any work. The ordering guarantee for work is the hold:
+    // until they are acknowledged nothing is forwarded to the host (the gated
+    // forward intent), direct operations get host-offline and the gate tick
+    // skips its lanes. Host-level frames (API egress reinstall, read-only
+    // probes) carry no initiator and keep their own post-hello order.
+    {
+        let state = state.clone();
+        let host_id = host_id.clone();
+        tokio::spawn(async move { crate::fence::deliver_host(&state, &host_id).await });
+    }
     spawn_egress_reinstall(state, host_id.clone());
     crate::workspaces::spawn_unregister_abort_sweep(state, host_id.clone());
     // r13 item 1: now that this carrier is registered, immediately reconcile

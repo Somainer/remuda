@@ -217,6 +217,9 @@ pub async fn dispatch_frame(
     params: Value,
     frame: MethodFrame,
 ) -> Result<Value, NodeError> {
+    if method == remuda_protocol::METHOD_LINEAGE_FENCE {
+        return node.apply_lineage_fence(&params).await;
+    }
     if crate::workspace::is_workspace_method(method) {
         return node.workspace_rpc(method, params);
     }
@@ -346,6 +349,7 @@ pub fn persist_hello_result(data_dir: &std::path::Path, frame: &Value) -> Result
 }
 
 async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeError> {
+    node.admit_create(&params)?;
     let parsed: InstanceCreateParams =
         serde_json::from_value(params.clone()).unwrap_or(InstanceCreateParams {
             instance_id: None,
@@ -879,15 +883,18 @@ pub fn hello_capabilities(host: &Value) -> Option<Value> {
     Some(node_capabilities(Some(host)))
 }
 
-/// The hello/heartbeat `capabilities` blob. `memoryContext` (D-060) is a
-/// property of this build and is always advertised: the Hub stamps a chapter's
-/// memory on create/resume only for a Node that says it carries it to the
-/// materializer. `driverInventory` (and the relay flag that rides with it)
-/// only when the inventory was collected — its absence reads "not reported",
-/// never "cannot launch".
+/// The hello/heartbeat `capabilities` blob. `lineageFence` (D-057 §7.6) and
+/// `memoryContext` (D-060) are properties of this build and are always
+/// advertised: the Hub stamps a chapter's memory on create/resume only for a
+/// Node that says it carries it to the materializer. `driverInventory` (and
+/// the relay flag that rides with it) only when the inventory was collected —
+/// its absence reads "not reported", never "cannot launch".
 #[must_use]
 pub fn node_capabilities(host: Option<&Value>) -> Value {
-    let mut capabilities = json!({ remuda_protocol::hubnode::MEMORY_CONTEXT_CAPABILITY: true });
+    let mut capabilities = json!({
+        remuda_protocol::LINEAGE_FENCE_CAPABILITY: true,
+        remuda_protocol::hubnode::MEMORY_CONTEXT_CAPABILITY: true,
+    });
     if let Some(inventory) = host
         .and_then(|host| host.get("driverInventory"))
         .filter(|inventory| !inventory.is_null())
@@ -1105,8 +1112,12 @@ mod tests {
             None,
             None,
         );
-        // No inventory claim; only this build's memory-context support.
-        assert_eq!(params["capabilities"], json!({"memoryContext": true}));
+        // No inventory claim; only this build's own lineage-fence and
+        // memory-context support.
+        assert_eq!(
+            params["capabilities"],
+            json!({"lineageFence": true, "memoryContext": true})
+        );
     }
 
     #[test]

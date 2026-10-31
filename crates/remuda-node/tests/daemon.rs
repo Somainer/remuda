@@ -1076,7 +1076,7 @@ async fn controller_generation_survives_a_real_daemon_restart() {
     .unwrap();
     let listener_a = bind_daemon(data_dir).await.unwrap();
     let mut serve = None;
-    let (_a, gen_a) = connect_runtime(
+    let (peer_a, gen_a) = connect_runtime(
         data_dir,
         &control_a,
         node_a.clone(),
@@ -1089,13 +1089,24 @@ async fn controller_generation_survives_a_real_daemon_restart() {
         "first controller on a fresh data dir is generation 1"
     );
 
+    // Runtime A is gone before anything else touches the counter: its accept
+    // loop is aborted and awaited (otherwise it shares the listener with B and
+    // can serve B's takeover from A's in-memory counter), its controller peer
+    // and its control are dropped, and its node is shut down.
+    if let Some(handle) = serve.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
+    drop(peer_a);
+    drop(control_a);
+    node_a.shutdown().await.unwrap();
+
     // The production daemon persists every allocated controller generation;
     // simulate the first takeover it performs after booting (gen 1 -> 2) by
     // writing the high-water mark the running daemon writes. A SECOND control
     // opened over the same data dir must seed at that persisted value, never
     // reset to 0/1.
     std::fs::write(data_dir.join("controller-generation"), "2").unwrap();
-    node_a.shutdown().await.unwrap();
 
     // The counter file recorded the last allocated generation.
     let persisted = std::fs::read_to_string(data_dir.join("controller-generation"))
@@ -1134,6 +1145,100 @@ async fn controller_generation_survives_a_real_daemon_restart() {
             .unwrap(),
         3
     );
+}
+
+/// ma-fence r2 item 3: a controller generation that cannot be made durable is
+/// never handed out. With the counter unwritable (its path is a non-empty
+/// directory, so publishing the new value fails) a takeover is refused and
+/// the current controller keeps its generation and keeps serving. Once the
+/// counter is writable again the next takeover gets exactly the next
+/// generation — the refused one consumed none — and the counter records it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_takeover_whose_generation_cannot_be_persisted_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path();
+    let control = DaemonControl::open(data_dir.to_path_buf(), None).unwrap();
+    let node = compose(&ServeConfig::fake(
+        DevServerConfig::loopback(0).with_workspace_roots(remuda_testing::test_workspace_roots!()),
+        data_dir.to_path_buf(),
+    ))
+    .unwrap();
+    let listener = bind_daemon(data_dir).await.unwrap();
+    let mut serve = None;
+    restart_serve(data_dir, &control, node.clone(), &listener, &mut serve).await;
+    let mut a = Peer::connect(data_dir, true, json!([])).await;
+    let counter = data_dir.join("controller-generation");
+    let persisted = || {
+        std::fs::read_to_string(&counter)
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap()
+    };
+    assert_eq!(persisted(), 1, "controller A holds generation 1");
+
+    // Injected persist failure.
+    std::fs::remove_file(&counter).unwrap();
+    std::fs::create_dir(&counter).unwrap();
+    std::fs::write(counter.join("occupied"), "").unwrap();
+    let (_b, gen_b) = Peer::takeover_generation(data_dir).await;
+    assert_eq!(
+        gen_b, None,
+        "a generation that could not be persisted is never handed out"
+    );
+
+    // A is still the controller: it is not closed and still gets answers.
+    a.send(json!({"jsonrpc":"2.0","id":"still-a","method":"node.heartbeat","params":{}}))
+        .await;
+    let answered = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let Some(frame) = a.next_opt().await else {
+                return false;
+            };
+            if frame["id"] == json!("still-a") {
+                return frame.get("result").is_some();
+            }
+        }
+    })
+    .await
+    .expect("controller A answers");
+    assert!(answered, "the refused takeover left controller A in force");
+
+    // Writable again: the next takeover is generation 2, persisted, and
+    // revokes A.
+    std::fs::remove_dir_all(&counter).unwrap();
+    std::fs::write(&counter, "1").unwrap();
+    let (_c, gen_c) = Peer::takeover_generation(data_dir).await;
+    assert_eq!(
+        gen_c,
+        Some(2),
+        "the refused takeover consumed no generation"
+    );
+    assert_eq!(persisted(), 2);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(3), a.next_opt())
+            .await
+            .expect("wait for A's close")
+            .is_none(),
+        "the successful takeover revokes A"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(data_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("controller-generation.tmp")
+        })
+        .collect();
+    assert!(leftovers.is_empty(), "no temp counter left: {leftovers:?}");
+
+    if let Some(handle) = serve.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
+    node.shutdown().await.unwrap();
 }
 
 // ── r15 item 7: TWO ACTUAL daemon processes over one data dir + bare origin ─

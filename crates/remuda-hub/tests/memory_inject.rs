@@ -294,8 +294,11 @@ impl Ctx {
     }
 }
 
+/// A current Node: it carries the memory context and, like every Node of this
+/// build, applies lineage fences (D-057 §7.6), so a continuity lineage on it
+/// can be resumed.
 fn capable() -> Option<Value> {
-    Some(json!({"memoryContext": true}))
+    Some(json!({"memoryContext": true, "lineageFence": true}))
 }
 
 /// The capable chapter start: the stamp carries the same index text the GET

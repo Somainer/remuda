@@ -584,7 +584,35 @@ pub async fn delete_instance(
             )));
         }
         crate::store::DeletionScope::Plain(chapter) => vec![chapter],
-        crate::store::DeletionScope::Current(chapters) => chapters,
+        crate::store::DeletionScope::Current(chapters) => {
+            // D-057 §6.3 (ma-fence): the current chapter of a lineage that is
+            // not paused is refused — close (pause) it first, so the delete
+            // never races a live lineage's authority. A current chapter with
+            // process-end evidence counts as paused (`paused{process-exit}`).
+            let lineage_id = state
+                .store
+                .get_instance(instance_id.clone())
+                .await?
+                .map(|instance| instance.lineage_id);
+            let current = state.store.get_instance(instance_id.clone()).await?;
+            if let Some(lineage_id) = lineage_id
+                && let Some(lineage) = state.store.get_lineage(lineage_id).await?
+                && lineage.state != "paused"
+                && let Some(current) = current
+                && !state
+                    .store
+                    .instance_has_process_end_evidence(&current)
+                    .await?
+            {
+                return Err(HubError::lineage_conflict(
+                    "not-paused",
+                    format!(
+                        "instance {instance_id} is the current chapter of a lineage that is not                          paused; close it first"
+                    ),
+                ));
+            }
+            chapters
+        }
     };
     let live: Vec<&crate::store::DeleteChapter> = chapters
         .iter()
@@ -2214,6 +2242,7 @@ async fn resume_lineage(
     //     forever and never close it.
     //   - the owner addressed the current chapter itself (normal resume).
     if addressed.instance_id != current.instance_id
+        && lineage.state != "paused"
         && crate::store::current_chapter_is_live(&current)
     {
         return Ok(Json(json!({
@@ -2222,6 +2251,21 @@ async fn resume_lineage(
             "mode": mode.as_str(),
             "replayed": true
         })));
+    }
+    // D-057 §6.3/§6.5 (ma-fence): Resume is accepted only on a paused
+    // lineage. A current chapter with process-end evidence counts as paused
+    // (`paused{process-exit}` is that state; the C1 supervisor that records it
+    // lands with ma-restart). Anything else: 409, pause it first.
+    if lineage.state != "paused"
+        && !state
+            .store
+            .instance_has_process_end_evidence(&current)
+            .await?
+    {
+        return Err(HubError::lineage_conflict(
+            "not-paused",
+            "the lineage is not paused; pause it first (close its current chapter), then resume",
+        ));
     }
     // Continue the current chapter (retarget when an older one was
     // addressed); `current` is still needed below for host id / bookkeeping.
@@ -2424,6 +2468,7 @@ async fn resume_lineage(
             origin,
             title,
             driver: successor_driver,
+            actor: json!({"deviceId": device.id, "by": "owner-resume"}),
         })
         .await
         .map_err(map_store)?;
@@ -2440,42 +2485,18 @@ async fn resume_lineage(
             })));
         }
         crate::store::ContinuationResumeResult::Resumed(resumed) => {
+            // §7.2 after commit: fence map, egress revocation, delivery. The
+            // successor's host gets the fence before its create (§7.6).
+            state.broadcast_settlement(&resumed.fence.settlement);
+            crate::fence::after_commit(state, &resumed.fence, Some(&resumed.successor.host_id))
+                .await;
             (resumed.fenced, resumed.successor, resumed.command)
         }
     };
-    // D-057 OA6 (ma-lineage): close the fenced predecessor's process only when
-    // it could still be running. A cleanly exited/closed process has nothing
-    // to stop, and a `failed` chapter with recorded process-end evidence (a
-    // classified end or an attested launch failure) also never started / is
-    // already gone. An AMBIGUOUS failed row is treated as potentially live:
-    // on a host with a live link it is still closed here so two chapters can
-    // never run at once.
-    let host_live = state.nodes.kind_of(&fenced.host_id).await.is_some();
-    let predecessor_process_ended = state
-        .store
-        .instance_has_process_end_evidence(&fenced)
-        .await?;
-    if host_live && !predecessor_process_ended {
-        // Until ma-fence lands, the old process loses Hub authority through
-        // its deleted launch credential; the Hub still forwards the existing
-        // instance.close so the live process stops.
-        let (close, _) = state
-            .store
-            .queue_command(
-                None,
-                Some(fenced.instance_id.clone()),
-                fenced.host_id.clone(),
-                "instance.close".into(),
-                json!({ "instanceId": fenced.instance_id, "origin": "human" }),
-                None,
-                None,
-                // Hub-internal cleanup inside a continuation resume.
-                None,
-                None,
-            )
-            .await?;
-        let _ = forward_if_online(state, close, true).await;
-    }
+    // D-057 §6.5 (ma-fence): Resume runs only on a paused lineage (or one
+    // whose current chapter has process-end evidence), so the predecessor's
+    // process was already closed by the pause — the close F queued at
+    // admission — or has ended. Nothing to stop here.
     let command = forward_if_online(state, command, true).await?;
     // Re-install the via egress credential for the successor id (the analog
     // of the post-spawn install in `placement::spawn_on_host`).
@@ -2590,13 +2611,26 @@ pub async fn get_lineage(
             "starting".into()
         };
     }
+    // D-057 §6.4/§7.4: every fence with the truthful outcome of each of the
+    // fenced generation's unfinished operations ("later outcomes").
+    let fences = {
+        let lineage_id = lineage.lineage_id.clone();
+        state
+            .store
+            .read("lineage_fences", move |conn| {
+                crate::fence::lineage_fences(conn, &lineage_id)
+            })
+            .await?
+    };
     Ok(Json(json!({
         "lineageId": lineage.lineage_id,
         "state": lineage_state,
         "pausedBy": lineage.paused_by,
+        "pausedAt": lineage.paused_at,
         "restart": lineage.restart,
         "generation": lineage.generation,
         "chapters": chapters,
+        "fences": fences,
     })))
 }
 
@@ -2754,33 +2788,80 @@ pub async fn post_command(
     if let Some(command_id) = body.command_id.as_deref()
         && let Some(existing) = state.store.get_command(command_id.to_owned()).await?
     {
-        if !retry_matches_row(&existing, &body.operation, &instance_id, &payload) {
-            return Err(HubError::Conflict(
-                "commandId reused with a different payload".into(),
-            ));
-        }
-        // The idempotency key is part of the command's identity: a replay may
-        // omit the key, but a key it carries must be the exact key already
-        // stored with this command — an unused key still names a *different*
-        // request and is a 409, not a silent rebinding.
-        if !replay_key_matches(
-            body.idempotency_key.as_deref(),
-            existing.idempotency_key.as_deref(),
-        ) {
-            return Err(HubError::Conflict(
-                "commandId replayed with a different idempotency key".into(),
-            ));
-        }
-        let command = replay_existing_command(
+        return replay_same_id(
             &state,
             &device,
             &instance,
             &body.operation,
+            body.idempotency_key.as_deref(),
             existing,
             &mut payload,
         )
-        .await?;
-        return Ok(Json(json!({ "command": command, "replayed": true })));
+        .await;
+    }
+    // D-057 §6.5/§7.2 (ma-fence): a chapter superseded by its successor
+    // takes no more input. Refused here, before any row exists, so nothing
+    // reaches its Node. Close and cancel stay allowed (a close applies to the
+    // lineage), and the paused lineage's own last chapter is not superseded.
+    if instance.fenced_at.is_some()
+        && matches!(
+            body.operation.as_str(),
+            "instance.send"
+                | "tty.write"
+                | "instance.keys"
+                | "instance.configure"
+                | "instance.respond"
+        )
+        && let Some(lineage) = state.store.get_lineage(instance.lineage_id.clone()).await?
+        && lineage.current_instance_id != instance_id
+    {
+        return Err(HubError::lineage_conflict(
+            "superseded",
+            format!(
+                "instance {instance_id} was superseded; address the lineage's current chapter {}",
+                lineage.current_instance_id
+            ),
+        ));
+    }
+    // D-057 §6.3/§6.5 (ma-fence): a close of any chapter of an unpaused
+    // continuity lineage is a pause — F without successor at admission, then
+    // the close of the current chapter is forwarded.
+    if body.operation == "instance.close"
+        && state
+            .store
+            .get_lineage(instance.lineage_id.clone())
+            .await?
+            .is_some()
+    {
+        if let Some(command) = crate::fence::pause_on_close(
+            &state,
+            &device,
+            &instance.lineage_id,
+            body.command_id.clone(),
+            payload.clone(),
+        )
+        .await?
+        {
+            return Ok(Json(
+                json!({ "command": command, "replayed": false, "paused": true }),
+            ));
+        }
+        // A same-id close that raced this one past the retry check above
+        // paused the lineage first: this request is its retry.
+        if let Some(command_id) = body.command_id.as_deref()
+            && let Some(existing) = state.store.get_command(command_id.to_owned()).await?
+        {
+            return replay_same_id(
+                &state,
+                &device,
+                &instance,
+                &body.operation,
+                body.idempotency_key.as_deref(),
+                existing,
+                &mut payload,
+            )
+            .await;
+        }
     }
     if body.operation == "instance.send" {
         crate::objects::validate_send_attachments(&state, &device, &instance, &mut payload).await?;
@@ -2879,6 +2960,69 @@ pub async fn post_command(
         .await;
     }
     Ok(Json(json!({ "command": command, "replayed": false })))
+}
+
+/// Answer a same-id client retry of the stored `existing` row: a replay of
+/// it when the retry denotes the same command, else 409.
+async fn replay_same_id(
+    state: &AppState,
+    device: &crate::store::Device,
+    instance: &crate::store::InstanceRecord,
+    operation: &str,
+    idempotency_key: Option<&str>,
+    existing: CommandRecord,
+    payload: &mut Value,
+) -> Result<Json<Value>, HubError> {
+    let (retry_instance, retry_payload) =
+        retry_target(state, &existing, operation, instance, payload).await?;
+    if !retry_matches_row(&existing, operation, &retry_instance, &retry_payload) {
+        return Err(HubError::Conflict(
+            "commandId reused with a different payload".into(),
+        ));
+    }
+    // The idempotency key is part of the command's identity: a replay may
+    // omit the key, but a key it carries must be the exact key already
+    // stored with this command — an unused key still names a *different*
+    // request and is a 409, not a silent rebinding.
+    if !replay_key_matches(idempotency_key, existing.idempotency_key.as_deref()) {
+        return Err(HubError::Conflict(
+            "commandId replayed with a different idempotency key".into(),
+        ));
+    }
+    let command =
+        replay_existing_command(state, device, instance, operation, existing, payload).await?;
+    Ok(Json(json!({ "command": command, "replayed": true })))
+}
+
+/// The instance and payload a same-id retry is compared as (D-057 §6.5).
+///
+/// A close of an older chapter of an unpaused continuity lineage is a pause:
+/// F stores its close against the lineage's then-current chapter, row
+/// instance and payload `instanceId` both retargeted. The retry still names
+/// the chapter it addressed, and is the same command when the row's chapter
+/// belongs to the addressed chapter's lineage — so it is compared as
+/// addressed to the row's chapter. Every other retry compares as addressed.
+async fn retry_target(
+    state: &AppState,
+    row: &CommandRecord,
+    operation: &str,
+    addressed: &crate::store::InstanceRecord,
+    payload: &Value,
+) -> Result<(String, Value), HubError> {
+    if operation == "instance.close"
+        && row.operation == operation
+        && let Some(row_instance) = row.instance_id.as_deref()
+        && row_instance != addressed.instance_id
+        && let Some(chapter) = state.store.get_instance(row_instance.to_owned()).await?
+        && chapter.lineage_id == addressed.lineage_id
+    {
+        let mut payload = payload.clone();
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("instanceId".into(), json!(row_instance));
+        }
+        return Ok((row_instance.to_owned(), payload));
+    }
+    Ok((addressed.instance_id.clone(), payload.clone()))
 }
 
 /// Key identity for a same-id replay: omitting the key is allowed; a present
@@ -3229,6 +3373,38 @@ async fn release_forward_intent(
             let command_id = command_id.to_owned();
             move |conn| {
                 let now = crate::config::now_rfc3339();
+                // D-057 §7.7: a row whose initiator is fenced is not returned
+                // to the queue (a same-id replay would only be refused); it
+                // settles `rejected(fenced)` — the frame was never queued on
+                // the Node, so it did not run.
+                let fenced = match crate::store::load_command(conn, &command_id)? {
+                    Some(row) => matches!(
+                        crate::store::check_initiator(
+                            conn,
+                            row.initiator.as_ref(),
+                            row.initiator_device_id.as_deref(),
+                        ),
+                        Err(crate::store::StoreError::Fenced)
+                    ),
+                    None => false,
+                };
+                if fenced {
+                    conn.execute(
+                        "UPDATE commands
+                            SET state = 'settled', resolution = 'clear', forwarded = 0,
+                                settlement_outcome = 'rejected', settlement_reason = ?1,
+                                updated_at = ?2
+                          WHERE id = ?3 AND state = 'queued' AND forwarded = 1",
+                        rusqlite::params![remuda_protocol::FENCED_REASON, now, command_id],
+                    )?;
+                    crate::fence::resolve_op_outcome(
+                        conn,
+                        "command",
+                        &command_id,
+                        crate::fence::outcome::CANCELLED_AT_HUB,
+                    )?;
+                    return Ok(());
+                }
                 conn.execute(
                     "UPDATE commands
                         SET forwarded = 0, resolution = 'clear', updated_at = ?1
@@ -4270,21 +4446,61 @@ pub(crate) async fn forward_if_online(
                 .store
                 .host_link_generation(command.host_id.clone())
                 .await?;
-            let first = state
+            let mark = state
                 .store
-                .mark_forward_intent(command.command_id.clone(), link_generation)
+                .mark_forward_intent_gated(command.command_id.clone(), link_generation)
                 .await
                 .map_err(map_store)?;
-            if !first {
-                // Durably forwarded/advanced already: a committed row. A
-                // follower could only have joined the slot before this point
-                // if a publish happened; there was none, so reload.
-                return state
-                    .store
-                    .get_command(command.command_id.clone())
-                    .await?
-                    .ok_or(HubError::NotFound);
+            match mark {
+                crate::store::ForwardMark::Marked => {}
+                crate::store::ForwardMark::AlreadyForwarded => {
+                    // Durably forwarded/advanced already: a committed row. A
+                    // follower could only have joined the slot before this
+                    // point if a publish happened; there was none, so reload.
+                    return state
+                        .store
+                        .get_command(command.command_id.clone())
+                        .await?
+                        .ok_or(HubError::NotFound);
+                }
+                crate::store::ForwardMark::HeldForFence => {
+                    // D-057 §7.6: the host has unacknowledged fences. Exactly
+                    // as for an offline host the row stays queued and nothing
+                    // is written; the acknowledgement forwards it.
+                    state
+                        .fences
+                        .note_held(&command.host_id, &command.command_id);
+                    return state
+                        .store
+                        .get_command(command.command_id.clone())
+                        .await?
+                        .ok_or(HubError::NotFound);
+                }
+                crate::store::ForwardMark::NodeLacksFence => {
+                    let error = HubError::node_lacks_fence(&command.host_id);
+                    let (status, body) = error.status_code_and_body();
+                    let _ = state
+                        .store
+                        .reject_command_outcome(
+                            command.command_id.clone(),
+                            remuda_protocol::NODE_LACKS_FENCE_REASON.into(),
+                            Some(i64::from(status)),
+                            Some(body.to_string()),
+                        )
+                        .await;
+                    return Err(error);
+                }
             }
+            // §7.10 send-gate seam: park after the intent committed, before
+            // the send gate reads the fence map. No-op in production.
+            state
+                .race_barriers
+                .wait_if_armed(
+                    crate::workspaces::RacePhase::ForwardIntentMarked,
+                    &command.host_id,
+                    &command.command_id,
+                )
+                .await;
             attempt
         }
         None => {
@@ -4374,14 +4590,41 @@ pub(crate) async fn forward_if_online(
             crate::memory::ChapterMemory::Withheld { .. }
             | crate::memory::ChapterMemory::NotApplicable => {}
         }
-        let token = crate::agent_scope::instance_token(state.store.clone(), instance_id).await?;
+        let token =
+            crate::agent_scope::instance_token(state.store.clone(), instance_id.clone()).await?;
         // Credential travels only on the authenticated carrier, never in the
         // persisted command, returned HTTP body, or launch recipe.
         // Resume launches a new child too: its re-resolved public provider
         // overlay needs a fresh, host-scoped secret just like create. Reusing
         // a parent's launch file would bypass rotation and scope checks.
         object.insert("agentCredential".into(), json!({"token":token}));
+        // D-057 §7.6: the Node learns the instance's lineage and generation,
+        // so a fence naming a higher live generation closes it.
+        if let Some(instance) = state.store.get_instance(instance_id.clone()).await? {
+            object.insert(
+                "lineage".into(),
+                serde_json::to_value(remuda_protocol::LineageRef {
+                    id: instance.lineage_id.clone(),
+                    generation: u64::try_from(instance.generation).unwrap_or(1),
+                })
+                .unwrap_or(Value::Null),
+            );
+        }
         params = crate::providers::with_launch_secret(state, &command.host_id, params).await?;
+    }
+    // D-057 §7.4 send gate: immediately before the frame is written, an
+    // initiator the in-memory fence map shows fenced writes nothing and the
+    // row settles `withheld(fenced)`. It narrows the window; it guarantees
+    // nothing (a frame that passed it can still reach the wire after F).
+    if let Some(initiator) = &command.initiator
+        && state.fences.is_fenced(initiator)
+    {
+        let withheld = state
+            .store
+            .withhold_command(command.command_id.clone())
+            .await?
+            .ok_or(HubError::NotFound)?;
+        return Ok(withheld);
     }
     // r12 item 2: resolve the transport at SEND time. A hello that replaced
     // the slot during the mark/token/secret round-trips above delivers the
@@ -4389,7 +4632,7 @@ pub(crate) async fn forward_if_online(
     //
     // Test seam: park right before the send lookup (keyed by command id), so
     // a test can replace the registered link in the mark→send window. No-op in
-    // production.
+    // production. It sits after the send gate (§7.10 link-order row).
     state
         .race_barriers
         .wait_if_armed(
@@ -4501,6 +4744,38 @@ pub(crate) async fn forward_if_online(
                 settle_stop_for_unknown_instance(state, &command, &response).await?
             {
                 return Ok(settled);
+            }
+            // D-057 §7.6: the Node refused a fenced initiator at entry
+            // (`OWNER_FENCED`). Settle with reason `fenced`; the fence record
+            // learns it was refused by the Node.
+            if node_refused_fenced(&response) {
+                state
+                    .store
+                    .note_command_refused_by_node(command.command_id.clone())
+                    .await?;
+                if command.operation == "instance.create" {
+                    return fail_unaccepted_create(
+                        state,
+                        &command,
+                        remuda_protocol::FENCED_REASON.into(),
+                    )
+                    .await;
+                }
+                if let Some(rejected) = state
+                    .store
+                    .reject_command(
+                        command.command_id.clone(),
+                        remuda_protocol::FENCED_REASON.into(),
+                    )
+                    .await?
+                {
+                    return Ok(rejected);
+                }
+                return state
+                    .store
+                    .get_command(command.command_id.clone())
+                    .await?
+                    .ok_or(HubError::NotFound);
             }
             fail_unaccepted_create(state, &command, node_rpc_error_message(&response)).await
         }
@@ -4665,6 +4940,18 @@ fn node_reports_unknown_instance(response: &Value) -> bool {
             let message = message.to_ascii_lowercase();
             message.contains("not found") || message.contains("unknown instance")
         })
+}
+
+/// Whether a Node JSON-RPC error reply is the §7.6 fence refusal: the
+/// `OWNER_FENCED` code, or a `reason: fenced` in its data.
+pub(crate) fn node_refused_fenced(response: &Value) -> bool {
+    let Some(error) = response.get("error") else {
+        return false;
+    };
+    let fenced_code = remuda_protocol::ErrorCode::OwnerFenced.rpc_code();
+    error.get("code").and_then(Value::as_i64) == Some(i64::from(fenced_code))
+        || error.pointer("/data/reason").and_then(Value::as_str)
+            == Some(remuda_protocol::FENCED_REASON)
 }
 
 async fn fail_unaccepted_create(

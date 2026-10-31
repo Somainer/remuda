@@ -20,26 +20,22 @@ use crate::error::HubError;
 use crate::http::map_store;
 use crate::store::{Store, StoreError};
 use rusqlite::{OptionalExtension, params};
-use serde_json::Value;
+use serde_json::{Value, json};
 
-/// Admission lifecycle of one direct RPC. `Canceled` is set by ma-fence's
-/// host-gating/settlement; until then rows pass admitted → sent → settled.
-#[allow(dead_code)]
+/// Admission lifecycle of one direct RPC: admitted → sent → settled. F moves
+/// an admitted row to `canceled` and the send gate a sent one to `withheld`
+/// (both written by `crate::fence`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NodeOpState {
-    Admitted,
     Sent,
     Settled,
-    Canceled,
 }
 
 impl NodeOpState {
     fn as_str(self) -> &'static str {
         match self {
-            Self::Admitted => "admitted",
             Self::Sent => "sent",
             Self::Settled => "settled",
-            Self::Canceled => "canceled",
         }
     }
 }
@@ -72,11 +68,6 @@ impl NodeOpAuth {
             initiator: None,
             device_id: None,
         }
-    }
-
-    #[allow(dead_code)]
-    fn as_check(&self) -> (Option<&remuda_protocol::Initiator>, Option<&str>) {
-        (self.initiator.as_ref(), self.device_id.as_deref())
     }
 
     /// Insert `initiator`/`opId` into outbound params. A `None` initiator
@@ -168,15 +159,39 @@ impl Store {
     /// Mark an admitted op `sent` (send intent) — committed BEFORE the frame
     /// is written to the Node link (main-agent.md §7.4/§7.5). Up to the RPC
     /// timeout the row therefore reads `sent` *while the frame is on the
-    /// wire*, never `admitted`, so ma-fence step 7 cannot record an op that
+    /// wire*, never `admitted`, so F step 7 cannot record an op that
     /// actually ran as "admitted but not sent → cancelled".
+    ///
+    /// The intent re-runs the §7.3 check on the stamped initiator and is a
+    /// compare-and-set against F: an F that committed between admission and
+    /// here already cancelled the row, so this refuses `Fenced` and nothing
+    /// is sent.
     pub(crate) async fn mark_node_op_sent(
         &self,
         op_id: String,
         host_id: String,
+        auth: &NodeOpAuth,
     ) -> Result<(), StoreError> {
-        self.node_op_set_state(op_id, host_id, NodeOpState::Sent, None)
-            .await
+        let initiator = auth.initiator.clone();
+        let device_id = auth.device_id.clone();
+        self.run_named("mark_node_op_sent", move |conn| {
+            crate::store::check_initiator(conn, initiator.as_ref(), device_id.as_deref())?;
+            let now = crate::config::now_rfc3339();
+            // A same-id replay of an op already past admission (the answer
+            // path re-sends for the Node's idempotent reply) moves as before;
+            // only a row F cancelled (or the send gate withheld) refuses.
+            let moved = conn.execute(
+                "UPDATE node_ops SET state = ?3, updated_at = ?4
+                  WHERE op_id = ?1 AND host_id = ?2
+                    AND state NOT IN ('canceled', 'withheld')",
+                params![op_id, host_id, NodeOpState::Sent.as_str(), now],
+            )?;
+            if moved == 0 {
+                return Err(StoreError::Fenced);
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// A `nodes.call` that produced no frame (`Ok(None)`: the host is not
@@ -207,35 +222,39 @@ impl Store {
         .await
     }
 
-    /// Mark an op `settled` with the Node's result (or failure summary).
+    /// Mark an op `settled` with the Node's result (or failure summary). A
+    /// fence that recorded the op as potentially executed learns the
+    /// definite `fence_outcome` from this reply (only while still unknown).
     pub(crate) async fn settle_node_op(
         &self,
         op_id: String,
         host_id: String,
         outcome: Option<Value>,
-    ) -> Result<(), StoreError> {
-        self.node_op_set_state(op_id, host_id, NodeOpState::Settled, outcome)
-            .await
-    }
-
-    async fn node_op_set_state(
-        &self,
-        op_id: String,
-        host_id: String,
-        state: NodeOpState,
-        outcome: Option<Value>,
+        fence_outcome: &'static str,
     ) -> Result<(), StoreError> {
         let outcome_json = match outcome {
             Some(value) => Some(serde_json::to_string(&value)?),
             None => None,
         };
-        self.run_named("node_op_set_state", move |conn| {
+        self.run_named("settle_node_op", move |conn| {
             let now = crate::config::now_rfc3339();
             conn.execute(
                 "UPDATE node_ops
                     SET state = ?3, outcome_json = COALESCE(?4, outcome_json), updated_at = ?5
                   WHERE op_id = ?1 AND host_id = ?2",
-                params![op_id, host_id, state.as_str(), outcome_json, now],
+                params![
+                    op_id,
+                    host_id,
+                    NodeOpState::Settled.as_str(),
+                    outcome_json,
+                    now
+                ],
+            )?;
+            conn.execute(
+                "UPDATE fence_ops SET outcome = ?3, updated_at = ?4
+                  WHERE op_kind = 'node-op' AND op_id = ?1 AND host_id = ?2
+                    AND outcome = 'unknown'",
+                params![op_id, host_id, fence_outcome, now],
             )?;
             Ok(())
         })
@@ -317,31 +336,83 @@ pub(crate) async fn call_admitted_frame(
     timeout: std::time::Duration,
     auth: &NodeOpAuth,
 ) -> Result<Option<Value>, HubError> {
+    // D-057 §7.5 item 2 / §7.6: a host with unacknowledged fences is not sent
+    // to (host-offline), and a continuity lineage's op is refused for a Node
+    // without fence support. Both refuse before anything is written.
+    match state
+        .store
+        .fence_host_refusal(host_id.to_owned(), auth.initiator.clone())
+        .await
+        .map_err(map_store)?
+    {
+        Some(crate::fence::HostRefusal::Gated) => {
+            return Err(HubError::HostOffline {
+                host_id: host_id.to_owned(),
+            });
+        }
+        Some(crate::fence::HostRefusal::LacksFence) => {
+            return Err(HubError::node_lacks_fence(host_id));
+        }
+        None => {}
+    }
     if auth.initiator.is_some() {
         state
             .store
             .admit_node_op(op_id.clone(), host_id.to_owned(), method, subject, auth)
             .await
             .map_err(map_store)?;
+        // §7.10 seam: park between admission and the send intent.
+        #[cfg(any(test, feature = "test-faults"))]
+        state
+            .race_barriers
+            .wait_if_armed(
+                crate::workspaces::RacePhase::NodeOpAdmitted,
+                host_id,
+                &op_id,
+            )
+            .await;
         // Send intent commits BEFORE the frame is written: while the RPC is
         // outstanding (up to the timeout) the row already reads `sent`, so a
         // fence landing in that window classifies the op truthfully.
         state
             .store
-            .mark_node_op_sent(op_id.clone(), host_id.to_owned())
+            .mark_node_op_sent(op_id.clone(), host_id.to_owned(), auth)
             .await
             .map_err(map_store)?;
+        // §7.4 send gate: the fence map shows the initiator fenced — write
+        // nothing and settle the op `withheld(fenced)`.
+        if let Some(initiator) = &auth.initiator
+            && state.fences.is_fenced(initiator)
+        {
+            state
+                .store
+                .withhold_node_op(op_id, host_id.to_owned())
+                .await
+                .map_err(map_store)?;
+            return Err(HubError::Fenced);
+        }
     }
     let params = auth.stamp_params(params, &op_id);
     let reply = state.nodes.call(host_id, method, params, timeout).await;
     if auth.initiator.is_some() {
         match &reply {
-            // The Node took the frame: settle with its result.
+            // The Node took the frame: settle with its result (an error
+            // frame settles with its error; a fence refusal at the Node's
+            // entry resolves the fence record as refused-by-node).
             Ok(Some(frame)) => {
-                let outcome = frame.get("result").cloned().unwrap_or(Value::Null);
+                let outcome = frame
+                    .get("result")
+                    .cloned()
+                    .or_else(|| frame.get("error").map(|error| json!({ "error": error })))
+                    .unwrap_or(Value::Null);
+                let fence_outcome = if crate::http::node_refused_fenced(frame) {
+                    crate::fence::outcome::REFUSED_BY_NODE
+                } else {
+                    crate::fence::outcome::RAN
+                };
                 state
                     .store
-                    .settle_node_op(op_id, host_id.to_owned(), Some(outcome))
+                    .settle_node_op(op_id, host_id.to_owned(), Some(outcome), fence_outcome)
                     .await
                     .map_err(map_store)?;
             }

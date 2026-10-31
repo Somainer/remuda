@@ -16,6 +16,7 @@ mod driver;
 mod enroll;
 mod entity;
 mod error;
+mod fence;
 mod files;
 mod gate;
 mod hook_shim;

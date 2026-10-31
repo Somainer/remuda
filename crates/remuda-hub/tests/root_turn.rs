@@ -38,7 +38,9 @@ impl FakeNode {
         ws.send(Message::Text(
             json!({
                 "jsonrpc":"2.0","id":"hello","method":"node.hello",
-                "params": { "hostId": host, "host": {
+                // A fence-capable Node: the seats are continuity lineages
+                // (D-057 §7.6).
+                "params": { "hostId": host, "capabilities": {"lineageFence": true}, "host": {
                     "hostname":"rootturn-node","workspaces":[], "workspaceRevision":0,
                     "herdr":{"path":"/usr/bin/herdr"},
                     "cli":[{"kind":"claude","path":"/usr/bin/claude","auth":"logged-in"}]

@@ -2481,6 +2481,7 @@ mod tests {
                     origin: "human".into(),
                     title: None,
                     driver: "claude-sdk".into(),
+                    actor: serde_json::json!({"by": "test"}),
                 })
                 .await
                 .unwrap()

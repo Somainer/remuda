@@ -221,3 +221,40 @@ describe("a delete whose revision went stale", () => {
     await waitFor(() => expect(listMemory.mock.calls.length).toBeGreaterThan(1));
   });
 });
+
+describe("about-me saves the draft's base revision", () => {
+  it("answers a moved server with 409 again after the dialog was dismissed", async () => {
+    const first = entry({ slug: "about-me", body: "theirs v1", revision: 1 });
+    const moved = entry({ slug: "about-me", body: "theirs v2", revision: 2 });
+    let serverVersion = first;
+    listMemory.mockResolvedValue([first]);
+    getMemory.mockImplementation(async () => serverVersion);
+    updateMemory.mockRejectedValue(
+      new HubHttpError(409, "MEMORY_REVISION_CONFLICT", "stale"),
+    );
+
+    renderPage("/s/ins_x/memory");
+    const textarea = (await screen.findByTestId("memory-about-body")) as HTMLTextAreaElement;
+    await waitFor(() => expect(textarea.value).toBe("theirs v1"));
+    fireEvent.change(textarea, { target: { value: "mine" } });
+
+    // The other tab moves the entry; the conflict dialog opens.
+    serverVersion = moved;
+    fireEvent.change(await screen.findByTestId("memory-search"), { target: { value: "边界" } });
+    await screen.findByTestId("memory-conflict");
+    // Dismiss it (Escape) — the draft stays dirty, base stays rev 1.
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+    await waitFor(() => expect(screen.queryByTestId("memory-conflict")).toBeNull());
+
+    fireEvent.click(screen.getByTestId("memory-about-save"));
+
+    // The save must CAS on the DRAFT's base (rev 1), never the latest rev 2.
+    await waitFor(() =>
+      expect(updateMemory).toHaveBeenCalledWith("ins_l", "about-me", 1, { body: "mine" }),
+    );
+    // The 409 reopens the two-body choice rather than overwriting.
+    expect(await screen.findByTestId("memory-conflict")).toBeTruthy();
+    expect(screen.getByTestId("memory-conflict-server")).toHaveTextContent("theirs v2");
+    expect(screen.getByTestId("memory-conflict-mine")).toHaveTextContent("mine");
+  });
+});

@@ -514,8 +514,30 @@ export function MemoryPage() {
     setAboutError(null);
     setAboutWarnings([]);
     try {
+      if (aboutMe && aboutBaseRevision === null) {
+        // The entry exists but this draft was never based on a server copy:
+        // never blind-update it. Show both bodies and let the owner choose.
+        try {
+          const server = await getMemory(lineageId, ABOUT_ME_SLUG);
+          setConflict({
+            mine: {
+              type: "user",
+              title: ABOUT_ME_TITLE,
+              description: ABOUT_ME_DESCRIPTION,
+              body: aboutDraft,
+            },
+            server,
+            kind: "about",
+          });
+        } catch (readError) {
+          setAboutError(saveErrorText(readError));
+        }
+        return;
+      }
       const result = aboutMe
-        ? await updateMemory(lineageId, ABOUT_ME_SLUG, aboutMe.revision, { body: aboutDraft })
+        ? await updateMemory(lineageId, ABOUT_ME_SLUG, aboutBaseRevision as number, {
+            body: aboutDraft,
+          })
         : await createMemory(lineageId, {
             slug: ABOUT_ME_SLUG,
             type: "user",

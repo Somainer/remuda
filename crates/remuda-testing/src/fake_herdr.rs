@@ -270,7 +270,8 @@ impl FakeHerdrOptions {
 
     /// Append one JSON line per served control dispatch
     /// (`agent.prompt`/`agent.send_keys`) to `record_file` (c-ctxusage r26
-    /// item 4): the zero-foreign-dispatch witness.
+    /// item 4): the zero-foreign-dispatch witness. An `agent.prompt` line also
+    /// carries the `text` it typed (D-060: the first input an agent got).
     #[must_use]
     pub fn control_dispatches_record_to(mut self, record_file: impl Into<PathBuf>) -> Self {
         self.control_dispatch_record_file = Some(record_file.into());
@@ -2051,7 +2052,7 @@ fn crash_screen(args: &[String]) -> String {
 /// Append one line per control dispatch the fake actually served
 /// (c-ctxusage r26 item 4). Best-effort: the witness file is test
 /// infrastructure, a write failure must never change the RPC result.
-fn record_control_dispatch(st: &State, method: &str, target: &str) {
+fn record_control_dispatch(st: &State, method: &str, target: &str, text: Option<&str>) {
     let Some(path) = &st.control_dispatch_record_file else {
         return;
     };
@@ -2064,11 +2065,13 @@ fn record_control_dispatch(st: &State, method: &str, target: &str) {
         .append(true)
         .open(path)
     {
-        let _ = writeln!(
-            file,
-            "{}",
-            serde_json::json!({ "method": method, "target": target })
-        );
+        let mut record = serde_json::json!({ "method": method, "target": target });
+        // D-060: what an `agent.prompt` actually typed, so a test can see the
+        // first input an agent received (the memory data block rides it).
+        if let Some(text) = text {
+            record["text"] = serde_json::json!(text);
+        }
+        let _ = writeln!(file, "{record}");
     }
 }
 
@@ -2077,8 +2080,8 @@ fn agent_prompt(st: &mut State, params: &Value) -> Result<Value, (&'static str, 
         .get("target")
         .and_then(Value::as_str)
         .ok_or(("invalid_request", "missing target".into()))?;
-    record_control_dispatch(st, "agent.prompt", target);
     let text = params.get("text").and_then(Value::as_str).unwrap_or("");
+    record_control_dispatch(st, "agent.prompt", target, Some(text));
     let name = resolve_agent(st, target)?;
     if st.dead_agents.contains(&name) {
         return Err((
@@ -2177,7 +2180,7 @@ fn agent_send_keys(st: &mut State, params: &Value) -> Result<Value, (&'static st
         .get("target")
         .and_then(Value::as_str)
         .ok_or(("invalid_request", "missing target".into()))?;
-    record_control_dispatch(st, "agent.send_keys", target);
+    record_control_dispatch(st, "agent.send_keys", target, None);
     let name = resolve_agent(st, target)?;
     let keys: Vec<String> = params
         .get("keys")

@@ -171,9 +171,26 @@ pub struct CreateInstanceRequest {
     /// Absent forces `hub-relay`; it is never discovered by the Node.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_relay_endpoint: Option<String>,
+    /// D-060: the Hub-stamped lineage memory, carried to the materializer
+    /// (its only writer). Read only from the top level of the create/resume
+    /// params by [`Self::take_memory_context`] — never from the spec or a local
+    /// request body — and kept out of the payload digest, so a re-forward
+    /// whose index was re-rendered is still the same create.
+    #[serde(skip)]
+    pub memory_context: Option<remuda_protocol::hubnode::MemoryContext>,
 }
 
 impl CreateInstanceRequest {
+    /// Carry the Hub-stamped `memoryContext` from the top level of the
+    /// forwarded create/resume `params` (D-060). A copy nested in the spec is
+    /// not the Hub's and is ignored; a malformed value carries nothing.
+    pub fn take_memory_context(&mut self, params: &serde_json::Value) {
+        self.memory_context = params
+            .get("memoryContext")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok());
+    }
+
     /// Copy launch fields that Hub stores on `spec` onto the Node request.
     pub fn apply_spec_launch_fields(&mut self, spec: &serde_json::Value) {
         if let Some(value) = spec

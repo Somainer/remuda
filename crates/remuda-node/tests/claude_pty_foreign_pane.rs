@@ -94,6 +94,7 @@ async fn a_forced_close_after_a_server_restart_refuses_the_reused_foreign_pane()
     // shortened grace only bounds how long the close call runs.
 
     let driver = ClaudePtyDriver::new(ClaudePtyOptions {
+        memory_context: None,
         instance_id: None,
         media_stager: None,
         profile: profile(),

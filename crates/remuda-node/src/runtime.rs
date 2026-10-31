@@ -23,6 +23,8 @@ use sha2::{Digest as _, Sha256};
 use std::{collections::BTreeMap, path::Path, sync::Arc};
 use tokio::sync::{RwLock, mpsc};
 
+#[cfg(test)]
+mod memory_launch_table;
 mod pty_queue;
 
 struct QueuedCommand {

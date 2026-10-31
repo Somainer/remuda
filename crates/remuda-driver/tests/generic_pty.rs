@@ -102,6 +102,7 @@ async fn fake_herdr_codex_start_send_wait_read_stop() {
     let bin = stub_bin(tmp.path(), "codex");
 
     let driver = GenericPtyDriver::new(GenericPtyOptions {
+        memory_context: None,
         profile: profile(),
         launch_dir: launch,
         native_home: home,
@@ -221,6 +222,7 @@ async fn fake_herdr_start_failure_emits_error_lifecycle() {
     let bin = stub_crash_bin(tmp.path(), "grok");
 
     let driver = GenericPtyDriver::new(GenericPtyOptions {
+        memory_context: None,
         profile: profile(),
         launch_dir: launch,
         native_home: home,
@@ -299,6 +301,7 @@ async fn fake_herdr_slow_start_emits_ready_lifecycle() {
     let bin = stub_bin(tmp.path(), "grok");
 
     let driver = GenericPtyDriver::new(GenericPtyOptions {
+        memory_context: None,
         profile: profile(),
         launch_dir: launch,
         native_home: home,
@@ -375,6 +378,7 @@ async fn fake_herdr_send_before_start_defers_without_blocking_control() {
     let cwd = tmp.path().join("work");
     fs::create_dir_all(&cwd).unwrap();
     let driver = Arc::new(GenericPtyDriver::new(GenericPtyOptions {
+        memory_context: None,
         profile: profile(),
         launch_dir: tmp.path().join("launch"),
         native_home: tmp.path().join("home"),
@@ -429,6 +433,7 @@ async fn fake_herdr_journals_bounded_screen_snapshot() {
     fs::create_dir_all(&cwd).unwrap();
     fs::create_dir_all(tmp.path().join("home")).unwrap();
     let driver = GenericPtyDriver::new(GenericPtyOptions {
+        memory_context: None,
         profile: profile(),
         launch_dir: tmp.path().join("launch"),
         native_home: tmp.path().join("home"),
@@ -609,6 +614,7 @@ async fn generic_pty_grok_spawns_file_adapter_and_emits_usage() {
     let instance = remuda_protocol::InstanceId::new();
     let real_home_str = real_home.to_string_lossy().into_owned();
     let mut options = GenericPtyOptions {
+        memory_context: None,
         profile: profile(),
         launch_dir: launch,
         native_home: native_home.clone(),

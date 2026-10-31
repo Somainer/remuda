@@ -827,6 +827,20 @@ pub(crate) async fn handle_node_method(
             if inventory.transport.is_none() {
                 inventory.transport = Some(TransportKind::OutboundWss);
             }
+            // D-060: a hello with no `capabilities` comes from a Node that does
+            // not carry `memoryContext`, so a claim an earlier (newer) Node
+            // build left on the row must not survive it. Only that key goes:
+            // the inventory claims (`driverInventory`, `apiRelay`) stay as
+            // stored, as before, until a heartbeat refreshes them.
+            if params.get("capabilities").is_none() {
+                state
+                    .store
+                    .forget_host_capability(
+                        host.host_id.clone(),
+                        remuda_protocol::hubnode::MEMORY_CONTEXT_CAPABILITY,
+                    )
+                    .await?;
+            }
             let host = state
                 .store
                 .apply_inventory(

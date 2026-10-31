@@ -261,11 +261,11 @@ describe("about-me saves the draft's base revision", () => {
 
 describe("the about-me editor waits for the server copy", () => {
   it("keeps the textarea disabled and the label neutral until the GET returns", async () => {
-    let resolveAbout!: (value: MemoryEntry) => void;
+    const pendingAbout: Array<(value: MemoryEntry) => void> = [];
     getMemory.mockImplementation(
       () =>
         new Promise<MemoryEntry>((resolve) => {
-          resolveAbout = resolve;
+          pendingAbout.push(resolve);
         }) as never,
     );
 
@@ -275,7 +275,12 @@ describe("the about-me editor waits for the server copy", () => {
     const card = screen.getByTestId("memory-about");
     expect(within(card).queryByText(/还没有；保存即创建/)).toBeNull();
 
-    resolveAbout(entry({ slug: "about-me", body: "server body", revision: 1 }));
+    // The disabled textarea renders before the about-me GET is issued, so a
+    // resolver exists only once that call has happened (under load it may not
+    // have yet). Answer every about-me GET made so far.
+    await waitFor(() => expect(getMemory).toHaveBeenCalledWith("ins_l", "about-me"));
+    const server = entry({ slug: "about-me", body: "server body", revision: 1 });
+    for (const resolve of pendingAbout) resolve(server);
     await waitFor(() => expect(textarea).not.toBeDisabled());
     await waitFor(() => expect(textarea.value).toBe("server body"));
   });

@@ -71,8 +71,8 @@ async function phoneContext(browser: Browser, baseURL: string) {
 
 const created: string[] = [];
 
-/** A session the fake Node parks on a pending approval (m-home's fixture). */
-async function createBlockedSession(page: Page): Promise<string> {
+/** A session on the fake Node; the prompt carries its scripted behaviour. */
+async function createSession(page: Page, prompt: string): Promise<string> {
   await page.goto("/sessions/new");
   const hostPicker = page.getByTestId("new-session-host");
   await expect(hostPicker).toContainText("e2e-fake-node", { timeout: 20_000 });
@@ -86,12 +86,46 @@ async function createBlockedSession(page: Page): Promise<string> {
   const workspacePicker = page.getByTestId("new-session-workspace");
   await expect(workspacePicker.locator("option")).not.toHaveCount(0, { timeout: 20_000 });
   await workspacePicker.selectOption("wsp_e2e");
-  await page.getByTestId("new-session-prompt").fill("HGLANCE_BLOCKED mhome-blocked approval gate");
+  await page.getByTestId("new-session-prompt").fill(prompt);
   await page.getByTestId("new-session-start").click();
   await page.waitForURL(/\/s\//, { timeout: 20_000 });
   const id = new URL(page.url()).pathname.split("/").pop()!;
   created.push(id);
   return id;
+}
+
+/** A session the fake Node parks on a pending approval (m-home's fixture). */
+function createBlockedSession(page: Page): Promise<string> {
+  return createSession(page, "HGLANCE_BLOCKED mhome-blocked approval gate");
+}
+
+/** A session the fake Node keeps in native `working` (rank 3). */
+function createWorkingSession(page: Page): Promise<string> {
+  return createSession(page, "HGLANCE_WORKING keep running");
+}
+
+/** Scroll the phone/desktop scroller holding `el` to its end; false if short. */
+async function scrollAncestorToEnd(page: Page, selector: string): Promise<boolean> {
+  return page.evaluate((sel) => {
+    const el = document.querySelector(sel) as HTMLElement | null;
+    let scroller = el?.parentElement ?? null;
+    while (scroller && !/(auto|scroll)/.test(getComputedStyle(scroller).overflowY)) {
+      scroller = scroller.parentElement;
+    }
+    if (!scroller || scroller.scrollHeight <= scroller.clientHeight + 4) return false;
+    scroller.scrollTop = scroller.scrollHeight;
+    return true;
+  }, selector);
+}
+
+/** The element's box lies in the viewport (below the sticky head is fine). */
+async function inViewport(page: Page, selector: string): Promise<boolean> {
+  return page.evaluate((sel) => {
+    const el = document.querySelector(sel);
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    return rect.bottom > 0 && rect.top < window.innerHeight && rect.right > 0 && rect.left < window.innerWidth;
+  }, selector);
 }
 
 test.describe("phone 390", () => {
@@ -163,12 +197,72 @@ test.describe("phone 390", () => {
       expect(stripGeometry.position, "② scrolls with the page").not.toBe("sticky");
       expect(stripGeometry.belowHead).toBe(true);
 
+      // §2.1 order: ② sits directly under ①; the search/order row follows ②.
+      const order = await page.evaluate(() => {
+        const head = document.querySelector('[data-testid="home-head"]') as HTMLElement;
+        const strip = document.querySelector('[data-testid="host-strip"]') as HTMLElement;
+        const search = document.querySelector('[data-testid="home-search"]') as HTMLElement;
+        return {
+          gap: strip.getBoundingClientRect().top - head.getBoundingClientRect().bottom,
+          searchAfterStrip: search.getBoundingClientRect().top >= strip.getBoundingClientRect().bottom - 0.5,
+        };
+      });
+      expect(Math.abs(order.gap), "② starts at the head's bottom edge").toBeLessThanOrEqual(1);
+      expect(order.searchAfterStrip, "the search row follows ②").toBe(true);
+
       await setMode(page, "light");
       await shot(page, "home-glance-390-light.png");
       await setMode(page, "dark");
       await shot(page, "home-glance-390-dark.png");
     } finally {
       // The suite shares one fake Node and its placement slots: release ours.
+      for (const id of created.splice(0)) {
+        await context.request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
+      }
+      await context.close();
+    }
+  });
+
+  test("the ① taps narrow the ledger by rank and scroll to the waiting row", async ({ browser }) => {
+    const baseURL = test.info().project.use.baseURL;
+    const context = await phoneContext(browser, baseURL!);
+    try {
+      const page = await context.newPage();
+      await page.goto("/m");
+      if (!(await needsFakeNode(page))) test.skip(true, "needs the in-process fake Node");
+      await createBlockedSession(page);
+      await createWorkingSession(page);
+      await page.goto("/m");
+
+      const working = page.getByTestId("glance-working");
+      await expect(working).toContainText(/工作中/, { timeout: 20_000 });
+      const count = Number(((await working.innerText()).match(/(\d+) 工作中/) ?? [])[1]);
+      expect(count).toBeGreaterThanOrEqual(1);
+      await working.click();
+      await expect(working).toHaveAttribute("aria-pressed", "true");
+      // The tapped list equals the count: every row left is rank 3, and there
+      // are exactly as many as the segment said.
+      await expect
+        .poll(async () =>
+          page.getByTestId("home-row").evaluateAll((rows) =>
+            rows.every((row) => (row as HTMLElement).dataset.rank === "working"),
+          ),
+        )
+        .toBe(true);
+      expect(await page.getByTestId("home-row").count()).toBe(count);
+      await working.click();
+      await expect(working).toHaveAttribute("aria-pressed", "false");
+      await expect(page.locator('[data-testid="home-row"][data-rank="blocked"]')).toHaveCount(1);
+
+      // 需要你 scrolls the ledger to the waiting row (scrolled to the end first
+      // so the assertion proves a scroll, not a lucky viewport).
+      await scrollAncestorToEnd(page, '[data-testid="home-head"]');
+      await page.getByTestId("glance-need-you").click();
+      await expect
+        .poll(() => inViewport(page, '[data-testid="home-row"][data-blocked="1"]'))
+        .toBe(true);
+      await shot(page, "home-glance-390-taps.png");
+    } finally {
       for (const id of created.splice(0)) {
         await context.request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
       }
@@ -234,6 +328,62 @@ test.describe("desktop 1280", () => {
       await setMode(page, "dark");
       await shot(page, "home-glance-1280-dark.png");
     } finally {
+      await context.close();
+    }
+  });
+
+  test("the ① taps filter the desktop ledger by rank and scroll to the waiting card", async ({
+    browser,
+  }) => {
+    const baseURL = test.info().project.use.baseURL;
+    const context = await browser.newContext({
+      baseURL: baseURL!,
+      viewport: { width: 1280, height: 900 },
+    });
+    try {
+      const page = await context.newPage();
+      await login(page, "e2e-hglance-desktop-taps");
+      await page.goto("/sessions");
+      if (!(await needsFakeNode(page))) test.skip(true, "needs the in-process fake Node");
+      await expect(page.getByTestId("session-list")).toBeVisible({ timeout: 20_000 });
+      await createBlockedSession(page);
+      await createWorkingSession(page);
+      await page.goto("/sessions");
+      await expect(page.getByTestId("session-list")).toBeVisible({ timeout: 20_000 });
+
+      const working = page.getByTestId("glance-working");
+      await expect(working).toContainText(/工作中/, { timeout: 20_000 });
+      const count = Number(((await working.innerText()).match(/(\d+) 工作中/) ?? [])[1]);
+      expect(count).toBeGreaterThanOrEqual(1);
+      await working.click();
+      await expect(working).toHaveAttribute("aria-pressed", "true");
+      await expect(page).toHaveURL(/rank=working/);
+      // The filter is a removable chip, and the list equals the count.
+      await expect(page.getByTestId("session-chip").filter({ hasText: "工作中" })).toBeVisible();
+      await expect
+        .poll(async () =>
+          page.getByTestId("board-card").evaluateAll((cards) =>
+            cards.every((card) => (card as HTMLElement).dataset.rank === "working"),
+          ),
+        )
+        .toBe(true);
+      expect(await page.getByTestId("board-card").count()).toBe(count);
+      await working.click();
+      await expect(working).toHaveAttribute("aria-pressed", "false");
+      await expect(page).not.toHaveURL(/rank=/);
+      await expect(page.locator('[data-testid="board-card"][data-rank="blocked"]')).toHaveCount(1);
+
+      // 需要你 scrolls the desktop list to the blocked card.
+      await scrollAncestorToEnd(page, '[data-testid="session-list"]');
+      await page.getByTestId("glance-need-you").click();
+      await expect
+        .poll(() => inViewport(page, '[data-testid="board-card"][data-rank="blocked"]'))
+        .toBe(true);
+      await shot(page, "home-glance-1280-taps.png");
+    } finally {
+      for (const id of created.splice(0)) {
+        await context.request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
+      }
       await context.close();
     }
   });

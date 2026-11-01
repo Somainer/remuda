@@ -103,9 +103,13 @@ pub struct SpinnerSpec {
 }
 
 impl TurnSpec {
-    /// True when `prompt` selects this turn spec.
+    /// True when `prompt` selects this turn spec. The leading Remuda data
+    /// blocks a launch puts ahead of its first input (the memory index, the
+    /// seat's capability section) are context the agent reads, not the
+    /// prompt the scenario scripts, so they are not part of the match.
     #[must_use]
     pub fn matches(&self, prompt: &str) -> bool {
+        let prompt = remuda_protocol::hubnode::strip_memory_context_block(prompt);
         if let Some(exact) = &self.r#match {
             return exact == prompt;
         }
@@ -572,6 +576,11 @@ mod tests {
         assert_eq!(scenario.turns.len(), 1);
         assert_eq!(scenario.turns[0].thinking.as_deref(), Some("hmm"));
         assert!(scenario.turns[0].matches("SLOW_QUEUE"));
+        // A launch's leading data blocks are context, not the scripted prompt.
+        assert!(scenario.turns[0].matches(
+            "<remuda-memory rev=\"1\">\nindex\n</remuda-memory>\n\n\
+             <remuda-capabilities>\n## This seat in Remuda\n</remuda-capabilities>\n\nSLOW_QUEUE"
+        ));
     }
 
     #[test]

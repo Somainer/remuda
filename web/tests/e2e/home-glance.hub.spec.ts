@@ -125,6 +125,39 @@ async function seedRows(page: Page, count: number): Promise<void> {
   }
 }
 
+/**
+ * Park `target` outside the scroller's visible band (above it, else below):
+ * the 需要你 tap must be the thing that brings it back. False when the scroller
+ * does not overflow or the target is missing — a short list cannot prove it.
+ */
+async function parkTargetOutOfView(
+  page: Page,
+  regionSelector: string,
+  targetSelector: string,
+): Promise<boolean> {
+  return page.evaluate(({ region, target }) => {
+    const el = document.querySelector(region) as HTMLElement | null;
+    let scroller = el?.parentElement ?? null;
+    while (scroller && !/(auto|scroll)/.test(getComputedStyle(scroller).overflowY)) {
+      scroller = scroller.parentElement;
+    }
+    const row = document.querySelector(target) as HTMLElement | null;
+    if (!scroller || !row || scroller.scrollHeight <= scroller.clientHeight + 4) return false;
+    const band = scroller.getBoundingClientRect();
+    const rect = row.getBoundingClientRect();
+    const rowTop = rect.top - band.top + scroller.scrollTop;
+    const max = scroller.scrollHeight - scroller.clientHeight;
+    // Just past it, or (when it is last) just above the band.
+    let next = rowTop + rect.height + 12;
+    if (next > max) next = rowTop - scroller.clientHeight - 12;
+    scroller.scrollTop = Math.max(0, Math.min(max, next));
+    const after = row.getBoundingClientRect();
+    const visibleTop = Math.max(0, band.top);
+    const visibleBottom = Math.min(window.innerHeight, band.bottom);
+    return after.bottom <= visibleTop || after.top >= visibleBottom;
+  }, { region: regionSelector, target: targetSelector });
+}
+
 /** Scroll the phone/desktop scroller holding `el` to its end; false if short. */
 async function scrollAncestorToEnd(page: Page, selector: string): Promise<boolean> {
   return page.evaluate((sel) => {
@@ -288,8 +321,10 @@ test.describe("phone 390", () => {
       await expect(page.locator('[data-testid="home-row"][data-rank="blocked"]')).toHaveCount(1);
 
       // 需要你 scrolls the ledger to the waiting row: the scroller overflows,
-      // the row is OUT of view at the end, and only the tap brings it back.
-      expect(await scrollAncestorToEnd(page, '[data-testid="home-head"]')).toBe(true);
+      // the row is parked OUT of view, and only the tap brings it back.
+      expect(
+        await parkTargetOutOfView(page, '[data-testid="home-head"]', '[data-testid="home-row"][data-blocked="1"]'),
+      ).toBe(true);
       expect(await inViewport(page, '[data-testid="home-row"][data-blocked="1"]')).toBe(false);
       await page.getByTestId("glance-need-you").click();
       await expect
@@ -413,8 +448,10 @@ test.describe("desktop 1280", () => {
       await expect(page.locator('[data-testid="board-card"][data-rank="blocked"]')).toHaveCount(1);
 
       // 需要你 scrolls the desktop list to the blocked card: the list overflows,
-      // the card is OUT of view at the end, and only the tap brings it back.
-      expect(await scrollAncestorToEnd(page, '[data-testid="session-list"]')).toBe(true);
+      // the card is parked OUT of view, and only the tap brings it back.
+      expect(
+        await parkTargetOutOfView(page, '[data-testid="session-list"]', '[data-testid="board-card"][data-rank="blocked"]'),
+      ).toBe(true);
       expect(await inViewport(page, '[data-testid="board-card"][data-rank="blocked"]')).toBe(false);
       await page.getByTestId("glance-need-you").click();
       await expect

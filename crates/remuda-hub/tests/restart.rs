@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
 use remuda_hub::{HubConfig, spawn};
 use remuda_protocol::HostId;
+use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -250,7 +251,17 @@ impl Ctx {
 
     /// Restart the Hub process on the same data directory.
     async fn restart_hub(&mut self, supervisor: bool) -> Result<()> {
+        self.restart_hub_editing(supervisor, |_| Ok(())).await
+    }
+
+    /// Restart the Hub, applying `edit` to its database while it is down.
+    async fn restart_hub_editing(
+        &mut self,
+        supervisor: bool,
+        edit: impl FnOnce(&rusqlite::Connection) -> Result<()>,
+    ) -> Result<()> {
         self.hub.shutdown_within(Duration::from_secs(10)).await;
+        edit(&self.db()?)?;
         let mut config = HubConfig::for_test(self.data.clone());
         config.bootstrap_token = self.bootstrap.clone();
         config.restart_supervisor = supervisor;
@@ -2512,5 +2523,71 @@ async fn owner_resume_keeps_the_api_via_unknown_host_code() -> Result<()> {
     let body: Value = resumed.json().await?;
     assert_eq!(status, 400, "{body}");
     assert_eq!(body["code"], json!("api-via-unknown-host"), "{body}");
+    Ok(())
+}
+
+// ── r4 item 1: the run marker ───────────────────────────────────────────
+
+impl Ctx {
+    fn marker(&self) -> Result<Option<String>> {
+        Ok(self
+            .db()?
+            .query_row(
+                "SELECT last_alive_at FROM hub_run_marker WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+}
+
+/// The boot evaluation measures history from the previous run's marker, not
+/// from its own clock. The previous run was last alive 10 minutes ago and
+/// first saw the end 35 minutes ago: the marker puts the history line at 40
+/// minutes ago, so the death is decided normally, whereas the no-marker
+/// fallback (30 minutes before boot) would wrongly call it stale. Only the
+/// marker and the first-seen column are aged. With the supervisor off, the
+/// first tick writes the marker; the new run writes its own after the boot
+/// read.
+#[tokio::test]
+async fn the_boot_reads_the_previous_run_marker_before_writing_its_own() -> Result<()> {
+    let mut ctx = Ctx::boot().await?;
+    // restart_supervisor = false here: the tick still writes the marker.
+    let first = ctx
+        .wait_until(|| async { ctx.marker().ok().flatten() })
+        .await
+        .context("the first tick writes a marker row")?;
+    assert!(!first.is_empty());
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host, true).await?;
+    let seat = ctx.seat(&mut node).await?;
+    ctx.report_running(&node, &seat, SESSION).await?;
+    ctx.report_killed(&node, &seat).await?;
+    let token = node.node_token.clone().context("nodeToken")?;
+    drop(node);
+    let (alive, seen) = (ago(10, 0), ago(35, 0));
+    ctx.restart_hub_editing(true, |db| {
+        db.execute(
+            "UPDATE hub_run_marker SET last_alive_at = ?1 WHERE id = 1",
+            rusqlite::params![alive],
+        )?;
+        db.execute(
+            "UPDATE instances SET end_seen_at = ?2 WHERE id = ?1",
+            rusqlite::params![seat, seen],
+        )?;
+        Ok(())
+    })
+    .await?;
+    let rows = ctx.decisions(&seat)?;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].2, "restarted", "decided normally: {rows:?}");
+    let mut node = FakeNode::connect_with(&ctx.hub, &ctx.host, &token, true, json!({})).await?;
+    let (method, _) = node.next_launch().await?;
+    assert_eq!(method, "instance.resume");
+    // The new run has written its own marker since.
+    let now_marker = ctx
+        .wait_until(|| async { ctx.marker().ok().flatten().filter(|at| at > &alive) })
+        .await
+        .context("the new run writes its own marker")?;
+    assert!(now_marker > alive);
     Ok(())
 }

@@ -300,9 +300,22 @@ fn claude_on_a_per_instance_home_gets_the_tree_with_the_section_appended() {
                 .iter()
                 .all(|file| file.lifetime == FileLifetime::Launch)
         );
-        // The launch's cleanup removes what it wrote.
+        // The launch's cleanup removes what it wrote, and the next launch in
+        // the same home (each claude-bg process, a respawn) writes it again:
+        // the empty directory cleanup leaves is not a user-owned tree.
         recipe.cleanup_launch_files();
         assert!(!root.join("SKILL.md").exists(), "{driver:?}");
+        assert!(root.is_dir());
+        let again = Run::new(driver, AgentKind::Claude, Some(&context)).materialize(&at);
+        assert!(
+            matches!(
+                again.skill.as_ref().unwrap().tree,
+                SkillTree::Installed { shared: false, .. }
+            ),
+            "{driver:?}: {:?}",
+            again.skill
+        );
+        assert_eq!(fs::read(root.join("SKILL.md")).unwrap(), expected);
     }
 }
 

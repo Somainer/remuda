@@ -281,12 +281,14 @@ fn framed(section: &str) -> String {
     )
 }
 
-/// A `skills/remuda` that exists without Remuda's marker.
+/// A `skills/remuda` that holds something without Remuda's marker. An empty
+/// directory is not the user's: it is what a launch's own cleanup leaves when
+/// it shreds a per-instance tree, and the next launch in that home rewrites it.
 fn user_owned(root: &Path) -> bool {
-    match fs::symlink_metadata(root) {
-        Ok(_) => !root.join(MANAGED_MARKER).is_file(),
-        Err(_) => false,
+    if fs::symlink_metadata(root).is_err() || root.join(MANAGED_MARKER).is_file() {
+        return false;
     }
+    fs::read_dir(root).map_or(true, |mut entries| entries.next().is_some())
 }
 
 /// Write the embedded tree (and, for a per-instance home, the section appended

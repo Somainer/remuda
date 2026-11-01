@@ -170,12 +170,22 @@ pub(crate) enum FenceMode {
         paused_by: Value,
         /// A Hub-internal `instance.close` for the predecessor, queued inside
         /// F (no initiator: the close follows the fence, it is not refused
-        /// by it). `(command id, payload)`.
-        close: Option<(String, Value)>,
+        /// by it).
+        close: Option<PauseClose>,
     },
     /// With successor: the lineage becomes `starting` on `successor_id`,
     /// which the caller inserts in the same transaction.
     Successor { successor_id: String },
+}
+
+/// The close a pause queues for the current chapter: the admitted request's
+/// command id, payload (retargeted to the current chapter) and idempotency
+/// key, so a retry by either id or key replays it.
+#[derive(Clone, Debug)]
+pub(crate) struct PauseClose {
+    pub command_id: String,
+    pub payload: Value,
+    pub idempotency_key: Option<String>,
 }
 
 /// One F request.
@@ -225,6 +235,9 @@ pub(crate) enum FenceTx {
     StateRefused,
     /// The self-close guard refused; nothing was written.
     Guarded(&'static str),
+    /// The pause close's command id or idempotency key already names a
+    /// stored command (a retry that raced this request); nothing was written.
+    CloseExists,
 }
 
 fn rows<T, P: rusqlite::Params>(
@@ -316,6 +329,17 @@ pub(crate) fn fence_core(conn: &Connection, spec: &FenceSpec) -> Result<FenceTx,
     }
     if !spec.from_states.contains(&lineage.state.as_str()) {
         return Ok(FenceTx::StateRefused);
+    }
+    if let FenceMode::Pause {
+        close: Some(close), ..
+    } = &spec.mode
+        && (crate::store::load_command(conn, &close.command_id)?.is_some()
+            || match &close.idempotency_key {
+                Some(key) => crate::store::load_command_by_key(conn, key)?.is_some(),
+                None => false,
+            })
+    {
+        return Ok(FenceTx::CloseExists);
     }
     if spec.self_close_guard {
         let pending: bool = conn
@@ -608,7 +632,7 @@ pub(crate) fn fence_core(conn: &Connection, spec: &FenceSpec) -> Result<FenceTx,
             spec.actor.to_string(),
             predecessor,
             successor_id,
-            close.as_ref().map(|(id, _)| id.clone()),
+            close.as_ref().map(|close| close.command_id.clone()),
             now
         ],
     )?;
@@ -628,22 +652,23 @@ pub(crate) fn fence_core(conn: &Connection, spec: &FenceSpec) -> Result<FenceTx,
     // gate nor the Node fence refuses it; it is forwarded once the host has
     // acknowledged this fence.
     let close_command = match close {
-        Some((command_id, payload)) => {
+        Some(close) => {
             conn.execute(
                 "INSERT INTO commands
                     (id, instance_id, host_id, operation, state, resolution, forwarded,
                      payload_json, idempotency_key, created_at, updated_at, link_generation)
-                 VALUES (?1, ?2, ?3, 'instance.close', 'queued', 'clear', 0, ?4, NULL, ?5, ?5,
+                 VALUES (?1, ?2, ?3, 'instance.close', 'queued', 'clear', 0, ?4, ?5, ?6, ?6,
                          (SELECT link_generation FROM hosts WHERE id = ?3))",
                 params![
-                    command_id,
+                    close.command_id,
                     predecessor,
                     predecessor_host,
-                    payload.to_string(),
+                    close.payload.to_string(),
+                    close.idempotency_key,
                     now
                 ],
             )?;
-            crate::store::load_command(conn, &command_id)?
+            crate::store::load_command(conn, &close.command_id)?
         }
         None => None,
     };
@@ -1261,12 +1286,15 @@ pub(crate) async fn after_commit(state: &AppState, core: &FenceCore, inline_host
 /// current chapter is then forwarded once its host acknowledged the fence.
 ///
 /// Returns `None` when the lineage is already paused (the caller forwards
-/// the close as before), otherwise the queued close of the current chapter.
+/// the close as before) or the close's command id or idempotency key already
+/// names a stored command (the caller replays it), otherwise the queued close
+/// of the current chapter.
 pub(crate) async fn pause_on_close(
     state: &AppState,
     device: &crate::store::Device,
     lineage_id: &str,
     command_id: Option<String>,
+    idempotency_key: Option<String>,
     payload: Value,
 ) -> Result<Option<CommandRecord>, crate::error::HubError> {
     use crate::error::HubError;
@@ -1319,7 +1347,11 @@ pub(crate) async fn pause_on_close(
             from_states: &["starting", "running"],
             mode: FenceMode::Pause {
                 paused_by: paused_by.clone(),
-                close: Some((command_id.clone(), close_payload)),
+                close: Some(PauseClose {
+                    command_id: command_id.clone(),
+                    payload: close_payload,
+                    idempotency_key: idempotency_key.clone(),
+                }),
             },
             actor: json!({
                 "deviceId": device.id,
@@ -1348,7 +1380,7 @@ pub(crate) async fn pause_on_close(
                 return Ok(Some(command));
             }
             FenceTx::CasLost => continue,
-            FenceTx::StateRefused => return Ok(None),
+            FenceTx::StateRefused | FenceTx::CloseExists => return Ok(None),
             FenceTx::Guarded(reason) => {
                 return Err(HubError::lineage_conflict(
                     reason,

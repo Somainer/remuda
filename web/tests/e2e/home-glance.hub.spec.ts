@@ -118,6 +118,13 @@ function createWorkingSession(page: Page): Promise<string> {
   return createSession(page, "HGLANCE_WORKING keep running");
 }
 
+/** More rows than the reduced viewport holds, so a scroll proof can bite. */
+async function seedRows(page: Page, count: number): Promise<void> {
+  for (let index = 0; index < count; index += 1) {
+    await createWorkingSession(page);
+  }
+}
+
 /** Scroll the phone/desktop scroller holding `el` to its end; false if short. */
 async function scrollAncestorToEnd(page: Page, selector: string): Promise<boolean> {
   return page.evaluate((sel) => {
@@ -244,6 +251,10 @@ test.describe("phone 390", () => {
       if (!(await needsFakeNode(page))) test.skip(true, "needs the in-process fake Node");
       await createBlockedSession(page);
       await createWorkingSession(page);
+      // Enough rows that the reduced viewport must scroll: a 需要你 tap that
+      // "works" only because everything already fits proves nothing.
+      await seedRows(page, 4);
+      await page.setViewportSize({ width: 390, height: 480 });
       await page.goto("/m");
 
       const working = page.getByTestId("glance-working");
@@ -266,9 +277,10 @@ test.describe("phone 390", () => {
       await expect(working).toHaveAttribute("aria-pressed", "false");
       await expect(page.locator('[data-testid="home-row"][data-rank="blocked"]')).toHaveCount(1);
 
-      // 需要你 scrolls the ledger to the waiting row (scrolled to the end first
-      // so the assertion proves a scroll, not a lucky viewport).
-      await scrollAncestorToEnd(page, '[data-testid="home-head"]');
+      // 需要你 scrolls the ledger to the waiting row: the scroller overflows,
+      // the row is OUT of view at the end, and only the tap brings it back.
+      expect(await scrollAncestorToEnd(page, '[data-testid="home-head"]')).toBe(true);
+      expect(await inViewport(page, '[data-testid="home-row"][data-blocked="1"]')).toBe(false);
       await page.getByTestId("glance-need-you").click();
       await expect
         .poll(() => inViewport(page, '[data-testid="home-row"][data-blocked="1"]'))
@@ -358,10 +370,12 @@ test.describe("desktop 1280", () => {
       await expect(page.getByTestId("session-list")).toBeVisible({ timeout: 20_000 });
       await createBlockedSession(page);
       await createWorkingSession(page);
+      await seedRows(page, 4);
       // The count row is owner-global while /sessions is pinned to the active
       // Space — and the default Space has no sessions, so its list renders the
       // empty state without the scope switch. Open the list in global scope so
       // the filtered rows are comparable with the count.
+      await page.setViewportSize({ width: 1280, height: 520 });
       await page.goto("/sessions?scope=all");
       await expect(page.getByTestId("session-list")).toBeVisible({ timeout: 20_000 });
       await expect(page.getByTestId("session-scope")).toHaveAttribute("data-scope", "all");
@@ -388,8 +402,10 @@ test.describe("desktop 1280", () => {
       await expect(page).not.toHaveURL(/rank=/);
       await expect(page.locator('[data-testid="board-card"][data-rank="blocked"]')).toHaveCount(1);
 
-      // 需要你 scrolls the desktop list to the blocked card.
-      await scrollAncestorToEnd(page, '[data-testid="session-list"]');
+      // 需要你 scrolls the desktop list to the blocked card: the list overflows,
+      // the card is OUT of view at the end, and only the tap brings it back.
+      expect(await scrollAncestorToEnd(page, '[data-testid="session-list"]')).toBe(true);
+      expect(await inViewport(page, '[data-testid="board-card"][data-rank="blocked"]')).toBe(false);
       await page.getByTestId("glance-need-you").click();
       await expect
         .poll(() => inViewport(page, '[data-testid="board-card"][data-rank="blocked"]'))

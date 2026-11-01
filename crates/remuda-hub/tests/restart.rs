@@ -2742,3 +2742,57 @@ async fn owner_resume_of_a_missing_profile_keeps_the_pre_restart_shape() -> Resu
     assert!(body.to_string().contains(&gone), "{body}");
     Ok(())
 }
+
+// ── ma-admission merge: the successor create under "never beyond the creator"
+
+/// OA5 under ma-admission's creator rule (OA1): a Human-seated seat that runs
+/// with its harness control off (`bypassPermissions`) is relaunched by the
+/// supervisor with the seating Human origin and its own mode, and with no
+/// `creatorPermissionMode` stamp, which only an Agent-origin create carries.
+/// The Node admits a control-off mode for a Human origin
+/// (`control_off_allowed(Human, _)`); an `agent` origin with no stamp would
+/// be refused as beyond its creator.
+#[tokio::test]
+async fn a_control_off_seat_restarts_as_its_seating_human_under_the_creator_rule() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host, true).await?;
+    let created: Value = ctx
+        .http
+        .post(format!("{}/v1/instances", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .json(&json!({
+            "hostId": ctx.host, "kind": "claude", "driver": "claude-sdk",
+            "title": "Main", "grants": ["address-owner"],
+            "permissionMode": "bypassPermissions", "model": "claude-test-model",
+            "restart": {"onProcessLoss": true, "maxPerHour": 3}, "prompt": "seat brief",
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let seat = created["instance"]["instanceId"]
+        .as_str()
+        .context("seat")?
+        .to_owned();
+    let (_, first) = node.next_launch().await?;
+    assert_eq!(first["origin"], json!("human"));
+    ctx.report_running(&node, &seat, SESSION).await?;
+    ctx.report_killed(&node, &seat).await?;
+    let decided = ctx.supervise().await;
+    assert_eq!(decided[0]["outcome"], json!("restarted"), "{decided:?}");
+    let (method, create) = node.next_launch().await?;
+    assert_eq!(method, "instance.resume");
+    assert_eq!(
+        create["origin"],
+        json!("human"),
+        "OA5: the seating Human grant"
+    );
+    assert_eq!(create["spec"]["permissionMode"], json!("bypassPermissions"));
+    assert!(
+        create.get("creatorPermissionMode").is_none()
+            && create["spec"].get("creatorPermissionMode").is_none(),
+        "a Human-origin create carries no creator stamp: {create}"
+    );
+    Ok(())
+}

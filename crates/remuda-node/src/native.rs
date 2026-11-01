@@ -359,6 +359,7 @@ impl DriverFactory for NativeClaudeFactory {
                 ));
                 options.agent_mcp = Some(crate::origin::instance_mcp(&launch));
                 options.origin = launch.request.origin;
+                options.creator = launch.request.creator_control();
                 options.handshake_timeout = self.config.print_handshake_timeout;
                 options.inherit_default_config = inherit_default_config;
                 options.settings_overlay_path = overlay.clone();
@@ -379,6 +380,7 @@ impl DriverFactory for NativeClaudeFactory {
                 ));
                 options.agent_mcp = Some(crate::origin::instance_mcp(&launch));
                 options.origin = launch.request.origin;
+                options.creator = launch.request.creator_control();
                 options.handshake_timeout = self.config.print_handshake_timeout;
                 options.inherit_default_config = inherit_default_config;
                 options.settings_overlay_path = overlay.clone();
@@ -394,6 +396,7 @@ impl DriverFactory for NativeClaudeFactory {
                 ));
                 options.agent_mcp = Some(crate::origin::instance_mcp(&launch));
                 options.origin = launch.request.origin.into();
+                options.creator = launch.request.creator_control();
                 options.session_name = self.config.herdr_session.clone();
                 options.socket_dir = self.config.herdr_socket_dir.clone();
                 options.herdr_binary = self.config.herdr_binary.clone();
@@ -423,6 +426,7 @@ impl DriverFactory for NativeClaudeFactory {
                 ));
                 options.agent_mcp = Some(crate::origin::instance_mcp(&launch));
                 options.origin = launch.request.origin.into();
+                options.creator = launch.request.creator_control();
                 options.session_name = self.config.herdr_session.clone();
                 options.socket_dir = self.config.herdr_socket_dir.clone();
                 options.herdr_binary = self.config.herdr_binary.clone();
@@ -440,6 +444,7 @@ impl DriverFactory for NativeClaudeFactory {
                 ));
                 options.agent_mcp = Some(crate::origin::instance_mcp(&launch));
                 options.origin = launch.request.origin.into();
+                options.creator = launch.request.creator_control();
                 options.session_name = self.config.herdr_session.clone();
                 options.socket_dir = self.config.herdr_socket_dir.clone();
                 options.herdr_binary = self.config.herdr_binary.clone();
@@ -517,6 +522,7 @@ impl DriverFactory for NativeClaudeFactory {
                                 _ => None,
                             },
                             origin: launch.request.origin.into(),
+                            creator: launch.request.creator_control(),
                             // D-045: the managed-home answer is per kind. The
                             // shadow homes codex/grok get are always managed;
                             // claude's is managed unless the operator home is
@@ -1503,6 +1509,19 @@ fn merge_launch_env(
     merged
 }
 
+/// The harness enum value a launch of `kind` runs for its requested mode
+/// word: `remuda_protocol::creator_permission::launched_mode`, the single
+/// spelling map the Hub also reads a creator's recorded mode through (D-057
+/// OA1), so what the Node launches and what the Hub calls "the creator's
+/// mode" can never disagree.
+fn canonical_mode<T: serde::de::DeserializeOwned>(kind: &str, launch: &DriverLaunch) -> Option<T> {
+    let word = remuda_protocol::creator_permission::launched_mode(
+        kind,
+        Some(launch.request.permission_mode.as_str()),
+    );
+    serde_json::from_value(serde_json::Value::String(word.to_owned())).ok()
+}
+
 fn build_permission_mode(
     launch: &DriverLaunch,
     claude_mode: ClaudePermissionMode,
@@ -1527,12 +1546,8 @@ fn build_permission_mode(
             }))
         }
         AgentKind::Codex => {
-            let policy = match launch.request.permission_mode.as_str() {
-                "never" | "no-request" => ApprovalPolicy::Never,
-                "on-request" | "onRequest" => ApprovalPolicy::OnRequest,
-                "untrusted" => ApprovalPolicy::Untrusted,
-                _ => ApprovalPolicy::Untrusted,
-            };
+            let policy = canonical_mode::<ApprovalPolicy>("codex", launch)
+                .unwrap_or(ApprovalPolicy::Untrusted);
             let sandbox = match launch
                 .request
                 .sandbox
@@ -1550,26 +1565,13 @@ fn build_permission_mode(
             }))
         }
         AgentKind::Grok => {
-            let mode = match launch.request.permission_mode.as_str() {
-                "always-approve" | "alwaysApprove" | "bypassPermissions" => {
-                    GrokPermissionMode::AlwaysApprove
-                }
-                "auto" => GrokPermissionMode::Auto,
-                "native-prompt" | "nativePrompt" => GrokPermissionMode::NativePrompt,
-                _ => GrokPermissionMode::NativePrompt,
-            };
+            let mode = canonical_mode::<GrokPermissionMode>("grok", launch)
+                .unwrap_or(GrokPermissionMode::NativePrompt);
             PermissionMode::Grok(Box::new(GrokPermission { mode }))
         }
         AgentKind::Agy => {
-            let mode = match launch.request.permission_mode.as_str() {
-                "always-proceed" | "alwaysProceed" | "bypassPermissions" => {
-                    AgyPermissionMode::AlwaysProceed
-                }
-                "accept-edits" | "acceptEdits" => AgyPermissionMode::AcceptEdits,
-                "plan" => AgyPermissionMode::Plan,
-                "native" => AgyPermissionMode::Native,
-                _ => AgyPermissionMode::Native,
-            };
+            let mode = canonical_mode::<AgyPermissionMode>("agy", launch)
+                .unwrap_or(AgyPermissionMode::Native);
             PermissionMode::Agy(Box::new(AgyPermission { mode }))
         }
         AgentKind::Generic => PermissionMode::Generic(Box::new(GenericPermission {
@@ -1584,20 +1586,14 @@ fn instance_spec(
     profile: &ProviderProfile,
 ) -> Result<InstanceSpec, DriverError> {
     let object_id = || Id::new("obj").map_err(|error| DriverError::Failed(error.to_string()));
-    let mode = match launch.request.permission_mode.as_str() {
-        "auto" => ClaudePermissionMode::Auto,
-        "acceptEdits" | "accept-edits" => ClaudePermissionMode::AcceptEdits,
-        "dontAsk" | "dont-ask" => ClaudePermissionMode::DontAsk,
-        "plan" => ClaudePermissionMode::Plan,
-        // "bypass" is the spelling the Hub's own project defaults normalize
-        // *from* and what operators and scripts actually send; without it the
-        // request fell through to `Manual`, so a session asked for in bypass
-        // launched in manual mode and never had its disclaimer suppressed.
-        "bypassPermissions" | "bypass-permissions" | "bypass" => {
-            ClaudePermissionMode::BypassPermissions
-        }
-        _ => ClaudePermissionMode::Manual,
-    };
+    // The spelling map is the one the Hub reads a creator's recorded mode
+    // through (D-057 OA1): `bypass` is the spelling the Hub's own project
+    // defaults normalize *from* and what operators and scripts actually send;
+    // without it the request fell through to `Manual`, so a session asked for
+    // in bypass launched in manual mode and never had its disclaimer
+    // suppressed.
+    let mode = canonical_mode::<ClaudePermissionMode>("claude", &launch)
+        .unwrap_or(ClaudePermissionMode::Manual);
     // The real per-harness permission union. Claude rides the mode above;
     // Codex's axis is approval policy (+ an optional sandbox mode), Grok and
     // agy their own native enums. A mode not in the harness's own set falls
@@ -1864,6 +1860,7 @@ mod tests {
             .expect("instance");
             let instance_id = instance.meta.id.clone();
             let request = crate::CreateInstanceRequest {
+                creator_permission_mode: None,
                 memory_context: None,
                 initiator: None,
                 origin: InputOrigin::Human,
@@ -2079,6 +2076,7 @@ mod tests {
                 fixture_instance(InstanceId::new(), HostId::new(), WorkspaceId::new(), kind)
                     .expect("instance");
             let request = crate::CreateInstanceRequest {
+                creator_permission_mode: None,
                 memory_context: None,
                 initiator: None,
                 origin: InputOrigin::Human,
@@ -2354,6 +2352,7 @@ mod tests {
             )
             .expect("instance");
             let request = crate::CreateInstanceRequest {
+                creator_permission_mode: None,
                 memory_context: None,
                 initiator: None,
                 origin: InputOrigin::Human,
@@ -2416,6 +2415,7 @@ mod tests {
         )
         .expect("instance");
         let request = crate::CreateInstanceRequest {
+            creator_permission_mode: None,
             memory_context: None,
             initiator: None,
             origin: InputOrigin::Human,
@@ -2469,6 +2469,7 @@ mod tests {
     #[test]
     fn parse_delegation_prefers_explicit_field_then_profile_id() {
         let mut request = crate::CreateInstanceRequest {
+            creator_permission_mode: None,
             memory_context: None,
             initiator: None,
             origin: InputOrigin::Human,
@@ -2526,6 +2527,7 @@ mod tests {
         )
         .expect("instance");
         let request = crate::CreateInstanceRequest {
+            creator_permission_mode: None,
             memory_context: None,
             initiator: None,
             origin: remuda_protocol::InputOrigin::Agent,
@@ -2587,6 +2589,7 @@ mod tests {
         )
         .expect("instance");
         let request = crate::CreateInstanceRequest {
+            creator_permission_mode: None,
             memory_context: None,
             initiator: None,
             origin: remuda_protocol::InputOrigin::Agent,
@@ -3071,6 +3074,7 @@ mod tests {
         )
         .expect("instance");
         let request = crate::CreateInstanceRequest {
+            creator_permission_mode: None,
             memory_context: None,
             initiator: None,
             origin: remuda_protocol::InputOrigin::Agent,
@@ -3496,6 +3500,7 @@ mod tests {
         );
         for spelling in ["bypass", "bypassPermissions", "bypass-permissions"] {
             assert!(request_is_bypass(&crate::CreateInstanceRequest {
+                creator_permission_mode: None,
                 memory_context: None,
                 permission_mode: spelling.into(),
                 ..test_create_request()
@@ -3503,6 +3508,7 @@ mod tests {
         }
         for spelling in ["manual", "acceptEdits", "plan", "auto", ""] {
             assert!(!request_is_bypass(&crate::CreateInstanceRequest {
+                creator_permission_mode: None,
                 memory_context: None,
                 permission_mode: spelling.into(),
                 ..test_create_request()
@@ -3512,6 +3518,7 @@ mod tests {
 
     fn test_create_request() -> crate::CreateInstanceRequest {
         crate::CreateInstanceRequest {
+            creator_permission_mode: None,
             memory_context: None,
             initiator: None,
             origin: InputOrigin::Human,

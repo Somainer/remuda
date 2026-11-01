@@ -77,6 +77,7 @@ async fn a_failed_first_carrier_close_is_completed_once_by_a_retry() {
     .unwrap();
 
     let driver = Arc::new(ClaudePtyDriver::new(ClaudePtyOptions {
+        creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
         instance_id: None,
         media_stager: None,

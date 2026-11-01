@@ -8,7 +8,7 @@
 //! them during the move.
 
 use crate::error::{DriverError, DriverResult};
-use crate::materializer::LaunchOrigin;
+use crate::materializer::{CreatorControl, LaunchOrigin};
 use remuda_protocol::{AgentKind, ClaudePermissionMode, InstanceSpec, PermissionMode};
 
 /// Per-kind PTY launch conventions.
@@ -143,18 +143,31 @@ pub fn preset_for_spec(spec: &InstanceSpec) -> DriverResult<&'static KindPreset>
         .ok_or_else(|| DriverError::InvalidLaunchSpec(format!("no launch preset for kind {id}")))
 }
 
-/// Append the preset's yolo argv when — and only when — D-011 / D-017 allow it.
+/// Append the preset's yolo argv when — and only when — D-011 / D-017 and
+/// D-057 OA1 allow it (protocol.md §4.3).
 ///
-/// Two independent gates, both required: the spec explicitly asks for
-/// `bypassPermissions`, and the launch did not originate from an agent. A bot
-/// dispatcher may pass a human's explicit bypass through, but never mint one.
+/// Two independent gates, both required:
+/// - the child's resolved mode is exactly the control-off mode this argv
+///   implements. Only the Claude row's `--dangerously-skip-permissions` is
+///   merged here, for `bypassPermissions` (never `dontAsk`); the Codex, Grok
+///   and Agy control-off modes reach their CLIs through the materializer's own
+///   permission flags, which `permission_plan` gates by the same rule. An
+///   explicit control-on mode never gets a yolo argv;
+/// - the origin is Human or Bot, or Agent whose Agent creator itself runs with
+///   its control off (the Hub's `creatorPermissionMode` stamp). A bot
+///   dispatcher may pass a human's explicit bypass through, but never mint one.
 pub fn merge_yolo_argv(
     argv: &mut Vec<String>,
     preset: &KindPreset,
     permission: &PermissionMode,
     origin: LaunchOrigin,
+    creator: CreatorControl,
 ) {
-    if !matches!(origin, LaunchOrigin::Human | LaunchOrigin::Bot)
+    let origin_admits = match origin {
+        LaunchOrigin::Human | LaunchOrigin::Bot => true,
+        LaunchOrigin::Agent => creator == CreatorControl::Off,
+    };
+    if !origin_admits
         || !matches!(permission, PermissionMode::Claude(mode) if mode.mode == ClaudePermissionMode::BypassPermissions)
     {
         return;
@@ -185,30 +198,38 @@ mod tests {
         assert!(preset_by_id("claude").unwrap().settings_flag);
     }
 
+    /// D-057 OA1 matrix for the yolo argv: preset × origin × creator ×
+    /// every Claude mode. Merged only for exactly `bypassPermissions`, and
+    /// for an Agent only under a control-off creator.
     #[test]
-    fn yolo_requires_explicit_bypass_and_non_agent_origin_for_every_preset() {
+    fn yolo_requires_exact_bypass_and_an_origin_the_creator_rule_admits() {
         for name in ["claude", "codex", "grok", "agy", "gemini"] {
             let preset = preset_by_id(name).unwrap();
             for origin in [LaunchOrigin::Human, LaunchOrigin::Bot, LaunchOrigin::Agent] {
-                for mode in [
-                    ClaudePermissionMode::Manual,
-                    ClaudePermissionMode::DontAsk,
-                    ClaudePermissionMode::BypassPermissions,
-                ] {
-                    let mut argv = vec!["--name".into(), "worker".into()];
-                    let permission = PermissionMode::Claude(Box::new(ClaudePermission {
-                        mode,
-                        interaction: ClaudeInteractionMode::NativeTty,
-                    }));
-                    merge_yolo_argv(&mut argv, preset, &permission, origin);
-                    let allowed = mode == ClaudePermissionMode::BypassPermissions
-                        && origin != LaunchOrigin::Agent;
-                    for flag in preset.yolo_argv {
-                        assert_eq!(
-                            argv.iter().any(|arg| arg == flag),
-                            allowed,
-                            "{name} {origin:?} {mode:?}"
-                        );
+                for creator in [CreatorControl::On, CreatorControl::Off] {
+                    for mode in [
+                        ClaudePermissionMode::Manual,
+                        ClaudePermissionMode::Auto,
+                        ClaudePermissionMode::AcceptEdits,
+                        ClaudePermissionMode::Plan,
+                        ClaudePermissionMode::DontAsk,
+                        ClaudePermissionMode::BypassPermissions,
+                    ] {
+                        let mut argv = vec!["--name".into(), "worker".into()];
+                        let permission = PermissionMode::Claude(Box::new(ClaudePermission {
+                            mode,
+                            interaction: ClaudeInteractionMode::NativeTty,
+                        }));
+                        merge_yolo_argv(&mut argv, preset, &permission, origin, creator);
+                        let allowed = mode == ClaudePermissionMode::BypassPermissions
+                            && (origin != LaunchOrigin::Agent || creator == CreatorControl::Off);
+                        for flag in preset.yolo_argv {
+                            assert_eq!(
+                                argv.iter().any(|arg| arg == flag),
+                                allowed,
+                                "{name} {origin:?} {creator:?} {mode:?}"
+                            );
+                        }
                     }
                 }
             }

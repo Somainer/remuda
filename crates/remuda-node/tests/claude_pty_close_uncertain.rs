@@ -98,6 +98,7 @@ async fn a_restart_between_the_verified_audit_and_close_aborts_uncertain_and_spa
     // The polite wait is bounded short; the agent ignores ctrl+c anyway.
 
     let driver = ClaudePtyDriver::new(ClaudePtyOptions {
+        creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
         instance_id: None,
         media_stager: None,

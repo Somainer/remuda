@@ -13,6 +13,17 @@ pub enum DriverError {
     /// Bypass/yolo is only allowed on human-originated specs. `decisions.md` D-011.
     #[error("bypass permissions (yolo) is not allowed for bot/dispatcher-originated specs")]
     BypassNotAllowedForBot,
+    /// D-057 OA1: an Agent-origin launch asked for a mode that switches its
+    /// harness's permission control off, and the Hub stamp says its Agent
+    /// creator keeps its own control on (or there is no stamp at all).
+    #[error(
+        "permission mode {mode} switches the harness's permission control off, and the Agent \
+         creator keeps its own control on: a child never runs beyond its creator (D-057 OA1)"
+    )]
+    BeyondCreator {
+        /// The refused control-off mode, in its wire spelling.
+        mode: String,
+    },
     /// Direct provider rotation is v2. `decisions.md` D-012.
     #[error("direct provider delegation is v2")]
     DirectDelegationV2,
@@ -94,6 +105,7 @@ impl DriverError {
         match self {
             Self::InvalidLaunchSpec(_) => ErrorCode::InvalidLaunchSpec,
             Self::BypassNotAllowedForBot => ErrorCode::InvalidLaunchSpec,
+            Self::BeyondCreator { .. } => ErrorCode::InvalidLaunchSpec,
             Self::DirectDelegationV2 => ErrorCode::CapabilityUnsupported,
             Self::NativeFeatureDisabled(_) => ErrorCode::NativeFeatureDisabled,
             Self::ProviderProtocolMismatch(_) => ErrorCode::ProviderProtocolMismatch,

@@ -178,6 +178,14 @@ pub struct CreateInstanceRequest {
     /// whose index was re-rendered is still the same create.
     #[serde(skip)]
     pub memory_context: Option<remuda_protocol::hubnode::MemoryContext>,
+    /// D-057 OA1: the Hub-stamped `creatorPermissionMode` of an Agent-origin
+    /// create or resume — the creator chapter's effective mode, read at the
+    /// create's commit point. Read only from the top level of the forwarded
+    /// params by [`Self::take_creator_permission_mode`], never from the spec
+    /// or a local request body; the materializer applies "never beyond the
+    /// creator" from it (absent reads as control on: fail closed).
+    #[serde(skip)]
+    pub creator_permission_mode: Option<String>,
 }
 
 impl CreateInstanceRequest {
@@ -189,6 +197,23 @@ impl CreateInstanceRequest {
             .get("memoryContext")
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok());
+    }
+
+    /// Carry the Hub-stamped `creatorPermissionMode` from the top level of
+    /// the forwarded create/resume `params` (D-057 OA1). A copy nested in the
+    /// spec is not the Hub's and is ignored; a non-string value carries
+    /// nothing.
+    pub fn take_creator_permission_mode(&mut self, params: &serde_json::Value) {
+        self.creator_permission_mode = params
+            .get(remuda_protocol::creator_permission::CREATOR_PERMISSION_MODE_FIELD)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+    }
+
+    /// D-057 OA1: the creator classification the launch materializer reads.
+    #[must_use]
+    pub fn creator_control(&self) -> remuda_driver::CreatorControl {
+        remuda_driver::CreatorControl::from_stamp(self.creator_permission_mode.as_deref())
     }
 
     /// Copy launch fields that Hub stores on `spec` onto the Node request.
@@ -519,6 +544,39 @@ mod tests {
                 assert!(!effort.ultracode, "{spec}");
             }
         }
+    }
+
+    /// D-057 OA1: the creator stamp is the Hub's, read only from the top
+    /// level of the forwarded params. A local request body and a copy nested
+    /// in the spec carry nothing, so they read as control on (fail closed).
+    #[test]
+    fn the_creator_stamp_is_read_only_from_the_top_level_params() {
+        let mut request: CreateInstanceRequest = serde_json::from_value(json!({
+            "kind": "claude",
+            "creatorPermissionMode": "bypassPermissions",
+        }))
+        .unwrap();
+        assert_eq!(
+            request.creator_permission_mode, None,
+            "a body never sets it"
+        );
+        request.take_creator_permission_mode(&json!({
+            "spec": { "creatorPermissionMode": "bypassPermissions" },
+        }));
+        assert_eq!(
+            request.creator_permission_mode, None,
+            "the spec copy is ignored"
+        );
+        assert_eq!(request.creator_control(), remuda_driver::CreatorControl::On);
+        request.take_creator_permission_mode(&json!({ "creatorPermissionMode": "dontAsk" }));
+        assert_eq!(
+            request.creator_control(),
+            remuda_driver::CreatorControl::Off
+        );
+        request.take_creator_permission_mode(&json!({ "creatorPermissionMode": "auto" }));
+        assert_eq!(request.creator_control(), remuda_driver::CreatorControl::On);
+        request.take_creator_permission_mode(&json!({ "creatorPermissionMode": true }));
+        assert_eq!(request.creator_permission_mode, None);
     }
 
     #[test]

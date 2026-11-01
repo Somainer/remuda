@@ -186,6 +186,7 @@ fn driver_for(root: &Path, scenario_path: &Path, events_path: &Path) -> ShellPty
         workspace.clone(),
         AgentKind::Claude,
         AgentLaunch {
+            creator: remuda_driver::CreatorControl::default(),
             profile: Box::new(profile()),
             launch_dir: instance_dir.join("launch"),
             native_home: native_home.clone(),

@@ -26,6 +26,7 @@ fn loopback_config(root: &std::path::Path) -> DevServerConfig {
 
 fn create_req(kind: AgentKind, driver: DriverKind) -> CreateInstanceRequest {
     CreateInstanceRequest {
+        creator_permission_mode: None,
         memory_context: None,
         initiator: None,
         origin: remuda_protocol::InputOrigin::Human,

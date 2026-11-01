@@ -7,7 +7,9 @@ use crate::binary::BinaryPin;
 use crate::capabilities::{ADAPTER_VERSION, capability_snapshot};
 use crate::driver::{Driver, DriverAck, RunHandle};
 use crate::error::{DriverError, DriverResult};
-use crate::materializer::{BinarySource, MaterializeRequest, SessionAction, materialize};
+use crate::materializer::{
+    BinarySource, CreatorControl, MaterializeRequest, SessionAction, materialize,
+};
 use crate::profile::{EnvFileSecretBroker, ProviderProfile, SecretBroker};
 use crate::recipe::{EnvAllowlistSource, LaunchRecipe};
 use async_trait::async_trait;
@@ -72,8 +74,11 @@ pub struct ClaudePrintOptions {
     pub inherit_default_config: bool,
     /// Binary to pin and exec.
     pub binary: BinarySource,
-    /// Launch origin; bot/agent cannot request bypass (D-011).
+    /// Launch origin; bot cannot request bypass (D-011), and an agent only
+    /// under a control-off creator (D-057 OA1).
     pub origin: InputOrigin,
+    /// D-057 OA1: the Hub's stamp on an Agent launch's creator.
+    pub creator: CreatorControl,
     /// Secret resolver.
     pub broker: Arc<dyn SecretBroker>,
     /// Extra env (tests set `FAKE_CLAUDE_SCRIPT` here).
@@ -119,6 +124,7 @@ impl ClaudePrintOptions {
             inherit_default_config: false,
             binary,
             origin: InputOrigin::Agent,
+            creator: CreatorControl::default(),
             broker: Arc::new(EnvFileSecretBroker::env_only()),
             extra_env: std::collections::BTreeMap::new(),
             agent_mcp: None,
@@ -1159,7 +1165,7 @@ impl ClaudePrintDriver {
                 spec.driver
             )));
         }
-        reject_bot_bypass(&spec, self.options.origin)?;
+        reject_bot_bypass(&spec, self.options.origin, self.options.creator)?;
         let session_id = session.session_id().to_string();
         let request = MaterializeRequest {
             spec: &spec,
@@ -1171,6 +1177,7 @@ impl ClaudePrintDriver {
             binary: self.options.binary.clone(),
             setting_sources: self.options.setting_sources.clone(),
             origin: self.options.origin.into(),
+            creator: self.options.creator,
             native_home_managed: Some(!self.options.inherit_default_config),
             settings_overlay_path: self.options.settings_overlay_path.clone(),
             secret_policy: None,
@@ -6966,16 +6973,26 @@ fn prompt_text(blocks: &[ContentBlock]) -> DriverResult<String> {
     Ok(parts.join(""))
 }
 
-fn reject_bot_bypass(spec: &InstanceSpec, origin: InputOrigin) -> DriverResult<()> {
+fn reject_bot_bypass(
+    spec: &InstanceSpec,
+    origin: InputOrigin,
+    creator: CreatorControl,
+) -> DriverResult<()> {
     let gated = match &spec.permission_mode {
         PermissionMode::Claude(claude) => matches!(
             claude.mode,
             ClaudePermissionMode::BypassPermissions | ClaudePermissionMode::DontAsk
-        ),
-        _ => false,
+        )
+        .then_some(claude.mode),
+        _ => None,
     };
-    if gated && matches!(origin, InputOrigin::Bot | InputOrigin::Agent) {
-        return Err(DriverError::BypassNotAllowedForBot);
+    if let Some(mode) = gated
+        && !crate::materializer::control_off_allowed(origin.into(), creator)
+    {
+        return Err(crate::materializer::control_off_refusal(
+            origin.into(),
+            remuda_protocol::permission_mode_wire(mode),
+        ));
     }
     Ok(())
 }
@@ -9066,9 +9083,14 @@ pub mod review {
         Ok(serde_json::to_value(&inbound)?)
     }
 
-    /// Driver-level bot/dontAsk/bypass gate.
-    pub fn reject_bot(spec: &InstanceSpec, origin: InputOrigin) -> DriverResult<()> {
-        reject_bot_bypass(spec, origin)
+    /// Driver-level bot/dontAsk/bypass gate. An Agent origin is judged under
+    /// `creator`, the Hub's stamp (D-057 OA1).
+    pub fn reject_bot(
+        spec: &InstanceSpec,
+        origin: InputOrigin,
+        creator: CreatorControl,
+    ) -> DriverResult<()> {
+        reject_bot_bypass(spec, origin, creator)
     }
 
     /// Final argv check for `--bare` / `--no-session-persistence`.

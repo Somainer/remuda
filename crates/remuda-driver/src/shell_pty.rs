@@ -4403,6 +4403,7 @@ mod tests {
             workspace.clone(),
             AgentKind::Codex,
             AgentLaunch {
+                creator: crate::materializer::CreatorControl::default(),
                 profile: Box::new(crate::profile::ProviderProfile {
                     id: spec.provider_profile.id.clone(),
                     kind: ProviderKind::OpenaiResponses,
@@ -4892,6 +4893,7 @@ mod tests {
             dir.path().to_path_buf(),
             AgentKind::Claude,
             AgentLaunch {
+                creator: crate::materializer::CreatorControl::default(),
                 profile: Box::new(crate::profile::ProviderProfile {
                     id: spec.provider_profile.id.clone(),
                     kind: ProviderKind::Anthropic,
@@ -5148,6 +5150,7 @@ mod tests {
             workspace.clone(),
             AgentKind::Claude,
             AgentLaunch {
+                creator: crate::materializer::CreatorControl::default(),
                 profile: Box::new(crate::profile::ProviderProfile {
                     id: spec.provider_profile.id.clone(),
                     kind: ProviderKind::Anthropic,
@@ -5334,6 +5337,7 @@ mod tests {
             dir.path().to_path_buf(),
             AgentKind::Claude,
             AgentLaunch {
+                creator: crate::materializer::CreatorControl::default(),
                 profile: Box::new(crate::profile::ProviderProfile {
                     id: spec.provider_profile.id.clone(),
                     kind: ProviderKind::Anthropic,
@@ -5439,6 +5443,7 @@ mod tests {
                 dir.path().to_path_buf(),
                 AgentKind::Claude,
                 AgentLaunch {
+                    creator: crate::materializer::CreatorControl::default(),
                     profile: Box::new(crate::profile::ProviderProfile {
                         id: spec.provider_profile.id.clone(),
                         kind: ProviderKind::Anthropic,
@@ -5625,6 +5630,7 @@ mod tests {
                 dir.path().to_path_buf(),
                 AgentKind::Claude,
                 AgentLaunch {
+                    creator: crate::materializer::CreatorControl::default(),
                     profile: Box::new(crate::profile::ProviderProfile {
                         id: spec.provider_profile.id.clone(),
                         kind: ProviderKind::Anthropic,
@@ -5812,6 +5818,7 @@ mod tests {
             dir.path().to_path_buf(),
             AgentKind::Claude,
             AgentLaunch {
+                creator: crate::materializer::CreatorControl::default(),
                 profile: Box::new(crate::profile::ProviderProfile {
                     id: spec.provider_profile.id.clone(),
                     kind: ProviderKind::Anthropic,
@@ -5951,6 +5958,7 @@ mod tests {
             dir.path().to_path_buf(),
             AgentKind::Claude,
             AgentLaunch {
+                creator: crate::materializer::CreatorControl::default(),
                 profile: Box::new(crate::profile::ProviderProfile {
                     id: spec.provider_profile.id.clone(),
                     kind: ProviderKind::Anthropic,
@@ -7857,6 +7865,7 @@ mod tests {
             dir.path().to_path_buf(),
             AgentKind::Codex,
             AgentLaunch {
+                creator: crate::materializer::CreatorControl::default(),
                 profile: Box::new(crate::profile::ProviderProfile {
                     id: spec.provider_profile.id.clone(),
                     kind: ProviderKind::OpenaiResponses,

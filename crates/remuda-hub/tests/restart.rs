@@ -33,6 +33,8 @@ struct FakeNode {
     appends: tokio::sync::mpsc::UnboundedSender<(String, Value)>,
     /// Scripted `lineage.fence` acknowledgements, one per delivery.
     acks: AckScript,
+    /// Methods answered with a JSON-RPC error `(code, message)`.
+    errors: Arc<Mutex<std::collections::HashMap<String, (i64, String)>>>,
     node_token: Option<String>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -95,6 +97,8 @@ impl FakeNode {
         assert!(hello.get("result").is_some(), "hello failed: {hello}");
         let node_token = hello["result"]["nodeToken"].as_str().map(str::to_owned);
         let acks: AckScript = Arc::default();
+        let errors: Arc<Mutex<std::collections::HashMap<String, (i64, String)>>> = Arc::default();
+        let task_errors = Arc::clone(&errors);
         let (frame_tx, frames) = tokio::sync::mpsc::unbounded_channel();
         let (appends, mut append_rx) = tokio::sync::mpsc::unbounded_channel::<(String, Value)>();
         let task_acks = Arc::clone(&acks);
@@ -117,7 +121,10 @@ impl FakeNode {
                         let params = frame["params"].clone();
                         if frame_tx.send((method.clone(), params.clone())).is_err() { break; }
                         if id.is_null() { continue; }
-                        let reply = if method == "lineage.fence" {
+                        let scripted = task_errors.lock().unwrap().get(&method).cloned();
+                        let reply = if let Some((code, message)) = scripted {
+                            json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}})
+                        } else if method == "lineage.fence" {
                             let outcomes = task_acks
                                 .lock()
                                 .unwrap()
@@ -140,6 +147,7 @@ impl FakeNode {
             frames,
             appends,
             acks,
+            errors,
             node_token,
             task: Some(task),
         })
@@ -2125,5 +2133,62 @@ async fn the_boot_evaluation_records_old_deaths_without_relaunching_them() -> Re
     // The expired seat is still resumable by its owner.
     let resumed = ctx.resume(&old).await?;
     assert_eq!(resumed.status(), 200, "{}", resumed.text().await?);
+    Ok(())
+}
+
+// ── r2 item 8: a notice whose successor create was rejected ─────────────
+
+/// The successor's host rejects its create (a non-fence reason): the restart
+/// notice can never follow it, so the next evaluation settles the notice
+/// `cancelled` with reason `successor-create-rejected` instead of leaving it
+/// queued forever. It is never sent.
+#[tokio::test]
+async fn a_notice_whose_successor_create_was_rejected_is_cancelled() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host, true).await?;
+    let seat = ctx.seat(&mut node).await?;
+    ctx.report_running(&node, &seat, SESSION).await?;
+    node.errors.lock().unwrap().insert(
+        "instance.resume".into(),
+        (-32000, "resume refused: the native session is gone".into()),
+    );
+    ctx.report_killed(&node, &seat).await?;
+    let decided = ctx.supervise().await;
+    assert_eq!(decided.len(), 1, "{decided:?}");
+    let record = ctx.lineage(&seat).await?;
+    let notice = record["restartDecisions"][0]["noticeCommandId"]
+        .as_str()
+        .context("notice")?
+        .to_owned();
+    let create_state: (String, Option<String>) = ctx.db()?.query_row(
+        "SELECT c.state, c.settlement_outcome FROM commands c
+           JOIN lineage_restart_decisions d ON d.create_command_id = c.id
+          WHERE d.failed_instance_id = ?1",
+        rusqlite::params![seat],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!(create_state, ("settled".into(), Some("rejected".into())));
+    // The next evaluation settles the orphaned notice.
+    ctx.supervise().await;
+    let row: (String, Option<String>, Option<String>, bool) = ctx.db()?.query_row(
+        "SELECT state, settlement_outcome, settlement_reason, forwarded FROM commands WHERE id = ?1",
+        rusqlite::params![notice],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    assert_eq!(
+        row,
+        (
+            "settled".into(),
+            Some("cancelled".into()),
+            Some("successor-create-rejected".into()),
+            false
+        )
+    );
+    assert!(
+        node.drain()
+            .iter()
+            .all(|(method, _)| method != "instance.send"),
+        "the notice is never sent"
+    );
     Ok(())
 }

@@ -543,6 +543,10 @@ pub(crate) async fn c1_replaces_exit_push(state: &AppState, instance_id: &str) -
         .is_some_and(|policy| policy.on_process_loss)
 }
 
+/// Settlement reason of a restart notice whose successor create was
+/// rejected or withheld for a non-fence reason.
+pub(crate) const NOTICE_ORPHANED_REASON: &str = "successor-create-rejected";
+
 /// The fixed tag the restart notice opens with (§6.4).
 pub(crate) const NOTICE_TAG: &str = "<remuda-restart>";
 
@@ -796,6 +800,44 @@ impl Store {
         .await
     }
 
+    /// Settle every still-queued restart notice whose successor create was
+    /// rejected or withheld for a reason other than a fence: the notice can
+    /// never follow that create. Settled `cancelled`, reason
+    /// `successor-create-rejected`. (A fenced create's notice was already
+    /// cancelled by the F that fenced it.) Returns the settled command ids.
+    async fn settle_orphan_notices(&self) -> Result<Vec<String>, StoreError> {
+        self.run_named("restart_orphan_notices", |conn| {
+            let tx = immediate_tx(conn)?;
+            let ids: Vec<String> = {
+                let mut stmt = tx.prepare(
+                    "SELECT n.id FROM lineage_restart_decisions d
+                       JOIN commands n ON n.id = d.notice_command_id
+                       JOIN commands c ON c.id = d.create_command_id
+                      WHERE n.state = 'queued' AND n.forwarded = 0
+                        AND c.state = 'settled'
+                        AND c.settlement_outcome IN ('rejected', 'withheld')
+                        AND COALESCE(c.settlement_reason, '') != ?1",
+                )?;
+                stmt.query_map(params![remuda_protocol::FENCED_REASON], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let now = crate::config::now_rfc3339();
+            for id in &ids {
+                tx.execute(
+                    "UPDATE commands
+                        SET state = 'settled', resolution = 'clear',
+                            settlement_outcome = 'cancelled', settlement_reason = ?2,
+                            updated_at = ?3
+                      WHERE id = ?1 AND state = 'queued' AND forwarded = 0",
+                    params![id, NOTICE_ORPHANED_REASON, now],
+                )?;
+            }
+            tx.commit()?;
+            Ok(ids)
+        })
+        .await
+    }
+
     /// Restart notices still queued for a host without fence support: §6.4
     /// sends hub-origin input only to Nodes that advertise it.
     async fn notices_for_incapable_hosts(&self) -> Result<Vec<(String, String)>, StoreError> {
@@ -862,6 +904,14 @@ impl Store {
 /// and never sent. Each notice is sent once: its forward intent is the
 /// replay identity.
 pub(crate) async fn drive_notices(state: &AppState) {
+    match state.store.settle_orphan_notices().await {
+        Ok(ids) => {
+            for id in ids {
+                tracing::info!(notice = %id, "restart notice cancelled: its successor create was rejected");
+            }
+        }
+        Err(error) => tracing::warn!(%error, "could not settle orphaned restart notices"),
+    }
     if let Ok(incapable) = state.store.notices_for_incapable_hosts().await {
         for (command_id, host_id) in incapable {
             let error = crate::error::HubError::node_lacks_fence(&host_id);
@@ -1219,6 +1269,10 @@ pub(crate) async fn boot(state: &AppState) {
 /// safe (the CAS and the key decide at most once) and the C1 suites run them
 /// concurrently on purpose.
 pub(crate) async fn evaluate(state: &AppState) -> Vec<Decided> {
+    // §6.4 bookkeeping first: a notice orphaned by a rejected successor
+    // create settles with that reason before any new F could cancel it as
+    // fenced, and notices due since the last tick go out.
+    drive_notices(state).await;
     let candidates = match state.store.restart_candidates().await {
         Ok(rows) => rows,
         Err(error) => {

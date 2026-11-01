@@ -24,7 +24,6 @@ use remuda_node::{
     NativeDriverConfig, ServeConfig,
 };
 use remuda_protocol::{AgentKind, DriverKind};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -43,7 +42,7 @@ fn install_fake_codex(root: &Path) -> PathBuf {
     let install = root.join("opt/bin");
     std::fs::create_dir_all(&install).unwrap();
     let dest = install.join("codex");
-    std::fs::write(
+    remuda_testing::install_at(
         &dest,
         r##"#!/bin/sh
 case "$1" in --version|version) echo 'codex 0.154.0'; exit 0;; esac
@@ -65,7 +64,6 @@ sleep 60
 "##,
     )
     .unwrap();
-    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).unwrap();
     dest
 }
 

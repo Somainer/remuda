@@ -4024,6 +4024,34 @@ pub mod test_barrier {
         notified.await;
     }
 
+    // Timeout texts are built with `concat!`: a wrapped literal's indentation
+    // survives a `\` continuation only if the next line is unindented, which
+    // rustfmt will undo, and the resulting runs of spaces in a panic message
+    // are invisible to every reader until the test fails.
+    fn result_enqueue_parked_timeout() -> String {
+        concat!(
+            "write_commit barrier: timed out waiting for the reader to park on ",
+            "the shut result-enqueue gate"
+        )
+        .to_owned()
+    }
+
+    fn backlog_overflow_timeout() -> String {
+        concat!(
+            "write_commit barrier: timed out waiting for the publication ",
+            "backlog overflow"
+        )
+        .to_owned()
+    }
+
+    fn overflow_kill_waiting_timeout() -> String {
+        concat!(
+            "write_commit barrier: timed out waiting for the overflow kill to ",
+            "contend on the live handle"
+        )
+        .to_owned()
+    }
+
     impl WriteCommitBarrier {
         /// r10 item 1: wait until `n` send callers have reached the `write_seq`
         /// lock await (the nth is parked behind the holder when the previous
@@ -4147,7 +4175,7 @@ pub mod test_barrier {
                     state.result_enqueue_parked.load(Ordering::Acquire)
                         && !state.result_enqueue_open.load(Ordering::Acquire)
                 },
-                || "write_commit barrier: timed out waiting for the reader to park on                     the shut result-enqueue gate".to_owned(),
+                result_enqueue_parked_timeout,
             )
             .await;
         }
@@ -4173,7 +4201,7 @@ pub mod test_barrier {
                 &self.state,
                 deadline,
                 |state| state.backlog_overflowed.load(Ordering::Acquire),
-                || "write_commit barrier: timed out waiting for the publication                     backlog overflow".to_owned(),
+                backlog_overflow_timeout,
             )
             .await;
         }
@@ -4241,7 +4269,7 @@ pub mod test_barrier {
                 &self.state,
                 deadline,
                 |state| state.overflow_kill_waiting.load(Ordering::Acquire),
-                || "write_commit barrier: timed out waiting for the overflow kill to                     contend on the live handle".to_owned(),
+                overflow_kill_waiting_timeout,
             )
             .await;
         }
@@ -4836,6 +4864,26 @@ pub mod test_barrier {
             // the worker. The slot is per-driver and is overwritten by the next
             // arm (or dies with the Inner), so it needs no global clearing.
             self.release();
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// A wrapped literal must not leave its indentation in the rendered
+        /// message: the panic text is the only thing a failing barrier test
+        /// shows, and runs of spaces make it hard to read.
+        #[test]
+        fn timeout_messages_have_single_spaces() {
+            for message in [
+                result_enqueue_parked_timeout(),
+                backlog_overflow_timeout(),
+                overflow_kill_waiting_timeout(),
+            ] {
+                assert!(!message.contains("  "), "run of spaces in {message:?}");
+                assert_eq!(message.trim(), message, "trailing space in {message:?}");
+            }
         }
     }
 }

@@ -53,6 +53,9 @@ struct Fixture {
     lane: std::path::PathBuf,
     target: std::path::PathBuf,
     bin: std::path::PathBuf,
+    /// Directory holding the fixture's own executables; it leads the Node's
+    /// controlled PATH, so the host never probes the developer's installs.
+    path: std::path::PathBuf,
     tmp: std::path::PathBuf,
 }
 
@@ -100,7 +103,9 @@ fn fixture() -> Fixture {
     // scratch is pid-named so only this run tails it and is removed on exit.
     // Fake shas are fine for a verify — pinning the merge only warns when the
     // object is absent.
-    let bin = dir.path().join("fake-merge.sh");
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let bin = bin_dir.join("fake-merge.sh");
     let script = r#"#!/bin/bash
 set -eu
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/remuda-mq-$$-0-XXXXXX")
@@ -112,9 +117,9 @@ cat <<'JSON'
 {"exitCode":0,"status":"verified","branch":"wt/fake/task","base":"1111111111111111111111111111111111111111","head":"2222222222222222222222222222222222222222","merged":"3333333333333333333333333333333333333333","steps":[{"name":"secret-scan","status":"ok","durationMs":11},{"name":"cargo-test","status":"ok","durationMs":22}]}
 JSON
 "#;
-    std::fs::write(&bin, script).unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Staged closed and renamed into place: the gate execs it moments later
+    // while other test threads fork, and a direct write can yield ETXTBSY.
+    remuda_testing::install_at(&bin, script).unwrap();
 
     let target = dir.path().join("target");
     std::fs::create_dir_all(&target).unwrap();
@@ -130,6 +135,7 @@ JSON
         lane,
         target,
         bin,
+        path: bin_dir,
         tmp,
     }
 }
@@ -144,22 +150,22 @@ struct Node {
 }
 
 impl Node {
-    fn spawn(home: &std::path::Path, tmp: &std::path::Path) -> Self {
-        // Inherit the ambient PATH so the Node's own git pre-steps (fetch / ff)
-        // use whatever git the harness provides, then guarantee the base system
-        // dirs the gate child needs (bash, mktemp, sleep) are present too.
-        let path = match std::env::var("PATH") {
-            Ok(path) if !path.is_empty() => {
-                format!("{path}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
-            }
-            _ => "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned(),
-        };
+    fn spawn(home: &std::path::Path, fixture: &Fixture) -> Self {
+        // A controlled PATH: the fixture's own executables first, then the base
+        // system directories the gate child needs (git, bash, mktemp, sleep).
+        // Never the developer's PATH — it carries a ~250 MB `claude`, and the
+        // hello inventory probe must not depend on how large the host's agent
+        // installs happen to be.
+        let path = format!(
+            "{}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            fixture.path.display()
+        );
         let mut child = Command::new(env!("CARGO_BIN_EXE_remuda-node-stdio"))
             .args(["node", "--stdio", "--data-dir"])
             .arg(home.join("data"))
             .env("PATH", path)
             .env("HOME", home)
-            .env("TMPDIR", tmp)
+            .env("TMPDIR", &fixture.tmp)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -240,7 +246,7 @@ fn gate_run_params(fixture: &Fixture) -> Value {
 /// Drive the hello handshake, start a gate, and return the started Node so the
 /// caller can prove the carrier stays live while the gate runs.
 fn start_gate(home: &std::path::Path, fixture: &Fixture) -> Node {
-    let mut node = Node::spawn(home, &fixture.tmp);
+    let mut node = Node::spawn(home, fixture);
     let hello = node
         .wait_for(Instant::now() + Duration::from_secs(10), |frame| {
             frame["method"] == json!("node.hello")

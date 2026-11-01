@@ -1,6 +1,6 @@
 ---
 name: remuda
-description: "Dispatch and drive coding agents (claude, codex, grok, agy, gemini) on Remuda Hub/Node hosts from a coordinator session. Use when the task is to run work in isolated git worktrees on other agents — create worktree, create pty instances, deliver task briefs, wait for DONE, read screens, stop — via the remuda CLI or the remuda_* MCP tools. Not for ordinary local shell work."
+description: "Dispatch and drive coding agents (claude, codex, grok, agy, gemini) on Remuda Hub/Node hosts, keep durable memory in the Remuda Hub, and know what this session may do through Remuda. Use when the task is to run work in isolated git worktrees on other agents — create worktree, create pty instances, deliver task briefs, wait for DONE, read screens, stop — via the remuda CLI or the remuda_* MCP tools; when storing or recalling what the owner told you; and before answering whether you may dispatch workers, merge a branch into main or answer a worker's question. Not for ordinary local shell work."
 ---
 
 # Remuda
@@ -17,6 +17,13 @@ Two interchangeable surfaces. Use whichever this session has:
 The installed binary is the authority for flags — `remuda instance --help`,
 `remuda merge --help`. Bare `remuda` has no default subcommand; don't run it
 for discovery.
+
+**What this session may do.** When Remuda launches you as a seat, it
+generates a "This seat in Remuda" section from the Hub's record of your
+grants and host: appended to the end of this file, or handed to you as a
+`<remuda-capabilities>` block in your context. It lists the verbs your grants
+allow; where it and this guide disagree, it wins. A session Remuda did not
+launch has no such section: it may do whatever its own credential allows.
 
 ## Coordinator loop
 

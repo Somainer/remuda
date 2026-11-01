@@ -1360,6 +1360,8 @@ async fn a_notice_is_never_sent_to_a_node_without_fence_support() -> Result<()> 
 #[derive(Default)]
 struct FakePush {
     hits: Mutex<usize>,
+    /// While set, every delivery is refused (HTTP 400, not retried).
+    fail: std::sync::atomic::AtomicBool,
 }
 
 impl remuda_push::Transport for FakePush {
@@ -1371,12 +1373,40 @@ impl remuda_push::Transport for FakePush {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<u16, remuda_push::Error>> + Send + '_>,
     > {
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return Box::pin(async { Ok(400) });
+        }
         *self.hits.lock().unwrap() += 1;
         Box::pin(async { Ok(201) })
     }
 }
 
 impl Ctx {
+    /// Restart the Hub on the same data dir with push on the same fake.
+    async fn restart_hub_push(&mut self, fake: &Arc<FakePush>, supervisor: bool) -> Result<()> {
+        self.hub.shutdown_within(Duration::from_secs(10)).await;
+        let mut config = HubConfig::for_test(self.data.clone());
+        config.bootstrap_token = self.bootstrap.clone();
+        config.restart_supervisor = supervisor;
+        self.hub = remuda_hub::spawn_with_push(config, fake.clone()).await?;
+        Ok(())
+    }
+
+    /// `(recipients, sent_at)` of every C1 push row of a lineage, oldest first.
+    fn c1_push_rows(&self, lineage: &str) -> Result<Vec<(Option<i64>, Option<String>)>> {
+        let db = self.db()?;
+        let mut stmt = db.prepare(
+            "SELECT recipients, sent_at FROM lineage_c1_pushes
+              WHERE lineage_id = ?1 ORDER BY created_at",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![lineage], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// A Hub with Web Push on a fake endpoint and one subscribed device.
     async fn boot_push() -> Result<(Self, Arc<FakePush>)> {
         let dir = tempfile::tempdir()?;
@@ -1700,5 +1730,55 @@ async fn the_successor_carries_the_seating_human_origin_not_the_spec_origin() ->
     )?;
     assert_eq!(seated_origin.as_deref(), Some("human"));
     assert!(seated_by.is_some());
+    Ok(())
+}
+
+// ── r2 item 2: a C1 push is sent before it is marked sent ───────────────
+
+/// A failed fanout leaves the push unsent (no `sent_at`, `recipients` NULL);
+/// the next evaluation retries it, and so does the boot evaluation after a
+/// Hub restart.
+#[tokio::test]
+async fn a_failed_c1_push_is_retried_next_tick_and_after_a_hub_restart() -> Result<()> {
+    use std::sync::atomic::Ordering;
+    let (mut ctx, fake) = Ctx::boot_push().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host, true).await?;
+    let seat = ctx.seat(&mut node).await?;
+    ctx.report_running(&node, &seat, SESSION).await?;
+    fake.fail.store(true, Ordering::SeqCst);
+    ctx.report_killed(&node, &seat).await?;
+    let decided = ctx.supervise().await;
+    let successor = decided[0]["successorInstanceId"]
+        .as_str()
+        .context("successor")?
+        .to_owned();
+    assert_eq!(
+        ctx.c1_push_rows(&seat)?,
+        [(None, None)],
+        "a failed fanout is not marked sent"
+    );
+    // The next tick retries it once delivery works.
+    fake.fail.store(false, Ordering::SeqCst);
+    let hits = *fake.hits.lock().unwrap();
+    assert!(ctx.supervise().await.is_empty());
+    let rows = ctx.c1_push_rows(&seat)?;
+    assert_eq!(rows[0].0, Some(1), "{rows:?}");
+    assert!(rows[0].1.is_some());
+    assert_eq!(*fake.hits.lock().unwrap(), hits + 1);
+
+    // The successor dies with delivery failing again; the Hub restarts before
+    // anything retries, and its boot evaluation sends the push.
+    let _ = node.next_launch().await?;
+    ctx.report_running(&node, &successor, SESSION).await?;
+    fake.fail.store(true, Ordering::SeqCst);
+    ctx.report_killed(&node, &successor).await?;
+    assert_eq!(ctx.supervise().await.len(), 1);
+    assert_eq!(ctx.c1_push_rows(&seat)?[1], (None, None));
+    drop(node);
+    fake.fail.store(false, Ordering::SeqCst);
+    ctx.restart_hub_push(&fake, true).await?;
+    let rows = ctx.c1_push_rows(&seat)?;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[1].0, Some(1), "the boot evaluation sent it: {rows:?}");
     Ok(())
 }

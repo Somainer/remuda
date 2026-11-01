@@ -439,16 +439,22 @@ struct C1Push {
     body: String,
 }
 
-/// Send every recorded, unsent C1 push through the existing push fanout and
-/// mark it sent with its recipient count (0 when push is off or a device is
-/// following the chapter: the record says it was decided, not delivered).
+/// Send every recorded, unsent C1 push (`recipients IS NULL`) through the
+/// existing push fanout. A row is marked sent — `sent_at` and its recipient
+/// count — only AFTER the fanout delivered it, or found nothing to deliver
+/// to (push off, a device following the chapter, no live subscription). A
+/// failed fanout leaves it unsent for the next evaluation, including the boot
+/// evaluation after a Hub restart; a crash between send and mark resends it,
+/// and the lineage tag makes the resend replace the first notification.
+/// Drives are serialized in-process, so two never send the same row.
 pub(crate) async fn drive_pushes(state: &AppState) {
+    let _drive = state.restart.pushes.lock().await;
     let pushes = match state
         .store
         .read("c1_pushes_unsent", |conn| {
             let mut stmt = conn.prepare(
                 "SELECT fence_id, lineage_id, instance_id, title, body
-                   FROM lineage_c1_pushes WHERE sent_at IS NULL ORDER BY created_at",
+                   FROM lineage_c1_pushes WHERE recipients IS NULL ORDER BY created_at",
             )?;
             let rows = stmt
                 .query_map([], |row| {
@@ -472,25 +478,7 @@ pub(crate) async fn drive_pushes(state: &AppState) {
         }
     };
     for push in pushes {
-        // Claim before sending, so a concurrent drive never sends it twice.
-        let claimed = state
-            .store
-            .run_named("c1_push_claim", {
-                let fence_id = push.fence_id.clone();
-                move |conn| {
-                    Ok(conn.execute(
-                        "UPDATE lineage_c1_pushes SET sent_at = ?2
-                          WHERE fence_id = ?1 AND sent_at IS NULL",
-                        params![fence_id, crate::config::now_rfc3339()],
-                    )? == 1)
-                }
-            })
-            .await
-            .unwrap_or(false);
-        if !claimed {
-            continue;
-        }
-        let sent = crate::alerts::c1_push(
+        let fanout = crate::alerts::c1_push(
             state,
             &push.lineage_id,
             &push.instance_id,
@@ -498,17 +486,30 @@ pub(crate) async fn drive_pushes(state: &AppState) {
             &push.body,
         )
         .await;
-        tracing::info!(lineage_id = %push.lineage_id, title = %push.title, sent, "C1 push");
-        let _ = state
+        let Some(recipients) = fanout.recipients() else {
+            tracing::warn!(lineage_id = %push.lineage_id, title = %push.title,
+                "C1 push failed; it stays unsent and is retried");
+            continue;
+        };
+        tracing::info!(lineage_id = %push.lineage_id, title = %push.title, recipients, "C1 push");
+        if let Err(error) = state
             .store
             .run_named("c1_push_sent", move |conn| {
                 conn.execute(
-                    "UPDATE lineage_c1_pushes SET recipients = ?2 WHERE fence_id = ?1",
-                    params![push.fence_id, i64::try_from(sent).unwrap_or(i64::MAX)],
+                    "UPDATE lineage_c1_pushes SET sent_at = ?2, recipients = ?3
+                      WHERE fence_id = ?1 AND recipients IS NULL",
+                    params![
+                        push.fence_id,
+                        crate::config::now_rfc3339(),
+                        i64::try_from(recipients).unwrap_or(i64::MAX)
+                    ],
                 )?;
                 Ok(())
             })
-            .await;
+            .await
+        {
+            tracing::warn!(%error, "could not mark a C1 push sent; it is resent");
+        }
     }
 }
 
@@ -986,6 +987,8 @@ pub struct Decided {
 #[derive(Clone, Default)]
 pub(crate) struct SupervisorState {
     running: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes [`drive_pushes`], so one row is never sent twice at once.
+    pushes: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Store {

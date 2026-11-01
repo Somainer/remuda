@@ -818,6 +818,13 @@ impl HubTestHandle {
             .collect()
     }
 
+    /// D-057 §6.3.1: the next `count` C1 successor preparations fail with a
+    /// transient store error (test-faults).
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_fail_restart_prepares(&self, count: usize) {
+        self.state.restart.fail_next_prepares(count);
+    }
+
     /// One scheduler tick (claims + dispatches), on an owned handle.
     pub async fn test_gate_tick(&self) {
         crate::gatequeue::tick(&self.state).await;

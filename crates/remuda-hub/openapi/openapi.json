@@ -2098,7 +2098,7 @@
             "type": "string"
           },
           "reason": {
-            "description": "Why a decision paused instead of restarting, when it is not the cap or the policy.",
+            "description": "Why a decision paused instead of restarting, when it is not the cap or the policy (for example, the successor's provider profile is gone).",
             "type": "string"
           },
           "recovery": {

@@ -1782,3 +1782,81 @@ async fn a_failed_c1_push_is_retried_next_tick_and_after_a_hub_restart() -> Resu
     assert_eq!(rows[1].0, Some(1), "the boot evaluation sent it: {rows:?}");
     Ok(())
 }
+
+// ── r2 items 4 and 5: a successor that cannot be prepared ──────────────
+
+/// A restart whose successor cannot be prepared because its provider profile
+/// is gone (a permanent cause) pauses the lineage `paused{process-exit}` with
+/// the reason on the decision, and records the C1 push "Main paused: could
+/// not restart" — the generic exited push is suppressed for this lineage, so
+/// without it the owner would get nothing.
+#[tokio::test]
+async fn a_seat_whose_profile_is_gone_pauses_and_pushes_could_not_restart() -> Result<()> {
+    let (ctx, fake) = Ctx::boot_push().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host, true).await?;
+    let seat = ctx.seat(&mut node).await?;
+    ctx.report_running(&node, &seat, SESSION).await?;
+    // The provider profile the chapter launched with has been deleted.
+    let gone = format!("prv_{}", uuid::Uuid::now_v7());
+    ctx.db()?.execute(
+        "UPDATE instances SET spec_json = json_set(spec_json, '$.providerProfileId', ?2)
+          WHERE id = ?1",
+        rusqlite::params![seat, gone],
+    )?;
+    let hits = *fake.hits.lock().unwrap();
+    ctx.report_killed(&node, &seat).await?;
+    let decided = ctx.supervise().await;
+    assert_eq!(decided.len(), 1, "{decided:?}");
+    assert_eq!(decided[0]["outcome"], json!("process-exit"));
+    let record = ctx.lineage(&seat).await?;
+    assert_eq!(record["state"], json!("paused"));
+    assert_eq!(record["pausedBy"]["kind"], json!("process-exit"));
+    let reason = record["restartDecisions"][0]["reason"]
+        .as_str()
+        .context("reason")?;
+    assert!(reason.contains(&gone), "{reason}");
+    let pushes = ctx.c1_pushes(&seat, 1).await?;
+    assert_eq!(
+        pushes,
+        [(
+            "restart-failed".to_owned(),
+            "Main paused: could not restart".to_owned(),
+            1
+        )]
+    );
+    assert_eq!(*fake.hits.lock().unwrap(), hits + 1);
+    assert!(
+        node.drain()
+            .iter()
+            .all(|(method, _)| !matches!(method.as_str(), "instance.create" | "instance.resume")),
+        "no successor launch"
+    );
+    Ok(())
+}
+
+/// A transient failure to prepare the successor (a store or lookup error)
+/// decides nothing: no decision row, no fence, the lineage stays unpaused,
+/// and the next evaluation retries and restarts it.
+#[tokio::test]
+async fn a_transient_prepare_error_decides_nothing_and_the_next_tick_restarts() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host, true).await?;
+    let seat = ctx.seat(&mut node).await?;
+    ctx.report_running(&node, &seat, SESSION).await?;
+    ctx.report_killed(&node, &seat).await?;
+    ctx.hub.test_handle().test_fail_restart_prepares(2);
+    for attempt in 0..2 {
+        assert!(ctx.supervise().await.is_empty(), "attempt {attempt}");
+        assert!(ctx.decisions(&seat)?.is_empty(), "attempt {attempt}");
+        let record = ctx.lineage(&seat).await?;
+        assert_ne!(record["state"], json!("paused"), "{record}");
+        assert_eq!(record["generation"], json!(1));
+        assert_eq!(record["fences"], json!([]));
+    }
+    let decided = ctx.supervise().await;
+    assert_eq!(decided.len(), 1, "{decided:?}");
+    assert_eq!(decided[0]["outcome"], json!("restarted"));
+    let (method, _) = node.next_launch().await?;
+    assert_eq!(method, "instance.resume");
+    Ok(())
+}

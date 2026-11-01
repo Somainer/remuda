@@ -2459,6 +2459,40 @@ pub(crate) async fn recovery_source(
     Ok(RecoverySource::Fresh)
 }
 
+/// Why a successor's create could not be prepared, typed by whether retrying
+/// can ever help (D-057 §6.3.1; ma-restart r2 item 5).
+#[derive(Debug)]
+pub(crate) enum ContinuationError {
+    /// What the successor needs no longer exists: the provider profile the
+    /// chapter ran with, or the via route's gateway profile or proxy host.
+    Gone(String),
+    /// Anything else (a store or lookup error, a via host offline, a Node too
+    /// old for the route): it may pass on a later attempt.
+    Other(HubError),
+}
+
+impl From<HubError> for ContinuationError {
+    fn from(error: HubError) -> Self {
+        Self::Other(error)
+    }
+}
+
+impl From<crate::store::StoreError> for ContinuationError {
+    fn from(error: crate::store::StoreError) -> Self {
+        Self::Other(HubError::Store(error))
+    }
+}
+
+impl From<ContinuationError> for HubError {
+    fn from(error: ContinuationError) -> Self {
+        match error {
+            // The owner Resume keeps today's refusal shape for a gone profile.
+            ContinuationError::Gone(reason) => HubError::BadRequest(reason),
+            ContinuationError::Other(error) => error,
+        }
+    }
+}
+
 /// A successor's create, prepared for the continuation transaction.
 pub(crate) struct PreparedContinuation {
     pub(crate) spec: Value,
@@ -2480,7 +2514,7 @@ pub(crate) async fn prepare_continuation(
     recovery: &RecoverySource,
     driver: &str,
     prompt: Option<&str>,
-) -> Result<PreparedContinuation, HubError> {
+) -> Result<PreparedContinuation, ContinuationError> {
     let (mut spec, operation) = match recovery.session() {
         Some(session_id) => {
             let mut spec = current.spec_for_resume();
@@ -2536,6 +2570,22 @@ pub(crate) async fn prepare_continuation(
     } else {
         crate::providers::RouteOverrides::default()
     };
+    // The provider profile the chapter ran with must still exist; a lookup
+    // that fails is not evidence that it is gone.
+    if let Some(profile_id) = spec
+        .get("providerProfileId")
+        .and_then(Value::as_str)
+        .filter(|id| crate::provider_resolve::is_real_profile_id(id))
+        && state
+            .store
+            .get_provider(profile_id.to_owned())
+            .await?
+            .is_none()
+    {
+        return Err(ContinuationError::Gone(format!(
+            "provider profile {profile_id} is gone"
+        )));
+    }
     crate::providers::resolve_and_attach(state, &host, &mut spec, resume_overrides).await?;
     if let Some(observed) = parent_observed_via.as_ref() {
         let target = match observed.via_host_id.as_ref() {
@@ -2561,7 +2611,7 @@ pub(crate) async fn prepare_continuation(
             .and_then(Value::as_str)
             .filter(|id| crate::provider_resolve::is_real_profile_id(id))
             .ok_or_else(|| {
-                HubError::BadRequest(
+                ContinuationError::Gone(
                     "the resumed via session has no gateway profile on its spec".into(),
                 )
             })?;
@@ -2570,9 +2620,17 @@ pub(crate) async fn prepare_continuation(
             .get_provider(profile_id.to_string())
             .await?
             .ok_or_else(|| {
-                HubError::BadRequest("the resumed via session's gateway profile vanished".into())
+                ContinuationError::Gone("the resumed via session's gateway profile vanished".into())
             })?;
-        crate::providers::validate_via_target(state, &host, &choice, &profile).await?;
+        match crate::providers::validate_via_target(state, &host, &choice, &profile).await {
+            Ok(_) => {}
+            // The via route names a proxy host the Hub no longer knows.
+            Err(HubError::ApiViaRefusal {
+                code: remuda_protocol::ApiViaRefusal::ApiViaUnknownHost,
+                message,
+            }) => return Err(ContinuationError::Gone(message)),
+            Err(error) => return Err(error.into()),
+        }
         crate::providers::write_requested_route(&mut spec, &choice)?;
     }
     // The resolved driver from the prepared spec — same value the queued

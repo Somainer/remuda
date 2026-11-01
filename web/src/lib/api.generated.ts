@@ -2813,7 +2813,7 @@ export interface components {
              * @enum {string}
              */
             outcome: "restarted" | "restart-cap" | "process-exit";
-            /** @description Why a decision paused instead of restarting, when it is not the cap or the policy. */
+            /** @description Why a decision paused instead of restarting, when it is not the cap or the policy (for example, the successor's provider profile is gone). */
             reason?: string;
             /** @description §6.3.1 recovery source of the successor: chapter-session, earlier-session or fresh. */
             recovery?: string;

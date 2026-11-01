@@ -350,6 +350,9 @@ pub(crate) mod push_kind {
     pub const SELF: &str = "self";
     /// A close by an Agent ancestor.
     pub const ANCESTOR: &str = "ancestor";
+    /// The successor could not be prepared (its profile or route is gone):
+    /// "Main paused: could not restart".
+    pub const RESTART_FAILED: &str = "restart-failed";
 }
 
 /// Record the C1 push of one F, in F's transaction (one per fence, so a
@@ -406,6 +409,10 @@ pub(crate) fn queue_push(
         push_kind::SELF => (
             format!("{label} closed itself"),
             "It is paused until you resume it.".to_owned(),
+        ),
+        push_kind::RESTART_FAILED => (
+            format!("{label} paused: could not restart"),
+            "Its relaunch could not be prepared; it stays paused until you resume it.".to_owned(),
         ),
         _ => (
             format!("{label} paused by its parent agent"),
@@ -989,6 +996,56 @@ pub(crate) struct SupervisorState {
     running: Arc<tokio::sync::Mutex<()>>,
     /// Serializes [`drive_pushes`], so one row is never sent twice at once.
     pushes: Arc<tokio::sync::Mutex<()>>,
+    /// Failed chapter → when its last transient preparation failure was
+    /// logged (one warning per chapter per minute).
+    prepare_logged: Arc<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>>,
+    /// Test seam: the next N successor preparations fail with a transient
+    /// store error.
+    #[cfg(any(test, feature = "test-faults"))]
+    prepare_faults: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl SupervisorState {
+    /// Whether a transient preparation failure of `failed` should be logged
+    /// now: the first one, then at most once a minute.
+    fn note_prepare_failure(&self, failed: &str) -> bool {
+        let mut logged = self
+            .prepare_logged
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = std::time::Instant::now();
+        match logged.get(failed) {
+            Some(at) if now.duration_since(*at) < std::time::Duration::from_secs(60) => false,
+            _ => {
+                logged.insert(failed.to_owned(), now);
+                true
+            }
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-faults"))]
+impl SupervisorState {
+    /// Arm `count` transient preparation failures.
+    pub(crate) fn fail_next_prepares(&self, count: usize) {
+        self.prepare_faults
+            .store(count, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn take_prepare_fault(&self) -> Option<crate::error::HubError> {
+        self.prepare_faults
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |left| left.checked_sub(1),
+            )
+            .ok()
+            .map(|_| {
+                crate::error::HubError::Store(StoreError::Id(
+                    "injected transient store error".into(),
+                ))
+            })
+    }
 }
 
 impl Store {
@@ -1042,6 +1099,7 @@ impl Store {
         cause: &'static str,
         decision_outcome: &'static str,
         reason: Option<String>,
+        push: Option<&'static str>,
     ) -> Result<(FenceTx, Settlement), StoreError> {
         self.run_named("restart_decide_pause", move |conn| {
             let tx = immediate_tx(conn)?;
@@ -1067,13 +1125,13 @@ impl Store {
                 &core.fence_id,
                 reason.as_deref(),
             )?;
-            if decision_outcome == outcome::RESTART_CAP {
+            if let Some(kind) = push {
                 queue_push(
                     &tx,
                     &core.fence_id,
                     &spec.lineage_id,
                     &failed_instance_id,
-                    push_kind::RESTART_CAP,
+                    kind,
                     Some(cause),
                 )?;
             }
@@ -1205,14 +1263,33 @@ async fn decide(
         .clone()
         .and_then(|value| serde_json::from_value(value).ok());
     let Some(policy) = policy.filter(|policy| policy.on_process_loss) else {
-        return pause(state, &lineage, &failed, cause, outcome::PROCESS_EXIT, None).await;
+        // Without `restart.onProcessLoss` the end keeps today's exited push.
+        return pause(
+            state,
+            &lineage,
+            &failed,
+            cause,
+            outcome::PROCESS_EXIT,
+            None,
+            None,
+        )
+        .await;
     };
     let restarts = state
         .store
         .restarts_in_last_hour(lineage.lineage_id.clone())
         .await?;
     if restarts >= policy.max_per_hour {
-        return pause(state, &lineage, &failed, cause, outcome::RESTART_CAP, None).await;
+        return pause(
+            state,
+            &lineage,
+            &failed,
+            cause,
+            outcome::RESTART_CAP,
+            None,
+            Some(push_kind::RESTART_CAP),
+        )
+        .await;
     }
     restart(state, &lineage, &failed, cause).await
 }
@@ -1225,6 +1302,7 @@ async fn pause(
     cause: &'static str,
     decision_outcome: &'static str,
     reason: Option<String>,
+    push: Option<&'static str>,
 ) -> Result<Option<Decided>, crate::error::HubError> {
     let paused_by =
         json!({"kind": decision_outcome, "instanceId": failed.instance_id, "cause": cause});
@@ -1251,6 +1329,7 @@ async fn pause(
                     cause,
                     decision_outcome,
                     reason,
+                    push,
                 )
                 .await
         })
@@ -1301,18 +1380,25 @@ async fn restart(
     } else {
         failed.driver.as_str()
     };
-    let prepared = match crate::http::prepare_continuation(
-        state, host, lineage, failed, &recovery, driver, None,
-    )
-    .await
-    {
+    #[cfg(any(test, feature = "test-faults"))]
+    let injected = state.restart.take_prepare_fault();
+    #[cfg(not(any(test, feature = "test-faults")))]
+    let injected: Option<crate::error::HubError> = None;
+    let prepared = match match injected {
+        Some(error) => Err(crate::http::ContinuationError::Other(error)),
+        None => {
+            crate::http::prepare_continuation(state, host, lineage, failed, &recovery, driver, None)
+                .await
+        }
+    } {
         Ok(prepared) => prepared,
-        Err(error) => {
-            // A successor that cannot even be prepared (its provider or route
-            // is gone) is not retried every second: the chapter's process
-            // ended and the Hub does not continue it, which is
-            // `paused{process-exit}`, with the reason on the decision.
-            let reason = format!("successor not prepared: {error}");
+        Err(crate::http::ContinuationError::Gone(what)) => {
+            // What the successor needs no longer exists (its provider profile
+            // or via route): retrying cannot help. The chapter's process
+            // ended and the Hub cannot continue it: `paused{process-exit}`,
+            // the reason on the decision, and the "could not restart" push
+            // (the generic exited push is replaced for this lineage).
+            let reason = format!("successor not prepared: {what}");
             return pause(
                 state,
                 lineage,
@@ -1320,8 +1406,19 @@ async fn restart(
                 cause,
                 outcome::PROCESS_EXIT,
                 Some(reason),
+                Some(push_kind::RESTART_FAILED),
             )
             .await;
+        }
+        Err(crate::http::ContinuationError::Other(error)) => {
+            // Possibly transient (a store or lookup error, a via host
+            // offline): decide nothing, so the next tick retries. Logged on
+            // the first failure of the chapter and then once a minute.
+            if state.restart.note_prepare_failure(&failed.instance_id) {
+                tracing::warn!(%error, failed = %failed.instance_id,
+                    "C1 successor could not be prepared; retrying on the next tick");
+            }
+            return Ok(None);
         }
     };
     let origin_spec = lineage.origin_spec_ref.as_ref();

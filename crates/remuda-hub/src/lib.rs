@@ -78,6 +78,7 @@ mod rate_limit;
 mod registry;
 mod root_turn;
 mod seen;
+mod skill_context;
 pub mod ssh_hosts;
 mod store;
 mod store_tickets;

@@ -405,6 +405,14 @@ pub fn render_section(context: &SkillContext) -> String {
          - the board inside your scope: `remuda task list`, `remuda task show`, \
          `remuda own check`, `remuda own list`.\n\n",
     );
+    // D-060 item 5: the memory rule must hold even when the skill body is
+    // not loaded, against the harness's own always-on auto-memory prompt.
+    out.push_str(
+        "Memory: what the owner asks you to remember goes into the Hub's lineage memory, \
+         through the memory section of the remuda skill. Never write the harness's native \
+         auto-memory files: they are keyed by host and directory, so no later chapter and no \
+         other Node reads them.\n\n",
+    );
 
     if dispatch {
         out.push_str(

@@ -1,6 +1,6 @@
 ---
 name: remuda
-description: "Dispatch and drive coding agents (claude, codex, grok, agy, gemini) on Remuda Hub/Node hosts, keep durable memory in the Remuda Hub, and know what this session may do through Remuda. Use when the task is to run work in isolated git worktrees on other agents — create worktree, create pty instances, deliver task briefs, wait for DONE, read screens, stop — via the remuda CLI or the remuda_* MCP tools; when storing or recalling what the owner told you; and before answering whether you may dispatch workers, merge a branch into main or answer a worker's question. Not for ordinary local shell work."
+description: "Dispatch and drive coding agents (claude, codex, grok, agy, gemini) on Remuda Hub/Node hosts, keep durable memory in the Remuda Hub, and know what this session may do through Remuda. Use when the task is to run work in isolated git worktrees on other agents — create worktree, create pty instances, deliver task briefs, wait for DONE, read screens, stop — via the remuda CLI or the remuda_* MCP tools; whenever the owner states a preference or asks you to remember something (Remuda memory replaces the harness's native auto-memory); and before answering whether you may dispatch workers, merge a branch into main or answer a worker's question. Not for ordinary local shell work."
 ---
 
 # Remuda

@@ -686,6 +686,17 @@ fn no_inbox_today() {
     assert!(text.contains("No inbox"), "{text}");
 }
 
+/// Every seat is told where its durable memory lives and that the harness's
+/// native auto-memory is not it, whatever its grants.
+#[test]
+fn every_section_carries_the_memory_rule() {
+    for context in every_context() {
+        let text = render_section(&context);
+        assert!(text.contains("Hub's lineage memory"), "{text}");
+        assert!(text.contains("Never write the harness's native"), "{text}");
+    }
+}
+
 // ── the parity ledger ──────────────────────────────────────────────────────
 
 /// The CLI subcommands the ledger lists, split by whether the Today column

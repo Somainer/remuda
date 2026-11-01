@@ -2295,9 +2295,10 @@ mod tests {
     fn an_owned_git_past_its_deadline_kills_the_whole_group() {
         let keep = tempfile::tempdir().unwrap();
         let git = keep.path().join("git");
-        std::fs::write(&git, "#!/bin/sh\n(sleep 47.73 &)\nexec sleep 47.73\n").unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Written through a hidden part file and renamed into place: a direct
+        // write leaves the destination open for writing while other test
+        // threads fork, and the spawn below then gets ETXTBSY.
+        remuda_testing::install_at(&git, "#!/bin/sh\n(sleep 47.73 &)\nexec sleep 47.73\n").unwrap();
         let mut command = std::process::Command::new(git.to_str().unwrap());
         command
             .current_dir(keep.path())
@@ -2340,9 +2341,10 @@ mod tests {
         let git = keep.path().join("git-transport");
         // Backgrounded transport in the SAME group: stdout detached to
         // /dev/null, stderr INHERITED (holds the captured pipe); leader exits.
-        std::fs::write(&git, "#!/bin/sh\n(sleep 47.66 >/dev/null) &\nexit 42\n").unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Staged and renamed like the deadline test above: this script is
+        // exec'd immediately, under the same parallel forks.
+        remuda_testing::install_at(&git, "#!/bin/sh\n(sleep 47.66 >/dev/null) &\nexit 42\n")
+            .unwrap();
         let command = std::process::Command::new(git.to_str().unwrap());
         let start = std::time::Instant::now();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -2427,15 +2429,15 @@ mod tests {
         // Fake transport: a receive-pack invocation refuses (push fails
         // immediately); an upload-pack invocation never returns (fetch stalls).
         let fake_ssh = keep.path().join("fake-ssh-r19.sh");
+        // git execs this as its ssh transport; install it closed and complete
+        // so the spawn cannot inherit a still-open write handle (ETXTBSY).
         // git probes resolved connection settings with `ssh -G host` first;
         // answer that with a minimal config so it proceeds to the real call.
-        std::fs::write(
+        remuda_testing::install_at(
             &fake_ssh,
             "#!/bin/sh\ncase \"$1\" in\n  -G) printf 'hostname %s\\nuser git\\nport 22\\n' \"$2\"; exit 0 ;;\nesac\ncase \" $*\" in\n  *git-receive-pack*) exit 1 ;;\n  *) exec sleep 47.61 ;;\nesac\n",
         )
         .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&fake_ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
         tgit_ok(
             &repo,
             &["remote", "set-url", "origin", "ssh://example.test/repo.git"],
@@ -3043,16 +3045,12 @@ mod tests {
         std::fs::write(old_scratch.join("valuable-file"), "do not delete me\n").unwrap();
         let marker = root.join("hook-marker");
         let hook = lane.join(".git/hooks/reference-transaction");
-        std::fs::write(
+        // git execs the hook; stage it so no fork can observe it mid-write.
+        remuda_testing::install_at(
             &hook,
             format!("#!/bin/sh\necho fired >> {}\n", marker.display()),
         )
         .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
         // Positive control: real hooksPath ref write fires the hook.
         tgit_ok(
             &lane,

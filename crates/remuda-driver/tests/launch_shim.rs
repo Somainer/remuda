@@ -12,7 +12,6 @@
 #![cfg(unix)]
 
 use remuda_driver::{materialize_shims, shim_disabled};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -43,8 +42,7 @@ fn harness() -> Harness {
         record.display()
     );
     let claude = real_bin.join("claude");
-    std::fs::write(&claude, script).unwrap();
-    std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+    remuda_testing::install_at(&claude, script).unwrap();
 
     Harness {
         _dir: dir,
@@ -443,7 +441,7 @@ fn the_pass_through_shims_reach_their_real_binaries_unchanged() {
 }
 
 fn write_recorder(path: &Path, record: &Path) {
-    std::fs::write(
+    remuda_testing::install_at(
         path,
         format!(
             "#!/bin/sh\n: > '{}'\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> '{}'; done\n",
@@ -452,7 +450,6 @@ fn write_recorder(path: &Path, record: &Path) {
         ),
     )
     .unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 #[test]

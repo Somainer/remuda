@@ -4,8 +4,6 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -147,8 +145,9 @@ impl Repo {
             &["worktree", "add", "-b", "topic", source.to_str().unwrap()],
         );
         let branch_commit = commit_file(&source, "shared file.txt", "branch\n");
-        fs::write(&stub, STUB).unwrap();
-        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        // Staged then renamed: the merge runs this stub almost immediately, and
+        // a direct write leaves it open for writing across other threads' forks.
+        remuda_testing::install_at(&stub, STUB).unwrap();
         Self {
             _keep: keep,
             root,
@@ -1275,7 +1274,8 @@ fn a_push_that_landed_but_lost_its_acknowledgement_is_reported_landed() {
     let hook_dir = repo.origin.join("hooks");
     fs::create_dir_all(&hook_dir).unwrap();
     let hook = hook_dir.join("pre-receive");
-    fs::write(
+    // git execs the hook: stage it closed before it lands at its fixed name.
+    remuda_testing::install_at(
         &hook,
         format!(
             r#"#!/bin/sh
@@ -1297,7 +1297,6 @@ exit 1
         ),
     )
     .unwrap();
-    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
 
     // 3. Land: the update-ref CAS succeeds locally, the server-side ref moved,
     //    and the push is rejected — the remote resolution turns it into landed.
@@ -1337,7 +1336,8 @@ fn install_lost_ack_hook(origin: &Path) {
     let hook_dir = origin.join("hooks");
     fs::create_dir_all(&hook_dir).unwrap();
     let hook = hook_dir.join("pre-receive");
-    fs::write(
+    // Same staging as the lost-ack test: the hook is exec'd by git at once.
+    remuda_testing::install_at(
         &hook,
         format!(
             r#"#!/bin/sh
@@ -1357,7 +1357,6 @@ exit 1
         ),
     )
     .unwrap();
-    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 /// Write a `git` wrapper on a throwaway PATH dir that delegates every call to
@@ -1380,7 +1379,8 @@ fn install_failing_git_wrapper(parent: &Path, fail: &str) -> PathBuf {
     let wrapper_dir = parent.join("wrapper-bin");
     fs::create_dir_all(&wrapper_dir).unwrap();
     let wrapper = wrapper_dir.join("git");
-    fs::write(
+    // git resolves this wrapper from PATH and execs it right away.
+    remuda_testing::install_at(
         &wrapper,
         format!(
             r#"#!/bin/sh
@@ -1406,7 +1406,6 @@ exec "{real_git}" "$@"
         ),
     )
     .unwrap();
-    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
     wrapper_dir
 }
 
@@ -1520,8 +1519,8 @@ fn an_established_rejection_with_remote_unchanged_is_failed_not_uncertain() {
     let hook_dir = repo.origin.join("hooks");
     fs::create_dir_all(&hook_dir).unwrap();
     let hook = hook_dir.join("pre-receive");
-    fs::write(&hook, "#!/bin/sh\necho \"policy: rejected\" >&2\nexit 1\n").unwrap();
-    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    remuda_testing::install_at(&hook, "#!/bin/sh\necho \"policy: rejected\" >&2\nexit 1\n")
+        .unwrap();
 
     let (output, report) = repo.merge(&["--land", "--onto", "main", "--report", &merged], &[]);
     assert_eq!(output.status.code(), Some(1), "{report}");

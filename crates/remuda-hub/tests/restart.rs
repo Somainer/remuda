@@ -1860,3 +1860,191 @@ async fn a_transient_prepare_error_decides_nothing_and_the_next_tick_restarts() 
     assert_eq!(method, "instance.resume");
     Ok(())
 }
+
+// ── r2 item 6: the three "no restart" rows of the §6.3 cause table ─────
+
+impl Ctx {
+    /// Append `events` to a running seat, run the supervisor, and assert the
+    /// row is "none": no decision, no restart-decision row, a lifecycle that
+    /// is neither exited nor failed, and no successor launch.
+    async fn assert_no_restart(
+        &self,
+        node: &mut FakeNode,
+        seat: &str,
+        label: &str,
+        events: Vec<Value>,
+    ) -> Result<()> {
+        let before: Value = self.instance(seat).await?;
+        let before_seq = before["durableSeq"]
+            .as_str()
+            .unwrap_or("0")
+            .parse::<u64>()?;
+        let count = u64::try_from(events.len())?;
+        for event in events {
+            node.appends.send((seat.to_owned(), event))?;
+        }
+        self.wait_instance(seat, |view| {
+            view["durableSeq"]
+                .as_str()
+                .and_then(|seq| seq.parse::<u64>().ok())
+                .is_some_and(|seq| seq >= before_seq + count)
+        })
+        .await
+        .with_context(|| format!("{label}: events journaled"))?;
+        let decided = self.supervise().await;
+        assert!(decided.is_empty(), "{label}: {decided:?}");
+        assert!(self.decisions(seat)?.is_empty(), "{label}: decision row");
+        let view = self.instance(seat).await?;
+        assert!(
+            !matches!(view["lifecycle"].as_str(), Some("exited" | "failed")),
+            "{label}: lifecycle {}",
+            view["lifecycle"]
+        );
+        let record = self.lineage(seat).await?;
+        assert_eq!(record["generation"], json!(1), "{label}: {record}");
+        assert_ne!(record["state"], json!("paused"), "{label}: {record}");
+        assert!(
+            node.drain().iter().all(|(method, _)| !matches!(
+                method.as_str(),
+                "instance.create" | "instance.resume"
+            )),
+            "{label}: no successor launch"
+        );
+        Ok(())
+    }
+}
+
+fn turn_event(name: &str, status: &str, severity: &str, related: Value) -> Value {
+    json!({"kind": "lifecycle", "payload": {
+        "type": "native", "topic": "turn", "nativeName": name,
+        "nativeId": {"state": "known", "value": SESSION},
+        "status": {"state": "known", "value": status},
+        "relatedIds": related, "dataRef": null,
+        "severity": severity, "affectsCompletion": false}})
+}
+
+/// Row: a settled root-session turn failure — the root turn's result reports
+/// an API error (429). The turn ends `failed` (idle plus a turn-error
+/// marker); it is not an exit and not a restart cause.
+#[tokio::test]
+async fn a_settled_root_turn_failure_is_not_a_restart_cause() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host, true).await?;
+    let seat = ctx.seat(&mut node).await?;
+    ctx.report_running(&node, &seat, SESSION).await?;
+    ctx.assert_no_restart(
+        &mut node,
+        &seat,
+        "settled API 429",
+        vec![
+            turn_event(
+                "turn_started",
+                "working",
+                "info",
+                json!({"nativeClientMessageId": "m1"}),
+            ),
+            turn_event(
+                "result",
+                "error",
+                "error",
+                json!({"resultIndex": "0", "queuedTurnCount": "0", "settledRootTurn": "true",
+                       "lastError": "API Error: 429 rate limited"}),
+            ),
+        ],
+    )
+    .await?;
+    let view = ctx.instance(&seat).await?;
+    assert_eq!(view["activity"], json!("idle"));
+    assert_eq!(
+        view["lastTurnError"]["text"],
+        json!("API Error: 429 rate limited")
+    );
+    Ok(())
+}
+
+/// Row: a main-session StopFailure that §5.6 cannot settle (no `agentId`, no
+/// versioned exact native error). Not an exit and not a restart cause.
+#[tokio::test]
+async fn an_unsettled_main_session_stop_failure_is_not_a_restart_cause() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host, true).await?;
+    let seat = ctx.seat(&mut node).await?;
+    ctx.report_running(&node, &seat, SESSION).await?;
+    ctx.assert_no_restart(
+        &mut node,
+        &seat,
+        "unsettled main StopFailure",
+        vec![
+            turn_event(
+                "turn_started",
+                "working",
+                "info",
+                json!({"nativeClientMessageId": "m1"}),
+            ),
+            turn_event(
+                "StopFailure",
+                "idle",
+                "warning",
+                json!({"outcome": "failed", "phase": "turn-ended"}),
+            ),
+        ],
+    )
+    .await
+}
+
+/// Row: scoped failures — a subagent StopFailure, a workflow member failure,
+/// a configure failure and a `severity=error` diagnostic. Each stays in its
+/// own scope: not an exit and not a restart cause.
+#[tokio::test]
+async fn scoped_failures_are_not_a_restart_cause() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host, true).await?;
+    let seat = ctx.seat(&mut node).await?;
+    ctx.report_running(&node, &seat, SESSION).await?;
+    let cases = vec![
+        (
+            "subagent StopFailure",
+            turn_event(
+                "StopFailure",
+                "idle",
+                "warning",
+                json!({"agentId": "agent0sub0agent000", "agentType": "workflow-subagent",
+                       "outcome": "failed", "phase": "turn-ended"}),
+            ),
+        ),
+        (
+            "subagent session error",
+            json!({"kind": "lifecycle", "payload": {
+                "type": "native", "topic": "session", "nativeName": "error",
+                "severity": "error", "affectsCompletion": true,
+                "status": {"state": "known", "value": "error"},
+                "relatedIds": {"agentId": "x", "agentType": "workflow-subagent"}}}),
+        ),
+        (
+            "workflow member failed",
+            json!({"kind": "lifecycle", "payload": {
+                "type": "entity", "entityType": "workflow.member",
+                "state": "failed", "reasonCode": "member-stop-failed",
+                "memberId": "wf_owner:agent:agent0sub0agent000"}}),
+        ),
+        (
+            "configure failure",
+            json!({"kind": "lifecycle", "payload": {
+                "type": "native", "topic": "configuration", "nativeName": "instance.configure",
+                "severity": "error", "affectsCompletion": false,
+                "status": {"state": "known", "value": "model-control-unavailable:x"}}}),
+        ),
+        (
+            "severity=error diagnostic",
+            json!({"kind": "lifecycle", "payload": {
+                "type": "native", "topic": "diagnostic", "nativeName": "api_error",
+                "severity": "error", "affectsCompletion": false,
+                "status": {"state": "known", "value": "rate limited"}}}),
+        ),
+    ];
+    for (label, event) in cases {
+        ctx.assert_no_restart(&mut node, &seat, label, vec![event])
+            .await?;
+    }
+    Ok(())
+}

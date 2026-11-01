@@ -2460,35 +2460,60 @@ pub(crate) async fn recovery_source(
 }
 
 /// Why a successor's create could not be prepared, typed by whether retrying
-/// can ever help (D-057 §6.3.1; ma-restart r2 item 5).
+/// can ever help (D-057 §6.3.1; ma-restart r3). Both carry the original
+/// error, so the owner Resume answers with its own status and code.
 #[derive(Debug)]
 pub(crate) enum ContinuationError {
-    /// What the successor needs no longer exists: the provider profile the
-    /// chapter ran with, or the via route's gateway profile or proxy host.
-    Gone(String),
-    /// Anything else (a store or lookup error, a via host offline, a Node too
-    /// old for the route): it may pass on a later attempt.
-    Other(HubError),
+    /// No retry can help: the via route (the chapter's observed route, or the
+    /// profile's own via delivery) names a proxy host the Hub no longer knows
+    /// (`api-via-unknown-host`).
+    Permanent(HubError),
+    /// Anything else, a missing provider profile included (it may be
+    /// re-created): a store or lookup error, a via host offline, a Node too
+    /// old for the route.
+    Retryable(HubError),
+}
+
+impl ContinuationError {
+    /// Classify a preparation error.
+    fn classify(error: HubError) -> Self {
+        if is_unknown_via_host(&error) {
+            Self::Permanent(error)
+        } else {
+            Self::Retryable(error)
+        }
+    }
+}
+
+/// The typed `api-via-unknown-host` refusal, also when wrapped with a next
+/// step.
+fn is_unknown_via_host(error: &HubError) -> bool {
+    match error {
+        HubError::ApiViaRefusal {
+            code: remuda_protocol::ApiViaRefusal::ApiViaUnknownHost,
+            ..
+        } => true,
+        HubError::Actionable { source, .. } => is_unknown_via_host(source),
+        _ => false,
+    }
 }
 
 impl From<HubError> for ContinuationError {
     fn from(error: HubError) -> Self {
-        Self::Other(error)
+        Self::classify(error)
     }
 }
 
 impl From<crate::store::StoreError> for ContinuationError {
     fn from(error: crate::store::StoreError) -> Self {
-        Self::Other(HubError::Store(error))
+        Self::Retryable(HubError::Store(error))
     }
 }
 
 impl From<ContinuationError> for HubError {
     fn from(error: ContinuationError) -> Self {
         match error {
-            // The owner Resume keeps today's refusal shape for a gone profile.
-            ContinuationError::Gone(reason) => HubError::BadRequest(reason),
-            ContinuationError::Other(error) => error,
+            ContinuationError::Permanent(error) | ContinuationError::Retryable(error) => error,
         }
     }
 }
@@ -2570,22 +2595,9 @@ pub(crate) async fn prepare_continuation(
     } else {
         crate::providers::RouteOverrides::default()
     };
-    // The provider profile the chapter ran with must still exist; a lookup
-    // that fails is not evidence that it is gone.
-    if let Some(profile_id) = spec
-        .get("providerProfileId")
-        .and_then(Value::as_str)
-        .filter(|id| crate::provider_resolve::is_real_profile_id(id))
-        && state
-            .store
-            .get_provider(profile_id.to_owned())
-            .await?
-            .is_none()
-    {
-        return Err(ContinuationError::Gone(format!(
-            "provider profile {profile_id} is gone"
-        )));
-    }
+    // A missing provider profile surfaces here as a retryable refusal (it may
+    // be re-created); the profile's own via delivery naming an unknown proxy
+    // host is permanent (`ContinuationError::classify`).
     crate::providers::resolve_and_attach(state, &host, &mut spec, resume_overrides).await?;
     if let Some(observed) = parent_observed_via.as_ref() {
         let target = match observed.via_host_id.as_ref() {
@@ -2611,26 +2623,22 @@ pub(crate) async fn prepare_continuation(
             .and_then(Value::as_str)
             .filter(|id| crate::provider_resolve::is_real_profile_id(id))
             .ok_or_else(|| {
-                ContinuationError::Gone(
+                ContinuationError::Retryable(HubError::BadRequest(
                     "the resumed via session has no gateway profile on its spec".into(),
-                )
+                ))
             })?;
         let profile = state
             .store
             .get_provider(profile_id.to_string())
             .await?
             .ok_or_else(|| {
-                ContinuationError::Gone("the resumed via session's gateway profile vanished".into())
+                ContinuationError::Retryable(HubError::BadRequest(
+                    "the resumed via session's gateway profile vanished".into(),
+                ))
             })?;
-        match crate::providers::validate_via_target(state, &host, &choice, &profile).await {
-            Ok(_) => {}
-            // The via route names a proxy host the Hub no longer knows.
-            Err(HubError::ApiViaRefusal {
-                code: remuda_protocol::ApiViaRefusal::ApiViaUnknownHost,
-                message,
-            }) => return Err(ContinuationError::Gone(message)),
-            Err(error) => return Err(error.into()),
-        }
+        // The chapter's observed via route naming a proxy host the Hub no
+        // longer knows is permanent (classified by the conversion).
+        crate::providers::validate_via_target(state, &host, &choice, &profile).await?;
         crate::providers::write_requested_route(&mut spec, &choice)?;
     }
     // The resolved driver from the prepared spec — same value the queued

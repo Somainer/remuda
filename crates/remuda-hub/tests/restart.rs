@@ -136,7 +136,14 @@ impl FakeNode {
                             json!({"jsonrpc":"2.0","id":id,"result":{
                                 "fenceId": params["fenceId"], "closedInstanceIds": [], "outcomes": outcomes}})
                         } else {
-                            json!({"jsonrpc":"2.0","id":id,"result":{"accepted":true}})
+                            // D-047: a launch echoes the route it was asked for.
+                            let mut result = json!({"accepted": true});
+                            if matches!(method.as_str(), "instance.create" | "instance.resume")
+                                && let Some(route) = params.pointer("/spec/apiRoute").cloned()
+                            {
+                                result["apiRoute"] = route;
+                            }
+                            json!({"jsonrpc":"2.0","id":id,"result":result})
                         };
                         if node.send(Message::Text(reply.to_string().into())).await.is_err() { break; }
                     }
@@ -1792,84 +1799,6 @@ async fn a_failed_c1_push_is_retried_next_tick_and_after_a_hub_restart() -> Resu
     Ok(())
 }
 
-// ── r2 items 4 and 5: a successor that cannot be prepared ──────────────
-
-/// A restart whose successor cannot be prepared because its provider profile
-/// is gone (a permanent cause) pauses the lineage `paused{process-exit}` with
-/// the reason on the decision, and records the C1 push "Main paused: could
-/// not restart" — the generic exited push is suppressed for this lineage, so
-/// without it the owner would get nothing.
-#[tokio::test]
-async fn a_seat_whose_profile_is_gone_pauses_and_pushes_could_not_restart() -> Result<()> {
-    let (ctx, fake) = Ctx::boot_push().await?;
-    let mut node = FakeNode::connect(&ctx.hub, &ctx.host, true).await?;
-    let seat = ctx.seat(&mut node).await?;
-    ctx.report_running(&node, &seat, SESSION).await?;
-    // The provider profile the chapter launched with has been deleted.
-    let gone = format!("prv_{}", uuid::Uuid::now_v7());
-    ctx.db()?.execute(
-        "UPDATE instances SET spec_json = json_set(spec_json, '$.providerProfileId', ?2)
-          WHERE id = ?1",
-        rusqlite::params![seat, gone],
-    )?;
-    let hits = *fake.hits.lock().unwrap();
-    ctx.report_killed(&node, &seat).await?;
-    let decided = ctx.supervise().await;
-    assert_eq!(decided.len(), 1, "{decided:?}");
-    assert_eq!(decided[0]["outcome"], json!("process-exit"));
-    let record = ctx.lineage(&seat).await?;
-    assert_eq!(record["state"], json!("paused"));
-    assert_eq!(record["pausedBy"]["kind"], json!("process-exit"));
-    let reason = record["restartDecisions"][0]["reason"]
-        .as_str()
-        .context("reason")?;
-    assert!(reason.contains(&gone), "{reason}");
-    let pushes = ctx.c1_pushes(&seat, 1).await?;
-    assert_eq!(
-        pushes,
-        [(
-            "restart-failed".to_owned(),
-            "Main paused: could not restart".to_owned(),
-            1
-        )]
-    );
-    assert_eq!(*fake.hits.lock().unwrap(), hits + 1);
-    assert!(
-        node.drain()
-            .iter()
-            .all(|(method, _)| !matches!(method.as_str(), "instance.create" | "instance.resume")),
-        "no successor launch"
-    );
-    Ok(())
-}
-
-/// A transient failure to prepare the successor (a store or lookup error)
-/// decides nothing: no decision row, no fence, the lineage stays unpaused,
-/// and the next evaluation retries and restarts it.
-#[tokio::test]
-async fn a_transient_prepare_error_decides_nothing_and_the_next_tick_restarts() -> Result<()> {
-    let ctx = Ctx::boot().await?;
-    let mut node = FakeNode::connect(&ctx.hub, &ctx.host, true).await?;
-    let seat = ctx.seat(&mut node).await?;
-    ctx.report_running(&node, &seat, SESSION).await?;
-    ctx.report_killed(&node, &seat).await?;
-    ctx.hub.test_handle().test_fail_restart_prepares(2);
-    for attempt in 0..2 {
-        assert!(ctx.supervise().await.is_empty(), "attempt {attempt}");
-        assert!(ctx.decisions(&seat)?.is_empty(), "attempt {attempt}");
-        let record = ctx.lineage(&seat).await?;
-        assert_ne!(record["state"], json!("paused"), "{record}");
-        assert_eq!(record["generation"], json!(1));
-        assert_eq!(record["fences"], json!([]));
-    }
-    let decided = ctx.supervise().await;
-    assert_eq!(decided.len(), 1, "{decided:?}");
-    assert_eq!(decided[0]["outcome"], json!("restarted"));
-    let (method, _) = node.next_launch().await?;
-    assert_eq!(method, "instance.resume");
-    Ok(())
-}
-
 // ── r2 item 6: the three "no restart" rows of the §6.3 cause table ─────
 
 impl Ctx {
@@ -2252,4 +2181,336 @@ fn chrono_now() -> String {
         now.second(),
         now.millisecond()
     )
+}
+
+// ── r3: bounded retry, then a visible pause ─────────────────────────────
+
+/// RFC3339 `minutes` (and `seconds`) before now, in the Hub's shape.
+fn ago(minutes: i64, seconds: i64) -> String {
+    let at = time::OffsetDateTime::now_utc()
+        - time::Duration::minutes(minutes)
+        - time::Duration::seconds(seconds);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        at.year(),
+        u8::from(at.month()),
+        at.day(),
+        at.hour(),
+        at.minute(),
+        at.second(),
+        at.millisecond()
+    )
+}
+
+impl Ctx {
+    /// Age when the Hub first saw `id`'s end (only that column).
+    fn age_end_seen(&self, id: &str, at: &str) -> Result<()> {
+        let changed = self.db()?.execute(
+            "UPDATE instances SET end_seen_at = ?2 WHERE id = ?1",
+            rusqlite::params![id, at],
+        )?;
+        anyhow::ensure!(changed == 1, "no end_seen_at to age for {id}");
+        Ok(())
+    }
+
+    /// A gateway provider profile; `delivery` as the operator sets it.
+    async fn gateway(&self, delivery: Option<Value>) -> Result<String> {
+        let mut body = json!({
+            "name": "routed", "kind": "gateway", "baseUrl": "http://127.0.0.1:1",
+            "models": ["passthrough/auto"], "authToken": "sk-fake-zzzz",
+        });
+        if let Some(delivery) = delivery {
+            body["delivery"] = delivery;
+        }
+        let created: Value = self
+            .http
+            .post(format!("{}/v1/providers", self.base()))
+            .bearer_auth(&self.human)
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(created["id"].as_str().context("profile id")?.to_owned())
+    }
+
+    /// A Main seat launched with provider profile `profile`.
+    async fn seat_on_profile(&self, node: &mut FakeNode, profile: &str) -> Result<String> {
+        let created = self
+            .http
+            .post(format!("{}/v1/instances", self.base()))
+            .bearer_auth(&self.human)
+            .json(&json!({
+                "hostId": self.host, "kind": "claude", "driver": "claude-sdk",
+                "title": "Main", "grants": ["address-owner"], "permissionMode": "auto",
+                "model": "passthrough/auto", "providerProfileId": profile,
+                "restart": {"onProcessLoss": true, "maxPerHour": 3}, "prompt": "seat brief",
+            }))
+            .send()
+            .await?;
+        let status = created.status();
+        let created: Value = created.json().await?;
+        anyhow::ensure!(status.is_success(), "seat on {profile}: {status} {created}");
+        let id = created["instance"]["instanceId"]
+            .as_str()
+            .context("seat")?
+            .to_owned();
+        let _ = node.next_launch().await?;
+        Ok(id)
+    }
+
+    /// `(kind, title)` of every C1 push recorded for a lineage.
+    fn c1_push_kinds(&self, lineage: &str) -> Result<Vec<(String, String)>> {
+        let db = self.db()?;
+        let mut stmt = db.prepare(
+            "SELECT kind, title FROM lineage_c1_pushes WHERE lineage_id = ?1 ORDER BY created_at",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![lineage], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// The lineage is still undecided: no decision row, generation 1, not
+    /// paused, no fence, no successor launch.
+    async fn assert_undecided(&self, node: &mut FakeNode, seat: &str, label: &str) -> Result<()> {
+        assert!(self.decisions(seat)?.is_empty(), "{label}: decision row");
+        let record = self.lineage(seat).await?;
+        assert_eq!(record["generation"], json!(1), "{label}: {record}");
+        assert_ne!(record["state"], json!("paused"), "{label}: {record}");
+        assert_eq!(record["fences"], json!([]), "{label}: {record}");
+        assert!(
+            node.drain().iter().all(|(method, _)| !matches!(
+                method.as_str(),
+                "instance.create" | "instance.resume"
+            )),
+            "{label}: no successor launch"
+        );
+        Ok(())
+    }
+}
+
+/// A candidate whose successor preparation fails transiently is retried on
+/// every tick inside the window (first seen 29 minutes ago here), decides
+/// nothing meanwhile, and restarts once preparation succeeds.
+#[tokio::test]
+async fn a_transient_prepare_error_retries_within_the_window_then_restarts() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host, true).await?;
+    let seat = ctx.seat(&mut node).await?;
+    ctx.report_running(&node, &seat, SESSION).await?;
+    ctx.report_killed(&node, &seat).await?;
+    ctx.age_end_seen(&seat, &ago(29, 0))?;
+    ctx.hub.test_handle().test_fail_restart_prepares(3);
+    for tick in 0..3 {
+        assert!(ctx.supervise().await.is_empty(), "tick {tick}");
+        ctx.assert_undecided(&mut node, &seat, &format!("tick {tick}"))
+            .await?;
+    }
+    let decided = ctx.supervise().await;
+    assert_eq!(decided.len(), 1, "{decided:?}");
+    assert_eq!(decided[0]["outcome"], json!("restarted"));
+    let (method, _) = node.next_launch().await?;
+    assert_eq!(method, "instance.resume");
+    assert!(
+        ctx.c1_push_kinds(&seat)?
+            .iter()
+            .all(|(kind, _)| kind == "restarted")
+    );
+    Ok(())
+}
+
+/// A successor that never becomes preparable — its provider profile is gone
+/// and nobody re-creates it — decides nothing until the window closes, then
+/// is paused `paused{process-exit}` with the restart-failed push, not before.
+#[tokio::test]
+async fn a_candidate_that_never_recovers_pauses_with_the_push_at_the_window_boundary() -> Result<()>
+{
+    let (ctx, fake) = Ctx::boot_push().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host, true).await?;
+    let seat = ctx.seat(&mut node).await?;
+    ctx.report_running(&node, &seat, SESSION).await?;
+    let gone = format!("prv_{}", uuid::Uuid::now_v7());
+    ctx.db()?.execute(
+        "UPDATE instances SET spec_json = json_set(spec_json, '$.providerProfileId', ?2)
+          WHERE id = ?1",
+        rusqlite::params![seat, gone],
+    )?;
+    ctx.report_killed(&node, &seat).await?;
+    // Inside the window: retried, nothing decided, no push.
+    ctx.age_end_seen(&seat, &ago(29, 0))?;
+    for tick in 0..2 {
+        assert!(ctx.supervise().await.is_empty(), "tick {tick}");
+        ctx.assert_undecided(&mut node, &seat, &format!("tick {tick}"))
+            .await?;
+    }
+    assert!(
+        ctx.c1_push_kinds(&seat)?.is_empty(),
+        "no push before the boundary"
+    );
+    // At the boundary: paused with the restart-failed push.
+    let hits = *fake.hits.lock().unwrap();
+    ctx.age_end_seen(&seat, &ago(30, 5))?;
+    let decided = ctx.supervise().await;
+    assert_eq!(decided.len(), 1, "{decided:?}");
+    assert_eq!(decided[0]["outcome"], json!("process-exit"));
+    let record = ctx.lineage(&seat).await?;
+    assert_eq!(record["pausedBy"]["kind"], json!("process-exit"));
+    let reason = record["restartDecisions"][0]["reason"]
+        .as_str()
+        .context("reason")?;
+    assert!(reason.contains("30 minutes"), "{reason}");
+    assert_eq!(
+        ctx.c1_push_kinds(&seat)?,
+        [(
+            "restart-failed".to_owned(),
+            "Main paused: could not restart".to_owned()
+        )]
+    );
+    assert_eq!(*fake.hits.lock().unwrap(), hits + 1);
+    Ok(())
+}
+
+/// A missing provider profile is not permanent: a profile deleted and then
+/// re-created (same id, restored) within the window restarts the seat.
+#[tokio::test]
+async fn a_deleted_profile_recreated_within_the_window_restarts_the_seat() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host, true).await?;
+    let profile = ctx.gateway(None).await?;
+    let seat = ctx.seat_on_profile(&mut node, &profile).await?;
+    ctx.report_running(&node, &seat, SESSION).await?;
+    let db = ctx.db()?;
+    db.execute(
+        "CREATE TABLE restored_profiles AS SELECT * FROM provider_profiles WHERE id = ?1",
+        rusqlite::params![profile],
+    )?;
+    db.execute(
+        "DELETE FROM provider_profiles WHERE id = ?1",
+        rusqlite::params![profile],
+    )?;
+    drop(db);
+    ctx.report_killed(&node, &seat).await?;
+    for tick in 0..2 {
+        assert!(ctx.supervise().await.is_empty(), "tick {tick}");
+        ctx.assert_undecided(&mut node, &seat, &format!("tick {tick}"))
+            .await?;
+    }
+    ctx.db()?.execute(
+        "INSERT INTO provider_profiles SELECT * FROM restored_profiles",
+        [],
+    )?;
+    let decided = ctx.supervise().await;
+    assert_eq!(decided.len(), 1, "{decided:?}");
+    assert_eq!(decided[0]["outcome"], json!("restarted"));
+    let (method, create) = node.next_launch().await?;
+    assert_eq!(method, "instance.resume");
+    assert_eq!(create["spec"]["providerProfileId"], json!(profile));
+    Ok(())
+}
+
+impl Ctx {
+    /// A worker host and a proxy host, both relay-capable, and a gateway
+    /// profile delivered via the proxy. Returns (worker node, proxy host,
+    /// profile).
+    async fn via_setup(&mut self) -> Result<(FakeNode, String, String)> {
+        let relay = json!({"capabilities": {"lineageFence": true, "apiRelay": true}});
+        let node = FakeNode::connect_with(
+            &self.hub,
+            &self.host,
+            &self.hub.mint_enroll_token(5).await?,
+            true,
+            relay.clone(),
+        )
+        .await?;
+        let proxy = HostId::new().as_id().as_str().to_owned();
+        let proxy_node = FakeNode::connect_with(
+            &self.hub,
+            &proxy,
+            &self.hub.mint_enroll_token(5).await?,
+            true,
+            relay,
+        )
+        .await?;
+        // The proxy link stays up for the launch; the test drops the row.
+        std::mem::forget(proxy_node);
+        let profile = self
+            .gateway(Some(
+                json!({"mode": "via", "viaHostId": proxy, "route": "hub-relay"}),
+            ))
+            .await?;
+        Ok((node, proxy, profile))
+    }
+}
+
+/// The profile's own via delivery names a proxy host whose row is gone
+/// (`resolve_and_attach` → `api-via-unknown-host`): permanent, so the
+/// supervisor pauses at once with the restart-failed push.
+#[tokio::test]
+async fn a_via_delivery_profile_whose_proxy_host_is_gone_pauses_at_once() -> Result<()> {
+    let (mut ctx, fake) = Ctx::boot_push().await?;
+    let (mut node, proxy, profile) = ctx.via_setup().await?;
+    let seat = ctx.seat_on_profile(&mut node, &profile).await?;
+    let view = ctx.instance(&seat).await?;
+    assert_eq!(
+        view["apiRoute"]["viaHostId"],
+        json!(proxy),
+        "{}",
+        view["apiRoute"]
+    );
+    ctx.report_running(&node, &seat, SESSION).await?;
+    ctx.report_killed(&node, &seat).await?;
+    ctx.db()?
+        .execute("DELETE FROM hosts WHERE id = ?1", rusqlite::params![proxy])?;
+    let hits = *fake.hits.lock().unwrap();
+    let decided = ctx.supervise().await;
+    assert_eq!(decided.len(), 1, "{decided:?}");
+    assert_eq!(decided[0]["outcome"], json!("process-exit"));
+    let record = ctx.lineage(&seat).await?;
+    assert_eq!(record["pausedBy"]["kind"], json!("process-exit"));
+    let reason = record["restartDecisions"][0]["reason"]
+        .as_str()
+        .context("reason")?;
+    assert!(reason.contains(&proxy), "{reason}");
+    assert_eq!(
+        ctx.c1_push_kinds(&seat)?,
+        [(
+            "restart-failed".to_owned(),
+            "Main paused: could not restart".to_owned()
+        )]
+    );
+    assert_eq!(*fake.hits.lock().unwrap(), hits + 1);
+    let _ = &mut ctx;
+    Ok(())
+}
+
+/// Owner Resume keeps the structured refusal: when the chapter's observed via
+/// route names a proxy host that is gone, the Resume answers 400 with code
+/// `api-via-unknown-host`, not a generic bad request.
+#[tokio::test]
+async fn owner_resume_keeps_the_api_via_unknown_host_code() -> Result<()> {
+    let mut ctx = Ctx::boot().await?;
+    let (mut node, proxy, profile) = ctx.via_setup().await?;
+    let seat = ctx.seat_on_profile(&mut node, &profile).await?;
+    ctx.report_running(&node, &seat, SESSION).await?;
+    assert_eq!(ctx.close(&seat).await?.status(), 200);
+    // The operator moved the profile to direct delivery and retired the
+    // proxy; the chapter still observed the via route.
+    let db = ctx.db()?;
+    db.execute(
+        "UPDATE provider_profiles SET delivery_json = '{\"mode\":\"direct\",\"route\":\"auto\"}'
+          WHERE id = ?1",
+        rusqlite::params![profile],
+    )?;
+    db.execute("DELETE FROM hosts WHERE id = ?1", rusqlite::params![proxy])?;
+    drop(db);
+    let resumed = ctx.resume(&seat).await?;
+    let status = resumed.status();
+    let body: Value = resumed.json().await?;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["code"], json!("api-via-unknown-host"), "{body}");
+    Ok(())
 }

@@ -1075,6 +1075,9 @@ struct Pending {
     lineage: LineageRecord,
     failed: InstanceRecord,
     cause: &'static str,
+    /// When the Hub first saw the end (Hub clock); the retry window runs
+    /// from here.
+    end_seen: String,
     /// Boot only: the end is history, decided `stale-at-boot` without F.
     stale_at_boot: Option<String>,
 }
@@ -1371,6 +1374,16 @@ pub(crate) async fn tick(state: &AppState) {
     evaluate(state).await;
 }
 
+/// `at` plus the decision window, in the Hub's RFC3339 shape; `None` when
+/// `at` does not parse.
+fn window_after(at: &str) -> Option<String> {
+    let at =
+        time::OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339).ok()?;
+    Some(crate::config::rfc3339(
+        at + time::Duration::minutes(DECISION_WINDOW_MINUTES),
+    ))
+}
+
 /// `at` minus the decision window, in the Hub's RFC3339 shape; `None` when
 /// `at` does not parse.
 fn window_before(at: &str) -> Option<String> {
@@ -1502,17 +1515,22 @@ async fn pending(
         }
         _ => None,
     };
-    if seen.is_none() && stale_at_boot.is_none() {
+    let end_seen = match seen {
+        Some(seen) => seen,
         // The stamp missed it: this evaluation is the Hub's first sighting.
-        state
-            .store
-            .stamp_end_seen(failed.instance_id.clone())
-            .await?;
-    }
+        None if stale_at_boot.is_none() => {
+            state
+                .store
+                .stamp_end_seen(failed.instance_id.clone())
+                .await?
+        }
+        None => String::new(),
+    };
     Ok(Some(Pending {
         lineage,
         failed,
         cause,
+        end_seen,
         stale_at_boot,
     }))
 }
@@ -1526,6 +1544,7 @@ async fn decide(
         lineage,
         failed,
         cause,
+        end_seen,
         stale_at_boot,
     } = pending;
     if let Some(why) = stale_at_boot {
@@ -1584,7 +1603,7 @@ async fn decide(
         )
         .await;
     }
-    restart(state, &lineage, &failed, cause).await
+    restart(state, &lineage, &failed, cause, &end_seen).await
 }
 
 /// F without successor: `paused{restart-cap}` or `paused{process-exit}`.
@@ -1661,6 +1680,7 @@ async fn restart(
     lineage: &LineageRecord,
     failed: &InstanceRecord,
     cause: &'static str,
+    end_seen: &str,
 ) -> Result<Option<Decided>, crate::error::HubError> {
     let Some(host) = state.store.get_host(failed.host_id.clone()).await? else {
         return Ok(None);
@@ -1678,20 +1698,19 @@ async fn restart(
     #[cfg(not(any(test, feature = "test-faults")))]
     let injected: Option<crate::error::HubError> = None;
     let prepared = match match injected {
-        Some(error) => Err(crate::http::ContinuationError::Other(error)),
+        Some(error) => Err(crate::http::ContinuationError::Retryable(error)),
         None => {
             crate::http::prepare_continuation(state, host, lineage, failed, &recovery, driver, None)
                 .await
         }
     } {
         Ok(prepared) => prepared,
-        Err(crate::http::ContinuationError::Gone(what)) => {
-            // What the successor needs no longer exists (its provider profile
-            // or via route): retrying cannot help. The chapter's process
-            // ended and the Hub cannot continue it: `paused{process-exit}`,
-            // the reason on the decision, and the "could not restart" push
-            // (the generic exited push is replaced for this lineage).
-            let reason = format!("successor not prepared: {what}");
+        Err(crate::http::ContinuationError::Permanent(error)) => {
+            // No retry can help (the via route names a proxy host the Hub no
+            // longer knows): `paused{process-exit}` at once, the reason on
+            // the decision, and the "could not restart" push (the generic
+            // exited push is replaced for this lineage).
+            let reason = format!("successor cannot be prepared: {error}");
             return pause(
                 state,
                 lineage,
@@ -1703,12 +1722,32 @@ async fn restart(
             )
             .await;
         }
-        Err(crate::http::ContinuationError::Other(error)) => {
-            // Possibly transient (a store or lookup error, a via host
-            // offline): decide nothing, so the next tick retries. Logged on
-            // the first failure of the chapter and then once a minute.
+        Err(crate::http::ContinuationError::Retryable(error)) => {
+            // Bounded retry (r3): every tick until the Hub has known of the
+            // end for the decision window, then a visible pause with the
+            // same push. Never silently expired.
+            let deadline = window_after(end_seen);
+            if deadline
+                .as_deref()
+                .is_none_or(|deadline| crate::config::now_rfc3339().as_str() >= deadline)
+            {
+                let reason = format!(
+                    "successor could not be prepared within {DECISION_WINDOW_MINUTES} minutes \
+                     of the Hub first seeing this end ({end_seen}): {error}"
+                );
+                return pause(
+                    state,
+                    lineage,
+                    failed,
+                    cause,
+                    outcome::PROCESS_EXIT,
+                    Some(reason),
+                    Some(push_kind::RESTART_FAILED),
+                )
+                .await;
+            }
             if state.restart.note_prepare_failure(&failed.instance_id) {
-                tracing::warn!(%error, failed = %failed.instance_id,
+                tracing::warn!(%error, failed = %failed.instance_id, deadline = ?deadline,
                     "C1 successor could not be prepared; retrying on the next tick");
             }
             return Ok(None);

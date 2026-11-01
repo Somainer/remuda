@@ -116,32 +116,51 @@ fn try_install(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
 /// this process is inherited by every `fork` any thread performs, and a
 /// descendant still holding it makes a later `exec` of that inode fail with
 /// `ETXTBSY`. Nothing else in this process can inherit the child's handle.
+///
+/// The part never outlives a failure: the shell removes it on any non-zero
+/// exit until the bytes and the mode are in place (a failed `cat`/`chmod`
+/// leaves it behind otherwise), and the caller removes it again if the child
+/// could not be fed or reaped. The child is always reaped, including when
+/// `write_all` fails with `EPIPE` because the writer already exited.
 fn write_part(path: &Path, bytes: &[u8]) -> io::Result<()> {
     #[cfg(unix)]
     {
         let mut child = Command::new("/bin/sh")
             .arg("-c")
-            .arg(r#"umask 077 && /bin/cat > "$1" && /bin/chmod 755 "$1""#)
+            .arg(
+                r#"trap 'rm -f "$1"' EXIT; umask 077 && /bin/cat > "$1" && /bin/chmod 755 "$1" && trap - EXIT"#,
+            )
             .arg("sh")
             .arg(path)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| io::Error::other("executable writer has no stdin"))?;
-        stdin.write_all(bytes)?;
-        drop(stdin);
-        let status = child.wait()?;
-        if !status.success() {
-            return Err(io::Error::other(format!(
+        let written = match child.stdin.take() {
+            Some(mut stdin) => {
+                let written = stdin.write_all(bytes);
+                // Closing the pipe lets the writer finish even after EPIPE.
+                drop(stdin);
+                written
+            }
+            None => Err(io::Error::other("executable writer has no stdin")),
+        };
+        let reaped = child.wait();
+        // A failed write still has to be reported after the child is reaped,
+        // and any state it left behind is removed below.
+        let result = match (written, reaped) {
+            (Err(err), _) => Err(err),
+            (Ok(()), Err(err)) => Err(err),
+            (Ok(()), Ok(status)) if status.success() => Ok(()),
+            (Ok(()), Ok(status)) => Err(io::Error::other(format!(
                 "executable writer for {} exited with {status}",
                 path.display()
-            )));
+            ))),
+        };
+        if result.is_err() {
+            let _ = fs::remove_file(path);
         }
-        Ok(())
+        result
     }
     #[cfg(not(unix))]
     {
@@ -209,5 +228,33 @@ mod tests {
         // A second install replaces the same path in place.
         install_at(&hook, b"#!/bin/sh\nexit 1\n").unwrap();
         assert_eq!(fs::read(&hook).unwrap(), b"#!/bin/sh\nexit 1\n");
+    }
+
+    /// A writer that cannot create or finish its part must not leave the
+    /// partial file behind for a later test (or a later install) to exec.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_write_leaves_no_part_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("blocked");
+        fs::create_dir(&blocked).unwrap();
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o555)).unwrap();
+        let result = install_at(&blocked.join("script"), b"#!/bin/sh\nexit 0\n");
+        // Restore so the tempdir can be cleaned up.
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o755)).unwrap();
+        if result.is_ok() {
+            // Root ignores the directory mode; there is nothing to prove.
+            return;
+        }
+        let leftovers: Vec<_> = fs::read_dir(&blocked)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a failed write left files behind: {leftovers:?}"
+        );
     }
 }

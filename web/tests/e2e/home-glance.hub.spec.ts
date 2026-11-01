@@ -85,8 +85,36 @@ async function cleanup(request: import("@playwright/test").APIRequestContext) {
   }
 }
 
+/** The shared fake Node seats at most 8 live instances; wait for a free slot. */
+async function waitForSeat(page: Page): Promise<void> {
+  await expect
+    .poll(
+      async () => {
+        const response = await page.request.get("/v1/hosts");
+        if (!response.ok()) return true;
+        const body = (await response.json()) as {
+          items?: { id?: string; label?: string; maxInstances?: number }[];
+        };
+        const host = (body.items ?? []).find((row) => row.label === "e2e-fake-node");
+        if (!host?.id) return true;
+        const instancesResponse = await page.request.get("/v1/instances");
+        if (!instancesResponse.ok()) return true;
+        const rows = ((await instancesResponse.json()) as {
+          items?: { hostId?: string; lifecycle?: string }[];
+        }).items ?? [];
+        const live = rows.filter(
+          (row) => row.hostId === host.id && !["exited", "failed", "closed"].includes(row.lifecycle ?? ""),
+        ).length;
+        return live < (host.maxInstances ?? 8);
+      },
+      { timeout: 30_000 },
+    )
+    .toBe(true);
+}
+
 /** A session on the fake Node; the prompt carries its scripted behaviour. */
 async function createSession(page: Page, prompt: string): Promise<string> {
+  await waitForSeat(page);
   await page.goto("/sessions/new");
   const hostPicker = page.getByTestId("new-session-host");
   await expect(hostPicker).toContainText("e2e-fake-node", { timeout: 20_000 });
@@ -116,6 +144,25 @@ function createBlockedSession(page: Page): Promise<string> {
 /** A session the fake Node keeps in native `working` (rank 3). */
 function createWorkingSession(page: Page): Promise<string> {
   return createSession(page, "HGLANCE_WORKING keep running");
+}
+
+/**
+ * The host list the Hub serving this page reports (the same rule the strip
+ * uses: `online === true`, state online, or state enrolled). The suite shares
+ * ONE Hub, so earlier specs may leave offline or extra hosts behind; the
+ * strip assertions must follow this state instead of assuming our own hosts.
+ */
+async function hubHosts(page: Page): Promise<{ total: number; online: number }> {
+  const response = await page.request.get("/v1/hosts");
+  expect(response.ok()).toBe(true);
+  const body = (await response.json()) as {
+    items?: { state?: string; online?: boolean; label?: string }[];
+  };
+  const items = body.items ?? [];
+  const online = items.filter(
+    (host) => host.online === true || host.state === "online" || host.state === "enrolled",
+  ).length;
+  return { total: items.length, online };
 }
 
 /** More rows than the reduced viewport holds, so a scroll proof can bite. */
@@ -243,12 +290,25 @@ test.describe("phone 390", () => {
       expect(Math.round(geometry.glanceHeight), "① is the 28px count row").toBe(28);
       expect(geometry.headHeight, "the sticky head is 80px at most").toBeLessThanOrEqual(80);
 
-      // ② is a 28px row under the head, scrolling with the page; every host is
-      // online, so it is the one summary chip.
+      // ② is a 28px row under the head, scrolling with the page. The shared
+      // Hub decides which shape it paints (all online = one summary chip; any
+      // offline host = per-host chips with the offline one first), so read the
+      // host list and assert exactly that shape.
       const strip = page.getByTestId("host-strip");
       await expect(strip).toBeVisible();
-      await expect(page.getByTestId("host-summary")).toContainText("主机在线 ›");
-      await expect(page.getByTestId("host-chip")).toHaveCount(0);
+      const hosts = await hubHosts(page);
+      if (hosts.total === 0) {
+        await expect(page.getByTestId("host-add")).toContainText("添加主机");
+      } else if (hosts.online === hosts.total) {
+        await expect(page.getByTestId("host-summary")).toContainText(
+          `${hosts.online}/${hosts.total} 主机在线 ›`,
+        );
+        await expect(page.getByTestId("host-chip")).toHaveCount(0);
+      } else {
+        await expect(page.getByTestId("host-summary")).toHaveCount(0);
+        await expect(page.getByTestId("host-chip")).toHaveCount(hosts.total);
+        await expect(page.getByTestId("host-chip").first()).toHaveAttribute("data-offline", "1");
+      }
       await expect(strip).not.toContainText("★");
       const stripGeometry = await page.evaluate(() => {
         const stripEl = document.querySelector('[data-testid="host-strip"]') as HTMLElement;

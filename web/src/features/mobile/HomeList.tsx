@@ -35,7 +35,8 @@ import {
   type HomeRow,
 } from "./homeRows";
 import { HarnessGlyph } from "../spaces/SpacesPanel";
-import { TaskGroups, useTaskLedger } from "../tasks/TaskList";
+import { TaskGroups } from "../tasks/TaskList";
+import { useTaskLedger } from "../tasks/taskLedger";
 import { SpacesDrawer } from "../spaces/SpacesMobile";
 import { ContextRing } from "./ContextRing";
 import { useHomeFreshness } from "../home/freshness";
@@ -448,7 +449,6 @@ export const HomeList = memo(function HomeList() {
         </div>
         <HomeGlance
           placement="phone"
-          projectId={projectFilter}
           workingFilter={rankFilter === "working"}
           onNeedYou={() => scrollToFirst(GLANCE_TARGETS.needYou, GLANCE_TARGETS.tasks)}
           onWorking={() => setRankFilter((current) => (current === "working" ? null : "working"))}

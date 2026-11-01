@@ -34,7 +34,6 @@ export function HomeGlance({
   onNeedYou,
   onWorking,
   workingFilter = false,
-  projectId = null,
   workingInstances,
 }: {
   placement: "phone" | "desktop";
@@ -48,15 +47,14 @@ export function HomeGlance({
    * count must equal the rows the 工作中 tap can show.
    */
   workingInstances?: (instance: NonNullable<GlanceSource["instances"][number]>) => boolean;
-  /**
-   * The scope the phone ledger is already polling. Passing it makes this row
-   * share that ONE poller instead of opening a second /v1/tasks loop.
-   */
-  projectId?: string | null;
 }) {
   const hub = useHub();
   const freshness = useHomeFreshness();
-  const { tasks } = useTaskLedger(projectId);
+  // Owner-wide (§5.1): N is the queue that matches the badge. A ?project=
+  // filter narrows the ledger/list only; the count keeps the global scope,
+  // which also means it shares the phone task layer's poller when that layer
+  // is unfiltered (default /m).
+  const { tasks } = useTaskLedger(null);
   const deviceId = useMemo(() => thisDeviceId(), []);
   const nowMs = useInboxClockNow();
   useEffect(() => {

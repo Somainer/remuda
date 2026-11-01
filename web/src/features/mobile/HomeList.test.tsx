@@ -87,8 +87,12 @@ vi.mock("../files/filesApi", () => ({
   fetchChanges: vi.fn(() => Promise.reject(new Error("offline"))),
 }));
 
+const ledgerScopes = vi.hoisted(() => [] as (string | null)[]);
 vi.mock("../tasks/taskLedger", () => ({
-  useTaskLedger: () => ({ tasks: [], projectName: () => null }),
+  useTaskLedger: (scope?: string | null) => {
+    ledgerScopes.push(scope ?? null);
+    return { tasks: [], projectName: () => null };
+  },
 }));
 
 vi.mock("../tasks/TaskList", () => ({
@@ -690,5 +694,22 @@ describe("① count vs the phone ledger's set", () => {
     renderHome();
     expect(await screen.findByTestId("glance-working")).toHaveTextContent("2 工作中");
     expect(screen.getAllByTestId("home-row")).toHaveLength(2);
+  });
+});
+
+describe("① stays owner-wide on a project-filtered /m", () => {
+  it("does not scope the count row's task ledger to ?project=", async () => {
+    ledgerScopes.length = 0;
+    hub.instances = [row("ins-work", { activity: known("working") })];
+    render(
+      <MemoryRouter initialEntries={["/m?project=prj_1"]}>
+        <HomeList />
+      </MemoryRouter>,
+    );
+    await screen.findByTestId("home-list");
+    // The ledger keeps its project scope; the ① count must stay global (§5.1:
+    // N is the owner-wide queue that matches the badge).
+    expect(ledgerScopes).toContain("prj_1");
+    expect(ledgerScopes).toContain(null);
   });
 });

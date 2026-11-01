@@ -1374,3 +1374,296 @@ async fn replace_decides_its_approval_before_retiring() {
     assert_eq!(replaced.body["worker"]["driver"], "shell-pty");
     assert_eq!(ctx.pending_approvals().await, 0);
 }
+
+// ── item 5: worker respawn without the operator-only route ───────────────
+
+impl Ctx {
+    /// Record that `instance_id` reported a native session (as its Node's
+    /// journal would), making it resumable with `--resume`.
+    async fn report_session(&self, instance_id: &str, session_id: &str) {
+        self.store()
+            .append_journal(
+                self.host.clone(),
+                instance_id.to_string(),
+                Some(1),
+                json!({
+                    "kind": "lifecycle",
+                    "payload": {
+                        "type": "native", "topic": "session", "nativeName": "session",
+                        "nativeId": { "state": "known", "value": session_id },
+                        "status": { "state": "known", "value": "started" },
+                        "relatedIds": { "transcriptPath": "/srv/transcript.jsonl" },
+                        "dataRef": null, "severity": "info", "affectsCompletion": false,
+                    }
+                }),
+            )
+            .await
+            .expect("session event");
+    }
+
+    async fn instance(&self, id: &str) -> Value {
+        let reply = self
+            .request("GET", &format!("/v1/instances/{id}"), None)
+            .await;
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        reply.body.get("instance").cloned().unwrap_or(reply.body)
+    }
+}
+
+/// An Agent respawns its own worker with no operator route: the native
+/// session continues on the same carrier with the same modes, the new
+/// instance's parent is the chapter that dispatched the worker (not the old
+/// worker) and `resumedFrom` is the old instance. Without a transcript the
+/// respawn is a fresh launch in the same worktree.
+#[tokio::test]
+async fn an_agent_respawns_its_worker_keeping_parent_carrier_and_modes() {
+    let mut ctx = Ctx::spawn().await.unwrap();
+    let seat = ctx.seat("claude", "auto").await;
+    let mut body = ctx.dispatch_body("again");
+    body["permissionMode"] = json!("acceptEdits");
+    let first = ctx
+        .send("POST", "/v1/workers/dispatch", Some(body), &seat.token, &[])
+        .await;
+    assert_eq!(first.status, 200, "{}", first.body);
+    let old = first.body["instanceId"].as_str().unwrap().to_string();
+    ctx.report_session(&old, "11111111-2222-4333-8444-555555555555")
+        .await;
+    ctx.node.drain();
+
+    let resumed = ctx
+        .send(
+            "POST",
+            "/v1/workers/again/resume",
+            Some(json!({})),
+            &seat.token,
+            &[],
+        )
+        .await;
+    assert_eq!(resumed.status, 200, "{}", resumed.body);
+    assert_eq!(resumed.body["mode"], "resume");
+    let new = resumed.body["instanceId"].as_str().unwrap().to_string();
+    let forwarded = Ctx::creates(&ctx.node.drain());
+    assert_eq!(forwarded.len(), 1);
+    let spec = &forwarded[0]["spec"];
+    assert_eq!(
+        spec["parentInstanceId"],
+        seat.id.as_str(),
+        "the dispatching chapter"
+    );
+    assert_eq!(spec["resumedFrom"], old.as_str());
+    assert_eq!(
+        spec["resumeSessionId"],
+        "11111111-2222-4333-8444-555555555555"
+    );
+    assert_eq!(spec["driver"], "claude-pty", "the carrier is kept");
+    assert_eq!(spec["permissionMode"], "acceptEdits");
+    assert_eq!(spec["permissionModeRequested"], "acceptEdits");
+    assert_eq!(forwarded[0][CREATOR_PERMISSION_MODE_FIELD], "auto");
+    let row = &resumed.body["worker"];
+    assert_eq!(row["resumedFrom"], old.as_str());
+    assert_eq!(row["instanceId"], new.as_str());
+    assert_eq!(row["permissionMode"], "acceptEdits");
+    assert_eq!(row["permissionModeRequested"], "acceptEdits");
+    let instance = ctx.instance(&new).await;
+    assert_eq!(instance["parentInstanceId"], seat.id.as_str());
+    assert_eq!(instance["resumedFrom"], old.as_str());
+
+    // The new instance never reported a session: a fresh launch in the same
+    // worktree, still under the dispatching chapter.
+    let fresh = ctx
+        .send(
+            "POST",
+            "/v1/workers/again/resume",
+            Some(json!({})),
+            &seat.token,
+            &[],
+        )
+        .await;
+    assert_eq!(fresh.status, 200, "{}", fresh.body);
+    assert_eq!(fresh.body["mode"], "relaunch");
+    let forwarded = ctx.node.drain();
+    let creates = Ctx::creates(&forwarded);
+    assert_eq!(creates.len(), 1);
+    assert!(
+        forwarded
+            .iter()
+            .any(|(method, _)| method == "instance.create"),
+        "a fresh launch, not a resume"
+    );
+    let spec = &creates[0]["spec"];
+    assert!(spec.get("resumeSessionId").is_none(), "{spec}");
+    assert_eq!(spec["resumedFrom"], new.as_str());
+    assert_eq!(spec["parentInstanceId"], seat.id.as_str());
+    assert_eq!(spec["cwd"], "/srv/wt/again", "the same worktree");
+}
+
+/// A respawn applies the same rules as any Agent create: another lineage's
+/// worker is not the caller's to respawn, the kept mode is re-admitted under
+/// the caller's current mode, and a shell-driver carrier asks the owner
+/// before anything launches.
+#[tokio::test]
+async fn a_respawn_follows_the_create_rules() {
+    let mut ctx = Ctx::spawn().await.unwrap();
+    let seat = ctx.seat("claude", "bypassPermissions").await;
+    let sibling = ctx.seat("claude", "bypassPermissions").await;
+    let first = ctx
+        .send(
+            "POST",
+            "/v1/workers/dispatch",
+            Some(ctx.dispatch_body("offmode")),
+            &seat.token,
+            &[],
+        )
+        .await;
+    assert_eq!(first.status, 200, "{}", first.body);
+    assert_eq!(first.body["worker"]["permissionMode"], "bypassPermissions");
+    ctx.node.drain();
+
+    // Cross-subtree: refused before anything else.
+    let other = ctx
+        .send(
+            "POST",
+            "/v1/workers/offmode/resume",
+            Some(json!({})),
+            &sibling.token,
+            &[],
+        )
+        .await;
+    assert_eq!(other.status, 403, "{}", other.body);
+    assert_eq!(reason(&other), "not-owner");
+
+    // The seat itself now keeps its control on: the control-off worker is
+    // not respawned beyond it.
+    ctx.store()
+        .patch_instance_configure(seat.id.clone(), json!({"permissionMode": "auto"}))
+        .await
+        .unwrap();
+    let beyond = ctx
+        .send(
+            "POST",
+            "/v1/workers/offmode/resume",
+            Some(json!({})),
+            &seat.token,
+            &[],
+        )
+        .await;
+    assert_eq!(beyond.status, 403, "{}", beyond.body);
+    assert_eq!(reason(&beyond), "beyond-creator");
+    assert!(Ctx::creates(&ctx.node.drain()).is_empty());
+
+    // A shell-driver worker: the respawn asks first, then runs once allowed.
+    let mut native = ctx.dispatch_body("nativew");
+    native["carrier"] = json!("native");
+    let pending = ctx
+        .send(
+            "POST",
+            "/v1/workers/dispatch",
+            Some(native.clone()),
+            &seat.token,
+            &[],
+        )
+        .await;
+    let card = pending.body["interactionId"].as_str().unwrap().to_string();
+    ctx.approve(&card).await;
+    let dispatched = ctx
+        .send(
+            "POST",
+            "/v1/workers/dispatch",
+            Some(native),
+            &seat.token,
+            &[("x-remuda-approval-id", card.as_str())],
+        )
+        .await;
+    assert_eq!(dispatched.status, 200, "{}", dispatched.body);
+    ctx.node.drain();
+    let ask = ctx
+        .send(
+            "POST",
+            "/v1/workers/nativew/resume",
+            Some(json!({})),
+            &seat.token,
+            &[],
+        )
+        .await;
+    assert_eq!(ask.status, 409, "{}", ask.body);
+    let card = ask.body["interactionId"].as_str().unwrap().to_string();
+    assert!(
+        Ctx::creates(&ctx.node.drain()).is_empty(),
+        "nothing launched yet"
+    );
+    ctx.approve(&card).await;
+    let respawned = ctx
+        .send(
+            "POST",
+            "/v1/workers/nativew/resume",
+            Some(json!({})),
+            &seat.token,
+            &[("x-remuda-approval-id", card.as_str())],
+        )
+        .await;
+    assert_eq!(respawned.status, 200, "{}", respawned.body);
+    let forwarded = Ctx::creates(&ctx.node.drain());
+    assert_eq!(forwarded[0]["spec"]["driver"], "shell-pty");
+}
+
+/// The operator's paths are unchanged: a Human resuming a worker it
+/// dispatched itself keeps the D-026 route (the old worker becomes the
+/// parent, terminal carrier), while a Human resuming a worker an Agent
+/// dispatched goes through the helper and keeps the Agent parent.
+#[tokio::test]
+async fn human_resume_keeps_the_operator_path_for_its_own_workers() {
+    let mut ctx = Ctx::spawn().await.unwrap();
+    let seat = ctx.seat("claude", "auto").await;
+    let human_worker = ctx
+        .request(
+            "POST",
+            "/v1/workers/dispatch",
+            Some(ctx.dispatch_body("hw")),
+        )
+        .await;
+    assert_eq!(human_worker.status, 200, "{}", human_worker.body);
+    let agent_worker = ctx
+        .send(
+            "POST",
+            "/v1/workers/dispatch",
+            Some(ctx.dispatch_body("aw")),
+            &seat.token,
+            &[],
+        )
+        .await;
+    assert_eq!(agent_worker.status, 200, "{}", agent_worker.body);
+    let hw = human_worker.body["instanceId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let aw = agent_worker.body["instanceId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    ctx.report_session(&hw, "aaaaaaaa-2222-4333-8444-555555555555")
+        .await;
+    ctx.report_session(&aw, "bbbbbbbb-2222-4333-8444-555555555555")
+        .await;
+    ctx.node.drain();
+
+    let reply = ctx
+        .request("POST", "/v1/workers/hw/resume", Some(json!({})))
+        .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let forwarded = Ctx::creates(&ctx.node.drain());
+    assert_eq!(
+        forwarded[0]["spec"]["parentInstanceId"],
+        hw.as_str(),
+        "D-026 edge"
+    );
+    assert!(forwarded[0].get(CREATOR_PERMISSION_MODE_FIELD).is_none());
+
+    let reply = ctx
+        .request("POST", "/v1/workers/aw/resume", Some(json!({})))
+        .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let forwarded = Ctx::creates(&ctx.node.drain());
+    assert_eq!(forwarded[0]["spec"]["parentInstanceId"], seat.id.as_str());
+    assert_eq!(forwarded[0]["spec"]["resumedFrom"], aw.as_str());
+    assert_eq!(forwarded[0]["origin"], "human");
+}

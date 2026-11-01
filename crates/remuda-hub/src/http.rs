@@ -229,7 +229,7 @@ const RESUME_IDEMPOTENCY_WINDOW: Duration = Duration::from_secs(60);
 /// Claude prunes its own transcripts, and a `--resume` against a pruned
 /// session starts an empty conversation that merely looks continuous. The
 /// cutoff keeps that failure visible instead of silent (D-026).
-const RESUME_MAX_AGE_DAYS: i64 = 30;
+pub(crate) const RESUME_MAX_AGE_DAYS: i64 = 30;
 
 /// REST routes (login, hosts, instances, journal). Placement/fleet merge later.
 pub fn routes() -> Router<crate::AppState> {
@@ -2686,7 +2686,7 @@ impl ResumeMode {
 }
 
 /// Whole days between `updated_at` and now; `None` when unparseable.
-fn resume_age_days(updated_at: &str) -> Option<i64> {
+pub(crate) fn resume_age_days(updated_at: &str) -> Option<i64> {
     let then =
         time::OffsetDateTime::parse(updated_at, &time::format_description::well_known::Rfc3339)
             .ok()?;
@@ -2705,7 +2705,7 @@ fn resume_window_index() -> u64 {
 
 /// Journal one side of the parent/child resume link, best effort.
 #[allow(clippy::too_many_arguments)]
-async fn journal_resume_link(
+pub(crate) async fn journal_resume_link(
     state: &AppState,
     host_id: &str,
     instance_id: &str,

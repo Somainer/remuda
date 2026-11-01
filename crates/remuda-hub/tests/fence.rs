@@ -555,7 +555,15 @@ async fn resume_only_from_paused_and_a_send_to_the_superseded_chapter_never_leav
         .send()
         .await?;
     assert_eq!(delete.status(), 409);
-    assert_eq!(delete.json::<Value>().await?["reason"], json!("not-paused"));
+    let body: Value = delete.json().await?;
+    assert_eq!(body["reason"], json!("not-paused"));
+    assert_eq!(
+        body["error"],
+        json!(format!(
+            "instance {seat} is the current chapter of a lineage that is not paused; \
+             close it first"
+        ))
+    );
 
     ctx.pause(&ctx.human, &seat).await?.error_for_status()?;
     node.drain();
@@ -736,6 +744,76 @@ async fn a_same_id_retry_of_a_close_addressed_to_an_older_chapter_replays_it() -
         )
         .await?;
     assert_eq!(different.status(), 409, "a different payload is a conflict");
+    Ok(())
+}
+
+/// r3 item 2: the pause close stores the request's idempotency key, so a
+/// retry carrying it replays the close — with its commandId, or by the key
+/// alone (addressed to either chapter) — while the key under another
+/// commandId is still a conflict.
+#[tokio::test]
+async fn a_keyed_retry_of_a_pause_close_replays_it() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.seat_host, true).await?;
+    let (older, current) = resumed_lineage(&ctx, &mut node).await?;
+
+    let close_id = cmd_id();
+    let key = format!("close-{close_id}");
+    let request = json!({"operation": "instance.close", "commandId": close_id,
+                         "idempotencyKey": key, "payload": {}});
+    let first = ctx.command(&ctx.human, &older, request.clone()).await?;
+    assert_eq!(first.status(), 200);
+    let first: Value = first.json().await?;
+    assert_eq!(first["paused"], json!(true), "{first}");
+    let stored: Option<String> = ctx.db()?.query_row(
+        "SELECT idempotency_key FROM commands WHERE id = ?1",
+        rusqlite::params![close_id],
+        |row| row.get(0),
+    )?;
+    assert_eq!(stored.as_deref(), Some(key.as_str()), "the key is stored");
+    let (method, _) = node.next_work_frame().await?;
+    assert_eq!(method, "instance.close");
+
+    let retry = ctx.command(&ctx.human, &older, request).await?;
+    assert_eq!(retry.status(), 200, "an identical keyed retry replays");
+    let retry: Value = retry.json().await?;
+    assert_eq!(retry["replayed"], json!(true), "{retry}");
+    same_close(&retry, &first);
+    for target in [&older, &current] {
+        let by_key = ctx
+            .command(
+                &ctx.human,
+                target,
+                json!({"operation": "instance.close", "idempotencyKey": key, "payload": {}}),
+            )
+            .await?;
+        assert_eq!(by_key.status(), 200, "the key alone replays the close");
+        let by_key: Value = by_key.json().await?;
+        assert_eq!(by_key["replayed"], json!(true), "{by_key}");
+        same_close(&by_key, &first);
+    }
+    let other = ctx
+        .command(
+            &ctx.human,
+            &older,
+            json!({"operation": "instance.close", "commandId": cmd_id(),
+                   "idempotencyKey": key, "payload": {}}),
+        )
+        .await?;
+    assert_eq!(other.status(), 409, "the key under another commandId");
+
+    let record = ctx.lineage(&older).await?;
+    assert_eq!(
+        record["fences"].as_array().map(Vec::len),
+        Some(2),
+        "{record}"
+    );
+    assert!(
+        node.drain()
+            .iter()
+            .all(|(method, _)| method != "instance.close"),
+        "no replay forwarded a second close"
+    );
     Ok(())
 }
 
@@ -1201,6 +1279,13 @@ async fn self_close_is_guarded_and_a_superseded_interaction_cannot_be_answered()
     assert_eq!(guarded.status(), 409);
     let body: Value = guarded.json().await?;
     assert_eq!(body["reason"], json!("pending-interaction"), "{body}");
+    assert_eq!(
+        body["error"],
+        json!(
+            "this chapter has a pending interaction; it cannot close itself until the \
+             interaction is answered"
+        )
+    );
     assert_eq!(ctx.lineage(&seat).await?["state"], json!("starting"));
 
     // The owner pauses instead: the question is superseded.
@@ -1277,6 +1362,13 @@ async fn a_self_close_with_an_approval_in_flight_is_refused_and_the_owner_close_
     assert_eq!(guarded.status(), 409);
     let body: Value = guarded.json().await?;
     assert_eq!(body["reason"], json!("approval-in-flight"), "{body}");
+    assert_eq!(
+        body["error"],
+        json!(
+            "this chapter has a D-017 approval in flight; it cannot close itself until the \
+             approval is answered or expires"
+        )
+    );
     let record = ctx.lineage(&seat).await?;
     assert_eq!(record["state"], json!("starting"), "{record}");
     assert_eq!(
@@ -1953,6 +2045,65 @@ async fn racing_identical_closes_of_an_older_chapter_answer_a_close_and_its_repl
         Some(2),
         "{record}"
     );
+    Ok(())
+}
+
+/// r3 item 2: a key taken by another command while a keyed close is being
+/// admitted makes F write nothing (the key is UNIQUE): the close parks after
+/// its retry checks (`pause-read`), a send claims the same key, and the
+/// close is then answered as a retry of that send — a 409, the lineage left
+/// unpaused, no fence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_whose_key_was_taken_meanwhile_writes_nothing() -> Result<()> {
+    let _serial = RACE_HOOK.lock().await;
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.seat_host, true).await?;
+    let (seat, _token) = ctx.seat(&mut node).await?;
+    let parked = Arc::new(Gate::default());
+    {
+        let (parked, lineage) = (Arc::clone(&parked), seat.clone());
+        remuda_hub::lineage_test_support::set_hook(Some(Arc::new(move |point, id| {
+            if id == lineage && point == "pause-read" {
+                parked.arrive();
+            }
+        })));
+    }
+    let key = format!("shared-{}", cmd_id());
+    let close = {
+        let http = ctx.http.clone();
+        let url = format!("{}/v1/instances/{seat}/commands", ctx.base());
+        let human = ctx.human.clone();
+        let body = json!({"operation": "instance.close", "commandId": cmd_id(),
+                          "idempotencyKey": key, "payload": {}});
+        tokio::spawn(async move { http.post(url).bearer_auth(human).json(&body).send().await })
+    };
+    let raced = async {
+        parked.reached().await?;
+        let send = ctx
+            .command(
+                &ctx.human,
+                &seat,
+                json!({"operation": "instance.send", "commandId": cmd_id(), "idempotencyKey": key,
+                       "payload": {"input": {"type": "prompt", "text": "KEY-OWNER"}}}),
+            )
+            .await?;
+        parked.release();
+        anyhow::Ok((send, close.await??))
+    }
+    .await;
+    parked.release();
+    remuda_hub::lineage_test_support::set_hook(None);
+    let (send, close) = raced?;
+
+    assert_eq!(send.status(), 200, "the send owns the key");
+    assert_eq!(
+        close.status(),
+        409,
+        "the close is a retry of another command under that key"
+    );
+    let record = ctx.lineage(&seat).await?;
+    assert_ne!(record["state"], json!("paused"), "{record}");
+    assert_eq!(record["fences"], json!([]), "F wrote nothing: {record}");
     Ok(())
 }
 

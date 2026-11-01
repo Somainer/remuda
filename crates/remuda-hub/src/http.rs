@@ -614,7 +614,8 @@ pub async fn delete_instance(
                 return Err(HubError::lineage_conflict(
                     "not-paused",
                     format!(
-                        "instance {instance_id} is the current chapter of a lineage that is not                          paused; close it first"
+                        "instance {instance_id} is the current chapter of a lineage that is not \
+                         paused; close it first"
                     ),
                 ));
             }
@@ -2944,11 +2945,32 @@ pub async fn post_command(
             .await?
             .is_some()
     {
+        // A keyed retry of a close that already paused the lineage (the
+        // same-id retry was answered above).
+        if let Some(existing) = close_retry_row(
+            &state,
+            body.command_id.as_deref(),
+            body.idempotency_key.as_deref(),
+        )
+        .await?
+        {
+            return replay_same_id(
+                &state,
+                &device,
+                &instance,
+                &body.operation,
+                body.idempotency_key.as_deref(),
+                existing,
+                &mut payload,
+            )
+            .await;
+        }
         if let Some(command) = crate::fence::pause_on_close(
             &state,
             &device,
             &instance.lineage_id,
             body.command_id.clone(),
+            body.idempotency_key.clone(),
             payload.clone(),
         )
         .await?
@@ -2957,10 +2979,14 @@ pub async fn post_command(
                 json!({ "command": command, "replayed": false, "paused": true }),
             ));
         }
-        // A same-id close that raced this one past the retry check above
-        // paused the lineage first: this request is its retry.
-        if let Some(command_id) = body.command_id.as_deref()
-            && let Some(existing) = state.store.get_command(command_id.to_owned()).await?
+        // A same-id or same-key close that raced this one past the retry
+        // checks above paused the lineage first: this request is its retry.
+        if let Some(existing) = close_retry_row(
+            &state,
+            body.command_id.as_deref(),
+            body.idempotency_key.as_deref(),
+        )
+        .await?
         {
             return replay_same_id(
                 &state,
@@ -3073,8 +3099,9 @@ pub async fn post_command(
     Ok(Json(json!({ "command": command, "replayed": false })))
 }
 
-/// Answer a same-id client retry of the stored `existing` row: a replay of
-/// it when the retry denotes the same command, else 409.
+/// Answer a client retry (same commandId or idempotency key) of the stored
+/// `existing` row: a replay of it when the retry denotes the same command,
+/// else 409.
 async fn replay_same_id(
     state: &AppState,
     device: &crate::store::Device,
@@ -3103,6 +3130,33 @@ async fn replay_same_id(
     let command =
         replay_existing_command(state, device, instance, operation, existing, payload).await?;
     Ok(Json(json!({ "command": command, "replayed": true })))
+}
+
+/// The stored command a close retry names: by commandId, else by
+/// idempotency key. A key already stored under another commandId names a
+/// different request (409), as in `Store::queue_command`.
+async fn close_retry_row(
+    state: &AppState,
+    command_id: Option<&str>,
+    idempotency_key: Option<&str>,
+) -> Result<Option<CommandRecord>, HubError> {
+    if let Some(command_id) = command_id
+        && let Some(row) = state.store.get_command(command_id.to_owned()).await?
+    {
+        return Ok(Some(row));
+    }
+    let Some(key) = idempotency_key else {
+        return Ok(None);
+    };
+    let Some(row) = state.store.get_command_by_key(key.to_owned()).await? else {
+        return Ok(None);
+    };
+    if command_id.is_some_and(|command_id| command_id != row.command_id) {
+        return Err(HubError::Conflict(
+            "idempotency key reused with a different commandId".into(),
+        ));
+    }
+    Ok(Some(row))
 }
 
 /// The instance and payload a same-id retry is compared as (D-057 §6.5).

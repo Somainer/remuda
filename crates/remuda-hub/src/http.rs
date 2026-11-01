@@ -607,7 +607,8 @@ pub async fn delete_instance(
                 return Err(HubError::lineage_conflict(
                     "not-paused",
                     format!(
-                        "instance {instance_id} is the current chapter of a lineage that is not                          paused; close it first"
+                        "instance {instance_id} is the current chapter of a lineage that is not \
+                         paused; close it first"
                     ),
                 ));
             }

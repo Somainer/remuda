@@ -1334,7 +1334,8 @@ pub(crate) async fn pause_on_close(
         if self_close && state.agent_approvals.in_flight_for(&current).await {
             return Err(HubError::lineage_conflict(
                 "approval-in-flight",
-                "this chapter has a D-017 approval in flight; it cannot close itself until the                  approval is answered or expires",
+                "this chapter has a D-017 approval in flight; it cannot close itself until the \
+                 approval is answered or expires",
             ));
         }
         let mut close_payload = payload.clone();
@@ -1384,7 +1385,8 @@ pub(crate) async fn pause_on_close(
             FenceTx::Guarded(reason) => {
                 return Err(HubError::lineage_conflict(
                     reason,
-                    "this chapter has a pending interaction; it cannot close itself until the                      interaction is answered",
+                    "this chapter has a pending interaction; it cannot close itself until the \
+                     interaction is answered",
                 ));
             }
         }

@@ -555,7 +555,15 @@ async fn resume_only_from_paused_and_a_send_to_the_superseded_chapter_never_leav
         .send()
         .await?;
     assert_eq!(delete.status(), 409);
-    assert_eq!(delete.json::<Value>().await?["reason"], json!("not-paused"));
+    let body: Value = delete.json().await?;
+    assert_eq!(body["reason"], json!("not-paused"));
+    assert_eq!(
+        body["error"],
+        json!(format!(
+            "instance {seat} is the current chapter of a lineage that is not paused; \
+             close it first"
+        ))
+    );
 
     ctx.pause(&ctx.human, &seat).await?.error_for_status()?;
     node.drain();
@@ -1271,6 +1279,13 @@ async fn self_close_is_guarded_and_a_superseded_interaction_cannot_be_answered()
     assert_eq!(guarded.status(), 409);
     let body: Value = guarded.json().await?;
     assert_eq!(body["reason"], json!("pending-interaction"), "{body}");
+    assert_eq!(
+        body["error"],
+        json!(
+            "this chapter has a pending interaction; it cannot close itself until the \
+             interaction is answered"
+        )
+    );
     assert_eq!(ctx.lineage(&seat).await?["state"], json!("starting"));
 
     // The owner pauses instead: the question is superseded.
@@ -1347,6 +1362,13 @@ async fn a_self_close_with_an_approval_in_flight_is_refused_and_the_owner_close_
     assert_eq!(guarded.status(), 409);
     let body: Value = guarded.json().await?;
     assert_eq!(body["reason"], json!("approval-in-flight"), "{body}");
+    assert_eq!(
+        body["error"],
+        json!(
+            "this chapter has a D-017 approval in flight; it cannot close itself until the \
+             approval is answered or expires"
+        )
+    );
     let record = ctx.lineage(&seat).await?;
     assert_eq!(record["state"], json!("starting"), "{record}");
     assert_eq!(

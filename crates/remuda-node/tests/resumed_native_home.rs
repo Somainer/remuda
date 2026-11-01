@@ -157,16 +157,17 @@ fn is_terminal(lifecycle: InstanceLifecycle) -> bool {
 
 /// Close the chapter and wait until it has process-end evidence; the transfer
 /// refuses a predecessor that is still running.
+fn close_request() -> remuda_node::InstanceCommandRequest {
+    serde_json::from_value(json!({"operation": "close"})).expect("close parses")
+}
+
 async fn close_and_wait(node: &DevNode, id: &InstanceId) -> InstanceLifecycle {
     if let Ok(instance) = node.get_instance(id)
         && !is_terminal(instance.lifecycle)
     {
-        node.submit_command(
-            id,
-            serde_json::from_value(json!({"operation": "close"})).expect("close parses"),
-        )
-        .await
-        .expect("close accepted");
+        node.submit_command(id, close_request())
+            .await
+            .expect("close accepted");
     }
     tokio::time::timeout(Duration::from_secs(60), async {
         loop {
@@ -437,13 +438,47 @@ async fn a_retried_resume_finds_the_home_already_in_the_successor_slot() {
     let mut b_request = successor(&a, SESSION);
     b_request.instance_id = Some(b_id.clone());
     // The retry must neither refuse nor look for a predecessor home.
-    node.create_instance(b_request)
+    let first = node
+        .create_instance(b_request.clone())
         .await
         .expect("the retried resume is accepted");
+    assert_eq!(first.instance.meta.id, b_id);
     let transcript = wait_for_transferred_slot(&b_slot).await;
     assert!(transcript.is_file());
     let recipe = wait_for_recipe(&node, &b_id).await;
     assert_eq!(Path::new(&recipe.native_home), b_slot);
+
+    // A RETRY of the SAME successor create (same instance and command id, as
+    // a re-forwarded create is) echoes the chapter already materialized: it
+    // creates no second home and no second launch, and the transcript stays.
+    let retried = node
+        .create_instance(b_request)
+        .await
+        .expect("the same successor create is replayed");
+    assert_eq!(retried.instance.meta.id, b_id);
+    assert_ne!(
+        node.get_instance(&b_id).expect("chapter B row").lifecycle,
+        InstanceLifecycle::Failed,
+        "the replay did not fail the chapter"
+    );
+    assert_eq!(retried.instance.meta.id, first.instance.meta.id);
+    assert!(
+        transcript.is_file(),
+        "the retry kept the transcript in place"
+    );
+    assert_eq!(
+        Path::new(&wait_for_recipe(&node, &b_id).await.native_home),
+        b_slot
+    );
+    let launches = std::fs::read_dir(b_slot.parent().expect("instance dir"))
+        .expect("instance dir")
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .is_ok_and(|entry| entry.file_name().to_string_lossy() == "launch")
+        })
+        .count();
+    assert_eq!(launches, 1, "exactly one launch directory");
 }
 
 // ── 6. A still-running predecessor is refused, never moved ────────────────
@@ -491,10 +526,157 @@ async fn a_still_running_predecessor_is_refused_with_a_clear_error() {
     .expect("chapter B is refused while A runs");
     let error = failed.last_error.unwrap_or_default();
     assert!(
-        error.contains("not exited"),
-        "the refusal says the predecessor is still live: {error}"
+        error.contains("no close was requested"),
+        "the refusal says the predecessor is live and no close is in flight: {error}"
     );
     assert!(a_slot.is_dir(), "A's home was not moved");
     assert!(!slot(data.path(), &b_id).exists(), "B owns no slot");
     close_and_wait(&node, &a).await;
+}
+
+// ── 7. Pause, then an immediate Resume: wait for the in-flight close ──────
+
+/// A Hub pause commits `paused` at close admission and only ENQUEUES the
+/// close, so a quick Resume forwards the successor while the predecessor's
+/// row still reads ready/closing. The successor must wait (bounded) for the
+/// process-end row, then take the home — not refuse and strand the transcript.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_quick_resume_waits_for_the_in_flight_close_and_takes_the_home() {
+    let data = tempfile::tempdir().expect("data dir");
+    let node = native_node(data.path());
+    let a = node
+        .create_instance(request("hello"))
+        .await
+        .expect("chapter A")
+        .instance
+        .meta
+        .id
+        .clone();
+    let a_slot = slot(data.path(), &a);
+    wait_for_slot(&a_slot).await;
+
+    // The pause's durable effect: a close on the ledger, process still live.
+    node.test_record_close_in_flight(&a)
+        .expect("close recorded");
+    assert!(!is_terminal(
+        node.get_instance(&a).expect("chapter A row").lifecycle
+    ));
+    // The close is enqueued by the pause; it lands while the Resume runs.
+    let closer = node.clone();
+    let owner = a.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let _ = closer.submit_command(&owner, close_request()).await;
+    });
+
+    let b_id = InstanceId::new();
+    let mut b_request = successor(&a, SESSION);
+    b_request.instance_id = Some(b_id.clone());
+    let started = std::time::Instant::now();
+    node.create_instance(b_request)
+        .await
+        .expect("the successor create is accepted");
+    let b_slot = slot(data.path(), &b_id);
+    wait_for_transferred_slot(&b_slot).await;
+    assert!(
+        started.elapsed() >= Duration::from_millis(900),
+        "the successor waited for the in-flight close (took {:?})",
+        started.elapsed()
+    );
+    assert!(!a_slot.exists(), "A's slot is empty after the transfer");
+    assert_ne!(
+        node.get_instance(&b_id).expect("chapter B row").lifecycle,
+        InstanceLifecycle::Failed,
+        "chapter B adopted the home instead of being refused"
+    );
+}
+
+// ── 8. Refusal, then retry: walk back to the real owner ───────────────────
+
+/// The r2 failure shape: a successor B is refused (predecessor live, no close
+/// requested) and owns no slot or recipe. A retry anchored on B must walk
+/// B -> A, find A's slot once the owner closes, and take the transcript.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retry_after_refusal_walks_back_to_the_real_owner() {
+    let data = tempfile::tempdir().expect("data dir");
+    let node = native_node(data.path());
+    let a = node
+        .create_instance(request("hello"))
+        .await
+        .expect("chapter A")
+        .instance
+        .meta
+        .id
+        .clone();
+    let a_slot = slot(data.path(), &a);
+    wait_for_slot(&a_slot).await;
+
+    let b_id = InstanceId::new();
+    let mut b_request = successor(&a, SESSION);
+    b_request.instance_id = Some(b_id.clone());
+    node.create_instance(b_request)
+        .await
+        .expect("the create is accepted before materialization");
+    let failed_b = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let instance = node.get_instance(&b_id).expect("chapter B row");
+            if instance.lifecycle == InstanceLifecycle::Failed {
+                return instance;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("chapter B refused while A runs with no close requested");
+    assert!(
+        failed_b
+            .last_error
+            .unwrap_or_default()
+            .contains("no close was requested")
+    );
+    assert!(!slot(data.path(), &b_id).exists(), "B owns no slot");
+    assert!(a_slot.is_dir(), "A still owns its home");
+
+    close_and_wait(&node, &a).await;
+
+    // The retry a Hub makes after a failed chapter anchors on B, not A.
+    let c_id = InstanceId::new();
+    let mut c_request = successor(&b_id, SESSION);
+    c_request.instance_id = Some(c_id.clone());
+    node.create_instance(c_request)
+        .await
+        .expect("the retry create is accepted");
+    let c_slot = slot(data.path(), &c_id);
+    wait_for_transferred_slot(&c_slot).await;
+    assert!(!a_slot.exists(), "A's home moved to C");
+    assert!(!slot(data.path(), &b_id).exists(), "B never had a home");
+    let recipe = wait_for_recipe(&node, &c_id).await;
+    assert_eq!(Path::new(&recipe.native_home), c_slot);
+}
+
+// ── 9. Unknown predecessor with nothing to transfer: fresh start ──────────
+
+/// A `resumedFrom` the Node never saw (no row, no slot, no recipe) has nothing
+/// to transfer: the successor starts in a fresh managed slot, which is logged,
+/// rather than refusing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unknown_predecessor_with_nothing_to_transfer_starts_fresh() {
+    let data = tempfile::tempdir().expect("data dir");
+    let node = native_node(data.path());
+    let ghost = InstanceId::new();
+    let b_id = InstanceId::new();
+    let mut b_request = successor(&ghost, SESSION);
+    b_request.instance_id = Some(b_id.clone());
+    node.create_instance(b_request)
+        .await
+        .expect("an unknown predecessor is not a refusal");
+    let recipe = wait_for_recipe(&node, &b_id).await;
+    assert_eq!(
+        Path::new(&recipe.native_home),
+        slot(data.path(), &b_id),
+        "the successor started in its own managed slot"
+    );
+    assert!(!is_terminal(
+        node.get_instance(&b_id).expect("chapter B row").lifecycle
+    ));
 }

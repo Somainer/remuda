@@ -231,6 +231,16 @@ test.describe("phone 390", () => {
       expect(Math.abs(order.gap), "② starts at the head's bottom edge").toBeLessThanOrEqual(1);
       expect(order.searchAfterStrip, "the search row follows ②").toBe(true);
 
+      // The empty state belongs to the ledger slot: below the toolbar, not
+      // between ① and ②.
+      await page.getByTestId("home-search").fill("zzz-glance-no-match");
+      const empty = page.getByTestId("home-empty");
+      await expect(empty).toBeVisible();
+      const emptyTop = await empty.evaluate((el) => el.getBoundingClientRect().top);
+      const searchBottom = await page.getByTestId("home-search").evaluate((el) => el.getBoundingClientRect().bottom);
+      expect(emptyTop, "the empty state follows the search row").toBeGreaterThanOrEqual(searchBottom - 0.5);
+      await page.getByTestId("home-search").fill("");
+
       await setMode(page, "light");
       await shot(page, "home-glance-390-light.png");
       await setMode(page, "dark");

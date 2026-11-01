@@ -135,6 +135,13 @@
   flex: none;
 }
 
+/* The ledger's empty / skeleton state: same slot as the project groups (after
+   the toolbar), so the phone order stays ①, ②, toolbar, ledger (§2.1). */
+.emptyLedger {
+  order: 3;
+  flex: none;
+}
+
 .group {
   border-bottom: 1px solid var(--divider);
 }

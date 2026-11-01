@@ -881,20 +881,28 @@ function HomeTaskLayer({
   );
   if (layer.length === 0) {
     if (!sessionEmpty) return null;
-    // Before the first snapshot there is nothing to say and nothing to
-    // create from: paint the three skeleton rows §8 asks for, never
-    // 「还没有会话」 (a cold start must not flash an empty state).
-    if (firstSnapshot) return <SkeletonRows variant="phone" />;
-    return query.trim() ? (
+    // home.md §2.1 order: ①, ②, the toolbar, THEN the ledger — so the empty
+    // and skeleton states sit in the ledger slot, not above the search row.
+    // Before the first snapshot there is nothing to say and nothing to create
+    // from: paint the three skeleton rows §8 asks for, never 「还没有会话」
+    // (a cold start must not flash an empty state).
+    const empty = firstSnapshot ? (
+      <SkeletonRows variant="phone" />
+    ) : query.trim() ? (
       <NoMatches onClear={onClearSearch} />
     ) : (
       <NoSessions newHref={newHref} />
+    );
+    return (
+      <div className={css.emptyLedger} data-slot="ledger">
+        {empty}
+      </div>
     );
   }
   // A plain wrapper (not .groups): it keeps no bottom padding so it flows
   // straight into the project groups below it.
   return (
-    <div data-testid="home-tasks" className={css.taskLayer}>
+    <div data-testid="home-tasks" className={css.taskLayer} data-slot="tasks">
       <TaskGroups groups={layer} variant="phone" />
     </div>
   );

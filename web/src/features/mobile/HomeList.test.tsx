@@ -713,3 +713,27 @@ describe("① stays owner-wide on a project-filtered /m", () => {
     expect(ledgerScopes).toContain(null);
   });
 });
+
+describe("empty and skeleton states sit in the ledger slot (§2.1)", () => {
+  it("paints a no-match empty state after the toolbar", async () => {
+    hub.instances = [row("ins-work", { activity: known("working") })];
+    renderHome();
+    await screen.findByTestId("home-row");
+    await userEvent.type(screen.getByTestId("home-search"), "no-such-session-zzz");
+    const slot = await waitFor(() => document.querySelector('[data-slot="ledger"]'));
+    expect(slot).not.toBeNull();
+    expect(slot!.querySelector('[data-testid="home-empty"]')).not.toBeNull();
+  });
+
+  it("paints the pre-snapshot skeleton in the ledger slot", async () => {
+    publishHealth({ lastOkAt: null });
+    try {
+      hub.instances = [];
+      renderHome();
+      const slot = await waitFor(() => document.querySelector('[data-slot="ledger"]'));
+      expect(slot!.querySelector('[data-testid="home-skeleton"]')).not.toBeNull();
+    } finally {
+      publishHealth({ lastOkAt: Date.now() });
+    }
+  });
+});

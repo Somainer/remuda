@@ -11,6 +11,7 @@ import {
 } from "@playwright/test";
 import { seedMode } from "./appearanceHelper";
 import { login } from "./hub-auth";
+import { openSpacesIndex } from "./spacesIndex";
 
 type StorageState = Awaited<ReturnType<BrowserContext["storageState"]>>;
 
@@ -361,6 +362,8 @@ for (const theme of THEMES) {
           // non-empty list the toolbar, rows and their actions all render.
           const row = page.getByTestId("session-row").filter({ hasText: LONG_TITLE });
           if (!(await row.first().isVisible().catch(() => false))) {
+            // §2.5: the Space index is collapsed behind 「空间 ▸」.
+            await openSpacesIndex(page);
             await page
               .locator('[data-testid="space-select"][title^="remuda-e2e ·"]')
               .first()

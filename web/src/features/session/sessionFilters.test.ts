@@ -16,12 +16,29 @@ import {
   type FilterConditions,
 } from "./sessionFilters";
 import type { Instance, UiStatus } from "../../types/instance";
+import { rank } from "../mobile/homeRows";
 import type { Workspace } from "../../types/workspace";
 import type { Id } from "../../types/wire";
 
 function conditions(over: Partial<FilterConditions> = {}): FilterConditions {
-  return { q: "", status: [], kind: [], host: [], workspace: [], scope: "space", ...over };
+  return { q: "", status: [], kind: [], host: [], workspace: [], rank: [], scope: "space", ...over };
 }
+
+/** The rank() inputs: the filter must read the same projection the row does. */
+function ranked(over: { id: string; activity: string; connectivity?: string }): Instance {
+  return {
+    id: over.id as Id,
+    hostId: "h1" as Id,
+    workspaceId: "w1" as Id,
+    kind: "claude",
+    lifecycle: "running",
+    activity: { state: "known", value: over.activity },
+    connectivity: over.connectivity ?? "connected",
+    nativeRef: { sessionId: { state: "unknown", reason: "none" } },
+  } as unknown as Instance;
+}
+
+const rankOf = (row: Instance) => rank(row);
 
 /** Only the fields the filter model reads; the rest of Instance is irrelevant here. */
 function instance(over: { id: string; hostId: string; workspaceId: string; kind?: string; native?: string }): Instance {
@@ -45,10 +62,11 @@ const hostName = (id: string) => hostNames[id] ?? id;
 
 describe("sessionFilters URL round-trip", () => {
   it("reads every condition out of the query string", () => {
-    const params = new URLSearchParams("q=spill&status=blocked,idle&kind=claude&host=h1&workspace=w1&scope=all");
+    const params = new URLSearchParams("q=spill&status=blocked,idle&rank=working&kind=claude&host=h1&workspace=w1&scope=all");
     expect(readConditions(params)).toEqual({
       q: "spill",
       status: ["blocked", "idle"],
+      rank: ["working"],
       kind: ["claude"],
       host: ["h1"],
       workspace: ["w1"],
@@ -257,5 +275,45 @@ describe("empty states", () => {
   it("checks hosts before workspaces before sessions", () => {
     expect(emptyState({ hostCount: 0, workspaceCount: 0, sourceCount: 0, matchCount: 0, conditions: conditions() })).toBe("no-hosts");
     expect(emptyState({ hostCount: 1, workspaceCount: 0, sourceCount: 0, matchCount: 0, conditions: conditions() })).toBe("no-workspaces");
+  });
+});
+
+describe("rank filter (① 工作中)", () => {
+  const context = { titleOf: (id: string) => id, workspaces: [] as Workspace[] };
+
+  it("keeps a working row whose host disconnected — the count's rank, not UiStatus", () => {
+    const dropped = ranked({ id: "i_work", activity: "working", connectivity: "disconnected" });
+    const idle = ranked({ id: "i_idle", activity: "idle" });
+    // UiStatus projects `unknown` for the dropped host; rank 3 still holds.
+    const byRank = applyFilters(
+      [dropped, idle],
+      conditions({ rank: ["working"], scope: "all" }),
+      () => "unknown" as UiStatus,
+      context,
+      rankOf,
+    );
+    expect(byRank.map((row) => row.id)).toEqual(["i_work"]);
+    // The old UiStatus filter would drop it — the bug this replaces.
+    const byStatus = applyFilters(
+      [dropped, idle],
+      conditions({ status: ["working"], scope: "all" }),
+      () => "unknown" as UiStatus,
+      context,
+      rankOf,
+    );
+    expect(byStatus).toEqual([]);
+  });
+
+  it("round-trips the rank param, counts it as a condition, names it as a chip and clears it", () => {
+    const params = writeConditions(new URLSearchParams(), conditions({ rank: ["working"] }));
+    expect(params.get("rank")).toBe("working");
+    expect(readConditions(params).rank).toEqual(["working"]);
+    expect(conditionCount(conditions({ rank: ["working"] }))).toBe(1);
+    const chips = selectedChips(conditions({ rank: ["working"] }), {
+      hostName, workspaceLabel: (id) => id, workspaceAmbiguous: () => false, workspaceHost: () => "h1",
+    });
+    expect(chips).toEqual([{ key: "rank", value: "working", label: "工作中" }]);
+    expect(withoutChip(conditions({ rank: ["working"] }), chips[0]).rank).toEqual([]);
+    expect(clearedConditions(conditions({ rank: ["working"] })).rank).toEqual([]);
   });
 });

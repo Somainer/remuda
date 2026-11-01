@@ -23,6 +23,7 @@ import {
   arrangeHomeGroups,
   buildHomeRows,
   buildHomeTaskLayer,
+  groupDots,
   homeRowsSignature,
   liveChildParents,
   rankFolds,
@@ -30,14 +31,19 @@ import {
   writeHomeOrder,
   type HomeGroup,
   type HomeOrder,
+  type HomeRank,
   type HomeRow,
 } from "./homeRows";
 import { HarnessGlyph } from "../spaces/SpacesPanel";
-import { TaskGroups, useTaskLedger } from "../tasks/TaskList";
+import { TaskGroups } from "../tasks/TaskList";
+import { useTaskLedger } from "../tasks/taskLedger";
 import { SpacesDrawer } from "../spaces/SpacesMobile";
 import { ContextRing } from "./ContextRing";
 import { useHomeFreshness } from "../home/freshness";
+import { HostStrip } from "../home/HostStrip";
 import { HubBanner } from "../home/HubBanner";
+import { HomeGlance } from "../home/HomeGlance";
+import { GLANCE_TARGETS, scrollToFirst } from "../home/glanceNav";
 import { MainAskDock, MainCard } from "../home/MainCard";
 import { NoMatches, NoSessions, SkeletonRows } from "../home/HomeStates";
 import { newSessionPath } from "../spaces/store";
@@ -181,6 +187,9 @@ export const HomeList = memo(function HomeList() {
   const projectFilter = params.get("project");
   const [query, setQuery] = useState("");
   const [order, setOrder] = useState<HomeOrder>(() => readHomeOrder(localStorageAccess()));
+  // §5.2: a count-row tap narrows the ledger to one rank; the second tap
+  // clears it. Not persisted — it is a look, not a device preference.
+  const [rankFilter, setRankFilter] = useState<HomeRank | null>(null);
   const [branches, setBranches] = useState<Record<string, string>>({});
   const [resumeStates, setResumeStates] = useState<Record<string, ResumeState>>({});
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -292,13 +301,30 @@ export const HomeList = memo(function HomeList() {
       }),
     [spaces, rows, query, order, branches],
   );
+  // §5.2: tapping ● filters the ledger to that rank; a second tap clears it.
+  // The filtered rows come from the same `rank()` the row already carries, so
+  // the count segment and the surviving rows always agree.
+  const rankFiltered = useMemo<HomeGroup[]>(() => {
+    if (rankFilter === null) return groups;
+    return groups
+      .map((group) => {
+        const rows = group.rows.filter((row) => row.rank === rankFilter);
+        // The header counts what is on screen, not what the filter hides.
+        return { ...group, rows, dots: groupDots(rows) };
+      })
+      .filter((group) => group.rows.length > 0);
+  }, [groups, rankFilter]);
   // What the list is painting right now: group order, each group's busy/quiet
   // bucket, and which rows sit behind its idle fold. This is the structure a
   // hold freezes (home.md §3.3).
   const searching = query.trim().length > 0;
   const painted = useMemo<PhoneSnapshot>(
-    () => ({ groups, fold: foldStateOf(groups, prefs, searching), quietOpen: searching || prefs.quietOpen }),
-    [groups, prefs, searching],
+    () => ({
+      groups: rankFiltered,
+      fold: foldStateOf(rankFiltered, prefs, searching),
+      quietOpen: searching || prefs.quietOpen,
+    }),
+    [rankFiltered, prefs, searching],
   );
   // The committed structure, read when a hold begins: a press must freeze what
   // is on screen, not a render that has not painted yet.
@@ -330,23 +356,38 @@ export const HomeList = memo(function HomeList() {
   // While held, the snapshot owns the structure; live data only replaces each
   // row's content by id. A row that vanished keeps its last painted content as
   // a placeholder, and a row that appeared waits for the release.
+  //
+  // The ① rank filter is a USER action, not new data: a row it excludes leaves
+  // (no placeholder), a group it empties drops, and the header dots count the
+  // rows actually rendered — even while a hold is active.
   const renderedGroups = useMemo<HomeGroup[]>(() => {
-    if (!snapshot) return groups;
-    const live = new Map(groups.flatMap((group) => group.rows.map((row) => [row.id, row] as const)));
-    return snapshot.groups.map((group) => ({
-      ...group,
-      rows: group.rows.map((row) => live.get(row.id) ?? row),
-    }));
-  }, [groups, snapshot]);
+    if (!snapshot) return rankFiltered;
+    const liveFiltered = new Map(
+      rankFiltered.flatMap((group) => group.rows.map((row) => [row.id, row] as const)),
+    );
+    const liveAll = new Set(groups.flatMap((group) => group.rows.map((row) => row.id)));
+    return snapshot.groups
+      .map((group) => {
+        const rows = group.rows.flatMap((row) => {
+          const liveRow = liveFiltered.get(row.id);
+          if (liveRow) return [liveRow];
+          // Removed by the rank filter: the tap asked for it, so drop it.
+          if (rankFilter !== null && liveAll.has(row.id)) return [];
+          return [row];
+        });
+        return { ...group, rows, dots: groupDots(rows) };
+      })
+      .filter((group) => group.rows.length > 0);
+  }, [rankFiltered, groups, snapshot, rankFilter]);
   // A row painted at hold start that has since left the live data: it keeps its
   // place as a placeholder, with every control inert until release.
   const staleIds = useMemo<ReadonlySet<string>>(() => {
     if (!snapshot) return new Set<string>();
-    const live = new Set(groups.flatMap((group) => group.rows.map((row) => row.id)));
+    const live = new Set(rankFiltered.flatMap((group) => group.rows.map((row) => row.id)));
     return new Set(
       snapshot.groups.flatMap((group) => group.rows.map((row) => row.id)).filter((id) => !live.has(id)),
     );
-  }, [snapshot, groups]);
+  }, [snapshot, rankFiltered]);
   const renderedFold = snapshot ? snapshot.fold : painted.fold;
   const renderedQuietOpen = snapshot ? snapshot.quietOpen : painted.quietOpen;
 
@@ -382,67 +423,42 @@ export const HomeList = memo(function HomeList() {
 
   return (
     <div className={css.home} data-testid="home-list">
-      {/* The probe wraps ONLY the session list surface (head + project
-          groups). The D-050 task layer sits outside it: its own 5s ledger
-          poll commits the task subtree, never `commit:HomeList`. */}
+      {/* The sticky head is the 52px title row plus the 28px ① count row
+          (home.md §2.1: 80px in total). ① is OUTSIDE the probe: its count
+          legitimately follows the badge, and the badge-only contract
+          (`commit:HomeList`) is about the ledger, not the count row. */}
+      <header className={css.head} data-testid="home-head">
+        <div className={css.titleRow}>
+          <h1 className={css.title}>会话</h1>
+          <button
+            ref={drawerOpener}
+            type="button"
+            className={css.spaceBtn}
+            data-testid="spaces-drawer-open"
+            aria-haspopup="dialog"
+            aria-expanded={drawerOpen}
+            aria-label="切换空间"
+            title={active?.name ?? "空间"}
+            onClick={() => setDrawerOpen(true)}
+          >
+            <span className={css.spaceBtnName}>{active?.name ?? "空间"}</span>
+            <span className={css.spaceBtnCaret} aria-hidden="true">
+              ▾
+            </span>
+          </button>
+        </div>
+        <HomeGlance
+          placement="phone"
+          workingFilter={rankFilter === "working"}
+          onNeedYou={() => scrollToFirst(GLANCE_TARGETS.needYou, GLANCE_TARGETS.tasks)}
+          onWorking={() => setRankFilter((current) => (current === "working" ? null : "working"))}
+        />
+      </header>
+      {/* The probe wraps ONLY the project groups: the toolbar, ①, ②, the task
+          layer and the Main card are outside it, so their own updates never
+          report `commit:HomeList`. */}
       <CommitProbe name="HomeList">
         <>
-          <header className={css.head}>
-            <div className={css.titleRow}>
-              <h1 className={css.title}>会话</h1>
-              <button
-                ref={drawerOpener}
-                type="button"
-                className={css.spaceBtn}
-                data-testid="spaces-drawer-open"
-                aria-haspopup="dialog"
-                aria-expanded={drawerOpen}
-                aria-label="切换空间"
-                title={active?.name ?? "空间"}
-                onClick={() => setDrawerOpen(true)}
-              >
-                <span className={css.spaceBtnName}>{active?.name ?? "空间"}</span>
-                <span className={css.spaceBtnCaret} aria-hidden="true">
-                  ▾
-                </span>
-              </button>
-            </div>
-            <div className={css.toolbar}>
-              <input
-                className={css.search}
-                data-testid="home-search"
-                type="search"
-                value={query}
-                onChange={(event) => setQuery(event.target.value)}
-                placeholder="搜索 会话 / 项目 / 主机"
-                aria-label="搜索会话、项目或主机"
-              />
-              <div className={ui.seg} role="group" aria-label="排序方式" data-testid="home-order">
-                <button
-                  type="button"
-                  className={ui.segItem}
-                  data-testid="home-order-clock"
-                  aria-pressed={order === "clock"}
-                  onClick={() => setOrder("clock")}
-                >
-                  <span className={ui.segLabel} title="时钟">
-                    时钟
-                  </span>
-                </button>
-                <button
-                  type="button"
-                  className={ui.segItem}
-                  data-testid="home-order-list"
-                  aria-pressed={order === "list"}
-                  onClick={() => setOrder("list")}
-                >
-                  <span className={ui.segLabel} title="列表">
-                    列表
-                  </span>
-                </button>
-              </div>
-            </div>
-          </header>
           {drawerOpen ? (
             <SpacesDrawer
               spaces={spaces}
@@ -499,6 +515,45 @@ export const HomeList = memo(function HomeList() {
           (its countdown ticks once a second while failing) and flex-ordered
           right under the sticky head, above the task layer. */}
       <HubBanner />
+      {/* ② 主机条: 28px, scrolling with the page (home.md §1 ② / §2.1). */}
+      <HostStrip placement="phone" />
+      {/* Search + ordering scroll with the list (§2.1: ② sits directly under
+          ①, this row comes after it). */}
+      <div className={css.toolbar}>
+        <input
+          className={css.search}
+          data-testid="home-search"
+          type="search"
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          placeholder="搜索 会话 / 项目 / 主机"
+          aria-label="搜索会话、项目或主机"
+        />
+        <div className={ui.seg} role="group" aria-label="排序方式" data-testid="home-order">
+          <button
+            type="button"
+            className={ui.segItem}
+            data-testid="home-order-clock"
+            aria-pressed={order === "clock"}
+            onClick={() => setOrder("clock")}
+          >
+            <span className={ui.segLabel} title="时钟">
+              时钟
+            </span>
+          </button>
+          <button
+            type="button"
+            className={ui.segItem}
+            data-testid="home-order-list"
+            aria-pressed={order === "list"}
+            onClick={() => setOrder("list")}
+          >
+            <span className={ui.segLabel} title="列表">
+              列表
+            </span>
+          </button>
+        </div>
+      </div>
       {/* D-057 Main card + 问 Main (H8a): outside the probe so its own echo
           and tail reads never report commit:HomeList; flex order 0 keeps it
           right under the sticky head, below the banner. Renders nothing
@@ -516,7 +571,9 @@ export const HomeList = memo(function HomeList() {
         onClearSearch={() => setQuery("")}
         newHref={newSessionPath(active)}
         firstSnapshot={firstSnapshot}
-        sessionEmpty={renderedGroups.length === 0}
+        // A rank filter that matches nothing is not "no sessions": keep the
+        // designed empty state for the unfiltered ledger only.
+        sessionEmpty={renderedGroups.length === 0 && rankFilter === null}
       />
       {/* D-061 ⑨: 问 Main docked at the bottom, above PhoneNav. */}
       <MainAskDock />
@@ -570,7 +627,9 @@ function HomeRowView({
       data-testid="home-row"
       data-status={row.status}
       data-rank={row.rank}
-      data-blocked={row.blocked ? "1" : "0"}
+      // home.md §3.1 rank 1, not the UiStatus: a waiting row on a dropped
+      // host still owns the ① 需要你 anchor.
+      data-blocked={row.rank === "blocked" ? "1" : "0"}
       data-stale={stale ? "1" : undefined}
       aria-disabled={stale || undefined}
     >
@@ -822,20 +881,28 @@ function HomeTaskLayer({
   );
   if (layer.length === 0) {
     if (!sessionEmpty) return null;
-    // Before the first snapshot there is nothing to say and nothing to
-    // create from: paint the three skeleton rows §8 asks for, never
-    // 「还没有会话」 (a cold start must not flash an empty state).
-    if (firstSnapshot) return <SkeletonRows variant="phone" />;
-    return query.trim() ? (
+    // home.md §2.1 order: ①, ②, the toolbar, THEN the ledger — so the empty
+    // and skeleton states sit in the ledger slot, not above the search row.
+    // Before the first snapshot there is nothing to say and nothing to create
+    // from: paint the three skeleton rows §8 asks for, never 「还没有会话」
+    // (a cold start must not flash an empty state).
+    const empty = firstSnapshot ? (
+      <SkeletonRows variant="phone" />
+    ) : query.trim() ? (
       <NoMatches onClear={onClearSearch} />
     ) : (
       <NoSessions newHref={newHref} />
+    );
+    return (
+      <div className={css.emptyLedger} data-slot="ledger">
+        {empty}
+      </div>
     );
   }
   // A plain wrapper (not .groups): it keeps no bottom padding so it flows
   // straight into the project groups below it.
   return (
-    <div data-testid="home-tasks" className={css.taskLayer}>
+    <div data-testid="home-tasks" className={css.taskLayer} data-slot="tasks">
       <TaskGroups groups={layer} variant="phone" />
     </div>
   );

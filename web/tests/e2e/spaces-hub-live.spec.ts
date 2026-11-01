@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { setMode } from "./appearanceHelper";
 import { login } from "./hub-auth";
+import { openSpacesIndex } from "./spacesIndex";
 
 // Committed evidence is refreshed only on request (REMUDA_EVIDENCE=1); every other run —
 // including the merge gate, whose verify-tree step rejects a dirty worktree — writes
@@ -81,6 +82,8 @@ function space(page: Page, workspaceId: string) {
 async function toList(page: Page) {
   await page.getByRole("navigation", { name: "主导航" }).getByRole("link", { name: "会话" }).click();
   await expect(page).toHaveURL(/\/sessions$/);
+  // §2.5: the Space index starts collapsed behind 「空间 ▸」.
+  await openSpacesIndex(page);
 }
 
 async function createSession(page: Page, workspace: Workspace, prompt: string, created: string[]) {

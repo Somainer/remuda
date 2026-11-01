@@ -1,3 +1,4 @@
+import { openSpacesIndex } from "./spacesIndex";
 import { expect, test, type Page } from "@playwright/test";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
@@ -788,6 +789,9 @@ test("the unbound session list never shows live while the Hub is unreachable @e2
   // panel rather than guessing the first workspace.
   await login(page);
   await page.goto("/sessions");
+  // §2.5: the pressed Space is read from the index panel, which starts
+  // collapsed behind 「空间 ▸」.
+  await openSpacesIndex(page);
   // Fail loudly when the handle is not installed (e.g. a production bundle
   // that ignores the marker): the assertions below would otherwise mistake
   // ordinary 2 s list polling for a scheduled reconnect probe.

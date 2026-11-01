@@ -28,6 +28,7 @@ import { mockDb } from "../../lib/mock";
 import type { Instance } from "../../types/instance";
 import { known, type Id } from "../../types/wire";
 import { HomeList } from "./HomeList";
+import { GLANCE_TARGETS } from "../home/glanceNav";
 import { SPACES_PREFS_KEY, spaceKey, spaceStore } from "../spaces/store";
 import { setClock } from "../../lib/clock";
 
@@ -84,6 +85,14 @@ vi.mock("../../lib/store", () => ({
 
 vi.mock("../files/filesApi", () => ({
   fetchChanges: vi.fn(() => Promise.reject(new Error("offline"))),
+}));
+
+const ledgerScopes = vi.hoisted(() => [] as (string | null)[]);
+vi.mock("../tasks/taskLedger", () => ({
+  useTaskLedger: (scope?: string | null) => {
+    ledgerScopes.push(scope ?? null);
+    return { tasks: [], projectName: () => null };
+  },
 }));
 
 vi.mock("../tasks/TaskList", () => ({
@@ -585,5 +594,146 @@ describe("HomeList §8 freshness states", () => {
     });
     expect(region()).toHaveAttribute("data-freshness", "stale");
     expect(region()).toHaveAttribute("data-dimmed", "1");
+  });
+});
+
+describe("① 需要你 anchor on the phone ledger", () => {
+  it("marks the row by rank 1, so a dropped host still carries the anchor", async () => {
+    hub.instances = [
+      row("ins-dropped", {
+        activity: known("waiting-interaction"),
+        connectivity: "disconnected",
+      }),
+    ];
+    const { container } = renderHome();
+    const article = await screen.findByTestId("home-row");
+    // UiStatus projects unknown on a dropped host; the rank stays blocked.
+    expect(article).toHaveAttribute("data-status", "unknown");
+    expect(article).toHaveAttribute("data-rank", "blocked");
+    expect(article).toHaveAttribute("data-blocked", "1");
+    expect(container.querySelector(GLANCE_TARGETS.needYou)).toBe(article);
+  });
+});
+
+describe("phone home order (§2.1)", () => {
+  it("puts ② directly after the sticky head and the search/order row after it", async () => {
+    hub.instances = [row("ins-work", { activity: known("working") })];
+    renderHome();
+    const head = await screen.findByTestId("home-head");
+    const strip = await screen.findByTestId("host-strip");
+    const toolbar = await screen.findByTestId("home-search");
+    // Document order is the contract the CSS orders follow: head → ② → toolbar.
+    expect(head.compareDocumentPosition(strip) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(strip.compareDocumentPosition(toolbar) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+});
+
+describe("① 工作中 filter and the group header", () => {
+  it("recomputes the dots from the filtered rows and clears on the second tap", async () => {
+    hub.instances = [
+      row("ins-blocked", { activity: known("waiting-interaction") }),
+      row("ins-work", { activity: known("working") }),
+    ];
+    renderHome();
+    const dots = await screen.findByTestId("home-group-dots");
+    expect(dots).toHaveTextContent("⚠1 ●1");
+    const segment = await screen.findByTestId("glance-working");
+    await userEvent.click(segment);
+    expect(screen.getAllByTestId("home-row").map((el) => el.getAttribute("data-rank"))).toEqual(["working"]);
+    expect(screen.getByTestId("home-group-dots")).toHaveTextContent("●1");
+    expect(screen.getByTestId("home-group-dots")).not.toHaveTextContent("⚠");
+    await userEvent.click(screen.getByTestId("glance-working"));
+    expect(screen.getAllByTestId("home-row")).toHaveLength(2);
+    expect(screen.getByTestId("home-group-dots")).toHaveTextContent("⚠1 ●1");
+  });
+});
+
+describe("① filter under an active hold", () => {
+  it("recomputes the dots from the rendered rows and drops groups the filter empties", async () => {
+    hub.instances = [
+      row("ins-blocked", { activity: known("waiting-interaction"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+      row("ins-work", { activity: known("working"), updatedAt: "2026-09-19T08:00:00.000Z" }),
+    ];
+    renderHome();
+    expect(await screen.findByTestId("home-group-dots")).toHaveTextContent("⚠1 ●1");
+
+    // A press on the row starts a pointer hold; a plain click on the count row
+    // does not dispatch pointerup, so the hold is still active when the rank
+    // filter changes (the reviewer's repro).
+    act(() => {
+      screen.getByText("title ins-blocked").closest("article")!
+        .dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+    });
+    expect(document.querySelector(HELD)).not.toBeNull();
+    fireEvent.click(screen.getByTestId("glance-working"));
+    expect(document.querySelector(HELD)).not.toBeNull();
+
+    // The header counts what is on screen, and the filtered-out row does not
+    // linger as a stale placeholder.
+    expect(screen.getByTestId("home-group-dots")).toHaveTextContent("●1");
+    expect(screen.queryByText("title ins-blocked")).toBeNull();
+    expect(screen.getAllByTestId("home-row")).toHaveLength(1);
+
+    act(() => {
+      window.dispatchEvent(new PointerEvent("pointerup"));
+    });
+    expect(document.querySelector(RELEASED)).not.toBeNull();
+    expect(screen.getAllByTestId("home-row")).toHaveLength(1);
+  });
+});
+
+describe("① count vs the phone ledger's set", () => {
+  it("includes a working child session, which /m does list as a row", async () => {
+    hub.instances = [
+      row("ins-parent", { activity: known("working") }),
+      row("ins-child", {
+        activity: known("working"),
+        parent: { instanceId: "ins-parent", runId: "run_1", commandId: "cmd_1" },
+      }),
+    ];
+    renderHome();
+    expect(await screen.findByTestId("glance-working")).toHaveTextContent("2 工作中");
+    expect(screen.getAllByTestId("home-row")).toHaveLength(2);
+  });
+});
+
+describe("① stays owner-wide on a project-filtered /m", () => {
+  it("does not scope the count row's task ledger to ?project=", async () => {
+    ledgerScopes.length = 0;
+    hub.instances = [row("ins-work", { activity: known("working") })];
+    render(
+      <MemoryRouter initialEntries={["/m?project=prj_1"]}>
+        <HomeList />
+      </MemoryRouter>,
+    );
+    await screen.findByTestId("home-list");
+    // The ledger keeps its project scope; the ① count must stay global (§5.1:
+    // N is the owner-wide queue that matches the badge).
+    expect(ledgerScopes).toContain("prj_1");
+    expect(ledgerScopes).toContain(null);
+  });
+});
+
+describe("empty and skeleton states sit in the ledger slot (§2.1)", () => {
+  it("paints a no-match empty state after the toolbar", async () => {
+    hub.instances = [row("ins-work", { activity: known("working") })];
+    renderHome();
+    await screen.findByTestId("home-row");
+    await userEvent.type(screen.getByTestId("home-search"), "no-such-session-zzz");
+    const slot = await waitFor(() => document.querySelector('[data-slot="ledger"]'));
+    expect(slot).not.toBeNull();
+    expect(slot!.querySelector('[data-testid="home-empty"]')).not.toBeNull();
+  });
+
+  it("paints the pre-snapshot skeleton in the ledger slot", async () => {
+    publishHealth({ lastOkAt: null });
+    try {
+      hub.instances = [];
+      renderHome();
+      const slot = await waitFor(() => document.querySelector('[data-slot="ledger"]'));
+      expect(slot!.querySelector('[data-testid="home-skeleton"]')).not.toBeNull();
+    } finally {
+      publishHealth({ lastOkAt: Date.now() });
+    }
   });
 });

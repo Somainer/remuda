@@ -1,0 +1,124 @@
+/* @tokens strict */
+/*
+ * ① 计数行 (home.md §2.1/§5.2): exactly 28px, one line, never wraps.
+ *
+ * On the phone it completes the sticky head together with the 52px title row
+ * (80px at most, §2.1). On the desktop it is the PageHeader's right-hand
+ * action. The row clips its children so the coarse-pointer hot zone below
+ * cannot paint or tap outside the 28px band (the same idiom as the §8 banner).
+ */
+.row {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  height: 28px;
+  padding: 0 var(--gutter);
+  overflow: hidden;
+  border-bottom: 1px solid var(--divider);
+  background: var(--bg-canvas);
+  color: var(--fg-body);
+  font-family: var(--font-ui);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+  white-space: nowrap;
+}
+
+.row[data-placement="desktop"] {
+  gap: var(--space-1);
+  height: auto;
+  padding: 0;
+  overflow: visible;
+  border-bottom: 0;
+  background: transparent;
+}
+
+/* §8: stale greys the whole row — segments and the 「更新于」 stamp alike. */
+.row[data-stale="1"] {
+  opacity: 0.55;
+}
+
+.sep {
+  flex: none;
+  color: var(--fg-faint);
+}
+
+/* A segment is a full-height text control: the 28px band IS its hit area. */
+.seg {
+  position: relative;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  height: 100%;
+  max-height: 28px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--fg-body);
+  font-family: var(--font-ui);
+  font-size: var(--text-meta);
+  font-weight: 500;
+  line-height: var(--lh-meta);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+/* 需要你 is the one attention-toned segment; 工作中 is an ordinary count. */
+.seg[data-key="needYou"] {
+  color: var(--attention-fg);
+}
+
+.row[data-placement="desktop"] .seg {
+  height: var(--control-h-sm);
+  max-height: var(--control-h-sm);
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-xs);
+}
+
+.seg:hover {
+  background: var(--bg-hover);
+}
+
+.seg:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: -2px;
+}
+
+/* The rank-filter marker: a second tap clears it. */
+.seg[aria-pressed="true"] {
+  box-shadow: inset 0 -2px 0 var(--attention-fg);
+}
+
+.glyph {
+  font-variant-numeric: tabular-nums;
+}
+
+.greeting,
+.hosts {
+  flex: none;
+  color: var(--fg-body);
+}
+
+.updated {
+  flex: none;
+  margin-left: auto;
+  color: var(--fg-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.row[data-placement="desktop"] .updated {
+  margin-left: var(--space-1);
+}
+
+@media (pointer: coarse) {
+  /* The hot band reaches the shared 44px touch height but is clipped to this
+     28px row (overflow: hidden), so it never covers the title row or the
+     strip below. */
+  .row:not([data-placement="desktop"]) .seg::after {
+    content: "";
+    position: absolute;
+    inset: -8px 0;
+  }
+}

@@ -1219,6 +1219,15 @@ async fn handle_incoming(
     if let Some(method) = method {
         let id = frame.get("id").cloned().unwrap_or(Value::Null);
         let params = frame.get("params").cloned().unwrap_or(json!({}));
+        // D-057 §7.6: frames run on their own tasks, so a fence is persisted
+        // and raised INLINE, before any frame read after it is spawned: a
+        // command behind the fence frame is refused, never raced.
+        if method == remuda_protocol::METHOD_LINEAGE_FENCE
+            && let Some(runtime) = runtime
+            && let Err(error) = runtime.node.persist_fence_frame(&params)
+        {
+            tracing::warn!(%error, "could not persist a lineage fence inline");
+        }
         if let Some(runtime) = runtime {
             runtime_wss::dispatch_in_background(
                 runtime,
@@ -1297,6 +1306,7 @@ fn rpc_node_error(id: Value, error: &NodeError) -> Value {
         NodeError::DriverUnavailable => -32002,
         NodeError::InteractionExpired => -32005,
         NodeError::InteractionSuperseded { .. } => -32004,
+        NodeError::Fenced => i64::from(remuda_protocol::ErrorCode::OwnerFenced.rpc_code()),
         _ => -32603,
     };
     rpc_error(id, code, &error.to_string())
@@ -1771,7 +1781,9 @@ mod tests {
 
     #[test]
     fn wss_hello_without_inventory_sends_no_inventory_rather_than_an_empty_claim() {
-        // Absence must read as "not reported", never as "cannot launch".
+        // Absence must read as "not reported", never as "cannot launch". The
+        // build's own lineageFence and memoryContext support is still
+        // advertised.
         let epoch = Id::new("epoch").expect("epoch");
         let host_id = remuda_protocol::HostId::new();
         let mut config = WssConfig::loopback(
@@ -1781,17 +1793,23 @@ mod tests {
         );
         config.host = Some(json!({ "hostname": "lab" }));
         let value = encode_hello_params(&config, &epoch, &HashMap::new());
-        assert_eq!(value["capabilities"], json!({"memoryContext": true}));
+        assert_eq!(
+            value["capabilities"],
+            json!({"lineageFence": true, "memoryContext": true})
+        );
 
         // No host at all (loopback config before inventory collection) still
-        // claims no inventory; only this build's memory-context support.
+        // claims no inventory; only this build's own capabilities.
         let bare = WssConfig::loopback(
             "127.0.0.1:1".parse().expect("addr"),
             "tok",
             host_id.as_id().as_str().to_owned(),
         );
         let value = encode_hello_params(&bare, &epoch, &HashMap::new());
-        assert_eq!(value["capabilities"], json!({"memoryContext": true}));
+        assert_eq!(
+            value["capabilities"],
+            json!({"lineageFence": true, "memoryContext": true})
+        );
     }
 
     #[test]

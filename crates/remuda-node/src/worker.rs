@@ -174,6 +174,16 @@ impl crate::runtime::DevNode {
     /// directly — even from a spawned task — would occupy a runtime worker for
     /// as long as the fetch takes.
     pub(crate) async fn provision_worker_capped(&self, params: &Value) -> Result<Value, NodeError> {
+        // D-057 §7.5: entry check and durable op log before any side effect.
+        self.direct_op(
+            "worker.provision",
+            params,
+            self.provision_worker_capped_entry(params),
+        )
+        .await
+    }
+
+    async fn provision_worker_capped_entry(&self, params: &Value) -> Result<Value, NodeError> {
         let request: WorkerProvisionParams =
             serde_json::from_value(params.clone()).map_err(|error| {
                 NodeError::InvalidRequest(format!("invalid worker.provision params: {error}"))
@@ -215,6 +225,12 @@ impl crate::runtime::DevNode {
     /// Handle `worker.remove`: close the herdr carrier (pty drivers), then
     /// remove worktree + target dir.
     pub(crate) async fn remove_worker(&self, params: &Value) -> Result<Value, NodeError> {
+        // D-057 §7.5: entry check and durable op log before any side effect.
+        self.direct_op("worker.remove", params, self.remove_worker_entry(params))
+            .await
+    }
+
+    async fn remove_worker_entry(&self, params: &Value) -> Result<Value, NodeError> {
         let request: WorkerRemoveParams =
             serde_json::from_value(params.clone()).map_err(|error| {
                 NodeError::InvalidRequest(format!("invalid worker.remove params: {error}"))

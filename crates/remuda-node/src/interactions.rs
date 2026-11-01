@@ -306,6 +306,36 @@ impl InteractionRuntime {
         Ok(())
     }
 
+    /// D-057 §7.6: a fence closed `instance_id`; its pending interactions
+    /// can never be answered. Each becomes `expired` (durably) and its broker
+    /// ticket is retired, so a late answer is refused.
+    pub(crate) async fn cancel_for_instance(&self, instance_id: &InstanceId) {
+        let mut glue = self.glue.lock().await;
+        let ids: Vec<InteractionId> = glue
+            .pending
+            .values()
+            .filter(|row| row.instance_id == *instance_id)
+            .map(|row| row.interaction_id.clone())
+            .collect();
+        let mut tickets = Vec::new();
+        for id in ids {
+            if let Some(mut row) = glue.pending.remove(&id) {
+                row.interaction.state = InteractionState::Expired;
+                row.interaction.answerable = false;
+                if let Err(error) = self.store.put_pending_interaction(&row) {
+                    tracing::warn!(%error, "could not persist a fenced interaction");
+                }
+            }
+            if let Some(ticket) = glue.native_to_broker.get(&id).cloned() {
+                tickets.push(ticket);
+            }
+        }
+        drop(glue);
+        for ticket in tickets {
+            self.broker.retire(&ticket).await;
+        }
+    }
+
     /// Pending rows, optionally filtered by instance and kind.
     pub async fn list(
         &self,

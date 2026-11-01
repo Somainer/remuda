@@ -1870,7 +1870,12 @@ impl DevNode {
         params: &Value,
     ) -> Result<Value, NodeError> {
         match method {
-            remuda_protocol::METHOD_GATE_RUN => self.run_gate(params).await,
+            // D-057 §7.5: the lane's own fence check — gate.run carries the
+            // job's initiator (opId = job id); follow-on steps of a started
+            // job carry none and are admitted as its continuation.
+            remuda_protocol::METHOD_GATE_RUN => {
+                self.direct_op(method, params, self.run_gate(params)).await
+            }
             remuda_protocol::METHOD_GATE_CANCEL => self.cancel_gate(params).await,
             remuda_protocol::METHOD_GATE_THEN => self.run_gate_then(params).await,
             remuda_protocol::METHOD_GATE_LAND => self.run_gate_land(params).await,

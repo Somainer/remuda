@@ -721,6 +721,7 @@ async fn enqueue_job(
         host_id: None,
         queued_at: ts(&now),
         started_at: None,
+        node_started_at: None,
         finished_at: None,
         cancel_requested_at: None,
         home_land_in_flight: false,
@@ -2011,6 +2012,32 @@ async fn dispatch(
         // is (elapsed time never authorizes the old dispatch).
         generation: job.attempts,
     };
+    // §7.10 seam: park between the claim and the send gate. No-op in
+    // production.
+    #[cfg(any(test, feature = "test-faults"))]
+    state
+        .race_barriers
+        .wait_if_armed(
+            crate::workspaces::RacePhase::GateClaimed,
+            lane.host_id.as_id().as_str(),
+            job.id.as_id().as_str(),
+        )
+        .await;
+    // D-057 §7.4/§7.5 send gate: a claimed job whose initiator the fence map
+    // shows fenced never reaches the lane — it is cancelled `fenced` and the
+    // fence record learns it was withheld.
+    if let Some(initiator) = &job.initiator
+        && state.fences.is_fenced(initiator)
+    {
+        cancel_fenced_attempt(
+            state,
+            job.id.as_id().as_str(),
+            job.attempts,
+            crate::fence::outcome::WITHHELD,
+        )
+        .await;
+        return;
+    }
     journal(state, &job.requested_by, "gate.running", &job).await;
     let state = state.clone();
     let job_id = job.id.as_id().to_string();
@@ -2051,6 +2078,16 @@ async fn dispatch(
                         // own granted session.
                         apply_result(&state, &job_id, result, dispatch_session).await;
                     }
+                } else if crate::http::node_refused_fenced(&frame) {
+                    // The lane's own fence check refused the run before it
+                    // started (§7.5): cancelled, never ran.
+                    cancel_fenced_attempt(
+                        &state,
+                        &job_id,
+                        dispatch_generation,
+                        crate::fence::outcome::REFUSED_BY_NODE,
+                    )
+                    .await;
                 } else if let Some(error) = frame.get("error") {
                     fail_rpc(&state, &job_id, dispatch_generation, error).await;
                 }
@@ -2076,6 +2113,38 @@ async fn dispatch(
         }
         schedule_once(&state);
     });
+}
+
+/// Cancel a claimed attempt of a fenced initiator that never started on its
+/// lane (the send gate withheld it, or the lane Node refused it at entry),
+/// and record that outcome on the fence.
+async fn cancel_fenced_attempt(
+    state: &AppState,
+    job_id: &str,
+    expected_generation: u32,
+    fence_outcome: &'static str,
+) {
+    let job_for_outcome = job_id.to_owned();
+    let canceled = state
+        .store
+        .mutate_gate_job(job_id, move |row, conn| {
+            if row.state != GateJobState::Running
+                || row.attempts != expected_generation
+                || row.node_started_at.is_some()
+            {
+                return None;
+            }
+            row.state = GateJobState::Canceled;
+            row.finished_at = Some(now_ts());
+            row.reason = Some(remuda_protocol::FENCED_REASON.into());
+            crate::fence::resolve_op_outcome(conn, "gate-job", &job_for_outcome, fence_outcome)
+                .ok()?;
+            Some(())
+        })
+        .await;
+    if let Ok(Some(job)) = canceled {
+        journal(state, &job.requested_by, "gate.canceled", &job).await;
+    }
 }
 
 async fn fail_rpc(state: &AppState, job_id: &str, expected_generation: u32, error: &Value) {
@@ -2204,7 +2273,31 @@ pub(crate) async fn on_event(
     use remuda_protocol::GateEventKind as Kind;
     let event_generation = event.generation;
     match event.kind {
-        Kind::Phase { .. } | Kind::Log { .. } => {}
+        Kind::Phase { .. } => {
+            // D-057 §7.5: the first phase of the CURRENT attempt is the Node
+            // attestation that its gate runner admitted the run after its own
+            // fence check. A fence that recorded the claimed job as
+            // potentially executed now knows it ran.
+            let job_for_outcome = job_id.clone();
+            let _ = state
+                .store
+                .mutate_gate_job(&job_id, move |row, conn| {
+                    if !matches!(
+                        row.state,
+                        GateJobState::Running | GateJobState::Landing | GateJobState::Canceling
+                    ) || row.attempts != event_generation
+                        || row.node_started_at.is_some()
+                    {
+                        return None;
+                    }
+                    row.node_started_at = Some(now_ts());
+                    crate::fence::resolve_op_outcome(conn, "gate-job", &job_for_outcome, "ran")
+                        .ok()?;
+                    Some(())
+                })
+                .await;
+        }
+        Kind::Log { .. } => {}
         Kind::Step { step } => {
             let _ = state
                 .store
@@ -4839,6 +4932,14 @@ impl Store {
             if job.state != GateJobState::Queued {
                 return Ok(GateJobClaim::NotReady);
             }
+            // D-057 §7.5/§7.6, atomic with the claim: no claim on a lane whose
+            // host owes fence acknowledgements, and no continuity-lineage job
+            // on a Node without fence support. The row stays queued.
+            if crate::fence::host_refusal(conn, claim_host.as_id().as_str(), job.initiator.as_ref())?
+                .is_some()
+            {
+                return Ok(GateJobClaim::NotReady);
+            }
             // r25 item 1 — EVIDENCE-UNCERTAIN RULE: a parked job is never
             // re-dispatched or claimed while the condition stands. An
             // evidence-uncertain row only reaches Queued after an AUTHORIZED
@@ -4885,6 +4986,8 @@ impl Store {
             job.lane_id = Some(claim_lane);
             job.host_id = Some(claim_host);
             job.started_at = Some(now_ts());
+            // A new attempt has not reached its executor yet (§7.5).
+            job.node_started_at = None;
             job.attempts = job.attempts.saturating_add(1);
             let doc = serde_json::to_string(&job)?;
             conn.execute(
@@ -5734,7 +5837,7 @@ fn now() -> String {
     crate::config::now_rfc3339()
 }
 
-fn now_ts() -> Timestamp {
+pub(crate) fn now_ts() -> Timestamp {
     ts(&now())
 }
 

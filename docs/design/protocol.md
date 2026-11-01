@@ -331,7 +331,7 @@ stateDiagram-v2
 | `dispatch` | `not-dispatched\|intent-durable\|transport-written\|native-acknowledged` | 不把写 pipe 成功称为原生接纳 |
 | `resolution` | `clear\|unknown\|reconciling` | 正交于 state；例如 queued + transport-written + unknown |
 | `acceptance` | `Knowledge<{scope: native-input\|native-control\|runtime-resource\|tty-bytes, eventIds: Id[]}>` | tty-bytes 只说明 PTY 接收字节，不代表 agent 理解或开始任务 |
-| `settlement` | `Knowledge<{outcome: completed\|rejected\|cancelled\|expired, resultRef: Id\|null, error: RuntimeError\|null}>` | send 的 completed 与相应 Run 范围绑定；approve 的 completed 与 broker native resolution 绑定 |
+| `settlement` | `Knowledge<{outcome: completed\|rejected\|cancelled\|expired\|withheld, resultRef: Id\|null, error: RuntimeError\|null}>` | send 的 completed 与相应 Run 范围绑定；approve 的 completed 与 broker native resolution 绑定 |
 | `queuedAt` / `acceptedAt` / `settledAt` / `expiresAt` | `Timestamp` / `Knowledge<Timestamp>` / `Knowledge<Timestamp>` / `Timestamp\|null` | expiresAt 只约束尚未派发的命令，不是自动杀任务的 deadline |
 | `nodeReceipt` | `Knowledge<{nodeEpoch: Id, ledgerRevision: U64}>` | Hub 持久排队与 Node 接收分开 |
 

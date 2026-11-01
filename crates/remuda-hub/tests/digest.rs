@@ -66,6 +66,8 @@ async fn enroll_node(
             "params": {
                 "hostId": host_id,
                 "nodeVersion": "0.1.0-test",
+                // Continuity seats dispatch here: a fence-capable Node.
+                "capabilities": { "lineageFence": true },
                 "label": format!("fake-{host_id}"),
                 "host": {
                     "hostname": format!("{host_id}.local"),

@@ -381,6 +381,11 @@ for (const theme of THEMES) {
       description: "archived",
       body: "先归档，再恢复。",
     });
+    // D-057 §6.3: pause (close) the lineage's current chapter, then retire it.
+    const paused = await page.request.post(`/v1/instances/${lineage}/commands`, {
+      data: { operation: "instance.close", payload: {} },
+    });
+    expect(paused.ok(), `pause: ${paused.status()} ${await paused.text()}`).toBe(true);
     const retired = await page.request.delete(`/v1/instances/${lineage}?force=1`);
     expect(retired.ok(), `retire: ${retired.status()} ${await retired.text()}`).toBe(true);
     await page.goto(`/s/${lineage}/memory`);

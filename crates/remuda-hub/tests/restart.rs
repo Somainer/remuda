@@ -2058,12 +2058,14 @@ async fn scoped_failures_are_not_a_restart_cause() -> Result<()> {
     Ok(())
 }
 
-// ── r2 item 7: the boot evaluation is bounded to recent evidence ────────
+// ── r3: the boot evaluation decides history as stale-at-boot ───────────
 
 /// The first boot after an upgrade must not relaunch long-dead seats. An end
-/// the Hub saw longer ago than the decision window is recorded as decided
-/// (outcome `expired`) without F: no fence, no successor, no push. A recent
-/// end, decided by the same boot evaluation, restarts as usual.
+/// the Hub first saw more than 30 minutes before its previous run was last
+/// alive is decided `stale-at-boot` by the boot evaluation, without F: no
+/// fence, no successor, no push. Only the first-seen column is aged; the
+/// journal is untouched. A recent end, decided by the same boot evaluation,
+/// restarts as usual.
 #[tokio::test]
 async fn the_boot_evaluation_records_old_deaths_without_relaunching_them() -> Result<()> {
     let mut ctx = Ctx::boot().await?;
@@ -2092,25 +2094,18 @@ async fn the_boot_evaluation_records_old_deaths_without_relaunching_them() -> Re
         ctx.report_running(&node, id, SESSION).await?;
         ctx.report_killed(&node, id).await?;
     }
-    // The old seat's end was seen by the Hub long before this boot.
-    let long_ago = "2026-01-01T00:00:00.000Z";
-    let db = ctx.db()?;
-    db.execute(
-        "UPDATE journal SET observed_at = ?2 WHERE instance_id = ?1",
-        rusqlite::params![old, long_ago],
+    // The Hub first saw the old seat's end long before its run ended.
+    ctx.db()?.execute(
+        "UPDATE instances SET end_seen_at = '2026-01-01T00:00:00.000Z' WHERE id = ?1",
+        rusqlite::params![old],
     )?;
-    db.execute(
-        "UPDATE instances SET ended_at = ?2 WHERE id = ?1",
-        rusqlite::params![old, long_ago],
-    )?;
-    drop(db);
     let token = node.node_token.clone().context("nodeToken")?;
     drop(node);
     ctx.restart_hub(true).await?;
 
     let rows = ctx.decisions(&old)?;
     assert_eq!(rows.len(), 1, "{rows:?}");
-    assert_eq!(rows[0].2, "expired", "{rows:?}");
+    assert_eq!(rows[0].2, "stale-at-boot", "{rows:?}");
     assert_eq!(rows[0].3, None, "no successor");
     let record = ctx.lineage(&old).await?;
     assert_eq!(record["generation"], json!(1), "no F: {record}");
@@ -2131,7 +2126,7 @@ async fn the_boot_evaluation_records_old_deaths_without_relaunching_them() -> Re
     let (method, create) = node.next_launch().await?;
     assert_eq!(method, "instance.resume");
     assert_eq!(create["lineage"]["id"], json!(recent));
-    // The expired seat is still resumable by its owner.
+    // The stale seat is still resumable by its owner.
     let resumed = ctx.resume(&old).await?;
     assert_eq!(resumed.status(), 200, "{}", resumed.text().await?);
     Ok(())

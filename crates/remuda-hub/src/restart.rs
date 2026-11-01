@@ -67,17 +67,18 @@ pub(crate) mod outcome {
     /// F without successor on a lineage without `restart.onProcessLoss`:
     /// `paused{process-exit}`.
     pub const PROCESS_EXIT: &str = "process-exit";
-    /// No F: the Hub saw the end longer ago than [`super::DECISION_WINDOW_MINUTES`]
-    /// (typically history found by the first boot after an upgrade). The
-    /// chapter is not relaunched; its owner can Resume it.
-    pub const EXPIRED: &str = "expired";
+    /// No F (boot only): the Hub first saw the end more than
+    /// [`super::DECISION_WINDOW_MINUTES`] before its previous run was last
+    /// alive, or never recorded seeing it (history from before the record).
+    /// Not relaunched, no push; the owner can Resume it.
+    pub const STALE_AT_BOOT: &str = "stale-at-boot";
 }
 
-/// An end the Hub saw longer ago than this is recorded `expired` instead of
-/// relaunched. The supervisor decides a fresh end within a tick, so only a
-/// Hub that was down (or ran without the supervisor) this long finds one;
-/// the first boot after the upgrade must not relaunch long-dead seats in a
-/// burst, while a Hub restart after a short outage still decides.
+/// The decision window, in minutes from when the Hub first saw an end
+/// (`instances.end_seen_at`). At boot, an end seen this long before the
+/// previous run was last alive is history (`stale-at-boot`); on a tick, a
+/// successor that keeps failing to prepare is retried until first-seen plus
+/// this window, then paused with the restart-failed push.
 pub(crate) const DECISION_WINDOW_MINUTES: i64 = 30;
 
 /// The supervisor's actor in fence and audit records.
@@ -1074,8 +1075,8 @@ struct Pending {
     lineage: LineageRecord,
     failed: InstanceRecord,
     cause: &'static str,
-    /// When the Hub saw the end, if that is before the decision window.
-    expired_seen: Option<String>,
+    /// Boot only: the end is history, decided `stale-at-boot` without F.
+    stale_at_boot: Option<String>,
 }
 
 /// What one evaluation decided (test seam and logs).
@@ -1156,17 +1157,12 @@ impl Store {
     /// Candidates: unpaused lineages whose current chapter, at the live
     /// generation and unfenced, is terminal-shaped and has no decision. The
     /// evidence predicate is applied by the caller.
-    async fn restart_candidates(&self) -> Result<Vec<(String, String, String)>, StoreError> {
+    async fn restart_candidates(
+        &self,
+    ) -> Result<Vec<(String, String, Option<String>)>, StoreError> {
         self.read("restart_candidates", |conn| {
-            // `seen` is when the Hub saw the end: the newest Hub-clock
-            // journal row of the chapter, or its end stamp when that is
-            // later (an end the Hub stamped itself), else its last update.
             let mut stmt = conn.prepare(
-                "SELECT l.lineage_id, i.id,
-                        COALESCE(NULLIF(MAX(COALESCE((SELECT MAX(j.observed_at) FROM journal j
-                                                       WHERE j.instance_id = i.id), ''),
-                                            COALESCE(i.ended_at, '')), ''),
-                                 i.updated_at)
+                "SELECT l.lineage_id, i.id, i.end_seen_at
                    FROM lineages l
                    JOIN instances i ON i.id = l.current_instance_id
                   WHERE l.state IN ('starting', 'running')
@@ -1184,9 +1180,41 @@ impl Store {
         .await
     }
 
-    /// Record an `expired` decision without F, with the same in-transaction
-    /// check as every decision. Returns whether it was recorded.
-    async fn decide_expired(
+    /// The supervisor's own first sighting of an end the stamp missed.
+    /// Returns the stamp in force.
+    async fn stamp_end_seen(&self, instance_id: String) -> Result<String, StoreError> {
+        self.run_named("restart_stamp_end_seen", move |conn| {
+            conn.execute(
+                "UPDATE instances SET end_seen_at = ?2 WHERE id = ?1 AND end_seen_at IS NULL",
+                params![instance_id, crate::config::now_rfc3339()],
+            )?;
+            Ok(conn.query_row(
+                "SELECT end_seen_at FROM instances WHERE id = ?1",
+                params![instance_id],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+    }
+
+    /// The previous run's last-alive time (Hub clock), if any run wrote one.
+    async fn last_alive_at(&self) -> Result<Option<String>, StoreError> {
+        self.read("hub_last_alive", |conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT last_alive_at FROM hub_run_marker WHERE id = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?)
+        })
+        .await
+    }
+
+    /// Record a `stale-at-boot` decision without F, with the same
+    /// in-transaction check as every decision. Returns whether it was
+    /// recorded.
+    async fn decide_stale(
         &self,
         lineage_id: String,
         expected_generation: i64,
@@ -1194,7 +1222,7 @@ impl Store {
         cause: &'static str,
         reason: String,
     ) -> Result<bool, StoreError> {
-        self.run_named("restart_decide_expired", move |conn| {
+        self.run_named("restart_decide_stale", move |conn| {
             let tx = immediate_tx(conn)?;
             if !decision_open(&tx, &lineage_id, expected_generation, &failed_instance_id)? {
                 return Ok(false);
@@ -1205,7 +1233,7 @@ impl Store {
                 &lineage_id,
                 expected_generation,
                 cause,
-                outcome::EXPIRED,
+                outcome::STALE_AT_BOOT,
                 None,
                 Some(&reason),
             )?;
@@ -1324,6 +1352,17 @@ pub(crate) async fn note_alive(state: &AppState) {
     }
 }
 
+/// Which evaluation runs.
+#[derive(Clone, Debug)]
+enum Pass {
+    /// The scheduler tick (and the test seam).
+    Tick,
+    /// Once at boot, before this run writes its own marker: an end first seen
+    /// before `history_before` (the previous run's last-alive time minus the
+    /// window), or never recorded, is history.
+    Boot { history_before: String },
+}
+
 /// Scheduler tick: one evaluation unless the previous one is still running.
 pub(crate) async fn tick(state: &AppState) {
     let Ok(_guard) = state.restart.running.clone().try_lock_owned() else {
@@ -1332,10 +1371,30 @@ pub(crate) async fn tick(state: &AppState) {
     evaluate(state).await;
 }
 
-/// Boot: decide every failure left pending by the previous Hub process.
+/// `at` minus the decision window, in the Hub's RFC3339 shape; `None` when
+/// `at` does not parse.
+fn window_before(at: &str) -> Option<String> {
+    let at =
+        time::OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339).ok()?;
+    Some(crate::config::rfc3339(
+        at - time::Duration::minutes(DECISION_WINDOW_MINUTES),
+    ))
+}
+
+/// Boot: decide every failure left pending by the previous Hub process. An
+/// end the previous run had first seen more than the window before it was
+/// last alive (or that predates the first-seen record) is history:
+/// `stale-at-boot`, without F, relaunch or push. A death seen in the last
+/// window of Hub time before the restart is decided normally. Without any
+/// previous marker the boot clock stands in for it.
 pub(crate) async fn boot(state: &AppState) {
     let _guard = state.restart.running.lock().await;
-    let decided = evaluate(state).await;
+    let previous = state.store.last_alive_at().await.ok().flatten();
+    let history_before = previous
+        .as_deref()
+        .and_then(window_before)
+        .unwrap_or_else(|| crate::config::rfc3339_minutes_ago(DECISION_WINDOW_MINUTES));
+    let decided = evaluate_pass(state, Pass::Boot { history_before }).await;
     if !decided.is_empty() {
         tracing::info!(
             count = decided.len(),
@@ -1344,10 +1403,14 @@ pub(crate) async fn boot(state: &AppState) {
     }
 }
 
-/// One evaluation of every candidate lineage. Unguarded: concurrent calls are
-/// safe (the CAS and the key decide at most once) and the C1 suites run them
-/// concurrently on purpose.
+/// One tick evaluation of every candidate lineage. Unguarded: concurrent
+/// calls are safe (the CAS and the key decide at most once) and the C1
+/// suites run them concurrently on purpose.
 pub(crate) async fn evaluate(state: &AppState) -> Vec<Decided> {
+    evaluate_pass(state, Pass::Tick).await
+}
+
+async fn evaluate_pass(state: &AppState, pass: Pass) -> Vec<Decided> {
     // §6.4 bookkeeping first: a notice orphaned by a rejected successor
     // create settles with that reason before any new F could cancel it as
     // fenced, and notices due since the last tick go out.
@@ -1360,9 +1423,8 @@ pub(crate) async fn evaluate(state: &AppState) -> Vec<Decided> {
         }
     };
     let mut decided = Vec::new();
-    let window_start = crate::config::rfc3339_minutes_ago(DECISION_WINDOW_MINUTES);
     for (lineage_id, failed_id, seen) in candidates {
-        let pending = match pending(state, &lineage_id, &failed_id, &seen, &window_start).await {
+        let pending = match pending(state, &lineage_id, &failed_id, seen, &pass).await {
             Ok(Some(pending)) => pending,
             Ok(None) => continue,
             Err(error) => {
@@ -1401,8 +1463,8 @@ async fn pending(
     state: &AppState,
     lineage_id: &str,
     failed_id: &str,
-    seen: &str,
-    window_start: &str,
+    seen: Option<String>,
+    pass: &Pass,
 ) -> Result<Option<Pending>, StoreError> {
     let Some(lineage) = state.store.get_lineage(lineage_id.to_owned()).await? else {
         return Ok(None);
@@ -1426,12 +1488,32 @@ async fn pending(
         &failed.lifecycle,
         failed.last_error.as_deref(),
     );
+    // RFC3339 stamps of one fixed-width shape compare chronologically.
+    let stale_at_boot = match (pass, &seen) {
+        (Pass::Boot { .. }, None) => Some(
+            "the Hub holds no record of when it first saw this end (it predates the record)"
+                .to_owned(),
+        ),
+        (Pass::Boot { history_before }, Some(seen)) if seen.as_str() < history_before.as_str() => {
+            Some(format!(
+                "the Hub first saw this end at {seen}, more than {DECISION_WINDOW_MINUTES} \
+                 minutes before its previous run was last alive"
+            ))
+        }
+        _ => None,
+    };
+    if seen.is_none() && stale_at_boot.is_none() {
+        // The stamp missed it: this evaluation is the Hub's first sighting.
+        state
+            .store
+            .stamp_end_seen(failed.instance_id.clone())
+            .await?;
+    }
     Ok(Some(Pending {
         lineage,
         failed,
         cause,
-        // RFC3339 stamps of one fixed-width shape compare chronologically.
-        expired_seen: (seen < window_start).then(|| seen.to_owned()),
+        stale_at_boot,
     }))
 }
 
@@ -1444,16 +1526,13 @@ async fn decide(
         lineage,
         failed,
         cause,
-        expired_seen,
+        stale_at_boot,
     } = pending;
-    if let Some(seen) = expired_seen {
-        let reason = format!(
-            "the Hub saw this end at {seen}, more than {DECISION_WINDOW_MINUTES} minutes before \
-             the supervisor evaluated it; not relaunched (Resume continues it)"
-        );
+    if let Some(why) = stale_at_boot {
+        let reason = format!("{why}; decided at boot, not relaunched (Resume continues it)");
         let recorded = state
             .store
-            .decide_expired(
+            .decide_stale(
                 lineage.lineage_id.clone(),
                 lineage.generation,
                 failed.instance_id.clone(),
@@ -1465,7 +1544,7 @@ async fn decide(
             lineage_id: lineage.lineage_id.clone(),
             failed_instance_id: failed.instance_id.clone(),
             cause: cause.into(),
-            outcome: outcome::EXPIRED.into(),
+            outcome: outcome::STALE_AT_BOOT.into(),
             successor_instance_id: None,
         }));
     }

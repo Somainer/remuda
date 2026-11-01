@@ -993,6 +993,11 @@ async fn fake_node(
     // by interaction id -> instance id. See the `ask-question-terminal` arm.
     let terminal_pending: Arc<Mutex<HashMap<String, String>>> =
         Arc::new(Mutex::new(HashMap::new()));
+    // c-hqueue: interaction ids raised under the `hqueue-race` sentinel. Once
+    // answered, a SECOND answer gets the real Node's "already answered"
+    // refusal (the Hub's 409 INTERACTION_SUPERSEDED) instead of the default
+    // idempotent ok, so a second device can genuinely lose the race.
+    let mut race_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Frames read while waiting for a journal.append ack (they may be stale
     // append responses or — importantly — unrelated Hub RPCs such as the
     // web poll's interaction.list). Never drop RPCs: reprocess them as soon
@@ -1719,6 +1724,9 @@ async fn fake_node(
                         )
                     };
                     let terminal_answer = prompt.contains("ask-question-terminal");
+                    if prompt.contains("hqueue-race") {
+                        race_ids.insert(interaction_id.as_id().as_str().to_string());
+                    }
                     if row_scenario.is_none() {
                         pending
                             .lock()
@@ -2858,6 +2866,15 @@ async fn fake_node(
                         } else {
                             None
                         };
+                    if removed.is_none()
+                        && params
+                            .get("interactionId")
+                            .and_then(Value::as_str)
+                            .is_some_and(|iid| race_ids.contains(iid))
+                    {
+                        send_rpc_error(&mut ws, id, "interaction already answered").await?;
+                        continue;
+                    }
                     // Reply to the answer RPC FIRST (the Hub gives the Node only
                     // a short RPC budget); journal the harness continuation
                     // afterwards, like the real Node applying owner answers.

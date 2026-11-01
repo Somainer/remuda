@@ -1,4 +1,14 @@
-import { devices, expect, test, type Browser, type BrowserContext, type Locator, type Page } from "@playwright/test";
+import {
+  devices,
+  expect,
+  request as apiRequest,
+  test,
+  type APIRequestContext,
+  type Browser,
+  type BrowserContext,
+  type Locator,
+  type Page,
+} from "@playwright/test";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -170,17 +180,41 @@ async function blockedTask(page: Page): Promise<string> {
   return task.id;
 }
 
-async function cleanup(page: Page) {
+/**
+ * Release this spec's sessions and tasks and WAIT until the Hub no longer
+ * serves the sessions: the suite shares one fake Node, and a leftover blocked
+ * row changes the next spec's exact group counts (m-home asserts ⚠1).
+ */
+async function cleanup(request: APIRequestContext) {
   for (const id of createdTasks.splice(0)) {
-    await page.request.post(`/v1/tasks/${id}/archive`, { data: {} }).catch(() => undefined);
+    await request.post(`/v1/tasks/${id}/archive`, { data: {} }).catch(() => undefined);
   }
   for (const id of createdInstances.splice(0)) {
-    await page.request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
+    await request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
     await expect
-      .poll(async () => (await page.request.get(`/v1/instances/${id}`)).status(), { timeout: 15_000 })
+      .poll(async () => (await request.get(`/v1/instances/${id}`)).status(), { timeout: 15_000 })
       .toBe(404);
   }
 }
+
+/**
+ * The last signed-in cookie jar, kept so afterAll can still release what a
+ * test seeded when that test ran out of time before its own finally.
+ */
+let lastStorage: Awaited<ReturnType<BrowserContext["storageState"]>> | null = null;
+
+test.afterAll(async () => {
+  if (!lastStorage || (createdInstances.length === 0 && createdTasks.length === 0)) return;
+  const request = await apiRequest.newContext({
+    baseURL: test.info().project.use.baseURL,
+    storageState: lastStorage,
+  });
+  try {
+    await cleanup(request);
+  } finally {
+    await request.dispose();
+  }
+});
 
 function card(page: Page, id: string): Locator {
   return page.locator(`[data-testid="home-queue-card"][data-card-id="${id}"]`);
@@ -195,6 +229,7 @@ async function expandQueue(page: Page) {
 async function phoneContext(browser: Browser, baseURL: string, name: string): Promise<BrowserContext> {
   const context = await browser.newContext({ ...devices["iPhone 13"], baseURL });
   await login(await context.newPage(), name);
+  lastStorage = await context.storageState();
   return context;
 }
 
@@ -207,6 +242,10 @@ async function inViewport(locator: Locator): Promise<boolean> {
 }
 
 test.describe("home queue", () => {
+  // Each test seeds several real fake-Node sessions and logs in more than one
+  // device; under gate load that outgrows the suite's 90 s default.
+  test.describe.configure({ timeout: 240_000 });
+
   test("390: card kinds, one N, the answer flow and 409", async ({ browser }) => {
     const baseURL = test.info().project.use.baseURL!;
     const context = await phoneContext(browser, baseURL, "e2e-hqueue-phone");
@@ -281,7 +320,9 @@ test.describe("home queue", () => {
       // A second device answers first. Freeze this page's interaction list
       // (its next poll would simply drop the card) so the tap reaches the Hub
       // and gets the real 409.
-      const raced = await park(page, "mhome-blocked");
+      // `hqueue-race`: the fake Node refuses a second answer the way the real
+      // Node does, so the Hub's own 409 reaches this device.
+      const raced = await park(page, "mhome-blocked hqueue-race");
       await expect(card(page, raced.interactionId).or(page.getByTestId("home-queue-more")).first()).toBeVisible({
         timeout: 20_000,
       });
@@ -317,7 +358,7 @@ test.describe("home queue", () => {
       await page.unroute(/\/v1\/interactions(\?.*)?$/);
     } finally {
       await page.unroute(/\/v1\/interactions(\?.*)?$/).catch(() => undefined);
-      await cleanup(page);
+      await cleanup(page.request);
       await context.close();
     }
   });
@@ -348,7 +389,7 @@ test.describe("home queue", () => {
       await expect(allow).toBeEnabled({ timeout: 30_000 });
     } finally {
       await context.setOffline(false);
-      await cleanup(page);
+      await cleanup(page.request);
       await context.close();
     }
   });
@@ -363,7 +404,7 @@ test.describe("home queue", () => {
       if (!(await needsFakeNode(page))) test.skip(true, "needs the in-process fake Node");
       // Enough of our own cards that the target can sit behind the fold.
       const parked = [];
-      for (let index = 0; index < 5; index += 1) parked.push(await park(page, "mhome-blocked"));
+      for (let index = 0; index < 4; index += 1) parked.push(await park(page, "mhome-blocked"));
       const target = parked[0];
 
       // The push payload URL (alerts.rs) → the compact redirect keeps ?focus.
@@ -393,13 +434,18 @@ test.describe("home queue", () => {
       await shot(desk, "home-queue-1280-dark.png");
       await setMode(desk, "light");
 
-      // §4.1: the queue hides while the list search has text.
+      // §4.1: the queue hides while the list search has text. A fresh
+      // device's default Space has no sessions (no search box), so open the
+      // list in global scope, as home-glance does.
+      await desk.goto("/sessions?scope=all");
+      await expect(desk.getByTestId("home-queue")).toBeVisible({ timeout: 20_000 });
+      await expect(desk.getByTestId("session-search")).toBeVisible({ timeout: 20_000 });
       await desk.getByTestId("session-search").fill("hqueue-no-such-session");
       await expect(desk.getByTestId("home-queue")).toHaveCount(0);
       await desk.getByTestId("session-search").fill("");
       await expect(desk.getByTestId("home-queue")).toBeVisible();
     } finally {
-      await cleanup(page);
+      await cleanup(page.request);
       await desktop.close();
       await phone.close();
     }

@@ -173,6 +173,33 @@ fn node_herdr_session(data_dir: &Path, configured: Option<String>) -> String {
     })
 }
 
+/// The Remuda-managed Claude home a resumed chapter's predecessor used.
+///
+/// A non-inherited native home is per instance
+/// (`data_dir/instances/<id>/native-home`), so a successor — which has its own
+/// instance id — would otherwise scan a directory its predecessor never wrote
+/// its transcript to and `--resume <sessionId>` would start blank. When the
+/// request names a `resumedFrom` chapter whose managed home is still on this
+/// Node, the successor runs in that same home. The two higher-precedence
+/// sources resolve first: an explicit `claudeConfigDir` (which the Hub carries
+/// onto the successor spec) and the Node-wide `REMUDA_CLAUDE_CONFIG_DIR`.
+///
+/// The `--resume` transcript does not live in the launch directory: Claude
+/// writes `<home>/projects/<slug>/<session>.jsonl`, and every carrier builds
+/// its `CLAUDE_CONFIG_DIR` / native-home pin from this one value, so one home
+/// is all a continuation needs.
+fn resumed_parent_native_home(
+    data_dir: &Path,
+    resumed_from: Option<&remuda_protocol::InstanceId>,
+) -> Option<PathBuf> {
+    let parent = resumed_from?;
+    let home = data_dir
+        .join("instances")
+        .join(parent.as_id().as_str())
+        .join("native-home");
+    home.is_dir().then_some(home)
+}
+
 /// Register the native per-instance factories.
 ///
 /// The registry MINTS and OWNS the Node census epoch shared by every driver
@@ -318,6 +345,12 @@ impl DriverFactory for NativeClaudeFactory {
             self.config
                 .claude_native_home
                 .clone()
+                .or_else(|| {
+                    resumed_parent_native_home(
+                        &self.config.data_dir,
+                        launch.request.resumed_from.as_ref(),
+                    )
+                })
                 .unwrap_or_else(|| instance_dir.join("native-home"))
         };
         #[cfg(target_os = "macos")]
@@ -2270,6 +2303,33 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("conflicts"));
+    }
+
+    /// resume-config: a resumed chapter inherits the managed native home its
+    /// predecessor's transcript lives in. The dir is the parent instance's
+    /// `native-home` under this Node's data dir; an absent one (inherited
+    /// default or an explicit `claudeConfigDir`) falls through to the
+    /// successor's own fallback.
+    #[test]
+    fn resumed_chapters_reuse_the_parents_managed_native_home() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let parent = InstanceId::new();
+        let parent_home = dir
+            .path()
+            .join("instances")
+            .join(parent.as_id().as_str())
+            .join("native-home");
+        std::fs::create_dir_all(&parent_home).expect("parent home");
+        assert_eq!(
+            resumed_parent_native_home(dir.path(), Some(&parent)),
+            Some(parent_home)
+        );
+        let never_launched = InstanceId::new();
+        assert_eq!(
+            resumed_parent_native_home(dir.path(), Some(&never_launched)),
+            None
+        );
+        assert_eq!(resumed_parent_native_home(dir.path(), None), None);
     }
 
     /// A spec `binaryPath` outranks the Node-wide `REMUDA_CLAUDE_BIN`.

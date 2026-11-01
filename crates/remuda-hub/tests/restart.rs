@@ -1353,3 +1353,302 @@ async fn a_notice_is_never_sent_to_a_node_without_fence_support() -> Result<()> 
     );
     Ok(())
 }
+
+// ── §8.5 C1 pushes ──────────────────────────────────────────────────────
+
+/// Counts Web Push deliveries.
+#[derive(Default)]
+struct FakePush {
+    hits: Mutex<usize>,
+}
+
+impl remuda_push::Transport for FakePush {
+    fn post(
+        &self,
+        _url: String,
+        _headers: Vec<(String, String)>,
+        _body: Vec<u8>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<u16, remuda_push::Error>> + Send + '_>,
+    > {
+        *self.hits.lock().unwrap() += 1;
+        Box::pin(async { Ok(201) })
+    }
+}
+
+impl Ctx {
+    /// A Hub with Web Push on a fake endpoint and one subscribed device.
+    async fn boot_push() -> Result<(Self, Arc<FakePush>)> {
+        let dir = tempfile::tempdir()?;
+        let data = dir.path().join("data");
+        let config = HubConfig::for_test(data.clone());
+        let bootstrap = config.bootstrap_token.clone();
+        let fake = Arc::new(FakePush::default());
+        let hub = remuda_hub::spawn_with_push(config, fake.clone()).await?;
+        let human = hub.mint_device_token("restart-phone").await?;
+        let ctx = Self {
+            _dir: dir,
+            data,
+            bootstrap,
+            hub,
+            http: reqwest::Client::new(),
+            human,
+            host: HostId::new().as_id().as_str().to_owned(),
+        };
+        let (pair, auth) = ece::generate_keypair_and_auth_secret().expect("ece");
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let subscribed = ctx
+            .http
+            .post(format!("{}/push/subscriptions", ctx.base()))
+            .bearer_auth(&ctx.human)
+            .json(
+                &json!({"endpoint": "http://127.0.0.1:9/fake-push", "keys": {
+                "p256dh": b64.encode(pair.pub_as_raw().expect("pub")),
+                "auth": b64.encode(auth)}}),
+            )
+            .send()
+            .await?;
+        anyhow::ensure!(subscribed.status() == 201, "{}", subscribed.text().await?);
+        Ok((ctx, fake))
+    }
+
+    /// `(kind, title, recipients)` of the lineage's recorded C1 pushes.
+    async fn c1_pushes(&self, lineage: &str, count: usize) -> Result<Vec<(String, String, i64)>> {
+        self.wait_until(|| async {
+            let db = self.db().ok()?;
+            let mut stmt = db
+                .prepare(
+                    "SELECT kind, title, recipients FROM lineage_c1_pushes
+                      WHERE lineage_id = ?1 AND recipients IS NOT NULL ORDER BY created_at",
+                )
+                .ok()?;
+            let rows = stmt
+                .query_map(rusqlite::params![lineage], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .ok()?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .ok()?;
+            (rows.len() >= count).then_some(rows)
+        })
+        .await
+    }
+}
+
+/// "Main restarted (cause)" replaces the generic exited push on a lineage
+/// that restarts on process loss; at the cap, "Main paused: restart cap";
+/// a pause from a Human device sends nothing; "Main closed itself" for a
+/// self-close. Each is recorded once per F, with its recipient count.
+#[tokio::test]
+async fn c1_pushes_restart_cap_and_self_close_and_none_for_a_device_pause() -> Result<()> {
+    let (ctx, fake) = Ctx::boot_push().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host, true).await?;
+    let seat = ctx
+        .seat_with(&mut node, json!({"onProcessLoss": true, "maxPerHour": 1}))
+        .await?;
+    ctx.report_running(&node, &seat, SESSION).await?;
+    let hits_before = *fake.hits.lock().unwrap();
+    // The process ends; the event also carries the generic exited marker.
+    node.appends.send((
+        seat.clone(),
+        json!({"kind":"lifecycle","lifecycle":"exited","payload":{
+            "type":"native","topic":"session","nativeName":"session",
+            "status":{"state":"known","value":"failed"},"severity":"error",
+            "affectsCompletion":true,"relatedIds":{"exitCode":"137"}}}),
+    ))?;
+    ctx.wait_instance(&seat, |view| {
+        matches!(view["lifecycle"].as_str(), Some("exited" | "failed"))
+    })
+    .await?;
+    let decided = ctx.supervise().await;
+    let successor = decided[0]["successorInstanceId"]
+        .as_str()
+        .context("successor")?
+        .to_owned();
+    let pushes = ctx.c1_pushes(&seat, 1).await?;
+    assert_eq!(
+        pushes,
+        [(
+            "restarted".to_owned(),
+            "Main restarted (process exited)".to_owned(),
+            1
+        )]
+    );
+    assert_eq!(
+        *fake.hits.lock().unwrap() - hits_before,
+        1,
+        "the C1 push replaces the generic exited push"
+    );
+
+    // The successor dies at the cap (maxPerHour 1).
+    let _ = node.next_launch().await?;
+    ctx.report_running(&node, &successor, SESSION).await?;
+    ctx.report_killed(&node, &successor).await?;
+    let capped = ctx.supervise().await;
+    assert_eq!(capped[0]["outcome"], json!("restart-cap"));
+    let pushes = ctx.c1_pushes(&seat, 2).await?;
+    assert_eq!(pushes[1].0, "restart-cap");
+    assert_eq!(pushes[1].1, "Main paused: restart cap");
+
+    // Owner Resume, then a Human pause: no push.
+    let resumed: Value = ctx
+        .resume(&successor)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let third = resumed["instance"]["instanceId"]
+        .as_str()
+        .context("third")?
+        .to_owned();
+    let (_, params) = node.next_launch().await?;
+    let third_token = params["agentCredential"]["token"]
+        .as_str()
+        .context("token")?
+        .to_owned();
+    // The chapter closes itself: paused{self}, "Main closed itself".
+    let closed = ctx
+        .http
+        .post(format!("{}/v1/instances/{third}/commands", ctx.base()))
+        .bearer_auth(&third_token)
+        .json(&json!({"operation": "instance.close", "payload": {}}))
+        .send()
+        .await?;
+    assert_eq!(closed.status(), 200, "{}", closed.text().await?);
+    let record = ctx.lineage(&seat).await?;
+    assert_eq!(record["pausedBy"]["kind"], json!("self"));
+    let pushes = ctx.c1_pushes(&seat, 3).await?;
+    assert_eq!(pushes[2].0, "self");
+    assert_eq!(pushes[2].1, "Main closed itself");
+
+    // Resume again and pause from the Human device: nothing is pushed.
+    let resumed: Value = ctx.resume(&third).await?.error_for_status()?.json().await?;
+    let fourth = resumed["instance"]["instanceId"]
+        .as_str()
+        .context("fourth")?
+        .to_owned();
+    let _ = node.next_launch().await?;
+    let hits_before = *fake.hits.lock().unwrap();
+    assert_eq!(ctx.close(&fourth).await?.status(), 200);
+    assert_eq!(
+        ctx.lineage(&seat).await?["pausedBy"]["kind"],
+        json!("device")
+    );
+    // Drive once more: still three records, nothing new sent.
+    assert!(ctx.supervise().await.is_empty());
+    assert_eq!(ctx.c1_pushes(&seat, 3).await?.len(), 3);
+    assert_eq!(*fake.hits.lock().unwrap(), hits_before);
+    Ok(())
+}
+
+/// A close by an Agent ancestor pauses the child lineage `paused{ancestor}`
+/// and records its C1 push, named by the child's title (it is not the seat).
+#[tokio::test]
+async fn an_ancestor_close_records_a_c1_push() -> Result<()> {
+    let (ctx, fake) = Ctx::boot_push().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host, true).await?;
+    let created: Value = ctx
+        .http
+        .post(format!("{}/v1/instances", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .json(&json!({
+            "hostId": ctx.host, "kind": "claude", "driver": "claude-sdk",
+            "name": "main", "title": "Main", "grants": ["address-owner", "dispatch"],
+            "permissionMode": "auto", "model": "claude-test-model",
+            "scope": {"hostIds": [ctx.host]},
+            "restart": {"onProcessLoss": true, "maxPerHour": 3},
+            "prompt": "seat brief",
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let seat = created["instance"]["instanceId"]
+        .as_str()
+        .context("seat")?
+        .to_owned();
+    let (_, params) = node.next_launch().await?;
+    let seat_token = params["agentCredential"]["token"]
+        .as_str()
+        .context("token")?
+        .to_owned();
+    // The seat creates a continuity child (it holds a grant) on its host.
+    let child = ctx
+        .http
+        .post(format!("{}/v1/instances", ctx.base()))
+        .bearer_auth(&seat_token)
+        .json(&json!({
+            "hostId": ctx.host, "kind": "claude", "driver": "claude-sdk",
+            "title": "Coordinator", "grants": ["dispatch"],
+            "permissionMode": "manual", "model": "claude-test-model",
+            "scope": {"hostIds": [ctx.host]}, "prompt": "child brief",
+        }))
+        .send()
+        .await?;
+    let status = child.status();
+    let child: Value = child.json().await?;
+    assert!(status.is_success(), "{child}");
+    let child = child["instance"]["instanceId"]
+        .as_str()
+        .context("child")?
+        .to_owned();
+    let _ = node.next_launch().await?;
+    let hits_before = *fake.hits.lock().unwrap();
+    let closed = ctx
+        .http
+        .post(format!("{}/v1/instances/{child}/commands", ctx.base()))
+        .bearer_auth(&seat_token)
+        .json(&json!({"operation": "instance.close", "payload": {}}))
+        .send()
+        .await?;
+    assert_eq!(closed.status(), 200, "{}", closed.text().await?);
+    let record = ctx.lineage(&child).await?;
+    assert_eq!(record["pausedBy"]["kind"], json!("ancestor"));
+    assert_eq!(record["pausedBy"]["instanceId"], json!(seat));
+    let pushes = ctx.c1_pushes(&child, 1).await?;
+    assert_eq!(
+        pushes,
+        [(
+            "ancestor".to_owned(),
+            "Coordinator paused by its parent agent".to_owned(),
+            1
+        )]
+    );
+    assert_eq!(*fake.hits.lock().unwrap() - hits_before, 1);
+    Ok(())
+}
+
+/// A lineage without `restart.onProcessLoss` keeps today's exited push and
+/// records no C1 push for its `paused{process-exit}`.
+#[tokio::test]
+async fn a_process_exit_pause_keeps_the_generic_exited_push() -> Result<()> {
+    let (ctx, fake) = Ctx::boot_push().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host, true).await?;
+    let seat = ctx
+        .seat_with(&mut node, json!({"onProcessLoss": false, "maxPerHour": 3}))
+        .await?;
+    ctx.report_running(&node, &seat, SESSION).await?;
+    let hits_before = *fake.hits.lock().unwrap();
+    node.appends.send((
+        seat.clone(),
+        json!({"kind":"lifecycle","lifecycle":"exited","payload":{
+            "type":"native","topic":"session","nativeName":"session",
+            "status":{"state":"known","value":"exited"},"severity":"info",
+            "affectsCompletion":true,"relatedIds":{"exitCode":"0"}}}),
+    ))?;
+    ctx.wait_until(|| async { (*fake.hits.lock().unwrap() > hits_before).then_some(()) })
+        .await
+        .context("the generic exited push")?;
+    let decided = ctx.supervise().await;
+    assert_eq!(decided[0]["outcome"], json!("process-exit"));
+    let db = ctx.db()?;
+    let recorded: i64 = db.query_row(
+        "SELECT COUNT(*) FROM lineage_c1_pushes WHERE lineage_id = ?1",
+        rusqlite::params![seat],
+        |row| row.get(0),
+    )?;
+    assert_eq!(recorded, 0);
+    Ok(())
+}

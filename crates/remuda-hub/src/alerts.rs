@@ -130,14 +130,22 @@ async fn dispatch(state: AppState, instance_id: String, kind: AlertKind) {
                     },
                     format!("/s/{instance_id}"),
                 ),
-                AlertKind::Exited => (
-                    "Session exited",
-                    "An instance left the ready state.".to_string(),
-                    PushTag::Instance {
-                        id: instance_id.clone(),
-                    },
-                    format!("/s/{instance_id}"),
-                ),
+                AlertKind::Exited => {
+                    // D-057 §8.5: on a lineage that restarts on process loss
+                    // the C1 push ("restarted" / "paused: restart cap")
+                    // replaces the generic exited push.
+                    if crate::restart::c1_replaces_exit_push(&state, &instance_id).await {
+                        return;
+                    }
+                    (
+                        "Session exited",
+                        "An instance left the ready state.".to_string(),
+                        PushTag::Instance {
+                            id: instance_id.clone(),
+                        },
+                        format!("/s/{instance_id}"),
+                    )
+                }
                 AlertKind::Waiting => unreachable!(),
             };
             fanout(&state, &instance_id, title, &body, tag, url).await;
@@ -145,6 +153,32 @@ async fn dispatch(state: AppState, instance_id: String, kind: AlertKind) {
     }
 }
 
+/// D-057 §8.5: one C1 push about a continuity lineage (restarted, restart
+/// cap, closed itself, paused by an ancestor). Tagged by the lineage, so a
+/// newer C1 push replaces an older one; it links to `instance_id`. Returns
+/// the number of notifications sent.
+pub(crate) async fn c1_push(
+    state: &AppState,
+    lineage_id: &str,
+    instance_id: &str,
+    title: &str,
+    body: &str,
+) -> usize {
+    fanout(
+        state,
+        instance_id,
+        title,
+        body,
+        PushTag::Instance {
+            id: lineage_id.to_owned(),
+        },
+        format!("/s/{instance_id}"),
+    )
+    .await
+}
+
+/// Send one notification to every subscription unless a device follows the
+/// instance; returns how many were sent.
 async fn fanout(
     state: &AppState,
     instance_id: &str,
@@ -152,16 +186,16 @@ async fn fanout(
     body: &str,
     tag: PushTag,
     url: String,
-) {
+) -> usize {
     let Some(push) = state.push.as_ref() else {
-        return;
+        return 0;
     };
     if state.followers.any_watching(instance_id).await {
         tracing::debug!(instance_id, "push suppressed: a device is following");
-        return;
+        return 0;
     }
     let Ok(subs) = push.subscriptions() else {
-        return;
+        return 0;
     };
     // The badge is this device's pending interaction count (ui-spec §4.5 /
     // D-049). Pending is global durable state — every subscribed device is
@@ -176,12 +210,17 @@ async fn fanout(
         .map(|rows| u64::try_from(rows.len()).unwrap_or(u64::MAX))
         .unwrap_or(0);
     let base = Notification::new(title, body, tag.clone(), url);
+    let mut sent = 0;
     for sub in subs {
         let notification = base.clone().with_badge(pending);
-        if let Err(err) = push.notify(&sub, &notification, &tag).await {
-            tracing::debug!(error = %err, endpoint = %sub.endpoint, "push notify failed");
+        match push.notify(&sub, &notification, &tag).await {
+            Ok(_) => sent += 1,
+            Err(err) => {
+                tracing::debug!(error = %err, endpoint = %sub.endpoint, "push notify failed");
+            }
         }
     }
+    sent
 }
 
 /// Map a journal event to its outward alert kind.

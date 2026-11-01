@@ -95,7 +95,20 @@ pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             decided_at TEXT NOT NULL
          );
          CREATE INDEX IF NOT EXISTS lineage_restart_decisions_lineage
-            ON lineage_restart_decisions(lineage_id, decided_at);",
+            ON lineage_restart_decisions(lineage_id, decided_at);
+         CREATE TABLE IF NOT EXISTS lineage_c1_pushes (
+            fence_id TEXT PRIMARY KEY,
+            lineage_id TEXT NOT NULL,
+            instance_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            title TEXT NOT NULL,
+            body TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            sent_at TEXT,
+            recipients INTEGER
+         );
+         CREATE INDEX IF NOT EXISTS lineage_c1_pushes_unsent
+            ON lineage_c1_pushes(sent_at, created_at);",
     )?;
     conn.execute(
         "UPDATE lineages SET state = 'running'
@@ -316,7 +329,199 @@ pub(crate) fn record_restart(
         "UPDATE lineage_restart_decisions SET notice_command_id = ?2 WHERE failed_instance_id = ?1",
         params![decision.failed_instance_id, notice_id],
     )?;
+    queue_push(
+        conn,
+        fence_id,
+        lineage_id,
+        successor_id,
+        push_kind::RESTARTED,
+        Some(decision.cause),
+    )?;
     Ok(())
+}
+
+/// §8.5 C1 push kinds.
+pub(crate) mod push_kind {
+    /// A restart decision: "Main restarted (cause)".
+    pub const RESTARTED: &str = "restarted";
+    /// The cap: "Main paused: restart cap".
+    pub const RESTART_CAP: &str = "restart-cap";
+    /// A close by the chapter itself: "Main closed itself".
+    pub const SELF: &str = "self";
+    /// A close by an Agent ancestor.
+    pub const ANCESTOR: &str = "ancestor";
+}
+
+/// Record the C1 push of one F, in F's transaction (one per fence, so a
+/// retried decision or close can never add a second). It is sent after
+/// commit, and by the supervisor's next evaluation if the Hub stopped first.
+/// A pause from a Human device and `paused{process-exit}` (today's exited
+/// push) record none.
+pub(crate) fn queue_push(
+    conn: &Connection,
+    fence_id: &str,
+    lineage_id: &str,
+    instance_id: &str,
+    kind: &str,
+    cause_name: Option<&str>,
+) -> Result<(), StoreError> {
+    // The seat (the chapter that addresses the owner) is "Main"; any other
+    // continuity lineage is named by its title.
+    let (title, grants): (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT title, grants_json FROM instances WHERE id = ?1",
+            params![instance_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .unwrap_or_default();
+    let is_seat = grants
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+        .is_some_and(|grants| grants.iter().any(|grant| grant == "address-owner"));
+    let label = if is_seat {
+        "Main".to_owned()
+    } else {
+        title
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or_else(|| "Session".to_owned())
+    };
+    let (headline, body) = match kind {
+        push_kind::RESTARTED => {
+            let why = match cause_name {
+                Some(cause::START_FAILED) => "start failed",
+                Some(cause::NODE_RESTARTED) => "Node restarted",
+                _ => "process exited",
+            };
+            (
+                format!("{label} restarted ({why})"),
+                "A new chapter is starting; the Hub's restart notice is its first input."
+                    .to_owned(),
+            )
+        }
+        push_kind::RESTART_CAP => (
+            format!("{label} paused: restart cap"),
+            "It reached its restarts per hour and stays paused until you resume it.".to_owned(),
+        ),
+        push_kind::SELF => (
+            format!("{label} closed itself"),
+            "It is paused until you resume it.".to_owned(),
+        ),
+        _ => (
+            format!("{label} paused by its parent agent"),
+            "It is paused until it is resumed.".to_owned(),
+        ),
+    };
+    conn.execute(
+        "INSERT OR IGNORE INTO lineage_c1_pushes
+            (fence_id, lineage_id, instance_id, kind, title, body, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            fence_id,
+            lineage_id,
+            instance_id,
+            kind,
+            headline,
+            body,
+            crate::config::now_rfc3339()
+        ],
+    )?;
+    Ok(())
+}
+
+/// One unsent C1 push.
+#[derive(Debug)]
+struct C1Push {
+    fence_id: String,
+    lineage_id: String,
+    instance_id: String,
+    title: String,
+    body: String,
+}
+
+/// Send every recorded, unsent C1 push through the existing push fanout and
+/// mark it sent with its recipient count (0 when push is off or a device is
+/// following the chapter: the record says it was decided, not delivered).
+pub(crate) async fn drive_pushes(state: &AppState) {
+    let pushes = match state
+        .store
+        .read("c1_pushes_unsent", |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT fence_id, lineage_id, instance_id, title, body
+                   FROM lineage_c1_pushes WHERE sent_at IS NULL ORDER BY created_at",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(C1Push {
+                        fence_id: row.get(0)?,
+                        lineage_id: row.get(1)?,
+                        instance_id: row.get(2)?,
+                        title: row.get(3)?,
+                        body: row.get(4)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%error, "could not read unsent C1 pushes");
+            return;
+        }
+    };
+    for push in pushes {
+        // Claim before sending, so a concurrent drive never sends it twice.
+        let claimed = state
+            .store
+            .run_named("c1_push_claim", {
+                let fence_id = push.fence_id.clone();
+                move |conn| {
+                    Ok(conn.execute(
+                        "UPDATE lineage_c1_pushes SET sent_at = ?2
+                          WHERE fence_id = ?1 AND sent_at IS NULL",
+                        params![fence_id, crate::config::now_rfc3339()],
+                    )? == 1)
+                }
+            })
+            .await
+            .unwrap_or(false);
+        if !claimed {
+            continue;
+        }
+        let sent = crate::alerts::c1_push(
+            state,
+            &push.lineage_id,
+            &push.instance_id,
+            &push.title,
+            &push.body,
+        )
+        .await;
+        tracing::info!(lineage_id = %push.lineage_id, title = %push.title, sent, "C1 push");
+        let _ = state
+            .store
+            .run_named("c1_push_sent", move |conn| {
+                conn.execute(
+                    "UPDATE lineage_c1_pushes SET recipients = ?2 WHERE fence_id = ?1",
+                    params![push.fence_id, i64::try_from(sent).unwrap_or(i64::MAX)],
+                )?;
+                Ok(())
+            })
+            .await;
+    }
+}
+
+/// Whether `instance_id`'s generic exited push is replaced by a C1 push: its
+/// lineage restarts on process loss (§8.5).
+pub(crate) async fn c1_replaces_exit_push(state: &AppState, instance_id: &str) -> bool {
+    let Ok(Some(instance)) = state.store.get_instance_read(instance_id.to_owned()).await else {
+        return false;
+    };
+    instance
+        .restart
+        .and_then(|value| serde_json::from_value::<RestartPolicy>(value).ok())
+        .is_some_and(|policy| policy.on_process_loss)
 }
 
 /// The fixed tag the restart notice opens with (§6.4).
@@ -859,6 +1064,16 @@ impl Store {
                 &core.fence_id,
                 reason.as_deref(),
             )?;
+            if decision_outcome == outcome::RESTART_CAP {
+                queue_push(
+                    &tx,
+                    &core.fence_id,
+                    &spec.lineage_id,
+                    &failed_instance_id,
+                    push_kind::RESTART_CAP,
+                    Some(cause),
+                )?;
+            }
             let settlement = core.settlement.clone();
             tx.commit()?;
             Ok((result, settlement))
@@ -928,6 +1143,8 @@ pub(crate) async fn evaluate(state: &AppState) -> Vec<Decided> {
     }
     // §6.4: notices whose successor is ready (also after a Hub restart).
     drive_notices(state).await;
+    // §8.5: C1 pushes recorded by an F and not sent yet.
+    drive_pushes(state).await;
     decided
 }
 

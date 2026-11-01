@@ -350,6 +350,10 @@ test.describe("desktop 1280", () => {
       await createWorkingSession(page);
       await page.goto("/sessions");
       await expect(page.getByTestId("session-list")).toBeVisible({ timeout: 20_000 });
+      // The count row is owner-global while the list is pinned to the active
+      // Space; compare like with like by widening the list to every Space.
+      await page.getByTestId("session-scope-all").click();
+      await expect(page.getByTestId("session-scope")).toHaveAttribute("data-scope", "all");
 
       const working = page.getByTestId("glance-working");
       await expect(working).toContainText(/工作中/, { timeout: 20_000 });

@@ -296,9 +296,10 @@ test.describe("phone 390", () => {
       await createWorkingSession(page);
       // Enough rows that the reduced viewport can park the waiting row fully
       // outside the visible band: a tap that "works" only because everything
-      // already fits proves nothing.
-      await seedRows(page, 10);
-      await page.setViewportSize({ width: 390, height: 480 });
+      // already fits proves nothing. The fake host seats 8 live instances, so
+      // six rows (blocked + working + four) leave room under that cap.
+      await seedRows(page, 4);
+      await page.setViewportSize({ width: 390, height: 340 });
       await page.goto("/m");
 
       const working = page.getByTestId("glance-working");
@@ -416,12 +417,12 @@ test.describe("desktop 1280", () => {
       await expect(page.getByTestId("session-list")).toBeVisible({ timeout: 20_000 });
       await createBlockedSession(page);
       await createWorkingSession(page);
-      await seedRows(page, 10);
+      await seedRows(page, 4);
       // The count row is owner-global while /sessions is pinned to the active
       // Space — and the default Space has no sessions, so its list renders the
       // empty state without the scope switch. Open the list in global scope so
       // the filtered rows are comparable with the count.
-      await page.setViewportSize({ width: 1280, height: 520 });
+      await page.setViewportSize({ width: 1280, height: 420 });
       await page.goto("/sessions?scope=all");
       await expect(page.getByTestId("session-list")).toBeVisible({ timeout: 20_000 });
       await expect(page.getByTestId("session-scope")).toHaveAttribute("data-scope", "all");

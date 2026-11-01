@@ -2296,27 +2296,7 @@ async fn resume_lineage(
     // Recovery source (§6.3.1): the current chapter's native session id, else
     // the most recent earlier chapter that reported one, else a fresh launch
     // from the lineage's original create spec.
-    let mut recovery_session = current.native_session_id.clone();
-    if recovery_session.is_none() {
-        let chapters = state
-            .store
-            .list_lineage_chapters(lineage.lineage_id.clone())
-            .await?;
-        for chapter in chapters.iter().rev() {
-            if chapter.generation >= lineage.generation {
-                continue;
-            }
-            if let Some(earlier) = state
-                .store
-                .get_instance_read(chapter.instance_id.clone())
-                .await?
-                && earlier.native_session_id.is_some()
-            {
-                recovery_session = earlier.native_session_id;
-                break;
-            }
-        }
-    }
+    let recovery = recovery_source(state, &lineage, &current).await?;
     // ma-lineage rounds 2/3/4 item 1 (OA6): a chapter with no native session
     // is continued only when there is definite process-end evidence. A LIVE
     // chapter (no session yet) is refused with a clear 409 — relaunching blank
@@ -2332,7 +2312,7 @@ async fn resume_lineage(
     // while the process was alive) is treated as potentially live, so without
     // a session the 409 stands; with a known session the successor closes the
     // predecessor below instead.
-    if recovery_session.is_none()
+    if matches!(recovery, RecoverySource::Fresh)
         && !state
             .store
             .instance_has_process_end_evidence(&current)
@@ -2344,21 +2324,169 @@ async fn resume_lineage(
                 .into(),
         ));
     }
-    let (mut spec, operation) = match recovery_session {
+    // A continuation keeps the same carrier (claude-sdk resumes as
+    // claude-sdk; ma-lineage r6 item 5 / r7 item 6(a): honour the requested
+    // resume mode's driver when it differs, on both recovery paths).
+    let prepared = prepare_continuation(
+        state,
+        host,
+        &lineage,
+        &current,
+        &recovery,
+        mode.driver(&current.driver),
+        body.prompt.as_deref(),
+    )
+    .await?;
+    let title = current
+        .title
+        .clone()
+        .map(|title| format!("{title} (resumed)"))
+        .or_else(|| Some("resumed session".to_string()));
+    let origin = serde_json::to_value(crate::agent_scope::origin(device))
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "human".into());
+    let result = state
+        .store
+        .continuation_resume(crate::store::ContinuationResumeRequest {
+            addressed_instance_id: addressed.instance_id.clone(),
+            expected_generation: lineage.generation,
+            host_id: current.host_id.clone(),
+            spec: prepared.spec.clone(),
+            operation: prepared.operation.to_string(),
+            prompt: body.prompt.clone(),
+            origin,
+            title,
+            driver: prepared.driver.clone(),
+            actor: json!({"deviceId": device.id, "by": "owner-resume"}),
+            chapter_cause: crate::store::OWNER_RESUME_CAUSE.into(),
+            from_states: &["starting", "running", "paused"],
+            restart: None,
+        })
+        .await
+        .map_err(map_store)?;
+    let resumed = match result {
+        crate::store::ContinuationResumeResult::Superseded { current } => {
+            // The generation CAS lost to a concurrent resume: present its
+            // successor as an idempotent replay.
+            let current = *current;
+            return Ok(Json(json!({
+                "instance": current,
+                "hostId": current.host_id,
+                "mode": mode.as_str(),
+                "replayed": true,
+            })));
+        }
+        crate::store::ContinuationResumeResult::Resumed(resumed) => resumed,
+    };
+    // D-057 §6.5 (ma-fence): Resume runs only on a paused lineage (or one
+    // whose current chapter has process-end evidence), so the predecessor's
+    // process was already closed by the pause — the close F queued at
+    // admission — or has ended. Nothing to stop here.
+    let command = finish_continuation(state, &resumed, &prepared.spec).await?;
+    Ok(Json(json!({
+        "instance": resumed.successor,
+        "command": command,
+        "hostId": resumed.successor.host_id,
+        "mode": mode.as_str(),
+        "replayed": false,
+    })))
+}
+
+/// D-057 §6.3.1 recovery source of a continuation, in order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RecoverySource {
+    /// The current (failed) chapter's own native session id.
+    Chapter(String),
+    /// The most recent earlier chapter that reported one: the conversation
+    /// continues from its last durable point.
+    Earlier(String),
+    /// No chapter ever reported one: a fresh launch from the lineage's
+    /// original create spec and launch brief.
+    Fresh,
+}
+
+impl RecoverySource {
+    /// Wire/record spelling.
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::Chapter(_) => "chapter-session",
+            Self::Earlier(_) => "earlier-session",
+            Self::Fresh => "fresh",
+        }
+    }
+
+    /// The native session the successor resumes, if any.
+    pub(crate) fn session(&self) -> Option<&str> {
+        match self {
+            Self::Chapter(session) | Self::Earlier(session) => Some(session),
+            Self::Fresh => None,
+        }
+    }
+}
+
+/// Pick the recovery source for continuing `current` (§6.3.1): its own
+/// native session id, else the newest earlier chapter's, else a fresh launch.
+pub(crate) async fn recovery_source(
+    state: &AppState,
+    lineage: &crate::store::LineageRecord,
+    current: &crate::store::InstanceRecord,
+) -> Result<RecoverySource, HubError> {
+    if let Some(session) = current.native_session_id.clone() {
+        return Ok(RecoverySource::Chapter(session));
+    }
+    let chapters = state
+        .store
+        .list_lineage_chapters(lineage.lineage_id.clone())
+        .await?;
+    for chapter in chapters.iter().rev() {
+        if chapter.generation >= current.generation {
+            continue;
+        }
+        if let Some(earlier) = state
+            .store
+            .get_instance_read(chapter.instance_id.clone())
+            .await?
+            && let Some(session) = earlier.native_session_id
+        {
+            return Ok(RecoverySource::Earlier(session));
+        }
+    }
+    Ok(RecoverySource::Fresh)
+}
+
+/// A successor's create, prepared for the continuation transaction.
+pub(crate) struct PreparedContinuation {
+    pub(crate) spec: Value,
+    pub(crate) operation: &'static str,
+    /// The resolved driver, stamped on the successor row (r7 item 6a).
+    pub(crate) driver: String,
+}
+
+/// Build the successor's create spec on `current`'s host from `recovery`:
+/// an `instance.resume` of the native session, or an `instance.create` of
+/// the lineage's original spec, with the provider route resolved the way the
+/// D-026 resume resolves it. Shared by the owner Resume and the C1
+/// supervisor.
+pub(crate) async fn prepare_continuation(
+    state: &AppState,
+    host: crate::store::HostRecord,
+    lineage: &crate::store::LineageRecord,
+    current: &crate::store::InstanceRecord,
+    recovery: &RecoverySource,
+    driver: &str,
+    prompt: Option<&str>,
+) -> Result<PreparedContinuation, HubError> {
+    let (mut spec, operation) = match recovery.session() {
         Some(session_id) => {
             let mut spec = current.spec_for_resume();
             if let Some(object) = spec.as_object_mut() {
-                // A continuation keeps the same carrier (claude-sdk resumes as
-                // claude-sdk; ma-lineage r6 item 5: honour the requested resume
-                // mode's driver when it differs, rather than forcing the
-                // structured/SDK driver for a {mode:"terminal"} continuation).
-                let driver = mode.driver(&current.driver);
                 object.insert("driver".into(), json!(driver));
                 object.insert("resumeSessionId".into(), json!(session_id));
                 object.insert("resumedFrom".into(), json!(current.instance_id));
                 object.insert("parentInstanceId".into(), json!(current.parent_instance_id));
                 object.insert("hostId".into(), json!(current.host_id));
-                object.insert("prompt".into(), json!(body.prompt));
+                object.insert("prompt".into(), json!(prompt));
                 object.remove("nativeSessionId");
                 object.remove("nativeTranscriptPath");
             }
@@ -2366,27 +2494,19 @@ async fn resume_lineage(
         }
         None => {
             // No chapter ever reported a session: relaunch the original create
-            // spec fresh, as the supervisor will on a first-chapter start
-            // failure.
+            // spec fresh.
             let mut spec = lineage
                 .origin_spec_ref
                 .as_ref()
                 .and_then(|reference| reference.get("spec").cloned())
                 .unwrap_or_else(|| current.spec_for_resume());
             if let Some(object) = spec.as_object_mut() {
-                // ma-lineage r7 item 6(a): honour the requested resume mode's
-                // driver on the FRESH path too — a {mode:"terminal"}
-                // continuation of a sessionless/failed chapter relaunches
-                // claude-pty, not the current chapter's driver (claude-sdk).
-                // Without this the row was inserted with the wrong driver and
-                // only corrected if the Node's reply carried /instance/driver.
-                let driver = mode.driver(&current.driver);
                 object.insert("driver".into(), json!(driver));
                 object.insert("resumedFrom".into(), json!(current.instance_id));
                 object.insert("parentInstanceId".into(), json!(current.parent_instance_id));
                 object.insert("hostId".into(), json!(current.host_id));
-                if body.prompt.is_some() {
-                    object.insert("prompt".into(), json!(body.prompt));
+                if prompt.is_some() {
+                    object.insert("prompt".into(), json!(prompt));
                 }
                 object.remove("resumeSessionId");
                 object.remove("nativeSessionId");
@@ -2451,68 +2571,42 @@ async fn resume_lineage(
         crate::providers::validate_via_target(state, &host, &choice, &profile).await?;
         crate::providers::write_requested_route(&mut spec, &choice)?;
     }
-    let title = current
-        .title
-        .clone()
-        .map(|title| format!("{title} (resumed)"))
-        .or_else(|| Some("resumed session".to_string()));
-    let origin = serde_json::to_value(crate::agent_scope::origin(device))
-        .ok()
-        .and_then(|value| value.as_str().map(str::to_string))
-        .unwrap_or_else(|| "human".into());
     // The resolved driver from the prepared spec — same value the queued
     // create/resume sends, stamped on the successor row (r7 item 6a).
-    let successor_driver = spec
+    let driver = spec
         .get("driver")
         .and_then(Value::as_str)
         .filter(|driver| !driver.is_empty())
         .unwrap_or(&current.driver)
         .to_string();
-    let result = state
-        .store
-        .continuation_resume(crate::store::ContinuationResumeRequest {
-            addressed_instance_id: addressed.instance_id.clone(),
-            expected_generation: lineage.generation,
-            host_id: current.host_id.clone(),
-            spec: spec.clone(),
-            operation: operation.to_string(),
-            prompt: body.prompt.clone(),
-            origin,
-            title,
-            driver: successor_driver,
-            actor: json!({"deviceId": device.id, "by": "owner-resume"}),
-        })
+    Ok(PreparedContinuation {
+        spec,
+        operation,
+        driver,
+    })
+}
+
+/// After a continuation transaction committed: §7.2's post-commit steps (the
+/// fence map, egress revocation, fence delivery — the successor's host first,
+/// so its create follows the acknowledgement), the create's forward when its
+/// host is live, the via egress credential and the resume links. Returns the
+/// create command as forwarding left it.
+pub(crate) async fn finish_continuation(
+    state: &AppState,
+    resumed: &crate::store::ContinuationResumed,
+    spec: &Value,
+) -> Result<CommandRecord, HubError> {
+    state.broadcast_settlement(&resumed.fence.settlement);
+    crate::fence::after_commit(state, &resumed.fence, Some(&resumed.successor.host_id)).await;
+    let live = state
+        .nodes
+        .kind_of(&resumed.successor.host_id)
         .await
-        .map_err(map_store)?;
-    let (fenced, successor, command) = match result {
-        crate::store::ContinuationResumeResult::Superseded { current } => {
-            // The generation CAS lost to a concurrent resume: present its
-            // successor as an idempotent replay.
-            let current = *current;
-            return Ok(Json(json!({
-                "instance": current,
-                "hostId": current.host_id,
-                "mode": mode.as_str(),
-                "replayed": true,
-            })));
-        }
-        crate::store::ContinuationResumeResult::Resumed(resumed) => {
-            // §7.2 after commit: fence map, egress revocation, delivery. The
-            // successor's host gets the fence before its create (§7.6).
-            state.broadcast_settlement(&resumed.fence.settlement);
-            crate::fence::after_commit(state, &resumed.fence, Some(&resumed.successor.host_id))
-                .await;
-            (resumed.fenced, resumed.successor, resumed.command)
-        }
-    };
-    // D-057 §6.5 (ma-fence): Resume runs only on a paused lineage (or one
-    // whose current chapter has process-end evidence), so the predecessor's
-    // process was already closed by the pause — the close F queued at
-    // admission — or has ended. Nothing to stop here.
-    let command = forward_if_online(state, command, true).await?;
+        .is_some();
+    let command = forward_if_online(state, resumed.command.clone(), live).await?;
     // Re-install the via egress credential for the successor id (the analog
     // of the post-spawn install in `placement::spawn_on_host`).
-    crate::placement::install_route_egress(state, &successor, &spec).await;
+    crate::placement::install_route_egress(state, &resumed.successor, spec).await;
     let now = crate::config::now_rfc3339();
     // The resume links describe native-transcript continuity; a successor
     // relaunched fresh from the origin spec (no chapter ever reported a
@@ -2524,32 +2618,26 @@ async fn resume_lineage(
     {
         journal_resume_link(
             state,
-            &fenced.host_id,
-            &fenced.instance_id,
+            &resumed.fenced.host_id,
+            &resumed.fenced.instance_id,
             "resumed-into",
-            &successor.instance_id,
+            &resumed.successor.instance_id,
             session_id,
             &now,
         )
         .await;
         journal_resume_link(
             state,
-            &successor.host_id,
-            &successor.instance_id,
+            &resumed.successor.host_id,
+            &resumed.successor.instance_id,
             "resumed-from",
-            &fenced.instance_id,
+            &resumed.fenced.instance_id,
             session_id,
             &now,
         )
         .await;
     }
-    Ok(Json(json!({
-        "instance": successor,
-        "command": command,
-        "hostId": successor.host_id,
-        "mode": mode.as_str(),
-        "replayed": false,
-    })))
+    Ok(command)
 }
 
 /// `GET /v1/lineages/{lineageId}` — D-057 §13 lineage projection.
@@ -2634,6 +2722,16 @@ pub async fn get_lineage(
             })
             .await?
     };
+    // D-057 §6.3.1: the restart-decision log, keyed by failed chapter.
+    let restart_decisions = {
+        let lineage_id = lineage.lineage_id.clone();
+        state
+            .store
+            .read("lineage_restart_decisions", move |conn| {
+                crate::restart::lineage_decisions(conn, &lineage_id)
+            })
+            .await?
+    };
     Ok(Json(json!({
         "lineageId": lineage.lineage_id,
         "state": lineage_state,
@@ -2643,6 +2741,7 @@ pub async fn get_lineage(
         "generation": lineage.generation,
         "chapters": chapters,
         "fences": fences,
+        "restartDecisions": restart_decisions,
     })))
 }
 

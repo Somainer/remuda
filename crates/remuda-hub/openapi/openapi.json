@@ -2012,7 +2012,7 @@
             "type": "string"
           },
           "pausedBy": {
-            "description": "Who paused the lineage: `{kind: device|self|ancestor|restart-cap|process-exit, deviceId?, instanceId?}`; null while unpaused.",
+            "description": "Who paused the lineage: `{kind: device|self|ancestor|restart-cap|process-exit, deviceId?, instanceId?, cause?}`; `restart-cap` and `process-exit` are the C1 supervisor's (with the failed chapter and its §6.3 cause); null while unpaused.",
             "type": [
               "object",
               "null"
@@ -2035,6 +2035,13 @@
               }
             ]
           },
+          "restartDecisions": {
+            "description": "D-057 §6.3.1: the C1 supervisor's restart-decision log, one row per failed chapter (the key), oldest first.",
+            "items": {
+              "$ref": "#/components/schemas/LineageRestartDecision"
+            },
+            "type": "array"
+          },
           "state": {
             "description": "starting, running, paused, or host-offline (a running current chapter whose host has no live link; derived, not starting).",
             "enum": [
@@ -2052,6 +2059,62 @@
           "generation",
           "chapters",
           "fences"
+        ],
+        "type": "object"
+      },
+      "LineageRestartDecision": {
+        "additionalProperties": false,
+        "description": "One C1 decision (D-057 §6.3.1), made inside F with a generation CAS and keyed by the failed chapter.",
+        "properties": {
+          "cause": {
+            "description": "The §6.3 cause: process-exit, start-failed or node-restarted.",
+            "type": "string"
+          },
+          "decidedAt": {
+            "type": "string"
+          },
+          "failedGeneration": {
+            "type": "integer"
+          },
+          "failedInstanceId": {
+            "description": "The failed chapter: the decision key.",
+            "type": "string"
+          },
+          "fenceId": {
+            "description": "The fence F committed for this decision.",
+            "type": "string"
+          },
+          "noticeCommandId": {
+            "description": "The restart notice's command id, chosen inside F (§6.4).",
+            "type": "string"
+          },
+          "outcome": {
+            "description": "restarted (F with successor), restart-cap or process-exit (F without successor: the lineage is paused).",
+            "enum": [
+              "restarted",
+              "restart-cap",
+              "process-exit"
+            ],
+            "type": "string"
+          },
+          "reason": {
+            "description": "Why a decision paused instead of restarting, when it is not the cap or the policy.",
+            "type": "string"
+          },
+          "recovery": {
+            "description": "§6.3.1 recovery source of the successor: chapter-session, earlier-session or fresh.",
+            "type": "string"
+          },
+          "successorInstanceId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "failedInstanceId",
+          "failedGeneration",
+          "cause",
+          "outcome",
+          "decidedAt"
         ],
         "type": "object"
       },

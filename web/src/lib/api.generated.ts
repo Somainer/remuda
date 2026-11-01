@@ -2785,14 +2785,39 @@ export interface components {
             lineageId: string;
             /** @description When the lineage was paused (RFC3339); null while unpaused. */
             pausedAt?: string | null;
-            /** @description Who paused the lineage: `{kind: device|self|ancestor|restart-cap|process-exit, deviceId?, instanceId?}`; null while unpaused. */
+            /** @description Who paused the lineage: `{kind: device|self|ancestor|restart-cap|process-exit, deviceId?, instanceId?, cause?}`; `restart-cap` and `process-exit` are the C1 supervisor's (with the failed chapter and its §6.3 cause); null while unpaused. */
             pausedBy?: Record<string, never> | null;
             restart?: components["schemas"]["RestartPolicy"] | null;
+            /** @description D-057 §6.3.1: the C1 supervisor's restart-decision log, one row per failed chapter (the key), oldest first. */
+            restartDecisions?: components["schemas"]["LineageRestartDecision"][];
             /**
              * @description starting, running, paused, or host-offline (a running current chapter whose host has no live link; derived, not starting).
              * @enum {string}
              */
             state: "starting" | "running" | "paused" | "host-offline";
+        };
+        /** @description One C1 decision (D-057 §6.3.1), made inside F with a generation CAS and keyed by the failed chapter. */
+        LineageRestartDecision: {
+            /** @description The §6.3 cause: process-exit, start-failed or node-restarted. */
+            cause: string;
+            decidedAt: string;
+            failedGeneration: number;
+            /** @description The failed chapter: the decision key. */
+            failedInstanceId: string;
+            /** @description The fence F committed for this decision. */
+            fenceId?: string;
+            /** @description The restart notice's command id, chosen inside F (§6.4). */
+            noticeCommandId?: string;
+            /**
+             * @description restarted (F with successor), restart-cap or process-exit (F without successor: the lineage is paused).
+             * @enum {string}
+             */
+            outcome: "restarted" | "restart-cap" | "process-exit";
+            /** @description Why a decision paused instead of restarting, when it is not the cap or the policy. */
+            reason?: string;
+            /** @description §6.3.1 recovery source of the successor: chapter-session, earlier-session or fresh. */
+            recovery?: string;
+            successorInstanceId?: string;
         };
         LoginRequest: {
             bootstrapToken: string;

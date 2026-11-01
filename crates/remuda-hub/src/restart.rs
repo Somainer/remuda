@@ -1,0 +1,762 @@
+//! D-057 §6.3 / §6.3.1 (ma-restart): the C1 supervisor.
+//!
+//! The supervisor runs on the Hub's 1 s scheduler tick and once at boot. It
+//! evaluates lineages that are `starting` or `running` by state (the derived
+//! `host-offline` is one of those) and acts only on Node-attested
+//! process-end evidence (OA6) bound to the lineage's CURRENT chapter at the
+//! live generation:
+//!
+//! * the process ended by itself after reporting running → `process-exit`;
+//! * the chapter never started (a rejected or never-acknowledged create, a
+//!   journaled start failure, or an end before the first running event) →
+//!   `start-failed`;
+//! * the Node's epoch changed and its inventory no longer holds the chapter
+//!   → `node-restarted`.
+//!
+//! Host loss is contact loss, never evidence: a host-lost row carries no
+//! `ended_at`, so it is not a candidate, and a same-epoch reconnect revives
+//! it. A close fences at admission and pauses the lineage, so an exit that
+//! follows a close finds it paused and is ignored (a close always wins).
+//!
+//! **Exactly one decision per failed chapter.** Every decision is F (§7.2)
+//! with a generation CAS — with a successor (a restart), or without one
+//! (`paused{restart-cap}` at the cap, `paused{process-exit}` when the
+//! lineage has no `restart.onProcessLoss`) — and it records its row in
+//! `lineage_restart_decisions`, keyed by the failed chapter id, in the same
+//! transaction. Inside that transaction the decision re-checks that the
+//! failed chapter is still current at the expected generation, still carries
+//! its evidence and has no row yet, so a second evaluation (another tick, a
+//! Hub restart, a racing Resume or close) writes nothing.
+//!
+//! **The cap** counts restart decisions of every cause in the last hour.
+//! **Recovery source** (§6.3.1): the failed chapter's native session, else
+//! the newest earlier chapter's, else a fresh launch from the original create
+//! spec; the successor runs claude-sdk on the same host. **Launch
+//! authority** (OA5): the successor's create carries the launch origin
+//! recorded for the lineage's first chapter; its actor is the supervisor,
+//! with the seating device beside it.
+
+use crate::AppState;
+use crate::fence::{FenceMode, FenceSpec, FenceTx, fence_core};
+use crate::store::{
+    InstanceRecord, LineageRecord, RestartPolicy, Settlement, Store, StoreError, immediate_tx,
+    lifecycle_has_process_end_evidence, load_lineage,
+};
+use rusqlite::{Connection, OptionalExtension, params};
+use serde::Serialize;
+use serde_json::{Value, json};
+use std::sync::Arc;
+
+/// §6.3 causes, as recorded on the decision and as the successor's
+/// `chapterCause`.
+pub(crate) mod cause {
+    /// The process ended by itself after reporting running.
+    pub const PROCESS_EXIT: &str = "process-exit";
+    /// The chapter never started.
+    pub const START_FAILED: &str = "start-failed";
+    /// The Node restarted and no longer holds the chapter.
+    pub const NODE_RESTARTED: &str = "node-restarted";
+}
+
+/// `lineage_restart_decisions.outcome` values.
+pub(crate) mod outcome {
+    /// F with successor.
+    pub const RESTARTED: &str = "restarted";
+    /// F without successor at the cap: `paused{restart-cap}`.
+    pub const RESTART_CAP: &str = "restart-cap";
+    /// F without successor on a lineage without `restart.onProcessLoss`:
+    /// `paused{process-exit}`.
+    pub const PROCESS_EXIT: &str = "process-exit";
+}
+
+/// The supervisor's actor in fence and audit records.
+const SUPERVISOR: &str = "hub-supervisor";
+
+/// Idempotent DDL; no `user_version` rung. Also lifts lineages whose current
+/// chapter already runs to the stored `running` state (rows written before
+/// the projection below existed).
+pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS lineage_restart_decisions (
+            failed_instance_id TEXT PRIMARY KEY,
+            lineage_id TEXT NOT NULL,
+            failed_generation INTEGER NOT NULL,
+            cause TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            successor_instance_id TEXT,
+            successor_generation INTEGER,
+            recovery TEXT,
+            recovery_session_id TEXT,
+            create_command_id TEXT,
+            notice_command_id TEXT,
+            fence_id TEXT,
+            reason TEXT,
+            push_state TEXT NOT NULL DEFAULT 'none',
+            decided_at TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS lineage_restart_decisions_lineage
+            ON lineage_restart_decisions(lineage_id, decided_at);",
+    )?;
+    conn.execute(
+        "UPDATE lineages SET state = 'running'
+          WHERE state = 'starting'
+            AND EXISTS (SELECT 1 FROM instances i
+                         WHERE i.id = lineages.current_instance_id
+                           AND i.generation = lineages.generation
+                           AND i.fenced_at IS NULL
+                           AND i.lifecycle IN ('ready', 'running'))",
+        [],
+    )?;
+    Ok(())
+}
+
+/// §6.2 stored state: a lineage moves `starting` → `running` when its current
+/// chapter at the live generation reports running. Runs in the journal
+/// append transaction; the cause table reads it (an end before the first
+/// running event is a start failure).
+pub(crate) fn note_chapter_running(conn: &Connection, instance_id: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE lineages SET state = 'running', updated_at = ?2
+          WHERE current_instance_id = ?1 AND state = 'starting'
+            AND EXISTS (SELECT 1 FROM instances i
+                         WHERE i.id = ?1 AND i.generation = lineages.generation
+                           AND i.fenced_at IS NULL
+                           AND i.lifecycle IN ('ready', 'running'))",
+        params![instance_id, crate::config::now_rfc3339()],
+    )?;
+    Ok(())
+}
+
+/// The §6.3 cause of a failed chapter's evidence.
+fn classify(lineage_state: &str, lifecycle: &str, last_error: Option<&str>) -> &'static str {
+    if last_error == Some(crate::ws::NODE_EPOCH_CHANGED) {
+        return cause::NODE_RESTARTED;
+    }
+    if lineage_state == "starting"
+        || (lifecycle == "failed"
+            && last_error.is_some_and(crate::store::is_attested_launch_failure_marker))
+    {
+        return cause::START_FAILED;
+    }
+    cause::PROCESS_EXIT
+}
+
+/// A C1 decision with successor, checked and recorded inside the
+/// continuation transaction (see [`crate::store::ContinuationResumeRequest`]).
+#[derive(Clone, Debug)]
+pub struct RestartDecision {
+    /// The failed chapter: the decision key.
+    pub failed_instance_id: String,
+    /// §6.3 cause.
+    pub cause: &'static str,
+    /// §6.3.1 recovery source (`chapter-session` / `earlier-session` /
+    /// `fresh`).
+    pub recovery: &'static str,
+    /// The native session the successor resumes, if any.
+    pub recovery_session_id: Option<String>,
+}
+
+/// `(lifecycle, last_error, ended_at, generation, fenced_at)` of a chapter.
+type ChapterEvidenceRow = (String, Option<String>, Option<String>, i64, Option<String>);
+
+/// Whether a decision about `failed_instance_id` may still be made, read
+/// inside the deciding transaction: the chapter is the lineage's current
+/// chapter at `expected_generation`, the lineage is not paused, the chapter
+/// is not fenced and carries process-end evidence, and no decision is keyed
+/// by it yet.
+pub(crate) fn decision_open(
+    conn: &Connection,
+    lineage_id: &str,
+    expected_generation: i64,
+    failed_instance_id: &str,
+) -> Result<bool, StoreError> {
+    let decided = conn
+        .query_row(
+            "SELECT 1 FROM lineage_restart_decisions WHERE failed_instance_id = ?1",
+            params![failed_instance_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if decided {
+        return Ok(false);
+    }
+    let Some(lineage) = load_lineage(conn, lineage_id)? else {
+        return Ok(false);
+    };
+    if lineage.current_instance_id != failed_instance_id
+        || lineage.generation != expected_generation
+        || lineage.state == "paused"
+    {
+        return Ok(false);
+    }
+    let row: Option<ChapterEvidenceRow> = conn
+        .query_row(
+            "SELECT lifecycle, last_error, ended_at, generation, fenced_at
+               FROM instances WHERE id = ?1",
+            params![failed_instance_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((lifecycle, last_error, ended_at, generation, fenced_at)) = row else {
+        return Ok(false);
+    };
+    Ok(generation == lineage.generation
+        && fenced_at.is_none()
+        && lifecycle_has_process_end_evidence(
+            &lifecycle,
+            last_error.as_deref(),
+            ended_at.as_deref(),
+        ))
+}
+
+/// Insert one decision row (the key is the failed chapter id).
+#[allow(clippy::too_many_arguments)]
+fn insert_decision(
+    conn: &Connection,
+    failed_instance_id: &str,
+    lineage_id: &str,
+    failed_generation: i64,
+    cause: &str,
+    outcome: &str,
+    fence_id: &str,
+    reason: Option<&str>,
+) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT INTO lineage_restart_decisions
+            (failed_instance_id, lineage_id, failed_generation, cause, outcome,
+             fence_id, reason, decided_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            failed_instance_id,
+            lineage_id,
+            failed_generation,
+            cause,
+            outcome,
+            fence_id,
+            reason,
+            crate::config::now_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Record a restart decision (F with successor), inside the continuation
+/// transaction, after the successor and its create are inserted.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_restart(
+    conn: &Connection,
+    decision: &RestartDecision,
+    lineage_id: &str,
+    failed_generation: i64,
+    successor_id: &str,
+    successor_generation: i64,
+    create_command_id: &str,
+    fence_id: &str,
+) -> Result<(), StoreError> {
+    insert_decision(
+        conn,
+        &decision.failed_instance_id,
+        lineage_id,
+        failed_generation,
+        decision.cause,
+        outcome::RESTARTED,
+        fence_id,
+        None,
+    )?;
+    conn.execute(
+        "UPDATE lineage_restart_decisions
+            SET successor_instance_id = ?2, successor_generation = ?3, recovery = ?4,
+                recovery_session_id = ?5, create_command_id = ?6
+          WHERE failed_instance_id = ?1",
+        params![
+            decision.failed_instance_id,
+            successor_id,
+            successor_generation,
+            decision.recovery,
+            decision.recovery_session_id,
+            create_command_id,
+        ],
+    )?;
+    Ok(())
+}
+
+/// One row of a lineage's restart-decision log (`GET /v1/lineages/{id}`).
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DecisionView {
+    pub failed_instance_id: String,
+    pub failed_generation: i64,
+    pub cause: String,
+    pub outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub successor_instance_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notice_command_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fence_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub decided_at: String,
+}
+
+/// The lineage's restart-decision log, oldest first.
+pub(crate) fn lineage_decisions(
+    conn: &Connection,
+    lineage_id: &str,
+) -> Result<Vec<DecisionView>, StoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT failed_instance_id, failed_generation, cause, outcome, successor_instance_id,
+                recovery, notice_command_id, fence_id, reason, decided_at
+           FROM lineage_restart_decisions WHERE lineage_id = ?1
+          ORDER BY decided_at ASC, failed_generation ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![lineage_id], |row| {
+            Ok(DecisionView {
+                failed_instance_id: row.get(0)?,
+                failed_generation: row.get(1)?,
+                cause: row.get(2)?,
+                outcome: row.get(3)?,
+                successor_instance_id: row.get(4)?,
+                recovery: row.get(5)?,
+                notice_command_id: row.get(6)?,
+                fence_id: row.get(7)?,
+                reason: row.get(8)?,
+                decided_at: row.get(9)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// A lineage whose current chapter carries process-end evidence and no
+/// decision yet.
+#[derive(Clone, Debug)]
+struct Pending {
+    lineage: LineageRecord,
+    failed: InstanceRecord,
+    cause: &'static str,
+}
+
+/// What one evaluation decided (test seam and logs).
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Decided {
+    pub lineage_id: String,
+    pub failed_instance_id: String,
+    pub cause: String,
+    pub outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub successor_instance_id: Option<String>,
+}
+
+/// Serializes the tick's evaluations (a slow one is skipped by the next tick,
+/// never stacked). Correctness never depends on it: the CAS and the decision
+/// key make concurrent evaluations decide at most once.
+#[derive(Clone, Default)]
+pub(crate) struct SupervisorState {
+    running: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl Store {
+    /// Candidates: unpaused lineages whose current chapter, at the live
+    /// generation and unfenced, is terminal-shaped and has no decision. The
+    /// evidence predicate is applied by the caller.
+    async fn restart_candidates(&self) -> Result<Vec<(String, String)>, StoreError> {
+        self.read("restart_candidates", |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT l.lineage_id, i.id FROM lineages l
+                   JOIN instances i ON i.id = l.current_instance_id
+                  WHERE l.state IN ('starting', 'running')
+                    AND i.generation = l.generation AND i.fenced_at IS NULL
+                    AND i.lifecycle IN ('exited', 'failed', 'closed')
+                    AND NOT EXISTS (SELECT 1 FROM lineage_restart_decisions d
+                                     WHERE d.failed_instance_id = i.id)
+                  ORDER BY l.lineage_id",
+            )?;
+            let rows = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// Restart decisions of every cause for `lineage_id` in the last hour.
+    async fn restarts_in_last_hour(&self, lineage_id: String) -> Result<u32, StoreError> {
+        self.read("restarts_in_last_hour", move |conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM lineage_restart_decisions
+                  WHERE lineage_id = ?1 AND outcome = ?2 AND decided_at >= ?3",
+                params![
+                    lineage_id,
+                    outcome::RESTARTED,
+                    crate::config::rfc3339_minutes_ago(60)
+                ],
+                |row| row.get(0),
+            )?;
+            Ok(u32::try_from(count).unwrap_or(u32::MAX))
+        })
+        .await
+    }
+
+    /// F without successor for a decision (`restart-cap` / `process-exit`),
+    /// with the decision row, in one writer transaction.
+    async fn decide_pause(
+        &self,
+        spec: FenceSpec,
+        failed_instance_id: String,
+        cause: &'static str,
+        decision_outcome: &'static str,
+        reason: Option<String>,
+    ) -> Result<(FenceTx, Settlement), StoreError> {
+        self.run_named("restart_decide_pause", move |conn| {
+            let tx = immediate_tx(conn)?;
+            if !decision_open(
+                &tx,
+                &spec.lineage_id,
+                spec.expected_generation,
+                &failed_instance_id,
+            )? {
+                return Ok((FenceTx::CasLost, Settlement::default()));
+            }
+            let result = fence_core(&tx, &spec)?;
+            let FenceTx::Committed(core) = &result else {
+                return Ok((result, Settlement::default()));
+            };
+            insert_decision(
+                &tx,
+                &failed_instance_id,
+                &spec.lineage_id,
+                spec.expected_generation,
+                cause,
+                decision_outcome,
+                &core.fence_id,
+                reason.as_deref(),
+            )?;
+            let settlement = core.settlement.clone();
+            tx.commit()?;
+            Ok((result, settlement))
+        })
+        .await
+    }
+}
+
+/// Scheduler tick: one evaluation unless the previous one is still running.
+pub(crate) async fn tick(state: &AppState) {
+    let Ok(_guard) = state.restart.running.clone().try_lock_owned() else {
+        return;
+    };
+    evaluate(state).await;
+}
+
+/// Boot: decide every failure left pending by the previous Hub process.
+pub(crate) async fn boot(state: &AppState) {
+    let _guard = state.restart.running.lock().await;
+    let decided = evaluate(state).await;
+    if !decided.is_empty() {
+        tracing::info!(
+            count = decided.len(),
+            "boot evaluation decided pending C1 failures"
+        );
+    }
+}
+
+/// One evaluation of every candidate lineage. Unguarded: concurrent calls are
+/// safe (the CAS and the key decide at most once) and the C1 suites run them
+/// concurrently on purpose.
+pub(crate) async fn evaluate(state: &AppState) -> Vec<Decided> {
+    let candidates = match state.store.restart_candidates().await {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%error, "C1 supervisor could not read candidates");
+            return Vec::new();
+        }
+    };
+    let mut decided = Vec::new();
+    for (lineage_id, failed_id) in candidates {
+        let pending = match pending(state, &lineage_id, &failed_id).await {
+            Ok(Some(pending)) => pending,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::warn!(%error, %lineage_id, "C1 supervisor could not read a candidate");
+                continue;
+            }
+        };
+        match decide(state, pending).await {
+            Ok(Some(decision)) => {
+                tracing::info!(
+                    lineage_id = %decision.lineage_id,
+                    failed = %decision.failed_instance_id,
+                    cause = %decision.cause,
+                    outcome = %decision.outcome,
+                    successor = ?decision.successor_instance_id,
+                    "C1 restart decision"
+                );
+                decided.push(decision);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%error, %lineage_id, "C1 restart decision failed");
+            }
+        }
+    }
+    decided
+}
+
+/// Load and check one candidate: Node-attested process-end evidence on the
+/// current chapter at the live generation.
+async fn pending(
+    state: &AppState,
+    lineage_id: &str,
+    failed_id: &str,
+) -> Result<Option<Pending>, StoreError> {
+    let Some(lineage) = state.store.get_lineage(lineage_id.to_owned()).await? else {
+        return Ok(None);
+    };
+    let Some(failed) = state.store.get_instance_read(failed_id.to_owned()).await? else {
+        return Ok(None);
+    };
+    if lineage.current_instance_id != failed.instance_id
+        || lineage.generation != failed.generation
+        || lineage.state == "paused"
+        || failed.fenced_at.is_some()
+        || !state
+            .store
+            .instance_has_process_end_evidence(&failed)
+            .await?
+    {
+        return Ok(None);
+    }
+    let cause = classify(
+        &lineage.state,
+        &failed.lifecycle,
+        failed.last_error.as_deref(),
+    );
+    Ok(Some(Pending {
+        lineage,
+        failed,
+        cause,
+    }))
+}
+
+/// Decide one pending failure. `None` when another F got there first.
+async fn decide(
+    state: &AppState,
+    pending: Pending,
+) -> Result<Option<Decided>, crate::error::HubError> {
+    let Pending {
+        lineage,
+        failed,
+        cause,
+    } = pending;
+    // Deterministic race hook: after the evidence read, before any writer
+    // job (a close or Resume parked here commits first). No-op in production.
+    crate::store::run_continuation_hook("restart-read", &lineage.lineage_id);
+    let policy: Option<RestartPolicy> = lineage
+        .restart
+        .clone()
+        .and_then(|value| serde_json::from_value(value).ok());
+    let Some(policy) = policy.filter(|policy| policy.on_process_loss) else {
+        return pause(state, &lineage, &failed, cause, outcome::PROCESS_EXIT, None).await;
+    };
+    let restarts = state
+        .store
+        .restarts_in_last_hour(lineage.lineage_id.clone())
+        .await?;
+    if restarts >= policy.max_per_hour {
+        return pause(state, &lineage, &failed, cause, outcome::RESTART_CAP, None).await;
+    }
+    restart(state, &lineage, &failed, cause).await
+}
+
+/// F without successor: `paused{restart-cap}` or `paused{process-exit}`.
+async fn pause(
+    state: &AppState,
+    lineage: &LineageRecord,
+    failed: &InstanceRecord,
+    cause: &'static str,
+    decision_outcome: &'static str,
+    reason: Option<String>,
+) -> Result<Option<Decided>, crate::error::HubError> {
+    let paused_by =
+        json!({"kind": decision_outcome, "instanceId": failed.instance_id, "cause": cause});
+    let spec = FenceSpec {
+        lineage_id: lineage.lineage_id.clone(),
+        expected_generation: lineage.generation,
+        from_states: &["starting", "running"],
+        mode: FenceMode::Pause {
+            paused_by,
+            // The process has already ended: nothing to close.
+            close: None,
+        },
+        actor: json!({"by": SUPERVISOR, "cause": cause}),
+        authority: None,
+        self_close_guard: false,
+    };
+    let result = state
+        .publish_settlement(async {
+            state
+                .store
+                .decide_pause(
+                    spec,
+                    failed.instance_id.clone(),
+                    cause,
+                    decision_outcome,
+                    reason,
+                )
+                .await
+        })
+        .await
+        .map_err(crate::http::map_store)?;
+    let FenceTx::Committed(core) = result else {
+        return Ok(None);
+    };
+    crate::fence::after_commit(state, &core, None).await;
+    Ok(Some(Decided {
+        lineage_id: lineage.lineage_id.clone(),
+        failed_instance_id: failed.instance_id.clone(),
+        cause: cause.into(),
+        outcome: decision_outcome.into(),
+        successor_instance_id: None,
+    }))
+}
+
+/// F with successor: the restart.
+async fn restart(
+    state: &AppState,
+    lineage: &LineageRecord,
+    failed: &InstanceRecord,
+    cause: &'static str,
+) -> Result<Option<Decided>, crate::error::HubError> {
+    let Some(host) = state.store.get_host(failed.host_id.clone()).await? else {
+        return Ok(None);
+    };
+    let recovery = crate::http::recovery_source(state, lineage, failed).await?;
+    // §6.3.1: the successor always runs claude-sdk on the same host (a
+    // non-Claude kind cannot, so it keeps its own carrier).
+    let driver = if failed.kind == "claude" {
+        "claude-sdk"
+    } else {
+        failed.driver.as_str()
+    };
+    let prepared = match crate::http::prepare_continuation(
+        state, host, lineage, failed, &recovery, driver, None,
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            // A successor that cannot even be prepared (its provider or route
+            // is gone) is not retried every second: the chapter's process
+            // ended and the Hub does not continue it, which is
+            // `paused{process-exit}`, with the reason on the decision.
+            let reason = format!("successor not prepared: {error}");
+            return pause(
+                state,
+                lineage,
+                failed,
+                cause,
+                outcome::PROCESS_EXIT,
+                Some(reason),
+            )
+            .await;
+        }
+    };
+    let origin_spec = lineage.origin_spec_ref.as_ref();
+    // OA5: the launch origin recorded for the lineage's first chapter.
+    let origin = origin_spec
+        .and_then(|reference| reference.get("origin"))
+        .and_then(Value::as_str)
+        .unwrap_or("human")
+        .to_owned();
+    let seated_by = origin_spec
+        .and_then(|reference| reference.get("deviceId"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let decision = RestartDecision {
+        failed_instance_id: failed.instance_id.clone(),
+        cause,
+        recovery: recovery.as_str(),
+        recovery_session_id: recovery.session().map(str::to_owned),
+    };
+    let result = state
+        .store
+        .continuation_resume(crate::store::ContinuationResumeRequest {
+            addressed_instance_id: failed.instance_id.clone(),
+            expected_generation: lineage.generation,
+            host_id: failed.host_id.clone(),
+            spec: prepared.spec.clone(),
+            operation: prepared.operation.to_string(),
+            prompt: None,
+            origin,
+            title: failed.title.clone(),
+            driver: prepared.driver.clone(),
+            actor: json!({"by": SUPERVISOR, "cause": cause, "seatedBy": seated_by}),
+            chapter_cause: cause.into(),
+            from_states: &["starting", "running"],
+            restart: Some(decision),
+        })
+        .await
+        .map_err(crate::http::map_store)?;
+    let resumed = match result {
+        crate::store::ContinuationResumeResult::Resumed(resumed) => resumed,
+        crate::store::ContinuationResumeResult::Superseded { .. } => return Ok(None),
+    };
+    if let Err(error) = crate::http::finish_continuation(state, &resumed, &prepared.spec).await {
+        // The decision committed; the create stays queued and the fence
+        // delivery (hello or tick) forwards it.
+        tracing::warn!(%error, successor = %resumed.successor.instance_id,
+            "forwarding a C1 successor's create failed; it stays queued");
+    }
+    Ok(Some(Decided {
+        lineage_id: lineage.lineage_id.clone(),
+        failed_instance_id: failed.instance_id.clone(),
+        cause: cause.into(),
+        outcome: outcome::RESTARTED.into(),
+        successor_instance_id: Some(resumed.successor.instance_id.clone()),
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_cause_table_classifies_each_evidence_row() {
+        // Row 1: ended by itself after reporting running.
+        assert_eq!(classify("running", "exited", None), cause::PROCESS_EXIT);
+        assert_eq!(
+            classify("running", "failed", Some("signal KILL")),
+            cause::PROCESS_EXIT
+        );
+        // Row 2: never reported running, or an attested launch failure.
+        assert_eq!(classify("starting", "exited", None), cause::START_FAILED);
+        assert_eq!(
+            classify("running", "failed", Some("create-never-acknowledged")),
+            cause::START_FAILED
+        );
+        assert_eq!(
+            classify("running", "failed", Some("native-driver-start-failed")),
+            cause::START_FAILED
+        );
+        // Row 3: the Node restarted without the chapter, whatever its state.
+        for state in ["starting", "running"] {
+            assert_eq!(
+                classify(state, "exited", Some("node-epoch-changed")),
+                cause::NODE_RESTARTED
+            );
+        }
+    }
+}

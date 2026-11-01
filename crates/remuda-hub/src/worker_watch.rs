@@ -1527,10 +1527,28 @@ async fn relaunch_instance(
         &worker.name,
         project.meta.id.as_id().as_str(),
         worker.task_id.as_ref().map(|id| id.as_id().as_str()),
+        // A respawn keeps the mode the worker launched with; rows written
+        // before the roster recorded one were all dispatched with the default.
+        worker
+            .permission_mode
+            .as_deref()
+            .unwrap_or(crate::workers::HUMAN_DISPATCH_PERMISSION_MODE),
         extra_env,
     );
-    crate::agent_scope::prepare_create(state, headers, &device, &host.host_id, &driver, &mut spec)
-        .await?;
+    let requested_mode = spec["permissionMode"].as_str().map(str::to_string);
+    crate::agent_scope::prepare_create(
+        state,
+        headers,
+        &device,
+        crate::agent_scope::CreateAdmission {
+            host: &host.host_id,
+            driver: &driver,
+            mode: crate::agent_scope::ModeAdmission::Request(requested_mode.as_deref()),
+            approval: crate::agent_scope::CreateApproval::OnSpec,
+        },
+        &mut spec,
+    )
+    .await?;
     if let Some(obj) = spec.as_object_mut()
         && let Some(path) = host
             .claude_binary_path
@@ -1645,6 +1663,9 @@ async fn replace_worker(
         // waterfall re-resolves from the stored profile/project layers.
         api_via: None,
         api_route: None,
+        // And the mode the original dispatch named, verbatim (D-057 §4.2
+        // item 2): an omitted one stays omitted and is resolved again.
+        permission_mode: worker.permission_mode_requested.clone(),
     };
 
     // Retire (force) reclaims worktree/target, then re-dispatch the same brief

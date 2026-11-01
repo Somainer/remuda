@@ -112,6 +112,17 @@ pub enum StoreError {
     /// reason to persist the oversized row.
     #[error("gate evidence object exceeds the {size}-byte cap (max {max})")]
     EvidenceTooLarge { size: usize, max: usize },
+    /// D-057 OA1 (§15.1 ma-admission): the Agent creator's effective
+    /// permission mode, re-read at the create's commit point, is no longer
+    /// the mode the create was admitted under. Maps to 409
+    /// `creator-mode-changed`.
+    #[error("creator permission mode changed from {stamped} to {now}")]
+    CreatorModeChanged {
+        /// The mode the create was admitted and stamped under.
+        stamped: String,
+        /// The creator's mode at the commit point.
+        now: String,
+    },
     /// An injected test fault (`test-faults` feature only).
     #[cfg(any(test, feature = "test-faults"))]
     #[error("injected store fault: {0}")]
@@ -4991,6 +5002,13 @@ impl Store {
         self.run_named("insert_instance_delegated", move |conn| {
             let (initiator, device_id) = authority.as_check();
             check_initiator(conn, initiator, device_id)?;
+            // D-057 OA1, §15.1 ma-admission: the creator's permission mode is
+            // read again at the commit point, inside this writer job — after
+            // any worktree or pool lease the create took — and the create
+            // aborts when it changed while the create was being prepared.
+            // `check_initiator` above re-checked the creator chapter's
+            // generation in the same job.
+            check_creator_permission(conn, initiator, &spec)?;
             let host =
                 load_host(conn, &host_id)?.ok_or_else(|| StoreError::Id("unknown host".into()))?;
             let running: i64 = conn.query_row(
@@ -16022,6 +16040,45 @@ pub(crate) fn check_initiator(
         if !device_ok {
             return Err(StoreError::Fenced);
         }
+    }
+    Ok(())
+}
+
+/// D-057 OA1 commit-point check: a create stamped with `creatorPermissionMode`
+/// commits only while its Agent creator still runs exactly that mode. The
+/// creator is the initiator's chapter (an Agent create always carries one); a
+/// stamp without an initiator is refused rather than trusted.
+pub(crate) fn check_creator_permission(
+    conn: &Connection,
+    initiator: Option<&crate::agent_scope::Initiator>,
+    spec: &Value,
+) -> Result<(), StoreError> {
+    let Some(stamped) = spec
+        .get(remuda_protocol::creator_permission::CREATOR_PERMISSION_MODE_FIELD)
+        .and_then(Value::as_str)
+    else {
+        return Ok(());
+    };
+    let creator = initiator.ok_or_else(|| {
+        StoreError::Forbidden("a creator permission stamp without an Agent initiator".into())
+    })?;
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT kind, spec_json FROM instances WHERE id = ?1",
+            params![creator.instance_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((kind, raw)) = row else {
+        return Err(StoreError::Fenced);
+    };
+    let creator_spec: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+    let now = remuda_protocol::creator_permission::recorded_mode(&kind, &creator_spec);
+    if now != stamped {
+        return Err(StoreError::CreatorModeChanged {
+            stamped: stamped.to_string(),
+            now: now.to_string(),
+        });
     }
     Ok(())
 }

@@ -3662,6 +3662,8 @@ export interface components {
             model?: string;
             /** @description Optional explicit worker name (one safe lowercase segment). */
             name?: string;
+            /** @description D-057 §4.2 item 2: a word of the worker harness's own permission vocabulary. Omitted, a Human or Bot dispatch keeps the dispatch default (bypassPermissions) and an Agent dispatch inherits its own mode; an Agent may name a mode that switches the harness's permission control off only when it runs with that control off itself (OA1). */
+            permissionMode?: string;
             /** @enum {string} */
             placement?: "local" | "remote" | "auto";
             projectId: string;
@@ -3717,6 +3719,10 @@ export interface components {
             lastNudgeAt?: string;
             model?: string;
             name: string;
+            /** @description The permission mode the worker launched with (effective). */
+            permissionMode?: string;
+            /** @description The permission mode the dispatch named, verbatim; absent when it named none (D-057 §4.2 item 2). */
+            permissionModeRequested?: string;
             portBlock?: string | null;
             projectId: string;
             providerProfileId?: string;

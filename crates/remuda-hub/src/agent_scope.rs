@@ -493,20 +493,134 @@ pub async fn same_host(state: &AppState, device: &Device, host: &str) -> Result<
     Ok(instance.host_id == host)
 }
 
-/// Agent launches retain only manual or plan permissions on every create path.
-pub fn restrict_permission(device: &Device, spec: &mut Value) -> Result<(), HubError> {
-    if origin(device) != remuda_protocol::InputOrigin::Human && spec["permissionMode"].is_null() {
-        spec["permissionMode"] = json!("manual");
+/// D-057 OA1, the Hub half of "never beyond the creator", on every create
+/// path (instance create, fleet, dispatch, worker respawn).
+///
+/// - Every origin: a body-supplied `creatorPermissionMode` or
+///   `permissionModeRequested` is stripped; both are Hub-written.
+/// - Human: unchanged.
+/// - Bot: unchanged (an omitted mode is `manual`; the Node refuses every
+///   control-off mode, D-011).
+/// - Agent: the mode is admitted against the creator chapter's effective mode
+///   as recorded on its instance ([`admit_agent_mode`]), or was admitted
+///   already by a path that decides before allocating. The spec gets the
+///   effective mode, the requested word verbatim (D-035), and the creator's
+///   mode as `creatorPermissionMode`: the store re-reads it at the create's
+///   commit point and the forward stamps it on the Node-facing params.
+pub async fn restrict_permission(
+    state: &AppState,
+    device: &Device,
+    mode: ModeAdmission<'_>,
+    spec: &mut Value,
+) -> Result<(), HubError> {
+    use remuda_protocol::creator_permission::CREATOR_PERMISSION_MODE_FIELD;
+    if let Some(object) = spec.as_object_mut() {
+        object.remove(CREATOR_PERMISSION_MODE_FIELD);
+        object.remove(PERMISSION_MODE_REQUESTED_FIELD);
     }
-    if origin(device) == InputOrigin::Agent
-        && !matches!(spec["permissionMode"].as_str(), Some("manual" | "plan"))
-    {
-        return Err(HubError::operator_field(
-            "Agent launches may only use permissionMode `manual` or `plan`; do not retry the \
-             same spec — relaunch with one of those, or ask the owner to launch it",
-        ));
+    match origin(device) {
+        InputOrigin::Human => Ok(()),
+        InputOrigin::Bot => {
+            if spec["permissionMode"].is_null() {
+                spec["permissionMode"] = json!("manual");
+            }
+            Ok(())
+        }
+        InputOrigin::Agent => {
+            let admitted = match mode {
+                ModeAdmission::Request(requested) => {
+                    let kind = spec
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .unwrap_or("claude")
+                        .to_string();
+                    admit_agent_mode(state, device, &kind, requested).await?
+                }
+                ModeAdmission::Admitted(admitted) => admitted.clone(),
+            };
+            spec["permissionMode"] = json!(admitted.effective);
+            spec[PERMISSION_MODE_REQUESTED_FIELD] = json!(admitted.requested);
+            spec[CREATOR_PERMISSION_MODE_FIELD] = json!(admitted.creator);
+            Ok(())
+        }
     }
-    Ok(())
+}
+
+/// How a create path hands its permission mode to [`restrict_permission`].
+#[derive(Clone, Copy, Debug)]
+pub enum ModeAdmission<'a> {
+    /// The caller's word verbatim (`None` when omitted); an Agent's is
+    /// admitted by the creator rule here.
+    Request(Option<&'a str>),
+    /// Already admitted before any allocation (dispatch, worker respawn), so
+    /// the commit-point re-read compares against the mode read back then.
+    Admitted(&'a AdmittedMode),
+}
+
+/// An Agent create's mode, admitted under the creator rule (D-057 OA1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdmittedMode {
+    /// The caller's word verbatim; `None` when omitted (inherited).
+    pub requested: Option<String>,
+    /// The mode the child launches with.
+    pub effective: &'static str,
+    /// The creator chapter's effective mode at admission: the stamp the
+    /// commit point re-checks and the Node reads.
+    pub creator: &'static str,
+}
+
+/// D-057 OA1: admit an Agent's `requested` mode (verbatim, `None` when
+/// omitted) for a `kind` child under the caller's own recorded mode.
+pub async fn admit_agent_mode(
+    state: &AppState,
+    device: &Device,
+    kind: &str,
+    requested: Option<&str>,
+) -> Result<AdmittedMode, HubError> {
+    let creator = creator_permission_mode(state, device).await?;
+    let effective = remuda_protocol::creator_permission::admit(kind, requested, creator)
+        .map_err(permission_refusal)?;
+    Ok(AdmittedMode {
+        requested: requested.map(str::to_string),
+        effective,
+        creator,
+    })
+}
+
+/// Spec key recording an Agent create's requested mode verbatim (D-035); the
+/// effective mode is `permissionMode`. `null` means the mode was omitted and
+/// inherited from the creator.
+pub const PERMISSION_MODE_REQUESTED_FIELD: &str = "permissionModeRequested";
+
+/// D-057 OA1: the Agent caller's own effective permission mode, as recorded
+/// on its chapter (`permissionEffective`, else the mode its launch ran).
+pub async fn creator_permission_mode(
+    state: &AppState,
+    device: &Device,
+) -> Result<&'static str, HubError> {
+    let id = device.instance_id.as_deref().ok_or(HubError::Forbidden)?;
+    let creator = state
+        .store
+        .get_instance(id.to_string())
+        .await?
+        .ok_or_else(HubError::stale_caller)?;
+    let spec = state
+        .store
+        .get_instance_spec_json(id.to_string())
+        .await?
+        .unwrap_or(Value::Null);
+    Ok(remuda_protocol::creator_permission::recorded_mode(
+        &creator.kind,
+        &spec,
+    ))
+}
+
+/// 403 with the creator rule's reason and the vocabulary to pick from.
+pub fn permission_refusal(refusal: remuda_protocol::creator_permission::Refusal) -> HubError {
+    HubError::ForbiddenReason(refusal.to_string()).with_next(
+        refusal.reason(),
+        crate::error::NextStep::new(crate::error::action::FIX_REQUEST, refusal.hint()),
+    )
 }
 
 /// Agent callers may not choose their own argv or executable.
@@ -533,17 +647,43 @@ pub fn restrict_launch_overrides(device: &Device, spec: &Value) -> Result<(), Hu
     Ok(())
 }
 
+/// How a create path decides its D-017 one-shot human approval.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CreateApproval {
+    /// `prepare_create` asks on the finished spec (instance create).
+    OnSpec,
+}
+
+/// What a create path hands [`prepare_create`].
+#[derive(Clone, Copy, Debug)]
+pub struct CreateAdmission<'a> {
+    /// Resolved host.
+    pub host: &'a str,
+    /// Resolved driver.
+    pub driver: &'a str,
+    /// The caller's permission mode, or the mode already admitted for it
+    /// ([`restrict_permission`]).
+    pub mode: ModeAdmission<'a>,
+    /// Where the D-017 approval is decided.
+    pub approval: CreateApproval,
+}
+
 pub async fn prepare_create(
     state: &AppState,
     headers: &HeaderMap,
     device: &Device,
-    host: &str,
-    driver: &str,
+    admission: CreateAdmission<'_>,
     spec: &mut Value,
 ) -> Result<(), HubError> {
+    let CreateAdmission {
+        host,
+        driver,
+        mode,
+        approval,
+    } = admission;
     stamp(spec, device);
     spec["parentInstanceId"] = json!(device.instance_id);
-    restrict_permission(device, spec)?;
+    restrict_permission(state, device, mode, spec).await?;
     restrict_launch_overrides(device, spec)?;
     if origin(device) == remuda_protocol::InputOrigin::Agent {
         // §2.4/§2.5: the chosen host and workspace must be inside the
@@ -568,9 +708,10 @@ pub async fn prepare_create(
         {
             return Err(HubError::out_of_scope());
         }
-        if !same_host(state, device, host).await?
-            || shell_driver(driver)
-            || headers.contains_key("x-remuda-require-approval")
+        if approval == CreateApproval::OnSpec
+            && (!same_host(state, device, host).await?
+                || shell_driver(driver)
+                || headers.contains_key("x-remuda-require-approval"))
         {
             require_approval(
                 state,

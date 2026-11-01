@@ -993,6 +993,15 @@ pub struct WorkerRoster {
     /// Bytes reclaimed from the target dir at retire (reported by the Node).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reclaimed_bytes: Option<crate::U64>,
+    /// D-057 §4.2 item 2 (D-035): the permission mode the dispatch named,
+    /// verbatim. Absent when it named none: an Agent dispatch then inherited
+    /// its creator's own mode, a Human or Bot dispatch got the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode_requested: Option<String>,
+    /// The permission mode the worker launched with (effective). Absent on
+    /// rows written before D-057 §4.2 recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
 }
 
 // ── Hub→Node worker.provision / worker.remove ──────────────────────────────

@@ -1592,7 +1592,7 @@ fn instance_spec(
     // without it the request fell through to `Manual`, so a session asked for
     // in bypass launched in manual mode and never had its disclaimer
     // suppressed.
-    let mode = canonical_mode::<ClaudePermissionMode>("claude", &launch)
+    let mode = canonical_mode::<ClaudePermissionMode>("claude", launch)
         .unwrap_or(ClaudePermissionMode::Manual);
     // The real per-harness permission union. Claude rides the mode above;
     // Codex's axis is approval policy (+ an optional sandbox mode), Grok and

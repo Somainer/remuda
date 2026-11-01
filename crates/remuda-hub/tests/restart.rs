@@ -2675,3 +2675,39 @@ async fn a_lookup_error_before_preparation_pauses_at_the_window_boundary() -> Re
     }
     Ok(())
 }
+
+// ── r4 item 3: an unreadable marker is an error, not "no previous run" ──
+
+/// A marker the boot cannot read is not guessed as "no previous run": the
+/// read error is logged and this boot skips the stale classification, so an
+/// end first seen two hours ago — which the no-marker fallback would call
+/// stale — is decided normally.
+#[tokio::test]
+async fn an_unreadable_marker_skips_stale_classification_at_boot() -> Result<()> {
+    let mut ctx = Ctx::boot().await?;
+    ctx.wait_until(|| async { ctx.marker().ok().flatten() })
+        .await
+        .context("marker row")?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host, true).await?;
+    let seat = ctx.seat(&mut node).await?;
+    ctx.report_running(&node, &seat, SESSION).await?;
+    ctx.report_killed(&node, &seat).await?;
+    drop(node);
+    let seen = ago(120, 0);
+    ctx.restart_hub_editing(true, |db| {
+        db.execute(
+            "UPDATE hub_run_marker SET last_alive_at = X'00' WHERE id = 1",
+            [],
+        )?;
+        db.execute(
+            "UPDATE instances SET end_seen_at = ?2 WHERE id = ?1",
+            rusqlite::params![seat, seen],
+        )?;
+        Ok(())
+    })
+    .await?;
+    let rows = ctx.decisions(&seat)?;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].2, "restarted", "no guess at boot: {rows:?}");
+    Ok(())
+}

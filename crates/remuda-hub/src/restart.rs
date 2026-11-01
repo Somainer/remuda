@@ -1378,8 +1378,9 @@ enum Pass {
     Tick,
     /// Once at boot, before this run writes its own marker: an end first seen
     /// before `history_before` (the previous run's last-alive time minus the
-    /// window), or never recorded, is history.
-    Boot { history_before: String },
+    /// window), or never recorded, is history. `None`: the marker could not
+    /// be read, so this boot classifies nothing as history.
+    Boot { history_before: Option<String> },
 }
 
 /// Scheduler tick: one evaluation unless the previous one is still running.
@@ -1418,11 +1419,23 @@ fn window_before(at: &str) -> Option<String> {
 /// previous marker the boot clock stands in for it.
 pub(crate) async fn boot(state: &AppState) {
     let _guard = state.restart.running.lock().await;
-    let previous = state.store.last_alive_at().await.ok().flatten();
-    let history_before = previous
-        .as_deref()
-        .and_then(window_before)
-        .unwrap_or_else(|| crate::config::rfc3339_minutes_ago(DECISION_WINDOW_MINUTES));
+    let history_before = match state.store.last_alive_at().await {
+        // No run ever wrote a marker: the boot clock stands in for it.
+        Ok(None) => Some(crate::config::rfc3339_minutes_ago(DECISION_WINDOW_MINUTES)),
+        Ok(Some(previous)) => match window_before(&previous) {
+            Some(history_before) => Some(history_before),
+            None => {
+                tracing::error!(%previous,
+                    "the Hub run marker does not parse; this boot classifies no C1 end as stale");
+                None
+            }
+        },
+        Err(error) => {
+            tracing::error!(%error,
+                "could not read the Hub run marker; this boot classifies no C1 end as stale");
+            None
+        }
+    };
     let decided = evaluate_pass(state, Pass::Boot { history_before }).await;
     if !decided.is_empty() {
         tracing::info!(
@@ -1594,16 +1607,24 @@ async fn pending(
     );
     // RFC3339 stamps of one fixed-width shape compare chronologically.
     let stale_at_boot = match (pass, &seen) {
-        (Pass::Boot { .. }, None) => Some(
+        (
+            Pass::Boot {
+                history_before: Some(_),
+            },
+            None,
+        ) => Some(
             "the Hub holds no record of when it first saw this end (it predates the record)"
                 .to_owned(),
         ),
-        (Pass::Boot { history_before }, Some(seen)) if seen.as_str() < history_before.as_str() => {
-            Some(format!(
-                "the Hub first saw this end at {seen}, more than {DECISION_WINDOW_MINUTES} \
+        (
+            Pass::Boot {
+                history_before: Some(history_before),
+            },
+            Some(seen),
+        ) if seen.as_str() < history_before.as_str() => Some(format!(
+            "the Hub first saw this end at {seen}, more than {DECISION_WINDOW_MINUTES} \
                  minutes before its previous run was last alive"
-            ))
-        }
+        )),
         _ => None,
     };
     let end_seen = match seen {

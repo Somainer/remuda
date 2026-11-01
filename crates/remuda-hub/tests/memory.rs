@@ -85,6 +85,9 @@ impl Ctx {
                 title: None,
                 driver: "claude-sdk".into(),
                 actor: serde_json::json!({"by": "test"}),
+                chapter_cause: remuda_hub::store_test_support::OWNER_RESUME_CAUSE.into(),
+                from_states: &["starting", "running", "paused"],
+                restart: None,
             })
             .await?;
         match outcome {

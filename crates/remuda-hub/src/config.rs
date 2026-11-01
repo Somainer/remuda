@@ -162,6 +162,17 @@ pub struct HubConfig {
     /// decides on the data it has (default one second).
     #[serde(default = "default_resource_refresh_timeout_ms")]
     pub resource_refresh_timeout_ms: u64,
+    /// D-057 §6.3.1: run the C1 restart supervisor on the scheduler tick and
+    /// once at boot. Always on in production; [`HubConfig::for_test`] turns
+    /// it off so suites that end continuity chapters on purpose stay
+    /// deterministic, and the C1 suites turn it back on (or drive one
+    /// evaluation through the test handle).
+    #[serde(default = "default_restart_supervisor")]
+    pub restart_supervisor: bool,
+}
+
+fn default_restart_supervisor() -> bool {
+    true
 }
 
 /// Default per-file attachment ceiling (D-027b): 25 MiB.
@@ -282,6 +293,7 @@ impl Default for HubConfig {
             attachment_max_bytes: default_attachment_max_bytes(),
             resource_sample_max_age_ms: default_resource_sample_max_age_ms(),
             resource_refresh_timeout_ms: default_resource_refresh_timeout_ms(),
+            restart_supervisor: default_restart_supervisor(),
         }
     }
 }
@@ -331,6 +343,7 @@ impl HubConfig {
             attachment_max_bytes: default_attachment_max_bytes(),
             resource_sample_max_age_ms: default_resource_sample_max_age_ms(),
             resource_refresh_timeout_ms: default_resource_refresh_timeout_ms(),
+            restart_supervisor: false,
         }
     }
 

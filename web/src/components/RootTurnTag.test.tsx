@@ -1,7 +1,7 @@
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { RootTurnTag } from "./RootTurnTag";
-import { rootTurnTagText } from "./rootTurnTag";
+import { rootTurnTagText, rootTurnTitle } from "./rootTurnTag";
 
 describe("rootTurnTagText", () => {
   it("labels only a turn the owner did not start, per surface", () => {
@@ -16,6 +16,14 @@ describe("rootTurnTagText", () => {
     expect(rootTurnTagText({ ...human, continuation: "unknown" }, "approvals")).toBeNull();
     expect(rootTurnTagText(null, "main")).toBeNull();
     expect(rootTurnTagText(undefined, "approvals")).toBeNull();
+  });
+
+  it("tags a turn the Hub's restart notice started and names the Hub", () => {
+    const hub = { commandId: "cmd_notice", origin: "hub", continuation: "hub" } as const;
+    expect(rootTurnTagText(hub, "main")).toBe("Main 自主");
+    expect(rootTurnTagText(hub, "approvals")).toBe("agent 自发");
+    expect(rootTurnTitle(hub)).toContain("来源 Hub");
+    expect(rootTurnTitle(hub)).toContain("cmd_notice");
   });
 
   it("renders the Main wording beside an initiator display", () => {

@@ -28,9 +28,9 @@
 //!   `origin: agent`, `continuation: native`;
 //! * a carrier without turn boundaries: the latest input delivered, with its
 //!   own origin, `continuation: unknown`;
-//! * an input the Hub authored (no human, bot or agent caller sent it):
-//!   `origin: agent`, `continuation: hub`, until ma-restart adds a `hub`
-//!   origin.
+//! * an input the Hub authored (the restart notice, stamped `origin: hub`,
+//!   or any row no caller sent): `origin: hub`, `continuation: hub`
+//!   (D-057 §6.4).
 //!
 //! * after the process that ran the turn ended — terminal native session
 //!   evidence (`exited`, `failed`, `carrier_closed`), an instance lifecycle
@@ -84,7 +84,7 @@ impl Input {
         if self.hub {
             return RootTurn {
                 command_id: self.command_id.clone(),
-                origin: InputOrigin::Agent,
+                origin: InputOrigin::Hub,
                 continuation: RootTurnContinuation::Hub,
             };
         }
@@ -250,10 +250,14 @@ fn input_for(
                 .and_then(Value::as_str)
                 .map(str::to_owned)
         });
-    // An initiator means an Agent caller (or the Hub acting on one's behalf);
-    // otherwise the origin `stamp()` wrote decides. A row with neither was
-    // written by the Hub itself.
-    let (origin, hub) = if initiator.is_some() {
+    // Input the Hub wrote is stamped `hub` (D-057 §6.4: the restart notice,
+    // which carries its successor's initiator). Otherwise an initiator means
+    // an Agent caller (or the Hub acting on one's behalf), and without one
+    // the origin `stamp()` wrote decides. A row with neither was written by
+    // the Hub itself.
+    let (origin, hub) = if stamped.as_deref() == Some("hub") {
+        (InputOrigin::Hub, true)
+    } else if initiator.is_some() {
         (InputOrigin::Agent, false)
     } else {
         match stamped.as_deref() {
@@ -583,7 +587,7 @@ mod tests {
     }
 
     #[test]
-    fn a_hub_authored_input_is_agent_with_a_hub_continuation() {
+    fn a_hub_authored_input_is_hub_with_a_hub_continuation() {
         let conn = db();
         command(
             &conn,
@@ -594,12 +598,40 @@ mod tests {
         fold_all(&conn, &[user_message("cmd_fact"), started("cmd_fact")]);
         assert_eq!(
             now(&conn),
+            Some(rt("cmd_fact", InputOrigin::Hub, RootTurnContinuation::Hub))
+        );
+    }
+
+    /// D-057 §6.4: the restart notice is stamped `origin: hub` and carries
+    /// its successor's initiator; it is still the Hub's input, never Agent.
+    #[test]
+    fn the_restart_notice_records_the_real_hub_origin() {
+        let conn = db();
+        command(
+            &conn,
+            "cmd_notice",
+            json!({"origin": "hub", "input": {"type": "prompt", "origin": "hub"}}),
+            Some("ins_main"),
+        );
+        fold_all(&conn, &[user_message("cmd_notice"), started("cmd_notice")]);
+        assert_eq!(
+            now(&conn),
             Some(rt(
-                "cmd_fact",
-                InputOrigin::Agent,
+                "cmd_notice",
+                InputOrigin::Hub,
                 RootTurnContinuation::Hub
             ))
         );
+        // After the notice's turn settles, the seat continuing on its own
+        // still traces back to the Hub's input.
+        fold_all(
+            &conn,
+            &[turn(
+                "result",
+                json!({"completedTurn": "cmd_notice", "settledRootTurn": "true"}),
+            )],
+        );
+        assert_eq!(now(&conn).map(|turn| turn.origin), Some(InputOrigin::Hub));
     }
 
     #[test]

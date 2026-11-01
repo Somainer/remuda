@@ -159,6 +159,32 @@ impl DevNode {
     pub async fn test_instance_driver(&self, id: &InstanceId) -> Option<Arc<dyn Driver>> {
         self.inner.instance_drivers.read().await.get(id).cloned()
     }
+
+    /// Test seam (resume-config r3): record an `instance.close` as accepted on
+    /// the durable ledger WITHOUT running it.
+    ///
+    /// This is the exact state a Hub pause leaves behind — the close is
+    /// enqueued and its command durable, while the process-end row still reads
+    /// ready/closing. A test can then race a successor create against it and
+    /// release the real close later, proving the bounded wait instead of
+    /// relying on driver timing.
+    #[cfg(feature = "test-stub")]
+    pub fn test_record_close_in_flight(&self, id: &InstanceId) -> Result<Command, NodeError> {
+        let instance = self.inner.store.get_instance(id)?;
+        let mut command = new_command(
+            CommandId::new(),
+            CommandOperation::InstanceClose,
+            id,
+            &instance.host_id,
+            &self.inner.projection_epoch,
+            None,
+            digest_json(&serde_json::json!({"operation": "close"}))?,
+            None,
+        )?;
+        accept_command(&mut command)?;
+        self.inner.store.insert_command(id, command.clone())?;
+        Ok(command)
+    }
 }
 
 /// Last-clone teardown.
@@ -1400,7 +1426,7 @@ impl DevNode {
             // unknown predecessor is refused.
             if let Some(inner) = node.upgrade()
                 && let Err(error) =
-                    adopt_resumed_native_home(&inner, &worker_instance, &launch.request)
+                    adopt_resumed_native_home(&inner, &worker_instance, &launch.request).await
             {
                 tracing::error!(%error, "resumed chapter could not take over its Claude home");
                 record_task_exit(store.as_ref(), &worker_instance, &error.to_string());
@@ -2606,26 +2632,35 @@ fn record_task_exit(store: &dyn LocalStore, instance_id: &InstanceId, reason: &s
     }
 }
 
-/// resume-config r2: a resumed chapter OWNS the managed Claude home it runs in.
+/// resume-config r2/r3: a resumed chapter OWNS the managed Claude home it runs
+/// in.
 ///
 /// A managed home is per instance (`data_dir/instances/<id>/native-home`), so
 /// a successor with no explicit `claudeConfigDir` and no Node-wide home takes
-/// the predecessor's home by MOVING it into its own slot — one rename on the
-/// same filesystem, before anything launches. Borrowing the predecessor's slot
+/// the real owner's home by MOVING it into its own slot — one rename on the
+/// same filesystem, before anything launches. Borrowing a predecessor's slot
 /// instead loses the transcript at the second hop of a chain (C would look in
 /// B's slot, which never held it), lets a purge of the predecessor delete a
 /// live successor's home, and lets two successors share one home.
 ///
-/// The predecessor must have stopped: its durable lifecycle must be `exited`
-/// or `failed` (ma-fence resumes a paused/closed chapter, so this is the
-/// construction, not a special case). A live or unknown predecessor is refused
-/// rather than moving a directory a process may still be writing.
+/// r3 makes the decision race-proof:
 ///
-/// Returns `Ok(())` when no transfer applies: an explicit config dir or a
-/// Node-wide home is shared on purpose, the successor already owns its slot
-/// (a retried resume after a crash between the rename and the launch), or the
-/// predecessor never used the managed slot (its recipe names another home).
-fn adopt_resumed_native_home(
+/// * **Wait, then decide.** A Hub pause commits `paused` at close admission and
+///   only ENQUEUES the close, so the Node's process-end row trails it by the
+///   driver's stop ladder. When the owner is non-terminal and its close is
+///   already on the ledger, wait up to [`CLOSE_WAIT`] for the process-end row,
+///   then transfer. A non-terminal owner with no close requested is refused
+///   with a distinct message instead of being waited on.
+/// * **Find the owner, not the parent.** The walk starts at `resumedFrom` and
+///   follows each chapter's own `parent` link (the Node records `resumedFrom`
+///   there) until a chapter's slot holds the home — or its recipe proves the
+///   home existed and moved onward. A failed/never-launched intermediate
+///   chapter (which owns no slot and has no recipe) is skipped.
+/// * **Unknown predecessor.** No row, no slot, no recipe: there is nothing to
+///   transfer, so the successor starts in a fresh slot and that is logged.
+///   Refusal is reserved for evidence that a home existed and moved elsewhere
+///   (a second successor of one conversation cannot be continued from it).
+async fn adopt_resumed_native_home(
     inner: &DevNodeInner,
     successor: &InstanceId,
     request: &CreateInstanceRequest,
@@ -2633,7 +2668,7 @@ fn adopt_resumed_native_home(
     let Some(config) = inner.herdr_config.as_ref() else {
         return Ok(());
     };
-    let Some(parent) = request.resumed_from.as_ref() else {
+    let Some(mut cursor) = request.resumed_from.clone() else {
         return Ok(());
     };
     if !crate::native::uses_managed_native_home(config, request, request.driver) {
@@ -2641,52 +2676,138 @@ fn adopt_resumed_native_home(
     }
     let target = crate::native::managed_native_home(&config.data_dir, successor);
     if target.exists() {
-        // Retried resume: the home already sits in this chapter's slot.
+        // Retried create: this successor already owns its home.
         return Ok(());
     }
-    let source = crate::native::managed_native_home(&config.data_dir, parent);
-    match inner.store.get_instance(parent) {
-        Ok(instance)
-            if matches!(
-                instance.lifecycle,
-                InstanceLifecycle::Exited | InstanceLifecycle::Failed
-            ) => {}
-        Ok(instance) => {
-            return Err(NodeError::Conflict(format!(
-                "cannot take over the managed Claude home of {}: that chapter is {:?}, \
-                 not exited; close or pause it before resuming",
-                parent.as_id(),
-                instance.lifecycle
-            )));
+    let store = inner.store.as_ref();
+    let mut visited = std::collections::BTreeSet::new();
+    loop {
+        if !visited.insert(cursor.clone()) {
+            tracing::warn!(
+                successor = %successor.as_id(),
+                "the resumedFrom chain revisits a chapter; starting in a fresh slot"
+            );
+            return Ok(());
         }
-        Err(error) => {
-            return Err(NodeError::Conflict(format!(
-                "cannot take over the managed Claude home of {}: the chapter is unknown \
-                 on this Node ({error})",
-                parent.as_id()
-            )));
+        let slot = crate::native::managed_native_home(&config.data_dir, &cursor);
+        if slot.is_dir() {
+            // The real owner. Wait for a close that is already in flight, then
+            // take the home out of this chapter's slot.
+            wait_for_process_end(store, &cursor).await?;
+            transfer_home(&slot, &target, &cursor, successor)?;
+            return Ok(());
         }
-    }
-    if !source.is_dir() {
-        // Only the predecessor's own recipe says whether it used the managed
-        // slot. If it did, the home already moved to another successor (or a
-        // purge removed it): starting a fresh, empty home here would silently
-        // discard the conversation, so refuse instead.
-        let owned_slot = inner
-            .store
-            .launch_recipe(parent)
+        // The chapter owns no slot. Its own recipe is the record of the home it
+        // launched in: the managed slot means the home existed and was moved
+        // onward (or purged), while any other path means it never used the
+        // managed slot at all.
+        let managed_before = store
+            .launch_recipe(&cursor)
             .ok()
             .flatten()
-            .is_some_and(|recipe| Path::new(&recipe.native_home) == source);
-        if owned_slot {
+            .is_some_and(|recipe| Path::new(&recipe.native_home) == slot);
+        if managed_before {
             return Err(NodeError::Conflict(format!(
                 "the managed Claude home of {} was already transferred to another \
                  successor (or purged); a second successor would start a blank conversation",
-                parent.as_id()
+                cursor.as_id()
             )));
         }
+        // A failed or never-launched intermediate chapter owns nothing; walk
+        // back to the chapter it resumed from. The Node records `resumedFrom`
+        // as the instance's own parent link.
+        match store.get_instance(&cursor) {
+            Ok(instance) => match instance.parent.map(|parent| parent.instance_id) {
+                Some(parent) => cursor = parent,
+                None => {
+                    tracing::info!(
+                        predecessor = %cursor.as_id(),
+                        successor = %successor.as_id(),
+                        "resumedFrom names a chapter with no managed home; starting in a fresh slot"
+                    );
+                    return Ok(());
+                }
+            },
+            Err(error) => {
+                tracing::info!(
+                    predecessor = %cursor.as_id(),
+                    successor = %successor.as_id(),
+                    %error,
+                    "resumedFrom names a chapter unknown to this Node with nothing to transfer; \
+                     starting in a fresh slot"
+                );
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// How long a successor waits for a close that is already in flight before
+/// refusing. The Hub pause only enqueues the close, so a quick Resume can
+/// arrive while the driver is still stopping.
+const CLOSE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Wait for a chapter's process-end row when its close is in flight, and refuse
+/// when it is non-terminal for any other reason.
+async fn wait_for_process_end(
+    store: &dyn LocalStore,
+    chapter: &InstanceId,
+) -> Result<(), NodeError> {
+    let mut instance = store.get_instance(chapter)?;
+    if is_terminal_lifecycle(instance.lifecycle) {
         return Ok(());
     }
+    if !store.close_requested(chapter)? {
+        return Err(NodeError::Conflict(format!(
+            "cannot take over the managed Claude home of {}: that chapter is {:?} and no \
+             close was requested; pause or close it first",
+            chapter.as_id(),
+            instance.lifecycle
+        )));
+    }
+    let deadline = tokio::time::Instant::now() + CLOSE_WAIT;
+    tracing::info!(
+        chapter = %chapter.as_id(),
+        lifecycle = ?instance.lifecycle,
+        "waiting for an in-flight close before taking over the managed Claude home"
+    );
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(NodeError::Conflict(format!(
+                "cannot take over the managed Claude home of {}: its close was requested but \
+                 the chapter is still {:?} after {} seconds",
+                chapter.as_id(),
+                instance.lifecycle,
+                CLOSE_WAIT.as_secs()
+            )));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        instance = store.get_instance(chapter)?;
+        if is_terminal_lifecycle(instance.lifecycle) {
+            tracing::info!(
+                chapter = %chapter.as_id(),
+                lifecycle = ?instance.lifecycle,
+                "in-flight close reached process-end evidence; taking over the home"
+            );
+            return Ok(());
+        }
+    }
+}
+
+fn is_terminal_lifecycle(lifecycle: InstanceLifecycle) -> bool {
+    matches!(
+        lifecycle,
+        InstanceLifecycle::Exited | InstanceLifecycle::Failed
+    )
+}
+
+/// Move the owner's home into the successor slot (one atomic rename).
+fn transfer_home(
+    source: &Path,
+    target: &Path,
+    owner: &InstanceId,
+    successor: &InstanceId,
+) -> Result<(), NodeError> {
     if let Some(parent_dir) = target.parent()
         && let Err(error) = std::fs::create_dir_all(parent_dir)
     {
@@ -2695,7 +2816,7 @@ fn adopt_resumed_native_home(
             parent_dir.display()
         )));
     }
-    if let Err(error) = std::fs::rename(&source, &target) {
+    if let Err(error) = std::fs::rename(source, target) {
         // A racing successor may have won the rename; report it as the same
         // clear ownership refusal rather than a bare IO error.
         return Err(NodeError::Conflict(format!(
@@ -2705,7 +2826,7 @@ fn adopt_resumed_native_home(
         )));
     }
     tracing::info!(
-        predecessor = %parent.as_id(),
+        owner = %owner.as_id(),
         successor = %successor.as_id(),
         "transferred the managed Claude home to the successor chapter"
     );

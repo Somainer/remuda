@@ -127,6 +127,16 @@ pub trait LocalStore: Send + Sync {
     -> Result<bool, NodeError>;
     /// Read one command.
     fn get_command(&self, command_id: &CommandId) -> Result<Command, NodeError>;
+    /// Whether an `instance.close` is PENDING (queued or accepted, not yet
+    /// settled) for this instance.
+    ///
+    /// A Hub pause only ENQUEUES the close (its `instance.close` returns at
+    /// enqueue), so the durable process-end row can trail the pause by the
+    /// driver's whole stop ladder. This ledger entry is the signal that a
+    /// successor may wait for that close instead of refusing a live
+    /// predecessor (resume-config r3). A settled close cannot still be
+    /// stopping the process, so it is not in flight (r4).
+    fn close_requested(&self, instance_id: &InstanceId) -> Result<bool, NodeError>;
     /// Replace one command with a later revision.
     fn save_command(&self, command: Command) -> Result<(), NodeError>;
     /// Mark every non-settled command for an Instance as dispatch-unknown.
@@ -918,6 +928,32 @@ impl LocalStore for MemoryStore {
             .get(command_id)
             .cloned()
             .ok_or_else(|| not_found("command", command_id.as_id().to_string()))
+    }
+
+    fn close_requested(&self, instance_id: &InstanceId) -> Result<bool, NodeError> {
+        // The durable ledger is the authority: a close accepted before a Node
+        // restart still counts as "in flight" for a successor's bounded wait.
+        // Only a close that is queued or accepted can still be stopping the
+        // process; a settled ("completed" / "rejected") one cannot, or an old
+        // close record would turn an immediate refusal into a 30 s wait with a
+        // misleading timeout.
+        fn pending_close(command: &Command) -> bool {
+            command.operation == remuda_protocol::CommandOperation::InstanceClose
+                && matches!(
+                    command.state,
+                    remuda_protocol::CommandState::Queued | remuda_protocol::CommandState::Accepted
+                )
+        }
+        if let Some(entities) = &self.entities {
+            return Ok(entities
+                .commands_for(instance_id)?
+                .iter()
+                .any(pending_close));
+        }
+        let state = self.state.read().map_err(|_| NodeError::StorePoisoned)?;
+        Ok(state.commands.values().any(|command| {
+            pending_close(command) && command.target.instance_id.as_ref() == Some(instance_id)
+        }))
     }
 
     fn save_command(&self, command: Command) -> Result<(), NodeError> {

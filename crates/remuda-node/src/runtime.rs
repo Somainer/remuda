@@ -159,6 +159,66 @@ impl DevNode {
     pub async fn test_instance_driver(&self, id: &InstanceId) -> Option<Arc<dyn Driver>> {
         self.inner.instance_drivers.read().await.get(id).cloned()
     }
+
+    /// Test seam (resume-config r3): record an `instance.close` as accepted on
+    /// the durable ledger WITHOUT running it.
+    ///
+    /// This is the exact state a Hub pause leaves behind — the close is
+    /// enqueued and its command durable, while the process-end row still reads
+    /// ready/closing. A test can then race a successor create against it and
+    /// release the real close later, proving the bounded wait instead of
+    /// relying on driver timing.
+    #[cfg(feature = "test-stub")]
+    pub fn test_record_close_in_flight(&self, id: &InstanceId) -> Result<Command, NodeError> {
+        let command = self.test_close_command(id)?;
+        self.inner.store.insert_command(id, command.clone())?;
+        Ok(command)
+    }
+
+    /// Test seam (resume-config r4): a close that already SETTLED cannot still
+    /// be stopping the process, so it must not count as in flight. This is the
+    /// state a refused or completed close leaves on the ledger.
+    #[cfg(feature = "test-stub")]
+    pub fn test_record_settled_close(&self, id: &InstanceId) -> Result<Command, NodeError> {
+        let mut command = self.test_close_command(id)?;
+        settle_command(
+            &mut command,
+            SettlementOutcome::Completed,
+            None,
+            remuda_protocol::ExecutionState::Settled,
+        )?;
+        self.inner.store.insert_command(id, command.clone())?;
+        Ok(command)
+    }
+
+    /// Test seam (resume-config r4): the bounded close wait with an explicit
+    /// bound, so the timeout branch is testable without a 30-second test.
+    #[cfg(feature = "test-stub")]
+    pub async fn test_wait_for_process_end(
+        &self,
+        id: &InstanceId,
+        wait: std::time::Duration,
+    ) -> Result<(), NodeError> {
+        wait_for_process_end(self.inner.store.as_ref(), id, wait).await
+    }
+
+    /// An accepted `instance.close` command for `id`, not yet on the ledger.
+    #[cfg(feature = "test-stub")]
+    fn test_close_command(&self, id: &InstanceId) -> Result<Command, NodeError> {
+        let instance = self.inner.store.get_instance(id)?;
+        let mut command = new_command(
+            CommandId::new(),
+            CommandOperation::InstanceClose,
+            id,
+            &instance.host_id,
+            &self.inner.projection_epoch,
+            None,
+            digest_json(&serde_json::json!({"operation": "close"}))?,
+            None,
+        )?;
+        accept_command(&mut command)?;
+        Ok(command)
+    }
 }
 
 /// Last-clone teardown.
@@ -1393,6 +1453,21 @@ impl DevNode {
         let api_relay = Arc::clone(&self.inner.api_relay);
         let node = Arc::downgrade(&self.inner);
         let worker = tokio::spawn(async move {
+            // resume-config r2: before anything is materialized, a resumed
+            // chapter takes OWNERSHIP of its managed Claude home by moving the
+            // predecessor's directory into its own slot. The predecessor was
+            // closed/paused before this chapter was admitted; a still-live or
+            // unknown predecessor is refused.
+            if let Some(inner) = node.upgrade()
+                && let Err(error) =
+                    adopt_resumed_native_home(&inner, &worker_instance, &launch.request).await
+            {
+                tracing::error!(%error, "resumed chapter could not take over its Claude home");
+                record_task_exit(store.as_ref(), &worker_instance, &error.to_string());
+                api_relay.revoke_instance(worker_instance.as_id().as_str());
+                inner.senders.write().await.remove(&worker_instance);
+                return;
+            }
             // Building the driver is materialization, not acceptance: it runs
             // `pin_binary` (a ~207 MB SHA-256 the first time, plus a blocking
             // `--version` subprocess), writes the settings overlay and launch
@@ -2589,6 +2664,235 @@ fn record_task_exit(store: &dyn LocalStore, instance_id: &InstanceId, reason: &s
     {
         tracing::error!(%error, "failed to append task-exit lifecycle event");
     }
+}
+
+/// resume-config r2/r3: a resumed chapter OWNS the managed Claude home it runs
+/// in.
+///
+/// A managed home is per instance (`data_dir/instances/<id>/native-home`), so
+/// a successor with no explicit `claudeConfigDir` and no Node-wide home takes
+/// the real owner's home by MOVING it into its own slot — one rename on the
+/// same filesystem, before anything launches. Borrowing a predecessor's slot
+/// instead loses the transcript at the second hop of a chain (C would look in
+/// B's slot, which never held it), lets a purge of the predecessor delete a
+/// live successor's home, and lets two successors share one home.
+///
+/// r3 makes the decision race-proof:
+///
+/// * **Wait, then decide.** A Hub pause commits `paused` at close admission and
+///   only ENQUEUES the close, so the Node's process-end row trails it by the
+///   driver's stop ladder. When the owner is non-terminal and its close is
+///   already on the ledger, wait up to [`CLOSE_WAIT`] for the process-end row,
+///   then transfer. A non-terminal owner with no close requested is refused
+///   with a distinct message instead of being waited on.
+/// * **Find the owner, not the parent.** The walk starts at `resumedFrom` and
+///   follows each chapter's own `parent` link (the Node records `resumedFrom`
+///   there) until a chapter's slot holds the home — or its recipe proves the
+///   home existed and moved onward. A failed/never-launched intermediate
+///   chapter (which owns no slot and has no recipe) is skipped.
+/// * **Unknown predecessor.** No row, no slot, no recipe: there is nothing to
+///   transfer, so the successor starts in a fresh slot and that is logged.
+///   Refusal is reserved for evidence that a home existed and moved elsewhere
+///   (a second successor of one conversation cannot be continued from it).
+async fn adopt_resumed_native_home(
+    inner: &DevNodeInner,
+    successor: &InstanceId,
+    request: &CreateInstanceRequest,
+) -> Result<(), NodeError> {
+    let Some(config) = inner.herdr_config.as_ref() else {
+        return Ok(());
+    };
+    let Some(mut cursor) = request.resumed_from.clone() else {
+        return Ok(());
+    };
+    if !crate::native::uses_managed_native_home(config, request, request.driver) {
+        return Ok(());
+    }
+    let target = crate::native::managed_native_home(&config.data_dir, successor);
+    if target.exists() {
+        // Retried create: this successor already owns its home.
+        return Ok(());
+    }
+    let store = inner.store.as_ref();
+    let mut visited = std::collections::BTreeSet::new();
+    loop {
+        if !visited.insert(cursor.clone()) {
+            tracing::warn!(
+                successor = %successor.as_id(),
+                "the resumedFrom chain revisits a chapter; starting in a fresh slot"
+            );
+            return Ok(());
+        }
+        let slot = crate::native::managed_native_home(&config.data_dir, &cursor);
+        if slot.is_dir() {
+            // The real owner. Wait for a close that is already in flight, then
+            // take the home out of this chapter's slot.
+            wait_for_process_end(store, &cursor, CLOSE_WAIT).await?;
+            transfer_home(&slot, &target, &cursor, successor)?;
+            return Ok(());
+        }
+        // The chapter owns no slot. Its own recipe is the record of the home it
+        // launched in: the managed slot means the home existed and was moved
+        // onward (or purged), while any other path means it never used the
+        // managed slot at all.
+        let managed_before = store
+            .launch_recipe(&cursor)
+            .ok()
+            .flatten()
+            .is_some_and(|recipe| Path::new(&recipe.native_home) == slot);
+        if managed_before {
+            return Err(NodeError::Conflict(format!(
+                "the managed Claude home of {} was already transferred to another \
+                 successor (or purged); a second successor would start a blank conversation",
+                cursor.as_id()
+            )));
+        }
+        // A failed or never-launched intermediate chapter owns nothing; walk
+        // back to the chapter it resumed from. The Node records `resumedFrom`
+        // as the instance's own parent link.
+        match store.get_instance(&cursor) {
+            Ok(instance) => match instance.parent.map(|parent| parent.instance_id) {
+                Some(parent) => cursor = parent,
+                None => {
+                    tracing::info!(
+                        predecessor = %cursor.as_id(),
+                        successor = %successor.as_id(),
+                        "resumedFrom names a chapter with no managed home; starting in a fresh slot"
+                    );
+                    return Ok(());
+                }
+            },
+            Err(error) => {
+                tracing::info!(
+                    predecessor = %cursor.as_id(),
+                    successor = %successor.as_id(),
+                    %error,
+                    "resumedFrom names a chapter unknown to this Node with nothing to transfer; \
+                     starting in a fresh slot"
+                );
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// How long a successor waits for a close that is already in flight before
+/// refusing. The Hub pause only enqueues the close, so a quick Resume can
+/// arrive while the driver is still stopping.
+const CLOSE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Wait for a chapter's process-end row when its close is in flight, and refuse
+/// when it is non-terminal for any other reason.
+///
+/// A chapter the Node has no row for has no process to wait for: a crash
+/// mid-purge or a rebuilt entity DB can leave the managed slot without its row,
+/// so the slot is adopted rather than failing with a raw lookup error.
+async fn wait_for_process_end(
+    store: &dyn LocalStore,
+    chapter: &InstanceId,
+    wait: std::time::Duration,
+) -> Result<(), NodeError> {
+    // `None` means the Node has no row for the chapter, not a store failure.
+    let current = |store: &dyn LocalStore| -> Result<Option<Instance>, NodeError> {
+        match store.get_instance(chapter) {
+            Ok(instance) => Ok(Some(instance)),
+            Err(NodeError::NotFound { .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
+    };
+    let Some(mut instance) = current(store)? else {
+        tracing::info!(
+            chapter = %chapter.as_id(),
+            "the managed-home owner has no instance row; nothing to wait for, taking its slot"
+        );
+        return Ok(());
+    };
+    if is_terminal_lifecycle(instance.lifecycle) {
+        return Ok(());
+    }
+    if !store.close_requested(chapter)? {
+        return Err(NodeError::Conflict(format!(
+            "cannot take over the managed Claude home of {}: that chapter is {:?} and no \
+             close was requested; pause or close it first",
+            chapter.as_id(),
+            instance.lifecycle
+        )));
+    }
+    let deadline = tokio::time::Instant::now() + wait;
+    tracing::info!(
+        chapter = %chapter.as_id(),
+        lifecycle = ?instance.lifecycle,
+        "waiting for an in-flight close before taking over the managed Claude home"
+    );
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(NodeError::Conflict(format!(
+                "cannot take over the managed Claude home of {}: its close was requested but \
+                 the chapter is still {:?} after {} seconds",
+                chapter.as_id(),
+                instance.lifecycle,
+                wait.as_secs_f32()
+            )));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        match current(store)? {
+            Some(next) if is_terminal_lifecycle(next.lifecycle) => {
+                tracing::info!(
+                    chapter = %chapter.as_id(),
+                    lifecycle = ?next.lifecycle,
+                    "in-flight close reached process-end evidence; taking over the home"
+                );
+                return Ok(());
+            }
+            Some(next) => instance = next,
+            None => {
+                tracing::info!(
+                    chapter = %chapter.as_id(),
+                    "the managed-home owner's row vanished during the wait; taking its slot"
+                );
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn is_terminal_lifecycle(lifecycle: InstanceLifecycle) -> bool {
+    matches!(
+        lifecycle,
+        InstanceLifecycle::Exited | InstanceLifecycle::Failed
+    )
+}
+
+/// Move the owner's home into the successor slot (one atomic rename).
+fn transfer_home(
+    source: &Path,
+    target: &Path,
+    owner: &InstanceId,
+    successor: &InstanceId,
+) -> Result<(), NodeError> {
+    if let Some(parent_dir) = target.parent()
+        && let Err(error) = std::fs::create_dir_all(parent_dir)
+    {
+        return Err(NodeError::Driver(format!(
+            "could not create the successor instance directory {}: {error}",
+            parent_dir.display()
+        )));
+    }
+    if let Err(error) = std::fs::rename(source, target) {
+        // A racing successor may have won the rename; report it as the same
+        // clear ownership refusal rather than a bare IO error.
+        return Err(NodeError::Conflict(format!(
+            "could not move the managed Claude home {} into {}: {error}",
+            source.display(),
+            target.display()
+        )));
+    }
+    tracing::info!(
+        owner = %owner.as_id(),
+        successor = %successor.as_id(),
+        "transferred the managed Claude home to the successor chapter"
+    );
+    Ok(())
 }
 
 /// Store what the live driver says this session can do (§4.3, §6).

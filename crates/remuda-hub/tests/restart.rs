@@ -2796,3 +2796,70 @@ async fn a_control_off_seat_restarts_as_its_seating_human_under_the_creator_rule
     );
     Ok(())
 }
+
+// ── resume-config: the successor keeps the Claude home ────────────────────
+
+/// resume-config: the C1 supervisor's successor keeps the chapter's recorded
+/// `claudeConfigDir` and `settingsOverlayPath`. The native `--resume` finds the
+/// transcript only in the home the predecessor wrote it to, so a restart that
+/// drops the pair silently starts a blank conversation.
+#[tokio::test]
+async fn a_restart_carries_the_chapters_claude_config_dir_and_settings_overlay() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host, true).await?;
+    let claude_home = "/srv/remuda/seats/claude-home";
+    let overlay = "/srv/remuda/seats/settings-overlay.json";
+    let created: Value = ctx
+        .http
+        .post(format!("{}/v1/instances", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .json(&json!({
+            "hostId": ctx.host,
+            "kind": "claude",
+            "driver": "claude-sdk",
+            "name": "main",
+            "title": "Main",
+            "grants": ["address-owner"],
+            "permissionMode": "auto",
+            "model": "claude-test-model",
+            "restart": {"onProcessLoss": true, "maxPerHour": 3},
+            "prompt": "seat brief",
+            "claudeConfigDir": claude_home,
+            "settingsOverlayPath": overlay,
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let seat = created["instance"]["instanceId"]
+        .as_str()
+        .context("seat")?
+        .to_owned();
+    let (method, create_params) = node.next_launch().await?;
+    assert_eq!(method, "instance.create");
+    assert_eq!(create_params["spec"]["claudeConfigDir"], json!(claude_home));
+    assert_eq!(create_params["spec"]["settingsOverlayPath"], json!(overlay));
+    ctx.report_running(&node, &seat, SESSION).await?;
+    ctx.report_killed(&node, &seat).await?;
+
+    let decided = ctx.supervise().await;
+    assert_eq!(decided.len(), 1, "{decided:?}");
+    assert_eq!(decided[0]["outcome"], json!("restarted"));
+    let successor = decided[0]["successorInstanceId"]
+        .as_str()
+        .context("successor")?
+        .to_owned();
+    let (method, create) = node.next_launch().await?;
+    assert_eq!(method, "instance.resume");
+    assert_eq!(create["instanceId"], json!(successor));
+    assert_eq!(create["spec"]["resumeSessionId"], json!(SESSION));
+    assert_eq!(create["spec"]["claudeConfigDir"], json!(claude_home));
+    assert_eq!(create["spec"]["settingsOverlayPath"], json!(overlay));
+
+    // The successor row records the pair, so the next restart carries it too.
+    let view = ctx.instance(&successor).await?;
+    assert_eq!(view["claudeConfigDir"], json!(claude_home));
+    assert_eq!(view["settingsOverlayPath"], json!(overlay));
+    Ok(())
+}

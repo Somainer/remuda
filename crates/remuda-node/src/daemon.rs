@@ -366,6 +366,11 @@ impl DaemonControl {
     }
 
     /// Wait until no bridge is attached, then acquire the primary WSS controller.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeError::Io`] when the lease's generation cannot be persisted; no
+    /// lease is handed out and the controller is unchanged.
     pub async fn acquire_outbound(&self) -> Result<DaemonWssLease, NodeError> {
         let mut changed = self.0.changed.subscribe();
         loop {
@@ -376,12 +381,18 @@ impl DaemonControl {
                     .lock()
                     .map_err(|_| NodeError::StorePoisoned)?;
                 if !controller.active {
-                    controller.generation += 1;
+                    // Durable before it is handed out, exactly like a bridge
+                    // takeover: on failure nothing changes and the caller
+                    // gets the error instead of a generation a restarted
+                    // daemon could hand out again.
+                    let next = controller.generation + 1;
+                    persist_controller_generation(&self.0.data_dir, next)?;
+                    controller.generation = next;
                     controller.active = true;
-                    self.0.changed.send_replace(controller.generation);
+                    self.0.changed.send_replace(next);
                     return Ok(DaemonWssLease(Arc::new(LeaseGuard {
                         shared: self.0.clone(),
-                        generation: controller.generation,
+                        generation: next,
                     })));
                 }
             }
@@ -398,6 +409,10 @@ struct LeaseGuard {
     generation: u64,
 }
 
+/// The bump on release only retires the lease's generation; it hands nothing
+/// out, so it is not persisted. The next generation handed out is persisted
+/// before use, and a restart seeds at the last persisted one, so every later
+/// hand-out is above everything ever handed out.
 impl Drop for LeaseGuard {
     fn drop(&mut self) {
         if let Ok(mut controller) = self.shared.controller.lock()

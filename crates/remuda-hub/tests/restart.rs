@@ -2711,3 +2711,32 @@ async fn an_unreadable_marker_skips_stale_classification_at_boot() -> Result<()>
     assert_eq!(rows[0].2, "restarted", "no guess at boot: {rows:?}");
     Ok(())
 }
+
+// ── r4 item 4: owner Resume of a missing profile keeps main's shape ─────
+
+/// Owner Resume of a lineage whose provider profile is gone answers exactly
+/// as it did before ma-restart: `resolve_and_attach`'s refusal, 422
+/// `PLACEMENT_UNSATISFIABLE` naming the unknown profile. (Round 2's pre-check
+/// had turned it into 400 `BAD_REQUEST`; the supervisor's retry rule does
+/// not change the owner-facing answer.)
+#[tokio::test]
+async fn owner_resume_of_a_missing_profile_keeps_the_pre_restart_shape() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host, true).await?;
+    let seat = ctx.seat(&mut node).await?;
+    ctx.report_running(&node, &seat, SESSION).await?;
+    assert_eq!(ctx.close(&seat).await?.status(), 200);
+    let gone = format!("prv_{}", uuid::Uuid::now_v7());
+    ctx.db()?.execute(
+        "UPDATE instances SET spec_json = json_set(spec_json, '$.providerProfileId', ?2)
+          WHERE id = ?1",
+        rusqlite::params![seat, gone],
+    )?;
+    let resumed = ctx.resume(&seat).await?;
+    let status = resumed.status();
+    let body: Value = resumed.json().await?;
+    assert_eq!(status, 422, "{body}");
+    assert_eq!(body["code"], json!("PLACEMENT_UNSATISFIABLE"), "{body}");
+    assert!(body.to_string().contains(&gone), "{body}");
+    Ok(())
+}

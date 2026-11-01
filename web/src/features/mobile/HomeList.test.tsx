@@ -643,3 +643,37 @@ describe("① 工作中 filter and the group header", () => {
     expect(screen.getByTestId("home-group-dots")).toHaveTextContent("⚠1 ●1");
   });
 });
+
+describe("① filter under an active hold", () => {
+  it("recomputes the dots from the rendered rows and drops groups the filter empties", async () => {
+    hub.instances = [
+      row("ins-blocked", { activity: known("waiting-interaction"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+      row("ins-work", { activity: known("working"), updatedAt: "2026-09-19T08:00:00.000Z" }),
+    ];
+    renderHome();
+    expect(await screen.findByTestId("home-group-dots")).toHaveTextContent("⚠1 ●1");
+
+    // A press on the row starts a pointer hold; a plain click on the count row
+    // does not dispatch pointerup, so the hold is still active when the rank
+    // filter changes (the reviewer's repro).
+    act(() => {
+      screen.getByText("title ins-blocked").closest("article")!
+        .dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+    });
+    expect(document.querySelector(HELD)).not.toBeNull();
+    fireEvent.click(screen.getByTestId("glance-working"));
+    expect(document.querySelector(HELD)).not.toBeNull();
+
+    // The header counts what is on screen, and the filtered-out row does not
+    // linger as a stale placeholder.
+    expect(screen.getByTestId("home-group-dots")).toHaveTextContent("●1");
+    expect(screen.queryByText("title ins-blocked")).toBeNull();
+    expect(screen.getAllByTestId("home-row")).toHaveLength(1);
+
+    act(() => {
+      window.dispatchEvent(new PointerEvent("pointerup"));
+    });
+    expect(document.querySelector(RELEASED)).not.toBeNull();
+    expect(screen.getAllByTestId("home-row")).toHaveLength(1);
+  });
+});

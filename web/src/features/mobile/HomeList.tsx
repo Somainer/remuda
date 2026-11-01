@@ -355,14 +355,29 @@ export const HomeList = memo(function HomeList() {
   // While held, the snapshot owns the structure; live data only replaces each
   // row's content by id. A row that vanished keeps its last painted content as
   // a placeholder, and a row that appeared waits for the release.
+  //
+  // The ① rank filter is a USER action, not new data: a row it excludes leaves
+  // (no placeholder), a group it empties drops, and the header dots count the
+  // rows actually rendered — even while a hold is active.
   const renderedGroups = useMemo<HomeGroup[]>(() => {
     if (!snapshot) return rankFiltered;
-    const live = new Map(rankFiltered.flatMap((group) => group.rows.map((row) => [row.id, row] as const)));
-    return snapshot.groups.map((group) => ({
-      ...group,
-      rows: group.rows.map((row) => live.get(row.id) ?? row),
-    }));
-  }, [rankFiltered, snapshot]);
+    const liveFiltered = new Map(
+      rankFiltered.flatMap((group) => group.rows.map((row) => [row.id, row] as const)),
+    );
+    const liveAll = new Set(groups.flatMap((group) => group.rows.map((row) => row.id)));
+    return snapshot.groups
+      .map((group) => {
+        const rows = group.rows.flatMap((row) => {
+          const liveRow = liveFiltered.get(row.id);
+          if (liveRow) return [liveRow];
+          // Removed by the rank filter: the tap asked for it, so drop it.
+          if (rankFilter !== null && liveAll.has(row.id)) return [];
+          return [row];
+        });
+        return { ...group, rows, dots: groupDots(rows) };
+      })
+      .filter((group) => group.rows.length > 0);
+  }, [rankFiltered, groups, snapshot, rankFilter]);
   // A row painted at hold start that has since left the live data: it keeps its
   // place as a placeholder, with every control inert until release.
   const staleIds = useMemo<ReadonlySet<string>>(() => {

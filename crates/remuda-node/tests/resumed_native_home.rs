@@ -14,7 +14,7 @@ use remuda_protocol::{AgentKind, DriverKind, InstanceId, InstanceLifecycle};
 use remuda_testing::ensure_workspace_bin;
 use serde_json::json;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const SESSION: &str = "01993ab0-0000-7000-8000-0000000000a1";
 const SECOND_SESSION: &str = "01993ab0-0000-7000-8000-0000000000a2";
@@ -437,25 +437,35 @@ async fn a_retried_resume_finds_the_home_already_in_the_successor_slot() {
 
     let mut b_request = successor(&a, SESSION);
     b_request.instance_id = Some(b_id.clone());
-    // The retry must neither refuse nor look for a predecessor home.
+    // A re-forwarded create keeps its client command id. Using one here is what
+    // makes the second call a genuine RETRY of the same command, not a fresh
+    // intent that happens to reuse the instance id.
+    let command_id = remuda_protocol::CommandId::new();
+    b_request.command_id = Some(command_id.clone());
     let first = node
         .create_instance(b_request.clone())
         .await
         .expect("the retried resume is accepted");
     assert_eq!(first.instance.meta.id, b_id);
+    assert_eq!(first.command.command_id, command_id);
     let transcript = wait_for_transferred_slot(&b_slot).await;
     assert!(transcript.is_file());
     let recipe = wait_for_recipe(&node, &b_id).await;
     assert_eq!(Path::new(&recipe.native_home), b_slot);
 
-    // A RETRY of the SAME successor create (same instance and command id, as
-    // a re-forwarded create is) echoes the chapter already materialized: it
-    // creates no second home and no second launch, and the transcript stays.
+    // A RETRY of the SAME command (same instance AND command id, as a
+    // re-forwarded create is) echoes the chapter already materialized: no
+    // second command ledger row, no second home and no second launch, and the
+    // transcript stays.
     let retried = node
         .create_instance(b_request)
         .await
         .expect("the same successor create is replayed");
     assert_eq!(retried.instance.meta.id, b_id);
+    assert_eq!(
+        retried.command.command_id, command_id,
+        "the retried command id is echoed, not re-minted"
+    );
     assert_ne!(
         node.get_instance(&b_id).expect("chapter B row").lifecycle,
         InstanceLifecycle::Failed,
@@ -470,6 +480,22 @@ async fn a_retried_resume_finds_the_home_already_in_the_successor_slot() {
         Path::new(&wait_for_recipe(&node, &b_id).await.native_home),
         b_slot
     );
+    // Exactly one `instance.create` command for this chapter on the durable
+    // ledger: the retry replayed the first, it did not admit a second.
+    let db = rusqlite::Connection::open(data.path().join("node.sqlite")).expect("node db");
+    let mut statement = db
+        .prepare("SELECT json FROM commands WHERE instance_id = ?1")
+        .expect("command query");
+    let commands: Vec<serde_json::Value> = statement
+        .query_map([b_id.as_id().as_str()], |row| row.get::<_, String>(0))
+        .expect("command rows")
+        .map(|raw| serde_json::from_str(&raw.expect("raw command")).expect("command json"))
+        .collect();
+    let creates = commands
+        .iter()
+        .filter(|command| command["operation"] == json!("instance.create"))
+        .count();
+    assert_eq!(creates, 1, "one create command, got {commands:?}");
     let launches = std::fs::read_dir(b_slot.parent().expect("instance dir"))
         .expect("instance dir")
         .filter(|entry| {
@@ -679,4 +705,146 @@ async fn an_unknown_predecessor_with_nothing_to_transfer_starts_fresh() {
     assert!(!is_terminal(
         node.get_instance(&b_id).expect("chapter B row").lifecycle
     ));
+}
+
+// ── 10. No row, surviving slot: adopt rather than fail ────────────────────
+
+/// A crash mid-purge or a rebuilt entity DB can leave the managed slot on disk
+/// without a row for its chapter. There is no process to wait for, so the
+/// successor takes the slot instead of failing with a raw lookup error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_predecessor_with_no_row_still_hands_over_its_surviving_slot() {
+    let data = tempfile::tempdir().expect("data dir");
+    let node = native_node(data.path());
+    let a = node
+        .create_instance(request("hello"))
+        .await
+        .expect("chapter A")
+        .instance
+        .meta
+        .id
+        .clone();
+    let a_slot = slot(data.path(), &a);
+    wait_for_slot(&a_slot).await;
+    close_and_wait(&node, &a).await;
+
+    // Rebuilt entity DB: the row is gone, the Node-owned home is still here.
+    node.shutdown().await.expect("shutdown");
+    drop(node);
+    let db = rusqlite::Connection::open(data.path().join("node.sqlite")).expect("node db");
+    db.execute("DELETE FROM instances WHERE id = ?1", [a.as_id().as_str()])
+        .expect("drop instance row");
+    db.execute(
+        "DELETE FROM commands WHERE instance_id = ?1",
+        [a.as_id().as_str()],
+    )
+    .expect("drop command rows");
+    drop(db);
+    assert!(a_slot.is_dir(), "the slot survived the row's loss");
+
+    let node = native_node(data.path());
+    let b_id = InstanceId::new();
+    let mut b_request = successor(&a, SESSION);
+    b_request.instance_id = Some(b_id.clone());
+    node.create_instance(b_request)
+        .await
+        .expect("a row-less predecessor with a slot is not a refusal");
+    let b_slot = slot(data.path(), &b_id);
+    wait_for_transferred_slot(&b_slot).await;
+    assert!(
+        !a_slot.exists(),
+        "the surviving slot moved to the successor"
+    );
+}
+
+// ── 11. A settled close is not "in flight" ────────────────────────────────
+
+/// Only a queued/accepted close can still be stopping the process. A settled
+/// one must not turn an immediate refusal into the 30 s wait with a misleading
+/// timeout message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_settled_close_is_not_in_flight_and_is_refused_immediately() {
+    let data = tempfile::tempdir().expect("data dir");
+    let node = native_node(data.path());
+    let a = node
+        .create_instance(request("hello"))
+        .await
+        .expect("chapter A")
+        .instance
+        .meta
+        .id
+        .clone();
+    wait_for_slot(&slot(data.path(), &a)).await;
+    let command = node.test_record_settled_close(&a).expect("settled close");
+    assert_eq!(command.state, remuda_protocol::CommandState::Settled);
+
+    let started = Instant::now();
+    let b_id = InstanceId::new();
+    let mut b_request = successor(&a, SESSION);
+    b_request.instance_id = Some(b_id.clone());
+    node.create_instance(b_request)
+        .await
+        .expect("the create is accepted before materialization");
+    let failed = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let instance = node.get_instance(&b_id).expect("chapter B row");
+            if instance.lifecycle == InstanceLifecycle::Failed {
+                return instance;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("chapter B refused");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "a settled close must not be waited on (took {:?})",
+        started.elapsed()
+    );
+    assert!(
+        failed
+            .last_error
+            .unwrap_or_default()
+            .contains("no close was requested"),
+        "the refusal names the situation"
+    );
+    close_and_wait(&node, &a).await;
+}
+
+// ── 12. A close that never completes hits the bounded timeout ─────────────
+
+/// The timeout branch of the bounded wait, with a short test-only bound so the
+/// test does not spend the production 30 s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_close_that_never_completes_times_out_with_a_clear_error() {
+    let data = tempfile::tempdir().expect("data dir");
+    let node = native_node(data.path());
+    let a = node
+        .create_instance(request("hello"))
+        .await
+        .expect("chapter A")
+        .instance
+        .meta
+        .id
+        .clone();
+    wait_for_slot(&slot(data.path(), &a)).await;
+    node.test_record_close_in_flight(&a)
+        .expect("close recorded");
+
+    let started = Instant::now();
+    let error = node
+        .test_wait_for_process_end(&a, Duration::from_millis(300))
+        .await
+        .expect_err("the bounded wait times out");
+    let message = error.to_string();
+    assert!(
+        message.contains("close was requested but") && message.contains("still"),
+        "the timeout names the in-flight close and the still-live chapter: {message}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the test-only bound stays short (took {:?})",
+        started.elapsed()
+    );
+    close_and_wait(&node, &a).await;
 }

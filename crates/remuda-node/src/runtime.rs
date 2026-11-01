@@ -170,6 +170,41 @@ impl DevNode {
     /// relying on driver timing.
     #[cfg(feature = "test-stub")]
     pub fn test_record_close_in_flight(&self, id: &InstanceId) -> Result<Command, NodeError> {
+        let command = self.test_close_command(id)?;
+        self.inner.store.insert_command(id, command.clone())?;
+        Ok(command)
+    }
+
+    /// Test seam (resume-config r4): a close that already SETTLED cannot still
+    /// be stopping the process, so it must not count as in flight. This is the
+    /// state a refused or completed close leaves on the ledger.
+    #[cfg(feature = "test-stub")]
+    pub fn test_record_settled_close(&self, id: &InstanceId) -> Result<Command, NodeError> {
+        let mut command = self.test_close_command(id)?;
+        settle_command(
+            &mut command,
+            SettlementOutcome::Completed,
+            None,
+            remuda_protocol::ExecutionState::Settled,
+        )?;
+        self.inner.store.insert_command(id, command.clone())?;
+        Ok(command)
+    }
+
+    /// Test seam (resume-config r4): the bounded close wait with an explicit
+    /// bound, so the timeout branch is testable without a 30-second test.
+    #[cfg(feature = "test-stub")]
+    pub async fn test_wait_for_process_end(
+        &self,
+        id: &InstanceId,
+        wait: std::time::Duration,
+    ) -> Result<(), NodeError> {
+        wait_for_process_end(self.inner.store.as_ref(), id, wait).await
+    }
+
+    /// An accepted `instance.close` command for `id`, not yet on the ledger.
+    #[cfg(feature = "test-stub")]
+    fn test_close_command(&self, id: &InstanceId) -> Result<Command, NodeError> {
         let instance = self.inner.store.get_instance(id)?;
         let mut command = new_command(
             CommandId::new(),
@@ -182,7 +217,6 @@ impl DevNode {
             None,
         )?;
         accept_command(&mut command)?;
-        self.inner.store.insert_command(id, command.clone())?;
         Ok(command)
     }
 }
@@ -2693,7 +2727,7 @@ async fn adopt_resumed_native_home(
         if slot.is_dir() {
             // The real owner. Wait for a close that is already in flight, then
             // take the home out of this chapter's slot.
-            wait_for_process_end(store, &cursor).await?;
+            wait_for_process_end(store, &cursor, CLOSE_WAIT).await?;
             transfer_home(&slot, &target, &cursor, successor)?;
             return Ok(());
         }
@@ -2749,11 +2783,30 @@ const CLOSE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Wait for a chapter's process-end row when its close is in flight, and refuse
 /// when it is non-terminal for any other reason.
+///
+/// A chapter the Node has no row for has no process to wait for: a crash
+/// mid-purge or a rebuilt entity DB can leave the managed slot without its row,
+/// so the slot is adopted rather than failing with a raw lookup error.
 async fn wait_for_process_end(
     store: &dyn LocalStore,
     chapter: &InstanceId,
+    wait: std::time::Duration,
 ) -> Result<(), NodeError> {
-    let mut instance = store.get_instance(chapter)?;
+    // `None` means the Node has no row for the chapter, not a store failure.
+    let current = |store: &dyn LocalStore| -> Result<Option<Instance>, NodeError> {
+        match store.get_instance(chapter) {
+            Ok(instance) => Ok(Some(instance)),
+            Err(NodeError::NotFound { .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
+    };
+    let Some(mut instance) = current(store)? else {
+        tracing::info!(
+            chapter = %chapter.as_id(),
+            "the managed-home owner has no instance row; nothing to wait for, taking its slot"
+        );
+        return Ok(());
+    };
     if is_terminal_lifecycle(instance.lifecycle) {
         return Ok(());
     }
@@ -2765,7 +2818,7 @@ async fn wait_for_process_end(
             instance.lifecycle
         )));
     }
-    let deadline = tokio::time::Instant::now() + CLOSE_WAIT;
+    let deadline = tokio::time::Instant::now() + wait;
     tracing::info!(
         chapter = %chapter.as_id(),
         lifecycle = ?instance.lifecycle,
@@ -2778,18 +2831,27 @@ async fn wait_for_process_end(
                  the chapter is still {:?} after {} seconds",
                 chapter.as_id(),
                 instance.lifecycle,
-                CLOSE_WAIT.as_secs()
+                wait.as_secs_f32()
             )));
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        instance = store.get_instance(chapter)?;
-        if is_terminal_lifecycle(instance.lifecycle) {
-            tracing::info!(
-                chapter = %chapter.as_id(),
-                lifecycle = ?instance.lifecycle,
-                "in-flight close reached process-end evidence; taking over the home"
-            );
-            return Ok(());
+        match current(store)? {
+            Some(next) if is_terminal_lifecycle(next.lifecycle) => {
+                tracing::info!(
+                    chapter = %chapter.as_id(),
+                    lifecycle = ?next.lifecycle,
+                    "in-flight close reached process-end evidence; taking over the home"
+                );
+                return Ok(());
+            }
+            Some(next) => instance = next,
+            None => {
+                tracing::info!(
+                    chapter = %chapter.as_id(),
+                    "the managed-home owner's row vanished during the wait; taking its slot"
+                );
+                return Ok(());
+            }
         }
     }
 }

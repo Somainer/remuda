@@ -2470,8 +2470,8 @@ export interface components {
             projectId?: string;
             prompt?: string;
             providerProfileId?: string;
-            /** @description D-057 §6.1 C1 restart policy: relaunch this instance on Node-attested process loss/start failure, at most `maxPerHour` decisions per hour. Accepted only from a Human origin in Phase 1; an Agent or Bot gets 403. Hub-side policy, never forwarded in the Node spec; makes the instance a continuity lineage. No behaviour follows until the C1 supervisor ships. */
-            restart?: components["schemas"]["RestartPolicy"] | null;
+            /** @description D-057 §6.1 C1 restart policy: the Hub's C1 supervisor relaunches this instance on Node-attested process loss or start failure, at most `maxPerHour` restart decisions per hour (an omitted `maxPerHour` takes the suggested cap, 3). Accepted only from a Human origin in Phase 1; an Agent or Bot gets 403. Hub-side policy, never forwarded in the Node spec; copied to every chapter; makes the instance a continuity lineage. */
+            restart?: components["schemas"]["RestartPolicyInput"] | null;
             /**
              * @description Preset name applied at create and stored for display; enforcement reads scope+grants, never this field (design §2.5).
              * @enum {string}
@@ -2785,14 +2785,39 @@ export interface components {
             lineageId: string;
             /** @description When the lineage was paused (RFC3339); null while unpaused. */
             pausedAt?: string | null;
-            /** @description Who paused the lineage: `{kind: device|self|ancestor|restart-cap|process-exit, deviceId?, instanceId?}`; null while unpaused. */
+            /** @description Who paused the lineage: `{kind: device|self|ancestor|restart-cap|process-exit, deviceId?, instanceId?, cause?}`; `restart-cap` and `process-exit` are the C1 supervisor's (with the failed chapter and its §6.3 cause); null while unpaused. */
             pausedBy?: Record<string, never> | null;
             restart?: components["schemas"]["RestartPolicy"] | null;
+            /** @description D-057 §6.3.1: the C1 supervisor's restart-decision log, one row per failed chapter (the key), oldest first. */
+            restartDecisions?: components["schemas"]["LineageRestartDecision"][];
             /**
              * @description starting, running, paused, or host-offline (a running current chapter whose host has no live link; derived, not starting).
              * @enum {string}
              */
             state: "starting" | "running" | "paused" | "host-offline";
+        };
+        /** @description One C1 decision (D-057 §6.3.1), made inside F with a generation CAS and keyed by the failed chapter. */
+        LineageRestartDecision: {
+            /** @description The §6.3 cause: process-exit, start-failed or node-restarted. */
+            cause: string;
+            decidedAt: string;
+            failedGeneration: number;
+            /** @description The failed chapter: the decision key. */
+            failedInstanceId: string;
+            /** @description The fence F committed for this decision; absent for a stale-at-boot decision, which runs no F. */
+            fenceId?: string;
+            /** @description The restart notice's command id, chosen inside F (§6.4). */
+            noticeCommandId?: string;
+            /**
+             * @description restarted (F with successor), restart-cap or process-exit (F without successor: the lineage is paused), or stale-at-boot (no F, decided only by the boot evaluation: the Hub first saw the end more than 30 minutes before its previous run was last alive, or holds no record of seeing it; not relaunched, no push, the owner can Resume).
+             * @enum {string}
+             */
+            outcome: "restarted" | "restart-cap" | "process-exit" | "stale-at-boot";
+            /** @description Why a decision paused instead of restarting, when it is not the cap or the policy (for example, the successor's provider profile is gone). */
+            reason?: string;
+            /** @description §6.3.1 recovery source of the successor: chapter-session, earlier-session or fresh. */
+            recovery?: string;
+            successorInstanceId?: string;
         };
         LoginRequest: {
             bootstrapToken: string;
@@ -3441,6 +3466,16 @@ export interface components {
             /** @description Restart on Node-attested process loss or start failure. */
             onProcessLoss: boolean;
         };
+        /** @description D-057 §6.1 C1 restart policy as a create body sets it; `maxPerHour` defaults to the suggested 3 (OA5). */
+        RestartPolicyInput: {
+            /**
+             * @description At-most restart decisions per rolling hour; at least 1. Omitted: 3.
+             * @default 3
+             */
+            maxPerHour: number;
+            /** @description Restart on Node-attested process loss or start failure. */
+            onProcessLoss: boolean;
+        };
         ResumeRequest: {
             /**
              * @description structured keeps the parent's driver; terminal continues the same native session in claude-pty so the conversation gains a terminal tab.
@@ -3472,10 +3507,10 @@ export interface components {
              */
             continuation: "none" | "native" | "hub" | "unknown";
             /**
-             * @description Who authored that input; `agent` for a continuation or a Hub-authored input.
+             * @description Who authored that input: `hub` for an input the Hub wrote (the restart notice, D-057 §6.4); `agent` for a continuation the carrier started on its own.
              * @enum {string}
              */
-            origin: "human" | "bot" | "agent";
+            origin: "human" | "bot" | "agent" | "hub";
         };
         SeenRequest: {
             /** @description Highest journal seq the client has shown for this instance, as the decimal string the Hub serializes (a JSON integer is also accepted). Clamped to the instance's durable seq; a value at or below the current seen seq changes nothing. */

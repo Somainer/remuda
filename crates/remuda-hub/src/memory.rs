@@ -2482,6 +2482,9 @@ mod tests {
                     title: None,
                     driver: "claude-sdk".into(),
                     actor: serde_json::json!({"by": "test"}),
+                    chapter_cause: crate::store::OWNER_RESUME_CAUSE.into(),
+                    from_states: &["starting", "running", "paused"],
+                    restart: None,
                 })
                 .await
                 .unwrap()

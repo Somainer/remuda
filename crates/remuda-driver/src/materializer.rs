@@ -197,7 +197,9 @@ impl From<InputOrigin> for LaunchOrigin {
         match value {
             InputOrigin::Human => Self::Human,
             InputOrigin::Bot => Self::Bot,
-            InputOrigin::Agent => Self::Agent,
+            // Hub-written input (the restart notice) carries no operator
+            // authority: like any non-Human, non-Bot caller it is Agent here.
+            InputOrigin::Agent | InputOrigin::Hub => Self::Agent,
         }
     }
 }

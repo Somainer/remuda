@@ -605,6 +605,9 @@ pub async fn restrict_permission(
             spec[CREATOR_PERMISSION_MODE_FIELD] = json!(admitted.creator);
             Ok(())
         }
+        // No device authenticates as the Hub (the `hub` origin is only ever
+        // stamped on Hub-written input, D-057 §6.4): fail closed.
+        InputOrigin::Hub => Err(HubError::Forbidden),
     }
 }
 

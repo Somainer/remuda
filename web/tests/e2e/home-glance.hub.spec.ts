@@ -348,11 +348,12 @@ test.describe("desktop 1280", () => {
       await expect(page.getByTestId("session-list")).toBeVisible({ timeout: 20_000 });
       await createBlockedSession(page);
       await createWorkingSession(page);
-      await page.goto("/sessions");
+      // The count row is owner-global while /sessions is pinned to the active
+      // Space — and the default Space has no sessions, so its list renders the
+      // empty state without the scope switch. Open the list in global scope so
+      // the filtered rows are comparable with the count.
+      await page.goto("/sessions?scope=all");
       await expect(page.getByTestId("session-list")).toBeVisible({ timeout: 20_000 });
-      // The count row is owner-global while the list is pinned to the active
-      // Space; compare like with like by widening the list to every Space.
-      await page.getByTestId("session-scope-all").click();
       await expect(page.getByTestId("session-scope")).toHaveAttribute("data-scope", "all");
 
       const working = page.getByTestId("glance-working");

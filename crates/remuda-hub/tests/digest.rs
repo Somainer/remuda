@@ -5,7 +5,7 @@
 //! redaction, folding). These cases pin what only the Hub wiring can show: the
 //! digest is assembled from real stored rows (journal tail, interaction row,
 //! command ledger, provider supply), and the lineage read predicate admits an
-//! Agent for its own lineage's workers only, without widening `/v1/workers/*`.
+//! Agent for its own lineage's workers only.
 
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
@@ -833,13 +833,15 @@ async fn an_agent_reads_only_its_own_lineages_workers_and_nothing_else_under_wor
         ctx.get(&token_b, "/v1/workers/wkr_unknown/digest").await?.0,
         403
     );
-    // The route family is not widened: roster reads stay refused to Agents.
-    for path in [
-        "/v1/workers".to_string(),
-        format!("/v1/workers/{worker_a}"),
-        format!("/v1/workers/{worker_a}/nudge"),
+    // The roster reads are scope-wide for a `dispatch` holder (ma-admission,
+    // main-agent.md §4.2 item 1); a GET on a mutating verb is still not a
+    // route an Agent may use.
+    for (path, expected) in [
+        ("/v1/workers".to_string(), 200),
+        (format!("/v1/workers/{worker_a}"), 200),
+        (format!("/v1/workers/{worker_a}/nudge"), 403),
     ] {
-        assert_eq!(ctx.get(&token_a, &path).await?.0, 403, "{path}");
+        assert_eq!(ctx.get(&token_a, &path).await?.0, expected, "{path}");
     }
     // A leaf worker holds no `dispatch` grant (project.rs:35), so even its own
     // digest is refused — the same rule as every other scope-wide worker read

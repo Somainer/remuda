@@ -12,7 +12,7 @@ use crate::claude_pty::{
 use crate::driver::{Driver, DriverAck, RunHandle};
 use crate::error::{DriverError, DriverResult};
 use crate::materializer::{
-    BinarySource, LaunchOrigin, MaterializeRequest, SessionAction, materialize,
+    BinarySource, CreatorControl, LaunchOrigin, MaterializeRequest, SessionAction, materialize,
 };
 use crate::profile::{EnvFileSecretBroker, ProviderProfile, SecretBroker};
 use crate::pty_interaction::PtyInteractions;
@@ -71,6 +71,8 @@ pub struct GenericPtyOptions {
     pub binary: BinarySource,
     /// Launch origin.
     pub origin: LaunchOrigin,
+    /// D-057 OA1: the Hub's stamp on an Agent launch's creator.
+    pub creator: CreatorControl,
     /// Isolated Herdr session name.
     pub session_name: String,
     /// Test socket directory (`{dir}/herdr.sock`).
@@ -125,6 +127,7 @@ impl GenericPtyOptions {
             native_home,
             binary,
             origin: LaunchOrigin::default(),
+            creator: CreatorControl::default(),
             session_name: "remuda-test".into(),
             socket_dir: None,
             herdr_binary: None,
@@ -277,9 +280,13 @@ impl GenericPtyDriver {
                 "GenericPtyDriver requires driverKind generic-pty".into(),
             ));
         }
-        // Agent-created PTYs always use the asking preset, including when an
-        // injected request explicitly asks for bypass (D-017).
+        // An Agent-created PTY keeps bypass/dontAsk only when its Agent
+        // creator itself runs with permission control off (D-057 OA1, the
+        // Hub's `creatorPermissionMode` stamp); otherwise it is downgraded to
+        // the asking preset before materialize, including when an injected
+        // request explicitly asks for bypass (D-017).
         if self.options.origin == LaunchOrigin::Agent
+            && self.options.creator != CreatorControl::Off
             && let remuda_protocol::PermissionMode::Claude(permission) = &mut spec.permission_mode
             && matches!(
                 permission.mode,
@@ -308,6 +315,7 @@ impl GenericPtyDriver {
             binary,
             setting_sources: None,
             origin: self.options.origin,
+            creator: self.options.creator,
             native_home_managed: None,
             settings_overlay_path: None,
             secret_policy: None,
@@ -320,6 +328,7 @@ impl GenericPtyDriver {
             preset,
             &spec.permission_mode,
             self.options.origin,
+            self.options.creator,
         );
         let agent_name = agent_name_for(&spec);
         if let Some(flag) = preset.name_flag {

@@ -76,6 +76,19 @@ pub(crate) struct DispatchArgs {
     /// Requires `--api-via`.
     #[arg(long = "api-route")]
     api_route: Option<String>,
+    /// Worker permission mode, a word of the harness's own vocabulary
+    /// (claude: manual, auto, acceptEdits, plan, dontAsk, bypassPermissions;
+    /// codex: untrusted, on-request, never; grok: native-prompt, auto,
+    /// always-approve). Omitted, a dispatch from a person keeps the dispatch
+    /// default and an Agent seat's worker inherits the seat's own mode; an
+    /// Agent may name a mode that switches the harness's permission control
+    /// off only when it runs with that control off itself (D-057 OA1).
+    #[arg(long = "permission-mode", value_name = "MODE")]
+    permission_mode: Option<String>,
+    /// Retry a dispatch the owner approved: the `interactionId` the first
+    /// attempt returned (D-017). The request must be the same one.
+    #[arg(long = "approval-id", value_name = "INTERACTION_ID")]
+    approval_id: Option<String>,
 }
 
 impl Entrypoint for DispatchArgs {
@@ -85,7 +98,10 @@ impl Entrypoint for DispatchArgs {
 }
 
 async fn run(args: DispatchArgs) -> anyhow::Result<i32> {
-    let client = args.hub.connect()?;
+    let client = args
+        .hub
+        .connect()?
+        .with_approval(args.approval_id.clone(), false);
     super::capability::validate_requested(&args.capabilities)?;
     if super::capability::requests_computer_use(&args.capabilities) {
         // D-045 Q4: dispatch workers are bot-originated and run unattended
@@ -142,7 +158,7 @@ async fn run(args: DispatchArgs) -> anyhow::Result<i32> {
         .map(|stem| stem.to_string_lossy().into_owned());
     // D-045: dispatch refuses every computer-use grant above, so no host
     // preflight is reachable here; the Hub repeats the refusal server-side.
-    let body = json!({
+    let mut body = json!({
         "projectId": args.project,
         "brief": content,
         "briefName": brief_name,
@@ -158,6 +174,13 @@ async fn run(args: DispatchArgs) -> anyhow::Result<i32> {
         "apiVia": args.api_via,
         "apiRoute": args.api_route,
     });
+    // D-057 §4.2 item 2: the mode travels only when named, so a dispatch
+    // without it sends exactly the body it always did and the Hub applies
+    // its own default (Human) or the creator rule (Agent). The CLI never
+    // chooses a mode itself.
+    if let Some(mode) = &args.permission_mode {
+        body["permissionMode"] = json!(mode);
+    }
     let value = client
         .post("/v1/workers/dispatch", &body)
         .await

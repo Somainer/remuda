@@ -73,6 +73,7 @@ fn recipe(
     let spec = spec(driver, kind, args);
     let profile = anthropic();
     materialize(&MaterializeRequest {
+        creator: remuda_driver::CreatorControl::default(),
         spec: &spec,
         profile: &profile,
         launch_dir: tmp.path().join("launch"),
@@ -251,6 +252,7 @@ fn a_native_resume_renders_its_own_system_prompt() {
         let spec = spec(driver, AgentKind::Claude, &[]);
         let profile = anthropic();
         materialize(&MaterializeRequest {
+            creator: remuda_driver::CreatorControl::default(),
             spec: &spec,
             profile: &profile,
             launch_dir: tmp.path().join("launch"),
@@ -467,6 +469,7 @@ async fn shell_pty_writes_the_block_once_and_none_on_a_native_resume() {
             workspace.clone(),
             AgentKind::Codex,
             AgentLaunch {
+                creator: remuda_driver::CreatorControl::default(),
                 profile: Box::new(ProviderProfile {
                     kind: ProviderKind::OpenaiResponses,
                     ..anthropic()

@@ -78,6 +78,8 @@ pub struct AgentLaunch {
     pub binary: Option<PathBuf>,
     /// Who asked for this launch. Gates yolo argv (D-011/D-017).
     pub origin: crate::materializer::LaunchOrigin,
+    /// D-057 OA1: the Hub's stamp on an Agent launch's creator.
+    pub creator: crate::materializer::CreatorControl,
     /// Whether `native_home` is Remuda-managed (skill delivery allowed) or the
     /// inherited operator home, which is never written (D-045).
     pub native_home_managed: bool,
@@ -133,6 +135,7 @@ pub fn agent_recipe(
         binary,
         setting_sources: None,
         origin: launch.origin,
+        creator: launch.creator,
         native_home_managed: Some(launch.native_home_managed),
         settings_overlay_path: launch.settings_overlay.clone(),
         secret_policy: None,

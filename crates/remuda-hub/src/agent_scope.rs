@@ -314,11 +314,8 @@ fn glance_read_target(path: &str) -> Option<&str> {
     (!id.is_empty() && !id.contains('/')).then_some(id)
 }
 
-/// `GET /v1/workers/{id}/digest` (cb-digest): the ONLY `/v1/workers/*` shape an
-/// Agent may read. It is admitted under the lineage read predicate (see
-/// [`agent_owns_worker`]), not by widening the worker routes: every other
-/// `/v1/workers/*` path, `GET /v1/workers` and `GET /v1/workers/{id}` included,
-/// stays behind the Agent refusal.
+/// `GET /v1/workers/{id}/digest` (cb-digest): admitted under the lineage read
+/// predicate (see [`agent_owns_worker`]), not as a scope-wide worker read.
 pub(crate) fn digest_read_target(path: &str) -> Option<&str> {
     let id = path.strip_prefix("/v1/workers/")?.strip_suffix("/digest")?;
     (!id.is_empty() && !id.contains('/')).then_some(id)
@@ -357,6 +354,71 @@ async fn agent_owns_worker(
         }
     }
     Ok(false)
+}
+
+/// D-057 §4.2 item 1: the worker reads an Agent may make, scope-wide (the
+/// handlers require `dispatch` and filter by project scope): `GET /v1/workers`
+/// and `GET /v1/workers/{id}`.
+fn worker_read_target(path: &str) -> bool {
+    path == "/v1/workers"
+        || path
+            .strip_prefix("/v1/workers/")
+            .is_some_and(|id| !id.is_empty() && !id.contains('/') && id != "dispatch")
+}
+
+/// D-057 §4.2 item 1: the worker POSTs an Agent may make. `dispatch` and
+/// `observe` are scope-wide; every per-worker verb is a mutation, and its
+/// handler also requires the worker in the caller's lineage subtree
+/// ([`require_worker_owned`]).
+fn worker_write_target(path: &str) -> bool {
+    if path == "/v1/workers/dispatch" || path == "/v1/workers/observe" {
+        return true;
+    }
+    path.strip_prefix("/v1/workers/")
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(id, verb)| {
+            !id.is_empty()
+                && matches!(
+                    verb,
+                    "retire"
+                        | "state"
+                        | "brief"
+                        | "nudge"
+                        | "answer"
+                        | "switch-model"
+                        | "resume"
+                        | "replace"
+                        | "stop"
+                )
+        })
+}
+
+/// D-057 §4.2 item 1: an Agent mutates only a worker whose instance is in its
+/// lineage subtree, so it can never stop, answer or respawn a worker the
+/// owner dispatched by hand in the same project (`resolve_worker` checks
+/// project scope only). Human and Bot callers are unchanged.
+pub async fn require_worker_owned(
+    state: &AppState,
+    device: &Device,
+    worker: &remuda_protocol::WorkerRoster,
+) -> Result<(), HubError> {
+    if origin(device) != InputOrigin::Agent {
+        return Ok(());
+    }
+    let caller = device.instance_id.as_deref().ok_or(HubError::Forbidden)?;
+    let Some(instance) = worker.instance_id.as_ref() else {
+        return Err(HubError::not_owner());
+    };
+    if state
+        .store
+        .lineage_subtree_owns(caller.to_string(), instance.as_id().to_string())
+        .await
+        .map_err(crate::http::map_store)?
+    {
+        Ok(())
+    } else {
+        Err(HubError::not_owner())
+    }
 }
 
 /// Whether an Agent device's bound instance belongs to `lineage_id`.
@@ -493,20 +555,134 @@ pub async fn same_host(state: &AppState, device: &Device, host: &str) -> Result<
     Ok(instance.host_id == host)
 }
 
-/// Agent launches retain only manual or plan permissions on every create path.
-pub fn restrict_permission(device: &Device, spec: &mut Value) -> Result<(), HubError> {
-    if origin(device) != remuda_protocol::InputOrigin::Human && spec["permissionMode"].is_null() {
-        spec["permissionMode"] = json!("manual");
+/// D-057 OA1, the Hub half of "never beyond the creator", on every create
+/// path (instance create, fleet, dispatch, worker respawn).
+///
+/// - Every origin: a body-supplied `creatorPermissionMode` or
+///   `permissionModeRequested` is stripped; both are Hub-written.
+/// - Human: unchanged.
+/// - Bot: unchanged (an omitted mode is `manual`; the Node refuses every
+///   control-off mode, D-011).
+/// - Agent: the mode is admitted against the creator chapter's effective mode
+///   as recorded on its instance ([`admit_agent_mode`]), or was admitted
+///   already by a path that decides before allocating. The spec gets the
+///   effective mode, the requested word verbatim (D-035), and the creator's
+///   mode as `creatorPermissionMode`: the store re-reads it at the create's
+///   commit point and the forward stamps it on the Node-facing params.
+pub async fn restrict_permission(
+    state: &AppState,
+    device: &Device,
+    mode: ModeAdmission<'_>,
+    spec: &mut Value,
+) -> Result<(), HubError> {
+    use remuda_protocol::creator_permission::CREATOR_PERMISSION_MODE_FIELD;
+    if let Some(object) = spec.as_object_mut() {
+        object.remove(CREATOR_PERMISSION_MODE_FIELD);
+        object.remove(PERMISSION_MODE_REQUESTED_FIELD);
     }
-    if origin(device) == InputOrigin::Agent
-        && !matches!(spec["permissionMode"].as_str(), Some("manual" | "plan"))
-    {
-        return Err(HubError::operator_field(
-            "Agent launches may only use permissionMode `manual` or `plan`; do not retry the \
-             same spec — relaunch with one of those, or ask the owner to launch it",
-        ));
+    match origin(device) {
+        InputOrigin::Human => Ok(()),
+        InputOrigin::Bot => {
+            if spec["permissionMode"].is_null() {
+                spec["permissionMode"] = json!("manual");
+            }
+            Ok(())
+        }
+        InputOrigin::Agent => {
+            let admitted = match mode {
+                ModeAdmission::Request(requested) => {
+                    let kind = spec
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .unwrap_or("claude")
+                        .to_string();
+                    admit_agent_mode(state, device, &kind, requested).await?
+                }
+                ModeAdmission::Admitted(admitted) => admitted.clone(),
+            };
+            spec["permissionMode"] = json!(admitted.effective);
+            spec[PERMISSION_MODE_REQUESTED_FIELD] = json!(admitted.requested);
+            spec[CREATOR_PERMISSION_MODE_FIELD] = json!(admitted.creator);
+            Ok(())
+        }
     }
-    Ok(())
+}
+
+/// How a create path hands its permission mode to [`restrict_permission`].
+#[derive(Clone, Copy, Debug)]
+pub enum ModeAdmission<'a> {
+    /// The caller's word verbatim (`None` when omitted); an Agent's is
+    /// admitted by the creator rule here.
+    Request(Option<&'a str>),
+    /// Already admitted before any allocation (dispatch, worker respawn), so
+    /// the commit-point re-read compares against the mode read back then.
+    Admitted(&'a AdmittedMode),
+}
+
+/// An Agent create's mode, admitted under the creator rule (D-057 OA1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdmittedMode {
+    /// The caller's word verbatim; `None` when omitted (inherited).
+    pub requested: Option<String>,
+    /// The mode the child launches with.
+    pub effective: &'static str,
+    /// The creator chapter's effective mode at admission: the stamp the
+    /// commit point re-checks and the Node reads.
+    pub creator: &'static str,
+}
+
+/// D-057 OA1: admit an Agent's `requested` mode (verbatim, `None` when
+/// omitted) for a `kind` child under the caller's own recorded mode.
+pub async fn admit_agent_mode(
+    state: &AppState,
+    device: &Device,
+    kind: &str,
+    requested: Option<&str>,
+) -> Result<AdmittedMode, HubError> {
+    let creator = creator_permission_mode(state, device).await?;
+    let effective = remuda_protocol::creator_permission::admit(kind, requested, creator)
+        .map_err(permission_refusal)?;
+    Ok(AdmittedMode {
+        requested: requested.map(str::to_string),
+        effective,
+        creator,
+    })
+}
+
+/// Spec key recording an Agent create's requested mode verbatim (D-035); the
+/// effective mode is `permissionMode`. `null` means the mode was omitted and
+/// inherited from the creator.
+pub const PERMISSION_MODE_REQUESTED_FIELD: &str = "permissionModeRequested";
+
+/// D-057 OA1: the Agent caller's own effective permission mode, as recorded
+/// on its chapter (`permissionEffective`, else the mode its launch ran).
+pub async fn creator_permission_mode(
+    state: &AppState,
+    device: &Device,
+) -> Result<&'static str, HubError> {
+    let id = device.instance_id.as_deref().ok_or(HubError::Forbidden)?;
+    let creator = state
+        .store
+        .get_instance(id.to_string())
+        .await?
+        .ok_or_else(HubError::stale_caller)?;
+    let spec = state
+        .store
+        .get_instance_spec_json(id.to_string())
+        .await?
+        .unwrap_or(Value::Null);
+    Ok(remuda_protocol::creator_permission::recorded_mode(
+        &creator.kind,
+        &spec,
+    ))
+}
+
+/// 403 with the creator rule's reason and the vocabulary to pick from.
+pub fn permission_refusal(refusal: remuda_protocol::creator_permission::Refusal) -> HubError {
+    HubError::ForbiddenReason(refusal.to_string()).with_next(
+        refusal.reason(),
+        crate::error::NextStep::new(crate::error::action::FIX_REQUEST, refusal.hint()),
+    )
 }
 
 /// Agent callers may not choose their own argv or executable.
@@ -533,17 +709,47 @@ pub fn restrict_launch_overrides(device: &Device, spec: &Value) -> Result<(), Hu
     Ok(())
 }
 
+/// How a create path decides its D-017 one-shot human approval.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CreateApproval {
+    /// `prepare_create` asks on the finished spec (instance create).
+    OnSpec,
+    /// The caller already decided it before any allocation, on a request
+    /// derived from its own body (dispatch and worker respawn, main-agent.md
+    /// §4.2 item 4).
+    Decided,
+}
+
+/// What a create path hands [`prepare_create`].
+#[derive(Clone, Copy, Debug)]
+pub struct CreateAdmission<'a> {
+    /// Resolved host.
+    pub host: &'a str,
+    /// Resolved driver.
+    pub driver: &'a str,
+    /// The caller's permission mode, or the mode already admitted for it
+    /// ([`restrict_permission`]).
+    pub mode: ModeAdmission<'a>,
+    /// Where the D-017 approval is decided.
+    pub approval: CreateApproval,
+}
+
 pub async fn prepare_create(
     state: &AppState,
     headers: &HeaderMap,
     device: &Device,
-    host: &str,
-    driver: &str,
+    admission: CreateAdmission<'_>,
     spec: &mut Value,
 ) -> Result<(), HubError> {
+    let CreateAdmission {
+        host,
+        driver,
+        mode,
+        approval,
+    } = admission;
     stamp(spec, device);
     spec["parentInstanceId"] = json!(device.instance_id);
-    restrict_permission(device, spec)?;
+    restrict_permission(state, device, mode, spec).await?;
     restrict_launch_overrides(device, spec)?;
     if origin(device) == remuda_protocol::InputOrigin::Agent {
         // §2.4/§2.5: the chosen host and workspace must be inside the
@@ -568,9 +774,10 @@ pub async fn prepare_create(
         {
             return Err(HubError::out_of_scope());
         }
-        if !same_host(state, device, host).await?
-            || shell_driver(driver)
-            || headers.contains_key("x-remuda-require-approval")
+        if approval == CreateApproval::OnSpec
+            && (!same_host(state, device, host).await?
+                || shell_driver(driver)
+                || headers.contains_key("x-remuda-require-approval"))
         {
             require_approval(
                 state,
@@ -910,6 +1117,9 @@ pub async fn restrict_agent_routes(
                     || project_read_target(path)
                     || task_read_target(request.method(), path)
                     || path == "/v1/instances"
+                    // D-057 §4.2 item 1: scope-wide worker reads; the
+                    // handlers require `dispatch` and project scope.
+                    || worker_read_target(path)
                     // D-045: `remuda hostcap` is the coordinator's pre-dispatch
                     // host fact, and a launched coordinator is always agent
                     // origin. `GET /v1/hosts/{id}` is operator-only, so this is
@@ -952,6 +1162,10 @@ pub async fn restrict_agent_routes(
                     || (path.starts_with("/v1/projects/") && path.ends_with("/members"))
                     // Batch 6 gate-queue enqueue/cancel POSTs.
                     || project_write_target(path)
+                    // D-057 §4.2 item 1: dispatch, observe and the
+                    // per-worker verbs. Handlers keep `dispatch` + project
+                    // scope and add lineage-subtree ownership for mutations.
+                    || worker_write_target(path)
                     || task_write_target(request.method(), path))
                 || request.method() == axum::http::Method::PATCH
                     && (project_write_target(path) || task_write_target(request.method(), path))
@@ -1011,6 +1225,49 @@ mod tests {
         assert!(!hostcap_read_target("/v1/hosts//hostcap"));
         // A different route with the same suffix is not it.
         assert!(!hostcap_read_target("/v1/workers/wkr_1/hostcap"));
+    }
+
+    #[test]
+    fn worker_route_shapes_admitted_for_agents() {
+        for path in ["/v1/workers", "/v1/workers/wkr_1", "/v1/workers/w1"] {
+            assert!(worker_read_target(path), "{path}");
+        }
+        for path in [
+            "/v1/workers/",
+            "/v1/workers/wkr_1/digest",
+            "/v1/workers/wkr_1/nudge",
+            "/v1/workersx",
+            "/v1/workers/dispatch",
+        ] {
+            assert!(!worker_read_target(path), "{path}");
+        }
+        for verb in [
+            "retire",
+            "state",
+            "brief",
+            "nudge",
+            "answer",
+            "switch-model",
+            "resume",
+            "replace",
+            "stop",
+        ] {
+            assert!(
+                worker_write_target(&format!("/v1/workers/w1/{verb}")),
+                "{verb}"
+            );
+        }
+        assert!(worker_write_target("/v1/workers/dispatch"));
+        assert!(worker_write_target("/v1/workers/observe"));
+        for path in [
+            "/v1/workers/w1/digest",
+            "/v1/workers/w1/delete",
+            "/v1/workers//nudge",
+            "/v1/workers/w1",
+            "/v1/workers",
+        ] {
+            assert!(!worker_write_target(path), "{path}");
+        }
     }
 
     #[test]

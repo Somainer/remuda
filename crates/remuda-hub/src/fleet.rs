@@ -360,7 +360,19 @@ async fn create_fleet(
     }
     crate::agent_scope::stamp(&mut spec, &device);
     spec["parentInstanceId"] = json!(device.instance_id);
-    crate::agent_scope::restrict_permission(&device, &mut spec)?;
+    // D-057 OA1: the fleet spec is the caller's body, so its own
+    // `permissionMode` is the requested word.
+    let requested_mode = spec
+        .get("permissionMode")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    crate::agent_scope::restrict_permission(
+        &state,
+        &device,
+        crate::agent_scope::ModeAdmission::Request(requested_mode.as_deref()),
+        &mut spec,
+    )
+    .await?;
     if crate::agent_scope::origin(&device) == remuda_protocol::InputOrigin::Agent {
         let mut approval_required = headers.contains_key("x-remuda-require-approval")
             || crate::agent_scope::shell_driver(&driver);

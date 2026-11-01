@@ -64,6 +64,7 @@ fn request<'a>(
     binary: &'a Path,
 ) -> MaterializeRequest<'a> {
     MaterializeRequest {
+        creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
         spec,
         profile: Box::leak(Box::new(profile())),
@@ -323,6 +324,7 @@ fn granted_skill_tree_in_a_shared_home_is_native_store_lifetime() {
     grant(&mut spec);
 
     let recipe = materialize(&MaterializeRequest {
+        creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
         spec: &spec,
         profile: Box::leak(Box::new(profile())),

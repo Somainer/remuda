@@ -273,6 +273,8 @@ impl Ctx {
     async fn seed_worker(&self, name: &str, task: Option<&str>) -> remuda_protocol::WorkerRoster {
         let now = Timestamp::try_from("2026-01-01T00:00:00.000Z".to_string()).unwrap();
         let worker = WorkerRoster {
+            permission_mode: None,
+            permission_mode_requested: None,
             meta: EntityMeta {
                 id: WorkerRosterId::new(),
                 revision: U64(1),

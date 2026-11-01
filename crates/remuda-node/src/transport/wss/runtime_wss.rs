@@ -405,6 +405,7 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
         }
     };
     let mut request = CreateInstanceRequest {
+        creator_permission_mode: None,
         origin: crate::origin::wire_origin(params),
         initiator: crate::origin::wire_initiator(params),
         agent_credential: params
@@ -475,6 +476,8 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
     // D-060: the Hub-stamped memory rides the top level of the params, for
     // create and resume alike; never read from `spec`.
     request.take_memory_context(params);
+    // D-057 OA1: likewise the creator stamp, top level only.
+    request.take_creator_permission_mode(params);
     Ok(request)
 }
 

@@ -81,6 +81,8 @@ pub struct ClaudePtyOptions {
     pub binary: BinarySource,
     /// Launch origin; bot/dispatcher cannot request bypass (D-011).
     pub origin: LaunchOrigin,
+    /// D-057 OA1: the Hub's stamp on an Agent launch's creator.
+    pub creator: crate::materializer::CreatorControl,
     /// Isolated Herdr session name. Never `"default"` unless explicit.
     pub session_name: String,
     /// If set, API socket is `{socket_dir}/herdr.sock` (tests bind fake-herdr here).
@@ -148,6 +150,7 @@ impl ClaudePtyOptions {
             native_home,
             binary,
             origin: LaunchOrigin::default(),
+            creator: crate::materializer::CreatorControl::default(),
             session_name: "remuda-test".into(),
             socket_dir: None,
             herdr_binary: None,
@@ -344,6 +347,7 @@ impl ClaudePtyDriver {
             binary: self.options.binary.clone(),
             setting_sources: self.options.setting_sources.clone(),
             origin: self.options.origin,
+            creator: self.options.creator,
             native_home_managed: Some(!self.options.inherit_default_config),
             settings_overlay_path: self.options.settings_overlay_path.clone(),
             secret_policy: None,

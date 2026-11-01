@@ -6,6 +6,7 @@
 mod macros;
 mod binary;
 mod capabilities;
+pub mod creator_permission;
 mod digest;
 mod effort;
 mod entities;

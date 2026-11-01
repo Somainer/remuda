@@ -10,6 +10,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use remuda_protocol::creator_permission::CREATOR_PERMISSION_MODE_FIELD;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -228,7 +229,7 @@ const RESUME_IDEMPOTENCY_WINDOW: Duration = Duration::from_secs(60);
 /// Claude prunes its own transcripts, and a `--resume` against a pruned
 /// session starts an empty conversation that merely looks continuous. The
 /// cutoff keeps that failure visible instead of silent (D-026).
-const RESUME_MAX_AGE_DAYS: i64 = 30;
+pub(crate) const RESUME_MAX_AGE_DAYS: i64 = 30;
 
 /// REST routes (login, hosts, instances, journal). Placement/fleet merge later.
 pub fn routes() -> Router<crate::AppState> {
@@ -1750,8 +1751,14 @@ pub async fn create_instance(
         &state,
         &headers,
         &device,
-        &host.host_id,
-        &driver,
+        crate::agent_scope::CreateAdmission {
+            host: &host.host_id,
+            driver: &driver,
+            // D-057 OA1: the body's own word, not a project posture default
+            // merged above — an Agent that names no mode inherits its own.
+            mode: crate::agent_scope::ModeAdmission::Request(body.permission_mode.as_deref()),
+            approval: crate::agent_scope::CreateApproval::OnSpec,
+        },
         &mut spec,
     )
     .await?;
@@ -2680,7 +2687,7 @@ impl ResumeMode {
 }
 
 /// Whole days between `updated_at` and now; `None` when unparseable.
-fn resume_age_days(updated_at: &str) -> Option<i64> {
+pub(crate) fn resume_age_days(updated_at: &str) -> Option<i64> {
     let then =
         time::OffsetDateTime::parse(updated_at, &time::format_description::well_known::Rfc3339)
             .ok()?;
@@ -2699,7 +2706,7 @@ fn resume_window_index() -> u64 {
 
 /// Journal one side of the parent/child resume link, best effort.
 #[allow(clippy::too_many_arguments)]
-async fn journal_resume_link(
+pub(crate) async fn journal_resume_link(
     state: &AppState,
     host_id: &str,
     instance_id: &str,
@@ -4599,8 +4606,10 @@ pub(crate) async fn forward_if_online(
     // spec) is stripped from every forwarded frame before the Hub's own is
     // stamped below.
     object.remove("memoryContext");
+    object.remove(CREATOR_PERMISSION_MODE_FIELD);
     if let Some(spec) = object.get_mut("spec").and_then(Value::as_object_mut) {
         spec.remove("memoryContext");
+        spec.remove(CREATOR_PERMISSION_MODE_FIELD);
     }
     if command.operation == "instance.send"
         && let Some(rev) = state
@@ -4643,6 +4652,22 @@ pub(crate) async fn forward_if_online(
             }
             crate::memory::ChapterMemory::Withheld { .. }
             | crate::memory::ChapterMemory::NotApplicable => {}
+        }
+        // D-057 OA1: an Agent-origin create carries its creator's mode, as
+        // committed on the instance row at the create's commit point — never
+        // a value from the command payload.
+        if object.get("origin").and_then(Value::as_str) == Some("agent")
+            && let Some(stamp) = state
+                .store
+                .get_instance_spec_json(instance_id.clone())
+                .await?
+                .and_then(|spec| {
+                    spec.get(CREATOR_PERMISSION_MODE_FIELD)
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+        {
+            object.insert(CREATOR_PERMISSION_MODE_FIELD.into(), json!(stamp));
         }
         let token =
             crate::agent_scope::instance_token(state.store.clone(), instance_id.clone()).await?;
@@ -5115,6 +5140,19 @@ pub(crate) fn map_store(err: crate::store::StoreError) -> HubError {
         }
         crate::store::StoreError::Conflict(msg) => HubError::Conflict(msg.clone()),
         crate::store::StoreError::Fenced => HubError::Fenced,
+        crate::store::StoreError::CreatorModeChanged { stamped, now } => {
+            HubError::Conflict(format!(
+                "the creator's permission mode changed from {stamped} to {now} while this \
+                 create was being prepared; nothing was launched (D-057 OA1)"
+            ))
+            .with_next(
+                "creator-mode-changed",
+                crate::error::NextStep::new(
+                    crate::error::action::RETRY_SAME_COMMAND,
+                    "retry the same request: it is admitted again under the creator's current mode",
+                ),
+            )
+        }
         crate::store::StoreError::Forbidden(_) => HubError::Forbidden,
         crate::store::StoreError::Id(msg) => HubError::BadRequest(msg.clone()),
         other => HubError::Store(other.clone_as_internal()),

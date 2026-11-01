@@ -15,10 +15,13 @@ pub mod action {
     pub const AWAIT_APPROVAL: &str = "await-approval";
     /// Outcome unknown: read the command state before deciding (D-055).
     pub const READ_THEN_DECIDE: &str = "read-then-decide";
-    // D-060 §9.1 also defines `retry-same-command` and `stop`. No refusal in
-    // this crate emits them yet (NODE_BUSY is retried by `code`, and the
-    // D-057 `fenced` refusals live in the writer path), so they are documented
-    // in protocol §9.1 rather than declared unused here.
+    /// Nothing ran; the same request may simply be sent again (D-057 OA1
+    /// `creator-mode-changed`).
+    pub const RETRY_SAME_COMMAND: &str = "retry-same-command";
+    // D-060 §9.1 also defines `stop`. No refusal in this crate emits it yet
+    // (NODE_BUSY is retried by `code`, and the D-057 `fenced` refusals live in
+    // the writer path), so it is documented in protocol §9.1 rather than
+    // declared unused here.
     /// The request itself is wrong.
     pub const FIX_REQUEST: &str = "fix-request";
 }

@@ -4403,6 +4403,7 @@ mod tests {
             workspace.clone(),
             AgentKind::Codex,
             AgentLaunch {
+                creator: crate::materializer::CreatorControl::default(),
                 profile: Box::new(crate::profile::ProviderProfile {
                     id: spec.provider_profile.id.clone(),
                     kind: ProviderKind::OpenaiResponses,
@@ -4442,7 +4443,7 @@ mod tests {
         // The fake creates the rollout under the shadow CODEX_HOME; read the
         // real thread id the production adapter will bind to.
         let rollout = r25_wait_rollout(&instance_dir).await;
-        let session_id = r25_session_id(&rollout);
+        let session_id = r25_session_id(&rollout).await;
 
         // Step 1: the FIRST run's production adapter tails the real file.
         r25_append_turn(&rollout, &session_id, "r25-pre-turn", 7, 1_000);
@@ -4569,15 +4570,32 @@ mod tests {
     }
 
     /// Read the thread id from a rollout's `session_meta` header.
-    fn r25_session_id(rollout: &Path) -> String {
-        let first = std::fs::read_to_string(rollout).expect("rollout readable");
-        let line = first.lines().next().expect("session_meta header");
-        let record: serde_json::Value = serde_json::from_str(line).expect("meta parses");
-        record
-            .pointer("/payload/id")
-            .and_then(serde_json::Value::as_str)
-            .expect("session_meta carries the thread id")
-            .to_owned()
+    ///
+    /// The rollout exists as soon as the fake opens it, but its header is
+    /// written in several `write` calls (an unbuffered `writeln!` of a JSON
+    /// value), so a read that lands between them sees a torn line. Wait for
+    /// the first newline-terminated line, exactly as the production tailer
+    /// only consumes complete lines; the deadline only bounds a failure.
+    async fn r25_session_id(rollout: &Path) -> String {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let content = std::fs::read_to_string(rollout).expect("rollout readable");
+            if let Some((line, _)) = content.split_once('\n') {
+                let record: serde_json::Value = serde_json::from_str(line).expect("meta parses");
+                return record
+                    .pointer("/payload/id")
+                    .and_then(serde_json::Value::as_str)
+                    .expect("session_meta carries the thread id")
+                    .to_owned();
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "the rollout {} never got a complete session_meta line: {content:?}",
+                    rollout.display()
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 
     /// Append one real codex turn to the rollout: a `token_usage_record`
@@ -4892,6 +4910,7 @@ mod tests {
             dir.path().to_path_buf(),
             AgentKind::Claude,
             AgentLaunch {
+                creator: crate::materializer::CreatorControl::default(),
                 profile: Box::new(crate::profile::ProviderProfile {
                     id: spec.provider_profile.id.clone(),
                     kind: ProviderKind::Anthropic,
@@ -5148,6 +5167,7 @@ mod tests {
             workspace.clone(),
             AgentKind::Claude,
             AgentLaunch {
+                creator: crate::materializer::CreatorControl::default(),
                 profile: Box::new(crate::profile::ProviderProfile {
                     id: spec.provider_profile.id.clone(),
                     kind: ProviderKind::Anthropic,
@@ -5334,6 +5354,7 @@ mod tests {
             dir.path().to_path_buf(),
             AgentKind::Claude,
             AgentLaunch {
+                creator: crate::materializer::CreatorControl::default(),
                 profile: Box::new(crate::profile::ProviderProfile {
                     id: spec.provider_profile.id.clone(),
                     kind: ProviderKind::Anthropic,
@@ -5439,6 +5460,7 @@ mod tests {
                 dir.path().to_path_buf(),
                 AgentKind::Claude,
                 AgentLaunch {
+                    creator: crate::materializer::CreatorControl::default(),
                     profile: Box::new(crate::profile::ProviderProfile {
                         id: spec.provider_profile.id.clone(),
                         kind: ProviderKind::Anthropic,
@@ -5625,6 +5647,7 @@ mod tests {
                 dir.path().to_path_buf(),
                 AgentKind::Claude,
                 AgentLaunch {
+                    creator: crate::materializer::CreatorControl::default(),
                     profile: Box::new(crate::profile::ProviderProfile {
                         id: spec.provider_profile.id.clone(),
                         kind: ProviderKind::Anthropic,
@@ -5812,6 +5835,7 @@ mod tests {
             dir.path().to_path_buf(),
             AgentKind::Claude,
             AgentLaunch {
+                creator: crate::materializer::CreatorControl::default(),
                 profile: Box::new(crate::profile::ProviderProfile {
                     id: spec.provider_profile.id.clone(),
                     kind: ProviderKind::Anthropic,
@@ -5951,6 +5975,7 @@ mod tests {
             dir.path().to_path_buf(),
             AgentKind::Claude,
             AgentLaunch {
+                creator: crate::materializer::CreatorControl::default(),
                 profile: Box::new(crate::profile::ProviderProfile {
                     id: spec.provider_profile.id.clone(),
                     kind: ProviderKind::Anthropic,
@@ -7857,6 +7882,7 @@ mod tests {
             dir.path().to_path_buf(),
             AgentKind::Codex,
             AgentLaunch {
+                creator: crate::materializer::CreatorControl::default(),
                 profile: Box::new(crate::profile::ProviderProfile {
                     id: spec.provider_profile.id.clone(),
                     kind: ProviderKind::OpenaiResponses,

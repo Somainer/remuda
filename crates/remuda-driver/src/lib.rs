@@ -96,8 +96,9 @@ pub use launch::{
     runtime_socket_limit, shim_disabled,
 };
 pub use materializer::{
-    BinarySource, LaunchOrigin, MaterializeRequest, SessionAction, TokenBrokerBind, materialize,
-    materialize_with_token_broker, pinned_model_for, render_api_key_helper_script,
+    BinarySource, CreatorControl, LaunchOrigin, MaterializeRequest, SessionAction, TokenBrokerBind,
+    control_off_allowed, materialize, materialize_with_token_broker, pinned_model_for,
+    render_api_key_helper_script,
 };
 pub use memory_context::{APPEND_SYSTEM_PROMPT, MemoryContext, RecipeMemory};
 pub use presets::{KindPreset, PRESETS, merge_yolo_argv, preset_by_id, preset_for_spec};

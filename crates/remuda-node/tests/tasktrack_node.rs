@@ -139,6 +139,7 @@ async fn start_in(root: PathBuf, _dir: Option<tempfile::TempDir>) -> Run {
         .expect("dev node");
 
     let request = CreateInstanceRequest {
+        creator_permission_mode: None,
         memory_context: None,
         initiator: None,
         origin: InputOrigin::Human,

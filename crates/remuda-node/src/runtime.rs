@@ -3246,6 +3246,8 @@ fn set_command_origin(command: &mut Command, origin: remuda_protocol::InputOrigi
         remuda_protocol::InputOrigin::Human => ActorType::Human,
         remuda_protocol::InputOrigin::Bot => ActorType::Bot,
         remuda_protocol::InputOrigin::Agent => ActorType::Agent,
+        // D-057 §6.4: Hub-written input (the restart notice).
+        remuda_protocol::InputOrigin::Hub => ActorType::System,
     };
 }
 

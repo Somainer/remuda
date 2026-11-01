@@ -395,10 +395,10 @@ async fn an_owner_input_turn_records_origin_human_on_the_dispatch() -> Result<()
 }
 
 /// A turn the carrier starts with no new input continues the last input as
-/// `agent` + `native`; an input the Hub authored is `agent` + `hub`. Neither
-/// ever reads as human.
+/// `agent` + `native`; an input the Hub authored is `hub` + `hub` (D-057
+/// §6.4). Neither ever reads as human.
 #[tokio::test]
-async fn continuation_and_fact_turns_record_origin_agent_with_continuation() -> Result<()> {
+async fn continuation_and_hub_turns_record_their_own_origins() -> Result<()> {
     let (ctx, mut node) = Ctx::boot().await?;
     let (seat, token) = ctx.seat(&mut node, "main").await?;
     let owner = ctx.owner_turn(&mut node, &seat).await;
@@ -421,7 +421,8 @@ async fn continuation_and_fact_turns_record_origin_agent_with_continuation() -> 
     );
 
     // A Hub-authored input (no caller origin, no initiator), the shape a
-    // delivered fact or wake-up takes, starts the next turn.
+    // delivered fact or wake-up takes, starts the next turn: it records the
+    // real `hub` origin (D-057 §6.4, ma-restart).
     let (fact, _) = ctx
         .hub
         .store()
@@ -449,7 +450,7 @@ async fn continuation_and_fact_turns_record_origin_agent_with_continuation() -> 
     .await;
     ctx.turn_starts(&node, &seat, &fact.command_id).await;
     let (child, params) = ctx.dispatch(&mut node, &token).await;
-    let expected = root_turn(&fact.command_id, "agent", "hub");
+    let expected = root_turn(&fact.command_id, "hub", "hub");
     assert_eq!(
         ctx.dispatch_audit(&child).await["initiator"]["rootTurn"],
         expected
@@ -646,7 +647,7 @@ async fn an_authorization_decision_is_identical_with_and_without_root_turn() -> 
     let params = node.next("instance.create").await;
     assert_eq!(
         params["initiator"]["rootTurn"],
-        root_turn(&fact.command_id, "agent", "hub"),
+        root_turn(&fact.command_id, "hub", "hub"),
         "the replay itself records the turn it was made in"
     );
     Ok(())

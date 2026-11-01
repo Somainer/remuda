@@ -1689,7 +1689,7 @@ export type InputAccounting = ("total-including-cache" | "uncached" | "provider-
 export type InputDelivery = ("stdio" | "tty" | "deferred-argv");
 
 /** InputOrigin wire values; `protocol.md` §3.1. */
-export type InputOrigin = ("human" | "bot" | "agent");
+export type InputOrigin = ("human" | "bot" | "agent" | "hub");
 
 /** Instance; `protocol.md` §2.3. */
 export type Instance = ({

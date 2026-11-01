@@ -3507,10 +3507,10 @@ export interface components {
              */
             continuation: "none" | "native" | "hub" | "unknown";
             /**
-             * @description Who authored that input; `agent` for a continuation or a Hub-authored input.
+             * @description Who authored that input: `hub` for an input the Hub wrote (the restart notice, D-057 §6.4); `agent` for a continuation the carrier started on its own.
              * @enum {string}
              */
-            origin: "human" | "bot" | "agent";
+            origin: "human" | "bot" | "agent" | "hub";
         };
         SeenRequest: {
             /** @description Highest journal seq the client has shown for this instance, as the decimal string the Hub serializes (a JSON integer is also accepted). Clamped to the instance's durable seq; a value at or below the current seen seq changes nothing. */

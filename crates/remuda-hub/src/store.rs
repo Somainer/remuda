@@ -1853,6 +1853,7 @@ fn continuation_resume_tx(
             request.expected_generation,
             &successor_id,
             successor_generation,
+            &current.host_id,
             &command_id,
             &fence.fence_id,
         )?;

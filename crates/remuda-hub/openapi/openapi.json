@@ -6046,11 +6046,12 @@
             "type": "string"
           },
           "origin": {
-            "description": "Who authored that input; `agent` for a continuation or a Hub-authored input.",
+            "description": "Who authored that input: `hub` for an input the Hub wrote (the restart notice, D-057 §6.4); `agent` for a continuation the carrier started on its own.",
             "enum": [
               "human",
               "bot",
-              "agent"
+              "agent",
+              "hub"
             ],
             "type": "string"
           }

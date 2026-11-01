@@ -32,7 +32,6 @@ struct FakeNode {
     frames: tokio::sync::mpsc::UnboundedReceiver<(String, Value)>,
     appends: tokio::sync::mpsc::UnboundedSender<(String, Value)>,
     /// Scripted `lineage.fence` acknowledgements, one per delivery.
-    #[allow(dead_code)]
     acks: AckScript,
     node_token: Option<String>,
     task: Option<tokio::task::JoinHandle<()>>,
@@ -73,9 +72,13 @@ impl FakeNode {
             "herdr": {"path": "/usr/bin/herdr"},
             "cli": [{"kind": "claude", "path": "/usr/bin/claude", "auth": "logged_in"}]
         }});
-        if fence_capable {
-            params["capabilities"] = json!({ "lineageFence": true });
-        }
+        // A hello without `capabilities` keeps the previous blob; a Node
+        // without fence support sends capabilities that lack it.
+        params["capabilities"] = if fence_capable {
+            json!({ "lineageFence": true })
+        } else {
+            json!({})
+        };
         if let (Some(object), Some(extra)) = (params.as_object_mut(), extra.as_object()) {
             for (key, value) in extra {
                 object.insert(key.clone(), value.clone());
@@ -154,6 +157,27 @@ impl FakeNode {
             let (method, params) = self.next_frame().await?;
             if method != "lineage.fence" {
                 return Ok((method, params));
+            }
+        }
+    }
+
+    /// The next `instance.create` / `instance.resume` (fences and restart
+    /// notices skipped).
+    async fn next_launch(&mut self) -> Result<(String, Value)> {
+        loop {
+            let (method, params) = self.next_frame().await?;
+            if matches!(method.as_str(), "instance.create" | "instance.resume") {
+                return Ok((method, params));
+            }
+        }
+    }
+
+    /// The next `instance.send` (fences and launches skipped).
+    async fn next_send(&mut self) -> Result<Value> {
+        loop {
+            let (method, params) = self.next_frame().await?;
+            if method == "instance.send" {
+                return Ok(params);
             }
         }
     }
@@ -250,7 +274,7 @@ impl Ctx {
             .as_str()
             .context("seat")?
             .to_owned();
-        let (method, _) = node.next_work_frame().await?;
+        let (method, _) = node.next_launch().await?;
         assert_eq!(method, "instance.create");
         Ok(id)
     }
@@ -481,7 +505,7 @@ async fn a_process_exit_after_running_restarts_once_as_a_native_claude_sdk_resum
     let (first, fence) = node.next_frame().await?;
     assert_eq!(first, "lineage.fence", "the fence precedes the create");
     assert_eq!(fence["liveGeneration"], json!("2"));
-    let (method, create) = node.next_work_frame().await?;
+    let (method, create) = node.next_launch().await?;
     assert_eq!(method, "instance.resume");
     assert_eq!(create["instanceId"], json!(successor));
     assert_eq!(create["origin"], json!("human"), "OA5: the seating origin");
@@ -558,7 +582,7 @@ async fn a_start_failure_restarts_fresh_from_the_original_spec_with_cause_start_
     let decided = ctx.supervise().await;
     assert_eq!(decided.len(), 1, "{decided:?}");
     assert_eq!(decided[0]["cause"], json!("start-failed"));
-    let (method, create) = node.next_work_frame().await?;
+    let (method, create) = node.next_launch().await?;
     assert_eq!(
         method, "instance.create",
         "no session anywhere: a fresh launch"
@@ -583,7 +607,7 @@ async fn an_end_before_the_first_running_event_is_a_start_failure() -> Result<()
     ctx.report_killed(&node, &seat).await?;
     let decided = ctx.supervise().await;
     assert_eq!(decided[0]["cause"], json!("start-failed"), "{decided:?}");
-    let (method, _) = node.next_work_frame().await?;
+    let (method, _) = node.next_launch().await?;
     assert_eq!(method, "instance.create");
     Ok(())
 }
@@ -619,7 +643,7 @@ async fn a_node_restart_without_the_chapter_restarts_with_cause_node_restarted()
     let decided = ctx.supervise().await;
     assert_eq!(decided.len(), 1, "{decided:?}");
     assert_eq!(decided[0]["cause"], json!("node-restarted"));
-    let (method, create) = node.next_work_frame().await?;
+    let (method, create) = node.next_launch().await?;
     assert_eq!(method, "instance.resume");
     assert_eq!(create["spec"]["resumeSessionId"], json!(SESSION));
     Ok(())
@@ -734,7 +758,7 @@ async fn the_cap_counts_every_cause_and_pauses_with_restart_cap() -> Result<()> 
         .as_str()
         .context("successor")?
         .to_owned();
-    let _ = node.next_work_frame().await?;
+    let _ = node.next_launch().await?;
     // Restart 2: a process exit.
     ctx.report_running(&node, &second_chapter, SESSION).await?;
     ctx.report_killed(&node, &second_chapter).await?;
@@ -744,7 +768,7 @@ async fn the_cap_counts_every_cause_and_pauses_with_restart_cap() -> Result<()> 
         .as_str()
         .context("successor")?
         .to_owned();
-    let _ = node.next_work_frame().await?;
+    let _ = node.next_launch().await?;
     // The third failure is at the cap: paused{restart-cap}, no successor.
     ctx.report_running(&node, &third_chapter, SESSION).await?;
     ctx.report_killed(&node, &third_chapter).await?;
@@ -796,7 +820,7 @@ async fn the_recovery_source_is_the_chapter_then_the_newest_earlier_session() ->
         .as_str()
         .context("successor")?
         .to_owned();
-    let (_, create) = node.next_work_frame().await?;
+    let (_, create) = node.next_launch().await?;
     assert_eq!(create["spec"]["resumeSessionId"], json!(EARLIER_SESSION));
     // Chapter 2 reports its own session and dies: its own session wins.
     ctx.report_running(&node, &second, SESSION).await?;
@@ -806,13 +830,13 @@ async fn the_recovery_source_is_the_chapter_then_the_newest_earlier_session() ->
         .as_str()
         .context("successor")?
         .to_owned();
-    let (_, create) = node.next_work_frame().await?;
+    let (_, create) = node.next_launch().await?;
     assert_eq!(create["spec"]["resumeSessionId"], json!(SESSION));
     // Chapter 3 fails to start without a session: the newest earlier one.
     ctx.report_start_failed(&node, &third).await?;
     let last = ctx.supervise().await;
     assert_eq!(last[0]["cause"], json!("start-failed"));
-    let (method, create) = node.next_work_frame().await?;
+    let (method, create) = node.next_launch().await?;
     assert_eq!(method, "instance.resume");
     assert_eq!(create["spec"]["resumeSessionId"], json!(SESSION));
     let record = ctx.lineage(&seat).await?;
@@ -885,13 +909,20 @@ async fn a_hub_restart_decides_a_pending_failure_exactly_once() -> Result<()> {
     assert_eq!(ctx.decisions(&seat)?.len(), 1, "decided at boot");
     let record = ctx.lineage(&seat).await?;
     assert_eq!(record["generation"], json!(2));
-    // The Node returns: the fence first, then the successor's create, once.
+    // The Node returns: the fence first, then the successor's create, then
+    // (the tick) the restart notice whose id F chose before the crash.
     let mut node = FakeNode::connect_with(&ctx.hub, &ctx.host, &token, true, json!({})).await?;
     let (first, _) = node.next_frame().await?;
     assert_eq!(first, "lineage.fence");
     let (method, create) = node.next_work_frame().await?;
     assert_eq!(method, "instance.resume");
     assert_eq!(create["spec"]["resumeSessionId"], json!(SESSION));
+    let notice = node.next_send().await?;
+    assert_eq!(
+        notice["commandId"],
+        ctx.lineage(&seat).await?["restartDecisions"][0]["noticeCommandId"]
+    );
+    assert_eq!(notice["origin"], json!("hub"));
     let token = node.node_token.clone().unwrap_or(token);
     drop(node);
     ctx.restart_hub(true).await?;
@@ -901,8 +932,8 @@ async fn a_hub_restart_decides_a_pending_failure_exactly_once() -> Result<()> {
         "a second boot decides nothing"
     );
     let mut node = FakeNode::connect_with(&ctx.hub, &ctx.host, &token, true, json!({})).await?;
-    // Nothing is re-sent for the decided failure: the create was forwarded,
-    // so the next frame on the link is an unrelated plain create.
+    // Nothing is re-sent for the decided failure — neither the create nor
+    // the notice — so the next frame on the link is an unrelated create.
     let probe: Value = ctx
         .http
         .post(format!("{}/v1/instances", ctx.base()))
@@ -936,7 +967,7 @@ async fn the_scheduler_tick_decides_without_a_test_hook() -> Result<()> {
     let seat = ctx.seat(&mut node).await?;
     ctx.report_running(&node, &seat, SESSION).await?;
     ctx.report_killed(&node, &seat).await?;
-    let (method, _) = node.next_work_frame().await?;
+    let (method, _) = node.next_launch().await?;
     assert_eq!(method, "instance.resume", "the tick restarted the seat");
     assert_eq!(ctx.decisions(&seat)?.len(), 1);
     Ok(())
@@ -1018,6 +1049,307 @@ async fn a_racing_resume_leaves_the_supervisor_nothing_to_decide() -> Result<()>
             .as_array()
             .map(Vec::len),
         Some(2)
+    );
+    Ok(())
+}
+
+// ── §6.4 the restart notice ─────────────────────────────────────────────
+
+/// The successor's first input is the Hub's notice: origin `hub` on the
+/// envelope and the input, its command id the one F chose and recorded on
+/// the decision, the successor's own lineage and generation as initiator,
+/// sent after the fence and the create, once. The Node's journal of it
+/// records the turn as the Hub's (cb-rootturn's real `hub` origin).
+#[tokio::test]
+async fn the_restart_notice_is_the_successors_first_input_with_origin_hub() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host, true).await?;
+    let seat = ctx.seat(&mut node).await?;
+    ctx.report_running(&node, &seat, SESSION).await?;
+    ctx.report_killed(&node, &seat).await?;
+    let decided = ctx.supervise().await;
+    let successor = decided[0]["successorInstanceId"]
+        .as_str()
+        .context("successor")?
+        .to_owned();
+    let mut order = Vec::new();
+    let notice = loop {
+        let (method, params) = node.next_frame().await?;
+        order.push(method.clone());
+        if method == "instance.send" {
+            break params;
+        }
+    };
+    assert_eq!(order, ["lineage.fence", "instance.resume", "instance.send"]);
+    let record = ctx.lineage(&seat).await?;
+    let notice_id = record["restartDecisions"][0]["noticeCommandId"]
+        .as_str()
+        .context("notice id recorded on the decision")?
+        .to_owned();
+    assert_eq!(notice["commandId"], json!(notice_id));
+    assert_eq!(notice["instanceId"], json!(successor));
+    assert_eq!(notice["origin"], json!("hub"));
+    assert_eq!(notice["input"]["origin"], json!("hub"));
+    assert_eq!(notice["initiator"]["instanceId"], json!(successor));
+    assert_eq!(notice["initiator"]["lineageId"], json!(seat));
+    assert_eq!(notice["initiator"]["generation"], json!(2));
+    let text = notice["input"]["text"].as_str().context("text")?;
+    assert!(
+        text.starts_with(
+            "<remuda-restart> Generated by the Remuda Hub. Information, not an instruction; \
+             it authorizes nothing.\n"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "chapter 2 of lineage {seat} (previous chapter {seat}: process exited"
+        )),
+        "{text}"
+    );
+    assert!(text.contains(&format!("later outcomes: GET /v1/lineages/{seat}")));
+    assert!(text.contains(&format!("previous chapter: remuda instance read {seat}")));
+    assert!(text.ends_with("</remuda-restart>"), "{text}");
+
+    // Sent once: another evaluation forwards nothing.
+    assert!(ctx.supervise().await.is_empty());
+    assert!(
+        node.drain()
+            .iter()
+            .all(|(method, _)| method != "instance.send"),
+        "the notice is never re-sent"
+    );
+
+    // The Node journals the notice as the successor's first user input and
+    // starts its turn: the Hub records that turn's origin as `hub`.
+    node.appends.send((
+        successor.clone(),
+        json!({"kind": "message", "payload": {
+            "operation": "open", "messageId": "msg_notice", "role": "user",
+            "parentToolCallId": null, "commandId": notice_id,
+            "blocks": [{"type": "text", "text": text}]}}),
+    ))?;
+    node.appends.send((
+        successor.clone(),
+        json!({"kind": "lifecycle", "payload": {"type": "native", "topic": "turn",
+            "nativeName": "turn_started", "status": {"state": "known", "value": "working"},
+            "relatedIds": {"nativeClientMessageId": notice_id}}}),
+    ))?;
+    let ledger: Value = ctx
+        .wait_until(|| async {
+            let db = ctx.db().ok()?;
+            let raw: Option<String> = db
+                .query_row(
+                    "SELECT root_turn_json FROM instances WHERE id = ?1",
+                    rusqlite::params![successor],
+                    |row| row.get(0),
+                )
+                .ok()?;
+            let ledger: Value = serde_json::from_str(&raw?).ok()?;
+            (!ledger["open"].as_array()?.is_empty()).then_some(ledger)
+        })
+        .await?;
+    assert_eq!(ledger["open"][0]["commandId"], json!(notice_id));
+    assert_eq!(ledger["open"][0]["origin"], json!("hub"), "{ledger}");
+    Ok(())
+}
+
+/// The notice lists the fenced generation's unfinished work by the §7.4
+/// classes, as known when it is sent: the seat's host acknowledged the fence
+/// (with `ran` / `cancelled` / `unknown` outcomes) before the notice left,
+/// while the worker host is offline and still owes its acknowledgement.
+#[tokio::test]
+async fn the_notice_lists_outcomes_by_class_as_known_when_it_is_sent() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let worker_host = HostId::new().as_id().as_str().to_owned();
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host, true).await?;
+    let mut worker_node = FakeNode::connect(&ctx.hub, &worker_host, true).await?;
+    let created: Value = ctx
+        .http
+        .post(format!("{}/v1/instances", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .json(&json!({
+            "hostId": ctx.host, "kind": "claude", "driver": "claude-sdk",
+            "name": "main", "title": "Main", "grants": ["address-owner", "dispatch"],
+            "permissionMode": "auto", "model": "claude-test-model",
+            "scope": {"hostIds": [ctx.host, worker_host]},
+            "restart": {"onProcessLoss": true, "maxPerHour": 3},
+            "prompt": "seat brief",
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let seat = created["instance"]["instanceId"]
+        .as_str()
+        .context("seat")?
+        .to_owned();
+    let (_, params) = node.next_launch().await?;
+    let token = params["agentCredential"]["token"]
+        .as_str()
+        .context("token")?
+        .to_owned();
+    // Owner-created workers the seat may message: one on each host.
+    let worker = |host: String| {
+        let ctx = &ctx;
+        async move {
+            let created: Value = ctx
+                .http
+                .post(format!("{}/v1/instances", ctx.base()))
+                .bearer_auth(&ctx.human)
+                .json(
+                    &json!({"hostId": host, "kind": "claude", "driver": "claude-print",
+                              "permissionMode": "manual", "prompt": "worker brief"}),
+                )
+                .send()
+                .await?
+                .error_for_status()?
+                .json::<Value>()
+                .await?;
+            anyhow::Ok(
+                created["instance"]["instanceId"]
+                    .as_str()
+                    .context("worker")?
+                    .to_owned(),
+            )
+        }
+    };
+    let local = worker(ctx.host.clone()).await?;
+    let _ = node.next_launch().await?;
+    let remote = worker(worker_host.clone()).await?;
+    let _ = worker_node.next_launch().await?;
+    let send = |target: String, text: &'static str| {
+        let ctx = &ctx;
+        let token = token.clone();
+        async move {
+            let command_id = remuda_protocol::CommandId::new()
+                .as_id()
+                .as_str()
+                .to_owned();
+            let response = ctx
+                .http
+                .post(format!("{}/v1/instances/{target}/commands", ctx.base()))
+                .bearer_auth(&token)
+                .json(
+                    &json!({"operation": "instance.send", "commandId": command_id,
+                              "payload": {"input": {"type": "prompt", "text": text}}}),
+                )
+                .send()
+                .await?;
+            assert!(response.status().is_success(), "{}", response.text().await?);
+            anyhow::Ok(command_id)
+        }
+    };
+    let ran = send(local.clone(), "ran on the seat host").await?;
+    let cancelled = send(local.clone(), "cancelled by the seat host").await?;
+    let unknown = send(local.clone(), "unknown after a crash").await?;
+    let in_flight = send(remote.clone(), "in flight to the offline host").await?;
+    worker_node.disconnect();
+    ctx.wait_until(|| async {
+        let hosts: Value = ctx
+            .http
+            .get(format!("{}/v1/hosts/{worker_host}", ctx.base()))
+            .bearer_auth(&ctx.human)
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        (hosts["online"] == json!(false)).then_some(())
+    })
+    .await?;
+    let held = send(remote.clone(), "held for the offline host").await?;
+    node.acks.lock().unwrap().push_back(vec![
+        (ran.clone(), "ran".into()),
+        (cancelled.clone(), "cancelled".into()),
+        (unknown.clone(), "unknown".into()),
+    ]);
+    ctx.report_running(&node, &seat, SESSION).await?;
+    ctx.report_killed(&node, &seat).await?;
+    let decided = ctx.supervise().await;
+    assert_eq!(decided.len(), 1, "{decided:?}");
+    let notice = loop {
+        let send = node.next_send().await?;
+        if send["origin"] == json!("hub") {
+            break send;
+        }
+    };
+    let text = notice["input"]["text"].as_str().context("text")?;
+    for expected in [
+        format!(
+            "cancelled, never left the Hub: {held} instance.send -> instance {remote} \
+             \"held for the offline host\""
+        ),
+        format!("ran before its host applied the fence: {ran} instance.send -> instance {local}"),
+        format!(
+            "cancelled by host {} when it applied the fence: {cancelled} instance.send -> \
+             instance {local}",
+            ctx.host
+        ),
+        format!(
+            "unknown, host {} applied the fence but cannot tell after a crash: {unknown} \
+             instance.send -> instance {local}",
+            ctx.host
+        ),
+        format!("may still run, host {worker_host} has not applied the fence (offline since "),
+        format!("): {in_flight} instance.send -> instance {remote}"),
+    ] {
+        assert!(text.contains(&expected), "missing {expected:?} in:\n{text}");
+    }
+    Ok(())
+}
+
+/// §6.4 / §7.6: hub-origin input goes only to Nodes that advertise the fence
+/// capability. The successor's host returns without it: the notice is
+/// settled `rejected(node-lacks-fence)` and no `instance.send` reaches it.
+#[tokio::test]
+async fn a_notice_is_never_sent_to_a_node_without_fence_support() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host, true).await?;
+    let seat = ctx.seat(&mut node).await?;
+    ctx.report_running(&node, &seat, SESSION).await?;
+    ctx.report_killed(&node, &seat).await?;
+    let token = node.node_token.clone().context("nodeToken")?;
+    node.disconnect();
+    ctx.wait_until(|| async {
+        let host: Value = ctx
+            .http
+            .get(format!("{}/v1/hosts/{}", ctx.base(), ctx.host))
+            .bearer_auth(&ctx.human)
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        (host["online"] == json!(false)).then_some(())
+    })
+    .await?;
+    let decided = ctx.supervise().await;
+    assert_eq!(decided.len(), 1, "{decided:?}");
+    // The Node comes back downgraded: no lineageFence capability.
+    let mut node = FakeNode::connect_with(&ctx.hub, &ctx.host, &token, false, json!({})).await?;
+    assert!(ctx.supervise().await.is_empty());
+    let notice_id = ctx.lineage(&seat).await?["restartDecisions"][0]["noticeCommandId"]
+        .as_str()
+        .context("notice")?
+        .to_owned();
+    let (state, outcome, reason): (String, Option<String>, Option<String>) = ctx.db()?.query_row(
+        "SELECT state, settlement_outcome, settlement_reason FROM commands WHERE id = ?1",
+        rusqlite::params![notice_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    assert_eq!(
+        (state.as_str(), outcome.as_deref(), reason.as_deref()),
+        ("settled", Some("rejected"), Some("node-lacks-fence"))
+    );
+    assert!(
+        node.drain()
+            .iter()
+            .all(|(method, _)| method != "instance.send"),
+        "no hub-origin input reaches a Node without fence support"
     );
     Ok(())
 }

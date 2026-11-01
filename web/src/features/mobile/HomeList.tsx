@@ -43,7 +43,7 @@ import { useHomeFreshness } from "../home/freshness";
 import { HostStrip } from "../home/HostStrip";
 import { HubBanner } from "../home/HubBanner";
 import { HomeGlance } from "../home/HomeGlance";
-import { GLANCE_TARGETS, scrollToFirst } from "../home/glanceNav";
+import { scrollToQueue } from "../home/glanceNav";
 import { MainAskDock, MainCard } from "../home/MainCard";
 import { HomeQueue } from "../home/HomeQueue";
 import { NoMatches, NoSessions, SkeletonRows } from "../home/HomeStates";
@@ -451,7 +451,7 @@ export const HomeList = memo(function HomeList() {
         <HomeGlance
           placement="phone"
           workingFilter={rankFilter === "working"}
-          onNeedYou={() => scrollToFirst(GLANCE_TARGETS.needYou, GLANCE_TARGETS.tasks)}
+          onNeedYou={scrollToQueue}
           onWorking={() => setRankFilter((current) => (current === "working" ? null : "working"))}
         />
       </header>

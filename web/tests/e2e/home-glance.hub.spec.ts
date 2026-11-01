@@ -177,6 +177,9 @@ async function seedRows(page: Page, count: number): Promise<void> {
  * the 需要你 tap must be the thing that brings it back. False when the scroller
  * does not overflow or the target is missing — a short list cannot prove it.
  */
+/** The ④ 需要你 queue: the ① 需要你 tap's scroll target (home.md §5.2). */
+const QUEUE = '[data-testid="home-queue"]';
+
 async function parkTargetOutOfView(
   page: Page,
   regionSelector: string,
@@ -387,7 +390,7 @@ test.describe("phone 390", () => {
     }
   });
 
-  test("the ① taps narrow the ledger by rank and scroll to the waiting row", async ({ browser }) => {
+  test("the ① taps narrow the ledger by rank and scroll to the ④ queue", async ({ browser }) => {
     const baseURL = test.info().project.use.baseURL;
     const context = await phoneContext(browser, baseURL!);
     try {
@@ -424,16 +427,13 @@ test.describe("phone 390", () => {
       await expect(working).toHaveAttribute("aria-pressed", "false");
       await expect(page.locator('[data-testid="home-row"][data-rank="blocked"]')).toHaveCount(1);
 
-      // 需要你 scrolls the ledger to the waiting row: the scroller overflows,
-      // the row is parked OUT of view, and only the tap brings it back.
-      expect(
-        await parkTargetOutOfView(page, '[data-testid="home-head"]', '[data-testid="home-row"][data-blocked="1"]'),
-      ).toBe(true);
-      expect(await inBand(page, '[data-testid="home-head"]', '[data-testid="home-row"][data-blocked="1"]')).toBe(false);
+      // 需要你 scrolls to the ④ queue (H2, home.md §5.2): the scroller
+      // overflows, the queue is parked OUT of view, and only the tap brings it
+      // back.
+      expect(await parkTargetOutOfView(page, '[data-testid="home-head"]', QUEUE)).toBe(true);
+      expect(await inBand(page, '[data-testid="home-head"]', QUEUE)).toBe(false);
       await page.getByTestId("glance-need-you").click();
-      await expect
-        .poll(() => inBand(page, '[data-testid="home-head"]', '[data-testid="home-row"][data-blocked="1"]'))
-        .toBe(true);
+      await expect.poll(() => inBand(page, '[data-testid="home-head"]', QUEUE)).toBe(true);
       await shot(page, "home-glance-390-taps.png");
     } finally {
       await cleanup(context.request);
@@ -503,7 +503,7 @@ test.describe("desktop 1280", () => {
     }
   });
 
-  test("the ① taps filter the desktop ledger by rank and scroll to the waiting card", async ({
+  test("the ① taps filter the desktop ledger by rank and scroll to the ④ queue", async ({
     browser,
   }) => {
     const baseURL = test.info().project.use.baseURL;
@@ -551,16 +551,13 @@ test.describe("desktop 1280", () => {
       await expect(page).not.toHaveURL(/rank=/);
       await expect(page.locator('[data-testid="board-card"][data-rank="blocked"]')).toHaveCount(1);
 
-      // 需要你 scrolls the desktop list to the blocked card: the list overflows,
-      // the card is parked OUT of view, and only the tap brings it back.
-      expect(
-        await parkTargetOutOfView(page, '[data-testid="session-list"]', '[data-testid="board-card"][data-rank="blocked"]'),
-      ).toBe(true);
-      expect(await inBand(page, '[data-testid="session-list"]', '[data-testid="board-card"][data-rank="blocked"]')).toBe(false);
+      // 需要你 scrolls the main column to the ④ queue (H2): the column
+      // overflows, the queue is parked OUT of view, and only the tap brings it
+      // back.
+      expect(await parkTargetOutOfView(page, '[data-testid="session-list"]', QUEUE)).toBe(true);
+      expect(await inBand(page, '[data-testid="session-list"]', QUEUE)).toBe(false);
       await page.getByTestId("glance-need-you").click();
-      await expect
-        .poll(() => inBand(page, '[data-testid="session-list"]', '[data-testid="board-card"][data-rank="blocked"]'))
-        .toBe(true);
+      await expect.poll(() => inBand(page, '[data-testid="session-list"]', QUEUE)).toBe(true);
       await shot(page, "home-glance-1280-taps.png");
     } finally {
       await cleanup(context.request);

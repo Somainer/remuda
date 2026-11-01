@@ -11,7 +11,7 @@ import { PageHeader } from "../components/PageHeader";
 import { HomeGlance } from "../features/home/HomeGlance";
 import { TOP_LEVEL_WORKING } from "../features/home/glance";
 import { HostStrip } from "../features/home/HostStrip";
-import { GLANCE_TARGETS, scrollToFirst } from "../features/home/glanceNav";
+import { scrollToQueue } from "../features/home/glanceNav";
 import { MainCard } from "../features/home/MainCard";
 import { HomeQueue } from "../features/home/HomeQueue";
 import { WorkingList } from "../features/home/WorkingList";
@@ -93,7 +93,7 @@ export function SessionsPage({ dimmed = false }: { dimmed?: boolean }) {
               // The list drops child sessions; the count must use that set.
               workingInstances={TOP_LEVEL_WORKING}
               workingFilter={workingFilter}
-              onNeedYou={() => scrollToFirst(GLANCE_TARGETS.needYouDesktop)}
+              onNeedYou={scrollToQueue}
               onWorking={toggleWorking}
             />
           }

@@ -386,7 +386,7 @@ MCP `call_tool` 在副作用前决定范围，并把需审批动作送到 Hub br
 - generic-pty：Agent create 的 bypass/dontAsk 只在创建者自身关闭控制时保留，否则在 materialize 前降为 asking mode，得到非 yolo argv；
 - preset bypass flags（§4.3 表里各 harness 的 yolo argv）逐 harness 判定，只在两条同时成立时合并：子实例解析后的档位（显式请求，或按上面的规则继承）正是该行 yolo argv 所实现的关闭控制档位；并且来源为 Human/Bot，或来源为 Agent 且其 Agent 创建者自身关闭控制。显式请求的保留控制档位永远不得到 yolo argv；默认模式绝不追加。
 
-D-011 的 Bot materializer 拒绝 bypass/dontAsk 规则继续存在，Bot 来源不变，上面的条件不授予 Bot 额外豁免。这是第一阶段唯一改动既有 Agent 来源权限规则的地方。它取代此前的规则：Agent create 的 generic-pty 一律降级，preset bypass flags 仅限 Human/Bot，Agent 的结构化 Claude create 显式请求 bypass/dontAsk 被拒绝，省略权限模式则采用 manual。实现随 `ma-admission` 落地。
+D-011 的 Bot materializer 拒绝 bypass/dontAsk 规则继续存在，Bot 来源不变，上面的条件不授予 Bot 额外豁免。这是第一阶段唯一改动既有 Agent 来源权限规则的地方。它取代此前的规则：Agent create 的 generic-pty 一律降级，preset bypass flags 仅限 Human/Bot，Agent 的结构化 Claude create 显式请求 bypass/dontAsk 被拒绝，省略权限模式则采用 manual。已随 `ma-admission` 落地（2026-11-01）：规则本身在 `remuda_protocol::creator_permission`，Hub 与 Node 读同一份；Node 只从转发 params 顶层读取 `creatorPermissionMode`，缺失按「创建者保留控制」处理（fail closed）。实现说明见 [main-agent.md §4.2.1](./main-agent.md#421-implementation-notes-ma-admission-2026-11-01)。
 
 此范围约束覆盖 Hub 与 MCP 控制面。Node stdio 的认证依赖其 SSH carrier，本地开发 Node HTTP 的 access code 仍是操作员凭据；同 UID 文件、原生 CLI 与 herdr 的进程隔离和凭据清理是独立边界（security-review-2 tasks 9/12/13），不能把 parent-child 范围检查描述为 OS sandbox。
 
@@ -2178,6 +2178,8 @@ HTTP 409
 ~~~
 
 **实现现状（`cb-errors`）。** 除首批取值外，当前实现还发出同一词汇的三个原因：`stale-caller`（凭证背后的实例行已不存在，`ask-owner`）、`approval-invalid`（approvalId 未知、过期、已用或不属于本次动作，`fix-request`）、`delivery-unknown`（`instance.configure` 重放的投递结果未知，`read-then-decide`，并带 `commandId`）。
+
+**`ma-admission`（D-057 OA1，2026-11-01）新增四个原因。** Agent 来源 create、dispatch、worker 重生的权限档位按「子不超父」被拒时为 403 `FORBIDDEN`，`next.action` 为 `fix-request`，`hint` 列出子实例 harness 可选的档位：`permission-mode-unknown`（请求的档位不在子实例 harness 的词表里）、`permission-mode-not-inheritable`（省略档位，而创建者自己的档位不在子实例 harness 的词表里）、`beyond-creator`（关闭控制的档位，而创建者自身保留控制）。提交点复读到创建者档位已变时为 409 `CONFLICT`，原因 `creator-mode-changed`，`next.action` 为 `retry-same-command`（什么都没有启动，原请求可直接重发，按创建者当前档位重新受理）。
 
 ### 9.2 Unknown 与 reconciliation 的实现要求
 

@@ -1,13 +1,27 @@
 //! Install per-test stub executables without `ETXTBSY`.
 //!
-//! Linux refuses `exec` of a file that is still open for write, and refuses
-//! `open(O_WRONLY)` / rename-over of a file a child still has mapped. Tests
-//! therefore never reuse a destination: bytes go to a unique `*.part` name,
-//! then `rename` installs a unique final path.
+//! Linux refuses `exec` of a file that any process still holds open for
+//! writing. Two things make tests trip it:
+//!
+//! * reusing a destination another child is executing, and
+//! * opening the destination for write in this process at all: every `fork`
+//!   in any test thread inherits that descriptor, and a descendant that has
+//!   not exec'd yet keeps the inode busy — a later `rename` does not help,
+//!   because the inherited descriptor and the renamed path are the same inode.
+//!
+//! So bytes are never written by this process. A short-lived `/bin/sh` child
+//! writes a unique `*.part` and sets its mode; when it exits its descriptor
+//! is gone, the parent renames the part into place, and the exec that follows
+//! has no writer anywhere. `install_executable` additionally never reuses a
+//! destination, so an executing child cannot block the install either.
 
-use std::fs::{self, OpenOptions};
+use std::fs;
+#[cfg(not(unix))]
+use std::fs::OpenOptions;
 use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -49,13 +63,13 @@ pub fn install_executable(dir: &Path, name: &str, bytes: impl AsRef<[u8]>) -> Pa
 ///
 /// Some callers cannot pick the final name — a git hook must sit at
 /// `.git/hooks/pre-receive`, a `core.sshCommand` must be the path the config
-/// names. Writing such a file and executing it immediately races `ETXTBSY`:
-/// while the write handle is open, another thread's `fork` inherits it, and
-/// `exec` refuses a file that any process still holds open for writing. The
-/// bytes therefore go to a unique hidden `*.part` in the same directory, the
-/// handle is closed and the mode set there, and only then is it renamed over
+/// names. Writing such a file and executing it immediately races `ETXTBSY`
+/// (see the module docs): the bytes go to a unique hidden `*.part` in the same
+/// directory, written and chmodded by a child process so no descriptor of
+/// this process ever refers to the inode, and only then is it renamed over
 /// `path`. A concurrent `exec` either sees the previous file or the complete
-/// new one, never a half-written one.
+/// new one, never a half-written one, and no descendant of this process can
+/// keep the new file busy.
 ///
 /// # Errors
 ///
@@ -74,23 +88,7 @@ pub fn install_at(path: &Path, bytes: impl AsRef<[u8]>) -> io::Result<()> {
         .and_then(|name| name.to_str())
         .unwrap_or("stub");
     let part = dir.join(format!(".{name}-{}.part", unique_token()));
-    let result = (|| -> io::Result<()> {
-        {
-            let mut file = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&part)?;
-            file.write_all(bytes.as_ref())?;
-            file.flush()?;
-            let _ = file.sync_all();
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&part, fs::Permissions::from_mode(0o755))?;
-        }
-        fs::rename(&part, path)
-    })();
+    let result = write_part(&part, bytes.as_ref()).and_then(|()| fs::rename(&part, path));
     if result.is_err() {
         let _ = fs::remove_file(&part);
     }
@@ -104,22 +102,55 @@ fn try_install(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
     if dest.exists() {
         return Err(io::Error::from(ErrorKind::AlreadyExists));
     }
+    write_part(&part, bytes)?;
+    if let Err(err) = fs::rename(&part, &dest) {
+        let _ = fs::remove_file(&part);
+        return Err(err);
+    }
+    Ok(dest)
+}
+
+/// Write `bytes` to `path` as a 0755 file, with the write done by a child.
+///
+/// The child exists for its descriptor table: an `O_WRONLY` handle opened in
+/// this process is inherited by every `fork` any thread performs, and a
+/// descendant still holding it makes a later `exec` of that inode fail with
+/// `ETXTBSY`. Nothing else in this process can inherit the child's handle.
+fn write_part(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    #[cfg(unix)]
     {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&part)?;
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(r#"umask 077 && /bin/cat > "$1" && /bin/chmod 755 "$1""#)
+            .arg("sh")
+            .arg(path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("executable writer has no stdin"))?;
+        stdin.write_all(bytes)?;
+        drop(stdin);
+        let status = child.wait()?;
+        if !status.success() {
+            return Err(io::Error::other(format!(
+                "executable writer for {} exited with {status}",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
         file.write_all(bytes)?;
         file.flush()?;
         let _ = file.sync_all();
+        Ok(())
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&part, fs::Permissions::from_mode(0o755))?;
-    }
-    fs::rename(&part, &dest)?;
-    Ok(dest)
 }
 
 fn unique_token() -> String {

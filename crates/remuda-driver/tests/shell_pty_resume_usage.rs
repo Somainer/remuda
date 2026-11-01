@@ -25,14 +25,12 @@ use remuda_protocol::{
 /// A pinned fake codex: answers the binary pin's --version probe, ignores the
 /// codex argv, and stays alive so the resumed run can accept a real prompt.
 fn fake_codex_script(dir: &Path) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let path = dir.join("fake-codex-resume-usage.sh");
-    std::fs::write(
+    remuda_testing::install_at(
         &path,
         "#!/bin/sh\ncase \"$1\" in --version|version) echo 'codex 0.154.0'; exit 0;; esac\nexec sleep 120\n",
     )
     .unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     path
 }
 

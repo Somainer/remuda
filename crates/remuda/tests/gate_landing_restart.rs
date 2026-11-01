@@ -185,21 +185,16 @@ if [ -n "$report" ]; then
 fi
 "#;
     let path = dir.join("gate.sh");
-    std::fs::write(&path, script).unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-}
-
-fn make_executable(path: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Staged closed and renamed into place: the gate runs it moments later,
+    // while other test threads are forking.
+    remuda_testing::install_at(&path, script).unwrap();
 }
 
 /// Block the CLIENT's `git push` before the ref reaches the server (waits on
 /// `$GATE_DIR/proceed`). Records every released push to pushes.log.
 fn install_pre_push_hook(lane: &std::path::Path) {
     let hook = lane.join(".git/hooks/pre-push");
-    std::fs::write(
+    remuda_testing::install_at(
         &hook,
         r#"#!/bin/bash
 set -eu
@@ -208,14 +203,13 @@ echo pushed >> "$GATE_DIR/pushes.log"
 "#,
     )
     .unwrap();
-    make_executable(&hook);
 }
 
 /// Block AFTER the server updated the ref (post-receive runs post-update), so
 /// the client's `git push` hangs while the ref is already on the remote.
 fn install_post_receive_hook(origin: &std::path::Path) {
     let hook = origin.join("hooks/post-receive");
-    std::fs::write(
+    remuda_testing::install_at(
         &hook,
         r#"#!/bin/bash
 set -eu
@@ -224,7 +218,6 @@ for _ in $(seq 1 1200); do [ -f "$GATE_DIR/proceed" ] && break; sleep 0.05; done
 "#,
     )
     .unwrap();
-    make_executable(&hook);
 }
 
 /// Build the lane-env map the real merge CLI/gate/hooks read.

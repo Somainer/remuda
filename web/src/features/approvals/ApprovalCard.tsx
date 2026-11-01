@@ -538,6 +538,9 @@ function HomeDecision({
             type="button"
             className={homeCss.chip}
             data-testid="home-card-chip"
+            // Single-line control (visual-system §8.1): a clipped label keeps
+            // its full text in the tooltip.
+            title={opt.label}
             disabled={disabled}
             onClick={() => {
               const answer = chipAnswer(item, opt.id);

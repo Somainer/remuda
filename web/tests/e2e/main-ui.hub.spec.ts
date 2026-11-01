@@ -72,22 +72,40 @@ async function seatMain(page: Page, prompt: string): Promise<string> {
   return body.instance.instanceId;
 }
 
+/**
+ * Release the address-owner seat between tests. Since ma-fence a close of a
+ * continuity lineage is a PAUSE, and the Hub refuses `DELETE` of the current
+ * chapter while the lineage is not paused (409 "close it first"): close
+ * (pause), wait for the pause, then delete the chapter. Newest first: deleting
+ * a lineage's current chapter removes every chapter.
+ */
 async function cleanup(page: Page) {
-  // Newest first: deleting a lineage's current chapter removes every chapter.
+  const origin = new URL(page.url()).origin;
   for (const id of created.splice(0).reverse()) {
-    let response = await page.request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
-    // D-057 §6.3: the current chapter of an unpaused continuity lineage is
-    // paused (closed) explicitly before it can be deleted, so the C1
-    // supervisor never sees it end on its own.
-    if (response?.status() === 409) {
-      const refusal = (await response.json().catch(() => ({}))) as { reason?: string };
-      if (refusal.reason === "not-paused") {
-        await page.request
-          .post(`/v1/instances/${id}/commands`, { data: { operation: "instance.close", payload: {} } })
-          .catch(() => undefined);
-        response = await page.request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
-      }
+    await page.request
+      .post(`/v1/instances/${id}/commands`, {
+        headers: { Origin: origin },
+        data: { operation: "instance.close", payload: {} },
+      })
+      .catch(() => undefined);
+    // Paused (or already gone) before the delete; a live chapter is a 409.
+    const pausedOrGone = async () => {
+      const record = await page.request.get(`/v1/instances/${id}`);
+      if (record.status() === 404) return true;
+      const body = (await record.json()) as { lineageId?: string | null };
+      if (!body.lineageId) return true;
+      const lineage = await page.request.get(`/v1/lineages/${body.lineageId}`);
+      return !lineage.ok() || ((await lineage.json()) as { state?: string }).state === "paused";
+    };
+    await expect.poll(pausedOrGone, { timeout: 20_000 }).toBe(true);
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const removed = await page.request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
+      if (!removed || removed.ok() || removed.status() === 404) break;
+      await page.waitForTimeout(500);
     }
+    await expect
+      .poll(async () => (await page.request.get(`/v1/instances/${id}`)).status(), { timeout: 15_000 })
+      .toBe(404);
   }
 }
 

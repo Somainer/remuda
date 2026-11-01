@@ -30,6 +30,22 @@ export const STATUS_LABELS: Record<string, string> = {
   unknown: "状态待确认",
 };
 
+/**
+ * home.md §3.1 档位 labels for the ① filter chip. The rank filter exists
+ * because the count row counts RANKS (connectivity-independent), while the
+ * status conditions above read UiStatus, which turns `unknown` on a dropped
+ * host and would hide a row the count still counts.
+ */
+export const RANK_LABELS: Record<string, string> = {
+  blocked: "待处理",
+  "done-unseen": "完成未看",
+  working: "工作中",
+  "awaiting-wake": "待唤醒",
+  starting: "启动中",
+  idle: "空闲",
+  exited: "已退出",
+};
+
 /** `scope=all` is the explicit opt-out of the current Space (P0-1 rule 2). */
 export const SCOPE_KEY = "scope";
 export const GLOBAL_SCOPE = "all";
@@ -38,6 +54,8 @@ export type FilterConditions = {
   /** Free text over title / cwd / native id / instance id. */
   q: string;
   status: string[];
+  /** §3.1 ranks, set by the ① count row (never by the filter panel). */
+  rank: string[];
   kind: string[];
   host: string[];
   workspace: string[];
@@ -57,7 +75,7 @@ export type FilterScope = {
 
 export type SelectedChip = {
   /** Param this chip lives in; removing the chip removes this value. */
-  key: "q" | "status" | "kind" | "host" | "workspace";
+  key: "q" | "status" | "rank" | "kind" | "host" | "workspace";
   value: string;
   label: string;
 };
@@ -70,6 +88,7 @@ export function readConditions(params: URLSearchParams): FilterConditions {
   return {
     q: params.get("q") ?? "",
     status: csv(params, "status"),
+    rank: csv(params, "rank"),
     kind: csv(params, "kind"),
     host: csv(params, "host"),
     workspace: csv(params, "workspace"),
@@ -86,6 +105,7 @@ export function writeConditions(params: URLSearchParams, next: FilterConditions)
   const set = (key: string, value: string) => (value ? out.set(key, value) : out.delete(key));
   set("q", next.q);
   set("status", next.status.join(","));
+  set("rank", next.rank.join(","));
   set("kind", next.kind.join(","));
   set("host", next.host.join(","));
   set("workspace", next.workspace.join(","));
@@ -100,7 +120,12 @@ export function toggleValue(values: string[], value: string): string[] {
 /** True when any condition would narrow the list. */
 export function hasConditions(conditions: FilterConditions): boolean {
   return Boolean(
-    conditions.q.trim() || conditions.status.length || conditions.kind.length || conditions.host.length || conditions.workspace.length,
+    conditions.q.trim()
+    || conditions.status.length
+    || conditions.rank.length
+    || conditions.kind.length
+    || conditions.host.length
+    || conditions.workspace.length,
   );
 }
 
@@ -109,6 +134,7 @@ export function conditionCount(conditions: FilterConditions): number {
   return (
     (conditions.q.trim() ? 1 : 0) +
     conditions.status.length +
+    conditions.rank.length +
     conditions.kind.length +
     conditions.host.length +
     conditions.workspace.length
@@ -173,7 +199,7 @@ export function pruneForScope(conditions: FilterConditions, scope: FilterScope):
 
 /** Conditions with every narrowing cleared, keeping the current scope. */
 export function clearedConditions(conditions: FilterConditions): FilterConditions {
-  return { q: "", status: [], kind: [], host: [], workspace: [], scope: conditions.scope };
+  return { q: "", status: [], rank: [], kind: [], host: [], workspace: [], scope: conditions.scope };
 }
 
 export type MatchContext = {
@@ -196,8 +222,16 @@ export function applyFilters(
   conditions: FilterConditions,
   statusOf: (instance: Instance) => UiStatus,
   context: MatchContext,
+  /**
+   * The shared §3.1 rank. Required only to narrow by `conditions.rank` (the ①
+   * count row's 工作中 tap): the count is rank-based, so the list must be too.
+   */
+  rankOf?: (instance: Instance) => string,
 ): Instance[] {
   return instances.filter((instance) => {
+    if (conditions.rank.length) {
+      if (!rankOf || !conditions.rank.includes(rankOf(instance))) return false;
+    }
     if (conditions.status.length && !conditions.status.includes(statusOf(instance))) return false;
     if (conditions.kind.length && !conditions.kind.includes(instance.kind)) return false;
     if (conditions.host.length && !conditions.host.includes(instance.hostId)) return false;
@@ -219,6 +253,7 @@ export function selectedChips(
   const chips: SelectedChip[] = [];
   if (conditions.q.trim()) chips.push({ key: "q", value: conditions.q, label: `搜索：${conditions.q.trim()}` });
   for (const value of conditions.status) chips.push({ key: "status", value, label: STATUS_LABELS[value] ?? value });
+  for (const value of conditions.rank) chips.push({ key: "rank", value, label: RANK_LABELS[value] ?? value });
   for (const value of conditions.kind) chips.push({ key: "kind", value, label: value });
   for (const value of conditions.host) chips.push({ key: "host", value, label: `主机：${names.hostName(value)}` });
   for (const value of conditions.workspace) {

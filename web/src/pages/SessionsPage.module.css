@@ -26,13 +26,20 @@
   min-height: 0;
 }
 
+/* §2.5 (D-061): collapsed by default behind the band's 「空间 ▸」 toggle; only
+   the device's remembered expanded state shows the index column. */
 .index {
+  display: none;
   flex: none;
   width: var(--index);
   min-height: 0;
   overflow: auto;
   border-right: 1px solid var(--divider);
   background: var(--bg-canvas);
+}
+
+.index[data-open="1"] {
+  display: block;
 }
 
 /* The sidebar owns folding now (⌘/Ctrl+B); the panel's own fold is moot. */
@@ -49,8 +56,36 @@
   overflow: auto;
 }
 
-.indexOpen {
-  display: none;
+/* The 「空间 ▸」 toggle at the host band's right end. Its 24px box keeps the
+   32px band intact even on a coarse pointer (where the shared .btn would be
+   44px tall). */
+.indexToggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  height: 24px;
+  min-height: 24px;
+  margin: 0;
+  padding: 0 var(--space-2);
+  border: 0;
+  border-radius: var(--radius-xs);
+  background: transparent;
+  color: var(--fg-muted);
+  font-family: var(--font-ui);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.indexToggle:hover {
+  background: var(--bg-hover);
+  color: var(--fg-body);
+}
+
+.indexToggle:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 1px;
 }
 
 .scrim {
@@ -58,14 +93,6 @@
 }
 
 @media (max-width: 1023px) {
-  .indexOpen {
-    display: inline-flex;
-  }
-
-  .index {
-    display: none;
-  }
-
   .index[data-open] {
     position: absolute;
     top: 0;

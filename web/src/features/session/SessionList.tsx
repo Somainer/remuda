@@ -94,17 +94,35 @@ export function SessionList({
   const scope = describeScope(conditions, space, (hostId) => hubStore.hostName(hostId as Id));
   const allowed = availableConditions(scope);
 
-  // In global scope the list leaves the Space behind and searches every
-  // top-level instance the hub knows about; otherwise it renders exactly what
-  // the caller handed it.
-  const source = global ? hub.instances.filter((i) => i.parent == null) : (instances ?? hub.instances.filter((i) => i.parent == null));
+  // home.md §5.2 / the 最近 caption: child sessions are never desktop rows.
+  // Global scope searches every top-level instance the hub knows about; a
+  // Space-pinned list renders the caller's instances minus children, so the ①
+  // 工作中 count (TOP_LEVEL_WORKING) always equals the rows a tap can show.
+  const source = (global ? hub.instances : (instances ?? hub.instances))
+    .filter((instance) => instance.parent == null);
+
+  // Children that are still running lift their idle parent into awaiting-wake.
+  // The child's own rank decides (blocked/working/starting), not connectivity.
+  // Declared before the filters: the ① rank filter reads this same rank().
+  const childLiveIds = useMemo(() => liveChildParents(hub.instances), [hub.instances]);
+  const rankOf = useCallback(
+    (instance: Instance) => rank(instance, childLiveIds.has(instance.id)),
+    [childLiveIds],
+  );
 
   const filtered = useMemo(
-    () => applyFilters(source, conditions, projectStatus, { titleOf: (id) => hubStore.titleOf(id as Id), workspaces: hub.workspaces }),
+    () => applyFilters(
+      source,
+      conditions,
+      projectStatus,
+      { titleOf: (id) => hubStore.titleOf(id as Id), workspaces: hub.workspaces },
+      // home.md §5.2: the ① 工作中 tap narrows by the SAME rank the count uses.
+      rankOf,
+    ),
     // `conditions` is rebuilt each render from params; key the memo on the
     // serialized params instead so it only recomputes when the URL changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [source, params.toString(), hub.workspaces],
+    [source, params.toString(), hub.workspaces, rankOf],
   );
 
   const filterCount = conditionCount(conditions);
@@ -195,10 +213,6 @@ export function SessionList({
   }, [spaceId, prunedKey]);
   // The notice belongs to the Space that triggered it; a later Space retires it.
   const notice = droppedNotice.spaceId === spaceId ? droppedNotice.chips : [];
-
-  // Children that are still running lift their idle parent into awaiting-wake.
-  // The child's own rank decides (blocked/working/starting), not connectivity.
-  const childLiveIds = useMemo(() => liveChildParents(hub.instances), [hub.instances]);
 
   const ranked = useMemo(() => {
     const rowOf = (instance: Instance) => ({

@@ -1,9 +1,7 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { rest } from "../../lib/api";
-import type { components } from "../../lib/api.generated";
-import { fetchChanges } from "../files/filesApi";
 import type { Task } from "../../types/generated";
+import { fetchChanges } from "../files/filesApi";
 import {
   taskNextStep,
   taskRowSignature,
@@ -22,64 +20,7 @@ import css from "./tasklist.module.css";
  * same hub store every other surface polls.
  */
 
-type TaskPage = components["schemas"]["TaskPage"];
-type ProjectPage = components["schemas"]["ProjectPage"];
-
-export type TaskLedger = {
-  tasks: Task[];
-  projectName: (projectId: string) => string | undefined;
-};
-
-/** Polls the task ledger (and the project list for names). Read-only. */
-export function useTaskLedger(projectId?: string | null): TaskLedger {
-  const [tasks, setTasks] = useState<Task[]>([]);
-  const [names, setNames] = useState<Map<string, string>>(new Map());
-
-  useEffect(() => {
-    let cancelled = false;
-    const projectTick = async () => {
-      try {
-        const page = await rest<ProjectPage>("/v1/projects");
-        if (cancelled) return;
-        setNames(
-          new Map(
-            (page.items ?? [])
-              .filter((project) => project.id && project.name)
-              .map((project) => [project.id, project.name]),
-          ),
-        );
-      } catch {
-        /* The rail stays usable with raw project ids while projects fail. */
-      }
-    };
-    const taskTick = async () => {
-      try {
-        const query = projectId ? `?project=${encodeURIComponent(projectId)}` : "";
-        const page = await rest<TaskPage>(`/v1/tasks${query}`);
-        if (!cancelled) setTasks((page.items ?? []) as Task[]);
-      } catch {
-        /* Keep the last good ledger slice; AuthGate handles 401. */
-      }
-    };
-    void projectTick();
-    void taskTick();
-    const projectTimer = window.setInterval(projectTick, 30_000);
-    const taskTimer = window.setInterval(taskTick, 5_000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(projectTimer);
-      window.clearInterval(taskTimer);
-    };
-  }, [projectId]);
-
-  return useMemo(
-    () => ({
-      tasks,
-      projectName: (id: string) => names.get(id),
-    }),
-    [tasks, names],
-  );
-}
+export { useTaskLedger, type TaskLedger } from "./taskLedger";
 
 /**
  * Live git branch per Space, hydrated through the same read-only changes

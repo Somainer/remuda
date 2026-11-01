@@ -1671,6 +1671,21 @@ async fn fake_node(
                             interaction_id.as_id().as_str(),
                             &deadline,
                         )
+                    } else if prompt.contains("hqueue-chips") {
+                        // c-hqueue: a single-field single-select question
+                        // with three options — the home's chip case (§4.2).
+                        fake_single_question(
+                            &instance_id,
+                            host_id.as_id().as_str(),
+                            interaction_id.as_id().as_str(),
+                        )
+                    } else if prompt.contains("hqueue-plan") {
+                        // c-hqueue: a plan review — review-only on the home.
+                        fake_plan_review(
+                            &instance_id,
+                            host_id.as_id().as_str(),
+                            interaction_id.as_id().as_str(),
+                        )
                     } else if prompt.contains("ask-question") {
                         fake_hook_question(
                             &instance_id,
@@ -4974,6 +4989,49 @@ fn fake_hook_question(instance_id: &str, host_id: &str, interaction_id: &str) ->
         "delivery": "not-sent",
         "resolution": { "state": "not-applicable" }
     })
+}
+
+/// c-hqueue: the home's chip question (home.md §4.2 简单问题): one field,
+/// single-select, three options, not sensitive.
+fn fake_single_question(instance_id: &str, host_id: &str, interaction_id: &str) -> Value {
+    let mut card = fake_hook_question(instance_id, host_id, interaction_id);
+    card["request"]["fields"] = json!([{
+        "id": "q0",
+        "title": "旧迁移 0042 删掉还是保留？",
+        "description": "迁移",
+        "input": "single-select",
+        "required": true,
+        "options": [
+            { "id": "删除", "label": "删除", "description": "删掉旧迁移" },
+            { "id": "保留", "label": "保留", "description": "原样保留" },
+            { "id": "改名", "label": "改名", "description": "改成新编号" }
+        ],
+        "allowFreeText": true,
+        "sensitive": false
+    }]);
+    card
+}
+
+/// c-hqueue: a plan review with an inline plan (home.md §4.2 计划: review-only
+/// on the home, never approved there).
+fn fake_plan_review(instance_id: &str, host_id: &str, interaction_id: &str) -> Value {
+    let mut card = fake_hook_question(instance_id, host_id, interaction_id);
+    card["kind"] = json!("plan-review");
+    card["carrier"] = json!("claude-control");
+    card["request"] = json!({
+        "kind": "plan-review",
+        "title": "Plan: split the gate",
+        "planRef": interaction_id,
+        "planRevision": "1",
+        "planDigest": "sha256:efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",
+        "options": [
+            { "id": "approve", "label": "批准", "effect": "allow-once", "nativeValueRef": interaction_id },
+            { "id": "deny", "label": "拒绝", "effect": "deny", "nativeValueRef": interaction_id }
+        ],
+        "allowFeedback": true,
+        "plan": "1. read the gate\n2. split it\n3. land it"
+    });
+    card
 }
 
 /// c-question-alert: like [`fake_hook_question`] but with a KNOWN deadline

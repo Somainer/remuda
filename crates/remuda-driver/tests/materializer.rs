@@ -1394,7 +1394,8 @@ mod shell_pty_agent {
     }
 
     /// D-057 OA1, the Node half, on the native agent path: every harness ×
-    /// origin × creator stamp × every mode of that harness. A control-off
+    /// every mode of that harness × origin × the Hub's creator stamp (every
+    /// creator word of every harness, and no stamp at all). A control-off
     /// mode is materialized for Human, never for Bot, and for Agent only
     /// under a control-off creator; a control-on mode always is.
     #[test]
@@ -1467,10 +1468,19 @@ mod shell_pty_agent {
                 mode == AgyPermissionMode::AlwaysProceed,
             ));
         }
+        let mut stamps: Vec<Option<&str>> = vec![None];
+        for harness in ["claude", "codex", "grok", "agy"] {
+            for word in remuda_protocol::creator_permission::vocabulary(harness) {
+                if !stamps.contains(&Some(*word)) {
+                    stamps.push(Some(*word));
+                }
+            }
+        }
         let mut n = 0;
         for (kind, permission, control_off) in cases {
             for origin in [LaunchOrigin::Human, LaunchOrigin::Bot, LaunchOrigin::Agent] {
-                for creator in [CreatorControl::On, CreatorControl::Off] {
+                for stamp in &stamps {
+                    let creator = CreatorControl::from_stamp(*stamp);
                     n += 1;
                     let mut spec = agent_spec(kind);
                     spec.permission_mode = permission.clone();
@@ -1491,7 +1501,7 @@ mod shell_pty_agent {
                     let admitted = !control_off
                         || origin == LaunchOrigin::Human
                         || (origin == LaunchOrigin::Agent && creator == CreatorControl::Off);
-                    let label = format!("{kind:?} {permission:?} {origin:?} {creator:?}");
+                    let label = format!("{kind:?} {permission:?} {origin:?} stamp {stamp:?}");
                     match (admitted, &outcome) {
                         (true, Ok(_)) => {}
                         (false, Err(DriverError::BypassNotAllowedForBot)) => {
@@ -1505,6 +1515,7 @@ mod shell_pty_agent {
                 }
             }
         }
+        assert_eq!(n, 16 * 3 * stamps.len());
     }
 
     /// A `terminal` kind on the same driver is still a login shell, not an

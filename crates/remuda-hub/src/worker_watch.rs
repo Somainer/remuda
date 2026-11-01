@@ -1958,29 +1958,29 @@ async fn replace_worker(
         permission_mode: worker.permission_mode_requested.clone(),
     };
 
-    // D-057 §4.2 item 4: decide the replacement's D-017 approval before the
-    // old worker is retired, so a pending approval reclaims nothing.
-    let decided = dispatch_core(
-        State(state.clone()),
-        headers.clone(),
-        body.clone(),
-        DispatchApproval::DecideOnly,
-    )
-    .await?
-    .0
-    .get("approval")
-    .cloned()
-    .filter(|request| !request.is_null());
+    // D-057 §4.2 item 4: decide an Agent replacement's D-017 approval before
+    // the old worker is retired, so a pending approval reclaims nothing. A
+    // Human or Bot replace has no such approval and keeps its old order.
+    let approval = if crate::agent_scope::origin(&device) == remuda_protocol::InputOrigin::Agent {
+        let decided = dispatch_core(
+            State(state.clone()),
+            headers.clone(),
+            body.clone(),
+            DispatchApproval::DecideOnly,
+        )
+        .await?
+        .0
+        .get("approval")
+        .cloned()
+        .filter(|request| !request.is_null());
+        DispatchApproval::Decided(decided)
+    } else {
+        DispatchApproval::Decide
+    };
     // Retire (force) reclaims worktree/target, then re-dispatch the same brief
     // under the same name on a fresh branch.
     let retired = retire_core(State(state.clone()), headers.clone(), old_id.clone(), true).await?;
-    let dispatched = dispatch_core(
-        State(state.clone()),
-        headers,
-        body,
-        DispatchApproval::Decided(decided),
-    )
-    .await?;
+    let dispatched = dispatch_core(State(state.clone()), headers, body, approval).await?;
     let new_id = dispatched
         .get("worker")
         .and_then(|row| row.get("id"))

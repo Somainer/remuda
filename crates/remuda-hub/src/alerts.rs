@@ -1,11 +1,14 @@
 //! Push triggers and Paseo-style follow suppression.
 
 use crate::AppState;
-use crate::store::JournalRecord;
+use crate::store::{InteractionRecord, JournalRecord};
+use remuda_protocol::Task;
 use remuda_push::{Notification, PushTag};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use tokio::sync::Mutex;
 
 /// Devices currently watching an instance over `/v1/follow`.
@@ -120,7 +123,7 @@ async fn dispatch(state: AppState, instance_id: String, kind: AlertKind) {
                     "Need your input",
                     "An approval or question is waiting.".to_string(),
                     PushTag::Interaction { id: id.clone() },
-                    format!("/approvals?focus={id}"),
+                    interaction_landing_url(id),
                 ),
                 AlertKind::TurnError => (
                     "Turn failed",
@@ -163,18 +166,13 @@ async fn fanout(
     let Ok(subs) = push.subscriptions() else {
         return;
     };
-    // The badge is this device's pending interaction count (ui-spec §4.5 /
-    // D-049). Pending is global durable state — every subscribed device is
-    // shown the same queue — so the count is read once per fanout, durable
+    // The badge is the owner's 「需要你」 N (home.md §5.1, ui-spec §4.5): the
+    // interactions really waiting plus the owner-blocked tasks with no such
+    // interaction. Pending is global durable state — every subscribed device
+    // is shown the same queue — so the count is read once per fanout, durable
     // Hub truth only: a device live-following the instance got no push at
-    // all thanks to the suppression above. The durable index is the same
-    // list the web boot gate and `/v1/interactions` serve.
-    let pending = state
-        .store
-        .list_interactions(None, None, None, true)
-        .await
-        .map(|rows| u64::try_from(rows.len()).unwrap_or(u64::MAX))
-        .unwrap_or(0);
+    // all thanks to the suppression above.
+    let pending = owner_badge(state).await;
     let base = Notification::new(title, body, tag.clone(), url);
     for sub in subs {
         let notification = base.clone().with_badge(pending);
@@ -182,6 +180,88 @@ async fn fanout(
             tracing::debug!(error = %err, endpoint = %sub.endpoint, "push notify failed");
         }
     }
+}
+
+/// Where a push about interaction `id` lands (home.md §9 角标与落点): the
+/// desktop home with the card focused. A phone keeps the query through the
+/// `/sessions` → `/m` redirect, so the same URL lands on `/m?focus=<id>`.
+pub(crate) fn interaction_landing_url(id: &str) -> String {
+    format!("/sessions?focus={id}")
+}
+
+/// Read the three inputs of [`owner_queue_count`] and count. A read failure
+/// leaves that part at zero rather than dropping the push.
+async fn owner_badge(state: &AppState) -> u64 {
+    let pending = state
+        .store
+        .list_interactions(None, None, None, true)
+        .await
+        .unwrap_or_default();
+    let tasks = state.store.list_tasks(None).await.unwrap_or_default();
+    let task_of_instance = state.store.instance_task_ids().await.unwrap_or_default();
+    owner_queue_count(
+        &pending,
+        &tasks,
+        &task_of_instance,
+        OffsetDateTime::now_utc(),
+    )
+}
+
+/// home.md §5.1 N = A + B, the count the web ① row, the ④ queue header and
+/// the OS badge all show (the web twin is `glanceCounts()` in
+/// `web/src/features/home/glance.ts`).
+///
+/// * A: pending interactions whose known deadline has not passed (a ghost card
+///   past its deadline is not shown, so it is not counted either).
+/// * B: unarchived tasks with a non-blank `blocked_reason` none of whose
+///   sessions (`instances.task_id`) has an interaction counted in A — the
+///   interaction card and the task card are never both shown (§4.6).
+///
+/// Done-unseen, notices and failed turns are not part of N.
+pub(crate) fn owner_queue_count(
+    pending: &[InteractionRecord],
+    tasks: &[Task],
+    task_of_instance: &HashMap<String, String>,
+    now: OffsetDateTime,
+) -> u64 {
+    let waiting: Vec<&InteractionRecord> = pending
+        .iter()
+        .filter(|row| row.state == "pending" && !deadline_passed(&row.payload, now))
+        .collect();
+    let covered: HashSet<&str> = waiting
+        .iter()
+        .filter_map(|row| task_of_instance.get(&row.instance_id).map(String::as_str))
+        .collect();
+    let blocked = tasks
+        .iter()
+        .filter(|task| task.archived_at.is_none())
+        .filter(|task| {
+            task.blocked_reason
+                .as_deref()
+                .is_some_and(|reason| !reason.trim().is_empty())
+        })
+        .filter(|task| !covered.contains(task.meta.id.as_id().as_str()))
+        .count();
+    u64::try_from(waiting.len() + blocked).unwrap_or(u64::MAX)
+}
+
+/// A durable interaction row whose wire entity carries a known deadline that
+/// is already in the past (the web's `deadlinePassed`).
+fn deadline_passed(payload: &Value, now: OffsetDateTime) -> bool {
+    let Some(entity) = payload
+        .pointer("/payload/interaction")
+        .or_else(|| payload.pointer("/payload/entity"))
+    else {
+        return false;
+    };
+    if entity.pointer("/deadline/state").and_then(Value::as_str) != Some("known") {
+        return false;
+    }
+    entity
+        .pointer("/deadline/value")
+        .and_then(Value::as_str)
+        .and_then(|raw| OffsetDateTime::parse(raw, &Rfc3339).ok())
+        .is_some_and(|deadline| deadline < now)
 }
 
 /// Map a journal event to its outward alert kind.
@@ -250,4 +330,111 @@ fn classify(event: &Value) -> Option<AlertKind> {
         return Some(AlertKind::Waiting);
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::InteractionRecord;
+    use remuda_protocol::{ProjectId, TaskBudget, TaskClass, Timestamp};
+    use serde_json::json;
+
+    const NOW: &str = "2026-11-01T10:00:00.000Z";
+
+    fn now() -> OffsetDateTime {
+        OffsetDateTime::parse(NOW, &Rfc3339).expect("now")
+    }
+
+    fn pending(id: &str, instance: &str, deadline: Option<&str>) -> InteractionRecord {
+        let deadline = match deadline {
+            Some(value) => json!({ "state": "known", "value": value }),
+            None => json!({ "state": "unknown" }),
+        };
+        InteractionRecord {
+            interaction_id: id.into(),
+            instance_id: instance.into(),
+            host_id: "hst_1".into(),
+            kind: "approval".into(),
+            state: "pending".into(),
+            blocking: true,
+            payload: json!({
+                "kind": "interaction.requested",
+                "payload": { "interaction": { "id": id, "deadline": deadline } }
+            }),
+            created_at: NOW.into(),
+            updated_at: NOW.into(),
+        }
+    }
+
+    fn task(blocked: Option<&str>, archived: bool) -> Task {
+        let stamp = Timestamp::try_from(NOW.to_string()).expect("timestamp");
+        let mut task = Task::new_root(
+            stamp.clone(),
+            ProjectId::new(),
+            "t".into(),
+            "intent".into(),
+            TaskClass::Implement,
+            Vec::new(),
+            Vec::new(),
+            TaskBudget::default(),
+        );
+        task.blocked_reason = blocked.map(str::to_string);
+        task.archived_at = archived.then_some(stamp);
+        task
+    }
+
+    #[test]
+    fn interaction_pushes_land_on_the_home_with_the_card_focused() {
+        assert_eq!(
+            interaction_landing_url("int_0193a5b2c3d4"),
+            "/sessions?focus=int_0193a5b2c3d4"
+        );
+    }
+
+    #[test]
+    fn the_badge_is_waiting_interactions_plus_owner_blocked_tasks_without_one() {
+        let lone = task(Some("等你确认验收范围"), false);
+        let covered = task(Some("等你看 gate"), false);
+        let archived = task(Some("x"), true);
+        let blank = task(Some("   "), false);
+        let fine = task(None, false);
+        let mut task_of_instance = HashMap::new();
+        task_of_instance.insert(
+            "ins_covered".to_string(),
+            covered.meta.id.as_id().to_string(),
+        );
+        let rows = vec![
+            pending("int_a", "ins_a", None),
+            pending("int_b", "ins_covered", Some("2999-01-01T00:00:00.000Z")),
+            // A ghost card past its known deadline counts for nothing.
+            pending("int_ghost", "ins_c", Some("2026-11-01T09:59:59.000Z")),
+        ];
+        let tasks = vec![lone, covered, archived, blank, fine];
+        // A = int_a + int_b; B = the lone blocked task only.
+        assert_eq!(
+            owner_queue_count(&rows, &tasks, &task_of_instance, now()),
+            3
+        );
+    }
+
+    #[test]
+    fn a_task_whose_only_interaction_is_a_ghost_counts_as_blocked() {
+        let blocked = task(Some("等你"), false);
+        let mut task_of_instance = HashMap::new();
+        task_of_instance.insert("ins_t".to_string(), blocked.meta.id.as_id().to_string());
+        let rows = vec![pending(
+            "int_ghost",
+            "ins_t",
+            Some("2026-01-01T00:00:00.000Z"),
+        )];
+        assert_eq!(
+            owner_queue_count(&rows, &[blocked], &task_of_instance, now()),
+            1
+        );
+    }
+
+    #[test]
+    fn nothing_waiting_clears_the_badge() {
+        assert_eq!(owner_queue_count(&[], &[], &HashMap::new(), now()), 0);
+    }
 }

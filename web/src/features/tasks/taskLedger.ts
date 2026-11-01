@@ -150,33 +150,44 @@ function stopPolling(key: string) {
 }
 
 /**
+ * Subscribe outside React (the OS badge sync, lib/push.ts): the same shared
+ * poller per scope as {@link useTaskLedger}. Returns the unsubscribe.
+ */
+export function subscribeTaskLedger(projectId: string | null, listener: () => void): () => void {
+  const key = projectId ?? "";
+  const entry = entryFor(key, projectId);
+  entry.listeners.add(listener);
+  startPolling(key);
+  return () => {
+    const current = entries.get(key);
+    if (!current) return;
+    current.listeners.delete(listener);
+    if (current.listeners.size === 0) stopPolling(key);
+  };
+}
+
+/** The current snapshot of a scope (empty until its first poll lands). */
+export function taskLedgerSnapshot(projectId: string | null): TaskLedger {
+  return entries.get(projectId ?? "")?.snapshot ?? EMPTY;
+}
+
+/**
  * Poll the task ledger (and the project list for names). Read-only. Every
  * caller with the same `projectId` shares one poller; the returned snapshot is
  * replaced only when the data changes, so quiet polls do not re-render.
  */
 export function useTaskLedger(projectId?: string | null): TaskLedger {
-  const key = projectId ?? "";
   // Stable per scope: an identity that changed on every render would make
   // React unsubscribe/resubscribe each time, restarting the poller.
+  // Keep the scope's last snapshot cached (identity-stable for a remount);
+  // the last unsubscribe only stops the timers.
   const subscribe = useCallback(
-    (listener: () => void) => {
-      const entry = entryFor(key, projectId ?? null);
-      entry.listeners.add(listener);
-      startPolling(key);
-      return () => {
-        const current = entries.get(key);
-        if (!current) return;
-        current.listeners.delete(listener);
-        // Keep the scope's last snapshot cached (identity-stable for a
-        // remount); only the timers stop.
-        if (current.listeners.size === 0) stopPolling(key);
-      };
-    },
-    [key, projectId],
+    (listener: () => void) => subscribeTaskLedger(projectId ?? null, listener),
+    [projectId],
   );
   return useSyncExternalStore(
     subscribe,
-    () => entries.get(key)?.snapshot ?? EMPTY,
+    () => taskLedgerSnapshot(projectId ?? null),
     () => EMPTY,
   );
 }

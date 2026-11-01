@@ -292,7 +292,8 @@ async fn pairing_list_revoke_and_push_with_follow_suppress() -> Result<()> {
     // pending interaction count, alongside the existing deep link.
     let payload = latest_payload(&fake, &components, &auth_bytes);
     assert_eq!(payload["badge"], 1, "badge equals pending count: {payload}");
-    assert_eq!(payload["data"]["url"], "/approvals?focus=int_test_1");
+    // home.md §9: an interaction lands on the home's ④ card, focused.
+    assert_eq!(payload["data"]["url"], "/sessions?focus=int_test_1");
 
     // A second pending interaction on the same instance pushes again with
     // the count raised to two.

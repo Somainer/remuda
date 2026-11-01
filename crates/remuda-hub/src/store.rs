@@ -9094,6 +9094,44 @@ mod tests {
         presented == hash
     }
 
+    /// home.md §5.1 B (push badge): the instance → task membership join reads
+    /// only bound instances.
+    #[tokio::test]
+    async fn instance_task_ids_maps_only_bound_instances() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let host = new_id("hst").unwrap();
+        store
+            .authenticate_host(
+                HostAuthRequest {
+                    presented: enroll_token(&store, "enroll-taskids").await,
+                    hello_host_id: Some(host.clone()),
+                    label: Some("taskids-test".into()),
+                    node_version: None,
+                },
+                verify_eq,
+                |_| Ok("test-hash".into()),
+            )
+            .await
+            .unwrap();
+        let bound = seed_instance(&store, &host).await.instance_id;
+        let unbound = seed_instance(&store, &host).await.instance_id;
+        let id = bound.clone();
+        store
+            .run_named("test_bind_task", move |conn| {
+                conn.execute(
+                    "UPDATE instances SET task_id = 'tsk_bound' WHERE id = ?1",
+                    params![id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let map = store.instance_task_ids().await.unwrap();
+        assert_eq!(map.get(&bound).map(String::as_str), Some("tsk_bound"));
+        assert!(!map.contains_key(&unbound));
+    }
+
     /// r40: a replaced link's late teardown never takes a host offline once a
     /// newer hello has adopted a link; the current link's teardown still does.
     #[tokio::test]

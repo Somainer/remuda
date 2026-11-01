@@ -2591,3 +2591,87 @@ async fn the_boot_reads_the_previous_run_marker_before_writing_its_own() -> Resu
     assert!(now_marker > alive);
     Ok(())
 }
+
+// ── r4 item 2: failures before preparation follow the same rule ─────────
+
+/// The failed chapter's host row is gone: its successor can never be placed,
+/// so the supervisor pauses at once with the restart-failed push instead of
+/// retrying silently on every tick.
+#[tokio::test]
+async fn a_seat_whose_host_row_is_gone_pauses_at_once_with_the_push() -> Result<()> {
+    let (ctx, fake) = Ctx::boot_push().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host, true).await?;
+    let seat = ctx.seat(&mut node).await?;
+    ctx.report_running(&node, &seat, SESSION).await?;
+    ctx.report_killed(&node, &seat).await?;
+    node.disconnect();
+    ctx.db()?.execute(
+        "DELETE FROM hosts WHERE id = ?1",
+        rusqlite::params![ctx.host],
+    )?;
+    let hits = *fake.hits.lock().unwrap();
+    let decided = ctx.supervise().await;
+    assert_eq!(decided.len(), 1, "{decided:?}");
+    assert_eq!(decided[0]["outcome"], json!("process-exit"));
+    let record = ctx.lineage(&seat).await?;
+    assert_eq!(record["pausedBy"]["kind"], json!("process-exit"));
+    let reason = record["restartDecisions"][0]["reason"]
+        .as_str()
+        .context("reason")?;
+    assert!(reason.contains(&ctx.host), "{reason}");
+    assert_eq!(
+        ctx.c1_push_kinds(&seat)?,
+        [(
+            "restart-failed".to_owned(),
+            "Main paused: could not restart".to_owned()
+        )]
+    );
+    assert_eq!(*fake.hits.lock().unwrap(), hits + 1);
+    Ok(())
+}
+
+/// A lookup error before preparation — loading the candidate, counting the
+/// hour's restarts, or the host and recovery-source lookups — is retryable
+/// under the same bound: nothing is decided inside the window, and at the
+/// boundary the lineage is paused with the restart-failed push.
+#[tokio::test]
+async fn a_lookup_error_before_preparation_pauses_at_the_window_boundary() -> Result<()> {
+    for point in ["pending", "cap", "recovery"] {
+        let (ctx, fake) = Ctx::boot_push().await?;
+        let mut node = FakeNode::connect(&ctx.hub, &ctx.host, true).await?;
+        let seat = ctx.seat(&mut node).await?;
+        ctx.report_running(&node, &seat, SESSION).await?;
+        ctx.report_killed(&node, &seat).await?;
+        ctx.hub.test_handle().test_fail_restart_step(point, 1_000);
+        ctx.age_end_seen(&seat, &ago(29, 0))?;
+        for tick in 0..2 {
+            assert!(ctx.supervise().await.is_empty(), "{point} tick {tick}");
+            ctx.assert_undecided(&mut node, &seat, &format!("{point} tick {tick}"))
+                .await?;
+        }
+        assert!(ctx.c1_push_kinds(&seat)?.is_empty(), "{point}: no push yet");
+        let hits = *fake.hits.lock().unwrap();
+        ctx.age_end_seen(&seat, &ago(30, 5))?;
+        ctx.supervise().await;
+        let record = ctx.lineage(&seat).await?;
+        assert_eq!(record["state"], json!("paused"), "{point}: {record}");
+        assert_eq!(record["pausedBy"]["kind"], json!("process-exit"), "{point}");
+        let reason = record["restartDecisions"][0]["reason"]
+            .as_str()
+            .context("reason")?;
+        assert!(
+            reason.contains(&format!("injected transient store error at {point}")),
+            "{reason}"
+        );
+        assert_eq!(
+            ctx.c1_push_kinds(&seat)?,
+            [(
+                "restart-failed".to_owned(),
+                "Main paused: could not restart".to_owned()
+            )],
+            "{point}"
+        );
+        assert_eq!(*fake.hits.lock().unwrap(), hits + 1, "{point}");
+    }
+    Ok(())
+}

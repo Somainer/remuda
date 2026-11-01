@@ -822,7 +822,15 @@ impl HubTestHandle {
     /// transient store error (test-faults).
     #[cfg(any(test, feature = "test-faults"))]
     pub fn test_fail_restart_prepares(&self, count: usize) {
-        self.state.restart.fail_next_prepares(count);
+        self.state.restart.fail_next("prepare", count);
+    }
+
+    /// D-057 §6.3.1: the next `count` passes through C1 fault point `point`
+    /// (`pending`, `cap`, `recovery`, `prepare`) fail with a transient store
+    /// error (test-faults).
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_fail_restart_step(&self, point: &str, count: usize) {
+        self.state.restart.fail_next(point, count);
     }
 
     /// One scheduler tick (claims + dispatches), on an owned handle.

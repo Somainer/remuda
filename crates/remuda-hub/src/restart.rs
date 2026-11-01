@@ -1107,10 +1107,24 @@ pub(crate) struct SupervisorState {
     /// Failed chapter → when its last transient preparation failure was
     /// logged (one warning per chapter per minute).
     prepare_logged: Arc<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>>,
-    /// Test seam: the next N successor preparations fail with a transient
-    /// store error.
+    /// Test seam: fault point → how many more times it fails with a
+    /// transient store error.
     #[cfg(any(test, feature = "test-faults"))]
-    prepare_faults: Arc<std::sync::atomic::AtomicUsize>,
+    faults: Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
+}
+
+/// Test seam: fail fault point `point` once if it is armed (test-faults).
+#[cfg(any(test, feature = "test-faults"))]
+fn injected(state: &AppState, point: &str) -> Result<(), StoreError> {
+    match state.restart.take_fault(point) {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+#[cfg(not(any(test, feature = "test-faults")))]
+fn injected(_state: &AppState, _point: &str) -> Result<(), StoreError> {
+    Ok(())
 }
 
 impl SupervisorState {
@@ -1134,25 +1148,27 @@ impl SupervisorState {
 
 #[cfg(any(test, feature = "test-faults"))]
 impl SupervisorState {
-    /// Arm `count` transient preparation failures.
-    pub(crate) fn fail_next_prepares(&self, count: usize) {
-        self.prepare_faults
-            .store(count, std::sync::atomic::Ordering::SeqCst);
+    /// Arm `count` transient store errors at fault point `point`: `pending`
+    /// (loading a candidate), `cap` (counting the last hour's restarts),
+    /// `recovery` (the host and recovery-source lookups) or `prepare` (the
+    /// successor's preparation).
+    pub(crate) fn fail_next(&self, point: &str, count: usize) {
+        self.faults
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(point.to_owned(), count);
     }
 
-    fn take_prepare_fault(&self) -> Option<crate::error::HubError> {
-        self.prepare_faults
-            .fetch_update(
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-                |left| left.checked_sub(1),
-            )
-            .ok()
-            .map(|_| {
-                crate::error::HubError::Store(StoreError::Id(
-                    "injected transient store error".into(),
-                ))
-            })
+    fn take_fault(&self, point: &str) -> Option<StoreError> {
+        let mut faults = self
+            .faults
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let left = faults.get_mut(point)?;
+        *left = left.checked_sub(1)?;
+        Some(StoreError::Id(format!(
+            "injected transient store error at {point}"
+        )))
     }
 }
 
@@ -1437,15 +1453,21 @@ async fn evaluate_pass(state: &AppState, pass: Pass) -> Vec<Decided> {
     };
     let mut decided = Vec::new();
     for (lineage_id, failed_id, seen) in candidates {
-        let pending = match pending(state, &lineage_id, &failed_id, seen, &pass).await {
-            Ok(Some(pending)) => pending,
+        let outcome = match pending(state, &lineage_id, &failed_id, seen.clone(), &pass).await {
+            Ok(Some(pending)) => decide(state, pending).await,
             Ok(None) => continue,
-            Err(error) => {
-                tracing::warn!(%error, %lineage_id, "C1 supervisor could not read a candidate");
-                continue;
-            }
+            Err(error) => Err(crate::error::HubError::Store(error)),
         };
-        match decide(state, pending).await {
+        // Any error while deciding (loading the candidate, counting the
+        // hour's restarts, the host and recovery lookups, the decision's own
+        // write) is retryable under the same bound as a failed preparation.
+        let outcome = match outcome {
+            Err(error) => {
+                pause_after_window(state, &lineage_id, &failed_id, seen.as_deref(), &error).await
+            }
+            other => other,
+        };
+        match outcome {
             Ok(Some(decision)) => {
                 tracing::info!(
                     lineage_id = %decision.lineage_id,
@@ -1470,6 +1492,74 @@ async fn evaluate_pass(state: &AppState, pass: Pass) -> Vec<Decided> {
     decided
 }
 
+/// Whether the retry window of an end first seen at `end_seen` has closed.
+fn window_closed(end_seen: &str) -> bool {
+    window_after(end_seen)
+        .is_none_or(|deadline| crate::config::now_rfc3339().as_str() >= deadline.as_str())
+}
+
+/// Bounded retry for an error that stopped a decision (r4): inside the
+/// window, log (once a minute per chapter) and let the next tick retry; once
+/// it has closed, decide `paused{process-exit}` with the restart-failed push
+/// and the error as the reason, reloading what the pause needs directly.
+async fn pause_after_window(
+    state: &AppState,
+    lineage_id: &str,
+    failed_id: &str,
+    seen: Option<&str>,
+    error: &crate::error::HubError,
+) -> Result<Option<Decided>, crate::error::HubError> {
+    let end_seen = match seen {
+        Some(seen) => seen.to_owned(),
+        // The first sighting was never recorded: record it now, so the
+        // window starts and the retries stay bounded.
+        None => state.store.stamp_end_seen(failed_id.to_owned()).await?,
+    };
+    if !window_closed(&end_seen) {
+        if state.restart.note_prepare_failure(failed_id) {
+            tracing::warn!(%error, %lineage_id, failed = %failed_id,
+                "C1 decision failed; retrying on the next tick");
+        }
+        return Ok(None);
+    }
+    let Some(lineage) = state.store.get_lineage(lineage_id.to_owned()).await? else {
+        return Ok(None);
+    };
+    let Some(failed) = state.store.get_instance_read(failed_id.to_owned()).await? else {
+        return Ok(None);
+    };
+    if lineage.current_instance_id != failed.instance_id
+        || lineage.generation != failed.generation
+        || lineage.state == "paused"
+        || failed.fenced_at.is_some()
+        || !state
+            .store
+            .instance_has_process_end_evidence(&failed)
+            .await?
+    {
+        return Ok(None);
+    }
+    let cause = classify(
+        &lineage.state,
+        &failed.lifecycle,
+        failed.last_error.as_deref(),
+    );
+    let reason = format!(
+        "successor could not be prepared within {DECISION_WINDOW_MINUTES} minutes of the Hub \
+         first seeing this end ({end_seen}): {error}"
+    );
+    pause(
+        state,
+        &lineage,
+        &failed,
+        cause,
+        outcome::PROCESS_EXIT,
+        Some(reason),
+        Some(push_kind::RESTART_FAILED),
+    )
+    .await
+}
+
 /// Load and check one candidate: Node-attested process-end evidence on the
 /// current chapter at the live generation.
 async fn pending(
@@ -1479,6 +1569,7 @@ async fn pending(
     seen: Option<String>,
     pass: &Pass,
 ) -> Result<Option<Pending>, StoreError> {
+    injected(state, "pending")?;
     let Some(lineage) = state.store.get_lineage(lineage_id.to_owned()).await? else {
         return Ok(None);
     };
@@ -1587,6 +1678,7 @@ async fn decide(
         )
         .await;
     };
+    injected(state, "cap")?;
     let restarts = state
         .store
         .restarts_in_last_hour(lineage.lineage_id.clone())
@@ -1682,8 +1774,28 @@ async fn restart(
     cause: &'static str,
     end_seen: &str,
 ) -> Result<Option<Decided>, crate::error::HubError> {
+    // The retry window, from when the Hub first saw this end: a retryable
+    // failure below pauses once it has closed (and so does any error the
+    // evaluation loop sees, via `pause_after_window`).
+    let window_has_closed = window_closed(end_seen);
+    injected(state, "recovery")?;
     let Some(host) = state.store.get_host(failed.host_id.clone()).await? else {
-        return Ok(None);
+        // The chapter's host is no longer registered: no successor can ever
+        // be placed there. Permanent: pause at once with the push.
+        let reason = format!(
+            "successor cannot be prepared: the chapter's host {} is no longer registered",
+            failed.host_id
+        );
+        return pause(
+            state,
+            lineage,
+            failed,
+            cause,
+            outcome::PROCESS_EXIT,
+            Some(reason),
+            Some(push_kind::RESTART_FAILED),
+        )
+        .await;
     };
     let recovery = crate::http::recovery_source(state, lineage, failed).await?;
     // §6.3.1: the successor always runs claude-sdk on the same host (a
@@ -1693,13 +1805,9 @@ async fn restart(
     } else {
         failed.driver.as_str()
     };
-    #[cfg(any(test, feature = "test-faults"))]
-    let injected = state.restart.take_prepare_fault();
-    #[cfg(not(any(test, feature = "test-faults")))]
-    let injected: Option<crate::error::HubError> = None;
-    let prepared = match match injected {
-        Some(error) => Err(crate::http::ContinuationError::Retryable(error)),
-        None => {
+    let prepared = match match injected(state, "prepare") {
+        Err(error) => Err(crate::http::ContinuationError::Retryable(error.into())),
+        Ok(()) => {
             crate::http::prepare_continuation(state, host, lineage, failed, &recovery, driver, None)
                 .await
         }
@@ -1726,11 +1834,7 @@ async fn restart(
             // Bounded retry (r3): every tick until the Hub has known of the
             // end for the decision window, then a visible pause with the
             // same push. Never silently expired.
-            let deadline = window_after(end_seen);
-            if deadline
-                .as_deref()
-                .is_none_or(|deadline| crate::config::now_rfc3339().as_str() >= deadline)
-            {
+            if window_has_closed {
                 let reason = format!(
                     "successor could not be prepared within {DECISION_WINDOW_MINUTES} minutes \
                      of the Hub first seeing this end ({end_seen}): {error}"
@@ -1747,7 +1851,7 @@ async fn restart(
                 .await;
             }
             if state.restart.note_prepare_failure(&failed.instance_id) {
-                tracing::warn!(%error, failed = %failed.instance_id, deadline = ?deadline,
+                tracing::warn!(%error, failed = %failed.instance_id,
                     "C1 successor could not be prepared; retrying on the next tick");
             }
             return Ok(None);

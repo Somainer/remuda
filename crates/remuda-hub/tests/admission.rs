@@ -1667,3 +1667,65 @@ async fn human_resume_keeps_the_operator_path_for_its_own_workers() {
     assert_eq!(forwarded[0]["spec"]["resumedFrom"], aw.as_str());
     assert_eq!(forwarded[0]["origin"], "human");
 }
+
+/// §15.1, the generation half: the creator's generation is re-checked in the
+/// same writer job as the mode. A creator chapter fenced (its lineage's
+/// generation moved) while the dispatch was provisioning aborts the create
+/// with `fenced`, launches nothing and gives the worktree back.
+#[tokio::test]
+async fn a_creator_generation_change_while_provisioning_aborts_the_dispatch() {
+    let mut ctx = Ctx::spawn().await.unwrap();
+    let seat = ctx.seat("claude", "auto").await;
+    ctx.node.drain();
+    let (mut arrived, release) = ctx.node.hold_provision();
+    let token = seat.token.clone();
+    let http = ctx.http.clone();
+    let url = format!("http://{}/v1/workers/dispatch", ctx.hub.addr);
+    let body = ctx.dispatch_body("gen");
+    let dispatch = tokio::spawn(async move {
+        let response = http
+            .post(url)
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        (status, response.json::<Value>().await.unwrap())
+    });
+    arrived.recv().await.expect("provision reached the Node");
+    let generation_before = ctx
+        .store()
+        .get_instance(seat.id.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    ctx.store()
+        .test_fence_instance(seat.id.clone())
+        .await
+        .expect("fence the creator chapter");
+    release.notify_one();
+    let (status, body) = dispatch.await.unwrap();
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["code"], "fenced", "{body}");
+    let methods: Vec<_> = ctx.node.drain().into_iter().map(|(m, _)| m).collect();
+    assert!(
+        methods.contains(&"worker.remove".to_string()),
+        "rolled back: {methods:?}"
+    );
+    assert!(
+        !methods.contains(&"instance.create".to_string()),
+        "{methods:?}"
+    );
+    assert!(ctx.roster().await.is_empty());
+    let lineage = ctx
+        .store()
+        .get_lineage(generation_before.lineage_id.clone())
+        .await
+        .unwrap()
+        .expect("lineage");
+    assert!(
+        lineage.generation > generation_before.generation,
+        "the generation moved"
+    );
+}

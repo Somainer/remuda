@@ -214,6 +214,36 @@ describe("HomeQueue answer flow (§4.4)", () => {
     expect(cards()).toHaveLength(0);
   });
 
+  it("keeps the card's slot while the store drops the committed row before respond() resolves", async () => {
+    vi.useFakeTimers();
+    oneApproval();
+    let resolve: () => void = () => undefined;
+    fake.respond.mockImplementation(() => new Promise<void>((done) => (resolve = done)));
+    const view = renderQueue();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "允许一次" }));
+    });
+    // The real store flips the row to committed (and out of the queue) before
+    // its follow-up refresh lets respond() resolve.
+    fake.state = hub({ instances: [inst({ id: "ins_a" })], interactions: [] });
+    view.rerender(
+      <MemoryRouter initialEntries={["/m"]}>
+        <HomeQueue placement="phone" searching={false} />
+      </MemoryRouter>,
+    );
+    expect(cards()).toHaveLength(1);
+    expect(screen.getByRole("button", { name: "允许一次" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "拒绝" })).toBeDisabled();
+    await act(async () => {
+      resolve();
+    });
+    expect(screen.getByTestId("home-card-receipt")).toHaveTextContent("已提交");
+    await act(async () => {
+      vi.advanceTimersByTime(2_000);
+    });
+    expect(cards()).toHaveLength(0);
+  });
+
   it.each([409, 410])("shows 已在其他设备处理 on %i, then the card leaves", async (status) => {
     vi.useFakeTimers();
     oneApproval();

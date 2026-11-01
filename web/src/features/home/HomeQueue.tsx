@@ -24,7 +24,12 @@ import {
 } from "./homeQueue";
 import css from "./homeQueue.module.css";
 
-type ReceiptEntry = { receipt: Receipt; card: HomeQueueCard; index: number };
+/**
+ * A card answered from here keeps its slot from the tap on: `sending` while
+ * the POST is in flight (the store already flips the row to committed before
+ * the call returns, so the live list drops it early), then its §4.4 receipt.
+ */
+type ReceiptEntry = { receipt: Receipt | "sending"; card: HomeQueueCard; index: number };
 
 /**
  * ④ 「需要你」 (home.md §4): the page's ONE needs-you queue, on `/m` (phone)
@@ -90,10 +95,10 @@ export function HomeQueue({
     [],
   );
   const settle = useCallback((id: string, receipt: Receipt) => {
-    const painted = paintedRef.current;
-    const index = painted.findIndex((card) => card.id === id);
-    if (index < 0) return;
-    setReceipts((current) => new Map(current).set(id, { receipt, card: painted[index], index }));
+    setReceipts((current) => {
+      const entry = current.get(id);
+      return entry ? new Map(current).set(id, { ...entry, receipt }) : current;
+    });
     const previous = timers.current.get(id);
     if (previous) clearTimeout(previous);
     timers.current.set(
@@ -111,10 +116,26 @@ export function HomeQueue({
   }, []);
   const respond = useCallback(
     async (item: Interaction, answer: InteractionAnswer) => {
+      // Pin the card's painted content and slot BEFORE the POST: the store
+      // marks the row committed before respond() resolves.
+      const painted = paintedRef.current;
+      const index = painted.findIndex((card) => card.id === item.id);
+      if (index >= 0) {
+        const pinned = painted[index];
+        setReceipts((current) => new Map(current).set(item.id, { receipt: "sending", card: pinned, index }));
+      }
       try {
         await hubStore.respond(item.id, answer);
       } catch (error) {
-        if (!answeredElsewhere(error)) throw error;
+        if (!answeredElsewhere(error)) {
+          setReceipts((current) => {
+            if (current.get(item.id)?.receipt !== "sending") return current;
+            const next = new Map(current);
+            next.delete(item.id);
+            return next;
+          });
+          throw error;
+        }
         settle(item.id, "elsewhere");
         // The queue still lists it until the next list; fetch it now.
         void hubStore.refresh().catch(() => undefined);
@@ -145,12 +166,12 @@ export function HomeQueue({
     if (snapshot) {
       return snapshot
         .filter((card) => !gone.has(card.id))
-        .map((card) => liveById.get(card.id) ?? receipts.get(card.id)?.card ?? card);
+        .map((card) => liveById.get(card.id) ?? pinnedCard(receipts.get(card.id)) ?? card);
     }
     // A receipt card the live data already dropped keeps its painted slot.
     const out = [...live];
     for (const [id, entry] of [...receipts].sort((a, b) => a[1].index - b[1].index)) {
-      if (!liveById.has(id)) out.splice(Math.min(entry.index, out.length), 0, entry.card);
+      if (!liveById.has(id)) out.splice(Math.min(entry.index, out.length), 0, pinnedCard(entry)!);
     }
     return out;
   }, [live, snapshot, gone, receipts]);
@@ -249,7 +270,7 @@ export function HomeQueue({
               card={card}
               placement={placement}
               focused={focus === id}
-              receipt={receipts.get(id)?.receipt ?? null}
+              receipt={receiptOf(receipts.get(id))}
               stale={stale}
               inert={inert}
               screenLines={card.type === "interaction" ? hub.screens[card.entry.item.instanceId]?.lines : undefined}
@@ -291,6 +312,23 @@ export function HomeQueue({
       ) : null}
     </section>
   );
+}
+
+/** The receipt a card shows (none while its POST is in flight). */
+function receiptOf(entry: ReceiptEntry | undefined): Receipt | null {
+  return entry && entry.receipt !== "sending" ? entry.receipt : null;
+}
+
+/**
+ * The pinned content of a card the live list already dropped. While its POST
+ * is in flight an interaction card reads `answering`: buttons stay disabled
+ * (§4.4, no optimistic update) until the receipt replaces them.
+ */
+function pinnedCard(entry: ReceiptEntry | undefined): HomeQueueCard | undefined {
+  if (!entry) return undefined;
+  const { card } = entry;
+  if (card.type !== "interaction") return card;
+  return { ...card, entry: { ...card.entry, uiState: "answering" } };
 }
 
 function workspaceLabelOf(

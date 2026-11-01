@@ -114,16 +114,41 @@ impl RecipeMemory {
 
 impl LaunchRecipe {
     /// The `--append-system-prompt` value this recipe's materializer emitted
-    /// itself: the one pair the finished-argv guards let through.
+    /// itself: the one pair the finished-argv guards let through. A recipe
+    /// persisted before the value was recorded falls back to the memory text,
+    /// which was the whole pair then.
     #[must_use]
     pub fn own_system_prompt(&self) -> Option<&str> {
-        self.memory.as_ref().and_then(RecipeMemory::flag_text)
+        self.system_prompt
+            .as_deref()
+            .or_else(|| self.memory.as_ref().and_then(RecipeMemory::flag_text))
     }
 
     /// The data block the driver delivers ahead of its first input.
     #[must_use]
     pub fn memory_data_block(&self) -> Option<&str> {
         self.memory.as_ref().and_then(RecipeMemory::data_block)
+    }
+
+    /// Everything the driver puts ahead of its first input: the memory block,
+    /// then the capability section (ma-skill), whichever this launch has.
+    #[must_use]
+    pub fn first_input_block(&self) -> Option<String> {
+        join_blocks(
+            self.memory_data_block(),
+            self.skill
+                .as_ref()
+                .and_then(crate::launch::remuda_skill::RecipeSkill::data_block),
+        )
+    }
+}
+
+/// Two framed blocks as one, memory first; `None` when neither is present.
+pub(crate) fn join_blocks(first: Option<&str>, second: Option<&str>) -> Option<String> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(format!("{first}\n\n{second}")),
+        (Some(only), None) | (None, Some(only)) => Some(only.to_owned()),
+        (None, None) => None,
     }
 }
 
@@ -176,7 +201,7 @@ pub(crate) struct PendingDataBlock(Mutex<Option<String>>);
 impl PendingDataBlock {
     /// Arm from a freshly materialized recipe (clears any previous launch's).
     pub(crate) fn arm(&self, recipe: &LaunchRecipe) {
-        *self.slot() = recipe.memory_data_block().map(str::to_owned);
+        *self.slot() = recipe.first_input_block();
     }
 
     /// `input` as it must be written: with the block ahead of it while one is

@@ -104,6 +104,7 @@ async fn fake_herdr_codex_start_send_wait_read_stop() {
     let driver = GenericPtyDriver::new(GenericPtyOptions {
         creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
+        skill_context: None,
         profile: profile(),
         launch_dir: launch,
         native_home: home,
@@ -225,6 +226,7 @@ async fn fake_herdr_start_failure_emits_error_lifecycle() {
     let driver = GenericPtyDriver::new(GenericPtyOptions {
         creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
+        skill_context: None,
         profile: profile(),
         launch_dir: launch,
         native_home: home,
@@ -305,6 +307,7 @@ async fn fake_herdr_slow_start_emits_ready_lifecycle() {
     let driver = GenericPtyDriver::new(GenericPtyOptions {
         creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
+        skill_context: None,
         profile: profile(),
         launch_dir: launch,
         native_home: home,
@@ -383,6 +386,7 @@ async fn fake_herdr_send_before_start_defers_without_blocking_control() {
     let driver = Arc::new(GenericPtyDriver::new(GenericPtyOptions {
         creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
+        skill_context: None,
         profile: profile(),
         launch_dir: tmp.path().join("launch"),
         native_home: tmp.path().join("home"),
@@ -439,6 +443,7 @@ async fn fake_herdr_journals_bounded_screen_snapshot() {
     let driver = GenericPtyDriver::new(GenericPtyOptions {
         creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
+        skill_context: None,
         profile: profile(),
         launch_dir: tmp.path().join("launch"),
         native_home: tmp.path().join("home"),
@@ -638,6 +643,7 @@ async fn generic_pty_grok_spawns_file_adapter_and_emits_usage() {
     let mut options = GenericPtyOptions {
         creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
+        skill_context: None,
         profile: profile(),
         launch_dir: launch,
         native_home: native_home.clone(),

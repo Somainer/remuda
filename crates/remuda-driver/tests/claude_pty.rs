@@ -81,6 +81,7 @@ async fn fake_herdr_start_prompt_idle_close() {
     let driver = ClaudePtyDriver::new(ClaudePtyOptions {
         creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
+        skill_context: None,
         instance_id: None,
         media_stager: None,
         profile: profile(),
@@ -291,6 +292,7 @@ async fn claude_pty_alt_screen_flips_when_the_harness_enters_fullscreen() {
     let driver = ClaudePtyDriver::new(ClaudePtyOptions {
         creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
+        skill_context: None,
         instance_id: None,
         media_stager: None,
         profile: profile(),
@@ -355,6 +357,7 @@ async fn live_claude_pty_haiku_once() {
     let driver = ClaudePtyDriver::new(ClaudePtyOptions {
         creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
+        skill_context: None,
         instance_id: None,
         media_stager: None,
         profile: profile(),

@@ -2194,6 +2194,12 @@ async fn spawn_inner(
                     tokio::spawn(async move {
                         crate::fence::sweep_deliveries(&sweep_state).await;
                     });
+                    // ma-restart r3: the persisted run marker the next
+                    // boot's C1 evaluation reads, whatever the setting.
+                    let alive_state = reaper_state.clone();
+                    tokio::spawn(async move {
+                        crate::restart::note_alive(&alive_state).await;
+                    });
                     // D-057 §6.3.1: the C1 supervisor, off the loop too.
                     if config.restart_supervisor {
                         let supervisor_state = reaper_state.clone();

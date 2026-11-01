@@ -696,6 +696,7 @@ async fn a_lost_host_link_is_no_action_and_a_same_epoch_reconnect_keeps_the_chap
     })
     .await?;
     assert_eq!(ctx.lineage(&seat).await?["state"], json!("host-offline"));
+    assert_eq!(ctx.end_seen_at(&seat)?, None, "contact loss is not an end");
     assert!(
         ctx.supervise().await.is_empty(),
         "host loss is not evidence"
@@ -2191,4 +2192,69 @@ async fn a_notice_whose_successor_create_was_rejected_is_cancelled() -> Result<(
         "the notice is never sent"
     );
     Ok(())
+}
+
+// ── r3: when the Hub first saw a chapter's end ──────────────────────────
+
+impl Ctx {
+    fn end_seen_at(&self, id: &str) -> Result<Option<String>> {
+        Ok(self.db()?.query_row(
+            "SELECT end_seen_at FROM instances WHERE id = ?1",
+            rusqlite::params![id],
+            |row| row.get(0),
+        )?)
+    }
+}
+
+/// The first time the Hub holds process-end evidence for a chapter it stamps
+/// `end_seen_at` with its own clock, once: a later end event does not move
+/// it, whatever that event's own `observedAt` says.
+#[tokio::test]
+async fn the_hub_stamps_when_it_first_saw_an_end_once() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host, true).await?;
+    let seat = ctx.seat(&mut node).await?;
+    ctx.report_running(&node, &seat, SESSION).await?;
+    assert_eq!(ctx.end_seen_at(&seat)?, None, "a live chapter has none");
+    let before = chrono_now();
+    ctx.report_killed(&node, &seat).await?;
+    let first = ctx.end_seen_at(&seat)?.context("stamped at first sight")?;
+    assert!(
+        first >= before,
+        "Hub clock, not the event's observedAt: {first} < {before}"
+    );
+    // A second end report arrives later: the first sighting stands.
+    let view = ctx.instance(&seat).await?;
+    let seq = view["durableSeq"].as_str().unwrap_or("0").parse::<u64>()?;
+    node.appends.send((
+        seat.clone(),
+        json!({"kind":"lifecycle","observedAt":"2026-11-01T09:00:00.000Z","payload":{
+            "type":"native","topic":"session","nativeName":"session",
+            "status":{"state":"known","value":"exited"},"severity":"info",
+            "affectsCompletion":true,"relatedIds":{}}}),
+    ))?;
+    ctx.wait_instance(&seat, |view| {
+        view["durableSeq"]
+            .as_str()
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_some_and(|value| value > seq)
+    })
+    .await?;
+    assert_eq!(ctx.end_seen_at(&seat)?.as_deref(), Some(first.as_str()));
+    Ok(())
+}
+
+/// Hub-clock now in the RFC3339 shape the Hub writes.
+fn chrono_now() -> String {
+    let now = time::OffsetDateTime::now_utc();
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        now.year(),
+        u8::from(now.month()),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second(),
+        now.millisecond()
+    )
 }

@@ -121,6 +121,45 @@ pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
          CREATE INDEX IF NOT EXISTS lineage_c1_pushes_unsent
             ON lineage_c1_pushes(sent_at, created_at);",
     )?;
+    // When THIS Hub first held process-end evidence for a chapter, on its
+    // own clock, written once (r3). A trigger rather than a call per write
+    // path, so every path that records an end (journal projection, failed
+    // create, epoch reconcile, stale-create sweep, daemon reconcile, delete
+    // stop) is covered. The predicate mirrors
+    // `store::lifecycle_has_process_end_evidence`: a host-contact-lost
+    // `exited` row without `ended_at` is contact loss, not an end. A row
+    // that returns to a live lifecycle loses the stamp.
+    crate::store::ensure_column(conn, "instances", "end_seen_at", "TEXT")?;
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS instances_end_seen;
+         CREATE TRIGGER instances_end_seen AFTER UPDATE ON instances
+         WHEN NEW.end_seen_at IS NULL AND (
+              NEW.lifecycle = 'closed'
+           OR (NEW.lifecycle = 'exited'
+               AND (NEW.ended_at IS NOT NULL
+                    OR COALESCE(NEW.last_error, '') <> 'host-contact-lost'))
+           OR (NEW.lifecycle = 'failed'
+               AND (NEW.ended_at IS NOT NULL
+                    OR LOWER(COALESCE(NEW.last_error, '')) = 'create-never-acknowledged'
+                    OR LOWER(COALESCE(NEW.last_error, '')) LIKE '%start-fail%'
+                    OR LOWER(COALESCE(NEW.last_error, '')) LIKE '%start failed%'
+                    OR LOWER(COALESCE(NEW.last_error, '')) LIKE '%never started%')))
+         BEGIN
+           UPDATE instances SET end_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = NEW.id AND end_seen_at IS NULL;
+         END;
+         DROP TRIGGER IF EXISTS instances_end_unseen;
+         CREATE TRIGGER instances_end_unseen AFTER UPDATE OF lifecycle ON instances
+         WHEN NEW.end_seen_at IS NOT NULL
+          AND NEW.lifecycle NOT IN ('exited', 'failed', 'closed')
+         BEGIN
+           UPDATE instances SET end_seen_at = NULL WHERE id = NEW.id;
+         END;
+         CREATE TABLE IF NOT EXISTS hub_run_marker (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            last_alive_at TEXT NOT NULL
+         );",
+    )?;
     conn.execute(
         "UPDATE lineages SET state = 'running'
           WHERE state = 'starting'
@@ -1059,6 +1098,8 @@ pub(crate) struct SupervisorState {
     running: Arc<tokio::sync::Mutex<()>>,
     /// Serializes [`drive_pushes`], so one row is never sent twice at once.
     pushes: Arc<tokio::sync::Mutex<()>>,
+    /// When this process last wrote the Hub run marker.
+    alive_written: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
     /// Failed chapter → when its last transient preparation failure was
     /// logged (one warning per chapter per minute).
     prepare_logged: Arc<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>>,
@@ -1242,6 +1283,44 @@ impl Store {
             Ok((result, settlement))
         })
         .await
+    }
+}
+
+/// How often the tick refreshes the Hub run marker.
+const ALIVE_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
+
+impl Store {
+    async fn write_alive(&self) -> Result<(), StoreError> {
+        self.run_named("hub_note_alive", |conn| {
+            conn.execute(
+                "INSERT INTO hub_run_marker (id, last_alive_at) VALUES (1, ?1)
+                 ON CONFLICT(id) DO UPDATE SET last_alive_at = excluded.last_alive_at",
+                params![crate::config::now_rfc3339()],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+}
+
+/// Scheduler tick, whatever the supervisor setting: refresh the persisted
+/// "this Hub was alive at" marker (at most every [`ALIVE_EVERY`]). The next
+/// boot reads it to tell an end seen moments before the Hub stopped from
+/// history (§6.3.2).
+pub(crate) async fn note_alive(state: &AppState) {
+    {
+        let mut last = state
+            .restart
+            .alive_written
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if last.is_some_and(|at| at.elapsed() < ALIVE_EVERY) {
+            return;
+        }
+        *last = Some(std::time::Instant::now());
+    }
+    if let Err(error) = state.store.write_alive().await {
+        tracing::warn!(%error, "could not record the Hub run marker");
     }
 }
 

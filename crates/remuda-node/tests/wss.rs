@@ -1501,7 +1501,20 @@ async fn wss_authenticated_origin_parent_scope_and_one_shot_human_approval() {
         .launch_recipe(&child_id.parse().unwrap())
         .unwrap()
         .unwrap();
-    assert_eq!(recipe.permission.cli_mode.as_deref(), Some("default"));
+    // D-057 OA1: the Agent named no mode, so its child inherits the creator's
+    // own `bypassPermissions`. The Hub stamped `creatorPermissionMode` on the
+    // forwarded create, and the Node admitted the control-off launch only
+    // because that stamp says the creator runs with control off.
+    assert_eq!(
+        recipe.permission.cli_mode.as_deref(),
+        Some("bypassPermissions")
+    );
+    assert!(
+        recipe
+            .argv
+            .iter()
+            .any(|flag| flag == "--allow-dangerously-skip-permissions")
+    );
     let serialized = serde_json::to_string(&recipe).unwrap();
     assert!(!serialized.contains(agent));
     assert!(!serialized.contains("REMUDA_TOKEN"));
@@ -1514,14 +1527,9 @@ async fn wss_authenticated_origin_parent_scope_and_one_shot_human_approval() {
             .any(|id| id == child_id)
     );
 
-    for mode in [
-        "bypassPermissions",
-        "dontAsk",
-        "auto",
-        "acceptEdits",
-        "default",
-        "future",
-    ] {
+    // Words outside the Claude vocabulary are refused for an Agent, whatever
+    // its own mode, before anything is indexed or dispatched (D-057 OA1).
+    for mode in ["default", "future", "bypass"] {
         let (status, denied_launch) = request(
             hub.addr,
             agent,
@@ -1531,6 +1539,7 @@ async fn wss_authenticated_origin_parent_scope_and_one_shot_human_approval() {
         )
         .await;
         assert_eq!(status, 403, "Agent {mode}: {denied_launch}");
+        assert_eq!(denied_launch["reason"], "permission-mode-unknown");
         assert!(
             denied_launch.get("instance").is_none(),
             "must reject before indexing or dispatch"

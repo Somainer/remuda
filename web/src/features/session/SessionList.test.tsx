@@ -1142,3 +1142,24 @@ describe("① rank filter on the list", () => {
     expect(screen.getByTestId("session-chip")).toHaveTextContent("工作中");
   });
 });
+
+describe("global scope and the desktop row set", () => {
+  it("still searches every top-level Space when the caller pins one", () => {
+    hub.instances = [
+      session("ins_pinned", { workspaceId: "wsp-a" }),
+      session("ins_elsewhere", { workspaceId: "wsp-b" }),
+      session("ins_child", {
+        workspaceId: "wsp-a",
+        parent: { instanceId: "ins_pinned", runId: "run_1", commandId: "cmd_1" },
+      }),
+    ];
+    render(
+      <MemoryRouter initialEntries={["/sessions?scope=all"]}>
+        <SessionList variant="full" instances={[hub.instances[0], hub.instances[2]]} title="demo-root" />
+      </MemoryRouter>,
+    );
+    // Global scope leaves the pinned Space behind; children stay out.
+    expect(new Set(screen.getAllByTestId("board-card").map((card) => card.getAttribute("data-instance-id"))))
+      .toEqual(new Set(["ins_pinned", "ins_elsewhere"]));
+  });
+});

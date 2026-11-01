@@ -98,7 +98,8 @@ export function SessionList({
   // Global scope searches every top-level instance the hub knows about; a
   // Space-pinned list renders the caller's instances minus children, so the ①
   // 工作中 count (TOP_LEVEL_WORKING) always equals the rows a tap can show.
-  const source = (instances ?? hub.instances).filter((instance) => instance.parent == null);
+  const source = (global ? hub.instances : (instances ?? hub.instances))
+    .filter((instance) => instance.parent == null);
 
   // Children that are still running lift their idle parent into awaiting-wake.
   // The child's own rank decides (blocked/working/starting), not connectivity.

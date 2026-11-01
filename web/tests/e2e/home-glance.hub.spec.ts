@@ -71,6 +71,20 @@ async function phoneContext(browser: Browser, baseURL: string) {
 
 const created: string[] = [];
 
+/**
+ * Delete this spec's sessions and WAIT until the Hub no longer serves them:
+ * the suite shares one fake Node, and a row that survived the next spec's
+ * setup changes its group counts (m-home asserts exact dots).
+ */
+async function cleanup(request: import("@playwright/test").APIRequestContext) {
+  for (const id of created.splice(0)) {
+    await request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
+    await expect
+      .poll(async () => (await request.get(`/v1/instances/${id}`)).status(), { timeout: 15_000 })
+      .toBe(404);
+  }
+}
+
 /** A session on the fake Node; the prompt carries its scripted behaviour. */
 async function createSession(page: Page, prompt: string): Promise<string> {
   await page.goto("/sessions/new");
@@ -216,9 +230,7 @@ test.describe("phone 390", () => {
       await shot(page, "home-glance-390-dark.png");
     } finally {
       // The suite shares one fake Node and its placement slots: release ours.
-      for (const id of created.splice(0)) {
-        await context.request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
-      }
+      await cleanup(context.request);
       await context.close();
     }
   });
@@ -263,9 +275,7 @@ test.describe("phone 390", () => {
         .toBe(true);
       await shot(page, "home-glance-390-taps.png");
     } finally {
-      for (const id of created.splice(0)) {
-        await context.request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
-      }
+      await cleanup(context.request);
       await context.close();
     }
   });
@@ -386,9 +396,7 @@ test.describe("desktop 1280", () => {
         .toBe(true);
       await shot(page, "home-glance-1280-taps.png");
     } finally {
-      for (const id of created.splice(0)) {
-        await context.request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
-      }
+      await cleanup(context.request);
       await context.close();
     }
   });

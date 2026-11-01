@@ -116,7 +116,7 @@ pub use inventory::{
     CLI_KINDS, COMPUTER_USE_KIND, CliAuth, CliEntry, CollectRequest, Collector, DEFAULT_TTL,
     HerdrReport, HostSnapshot, ProbeEnv, ResourceReport, claude_native_gateway_configured, collect,
     collect_fresh, computer_use_bundle_path, computer_use_client_path, computer_use_plist_path,
-    driver_capability_snapshot,
+    digest_of, driver_capability_snapshot,
 };
 pub use model::{
     CommandAction, CreateInstanceRequest, CreateInstanceResponse, InstanceCommandRequest,

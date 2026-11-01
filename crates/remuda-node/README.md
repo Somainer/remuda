@@ -48,10 +48,13 @@ Hub-acked seq (no Command replay, no duplicate appends). Frames use
 ## Host inventory
 
 `inventory::collect` probes `claude` / `codex` / `grok` / `agy` / `gemini` on
-PATH (canonical absolute path, `--version`, sha256), login markers without
+PATH (canonical absolute path, `--version`), login markers without
 reading secret values (`~/.claude.json` `oauthAccount` key presence;
 `~/.codex/auth.json` / `~/.grok/auth.json` existence; `agy` `settings.json`
-presence), Herdr version and socket, OS/kernel/libc, and cpu/mem. Results are
+presence), Herdr version and socket, OS/kernel/libc, and cpu/mem. Executable
+digests are deliberately not part of this probe — hashing a large CLI blocks
+`node.hello` for seconds and the Hub drops the field; `inventory::digest_of`
+computes one on demand. Results are
 cached (default 30s) for hello and heartbeat. Hub stores `cli[]` as
 `{kind,version,path,auth}` with `auth` in `logged_in` / `logged_out` /
 `unknown`. `WssConfig::with_collected_inventory` fills hello `cli` from this

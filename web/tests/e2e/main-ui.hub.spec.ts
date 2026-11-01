@@ -75,7 +75,19 @@ async function seatMain(page: Page, prompt: string): Promise<string> {
 async function cleanup(page: Page) {
   // Newest first: deleting a lineage's current chapter removes every chapter.
   for (const id of created.splice(0).reverse()) {
-    await page.request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
+    let response = await page.request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
+    // D-057 §6.3: the current chapter of an unpaused continuity lineage is
+    // paused (closed) explicitly before it can be deleted, so the C1
+    // supervisor never sees it end on its own.
+    if (response?.status() === 409) {
+      const refusal = (await response.json().catch(() => ({}))) as { reason?: string };
+      if (refusal.reason === "not-paused") {
+        await page.request
+          .post(`/v1/instances/${id}/commands`, { data: { operation: "instance.close", payload: {} } })
+          .catch(() => undefined);
+        response = await page.request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
+      }
+    }
   }
 }
 
@@ -128,7 +140,7 @@ test.describe("desktop Main entry", () => {
     await shot(page, "main-ui-1440.png");
   });
 
-  test("an ended Main reads 已结束 with one 恢复, which continues the lineage in chapter 2 with a divider", async ({ page }) => {
+  test("an ended Main reads 已暂停 · 进程退出 with one 恢复, which continues the lineage in chapter 2 with a divider", async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 800 });
     await login(page);
     const firstId = await seatMain(page, "main-ui mhome-exit chapter one");
@@ -142,11 +154,13 @@ test.describe("desktop Main entry", () => {
     await expect(page.getByTestId("ended-bar")).toBeVisible();
     await expect(page.getByTestId("resume-control")).toHaveCount(0);
     await expect(page.getByTestId("main-resume")).toHaveCount(1);
-    await expect(bar.getByTestId("main-status-lineage")).toHaveText(/^已结束/);
+    // The C1 supervisor records the end of a Main without a restart policy
+    // as paused{process-exit} (main-agent.md §6.3).
+    await expect(bar.getByTestId("main-status-lineage")).toHaveText(/^已暂停 · 进程退出/);
 
     await page.goto("/sessions");
     const card = page.getByTestId("main-card");
-    await expect(card.getByTestId("main-card-status")).toHaveText(/^已结束/, { timeout: 20_000 });
+    await expect(card.getByTestId("main-card-status")).toHaveText(/^已暂停 · 进程退出/, { timeout: 20_000 });
     await expect(card.getByTestId("composer-send")).toHaveCount(0);
     await card.getByTestId("main-ask-resume").click();
     // The resolution moves to the successor chapter; the input is 发送 again.

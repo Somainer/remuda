@@ -73,6 +73,9 @@ async fn main() -> Result<()> {
         "http://127.0.0.1:4179,http://localhost:4179,http://127.0.0.1:4177".into()
     });
     let mut config = HubConfig::for_test(dir.path().join("data"));
+    // D-057 §6.3.1: the browser suite runs the C1 restart supervisor, as
+    // production does (for_test turns it off for the Rust suites).
+    config.restart_supervisor = true;
     config.listen = std::env::var("HUB_E2E_LISTEN")
         .unwrap_or_else(|_| LISTEN.into())
         .parse::<SocketAddr>()

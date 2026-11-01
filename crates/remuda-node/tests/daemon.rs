@@ -1241,6 +1241,112 @@ async fn a_takeover_whose_generation_cannot_be_persisted_is_refused() {
     node.shutdown().await.unwrap();
 }
 
+fn persisted_generation(data_dir: &Path) -> u64 {
+    std::fs::read_to_string(data_dir.join("controller-generation"))
+        .expect("generation counter persisted")
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// ma-fence r3 item 1: an outbound WSS lease's generation is durable before
+/// it is handed out. A daemon that allocated generation 1 to its lease and
+/// then restarted must never hand 1 out again: the bridge that takes over the
+/// restarted daemon is 2, and a lease after a further restart is 3.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lease_allocated_generation_survives_a_daemon_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path();
+
+    let control_a = DaemonControl::open(data_dir.to_path_buf(), None).unwrap();
+    let lease = tokio::time::timeout(Duration::from_secs(2), control_a.acquire_outbound())
+        .await
+        .expect("no controller is attached")
+        .unwrap();
+    assert_eq!(
+        persisted_generation(data_dir),
+        1,
+        "the lease's generation is persisted before it is handed out"
+    );
+    // Restart: the lease and its daemon are gone.
+    drop(lease);
+    drop(control_a);
+
+    let control_b = DaemonControl::open(data_dir.to_path_buf(), None).unwrap();
+    let node_b = compose(&ServeConfig::fake(
+        DevServerConfig::loopback(0).with_workspace_roots(remuda_testing::test_workspace_roots!()),
+        data_dir.to_path_buf(),
+    ))
+    .unwrap();
+    let listener = bind_daemon(data_dir).await.unwrap();
+    let mut serve = None;
+    let (peer, gen_b) =
+        connect_runtime(data_dir, &control_b, node_b.clone(), &listener, &mut serve).await;
+    assert_eq!(
+        gen_b, 2,
+        "after a restart the bridge must not reuse the lease's generation"
+    );
+    assert_eq!(persisted_generation(data_dir), 2);
+    if let Some(handle) = serve.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
+    drop(peer);
+    drop(control_b);
+    node_b.shutdown().await.unwrap();
+
+    // A lease after a further restart is above the bridge's generation.
+    let control_c = DaemonControl::open(data_dir.to_path_buf(), None).unwrap();
+    let _lease = tokio::time::timeout(Duration::from_secs(2), control_c.acquire_outbound())
+        .await
+        .expect("no controller is attached")
+        .unwrap();
+    assert_eq!(persisted_generation(data_dir), 3);
+}
+
+/// ma-fence r3 item 1: a lease whose generation cannot be persisted is not
+/// handed out — `acquire_outbound` answers the I/O error at once and leaves
+/// the controller as it was, so the next lease gets exactly the next
+/// generation once the counter is writable again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lease_whose_generation_cannot_be_persisted_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path();
+    let control = DaemonControl::open(data_dir.to_path_buf(), None).unwrap();
+    let lease = tokio::time::timeout(Duration::from_secs(2), control.acquire_outbound())
+        .await
+        .expect("no controller is attached")
+        .unwrap();
+    assert_eq!(persisted_generation(data_dir), 1);
+    // Releasing retires generation 1 (the in-memory counter moves to 2).
+    drop(lease);
+
+    // Injected persist failure.
+    let counter = data_dir.join("controller-generation");
+    std::fs::remove_file(&counter).unwrap();
+    std::fs::create_dir(&counter).unwrap();
+    std::fs::write(counter.join("occupied"), "").unwrap();
+    let refused = tokio::time::timeout(Duration::from_secs(2), control.acquire_outbound())
+        .await
+        .expect("a failed persist answers at once");
+    assert!(
+        matches!(refused, Err(remuda_node::NodeError::Io(_))),
+        "a generation that could not be persisted is never handed out"
+    );
+
+    std::fs::remove_dir_all(&counter).unwrap();
+    std::fs::write(&counter, "1").unwrap();
+    let _lease = tokio::time::timeout(Duration::from_secs(2), control.acquire_outbound())
+        .await
+        .expect("no controller is attached")
+        .unwrap();
+    assert_eq!(
+        persisted_generation(data_dir),
+        3,
+        "the refused lease consumed no generation"
+    );
+}
+
 // ── r15 item 7: TWO ACTUAL daemon processes over one data dir + bare origin ─
 
 const R15_INNER_ENV: &str = "R15_DAEMON_FIXTURE_DATA_DIR";

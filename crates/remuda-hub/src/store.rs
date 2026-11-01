@@ -1663,6 +1663,7 @@ fn continuation_resume_tx(
         crate::fence::FenceTx::Committed(core) => core,
         crate::fence::FenceTx::CasLost
         | crate::fence::FenceTx::StateRefused
+        | crate::fence::FenceTx::CloseExists
         | crate::fence::FenceTx::Guarded(_) => {
             drop(tx);
             let lineage = load_lineage(conn, &lineage_id)?
@@ -6062,6 +6063,17 @@ impl Store {
     ) -> Result<Option<CommandRecord>, StoreError> {
         self.run_named("get_command", move |conn| load_command(conn, &command_id))
             .await
+    }
+
+    /// Load the command stored under an idempotency key.
+    pub async fn get_command_by_key(
+        &self,
+        key: String,
+    ) -> Result<Option<CommandRecord>, StoreError> {
+        self.run_named("get_command_by_key", move |conn| {
+            load_command_by_key(conn, &key)
+        })
+        .await
     }
 
     /// c-dirpicker r7 item 1: settle a `queued`/`accepted` workspace mutation
@@ -16065,7 +16077,10 @@ pub(crate) fn load_command(
     .map_err(StoreError::from)
 }
 
-fn load_command_by_key(conn: &Connection, key: &str) -> Result<Option<CommandRecord>, StoreError> {
+pub(crate) fn load_command_by_key(
+    conn: &Connection,
+    key: &str,
+) -> Result<Option<CommandRecord>, StoreError> {
     conn.query_row(
         "SELECT id, instance_id, host_id, operation, state, resolution, forwarded,
                 payload_json, idempotency_key, created_at, updated_at,

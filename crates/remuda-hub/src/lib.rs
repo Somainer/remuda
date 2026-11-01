@@ -375,6 +375,7 @@ pub mod store_test_support {
             task_id: None,
             enforce_tree: true,
             restart: None,
+            seated_by: None,
         })
     }
 

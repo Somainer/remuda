@@ -945,10 +945,14 @@ pub struct TurnErrorMarker {
     pub text: String,
 }
 
+/// OA5: the suggested restart cap, used when a create omits `maxPerHour`.
+pub const SUGGESTED_MAX_RESTARTS_PER_HOUR: u32 = 3;
+
 /// C1 restart policy chosen at create time (D-057 §6.1).
 ///
 /// Stored on every chapter of a continuity lineage and on the lineage row.
-/// Only a Human creator may set it; no behaviour follows until `ma-restart`.
+/// Only a Human creator may set it; the C1 supervisor (`crate::restart`)
+/// acts on it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RestartPolicy {
@@ -1118,6 +1122,11 @@ pub struct InstanceDelegation {
     /// D-057 §6.1 C1 restart policy; `Some` makes the new instance a
     /// continuity lineage even when it holds no grants.
     pub restart: Option<RestartPolicy>,
+    /// D-057 §6.3.1 / OA5: the Human device that seated a lineage with a
+    /// restart policy. Setting `restart` is that owner's standing grant to
+    /// relaunch the same spec, so the lineage records who gave it and the
+    /// supervisor's successor creates name it beside the supervisor actor.
+    pub seated_by: Option<String>,
 }
 
 impl Default for InstanceDelegation {
@@ -1134,6 +1143,7 @@ impl Default for InstanceDelegation {
             task_id: None,
             enforce_tree: false,
             restart: None,
+            seated_by: None,
         }
     }
 }
@@ -1729,6 +1739,7 @@ fn continuation_resume_tx(
             .restart
             .clone()
             .and_then(|value| serde_json::from_value(value).ok()),
+        seated_by: None,
     };
     // The predecessor is fenced inside this same transaction, so the copied
     // seat grants do not collide with it.
@@ -5070,10 +5081,14 @@ impl Store {
             let continuity = !delegation.grants.is_empty() || delegation.restart.is_some();
             if continuity {
                 let origin = spec.get("origin").cloned().unwrap_or(json!("agent"));
-                let origin_spec_ref = serde_json::to_string(&json!({
+                let mut origin_spec_ref = json!({
                     "origin": origin,
                     "spec": spec,
-                }))?;
+                });
+                if let Some(device_id) = &delegation.seated_by {
+                    origin_spec_ref["deviceId"] = json!(device_id);
+                }
+                let origin_spec_ref = serde_json::to_string(&origin_spec_ref)?;
                 conn.execute(
                     "INSERT INTO lineages
                         (lineage_id, current_instance_id, generation, state,

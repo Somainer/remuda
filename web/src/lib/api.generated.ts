@@ -2470,8 +2470,8 @@ export interface components {
             projectId?: string;
             prompt?: string;
             providerProfileId?: string;
-            /** @description D-057 §6.1 C1 restart policy: relaunch this instance on Node-attested process loss/start failure, at most `maxPerHour` decisions per hour. Accepted only from a Human origin in Phase 1; an Agent or Bot gets 403. Hub-side policy, never forwarded in the Node spec; makes the instance a continuity lineage. No behaviour follows until the C1 supervisor ships. */
-            restart?: components["schemas"]["RestartPolicy"] | null;
+            /** @description D-057 §6.1 C1 restart policy: the Hub's C1 supervisor relaunches this instance on Node-attested process loss or start failure, at most `maxPerHour` restart decisions per hour (an omitted `maxPerHour` takes the suggested cap, 3). Accepted only from a Human origin in Phase 1; an Agent or Bot gets 403. Hub-side policy, never forwarded in the Node spec; copied to every chapter; makes the instance a continuity lineage. */
+            restart?: components["schemas"]["RestartPolicyInput"] | null;
             /**
              * @description Preset name applied at create and stored for display; enforcement reads scope+grants, never this field (design §2.5).
              * @enum {string}
@@ -3437,6 +3437,16 @@ export interface components {
         /** @description D-057 §6.1 C1 restart policy chosen at create time. */
         RestartPolicy: {
             /** @description At-most restart decisions per rolling hour; at least 1. */
+            maxPerHour: number;
+            /** @description Restart on Node-attested process loss or start failure. */
+            onProcessLoss: boolean;
+        };
+        /** @description D-057 §6.1 C1 restart policy as a create body sets it; `maxPerHour` defaults to the suggested 3 (OA5). */
+        RestartPolicyInput: {
+            /**
+             * @description At-most restart decisions per rolling hour; at least 1. Omitted: 3.
+             * @default 3
+             */
             maxPerHour: number;
             /** @description Restart on Node-attested process loss or start failure. */
             onProcessLoss: boolean;

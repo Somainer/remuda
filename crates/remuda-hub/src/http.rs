@@ -140,17 +140,24 @@ pub struct CreateInstanceBody {
     api_route: Option<String>,
     /// D-057 §6.1 C1 restart policy. In Phase 1 only a Human creator may set
     /// it; an Agent or Bot gets 403. It is Hub-side state, never part of the
-    /// Node-facing spec; no restart behaviour follows until `ma-restart`.
+    /// Node-facing spec; the C1 supervisor (`crate::restart`) acts on it.
     #[serde(default)]
     restart: Option<RestartPolicyBody>,
 }
 
 /// `restart: {onProcessLoss, maxPerHour}` on the create body (D-057 §6.1).
+/// An omitted `maxPerHour` takes the suggested cap (OA5).
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RestartPolicyBody {
     on_process_loss: bool,
+    #[serde(default = "suggested_max_per_hour")]
     max_per_hour: u32,
+}
+
+/// OA5: the suggested restart cap, 3 decisions per hour.
+fn suggested_max_per_hour() -> u32 {
+    crate::store::SUGGESTED_MAX_RESTARTS_PER_HOUR
 }
 
 fn default_kind() -> String {
@@ -1222,6 +1229,7 @@ pub(crate) fn resolve_delegation(
         task_id,
         enforce_tree: true,
         restart: None,
+        seated_by: None,
     })
 }
 
@@ -1477,6 +1485,10 @@ pub async fn create_instance(
         placement_project_id.as_deref(),
     )?;
     // D-057 §6.1: Hub-side only; never stamped into the Node-facing spec.
+    // The seating Human device is recorded with it (OA5 standing grant).
+    if restart_policy.is_some() {
+        delegation.seated_by = Some(device.id.clone());
+    }
     delegation.restart = restart_policy;
     let project_provider = project.as_ref().map(|project| project.provider.clone());
     let place_spec = crate::placement::PlaceSpec::from_json(&spec);

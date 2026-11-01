@@ -26,6 +26,13 @@ export type GlanceSource = {
   nowMs: number;
 };
 
+/**
+ * Top-level sessions only. `/sessions` lists these (SessionList drops
+ * `parent != null`, and its caption says 「子 agent 不在此列」), so its ① count
+ * must use the same set; `/m`'s ledger includes children and counts them.
+ */
+export const TOP_LEVEL_WORKING = (instance: Instance): boolean => instance.parent == null;
+
 export type GlanceCounts = {
   /** §5.1 N = A (interactions really waiting on the owner) + B (owner-blocked tasks with no such interaction). */
   needYou: number;
@@ -43,7 +50,15 @@ export type GlanceCounts = {
  * never both shown, so the task is never counted next to its interaction).
  * 完成未看, notices and failed turns are deliberately absent.
  */
-export function glanceCounts(source: GlanceSource): GlanceCounts {
+export function glanceCounts(
+  source: GlanceSource,
+  /**
+   * The instances the calling surface actually LISTS for 工作中 (default: all
+   * of them). Desktop passes top-level sessions; the phone ledger includes
+   * child sessions, so it keeps the default.
+   */
+  workingInstances: readonly Instance[] = source.instances,
+): GlanceCounts {
   const queue = deriveInboxQueue({
     interactions: [...source.interactions],
     instances: [...source.instances],
@@ -72,7 +87,7 @@ export function glanceCounts(source: GlanceSource): GlanceCounts {
   const childLive = liveChildParents(source.instances);
   const seen = new Set<string>();
   let working = 0;
-  for (const instance of source.instances) {
+  for (const instance of workingInstances) {
     if (seen.has(instance.id)) continue;
     seen.add(instance.id);
     if (rank(instance, childLive.has(instance.id)) === "working") working += 1;

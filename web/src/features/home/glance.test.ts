@@ -5,6 +5,7 @@ import type { Task } from "../../types/generated";
 import { known, na, unknownKnowledge, type Id } from "../../types/wire";
 import {
   GLANCE_COUNT_MAX,
+  TOP_LEVEL_WORKING,
   formatGlanceCount,
   formatUpdatedAt,
   glanceCounts,
@@ -122,7 +123,9 @@ function task(overrides: Partial<Task> & { id: string }): Task {
   } as Task;
 }
 
-function source(overrides: Partial<GlanceSource> = {}): GlanceSource {
+function source(overrides: Partial<GlanceSource> = {}): GlanceSource { return sourceOf(overrides); }
+
+function sourceOf(overrides: Partial<GlanceSource> = {}): GlanceSource {
   return {
     instances: [],
     interactions: [],
@@ -225,6 +228,21 @@ describe("glanceCounts: §5.1 N = A + B", () => {
       }),
     );
     expect(counts.working).toBe(4);
+  });
+
+  it("counts 工作中 from the instance set the surface actually lists", () => {
+    // Desktop /sessions drops child sessions (its rows and caption say so);
+    // /m's ledger includes them. One function, two sets.
+    const source = sourceOf({
+      instances: [
+        inst({ id: "ins_parent" }),
+        inst({ id: "ins_child", parent: { instanceId: "ins_parent", runId: "run_1", commandId: "cmd_1" } }),
+      ],
+    });
+    expect(glanceCounts(source).working).toBe(2);
+    expect(
+      glanceCounts(source, source.instances.filter(TOP_LEVEL_WORKING)).working,
+    ).toBe(1);
   });
 
   it("never counts the same instance twice", () => {

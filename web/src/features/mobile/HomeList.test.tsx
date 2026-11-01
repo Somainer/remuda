@@ -677,3 +677,18 @@ describe("① filter under an active hold", () => {
     expect(screen.getAllByTestId("home-row")).toHaveLength(1);
   });
 });
+
+describe("① count vs the phone ledger's set", () => {
+  it("includes a working child session, which /m does list as a row", async () => {
+    hub.instances = [
+      row("ins-parent", { activity: known("working") }),
+      row("ins-child", {
+        activity: known("working"),
+        parent: { instanceId: "ins-parent", runId: "run_1", commandId: "cmd_1" },
+      }),
+    ];
+    renderHome();
+    expect(await screen.findByTestId("glance-working")).toHaveTextContent("2 工作中");
+    expect(screen.getAllByTestId("home-row")).toHaveLength(2);
+  });
+});

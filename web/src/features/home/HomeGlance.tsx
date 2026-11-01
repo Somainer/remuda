@@ -12,6 +12,7 @@ import {
   glanceCounts,
   glancePieces,
   type GlanceCounts,
+  type GlanceSource,
 } from "./glance";
 import css from "./homeGlance.module.css";
 
@@ -34,12 +35,19 @@ export function HomeGlance({
   onWorking,
   workingFilter = false,
   projectId = null,
+  workingInstances,
 }: {
   placement: "phone" | "desktop";
   onNeedYou: () => void;
   onWorking: () => void;
   /** The rank filter this segment currently applies, for aria-pressed. */
   workingFilter?: boolean;
+  /**
+   * Which instances this surface lists for 工作中 (default: every instance).
+   * `/sessions` hides child sessions, so it passes TOP_LEVEL_WORKING — the
+   * count must equal the rows the 工作中 tap can show.
+   */
+  workingInstances?: (instance: NonNullable<GlanceSource["instances"][number]>) => boolean;
   /**
    * The scope the phone ledger is already polling. Passing it makes this row
    * share that ONE poller instead of opening a second /v1/tasks loop.
@@ -63,16 +71,19 @@ export function HomeGlance({
     () =>
       freshness.state === "unknown"
         ? null
-        : glanceCounts({
-            instances: hub.instances,
-            interactions: hub.interactions,
-            hosts: hub.hosts,
-            tasks,
-            answering: hub.answering,
-            deviceId,
-            nowMs,
-          }),
-    [freshness.state, hub.instances, hub.interactions, hub.hosts, tasks, hub.answering, deviceId, nowMs],
+        : glanceCounts(
+            {
+              instances: hub.instances,
+              interactions: hub.interactions,
+              hosts: hub.hosts,
+              tasks,
+              answering: hub.answering,
+              deviceId,
+              nowMs,
+            },
+            workingInstances ? hub.instances.filter(workingInstances) : hub.instances,
+          ),
+    [freshness.state, hub.instances, hub.interactions, hub.hosts, tasks, hub.answering, deviceId, nowMs, workingInstances],
   );
 
   const hostsOnline = hub.hosts.filter((host) => hostIsOnline(host)).length;

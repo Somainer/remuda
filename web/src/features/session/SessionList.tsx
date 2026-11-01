@@ -94,10 +94,11 @@ export function SessionList({
   const scope = describeScope(conditions, space, (hostId) => hubStore.hostName(hostId as Id));
   const allowed = availableConditions(scope);
 
-  // In global scope the list leaves the Space behind and searches every
-  // top-level instance the hub knows about; otherwise it renders exactly what
-  // the caller handed it.
-  const source = global ? hub.instances.filter((i) => i.parent == null) : (instances ?? hub.instances.filter((i) => i.parent == null));
+  // home.md §5.2 / the 最近 caption: child sessions are never desktop rows.
+  // Global scope searches every top-level instance the hub knows about; a
+  // Space-pinned list renders the caller's instances minus children, so the ①
+  // 工作中 count (TOP_LEVEL_WORKING) always equals the rows a tap can show.
+  const source = (instances ?? hub.instances).filter((instance) => instance.parent == null);
 
   // Children that are still running lift their idle parent into awaiting-wake.
   // The child's own rank decides (blocked/working/starting), not connectivity.

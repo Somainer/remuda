@@ -95,6 +95,30 @@ describe("HomeGlance", () => {
     expect(onWorking).toHaveBeenCalledTimes(1);
   });
 
+  it("counts only the instances the surface lists, when given that set", () => {
+    fake.state = hub({
+      instances: [
+        instance("ins_parent", null),
+        instance("ins_child", { instanceId: "ins_parent", runId: "run_1", commandId: "cmd_1" }),
+      ],
+    });
+    fake.freshness = { state: "fresh", lastOkAt: 1, failingSince: null };
+    const { unmount } = render(
+      <HomeGlance placement="desktop" onNeedYou={noop} onWorking={noop} />,
+    );
+    expect(screen.getByTestId("glance-working")).toHaveTextContent("2 工作中");
+    unmount();
+    render(
+      <HomeGlance
+        placement="desktop"
+        onNeedYou={noop}
+        onWorking={noop}
+        workingInstances={(row) => row.parent == null}
+      />,
+    );
+    expect(screen.getByTestId("glance-working")).toHaveTextContent("1 工作中");
+  });
+
   it("toggles the working filter segment and reports its state", async () => {
     fake.state = hub({ instances: [instance()] });
     fake.freshness = { state: "fresh", lastOkAt: 1, failingSince: null };
@@ -112,9 +136,9 @@ describe("HomeGlance", () => {
 });
 
 /** A live instance on an unknown activity: rank 3 (home.md §3.1 h). */
-function instance() {
+function instance(id = "ins_a", parent: unknown = null) {
   return {
-    id: "ins_a",
+    id,
     revision: "1",
     createdAt: "2026-10-31T08:00:00.000Z",
     updatedAt: "2026-10-31T08:00:00.000Z",
@@ -133,7 +157,7 @@ function instance() {
     capabilities: {},
     ownerFence: "1",
     activeRunIds: [],
-    parent: null,
+    parent,
     journalId: "jrn_1",
     durableSeq: "1",
     exit: { state: "na" },

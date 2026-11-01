@@ -2425,9 +2425,10 @@ async fn a_deleted_profile_recreated_within_the_window_restarts_the_seat() -> Re
 
 impl Ctx {
     /// A worker host and a proxy host, both relay-capable, and a gateway
-    /// profile delivered via the proxy. Returns (worker node, proxy host,
-    /// profile).
-    async fn via_setup(&mut self) -> Result<(FakeNode, String, String)> {
+    /// profile delivered via the proxy. The caller holds the proxy Node for
+    /// the whole test; dropping it aborts its link task. Returns
+    /// `(worker node, proxy node, proxy host, profile)`.
+    async fn via_setup(&mut self) -> Result<(FakeNode, FakeNode, String, String)> {
         let relay = json!({"capabilities": {"lineageFence": true, "apiRelay": true}});
         let node = FakeNode::connect_with(
             &self.hub,
@@ -2446,14 +2447,12 @@ impl Ctx {
             relay,
         )
         .await?;
-        // The proxy link stays up for the launch; the test drops the row.
-        std::mem::forget(proxy_node);
         let profile = self
             .gateway(Some(
                 json!({"mode": "via", "viaHostId": proxy, "route": "hub-relay"}),
             ))
             .await?;
-        Ok((node, proxy, profile))
+        Ok((node, proxy_node, proxy, profile))
     }
 }
 
@@ -2463,7 +2462,7 @@ impl Ctx {
 #[tokio::test]
 async fn a_via_delivery_profile_whose_proxy_host_is_gone_pauses_at_once() -> Result<()> {
     let (mut ctx, fake) = Ctx::boot_push().await?;
-    let (mut node, proxy, profile) = ctx.via_setup().await?;
+    let (mut node, proxy_node, proxy, profile) = ctx.via_setup().await?;
     let seat = ctx.seat_on_profile(&mut node, &profile).await?;
     let view = ctx.instance(&seat).await?;
     assert_eq!(
@@ -2494,7 +2493,8 @@ async fn a_via_delivery_profile_whose_proxy_host_is_gone_pauses_at_once() -> Res
         )]
     );
     assert_eq!(*fake.hits.lock().unwrap(), hits + 1);
-    let _ = &mut ctx;
+    // Tear the proxy link down with the test.
+    drop(proxy_node);
     Ok(())
 }
 
@@ -2504,7 +2504,7 @@ async fn a_via_delivery_profile_whose_proxy_host_is_gone_pauses_at_once() -> Res
 #[tokio::test]
 async fn owner_resume_keeps_the_api_via_unknown_host_code() -> Result<()> {
     let mut ctx = Ctx::boot().await?;
-    let (mut node, proxy, profile) = ctx.via_setup().await?;
+    let (mut node, proxy_node, proxy, profile) = ctx.via_setup().await?;
     let seat = ctx.seat_on_profile(&mut node, &profile).await?;
     ctx.report_running(&node, &seat, SESSION).await?;
     assert_eq!(ctx.close(&seat).await?.status(), 200);
@@ -2523,6 +2523,8 @@ async fn owner_resume_keeps_the_api_via_unknown_host_code() -> Result<()> {
     let body: Value = resumed.json().await?;
     assert_eq!(status, 400, "{body}");
     assert_eq!(body["code"], json!("api-via-unknown-host"), "{body}");
+    // Tear the proxy link down with the test.
+    drop(proxy_node);
     Ok(())
 }
 

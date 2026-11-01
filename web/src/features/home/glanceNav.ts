@@ -16,6 +16,8 @@ export const GLANCE_TARGETS = {
    */
   needYouDesktop: '[data-testid="board-card"][data-rank="blocked"]',
   tasks: '[data-testid="home-tasks"]',
+  /** The ④ 需要你 queue's element id (home.md §4; the push/① scroll anchor). */
+  queueId: "home-queue",
 } as const;
 
 /** Scroll the first match among `selectors` into view (no-op when none). */

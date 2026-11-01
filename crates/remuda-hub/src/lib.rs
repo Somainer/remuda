@@ -76,6 +76,7 @@ mod proxy;
 mod push_http;
 mod rate_limit;
 mod registry;
+mod restart;
 mod root_turn;
 mod seen;
 mod skill_context;
@@ -192,6 +193,8 @@ pub struct AppState {
     /// D-057 §7.4: the in-memory fence map the send gate reads, and per-host
     /// fence delivery state.
     pub(crate) fences: crate::fence::FenceState,
+    /// D-057 §6.3.1 (ma-restart): the C1 supervisor's tick serialization.
+    pub(crate) restart: crate::restart::SupervisorState,
 }
 
 impl AppState {
@@ -312,7 +315,8 @@ pub mod store_test_support {
     use std::collections::BTreeSet;
 
     pub use crate::store::{
-        APPEND_CHUNK_MAX, JOURNAL_WINDOW_BYTES, JOURNAL_WINDOW_ROWS, SCHEMA_USER_VERSION, Store,
+        APPEND_CHUNK_MAX, JOURNAL_WINDOW_BYTES, JOURNAL_WINDOW_ROWS, OWNER_RESUME_CAUSE,
+        SCHEMA_USER_VERSION, Store,
     };
 
     /// D-057 §7.3 commit-time check error (the initiator suite matches on it).
@@ -376,6 +380,7 @@ pub mod store_test_support {
             task_id: None,
             enforce_tree: true,
             restart: None,
+            seated_by: None,
         })
     }
 
@@ -404,6 +409,7 @@ pub mod store_test_support {
             task_id: None,
             enforce_tree: false,
             restart: None,
+            seated_by: None,
         }
     }
 
@@ -818,6 +824,10 @@ impl HubTestHandle {
                 title: current.title.clone(),
                 driver: current.driver.clone(),
                 actor: serde_json::json!({"by": "hub-supervisor"}),
+                chapter_cause: crate::restart::cause::PROCESS_EXIT.into(),
+                // A restart never starts from a paused lineage: a close wins.
+                from_states: &["starting", "running"],
+                restart: None,
             })
             .await?;
         match result {
@@ -828,6 +838,32 @@ impl HubTestHandle {
             }
             crate::store::ContinuationResumeResult::Superseded { .. } => Ok(None),
         }
+    }
+
+    /// D-057 §6.3.1: one C1 supervisor evaluation, unguarded (two may run
+    /// concurrently, as a tick and a boot evaluation could). Returns what it
+    /// decided, as JSON.
+    pub async fn test_supervise(&self) -> Vec<serde_json::Value> {
+        crate::restart::evaluate(&self.state)
+            .await
+            .into_iter()
+            .filter_map(|decided| serde_json::to_value(decided).ok())
+            .collect()
+    }
+
+    /// D-057 §6.3.1: the next `count` C1 successor preparations fail with a
+    /// transient store error (test-faults).
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_fail_restart_prepares(&self, count: usize) {
+        self.state.restart.fail_next("prepare", count);
+    }
+
+    /// D-057 §6.3.1: the next `count` passes through C1 fault point `point`
+    /// (`pending`, `cap`, `recovery`, `prepare`) fail with a transient store
+    /// error (test-faults).
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_fail_restart_step(&self, point: &str, count: usize) {
+        self.state.restart.fail_next(point, count);
     }
 
     /// D-057 OA1 test seam: the Hub's create-path permission admission
@@ -2142,6 +2178,7 @@ async fn spawn_inner(
         race_barriers: crate::workspaces::RaceBarriers::default(),
         gate_decision_guards: crate::gatequeue::GateDecisionGuards::new(),
         fences: crate::fence::FenceState::default(),
+        restart: crate::restart::SupervisorState::default(),
     };
     // D-057 §7.7: the send gate's map survives a Hub restart through the
     // lineages table; deliveries are re-sent on hello and by the tick.
@@ -2161,6 +2198,11 @@ async fn spawn_inner(
     // A Hub restart must not inherit yesterday's unacknowledged creates: they
     // would keep holding placement slots with no Node that can ever settle them.
     expire_stale_requested(&state, config.requested_grace_ms).await;
+    // D-057 §6.3.1 / §7.7: the C1 supervisor evaluates once at boot, so a
+    // failure the previous Hub process left pending is decided exactly once.
+    if config.restart_supervisor {
+        crate::restart::boot(&state).await;
+    }
     // Batch 6: jobs left running by a previous Hub process re-enter the queue.
     crate::gatequeue::reconcile(&state).await;
     crate::gatequeue::tick(&state).await;
@@ -2221,6 +2263,19 @@ async fn spawn_inner(
                     tokio::spawn(async move {
                         crate::fence::sweep_deliveries(&sweep_state).await;
                     });
+                    // ma-restart r3: the persisted run marker the next
+                    // boot's C1 evaluation reads, whatever the setting.
+                    let alive_state = reaper_state.clone();
+                    tokio::spawn(async move {
+                        crate::restart::note_alive(&alive_state).await;
+                    });
+                    // D-057 §6.3.1: the C1 supervisor, off the loop too.
+                    if config.restart_supervisor {
+                        let supervisor_state = reaper_state.clone();
+                        tokio::spawn(async move {
+                            crate::restart::tick(&supervisor_state).await;
+                        });
+                    }
                     crate::gatequeue::tick(&reaper_state).await;
                 }
             }

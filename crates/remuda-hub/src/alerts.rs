@@ -130,14 +130,22 @@ async fn dispatch(state: AppState, instance_id: String, kind: AlertKind) {
                     },
                     format!("/s/{instance_id}"),
                 ),
-                AlertKind::Exited => (
-                    "Session exited",
-                    "An instance left the ready state.".to_string(),
-                    PushTag::Instance {
-                        id: instance_id.clone(),
-                    },
-                    format!("/s/{instance_id}"),
-                ),
+                AlertKind::Exited => {
+                    // D-057 §8.5: on a lineage that restarts on process loss
+                    // the C1 push ("restarted" / "paused: restart cap")
+                    // replaces the generic exited push.
+                    if crate::restart::c1_replaces_exit_push(&state, &instance_id).await {
+                        return;
+                    }
+                    (
+                        "Session exited",
+                        "An instance left the ready state.".to_string(),
+                        PushTag::Instance {
+                            id: instance_id.clone(),
+                        },
+                        format!("/s/{instance_id}"),
+                    )
+                }
                 AlertKind::Waiting => unreachable!(),
             };
             fanout(&state, &instance_id, title, &body, tag, url).await;
@@ -145,6 +153,58 @@ async fn dispatch(state: AppState, instance_id: String, kind: AlertKind) {
     }
 }
 
+/// What one fanout did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Fanout {
+    /// This many notifications were accepted by a push service (some
+    /// endpoints may have failed or been pruned as gone).
+    Sent(usize),
+    /// Nothing to deliver: push is off, a device follows the instance, or no
+    /// subscription accepted it because every endpoint was gone.
+    Nothing,
+    /// Delivery failed: the subscriptions could not be read, or every
+    /// endpoint that was tried failed. A durable push is retried.
+    Failed,
+}
+
+impl Fanout {
+    /// Recipients to record when the push counts as delivered; `None` when it
+    /// failed and stays unsent.
+    pub(crate) fn recipients(self) -> Option<usize> {
+        match self {
+            Self::Sent(sent) => Some(sent),
+            Self::Nothing => Some(0),
+            Self::Failed => None,
+        }
+    }
+}
+
+/// D-057 §8.5: one C1 push about a continuity lineage (restarted, restart
+/// cap, closed itself, paused by an ancestor, could not restart). Tagged by
+/// the lineage, so a newer C1 push replaces an older one (and a resend after
+/// a crash replaces itself); it links to `instance_id`.
+pub(crate) async fn c1_push(
+    state: &AppState,
+    lineage_id: &str,
+    instance_id: &str,
+    title: &str,
+    body: &str,
+) -> Fanout {
+    fanout(
+        state,
+        instance_id,
+        title,
+        body,
+        PushTag::Instance {
+            id: lineage_id.to_owned(),
+        },
+        format!("/s/{instance_id}"),
+    )
+    .await
+}
+
+/// Send one notification to every subscription unless a device follows the
+/// instance.
 async fn fanout(
     state: &AppState,
     instance_id: &str,
@@ -152,16 +212,20 @@ async fn fanout(
     body: &str,
     tag: PushTag,
     url: String,
-) {
+) -> Fanout {
     let Some(push) = state.push.as_ref() else {
-        return;
+        return Fanout::Nothing;
     };
     if state.followers.any_watching(instance_id).await {
         tracing::debug!(instance_id, "push suppressed: a device is following");
-        return;
+        return Fanout::Nothing;
     }
-    let Ok(subs) = push.subscriptions() else {
-        return;
+    let subs = match push.subscriptions() {
+        Ok(subs) => subs,
+        Err(error) => {
+            tracing::warn!(%error, "could not read push subscriptions");
+            return Fanout::Failed;
+        }
     };
     // The badge is this device's pending interaction count (ui-spec §4.5 /
     // D-049). Pending is global durable state — every subscribed device is
@@ -176,11 +240,22 @@ async fn fanout(
         .map(|rows| u64::try_from(rows.len()).unwrap_or(u64::MAX))
         .unwrap_or(0);
     let base = Notification::new(title, body, tag.clone(), url);
+    let (mut sent, mut failed) = (0, 0);
     for sub in subs {
         let notification = base.clone().with_badge(pending);
-        if let Err(err) = push.notify(&sub, &notification, &tag).await {
-            tracing::debug!(error = %err, endpoint = %sub.endpoint, "push notify failed");
+        match push.notify(&sub, &notification, &tag).await {
+            Ok(remuda_push::Delivery::Sent) => sent += 1,
+            Ok(remuda_push::Delivery::Gone) => {}
+            Err(err) => {
+                failed += 1;
+                tracing::debug!(error = %err, endpoint = %sub.endpoint, "push notify failed");
+            }
         }
+    }
+    match (sent, failed) {
+        (0, 0) => Fanout::Nothing,
+        (0, _) => Fanout::Failed,
+        (sent, _) => Fanout::Sent(sent),
     }
 }
 

@@ -24,6 +24,8 @@ const ORIGIN_TEXT: Record<RootTurn["origin"], string> = {
   human: "你",
   bot: "bot",
   agent: "agent",
+  // D-057 §6.4: input the Hub itself wrote (the restart notice).
+  hub: "Hub",
 };
 
 /** The tag text for `rootTurn`, or null when no tag is shown. */

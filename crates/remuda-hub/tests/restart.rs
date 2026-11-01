@@ -1652,3 +1652,53 @@ async fn a_process_exit_pause_keeps_the_generic_exited_push() -> Result<()> {
     assert_eq!(recorded, 0);
     Ok(())
 }
+
+// ── r2 item 1: the successor carries the seating Human grant ────────────
+
+/// OA5: the successor's create carries the seating device's real origin,
+/// recorded at create time (`seatedOrigin`), never the spec's incidental
+/// `origin` key. The stored spec origin is rewritten to `agent` — what the
+/// lineage insert records for a spec without an `origin` key — and the
+/// successor is still queued and forwarded as `human`.
+#[tokio::test]
+async fn the_successor_carries_the_seating_human_origin_not_the_spec_origin() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host, true).await?;
+    let seat = ctx.seat(&mut node).await?;
+    ctx.db()?.execute(
+        "UPDATE lineages SET origin_spec_ref = json_set(origin_spec_ref, '$.origin', 'agent')
+          WHERE lineage_id = ?1",
+        rusqlite::params![seat],
+    )?;
+    ctx.report_running(&node, &seat, SESSION).await?;
+    ctx.report_killed(&node, &seat).await?;
+    let decided = ctx.supervise().await;
+    let successor = decided[0]["successorInstanceId"]
+        .as_str()
+        .context("successor")?
+        .to_owned();
+    let (method, create) = node.next_launch().await?;
+    assert_eq!(method, "instance.resume");
+    assert_eq!(
+        create["origin"],
+        json!("human"),
+        "OA5: the seating Human grant, not the spec's origin"
+    );
+    let stored: String = ctx.db()?.query_row(
+        "SELECT json_extract(payload_json, '$.origin') FROM commands
+          WHERE instance_id = ?1 AND operation = 'instance.resume'",
+        rusqlite::params![successor],
+        |row| row.get(0),
+    )?;
+    assert_eq!(stored, "human");
+    let (seated_origin, seated_by): (Option<String>, Option<String>) = ctx.db()?.query_row(
+        "SELECT json_extract(origin_spec_ref, '$.seatedOrigin'),
+                json_extract(origin_spec_ref, '$.deviceId')
+           FROM lineages WHERE lineage_id = ?1",
+        rusqlite::params![seat],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!(seated_origin.as_deref(), Some("human"));
+    assert!(seated_by.is_some());
+    Ok(())
+}

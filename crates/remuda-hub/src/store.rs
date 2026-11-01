@@ -1122,11 +1122,20 @@ pub struct InstanceDelegation {
     /// D-057 §6.1 C1 restart policy; `Some` makes the new instance a
     /// continuity lineage even when it holds no grants.
     pub restart: Option<RestartPolicy>,
-    /// D-057 §6.3.1 / OA5: the Human device that seated a lineage with a
-    /// restart policy. Setting `restart` is that owner's standing grant to
-    /// relaunch the same spec, so the lineage records who gave it and the
-    /// supervisor's successor creates name it beside the supervisor actor.
-    pub seated_by: Option<String>,
+    /// D-057 §6.3.1 / OA5: the device that seated a lineage with a restart
+    /// policy, with its authenticated origin. Setting `restart` is that
+    /// owner's standing grant to relaunch the same spec, so the lineage
+    /// records who gave it and with what origin; the supervisor's successor
+    /// creates carry that origin and name the device beside its own actor.
+    pub seated_by: Option<Seating>,
+}
+
+/// Who seated a continuity lineage (D-057 §6.3.1, OA5): the authenticating
+/// device and its origin, read from the device at create time.
+#[derive(Debug, Clone)]
+pub struct Seating {
+    pub device_id: String,
+    pub origin: remuda_protocol::InputOrigin,
 }
 
 impl Default for InstanceDelegation {
@@ -5132,8 +5141,9 @@ impl Store {
                     "origin": origin,
                     "spec": spec,
                 });
-                if let Some(device_id) = &delegation.seated_by {
-                    origin_spec_ref["deviceId"] = json!(device_id);
+                if let Some(seating) = &delegation.seated_by {
+                    origin_spec_ref["deviceId"] = json!(seating.device_id);
+                    origin_spec_ref["seatedOrigin"] = json!(seating.origin);
                 }
                 let origin_spec_ref = serde_json::to_string(&origin_spec_ref)?;
                 conn.execute(

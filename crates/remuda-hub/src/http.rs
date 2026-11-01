@@ -1488,7 +1488,10 @@ pub async fn create_instance(
     // D-057 §6.1: Hub-side only; never stamped into the Node-facing spec.
     // The seating Human device is recorded with it (OA5 standing grant).
     if restart_policy.is_some() {
-        delegation.seated_by = Some(device.id.clone());
+        delegation.seated_by = Some(crate::store::Seating {
+            device_id: device.id.clone(),
+            origin: crate::agent_scope::origin(&device),
+        });
     }
     delegation.restart = restart_policy;
     let project_provider = project.as_ref().map(|project| project.provider.clone());

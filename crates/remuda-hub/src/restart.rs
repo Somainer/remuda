@@ -1266,6 +1266,20 @@ async fn pause(
     }))
 }
 
+/// OA5: the origin the successor's create carries — the seating device's
+/// own origin, recorded at create as `seatedOrigin`. Never the create spec's
+/// `origin` key, which is incidental to how the spec was stamped. A lineage
+/// seated before the record existed is Human-seated by construction: only a
+/// Human device may set `restart` (403 otherwise, §6.1), and the supervisor
+/// relaunches only lineages with `restart.onProcessLoss`.
+fn seated_origin(origin_spec: Option<&Value>) -> String {
+    origin_spec
+        .and_then(|reference| reference.get("seatedOrigin"))
+        .and_then(Value::as_str)
+        .unwrap_or("human")
+        .to_owned()
+}
+
 /// F with successor: the restart.
 async fn restart(
     state: &AppState,
@@ -1308,12 +1322,7 @@ async fn restart(
         }
     };
     let origin_spec = lineage.origin_spec_ref.as_ref();
-    // OA5: the launch origin recorded for the lineage's first chapter.
-    let origin = origin_spec
-        .and_then(|reference| reference.get("origin"))
-        .and_then(Value::as_str)
-        .unwrap_or("human")
-        .to_owned();
+    let origin = seated_origin(origin_spec);
     let seated_by = origin_spec
         .and_then(|reference| reference.get("deviceId"))
         .cloned()
@@ -1365,6 +1374,15 @@ async fn restart(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_successor_origin_is_the_seating_origin_never_the_spec_origin() {
+        let spec = json!({"origin": "agent", "seatedOrigin": "human", "spec": {"origin": "agent"}});
+        assert_eq!(seated_origin(Some(&spec)), "human");
+        // Seated before the record existed: Human by construction.
+        assert_eq!(seated_origin(Some(&json!({"origin": "agent"}))), "human");
+        assert_eq!(seated_origin(None), "human");
+    }
 
     #[test]
     fn the_cause_table_classifies_each_evidence_row() {

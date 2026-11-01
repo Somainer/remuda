@@ -52,7 +52,7 @@ pub use paths::{
 };
 pub use script::{load_script, load_script_from_env};
 pub use short_temp::ShortTempDir;
-pub use stub::install_executable;
+pub use stub::{install_at, install_executable};
 pub use workspace_roots::test_workspace_roots;
 
 /// Directory containing captured Claude / Codex / grok / agy samples.

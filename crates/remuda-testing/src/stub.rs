@@ -45,6 +45,58 @@ pub fn install_executable(dir: &Path, name: &str, bytes: impl AsRef<[u8]>) -> Pa
     );
 }
 
+/// Install `bytes` as the executable at exactly `path`.
+///
+/// Some callers cannot pick the final name — a git hook must sit at
+/// `.git/hooks/pre-receive`, a `core.sshCommand` must be the path the config
+/// names. Writing such a file and executing it immediately races `ETXTBSY`:
+/// while the write handle is open, another thread's `fork` inherits it, and
+/// `exec` refuses a file that any process still holds open for writing. The
+/// bytes therefore go to a unique hidden `*.part` in the same directory, the
+/// handle is closed and the mode set there, and only then is it renamed over
+/// `path`. A concurrent `exec` either sees the previous file or the complete
+/// new one, never a half-written one.
+///
+/// # Errors
+///
+/// Returns the write, chmod, or rename failure; a failed call leaves no part
+/// file behind.
+pub fn install_at(path: &Path, bytes: impl AsRef<[u8]>) -> io::Result<()> {
+    let dir = path.parent().ok_or_else(|| {
+        io::Error::new(
+            ErrorKind::InvalidInput,
+            "an executable needs a parent directory",
+        )
+    })?;
+    fs::create_dir_all(dir)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("stub");
+    let part = dir.join(format!(".{name}-{}.part", unique_token()));
+    let result = (|| -> io::Result<()> {
+        {
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&part)?;
+            file.write_all(bytes.as_ref())?;
+            file.flush()?;
+            let _ = file.sync_all();
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&part, fs::Permissions::from_mode(0o755))?;
+        }
+        fs::rename(&part, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&part);
+    }
+    result
+}
+
 fn try_install(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
     let token = unique_token();
     let dest = dir.join(format!("{name}-{token}"));
@@ -104,5 +156,27 @@ mod tests {
             .filter_map(Result::ok)
             .any(|entry| entry.file_name().to_string_lossy().ends_with(".part"));
         assert!(!leftover_parts, "part files must be renamed away");
+    }
+
+    #[test]
+    fn install_at_write_rename_never_leaves_a_part_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let hook = dir.path().join("hooks").join("pre-receive");
+        install_at(&hook, b"#!/bin/sh\nexit 0\n").unwrap();
+        assert_eq!(fs::read(&hook).unwrap(), b"#!/bin/sh\nexit 0\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&hook).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o755);
+        }
+        let leftover_parts = fs::read_dir(hook.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().ends_with(".part"));
+        assert!(!leftover_parts, "part files must be renamed away");
+        // A second install replaces the same path in place.
+        install_at(&hook, b"#!/bin/sh\nexit 1\n").unwrap();
+        assert_eq!(fs::read(&hook).unwrap(), b"#!/bin/sh\nexit 1\n");
     }
 }

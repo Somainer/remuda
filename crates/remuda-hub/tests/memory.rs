@@ -952,7 +952,7 @@ fn repo_root() -> PathBuf {
 fn fake_age(bin: &Path) -> Result<()> {
     std::fs::create_dir_all(bin)?;
     let path = bin.join("age");
-    std::fs::write(
+    remuda_testing::install_at(
         &path,
         "#!/bin/sh\n\
          # Test stand-in: copies bytes; the backup test checks members, not crypto.\n\
@@ -967,11 +967,6 @@ fn fake_age(bin: &Path) -> Result<()> {
          done\n\
          cat \"$in\" > \"$out\"\n",
     )?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
-    }
     Ok(())
 }
 

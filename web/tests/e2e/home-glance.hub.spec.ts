@@ -294,9 +294,10 @@ test.describe("phone 390", () => {
       if (!(await needsFakeNode(page))) test.skip(true, "needs the in-process fake Node");
       await createBlockedSession(page);
       await createWorkingSession(page);
-      // Enough rows that the reduced viewport must scroll: a 需要你 tap that
-      // "works" only because everything already fits proves nothing.
-      await seedRows(page, 4);
+      // Enough rows that the reduced viewport can park the waiting row fully
+      // outside the visible band: a tap that "works" only because everything
+      // already fits proves nothing.
+      await seedRows(page, 10);
       await page.setViewportSize({ width: 390, height: 480 });
       await page.goto("/m");
 
@@ -415,7 +416,7 @@ test.describe("desktop 1280", () => {
       await expect(page.getByTestId("session-list")).toBeVisible({ timeout: 20_000 });
       await createBlockedSession(page);
       await createWorkingSession(page);
-      await seedRows(page, 4);
+      await seedRows(page, 10);
       // The count row is owner-global while /sessions is pinned to the active
       // Space — and the default Space has no sessions, so its list renders the
       // empty state without the scope switch. Open the list in global scope so

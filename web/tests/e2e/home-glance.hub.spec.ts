@@ -172,14 +172,26 @@ async function scrollAncestorToEnd(page: Page, selector: string): Promise<boolea
   }, selector);
 }
 
-/** The element's box lies in the viewport (below the sticky head is fine). */
-async function inViewport(page: Page, selector: string): Promise<boolean> {
-  return page.evaluate((sel) => {
-    const el = document.querySelector(sel);
-    if (!el) return false;
-    const rect = el.getBoundingClientRect();
-    return rect.bottom > 0 && rect.top < window.innerHeight && rect.right > 0 && rect.left < window.innerWidth;
-  }, selector);
+/**
+ * The element's box lies in the ledger scroller's visible band (the phone's
+ * scroller ends above PhoneNav, so a window-only check would call a row below
+ * the band "visible").
+ */
+async function inBand(page: Page, regionSelector: string, selector: string): Promise<boolean> {
+  return page.evaluate(({ region, target }) => {
+    const el = document.querySelector(region) as HTMLElement | null;
+    let scroller = el?.parentElement ?? null;
+    while (scroller && !/(auto|scroll)/.test(getComputedStyle(scroller).overflowY)) {
+      scroller = scroller.parentElement;
+    }
+    const row = document.querySelector(target);
+    if (!scroller || !row) return false;
+    const band = scroller.getBoundingClientRect();
+    const rect = row.getBoundingClientRect();
+    const top = Math.max(0, band.top);
+    const bottom = Math.min(window.innerHeight, band.bottom);
+    return rect.bottom > top && rect.top < bottom && rect.right > 0 && rect.left < window.innerWidth;
+  }, { region: regionSelector, target: selector });
 }
 
 test.describe("phone 390", () => {
@@ -327,10 +339,10 @@ test.describe("phone 390", () => {
       expect(
         await parkTargetOutOfView(page, '[data-testid="home-head"]', '[data-testid="home-row"][data-blocked="1"]'),
       ).toBe(true);
-      expect(await inViewport(page, '[data-testid="home-row"][data-blocked="1"]')).toBe(false);
+      expect(await inBand(page, '[data-testid="home-head"]', '[data-testid="home-row"][data-blocked="1"]')).toBe(false);
       await page.getByTestId("glance-need-you").click();
       await expect
-        .poll(() => inViewport(page, '[data-testid="home-row"][data-blocked="1"]'))
+        .poll(() => inBand(page, '[data-testid="home-head"]', '[data-testid="home-row"][data-blocked="1"]'))
         .toBe(true);
       await shot(page, "home-glance-390-taps.png");
     } finally {
@@ -454,10 +466,10 @@ test.describe("desktop 1280", () => {
       expect(
         await parkTargetOutOfView(page, '[data-testid="session-list"]', '[data-testid="board-card"][data-rank="blocked"]'),
       ).toBe(true);
-      expect(await inViewport(page, '[data-testid="board-card"][data-rank="blocked"]')).toBe(false);
+      expect(await inBand(page, '[data-testid="session-list"]', '[data-testid="board-card"][data-rank="blocked"]')).toBe(false);
       await page.getByTestId("glance-need-you").click();
       await expect
-        .poll(() => inViewport(page, '[data-testid="board-card"][data-rank="blocked"]'))
+        .poll(() => inBand(page, '[data-testid="session-list"]', '[data-testid="board-card"][data-rank="blocked"]'))
         .toBe(true);
       await shot(page, "home-glance-1280-taps.png");
     } finally {

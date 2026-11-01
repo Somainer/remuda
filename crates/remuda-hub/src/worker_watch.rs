@@ -1701,6 +1701,7 @@ async fn respawn_scoped(
         task_id: worker.task_id.as_ref().map(|id| id.as_id().to_string()),
         enforce_tree: true,
         restart: None,
+        seated_by: None,
     };
     let (respawn_initiator, respawn_device_id) = initiator_and_device(state, device).await?;
     let (instance, _command) = crate::placement::spawn_on_host(
@@ -1871,6 +1872,7 @@ async fn relaunch_instance(
         task_id: worker.task_id.as_ref().map(|id| id.as_id().to_string()),
         enforce_tree: true,
         restart: None,
+        seated_by: None,
     };
     // D-057 §7.1: a respawn the Hub authors on the caller's behalf carries
     // that caller's initiator and device id.

@@ -536,7 +536,11 @@ impl InteractionRuntime {
                 let caller_origin = match origin {
                     remuda_protocol::InputOrigin::Human => remuda_driver::LaunchOrigin::Human,
                     remuda_protocol::InputOrigin::Bot => remuda_driver::LaunchOrigin::Bot,
-                    remuda_protocol::InputOrigin::Agent => remuda_driver::LaunchOrigin::Agent,
+                    // The Hub never answers an interaction itself; a Hub
+                    // origin carries no operator authority either way.
+                    remuda_protocol::InputOrigin::Agent | remuda_protocol::InputOrigin::Hub => {
+                        remuda_driver::LaunchOrigin::Agent
+                    }
                 };
                 let answer: InteractionAnswer =
                     serde_json::from_value(params.get("answer").cloned().unwrap_or(Value::Null))?;

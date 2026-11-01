@@ -18,6 +18,8 @@ fn parse_origin(value: &Value) -> InputOrigin {
     match value.as_str() {
         Some("human") => InputOrigin::Human,
         Some("bot") => InputOrigin::Bot,
+        // D-057 §6.4: input the Hub itself wrote (the restart notice).
+        Some("hub") => InputOrigin::Hub,
         _ => InputOrigin::Agent,
     }
 }
@@ -54,19 +56,26 @@ pub(crate) fn wire_initiator(params: &Value) -> Option<remuda_protocol::Initiato
         .and_then(|value| serde_json::from_value(value).ok())
 }
 
+/// The Command record's origin for a wire input origin. D-057 §6.4: `hub`
+/// maps to the existing `system`, so the wire enum is not extended.
 pub(crate) fn command_origin(origin: InputOrigin) -> CommandOrigin {
     match origin {
         InputOrigin::Human => CommandOrigin::Ui,
         InputOrigin::Bot => CommandOrigin::Bot,
         InputOrigin::Agent => CommandOrigin::Mcp,
+        InputOrigin::Hub => CommandOrigin::System,
     }
 }
 
+/// The input origin a Command record carries back out. D-057 §6.4: `system`
+/// is produced only by Hub-written input, so it reads back as `hub` — never
+/// Human and never Agent.
 pub(crate) fn input_origin(origin: CommandOrigin) -> InputOrigin {
     match origin {
         CommandOrigin::Ui | CommandOrigin::Cli => InputOrigin::Human,
         CommandOrigin::Bot => InputOrigin::Bot,
-        CommandOrigin::Mcp | CommandOrigin::System => InputOrigin::Agent,
+        CommandOrigin::Mcp => InputOrigin::Agent,
+        CommandOrigin::System => InputOrigin::Hub,
     }
 }
 
@@ -158,12 +167,45 @@ mod tests {
         }
     }
 
+    /// D-057 §6.4: `hub` maps both ways to the existing command origin
+    /// `system`, and nothing else does; every origin round-trips.
+    #[test]
+    fn the_hub_origin_maps_to_and_from_the_system_command_origin() {
+        assert_eq!(wire_origin(&json!({"origin": "hub"})), InputOrigin::Hub);
+        assert_eq!(command_origin(InputOrigin::Hub), CommandOrigin::System);
+        assert_eq!(input_origin(CommandOrigin::System), InputOrigin::Hub);
+        for origin in [
+            InputOrigin::Human,
+            InputOrigin::Bot,
+            InputOrigin::Agent,
+            InputOrigin::Hub,
+        ] {
+            assert_eq!(input_origin(command_origin(origin)), origin, "{origin:?}");
+        }
+        // Hub input is never Human or Agent on the way back out, and no
+        // other command origin reads as Hub.
+        for command in [
+            CommandOrigin::Ui,
+            CommandOrigin::Cli,
+            CommandOrigin::Bot,
+            CommandOrigin::Mcp,
+        ] {
+            assert_ne!(input_origin(command), InputOrigin::Hub, "{command:?}");
+        }
+        // It carries no operator authority at launch.
+        assert_eq!(
+            remuda_driver::LaunchOrigin::from(InputOrigin::Hub),
+            remuda_driver::LaunchOrigin::Agent
+        );
+    }
+
     #[test]
     fn only_hub_envelope_sets_origin() {
         for (wire, expected) in [
             ("human", InputOrigin::Human),
             ("bot", InputOrigin::Bot),
             ("agent", InputOrigin::Agent),
+            ("hub", InputOrigin::Hub),
             ("mcp", InputOrigin::Agent),
             ("future", InputOrigin::Agent),
         ] {

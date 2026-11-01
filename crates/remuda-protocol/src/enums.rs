@@ -352,6 +352,9 @@ wire_enum!(InputOrigin, "3.1", {
     Human => "human",
     Bot => "bot",
     Agent => "agent",
+    // D-057 §6.4: input the Hub itself wrote (the restart notice). Never
+    // Human and never Agent; a Node maps it to and from CommandOrigin::System.
+    Hub => "hub",
 });
 
 wire_enum!(ModelEffective, "3.1", {

@@ -7637,6 +7637,11 @@
           "const": "agent",
           "description": "Wire value `agent`.",
           "type": "string"
+        },
+        {
+          "const": "hub",
+          "description": "Wire value `hub`.",
+          "type": "string"
         }
       ]
     },

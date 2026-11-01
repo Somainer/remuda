@@ -1206,10 +1206,10 @@
             "type": "string"
           },
           "restart": {
-            "description": "D-057 §6.1 C1 restart policy: relaunch this instance on Node-attested process loss/start failure, at most `maxPerHour` decisions per hour. Accepted only from a Human origin in Phase 1; an Agent or Bot gets 403. Hub-side policy, never forwarded in the Node spec; makes the instance a continuity lineage. No behaviour follows until the C1 supervisor ships.",
+            "description": "D-057 §6.1 C1 restart policy: the Hub's C1 supervisor relaunches this instance on Node-attested process loss or start failure, at most `maxPerHour` restart decisions per hour (an omitted `maxPerHour` takes the suggested cap, 3). Accepted only from a Human origin in Phase 1; an Agent or Bot gets 403. Hub-side policy, never forwarded in the Node spec; copied to every chapter; makes the instance a continuity lineage.",
             "oneOf": [
               {
-                "$ref": "#/components/schemas/RestartPolicy"
+                "$ref": "#/components/schemas/RestartPolicyInput"
               },
               {
                 "type": "null"
@@ -2012,7 +2012,7 @@
             "type": "string"
           },
           "pausedBy": {
-            "description": "Who paused the lineage: `{kind: device|self|ancestor|restart-cap|process-exit, deviceId?, instanceId?}`; null while unpaused.",
+            "description": "Who paused the lineage: `{kind: device|self|ancestor|restart-cap|process-exit, deviceId?, instanceId?, cause?}`; `restart-cap` and `process-exit` are the C1 supervisor's (with the failed chapter and its §6.3 cause); null while unpaused.",
             "type": [
               "object",
               "null"
@@ -2035,6 +2035,13 @@
               }
             ]
           },
+          "restartDecisions": {
+            "description": "D-057 §6.3.1: the C1 supervisor's restart-decision log, one row per failed chapter (the key), oldest first.",
+            "items": {
+              "$ref": "#/components/schemas/LineageRestartDecision"
+            },
+            "type": "array"
+          },
           "state": {
             "description": "starting, running, paused, or host-offline (a running current chapter whose host has no live link; derived, not starting).",
             "enum": [
@@ -2055,6 +2062,63 @@
         ],
         "type": "object"
       },
+      "LineageRestartDecision": {
+        "additionalProperties": false,
+        "description": "One C1 decision (D-057 §6.3.1), made inside F with a generation CAS and keyed by the failed chapter.",
+        "properties": {
+          "cause": {
+            "description": "The §6.3 cause: process-exit, start-failed or node-restarted.",
+            "type": "string"
+          },
+          "decidedAt": {
+            "type": "string"
+          },
+          "failedGeneration": {
+            "type": "integer"
+          },
+          "failedInstanceId": {
+            "description": "The failed chapter: the decision key.",
+            "type": "string"
+          },
+          "fenceId": {
+            "description": "The fence F committed for this decision; absent for a stale-at-boot decision, which runs no F.",
+            "type": "string"
+          },
+          "noticeCommandId": {
+            "description": "The restart notice's command id, chosen inside F (§6.4).",
+            "type": "string"
+          },
+          "outcome": {
+            "description": "restarted (F with successor), restart-cap or process-exit (F without successor: the lineage is paused), or stale-at-boot (no F, decided only by the boot evaluation: the Hub first saw the end more than 30 minutes before its previous run was last alive, or holds no record of seeing it; not relaunched, no push, the owner can Resume).",
+            "enum": [
+              "restarted",
+              "restart-cap",
+              "process-exit",
+              "stale-at-boot"
+            ],
+            "type": "string"
+          },
+          "reason": {
+            "description": "Why a decision paused instead of restarting, when it is not the cap or the policy (for example, the successor's provider profile is gone).",
+            "type": "string"
+          },
+          "recovery": {
+            "description": "§6.3.1 recovery source of the successor: chapter-session, earlier-session or fresh.",
+            "type": "string"
+          },
+          "successorInstanceId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "failedInstanceId",
+          "failedGeneration",
+          "cause",
+          "outcome",
+          "decidedAt"
+        ],
+        "type": "object"
+      },
       "LineageGlance": {
         "type": "object",
         "description": "Generated shape: LineageGlance in crates/remuda-protocol/schema/protocol.schema.json.",
@@ -2067,6 +2131,26 @@
           "doneToday"
         ],
         "additionalProperties": true
+      },
+      "RestartPolicyInput": {
+        "additionalProperties": false,
+        "description": "D-057 §6.1 C1 restart policy as a create body sets it; `maxPerHour` defaults to the suggested 3 (OA5).",
+        "properties": {
+          "maxPerHour": {
+            "default": 3,
+            "description": "At-most restart decisions per rolling hour; at least 1. Omitted: 3.",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "onProcessLoss": {
+            "description": "Restart on Node-attested process loss or start failure.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "onProcessLoss"
+        ],
+        "type": "object"
       },
       "RestartPolicy": {
         "additionalProperties": false,
@@ -5975,11 +6059,12 @@
             "type": "string"
           },
           "origin": {
-            "description": "Who authored that input; `agent` for a continuation or a Hub-authored input.",
+            "description": "Who authored that input: `hub` for an input the Hub wrote (the restart notice, D-057 §6.4); `agent` for a continuation the carrier started on its own.",
             "enum": [
               "human",
               "bot",
-              "agent"
+              "agent",
+              "hub"
             ],
             "type": "string"
           }

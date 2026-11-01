@@ -956,10 +956,14 @@ pub struct TurnErrorMarker {
     pub text: String,
 }
 
+/// OA5: the suggested restart cap, used when a create omits `maxPerHour`.
+pub const SUGGESTED_MAX_RESTARTS_PER_HOUR: u32 = 3;
+
 /// C1 restart policy chosen at create time (D-057 §6.1).
 ///
 /// Stored on every chapter of a continuity lineage and on the lineage row.
-/// Only a Human creator may set it; no behaviour follows until `ma-restart`.
+/// Only a Human creator may set it; the C1 supervisor (`crate::restart`)
+/// acts on it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RestartPolicy {
@@ -1129,6 +1133,20 @@ pub struct InstanceDelegation {
     /// D-057 §6.1 C1 restart policy; `Some` makes the new instance a
     /// continuity lineage even when it holds no grants.
     pub restart: Option<RestartPolicy>,
+    /// D-057 §6.3.1 / OA5: the device that seated a lineage with a restart
+    /// policy, with its authenticated origin. Setting `restart` is that
+    /// owner's standing grant to relaunch the same spec, so the lineage
+    /// records who gave it and with what origin; the supervisor's successor
+    /// creates carry that origin and name the device beside its own actor.
+    pub seated_by: Option<Seating>,
+}
+
+/// Who seated a continuity lineage (D-057 §6.3.1, OA5): the authenticating
+/// device and its origin, read from the device at create time.
+#[derive(Debug, Clone)]
+pub struct Seating {
+    pub device_id: String,
+    pub origin: remuda_protocol::InputOrigin,
 }
 
 impl Default for InstanceDelegation {
@@ -1145,6 +1163,7 @@ impl Default for InstanceDelegation {
             task_id: None,
             enforce_tree: false,
             restart: None,
+            seated_by: None,
         }
     }
 }
@@ -1578,7 +1597,20 @@ pub struct ContinuationResumeRequest {
     pub driver: String,
     /// Audit actor chain recorded by the fence (`{deviceId?, by}`).
     pub actor: Value,
+    /// The successor's `chapterCause`: [`OWNER_RESUME_CAUSE`] for an owner
+    /// Resume, the §6.3 cause for a C1 restart decision.
+    pub chapter_cause: String,
+    /// Lineage states this F may start from: an owner Resume continues a
+    /// paused lineage too; the C1 supervisor never does (a close wins).
+    pub from_states: &'static [&'static str],
+    /// D-057 §6.3.1: the C1 restart decision this F records, keyed by the
+    /// failed chapter (`None` for an owner Resume). Checked and written in
+    /// the same transaction as F.
+    pub restart: Option<crate::restart::RestartDecision>,
 }
+
+/// `chapterCause` of a chapter an owner Resume opened.
+pub const OWNER_RESUME_CAUSE: &str = "owner-resume";
 
 /// Result of [`Store::mark_forward_intent_gated`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1686,6 +1718,25 @@ fn continuation_resume_tx(
             current: Box::new(current),
         });
     }
+    // D-057 §6.3.1: a C1 decision acts only while the failed chapter is
+    // still the current chapter at the expected generation, still carries
+    // its process-end evidence and has no decision yet (the key). Otherwise
+    // nothing is written: another tick, a Hub restart or a racing Resume or
+    // close got there first.
+    if let Some(decision) = &request.restart
+        && !crate::restart::decision_open(
+            &tx,
+            &lineage_id,
+            request.expected_generation,
+            &decision.failed_instance_id,
+        )?
+    {
+        let current = load_instance(&tx, &current_id)?
+            .ok_or_else(|| StoreError::Id("current chapter missing".into()))?;
+        return Ok(ContinuationResumeResult::Superseded {
+            current: Box::new(current),
+        });
+    }
     let successor_id = new_id("ins").map_err(|e| StoreError::Id(e.to_string()))?;
     let journal_id = new_id("obj").map_err(|e| StoreError::Id(e.to_string()))?;
     let command_id = new_id("cmd").map_err(|e| StoreError::Id(e.to_string()))?;
@@ -1701,7 +1752,7 @@ fn continuation_resume_tx(
         &crate::fence::FenceSpec {
             lineage_id: lineage_id.clone(),
             expected_generation: request.expected_generation,
-            from_states: &["starting", "running", "paused"],
+            from_states: request.from_states,
             mode: crate::fence::FenceMode::Successor {
                 successor_id: successor_id.clone(),
             },
@@ -1780,6 +1831,7 @@ fn continuation_resume_tx(
             .restart
             .clone()
             .and_then(|value| serde_json::from_value(value).ok()),
+        seated_by: None,
     };
     // The predecessor is fenced inside this same transaction, so the copied
     // seat grants do not collide with it.
@@ -1793,7 +1845,7 @@ fn continuation_resume_tx(
          VALUES (?1, ?2, ?3, ?4, ?5, 'requested', 'unknown', ?6,
                  ?7, ?8, 0, ?9, ?10, ?10,
                  ?11, ?12, ?13, ?14,
-                 ?15, ?16, 'owner-resume', NULL, ?17)",
+                 ?15, ?16, ?18, NULL, ?17)",
         params![
             successor_id,
             current.host_id,
@@ -1812,6 +1864,7 @@ fn continuation_resume_tx(
             lineage_id,
             successor_generation,
             restart_json,
+            request.chapter_cause,
         ],
     )?;
     // 5. Queue the successor's resume create (forwarded after commit).
@@ -1852,6 +1905,19 @@ fn continuation_resume_tx(
     let command = load_command(&tx, &command_id)?
         .ok_or_else(|| StoreError::Id("successor command missing".into()))?;
     crate::fence::set_successor_command(&tx, &fence.fence_id, &command_id)?;
+    if let Some(decision) = &request.restart {
+        crate::restart::record_restart(
+            &tx,
+            decision,
+            &lineage_id,
+            request.expected_generation,
+            &successor_id,
+            successor_generation,
+            &current.host_id,
+            &command_id,
+            &fence.fence_id,
+        )?;
+    }
     tx.commit()?;
     Ok(ContinuationResumeResult::Resumed(Box::new(
         ContinuationResumed {
@@ -5128,10 +5194,15 @@ impl Store {
             let continuity = !delegation.grants.is_empty() || delegation.restart.is_some();
             if continuity {
                 let origin = spec.get("origin").cloned().unwrap_or(json!("agent"));
-                let origin_spec_ref = serde_json::to_string(&json!({
+                let mut origin_spec_ref = json!({
                     "origin": origin,
                     "spec": spec,
-                }))?;
+                });
+                if let Some(seating) = &delegation.seated_by {
+                    origin_spec_ref["deviceId"] = json!(seating.device_id);
+                    origin_spec_ref["seatedOrigin"] = json!(seating.origin);
+                }
+                let origin_spec_ref = serde_json::to_string(&origin_spec_ref)?;
                 conn.execute(
                     "INSERT INTO lineages
                         (lineage_id, current_instance_id, generation, state,
@@ -8218,6 +8289,7 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     crate::gatequeue::migrate(&conn)?;
     crate::node_ops::migrate(&conn)?;
     crate::fence::migrate(&conn)?;
+    crate::restart::migrate(&conn)?;
     // c-usagefu r14 item 1 (Ruling M1): a failed usage migration must never
     // brick Hub startup. The migration is one transaction and rolls back to
     // the previously-openable shape on any error; log it and open. Usage
@@ -15994,6 +16066,9 @@ fn append_loaded_event(
     // this event's own terminal transition produced.
     settlement.merge(apply_interaction_event(conn, host_id, instance_id, &event)?);
     let turn_ended = apply_instance_lifecycle(conn, instance_id, &event, &mut settlement)?;
+    // D-057 §6.2: the lineage's stored state follows its current chapter's
+    // first running report (`starting` → `running`).
+    crate::restart::note_chapter_running(conn, instance_id)?;
     // seen-hub: a settled turn end becomes the instance's turn-end mark; an
     // owner client showing the session right now folds it seen in this write.
     let seen = if turn_ended {
@@ -16623,7 +16698,7 @@ pub(crate) const HUB_JOURNAL_ORIGIN: &str = "hub";
 
 /// `last_error` markers that ATTEST a launch never started even when an older
 /// row has no `ended_at` yet (ma-lineage r4 item 1).
-fn is_attested_launch_failure_marker(last_error: &str) -> bool {
+pub(crate) fn is_attested_launch_failure_marker(last_error: &str) -> bool {
     // Match the Hub's OWN exact markers, not prose: the stale-create sweep
     // stamps `create-never-acknowledged` (ma-lineage r5 item 4).
     let text = last_error.to_ascii_lowercase();

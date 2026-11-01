@@ -673,6 +673,18 @@ pub(crate) fn fence_core(conn: &Connection, spec: &FenceSpec) -> Result<FenceTx,
         None => None,
     };
 
+    // §8.5: a close by the chapter itself or by an Agent ancestor records its
+    // C1 push with F (a pause from a Human device sends nothing).
+    if let FenceMode::Pause { paused_by, .. } = &spec.mode {
+        let kind = paused_by.get("kind").and_then(Value::as_str);
+        if let Some(
+            kind @ (crate::restart::push_kind::SELF | crate::restart::push_kind::ANCESTOR),
+        ) = kind
+        {
+            crate::restart::queue_push(conn, &fence_id, &lineage_id, &predecessor, kind, None)?;
+        }
+    }
+
     // 11. Audit, with the actor chain.
     let audit_device = spec
         .actor
@@ -1372,6 +1384,11 @@ pub(crate) async fn pause_on_close(
         match result {
             FenceTx::Committed(core) => {
                 after_commit(state, &core, Some(&core.predecessor_host_id)).await;
+                // §8.5: the self / ancestor C1 push F recorded.
+                {
+                    let state = state.clone();
+                    tokio::spawn(async move { crate::restart::drive_pushes(&state).await });
+                }
                 let command = state
                     .store
                     .get_command(command_id.clone())

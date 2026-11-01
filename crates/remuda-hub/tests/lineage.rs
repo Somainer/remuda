@@ -2878,6 +2878,9 @@ async fn two_concurrent_resumes_produce_one_successor() -> Result<()> {
             title: None,
             driver: "claude-sdk".to_owned(),
             actor: serde_json::json!({"by": "test"}),
+            chapter_cause: remuda_hub::store_test_support::OWNER_RESUME_CAUSE.into(),
+            from_states: &["starting", "running", "paused"],
+            restart: None,
         };
         store1.continuation_resume(req).await
     });
@@ -2908,6 +2911,9 @@ async fn two_concurrent_resumes_produce_one_successor() -> Result<()> {
             title: None,
             driver: "claude-sdk".to_owned(),
             actor: serde_json::json!({"by": "test"}),
+            chapter_cause: remuda_hub::store_test_support::OWNER_RESUME_CAUSE.into(),
+            from_states: &["starting", "running", "paused"],
+            restart: None,
         };
         store2.continuation_resume(req).await
     });
@@ -3736,6 +3742,64 @@ async fn restart_policy_from_agent_or_bot_origin_is_forbidden() -> Result<()> {
         .await?;
     assert_eq!(bad.status(), 400);
     let _ = maker;
+    Ok(())
+}
+
+/// ma-restart item 1 (D-057 §6.1, OA5): an omitted `maxPerHour` takes the
+/// suggested cap of 3, the lineage records the seating Human device (the
+/// standing relaunch grant), and the policy is on the chapter and lineage.
+#[tokio::test]
+async fn restart_policy_defaults_to_the_suggested_cap_and_records_the_seating_device() -> Result<()>
+{
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let created: Value = ctx
+        .http
+        .post(format!("{}/v1/instances", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .json(&json!({
+            "hostId": ctx.host, "kind": "claude", "driver": "claude-sdk",
+            "permissionMode": "manual",
+            "restart": { "onProcessLoss": true },
+            "prompt": "seat with the suggested cap"
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let seat = created["instance"]["instanceId"]
+        .as_str()
+        .context("seat id")?
+        .to_owned();
+    let _ = node.next_frame().await?;
+    let suggested = json!({ "onProcessLoss": true, "maxPerHour": 3 });
+    assert_eq!(created["instance"]["restart"], suggested);
+    let lineage: Value = ctx
+        .http
+        .get(format!("{}/v1/lineages/{seat}", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(lineage["restart"], suggested);
+    let db = rusqlite::Connection::open(&ctx.db_path)?;
+    let (seated_by, device_exists): (Option<String>, bool) = db.query_row(
+        "SELECT json_extract(l.origin_spec_ref, '$.deviceId'),
+                EXISTS (SELECT 1 FROM devices d
+                         WHERE d.id = json_extract(l.origin_spec_ref, '$.deviceId')
+                           AND d.instance_id IS NULL)
+           FROM lineages l WHERE l.lineage_id = ?1",
+        rusqlite::params![seat],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert!(seated_by.is_some(), "the seating device is recorded");
+    assert!(
+        device_exists,
+        "it is the Human device that created the seat"
+    );
     Ok(())
 }
 

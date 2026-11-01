@@ -310,6 +310,36 @@ test.describe("phone 390", () => {
         await expect(page.getByTestId("host-chip").first()).toHaveAttribute("data-offline", "1");
       }
       await expect(strip).not.toContainText("★");
+
+      // Deterministic offline shape: add a host of our own (a never-reachable
+      // SSH target) and check the strip's offline branch on controlled state.
+      const added = await page.request.post("/v1/hosts/ssh", {
+        headers: { Origin: new URL(page.url()).origin },
+        data: { target: "rc-never@127.0.0.1:1", label: "rc-offline", labels: [] },
+      });
+      expect(added.ok(), `add ssh host: ${added.status()}`).toBe(true);
+      const addedHost = (await added.json()) as { id?: string };
+      expect(addedHost.id).toBeTruthy();
+      try {
+        // Wait for the Hub to serve it, then for the strip's 2 s poll to paint.
+        await expect
+          .poll(async () => {
+            const response = await page.request.get("/v1/hosts");
+            const items = ((await response.json()) as { items?: { id?: string }[] }).items ?? [];
+            return items.some((host) => host.id === addedHost.id);
+          }, { timeout: 20_000 })
+          .toBe(true);
+        await expect
+          .poll(async () => page.getByTestId("host-chip").count(), { timeout: 20_000 })
+          .toBeGreaterThan(0);
+        await expect(page.getByTestId("host-summary")).toHaveCount(0);
+        await expect(page.getByTestId("host-chip").first()).toHaveAttribute("data-offline", "1");
+        await expect(
+          page.locator(`[data-testid="host-chip"][data-host-id="${addedHost.id}"]`),
+        ).toContainText("离线");
+      } finally {
+        await page.request.delete(`/v1/hosts/${addedHost.id}`).catch(() => undefined);
+      }
       const stripGeometry = await page.evaluate(() => {
         const stripEl = document.querySelector('[data-testid="host-strip"]') as HTMLElement;
         const head = document.querySelector('[data-testid="home-head"]') as HTMLElement;

@@ -4142,7 +4142,11 @@ pub mod test_barrier {
                     state.result_enqueue_parked.load(Ordering::Acquire)
                         && !state.result_enqueue_open.load(Ordering::Acquire)
                 },
-                || "write_commit barrier: timed out waiting for the reader to park on                     the shut result-enqueue gate".to_owned(),
+                || {
+                    "write_commit barrier: timed out waiting for the reader to park on \
+                    the shut result-enqueue gate"
+                        .to_owned()
+                },
             )
             .await;
         }
@@ -4168,7 +4172,11 @@ pub mod test_barrier {
                 &self.state,
                 deadline,
                 |state| state.backlog_overflowed.load(Ordering::Acquire),
-                || "write_commit barrier: timed out waiting for the publication                     backlog overflow".to_owned(),
+                || {
+                    "write_commit barrier: timed out waiting for the publication \
+                    backlog overflow"
+                        .to_owned()
+                },
             )
             .await;
         }
@@ -4236,7 +4244,11 @@ pub mod test_barrier {
                 &self.state,
                 deadline,
                 |state| state.overflow_kill_waiting.load(Ordering::Acquire),
-                || "write_commit barrier: timed out waiting for the overflow kill to                     contend on the live handle".to_owned(),
+                || {
+                    "write_commit barrier: timed out waiting for the overflow kill to \
+                    contend on the live handle"
+                        .to_owned()
+                },
             )
             .await;
         }

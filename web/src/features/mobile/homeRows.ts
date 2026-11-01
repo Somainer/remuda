@@ -513,7 +513,9 @@ function compareGroups(a: HomeGroup, b: HomeGroup, order: HomeOrder): number {
   return latest(b) - latest(a) || a.id.localeCompare(b.id);
 }
 
-function groupDots(rows: readonly HomeRow[]): HomeGroup["dots"] {
+/** One glyph per rank in a group's header (home.md §3.2). Exported so a
+ *  rank-filtered ledger can recompute them from the rows it actually shows. */
+export function groupDots(rows: readonly HomeRow[]): HomeGroup["dots"] {
   const dots = { blocked: 0, unseen: 0, working: 0, wake: 0, starting: 0, idle: 0, exited: 0 };
   for (const row of rows) {
     if (row.rank === "blocked") dots.blocked += 1;

@@ -9,7 +9,7 @@ type Workbench = ReturnType<typeof useSpaceWorkbench>;
 
 /**
  * Desktop workbench chords, moved verbatim out of Shell. ⌘/Ctrl+B folds the
- * sidebar (`prefs.collapsed`) on every desktop route; ⌘[ / ⌘] walk Spaces.
+ * sidebar on every desktop route; ⌘[ / ⌘] walk Spaces.
  *
  * ⌘/Ctrl+1..9 always numbers what is on screen (D-053 §10): on /s/* it is the
  * tab strip (`tabSlots()` — the bound Task's tabs or the Space tabs), on
@@ -20,11 +20,18 @@ export function useWorkbenchKeys({
   onSessions,
   onNew,
   workbench,
+  sidebarCollapsed,
 }: {
   mobile: boolean;
   onSessions: boolean;
   onNew: boolean;
   workbench: Workbench;
+  /**
+   * The EFFECTIVE fold — the stored preference, else home.md §2.4's initial
+   * state for this width. Toggling must flip what is painted, not the stored
+   * value, or the first ⌘B at 1024–1279 would "fold" an already folded rail.
+   */
+  sidebarCollapsed: boolean;
 }): void {
   const navigate = useNavigate();
   const location = useLocation();
@@ -42,7 +49,7 @@ export function useWorkbenchKeys({
       if (isTypingTarget(event.target)) return;
       if (event.key.toLowerCase() === "b") {
         event.preventDefault();
-        spaceStore.setCollapsed(!workbench.prefs.collapsed);
+        spaceStore.setCollapsed(!sidebarCollapsed);
       } else if (!switching) {
         return;
       } else if (/^[1-9]$/.test(event.key)) {
@@ -75,5 +82,5 @@ export function useWorkbenchKeys({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [mobile, onSessions, onNew, workbench, navigate, location.pathname]);
+  }, [mobile, onSessions, onNew, workbench, sidebarCollapsed, navigate, location.pathname]);
 }

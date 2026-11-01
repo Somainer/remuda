@@ -11,6 +11,7 @@ import { known, type Id } from "../../types/wire";
 import { detectPlatform, setPlatformForTest } from "../../lib/platform";
 import { setClock } from "../../lib/clock";
 import { SessionList } from "./SessionList";
+import { GLANCE_TARGETS } from "../home/glanceNav";
 
 // jsdom has no matchMedia; the workbench viewport hook needs one to pick the
 // popover (desktop) or the sheet (phone). Default to desktop; `viewport` flips it.
@@ -1095,5 +1096,70 @@ describe("SessionList §8 freshness states", () => {
     const rows = screen.getByTestId("session-list").querySelector("[data-freshness]");
     expect(rows).toHaveAttribute("data-freshness", "grace");
     expect(rows).not.toHaveAttribute("data-dimmed");
+  });
+});
+
+describe("① 需要你 anchor on the real list markup", () => {
+  it("matches the full-variant row (board-card with the shared rank), not the inner link", () => {
+    hub.instances = [
+      session("ins_blocked", { activity: known("waiting-interaction") }),
+      session("ins_idle", { activity: known("idle") }),
+    ];
+    const { container } = renderList();
+    const article = container.querySelector(GLANCE_TARGETS.needYouDesktop);
+    expect(article).not.toBeNull();
+    expect(article).toHaveAttribute("data-testid", "board-card");
+    expect(article).toHaveAttribute("data-instance-id", "ins_blocked");
+  });
+
+  it("still matches a blocked row whose host connection dropped (rank, not UiStatus)", () => {
+    hub.instances = [
+      session("ins_dropped", { activity: known("waiting-interaction"), connectivity: "disconnected" }),
+    ];
+    const { container } = renderList();
+    // The UiStatus projects unknown for a dropped host; rank 1 does not.
+    expect(screen.getByTestId("board-card")).toHaveAttribute("data-status", "unknown");
+    expect(container.querySelector(GLANCE_TARGETS.needYouDesktop)).not.toBeNull();
+  });
+
+  it("finds nothing when no row is blocked", () => {
+    hub.instances = [session("ins_idle", { activity: known("idle") })];
+    const { container } = renderList();
+    expect(container.querySelector(GLANCE_TARGETS.needYouDesktop)).toBeNull();
+  });
+});
+
+describe("① rank filter on the list", () => {
+  it("narrows to the count's rank, keeping a working row whose host dropped", () => {
+    hub.instances = [
+      session("ins_work", { activity: known("working"), connectivity: "disconnected" }),
+      session("ins_idle", { activity: known("idle") }),
+    ];
+    renderList("?rank=working");
+    const cards = screen.getAllByTestId("board-card");
+    expect(cards.map((card) => card.getAttribute("data-instance-id"))).toEqual(["ins_work"]);
+    // The filter is a removable chip, so it cannot outlive its control.
+    expect(screen.getByTestId("session-chip")).toHaveTextContent("工作中");
+  });
+});
+
+describe("global scope and the desktop row set", () => {
+  it("still searches every top-level Space when the caller pins one", () => {
+    hub.instances = [
+      session("ins_pinned", { workspaceId: "wsp-a" }),
+      session("ins_elsewhere", { workspaceId: "wsp-b" }),
+      session("ins_child", {
+        workspaceId: "wsp-a",
+        parent: { instanceId: "ins_pinned", runId: "run_1", commandId: "cmd_1" },
+      }),
+    ];
+    render(
+      <MemoryRouter initialEntries={["/sessions?scope=all"]}>
+        <SessionList variant="full" instances={[hub.instances[0], hub.instances[2]]} title="demo-root" />
+      </MemoryRouter>,
+    );
+    // Global scope leaves the pinned Space behind; children stay out.
+    expect(new Set(screen.getAllByTestId("board-card").map((card) => card.getAttribute("data-instance-id"))))
+      .toEqual(new Set(["ins_pinned", "ins_elsewhere"]));
   });
 });

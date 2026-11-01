@@ -177,7 +177,7 @@
    scroller, so a short list still parks the dock at the bottom edge; a long
    one keeps it there with sticky positioning. */
 .dock {
-  order: 3;
+  order: 4;
   position: sticky;
   bottom: 0;
   z-index: 5;

@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { openSpacesIndex } from "./spacesIndex";
 
 /**
  * P0-1 acceptance: filtering, scope and zero results (exploration §5).
@@ -76,6 +77,8 @@ async function applyFixture(page: Page) {
 async function visit(page: Page, url: string) {
   await page.goto(url);
   await applyFixture(page);
+  // §2.5: the Space index starts collapsed behind 「空间 ▸」.
+  if (new URL(url, "http://x").pathname.startsWith("/sessions")) await openSpacesIndex(page);
 }
 
 /** Select the Space whose sidebar entry carries this name. */
@@ -92,6 +95,7 @@ function space(page: Page, name: string) {
  * anything about the detail route.
  */
 async function selectSpace(page: Page, name: string, index = 0) {
+  await openSpacesIndex(page);
   await space(page, name).nth(index).click();
   await page.getByRole("navigation", { name: "主导航" }).getByRole("link").first().click();
   await expect(page.getByTestId("session-list")).toBeVisible();

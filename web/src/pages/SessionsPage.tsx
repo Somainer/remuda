@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
+import { useSearchParams } from "react-router-dom";
 import { SessionList } from "../features/session/SessionList";
 import { useHomeFreshness } from "../features/home/freshness";
 import { useHub } from "../lib/store";
@@ -7,11 +8,19 @@ import { SpacesPanel } from "../features/spaces/SpacesPanel";
 import { spaceStore, type Space } from "../features/spaces/store";
 import { useSpaceWorkbench } from "../features/spaces/useSpaceWorkbench";
 import { PageHeader } from "../components/PageHeader";
+import { HomeGlance } from "../features/home/HomeGlance";
+import { TOP_LEVEL_WORKING } from "../features/home/glance";
+import { HostStrip } from "../features/home/HostStrip";
+import { GLANCE_TARGETS, scrollToFirst } from "../features/home/glanceNav";
 import { MainCard } from "../features/home/MainCard";
 import { WorkingList } from "../features/home/WorkingList";
 import { useMainAside } from "../features/home/useMain";
-import ui from "../styles/ui.module.css";
 import css from "./SessionsPage.module.css";
+
+/** The URL's `rank` list (home.md §5.2 ① tap); the list's filter model reads it. */
+function rankValues(params: URLSearchParams): string[] {
+  return (params.get("rank") ?? "").split(",").filter(Boolean);
+}
 
 export function SessionsPage({ dimmed = false }: { dimmed?: boolean }) {
   const hub = useHub();
@@ -28,24 +37,45 @@ export function SessionsPage({ dimmed = false }: { dimmed?: boolean }) {
   // input at a time).
   const mainAside = useMainAside();
   const showMain = !mobile && !dimmed;
-  // Below 1024 the index column folds into the header's 空间 button, which
-  // opens the same panel as an overlay (one instance, same testids).
-  const [indexOpen, setIndexOpen] = useState(false);
+  // §2.5 (D-061): the SpacesPanel starts collapsed behind 「空间 ▸」 at the
+  // host band's right end. Expanding is a per-device preference: ≥1024 the
+  // panel is the index column, below 1024 the same component is an overlay.
+  const indexOpen = prefs.spacesOpen;
+  // §5.2: 工作中 on the count row narrows the SessionList to that RANK (the
+  // same rank() the count uses — not the connectivity-dependent UiStatus); a
+  // second tap removes it again.
+  const [params, setParams] = useSearchParams();
+  const workingFilter = rankValues(params).includes("working");
+
+  function toggleWorking() {
+    const next = new URLSearchParams(params);
+    const ranks = rankValues(params);
+    const updated = workingFilter
+      ? ranks.filter((value) => value !== "working")
+      : [...ranks, "working"];
+    if (updated.length) next.set("rank", updated.join(","));
+    else next.delete("rank");
+    setParams(next, { replace: true });
+  }
 
   useEffect(() => {
     if (!indexOpen) return;
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setIndexOpen(false);
+      if (event.key === "Escape") spaceStore.setSpacesOpen(false);
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
   }, [indexOpen]);
 
   // Picking a Space on the list route keeps the list route: the column is an
-  // index of this page, not a jump to the Space's last tab.
+  // index of this page, not a jump to the Space's last tab. Below 1024 the
+  // panel is an overlay and closes after the pick; the column stays open.
   function select(space: Space) {
     spaceStore.selectSpace(space.id);
-    setIndexOpen(false);
+    if (typeof window !== "undefined" && typeof window.matchMedia === "function"
+      && window.matchMedia("(max-width: 1023px)").matches) {
+      spaceStore.setSpacesOpen(false);
+    }
   }
 
   return (
@@ -55,14 +85,31 @@ export function SessionsPage({ dimmed = false }: { dimmed?: boolean }) {
           crumbs={[{ label: "会话" }]}
           title={active?.name ?? "全部空间"}
           actions={
+            <HomeGlance
+              placement="desktop"
+              // The list drops child sessions; the count must use that set.
+              workingInstances={TOP_LEVEL_WORKING}
+              workingFilter={workingFilter}
+              onNeedYou={() => scrollToFirst(GLANCE_TARGETS.needYouDesktop)}
+              onWorking={toggleWorking}
+            />
+          }
+        />
+      ) : null}
+      {/* ② 主机条: the 32px band under the PageHeader (home.md §2.2), with the
+          §2.5 「空间 ▸」 toggle at its right end. */}
+      {!mobile ? (
+        <HostStrip
+          placement="desktop"
+          trailing={
             <button
               type="button"
-              className={`${ui.btnGhost} ${css.indexOpen}`}
+              className={css.indexToggle}
               data-testid="spaces-index-open"
               aria-expanded={indexOpen}
-              onClick={() => setIndexOpen((v) => !v)}
+              onClick={() => spaceStore.setSpacesOpen(!indexOpen)}
             >
-              空间
+              空间 <span aria-hidden="true">{indexOpen ? "▾" : "▸"}</span>
             </button>
           }
         />
@@ -70,7 +117,13 @@ export function SessionsPage({ dimmed = false }: { dimmed?: boolean }) {
       <div className={css.body}>
         {!mobile ? (
           <>
-            {indexOpen ? <div className={css.scrim} data-testid="spaces-index-scrim" onClick={() => setIndexOpen(false)} /> : null}
+            {indexOpen ? (
+              <div
+                className={css.scrim}
+                data-testid="spaces-index-scrim"
+                onClick={() => spaceStore.setSpacesOpen(false)}
+              />
+            ) : null}
             <aside className={css.index} data-open={indexOpen ? "1" : undefined} aria-label="空间">
               <SpacesPanel spaces={spaces} active={active} prefs={prefs} instanceId={instanceId} collapsed={false} onSelect={select} />
             </aside>

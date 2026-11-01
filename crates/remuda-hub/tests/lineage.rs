@@ -4380,3 +4380,92 @@ async fn a_post_commit_lease_lookup_failure_still_purges_every_chapter_and_retur
     }
     Ok(())
 }
+
+// --- resume-config: a chapter keeps the seat's Claude home -----------------
+
+/// resume-config: a continuation Resume keeps the seat's recorded
+/// `claudeConfigDir` and `settingsOverlayPath` on the successor. The native
+/// home is where the predecessor's transcript lives, so dropping either makes
+/// `--resume <sessionId>` silently start a blank conversation. Neither is
+/// overridable from the resume body.
+#[tokio::test]
+async fn owner_resume_carries_the_chapters_claude_config_dir_and_settings_overlay() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let claude_home = "/srv/remuda/seats/claude-home";
+    let overlay = "/srv/remuda/seats/settings-overlay.json";
+    let created: Value = ctx
+        .http
+        .post(format!("{}/v1/instances", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .json(&json!({
+            "hostId": ctx.host,
+            "kind": "claude",
+            "driver": "claude-sdk",
+            "name": "main",
+            "title": "Main",
+            "grants": ["address-owner", "dispatch"],
+            "permissionMode": "manual",
+            "restart": Ctx::restart_on(),
+            "prompt": "seat brief",
+            "claudeConfigDir": claude_home,
+            "settingsOverlayPath": overlay,
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let seat = created["instance"]["instanceId"]
+        .as_str()
+        .context("seat id")?
+        .to_owned();
+    let (method, create_params) = node.next_frame().await?;
+    assert_eq!(method, "instance.create");
+    assert_eq!(create_params["spec"]["claudeConfigDir"], json!(claude_home));
+    assert_eq!(create_params["spec"]["settingsOverlayPath"], json!(overlay));
+    ctx.report_session(&node, &seat, false).await?;
+
+    // Resume is accepted only on a paused lineage (§6.5): close first, then
+    // continue with a body that tries (and fails) to redirect the home.
+    ctx.pause(&seat, &ctx.human).await?;
+    let resumed: Value = ctx
+        .http
+        .post(format!("{}/v1/instances/{seat}/resume", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .json(&json!({
+            "mode": "structured",
+            "claudeConfigDir": "/srv/remuda/elsewhere/claude-home",
+            "settingsOverlayPath": "/srv/remuda/elsewhere/overlay.json",
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let successor = resumed["instance"]["instanceId"]
+        .as_str()
+        .context("successor id")?
+        .to_owned();
+    assert_ne!(successor, seat);
+
+    let (close_method, close_params) = node.next_frame().await?;
+    assert_eq!(close_method, "instance.close");
+    assert_eq!(close_params["instanceId"], json!(seat));
+    let (resume_method, resume_params) = node.next_frame().await?;
+    assert_eq!(resume_method, "instance.resume");
+    assert_eq!(resume_params["instanceId"], json!(successor));
+    assert_eq!(resume_params["spec"]["resumeSessionId"], json!(SESSION));
+    assert_eq!(resume_params["spec"]["claudeConfigDir"], json!(claude_home));
+    assert_eq!(resume_params["spec"]["settingsOverlayPath"], json!(overlay));
+    assert!(
+        !resume_params.to_string().contains("elsewhere"),
+        "the resume body must not override the seat's home: {resume_params}"
+    );
+
+    // The successor row records the pair, so the next chapter inherits it too.
+    let successor_view = ctx.get_instance(&successor, &ctx.human).await?;
+    assert_eq!(successor_view["claudeConfigDir"], json!(claude_home));
+    assert_eq!(successor_view["settingsOverlayPath"], json!(overlay));
+    Ok(())
+}

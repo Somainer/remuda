@@ -6,10 +6,6 @@
 //! (`sha256`, `installed`, `nativeGateway`, `cpuCount`, `os`/`kernel`/`libc`)
 //! are advertised for Node use; Hub ignores unknown keys. Auth never carries
 //! secret values.
-//!
-//! Executable digests are **not** part of the hello/heartbeat probe: hashing a
-//! large CLI takes seconds and would delay the handshake for a field nothing
-//! reads. [`digest_of`] computes one on demand.
 
 use remuda_protocol::{
     AdapterTransport, Capability, CapabilitySet, CapabilitySnapshot, CapabilityState, Digest,
@@ -42,7 +38,7 @@ const COMPUTER_USE_CLIENT: &str = "computer-use/Codex Computer Use.app/Contents/
 /// Bundle-relative path of the `Info.plist` that names the client's version.
 const COMPUTER_USE_PLIST: &str = "computer-use/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/Info.plist";
 
-/// Default cache lifetime for PATH/--version/auth probes.
+/// Default cache lifetime for PATH/--version/sha256/auth probes.
 pub const DEFAULT_TTL: Duration = Duration::from_secs(30);
 
 /// Login heuristic result. Serialized as Hub `auth`.
@@ -64,7 +60,7 @@ pub enum CliAuth {
     Unknown,
 }
 
-/// One native CLI in Hub `cli[]` shape, plus an optional on-demand `sha256`.
+/// One native CLI in Hub `cli[]` shape, plus `sha256`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CliEntry {
@@ -84,8 +80,6 @@ pub struct CliEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub native_gateway: Option<bool>,
     /// `sha256:` + 64 hex digits of the executable, when hashed.
-    ///
-    /// [`digest_of`] is the only producer; the hello probe leaves this unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
 }
@@ -514,13 +508,7 @@ fn probe_cli(kind: &str, env: &ProbeEnv) -> CliEntry {
     let path = find_executable(kind, &env.path);
     let installed = path.is_some();
     let version = path.as_deref().and_then(binary_version);
-    // Deliberately not hashed here. The digest is an extra the Hub drops
-    // (`remuda-hub::inventory::normalize_cli` keeps kind/version/path/auth),
-    // and hashing a 250 MB CLI in a debug build took ~8 s — more than the
-    // `node.hello` deadline — so computing it on the handshake path could
-    // block the Node from ever coming online. Callers that need a digest ask
-    // for one with [`digest_of`]; the handshake advertises the rest.
-    let sha256 = None;
+    let sha256 = path.as_deref().and_then(hash_file);
     let native_gateway = (kind == "claude").then(|| claude_native_gateway_configured(&env.home));
     let auth = cli_auth(kind, &env.home, installed, native_gateway.unwrap_or(false));
     tracing::debug!(
@@ -881,13 +869,7 @@ fn is_retryable_spawn(err: &std::io::Error) -> bool {
     ) || err.raw_os_error() == Some(26)
 }
 
-/// SHA-256 of an executable, `sha256:` prefixed, computed on demand.
-///
-/// The hello/heartbeat probe never calls this: hashing a large CLI blocks the
-/// handshake, and no Hub path reads the digest. A caller that needs to pin or
-/// compare a binary (drift checks, operator read-outs) asks for it explicitly.
-#[must_use]
-pub fn digest_of(path: &Path) -> Option<String> {
+fn hash_file(path: &Path) -> Option<String> {
     let mut hasher = Sha256::new();
     let mut file = File::open(path).ok()?;
     let mut buf = [0_u8; 8192];
@@ -1107,12 +1089,12 @@ mod tests {
     }
 
     #[test]
-    fn fake_path_resolves_absolute_version_and_leaves_digests_lazy() {
+    fn fake_path_resolves_absolute_version_and_sha256() {
         let bin = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         let claude = write_stub(bin.path(), "claude", "claude 9.9.9");
         write_stub(bin.path(), "gemini", "gemini 1.2.3");
-        let expected_sha = digest_of(&claude).expect("sha");
+        let expected_sha = hash_file(&claude).expect("sha");
         let collector = Collector::new(env_for(bin.path(), home.path()), Duration::from_secs(30));
         let snap = collector.snapshot(&config_with(&[("region", "sg")], None));
         assert_eq!(snap.hostname, "test-host");
@@ -1121,9 +1103,7 @@ mod tests {
         assert_eq!(snap.cli.len(), 6);
         let claude_ent = snap.cli.iter().find(|c| c.kind == "claude").unwrap();
         assert_eq!(claude_ent.version.as_deref(), Some("claude 9.9.9"));
-        // The handshake probe never hashes; the caller can ask for it.
-        assert_eq!(claude_ent.sha256, None, "the probe must not hash");
-        assert_eq!(digest_of(&claude).as_deref(), Some(expected_sha.as_str()));
+        assert_eq!(claude_ent.sha256.as_deref(), Some(expected_sha.as_str()));
         let path = claude_ent.path.as_ref().expect("path");
         assert!(path.is_absolute(), "{path:?}");
         assert_eq!(claude_ent.auth, CliAuth::LoggedOut);

@@ -74,3 +74,33 @@ remuda-testing = { path = "crates/remuda-testing" }
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "deny"
+
+# The host inventory digests every installed agent CLI for `node.hello`
+# (adapter selection is by absolute path AND digest, so two installs that share
+# a name stay distinguishable). Unoptimized sha2 is an order of magnitude
+# slower, which turned a 250 MB agent binary into ~8 s of handshake latency in
+# debug builds and test binaries. Build just the digest stack optimized; the
+# rest of the workspace keeps its debug profile.
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.dev.package.digest]
+opt-level = 3
+
+[profile.dev.package.block-buffer]
+opt-level = 3
+
+[profile.dev.package.cpufeatures]
+opt-level = 3
+
+[profile.test.package.sha2]
+opt-level = 3
+
+[profile.test.package.digest]
+opt-level = 3
+
+[profile.test.package.block-buffer]
+opt-level = 3
+
+[profile.test.package.cpufeatures]
+opt-level = 3

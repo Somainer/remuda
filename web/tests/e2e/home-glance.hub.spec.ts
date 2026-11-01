@@ -315,7 +315,7 @@ test.describe("phone 390", () => {
       // SSH target) and check the strip's offline branch on controlled state.
       const added = await page.request.post("/v1/hosts/ssh", {
         headers: { Origin: new URL(page.url()).origin },
-        data: { target: "rc-never@127.0.0.1:1", label: "rc-offline", labels: [] },
+        data: { target: "rc-never@rc-never.invalid", label: "rc-offline", labels: [] },
       });
       expect(added.ok(), `add ssh host: ${added.status()}`).toBe(true);
       const addedHost = (await added.json()) as { id?: string };

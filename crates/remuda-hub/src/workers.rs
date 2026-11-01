@@ -1418,6 +1418,8 @@ pub(crate) async fn retire_core(
     require_grant(&state, &device, remuda_protocol::GrantVerb::Dispatch).await?;
     let scope = caller_project_scope(&state, &device).await?;
     let worker = resolve_worker(&state, &id, &scope).await?;
+    // D-057 §4.2 item 1: an Agent retires only workers in its subtree.
+    crate::agent_scope::require_worker_owned(&state, &device, &worker).await?;
     // D-057 §7.1: the stop/remove the Hub authors in retire carry the
     // caller's initiator (a command made on the caller's behalf).
     let (retire_initiator, retire_device_id) = initiator_and_device(&state, &device).await?;
@@ -1616,6 +1618,7 @@ async fn set_worker_state(
     let scope = caller_project_scope(&state, &device).await?;
     let authority = crate::agent_scope::CallerAuthority::for_device(&state, &device).await?;
     let worker = resolve_worker(&state, &id, &scope).await?;
+    crate::agent_scope::require_worker_owned(&state, &device, &worker).await?;
     let next = WorkerState::from_update(&body.state, body.sha.as_deref(), body.reason.as_deref())
         .map_err(HubError::BadRequest)?;
     // A retired worker stays retired (retire is terminal).
@@ -1650,6 +1653,7 @@ async fn send_worker_brief(
     let scope = caller_project_scope(&state, &device).await?;
     let (brief_initiator, brief_device_id) = initiator_and_device(&state, &device).await?;
     let worker = resolve_worker(&state, &id, &scope).await?;
+    crate::agent_scope::require_worker_owned(&state, &device, &worker).await?;
     if !worker.state.is_active() {
         return Err(HubError::Conflict("worker is retired".into()));
     }

@@ -314,11 +314,8 @@ fn glance_read_target(path: &str) -> Option<&str> {
     (!id.is_empty() && !id.contains('/')).then_some(id)
 }
 
-/// `GET /v1/workers/{id}/digest` (cb-digest): the ONLY `/v1/workers/*` shape an
-/// Agent may read. It is admitted under the lineage read predicate (see
-/// [`agent_owns_worker`]), not by widening the worker routes: every other
-/// `/v1/workers/*` path, `GET /v1/workers` and `GET /v1/workers/{id}` included,
-/// stays behind the Agent refusal.
+/// `GET /v1/workers/{id}/digest` (cb-digest): admitted under the lineage read
+/// predicate (see [`agent_owns_worker`]), not as a scope-wide worker read.
 pub(crate) fn digest_read_target(path: &str) -> Option<&str> {
     let id = path.strip_prefix("/v1/workers/")?.strip_suffix("/digest")?;
     (!id.is_empty() && !id.contains('/')).then_some(id)
@@ -357,6 +354,71 @@ async fn agent_owns_worker(
         }
     }
     Ok(false)
+}
+
+/// D-057 §4.2 item 1: the worker reads an Agent may make, scope-wide (the
+/// handlers require `dispatch` and filter by project scope): `GET /v1/workers`
+/// and `GET /v1/workers/{id}`.
+fn worker_read_target(path: &str) -> bool {
+    path == "/v1/workers"
+        || path
+            .strip_prefix("/v1/workers/")
+            .is_some_and(|id| !id.is_empty() && !id.contains('/') && id != "dispatch")
+}
+
+/// D-057 §4.2 item 1: the worker POSTs an Agent may make. `dispatch` and
+/// `observe` are scope-wide; every per-worker verb is a mutation, and its
+/// handler also requires the worker in the caller's lineage subtree
+/// ([`require_worker_owned`]).
+fn worker_write_target(path: &str) -> bool {
+    if path == "/v1/workers/dispatch" || path == "/v1/workers/observe" {
+        return true;
+    }
+    path.strip_prefix("/v1/workers/")
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(id, verb)| {
+            !id.is_empty()
+                && matches!(
+                    verb,
+                    "retire"
+                        | "state"
+                        | "brief"
+                        | "nudge"
+                        | "answer"
+                        | "switch-model"
+                        | "resume"
+                        | "replace"
+                        | "stop"
+                )
+        })
+}
+
+/// D-057 §4.2 item 1: an Agent mutates only a worker whose instance is in its
+/// lineage subtree, so it can never stop, answer or respawn a worker the
+/// owner dispatched by hand in the same project (`resolve_worker` checks
+/// project scope only). Human and Bot callers are unchanged.
+pub async fn require_worker_owned(
+    state: &AppState,
+    device: &Device,
+    worker: &remuda_protocol::WorkerRoster,
+) -> Result<(), HubError> {
+    if origin(device) != InputOrigin::Agent {
+        return Ok(());
+    }
+    let caller = device.instance_id.as_deref().ok_or(HubError::Forbidden)?;
+    let Some(instance) = worker.instance_id.as_ref() else {
+        return Err(HubError::not_owner());
+    };
+    if state
+        .store
+        .lineage_subtree_owns(caller.to_string(), instance.as_id().to_string())
+        .await
+        .map_err(crate::http::map_store)?
+    {
+        Ok(())
+    } else {
+        Err(HubError::not_owner())
+    }
 }
 
 /// Whether an Agent device's bound instance belongs to `lineage_id`.
@@ -1051,6 +1113,9 @@ pub async fn restrict_agent_routes(
                     || project_read_target(path)
                     || task_read_target(request.method(), path)
                     || path == "/v1/instances"
+                    // D-057 §4.2 item 1: scope-wide worker reads; the
+                    // handlers require `dispatch` and project scope.
+                    || worker_read_target(path)
                     // D-045: `remuda hostcap` is the coordinator's pre-dispatch
                     // host fact, and a launched coordinator is always agent
                     // origin. `GET /v1/hosts/{id}` is operator-only, so this is
@@ -1093,6 +1158,10 @@ pub async fn restrict_agent_routes(
                     || (path.starts_with("/v1/projects/") && path.ends_with("/members"))
                     // Batch 6 gate-queue enqueue/cancel POSTs.
                     || project_write_target(path)
+                    // D-057 §4.2 item 1: dispatch, observe and the
+                    // per-worker verbs. Handlers keep `dispatch` + project
+                    // scope and add lineage-subtree ownership for mutations.
+                    || worker_write_target(path)
                     || task_write_target(request.method(), path))
                 || request.method() == axum::http::Method::PATCH
                     && (project_write_target(path) || task_write_target(request.method(), path))
@@ -1152,6 +1221,49 @@ mod tests {
         assert!(!hostcap_read_target("/v1/hosts//hostcap"));
         // A different route with the same suffix is not it.
         assert!(!hostcap_read_target("/v1/workers/wkr_1/hostcap"));
+    }
+
+    #[test]
+    fn worker_route_shapes_admitted_for_agents() {
+        for path in ["/v1/workers", "/v1/workers/wkr_1", "/v1/workers/w1"] {
+            assert!(worker_read_target(path), "{path}");
+        }
+        for path in [
+            "/v1/workers/",
+            "/v1/workers/wkr_1/digest",
+            "/v1/workers/wkr_1/nudge",
+            "/v1/workersx",
+            "/v1/workers/dispatch",
+        ] {
+            assert!(!worker_read_target(path), "{path}");
+        }
+        for verb in [
+            "retire",
+            "state",
+            "brief",
+            "nudge",
+            "answer",
+            "switch-model",
+            "resume",
+            "replace",
+            "stop",
+        ] {
+            assert!(
+                worker_write_target(&format!("/v1/workers/w1/{verb}")),
+                "{verb}"
+            );
+        }
+        assert!(worker_write_target("/v1/workers/dispatch"));
+        assert!(worker_write_target("/v1/workers/observe"));
+        for path in [
+            "/v1/workers/w1/digest",
+            "/v1/workers/w1/delete",
+            "/v1/workers//nudge",
+            "/v1/workers/w1",
+            "/v1/workers",
+        ] {
+            assert!(!worker_write_target(path), "{path}");
+        }
     }
 
     #[test]

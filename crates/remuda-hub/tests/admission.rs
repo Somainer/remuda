@@ -51,7 +51,6 @@ impl Drop for FakeNode {
     }
 }
 
-#[allow(dead_code)] // the worker-route tests use the rest
 impl FakeNode {
     fn drain(&mut self) -> Vec<(String, Value)> {
         let mut out = Vec::new();
@@ -66,6 +65,7 @@ impl FakeNode {
     }
 
     /// Park the next `worker.provision` until the returned notify fires.
+    #[allow(dead_code)] // the commit-point test uses it
     fn hold_provision(&self) -> (mpsc::UnboundedReceiver<Value>, Arc<Notify>) {
         let (arrived, arrivals) = mpsc::unbounded_channel();
         let release = Arc::new(Notify::new());
@@ -808,4 +808,320 @@ async fn bot_dispatch_is_unchanged() {
             .is_none()
     );
     assert!(forwarded[0].get(CREATOR_PERMISSION_MODE_FIELD).is_none());
+}
+
+// ── item 1: worker routes for Agent origin ────────────────────────────────
+
+impl Ctx {
+    /// Approve a pending D-017 one-shot approval as the human owner.
+    async fn approve(&self, interaction_id: &str) {
+        let pending = self.request("GET", "/v1/interactions", None).await;
+        let card = pending.body["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|item| {
+                item["id"] == json!(interaction_id)
+                    || item["interactionId"] == json!(interaction_id)
+            })
+            .cloned()
+            .unwrap_or_else(|| panic!("no card {interaction_id}: {}", pending.body));
+        let digest = card
+            .pointer("/request/inputDigest")
+            .or_else(|| card.pointer("/interaction/request/inputDigest"))
+            .and_then(Value::as_str)
+            .expect("digest")
+            .to_owned();
+        let reply = self
+            .request(
+                "POST",
+                &format!("/v1/interactions/{interaction_id}/answer"),
+                Some(json!({"answer": {"kind": "approval", "optionId": "allow-once", "inputDigest": digest}})),
+            )
+            .await;
+        assert_eq!(reply.status, 200, "{}", reply.body);
+    }
+
+    /// Pending approval cards the human owner sees.
+    async fn pending_approvals(&self) -> usize {
+        let pending = self.request("GET", "/v1/interactions", None).await;
+        pending.body["items"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|item| item["kind"] == "approval")
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+}
+
+/// A seat dispatches a same-host herdr worker with no Remuda approval; with no
+/// mode named the worker inherits the seat's own mode, and both values are
+/// recorded verbatim. Worker reads are scope-wide.
+#[tokio::test]
+async fn an_agent_dispatches_and_reads_workers() {
+    let mut ctx = Ctx::spawn().await.unwrap();
+    let seat = ctx.seat("claude", "auto").await;
+    // A worker the owner dispatched by hand in the same project.
+    let human = ctx
+        .request(
+            "POST",
+            "/v1/workers/dispatch",
+            Some(ctx.dispatch_body("byhand")),
+        )
+        .await;
+    assert_eq!(human.status, 200, "{}", human.body);
+    ctx.node.drain();
+
+    let reply = ctx
+        .send(
+            "POST",
+            "/v1/workers/dispatch",
+            Some(ctx.dispatch_body("seatw")),
+            &seat.token,
+            &[],
+        )
+        .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let worker = &reply.body["worker"];
+    assert_eq!(worker["permissionMode"], "auto");
+    assert!(worker.get("permissionModeRequested").is_none(), "{worker}");
+    assert_eq!(worker["driver"], "claude-pty");
+    let forwarded = Ctx::creates(&ctx.node.drain());
+    assert_eq!(forwarded.len(), 1);
+    assert_eq!(forwarded[0]["origin"], "agent");
+    assert_eq!(forwarded[0]["spec"]["parentInstanceId"], seat.id.as_str());
+    assert_eq!(forwarded[0]["spec"]["permissionMode"], "auto");
+    assert_eq!(forwarded[0]["spec"]["permissionModeRequested"], Value::Null);
+    assert_eq!(forwarded[0][CREATOR_PERMISSION_MODE_FIELD], "auto");
+    assert_eq!(ctx.pending_approvals().await, 0, "no Remuda prompt");
+
+    // Reads stay scope-wide: the owner's worker is listed and readable too.
+    let list = ctx.send("GET", "/v1/workers", None, &seat.token, &[]).await;
+    assert_eq!(list.status, 200, "{}", list.body);
+    let names: Vec<_> = list.body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(names.contains(&"byhand".to_string()) && names.contains(&"seatw".to_string()));
+    let get = ctx
+        .send("GET", "/v1/workers/byhand", None, &seat.token, &[])
+        .await;
+    assert_eq!(get.status, 200, "{}", get.body);
+    let observe = ctx
+        .send(
+            "POST",
+            "/v1/workers/observe",
+            Some(json!({})),
+            &seat.token,
+            &[],
+        )
+        .await;
+    assert_eq!(observe.status, 200, "{}", observe.body);
+}
+
+/// Every mutating worker verb refuses an Agent on a worker outside its
+/// lineage subtree (here: one the owner dispatched by hand) before anything
+/// reaches a Node, and admits it on the seat's own worker.
+#[tokio::test]
+async fn worker_mutations_need_the_worker_in_the_callers_subtree() {
+    let mut ctx = Ctx::spawn().await.unwrap();
+    let seat = ctx.seat("claude", "auto").await;
+    let human = ctx
+        .request(
+            "POST",
+            "/v1/workers/dispatch",
+            Some(ctx.dispatch_body("byhand")),
+        )
+        .await;
+    assert_eq!(human.status, 200, "{}", human.body);
+    let own = ctx
+        .send(
+            "POST",
+            "/v1/workers/dispatch",
+            Some(ctx.dispatch_body("mine")),
+            &seat.token,
+            &[],
+        )
+        .await;
+    assert_eq!(own.status, 200, "{}", own.body);
+    ctx.node.drain();
+    let verbs = [
+        ("nudge", json!({"text": "go on"})),
+        ("answer", json!({"key": "enter"})),
+        ("switch-model", json!({"model": "claude-opus-5-5"})),
+        ("resume", json!({})),
+        ("replace", json!({})),
+        ("stop", json!({})),
+        ("retire", json!({"force": true})),
+        ("state", json!({"state": "blocked", "reason": "x"})),
+        ("brief", json!({"content": "more"})),
+    ];
+    for (verb, body) in &verbs {
+        let reply = ctx
+            .send(
+                "POST",
+                &format!("/v1/workers/byhand/{verb}"),
+                Some(body.clone()),
+                &seat.token,
+                &[],
+            )
+            .await;
+        assert_eq!(reply.status, 403, "{verb}: {}", reply.body);
+        assert_eq!(reason(&reply), "not-owner", "{verb}");
+        assert!(
+            ctx.node.drain().is_empty(),
+            "{verb}: nothing reached the Node"
+        );
+    }
+    // The seat's own worker: the plain mutations are admitted.
+    for (verb, body) in [
+        ("nudge", json!({"text": "go on"})),
+        ("state", json!({"state": "blocked", "reason": "x"})),
+        ("brief", json!({"content": "more"})),
+        ("stop", json!({})),
+        ("retire", json!({"force": true})),
+    ] {
+        let reply = ctx
+            .send(
+                "POST",
+                &format!("/v1/workers/mine/{verb}"),
+                Some(body),
+                &seat.token,
+                &[],
+            )
+            .await;
+        assert_eq!(reply.status, 200, "{verb}: {}", reply.body);
+    }
+}
+
+/// Ownership reaches the whole lineage subtree: a worker dispatched by the
+/// seat's own sub-coordinator is the seat's to stop, and a sibling seat's
+/// worker is not.
+#[tokio::test]
+async fn the_subtree_reaches_grandchildren_and_stops_at_siblings() {
+    let ctx = Ctx::spawn().await.unwrap();
+    let seat = ctx.seat("claude", "auto").await;
+    let sibling = ctx.seat("claude", "auto").await;
+    // A sub-coordinator the seat created (a child holding dispatch).
+    let project = remuda_protocol::ProjectId::try_from(ctx.project.clone()).unwrap();
+    let sub = ctx
+        .store()
+        .insert_instance_delegated(
+            ctx.host.clone(),
+            Some(ctx.workspace.clone()),
+            "claude".into(),
+            "claude-pty".into(),
+            None,
+            json!({"kind": "claude", "permissionMode": "auto", "parentInstanceId": seat.id}),
+            remuda_hub::store_test_support::seat_delegation(
+                remuda_protocol::InstanceScope {
+                    project_ids: vec![project],
+                    ..Default::default()
+                },
+                vec!["dispatch".into()],
+            ),
+            remuda_hub::agent_scope_test_support::CallerAuthority::internal(),
+        )
+        .await
+        .unwrap();
+    let sub_token = remuda_hub::instance_token(ctx.store().clone(), sub.instance_id.clone())
+        .await
+        .unwrap();
+    let reply = ctx
+        .send(
+            "POST",
+            "/v1/workers/dispatch",
+            Some(ctx.dispatch_body("grandchild")),
+            &sub_token,
+            &[],
+        )
+        .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let reply = ctx
+        .send(
+            "POST",
+            "/v1/workers/grandchild/stop",
+            Some(json!({})),
+            &sibling.token,
+            &[],
+        )
+        .await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+    let reply = ctx
+        .send(
+            "POST",
+            "/v1/workers/grandchild/stop",
+            Some(json!({})),
+            &seat.token,
+            &[],
+        )
+        .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+}
+
+/// `worker answer` writes keys, and keys cannot stand in for an approval:
+/// an Agent's answer on its own worker needs the D-017 one-shot approval for
+/// exactly those keys. A retry reuses the same card; nothing is written
+/// before the owner allows it.
+#[tokio::test]
+async fn an_agents_worker_answer_needs_a_human_approval() {
+    let mut ctx = Ctx::spawn().await.unwrap();
+    let seat = ctx.seat("claude", "auto").await;
+    let own = ctx
+        .send(
+            "POST",
+            "/v1/workers/dispatch",
+            Some(ctx.dispatch_body("mine")),
+            &seat.token,
+            &[],
+        )
+        .await;
+    assert_eq!(own.status, 200, "{}", own.body);
+    ctx.node.drain();
+    let answer = || {
+        ctx.send(
+            "POST",
+            "/v1/workers/mine/answer",
+            Some(json!({"key": "1"})),
+            &seat.token,
+            &[],
+        )
+    };
+    let first = answer().await;
+    assert_eq!(first.status, 409, "{}", first.body);
+    let card = first.body["interactionId"].as_str().unwrap().to_string();
+    let again = answer().await;
+    assert_eq!(
+        again.body["interactionId"],
+        card.as_str(),
+        "the retry reuses the card"
+    );
+    assert!(
+        !ctx.node.methods().contains(&"tty.write".to_string()),
+        "no keys before approval"
+    );
+    ctx.approve(&card).await;
+    let approved = ctx
+        .send(
+            "POST",
+            "/v1/workers/mine/answer",
+            Some(json!({"key": "1"})),
+            &seat.token,
+            &[("x-remuda-approval-id", card.as_str())],
+        )
+        .await;
+    assert_eq!(approved.status, 200, "{}", approved.body);
+    let writes: Vec<_> = ctx
+        .node
+        .drain()
+        .into_iter()
+        .filter(|(method, _)| method == "tty.write")
+        .collect();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].1["keys"], json!(["1"]));
 }

@@ -1444,6 +1444,45 @@ pub(crate) fn lineage_owns_conn(
     Ok(parent_lineage_of(conn, target_id)? == Some(caller_lineage))
 }
 
+/// D-057 §4.2 item 1 / §5: whether `target_id` lies in `caller_id`'s lineage
+/// subtree: the target, or an ancestor reached over its parent edges, is a
+/// chapter of the caller's lineage. A superset of [`lineage_owns_conn`]'s one
+/// hop — a seat also reaches the workers its own sub-coordinators dispatched
+/// — read through the same lineage resolver, so a later chapter keeps what
+/// earlier chapters created. The walk is bounded like the depth walk.
+pub(crate) fn lineage_subtree_owns_conn(
+    conn: &Connection,
+    caller_id: &str,
+    target_id: &str,
+) -> Result<bool, StoreError> {
+    let Some(caller_lineage) = lineage_id_of(conn, caller_id)? else {
+        return Ok(false);
+    };
+    let mut current = target_id.to_string();
+    let mut visited = std::collections::HashSet::new();
+    while visited.insert(current.clone()) && visited.len() <= 1000 {
+        match lineage_id_of(conn, &current)? {
+            Some(lineage) if lineage == caller_lineage => return Ok(true),
+            Some(_) => {}
+            None => return Ok(false),
+        }
+        let parent: Option<String> = conn
+            .query_row(
+                "SELECT json_extract(spec_json, '$.parentInstanceId')
+                 FROM instances WHERE id = ?1",
+                params![current],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        match parent {
+            Some(parent) => current = parent,
+            None => return Ok(false),
+        }
+    }
+    Ok(false)
+}
+
 /// Stamped lineage id of `id`'s parent edge, when the edge names an existing
 /// instance. The shared half of the lineage resolver: every parent-edge rule
 /// ultimately compares this value against a caller lineage.
@@ -5398,6 +5437,19 @@ impl Store {
     ) -> Result<bool, StoreError> {
         self.read("lineage_owns", move |conn| {
             lineage_owns_conn(conn, &caller_instance_id, &target_instance_id)
+        })
+        .await
+    }
+
+    /// D-057 §4.2 item 1: whether `target_instance_id` lies in the caller's
+    /// lineage subtree ([`lineage_subtree_owns_conn`]).
+    pub async fn lineage_subtree_owns(
+        &self,
+        caller_instance_id: String,
+        target_instance_id: String,
+    ) -> Result<bool, StoreError> {
+        self.read("lineage_subtree_owns", move |conn| {
+            lineage_subtree_owns_conn(conn, &caller_instance_id, &target_instance_id)
         })
         .await
     }

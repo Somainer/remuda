@@ -773,6 +773,8 @@ async fn nudge_worker(
     let scope = caller_project_scope(&state, &device).await?;
     let (nudge_initiator, nudge_device_id) = initiator_and_device(&state, &device).await?;
     let worker = resolve_worker(&state, &id, &scope).await?;
+    // D-057 §4.2 item 1: an Agent acts only on workers in its subtree.
+    crate::agent_scope::require_worker_owned(&state, &device, &worker).await?;
     if !worker.state.is_active() {
         return Err(HubError::Conflict("worker is retired".into()));
     }
@@ -914,6 +916,8 @@ async fn answer_worker(
     let scope = caller_project_scope(&state, &device).await?;
     let (answer_initiator, answer_device_id) = initiator_and_device(&state, &device).await?;
     let worker = resolve_worker(&state, &id, &scope).await?;
+    // D-057 §4.2 item 1: an Agent acts only on workers in its subtree.
+    crate::agent_scope::require_worker_owned(&state, &device, &worker).await?;
     if !worker.state.is_active() {
         return Err(HubError::Conflict("worker is retired".into()));
     }
@@ -922,6 +926,23 @@ async fn answer_worker(
         .instance_id
         .as_ref()
         .ok_or_else(|| HubError::Conflict("worker never launched an instance".into()))?;
+    // D-057 §4.1: keys cannot stand in for an approval. `worker answer`
+    // writes keystrokes, so every Agent use needs the D-017 one-shot human
+    // approval for exactly these keys on exactly this worker, like `tty.write`.
+    if crate::agent_scope::origin(&device) == remuda_protocol::InputOrigin::Agent {
+        crate::agent_scope::require_approval(
+            &state,
+            &headers,
+            &device,
+            json!({
+                "operation": "worker.answer",
+                "workerId": worker.meta.id.as_id(),
+                "instanceId": instance_id.as_id(),
+                "keys": encoded.names,
+            }),
+        )
+        .await?;
+    }
     let command = write_keys(
         &state,
         instance_id.as_id().as_str(),
@@ -1067,6 +1088,8 @@ async fn switch_worker_model(
     let scope = caller_project_scope(&state, &device).await?;
     let (switch_initiator, switch_device_id) = initiator_and_device(&state, &device).await?;
     let worker = resolve_worker(&state, &id, &scope).await?;
+    // D-057 §4.2 item 1: an Agent acts only on workers in its subtree.
+    crate::agent_scope::require_worker_owned(&state, &device, &worker).await?;
     if !worker.state.is_active() {
         return Err(HubError::Conflict("worker is retired".into()));
     }
@@ -1298,6 +1321,8 @@ async fn resume_worker(
     // D-057 §7.1: the re-delivered handback is authored on the caller's behalf.
     let (resume_initiator, resume_device_id) = initiator_and_device(&state, &device).await?;
     let worker = resolve_worker(&state, &id, &scope).await?;
+    // D-057 §4.2 item 1: an Agent respawns only workers in its subtree.
+    crate::agent_scope::require_worker_owned(&state, &device, &worker).await?;
     if !worker.state.is_active() {
         return Err(HubError::Conflict("worker is retired".into()));
     }
@@ -1620,6 +1645,8 @@ async fn replace_worker(
     require_grant(&state, &device, remuda_protocol::GrantVerb::Dispatch).await?;
     let scope = caller_project_scope(&state, &device).await?;
     let worker = resolve_worker(&state, &id, &scope).await?;
+    // D-057 §4.2 item 1: an Agent replaces only workers in its subtree.
+    crate::agent_scope::require_worker_owned(&state, &device, &worker).await?;
 
     // Recover the original brief so the replacement gets the same task.
     let brief = match &worker.brief_object_id {
@@ -1724,6 +1751,8 @@ async fn stop_worker(
     // D-057 §7.1: worker stop the Hub authors carries the caller's initiator.
     let (stop_initiator, stop_device_id) = initiator_and_device(&state, &device).await?;
     let worker = resolve_worker(&state, &id, &scope).await?;
+    // D-057 §4.2 item 1: an Agent acts only on workers in its subtree.
+    crate::agent_scope::require_worker_owned(&state, &device, &worker).await?;
     let mut command = Value::Null;
     if let Some(instance_id) = &worker.instance_id {
         let (queued, _) = state

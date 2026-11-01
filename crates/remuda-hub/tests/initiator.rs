@@ -5855,41 +5855,48 @@ async fn fenced_forward_intent_on_a_continuity_child_purges_its_lineage_seat() {
     node.assert_next_frame_is_sentinel(&ctx).await;
 }
 
-// ── 10. Worker routes stay 403 for Agents; the node_ops admission boundary ─
-//      still covers worker.provision at the helper/store level (ma-admission
-//      owns the route opening: main-agent.md §15 task 7). ───────────────────
+// ── 10. Worker routes are open to Agents (ma-admission, main-agent.md §4.2
+//      item 1) and refuse in their handlers; the node_ops admission boundary
+//      still covers worker.provision at the helper/store level. ─────────────
 
 #[tokio::test]
-async fn agent_worker_routes_are_forbidden_and_provision_admission_is_fence_checked() {
+async fn agent_worker_routes_refuse_in_their_handlers_and_provision_admission_is_fence_checked() {
     let (ctx, mut node) = Ctx::boot().await.unwrap();
 
-    // Every worker route an Agent could name is refused by the pre-handler
-    // middleware — the dispatch grant widens nothing until ma-admission lands.
+    // The middleware admits the worker routes for Agent origin; the handlers
+    // decide. A control-off worker under this `manual` coordinator is refused
+    // by the creator rule before any name, port block or worktree exists.
     let (status, body) = ctx
         .agent_post(
             "/v1/workers/dispatch",
-            json!({"projectId":ctx.project,"brief":BRIEF,"harness":"claude"}),
+            json!({"projectId":ctx.project,"brief":BRIEF,"harness":"claude",
+                   "permissionMode":"bypassPermissions"}),
         )
         .await;
-    assert_eq!(status, 403, "agent dispatch must stay 403: {body}");
-    for path in [
-        "/v1/workers",
-        "/v1/workers/wkr_1",
-        "/v1/workers/wkr_1/answer",
-        "/v1/workers/wkr_1/stop",
-        "/v1/workers/wkr_1/retire",
-        "/v1/workers/wkr_1/nudge",
-        "/v1/workers/wkr_1/observe",
+    assert_eq!(status, 403, "beyond the creator: {body}");
+    assert_eq!(body["reason"], "beyond-creator", "{body}");
+    for (method, path, body, expected) in [
+        ("GET", "/v1/workers", json!({}), 200),
+        ("GET", "/v1/workers/wkr_1", json!({}), 404),
+        (
+            "POST",
+            "/v1/workers/wkr_1/answer",
+            json!({"key": "enter"}),
+            404,
+        ),
+        ("POST", "/v1/workers/wkr_1/stop", json!({}), 404),
+        (
+            "POST",
+            "/v1/workers/wkr_1/retire",
+            json!({"force": true}),
+            404,
+        ),
+        ("POST", "/v1/workers/wkr_1/nudge", json!({}), 404),
+        // Not a worker route shape at all: still refused by the middleware.
+        ("POST", "/v1/workers/wkr_1/observe", json!({}), 403),
     ] {
-        let method = if path.contains('/') && path != "/v1/workers" {
-            "POST"
-        } else {
-            "GET"
-        };
-        let (status, _) = ctx
-            .send(method, path, &ctx.agent, None, Some(json!({})))
-            .await;
-        assert_eq!(status, 403, "agent {method} {path} must stay 403");
+        let (status, _) = ctx.send(method, path, &ctx.agent, None, Some(body)).await;
+        assert_eq!(status, expected, "agent {method} {path}");
     }
     // No roster row, and the Node never saw worker.provision: a Human command
     // sentinel frame is the first (and only) frame after the refused calls.

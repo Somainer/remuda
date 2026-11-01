@@ -4922,6 +4922,8 @@ export type WorkerRoster = ({
   "model"?: (string | null);
   "modelEffective"?: (string | null);
   "name": (string);
+  "permissionMode"?: (string | null);
+  "permissionModeRequested"?: (string | null);
   "portBlock"?: (string | null);
   "projectId": ProjectId;
   "providerProfileId"?: (string | null);

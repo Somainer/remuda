@@ -168,6 +168,7 @@ async fn start_run(hooks: bool) -> LiveRun {
         .expect("dev node");
 
     let request = CreateInstanceRequest {
+        creator_permission_mode: None,
         memory_context: None,
         initiator: None,
         origin: remuda_protocol::InputOrigin::Human,

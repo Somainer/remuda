@@ -23,8 +23,8 @@ use crate::error::HubError;
 use crate::http::map_store;
 use crate::store::{InstanceDelegation, Store, StoreError};
 use crate::workers::{
-    DispatchBody, dispatch_core, driver_for, resolve_worker, retire_core, stage_brief,
-    worker_extra_env, worker_launch_spec,
+    DispatchApproval, DispatchBody, dispatch_core, driver_for, resolve_worker, retire_core,
+    stage_brief, worker_extra_env, worker_launch_spec,
 };
 use axum::Json;
 use axum::Router;
@@ -773,6 +773,8 @@ async fn nudge_worker(
     let scope = caller_project_scope(&state, &device).await?;
     let (nudge_initiator, nudge_device_id) = initiator_and_device(&state, &device).await?;
     let worker = resolve_worker(&state, &id, &scope).await?;
+    // D-057 §4.2 item 1: an Agent acts only on workers in its subtree.
+    crate::agent_scope::require_worker_owned(&state, &device, &worker).await?;
     if !worker.state.is_active() {
         return Err(HubError::Conflict("worker is retired".into()));
     }
@@ -914,6 +916,8 @@ async fn answer_worker(
     let scope = caller_project_scope(&state, &device).await?;
     let (answer_initiator, answer_device_id) = initiator_and_device(&state, &device).await?;
     let worker = resolve_worker(&state, &id, &scope).await?;
+    // D-057 §4.2 item 1: an Agent acts only on workers in its subtree.
+    crate::agent_scope::require_worker_owned(&state, &device, &worker).await?;
     if !worker.state.is_active() {
         return Err(HubError::Conflict("worker is retired".into()));
     }
@@ -922,6 +926,23 @@ async fn answer_worker(
         .instance_id
         .as_ref()
         .ok_or_else(|| HubError::Conflict("worker never launched an instance".into()))?;
+    // D-057 §4.1: keys cannot stand in for an approval. `worker answer`
+    // writes keystrokes, so every Agent use needs the D-017 one-shot human
+    // approval for exactly these keys on exactly this worker, like `tty.write`.
+    if crate::agent_scope::origin(&device) == remuda_protocol::InputOrigin::Agent {
+        crate::agent_scope::require_approval(
+            &state,
+            &headers,
+            &device,
+            json!({
+                "operation": "worker.answer",
+                "workerId": worker.meta.id.as_id(),
+                "instanceId": instance_id.as_id(),
+                "keys": encoded.names,
+            }),
+        )
+        .await?;
+    }
     let command = write_keys(
         &state,
         instance_id.as_id().as_str(),
@@ -1067,6 +1088,8 @@ async fn switch_worker_model(
     let scope = caller_project_scope(&state, &device).await?;
     let (switch_initiator, switch_device_id) = initiator_and_device(&state, &device).await?;
     let worker = resolve_worker(&state, &id, &scope).await?;
+    // D-057 §4.2 item 1: an Agent acts only on workers in its subtree.
+    crate::agent_scope::require_worker_owned(&state, &device, &worker).await?;
     if !worker.state.is_active() {
         return Err(HubError::Conflict("worker is retired".into()));
     }
@@ -1298,6 +1321,8 @@ async fn resume_worker(
     // D-057 §7.1: the re-delivered handback is authored on the caller's behalf.
     let (resume_initiator, resume_device_id) = initiator_and_device(&state, &device).await?;
     let worker = resolve_worker(&state, &id, &scope).await?;
+    // D-057 §4.2 item 1: an Agent respawns only workers in its subtree.
+    crate::agent_scope::require_worker_owned(&state, &device, &worker).await?;
     if !worker.state.is_active() {
         return Err(HubError::Conflict("worker is retired".into()));
     }
@@ -1308,8 +1333,24 @@ async fn resume_worker(
         .as_id()
         .to_string();
 
-    let (new_instance_id, mode) =
-        respawn_instance(&state, &headers, &worker, &old_instance_id).await?;
+    // D-057 §4.2 item 5: an Agent caller, or any caller resuming a worker an
+    // Agent dispatched, goes through the scoped respawn helper. A Human (or
+    // Bot) resume of a worker with no Agent parent is byte-identical to
+    // before: the operator's D-026 resume path.
+    let old_instance = state
+        .store
+        .get_instance(old_instance_id.clone())
+        .await
+        .map_err(map_store)?
+        .ok_or(HubError::NotFound)?;
+    let (new_instance_id, mode) = if crate::agent_scope::origin(&device)
+        != remuda_protocol::InputOrigin::Agent
+        && old_instance.parent_instance_id.is_none()
+    {
+        respawn_instance(&state, &headers, &worker, &old_instance_id).await?
+    } else {
+        respawn_scoped(&state, &headers, &device, &worker, &old_instance).await?
+    };
 
     // Recover the last brief bytes so it can be re-delivered.
     let mut content = body
@@ -1465,6 +1506,254 @@ async fn respawn_instance(
         .map(|id| (id, "relaunch"))
 }
 
+/// D-057 §4.2 item 5: respawn a worker without the operator-only resume
+/// route, authorized by the `dispatch` grant, project scope and lineage
+/// ownership (already checked by `resume_worker`).
+///
+/// - The carrier and the requested and effective permission modes are kept.
+/// - The new instance's parent is the old worker's parent — the chapter that
+///   dispatched it — so a respawn is never a new delegation edge; `resumedFrom`
+///   points at the old instance.
+/// - The same permission and approval rules as any Agent create apply: the
+///   kept mode is re-admitted under the creator rule against the caller's own
+///   mode, and a shell-driver carrier (or another host) needs the D-017
+///   one-shot approval, decided before anything is launched.
+/// - With a resumable transcript the native session continues
+///   (`instance.resume` with `--resume`); without one, a fresh agent launches
+///   in the same worktree.
+async fn respawn_scoped(
+    state: &AppState,
+    headers: &HeaderMap,
+    device: &crate::store::Device,
+    worker: &WorkerRoster,
+    old: &crate::store::InstanceRecord,
+) -> Result<(String, &'static str), HubError> {
+    let host = state
+        .store
+        .get_host(worker.host_id.as_id().to_string())
+        .await
+        .map_err(map_store)?
+        .ok_or(HubError::NotFound)?;
+    if state.nodes.kind_of(&host.host_id).await.is_none() {
+        return Err(HubError::HostOffline {
+            host_id: host.host_id.clone(),
+        });
+    }
+    let host = Store::with_live_link(host, true);
+    let project = state
+        .store
+        .get_project(worker.project_id.as_id().to_string())
+        .await
+        .map_err(map_store)?
+        .ok_or(HubError::NotFound)?;
+    // Keep the carrier the worker ran on; rows from before the roster
+    // recorded one fall back to the host default.
+    let driver = match worker.driver.as_deref() {
+        Some(recorded) => recorded.to_string(),
+        None => driver_for(&worker.harness, &host)?,
+    };
+    let kept_mode = worker
+        .permission_mode
+        .clone()
+        .unwrap_or_else(|| crate::workers::HUMAN_DISPATCH_PERMISSION_MODE.to_string());
+    // The kept mode is re-admitted under the creator rule: a worker an earlier
+    // control-off chapter launched with control off is not respawned that way
+    // under a creator that now keeps its control on.
+    let admitted = match crate::agent_scope::origin(device) {
+        remuda_protocol::InputOrigin::Agent => {
+            let creator = crate::agent_scope::creator_permission_mode(state, device).await?;
+            let effective = remuda_protocol::creator_permission::admit(
+                &worker.harness,
+                Some(&kept_mode),
+                creator,
+            )
+            .map_err(crate::agent_scope::permission_refusal)?;
+            Some(crate::agent_scope::AdmittedMode {
+                requested: worker.permission_mode_requested.clone(),
+                effective,
+                creator,
+            })
+        }
+        _ => None,
+    };
+    // A transcript resumes only on a Claude carrier that can take `--resume`,
+    // within the D-026 age window; otherwise the respawn is a fresh launch.
+    let session = old
+        .native_session_id
+        .clone()
+        .filter(|_| worker.harness == "claude" && driver != "generic-pty")
+        .filter(|_| {
+            crate::http::resume_age_days(&old.updated_at)
+                .is_none_or(|age| age <= crate::http::RESUME_MAX_AGE_DAYS)
+        });
+    // D-017, before anything is launched: another host or a shell driver asks
+    // the owner once, on a request derived from the worker and the respawn.
+    if crate::agent_scope::origin(device) == remuda_protocol::InputOrigin::Agent
+        && (!crate::agent_scope::same_host(state, device, &host.host_id).await?
+            || crate::agent_scope::shell_driver(&driver)
+            || headers.contains_key("x-remuda-require-approval"))
+    {
+        crate::agent_scope::require_approval(
+            state,
+            headers,
+            device,
+            json!({
+                "operation": "worker.respawn",
+                "workerId": worker.meta.id.as_id(),
+                "instanceId": old.instance_id,
+                "hostId": host.host_id,
+                "harness": worker.harness,
+                "driver": driver,
+                "model": worker.model,
+                "permissionMode": kept_mode,
+                "resume": session.is_some(),
+            }),
+        )
+        .await?;
+    }
+
+    let delegation = match &worker.provider_profile_id {
+        Some(profile_id) => {
+            let profile = state
+                .store
+                .get_provider(profile_id.clone())
+                .await
+                .map_err(map_store)?
+                .ok_or_else(|| HubError::Internal("launch named a vanished profile".into()))?;
+            Some(match profile.kind.as_str() {
+                "native" => "none".to_string(),
+                "direct" => "direct".to_string(),
+                _ => "gateway".to_string(),
+            })
+        }
+        None => None,
+    };
+    let extra_env = worker_extra_env(worker.target_dir.as_deref(), worker.port_block.as_deref());
+    let mut spec = worker_launch_spec(
+        &worker.harness,
+        &driver,
+        &worker.model,
+        &worker.provider_profile_id,
+        &delegation,
+        worker.workspace_id.as_id().as_str(),
+        &host.host_id,
+        &worker.worktree_path,
+        &worker.name,
+        project.meta.id.as_id().as_str(),
+        worker.task_id.as_ref().map(|id| id.as_id().as_str()),
+        &kept_mode,
+        extra_env,
+    );
+    crate::agent_scope::prepare_create(
+        state,
+        headers,
+        device,
+        crate::agent_scope::CreateAdmission {
+            host: &host.host_id,
+            driver: &driver,
+            mode: match &admitted {
+                Some(admitted) => crate::agent_scope::ModeAdmission::Admitted(admitted),
+                None => crate::agent_scope::ModeAdmission::Request(Some(&kept_mode)),
+            },
+            approval: crate::agent_scope::CreateApproval::Decided,
+        },
+        &mut spec,
+    )
+    .await?;
+    if let Some(object) = spec.as_object_mut() {
+        // Not a new delegation edge: the respawned worker keeps the chapter
+        // that dispatched it as its parent (main-agent.md §5).
+        object.insert("parentInstanceId".into(), json!(old.parent_instance_id));
+        object.insert("resumedFrom".into(), json!(old.instance_id));
+        if let Some(session_id) = &session {
+            object.insert("resumeSessionId".into(), json!(session_id));
+        }
+        if let Some(path) = host
+            .claude_binary_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            && object.get("binaryPath").is_none_or(Value::is_null)
+        {
+            object.insert("binaryPath".into(), json!(path));
+        }
+    }
+    let project_route_doc = state
+        .store
+        .get_project_route_override(project.meta.id.as_id().to_string())
+        .await?;
+    crate::providers::resolve_and_attach_with_project(
+        state,
+        &host,
+        &mut spec,
+        Some(&project.provider),
+        project_route_doc.as_ref(),
+        crate::providers::RouteOverrides::default(),
+    )
+    .await?;
+    let delegation_tree = InstanceDelegation {
+        role: Some("worker".into()),
+        scope: remuda_protocol::InstanceScope {
+            project_ids: vec![project.meta.id.clone()],
+            ..Default::default()
+        },
+        grants: Vec::new(),
+        task_id: worker.task_id.as_ref().map(|id| id.as_id().to_string()),
+        enforce_tree: true,
+        restart: None,
+        seated_by: None,
+    };
+    let (respawn_initiator, respawn_device_id) = initiator_and_device(state, device).await?;
+    let (instance, _command) = crate::placement::spawn_on_host(
+        state,
+        &host,
+        crate::placement::SpawnRequest {
+            kind: worker.harness.clone(),
+            driver,
+            workspace_id: Some(worker.workspace_id.as_id().to_string()),
+            title: Some(worker.name.clone()),
+            prompt: None,
+            spec,
+            operation: if session.is_some() {
+                "instance.resume"
+            } else {
+                "instance.create"
+            },
+            idempotency_key: None,
+            delegation: delegation_tree,
+            initiator: respawn_initiator,
+            initiator_device_id: respawn_device_id,
+        },
+    )
+    .await?;
+    if let Some(session_id) = &session {
+        // Both ends of the link are journaled, as on the D-026 path.
+        let now = crate::config::now_rfc3339();
+        crate::http::journal_resume_link(
+            state,
+            &host.host_id,
+            &old.instance_id,
+            "resumed-into",
+            &instance.instance_id,
+            session_id,
+            &now,
+        )
+        .await;
+        crate::http::journal_resume_link(
+            state,
+            &host.host_id,
+            &instance.instance_id,
+            "resumed-from",
+            &old.instance_id,
+            session_id,
+            &now,
+        )
+        .await;
+        return Ok((instance.instance_id, "resume"));
+    }
+    Ok((instance.instance_id, "relaunch"))
+}
+
 /// Launch a fresh agent in the worker's existing (surviving) worktree.
 async fn relaunch_instance(
     state: &AppState,
@@ -1527,10 +1816,28 @@ async fn relaunch_instance(
         &worker.name,
         project.meta.id.as_id().as_str(),
         worker.task_id.as_ref().map(|id| id.as_id().as_str()),
+        // A respawn keeps the mode the worker launched with; rows written
+        // before the roster recorded one were all dispatched with the default.
+        worker
+            .permission_mode
+            .as_deref()
+            .unwrap_or(crate::workers::HUMAN_DISPATCH_PERMISSION_MODE),
         extra_env,
     );
-    crate::agent_scope::prepare_create(state, headers, &device, &host.host_id, &driver, &mut spec)
-        .await?;
+    let requested_mode = spec["permissionMode"].as_str().map(str::to_string);
+    crate::agent_scope::prepare_create(
+        state,
+        headers,
+        &device,
+        crate::agent_scope::CreateAdmission {
+            host: &host.host_id,
+            driver: &driver,
+            mode: crate::agent_scope::ModeAdmission::Request(requested_mode.as_deref()),
+            approval: crate::agent_scope::CreateApproval::OnSpec,
+        },
+        &mut spec,
+    )
+    .await?;
     if let Some(obj) = spec.as_object_mut()
         && let Some(path) = host
             .claude_binary_path
@@ -1603,6 +1910,8 @@ async fn replace_worker(
     require_grant(&state, &device, remuda_protocol::GrantVerb::Dispatch).await?;
     let scope = caller_project_scope(&state, &device).await?;
     let worker = resolve_worker(&state, &id, &scope).await?;
+    // D-057 §4.2 item 1: an Agent replaces only workers in its subtree.
+    crate::agent_scope::require_worker_owned(&state, &device, &worker).await?;
 
     // Recover the original brief so the replacement gets the same task.
     let brief = match &worker.brief_object_id {
@@ -1646,12 +1955,34 @@ async fn replace_worker(
         // waterfall re-resolves from the stored profile/project layers.
         api_via: None,
         api_route: None,
+        // And the mode the original dispatch named, verbatim (D-057 §4.2
+        // item 2): an omitted one stays omitted and is resolved again.
+        permission_mode: worker.permission_mode_requested.clone(),
     };
 
+    // D-057 §4.2 item 4: decide an Agent replacement's D-017 approval before
+    // the old worker is retired, so a pending approval reclaims nothing. A
+    // Human or Bot replace has no such approval and keeps its old order.
+    let approval = if crate::agent_scope::origin(&device) == remuda_protocol::InputOrigin::Agent {
+        let decided = dispatch_core(
+            State(state.clone()),
+            headers.clone(),
+            body.clone(),
+            DispatchApproval::DecideOnly,
+        )
+        .await?
+        .0
+        .get("approval")
+        .cloned()
+        .filter(|request| !request.is_null());
+        DispatchApproval::Decided(decided)
+    } else {
+        DispatchApproval::Decide
+    };
     // Retire (force) reclaims worktree/target, then re-dispatch the same brief
     // under the same name on a fresh branch.
     let retired = retire_core(State(state.clone()), headers.clone(), old_id.clone(), true).await?;
-    let dispatched = dispatch_core(State(state.clone()), headers, body).await?;
+    let dispatched = dispatch_core(State(state.clone()), headers, body, approval).await?;
     let new_id = dispatched
         .get("worker")
         .and_then(|row| row.get("id"))
@@ -1704,6 +2035,8 @@ async fn stop_worker(
     // D-057 §7.1: worker stop the Hub authors carries the caller's initiator.
     let (stop_initiator, stop_device_id) = initiator_and_device(&state, &device).await?;
     let worker = resolve_worker(&state, &id, &scope).await?;
+    // D-057 §4.2 item 1: an Agent acts only on workers in its subtree.
+    crate::agent_scope::require_worker_owned(&state, &device, &worker).await?;
     let mut command = Value::Null;
     if let Some(instance_id) = &worker.instance_id {
         let (queued, _) = state

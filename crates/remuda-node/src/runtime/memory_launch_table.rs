@@ -134,6 +134,7 @@ fn materialize(
     };
     let session_id = "01993ab0-0000-7000-8000-000000000003".to_owned();
     let request = MaterializeRequest {
+        creator: remuda_driver::CreatorControl::default(),
         spec: &spec,
         profile: &profile,
         launch_dir: tmp.path().join("launch"),

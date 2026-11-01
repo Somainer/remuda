@@ -55,6 +55,7 @@ fn request<'a>(
     binary: BinarySource,
 ) -> MaterializeRequest<'a> {
     MaterializeRequest {
+        creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
         spec,
         profile,
@@ -1362,8 +1363,9 @@ mod shell_pty_agent {
         );
         assert!(!not_asked.argv.iter().any(|token| token == flag));
 
-        // An agent asking for bypass is refused before argv is built at all.
-        let error = {
+        // An agent asking for bypass under a creator that keeps its control
+        // on (or with no Hub stamp at all) is refused before argv is built.
+        let agent = |creator, launch: &str| {
             let spec = bypass(ClaudePermissionMode::BypassPermissions);
             let binary = stub_binary(tmp.path(), "1.0.0");
             let home = tmp.path().join("home");
@@ -1372,14 +1374,148 @@ mod shell_pty_agent {
             let mut request = request(
                 &spec,
                 &profile,
-                &tmp.path().join("launch-agent"),
+                &tmp.path().join(launch),
                 &home,
                 pin_source(&binary),
             );
             request.origin = LaunchOrigin::Agent;
-            materialize(&request).unwrap_err()
+            request.creator = creator;
+            materialize(&request)
         };
-        assert!(matches!(error, DriverError::BypassNotAllowedForBot));
+        let error = agent(remuda_driver::CreatorControl::On, "launch-agent").unwrap_err();
+        assert!(
+            matches!(error, DriverError::BeyondCreator { .. }),
+            "{error}"
+        );
+        // D-057 OA1: under a control-off creator the agent's own explicit
+        // bypass gets the yolo argv, exactly like a human's.
+        let admitted = agent(remuda_driver::CreatorControl::Off, "launch-agent-off").unwrap();
+        assert!(admitted.argv.iter().any(|token| token == flag));
+    }
+
+    /// D-057 OA1, the Node half, on the native agent path: every harness ×
+    /// every mode of that harness × origin × the Hub's creator stamp (every
+    /// creator word of every harness, and no stamp at all). A control-off
+    /// mode is materialized for Human, never for Bot, and for Agent only
+    /// under a control-off creator; a control-on mode always is.
+    #[test]
+    fn the_creator_rule_matrix_on_the_node() {
+        use remuda_driver::CreatorControl;
+        use remuda_protocol::{
+            AgyPermission, AgyPermissionMode, ApprovalPolicy, CodexExecution, CodexPermission,
+            GrokPermission, GrokPermissionMode, SandboxExecution, SandboxMode,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cases: Vec<(AgentKind, PermissionMode, bool)> = Vec::new();
+        for mode in [
+            ClaudePermissionMode::Manual,
+            ClaudePermissionMode::Auto,
+            ClaudePermissionMode::AcceptEdits,
+            ClaudePermissionMode::Plan,
+            ClaudePermissionMode::DontAsk,
+            ClaudePermissionMode::BypassPermissions,
+        ] {
+            let off = matches!(
+                mode,
+                ClaudePermissionMode::DontAsk | ClaudePermissionMode::BypassPermissions
+            );
+            cases.push((
+                AgentKind::Claude,
+                PermissionMode::Claude(Box::new(ClaudePermission {
+                    mode,
+                    interaction: ClaudeInteractionMode::NativeTty,
+                })),
+                off,
+            ));
+        }
+        for policy in [
+            ApprovalPolicy::Untrusted,
+            ApprovalPolicy::OnRequest,
+            ApprovalPolicy::Never,
+        ] {
+            cases.push((
+                AgentKind::Codex,
+                PermissionMode::Codex(Box::new(CodexPermission {
+                    approval_policy: policy,
+                    approvals_reviewer: remuda_protocol::ApprovalsReviewer::User,
+                    execution: CodexExecution::Sandbox(SandboxExecution {
+                        sandbox: SandboxMode::WorkspaceWrite,
+                    }),
+                })),
+                policy == ApprovalPolicy::Never,
+            ));
+        }
+        for mode in [
+            GrokPermissionMode::NativePrompt,
+            GrokPermissionMode::Auto,
+            GrokPermissionMode::AlwaysApprove,
+        ] {
+            cases.push((
+                AgentKind::Grok,
+                PermissionMode::Grok(Box::new(GrokPermission { mode })),
+                mode == GrokPermissionMode::AlwaysApprove,
+            ));
+        }
+        for mode in [
+            AgyPermissionMode::Native,
+            AgyPermissionMode::AcceptEdits,
+            AgyPermissionMode::Plan,
+            AgyPermissionMode::AlwaysProceed,
+        ] {
+            cases.push((
+                AgentKind::Agy,
+                PermissionMode::Agy(Box::new(AgyPermission { mode })),
+                mode == AgyPermissionMode::AlwaysProceed,
+            ));
+        }
+        let mut stamps: Vec<Option<&str>> = vec![None];
+        for harness in ["claude", "codex", "grok", "agy"] {
+            for word in remuda_protocol::creator_permission::vocabulary(harness) {
+                if !stamps.contains(&Some(*word)) {
+                    stamps.push(Some(*word));
+                }
+            }
+        }
+        let mut n = 0;
+        for (kind, permission, control_off) in cases {
+            for origin in [LaunchOrigin::Human, LaunchOrigin::Bot, LaunchOrigin::Agent] {
+                for stamp in &stamps {
+                    let creator = CreatorControl::from_stamp(*stamp);
+                    n += 1;
+                    let mut spec = agent_spec(kind);
+                    spec.permission_mode = permission.clone();
+                    let binary = stub_binary(tmp.path(), "1.0.0");
+                    let home = tmp.path().join(format!("home-{n}"));
+                    fs::create_dir_all(&home).unwrap();
+                    let profile = native_profile();
+                    let mut request = request(
+                        &spec,
+                        &profile,
+                        &tmp.path().join(format!("launch-{n}")),
+                        &home,
+                        pin_source(&binary),
+                    );
+                    request.origin = origin;
+                    request.creator = creator;
+                    let outcome = materialize(&request);
+                    let admitted = !control_off
+                        || origin == LaunchOrigin::Human
+                        || (origin == LaunchOrigin::Agent && creator == CreatorControl::Off);
+                    let label = format!("{kind:?} {permission:?} {origin:?} stamp {stamp:?}");
+                    match (admitted, &outcome) {
+                        (true, Ok(_)) => {}
+                        (false, Err(DriverError::BypassNotAllowedForBot)) => {
+                            assert_eq!(origin, LaunchOrigin::Bot, "{label}");
+                        }
+                        (false, Err(DriverError::BeyondCreator { .. })) => {
+                            assert_eq!(origin, LaunchOrigin::Agent, "{label}");
+                        }
+                        other => panic!("{label}: {other:?}"),
+                    }
+                }
+            }
+        }
+        assert_eq!(n, 16 * 3 * stamps.len());
     }
 
     /// A `terminal` kind on the same driver is still a login shell, not an

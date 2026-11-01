@@ -984,7 +984,7 @@ D-051 让持有 D-051 项目开关的 Agent 设备，在**一跳家庭边**（se
 - 任一调用方/目标子任一侧为 bypass 姿态时，Agent 答案在 list 和 answer 两处都被拒。
 - 非一跳（祖父/兄弟）不路由。
 
-> **2026-10-05 修订（D-057，所有者补充裁定 OA3；main-agent.md 称本条 bypass 排除为 D-051(b)，approval 排除为 D-051(a)）**：自开发项目开启本开关。上面的 bypass 排除改为：提问与 plan review 即使上级或子实例运行 bypass，也路由给 Agent 上级；approval 仍永不下放，只由人回答（D-017）；非一跳不路由、plan-review 自排除不变。理由：D-057 的「子不超父」（OA1）让子实例只有在 Agent 创建者自身关闭 harness 控制时才能关闭控制，所以委托不扩大权限。实现随第一阶段 `ma-admission` 落地，此前代码仍按上面的旧条文执行。
+> **2026-10-05 修订（D-057，所有者补充裁定 OA3；main-agent.md 称本条 bypass 排除为 D-051(b)，approval 排除为 D-051(a)）**：自开发项目开启本开关。上面的 bypass 排除改为：提问与 plan review 即使上级或子实例运行 bypass，也路由给 Agent 上级；approval 仍永不下放，只由人回答（D-017）；非一跳不路由、plan-review 自排除不变。理由：D-057 的「子不超父」（OA1）让子实例只有在 Agent 创建者自身关闭 harness 控制时才能关闭控制，所以委托不扩大权限。已随第一阶段 `ma-admission` 落地（2026-11-01）：提问与 plan review 不再因任一侧 bypass 被排除；elicitation 等其他可路由种类仍保留 bypass 排除。
 
 **(6) plan-review v2（2026-09-24 修正，取代早先 Hub-fold 设计）**
 

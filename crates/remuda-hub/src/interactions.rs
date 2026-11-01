@@ -25,6 +25,17 @@ const APPROVAL_KIND: &str = "approval";
 const PLAN_REVIEW_KIND: &str = "plan-review";
 /// Session posture that disables every downstream gate (D-011).
 const BYPASS_PERMISSIONS: &str = "bypassPermissions";
+/// D-051 question kind.
+const QUESTION_KIND: &str = "question";
+
+/// D-051(b) as amended by D-057 OA3 (ma-admission item 6): questions and plan
+/// reviews route to the Agent parent even when the parent or the child runs
+/// bypass — OA1 lets a child run bypass only under a creator that does, so
+/// the delegation widens nothing. The bypass exclusion still applies to every
+/// other routable kind; approvals never route at all (D-017, D-051(a)).
+fn bypass_excludes(kind: &str) -> bool {
+    !matches!(kind, QUESTION_KIND | PLAN_REVIEW_KIND)
+}
 
 // ---------------------------------------------------------------------------
 // D-051 feature switch: `REMUDA_DELEGATED_DECISIONS`, per-project override
@@ -148,24 +159,27 @@ async fn delegated_visible_items(
     let Some(caller_instance) = device.instance_id.as_deref() else {
         return Ok(Vec::new());
     };
-    // Parent-posture exclusion (D-051 (b)): a caller holding a human-granted
-    // bypass mandate must not route anything, even to manual-posture children.
-    let caller_mode = RouteTarget::load(state, caller_instance).await?;
-    if caller_mode
+    // Parent-posture exclusion (D-051 (b), amended by OA3): a caller holding
+    // a bypass mandate is routed no kind the amendment leaves excluded.
+    let caller_bypass = RouteTarget::load(state, caller_instance)
+        .await?
         .and_then(|target| target.permission_mode)
         .as_deref()
-        == Some(BYPASS_PERMISSIONS)
-    {
-        return Ok(Vec::new());
-    }
+        == Some(BYPASS_PERMISSIONS);
     let mut resolved: HashMap<String, Option<RouteTarget>> = HashMap::new();
     let mut kept = Vec::with_capacity(items.len());
     for item in items {
         let Some(target) = item.get("instanceId").and_then(Value::as_str) else {
             continue;
         };
+        let kind = item.get("kind").and_then(Value::as_str).unwrap_or_default();
         // (a) approvals never route, from whichever branch the item came.
-        if item.get("kind").and_then(Value::as_str) == Some(APPROVAL_KIND) {
+        if kind == APPROVAL_KIND {
+            continue;
+        }
+        // (b) as amended by OA3: bypass on either side still excludes every
+        // kind but questions and plan reviews.
+        if caller_bypass && bypass_excludes(kind) {
             continue;
         }
         // D-051 (6d): a plan review is the target instance's OWN plan. No
@@ -211,8 +225,9 @@ async fn delegated_visible_items(
         {
             continue;
         }
-        // (b) bypass-posture child never routes.
-        if route_target.permission_mode.as_deref() == Some(BYPASS_PERMISSIONS) {
+        if route_target.permission_mode.as_deref() == Some(BYPASS_PERMISSIONS)
+            && bypass_excludes(kind)
+        {
             continue;
         }
         if !delegated_decisions_enabled(route_target.project_id.as_deref()) {
@@ -275,19 +290,21 @@ async fn authorize_agent_answer(
     if !delegated_decisions_enabled(route_target.project_id.as_deref()) {
         return Err(HubError::Forbidden);
     }
-    // (b) Bypass posture on EITHER side refuses (D-011): the child has no
-    // downstream gates, and a bypass-mandated parent must not lend its mandate
-    // to the child's next action. Both reads go through the same existing
-    // `get_instance_spec_json` accessor (`store.rs:3551`), one for each side.
-    if route_target.permission_mode.as_deref() == Some(BYPASS_PERMISSIONS) {
-        return Err(HubError::Forbidden);
-    }
-    let caller_instance = device.instance_id.as_deref().ok_or(HubError::Forbidden)?;
-    let caller_mode = RouteTarget::load(state, caller_instance)
-        .await?
-        .and_then(|target| target.permission_mode);
-    if caller_mode.as_deref() == Some(BYPASS_PERMISSIONS) {
-        return Err(HubError::Forbidden);
+    // (b) as amended by D-057 OA3: questions and plan reviews route even
+    // when either side runs bypass; for every other kind, bypass posture on
+    // EITHER side still refuses (D-011). Both reads go through the same
+    // `get_instance_spec_json` accessor, one for each side.
+    if bypass_excludes(&row.kind) {
+        if route_target.permission_mode.as_deref() == Some(BYPASS_PERMISSIONS) {
+            return Err(HubError::Forbidden);
+        }
+        let caller_instance = device.instance_id.as_deref().ok_or(HubError::Forbidden)?;
+        let caller_mode = RouteTarget::load(state, caller_instance)
+            .await?
+            .and_then(|target| target.permission_mode);
+        if caller_mode.as_deref() == Some(BYPASS_PERMISSIONS) {
+            return Err(HubError::Forbidden);
+        }
     }
     Ok(row)
 }

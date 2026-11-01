@@ -102,6 +102,7 @@ async fn fake_herdr_codex_start_send_wait_read_stop() {
     let bin = stub_bin(tmp.path(), "codex");
 
     let driver = GenericPtyDriver::new(GenericPtyOptions {
+        creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
         profile: profile(),
         launch_dir: launch,
@@ -222,6 +223,7 @@ async fn fake_herdr_start_failure_emits_error_lifecycle() {
     let bin = stub_crash_bin(tmp.path(), "grok");
 
     let driver = GenericPtyDriver::new(GenericPtyOptions {
+        creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
         profile: profile(),
         launch_dir: launch,
@@ -301,6 +303,7 @@ async fn fake_herdr_slow_start_emits_ready_lifecycle() {
     let bin = stub_bin(tmp.path(), "grok");
 
     let driver = GenericPtyDriver::new(GenericPtyOptions {
+        creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
         profile: profile(),
         launch_dir: launch,
@@ -378,6 +381,7 @@ async fn fake_herdr_send_before_start_defers_without_blocking_control() {
     let cwd = tmp.path().join("work");
     fs::create_dir_all(&cwd).unwrap();
     let driver = Arc::new(GenericPtyDriver::new(GenericPtyOptions {
+        creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
         profile: profile(),
         launch_dir: tmp.path().join("launch"),
@@ -433,6 +437,7 @@ async fn fake_herdr_journals_bounded_screen_snapshot() {
     fs::create_dir_all(&cwd).unwrap();
     fs::create_dir_all(tmp.path().join("home")).unwrap();
     let driver = GenericPtyDriver::new(GenericPtyOptions {
+        creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
         profile: profile(),
         launch_dir: tmp.path().join("launch"),
@@ -515,41 +520,58 @@ async fn live_agy_pty_once() {
     live_kind(AgentKind::Agy, "agy");
 }
 
+/// D-057 OA1, the generic-pty Agent downgrade: an Agent's bypass keeps the
+/// yolo preset only under a control-off creator stamp; otherwise it is
+/// downgraded to the asking preset before materialize.
 #[tokio::test]
-async fn agent_origin_bypass_create_uses_non_yolo_preset() {
-    let tmp = tempfile::tempdir().unwrap();
-    let socket_root = ShortTempDir::new().unwrap();
-    let socket_dir = socket_root.path().join("herdr");
-    fs::create_dir_all(&socket_dir).unwrap();
-    let _fake =
-        FakeHerdrServer::spawn(FakeHerdrOptions::new(socket_dir.join("herdr.sock"))).unwrap();
-    let cwd = tmp.path().join("work");
-    fs::create_dir_all(&cwd).unwrap();
-    let home = tmp.path().join("home");
-    fs::create_dir_all(&home).unwrap();
-    let mut options = GenericPtyOptions::new(
-        profile(),
-        tmp.path().join("launch"),
-        home,
-        BinarySource::Pinned(pin_binary(stub_bin(tmp.path(), "codex")).unwrap()),
-    );
-    options.origin = LaunchOrigin::Agent;
-    options.socket_dir = Some(socket_dir);
-    options.herdr_binary = Some(ensure_workspace_bin("fake-herdr"));
-    let driver = GenericPtyDriver::new(options);
-    let mut requested = spec(&cwd, AgentKind::Codex);
-    if let remuda_protocol::PermissionMode::Claude(permission) = &mut requested.permission_mode {
-        permission.mode = remuda_protocol::ClaudePermissionMode::BypassPermissions;
+async fn agent_origin_bypass_follows_the_creator_stamp() {
+    for creator in [
+        remuda_driver::CreatorControl::On,
+        remuda_driver::CreatorControl::Off,
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket_root = ShortTempDir::new().unwrap();
+        let socket_dir = socket_root.path().join("herdr");
+        fs::create_dir_all(&socket_dir).unwrap();
+        let _fake =
+            FakeHerdrServer::spawn(FakeHerdrOptions::new(socket_dir.join("herdr.sock"))).unwrap();
+        let cwd = tmp.path().join("work");
+        fs::create_dir_all(&cwd).unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let mut options = GenericPtyOptions::new(
+            profile(),
+            tmp.path().join("launch"),
+            home,
+            BinarySource::Pinned(pin_binary(stub_bin(tmp.path(), "codex")).unwrap()),
+        );
+        options.origin = LaunchOrigin::Agent;
+        options.creator = creator;
+        options.socket_dir = Some(socket_dir);
+        options.herdr_binary = Some(ensure_workspace_bin("fake-herdr"));
+        let driver = GenericPtyDriver::new(options);
+        let mut requested = spec(&cwd, AgentKind::Codex);
+        if let remuda_protocol::PermissionMode::Claude(permission) = &mut requested.permission_mode
+        {
+            permission.mode = remuda_protocol::ClaudePermissionMode::BypassPermissions;
+        }
+        let handle = driver.start(requested).await.unwrap();
+        let kept = creator == remuda_driver::CreatorControl::Off;
+        for flag in preset_by_id("codex").unwrap().yolo_argv {
+            assert_eq!(
+                handle.recipe().argv.iter().any(|arg| arg == flag),
+                kept,
+                "{creator:?}"
+            );
+        }
+        if !kept {
+            assert_ne!(
+                handle.recipe().permission.cli_mode.as_deref(),
+                Some("bypassPermissions")
+            );
+        }
+        driver.close().await.unwrap();
     }
-    let handle = driver.start(requested).await.unwrap();
-    for flag in preset_by_id("codex").unwrap().yolo_argv {
-        assert!(!handle.recipe().argv.iter().any(|arg| arg == flag));
-    }
-    assert_ne!(
-        handle.recipe().permission.cli_mode.as_deref(),
-        Some("bypassPermissions")
-    );
-    driver.close().await.unwrap();
 }
 
 /// c-usagefu (d) + r2 item 1: Hub dispatch forces Grok onto generic-pty, so
@@ -614,6 +636,7 @@ async fn generic_pty_grok_spawns_file_adapter_and_emits_usage() {
     let instance = remuda_protocol::InstanceId::new();
     let real_home_str = real_home.to_string_lossy().into_owned();
     let mut options = GenericPtyOptions {
+        creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
         profile: profile(),
         launch_dir: launch,

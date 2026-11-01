@@ -42,6 +42,7 @@ fn options_for(dir: &Path, instance_id: &InstanceId, spec: &InstanceSpec) -> She
         dir.to_path_buf(),
         AgentKind::Codex,
         AgentLaunch {
+            creator: remuda_driver::CreatorControl::default(),
             profile: Box::new(ProviderProfile {
                 id: spec.provider_profile.id.clone(),
                 kind: ProviderKind::OpenaiResponses,

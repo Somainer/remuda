@@ -68,6 +68,7 @@ async fn two_concurrent_closes_emit_one_terminal_observation_and_retire_once() {
     let _fake = FakeHerdrServer::spawn(FakeHerdrOptions::new(&socket)).unwrap();
 
     let driver = Arc::new(ClaudePtyDriver::new(ClaudePtyOptions {
+        creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
         instance_id: None,
         media_stager: None,

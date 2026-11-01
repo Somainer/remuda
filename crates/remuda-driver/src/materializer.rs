@@ -83,6 +83,10 @@ pub struct MaterializeRequest<'a> {
     pub setting_sources: Option<Vec<String>>,
     /// Who originated this launch. Bot/dispatcher specs cannot request bypass/yolo.
     pub origin: LaunchOrigin,
+    /// D-057 OA1: for an Agent-origin launch, whether its Agent creator runs
+    /// with its harness's permission control off (the Hub stamp). Ignored for
+    /// Human and Bot origins.
+    pub creator: CreatorControl,
     /// Whether `native_home` is a Remuda-managed home this launch may write the
     /// skill tree into. `None` reads as managed (the default); `Some(false)` is
     /// the inherited operator home, which is never written (D-045).
@@ -136,6 +140,56 @@ pub enum LaunchOrigin {
     #[default]
     #[serde(other)]
     Agent,
+}
+
+/// D-057 OA1: what the Hub stamped about an Agent launch's creator.
+///
+/// Read from `creatorPermissionMode` at the top level of the forwarded create
+/// or resume params, never from the spec or a local request body. An absent
+/// stamp is [`CreatorControl::On`]: the Node fails closed, so an Agent child
+/// under an older Hub keeps today's refusal of every control-off mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CreatorControl {
+    /// The creator keeps its harness's permission control on (or is unknown).
+    #[default]
+    On,
+    /// The creator itself runs with its harness's permission control off.
+    Off,
+}
+
+impl CreatorControl {
+    /// Classify the Hub's `creatorPermissionMode` stamp.
+    #[must_use]
+    pub fn from_stamp(stamp: Option<&str>) -> Self {
+        if remuda_protocol::creator_permission::stamp_is_control_off(stamp) {
+            Self::Off
+        } else {
+            Self::On
+        }
+    }
+}
+
+/// D-011 / D-057 OA1, the Node half of the one rule: may a launch of this
+/// origin use a mode that switches its harness's permission control off?
+/// Human: yes. Bot: never (D-011, unchanged). Agent: only when its Agent
+/// creator itself runs with control off.
+#[must_use]
+pub fn control_off_allowed(origin: LaunchOrigin, creator: CreatorControl) -> bool {
+    match origin {
+        LaunchOrigin::Human => true,
+        LaunchOrigin::Bot => false,
+        LaunchOrigin::Agent => creator == CreatorControl::Off,
+    }
+}
+
+/// The refusal for a control-off mode [`control_off_allowed`] denies.
+pub(crate) fn control_off_refusal(origin: LaunchOrigin, mode: &str) -> DriverError {
+    match origin {
+        LaunchOrigin::Agent => DriverError::BeyondCreator {
+            mode: mode.to_string(),
+        },
+        LaunchOrigin::Human | LaunchOrigin::Bot => DriverError::BypassNotAllowedForBot,
+    }
 }
 
 impl From<InputOrigin> for LaunchOrigin {
@@ -218,7 +272,8 @@ fn materialize_inner(
         None => pin_source(&request.binary)?,
     };
     let model = resolve_model(request.spec, request.profile)?;
-    let (permission, debt, approval) = permission_plan(request.spec, request.origin)?;
+    let (permission, debt, approval) =
+        permission_plan(request.spec, request.origin, request.creator)?;
     let inject_provider = request.profile.delegation == Delegation::Gateway;
 
     fs::create_dir_all(&request.launch_dir)?;
@@ -603,7 +658,8 @@ fn materialize_shell_pty_agent(
     binary_override: bool,
 ) -> DriverResult<LaunchRecipe> {
     let preset = crate::presets::preset_for_spec(request.spec)?;
-    let (permission, debt, approval) = permission_plan(request.spec, request.origin)?;
+    let (permission, debt, approval) =
+        permission_plan(request.spec, request.origin, request.creator)?;
     crate::launch::skills::computer_use_requested(
         &request.spec.capabilities,
         request.origin,
@@ -752,6 +808,7 @@ fn materialize_shell_pty_agent(
         preset,
         &request.spec.permission_mode,
         request.origin,
+        request.creator,
     );
 
     if let Some(name) = preset.home_env {
@@ -1090,15 +1147,20 @@ pub fn pinned_model_for(spec: &InstanceSpec) -> Option<String> {
 fn permission_plan(
     spec: &InstanceSpec,
     origin: LaunchOrigin,
+    creator: CreatorControl,
 ) -> DriverResult<(RecipePermission, Vec<String>, ApprovalAuthority)> {
+    let allowed = control_off_allowed(origin, creator);
     match &spec.permission_mode {
         PermissionMode::Claude(claude) => {
             if matches!(
                 claude.mode,
                 ClaudePermissionMode::BypassPermissions | ClaudePermissionMode::DontAsk
-            ) && matches!(origin, LaunchOrigin::Bot | LaunchOrigin::Agent)
+            ) && !allowed
             {
-                return Err(DriverError::BypassNotAllowedForBot);
+                return Err(control_off_refusal(
+                    origin,
+                    remuda_protocol::permission_mode_wire(claude.mode),
+                ));
             }
             let (cli, dont_ask) = map_claude_mode(claude.mode);
             let mut debt = Vec::new();
@@ -1165,10 +1227,8 @@ fn permission_plan(
             ))
         }
         PermissionMode::Codex(codex) => {
-            if codex.approval_policy == ApprovalPolicy::Never
-                && matches!(origin, LaunchOrigin::Bot | LaunchOrigin::Agent)
-            {
-                return Err(DriverError::BypassNotAllowedForBot);
+            if codex.approval_policy == ApprovalPolicy::Never && !allowed {
+                return Err(control_off_refusal(origin, "never"));
             }
             // Codex's two real CLI axes (`codex --help` 0.x): approval policy
             // `-a/--ask-for-approval <untrusted|on-request|never>` and sandbox
@@ -1201,10 +1261,8 @@ fn permission_plan(
             ))
         }
         PermissionMode::Grok(grok) => {
-            if grok.mode == GrokPermissionMode::AlwaysApprove
-                && matches!(origin, LaunchOrigin::Bot | LaunchOrigin::Agent)
-            {
-                return Err(DriverError::BypassNotAllowedForBot);
+            if grok.mode == GrokPermissionMode::AlwaysApprove && !allowed {
+                return Err(control_off_refusal(origin, "always-approve"));
             }
             // grok agent's yolo argv; the other modes are the ACP default and
             // `_meta.autoMode` (build-gated by the native CLI), no flag.
@@ -1224,10 +1282,8 @@ fn permission_plan(
             ))
         }
         PermissionMode::Agy(agy) => {
-            if agy.mode == AgyPermissionMode::AlwaysProceed
-                && matches!(origin, LaunchOrigin::Bot | LaunchOrigin::Agent)
-            {
-                return Err(DriverError::BypassNotAllowedForBot);
+            if agy.mode == AgyPermissionMode::AlwaysProceed && !allowed {
+                return Err(control_off_refusal(origin, "always-proceed"));
             }
             let extra_flags = match agy.mode {
                 AgyPermissionMode::AlwaysProceed => vec!["--yolo".into()],

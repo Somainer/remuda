@@ -35,6 +35,10 @@ const DEFAULT_PORT_RANGE: (i64, i64) = (58600, 58959);
 /// Build-jobs cap exported into every worker's tab env (the shared-host cap
 /// the coordinator scripts hand-roll as `CARGO_BUILD_JOBS=8`).
 const WORKER_BUILD_JOBS: i64 = 8;
+/// The mode a Human or Bot dispatch that names none launches its worker with,
+/// unchanged since before D-057 (§4.2 item 2: "byte for byte"). An Agent
+/// dispatch never gets it: an omitted mode inherits the creator's (OA1).
+pub(crate) const HUMAN_DISPATCH_PERMISSION_MODE: &str = "bypassPermissions";
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
@@ -71,7 +75,7 @@ pub fn routes() -> Router<AppState> {
 
 // ── request bodies ─────────────────────────────────────────────────────────
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DispatchBody {
     /// Brief text (utf8). The CLI reads the brief file and posts the bytes;
@@ -112,10 +116,17 @@ pub(crate) struct DispatchBody {
     #[serde(default)]
     pub(crate) carrier: Option<String>,
     /// Per-launch host capability grants, e.g. `["computer-use"]` (D-045).
-    /// Dispatch workers otherwise run with `bypassPermissions`, so a requested
-    /// capability is rejected with a named message rather than silently dropped.
+    /// Dispatch workers run unattended, so a requested capability is rejected
+    /// with a named message rather than silently dropped.
     #[serde(default)]
     pub(crate) capabilities: Vec<String>,
+    /// D-057 §4.2 item 2: the worker's permission mode, a word of the worker
+    /// harness's own vocabulary. Omitted, a Human or Bot dispatch keeps the
+    /// dispatch default ([`HUMAN_DISPATCH_PERMISSION_MODE`]) byte for byte and
+    /// an Agent dispatch inherits its own mode (OA1); either way the
+    /// requested and effective values are recorded verbatim.
+    #[serde(default)]
+    pub(crate) permission_mode: Option<String>,
     /// D-047 per-dispatch proxy override: proxy host id, `self`, or `none`.
     #[serde(default, rename = "apiVia")]
     pub(crate) api_via: Option<String>,
@@ -239,7 +250,51 @@ async fn dispatch_worker(
     headers: HeaderMap,
     Json(body): Json<DispatchBody>,
 ) -> Result<Json<Value>, HubError> {
-    dispatch_core(State(state), headers, body).await
+    dispatch_core(State(state), headers, body, DispatchApproval::Decide).await
+}
+
+/// How [`dispatch_core`] treats an Agent dispatch's D-017 one-shot approval
+/// (main-agent.md §4.2 item 4). The approval is always decided before any
+/// name, port block or worktree is allocated.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum DispatchApproval {
+    /// Decide it here, then dispatch.
+    Decide,
+    /// Decide it and stop before allocating anything, answering
+    /// `{"approval": <request or null>}`: `worker replace` decides before it
+    /// retires the old worker.
+    DecideOnly,
+    /// Already decided earlier in this same request on exactly this request
+    /// (or on none). A dispatch that now resolves to a different request is
+    /// refused rather than run unapproved.
+    Decided(Option<Value>),
+}
+
+/// The D-017 approval request for an Agent dispatch, derived from the body
+/// and its resolution only — never from anything allocated — so an approved
+/// retry of the same body matches and a changed body does not (main-agent.md
+/// §4.2 item 4): project, resolved host, harness, carrier, model, permission
+/// mode, brief digest, task and name.
+fn dispatch_approval_request(
+    body: &DispatchBody,
+    host_id: &str,
+    harness: &str,
+    driver: &str,
+    model: Option<&str>,
+    permission_mode: &str,
+) -> Value {
+    json!({
+        "operation": "worker.dispatch",
+        "projectId": body.project_id.as_id(),
+        "hostId": host_id,
+        "harness": harness,
+        "driver": driver,
+        "model": model,
+        "permissionMode": permission_mode,
+        "briefDigest": format!("sha256:{}", crate::config::sha256_hex(body.brief.as_bytes())),
+        "taskId": body.task_id,
+        "name": body.name,
+    })
 }
 
 /// Dispatch a worker from a validated body. Shared by the HTTP route and
@@ -249,6 +304,7 @@ pub(crate) async fn dispatch_core(
     state: State<AppState>,
     headers: HeaderMap,
     body: DispatchBody,
+    approval: DispatchApproval,
 ) -> Result<Json<Value>, HubError> {
     require_origin(&headers, &state.config)?;
     let device = caller(&state, &headers).await?;
@@ -464,6 +520,88 @@ pub(crate) async fn dispatch_core(
         }
     }
 
+    // ── carrier choice, before anything is provisioned ─────────────────────
+    // An explicit driver/carrier is honoured verbatim or refused; the default
+    // comes from what this host reports it can actually launch. Deciding here
+    // means a refusal costs no worktree, so there is nothing to roll back.
+    let driver = match body.driver.as_deref() {
+        Some(explicit) => select_worker_driver(&harness, explicit, &host)?,
+        None => select_carrier(&harness, &host, body.carrier.as_deref())?,
+    };
+
+    // ── permission mode (D-057 §4.2 items 2-3), before any allocation ──────
+    // A Human or Bot dispatch keeps today's default when it names no mode.
+    // An Agent's mode is admitted under the creator rule now, so a refusal
+    // costs no name, port block or worktree; the creator's mode read here is
+    // the one the create's commit point re-checks.
+    let admitted_mode = match crate::agent_scope::origin(&device) {
+        remuda_protocol::InputOrigin::Agent => Some(
+            crate::agent_scope::admit_agent_mode(
+                &state,
+                &device,
+                &harness,
+                body.permission_mode.as_deref(),
+            )
+            .await?,
+        ),
+        _ => None,
+    };
+    let permission_mode = match &admitted_mode {
+        Some(admitted) => admitted.effective.to_string(),
+        None => body
+            .permission_mode
+            .clone()
+            .unwrap_or_else(|| HUMAN_DISPATCH_PERMISSION_MODE.to_string()),
+    };
+
+    // ── D-017 approval (D-057 §4.2 item 4), before any allocation ──────────
+    // An Agent dispatch to another host, or onto a shell-driver carrier, asks
+    // the owner once, on a request derived from the body. Nothing is named,
+    // port-blocked or provisioned while it is pending, and an approved retry
+    // of the same body passes.
+    let approval_request = if admitted_mode.is_some() {
+        // A placement outside the seat's box is refused before anyone is paged.
+        if !scope.allows_host(&host.host_id)
+            || !scope.allows_workspace(workspace_id.as_id().as_str())
+        {
+            return Err(HubError::out_of_scope());
+        }
+        let needed = !crate::agent_scope::same_host(&state, &device, &host.host_id).await?
+            || crate::agent_scope::shell_driver(&driver)
+            || headers.contains_key("x-remuda-require-approval");
+        needed.then(|| {
+            dispatch_approval_request(
+                &body,
+                &host.host_id,
+                &harness,
+                &driver,
+                model.as_deref(),
+                &permission_mode,
+            )
+        })
+    } else {
+        None
+    };
+    match (&approval, &approval_request) {
+        (DispatchApproval::Decided(decided), current) => {
+            if decided != current {
+                return Err(HubError::Conflict(
+                    "the dispatch resolved to a different request than the one decided \
+                     before; retry it"
+                        .into(),
+                ));
+            }
+        }
+        (_, Some(request)) => {
+            crate::agent_scope::require_approval(&state, &headers, &device, request.clone())
+                .await?;
+        }
+        (_, None) => {}
+    }
+    if approval == DispatchApproval::DecideOnly {
+        return Ok(Json(json!({ "approval": approval_request })));
+    }
+
     // ── product-assigned name / branch / port block (§2.4) ─────────────────
     let slug_source = task
         .as_ref()
@@ -494,15 +632,6 @@ pub(crate) async fn dispatch_core(
         )));
     }
     let port_block = allocate_port_block(&state, &project, &host.host_id).await?;
-
-    // ── carrier choice, before anything is provisioned ─────────────────────
-    // An explicit driver/carrier is honoured verbatim or refused; the default
-    // comes from what this host reports it can actually launch. Deciding here
-    // means a refusal costs no worktree, so there is nothing to roll back.
-    let driver = match body.driver.as_deref() {
-        Some(explicit) => select_worker_driver(&harness, explicit, &host)?,
-        None => select_carrier(&harness, &host, body.carrier.as_deref())?,
-    };
 
     // ── provision through the Node (worktree + target dir) ─────────────────
     // D-057 §7.5: worker.provision is a direct RPC; admit it (check + row)
@@ -551,14 +680,23 @@ pub(crate) async fn dispatch_core(
         &name,
         project.meta.id.as_id().as_str(),
         task.as_ref().map(|task| task.meta.id.as_id().as_str()),
+        &permission_mode,
         extra_env,
     );
     crate::agent_scope::prepare_create(
         &state,
         &headers,
         &device,
-        &host.host_id,
-        &driver,
+        crate::agent_scope::CreateAdmission {
+            host: &host.host_id,
+            driver: &driver,
+            mode: match &admitted_mode {
+                Some(admitted) => crate::agent_scope::ModeAdmission::Admitted(admitted),
+                None => crate::agent_scope::ModeAdmission::Request(body.permission_mode.as_deref()),
+            },
+            // Decided above, before any allocation.
+            approval: crate::agent_scope::CreateApproval::Decided,
+        },
         &mut spec,
     )
     .await?;
@@ -742,6 +880,10 @@ pub(crate) async fn dispatch_core(
             replace_count: None,
             supply_decision,
             reclaimed_bytes: None,
+            // D-057 §4.2 item 2 (D-035): what the dispatch named, verbatim,
+            // and what the worker launched with.
+            permission_mode_requested: body.permission_mode.clone(),
+            permission_mode: Some(permission_mode),
         };
         let row = state
             .store
@@ -1098,6 +1240,7 @@ pub(crate) fn worker_launch_spec(
     name: &str,
     project_id: &str,
     task_id: Option<&str>,
+    permission_mode: &str,
     extra_env: serde_json::Map<String, Value>,
 ) -> Value {
     let mut spec = json!({
@@ -1106,7 +1249,7 @@ pub(crate) fn worker_launch_spec(
         "model": model,
         "providerProfileId": provider_profile_id,
         "delegation": delegation,
-        "permissionMode": "bypassPermissions",
+        "permissionMode": permission_mode,
         "workspaceId": workspace_id,
         "hostId": host_id,
         "cwd": cwd,
@@ -1370,6 +1513,8 @@ pub(crate) async fn retire_core(
     require_grant(&state, &device, remuda_protocol::GrantVerb::Dispatch).await?;
     let scope = caller_project_scope(&state, &device).await?;
     let worker = resolve_worker(&state, &id, &scope).await?;
+    // D-057 §4.2 item 1: an Agent retires only workers in its subtree.
+    crate::agent_scope::require_worker_owned(&state, &device, &worker).await?;
     // D-057 §7.1: the stop/remove the Hub authors in retire carry the
     // caller's initiator (a command made on the caller's behalf).
     let (retire_initiator, retire_device_id) = initiator_and_device(&state, &device).await?;
@@ -1568,6 +1713,7 @@ async fn set_worker_state(
     let scope = caller_project_scope(&state, &device).await?;
     let authority = crate::agent_scope::CallerAuthority::for_device(&state, &device).await?;
     let worker = resolve_worker(&state, &id, &scope).await?;
+    crate::agent_scope::require_worker_owned(&state, &device, &worker).await?;
     let next = WorkerState::from_update(&body.state, body.sha.as_deref(), body.reason.as_deref())
         .map_err(HubError::BadRequest)?;
     // A retired worker stays retired (retire is terminal).
@@ -1602,6 +1748,7 @@ async fn send_worker_brief(
     let scope = caller_project_scope(&state, &device).await?;
     let (brief_initiator, brief_device_id) = initiator_and_device(&state, &device).await?;
     let worker = resolve_worker(&state, &id, &scope).await?;
+    crate::agent_scope::require_worker_owned(&state, &device, &worker).await?;
     if !worker.state.is_active() {
         return Err(HubError::Conflict("worker is retired".into()));
     }

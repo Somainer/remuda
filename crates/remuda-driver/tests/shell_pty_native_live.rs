@@ -149,6 +149,7 @@ async fn real_claude_through_native_shell_pty() {
         workspace.clone(),
         AgentKind::Claude,
         AgentLaunch {
+            creator: remuda_driver::CreatorControl::default(),
             profile: Box::new(profile()),
             launch_dir: instance_dir.join("launch"),
             native_home: host_claude_home.clone(),
@@ -304,6 +305,7 @@ async fn scoped_home_lists_gateway_models_in_model_picker() {
         workspace.clone(),
         AgentKind::Claude,
         AgentLaunch {
+            creator: remuda_driver::CreatorControl::default(),
             profile: Box::new(profile()),
             launch_dir: instance_dir.join("launch"),
             native_home: native_home.clone(),

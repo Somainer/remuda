@@ -2,8 +2,9 @@
 //!
 //! The two handler relaxations (`GET /v1/interactions`,
 //! `POST /v1/interactions/{id}/answer`) for the one-hop `owns()` edge; the
-//! three mechanical exclusions (approval kind, bypass-posture child,
-//! bypass-posture parent); the in-memory approval broker origin gate; the
+//! mechanical exclusions (approval kind; bypass posture on either side, which
+//! D-057 OA3 narrowed to kinds other than questions and plan reviews); the
+//! in-memory approval broker origin gate; the
 //! literal middleware predicates; and the feature-off behavior being
 //! byte-for-byte the old operator-only refusal.
 //!
@@ -153,6 +154,8 @@ impl Ctx {
                 "optionId": "allow-once",
                 "inputDigest": format!("sha256:{}", "0".repeat(64))
             })
+        } else if kind == "elicitation" {
+            json!({ "kind": "elicitation", "action": "decline", "content": null })
         } else {
             json!({ "kind": kind, "answers": {} })
         };
@@ -227,12 +230,14 @@ async fn agent_lists_own_and_direct_child_pending_but_not_sibling_or_excluded() 
     let child_approval = ctx.interaction(&child, "approval")?;
     let sibling_question = ctx.interaction(&sibling, "question")?;
     let bypass_question = ctx.interaction(&bypass_child, "question")?;
+    let bypass_elicitation = ctx.interaction(&bypass_child, "elicitation")?;
 
     let token = ctx.agent_token(&parent).await?;
 
-    // Unpinned page: self + owned non-approval, non-bypass rows only. The
-    // approval comes from the SQL branch here; the same filter covers the
-    // in-memory agent_approvals branch merged into the same page.
+    // Unpinned page: self + owned non-approval rows; a bypass-posture child
+    // routes its question (D-057 OA3) but not its elicitation. The approval
+    // comes from the SQL branch here; the same filter covers the in-memory
+    // agent_approvals branch merged into the same page.
     let response = ctx.list(&token, &[]).await?;
     assert_eq!(response.status(), 200);
     let body = response.json::<Value>().await?;
@@ -242,12 +247,13 @@ async fn agent_lists_own_and_direct_child_pending_but_not_sibling_or_excluded() 
         own_question.clone(),
         child_question.clone(),
         child_elicitation.clone(),
+        bypass_question.clone(),
     ];
     expected.sort();
     assert_eq!(ids, expected, "unpinned page: {body}");
     assert!(!ids.contains(&child_approval));
     assert!(!ids.contains(&sibling_question));
-    assert!(!ids.contains(&bypass_question));
+    assert!(!ids.contains(&bypass_elicitation));
 
     // Pinned to the child: question + elicitation survive, approval does not.
     let response = ctx.list(&token, &[("instanceId", child.as_str())]).await?;
@@ -347,46 +353,82 @@ async fn agent_answer_to_approval_kind_is_forbidden_even_when_owned() -> Result<
     Ok(())
 }
 
-// --- exclusion (b): bypass posture on either side -------------------------
+// --- exclusion (b), as amended by D-057 OA3 (ma-admission item 6) ---------
+// Questions and plan reviews route to the Agent parent even when the parent
+// or the child runs bypass; the bypass exclusion stays for every other kind
+// (here: elicitation), and approvals never route at all.
 
 #[tokio::test]
-async fn bypass_posture_child_interaction_is_refused_and_hidden() -> Result<()> {
+async fn bypass_posture_child_routes_questions_but_not_other_kinds() -> Result<()> {
     let _flag = flag(Some(true)).await;
     let ctx = Ctx::boot().await?;
     let parent = ctx.instance("manual", None).await?;
     let child = ctx.instance("bypassPermissions", Some(&parent)).await?;
     let question = ctx.interaction(&child, "question")?;
+    let plan = ctx.interaction(&child, "plan-review")?;
+    let elicitation = ctx.interaction(&child, "elicitation")?;
+    let approval = ctx.interaction(&child, "approval")?;
+    ctx.hub
+        .test_set_node_reply(
+            &ctx.host,
+            Some(json!({ "jsonrpc": "2.0", "id": "1", "result": { "state": "answered" } })),
+        )
+        .await;
     let token = ctx.agent_token(&parent).await?;
-
-    let response = ctx.answer(&token, &question, "question").await?;
-    assert_eq!(response.status(), 403);
-    assert_eq!(ctx.interaction_state(&question)?, "pending");
 
     let response = ctx.list(&token, &[("instanceId", child.as_str())]).await?;
     assert_eq!(response.status(), 200);
-    assert!(item_ids(&response.json::<Value>().await?).is_empty());
+    let mut ids = item_ids(&response.json::<Value>().await?);
+    ids.sort();
+    let mut expected = vec![question.clone(), plan.clone()];
+    expected.sort();
+    assert_eq!(ids, expected, "questions and plan reviews only");
+
+    let response = ctx.answer(&token, &question, "question").await?;
+    assert_eq!(response.status(), 200, "{}", response.text().await?);
+    assert_eq!(ctx.interaction_state(&question)?, "answer-committed");
+    for (id, kind) in [(&elicitation, "elicitation"), (&approval, "approval")] {
+        let response = ctx.answer(&token, id, kind).await?;
+        assert_eq!(response.status(), 403, "{kind}");
+        assert_eq!(ctx.interaction_state(id)?, "pending", "{kind}");
+    }
     Ok(())
 }
 
 #[tokio::test]
-async fn bypass_posture_parent_cannot_answer_or_see_child_pending() -> Result<()> {
+async fn bypass_posture_parent_routes_questions_but_not_other_kinds() -> Result<()> {
     let _flag = flag(Some(true)).await;
     let ctx = Ctx::boot().await?;
     // A Human session can run bypassPermissions; its instance-bound credential
-    // is Agent origin. That mandate must not be lent to a child's answer.
+    // is Agent origin. Under OA3 its children's questions route to it.
     let parent = ctx.instance("bypassPermissions", None).await?;
     let child = ctx.instance("manual", Some(&parent)).await?;
     let question = ctx.interaction(&child, "question")?;
+    let elicitation = ctx.interaction(&child, "elicitation")?;
+    let approval = ctx.interaction(&child, "approval")?;
+    ctx.hub
+        .test_set_node_reply(
+            &ctx.host,
+            Some(json!({ "jsonrpc": "2.0", "id": "1", "result": { "state": "answered" } })),
+        )
+        .await;
     let token = ctx.agent_token(&parent).await?;
 
-    let response = ctx.answer(&token, &question, "question").await?;
-    assert_eq!(response.status(), 403);
-    assert_eq!(ctx.interaction_state(&question)?, "pending");
-
-    // The parent-posture exclusion filters every routed row, even manual ones.
     let response = ctx.list(&token, &[("instanceId", child.as_str())]).await?;
     assert_eq!(response.status(), 200);
-    assert!(item_ids(&response.json::<Value>().await?).is_empty());
+    assert_eq!(
+        item_ids(&response.json::<Value>().await?),
+        vec![question.clone()]
+    );
+
+    let response = ctx.answer(&token, &question, "question").await?;
+    assert_eq!(response.status(), 200, "{}", response.text().await?);
+    assert_eq!(ctx.interaction_state(&question)?, "answer-committed");
+    for (id, kind) in [(&elicitation, "elicitation"), (&approval, "approval")] {
+        let response = ctx.answer(&token, id, kind).await?;
+        assert_eq!(response.status(), 403, "{kind}");
+        assert_eq!(ctx.interaction_state(id)?, "pending", "{kind}");
+    }
     Ok(())
 }
 
@@ -861,6 +903,49 @@ async fn a_parents_plan_review_answer_wins_the_real_node_cas_once() -> Result<()
         "driver received the wrong answer: {:?}",
         got[0].1
     );
+    Ok(())
+}
+
+/// D-057 OA3: a plan review routes to the Agent parent when either side runs
+/// bypass, and the parent's answer wins the real Node CAS; the bypass-posture
+/// child still cannot review its own plan (the self-exclusion is unchanged).
+#[tokio::test]
+async fn a_plan_review_routes_under_bypass_on_either_side_but_never_to_its_own_child() -> Result<()>
+{
+    let _flag = flag(Some(true)).await;
+    for (parent_mode, child_mode) in [
+        ("bypassPermissions", "bypassPermissions"),
+        ("manual", "bypassPermissions"),
+        ("bypassPermissions", "manual"),
+    ] {
+        let ctx = Ctx::boot().await?;
+        let parent = ctx.instance(parent_mode, None).await?;
+        let child = ctx.instance(child_mode, Some(&parent)).await?;
+        let (review, deliveries) = ctx.seed_plan_review_node(&child).await?;
+        let child_token = ctx.agent_token(&child).await?;
+        let label = format!("parent {parent_mode} child {child_mode}");
+        let response = ctx.plan_answer(&child_token, &review).await?;
+        assert_eq!(
+            response.status(),
+            403,
+            "{label}: the child never reviews itself"
+        );
+        let token = ctx.agent_token(&parent).await?;
+        let response = ctx.list(&token, &[("instanceId", child.as_str())]).await?;
+        assert_eq!(
+            item_ids(&response.json::<Value>().await?),
+            vec![review.clone()]
+        );
+        let response = ctx.plan_answer(&token, &review).await?;
+        assert_eq!(
+            response.status(),
+            200,
+            "{label}: {}",
+            response.text().await?
+        );
+        assert_eq!(ctx.interaction_state(&review)?, "answer-committed");
+        assert_eq!(deliveries.lock().await.len(), 1, "{label}");
+    }
     Ok(())
 }
 

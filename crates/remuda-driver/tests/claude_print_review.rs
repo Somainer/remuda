@@ -192,28 +192,36 @@ fn first_workflow_result_does_not_complete_the_run() {
 
 #[test]
 fn bot_origin_rejects_bypass_and_dont_ask() {
+    use remuda_driver::CreatorControl;
     let mut spec = load_spec();
     spec.permission_mode = PermissionMode::Claude(Box::new(ClaudePermission {
         mode: ClaudePermissionMode::BypassPermissions,
         interaction: remuda_protocol::ClaudeInteractionMode::Host,
     }));
-    assert!(matches!(
-        review::reject_bot(&spec, InputOrigin::Bot),
-        Err(DriverError::BypassNotAllowedForBot)
-    ));
+    // D-011: a Bot never runs control-off, whatever any stamp says.
+    for creator in [CreatorControl::On, CreatorControl::Off] {
+        assert!(matches!(
+            review::reject_bot(&spec, InputOrigin::Bot, creator),
+            Err(DriverError::BypassNotAllowedForBot)
+        ));
+    }
     spec.permission_mode = PermissionMode::Claude(Box::new(ClaudePermission {
         mode: ClaudePermissionMode::DontAsk,
         interaction: remuda_protocol::ClaudeInteractionMode::Host,
     }));
+    // D-057 OA1: an Agent runs control-off only under a control-off creator.
     assert!(matches!(
-        review::reject_bot(&spec, InputOrigin::Agent),
-        Err(DriverError::BypassNotAllowedForBot)
+        review::reject_bot(&spec, InputOrigin::Agent, CreatorControl::On),
+        Err(DriverError::BeyondCreator { ref mode }) if mode == "dontAsk"
     ));
+    assert!(review::reject_bot(&spec, InputOrigin::Agent, CreatorControl::Off).is_ok());
+    assert!(review::reject_bot(&spec, InputOrigin::Human, CreatorControl::On).is_ok());
     spec.permission_mode = PermissionMode::Claude(Box::new(ClaudePermission {
         mode: ClaudePermissionMode::Manual,
         interaction: remuda_protocol::ClaudeInteractionMode::Host,
     }));
-    assert!(review::reject_bot(&spec, InputOrigin::Bot).is_ok());
+    assert!(review::reject_bot(&spec, InputOrigin::Bot, CreatorControl::On).is_ok());
+    assert!(review::reject_bot(&spec, InputOrigin::Agent, CreatorControl::On).is_ok());
 }
 
 #[test]

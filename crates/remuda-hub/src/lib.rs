@@ -395,6 +395,38 @@ pub mod store_test_support {
         }
     }
 
+    /// A Human-seated root holding `grants` inside `scope` (D-057 seat shape);
+    /// any grant makes the insert a continuity lineage.
+    pub fn seat_delegation(
+        scope: remuda_protocol::InstanceScope,
+        grants: Vec<String>,
+    ) -> InstanceDelegation {
+        InstanceDelegation {
+            role: Some("top-coordinator".into()),
+            scope,
+            grants,
+            task_id: None,
+            enforce_tree: false,
+            restart: None,
+            seated_by: None,
+        }
+    }
+
+    /// The Hub-stamped initiator of `instance_id`'s chapter, as the Agent
+    /// routes resolve it (no root turn).
+    pub async fn initiator_of(
+        store: &Store,
+        instance_id: &str,
+    ) -> Option<crate::agent_scope::Initiator> {
+        let instance = store.get_instance(instance_id.to_string()).await.ok()??;
+        Some(crate::agent_scope::Initiator {
+            instance_id: instance.instance_id,
+            lineage_id: instance.lineage_id,
+            generation: instance.generation,
+            root_turn: None,
+        })
+    }
+
     /// Open a Hub DB and enroll one host, returning the store and its host id.
     ///
     /// The Store-direct equivalent of the `spawn` + fake-node WS dance, for
@@ -831,6 +863,34 @@ impl HubTestHandle {
     #[cfg(any(test, feature = "test-faults"))]
     pub fn test_fail_restart_step(&self, point: &str, count: usize) {
         self.state.restart.fail_next(point, count);
+    }
+
+    /// D-057 OA1 test seam: the Hub's create-path permission admission
+    /// (`agent_scope::restrict_permission`) for an Agent bound to
+    /// `instance_id`, on `spec`, exactly as `prepare_create` runs it — without
+    /// the HTTP layer, so a test can walk every cell of the creator-rule
+    /// matrix. Returns the admitted spec, or the refusal's status and body.
+    pub async fn test_restrict_permission(
+        &self,
+        instance_id: &str,
+        requested: Option<&str>,
+        mut spec: serde_json::Value,
+    ) -> Result<serde_json::Value, (u16, serde_json::Value)> {
+        let device = crate::store::Device {
+            id: "dev_test_restrict_permission".into(),
+            name: "test".into(),
+            kind: "agent".into(),
+            instance_id: Some(instance_id.into()),
+        };
+        crate::agent_scope::restrict_permission(
+            &self.state,
+            &device,
+            crate::agent_scope::ModeAdmission::Request(requested),
+            &mut spec,
+        )
+        .await
+        .map(|()| spec)
+        .map_err(|error| error.status_code_and_body())
     }
 
     /// One scheduler tick (claims + dispatches), on an owned handle.

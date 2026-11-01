@@ -175,6 +175,10 @@ fn public_wire_types_are_registered_for_generation() {
         // outcome used to scrub the sidecar; never serialized on the wire.
         "ImageOutcome",
         "FoldedToolResult",
+        // D-057 OA1 (ma-admission): the creator rule's refusal decision; the
+        // Hub renders it as an error message and a `reason` string, so the
+        // enum itself is never serialized on the wire.
+        "Refusal",
     ];
     for file in std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("src")).unwrap() {
         let file = file.unwrap().path();

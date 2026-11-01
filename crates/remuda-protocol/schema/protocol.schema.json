@@ -21953,6 +21953,20 @@
           "description": "Human-facing worker name; unique among *active* rows of the project.\nBranch and worktree directory derive from it.",
           "type": "string"
         },
+        "permissionMode": {
+          "description": "The permission mode the worker launched with (effective). Absent on\nrows written before D-057 §4.2 recorded it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "permissionModeRequested": {
+          "description": "D-057 §4.2 item 2 (D-035): the permission mode the dispatch named,\nverbatim. Absent when it named none: an Agent dispatch then inherited\nits creator's own mode, a Human or Bot dispatch got the default.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "portBlock": {
           "description": "Allocated port block (e.g. `58600-58609`).",
           "type": [

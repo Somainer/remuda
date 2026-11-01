@@ -252,6 +252,8 @@ fn help_lists_new_verbs() -> Result<()> {
                 "--host",
                 "--api-via",
                 "--api-route",
+                "--permission-mode",
+                "--approval-id",
             ][..],
         ),
         ("retire", &["--force"][..]),
@@ -367,7 +369,7 @@ async fn spawn_hub_with_cli(extra_cli: Option<Value>) -> Result<Hub> {
                 // `--api-via self` refusal tests reach the Hub-host checks
                 // (direct-net unreachable) instead of stopping at
                 // api-via-unsupported.
-                "capabilities": {"apiRelay": true}
+                "capabilities": {"apiRelay": true, "lineageFence": true}
             }
         })
         .to_string()
@@ -660,6 +662,127 @@ async fn dispatch_retire_hostcap_cli_lifecycle() -> Result<()> {
     let body: Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(body["worker"]["state"]["state"], "retired");
     assert_eq!(body["node"]["reclaimedBytes"], "2048");
+    Ok(())
+}
+
+// ── dispatch --permission-mode (D-057 §4.2 items 2-3, ma-admission item 7) ──
+
+/// `remuda dispatch` never chooses a mode itself: without `--permission-mode`
+/// a person's dispatch keeps the Hub default and an Agent seat's worker
+/// inherits the seat's own mode; a named mode is recorded verbatim, and an
+/// Agent asking beyond its own mode is refused with the Hub's reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dispatch_permission_mode_goes_through_the_creator_rule() -> Result<()> {
+    let hub = spawn_hub().await?;
+    let output = run(&["project", "create", "--name", "cli-mode"], &hub);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let project: Value = serde_json::from_slice(&output.stdout)?;
+    let project_id = project["id"].as_str().unwrap().to_string();
+    let client =
+        remuda_hub_client::HubClient::new(hub.base.clone(), Some(hub.token.clone()), None)?;
+    client
+        .post(
+            &format!("/v1/projects/{project_id}/members"),
+            &json!({"hostId": hub.host, "workspaceId": hub.workspace, "role": "build"}),
+        )
+        .await?;
+    let brief = hub._dir.path().join("mode-brief.md");
+    std::fs::write(
+        &brief,
+        "Complete the trivial task in your worktree.
+         Reply on one line: DONE <sha> or BLOCKED <reason>.
+",
+    )?;
+    let dispatch = |name: &str, extra: &[&str], token: &str| {
+        let mut args = vec![
+            "dispatch",
+            "--project",
+            &project_id,
+            "--brief",
+            brief.to_str().unwrap(),
+            "--carrier",
+            "herdr",
+            "--hub",
+            &hub.base,
+            "--token",
+            token,
+            "--name",
+        ];
+        args.push(name);
+        args.extend_from_slice(extra);
+        std::process::Command::new(bin())
+            .args(args)
+            .env_remove("REMUDA_INSTANCE_ID")
+            .output()
+            .expect("run remuda")
+    };
+
+    // A person: the default, then a named mode.
+    let output = dispatch("p-default", &[], &hub.token);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(body["worker"]["permissionMode"], "bypassPermissions");
+    assert!(body["worker"].get("permissionModeRequested").is_none());
+    let output = dispatch("p-named", &["--permission-mode", "plan"], &hub.token);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(body["worker"]["permissionMode"], "plan");
+    assert_eq!(body["worker"]["permissionModeRequested"], "plan");
+
+    // An Agent seat running `auto`, holding `dispatch` in the project.
+    let store = hub._hub.store().context("store")?;
+    let seat = store
+        .insert_instance_delegated(
+            hub.host.clone(),
+            Some(hub.workspace.clone()),
+            "claude".into(),
+            "claude-sdk".into(),
+            Some("seat".into()),
+            json!({"kind": "claude", "permissionMode": "auto", "projectId": project_id}),
+            remuda_hub::store_test_support::seat_delegation(
+                remuda_protocol::InstanceScope {
+                    project_ids: vec![project_id.clone().try_into()?],
+                    ..Default::default()
+                },
+                vec!["dispatch".into()],
+            ),
+            remuda_hub::agent_scope_test_support::CallerAuthority::internal(),
+        )
+        .await?;
+    let seat_token = remuda_hub::instance_token(store.clone(), seat.instance_id.clone()).await?;
+    let output = dispatch("a-inherit", &[], &seat_token);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(
+        body["worker"]["permissionMode"], "auto",
+        "inherited, not bypass"
+    );
+    assert!(body["worker"].get("permissionModeRequested").is_none());
+    let output = dispatch(
+        "a-beyond",
+        &["--permission-mode", "bypassPermissions"],
+        &seat_token,
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("hub HTTP 403"), "{stderr}");
+    assert!(stderr.contains("beyond-creator"), "{stderr}");
     Ok(())
 }
 

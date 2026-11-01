@@ -16,7 +16,7 @@
 use clap::{Args, Subcommand};
 use serde_json::json;
 
-use super::hub_client::{HubOpts, block_on, print_json};
+use super::hub_client::{HubOpts, block_on, hub_http_error, print_json};
 use super::registry::Entrypoint;
 
 #[derive(Args)]
@@ -24,6 +24,11 @@ use super::registry::Entrypoint;
 pub(crate) struct WorkerArgs {
     #[command(flatten)]
     hub: HubOpts,
+    /// Retry a verb the owner approved (`answer`, or a `resume`/`replace` on a
+    /// shell-driver carrier): the `interactionId` the first attempt returned
+    /// (D-017). The request must be the same one.
+    #[arg(long = "approval-id", value_name = "INTERACTION_ID", global = true)]
+    approval_id: Option<String>,
     #[command(subcommand)]
     command: WorkerCommand,
 }
@@ -86,7 +91,10 @@ enum WorkerCommand {
 impl Entrypoint for WorkerArgs {
     fn enter(self, _context: super::registry::Context) -> anyhow::Result<i32> {
         block_on(async move {
-            let client = self.hub.connect()?;
+            let client = self
+                .hub
+                .connect()?
+                .with_approval(self.approval_id.clone(), false);
             if let WorkerCommand::Digest { worker } = &self.command {
                 let value = client.get(&format!("/v1/workers/{worker}/digest")).await?;
                 print_json(&value)?;
@@ -107,7 +115,8 @@ impl Entrypoint for WorkerArgs {
             };
             let value = client
                 .post(&format!("/v1/workers/{worker}/{path}"), &body)
-                .await?;
+                .await
+                .map_err(hub_http_error)?;
             print_json(&value)?;
             Ok(0)
         })

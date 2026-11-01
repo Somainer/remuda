@@ -1,6 +1,6 @@
 # Agent/user capability ledger: the human half
 
-> Status: proposed with ADR D-060 (2026-10-29), decision 12. Derived from origin/main `c27e0eac`: one row per PWA action (the routes in `web/src/app/router.tsx`, and the Hub calls their pages make through `web/src/lib/api.ts`, `web/src/lib/store.ts` and the feature modules) and one row per clap subcommand (`crates/remuda/src/cmd/`). The Agent side is read from the Hub's route filter `restrict_agent_routes` (`crates/remuda-hub/src/agent_scope.rs`) and each handler. Coverage was checked mechanically against that tree: every exported method of `web/src/lib/api.ts` (71), every Hub route (126 method-and-path pairs, plus the static web fallback) and every clap entry (98, of which 14 are pure command groups) maps to a row below, to "Hub routes no human action calls", or to "Not agent actions". The machine half is a later task: a table generated from the Hub router, `restrict_agent_routes` and the clap registry, with a gate check that the two halves do not drift.
+> Status: proposed with ADR D-060 (2026-10-29), decision 12. Rows closed by `ma-admission` (D-057 §4.2 items 1-6, 2026-11-01) were moved from Gap to the Today column, which for them describes the branch that landed it. Derived from origin/main `c27e0eac`: one row per PWA action (the routes in `web/src/app/router.tsx`, and the Hub calls their pages make through `web/src/lib/api.ts`, `web/src/lib/store.ts` and the feature modules) and one row per clap subcommand (`crates/remuda/src/cmd/`). The Agent side is read from the Hub's route filter `restrict_agent_routes` (`crates/remuda-hub/src/agent_scope.rs`) and each handler. Coverage was checked mechanically against that tree: every exported method of `web/src/lib/api.ts` (71), every Hub route (126 method-and-path pairs, plus the static web fallback) and every clap entry (98, of which 14 are pure command groups) maps to a row below, to "Hub routes no human action calls", or to "Not agent actions". The machine half is a later task: a table generated from the Hub router, `restrict_agent_routes` and the clap registry, with a gate check that the two halves do not drift.
 
 ## The rule
 
@@ -20,7 +20,7 @@ The ledger makes that rule auditable, and it keeps the seat's skill (`ma-skill`,
     - agent callers act only on what they own (D-057 §4.1), so an agent does not change configuration shared by sessions it does not own;
     - scope narrows and never grows (`validate_child_delegation`);
     - records are truthful (D-057 §0), so an agent does not erase the record of what agents did.
-  - **Gap.** Nothing stops it except a missing route or a missing rule. Every gap has a task id in **Planned**: `ma-admission` (main-agent.md §15) or an `ap-*` follow-up (§15.2).
+  - **Gap.** Nothing stops it except a missing route or a missing rule. Every gap has a task id in **Planned**: an `ap-*` follow-up (main-agent.md §15.2); the `ma-admission` gaps are closed.
 - **Planned** is the change a named task makes, or "—" when nothing is planned to change.
 
 How a row is decided on origin/main:
@@ -30,7 +30,7 @@ How a row is decided on origin/main:
 - `authorize_command`, `prepare_create`, `check_broadcast` and the fleet create ask for the D-017 one-shot approval where the row says so.
 
 Two limits recur below:
-- **D-051 limits** (`delegated_visible_items`, `authorize_agent_answer` in `crates/remuda-hub/src/interactions.rs`): only items of the caller and its direct children (`owns()`), only in projects whose D-051 switch is on, never approvals, and none at all while **either side runs `bypassPermissions`**. The plan-review self-exclusion applies. `ma-admission` lifts the bypass exclusion for questions and plan reviews (OA3).
+- **D-051 limits** (`delegated_visible_items`, `authorize_agent_answer` in `crates/remuda-hub/src/interactions.rs`): only items of the caller and its direct children (`owns()`), only in projects whose D-051 switch is on, and never approvals. Questions and plan reviews route whichever side runs `bypassPermissions` (OA3, `ma-admission`); while **either side runs `bypassPermissions`** every other kind (elicitation) is still excluded. The plan-review self-exclusion applies.
 - **Send rule** (`authorize_command`): no grant; no prompt for owned targets or for targets inside an explicitly narrowed scope; a shell-driver target, or an out-of-scope target the caller does not own, needs the D-017 approval.
 
 ## PWA actions
@@ -39,12 +39,12 @@ Two limits recur below:
 
 | Human action | Hub route | Today (origin/main) | Planned |
 |---|---|---|---|
-| See the session list | `GET /v1/instances`, `GET /v1/interactions` | Agent route. The full list needs `dispatch` and is filtered to the caller's scope; without `dispatch` an instance may list only itself or a direct child (`list_instances`). Interactions under the D-051 limits | `ma-admission` (OA3) for the interaction part |
+| See the session list | `GET /v1/instances`, `GET /v1/interactions` | Agent route. The full list needs `dispatch` and is filtered to the caller's scope; without `dispatch` an instance may list only itself or a direct child (`list_instances`). Interactions under the D-051 limits | — |
 | Preview a row's screen | `GET /v1/instances/{id}/screen` | Agent route. Owned targets (`owns()`) | — |
 | Send one prompt to several selected sessions | `POST /v1/instances/{id}/commands`, `instance.send`, once per session | Agent route. The send rule, per target | — |
 | Send keys from the list | commands, `instance.keys` | Safety. Keystrokes: every Agent `instance.keys` needs the D-017 approval | — |
 | Close a session from the list or a space tab | commands, `instance.close` | Agent route. Owned targets; any other needs the D-017 approval | — |
-| Resume a session (list, phone home, session page) | `POST /v1/instances/{id}/resume` | Gap. Operator-only (D-026) | Workers: `ma-admission` (scoped respawn helper, main-agent.md §4.2 item 5). Other owned instances: `ap-resume`. Main's own Resume stays a Human control (§6.5) |
+| Resume a session (list, phone home, session page) | `POST /v1/instances/{id}/resume` | Workers: Agent route by another path, `POST /v1/workers/{id}/resume` (the scoped respawn helper: `dispatch`, project scope, lineage-subtree ownership, the creator rule, and the D-017 approval for a shell-driver carrier; main-agent.md §4.2 item 5). Any other instance: Gap. The public route is operator-only (D-026) | Other owned instances: `ap-resume`. Main's own Resume stays a Human control (§6.5) |
 | Delete a session (spaces panel) | `DELETE /v1/instances/{id}` | Safety. Records are truthful: the record and journal are the evidence of what agents did. Operator-only (`delete_instance`) | — |
 
 ### Session (`/s/:id` and its tabs)
@@ -60,7 +60,7 @@ Two limits recur below:
 | See a send's receipt | `GET /v1/instances/{id}/commands/{commandId}` | Gap. The middleware's `read_target` admits only `/journal` and `/screen` below an instance, so command reads are refused for Agent origin; an agent cannot reconcile an unknown outcome by commandId (D-055) | `ap-command-read` admits both command reads for owned targets |
 | Stop the turn | commands, `instance.cancel` | Agent route. Owned targets; any other needs the D-017 approval | — |
 | Close the session | commands, `instance.close` | Agent route. As Stop. A chapter closing itself becomes `paused{self}`; pausing Main is the owner's control (main-agent.md §6.5) | — |
-| Answer a question or a plan review inline | `POST /v1/interactions/{id}/answer` | Agent route under the D-051 limits | `ma-admission` (OA3) |
+| Answer a question or a plan review inline | `POST /v1/interactions/{id}/answer` | Agent route under the D-051 limits | — |
 | Answer an approval inline | `POST /v1/interactions/{id}/answer` | Safety. Approvals are answered only by humans (D-017, D-051(a)) | — |
 | Change the model | commands, `instance.configure` | Gap. `authorize_command` admits only send, cancel, close, `tty.write` and keys for Agent origin | `ap-configure` |
 | Change the effort | commands, `instance.configure` | Gap. As above | `ap-configure` |
@@ -77,7 +77,7 @@ Two limits recur below:
 
 | Human action | Hub route | Today (origin/main) | Planned |
 |---|---|---|---|
-| Create a session | `POST /v1/instances` | Agent route. `dispatch` and scope (`prepare_create`); a cross-host or shell-driver create needs the D-017 approval; only `manual` or `plan` permission (`restrict_permission`); no argv or executable (`restrict_launch_overrides`) | `ma-admission`: "never beyond the creator" (OA1) replaces the `manual`/`plan` rule |
+| Create a session | `POST /v1/instances` | Agent route. `dispatch` and scope (`prepare_create`); a cross-host or shell-driver create needs the D-017 approval; the permission mode is "never beyond the creator" (OA1, `restrict_permission`): a control-off mode only under a caller that runs control-off, an omitted mode inherits the caller's own; no argv or executable (`restrict_launch_overrides`) | — |
 | Create a worktree for it | `POST /v1/worktrees` | Agent route by another path: a task binding (`POST /v1/tasks` with `workspaceBinding`, D-050, `dispatch`) or a dispatch leases the worktree; the raw worktree routes stay operator-only (main-agent.md §7.5) | — |
 | Pick a host | `GET /v1/hosts` | Gap. Operator-only (`list_hosts`); an agent reads hosts in its scope one by one through `GET /v1/hosts/{id}/hostcap` | `ap-host-read` |
 | Pick a workspace | `GET /v1/follow` (the host-workspace snapshot frames, `hostWorkspaceSubscribe` in `web/src/lib/api.ts`) | Gap. The follow socket is not admitted for Agent origin, and the REST list `GET /v1/hosts/{id}/workspaces` is operator-only (`workspaces.rs`) | `ap-host-read` |
@@ -90,8 +90,8 @@ Two limits recur below:
 
 | Human action | Hub route | Today (origin/main) | Planned |
 |---|---|---|---|
-| List pending items | `GET /v1/interactions`; settlement frames on `GET /v1/follow` (`settlementSubscribe`) | Agent route under the D-051 limits for the list. The settlement frames ride the follow socket, which is not admitted for Agent origin; an agent re-reads the list instead | `ma-admission` (OA3) |
-| Answer a question or a plan review | `POST /v1/interactions/{id}/answer` | Agent route under the D-051 limits | `ma-admission` (OA3) |
+| List pending items | `GET /v1/interactions`; settlement frames on `GET /v1/follow` (`settlementSubscribe`) | Agent route under the D-051 limits for the list. The settlement frames ride the follow socket, which is not admitted for Agent origin; an agent re-reads the list instead | — |
+| Answer a question or a plan review | `POST /v1/interactions/{id}/answer` | Agent route under the D-051 limits | — |
 | Answer an approval | `POST /v1/interactions/{id}/answer` | Safety. Approvals are answered only by humans | — |
 
 ### Board and projects (`/board`, `/projects`)
@@ -156,12 +156,12 @@ The page's create form is not wired to the Hub yet (`web/src/features/fleet/stor
 
 | Subcommand | Hub route | Today (origin/main) | Planned |
 |---|---|---|---|
-| `instance create` | `POST /v1/instances`; `GET /v1/hosts` only for label or unplaced creates | Agent route, as "Create a session". With an explicit `--host` the CLI reads no host list; with `--labels` or no host it tries `GET /v1/hosts`, which is refused for Agent origin, and lets the Hub place (`crates/remuda/src/cmd/instance.rs`). A computer-use create needs the list and fails for Agent origin | `ma-admission` (OA1) |
+| `instance create` | `POST /v1/instances`; `GET /v1/hosts` only for label or unplaced creates | Agent route, as "Create a session". With an explicit `--host` the CLI reads no host list; with `--labels` or no host it tries `GET /v1/hosts`, which is refused for Agent origin, and lets the Hub place (`crates/remuda/src/cmd/instance.rs`). A computer-use create needs the list and fails for Agent origin. `--permission-mode` follows "never beyond the creator" (OA1) | — |
 | `instance list` | `GET /v1/hosts` and `GET /v1/instances`; with `--watch`, `GET /v1/follow` | Gap. The CLI path (`agents::list` in `crates/remuda/src/cmd/agents.rs`) joins the host inventory, `GET /v1/hosts` (operator-only, `list_hosts`), with `GET /v1/instances`, so it fails for Agent origin even though `GET /v1/instances` itself admits a `dispatch` holder. `--watch` also opens the all-instances follow socket, which is not admitted for Agent origin | `ap-agent-list` |
 | `agents` | as `instance list` | Gap. The same `agents::list` path, with the same host-inventory and follow-socket dependencies | `ap-agent-list` |
 | `instance show` | `GET /v1/instances/{id}` | Agent route. Owned targets | — |
 | `instance send` | commands, `instance.send`; then `GET /v1/instances/{id}/commands` to follow a forwarded command | Agent route for the send. The send rule. The follow-up read (`resolve_command_state` in `crates/remuda/src/cmd/instance.rs`) is refused for Agent origin by `read_target`; the CLI then prints the POST's own row, so a send whose reply was lost stays `queued` in its output | `ap-command-read` for the follow-up read |
-| `instance respond` | `GET /v1/interactions?instanceId=`, `POST /v1/interactions/{id}/answer` | Agent route under the D-051 limits for questions and plan reviews; approvals: Safety | `ma-admission` (OA3) |
+| `instance respond` | `GET /v1/interactions?instanceId=`, `POST /v1/interactions/{id}/answer` | Agent route under the D-051 limits for questions and plan reviews; approvals: Safety | — |
 | `instance wait` | `GET /v1/instances/{id}/journal` | Agent route. Owned targets | — |
 | `instance read` | `GET /v1/instances/{id}/journal` | Agent route. Owned targets | — |
 | `instance keys` | commands, `instance.keys` | Safety. Keystrokes | — |
@@ -204,24 +204,24 @@ The worker subcommands send the worker's name or `wkr_…` id as given; the Hub 
 
 | Subcommand | Hub route | Today (origin/main) | Planned |
 |---|---|---|---|
-| `dispatch` | `POST /v1/workers/dispatch` | Gap. `restrict_agent_routes` does not admit `/v1/workers/*`, and dispatch writes a control-off mode for every harness (main-agent.md §4.2) | `ma-admission` |
-| `watch` | `POST /v1/workers/observe`, `GET /v1/instances`, `GET /v1/gate/jobs` (active jobs) or `GET /v1/projects/{id}/gate` with `--project` | Gap. `/v1/workers/*` and the cross-project gate read are not admitted | `ma-admission`; `ap-gate-reads` |
-| `report` | `GET /v1/workers`, and the gate queue: `GET /v1/projects/{id}/gate` with `--project`, otherwise `GET /v1/gate/jobs` | Gap. Worker routes are not admitted; without `--project` the gate read is refused too | `ma-admission`; `ap-gate-reads` |
-| `retire` | `POST /v1/workers/{id}/retire` | Gap. Not admitted | `ma-admission`, with lineage-subtree ownership (main-agent.md §4.2 item 1) |
-| `worker nudge` | `POST /v1/workers/{id}/nudge` | Gap. Not admitted | `ma-admission`, as `retire` |
-| `worker answer` | `POST /v1/workers/{id}/answer` | Gap. Not admitted | `ma-admission` admits it; it writes keys, so every Agent use then needs the D-017 approval (Safety, main-agent.md §13) |
-| `worker switch-model` | `POST /v1/workers/{id}/switch-model` | Gap. Not admitted | `ma-admission`, as `retire` |
-| `worker resume` | `POST /v1/workers/{id}/resume` | Gap. Not admitted | `ma-admission` (scoped respawn helper) |
-| `worker replace` | `POST /v1/workers/{id}/replace` | Gap. Not admitted | `ma-admission` (scoped respawn helper) |
-| `worker stop` | `POST /v1/workers/{id}/stop` | Gap. Not admitted | `ma-admission`, as `retire` |
-| `brief send` | `POST /v1/workers/{id}/brief` | Gap. Not admitted | `ma-admission`, as `retire` |
+| `dispatch` | `POST /v1/workers/dispatch` | Agent route. `dispatch` and project scope; `--permission-mode` follows "never beyond the creator" (OA1) and an omitted mode inherits the caller's own; another host or a shell-driver carrier needs the D-017 approval, decided before any name, port block or worktree is allocated (main-agent.md §4.2 items 2-4) | — |
+| `watch` | `POST /v1/workers/observe`, `GET /v1/instances`, `GET /v1/gate/jobs` (active jobs) or `GET /v1/projects/{id}/gate` with `--project` | Agent route for the worker part: `observe` is scope-wide under `dispatch`. Gap for the cross-project gate read, which is not admitted | `ap-gate-reads` |
+| `report` | `GET /v1/workers`, and the gate queue: `GET /v1/projects/{id}/gate` with `--project`, otherwise `GET /v1/gate/jobs` | Agent route for `GET /v1/workers` (scope-wide under `dispatch`). Gap without `--project`: the gate read is refused | `ap-gate-reads` |
+| `retire` | `POST /v1/workers/{id}/retire` | Agent route. `dispatch`, project scope, and the worker in the caller's lineage subtree (main-agent.md §4.2 item 1) | — |
+| `worker nudge` | `POST /v1/workers/{id}/nudge` | Agent route, as `retire` | — |
+| `worker answer` | `POST /v1/workers/{id}/answer` | Agent route, as `retire`. It writes keys, so every Agent use needs the D-017 approval (Safety, keystrokes) | — |
+| `worker switch-model` | `POST /v1/workers/{id}/switch-model` | Agent route, as `retire` | — |
+| `worker resume` | `POST /v1/workers/{id}/resume` | Agent route, as `retire`, through the scoped respawn helper: carrier and modes kept, the new instance's parent is the chapter that dispatched the worker, the creator rule and the D-017 approval for a shell-driver carrier apply (main-agent.md §4.2 item 5) | — |
+| `worker replace` | `POST /v1/workers/{id}/replace` | Agent route, as `retire`; the replacement is a dispatch, its approval decided before the old worker is retired | — |
+| `worker stop` | `POST /v1/workers/{id}/stop` | Agent route, as `retire` | — |
+| `brief send` | `POST /v1/workers/{id}/brief` | Agent route, as `retire` | — |
 | `hostcap` | `GET /v1/hosts/{id}/hostcap` | Agent route. `dispatch` and host scope (D-045) | — |
 
 ### Fleet, host files and diagnostics
 
 | Subcommand | Hub route | Today (origin/main) | Planned |
 |---|---|---|---|
-| `fleet run` | `POST /v1/fleet/instances` | Agent route. `dispatch`, checked as each child is inserted (`validate_child_delegation`); the D-017 approval when any chosen host is not the caller's host or the driver is a shell driver (`create_fleet`); only `manual` or `plan` permission | `ma-admission` (OA1) |
+| `fleet run` | `POST /v1/fleet/instances` | Agent route. `dispatch`, checked as each child is inserted (`validate_child_delegation`); the D-017 approval when any chosen host is not the caller's host or the driver is a shell driver (`create_fleet`); the permission mode follows "never beyond the creator" (OA1) | — |
 | `fleet send` | `POST /v1/fleet/broadcast`, `instance.send` | Agent route, as "Broadcast a prompt"; `--all` is refused | — |
 | `fleet keys` | `POST /v1/fleet/broadcast`, `tty.write` | Safety. Keystrokes | — |
 | `host files list` | `GET /v1/hosts/{id}/files` | Safety. Cross-host, as for workspace changes (`host_files.rs`) | — |
@@ -316,7 +316,6 @@ Every Gap row above, by the task that closes it. The `ap-*` tasks are defined in
 
 | Task | Closes |
 |---|---|
-| `ma-admission` | `dispatch`; `watch`, `report` (worker reads); `retire`; `worker nudge`, `answer`, `switch-model`, `resume`, `replace`, `stop`; `brief send`; worker resume from the PWA; the D-051 bypass exclusion (OA3) |
 | `ap-command-read` | a send's receipt, `instance send`'s follow-up read, and every command read (`GET /v1/instances/{id}/commands`, `GET /v1/instances/{id}/commands/{commandId}`) |
 | `ap-gate-reads` | `gate log`; `gate list` without `--project`; the gate parts of `watch` and `report`; the failure log of `gate <branch>` |
 | `ap-agent-list` | `instance list` and `agents`, including `--watch` |

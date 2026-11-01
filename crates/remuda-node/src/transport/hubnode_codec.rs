@@ -406,6 +406,7 @@ async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeErr
         // recovered from the raw spec below and, if either is present and
         // unrecognized, the create is refused rather than quietly replaced.
         Err(_) => CreateInstanceRequest {
+            creator_permission_mode: None,
             origin: remuda_protocol::InputOrigin::Agent,
             initiator: None,
             agent_credential: None,
@@ -476,6 +477,8 @@ async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeErr
     request.initiator = crate::origin::wire_initiator(&params);
     // D-060: top-level `memoryContext` only, never the spec's.
     request.take_memory_context(&params);
+    // D-057 OA1: top-level `creatorPermissionMode` only, never the spec's.
+    request.take_creator_permission_mode(&params);
     request.agent_credential = params
         .get("agentCredential")
         .cloned()

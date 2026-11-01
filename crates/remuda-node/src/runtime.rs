@@ -1393,6 +1393,21 @@ impl DevNode {
         let api_relay = Arc::clone(&self.inner.api_relay);
         let node = Arc::downgrade(&self.inner);
         let worker = tokio::spawn(async move {
+            // resume-config r2: before anything is materialized, a resumed
+            // chapter takes OWNERSHIP of its managed Claude home by moving the
+            // predecessor's directory into its own slot. The predecessor was
+            // closed/paused before this chapter was admitted; a still-live or
+            // unknown predecessor is refused.
+            if let Some(inner) = node.upgrade()
+                && let Err(error) =
+                    adopt_resumed_native_home(&inner, &worker_instance, &launch.request)
+            {
+                tracing::error!(%error, "resumed chapter could not take over its Claude home");
+                record_task_exit(store.as_ref(), &worker_instance, &error.to_string());
+                api_relay.revoke_instance(worker_instance.as_id().as_str());
+                inner.senders.write().await.remove(&worker_instance);
+                return;
+            }
             // Building the driver is materialization, not acceptance: it runs
             // `pin_binary` (a ~207 MB SHA-256 the first time, plus a blocking
             // `--version` subprocess), writes the settings overlay and launch
@@ -2589,6 +2604,112 @@ fn record_task_exit(store: &dyn LocalStore, instance_id: &InstanceId, reason: &s
     {
         tracing::error!(%error, "failed to append task-exit lifecycle event");
     }
+}
+
+/// resume-config r2: a resumed chapter OWNS the managed Claude home it runs in.
+///
+/// A managed home is per instance (`data_dir/instances/<id>/native-home`), so
+/// a successor with no explicit `claudeConfigDir` and no Node-wide home takes
+/// the predecessor's home by MOVING it into its own slot — one rename on the
+/// same filesystem, before anything launches. Borrowing the predecessor's slot
+/// instead loses the transcript at the second hop of a chain (C would look in
+/// B's slot, which never held it), lets a purge of the predecessor delete a
+/// live successor's home, and lets two successors share one home.
+///
+/// The predecessor must have stopped: its durable lifecycle must be `exited`
+/// or `failed` (ma-fence resumes a paused/closed chapter, so this is the
+/// construction, not a special case). A live or unknown predecessor is refused
+/// rather than moving a directory a process may still be writing.
+///
+/// Returns `Ok(())` when no transfer applies: an explicit config dir or a
+/// Node-wide home is shared on purpose, the successor already owns its slot
+/// (a retried resume after a crash between the rename and the launch), or the
+/// predecessor never used the managed slot (its recipe names another home).
+fn adopt_resumed_native_home(
+    inner: &DevNodeInner,
+    successor: &InstanceId,
+    request: &CreateInstanceRequest,
+) -> Result<(), NodeError> {
+    let Some(config) = inner.herdr_config.as_ref() else {
+        return Ok(());
+    };
+    let Some(parent) = request.resumed_from.as_ref() else {
+        return Ok(());
+    };
+    if !crate::native::uses_managed_native_home(config, request, request.driver) {
+        return Ok(());
+    }
+    let target = crate::native::managed_native_home(&config.data_dir, successor);
+    if target.exists() {
+        // Retried resume: the home already sits in this chapter's slot.
+        return Ok(());
+    }
+    let source = crate::native::managed_native_home(&config.data_dir, parent);
+    match inner.store.get_instance(parent) {
+        Ok(instance)
+            if matches!(
+                instance.lifecycle,
+                InstanceLifecycle::Exited | InstanceLifecycle::Failed
+            ) => {}
+        Ok(instance) => {
+            return Err(NodeError::Conflict(format!(
+                "cannot take over the managed Claude home of {}: that chapter is {:?}, \
+                 not exited; close or pause it before resuming",
+                parent.as_id(),
+                instance.lifecycle
+            )));
+        }
+        Err(error) => {
+            return Err(NodeError::Conflict(format!(
+                "cannot take over the managed Claude home of {}: the chapter is unknown \
+                 on this Node ({error})",
+                parent.as_id()
+            )));
+        }
+    }
+    if !source.is_dir() {
+        // Only the predecessor's own recipe says whether it used the managed
+        // slot. If it did, the home already moved to another successor (or a
+        // purge removed it): starting a fresh, empty home here would silently
+        // discard the conversation, so refuse instead.
+        let owned_slot = inner
+            .store
+            .launch_recipe(parent)
+            .ok()
+            .flatten()
+            .is_some_and(|recipe| Path::new(&recipe.native_home) == source);
+        if owned_slot {
+            return Err(NodeError::Conflict(format!(
+                "the managed Claude home of {} was already transferred to another \
+                 successor (or purged); a second successor would start a blank conversation",
+                parent.as_id()
+            )));
+        }
+        return Ok(());
+    }
+    if let Some(parent_dir) = target.parent()
+        && let Err(error) = std::fs::create_dir_all(parent_dir)
+    {
+        return Err(NodeError::Driver(format!(
+            "could not create the successor instance directory {}: {error}",
+            parent_dir.display()
+        )));
+    }
+    if let Err(error) = std::fs::rename(&source, &target) {
+        // A racing successor may have won the rename; report it as the same
+        // clear ownership refusal rather than a bare IO error.
+        return Err(NodeError::Conflict(format!(
+            "could not move the managed Claude home {} into {}: {error}",
+            source.display(),
+            target.display()
+        )));
+    }
+    tracing::info!(
+        predecessor = %parent.as_id(),
+        successor = %successor.as_id(),
+        "transferred the managed Claude home to the successor chapter"
+    );
+    Ok(())
 }
 
 /// Store what the live driver says this session can do (§4.3, §6).

@@ -15,9 +15,10 @@ use remuda_driver::{
 use remuda_protocol::{
     AgentKind, ArgvInputPolicy, BgInputDelivery, CarrierSpec, ClaudeInteractionMode,
     ClaudePermission, ClaudePermissionMode, CompletionScope, ContentBlock, DriverInput, DriverKind,
-    HerdrRepresentation, HerdrServer, HostId, Id, InputOrigin, InstanceSpec, InteractionAnswer,
-    NativeHome, NativeHomeMode, PermissionMode, ProfileRef, PromptInput, PromptMode, PtyBackend,
-    PtyCarrier, SchemaVersion, SettingsFormat, SettingsOverlay, TextBlock, U64,
+    HerdrRepresentation, HerdrServer, HostId, Id, InputOrigin, InstanceId, InstanceSpec,
+    InteractionAnswer, NativeHome, NativeHomeMode, PermissionMode, ProfileRef, PromptInput,
+    PromptMode, PtyBackend, PtyCarrier, SchemaVersion, SettingsFormat, SettingsOverlay, TextBlock,
+    U64,
 };
 use sha2::{Digest as _, Sha256};
 use std::future::Future;
@@ -173,31 +174,48 @@ fn node_herdr_session(data_dir: &Path, configured: Option<String>) -> String {
     })
 }
 
-/// The Remuda-managed Claude home a resumed chapter's predecessor used.
+/// The Remuda-managed Claude home slot of one instance
+/// (`data_dir/instances/<id>/native-home`).
 ///
-/// A non-inherited native home is per instance
-/// (`data_dir/instances/<id>/native-home`), so a successor — which has its own
-/// instance id — would otherwise scan a directory its predecessor never wrote
-/// its transcript to and `--resume <sessionId>` would start blank. When the
-/// request names a `resumedFrom` chapter whose managed home is still on this
-/// Node, the successor runs in that same home. The two higher-precedence
-/// sources resolve first: an explicit `claudeConfigDir` (which the Hub carries
-/// onto the successor spec) and the Node-wide `REMUDA_CLAUDE_CONFIG_DIR`.
-///
-/// The `--resume` transcript does not live in the launch directory: Claude
-/// writes `<home>/projects/<slug>/<session>.jsonl`, and every carrier builds
-/// its `CLAUDE_CONFIG_DIR` / native-home pin from this one value, so one home
-/// is all a continuation needs.
-fn resumed_parent_native_home(
-    data_dir: &Path,
-    resumed_from: Option<&remuda_protocol::InstanceId>,
-) -> Option<PathBuf> {
-    let parent = resumed_from?;
-    let home = data_dir
+/// resume-config r2 transfers ownership between chapters by moving this
+/// directory into the successor's slot; nothing may borrow a predecessor's
+/// slot, or a chain would lose the transcript at the second hop, a purge of
+/// the predecessor would delete a live successor's home, and two successors
+/// could share one home.
+pub(crate) fn managed_native_home(data_dir: &Path, instance_id: &InstanceId) -> PathBuf {
+    data_dir
         .join("instances")
-        .join(parent.as_id().as_str())
-        .join("native-home");
-    home.is_dir().then_some(home)
+        .join(instance_id.as_id().as_str())
+        .join("native-home")
+}
+
+/// Whether this launch lands in the per-instance managed home: no explicit
+/// `claudeConfigDir`, no operator-inherited default, and no Node-wide
+/// `REMUDA_CLAUDE_CONFIG_DIR`.
+///
+/// Mirrors the `native_home` branch of [`NativeClaudeFactory::build`] exactly;
+/// the Node's home-ownership transfer (resume-config r2) only applies where
+/// that branch chooses the managed slot. An explicit config dir is shared on
+/// purpose and is never moved.
+pub(crate) fn uses_managed_native_home(
+    config: &NativeDriverConfig,
+    request: &crate::CreateInstanceRequest,
+    driver: DriverKind,
+) -> bool {
+    if config.claude_native_home.is_some() {
+        return false;
+    }
+    let explicit = request
+        .claude_config_dir
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|path| !path.is_empty());
+    if explicit {
+        return false;
+    }
+    let inherit_default =
+        driver != DriverKind::GenericPty && matches!(parse_delegation(request), Delegation::None);
+    !inherit_default
 }
 
 /// Register the native per-instance factories.
@@ -345,12 +363,6 @@ impl DriverFactory for NativeClaudeFactory {
             self.config
                 .claude_native_home
                 .clone()
-                .or_else(|| {
-                    resumed_parent_native_home(
-                        &self.config.data_dir,
-                        launch.request.resumed_from.as_ref(),
-                    )
-                })
                 .unwrap_or_else(|| instance_dir.join("native-home"))
         };
         #[cfg(target_os = "macos")]
@@ -2305,31 +2317,95 @@ mod tests {
         assert!(error.to_string().contains("conflicts"));
     }
 
-    /// resume-config: a resumed chapter inherits the managed native home its
-    /// predecessor's transcript lives in. The dir is the parent instance's
-    /// `native-home` under this Node's data dir; an absent one (inherited
-    /// default or an explicit `claudeConfigDir`) falls through to the
-    /// successor's own fallback.
+    /// resume-config r2: a managed home lives in exactly one instance slot;
+    /// the ownership transfer moves it, and only a launch that really lands in
+    /// that slot participates. An explicit dir and a Node-wide home are shared
+    /// on purpose and never move.
     #[test]
-    fn resumed_chapters_reuse_the_parents_managed_native_home() {
+    fn only_the_managed_slot_participates_in_a_home_transfer() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let parent = InstanceId::new();
-        let parent_home = dir
-            .path()
-            .join("instances")
-            .join(parent.as_id().as_str())
-            .join("native-home");
-        std::fs::create_dir_all(&parent_home).expect("parent home");
+        let id = InstanceId::new();
         assert_eq!(
-            resumed_parent_native_home(dir.path(), Some(&parent)),
-            Some(parent_home)
+            managed_native_home(dir.path(), &id),
+            dir.path()
+                .join("instances")
+                .join(id.as_id().as_str())
+                .join("native-home")
         );
-        let never_launched = InstanceId::new();
-        assert_eq!(
-            resumed_parent_native_home(dir.path(), Some(&never_launched)),
-            None
-        );
-        assert_eq!(resumed_parent_native_home(dir.path(), None), None);
+
+        let mut request = crate::CreateInstanceRequest {
+            creator_permission_mode: None,
+            memory_context: None,
+            initiator: None,
+            origin: InputOrigin::Human,
+            agent_credential: None,
+            command_id: None,
+            instance_id: None,
+            host_id: None,
+            workspace_id: None,
+            kind: AgentKind::Claude,
+            driver: DriverKind::ClaudePrint,
+            model: "fake".into(),
+            args: Vec::new(),
+            binary_path: None,
+            binary_sha256: None,
+            provider_profile_id: "none".into(),
+            permission_mode: "dontAsk".into(),
+            sandbox: None,
+            prompt: String::new(),
+            cwd: None,
+            delegation: Some("direct".into()),
+            settings_overlay_path: None,
+            claude_config_dir: None,
+            max_budget_usd: None,
+            provider_overlay: None,
+            provider_auth_token: None,
+            resume_session_id: None,
+            resumed_from: None,
+            effort: None,
+            tui: None,
+            extra_env: Default::default(),
+            capabilities: Default::default(),
+            api_route: None,
+            api_relay_endpoint: None,
+        };
+        let config = NativeDriverConfig::new(dir.path().to_path_buf());
+        assert!(uses_managed_native_home(
+            &config,
+            &request,
+            DriverKind::ClaudePrint
+        ));
+        // Delegation `none` on a CLI carrier inherits the operator default.
+        request.delegation = None;
+        assert!(!uses_managed_native_home(
+            &config,
+            &request,
+            DriverKind::ClaudePrint
+        ));
+        request.delegation = Some("direct".into());
+        // An explicit config dir is shared on purpose.
+        request.claude_config_dir = Some("/opt/claude-home".into());
+        assert!(!uses_managed_native_home(
+            &config,
+            &request,
+            DriverKind::ClaudePrint
+        ));
+        request.claude_config_dir = None;
+        // A Node-wide home is shared on purpose.
+        let node_wide = config
+            .clone()
+            .with_claude_native_home(PathBuf::from("/opt/node-wide-home"));
+        assert!(!uses_managed_native_home(
+            &node_wide,
+            &request,
+            DriverKind::ClaudePrint
+        ));
+        // generic-pty never inherits the operator default.
+        assert!(uses_managed_native_home(
+            &config,
+            &request,
+            DriverKind::GenericPty
+        ));
     }
 
     /// A spec `binaryPath` outranks the Node-wide `REMUDA_CLAUDE_BIN`.

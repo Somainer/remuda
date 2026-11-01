@@ -41,7 +41,6 @@ struct FakeNode {
     task: tokio::task::JoinHandle<()>,
     /// Every Hub→Node call, in order: method and params.
     calls: mpsc::UnboundedReceiver<(String, Value)>,
-    #[allow(dead_code)] // the commit-point and approval tests use it
     hold: Arc<Mutex<Option<ProvisionHold>>>,
 }
 
@@ -65,7 +64,6 @@ impl FakeNode {
     }
 
     /// Park the next `worker.provision` until the returned notify fires.
-    #[allow(dead_code)] // the commit-point test uses it
     fn hold_provision(&self) -> (mpsc::UnboundedReceiver<Value>, Arc<Notify>) {
         let (arrived, arrivals) = mpsc::unbounded_channel();
         let release = Arc::new(Notify::new());
@@ -156,7 +154,11 @@ async fn enroll_node(
                         continue;
                     };
                     let params = frame.get("params").cloned().unwrap_or(json!({}));
-                    let _ = tx.send((method.clone(), params.clone()));
+                    // The owner's `GET /v1/interactions` fans out to every
+                    // Node; a read, never an effect the tests count.
+                    if method != "interaction.list" {
+                        let _ = tx.send((method.clone(), params.clone()));
+                    }
                     let result = match method.as_str() {
                         "worker.provision" => {
                             let name = params["name"].as_str().unwrap_or("x").to_string();
@@ -189,6 +191,7 @@ async fn enroll_node(
                             "fenceId": params["fenceId"], "closedInstanceIds": [], "outcomes": [],
                         }),
                         "tty.screen" => json!({"supported": false}),
+                        "interaction.list" => json!({"items": []}),
                         _ => json!({"accepted": true}),
                     };
                     let response = json!({"jsonrpc": "2.0", "id": id, "result": result});
@@ -222,7 +225,6 @@ struct Ctx {
     /// A second project member host, for cross-host dispatch.
     far_host: String,
     far_workspace: String,
-    #[allow(dead_code)] // the cross-host approval test uses it
     far_node: FakeNode,
     project: String,
 }
@@ -1124,4 +1126,251 @@ async fn an_agents_worker_answer_needs_a_human_approval() {
         .collect();
     assert_eq!(writes.len(), 1);
     assert_eq!(writes[0].1["keys"], json!(["1"]));
+}
+
+// ── item 4: the D-017 approval is decided before any allocation ──────────
+
+impl Ctx {
+    /// Roster rows in the project.
+    async fn roster(&self) -> Vec<Value> {
+        let reply = self
+            .request(
+                "GET",
+                &format!("/v1/workers?project={}", self.project),
+                None,
+            )
+            .await;
+        reply.body["items"].as_array().cloned().unwrap_or_default()
+    }
+}
+
+/// A cross-host Agent dispatch raises exactly one approval and allocates
+/// nothing while it is pending: no Node call, no roster row, and a retry of
+/// the same body reuses the same card. The approved retry dispatches.
+#[tokio::test]
+async fn a_cross_host_dispatch_is_approved_before_anything_is_allocated() {
+    let mut ctx = Ctx::spawn().await.unwrap();
+    let seat = ctx.seat("claude", "auto").await;
+    ctx.node.drain();
+    ctx.far_node.drain();
+    let mut body = ctx.dispatch_body("faraway");
+    body["hostId"] = json!(ctx.far_host);
+    let first = ctx
+        .send(
+            "POST",
+            "/v1/workers/dispatch",
+            Some(body.clone()),
+            &seat.token,
+            &[],
+        )
+        .await;
+    assert_eq!(first.status, 409, "{}", first.body);
+    assert_eq!(first.body["code"], "HUMAN_APPROVAL_REQUIRED");
+    let card = first.body["interactionId"].as_str().unwrap().to_string();
+    let retry = ctx
+        .send(
+            "POST",
+            "/v1/workers/dispatch",
+            Some(body.clone()),
+            &seat.token,
+            &[],
+        )
+        .await;
+    assert_eq!(
+        retry.body["interactionId"],
+        card.as_str(),
+        "same request, same card"
+    );
+    assert_eq!(ctx.pending_approvals().await, 1, "exactly one approval");
+    let far = ctx.far_node.drain();
+    assert!(
+        far.is_empty(),
+        "nothing provisioned on the far host: {far:?}"
+    );
+    assert!(ctx.node.drain().is_empty());
+    assert!(
+        ctx.roster().await.is_empty(),
+        "no roster row, no name, no port block"
+    );
+
+    ctx.approve(&card).await;
+    let approved = ctx
+        .send(
+            "POST",
+            "/v1/workers/dispatch",
+            Some(body),
+            &seat.token,
+            &[("x-remuda-approval-id", card.as_str())],
+        )
+        .await;
+    assert_eq!(approved.status, 200, "{}", approved.body);
+    let methods: Vec<_> = ctx.far_node.drain().into_iter().map(|(m, _)| m).collect();
+    assert!(
+        methods.contains(&"worker.provision".to_string()),
+        "{methods:?}"
+    );
+    assert!(
+        methods.contains(&"instance.create".to_string()),
+        "{methods:?}"
+    );
+    assert_eq!(approved.body["worker"]["permissionMode"], "auto");
+}
+
+/// A same-host dispatch onto the shell-driver carrier asks too, before the
+/// worktree; a changed body after the approval is a new request.
+#[tokio::test]
+async fn a_shell_driver_dispatch_is_approved_first_and_a_changed_body_asks_again() {
+    let mut ctx = Ctx::spawn().await.unwrap();
+    let seat = ctx.seat("claude", "auto").await;
+    ctx.node.drain();
+    let mut body = ctx.dispatch_body("native1");
+    body["carrier"] = json!("native");
+    let first = ctx
+        .send(
+            "POST",
+            "/v1/workers/dispatch",
+            Some(body.clone()),
+            &seat.token,
+            &[],
+        )
+        .await;
+    assert_eq!(first.status, 409, "{}", first.body);
+    let card = first.body["interactionId"].as_str().unwrap().to_string();
+    assert!(
+        ctx.node.drain().is_empty(),
+        "no worktree before the approval"
+    );
+    ctx.approve(&card).await;
+
+    // The approval names this exact dispatch: another brief is another
+    // request, and the approval id does not carry over to it.
+    let mut changed = body.clone();
+    changed["brief"] = json!("A different task.\nReply on one line: DONE <sha>.\n");
+    let other = ctx
+        .send(
+            "POST",
+            "/v1/workers/dispatch",
+            Some(changed),
+            &seat.token,
+            &[("x-remuda-approval-id", card.as_str())],
+        )
+        .await;
+    assert_eq!(other.status, 403, "{}", other.body);
+    assert_eq!(reason(&other), "approval-invalid");
+    assert!(ctx.node.drain().is_empty());
+
+    let approved = ctx
+        .send(
+            "POST",
+            "/v1/workers/dispatch",
+            Some(body),
+            &seat.token,
+            &[("x-remuda-approval-id", card.as_str())],
+        )
+        .await;
+    assert_eq!(approved.status, 200, "{}", approved.body);
+    assert_eq!(approved.body["worker"]["driver"], "shell-pty");
+}
+
+/// §15.1: the creator's mode is read again at the commit point, after the
+/// worktree exists. A mode change while the dispatch was provisioning aborts
+/// the create with a reason, launches nothing, and gives the worktree back.
+#[tokio::test]
+async fn a_creator_mode_change_while_provisioning_aborts_the_dispatch() {
+    let mut ctx = Ctx::spawn().await.unwrap();
+    let seat = ctx.seat("claude", "auto").await;
+    ctx.node.drain();
+    let (mut arrived, release) = ctx.node.hold_provision();
+    let token = seat.token.clone();
+    let http = ctx.http.clone();
+    let url = format!("http://{}/v1/workers/dispatch", ctx.hub.addr);
+    let body = ctx.dispatch_body("raced");
+    let dispatch = tokio::spawn(async move {
+        let response = http
+            .post(url)
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        (status, response.json::<Value>().await.unwrap())
+    });
+    // The worktree is being provisioned: the admission already read `auto`.
+    arrived.recv().await.expect("provision reached the Node");
+    ctx.store()
+        .patch_instance_configure(seat.id.clone(), json!({"permissionMode": "manual"}))
+        .await
+        .unwrap();
+    release.notify_one();
+    let (status, body) = dispatch.await.unwrap();
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["reason"], "creator-mode-changed", "{body}");
+    assert_eq!(body["next"]["action"], "retry-same-command");
+    let methods: Vec<_> = ctx.node.drain().into_iter().map(|(m, _)| m).collect();
+    assert!(
+        methods.contains(&"worker.remove".to_string()),
+        "rolled back: {methods:?}"
+    );
+    assert!(
+        !methods.contains(&"instance.create".to_string()),
+        "{methods:?}"
+    );
+    assert!(ctx.roster().await.is_empty());
+}
+
+/// `worker replace` decides the replacement's approval before it retires the
+/// old worker: while the approval is pending the old worker is untouched.
+#[tokio::test]
+async fn replace_decides_its_approval_before_retiring() {
+    let mut ctx = Ctx::spawn().await.unwrap();
+    let seat = ctx.seat("claude", "auto").await;
+    let own = ctx
+        .send(
+            "POST",
+            "/v1/workers/dispatch",
+            Some(ctx.dispatch_body("swap")),
+            &seat.token,
+            &[],
+        )
+        .await;
+    assert_eq!(own.status, 200, "{}", own.body);
+    ctx.node.drain();
+    // The replacement re-selects the default carrier, here the native
+    // shell-pty: a shell driver, so the owner is asked first.
+    let pending = ctx
+        .send(
+            "POST",
+            "/v1/workers/swap/replace",
+            Some(json!({})),
+            &seat.token,
+            &[],
+        )
+        .await;
+    assert_eq!(pending.status, 409, "{}", pending.body);
+    let card = pending.body["interactionId"].as_str().unwrap().to_string();
+    assert!(
+        ctx.node.drain().is_empty(),
+        "nothing closed, removed or provisioned"
+    );
+    let roster = ctx.roster().await;
+    assert_eq!(roster.len(), 1);
+    assert_eq!(
+        roster[0]["state"]["state"], "working",
+        "the old worker is untouched"
+    );
+
+    ctx.approve(&card).await;
+    let replaced = ctx
+        .send(
+            "POST",
+            "/v1/workers/swap/replace",
+            Some(json!({})),
+            &seat.token,
+            &[("x-remuda-approval-id", card.as_str())],
+        )
+        .await;
+    assert_eq!(replaced.status, 200, "{}", replaced.body);
+    assert_eq!(replaced.body["worker"]["driver"], "shell-pty");
+    assert_eq!(ctx.pending_approvals().await, 0);
 }

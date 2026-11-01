@@ -714,6 +714,10 @@ pub fn restrict_launch_overrides(device: &Device, spec: &Value) -> Result<(), Hu
 pub enum CreateApproval {
     /// `prepare_create` asks on the finished spec (instance create).
     OnSpec,
+    /// The caller already decided it before any allocation, on a request
+    /// derived from its own body (dispatch and worker respawn, main-agent.md
+    /// §4.2 item 4).
+    Decided,
 }
 
 /// What a create path hands [`prepare_create`].

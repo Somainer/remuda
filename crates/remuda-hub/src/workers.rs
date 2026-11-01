@@ -75,7 +75,7 @@ pub fn routes() -> Router<AppState> {
 
 // ── request bodies ─────────────────────────────────────────────────────────
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DispatchBody {
     /// Brief text (utf8). The CLI reads the brief file and posts the bytes;
@@ -250,7 +250,51 @@ async fn dispatch_worker(
     headers: HeaderMap,
     Json(body): Json<DispatchBody>,
 ) -> Result<Json<Value>, HubError> {
-    dispatch_core(State(state), headers, body).await
+    dispatch_core(State(state), headers, body, DispatchApproval::Decide).await
+}
+
+/// How [`dispatch_core`] treats an Agent dispatch's D-017 one-shot approval
+/// (main-agent.md §4.2 item 4). The approval is always decided before any
+/// name, port block or worktree is allocated.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum DispatchApproval {
+    /// Decide it here, then dispatch.
+    Decide,
+    /// Decide it and stop before allocating anything, answering
+    /// `{"approval": <request or null>}`: `worker replace` decides before it
+    /// retires the old worker.
+    DecideOnly,
+    /// Already decided earlier in this same request on exactly this request
+    /// (or on none). A dispatch that now resolves to a different request is
+    /// refused rather than run unapproved.
+    Decided(Option<Value>),
+}
+
+/// The D-017 approval request for an Agent dispatch, derived from the body
+/// and its resolution only — never from anything allocated — so an approved
+/// retry of the same body matches and a changed body does not (main-agent.md
+/// §4.2 item 4): project, resolved host, harness, carrier, model, permission
+/// mode, brief digest, task and name.
+fn dispatch_approval_request(
+    body: &DispatchBody,
+    host_id: &str,
+    harness: &str,
+    driver: &str,
+    model: Option<&str>,
+    permission_mode: &str,
+) -> Value {
+    json!({
+        "operation": "worker.dispatch",
+        "projectId": body.project_id.as_id(),
+        "hostId": host_id,
+        "harness": harness,
+        "driver": driver,
+        "model": model,
+        "permissionMode": permission_mode,
+        "briefDigest": format!("sha256:{}", crate::config::sha256_hex(body.brief.as_bytes())),
+        "taskId": body.task_id,
+        "name": body.name,
+    })
 }
 
 /// Dispatch a worker from a validated body. Shared by the HTTP route and
@@ -260,6 +304,7 @@ pub(crate) async fn dispatch_core(
     state: State<AppState>,
     headers: HeaderMap,
     body: DispatchBody,
+    approval: DispatchApproval,
 ) -> Result<Json<Value>, HubError> {
     require_origin(&headers, &state.config)?;
     let device = caller(&state, &headers).await?;
@@ -509,6 +554,54 @@ pub(crate) async fn dispatch_core(
             .unwrap_or_else(|| HUMAN_DISPATCH_PERMISSION_MODE.to_string()),
     };
 
+    // ── D-017 approval (D-057 §4.2 item 4), before any allocation ──────────
+    // An Agent dispatch to another host, or onto a shell-driver carrier, asks
+    // the owner once, on a request derived from the body. Nothing is named,
+    // port-blocked or provisioned while it is pending, and an approved retry
+    // of the same body passes.
+    let approval_request = if admitted_mode.is_some() {
+        // A placement outside the seat's box is refused before anyone is paged.
+        if !scope.allows_host(&host.host_id)
+            || !scope.allows_workspace(workspace_id.as_id().as_str())
+        {
+            return Err(HubError::out_of_scope());
+        }
+        let needed = !crate::agent_scope::same_host(&state, &device, &host.host_id).await?
+            || crate::agent_scope::shell_driver(&driver)
+            || headers.contains_key("x-remuda-require-approval");
+        needed.then(|| {
+            dispatch_approval_request(
+                &body,
+                &host.host_id,
+                &harness,
+                &driver,
+                model.as_deref(),
+                &permission_mode,
+            )
+        })
+    } else {
+        None
+    };
+    match (&approval, &approval_request) {
+        (DispatchApproval::Decided(decided), current) => {
+            if decided != current {
+                return Err(HubError::Conflict(
+                    "the dispatch resolved to a different request than the one decided \
+                     before; retry it"
+                        .into(),
+                ));
+            }
+        }
+        (_, Some(request)) => {
+            crate::agent_scope::require_approval(&state, &headers, &device, request.clone())
+                .await?;
+        }
+        (_, None) => {}
+    }
+    if approval == DispatchApproval::DecideOnly {
+        return Ok(Json(json!({ "approval": approval_request })));
+    }
+
     // ── product-assigned name / branch / port block (§2.4) ─────────────────
     let slug_source = task
         .as_ref()
@@ -601,7 +694,8 @@ pub(crate) async fn dispatch_core(
                 Some(admitted) => crate::agent_scope::ModeAdmission::Admitted(admitted),
                 None => crate::agent_scope::ModeAdmission::Request(body.permission_mode.as_deref()),
             },
-            approval: crate::agent_scope::CreateApproval::OnSpec,
+            // Decided above, before any allocation.
+            approval: crate::agent_scope::CreateApproval::Decided,
         },
         &mut spec,
     )

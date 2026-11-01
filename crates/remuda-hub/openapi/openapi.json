@@ -2081,7 +2081,7 @@
             "type": "string"
           },
           "fenceId": {
-            "description": "The fence F committed for this decision.",
+            "description": "The fence F committed for this decision; absent for an expired decision, which runs no F.",
             "type": "string"
           },
           "noticeCommandId": {
@@ -2089,11 +2089,12 @@
             "type": "string"
           },
           "outcome": {
-            "description": "restarted (F with successor), restart-cap or process-exit (F without successor: the lineage is paused).",
+            "description": "restarted (F with successor), restart-cap or process-exit (F without successor: the lineage is paused), or expired (no F: the Hub saw the end longer ago than the 30-minute decision window, e.g. history at the first boot after an upgrade; not relaunched, the owner can Resume).",
             "enum": [
               "restarted",
               "restart-cap",
-              "process-exit"
+              "process-exit",
+              "expired"
             ],
             "type": "string"
           },

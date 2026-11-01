@@ -2804,15 +2804,15 @@ export interface components {
             failedGeneration: number;
             /** @description The failed chapter: the decision key. */
             failedInstanceId: string;
-            /** @description The fence F committed for this decision. */
+            /** @description The fence F committed for this decision; absent for an expired decision, which runs no F. */
             fenceId?: string;
             /** @description The restart notice's command id, chosen inside F (§6.4). */
             noticeCommandId?: string;
             /**
-             * @description restarted (F with successor), restart-cap or process-exit (F without successor: the lineage is paused).
+             * @description restarted (F with successor), restart-cap or process-exit (F without successor: the lineage is paused), or expired (no F: the Hub saw the end longer ago than the 30-minute decision window, e.g. history at the first boot after an upgrade; not relaunched, the owner can Resume).
              * @enum {string}
              */
-            outcome: "restarted" | "restart-cap" | "process-exit";
+            outcome: "restarted" | "restart-cap" | "process-exit" | "expired";
             /** @description Why a decision paused instead of restarting, when it is not the cap or the policy (for example, the successor's provider profile is gone). */
             reason?: string;
             /** @description §6.3.1 recovery source of the successor: chapter-session, earlier-session or fresh. */

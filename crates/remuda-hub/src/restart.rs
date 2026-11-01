@@ -67,7 +67,18 @@ pub(crate) mod outcome {
     /// F without successor on a lineage without `restart.onProcessLoss`:
     /// `paused{process-exit}`.
     pub const PROCESS_EXIT: &str = "process-exit";
+    /// No F: the Hub saw the end longer ago than [`super::DECISION_WINDOW_MINUTES`]
+    /// (typically history found by the first boot after an upgrade). The
+    /// chapter is not relaunched; its owner can Resume it.
+    pub const EXPIRED: &str = "expired";
 }
+
+/// An end the Hub saw longer ago than this is recorded `expired` instead of
+/// relaunched. The supervisor decides a fresh end within a tick, so only a
+/// Hub that was down (or ran without the supervisor) this long finds one;
+/// the first boot after the upgrade must not relaunch long-dead seats in a
+/// burst, while a Hub restart after a short outage still decides.
+pub(crate) const DECISION_WINDOW_MINUTES: i64 = 30;
 
 /// The supervisor's actor in fence and audit records.
 const SUPERVISOR: &str = "hub-supervisor";
@@ -240,7 +251,7 @@ fn insert_decision(
     failed_generation: i64,
     cause: &str,
     outcome: &str,
-    fence_id: &str,
+    fence_id: Option<&str>,
     reason: Option<&str>,
 ) -> Result<(), StoreError> {
     conn.execute(
@@ -288,7 +299,7 @@ pub(crate) fn record_restart(
         failed_generation,
         decision.cause,
         outcome::RESTARTED,
-        fence_id,
+        Some(fence_id),
         None,
     )?;
     conn.execute(
@@ -974,6 +985,8 @@ struct Pending {
     lineage: LineageRecord,
     failed: InstanceRecord,
     cause: &'static str,
+    /// When the Hub saw the end, if that is before the decision window.
+    expired_seen: Option<String>,
 }
 
 /// What one evaluation decided (test seam and logs).
@@ -1052,10 +1065,18 @@ impl Store {
     /// Candidates: unpaused lineages whose current chapter, at the live
     /// generation and unfenced, is terminal-shaped and has no decision. The
     /// evidence predicate is applied by the caller.
-    async fn restart_candidates(&self) -> Result<Vec<(String, String)>, StoreError> {
+    async fn restart_candidates(&self) -> Result<Vec<(String, String, String)>, StoreError> {
         self.read("restart_candidates", |conn| {
+            // `seen` is when the Hub saw the end: the newest Hub-clock
+            // journal row of the chapter, or its end stamp when that is
+            // later (an end the Hub stamped itself), else its last update.
             let mut stmt = conn.prepare(
-                "SELECT l.lineage_id, i.id FROM lineages l
+                "SELECT l.lineage_id, i.id,
+                        COALESCE(NULLIF(MAX(COALESCE((SELECT MAX(j.observed_at) FROM journal j
+                                                       WHERE j.instance_id = i.id), ''),
+                                            COALESCE(i.ended_at, '')), ''),
+                                 i.updated_at)
+                   FROM lineages l
                    JOIN instances i ON i.id = l.current_instance_id
                   WHERE l.state IN ('starting', 'running')
                     AND i.generation = l.generation AND i.fenced_at IS NULL
@@ -1065,9 +1086,40 @@ impl Store {
                   ORDER BY l.lineage_id",
             )?;
             let rows = stmt
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
+        })
+        .await
+    }
+
+    /// Record an `expired` decision without F, with the same in-transaction
+    /// check as every decision. Returns whether it was recorded.
+    async fn decide_expired(
+        &self,
+        lineage_id: String,
+        expected_generation: i64,
+        failed_instance_id: String,
+        cause: &'static str,
+        reason: String,
+    ) -> Result<bool, StoreError> {
+        self.run_named("restart_decide_expired", move |conn| {
+            let tx = immediate_tx(conn)?;
+            if !decision_open(&tx, &lineage_id, expected_generation, &failed_instance_id)? {
+                return Ok(false);
+            }
+            insert_decision(
+                &tx,
+                &failed_instance_id,
+                &lineage_id,
+                expected_generation,
+                cause,
+                outcome::EXPIRED,
+                None,
+                Some(&reason),
+            )?;
+            tx.commit()?;
+            Ok(true)
         })
         .await
     }
@@ -1122,7 +1174,7 @@ impl Store {
                 spec.expected_generation,
                 cause,
                 decision_outcome,
-                &core.fence_id,
+                Some(&core.fence_id),
                 reason.as_deref(),
             )?;
             if let Some(kind) = push {
@@ -1175,8 +1227,9 @@ pub(crate) async fn evaluate(state: &AppState) -> Vec<Decided> {
         }
     };
     let mut decided = Vec::new();
-    for (lineage_id, failed_id) in candidates {
-        let pending = match pending(state, &lineage_id, &failed_id).await {
+    let window_start = crate::config::rfc3339_minutes_ago(DECISION_WINDOW_MINUTES);
+    for (lineage_id, failed_id, seen) in candidates {
+        let pending = match pending(state, &lineage_id, &failed_id, &seen, &window_start).await {
             Ok(Some(pending)) => pending,
             Ok(None) => continue,
             Err(error) => {
@@ -1215,6 +1268,8 @@ async fn pending(
     state: &AppState,
     lineage_id: &str,
     failed_id: &str,
+    seen: &str,
+    window_start: &str,
 ) -> Result<Option<Pending>, StoreError> {
     let Some(lineage) = state.store.get_lineage(lineage_id.to_owned()).await? else {
         return Ok(None);
@@ -1242,6 +1297,8 @@ async fn pending(
         lineage,
         failed,
         cause,
+        // RFC3339 stamps of one fixed-width shape compare chronologically.
+        expired_seen: (seen < window_start).then(|| seen.to_owned()),
     }))
 }
 
@@ -1254,7 +1311,31 @@ async fn decide(
         lineage,
         failed,
         cause,
+        expired_seen,
     } = pending;
+    if let Some(seen) = expired_seen {
+        let reason = format!(
+            "the Hub saw this end at {seen}, more than {DECISION_WINDOW_MINUTES} minutes before \
+             the supervisor evaluated it; not relaunched (Resume continues it)"
+        );
+        let recorded = state
+            .store
+            .decide_expired(
+                lineage.lineage_id.clone(),
+                lineage.generation,
+                failed.instance_id.clone(),
+                cause,
+                reason,
+            )
+            .await?;
+        return Ok(recorded.then(|| Decided {
+            lineage_id: lineage.lineage_id.clone(),
+            failed_instance_id: failed.instance_id.clone(),
+            cause: cause.into(),
+            outcome: outcome::EXPIRED.into(),
+            successor_instance_id: None,
+        }));
+    }
     // Deterministic race hook: after the evidence read, before any writer
     // job (a close or Resume parked here commits first). No-op in production.
     crate::store::run_continuation_hook("restart-read", &lineage.lineage_id);

@@ -1,0 +1,205 @@
+/* @tokens strict */
+/*
+ * ④ 需要你 queue (home.md §4, §2.1–2.3). Phone: a stack of cards under the
+ * Main card, 3 shown; desktop: a 2-column grid at the top of the main column,
+ * 4 shown. Overflow folds into 「还有 N 条 ▾」 and expands in place. Role
+ * tokens only; buttons are the shared single-line controls (visual-system
+ * §8.1), and hit areas follow pointer: coarse through --control-h.
+ */
+
+.queue {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: var(--space-2) var(--gutter) var(--space-3);
+  /* Scroll target of the ① 需要你 tap: clear the sticky head. */
+  scroll-margin-top: calc(var(--header-h) + var(--space-7));
+}
+
+.queue[data-placement="desktop"] {
+  margin: var(--space-3) var(--space-4) var(--space-4);
+}
+
+.queueHead {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.queueTitle {
+  margin: 0;
+  color: var(--fg-strong);
+  font-size: var(--text-ui);
+  font-weight: 600;
+  line-height: var(--lh-ui);
+}
+
+.inboxLink {
+  margin-left: auto;
+  color: var(--link);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+  text-decoration: none;
+}
+
+.inboxLink:hover {
+  text-decoration: underline;
+}
+
+.grid {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.queue[data-placement="desktop"] .grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-3);
+}
+
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  /* A focus deep link lands mid-screen, not under the sticky head. */
+  scroll-margin-top: calc(var(--header-h) + var(--space-7));
+}
+
+.card[data-stale="1"] {
+  opacity: 0.6;
+}
+
+/* Push landing (home.md §9 角标与落点): the ?focus card is ringed, the same
+   2px focus ring the inbox uses, plus the attention wash so it reads at a
+   glance on a phone. */
+.cardFocus {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+  background: var(--attention-bg);
+}
+
+.head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.label {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--attention-fg);
+  font-size: var(--text-meta);
+  font-weight: 600;
+  line-height: var(--lh-meta);
+}
+
+.card[data-card-type="failed"] .label {
+  color: var(--danger-fg);
+}
+
+.where {
+  flex: 0 1 auto;
+  min-width: 0;
+  margin-left: auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+}
+
+.body {
+  margin: 0;
+  color: var(--fg-body);
+  font-size: var(--text-ui);
+  line-height: var(--lh-ui);
+  overflow-wrap: anywhere;
+  white-space: pre-line;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+}
+
+.bodyMono {
+  composes: body;
+  font-family: var(--font-mono);
+  font-size: var(--text-code);
+  line-height: var(--lh-code);
+  white-space: pre-wrap;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+}
+
+/* 回合失败: the error text verbatim, one truncated line (§4.2). */
+.bodyLine {
+  composes: bodyMono;
+  -webkit-line-clamp: 1;
+  line-clamp: 1;
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+/* Approval cards: 拒绝 at the start, 允许一次 at the end (§2.1 wireframe). */
+.actions [data-effect="allow-once"] {
+  margin-left: auto;
+}
+
+.chip {
+  composes: btn from "../../styles/ui.module.css";
+  border-radius: var(--radius-pill);
+}
+
+.chipLink {
+  composes: btnGhost from "../../styles/ui.module.css";
+  border-radius: var(--radius-pill);
+}
+
+.hint {
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+}
+
+.receipt {
+  margin: 0;
+  color: var(--fg-strong);
+  font-size: var(--text-meta);
+  font-weight: 600;
+  line-height: var(--lh-meta);
+  min-height: var(--control-h);
+  display: flex;
+  align-items: center;
+}
+
+.more {
+  composes: btnGhost from "../../styles/ui.module.css";
+  align-self: flex-start;
+}
+
+.skeleton {
+  height: calc(var(--control-h) * 2 + var(--space-6));
+  border: 1px solid var(--divider);
+  border-radius: var(--radius-md);
+  background: var(--bg-inset);
+}

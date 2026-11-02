@@ -925,6 +925,39 @@ fn a_dangling_marker_link_makes_the_tree_the_users() {
     );
 }
 
+/// Cleanup unlinks in recipe order, so the marker is recorded last: a scan
+/// running during cleanup never sees `SKILL.md` without the marker and takes
+/// the tree for the user's.
+#[test]
+fn the_marker_is_cleaned_up_last() {
+    let context = facts(&["dispatch"]);
+    let at = launch(false);
+    let recipe =
+        Run::new(DriverKind::ClaudeSdk, AgentKind::Claude, Some(&context)).materialize(&at);
+    let tree: Vec<&str> = recipe
+        .materialized_files
+        .iter()
+        .filter(|file| file.role == FileRole::RemudaSkill)
+        .filter(|file| file.lifetime == FileLifetime::Launch)
+        .map(|file| file.path.as_str())
+        .collect();
+    assert!(tree.len() >= 2, "{tree:?}");
+    assert!(
+        tree.last().unwrap().ends_with(MANAGED_MARKER),
+        "the marker must be removed last: {tree:?}"
+    );
+    assert!(
+        tree[..tree.len() - 1]
+            .iter()
+            .any(|path| path.ends_with("SKILL.md"))
+    );
+    // And cleanup really takes every one of them.
+    recipe.cleanup_launch_files();
+    for path in tree {
+        assert!(!Path::new(path).exists(), "{path} survived cleanup");
+    }
+}
+
 /// The `skills` directory is often the user's own: its mode is theirs. Only
 /// directories Remuda creates get 0700.
 #[cfg(unix)]

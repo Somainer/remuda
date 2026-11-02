@@ -409,13 +409,16 @@ fn write_tree(
     // tree as Remuda's.
     let marker = root.join(MANAGED_MARKER);
     write_atomic(&marker, MARKER_TEXT)?;
-    files.push(MaterializedFile {
+    // Recorded last, so `cleanup_launch_files` (which unlinks in vector order)
+    // removes the marker after every tree file: a scan that runs during
+    // cleanup then reads a tree that still has its marker.
+    let marker_record = MaterializedFile {
         path: marker.to_string_lossy().into_owned(),
         role: FileRole::RemudaSkill,
         mode: "0600".into(),
         content_digest: hash_bytes(MARKER_TEXT)?,
         lifetime,
-    });
+    };
     let mut write = |rel: &str, bytes: &[u8]| -> DriverResult<()> {
         let dest = root.join(rel);
         if let Some(parent) = dest.parent()
@@ -444,6 +447,7 @@ fn write_tree(
             _ => write(embedded.rel, embedded.bytes)?,
         }
     }
+    files.push(marker_record);
     Ok(())
 }
 

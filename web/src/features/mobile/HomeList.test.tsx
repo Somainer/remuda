@@ -56,34 +56,38 @@ function publishHealth(patch: Partial<typeof health>) {
   for (const listener of healthListeners) listener();
 }
 
-vi.mock("../../lib/store", () => ({
-  useHub: () => hub,
-  // The home reads the store through the cached external-store seam: the mock
-  // offers the same subscribe/getSnapshot surface (no store polling in unit
-  // tests) plus the imperative row helpers the component calls.
-  // No address-owner Main in these fixtures: the Main card renders nothing.
-  useMainEntry: () => null,
-  hubStore: {
-    subscribe: (listener: () => void) => {
-      listeners.add(listener);
-      return () => listeners.delete(listener);
+vi.mock("../../lib/store", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../lib/store")>();
+  return {
+    useHub: () => hub,
+    resolveMain: actual.resolveMain,
+    // The home reads the store through the cached external-store seam: the mock
+    // offers the same subscribe/getSnapshot surface (no store polling in unit
+    // tests) plus the imperative row helpers the component calls.
+    // No address-owner Main in these fixtures: the Main card renders nothing.
+    useMainEntry: () => null,
+    hubStore: {
+      subscribe: (listener: () => void) => {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
+      getSnapshot: () => ({ ...hub, instances: hub.instances.slice() }),
+      getRefreshHealth: () => health,
+      subscribeRefreshHealth: (listener: () => void) => {
+        healthListeners.add(listener);
+        return () => healthListeners.delete(listener);
+      },
+      refresh: () => refreshMock(),
+      titleOf: (id: string) => `title ${id}`,
+      hostName: () => "alpha",
+      usageRollupOf: () => null,
+      summaryOf: () => undefined,
+      resume: (...args: unknown[]) => resumeMock(...args),
+      refreshScreens: vi.fn().mockResolvedValue(undefined),
+      hydrateRowSummaries: vi.fn().mockResolvedValue(undefined),
     },
-    getSnapshot: () => ({ ...hub, instances: hub.instances.slice() }),
-    getRefreshHealth: () => health,
-    subscribeRefreshHealth: (listener: () => void) => {
-      healthListeners.add(listener);
-      return () => healthListeners.delete(listener);
-    },
-    refresh: () => refreshMock(),
-    titleOf: (id: string) => `title ${id}`,
-    hostName: () => "alpha",
-    usageRollupOf: () => null,
-    summaryOf: () => undefined,
-    resume: (...args: unknown[]) => resumeMock(...args),
-    refreshScreens: vi.fn().mockResolvedValue(undefined),
-    hydrateRowSummaries: vi.fn().mockResolvedValue(undefined),
-  },
-}));
+  };
+});
 
 vi.mock("../files/filesApi", () => ({
   fetchChanges: vi.fn(() => Promise.reject(new Error("offline"))),
@@ -666,6 +670,24 @@ describe("① 工作中 filter and the group header", () => {
     await userEvent.click(screen.getByTestId("glance-working"));
     expect(screen.getAllByTestId("home-row")).toHaveLength(2);
     expect(screen.getByTestId("home-group-dots")).toHaveTextContent("⚠1 ●1");
+  });
+});
+
+describe("① 完成未看 filter", () => {
+  it("narrows the ledger to the done-unseen rank and clears it on the second tap", async () => {
+    hub.instances = [
+      row("ins-done", { activity: known("idle"), unseen: true }),
+      row("ins-work", { activity: known("working") }),
+    ];
+    renderHome();
+    const segment = await screen.findByTestId("glance-done-unseen");
+    expect(segment).toHaveTextContent("1 完成未看");
+    await userEvent.click(segment);
+    expect(screen.getAllByTestId("home-row").map((el) => el.getAttribute("data-rank"))).toEqual(["done-unseen"]);
+    expect(screen.getByTestId("glance-done-unseen")).toHaveAttribute("aria-pressed", "true");
+    await userEvent.click(screen.getByTestId("glance-done-unseen"));
+    expect(screen.getAllByTestId("home-row")).toHaveLength(2);
+    expect(screen.getByTestId("glance-done-unseen")).toHaveAttribute("aria-pressed", "false");
   });
 });
 

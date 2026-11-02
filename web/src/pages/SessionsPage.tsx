@@ -47,18 +47,25 @@ export function SessionsPage({ dimmed = false }: { dimmed?: boolean }) {
   // second tap removes it again.
   const [params, setParams] = useSearchParams();
   const workingFilter = rankValues(params).includes("working");
+  const doneUnseenFilter = rankValues(params).includes("done-unseen");
   // §4.1: the queue hides while the SessionList search (its `q` param) is set.
   const searching = (params.get("q") ?? "").trim().length > 0;
 
-  function toggleWorking() {
+  function toggleRank(rank: string, active: boolean) {
     const next = new URLSearchParams(params);
     const ranks = rankValues(params);
-    const updated = workingFilter
-      ? ranks.filter((value) => value !== "working")
-      : [...ranks, "working"];
+    const updated = active ? ranks.filter((value) => value !== rank) : [...ranks, rank];
     if (updated.length) next.set("rank", updated.join(","));
     else next.delete("rank");
     setParams(next, { replace: true });
+  }
+
+  function toggleWorking() {
+    toggleRank("working", workingFilter);
+  }
+
+  function toggleDoneUnseen() {
+    toggleRank("done-unseen", doneUnseenFilter);
   }
 
   useEffect(() => {
@@ -93,8 +100,10 @@ export function SessionsPage({ dimmed = false }: { dimmed?: boolean }) {
               // The list drops child sessions; the count must use that set.
               workingInstances={TOP_LEVEL_WORKING}
               workingFilter={workingFilter}
+              doneUnseenFilter={doneUnseenFilter}
               onNeedYou={scrollToQueue}
               onWorking={toggleWorking}
+              onDoneUnseen={toggleDoneUnseen}
             />
           }
         />

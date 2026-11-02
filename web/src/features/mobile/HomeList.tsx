@@ -451,8 +451,10 @@ export const HomeList = memo(function HomeList() {
         <HomeGlance
           placement="phone"
           workingFilter={rankFilter === "working"}
+          doneUnseenFilter={rankFilter === "done-unseen"}
           onNeedYou={scrollToQueue}
           onWorking={() => setRankFilter((current) => (current === "working" ? null : "working"))}
+          onDoneUnseen={() => setRankFilter((current) => (current === "done-unseen" ? null : "done-unseen"))}
         />
       </header>
       {/* The probe wraps ONLY the project groups: the toolbar, ①, ②, the task

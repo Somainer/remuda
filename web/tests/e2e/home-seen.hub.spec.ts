@@ -115,6 +115,22 @@ test.afterEach(async ({ page }) => {
 test("a finished turn shows in ⑤ and the count, and 打开 clears it", async ({ page }) => {
   await login(page);
   test.skip(!(await needsFakeNode(page)), "needs the in-process fake node");
+  // Record which page issued each seen write: the 打开 click itself must post
+  // from /sessions, or the assertion would only prove that visiting the
+  // session page clears the ◉.
+  await page.addInitScript(() => {
+    const w = window as unknown as { __seenPosts?: string[] };
+    w.__seenPosts = [];
+    const original = window.fetch.bind(window);
+    window.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
+      if (method === "POST" && new URL(url, location.href).pathname.endsWith("/seen")) {
+        w.__seenPosts!.push(location.pathname);
+      }
+      return original(input, init);
+    };
+  });
   const prompt = `seenweb finished ${Date.now().toString(36)}`;
   const id = await createSession(page, prompt);
   await finishTurn(page, id);
@@ -127,50 +143,14 @@ test("a finished turn shows in ⑤ and the count, and 打开 clears it", async (
 
   await section.getByTestId("just-done-open").first().click();
   await expect(page).toHaveURL(new RegExp(`/s/${id}`));
+  // The click's own handler posted seen while the list was still the page;
+  // the session page's reporter would have recorded /s/<id> instead.
+  await expect
+    .poll(() => page.evaluate(() => (window as unknown as { __seenPosts?: string[] }).__seenPosts ?? []))
+    .toContain("/sessions");
   await page.goto("/sessions");
   await expect(page.getByTestId("home-just-done")).toHaveCount(0, { timeout: 20_000 });
   await shot(page, "seenweb-opened.png");
-});
-
-test("a long-press at 390 opens the row menu below the sticky head, and 关闭… names the host", async ({ browser }) => {
-  const context = await browser.newContext({ ...devices["iPhone 13"] });
-  const page = await context.newPage();
-  try {
-    await login(page, "e2e-seenweb-phone");
-    test.skip(!(await needsFakeNode(page)), "needs the in-process fake node");
-    await createSession(page, `seenweb menu ${Date.now().toString(36)}`);
-
-    await page.goto("/m");
-    const row = page.getByTestId("home-row").first();
-    await expect(row).toBeVisible({ timeout: 20_000 });
-    const box = await row.boundingBox();
-    expect(box).not.toBeNull();
-    // A press held past the long-press threshold. The steps option spaces the
-    // move so it is a hold, not a flick, and the assertion waits on the menu.
-    await page.mouse.move(box!.x + box!.width / 2, box!.y + box!.height / 2);
-    await page.mouse.down();
-    await expect(page.getByTestId("row-actions-menu")).toBeVisible({ timeout: 5_000 });
-    await page.mouse.up();
-
-    const menu = page.getByTestId("row-actions-menu");
-    const head = await page.getByTestId("home-head").boundingBox();
-    const menuBox = await menu.boundingBox();
-    expect(head).not.toBeNull();
-    expect(menuBox).not.toBeNull();
-    expect(menuBox!.y).toBeGreaterThanOrEqual(head!.y + head!.height);
-
-    await page.getByTestId("row-action-close").click();
-    const confirm = page.getByTestId("row-close-confirm");
-    await expect(confirm).toContainText("e2e-fake-node");
-    await shot(page, "seenweb-menu-390.png");
-  } finally {
-    // The default page never logged in, so the shared afterEach cannot delete
-    // this context's session; a leftover working row changes m-home's counts.
-    for (const id of created.splice(0)) {
-      await page.request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
-    }
-    await context.close();
-  }
 });
 
 test("390: ⑤ paints below the whole queue, including 任务待你", async ({ browser }) => {
@@ -245,4 +225,45 @@ test("1440: hovering a ⑦ and a ⑥ row reveals the ⋯, and each menu opens", 
   await expect(page.getByTestId("row-actions-menu")).toBeVisible();
   await expect(page.getByTestId("row-action-interrupt")).toBeVisible();
   await shot(page, "seenweb-hover-1440.png");
+});
+
+test("a long-press at 390 opens the row menu below the sticky head, and 关闭… names the host", async ({ browser }) => {
+  const context = await browser.newContext({ ...devices["iPhone 13"] });
+  const page = await context.newPage();
+  try {
+    await login(page, "e2e-seenweb-phone");
+    test.skip(!(await needsFakeNode(page)), "needs the in-process fake node");
+    await createSession(page, `seenweb menu ${Date.now().toString(36)}`);
+
+    await page.goto("/m");
+    const row = page.getByTestId("home-row").first();
+    await expect(row).toBeVisible({ timeout: 20_000 });
+    const box = await row.boundingBox();
+    expect(box).not.toBeNull();
+    // A press held past the long-press threshold. The steps option spaces the
+    // move so it is a hold, not a flick, and the assertion waits on the menu.
+    await page.mouse.move(box!.x + box!.width / 2, box!.y + box!.height / 2);
+    await page.mouse.down();
+    await expect(page.getByTestId("row-actions-menu")).toBeVisible({ timeout: 5_000 });
+    await page.mouse.up();
+
+    const menu = page.getByTestId("row-actions-menu");
+    const head = await page.getByTestId("home-head").boundingBox();
+    const menuBox = await menu.boundingBox();
+    expect(head).not.toBeNull();
+    expect(menuBox).not.toBeNull();
+    expect(menuBox!.y).toBeGreaterThanOrEqual(head!.y + head!.height);
+
+    await page.getByTestId("row-action-close").click();
+    const confirm = page.getByTestId("row-close-confirm");
+    await expect(confirm).toContainText("e2e-fake-node");
+    await shot(page, "seenweb-menu-390.png");
+  } finally {
+    // The default page never logged in, so the shared afterEach cannot delete
+    // this context's session; a leftover working row changes m-home's counts.
+    for (const id of created.splice(0)) {
+      await page.request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
+    }
+    await context.close();
+  }
 });

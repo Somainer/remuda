@@ -8,7 +8,9 @@ import { known, unknownKnowledge, type Id } from "../../types/wire";
 
 /**
  * ⑦ 行操作菜单 (home.md §9): the items a row's state allows, the 关闭… confirm
- * naming the session and the host, and the long-press entry.
+ * naming the session and the host, the long-press entry, and its teardown —
+ * a dismissed menu must not re-open and a per-row mount must not touch the
+ * shell's keyboard band.
  */
 
 const calls = vi.hoisted(() => ({

@@ -26,10 +26,12 @@ export function WorkingList() {
     .filter((row) => row.parent == null && projectStatus(row) === "working")
     .sort((a, b) => (Date.parse(b.updatedAt) || 0) - (Date.parse(a.updatedAt) || 0));
   const stale = hub.connection !== "live";
-  // A menu id whose row stopped ranking working has no menu to close it.
+  // A menu id whose row left the PAINTED slice has no menu to close it: a
+  // later re-rank would otherwise pop it open by itself. (Checking all working
+  // rows is not enough — the row can stay working behind 「+N」.)
   useEffect(() => {
     if (menuFor === null) return;
-    if (rows.some((row) => row.id === menuFor)) return;
+    if (rows.slice(0, WORKING_ROWS).some((row) => row.id === menuFor)) return;
     setMenuFor(null);
   }, [menuFor, rows]);
   return (

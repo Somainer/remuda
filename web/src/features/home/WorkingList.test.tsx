@@ -1,4 +1,5 @@
 import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { describe, expect, it, vi } from "vitest";
 import { mockDb } from "../../lib/mock";
@@ -57,5 +58,31 @@ describe("WorkingList (home.md ⑥)", () => {
     hub.instances = [row("ins_idle", 1, "idle")];
     renderList();
     expect(screen.getByText("没有在跑的会话")).toBeTruthy();
+  });
+
+  it("releases the menu id when its row drops behind +N, so it cannot re-open by itself", async () => {
+    hub.instances = [1, 2, 3, 4, 5, 6, 7].map((m) => row(`ins_${m}`, m));
+    const { rerender } = renderList();
+    const view = () => (
+      <MemoryRouter>
+        <WorkingList />
+      </MemoryRouter>
+    );
+    const fifth = screen.getAllByTestId("home-working-row")[4];
+    expect(fifth.textContent).toContain("title ins_3");
+    await userEvent.click(fifth.querySelector("[data-testid='row-actions-more']") as HTMLElement);
+    expect(screen.getByTestId("row-actions-menu")).toBeTruthy();
+
+    // A newer session pushes ins_3 behind 「+N ›」: its menu is not painted.
+    hub.instances = [1, 2, 3, 4, 5, 6, 7, 8].map((m) => row(`ins_${m}`, m));
+    rerender(view());
+    expect(screen.getAllByTestId("home-working-row")).toHaveLength(5);
+    expect(screen.queryByTestId("row-actions-menu")).toBeNull();
+
+    // Back inside the painted five: the stale id must not pop the menu open.
+    hub.instances = [1, 2, 3, 4, 5, 6, 7].map((m) => row(`ins_${m}`, m));
+    rerender(view());
+    expect(screen.getByText("title ins_3")).toBeTruthy();
+    expect(screen.queryByTestId("row-actions-menu")).toBeNull();
   });
 });

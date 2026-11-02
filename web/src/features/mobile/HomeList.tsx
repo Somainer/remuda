@@ -46,6 +46,8 @@ import { HomeGlance } from "../home/HomeGlance";
 import { scrollToQueue } from "../home/glanceNav";
 import { MainAskDock, MainCard } from "../home/MainCard";
 import { HomeQueue } from "../home/HomeQueue";
+import { JustDone } from "../home/JustDone";
+import { RowActions, ROW_ACTIONS_HOST, useRowLongPress } from "../home/RowActions";
 import { NoMatches, NoSessions, SkeletonRows } from "../home/HomeStates";
 import { newSessionPath } from "../spaces/store";
 import ui from "../../styles/ui.module.css";
@@ -194,6 +196,8 @@ export const HomeList = memo(function HomeList() {
   const [branches, setBranches] = useState<Record<string, string>>({});
   const [resumeStates, setResumeStates] = useState<Record<string, ResumeState>>({});
   const [drawerOpen, setDrawerOpen] = useState(false);
+  // home.md §3.3: the row menu is a sheet hold source. One menu at a time.
+  const [rowMenuFor, setRowMenuFor] = useState<string | null>(null);
   const drawerOpener = useRef<HTMLButtonElement>(null);
 
   const active = useMemo(() => selectedSpace(spaces, prefs), [spaces, prefs]);
@@ -344,7 +348,7 @@ export const HomeList = memo(function HomeList() {
   // freezes the list and only closing it releases — taps inside the drawer
   // must not.
   useEffect(() => {
-    if (drawerOpen) {
+    if (drawerOpen || rowMenuFor !== null) {
       startHold("sheet");
     } else {
       // Closing the drawer releases its source and the focus it restored to
@@ -352,7 +356,7 @@ export const HomeList = memo(function HomeList() {
       end("sheet");
       end("focus");
     }
-  }, [drawerOpen, startHold, end]);
+  }, [drawerOpen, rowMenuFor, startHold, end]);
 
   // While held, the snapshot owns the structure; live data only replaces each
   // row's content by id. A row that vanished keeps its last painted content as
@@ -391,6 +395,15 @@ export const HomeList = memo(function HomeList() {
   }, [snapshot, rankFiltered]);
   const renderedFold = snapshot ? snapshot.fold : painted.fold;
   const renderedQuietOpen = snapshot ? snapshot.quietOpen : painted.quietOpen;
+
+  // A menu id whose row is no longer painted has no menu to close it (a rank
+  // filter drops rows even while a hold freezes the rest): release the hold
+  // instead of leaving the ledger frozen on nothing.
+  useEffect(() => {
+    if (rowMenuFor === null) return;
+    if (renderedGroups.some((group) => group.rows.some((row) => row.id === rowMenuFor))) return;
+    setRowMenuFor(null);
+  }, [renderedGroups, rowMenuFor]);
 
   // D-050 task layer stacked above the project+branch session groups:
   // 需要你 first, tasks nested by parent, SE-nn keys, archive folded. Tapping
@@ -451,8 +464,10 @@ export const HomeList = memo(function HomeList() {
         <HomeGlance
           placement="phone"
           workingFilter={rankFilter === "working"}
+          doneUnseenFilter={rankFilter === "done-unseen"}
           onNeedYou={scrollToQueue}
           onWorking={() => setRankFilter((current) => (current === "working" ? null : "working"))}
+          onDoneUnseen={() => setRankFilter((current) => (current === "done-unseen" ? null : "done-unseen"))}
         />
       </header>
       {/* The probe wraps ONLY the project groups: the toolbar, ①, ②, the task
@@ -506,6 +521,16 @@ export const HomeList = memo(function HomeList() {
                 quietOpen={renderedQuietOpen}
                 resumeStates={resumeStates}
                 staleIds={staleIds}
+                staleRead={freshness.state === "stale"}
+                rowMenuFor={rowMenuFor}
+                onMenu={(id) => {
+                  // A press can outlive the row it started on (a poll dropped
+                  // it): opening a menu for an id with no menu would freeze
+                  // the ledger with nothing able to release it.
+                  if (!renderedGroups.some((group) => group.rows.some((row) => row.id === id))) return;
+                  setRowMenuFor(id);
+                }}
+                onMenuClose={(id) => setRowMenuFor((current) => (current === id ? null : current))}
                 onResume={(instanceId) => void onResume(instanceId)}
               />
             </div>
@@ -580,6 +605,9 @@ export const HomeList = memo(function HomeList() {
         // designed empty state for the unfiltered ledger only.
         sessionEmpty={renderedGroups.length === 0 && rankFilter === null}
       />
+      {/* ⑤ 刚完成 (home.md §7): after the whole queue, including the task
+          layer above, so it never splits ④. Hidden when nothing is ◉. */}
+      <JustDone placement="phone" />
       {/* D-061 ⑨: 问 Main docked at the bottom, above PhoneNav. */}
       <MainAskDock />
     </div>
@@ -618,17 +646,27 @@ function HomeRowView({
   row,
   resumeState,
   onResume,
+  menuOpen = false,
+  onMenu,
+  onMenuClose,
   stale = false,
 }: {
   row: HomeRow;
   resumeState: ResumeState | undefined;
   onResume: (instanceId: string) => void;
+  menuOpen?: boolean;
+  onMenu?: () => void;
+  onMenuClose?: () => void;
   /** Painted during a hold but gone from the live data: show it, let nothing fire. */
   stale?: boolean;
 }) {
+  // The long-press covers the whole row: the ⋯ button is hover-only on a fine
+  // pointer and hidden on a coarse one, so the row body is the phone's entry.
+  const longPress = useRowLongPress(() => onMenu?.());
   return (
     <article
-      className={css.row}
+      className={`${css.row} ${ROW_ACTIONS_HOST}`}
+      {...(onMenu && !stale ? longPress : {})}
       data-testid="home-row"
       data-status={row.status}
       data-rank={row.rank}
@@ -678,6 +716,15 @@ function HomeRowView({
         </span>
         <ContextRing pct={row.contextPct} approximate={row.contextPctApproximate} />
       </Link>
+      {onMenu && onMenuClose ? (
+        <RowActions
+          instance={row.instance}
+          open={menuOpen}
+          onOpen={onMenu}
+          onClose={onMenuClose}
+          stale={stale}
+        />
+      ) : null}
       {row.canResume ? (
         <button
           type="button"
@@ -741,6 +788,10 @@ function HomeGroups({
   quietOpen,
   resumeStates,
   staleIds,
+  staleRead,
+  rowMenuFor,
+  onMenu,
+  onMenuClose,
   onResume,
 }: {
   groups: HomeGroup[];
@@ -749,6 +800,11 @@ function HomeGroups({
   quietOpen: boolean;
   resumeStates: Record<string, ResumeState>;
   staleIds: ReadonlySet<string>;
+  /** §8: the whole read is stale, so every row's menu greys. */
+  staleRead: boolean;
+  rowMenuFor: string | null;
+  onMenu: (id: string) => void;
+  onMenuClose: (id: string) => void;
   onResume: (instanceId: string) => void;
 }) {
   const searching = query.trim().length > 0;
@@ -779,7 +835,10 @@ function HomeGroups({
             key={row.id}
             row={row}
             resumeState={resumeStates[row.id]}
-            stale={staleIds.has(row.id)}
+            stale={staleIds.has(row.id) || staleRead}
+            menuOpen={rowMenuFor === row.id}
+            onMenu={() => onMenu(row.id)}
+            onMenuClose={() => onMenuClose(row.id)}
             onResume={onResume}
           />
         ))}

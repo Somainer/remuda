@@ -80,8 +80,9 @@
 
 .toolbar {
   /* home.md §2.1: ② sits directly under ①; this row comes after ② and before
-     the ledger, scrolling with the page. */
-  order: 2;
+     the ledger, scrolling with the page. The task layer (1) and ⑤ 刚完成 (2)
+     paint above it even though they follow it in the DOM. */
+  order: 3;
   display: flex;
   align-items: center;
   gap: var(--space-3);
@@ -115,7 +116,7 @@
    band. The class is composed on the element (ui.seg), so no bespoke styles. */
 
 .groups {
-  order: 3;
+  order: 4;
   flex: 1 1 auto;
   padding-bottom: var(--space-5);
 }
@@ -129,7 +130,8 @@
 
 /* The D-050 task layer renders outside the commit:HomeList probe subtree but
    stays in the same visual position: under the sticky head, above the project
-   groups (flex order; the head is order 0). */
+   groups (flex order; the head is order 0). ⑤ 刚完成 paints after it at 2,
+   so ⑤ never splits the queue it belongs under. */
 .taskLayer {
   order: 1;
   flex: none;
@@ -138,7 +140,7 @@
 /* The ledger's empty / skeleton state: same slot as the project groups (after
    the toolbar), so the phone order stays ①, ②, toolbar, ledger (§2.1). */
 .emptyLedger {
-  order: 3;
+  order: 4;
   flex: none;
 }
 

@@ -21,6 +21,7 @@ mod instance_interaction;
 pub mod journal_diff;
 pub mod mcp;
 mod memory;
+mod memory_import;
 pub mod merge;
 pub mod node;
 mod own;

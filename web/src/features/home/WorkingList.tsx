@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { StateDot } from "../../components/StateDot";
 import { formatListTime } from "../../lib/format";
@@ -6,6 +6,7 @@ import { projectStatus } from "../../lib/status";
 import { hubStore, useHub } from "../../lib/store";
 import { useNowTick } from "../../lib/useNowTick";
 import type { Id } from "../../types/wire";
+import { RowActions, ROW_ACTIONS_HOST } from "./RowActions";
 import css from "./workingList.module.css";
 
 /** Rows shown before 「+N ›」 (home.md §9 ⑥). */
@@ -25,6 +26,14 @@ export function WorkingList() {
     .filter((row) => row.parent == null && projectStatus(row) === "working")
     .sort((a, b) => (Date.parse(b.updatedAt) || 0) - (Date.parse(a.updatedAt) || 0));
   const stale = hub.connection !== "live";
+  // A menu id whose row left the PAINTED slice has no menu to close it: a
+  // later re-rank would otherwise pop it open by itself. (Checking all working
+  // rows is not enough — the row can stay working behind 「+N」.)
+  useEffect(() => {
+    if (menuFor === null) return;
+    if (rows.slice(0, WORKING_ROWS).some((row) => row.id === menuFor)) return;
+    setMenuFor(null);
+  }, [menuFor, rows]);
   return (
     <section className={css.section} data-testid="home-working" data-stale={stale ? "1" : "0"} aria-label="工作中">
       <header className={css.head}>工作中 · {hub.ready ? rows.length : "–"}</header>
@@ -35,38 +44,19 @@ export function WorkingList() {
       ) : (
         <ul className={css.list}>
           {rows.slice(0, WORKING_ROWS).map((row) => (
-            <li key={row.id} className={css.row} data-testid="home-working-row">
+            <li key={row.id} className={`${css.row} ${ROW_ACTIONS_HOST}`} data-testid="home-working-row">
               <Link className={css.rowLink} to={`/s/${row.id}`}>
                 <StateDot status="working" />
                 <span className={css.title}>{hubStore.titleOf(row.id as Id)}</span>
                 <span className={css.time}>{formatListTime(row.updatedAt, nowMs)}</span>
               </Link>
-              <button
-                type="button"
-                className={css.more}
-                aria-label="更多操作"
-                aria-expanded={menuFor === row.id}
-                data-testid="home-working-more"
-                onClick={() => setMenuFor((current) => (current === row.id ? null : row.id))}
-              >
-                ⋯
-              </button>
-              {menuFor === row.id ? (
-                <div className={css.menu} role="menu">
-                  <button
-                    type="button"
-                    role="menuitem"
-                    className={css.menuItem}
-                    data-testid="home-working-interrupt"
-                    onClick={() => {
-                      setMenuFor(null);
-                      void hubStore.cancel(row.id as Id).catch(() => undefined);
-                    }}
-                  >
-                    中断
-                  </button>
-                </div>
-              ) : null}
+              <RowActions
+                instance={row}
+                open={menuFor === row.id}
+                onOpen={() => setMenuFor(row.id)}
+                onClose={() => setMenuFor((current) => (current === row.id ? null : current))}
+                stale={stale}
+              />
             </li>
           ))}
         </ul>

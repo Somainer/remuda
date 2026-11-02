@@ -251,6 +251,53 @@ describe("glanceCounts: §5.1 N = A + B", () => {
     );
     expect(counts.working).toBe(1);
   });
+
+  it("counts ◉ from the done-unseen rank: idle, unseen, and not a failed turn", () => {
+    const counts = glanceCounts(
+      source({
+        instances: [
+          inst({ id: "ins_done", activity: known("idle"), unseen: true }),
+          // A failed turn is a queue card (§4.5), never ◉.
+          inst({ id: "ins_failed", activity: known("idle"), unseen: true, lastTurnError: { at: T1, text: "boom" } }),
+          // Seen, or still working: not ◉.
+          inst({ id: "ins_seen", activity: known("idle"), unseen: false }),
+          inst({ id: "ins_working", activity: known("working"), unseen: true }),
+          // §3.1 matches done-unseen BEFORE awaiting-wake, so an unseen parent
+          // whose child is still running stays ◉.
+          inst({ id: "ins_waiting", activity: known("idle"), unseen: true }),
+          inst({ id: "ins_child", activity: known("working"), parent: { instanceId: "ins_waiting", runId: "run_1", commandId: "cmd_1" } }),
+        ],
+      }),
+    );
+    expect(counts.doneUnseen).toBe(2);
+  });
+
+  it("counts only Main's current chapter: an older or fenced chapter of the Main lineage is not ◉", () => {
+    const counts = glanceCounts(
+      source({
+        instances: [
+          // The live current chapter is ◉.
+          inst({ id: "ins_current", activity: known("idle"), unseen: true, grants: ["address-owner"], lineageId: "lin_main" as Id, generation: 2 }),
+          // The fenced predecessor shares the lineage and is not shown.
+          inst({ id: "ins_old", activity: known("idle"), unseen: true, grants: ["address-owner"], lineageId: "lin_main" as Id, generation: 1, fencedAt: T1 }),
+          // An ordinary session on another lineage still counts.
+          inst({ id: "ins_other", activity: known("idle"), unseen: true }),
+        ],
+      }),
+    );
+    expect(counts.doneUnseen).toBe(2);
+  });
+
+  it("counts ◉ from the instance set the surface lists, like 工作中", () => {
+    const source = sourceOf({
+      instances: [
+        inst({ id: "ins_parent", activity: known("idle"), unseen: true }),
+        inst({ id: "ins_child", activity: known("idle"), unseen: true, parent: { instanceId: "ins_parent", runId: "run_1", commandId: "cmd_1" } }),
+      ],
+    });
+    expect(glanceCounts(source).doneUnseen).toBe(2);
+    expect(glanceCounts(source, source.instances.filter(TOP_LEVEL_WORKING)).doneUnseen).toBe(1);
+  });
 });
 
 describe("§5.2 numbers", () => {
@@ -284,9 +331,10 @@ describe("glancePieces: §5.2 段的取舍", () => {
     const pieces = glancePieces({ counts: null, hour: 9, hostsOnline: 3, hostsTotal: 4 });
     expect(pieces).toEqual([
       { key: "needYou", count: null },
+      { key: "doneUnseen", count: null },
       { key: "working", count: null },
     ]);
-    expect(glanceText(pieces)).toBe("⚠– 需要你 · ●– 工作中");
+    expect(glanceText(pieces)).toBe("⚠– 需要你 · ◉– 完成未看 · ●– 工作中");
   });
 
   it("hides a segment known to be 0", () => {
@@ -325,5 +373,34 @@ describe("glancePieces: §5.2 段的取舍", () => {
   it("drops the host tail when no host is registered at all", () => {
     expect(glanceText(glancePieces({ counts: { needYou: 0, working: 0 }, hour: 9, hostsOnline: 0, hostsTotal: 0 })))
       .toBe("早上好 · 都处理完了");
+  });
+
+  it("places ◉ 完成未看 between 需要你 and 工作中, hides it at 0, writes 99+, and reads 「–」 before the snapshot", () => {
+    expect(
+      glanceText(glancePieces({ counts: { needYou: 2, doneUnseen: 4, working: 1 }, hour: 9, hostsOnline: 1, hostsTotal: 1 })),
+    ).toBe("⚠2 需要你 · ◉4 完成未看 · ●1 工作中");
+    // A known zero is hidden, like the other segments (§5.2).
+    expect(
+      glanceText(glancePieces({ counts: { needYou: 2, doneUnseen: 0, working: 0 }, hour: 9, hostsOnline: 1, hostsTotal: 1 })),
+    ).toBe("⚠2 需要你");
+    expect(
+      glanceText(glancePieces({ counts: { needYou: 0, doneUnseen: 150, working: 0 }, hour: 9, hostsOnline: 1, hostsTotal: 1 })),
+    ).toBe("早上好 · 都处理完了 · ◉99+ 完成未看");
+    // Before the first snapshot every segment, including ◉, reads 「–」.
+    const pieces = glancePieces({ counts: null, hour: 9, hostsOnline: 1, hostsTotal: 1 });
+    expect(pieces).toEqual([
+      { key: "needYou", count: null },
+      { key: "doneUnseen", count: null },
+      { key: "working", count: null },
+    ]);
+    expect(glanceText(pieces)).toBe("⚠– 需要你 · ◉– 完成未看 · ●– 工作中");
+  });
+
+  it("keeps the ◉ segment alive at zero while its filter is active", () => {
+    expect(
+      glanceText(
+        glancePieces({ counts: { needYou: 0, doneUnseen: 0, working: 0 }, hour: 9, hostsOnline: 3, hostsTotal: 4, doneUnseenFilter: true }),
+      ),
+    ).toBe("早上好 · 都处理完了 · ◉0 完成未看 · 3/4 主机在线");
   });
 });

@@ -73,7 +73,7 @@ impl NextStep {
         self
     }
 
-    fn json(&self) -> serde_json::Value {
+    pub(crate) fn json(&self) -> serde_json::Value {
         let mut value = json!({ "action": self.action, "hint": self.hint });
         if let Some(object) = value.as_object_mut() {
             if let Some(grant) = &self.grant {

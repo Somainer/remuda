@@ -10,11 +10,14 @@ The worker's completion line, its test names and its proof files are claims.
 - List the delivery's commits (`git log --oneline <base>..<tip>`) and its
   footprint (`git diff --stat <base>..<tip>`). A diff wider than the files the
   task named is itself a reason to look closely.
-- Read the diff hunk by hunk. For every acceptance criterion, find the code or
-  test that implements it and cite `file:line`.
+- Read the diff hunk by hunk. A criterion is MET only when you traced the
+  exact path it names, including failure and a different identity, session or
+  timing; cite `file:line`. A helper that exists is not a criterion that works.
 - Tests are evidence only when they exercise the production path. A test that
-  drives a stub proves the stub and the test, not the delivery; compare the
-  stub with the component it replaces before calling the criterion MET.
+  drives a stub proves the stub; compare the stub with the component it
+  replaces. Check the unit, encoding and serialized field behind any window or
+  cap it reimplements — if the difference changes which input the cap cuts,
+  the regression is not testing production.
 - The review is read-only. Do not build, run tests, start services or write
   files. If a claim can only be settled by execution, see "Claims you cannot
   verify".
@@ -30,14 +33,10 @@ Every finding states all four parts, or it is not a finding:
   obligation, a stale row, a cross-owner write, a crash;
 - **fix**: a specific change, not "handle this".
 
-Trace the whole call path yourself before writing it down: the arguments the
-caller actually sends, what any wrapper does to the response after it arrives,
-and whether the state needed for the failure is reachable at all. An apparent
-hole in a helper that no production caller reaches is not a defect.
-
-Findings are per defect, not per wording. Do not inflate one problem by
-restating it under several titles, and do not report the same issue as both a
-criterion failure and a separate defect.
+Trace the whole call path: the arguments actually sent, what any wrapper does
+to the response, and whether the state the failure needs is reachable. An
+apparent hole in a helper no production caller reaches is not a defect. Report
+each defect once, not also as a separate criterion failure.
 
 ## Severity
 
@@ -51,30 +50,40 @@ criterion failure and a separate defect.
 - **low** — real but minor: a test that proves the wrong thing, a comment that
   states something false, an edge the product already tolerates.
 
-Severity follows consequence and reachability, not how hard the code was to
-read or how confident you feel. "Probably fine on the common path" does not
-lower it; "I could not construct a failure" does.
+Severity follows consequence and reachability, not difficulty or confidence.
+"Probably fine on the common path" does not lower it.
 
-## Ownership and durable state
+## Common traps in stateful code
 
-Most serious defects in a stateful client are state that outlives its owner.
-For every map, queue, timer or obligation the delivery adds or changes:
+For every map, queue, timer or obligation the delivery adds or changes, write
+down its identity key — epoch, session, instance, device, generation — and
+check the whole key, not a stable prefix. Then check these shapes:
 
-- **Who owns it?** Write down the identity key — epoch, session, instance,
-  device, journal generation. Check that the whole key is compared, not a
-  stable prefix of it. Ask what happens when a *different* identity, session or
-  page adopts the same state without that key changing.
-- **Is retirement durable?** A "settled", "done" or "retired" transition must
-  be backed by an awaited write whose failure keeps the obligation. A
-  fire-and-forget patch whose rejection is unhandled loses recovery.
-- **Does a read write shared state?** A read path that inserts into history, a
-  dedupe set or another consumer's input changes behaviour beyond the read.
-  When a ruling forbids such writes, test each write against the rule
-  literally; a comment calling the write harmless is not an exemption.
-- **Can the pass make progress?** Bounded retries need a bound that shrinks, a
-  cursor that advances only over inspected data, and a terminal state. A pass
-  that can repeat the same window forever, or advance past data it never saw,
-  is a finding.
+1. **A guard on the wrong path.** A retirement or logout path may clear state
+   while a successful re-auth as a different identity never runs it. Enumerate
+   every identity-changing path — logout, failed re-auth, same-device and
+   different-device re-auth, reconnect, page takeover — and verify the fence on
+   the path the criterion names. An epoch bumped elsewhere proves nothing.
+2. **"Not recorded" in a comment, but recorded through a shared structure.**
+   A read path appends to shared history, cache or dedupe state and claims the
+   ids stay out. Follow the structure to every consumer; the write reaches
+   them without an explicit registration call. A "harmless" comment is not an
+   exemption.
+3. **Final in memory, not on disk.** `void write(...)`, a missing `await`, or a
+   logging-only catch makes a "done" or "settled" transition provisional. If
+   the write fails, the obligation must remain and be retried; a success-only
+   test does not cover this.
+4. **A double measures a different quantity.** A stub counting characters,
+   code units or JSON text where production counts UTF-8 payload bytes (or
+   another field) does not reproduce a cap. Find the input where they disagree
+   before dismissing it.
+5. **A cursor claims what it did not read.** Compute the range actually sent —
+   both bounds — and its size against the cap before alleging a slice lost
+   rows. A slice only loses rows when the page is wider than it.
+
+Bounded retries also need a shrinking bound, a cursor that advances only over
+inspected data, and a terminal state; a pass that can repeat the same window
+forever is a finding.
 
 ## What not to report
 
@@ -82,24 +91,23 @@ The landing gate already checks these. Do not spend findings on them, and do
 not reject on them:
 
 - formatting and lint (`cargo fmt`, `cargo check`, `cargo clippy -D warnings`);
-- the secret scan, tunnel scan and host-wide-kill audit;
-- the documentation contract (links, anchors, command references);
-- the Rust and web test suites, builds, typecheck and browser end-to-end runs.
+- the secret, tunnel and host-wide-kill scans;
+- the documentation contract;
+- the Rust and web suites, builds, typecheck and browser end-to-end runs.
 
-These are gate results, not review findings. Mention one only when the brief
-asked you to verify that evidence, and then as evidence or CANNOT TELL. A
-worker's claimed check line is not proof that the check passed.
+These are gate results. Mention one only when the brief asked you to verify
+that evidence, and then as evidence or CANNOT TELL. A worker's claimed check
+line is not proof that the check passed.
 
 Also out of scope:
 
-- **style and preference** — naming, comment wording, file layout, a different
-  but working design. Report a comment only when it asserts something false
-  that would mislead the next change, and then at low.
-- **speculation** — "might race", "could be slow", "may be uncovered", with no
-  sequence and no consequence.
-- **pre-existing issues** in code the delivery did not change, unless the
-  delivery makes them reachable or worse; name the change that does.
-- **scope you invent** — a requirement the brief never stated is not a missed
+- **style and preference** — naming, comment wording, layout, a different but
+  working design. Report a false or misleading comment at low.
+- **speculation** — "might race", "could be slow", with no sequence or
+  consequence.
+- **pre-existing issues** in unchanged code, unless the delivery makes them
+  reachable or worse; name the change that does.
+- **invented scope** — a requirement the brief never stated is not a missed
   criterion.
 
 ## Claims you cannot verify
@@ -110,6 +118,10 @@ not a defect and must not drive the verdict. Do not infer MET from a
 plausible test name, and do not infer NOT MET from the absence of a report.
 
 ## Verdict
+
+Before the verdict, name the line that enforces each stated invariant and the
+alternate path that could bypass it. A happy-path check, or the code's own
+comment about itself, is not a check.
 
 - **REJECT** when a verified high exists, or when a verified medium leaves a
   stated acceptance criterion NOT MET.

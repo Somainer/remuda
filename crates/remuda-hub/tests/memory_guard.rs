@@ -1138,6 +1138,27 @@ async fn the_import_is_owner_only_linted_and_all_or_nothing() -> Result<()> {
         .await?;
     assert_eq!(b["origin"], "agent");
     assert!(b.get("writerInstanceId").is_none(), "{b}");
+    // The same body under another slug is skipped, whatever whitespace
+    // surrounds it on either side; nothing is overwritten.
+    ctx.ok(
+        "POST",
+        &mem(&lineage, ""),
+        &ctx.human,
+        Some(entry("kept", "\n  same words\r\n\n")),
+    )
+    .await?;
+    let again = ctx
+        .ok(
+            "POST",
+            &path,
+            &ctx.human,
+            Some(json!({"entries": [import_entry("copy", "agent", "same words")]})),
+        )
+        .await?;
+    assert_eq!(
+        again["skipped"],
+        json!([{"slug": "copy", "reason": "same-content", "existing": "kept"}])
+    );
     // An unknown lineage is a 404, as for any owner create.
     let reply = ctx
         .call(

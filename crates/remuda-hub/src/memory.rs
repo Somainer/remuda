@@ -83,6 +83,8 @@ const MAX_SOURCE_REFS: usize = 64;
 const MAX_CONSOLIDATE_SOURCES: usize = 32;
 /// Entries per Phase 1 import.
 const MAX_IMPORT_ENTRIES: usize = 512;
+/// What the import's same-content check trims from a body, on both sides.
+const IMPORT_TRIM: [char; 4] = [' ', '\t', '\n', '\r'];
 /// Search terms considered (whitespace-separated).
 const MAX_SEARCH_TERMS: usize = 8;
 /// Search hits returned by default / at most.
@@ -1586,10 +1588,15 @@ fn import_tx(
         }
         // The same content under another slug: the body, or for an entry
         // without one, its title and description. Archived entries count.
-        let twin: Option<String> = if input.body.trim().is_empty() {
+        // Both sides trim the same characters (SQLite's trim() alone strips
+        // only spaces).
+        let body = input.body.trim_matches(IMPORT_TRIM);
+        let twin: Option<String> = if body.is_empty() {
             tx.query_row(
                 "SELECT slug FROM memory_entries
-                  WHERE lineage_id = ?1 AND trim(body) = '' AND title = ?2 AND description = ?3
+                  WHERE lineage_id = ?1
+                    AND trim(body, ' ' || char(9) || char(10) || char(13)) = ''
+                    AND title = ?2 AND description = ?3
                   ORDER BY slug LIMIT 1",
                 params![lineage_id, input.title, input.description],
                 |row| row.get(0),
@@ -1598,9 +1605,10 @@ fn import_tx(
         } else {
             tx.query_row(
                 "SELECT slug FROM memory_entries
-                  WHERE lineage_id = ?1 AND trim(body) = ?2
+                  WHERE lineage_id = ?1
+                    AND trim(body, ' ' || char(9) || char(10) || char(13)) = ?2
                   ORDER BY slug LIMIT 1",
-                params![lineage_id, input.body.trim()],
+                params![lineage_id, body],
                 |row| row.get(0),
             )
             .optional()?

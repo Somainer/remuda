@@ -1093,6 +1093,12 @@ describe("SessionList §8 freshness states", () => {
     expect(rows).toHaveAttribute("data-dimmed", "1");
   });
 
+  it("disables a row's ⋯ menu while stale (home.md §8 controls grey)", () => {
+    health.lastOkAt = NOW - 20_000;
+    renderList();
+    expect(screen.getAllByTestId("row-actions-more")[0]).toBeDisabled();
+  });
+
   it("does not grey them during a foreground grace", () => {
     health.lastOkAt = NOW - 20_000;
     renderList();

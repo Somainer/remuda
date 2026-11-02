@@ -53,9 +53,11 @@ function inst(overrides: Partial<Instance> = {}): Instance {
 
 function Harness({
   instance,
+  stale = false,
   onOpen,
 }: {
   instance: Instance;
+  stale?: boolean;
   onOpen?: () => void;
 }) {
   const [open, setOpen] = useState(false);
@@ -69,6 +71,7 @@ function Harness({
           setOpen(true);
         }}
         onClose={() => setOpen(false)}
+        stale={stale}
       />
     </MemoryRouter>
   );
@@ -120,6 +123,19 @@ describe("RowActions", () => {
     expect(calls.close).not.toHaveBeenCalled();
     await userEvent.click(screen.getByTestId("row-close-confirm-yes"));
     expect(calls.close).toHaveBeenCalledWith("ins_a");
+  });
+
+  it("refuses the portaled 关闭… confirm once the read is stale", async () => {
+    calls.close.mockClear();
+    const { rerender } = render(<Harness instance={inst()} />);
+    await userEvent.click(screen.getByTestId("row-actions-more"));
+    await userEvent.click(screen.getByTestId("row-action-close"));
+    expect(screen.getByTestId("row-close-confirm")).toBeTruthy();
+    rerender(<Harness instance={inst()} stale />);
+    const yes = screen.getByTestId("row-close-confirm-yes") as HTMLButtonElement;
+    expect(yes.disabled).toBe(true);
+    await userEvent.click(yes);
+    expect(calls.close).not.toHaveBeenCalled();
   });
 
   it("opens on a long-press and not on a short tap", async () => {

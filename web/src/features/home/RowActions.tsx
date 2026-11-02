@@ -90,7 +90,7 @@ export function useRowLongPress(onOpen: () => void) {
  * focus-visible, and it is always in flow and in tab order. Items that do not
  * apply to the row's state are absent ({@link rowActionKeys}). 关闭… confirms
  * first, naming the session and the host. While the read is stale every item
- * is disabled.
+ * is disabled, including the portaled 关闭… confirm.
  */
 export function RowActions({
   instance,
@@ -193,6 +193,7 @@ export function RowActions({
         <button
           type="button"
           data-testid="row-close-confirm-yes"
+          disabled={stale}
           onClick={() => {
             setConfirming(false);
             onClose();

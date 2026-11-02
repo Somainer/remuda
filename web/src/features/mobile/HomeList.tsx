@@ -521,6 +521,7 @@ export const HomeList = memo(function HomeList() {
                 quietOpen={renderedQuietOpen}
                 resumeStates={resumeStates}
                 staleIds={staleIds}
+                staleRead={freshness.state === "stale"}
                 rowMenuFor={rowMenuFor}
                 onMenu={(id) => {
                   // A press can outlive the row it started on (a poll dropped
@@ -787,6 +788,7 @@ function HomeGroups({
   quietOpen,
   resumeStates,
   staleIds,
+  staleRead,
   rowMenuFor,
   onMenu,
   onMenuClose,
@@ -798,6 +800,8 @@ function HomeGroups({
   quietOpen: boolean;
   resumeStates: Record<string, ResumeState>;
   staleIds: ReadonlySet<string>;
+  /** §8: the whole read is stale, so every row's menu greys. */
+  staleRead: boolean;
   rowMenuFor: string | null;
   onMenu: (id: string) => void;
   onMenuClose: (id: string) => void;
@@ -831,7 +835,7 @@ function HomeGroups({
             key={row.id}
             row={row}
             resumeState={resumeStates[row.id]}
-            stale={staleIds.has(row.id)}
+            stale={staleIds.has(row.id) || staleRead}
             menuOpen={rowMenuFor === row.id}
             onMenu={() => onMenu(row.id)}
             onMenuClose={() => onMenuClose(row.id)}

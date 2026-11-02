@@ -625,6 +625,14 @@ describe("HomeList §8 freshness states", () => {
     await waitFor(() => expect(screen.queryByTestId("home-empty")).toBeNull());
   });
 
+  it("disables a row's ⋯ menu while stale (home.md §8 controls grey)", async () => {
+    health.lastOkAt = NOW - 20_000;
+    hub.instances = [row("ins-a", { activity: known("working") })];
+    renderHome();
+    await screen.findByTestId("home-row");
+    expect(screen.getAllByTestId("row-actions-more")[0]).toBeDisabled();
+  });
+
   it("greys the cached rows while stale, and a foreground grace lifts the grey until the first refresh settles", async () => {
     health.lastOkAt = NOW - 20_000;
     hub.instances = [row("ins-a", { activity: known("waiting-interaction") })];

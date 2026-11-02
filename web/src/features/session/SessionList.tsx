@@ -891,7 +891,9 @@ export function SessionList({
                       open={rowMenuFor === instance.id}
                       onOpen={() => setRowMenuFor(instance.id)}
                       onClose={() => setRowMenuFor((current) => (current === instance.id ? null : current))}
-                      stale={stale}
+                      // §8: a stale read greys the menu, not just a row that
+                      // vanished under a hold.
+                      stale={stale || freshness.state === "stale"}
                     />
                     <button
                       type="button"

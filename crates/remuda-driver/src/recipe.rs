@@ -64,6 +64,9 @@ pub enum FileRole {
     CapabilityScript,
     /// One file of the embedded skill tree materialized into a managed home.
     CapabilitySkill,
+    /// One file of the embedded `remuda` skill (ma-skill) materialized into a
+    /// managed home.
+    RemudaSkill,
 }
 
 /// One MCP server a capability grant registered for this launch (D-045 §3.3).
@@ -237,6 +240,16 @@ pub struct LaunchRecipe {
     /// native resume).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<crate::memory_context::RecipeMemory>,
+    /// ma-skill: what this launch did with the Hub's `skillContext` — where
+    /// the embedded `remuda` skill went and how the capability section rides
+    /// the launch. Absent when the launch carried no `skillContext`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill: Option<crate::launch::remuda_skill::RecipeSkill>,
+    /// The materializer's own `--append-system-prompt` value, exactly as
+    /// emitted: the memory index, the capability section, or both joined.
+    /// The finished-argv guards let exactly this one pair through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
 }
 
 impl LaunchRecipe {

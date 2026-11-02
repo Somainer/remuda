@@ -17,6 +17,7 @@
 //! `SessionStart` hook both fire).
 
 pub mod overlay;
+pub mod remuda_skill;
 pub(crate) mod runtime_dir;
 pub mod session;
 mod shadow;

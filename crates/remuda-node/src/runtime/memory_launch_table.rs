@@ -156,6 +156,7 @@ fn materialize(
         settings_overlay_path: None,
         secret_policy: None,
         memory_context: Some(&context),
+        skill_context: None,
     };
     remuda_driver::materialize(&request)
         .unwrap_or_else(|error| panic!("{driver:?}/{kind:?}: {error}"))

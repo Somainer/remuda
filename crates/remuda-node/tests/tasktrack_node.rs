@@ -141,6 +141,7 @@ async fn start_in(root: PathBuf, _dir: Option<tempfile::TempDir>) -> Run {
     let request = CreateInstanceRequest {
         creator_permission_mode: None,
         memory_context: None,
+        skill_context: None,
         initiator: None,
         origin: InputOrigin::Human,
         agent_credential: None,

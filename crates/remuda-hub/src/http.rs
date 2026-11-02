@@ -4787,9 +4787,12 @@ pub(crate) async fn forward_if_online(
     // stamped below.
     object.remove("memoryContext");
     object.remove(CREATOR_PERMISSION_MODE_FIELD);
+    // ma-skill: likewise the seat's launch facts.
+    object.remove("skillContext");
     if let Some(spec) = object.get_mut("spec").and_then(Value::as_object_mut) {
         spec.remove("memoryContext");
         spec.remove(CREATOR_PERMISSION_MODE_FIELD);
+        spec.remove("skillContext");
     }
     if command.operation == "instance.send"
         && let Some(rev) = state
@@ -4832,6 +4835,22 @@ pub(crate) async fn forward_if_online(
             }
             crate::memory::ChapterMemory::Withheld { .. }
             | crate::memory::ChapterMemory::NotApplicable => {}
+        }
+        // ma-skill: the launch facts the seat's capability section is
+        // rendered from, read from the rows at forward time.
+        if let (Some(instance), Some(host)) = (
+            state.store.get_instance(instance_id.clone()).await?,
+            state.store.get_host(command.host_id.clone()).await?,
+        ) {
+            let delegated =
+                crate::interactions::delegated_decisions_enabled(instance.project_id.as_deref());
+            if let Some(context) = crate::skill_context::facts(&instance, &host, delegated) {
+                object.insert(
+                    "skillContext".into(),
+                    serde_json::to_value(context)
+                        .map_err(|error| HubError::Internal(error.to_string()))?,
+                );
+            }
         }
         // D-057 OA1: an Agent-origin create carries its creator's mode, as
         // committed on the instance row at the create's commit point — never

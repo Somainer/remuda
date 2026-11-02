@@ -923,7 +923,7 @@ Additive, like the Phase 1 budget. Each item lands with the task named in bracke
   - `resume_on_reset` [`cb-usage-resume`].
   - `owner notify` claim rows, unique per dedupe key [`cb-owner-notify`].
 - Hub columns: instances `auto_continue` [`cb-usage-resume`]; memory write references (instance, turn) [`cb-memory-ui`].
-- Task and dispatch documents gain `requestedBy` inside the existing `doc_json`, with a serde default and no migration: an owner-origin root turn records `{commandId, excerpt}` (the owner's own words for that command, one line, at most 280 chars, secret-scrubbed); any other origin records `{origin}` [`cb-requested-by`]. The same record rides the approval card the request opened. It is never a gate.
+- Task and dispatch documents gain `requestedBy` inside the existing `doc_json`, with a serde default and no migration: an owner-origin root turn records `{commandId, excerpt}` (the owner's own words for that command, one line, at most 280 chars, secret-scrubbed); any other origin records `{origin}` [`cb-requested-by`]. The same record rides the approval card the request opened, and the excerpt is served to Human callers only: an Agent or Bot reading a task, board, worker or card gets `{commandId}` / `{origin}`. It is never a gate.
 - Project policy gains an optional `stallToolThresholdMins` (unset by default: no stall fact while a tool call is in flight) and the 24-hour fact cap (default 6) [`cb-stall-tooluse`, `cb-inbox-facts`].
 - On the Node: nothing for memory, digest or glance. `check` runs keep their exit code and a bounded stdout [`cb-wake-check`].
 

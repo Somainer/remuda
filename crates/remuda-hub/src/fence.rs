@@ -603,14 +603,16 @@ pub(crate) fn fence_core(conn: &Connection, spec: &FenceSpec) -> Result<FenceTx,
         if changed > 0 {
             // cb-inbox-facts: the predecessor's subscriber learns the
             // interaction is moot, in F's transaction.
-            crate::inbox::interaction_superseded(
-                conn,
-                &predecessor,
-                &id,
-                &interaction_kind,
-                &superseded_by,
-                &now,
-            )?;
+            crate::inbox::guard("interaction_superseded", conn, || {
+                crate::inbox::interaction_superseded(
+                    conn,
+                    &predecessor,
+                    &id,
+                    &interaction_kind,
+                    &superseded_by,
+                    &now,
+                )
+            });
             let seq = insert_settlement_event(conn, &predecessor, &id, "superseded", &now)?;
             settlement.interactions.push(SettledInteraction {
                 instance_id: predecessor.clone(),

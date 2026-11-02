@@ -993,6 +993,42 @@ async fn host_link_changes_are_facts_for_lineages_in_scope() -> Result<()> {
     Ok(())
 }
 
+// ─── hook faults (r2 item 2) ────────────────────────────────────────────────
+
+/// "A fact must never harm the append" is structural: the inbox fold runs in
+/// its own savepoint, so a failing fold rolls back to it, logs, and the
+/// journal row still commits; the writer keeps serving afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failing_inbox_hook_rolls_back_and_leaves_the_append_committed() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("inbox-hook-fault").await?;
+    let (seat, seat_token) = ctx.coordinator(&project).await?;
+    let worker = ctx.worker(&seat_token, &project).await?;
+
+    remuda_hub::inbox_test_support::arm_fold_failure(&worker);
+    // The append whose fact would fail is still durable.
+    assert!(!ctx.journal(&worker, entity("running", &at(0))).await?);
+    let committed: i64 = ctx.db()?.query_row(
+        "SELECT COUNT(*) FROM journal
+          WHERE instance_id = ?1 AND json_extract(payload_json, '$.payload.state') = 'running'",
+        rusqlite::params![worker],
+        |row| row.get(0),
+    )?;
+    assert_eq!(committed, 1, "the journal row committed");
+    assert!(
+        ctx.inbox(&ctx.human, &seat).await?.is_empty(),
+        "the failed fold recorded nothing"
+    );
+
+    // The writer is usable: the next append records its fact.
+    ctx.journal(&worker, question("int_after_hook_fault", &at(1)))
+        .await?;
+    let items = ctx.inbox(&ctx.human, &seat).await?;
+    assert_eq!(items.len(), 1, "{items:#?}");
+    assert_eq!(items[0]["payload"]["interactionId"], "int_after_hook_fault");
+    Ok(())
+}
+
 // ─── stalls and wall budgets (§10.1 item 8) ─────────────────────────────────
 
 fn tool_call(id: &str) -> Value {

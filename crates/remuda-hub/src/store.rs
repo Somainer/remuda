@@ -431,7 +431,9 @@ fn delete_instance_rows(tx: &Transaction, instance_id: &str) -> Result<(), Store
     // cb-inbox-facts: the instance's journal-derived run tracker and supply
     // parks go with it; facts already recorded about it stay in their
     // subscriber's inbox.
-    crate::inbox::forget_instance(tx, instance_id)?;
+    crate::inbox::guard("forget_instance", tx, || {
+        crate::inbox::forget_instance(tx, instance_id)
+    });
     // t-pool: a deleted instance must not keep holding an attach lock.
     tx.execute(
         "UPDATE worktree_leases SET holder_instance_id = NULL, updated_at = ?2
@@ -7507,7 +7509,9 @@ impl Store {
                 params![encoded, now, id],
             )?;
             if let Some(resets_at) = resets_at {
-                crate::inbox::note_supply_park(&tx, &instance_id, &id, &family, resets_at)?;
+                crate::inbox::guard("note_supply_park", &tx, || {
+                    crate::inbox::note_supply_park(&tx, &instance_id, &id, &family, resets_at)
+                });
             }
             let record =
                 load_provider(&tx, &id)?.ok_or_else(|| StoreError::Id("unknown provider".into()))?;
@@ -15485,7 +15489,9 @@ fn touch_host_online(
         .ok_or_else(|| StoreError::Id("host vanished after auth".into()))?;
     // cb-inbox-facts: a Node link came up.
     if host.state == "online" {
-        crate::inbox::host_link(conn, host_id, true)?;
+        crate::inbox::guard("host_link", conn, || {
+            crate::inbox::host_link(conn, host_id, true)
+        });
     }
     Ok(host)
 }
@@ -16133,7 +16139,11 @@ fn append_loaded_event(
     // cb-inbox-facts: the facts this event implies, in the same transaction
     // as the row; a replayed append (returned above) writes none.
     if let Some(before) = inbox_before {
-        crate::inbox::fold_append(conn, instance_id, &event, &now, before, turn_ended)?;
+        // A fact must never harm the append (r2): the fold runs inside its own
+        // savepoint, and a failure rolls back to it and is logged.
+        crate::inbox::guard("fold_append", conn, || {
+            crate::inbox::fold_append(conn, instance_id, &event, &now, before, turn_ended)
+        });
     }
     // seen-hub: a settled turn end becomes the instance's turn-end mark; an
     // owner client showing the session right now folds it seen in this write.
@@ -16906,7 +16916,9 @@ fn mark_host_offline_rows(conn: &Connection, host_id: &str) -> Result<(), StoreE
     // cb-inbox-facts: a live Node link went down (link loss, not boot
     // bookkeeping, which `mark_all_hosts_offline` does without a fact).
     if went_offline > 0 {
-        crate::inbox::host_link(conn, host_id, false)?;
+        crate::inbox::guard("host_link", conn, || {
+            crate::inbox::host_link(conn, host_id, false)
+        });
     }
     conn.execute(
         "UPDATE instances SET connectivity = 'disconnected', updated_at = ?1

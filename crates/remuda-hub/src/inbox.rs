@@ -108,6 +108,76 @@ fn report_once(code: &'static str) {
     }
 }
 
+/// Run one inbox hook inside a SAVEPOINT on the caller's connection: a fact
+/// must never harm the write that produced it. On error the savepoint rolls
+/// back, the hook's category and the error's code are logged, and the
+/// caller's write commits without it.
+pub(crate) fn guard<T>(
+    hook: &'static str,
+    conn: &Connection,
+    run: impl FnOnce() -> Result<T, StoreError>,
+) -> Option<T> {
+    if let Err(err) = conn.execute_batch("SAVEPOINT inbox_hook") {
+        tracing::error!(
+            hook,
+            code = error_code(&StoreError::Sqlite(err)),
+            "inbox hook savepoint failed; its write commits without it"
+        );
+        return None;
+    }
+    match run() {
+        Ok(value) => {
+            if let Err(err) = conn.execute_batch("RELEASE inbox_hook") {
+                tracing::error!(
+                    hook,
+                    code = error_code(&StoreError::Sqlite(err)),
+                    "inbox hook savepoint release failed"
+                );
+            }
+            Some(value)
+        }
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK TO inbox_hook; RELEASE inbox_hook");
+            tracing::error!(
+                hook,
+                code = error_code(&err),
+                "inbox hook failed; its write commits without it"
+            );
+            None
+        }
+    }
+}
+
+/// Test seams (r2 item 2): a fault-injection point under `test-faults`, so a
+/// suite can prove the append survives a failing inbox hook. Scoped to one
+/// instance id and consumed once, so parallel tests cannot cross.
+#[cfg(any(test, feature = "test-faults"))]
+pub(crate) mod test_seams {
+    use std::sync::Mutex;
+
+    static FOLD_FAILURE: Mutex<Option<String>> = Mutex::new(None);
+
+    /// Make the next inbox fold for `instance_id` fail.
+    pub fn arm_fold_failure(instance_id: &str) {
+        *FOLD_FAILURE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(instance_id.to_owned());
+    }
+
+    /// Whether this fold for `instance_id` is the armed one (consumes it).
+    pub(crate) fn take_fold_failure(instance_id: &str) -> bool {
+        let mut slot = FOLD_FAILURE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if slot.as_deref() == Some(instance_id) {
+            *slot = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Idempotent DDL; no `user_version` rung.
 pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
@@ -991,6 +1061,10 @@ pub(crate) fn fold_append(
     before: Before,
     turn_ended: bool,
 ) -> Result<(), StoreError> {
+    #[cfg(any(test, feature = "test-faults"))]
+    if test_seams::take_fold_failure(instance_id) {
+        return Err(StoreError::FaultInjected("inbox fold".into()));
+    }
     let after: Option<(String, String)> = conn
         .query_row(
             "SELECT lifecycle, activity FROM instances WHERE id = ?1",

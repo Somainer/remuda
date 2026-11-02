@@ -2570,6 +2570,52 @@ export type MemoryEntry = ({
   [key: string]: unknown;
 });
 
+/** One entry the import created. */
+export type MemoryImportCreated = ({
+  "origin": MemoryOrigin;
+  "revision": (number);
+  "slug": (string);
+  [key: string]: unknown;
+});
+
+/** One entry of the one-time Phase 1 import (main-agent.md §12.4, cb-memory-guard): a workspace memory file, with the origin it recorded. */
+export type MemoryImportEntry = ({
+  "body": (string);
+  "description": (string);
+  "origin": MemoryOrigin;
+  "slug": (string);
+  "title": (string);
+  "type": MemoryType;
+  [key: string]: unknown;
+});
+
+/** `POST /v1/lineages/{id}/memory/import` body. Owner only. */
+export type MemoryImportRequest = ({
+  "dryRun": (boolean);
+  "entries": ((MemoryImportEntry)[]);
+  [key: string]: unknown;
+});
+
+/** Result of a Phase 1 import: what was (or, in a dry run, would be) created and what was skipped. Nothing else changes. */
+export type MemoryImportResult = ({
+  "created": ((MemoryImportCreated)[]);
+  "dryRun": (boolean);
+  "lineageId": (string);
+  "skipped": ((MemoryImportSkip)[]);
+  [key: string]: unknown;
+});
+
+/** One entry the import skipped. */
+export type MemoryImportSkip = ({
+  "existing"?: (string | null);
+  "reason": MemoryImportSkipReason;
+  "slug": (string);
+  [key: string]: unknown;
+});
+
+/** MemoryImportSkipReason wire values; `protocol.md` §8. */
+export type MemoryImportSkipReason = ("same-entry" | "slug-exists" | "same-content");
+
 /** The Hub-rendered index: one line per live entry (archived entries too when asked for, marked `(archived)`), stable-ordered by type then slug. */
 export type MemoryIndex = ({
   "bytes": (number);

@@ -777,7 +777,7 @@ The entry model follows Cindy's memory store (`packages/maker-core/src/memory/ty
 - **Sizes.** A body over 2 KiB, or a rendered index over 4 KiB, is accepted, and the response states the actual sizes. A body over 8 KiB is refused. `consolidate` merges several entries into one atomically, in one writer job.
 - **Search.** SQLite FTS5 `MATCH` first; the bundled SQLite build compiles FTS5 in (rusqlite `bundled` in the root `Cargo.toml`). When `MATCH` finds nothing, or the query contains CJK characters, the search falls back to `LIKE`. The `unicode61` tokenizer treats a run of Chinese text as one token, and a trigram tokenizer returns nothing for queries under 3 characters.
 - **Backup.** Entries live in the Hub's SQLite file, which `scripts/hub-backup.sh` already bundles. A backup and restore must round-trip them.
-- **CLI.** `remuda memory write|read|search|rm|consolidate`; routes in protocol.md §8.4.
+- **CLI.** `remuda memory write|read|search|rm|consolidate`, and the owner's one-time `remuda memory import` (§12.4); routes in protocol.md §8.4.
 
 ### 12.2 Writers and origin
 
@@ -833,6 +833,9 @@ The launch-path table referred to above (exhaustive over the match; 18 rows):
 - **Retiring a lineage archives its entries; it never deletes them** (D-060 R1). Archived entries are read-only and the owner can import them into a new lineage. Deleting a single entry is a separate explicit owner action.
 - **Derived entries.** `source_refs` point at journal rows. When a journal row is deleted or redacted, the Hub lists the entries derived from it and flags them for the owner (privacy deletion).
 - **Phase 1 import** (`cb-memory-guard`) reads the workspace files once. A read failure other than "file not found" is an error and deletes nothing.
+  - *The layout.* The Phase 1 files follow the layout of Claude Code's own memory directory, which is where the four entry types come from: `MEMORY.md`, one `- [Title](file.md) — hook` line per entry, and one `<name>.md` per entry with front matter `name`, `description` and `type` (top level or under `metadata:`), then the body. `origin: human|agent` records who the entry came from; a file that records none was written by the seat on its own and imports as `agent`. The title comes from the index line (else a `# heading`, else the name).
+  - *The command.* `remuda memory import --from <dir> [--dry-run] --lineage <id>`, owner only. The CLI reads every file before it sends anything: a missing directory or file is empty, and any other read error (permission, I/O) stops the import with nothing sent. A file without a type, or with credential-shaped text, stops it too, naming every such file.
+  - *The Hub half* (`POST /v1/lineages/{id}/memory/import`, protocol.md §8.4) runs in one writer transaction and only creates: an entry whose slug is already there, or whose content another entry already has, is skipped and reported. Nothing is overwritten or deleted, so a re-run changes nothing; `--dry-run` decides the same and commits nothing.
 
 ### 12.5 Nothing the Hub enforces is read from memory
 

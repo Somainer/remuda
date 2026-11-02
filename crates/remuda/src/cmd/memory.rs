@@ -9,6 +9,8 @@
 //! `--expected-revision` creates (refused when the slug exists), with it
 //! updates; `rm` and `consolidate` carry the revisions they replace. Writes
 //! print the new revision; soft size limits print the actual numbers.
+//!
+//! `import` is the owner's one-time Phase 1 import (`memory_import`).
 
 use anyhow::{Context, bail};
 use clap::{Args, Subcommand};
@@ -122,6 +124,22 @@ enum MemoryCommand {
     },
     /// Owner only: restore archived entries (all when no slug is given).
     Restore { slugs: Vec<String> },
+    /// Owner only: import a seat's Phase 1 workspace memory files once.
+    ///
+    /// Reads `MEMORY.md` and every `<name>.md` (front matter `name`,
+    /// `description`, `type`, optional `origin`) before sending anything. A
+    /// missing directory or file is empty; any other read error stops the
+    /// import with nothing sent. Entries already there (same slug or same
+    /// content) are skipped, so a re-run changes nothing; nothing is ever
+    /// overwritten or deleted.
+    Import {
+        /// The Phase 1 memory directory.
+        #[arg(long, value_name = "DIR")]
+        from: std::path::PathBuf,
+        /// Print what would be created and skipped; commit nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 async fn run(args: MemoryArgs) -> anyhow::Result<()> {
@@ -270,6 +288,18 @@ async fn run(args: MemoryArgs) -> anyhow::Result<()> {
             }
             print!("{}", value["text"].as_str().unwrap_or(""));
             print_warnings(&value["warnings"]);
+            Ok(())
+        }
+        MemoryCommand::Import { from, dry_run } => {
+            super::memory_import::run_import(
+                &client,
+                &lineage,
+                &from,
+                dry_run,
+                json_out,
+                &super::memory_import::DiskFiles,
+            )
+            .await?;
             Ok(())
         }
         MemoryCommand::Restore { slugs } => {

@@ -119,6 +119,7 @@ fn memory_help_lists_the_verbs() {
         "consolidate",
         "index",
         "restore",
+        "import",
     ] {
         assert!(stdout.contains(verb), "help must list `{verb}`: {stdout}");
     }
@@ -322,5 +323,76 @@ async fn a_seat_writes_searches_consolidates_and_removes_its_memory() -> Result<
     // Without --lineage or an instance there is nothing to resolve.
     let stderr = refused(&run(hub.command(&hub.owner, None), &["index"]));
     assert!(stderr.contains("pass --lineage"), "{stderr}");
+    Ok(())
+}
+
+/// The owner imports a seat's Phase 1 memory directory: a dry run writes
+/// nothing, the import creates every entry with its recorded origin, and a
+/// re-run skips them all. The seat's own credential is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_owner_imports_phase1_memory_once() -> Result<()> {
+    let hub = spawn_hub().await?;
+    let (seat, token) = hub.seat().await?;
+    let dir = tempfile::tempdir()?;
+    std::fs::write(
+        dir.path().join("MEMORY.md"),
+        "- [Lead with the outcome](outcome.md) — first line first\n",
+    )?;
+    std::fs::write(
+        dir.path().join("outcome.md"),
+        "---\nname: outcome\ndescription: The owner reads the first line.\ntype: feedback\n\
+         origin: human\n---\nThe owner asked on 2026-10-30 to lead with the outcome.\n",
+    )?;
+    std::fs::write(
+        dir.path().join("gate.md"),
+        "---\nname: gate\ndescription: fmt runs first.\nmetadata:\n  type: project\n---\n\
+         The gate runs cargo fmt first.\n",
+    )?;
+    let from = dir.path().to_str().context("utf-8 path")?;
+    let owner = |args: &[&str]| {
+        let mut full = vec!["--lineage", seat.as_str()];
+        full.extend_from_slice(args);
+        run(hub.command(&hub.owner, None), &full)
+    };
+
+    let (stdout, _) = ok(&owner(&["import", "--from", from, "--dry-run"]));
+    assert!(
+        stdout.contains("dry run: 2 file(s) read, 2 would be created"),
+        "{stdout}"
+    );
+    let (listed, _) = ok(&owner(&["read"]));
+    assert!(listed.trim().is_empty(), "a dry run wrote: {listed}");
+
+    let (stdout, _) = ok(&owner(&["import", "--from", from]));
+    assert!(
+        stdout.contains("imported: 2 file(s) read, 2 created"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("created  outcome (origin human, revision 1)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("created  gate (origin agent, revision 1)"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("1 file(s) recorded no origin"), "{stdout}");
+    let (entry, _) = ok(&owner(&["read", "outcome", "--json"]));
+    let entry: serde_json::Value = serde_json::from_str(&entry)?;
+    assert_eq!(entry["title"], "Lead with the outcome");
+    assert_eq!(entry["origin"], "human");
+
+    let (stdout, _) = ok(&owner(&["import", "--from", from]));
+    assert!(stdout.contains("0 created, 2 skipped"), "{stdout}");
+    assert!(
+        stdout.contains("skipped  outcome: already imported"),
+        "{stdout}"
+    );
+
+    let stderr = refused(&run(
+        hub.command(&token, Some(&seat)),
+        &["import", "--from", from],
+    ));
+    assert!(stderr.contains("403"), "{stderr}");
     Ok(())
 }

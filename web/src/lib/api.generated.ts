@@ -1074,6 +1074,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/lineages/{id}/memory/import": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Import Phase 1 memory files once (owner only)
+         * @description Owner (Human) only: the one-time Phase 1 import of a seat's workspace memory files (main-agent.md §12.4), as `remuda memory import --from <dir>` sends it after reading every file. One writer transaction creates each new entry with the origin its file recorded (no writing chapter, no turn), and skips an entry whose slug is already there (`same-entry` when identical, `slug-exists` when different, which is kept) or whose body (title and description for an empty body) another entry already has (`same-content`, naming it). Nothing is ever overwritten or deleted, so a re-run changes nothing. `dryRun` decides the same and commits nothing. Every entry is validated and linted first: credential-shaped text is 422 MEMORY_SECRET_REJECTED (field and rule, never the text), a repeated slug, an `about-me` entry whose origin is not human or more than 512 entries are 400, and an unknown lineage is 404; any of these stores nothing. Agent and Bot devices are refused.
+         */
+        post: operations["memoryImport"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/lineages/{id}/memory/index": {
         parameters: {
             query?: never;
@@ -2897,6 +2917,42 @@ export interface components {
         /** @description Memory entries. */
         MemoryEntryPage: {
             items: components["schemas"]["MemoryEntry"][];
+        };
+        /** @description A Phase 1 import: the seat's memory files as entries, in file order. */
+        MemoryImport: {
+            /** @description Decide everything and commit nothing. */
+            dryRun?: boolean;
+            entries: {
+                body?: string;
+                description: string;
+                /**
+                 * @description The origin the file recorded.
+                 * @enum {string}
+                 */
+                origin: "human" | "agent";
+                slug: string;
+                title: string;
+                /** @enum {string} */
+                type: "user" | "feedback" | "project" | "reference";
+            }[];
+        };
+        /** @description What a Phase 1 import created (or, in a dry run, would create) and skipped; nothing else changes. */
+        MemoryImportResult: {
+            created: {
+                /** @enum {string} */
+                origin: "human" | "agent";
+                revision: number;
+                slug: string;
+            }[];
+            dryRun: boolean;
+            lineageId: string;
+            skipped: {
+                /** @description The entry it duplicates (`same-content` only). */
+                existing?: string;
+                /** @enum {string} */
+                reason: "same-entry" | "slug-exists" | "same-content";
+                slug: string;
+            }[];
         };
         /** @description The Hub-rendered index of a lineage's live entries (archived ones too on request). */
         MemoryIndex: {
@@ -6065,6 +6121,38 @@ export interface operations {
             403: components["responses"]["Error"];
             404: components["responses"]["Error"];
             409: components["responses"]["Error"];
+        };
+    };
+    memoryImport: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MemoryImport"];
+            };
+        };
+        responses: {
+            /** @description Created and skipped entries */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryImportResult"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            413: components["responses"]["Error"];
+            422: components["responses"]["Error"];
         };
     };
     memoryIndex: {

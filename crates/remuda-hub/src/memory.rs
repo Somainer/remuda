@@ -30,6 +30,12 @@
 //!   description and body before the writer job. A hit is a 422
 //!   `MEMORY_SECRET_REJECTED` naming the field and rule, never the text, and
 //!   nothing is stored. It is a lint on secrets only (D-060 R2).
+//! - **Phase 1 import** (main-agent.md §12.4). The owner imports a seat's
+//!   workspace memory files once: one writer transaction creates what is new
+//!   with the origin each file recorded, skips duplicates by slug and by
+//!   content, and never overwrites or deletes. A dry run decides the same and
+//!   rolls back. Reading the files (and refusing on any read error but "not
+//!   found") is the CLI's half, `remuda memory import`.
 //!
 //! The FTS table is external-content over `memory_entries` and kept in sync by
 //! triggers, so every write path (including the retire archive) updates it in
@@ -52,7 +58,8 @@ use remuda_protocol::hubnode::{
 };
 use remuda_protocol::{
     InputOrigin, MEMORY_ENTRY_HARD_BYTES, MEMORY_ENTRY_SOFT_BYTES, MEMORY_INDEX_SOFT_BYTES,
-    MemoryEntry, MemoryIndex, MemoryLimit, MemoryMatch, MemoryOrigin, MemorySearchHit,
+    MemoryEntry, MemoryImportCreated, MemoryImportRequest, MemoryImportResult, MemoryImportSkip,
+    MemoryImportSkipReason, MemoryIndex, MemoryLimit, MemoryMatch, MemoryOrigin, MemorySearchHit,
     MemorySizeWarning, MemorySourceRef, MemoryTurnRef, MemoryType, MemoryWriteItem, MemoryWriteOp,
     MemoryWritePage, MemoryWriteResult, U64, memory_entry_bytes, memory_index_line,
     validate_memory_slug,
@@ -74,6 +81,8 @@ pub(crate) const MEMORY_WRITE_LOG_SCHEMA_VERSION: i64 = 6;
 const MAX_SOURCE_REFS: usize = 64;
 /// Inputs per consolidate.
 const MAX_CONSOLIDATE_SOURCES: usize = 32;
+/// Entries per Phase 1 import.
+const MAX_IMPORT_ENTRIES: usize = 512;
 /// Search terms considered (whitespace-separated).
 const MAX_SEARCH_TERMS: usize = 8;
 /// Search hits returned by default / at most.
@@ -668,6 +677,9 @@ pub(crate) enum MemoryWriter {
     Owner,
     /// Agent origin, bound to this instance (chapter).
     Agent { instance_id: String },
+    /// The owner's Phase 1 import: an owner write that stores the origin the
+    /// imported file recorded, with no writing chapter.
+    Import { origin: MemoryOrigin },
 }
 
 impl MemoryWriter {
@@ -679,6 +691,13 @@ impl MemoryWriter {
     fn stamp(&self, conn: &Connection) -> Result<(&'static str, Option<String>), MemoryError> {
         match self {
             Self::Owner => Ok(("human", None)),
+            Self::Import { origin } => Ok((
+                match origin {
+                    MemoryOrigin::Human => "human",
+                    MemoryOrigin::Agent => "agent",
+                },
+                None,
+            )),
             Self::Agent { instance_id } => {
                 let root_turn = crate::root_turn::derive(conn, instance_id)?;
                 let origin = match root_turn.as_ref().map(|turn| turn.origin) {
@@ -692,7 +711,7 @@ impl MemoryWriter {
 
     fn instance(&self) -> Option<&str> {
         match self {
-            Self::Owner => None,
+            Self::Owner | Self::Import { .. } => None,
             Self::Agent { instance_id } => Some(instance_id),
         }
     }
@@ -941,7 +960,7 @@ fn authorize_write(
         )));
     };
     match writer {
-        MemoryWriter::Owner => Ok(()),
+        MemoryWriter::Owner | MemoryWriter::Import { .. } => Ok(()),
         MemoryWriter::Agent { instance_id } => {
             if instance_id == &current_id && fenced_at.is_none() {
                 Ok(())
@@ -1530,6 +1549,103 @@ fn consolidate_tx(
     Ok(result)
 }
 
+/// The Phase 1 import in one writer transaction: create each new entry with
+/// its recorded origin, skip what is already there, and roll back on a dry
+/// run. Inputs arrive normalized (slug, one-line fields, size, secret lint).
+fn import_tx(
+    conn: &mut Connection,
+    lineage_id: &str,
+    entries: &[(MemoryInput, MemoryOrigin)],
+    dry_run: bool,
+) -> Result<MemoryImportResult, MemoryError> {
+    let tx = immediate_tx(conn)?;
+    authorize_write(&tx, lineage_id, &MemoryWriter::Owner, WriteKind::Create)?;
+    let now = now_rfc3339();
+    let mut created = Vec::new();
+    let mut skipped = Vec::new();
+    for (input, origin) in entries {
+        let skip = |reason, existing: Option<String>| MemoryImportSkip {
+            slug: input.slug.clone(),
+            reason,
+            existing,
+        };
+        if let Some(existing) = load_entry(&tx, lineage_id, &input.slug)? {
+            let same = existing.memory_type == input.memory_type
+                && existing.title == input.title
+                && existing.description == input.description
+                && existing.body == input.body;
+            skipped.push(skip(
+                if same {
+                    MemoryImportSkipReason::SameEntry
+                } else {
+                    MemoryImportSkipReason::SlugExists
+                },
+                None,
+            ));
+            continue;
+        }
+        // The same content under another slug: the body, or for an entry
+        // without one, its title and description. Archived entries count.
+        let twin: Option<String> = if input.body.trim().is_empty() {
+            tx.query_row(
+                "SELECT slug FROM memory_entries
+                  WHERE lineage_id = ?1 AND trim(body) = '' AND title = ?2 AND description = ?3
+                  ORDER BY slug LIMIT 1",
+                params![lineage_id, input.title, input.description],
+                |row| row.get(0),
+            )
+            .optional()?
+        } else {
+            tx.query_row(
+                "SELECT slug FROM memory_entries
+                  WHERE lineage_id = ?1 AND trim(body) = ?2
+                  ORDER BY slug LIMIT 1",
+                params![lineage_id, input.body.trim()],
+                |row| row.get(0),
+            )
+            .optional()?
+        };
+        if let Some(twin) = twin {
+            skipped.push(skip(MemoryImportSkipReason::SameContent, Some(twin)));
+            continue;
+        }
+        let writer = MemoryWriter::Import { origin: *origin };
+        let revision = next_revision(&tx, lineage_id, &input.slug)?;
+        insert_entry(&tx, lineage_id, &writer, input, revision, None, &now, &now)?;
+        record_revision(&tx, lineage_id, &input.slug, revision)?;
+        log_write(
+            &tx,
+            lineage_id,
+            &input.slug,
+            revision,
+            &input.title,
+            MemoryWriteOp::Write,
+            &writer,
+            None,
+            &now,
+        )?;
+        created.push(MemoryImportCreated {
+            slug: input.slug.clone(),
+            origin: *origin,
+            revision,
+        });
+    }
+    if !created.is_empty() {
+        bump_memory_rev(&tx, lineage_id)?;
+    }
+    if dry_run {
+        tx.rollback()?;
+    } else {
+        tx.commit()?;
+    }
+    Ok(MemoryImportResult {
+        lineage_id: lineage_id.to_string(),
+        dry_run,
+        created,
+        skipped,
+    })
+}
+
 fn restore_tx(
     conn: &mut Connection,
     lineage_id: &str,
@@ -1804,6 +1920,54 @@ impl Store {
         .await
     }
 
+    /// The owner's Phase 1 import (main-agent.md §12.4). Every entry is
+    /// validated and linted before the writer job, so a refusal stores
+    /// nothing; the transaction itself only creates.
+    pub(crate) async fn memory_import(
+        &self,
+        lineage_id: String,
+        request: MemoryImportRequest,
+    ) -> Result<MemoryImportResult, MemoryError> {
+        if request.entries.len() > MAX_IMPORT_ENTRIES {
+            return Err(MemoryError::BadRequest(format!(
+                "an import takes at most {MAX_IMPORT_ENTRIES} entries"
+            )));
+        }
+        let mut entries = Vec::with_capacity(request.entries.len());
+        for (index, entry) in request.entries.into_iter().enumerate() {
+            if entry.slug == OWNER_AUTHORED_SLUG && entry.origin != MemoryOrigin::Human {
+                return Err(MemoryError::BadRequest(format!(
+                    "{OWNER_AUTHORED_SLUG:?} is owner-authored; import it with origin human \
+                     or under another slug"
+                )));
+            }
+            let input = MemoryInput {
+                slug: entry.slug,
+                memory_type: entry.memory_type,
+                title: entry.title,
+                description: entry.description,
+                body: entry.body,
+                source_refs: Vec::new(),
+            }
+            .normalized()?;
+            if entries[..index]
+                .iter()
+                .any(|(seen, _): &(MemoryInput, MemoryOrigin)| seen.slug == input.slug)
+            {
+                return Err(MemoryError::BadRequest(format!(
+                    "slug {:?} appears twice in the import",
+                    input.slug
+                )));
+            }
+            entries.push((input, entry.origin));
+        }
+        let dry_run = request.dry_run;
+        write(self, "memory_import", move |conn| {
+            import_tx(conn, &lineage_id, &entries, dry_run)
+        })
+        .await
+    }
+
     /// Owner restore of archived entries (all of the lineage's when `slugs`
     /// is `None`); returns the slugs restored.
     pub(crate) async fn memory_restore(
@@ -2049,6 +2213,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/lineages/{id}/memory/search", get(search))
         .route("/v1/lineages/{id}/memory/consolidate", post(consolidate))
         .route("/v1/lineages/{id}/memory/restore", post(restore))
+        .route("/v1/lineages/{id}/memory/import", post(import))
         .route("/v1/memory/derived", get(derived))
         // The transcript's write rows: one writer chapter's log, Human/Bot
         // callers only. Deliberately absent from `restrict_agent_routes`, so
@@ -2384,6 +2549,18 @@ async fn restore(
     require_owner(&state, &headers).await?;
     let restored = state.store.memory_restore(lineage_id, body.slugs).await?;
     Ok(Json(json!({ "restored": restored })))
+}
+
+/// `POST /v1/lineages/{id}/memory/import` — the owner's one-time Phase 1
+/// import. Human only, like restore.
+async fn import(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(lineage_id): Path<String>,
+    Json(body): Json<MemoryImportRequest>,
+) -> Result<Json<MemoryImportResult>, MemoryError> {
+    require_owner(&state, &headers).await?;
+    Ok(Json(state.store.memory_import(lineage_id, body).await?))
 }
 
 async fn derived(

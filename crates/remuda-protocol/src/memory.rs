@@ -227,6 +227,90 @@ pub struct MemoryWriteResult {
     pub warnings: Vec<MemorySizeWarning>,
 }
 
+/// One entry of the one-time Phase 1 import (main-agent.md §12.4,
+/// cb-memory-guard): a workspace memory file, with the origin it recorded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryImportEntry {
+    /// Entry slug.
+    pub slug: String,
+    /// Entry type.
+    #[serde(rename = "type")]
+    pub memory_type: MemoryType,
+    /// One-line title.
+    pub title: String,
+    /// One-line description.
+    pub description: String,
+    /// Body.
+    #[serde(default)]
+    pub body: String,
+    /// The origin the file recorded: `human` for what the owner said,
+    /// `agent` for what the seat noted on its own.
+    pub origin: MemoryOrigin,
+}
+
+/// `POST /v1/lineages/{id}/memory/import` body. Owner only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryImportRequest {
+    /// The entries, in file order; at most 512, slugs distinct.
+    pub entries: Vec<MemoryImportEntry>,
+    /// Decide everything and commit nothing.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+// Why an import entry was not created. The import never overwrites or
+// deletes: `same-entry` is the identical entry already there (a re-run),
+// `slug-exists` keeps a different entry under the same slug, `same-content`
+// is an entry with the same body (or, for an empty body, the same title and
+// description) under another slug.
+wire_enum!(MemoryImportSkipReason, "8", {
+    SameEntry => "same-entry",
+    SlugExists => "slug-exists",
+    SameContent => "same-content",
+});
+
+/// One entry the import created.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryImportCreated {
+    /// Entry slug.
+    pub slug: String,
+    /// The recorded origin it was stored with.
+    pub origin: MemoryOrigin,
+    /// Its revision.
+    pub revision: u64,
+}
+
+/// One entry the import skipped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryImportSkip {
+    /// The slug the file asked for.
+    pub slug: String,
+    /// Why it was skipped.
+    pub reason: MemoryImportSkipReason,
+    /// The entry it duplicates (`same-content` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub existing: Option<String>,
+}
+
+/// Result of a Phase 1 import: what was (or, in a dry run, would be)
+/// created and what was skipped. Nothing else changes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryImportResult {
+    /// Lineage.
+    pub lineage_id: String,
+    /// True when nothing was committed.
+    pub dry_run: bool,
+    /// Created entries, in request order.
+    pub created: Vec<MemoryImportCreated>,
+    /// Skipped entries, in request order.
+    pub skipped: Vec<MemoryImportSkip>,
+}
+
 /// The Hub-rendered index: one line per live entry (archived entries too
 /// when asked for, marked `(archived)`), stable-ordered by type then slug.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]

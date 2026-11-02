@@ -1064,3 +1064,89 @@ fn the_structure_scan_catches_out_of_place_reads_however_written() {
     assert!(scan::offenders(&files("#[cfg(test)]\nmod probe;"), &hub_src).is_empty());
     assert_eq!(scan::offenders(&files("mod probe;"), &hub_src).len(), 1);
 }
+
+// ─── The Phase 1 import route ─────────────────────────────────────────────
+
+fn import_entry(slug: &str, origin: &str, body: &str) -> Value {
+    json!({"slug": slug, "type": "project", "title": format!("Title {slug}"),
+           "description": format!("About {slug}"), "body": body, "origin": origin})
+}
+
+#[tokio::test]
+async fn the_import_is_owner_only_linted_and_all_or_nothing() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let lineage = ctx.seat().await?;
+    let seat = ctx.agent(&lineage).await?;
+    let bot = ctx.hub.mint_bot_device_token("guard-bot").await?;
+    let path = mem(&lineage, "/import");
+    let entries = json!([
+        import_entry("a", "human", "first"),
+        import_entry("b", "agent", "second")
+    ]);
+    let before = ctx.snapshot(&lineage, &lineage).await?;
+
+    // Only the owner imports.
+    for token in [&seat, &bot] {
+        let reply = ctx
+            .call("POST", &path, token, Some(json!({"entries": entries})))
+            .await?;
+        assert_eq!(reply.status, 403, "{}", reply.text);
+    }
+    // A credential anywhere refuses the whole import, unechoed.
+    for secret in secrets() {
+        let body = json!({"entries": [import_entry("a", "human", "first"),
+                                      import_entry("c", "agent", &format!("x\n{secret}"))]});
+        let reply = ctx.call("POST", &path, &ctx.human, Some(body)).await?;
+        assert_refused(&reply, "body", &secret);
+        assert_eq!(reply.body["slug"], "c");
+    }
+    // A repeated slug, an agent-origin about-me and an oversized import are
+    // refused before anything is written.
+    for body in [
+        json!({"entries": [import_entry("a", "human", "1"), import_entry("a", "agent", "2")]}),
+        json!({"entries": [import_entry("about-me", "agent", "I am the owner")]}),
+        json!({"entries": (0..513).map(|i| import_entry(&format!("e{i}"), "agent", &i.to_string()))
+                                  .collect::<Vec<_>>()}),
+    ] {
+        let reply = ctx.call("POST", &path, &ctx.human, Some(body)).await?;
+        assert_eq!(reply.status, 400, "{}", reply.text);
+    }
+    assert_eq!(ctx.snapshot(&lineage, &lineage).await?, before);
+
+    // A dry run decides and commits nothing; the import then does the same.
+    let dry = ctx
+        .ok(
+            "POST",
+            &path,
+            &ctx.human,
+            Some(json!({"entries": entries, "dryRun": true})),
+        )
+        .await?;
+    assert_eq!(dry["dryRun"], true);
+    assert_eq!(ctx.snapshot(&lineage, &lineage).await?, before);
+    let done = ctx
+        .ok("POST", &path, &ctx.human, Some(json!({"entries": entries})))
+        .await?;
+    assert_eq!(done["created"], dry["created"]);
+    assert_eq!(
+        done["created"],
+        json!([{"slug": "a", "origin": "human", "revision": 1},
+               {"slug": "b", "origin": "agent", "revision": 1}])
+    );
+    let b = ctx
+        .ok("GET", &mem(&lineage, "/entries/b"), &ctx.human, None)
+        .await?;
+    assert_eq!(b["origin"], "agent");
+    assert!(b.get("writerInstanceId").is_none(), "{b}");
+    // An unknown lineage is a 404, as for any owner create.
+    let reply = ctx
+        .call(
+            "POST",
+            &mem("ins_missing", "/import"),
+            &ctx.human,
+            Some(json!({"entries": entries})),
+        )
+        .await?;
+    assert_eq!(reply.status, 404, "{}", reply.text);
+    Ok(())
+}

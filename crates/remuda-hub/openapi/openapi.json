@@ -5992,6 +5992,141 @@
         ],
         "type": "object"
       },
+      "MemoryImport": {
+        "additionalProperties": false,
+        "description": "A Phase 1 import: the seat's memory files as entries, in file order.",
+        "properties": {
+          "dryRun": {
+            "description": "Decide everything and commit nothing.",
+            "type": "boolean"
+          },
+          "entries": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "body": {
+                  "type": "string"
+                },
+                "description": {
+                  "type": "string"
+                },
+                "origin": {
+                  "description": "The origin the file recorded.",
+                  "enum": [
+                    "human",
+                    "agent"
+                  ],
+                  "type": "string"
+                },
+                "slug": {
+                  "type": "string"
+                },
+                "title": {
+                  "type": "string"
+                },
+                "type": {
+                  "enum": [
+                    "user",
+                    "feedback",
+                    "project",
+                    "reference"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "description",
+                "origin",
+                "slug",
+                "title",
+                "type"
+              ],
+              "type": "object"
+            },
+            "maxItems": 512,
+            "type": "array"
+          }
+        },
+        "required": [
+          "entries"
+        ],
+        "type": "object"
+      },
+      "MemoryImportResult": {
+        "additionalProperties": false,
+        "description": "What a Phase 1 import created (or, in a dry run, would create) and skipped; nothing else changes.",
+        "properties": {
+          "created": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "origin": {
+                  "enum": [
+                    "human",
+                    "agent"
+                  ],
+                  "type": "string"
+                },
+                "revision": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "slug": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "origin",
+                "revision",
+                "slug"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "dryRun": {
+            "type": "boolean"
+          },
+          "lineageId": {
+            "type": "string"
+          },
+          "skipped": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "existing": {
+                  "description": "The entry it duplicates (`same-content` only).",
+                  "type": "string"
+                },
+                "reason": {
+                  "enum": [
+                    "same-entry",
+                    "slug-exists",
+                    "same-content"
+                  ],
+                  "type": "string"
+                },
+                "slug": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "reason",
+                "slug"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "created",
+          "dryRun",
+          "lineageId",
+          "skipped"
+        ],
+        "type": "object"
+      },
       "SeenRequest": {
         "additionalProperties": false,
         "properties": {
@@ -8932,6 +9067,61 @@
           }
         },
         "summary": "Restore archived memory entries",
+        "tags": [
+          "memory"
+        ]
+      }
+    },
+    "/v1/lineages/{id}/memory/import": {
+      "post": {
+        "description": "Owner (Human) only: the one-time Phase 1 import of a seat's workspace memory files (main-agent.md §12.4), as `remuda memory import --from <dir>` sends it after reading every file. One writer transaction creates each new entry with the origin its file recorded (no writing chapter, no turn), and skips an entry whose slug is already there (`same-entry` when identical, `slug-exists` when different, which is kept) or whose body (title and description for an empty body) another entry already has (`same-content`, naming it). Nothing is ever overwritten or deleted, so a re-run changes nothing. `dryRun` decides the same and commits nothing. Every entry is validated and linted first: credential-shaped text is 422 MEMORY_SECRET_REJECTED (field and rule, never the text), a repeated slug, an `about-me` entry whose origin is not human or more than 512 entries are 400, and an unknown lineage is 404; any of these stores nothing. Agent and Bot devices are refused.",
+        "operationId": "memoryImport",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemoryImport"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryImportResult"
+                }
+              }
+            },
+            "description": "Created and skipped entries"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Import Phase 1 memory files once (owner only)",
         "tags": [
           "memory"
         ]

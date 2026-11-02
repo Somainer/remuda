@@ -17,7 +17,10 @@
 //! opened for reading: each name is checked with `lstat`, opened with
 //! `O_NOFOLLOW | O_NONBLOCK`, checked again on the open handle, and its
 //! canonical path must sit directly in the canonical source directory. A
-//! source directory that is itself a link is refused. Each file is read up to
+//! source directory that is itself a link is refused however it is spelled
+//! (`link/`, `link/.`, `link//`): it is opened once, with its trailing
+//! separators and `.` components dropped, under `O_DIRECTORY | O_NOFOLLOW`,
+//! and the root is that handle's own path. Each file is read up to
 //! [`MAX_FILE_BYTES`].
 //!
 //! Every file is read before anything is sent. "Not found" is empty — a
@@ -96,17 +99,64 @@ fn kind_of(file_type: std::fs::FileType) -> &'static str {
     }
 }
 
+/// The canonical path of an opened directory: the handle's own path where
+/// the platform reports it, else the (just checked, non-link) path's.
+#[cfg(target_os = "linux")]
+fn opened_path(handle: &std::fs::File, _path: &Path) -> io::Result<PathBuf> {
+    use std::os::fd::AsRawFd;
+    std::fs::read_link(format!("/proc/self/fd/{}", handle.as_raw_fd()))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn opened_path(_handle: &std::fs::File, path: &Path) -> io::Result<PathBuf> {
+    std::fs::canonicalize(path)
+}
+
 impl MemoryFiles for DiskFiles {
     fn source(&self, dir: &Path) -> io::Result<Result<PathBuf, String>> {
-        let meta = std::fs::symlink_metadata(dir)?;
-        if !meta.file_type().is_dir() {
-            return Ok(Err(format!(
-                "the source {} is {}, not a directory; pass the directory's own path",
-                dir.display(),
-                kind_of(meta.file_type())
-            )));
+        // `link/`, `link/.` and `link//` all name the link itself; with the
+        // trailing separators and `.` components left on, every lookup below
+        // would resolve through it. Rebuilding from the components drops them.
+        let stripped: PathBuf = dir.components().collect();
+        let refused = |kind: &str| {
+            Ok(Err(format!(
+                "the source {} is {kind}, not a directory; pass the directory's own path",
+                dir.display()
+            )))
+        };
+        #[cfg(unix)]
+        {
+            use nix::fcntl::OFlag;
+            use std::os::unix::fs::OpenOptionsExt;
+            // Open it once, refusing a link outright; the root every file is
+            // checked against is this handle's own path.
+            let handle = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags((OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW).bits())
+                .open(&stripped);
+            let handle = match handle {
+                Ok(handle) => handle,
+                Err(error) if error.raw_os_error() == Some(nix::libc::ELOOP) => {
+                    return refused("a symbolic link");
+                }
+                Err(error) if error.raw_os_error() == Some(nix::libc::ENOTDIR) => {
+                    let kind = std::fs::symlink_metadata(&stripped)
+                        .map(|meta| kind_of(meta.file_type()))
+                        .unwrap_or("not a directory");
+                    return refused(kind);
+                }
+                Err(error) => return Err(error),
+            };
+            Ok(Ok(opened_path(&handle, &stripped)?))
         }
-        Ok(Ok(std::fs::canonicalize(dir)?))
+        #[cfg(not(unix))]
+        {
+            let meta = std::fs::symlink_metadata(&stripped)?;
+            if !meta.file_type().is_dir() {
+                return refused(kind_of(meta.file_type()));
+            }
+            Ok(Ok(std::fs::canonicalize(&stripped)?))
+        }
     }
 
     fn list(&self, dir: &Path) -> io::Result<Vec<PathBuf>> {
@@ -933,6 +983,50 @@ mod tests {
                 .starts_with("larger than 65536 bytes")
         );
         assert_eq!(collected.entries.len(), 3);
+    }
+
+    /// Disk reads that record every name opened for reading.
+    struct Recording(std::sync::Mutex<Vec<PathBuf>>);
+
+    impl MemoryFiles for Recording {
+        fn source(&self, dir: &Path) -> io::Result<Result<PathBuf, String>> {
+            DiskFiles.source(dir)
+        }
+
+        fn list(&self, dir: &Path) -> io::Result<Vec<PathBuf>> {
+            DiskFiles.list(dir)
+        }
+
+        fn read(&self, root: &Path, path: &Path) -> io::Result<Opened> {
+            self.0.lock().unwrap().push(path.to_path_buf());
+            DiskFiles.read(root, path)
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_source_with_a_trailing_separator_is_refused_too() {
+        let (root, dir) = planted(false);
+        let link = root.path().join("linked");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        let link = link.to_str().unwrap().to_string();
+        for spelled in [format!("{link}/"), format!("{link}/."), format!("{link}//")] {
+            let files = Recording(std::sync::Mutex::new(Vec::new()));
+            let result = collect(Path::new(&spelled), &files);
+            let error = match result {
+                Err(error) => error.to_string(),
+                Ok(collected) => panic!("{spelled}: imported {:?}", collected.sources),
+            };
+            assert!(error.contains("symbolic link"), "{spelled}: {error}");
+            assert!(error.contains("nothing was imported"), "{spelled}: {error}");
+            assert!(files.0.lock().unwrap().is_empty(), "{spelled}: read files");
+        }
+        // The real directory, spelled the same ways, still imports.
+        let real = dir.to_str().unwrap().to_string();
+        for spelled in [format!("{real}/"), format!("{real}/."), format!("{real}//")] {
+            let collected = collect(Path::new(&spelled), &DiskFiles).unwrap();
+            assert_eq!(collected.entries.len(), 3, "{spelled}");
+        }
     }
 
     #[cfg(unix)]

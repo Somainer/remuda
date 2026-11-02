@@ -7540,6 +7540,262 @@
       "pattern": "^(hst|wsp|wkt|ins|run|cmd|int|evt|dev|prn|pvp|cred|obj|sub|tty|launch|epoch|hook|prj|tsk|plc|wkr|gjb|wtl)_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
       "type": "string"
     },
+    "InboxFact": {
+      "description": "One inbox row.",
+      "properties": {
+        "batchId": {
+          "description": "The delivery batch that carried the row; absent until one does.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "createdAt": {
+          "description": "When the Hub wrote the row (UTC RFC3339).",
+          "type": "string"
+        },
+        "dedupeKey": {
+          "description": "`kind:subject:runGeneration:stateEnteredAt`; unique in the\nsubscriber's inbox and stable across a Hub restart and a replayed\njournal append.",
+          "type": "string"
+        },
+        "id": {
+          "description": "Row id; the `after` cursor of the read route.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "kind": {
+          "$ref": "#/$defs/InboxFactKind",
+          "description": "What happened."
+        },
+        "lineageId": {
+          "description": "Lineage the fact is for.",
+          "type": "string"
+        },
+        "payload": {
+          "description": "Kind-specific detail. Worker- and tool-produced text in it is\nuntrusted data."
+        },
+        "runGeneration": {
+          "description": "Run generation of the subject the fact is about (its root-turn count\nwhen the state was entered); `0` for facts not about a run.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "stateEnteredAt": {
+          "description": "When the subject entered the state: journal time for journal facts,\nthe Hub's commit time for Hub-observed ones (UTC RFC3339, ms).",
+          "type": "string"
+        },
+        "subjectInstanceId": {
+          "description": "The instance the fact is about, when it is about one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "lineageId",
+        "kind",
+        "dedupeKey",
+        "runGeneration",
+        "stateEnteredAt",
+        "createdAt",
+        "payload"
+      ],
+      "type": "object"
+    },
+    "InboxFactKind": {
+      "description": "InboxFactKind wire values; `protocol.md` §8.4.",
+      "oneOf": [
+        {
+          "const": "started",
+          "description": "Wire value `started`.",
+          "type": "string"
+        },
+        {
+          "const": "exited",
+          "description": "Wire value `exited`.",
+          "type": "string"
+        },
+        {
+          "const": "waiting",
+          "description": "Wire value `waiting`.",
+          "type": "string"
+        },
+        {
+          "const": "turn-done",
+          "description": "Wire value `turn-done`.",
+          "type": "string"
+        },
+        {
+          "const": "turn-failed",
+          "description": "Wire value `turn-failed`.",
+          "type": "string"
+        },
+        {
+          "const": "interaction",
+          "description": "Wire value `interaction`.",
+          "type": "string"
+        },
+        {
+          "const": "interaction-superseded",
+          "description": "Wire value `interaction-superseded`.",
+          "type": "string"
+        },
+        {
+          "const": "gate",
+          "description": "Wire value `gate`.",
+          "type": "string"
+        },
+        {
+          "const": "supply-reset",
+          "description": "Wire value `supply-reset`.",
+          "type": "string"
+        },
+        {
+          "const": "host-online",
+          "description": "Wire value `host-online`.",
+          "type": "string"
+        },
+        {
+          "const": "host-offline",
+          "description": "Wire value `host-offline`.",
+          "type": "string"
+        },
+        {
+          "const": "stalled",
+          "description": "Wire value `stalled`.",
+          "type": "string"
+        },
+        {
+          "const": "budget-expired",
+          "description": "Wire value `budget-expired`.",
+          "type": "string"
+        },
+        {
+          "const": "wake-due",
+          "description": "Wire value `wake-due`.",
+          "type": "string"
+        },
+        {
+          "const": "context-threshold",
+          "description": "Wire value `context-threshold`.",
+          "type": "string"
+        }
+      ]
+    },
+    "InboxOccurrence": {
+      "description": "How often the same fact occurred for this subscriber in the rolling window\nending at the fact's `stateEnteredAt` (§10.1 item 2). The count survives a\nHub restart; occurrences over the cap are counted but write no row, so the\nnext recorded fact carries them.",
+      "properties": {
+        "cap": {
+          "description": "The cap in force when the fact was written.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "capped": {
+          "description": "Occurrences in the window the cap kept out of the inbox.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "count": {
+          "description": "Occurrences in the window, this one included.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "windowHours": {
+          "description": "Window length in hours.",
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "count",
+        "capped",
+        "cap",
+        "windowHours"
+      ],
+      "type": "object"
+    },
+    "InboxPage": {
+      "description": "`GET /v1/lineages/{id}/inbox`: one page of a lineage's inbox, oldest first.",
+      "properties": {
+        "items": {
+          "description": "Rows with `id > after`, ascending, at most `limit`.",
+          "items": {
+            "$ref": "#/$defs/InboxFact"
+          },
+          "type": "array"
+        },
+        "lineageId": {
+          "description": "Lineage the page is for.",
+          "type": "string"
+        },
+        "more": {
+          "description": "Whether rows beyond this page exist.",
+          "type": "boolean"
+        },
+        "nextAfter": {
+          "description": "The cursor for the next page: the last row's id, or the request's\n`after` when the page is empty.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "settings": {
+          "$ref": "#/$defs/InboxSettings",
+          "description": "The lineage's subscription settings."
+        }
+      },
+      "required": [
+        "lineageId",
+        "items",
+        "nextAfter",
+        "more",
+        "settings"
+      ],
+      "type": "object"
+    },
+    "InboxSettings": {
+      "description": "A lineage's inbox settings (§10, Defaults).",
+      "properties": {
+        "mutedKinds": {
+          "description": "Kinds the lineage does not receive.",
+          "items": {
+            "$ref": "#/$defs/InboxFactKind"
+          },
+          "type": "array"
+        },
+        "optIn": {
+          "description": "A Human-created lineage without continuity receives facts only when\nits creator opted in. Continuity lineages and agent-created\ncoordinators receive them regardless.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "optIn",
+        "mutedKinds"
+      ],
+      "type": "object"
+    },
+    "InboxSettingsPatch": {
+      "description": "`PATCH /v1/lineages/{id}/inbox`: absent fields keep their value.",
+      "properties": {
+        "mutedKinds": {
+          "description": "The full set of muted kinds (replaces the stored set).",
+          "items": {
+            "$ref": "#/$defs/InboxFactKind"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "optIn": {
+          "description": "Owner opt-in; Human devices only.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "Initiator": {
       "description": "The chapter instance a mutation was initiated by, with its place in the\nlineage. `{instanceId, lineageId, generation}` — D-057 §7.1.\n\nThe generation is the chapter generation stamped at authentication time.\nA fence bumps the lineage's live generation, so the commit-time check can\nrefuse a request authenticated before the fence (main-agent.md §7.3).",
       "properties": {
@@ -15776,6 +16032,7 @@
               "completionLine": "DONE <sha>",
               "coordinatorFanOut": 8,
               "defaultPlacement": "remote-when-build-heavy",
+              "factOccurrenceCap": 6,
               "maxConcurrentWorkers": 8,
               "maxDelegationDepth": 3,
               "maxFanOutPerTask": 6,
@@ -15859,6 +16116,12 @@
           "description": "Placement tendency policy name.",
           "type": "string"
         },
+        "factOccurrenceCap": {
+          "default": 6,
+          "description": "Inbox facts recorded per `(subscriber, subject, kind)` in a rolling\n24 h window (D-060 §10.1 item 2). It only stops re-recording the same\nfact; it limits nothing an agent can do.",
+          "format": "int64",
+          "type": "integer"
+        },
         "maxConcurrentWorkers": {
           "default": 8,
           "description": "Max concurrent workers in this project.",
@@ -15888,6 +16151,14 @@
           "description": "Stall threshold, minutes.",
           "format": "int64",
           "type": "integer"
+        },
+        "stallToolThresholdMins": {
+          "description": "Minutes a tool call may stay in flight before it yields one stall\nfact (D-060 §10.1 item 8). Absent: a tool in flight never yields one;\nthe Hub picks no number.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
       "required": [
@@ -15899,7 +16170,8 @@
         "defaultPlacement",
         "maxDelegationDepth",
         "coordinatorFanOut",
-        "allowMultipleDispatchers"
+        "allowMultipleDispatchers",
+        "factOccurrenceCap"
       ],
       "type": "object"
     },
@@ -16314,6 +16586,7 @@
             "completionLine": "DONE <sha>",
             "coordinatorFanOut": 8,
             "defaultPlacement": "remote-when-build-heavy",
+            "factOccurrenceCap": 6,
             "maxConcurrentWorkers": 8,
             "maxDelegationDepth": 3,
             "maxFanOutPerTask": 6,

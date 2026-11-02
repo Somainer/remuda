@@ -304,6 +304,18 @@ fn memory_target<'a>(method: &axum::http::Method, path: &'a str) -> Option<&'a s
     admitted.then_some(id)
 }
 
+/// `GET` and `PATCH /v1/lineages/{id}/inbox` (cb-inbox-facts): the lineage
+/// read predicate, extended to the inbox hung under it. The path id must be
+/// the caller's own lineage; the handler re-checks that and keeps the
+/// creator's opt-in Human-only.
+fn inbox_target<'a>(method: &axum::http::Method, path: &'a str) -> Option<&'a str> {
+    if *method != axum::http::Method::GET && *method != axum::http::Method::PATCH {
+        return None;
+    }
+    let id = path.strip_prefix("/v1/lineages/")?.strip_suffix("/inbox")?;
+    (!id.is_empty() && !id.contains('/')).then_some(id)
+}
+
 /// `GET /v1/lineages/{id}/glance` (cb-digest): the lineage read predicate,
 /// extended to the one projection hung under it. Same rule as
 /// [`lineage_read_target`]: the path id must be the caller's own lineage.
@@ -1182,7 +1194,12 @@ pub async fn restrict_agent_routes(
                 Some(id) => agent_owns_lineage(&state, &device, id).await?,
                 None => false,
             };
-            if !read && !write && !memory {
+            // cb-inbox-facts: the caller's own lineage inbox.
+            let inbox = match inbox_target(request.method(), path) {
+                Some(id) => agent_owns_lineage(&state, &device, id).await?,
+                None => false,
+            };
+            if !read && !write && !memory && !inbox {
                 // cb-errors: the same 403 for a route an Agent may not use,
                 // carrying its reason and next step.
                 return Err(HubError::agent_route());
@@ -1210,6 +1227,31 @@ mod tests {
         assert!(!is_auth_establishing("/v1/auth/passkeys"));
         // Listing/management are not auth-establishing either.
         assert!(!is_auth_establishing("/v1/devices"));
+    }
+
+    #[test]
+    fn only_the_exact_inbox_shape_is_an_agent_inbox_target() {
+        use axum::http::Method;
+        assert_eq!(
+            inbox_target(&Method::GET, "/v1/lineages/ins_1/inbox"),
+            Some("ins_1")
+        );
+        assert_eq!(
+            inbox_target(&Method::PATCH, "/v1/lineages/ins_1/inbox"),
+            Some("ins_1")
+        );
+        for method in [Method::POST, Method::PUT, Method::DELETE] {
+            assert_eq!(inbox_target(&method, "/v1/lineages/ins_1/inbox"), None);
+        }
+        for path in [
+            "/v1/lineages/ins_1",
+            "/v1/lineages//inbox",
+            "/v1/lineages/ins_1/inbox/extra",
+            "/v1/lineages/a/b/inbox",
+            "/v1/instances/ins_1/inbox",
+        ] {
+            assert_eq!(inbox_target(&Method::GET, path), None, "{path}");
+        }
     }
 
     #[test]

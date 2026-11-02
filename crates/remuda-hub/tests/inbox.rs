@@ -1,0 +1,1140 @@
+//! cb-inbox-facts (D-057 §10, D-060 §10.1): the Hub inbox of facts, against
+//! the in-process Hub with one fake Node.
+//!
+//! Facts are driven the way production drives them: journal appends through
+//! the store, the Hub's own commands over HTTP, a Hub restart on the same data
+//! directory. Every read goes through `GET /v1/lineages/{id}/inbox`, so the
+//! cases also pin the lineage read predicate. Journal times are fixed in the
+//! events (`observedAt`); nothing waits on a wall-clock threshold.
+
+use anyhow::{Context, Result};
+use futures::{SinkExt, StreamExt};
+use remuda_hub::{HubConfig, spawn};
+use remuda_protocol::HostId;
+use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
+use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
+
+// ─── fake Node ──────────────────────────────────────────────────────────────
+
+struct FakeNode {
+    task: tokio::task::JoinHandle<()>,
+    node_token: Option<String>,
+}
+
+impl Drop for FakeNode {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn recv_json<S>(ws: &mut S) -> Result<Value>
+where
+    S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    match tokio::time::timeout(Duration::from_secs(8), ws.next()).await {
+        Ok(Some(Ok(Message::Text(text)))) => Ok(serde_json::from_str(&text)?),
+        other => Err(anyhow::anyhow!("unexpected ws frame {other:?}")),
+    }
+}
+
+/// Connect a Node that accepts every Hub request. `bearer` is an enroll
+/// token on first contact and the returned node token afterwards.
+async fn connect_node(
+    hub: &remuda_hub::RunningHub,
+    host_id: &str,
+    workspace: &str,
+    bearer: &str,
+) -> Result<FakeNode> {
+    let mut request = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
+    request
+        .headers_mut()
+        .insert("Authorization", format!("Bearer {bearer}").parse()?);
+    let (mut node, _) = tokio_tungstenite::connect_async(request).await?;
+    node.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0", "id": "hello", "method": "runtime.hello",
+            "params": {
+                "hostId": host_id,
+                "nodeVersion": "0.1.0-test",
+                "capabilities": { "lineageFence": true },
+                "label": format!("fake-{host_id}"),
+                "host": {
+                    "hostname": format!("{host_id}.local"),
+                    "maxInstances": 8,
+                    "cli": [{"kind":"claude","version":"0.0.0","absolutePath":"/usr/bin/claude","authState":"unknown"}],
+                    "herdr": {"version": "0.9.0", "socket": "/tmp/fake-herdr.sock"},
+                    "workspaces": [{ "workspaceId": workspace, "hostId": host_id,
+                                     "root": format!("/tmp/{workspace}") }],
+                    "workspaceRevision": 1,
+                }
+            }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    let hello = recv_json(&mut node).await?;
+    anyhow::ensure!(hello.get("result").is_some(), "hello {hello}");
+    let node_token = hello["result"]["nodeToken"].as_str().map(str::to_owned);
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok(frame) = recv_json(&mut node).await else {
+                break;
+            };
+            if let Some(id) = frame.get("id").cloned()
+                && frame.get("method").is_some()
+            {
+                let response =
+                    json!({ "jsonrpc": "2.0", "id": id, "result": { "accepted": true } });
+                if node
+                    .send(Message::Text(response.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    });
+    Ok(FakeNode { task, node_token })
+}
+
+// ─── harness ────────────────────────────────────────────────────────────────
+
+struct Ctx {
+    dir: tempfile::TempDir,
+    hub: remuda_hub::RunningHub,
+    http: reqwest::Client,
+    human: String,
+    host: String,
+    workspace: String,
+    node: Option<FakeNode>,
+}
+
+impl Ctx {
+    async fn spawn() -> Result<Ctx> {
+        let dir = tempfile::tempdir()?;
+        let hub = spawn(HubConfig::for_test(dir.path().join("hub"))).await?;
+        let human = hub.mint_device_token("inbox-human").await?;
+        let host = HostId::new().as_id().to_string();
+        let workspace = remuda_protocol::WorkspaceId::new().as_id().to_string();
+        let enroll = hub
+            .mint_enroll_token(remuda_hub::DEFAULT_ENROLL_TOKEN_TTL_MINUTES)
+            .await?;
+        let node = connect_node(&hub, &host, &workspace, &enroll).await?;
+        Ok(Ctx {
+            dir,
+            hub,
+            http: reqwest::Client::new(),
+            human,
+            host,
+            workspace,
+            node: Some(node),
+        })
+    }
+
+    /// Drop the Node's link and wait until the Hub has recorded the loss
+    /// (the host row reads offline; its fact commits in the same write).
+    async fn disconnect(&mut self) -> Result<()> {
+        if self.node.take().is_none() {
+            return Ok(());
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let (_, hosts) = self
+                .request(reqwest::Method::GET, &self.human, "/v1/hosts", None)
+                .await?;
+            let online = hosts
+                .as_array()
+                .or_else(|| hosts["items"].as_array())
+                .into_iter()
+                .flatten()
+                .find(|host| {
+                    host["hostId"] == self.host.as_str() || host["id"] == self.host.as_str()
+                })
+                .map(|host| host["online"] == true || host["state"] == "online");
+            if online == Some(false) {
+                return Ok(());
+            }
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "host never offline: {hosts}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Stop the Hub and start a new one on the same data directory: the
+    /// tokens, rows and journal survive; in-memory state does not. The Node
+    /// link is dropped (and its loss recorded) first.
+    async fn restart(mut self) -> Result<Ctx> {
+        self.disconnect().await?;
+        let Ctx {
+            dir,
+            hub,
+            human,
+            host,
+            workspace,
+            ..
+        } = self;
+        hub.shutdown().await;
+        let hub = spawn(HubConfig::for_test(dir.path().join("hub"))).await?;
+        Ok(Ctx {
+            dir,
+            hub,
+            http: reqwest::Client::new(),
+            human,
+            host,
+            workspace,
+            node: None,
+        })
+    }
+
+    fn data_dir(&self) -> PathBuf {
+        self.dir.path().join("hub")
+    }
+
+    fn base(&self) -> String {
+        format!("http://{}", self.hub.addr)
+    }
+
+    async fn request(
+        &self,
+        method: reqwest::Method,
+        token: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<(u16, Value)> {
+        let mut request = self
+            .http
+            .request(method, format!("{}{path}", self.base()))
+            .bearer_auth(token);
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request.send().await?;
+        let status = response.status().as_u16();
+        let text = response.text().await?;
+        Ok((status, serde_json::from_str(&text).unwrap_or(Value::Null)))
+    }
+
+    async fn post(&self, token: &str, path: &str, body: Value) -> Result<Value> {
+        let (status, body) = self
+            .request(reqwest::Method::POST, token, path, Some(body))
+            .await?;
+        anyhow::ensure!((200..300).contains(&status), "POST {path} {status}: {body}");
+        Ok(body)
+    }
+
+    async fn project(&self, name: &str) -> Result<String> {
+        let created = self
+            .post(
+                &self.human,
+                "/v1/projects",
+                json!({ "name": name, "members": [
+                    {"hostId": self.host, "workspaceId": self.workspace, "role": "primary"}] }),
+            )
+            .await?;
+        Ok(created["id"].as_str().context("project id")?.to_string())
+    }
+
+    async fn agent_token(&self, instance_id: &str) -> Result<String> {
+        let value = self
+            .post(
+                &self.human,
+                &format!("/v1/instances/{instance_id}/mcp-token"),
+                json!({}),
+            )
+            .await?;
+        Ok(value["token"].as_str().context("mcp token")?.to_string())
+    }
+
+    /// A human-seated project coordinator (a continuity lineage: it holds
+    /// grants); returns its instance id (= lineage id) and agent token.
+    async fn coordinator(&self, project: &str) -> Result<(String, String)> {
+        let created = self
+            .post(
+                &self.human,
+                "/v1/instances",
+                json!({ "role": "project-coordinator", "projectId": project,
+                        "prompt": "coordinate", "driver": "claude-pty" }),
+            )
+            .await?;
+        let id = created["instance"]["instanceId"]
+            .as_str()
+            .context("id")?
+            .to_string();
+        let token = self.agent_token(&id).await?;
+        Ok((id, token))
+    }
+
+    /// A worker the coordinator behind `token` dispatched.
+    async fn worker(&self, token: &str, project: &str) -> Result<String> {
+        let created = self
+            .post(
+                token,
+                "/v1/instances",
+                json!({ "role": "worker", "projectId": project, "prompt": "work",
+                        "driver": "claude-pty" }),
+            )
+            .await?;
+        Ok(created["instance"]["instanceId"]
+            .as_str()
+            .context("id")?
+            .to_string())
+    }
+
+    /// A plain instance written by an internal path with `spec` (a D-026
+    /// resume child, a fleet fan-out): no grants, no lineage row.
+    async fn plain_instance(&self, spec: Value) -> Result<String> {
+        let record = self
+            .hub
+            .store()
+            .context("store")?
+            .insert_instance(
+                self.host.clone(),
+                Some(self.workspace.clone()),
+                "claude".into(),
+                "claude-pty".into(),
+                None,
+                spec,
+            )
+            .await?;
+        Ok(record.instance_id)
+    }
+
+    async fn journal(&self, instance_id: &str, event: Value) -> Result<bool> {
+        let append = self
+            .hub
+            .store()
+            .context("store")?
+            .append_journal(self.host.clone(), instance_id.to_string(), None, event)
+            .await?;
+        Ok(append.replayed)
+    }
+
+    /// Append `event` at the next seq; returns the seq it got.
+    async fn journal_seq(&self, instance_id: &str, event: Value) -> Result<i64> {
+        let append = self
+            .hub
+            .store()
+            .context("store")?
+            .append_journal(self.host.clone(), instance_id.to_string(), None, event)
+            .await?;
+        anyhow::ensure!(!append.replayed, "a fresh append");
+        Ok(append.record.seq)
+    }
+
+    async fn journal_at(&self, instance_id: &str, seq: i64, event: Value) -> Result<bool> {
+        let append = self
+            .hub
+            .store()
+            .context("store")?
+            .append_journal(self.host.clone(), instance_id.to_string(), Some(seq), event)
+            .await?;
+        Ok(append.replayed)
+    }
+
+    /// Every fact in `lineage`'s inbox, read as `token`.
+    async fn inbox(&self, token: &str, lineage: &str) -> Result<Vec<Value>> {
+        let (status, body) = self
+            .request(
+                reqwest::Method::GET,
+                token,
+                &format!("/v1/lineages/{lineage}/inbox?limit=200"),
+                None,
+            )
+            .await?;
+        anyhow::ensure!(status == 200, "GET inbox {lineage}: {status} {body}");
+        Ok(body["items"].as_array().context("items")?.clone())
+    }
+
+    async fn inbox_status(&self, token: &str, lineage: &str) -> Result<u16> {
+        Ok(self
+            .request(
+                reqwest::Method::GET,
+                token,
+                &format!("/v1/lineages/{lineage}/inbox"),
+                None,
+            )
+            .await?
+            .0)
+    }
+
+    async fn patch_inbox(&self, token: &str, lineage: &str, body: Value) -> Result<(u16, Value)> {
+        self.request(
+            reqwest::Method::PATCH,
+            token,
+            &format!("/v1/lineages/{lineage}/inbox"),
+            Some(body),
+        )
+        .await
+    }
+}
+
+/// Facts of `kind` about `subject` in an inbox page.
+fn of_kind<'a>(items: &'a [Value], kind: &str, subject: &str) -> Vec<&'a Value> {
+    items
+        .iter()
+        .filter(|fact| fact["kind"] == kind && fact["subjectInstanceId"] == subject)
+        .collect()
+}
+
+// ─── journal events ─────────────────────────────────────────────────────────
+
+const T0: &str = "2026-11-01T08:00:00.000Z";
+
+/// `T0` plus `seconds`, in the journal's RFC3339 shape.
+fn at(seconds: i64) -> String {
+    let base = time::OffsetDateTime::parse(T0, &time::format_description::well_known::Rfc3339)
+        .expect("T0");
+    let t = base + time::Duration::seconds(seconds);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        t.year(),
+        u8::from(t.month()),
+        t.day(),
+        t.hour(),
+        t.minute(),
+        t.second(),
+        t.millisecond()
+    )
+}
+
+fn entity(state: &str, observed_at: &str) -> Value {
+    json!({ "kind": "lifecycle", "observedAt": observed_at,
+            "payload": { "type": "entity", "entityType": "instance", "state": state } })
+}
+
+fn activity(value: &str, observed_at: &str) -> Value {
+    json!({ "kind": "lifecycle", "observedAt": observed_at, "payload": {
+        "type": "native", "topic": "session", "nativeName": "session",
+        "status": { "state": "known", "value": value },
+        "relatedIds": {}, "dataRef": null, "severity": "info", "affectsCompletion": false } })
+}
+
+fn question(id: &str, observed_at: &str) -> Value {
+    json!({ "kind": "interaction.requested", "observedAt": observed_at, "payload": { "interaction": {
+        "id": id, "kind": "question", "state": "pending", "blocking": true,
+        "answerable": true, "carrier": "harness-hook",
+        "request": { "kind": "question", "title": "Which way?", "options": [] } } } })
+}
+
+fn turn_started(command: &str, observed_at: &str) -> Value {
+    json!({ "kind": "lifecycle", "observedAt": observed_at, "payload": {
+        "type": "native", "topic": "turn", "nativeName": "turn_started",
+        "nativeId": { "state": "known", "value": "session-1" },
+        "status": { "state": "known", "value": "working" },
+        "relatedIds": { "nativeClientMessageId": command },
+        "dataRef": null, "severity": "info", "affectsCompletion": false } })
+}
+
+fn turn_result(
+    status: &str,
+    completed: Option<&str>,
+    settled: bool,
+    error: Option<&str>,
+    observed_at: &str,
+) -> Value {
+    let mut related = serde_json::Map::new();
+    if let Some(command) = completed {
+        related.insert("completedTurn".into(), json!(command));
+    }
+    if settled {
+        related.insert("settledRootTurn".into(), json!("true"));
+    }
+    if let Some(text) = error {
+        related.insert("lastError".into(), json!(text));
+    }
+    json!({ "kind": "lifecycle", "observedAt": observed_at, "payload": {
+        "type": "native", "topic": "turn", "nativeName": "result",
+        "nativeId": { "state": "known", "value": "session-1" },
+        "status": { "state": "known", "value": status },
+        "relatedIds": related, "dataRef": null, "severity": "info", "affectsCompletion": false } })
+}
+
+// ─── cases ──────────────────────────────────────────────────────────────────
+
+/// The basic path: a dispatched worker's lifecycle, interaction and turn
+/// result become facts in the dispatcher's inbox, readable by the owner and
+/// by the lineage itself, and by nobody else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dispatched_child_yields_facts_its_lineage_reads() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("inbox-basic").await?;
+    let (seat, seat_token) = ctx.coordinator(&project).await?;
+    let worker = ctx.worker(&seat_token, &project).await?;
+    let worker_token = ctx.agent_token(&worker).await?;
+
+    ctx.journal(&worker, entity("running", &at(0))).await?;
+    ctx.journal(&worker, activity("working", &at(1))).await?;
+    ctx.journal(&worker, question("int_basic_1", &at(2)))
+        .await?;
+    ctx.journal(&worker, activity("idle", &at(3))).await?;
+
+    let items = ctx.inbox(&ctx.human, &seat).await?;
+    let kinds: Vec<&str> = items.iter().filter_map(|f| f["kind"].as_str()).collect();
+    assert_eq!(kinds, ["started", "interaction", "turn-done"], "{items:#?}");
+    for fact in &items {
+        assert_eq!(fact["lineageId"], seat.as_str());
+        assert_eq!(fact["subjectInstanceId"], worker.as_str());
+        assert!(fact["batchId"].is_null(), "no batch before delivery");
+    }
+    let interaction = &items[1];
+    assert_eq!(interaction["payload"]["interactionId"], "int_basic_1");
+    assert_eq!(interaction["payload"]["interactionKind"], "question");
+    // D-051 is off in the test Hub: the question pages the owner instead.
+    assert_eq!(interaction["payload"]["routedToParent"], false);
+    assert_eq!(
+        interaction["dedupeKey"],
+        format!("interaction:{worker}/int_basic_1:1:{}", at(2)),
+        "kind:subject:run:stateEnteredAt, journal time"
+    );
+    assert_eq!(items[2]["runGeneration"], 1);
+    assert_eq!(items[2]["payload"]["outcome"], "done");
+
+    // The lineage reads its own inbox; the paging cursor is exclusive.
+    let own = ctx.inbox(&seat_token, &seat).await?;
+    assert_eq!(own, items);
+    let (status, page) = ctx
+        .request(
+            reqwest::Method::GET,
+            &seat_token,
+            &format!("/v1/lineages/{seat}/inbox?after={}&limit=1", items[0]["id"]),
+            None,
+        )
+        .await?;
+    assert_eq!(status, 200);
+    assert_eq!(page["items"].as_array().map(Vec::len), Some(1));
+    assert_eq!(page["items"][0], items[1]);
+    assert_eq!(page["nextAfter"], items[1]["id"]);
+    assert_eq!(page["more"], true);
+
+    // Nobody else: the worker cannot read its dispatcher's inbox, a Bot is
+    // refused outright, and an unknown lineage is 404 for the owner.
+    assert_eq!(ctx.inbox_status(&worker_token, &seat).await?, 403);
+    let bot = ctx
+        .post(
+            "unused-bearer",
+            "/v1/login",
+            json!({ "bootstrapToken": ctx.hub.bootstrap_token,
+                    "deviceName": "inbox-bot", "deviceKind": "bot" }),
+        )
+        .await?["token"]
+        .as_str()
+        .context("bot token")?
+        .to_string();
+    assert_eq!(ctx.inbox_status(&bot, &seat).await?, 403);
+    assert_eq!(ctx.inbox_status(&ctx.human, "ins_nobody").await?, 404);
+    // The worker's own inbox is empty: nothing it dispatched did anything.
+    assert!(ctx.inbox(&worker_token, &worker).await?.is_empty());
+    Ok(())
+}
+
+/// §10.1 item 2: the cap counts per `(subscriber, instance, kind)` in a
+/// rolling 24 h window, survives a Hub restart, and the next recorded fact
+/// carries the count. Hitting it limits nothing else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_occurrence_cap_is_per_subject_and_kind_rolls_and_survives_a_restart() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("inbox-cap").await?;
+    let (seat, seat_token) = ctx.coordinator(&project).await?;
+    let worker = ctx.worker(&seat_token, &project).await?;
+    let sibling = ctx.worker(&seat_token, &project).await?;
+    ctx.journal(&worker, entity("running", &at(0))).await?;
+
+    // Seven questions, one a minute: the seventh is over the default cap.
+    for n in 1..=7 {
+        ctx.journal(&worker, question(&format!("int_cap_{n}"), &at(60 * n)))
+            .await?;
+    }
+    let items = ctx.inbox(&ctx.human, &seat).await?;
+    let asked = of_kind(&items, "interaction", &worker);
+    assert_eq!(asked.len(), 6, "six recorded, the seventh capped");
+    assert_eq!(asked[5]["payload"]["occurrence"]["count"], 6);
+    assert_eq!(asked[5]["payload"]["occurrence"]["cap"], 6);
+
+    // The cap is per subject and per kind: a sibling's question and the same
+    // worker's turn result are still recorded.
+    ctx.journal(&sibling, question("int_cap_sibling", &at(500)))
+        .await?;
+    ctx.journal(&worker, activity("idle", &at(510))).await?;
+
+    // Restart: the count persists, so an eighth question is still capped.
+    let ctx = ctx.restart().await?;
+    ctx.journal(&worker, question("int_cap_8", &at(600)))
+        .await?;
+    let items = ctx.inbox(&ctx.human, &seat).await?;
+    assert_eq!(of_kind(&items, "interaction", &worker).len(), 6);
+    assert_eq!(of_kind(&items, "interaction", &sibling).len(), 1);
+    assert_eq!(of_kind(&items, "turn-done", &worker).len(), 1);
+
+    // Rolling: once the first question (T0+60 s) is more than 24 h old, one
+    // more fits; it carries the count of everything still in the window.
+    ctx.journal(&worker, question("int_cap_late", &at(24 * 3600 + 90)))
+        .await?;
+    let items = ctx.inbox(&ctx.human, &seat).await?;
+    let asked = of_kind(&items, "interaction", &worker);
+    assert_eq!(asked.len(), 7);
+    let occurrence = &asked[6]["payload"]["occurrence"];
+    // In (T0+90 s, T0+24 h+90 s]: questions 2..=8 (seven) plus this one.
+    assert_eq!(occurrence["count"], 8, "{occurrence}");
+    assert_eq!(occurrence["capped"], 2, "{occurrence}");
+    // And the window is full again.
+    ctx.journal(&worker, question("int_cap_later", &at(24 * 3600 + 100)))
+        .await?;
+    let items = ctx.inbox(&ctx.human, &seat).await?;
+    assert_eq!(of_kind(&items, "interaction", &worker).len(), 7);
+    Ok(())
+}
+
+/// §10.1 item 3: a structured carrier's result names its turn, so a late
+/// result of an earlier run is recorded as that run's outcome and leaves the
+/// newer run open; the newer run's own end is still recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_late_result_of_an_earlier_run_does_not_settle_the_newer_run() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("inbox-runs").await?;
+    let (seat, seat_token) = ctx.coordinator(&project).await?;
+    let worker = ctx.worker(&seat_token, &project).await?;
+    ctx.journal(&worker, entity("running", &at(0))).await?;
+
+    ctx.journal(&worker, turn_started("cmd_run_1", &at(10)))
+        .await?;
+    ctx.journal(
+        &worker,
+        turn_result("turn_done", Some("cmd_run_1"), true, None, &at(20)),
+    )
+    .await?;
+    ctx.journal(&worker, turn_started("cmd_run_2", &at(30)))
+        .await?;
+    // A late result for run 1 arrives while run 2 works (not settling).
+    ctx.journal(
+        &worker,
+        turn_result("error", Some("cmd_run_1"), false, Some("late 429"), &at(40)),
+    )
+    .await?;
+
+    let items = ctx.inbox(&ctx.human, &seat).await?;
+    let ends: Vec<(&str, i64, bool)> = items
+        .iter()
+        .filter(|f| matches!(f["kind"].as_str(), Some("turn-done" | "turn-failed")))
+        .map(|f| {
+            (
+                f["kind"].as_str().unwrap(),
+                f["runGeneration"].as_i64().unwrap(),
+                f["payload"]["late"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        ends,
+        [("turn-done", 1, false), ("turn-failed", 1, true)],
+        "{items:#?}"
+    );
+    let late = items.iter().find(|f| f["kind"] == "turn-failed").unwrap();
+    assert_eq!(late["payload"]["currentRun"], 2);
+    assert_eq!(late["payload"]["error"], "late 429");
+    assert!(
+        late["dedupeKey"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("turn-failed:{worker}:1:")),
+        "the run is in the key: {late}"
+    );
+    // Run 2 is still working: the late result settled nothing.
+    let (_, instance) = ctx
+        .request(
+            reqwest::Method::GET,
+            &ctx.human,
+            &format!("/v1/instances/{worker}"),
+            None,
+        )
+        .await?;
+    let activity = instance
+        .pointer("/instance/activity")
+        .or_else(|| instance.get("activity"))
+        .cloned();
+    assert_eq!(activity, Some(json!("working")), "{instance}");
+
+    // Run 2 ends: its own fact, run 2, not swallowed by run 1's.
+    ctx.journal(
+        &worker,
+        turn_result("turn_done", Some("cmd_run_2"), true, None, &at(50)),
+    )
+    .await?;
+    let items = ctx.inbox(&ctx.human, &seat).await?;
+    let run_two: Vec<_> = items
+        .iter()
+        .filter(|f| f["kind"] == "turn-done" && f["runGeneration"] == 2)
+        .collect();
+    assert_eq!(run_two.len(), 1, "{items:#?}");
+    assert_eq!(run_two[0]["payload"]["late"], false);
+    Ok(())
+}
+
+/// §10.1 item 4: a lineage never receives facts about its own chapters. A
+/// seat's own turns, questions and exit land in no inbox (it has no parent
+/// lineage), while its worker's land in the seat's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_facts_about_a_lineages_own_chapters() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("inbox-own").await?;
+    let (seat, seat_token) = ctx.coordinator(&project).await?;
+    let worker = ctx.worker(&seat_token, &project).await?;
+    let worker_token = ctx.agent_token(&worker).await?;
+
+    for subject in [&seat, &worker] {
+        ctx.journal(subject, entity("running", &at(0))).await?;
+        ctx.journal(subject, activity("working", &at(1))).await?;
+        ctx.journal(subject, question(&format!("int_own_{subject}"), &at(2)))
+            .await?;
+        ctx.journal(subject, activity("idle", &at(3))).await?;
+        ctx.journal(subject, entity("exited", &at(4))).await?;
+    }
+    let seat_inbox = ctx.inbox(&seat_token, &seat).await?;
+    assert!(
+        seat_inbox
+            .iter()
+            .all(|fact| fact["subjectInstanceId"] == worker.as_str()),
+        "the seat's inbox holds only its worker's facts: {seat_inbox:#?}"
+    );
+    let kinds: Vec<&str> = seat_inbox
+        .iter()
+        .filter_map(|f| f["kind"].as_str())
+        .collect();
+    assert_eq!(kinds, ["started", "interaction", "turn-done", "exited"]);
+    assert!(ctx.inbox(&worker_token, &worker).await?.is_empty());
+    Ok(())
+}
+
+/// §10.1 item 1: the dedupe key is built from journal time, so a replayed
+/// append adds nothing and a Hub restart changes no key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_dedupe_key_is_stable_across_a_restart_and_a_replayed_append() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("inbox-keys").await?;
+    let (seat, seat_token) = ctx.coordinator(&project).await?;
+    let worker = ctx.worker(&seat_token, &project).await?;
+    let subject_facts = |items: Vec<Value>| -> Vec<Value> {
+        items
+            .into_iter()
+            .filter(|fact| fact["subjectInstanceId"] == worker.as_str())
+            .collect()
+    };
+    let started = ctx.journal_seq(&worker, entity("running", &at(0))).await?;
+    let asked = ctx
+        .journal_seq(&worker, question("int_key_1", &at(5)))
+        .await?;
+    let before = ctx.inbox(&ctx.human, &seat).await?;
+    assert_eq!(before.len(), 2);
+
+    // The Node replays the same rows (a lost acknowledgement).
+    assert!(
+        ctx.journal_at(&worker, started, entity("running", &at(0)))
+            .await?
+    );
+    assert!(
+        ctx.journal_at(&worker, asked, question("int_key_1", &at(5)))
+            .await?
+    );
+    assert_eq!(ctx.inbox(&ctx.human, &seat).await?, before);
+
+    // After a restart, the replay is still nothing new, and the keys and
+    // rows read back unchanged.
+    let ctx = ctx.restart().await?;
+    assert!(
+        ctx.journal_at(&worker, asked, question("int_key_1", &at(5)))
+            .await?
+    );
+    let after = subject_facts(ctx.inbox(&ctx.human, &seat).await?);
+    assert_eq!(after, before);
+    assert_eq!(
+        after[0]["dedupeKey"],
+        format!("started:{worker}:0:{}", at(0))
+    );
+    assert_eq!(after[0]["stateEnteredAt"], at(0));
+
+    // A re-sent request for an interaction the Hub already holds (a new row,
+    // a later journal time) is not a second fact either.
+    assert!(!ctx.journal(&worker, question("int_key_1", &at(9))).await?);
+    assert_eq!(subject_facts(ctx.inbox(&ctx.human, &seat).await?), before);
+    Ok(())
+}
+
+/// §10 Defaults: continuity lineages and agent-created coordinators receive
+/// facts; a Human-created instance without continuity only after its creator
+/// opts in; a muted kind is never recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_default_opt_in_and_mute_matrix() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("inbox-matrix").await?;
+    let (seat, seat_token) = ctx.coordinator(&project).await?;
+    let worker = ctx.worker(&seat_token, &project).await?;
+
+    // Human-created, no continuity: its resume child's facts are not kept.
+    let owner_session = ctx.plain_instance(json!({ "origin": "human" })).await?;
+    let owner_child = ctx
+        .plain_instance(json!({ "origin": "human", "parentInstanceId": owner_session }))
+        .await?;
+    // Agent-created (no grants), with a child of its own.
+    let agent_made = ctx.plain_instance(json!({ "origin": "agent" })).await?;
+    let agent_child = ctx
+        .plain_instance(json!({ "origin": "agent", "parentInstanceId": agent_made }))
+        .await?;
+
+    for subject in [&worker, &owner_child, &agent_child] {
+        ctx.journal(subject, entity("running", &at(0))).await?;
+        ctx.journal(subject, question(&format!("int_mx_{subject}"), &at(1)))
+            .await?;
+    }
+    assert_eq!(ctx.inbox(&ctx.human, &seat).await?.len(), 2, "continuity");
+    assert_eq!(
+        ctx.inbox(&ctx.human, &agent_made).await?.len(),
+        2,
+        "agent-created"
+    );
+    assert!(
+        ctx.inbox(&ctx.human, &owner_session).await?.is_empty(),
+        "a Human-created plain instance gets none by default"
+    );
+
+    // Only the owner opts in; the lineage itself cannot.
+    let owner_token = ctx.agent_token(&owner_session).await?;
+    let (status, _) = ctx
+        .patch_inbox(&owner_token, &owner_session, json!({ "optIn": true }))
+        .await?;
+    assert_eq!(status, 403);
+    let (status, settings) = ctx
+        .patch_inbox(&ctx.human, &owner_session, json!({ "optIn": true }))
+        .await?;
+    assert_eq!(status, 200, "{settings}");
+    assert_eq!(settings, json!({ "optIn": true, "mutedKinds": [] }));
+    ctx.journal(&owner_child, question("int_mx_after", &at(2)))
+        .await?;
+    let opted = ctx.inbox(&ctx.human, &owner_session).await?;
+    assert_eq!(opted.len(), 1);
+    assert_eq!(opted[0]["payload"]["interactionId"], "int_mx_after");
+
+    // The lineage mutes a kind for itself: none of that kind, others still.
+    let (status, settings) = ctx
+        .patch_inbox(&seat_token, &seat, json!({ "mutedKinds": ["interaction"] }))
+        .await?;
+    assert_eq!(status, 200, "{settings}");
+    assert_eq!(settings["mutedKinds"], json!(["interaction"]));
+    ctx.journal(&worker, question("int_mx_muted", &at(3)))
+        .await?;
+    ctx.journal(&worker, activity("idle", &at(4))).await?;
+    let items = ctx.inbox(&seat_token, &seat).await?;
+    assert!(
+        !items
+            .iter()
+            .any(|f| f["payload"]["interactionId"] == "int_mx_muted"),
+        "{items:#?}"
+    );
+    assert_eq!(items.last().unwrap()["kind"], "turn-done");
+    // A lineage reads and changes only its own settings.
+    let (status, _) = ctx
+        .patch_inbox(&seat_token, &agent_made, json!({ "mutedKinds": [] }))
+        .await?;
+    assert_eq!(status, 403);
+    // Unmuted, the kind is recorded again.
+    ctx.patch_inbox(&seat_token, &seat, json!({ "mutedKinds": [] }))
+        .await?;
+    ctx.journal(&worker, question("int_mx_unmuted", &at(5)))
+        .await?;
+    let items = ctx.inbox(&seat_token, &seat).await?;
+    assert_eq!(
+        items.last().unwrap()["payload"]["interactionId"],
+        "int_mx_unmuted"
+    );
+    Ok(())
+}
+
+/// F supersedes a paused chapter's pending interactions (D-057 §7.2 step
+/// 8): a fact for the chapter's parent lineage, never for its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn superseded_interactions_are_facts_for_the_parent_lineage() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("inbox-superseded").await?;
+    let (seat, seat_token) = ctx.coordinator(&project).await?;
+    // A continuity child: it holds a grant.
+    let created = ctx
+        .post(
+            &seat_token,
+            "/v1/instances",
+            json!({ "role": "worker", "grants": ["spend"], "projectId": project,
+                    "prompt": "work", "driver": "claude-pty" }),
+        )
+        .await?;
+    let child = created["instance"]["instanceId"]
+        .as_str()
+        .context("id")?
+        .to_string();
+    ctx.journal(&child, entity("running", &at(0))).await?;
+    ctx.journal(&child, question("int_sup_1", &at(1))).await?;
+
+    let (status, body) = ctx
+        .request(
+            reqwest::Method::POST,
+            &ctx.human,
+            &format!("/v1/instances/{child}/commands"),
+            Some(json!({"operation": "instance.close", "payload": {}})),
+        )
+        .await?;
+    assert!((200..300).contains(&status), "pause: {status} {body}");
+
+    let items = ctx.inbox(&seat_token, &seat).await?;
+    let superseded = of_kind(&items, "interaction-superseded", &child);
+    assert_eq!(superseded.len(), 1, "{items:#?}");
+    assert_eq!(superseded[0]["payload"]["interactionId"], "int_sup_1");
+    assert_eq!(superseded[0]["payload"]["interactionKind"], "question");
+    assert_eq!(superseded[0]["payload"]["supersededBy"], child.as_str());
+    assert!(
+        ctx.inbox(&ctx.human, &child).await?.is_empty(),
+        "never in the paused lineage's own inbox"
+    );
+    Ok(())
+}
+
+/// The scheduler's clock `minutes` from now, for the inbox tick hook.
+fn minutes_from_now(minutes: i64) -> String {
+    let t = time::OffsetDateTime::now_utc() + time::Duration::minutes(minutes);
+    t.format(&time::format_description::well_known::Rfc3339)
+        .expect("format")
+}
+
+/// Hosts in scope going offline and online, observed on the link. A drop is
+/// announced once the link stays down for the host-lost grace (10 min in
+/// the test Hub), counted from no earlier than the Hub's own start; the
+/// hello after it is the online fact. A blip, the boot bookkeeping that
+/// marks every host offline and the Hub's own restart announce nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_link_changes_are_facts_for_lineages_in_scope() -> Result<()> {
+    let mut ctx = Ctx::spawn().await?;
+    let project = ctx.project("inbox-hosts").await?;
+    let (seat, seat_token) = ctx.coordinator(&project).await?;
+    let token = ctx
+        .node
+        .as_ref()
+        .and_then(|node| node.node_token.clone())
+        .context("node token")?;
+    let host_facts = |items: &[Value]| -> Vec<String> {
+        items
+            .iter()
+            .filter(|f| f["payload"]["hostId"].is_string())
+            .map(|f| f["kind"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert!(host_facts(&ctx.inbox(&seat_token, &seat).await?).is_empty());
+
+    // A blip: down and back inside the grace.
+    ctx.disconnect().await?;
+    assert_eq!(ctx.hub.test_inbox_tick(&minutes_from_now(5)).await?, 0);
+    ctx.node = Some(connect_node(&ctx.hub, &ctx.host, &ctx.workspace, &token).await?);
+    assert_eq!(ctx.hub.test_inbox_tick(&minutes_from_now(11)).await?, 0);
+    assert!(host_facts(&ctx.inbox(&seat_token, &seat).await?).is_empty());
+
+    // Down past the grace: one offline fact, however often the tick runs.
+    ctx.disconnect().await?;
+    assert_eq!(ctx.hub.test_inbox_tick(&minutes_from_now(11)).await?, 1);
+    assert_eq!(ctx.hub.test_inbox_tick(&minutes_from_now(12)).await?, 0);
+    assert_eq!(
+        host_facts(&ctx.inbox(&seat_token, &seat).await?),
+        ["host-offline"]
+    );
+    // Back: the online fact.
+    ctx.node = Some(connect_node(&ctx.hub, &ctx.host, &ctx.workspace, &token).await?);
+    let items = ctx.inbox(&seat_token, &seat).await?;
+    assert_eq!(host_facts(&items), ["host-offline", "host-online"]);
+    assert_eq!(
+        items.last().unwrap()["payload"]["hostId"],
+        ctx.host.as_str()
+    );
+
+    // The Hub restarts: its own shutdown drops the link and the boot marks
+    // every host offline; the Node returns inside the grace. Nothing.
+    let mut ctx = ctx.restart().await?;
+    ctx.node = Some(connect_node(&ctx.hub, &ctx.host, &ctx.workspace, &token).await?);
+    assert_eq!(ctx.hub.test_inbox_tick(&minutes_from_now(30)).await?, 0);
+    assert_eq!(
+        host_facts(&ctx.inbox(&seat_token, &seat).await?),
+        ["host-offline", "host-online"]
+    );
+
+    // The Hub restarts and the Node does not come back: the grace runs from
+    // the new process's start, then the offline fact follows.
+    let ctx = ctx.restart().await?;
+    assert_eq!(ctx.hub.test_inbox_tick(&minutes_from_now(5)).await?, 0);
+    assert_eq!(ctx.hub.test_inbox_tick(&minutes_from_now(11)).await?, 1);
+    assert_eq!(
+        host_facts(&ctx.inbox(&seat_token, &seat).await?),
+        ["host-offline", "host-online", "host-offline"]
+    );
+    Ok(())
+}
+
+// ─── backup ─────────────────────────────────────────────────────────────────
+
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+/// A byte-copying stand-in for `age` (`-e -r R -o OUT IN` / `-d -i K -o OUT IN`).
+fn fake_age(bin: &Path) -> Result<()> {
+    std::fs::create_dir_all(bin)?;
+    remuda_testing::install_at(
+        &bin.join("age"),
+        "#!/bin/sh\n\
+         # Test stand-in: copies bytes; the backup test checks members, not crypto.\n\
+         out=''; in=''\n\
+         while [ $# -gt 0 ]; do\n\
+           case \"$1\" in\n\
+             -o) out=\"$2\"; shift 2 ;;\n\
+             -r|-i) shift 2 ;;\n\
+             -e|-d) shift ;;\n\
+             *) in=\"$1\"; shift ;;\n\
+           esac\n\
+         done\n\
+         cat \"$in\" > \"$out\"\n",
+    )?;
+    Ok(())
+}
+
+fn run(command: &mut Command) -> Result<String> {
+    let output = command.output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    anyhow::ensure!(
+        output.status.success(),
+        "{command:?} failed: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(stdout)
+}
+
+/// Item 1: the inbox, its occurrence counts and its settings ride
+/// `hub.sqlite`, so `scripts/hub-backup.sh` and a restore per hub-topology
+/// §6.1 carry them: the restored Hub reads the same page and keeps capping.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_inbox_survives_backup_and_restore() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("inbox-backup").await?;
+    let (seat, seat_token) = ctx.coordinator(&project).await?;
+    let worker = ctx.worker(&seat_token, &project).await?;
+    ctx.journal(&worker, entity("running", &at(0))).await?;
+    for n in 1..=7 {
+        ctx.journal(&worker, question(&format!("int_bk_{n}"), &at(60 * n)))
+            .await?;
+    }
+    ctx.patch_inbox(&seat_token, &seat, json!({ "mutedKinds": ["waiting"] }))
+        .await?;
+    let mut ctx = ctx;
+    ctx.disconnect().await?;
+    let before = ctx
+        .request(
+            reqwest::Method::GET,
+            &ctx.human,
+            &format!("/v1/lineages/{seat}/inbox?limit=200"),
+            None,
+        )
+        .await?
+        .1;
+    // started, six questions (the seventh capped).
+    assert_eq!(before["items"].as_array().map(Vec::len), Some(7));
+
+    let data = ctx.data_dir();
+    let Ctx { dir, hub, .. } = ctx;
+    hub.shutdown().await;
+    std::fs::create_dir_all(data.join("secrets"))?;
+    if !data.join("secrets/master.key").exists() {
+        std::fs::write(data.join("secrets/master.key"), "test-master-key")?;
+    }
+    if !data.join("bootstrap-token").exists() {
+        std::fs::write(data.join("bootstrap-token"), "test-bootstrap")?;
+    }
+    let bin = dir.path().join("bin");
+    fake_age(&bin)?;
+    let out = dir.path().join("backups");
+    let scratch = dir.path().join("tmp");
+    std::fs::create_dir_all(&scratch)?;
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let report = run(Command::new("bash")
+        .arg(repo_root().join("scripts/hub-backup.sh"))
+        .arg("--data-dir")
+        .arg(&data)
+        .arg("--output-dir")
+        .arg(&out)
+        .args(["--recipient", "age1testrecipient", "--execute"])
+        .env("REMUDA_BACKUP_YES_I_KNOW", "1")
+        .env("PATH", &path)
+        .env("TMPDIR", &scratch))?;
+    assert!(report.contains("execute ok"), "{report}");
+
+    let bundle = std::fs::read_dir(&out)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|ext| ext == "age"))
+        .context("bundle")?;
+    run(Command::new("sha256sum")
+        .arg("-c")
+        .arg(bundle.with_extension("age.sha256").file_name().unwrap())
+        .current_dir(&out))?;
+    let tar = dir.path().join("bundle.tar");
+    run(Command::new(bin.join("age"))
+        .args(["-d", "-i", "key", "-o"])
+        .arg(&tar)
+        .arg(&bundle))?;
+    let staged = dir.path().join("staged");
+    std::fs::create_dir_all(&staged)?;
+    run(Command::new("tar")
+        .arg("-xf")
+        .arg(&tar)
+        .arg("-C")
+        .arg(&staged))?;
+    let manifest: Value = serde_json::from_slice(&std::fs::read(staged.join("manifest.json"))?)?;
+    let restored_dir = tempfile::tempdir()?;
+    let restored = restored_dir.path().join("hub");
+    std::fs::create_dir_all(&restored)?;
+    for member in manifest["members"].as_array().context("members")? {
+        let rel = member["path"].as_str().context("path")?;
+        let digest = run(Command::new("sha256sum").arg(rel).current_dir(&staged))?;
+        assert_eq!(
+            digest.split_whitespace().next(),
+            member["sha256"].as_str(),
+            "{rel}"
+        );
+        let target = restored.join(rel);
+        std::fs::create_dir_all(target.parent().unwrap())?;
+        std::fs::copy(staged.join(rel), &target)?;
+    }
+
+    let hub = spawn(HubConfig::for_test(restored.clone())).await?;
+    let human = hub.mint_device_token("inbox-restored").await?;
+    let restored_ctx = Ctx {
+        dir: restored_dir,
+        hub,
+        http: reqwest::Client::new(),
+        human,
+        host: String::new(),
+        workspace: String::new(),
+        node: None,
+    };
+    let after = restored_ctx
+        .request(
+            reqwest::Method::GET,
+            &restored_ctx.human,
+            &format!("/v1/lineages/{seat}/inbox?limit=200"),
+            None,
+        )
+        .await?
+        .1;
+    assert_eq!(after, before, "rows, keys, counts and settings survive");
+    drop(dir);
+    Ok(())
+}

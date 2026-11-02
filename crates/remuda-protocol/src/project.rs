@@ -422,6 +422,16 @@ pub struct ProjectConfigurablePolicy {
     /// Relax "one active dispatch holder per project".
     #[serde(default)]
     pub allow_multiple_dispatchers: bool,
+    /// Inbox facts recorded per `(subscriber, subject, kind)` in a rolling
+    /// 24 h window (D-060 §10.1 item 2). It only stops re-recording the same
+    /// fact; it limits nothing an agent can do.
+    #[serde(default = "default_fact_occurrence_cap")]
+    pub fact_occurrence_cap: i64,
+    /// Minutes a tool call may stay in flight before it yields one stall
+    /// fact (D-060 §10.1 item 8). Absent: a tool in flight never yields one;
+    /// the Hub picks no number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stall_tool_threshold_mins: Option<i64>,
 }
 
 fn default_max_concurrent_workers() -> i64 {
@@ -448,6 +458,9 @@ fn default_max_delegation_depth() -> i64 {
 fn default_coordinator_fan_out() -> i64 {
     crate::DEFAULT_COORDINATOR_FAN_OUT as i64
 }
+fn default_fact_occurrence_cap() -> i64 {
+    crate::DEFAULT_FACT_OCCURRENCE_CAP
+}
 
 impl Default for ProjectConfigurablePolicy {
     fn default() -> Self {
@@ -461,6 +474,8 @@ impl Default for ProjectConfigurablePolicy {
             max_delegation_depth: default_max_delegation_depth(),
             coordinator_fan_out: default_coordinator_fan_out(),
             allow_multiple_dispatchers: false,
+            fact_occurrence_cap: default_fact_occurrence_cap(),
+            stall_tool_threshold_mins: None,
         }
     }
 }

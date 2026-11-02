@@ -11,7 +11,8 @@ import { rank } from "../mobile/homeRows";
  *   unsupported. A row that is merely idle, ended, or starting has no turn.
  * - 重命名: always. It is a local display name; no Hub route exists for it.
  * - 复制目录: only when the row has a working directory.
- * - 复制恢复命令: only when a native session id is known.
+ * - 复制恢复命令: only for a kind with a documented resume form and a native
+ *   session id. Only `claude --resume <id>` is documented.
  * - 在此项目新建: only when the row names a host and a workspace or directory.
  * - 关闭…: only while the session is still alive.
  */
@@ -27,16 +28,28 @@ export function rowActionKeys(instance: Instance): RowActionKey[] {
   }
   keys.push("rename");
   if (instance.cwd?.trim()) keys.push("copyCwd");
-  if (knowledgeValue(instance.nativeRef?.sessionId)) keys.push("copyResume");
+  if (resumeCommand(instance)) keys.push("copyResume");
   if (instance.hostId && (instance.workspaceId || instance.cwd)) keys.push("newInProject");
   if (!ENDED.has(instance.lifecycle)) keys.push("close");
   return keys;
 }
 
-/** `claude --resume <id>` for a claude session, `<kind> --resume <id>` otherwise. */
+/** Single-quote a shell word, escaping embedded quotes (`'` → `'\''`). */
+export function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * The documented resume command for the row, or null.
+ *
+ * Only Claude documents `--resume <session uuid>` (docs/design/protocol.md
+ * D-026); no other harness's resume form is documented and the remuda CLI has
+ * no verb that resumes an instance by id, so the item is offered for a claude
+ * row only. The id comes from the driver's report and is never trusted to be
+ * shell-safe: it is single-quoted, with embedded quotes escaped.
+ */
 export function resumeCommand(instance: Instance): string | null {
   const sessionId = knowledgeValue(instance.nativeRef?.sessionId);
-  if (!sessionId) return null;
-  const driver = instance.kind === "claude" ? "claude" : instance.kind;
-  return `${driver} --resume ${sessionId}`;
+  if (!sessionId || instance.kind !== "claude") return null;
+  return `claude --resume ${shellQuote(sessionId)}`;
 }

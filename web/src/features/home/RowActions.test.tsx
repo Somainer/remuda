@@ -193,4 +193,16 @@ describe("RowActions", () => {
       delete document.documentElement.dataset.keyboard;
     }
   });
+
+  it("offers 复制恢复命令 only for a claude row", async () => {
+    render(<Harness instance={inst({ nativeRef: { sessionId: known("sess_abc") } as Instance["nativeRef"] })} />);
+    await userEvent.click(screen.getByTestId("row-actions-more"));
+    expect(screen.getByTestId("row-action-copyResume").textContent).toBe("复制恢复命令");
+  });
+
+  it("has no 复制恢复命令 for a kind without a documented resume form", async () => {
+    render(<Harness instance={inst({ kind: "codex", nativeRef: { sessionId: known("thr_1") } as Instance["nativeRef"] })} />);
+    await userEvent.click(screen.getByTestId("row-actions-more"));
+    expect(screen.queryByTestId("row-action-copyResume")).toBeNull();
+  });
 });

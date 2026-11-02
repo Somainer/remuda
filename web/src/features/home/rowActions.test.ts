@@ -67,10 +67,26 @@ describe("rowActionKeys", () => {
   it("offers 复制恢复命令 only with a known native session id", () => {
     const withId = inst({ nativeRef: { sessionId: known("sess_abc") } as Instance["nativeRef"] });
     expect(rowActionKeys(withId)).toContain("copyResume");
-    expect(resumeCommand(withId)).toBe("claude --resume sess_abc");
-    const codex = inst({ kind: "codex", nativeRef: { sessionId: known("thr_1") } as Instance["nativeRef"] });
-    expect(resumeCommand(codex)).toBe("codex --resume thr_1");
+    expect(resumeCommand(withId)).toBe("claude --resume 'sess_abc'");
     expect(resumeCommand(inst())).toBeNull();
+  });
+
+  it("offers 复制恢复命令 only for claude, the one documented resume form", () => {
+    // No documented `codex --resume` here: the item is absent for every other
+    // kind rather than a guessed command.
+    const codex = inst({ kind: "codex", nativeRef: { sessionId: known("thr_1") } as Instance["nativeRef"] });
+    expect(resumeCommand(codex)).toBeNull();
+    expect(rowActionKeys(codex)).not.toContain("copyResume");
+  });
+
+  it("single-quotes the resume id, so a hostile id cannot run a command", () => {
+    const hostile = inst({
+      nativeRef: { sessionId: known("abc'; rm -rf ~") } as Instance["nativeRef"],
+    });
+    expect(resumeCommand(hostile)).toBe("claude --resume 'abc'\\''; rm -rf ~'");
+    expect(resumeCommand(inst({ nativeRef: { sessionId: known("a b") } as Instance["nativeRef"] }))).toBe(
+      "claude --resume 'a b'",
+    );
   });
 
   it("offers 关闭… only while the session is alive", () => {

@@ -18,6 +18,7 @@ import {
   arrangeHomeGroups,
   buildHomeGroups,
   buildHomeRows,
+  buildHomeTaskLayer,
   homeError,
   homeTurnError,
   homeRowsSignature,
@@ -31,6 +32,8 @@ import {
   writeHomeOrder,
 } from "./homeRows";
 import { mapInstance } from "../../lib/api";
+import { deriveHomeQueue } from "../home/homeQueue";
+import { source as queueSource, task as queueTask } from "../home/queueTestData";
 
 /**
  * Fixtures: the mock's first instance is a connected claude-print session
@@ -949,5 +952,22 @@ describe("buildHomeRows / arrangeHomeGroups split (commit:HomeList caching seam)
     expect(a.sig, "a detail-only last_error change must invalidate the cached slice").not.toBe(
       b.sig,
     );
+  });
+});
+
+describe("home task layer dedupe (home.md §4.6)", () => {
+  it("drops the ledger's own 需要你 attention group; the task stays in its project", () => {
+    const blocked = queueTask({ id: "tsk_b", blockedReason: "等你确认验收范围" });
+    const groups = buildHomeTaskLayer({
+      tasks: [blocked, queueTask({ id: "tsk_ok" })],
+      instances: [],
+      interactions: [],
+      spaces: [],
+      projectName: () => "remuda",
+    });
+    expect(groups.some((group) => group.kind === "attention")).toBe(false);
+    expect(groups.flatMap((group) => group.rows.map((row) => row.id))).toContain("tsk_b");
+    // …and it is a 「任务待你」 card in the ④ queue instead.
+    expect(deriveHomeQueue(queueSource({ tasks: [blocked] })).cards.map((card) => card.id)).toEqual(["tsk_b"]);
   });
 });

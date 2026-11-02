@@ -42,6 +42,21 @@ const storeMock = vi.hoisted(() => {
 });
 vi.mock("./store", () => ({ hubStore: storeMock.hubStore }));
 
+// §5.1 B: the badge adds owner-blocked tasks from the shared task ledger.
+const ledgerMock = vi.hoisted(() => ({
+  tasks: [] as unknown[],
+  listeners: new Set<() => void>(),
+}));
+vi.mock("../features/tasks/taskLedger", () => ({
+  subscribeTaskLedger: (_projectId: string | null, listener: () => void) => {
+    ledgerMock.listeners.add(listener);
+    return () => {
+      ledgerMock.listeners.delete(listener);
+    };
+  },
+  taskLedgerSnapshot: () => ({ tasks: ledgerMock.tasks, projectName: () => undefined }),
+}));
+
 class FakeSubscription {
   endpoint = "https://push.example/sub/abc";
   expirationTime = null;
@@ -107,7 +122,7 @@ function stubPushManager(existing: FakeSubscription | null = null) {
 describe("push deep links", () => {
   it("prefers data.url, else tag, else sessions", () => {
     expect(resolvePushDeepLink({ data: { url: "/s/ins_1" } })).toBe("/s/ins_1");
-    expect(resolvePushDeepLink({ tag: "interaction:int_9" })).toBe("/approvals?focus=int_9");
+    expect(resolvePushDeepLink({ tag: "interaction:int_9" })).toBe("/sessions?focus=int_9");
     expect(resolvePushDeepLink({ tag: "instance:ins_2" })).toBe("/s/ins_2");
     expect(resolvePushDeepLink({})).toBe("/sessions");
   });
@@ -212,6 +227,7 @@ describe("startAppBadgeSync follows the store pending count", () => {
 
   afterEach(() => {
     stopAppBadgeSync();
+    expect(ledgerMock.listeners.size).toBe(0);
     delete (navigator as { setAppBadge?: unknown }).setAppBadge;
     delete (navigator as { clearAppBadge?: unknown }).clearAppBadge;
   });
@@ -240,6 +256,22 @@ describe("startAppBadgeSync follows the store pending count", () => {
     storeMock.interactions.splice(0, 2);
     storeMock.emit();
     expect(clearAppBadge).toHaveBeenCalledTimes(2);
+  });
+
+  it("adds owner-blocked tasks with no waiting interaction (home.md §5.1 N)", () => {
+    startAppBadgeSync();
+    ledgerMock.tasks = [
+      { id: "tsk_b", blockedReason: "等你确认验收范围", archivedAt: null, createdAt: "2026-10-31T08:00:00.000Z" },
+      { id: "tsk_a", blockedReason: "x", archivedAt: "2026-10-31T09:00:00.000Z", createdAt: "2026-10-31T08:00:00.000Z" },
+      { id: "tsk_ok", blockedReason: null, archivedAt: null, createdAt: "2026-10-31T08:00:00.000Z" },
+    ];
+    for (const listener of [...ledgerMock.listeners]) listener();
+    expect(setAppBadge).toHaveBeenCalledWith(1);
+    storeMock.interactions.push({ state: "pending", deadline: { state: "unknown" } });
+    storeMock.emit();
+    expect(setAppBadge).toHaveBeenLastCalledWith(2);
+    expect(pendingInteractionCount()).toBe(2);
+    ledgerMock.tasks = [];
   });
 
   it("does not call the API again while the count is unchanged", () => {

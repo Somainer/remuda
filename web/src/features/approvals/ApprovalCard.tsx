@@ -18,9 +18,37 @@ import { QuestionForm } from "./QuestionForm";
 import { ElicitationCard } from "./ElicitationCard";
 import { InteractionDeadline } from "./InteractionDeadline";
 import { PtyQuestionAnswers } from "../../components/PtyQuestionAnswers";
+import {
+  HOME_RECEIPT_TEXT,
+  HOME_STALE_TEXT,
+  chipAnswer,
+  homeApprovalOptions,
+  homeCardKind,
+  inboxHref,
+  lastLines,
+  type HomeCardKind,
+} from "../home/homeQueue";
 import css from "./decision.module.css";
+import homeCss from "../home/homeQueue.module.css";
 
-export type InboxMode = "desktop" | "compact";
+/**
+ * `home` is the ④ 需要你 card (home.md §4.2): it grants less than the inbox
+ * (§4.3) — see {@link HomeDecision}.
+ */
+export type InboxMode = "desktop" | "compact" | "home";
+
+/** What only a `mode="home"` card needs from its queue (home.md §4.4, §8). */
+export type HomeCardState = {
+  placement: "phone" | "desktop";
+  /** §4.4 receipt: 「已提交」 after a 200, 「已在其他设备处理」 after 409/410. */
+  receipt: "submitted" | "elsewhere" | null;
+  /** §8 stale: buttons grey out with 「数据可能过期」. */
+  stale: boolean;
+  /** Painted during a §3.3 hold but gone from the live queue: nothing fires. */
+  inert?: boolean;
+  /** The tty card's last screen lines (§4.2 终端提示); empty = request text. */
+  screenLines?: readonly string[];
+};
 
 /**
  * The single normalized shape the shared decision card renders. Both row
@@ -88,10 +116,13 @@ export const DecisionCard = memo(function DecisionCard({
   view,
   mode,
   onRespond,
+  home,
 }: {
   view: DecisionView;
   mode: InboxMode;
   onRespond: (item: Interaction, answer: InteractionAnswer) => void | Promise<void>;
+  /** Required by `mode="home"`; ignored by the inbox modes. */
+  home?: HomeCardState;
 }) {
   const { item, uiState, focused } = view;
   const paused = uiState === "paused";
@@ -120,6 +151,18 @@ export const DecisionCard = memo(function DecisionCard({
   };
 
   const blocked = paused || !item.answerable;
+
+  if (mode === "home") {
+    return (
+      <HomeDecision
+        view={view}
+        home={home ?? { placement: "phone", receipt: null, stale: false }}
+        submitError={submitError}
+        submit={submit}
+      />
+    );
+  }
+
   const previewText = decisionPreview(item);
   // The verbatim <pre> carries approvals and native-tty questions. Hook
   // questions render the tabbed form and plan reviews / elicitations their
@@ -353,12 +396,257 @@ export const DecisionCard = memo(function DecisionCard({
 }, areEqual);
 
 function areEqual(
-  prev: { view: DecisionView; mode: InboxMode; onRespond: (i: Interaction, a: InteractionAnswer) => void | Promise<void> },
+  prev: {
+    view: DecisionView;
+    mode: InboxMode;
+    onRespond: (i: Interaction, a: InteractionAnswer) => void | Promise<void>;
+    home?: HomeCardState;
+  },
   next: typeof prev,
 ): boolean {
   // The adapters allocate a fresh view object every poll; compare its sig
   // (which covers every rendered field) instead of object identity.
-  return prev.view.sig === next.view.sig && prev.mode === next.mode && prev.onRespond === next.onRespond;
+  return (
+    prev.view.sig === next.view.sig
+    && prev.mode === next.mode
+    && prev.onRespond === next.onRespond
+    && sameHome(prev.home, next.home)
+  );
+}
+
+function sameHome(a: HomeCardState | undefined, b: HomeCardState | undefined): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return (
+    a.placement === b.placement
+    && a.receipt === b.receipt
+    && a.stale === b.stale
+    && (a.inert ?? false) === (b.inert ?? false)
+    && (a.screenLines ?? []).join("\n") === (b.screenLines ?? []).join("\n")
+  );
+}
+
+/** The kind label on a home card's first line (home.md §2.1 wireframe). */
+function homeLabel(item: Interaction, kind: HomeCardKind): string {
+  if (kind === "approval") {
+    return item.request.kind === "approval" ? `需要你授权 · ${item.request.title}` : "需要你授权";
+  }
+  if (kind === "plan") return "计划待审";
+  if (kind === "tty") return "终端提示";
+  if (kind === "sensitive") return item.kind === "elicitation" ? "需要你填写" : "需要你回答 · 敏感";
+  return "需要你回答";
+}
+
+/** The card's body text, verbatim (ui-spec §2.5: never rewritten). */
+function homeBody(item: Interaction, kind: HomeCardKind, screenLines: readonly string[]): string {
+  if (kind === "tty") {
+    const screen = lastLines(screenLines);
+    if (screen.length) return screen.join("\n");
+    return lastLines(decisionPreview(item).split("\n")).join("\n");
+  }
+  if (item.request.kind === "question") {
+    const fields = item.request.fields;
+    if (fields.length === 1) return fields[0].title || fields[0].description || item.request.title;
+    return `问你 ${fields.length} 题 · ${item.request.title}`;
+  }
+  if (item.request.kind === "plan-review") return planPreview(item);
+  return decisionPreview(item);
+}
+
+/**
+ * §4.2 计划：「标题、正文前 2 行」. The title is its own line (never clamped
+ * into the body's budget); the body carries exactly the first two non-blank
+ * plan lines, both shown in full.
+ */
+function planPreview(item: Interaction): string {
+  if (item.request.kind !== "plan-review") return "";
+  return typeof item.request.plan === "string" ? lastLinesHead(item.request.plan, 2) : "";
+}
+
+/** The first `count` non-blank lines of a text. */
+function lastLinesHead(text: string, count: number): string {
+  return text
+    .split("\n")
+    .filter((line) => line.trim().length > 0)
+    .slice(0, count)
+    .join("\n");
+}
+
+/**
+ * The ④ 需要你 card (home.md §4.2–4.4, `mode="home"`). Smaller surfaces grant
+ * less (§4.3): an approval offers only its `deny` and `allow-once` options
+ * (allow-session is never rendered; with either missing the card is a
+ * 去收件箱 link), a simple question gets chips plus 「其他…」, every other
+ * question 去回答, a plan only 审阅计划 — there is no approve control on the
+ * home at all — a terminal prompt its last 3 lines plus 去终端, and a
+ * sensitive field or an elicitation only 去会话. No batch control exists.
+ *
+ * The answer flow is not optimistic (§4.4): buttons stay disabled while the
+ * POST is in flight; the queue owns the receipt (「已提交」 / 「已在其他设备处理」),
+ * and any other error is shown under the buttons, which re-enable.
+ */
+function HomeDecision({
+  view,
+  home,
+  submitError,
+  submit,
+}: {
+  view: DecisionView;
+  home: HomeCardState;
+  submitError: string | null;
+  submit: (answer: InteractionAnswer) => Promise<void>;
+}) {
+  const { item, uiState, focused } = view;
+  const kind = homeCardKind(item);
+  const answering = uiState === "answering";
+  const paused = uiState === "paused";
+  const inert = home.inert === true;
+  // §8: a stale queue greys every answer control; answering, paused and the
+  // receipt keep them off too. Links stay live — they only navigate.
+  const disabled = answering || paused || home.stale || inert || home.receipt !== null || !item.answerable;
+  const where = [view.hostLabel, view.workspaceLabel].filter(Boolean).join(" › ");
+  const session = `/s/${item.instanceId}`;
+  const linkProps = inert
+    ? { "aria-disabled": true, tabIndex: -1, onClick: (event: { preventDefault: () => void }) => event.preventDefault() }
+    : {};
+
+  const actions = (() => {
+    if (kind === "approval") {
+      const options = homeApprovalOptions(item);
+      if (!options) {
+        return (
+          <Link to={inboxHref(home.placement, item.id)} className={css.actionBtn} data-testid="home-card-inbox" {...linkProps}>
+            去收件箱
+          </Link>
+        );
+      }
+      return [options.deny, options.allowOnce].map((opt) => (
+        <button
+          key={opt.id}
+          type="button"
+          className={opt.effect === "deny" ? css.actionBtn : css.actionPrimary}
+          data-testid="home-card-option"
+          data-effect={opt.effect}
+          disabled={disabled}
+          onClick={() => {
+            const answer = optionAnswerFor(item, opt.id);
+            if (answer) void submit(answer);
+          }}
+        >
+          {opt.label}
+        </button>
+      ));
+    }
+    if (kind === "simple-question" && item.request.kind === "question") {
+      return [
+        ...item.request.fields[0].options.map((opt) => (
+          <button
+            key={opt.id}
+            type="button"
+            className={homeCss.chip}
+            data-testid="home-card-chip"
+            // Single-line control (visual-system §8.1): a clipped label keeps
+            // its full text in the tooltip.
+            title={opt.label}
+            disabled={disabled}
+            onClick={() => {
+              const answer = chipAnswer(item, opt.id);
+              if (answer) void submit(answer);
+            }}
+          >
+            {opt.label}
+          </button>
+        )),
+        <Link key="other" to={session} className={homeCss.chipLink} data-testid="home-card-other" {...linkProps}>
+          其他…
+        </Link>,
+      ];
+    }
+    const link =
+      kind === "plan"
+        ? { to: session, text: "审阅计划", testid: "home-card-review" }
+        : kind === "tty"
+          ? { to: `/s/${item.instanceId}/tty`, text: "去终端", testid: "home-card-tty" }
+          : kind === "sensitive"
+            ? { to: session, text: "去会话", testid: "home-card-session" }
+            : { to: session, text: "去回答", testid: "home-card-answer" };
+    return (
+      <Link to={link.to} className={css.actionPrimary} data-testid={link.testid} {...linkProps}>
+        {link.text}
+      </Link>
+    );
+  })();
+
+  return (
+    <article
+      className={`${homeCss.card} ${focused ? homeCss.cardFocus : ""}`}
+      data-testid="home-queue-card"
+      data-card-type="interaction"
+      data-card-id={item.id}
+      data-interaction-id={item.id}
+      data-kind={item.kind}
+      data-home-kind={kind}
+      data-state={uiState}
+      data-focus={focused ? "true" : "false"}
+      data-receipt={home.receipt ?? undefined}
+      data-stale={inert ? "1" : undefined}
+    >
+      <header className={homeCss.head}>
+        <span className={homeCss.label} title={homeLabel(item, kind)}>
+          {homeLabel(item, kind)}
+        </span>
+        {where ? (
+          <span className={homeCss.where} title={where}>
+            {where}
+          </span>
+        ) : null}
+      </header>
+      {kind === "plan" && item.request.kind === "plan-review" ? (
+        <>
+          <p className={homeCss.planTitle} data-testid="home-card-plan-title" title={item.request.title}>
+            {item.request.title}
+          </p>
+          {planPreview(item) ? (
+            <p className={homeCss.body} data-testid="home-card-body">
+              {planPreview(item)}
+            </p>
+          ) : null}
+        </>
+      ) : (
+        <p
+          className={kind === "tty" || kind === "approval" ? homeCss.bodyMono : homeCss.body}
+          data-testid="home-card-body"
+        >
+          {homeBody(item, kind, home.screenLines ?? [])}
+        </p>
+      )}
+      {home.receipt ? (
+        <p className={homeCss.receipt} role="status" data-testid="home-card-receipt" data-receipt={home.receipt}>
+          {HOME_RECEIPT_TEXT[home.receipt]}
+        </p>
+      ) : (
+        <div className={homeCss.actions}>
+          {actions}
+          {answering ? (
+            <span className={homeCss.hint} data-testid="home-card-submitting">
+              {QUEUE_STATUS_TEXT.answering}
+            </span>
+          ) : paused ? (
+            <span className={homeCss.hint}>{QUEUE_STATUS_TEXT.paused}</span>
+          ) : home.stale ? (
+            <span className={homeCss.hint} data-testid="home-card-stale">
+              {HOME_STALE_TEXT}
+            </span>
+          ) : null}
+        </div>
+      )}
+      {submitError && !home.receipt ? (
+        <p className={css.planError} role="alert" data-testid="home-card-error">
+          {submitError}
+        </p>
+      ) : null}
+    </article>
+  );
 }
 
 /**

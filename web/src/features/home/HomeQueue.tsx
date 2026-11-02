@@ -16,6 +16,7 @@ import { formatGlanceCount, glanceCounts, type GlanceSource } from "./glance";
 import { GLANCE_TARGETS } from "./glanceNav";
 import {
   HOME_QUEUE_LIMIT,
+  HOME_STALE_TEXT,
   answeredElsewhere,
   deriveHomeQueue,
   inboxHref,
@@ -455,7 +456,14 @@ function QueueCard({
     );
   }
   return (
-    <FailedCard card={card} focused={focused} inert={inert} workspaceLabel={workspaceLabel} linkProps={linkProps} />
+    <FailedCard
+      card={card}
+      focused={focused}
+      inert={inert}
+      stale={stale}
+      workspaceLabel={workspaceLabel}
+      linkProps={linkProps}
+    />
   );
 }
 
@@ -468,12 +476,15 @@ function FailedCard({
   card,
   focused,
   inert,
+  stale,
   workspaceLabel,
   linkProps,
 }: {
   card: Extract<HomeQueueCard, { type: "failed" }>;
   focused: boolean;
   inert: boolean;
+  /** §8: the queue is stale — 知道了 greys out like every other home action. */
+  stale: boolean;
   workspaceLabel: string;
   linkProps: object;
 }) {
@@ -510,7 +521,7 @@ function FailedCard({
           type="button"
           className={css.chip}
           data-testid="home-card-ack"
-          disabled={inert || busy}
+          disabled={inert || busy || stale}
           onClick={() => {
             setBusy(true);
             setError(null);
@@ -525,6 +536,11 @@ function FailedCard({
         >
           知道了
         </button>
+        {stale ? (
+          <span className={css.hint} data-testid="home-card-stale">
+            {HOME_STALE_TEXT}
+          </span>
+        ) : null}
       </div>
       {error ? (
         <p className={css.hint} role="alert">

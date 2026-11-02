@@ -176,6 +176,21 @@ describe("HomeQueue (§4.1)", () => {
     expect(screen.queryByTestId("home-queue")).toBeNull();
   });
 
+  it("greys 知道了 with 数据可能过期 while the queue is stale (§8)", () => {
+    fake.state = hub({
+      instances: [inst({ id: "ins_f", lastTurnError: { at: T1, text: "API Error: 529" }, unseen: true })],
+    });
+    fake.freshness = { state: "stale", lastOkAt: 1, failingSince: 1 };
+    renderQueue();
+    const card = cards()[0];
+    expect(within(card).getByTestId("home-card-ack")).toBeDisabled();
+    expect(within(card).getByTestId("home-card-stale")).toHaveTextContent("数据可能过期");
+    // 打开 only navigates, so it stays live (§4.4).
+    expect(within(card).getByTestId("home-card-open")).not.toHaveAttribute("aria-disabled");
+    fireEvent.click(within(card).getByTestId("home-card-ack"));
+    expect(fake.markSeen).not.toHaveBeenCalled();
+  });
+
   it("renders a failed turn with 打开 and 知道了 (seen), outside the count", async () => {
     fake.state = hub({
       instances: [inst({ id: "ins_f", lastTurnError: { at: T1, text: "API Error: 529" }, unseen: true })],

@@ -11,7 +11,44 @@ omits these produces an agent that pushes, edits `main`, or never terminates:
 - run the gates for the crates touched (fmt, test, clippy `-D warnings`) and
   the repo secret scan
 - **never push**, never touch `main` — the coordinator fetches the branch
-- finish with a single line: `DONE <sha>`, or `BLOCKED <reason>`
+- finish with the DONE report below, or `BLOCKED <reason>`
 
-Tell the agent the literal completion line. The `DONE <sha>` convention is
-what makes `wait --until 'line:…'` work, and the sha is what you merge.
+Tell the agent the literal completion line. `DONE <task> tip=<sha>` is what
+makes `wait --until 'line:^DONE'` work, and the tip sha is what you merge.
+
+## DONE report
+
+A completion line is a claim; the report is its evidence. Ask for this shape
+and tell the worker to print it verbatim as its last message:
+
+```text
+DONE <task> tip=<sha>
+item 1: commit=<sha> test=<name> red=<the assertion that failed on the base tip>
+item 2: commit=<sha> test=<name> red=<the assertion that failed on the base tip>
+checks: <check> — <the verbatim final result line>
+rc: <what ran outside the unit suites> — <observed result>; evidence: <path>
+flake: <test name> — <failure message>
+```
+
+- **First line.** `DONE <task> tip=<sha>` names the full tip commit that is
+  already on the pushed branch — not the short sha, not the first commit of
+  the series.
+- **One line per item.** The `commit` that implements it, the `test` that
+  proves it, and the exact failure that test produced on the base tip (`red`).
+  "It failed before my change" is not a RED proof; the failing assertion line
+  is.
+- **Checks as result lines.** Paste the final line each check prints (`passed`,
+  `0 unhandled errors`, the exit status). Do not paraphrase or summarise a
+  log. A check that did not run says `skipped` and why; a check that failed is
+  reported as failed, not omitted.
+- **Real-condition check.** Name what ran outside the unit suites (a live
+  round trip, a real service, a browser flow), the observed result, and the
+  path to the evidence file under `scratch/proof/`. The path is the evidence;
+  a summary of a log is not.
+- **Flakes.** An unrelated suite that failed is reported with its test name
+  and failure message and left untouched. Do not fix it on a branch that does
+  not own it.
+- **Missing pieces are explicit.** If an item has no test, write `test=none`
+  and why. Silence is indistinguishable from an omission.
+- **BLOCKED is the only alternative** to DONE: one line, `BLOCKED <reason>`.
+  Never dress a blocked task as a partial DONE report.

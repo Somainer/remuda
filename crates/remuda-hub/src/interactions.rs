@@ -400,6 +400,12 @@ pub async fn list_interactions(
         .into_iter()
         .map(|row| row.to_list_item())
         .collect();
+    // cb-requested-by: durable rows are Node-sourced and `requestedBy` is
+    // Hub-stamped only, so a record a Node supplied (including one stored
+    // before ingest stripped it) is dropped before this page is built.
+    for item in &mut items {
+        crate::root_turn::strip_requested_by(item);
+    }
     let mut hub_cards: Vec<Value> = state
         .agent_approvals
         .list(&device)
@@ -504,7 +510,9 @@ pub async fn list_interactions(
                                 continue;
                             }
                             if id.is_empty() || seen.insert(id.to_string()) {
-                                items.push(flatten_interaction(item.clone()));
+                                let mut item = item.clone();
+                                crate::root_turn::strip_requested_by(&mut item);
+                                items.push(flatten_interaction(item));
                             }
                         }
                     }

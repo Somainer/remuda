@@ -16045,6 +16045,11 @@ fn append_loaded_event(
         .and_then(Value::as_str)
         .map(str::to_string)
         .unwrap_or_else(|| new_id("evt").unwrap_or_else(|_| "evt_missing".into()));
+    // cb-requested-by: a Node's interaction payload is untrusted, and
+    // `requestedBy` is Hub-stamped only. Drop any record it supplied before
+    // the event is journaled, so it reaches neither the journal row nor the
+    // interaction table the inbox serves.
+    crate::root_turn::strip_supplied_requested_by(&mut event);
     if let Some(obj) = event.as_object_mut() {
         obj.entry("eventId".to_string())
             .or_insert_with(|| json!(event_id.clone()));

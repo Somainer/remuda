@@ -1392,6 +1392,10 @@ async fn an_owner_create_prompt_is_the_first_turns_excerpt() -> Result<()> {
 /// body carries it verbatim if a route leaks it.
 const SENTINEL: &str = "reqby-sentinel-8c1f";
 
+/// A string that only ever appears in a Node-supplied `requestedBy` (r4): the
+/// Hub must neither store it nor serve it.
+const NODE_SENTINEL: &str = "reqby-sentinel-node-4d2a";
+
 /// Where [`scan_data_dir`] found the sentinel: the file, and for a SQLite
 /// file the table, the column and the row's text and integer cells.
 #[derive(Debug)]
@@ -1601,6 +1605,34 @@ async fn the_owners_words_are_stored_only_in_the_command_row() -> Result<()> {
             "the scan saw no {table} row with the owner's words: {hits:?}"
         );
     }
+
+    // A Node's interaction payload is untrusted: a record it supplies is
+    // dropped at ingest, so the same scan finds no part of it — in the
+    // interaction row, the journal row or anywhere else.
+    ctx.journal(
+        &node,
+        &seat,
+        json!({
+            "kind": "interaction.requested",
+            "payload": {
+                "interactionKind": "approval",
+                "interaction": {
+                    "id": "int_node_supplied", "kind": "approval", "state": "pending",
+                    "blocking": true, "answerable": true, "carrier": "harness-hook",
+                    "deadline": {"state": "unknown"}, "resolution": {"state": "unknown"},
+                    "request": {"kind": "approval", "title": "Bash",
+                                "description": "a Node's own card", "options": []},
+                    "requestedBy": {"commandId": "cmd_node", "excerpt": NODE_SENTINEL},
+                }
+            }
+        }),
+    )
+    .await;
+    let supplied = scan_data_dir(&ctx.dir.path().join("data"), NODE_SENTINEL);
+    assert!(
+        supplied.is_empty(),
+        "a Node's requestedBy was stored: {supplied:?}"
+    );
 
     // The approval cards live in the Hub's memory, not a table: a Bot reads
     // them exactly as stored (nothing hydrates a Bot), and they hold the
@@ -2005,17 +2037,19 @@ async fn the_owner_reads_their_words_on_the_card_board_and_task_detail() -> Resu
         "the task list is not a surface the words are shown on"
     );
 
-    // A card a Node lists is the Node's word, not a record the Hub stamped:
-    // naming the owner's command never borrows the owner's words.
+    // `requestedBy` is Hub-stamped only: a card a Node lists carries none of
+    // its own, even when it names the owner's command, and even for the owner.
     node.cards.lock().expect("cards").push(json!({
         "interactionId": "int_node_card", "id": "int_node_card",
         "instanceId": seat, "hostId": ctx.host, "kind": "approval",
         "state": "pending", "requestedBy": {"commandId": owner},
     }));
     let cards = ctx.get("/v1/interactions").await;
-    assert_eq!(
-        card_in(&cards, "int_node_card").context("the Node's card")?["requestedBy"],
-        json!({"commandId": owner}),
+    assert!(
+        card_in(&cards, "int_node_card")
+            .context("the Node's card")?
+            .get("requestedBy")
+            .is_none(),
         "{cards}"
     );
     assert_eq!(
@@ -2023,5 +2057,107 @@ async fn the_owner_reads_their_words_on_the_card_board_and_task_detail() -> Resu
         expected,
         "the Hub's own card still carries the words"
     );
+    Ok(())
+}
+
+/// cb-requested-by r4: `requestedBy` is Hub-stamped only. A Node's interaction
+/// payload — journaled as `interaction.requested` or listed live — can neither
+/// leak nor forge the owner's words: the record is dropped at ingest (never
+/// stored) and again from every Node-merged item served, for every caller.
+#[tokio::test]
+async fn a_node_supplied_requested_by_is_never_stored_or_served() -> Result<()> {
+    let (ctx, mut node) = Ctx::boot().await?;
+    let (seat, _token) = ctx.seat(&mut node, "main").await?;
+    let bot = ctx.hub.mint_bot_device_token("reqby-bot").await?;
+    let forged = json!({
+        "commandId": "cmd_never_issued",
+        "excerpt": NODE_SENTINEL,
+        "origin": "human",
+    });
+
+    // A Node journals an approval whose payload carries its own record.
+    let journal_card = "int_node_journal_card";
+    ctx.journal(
+        &node,
+        &seat,
+        json!({
+            "kind": "interaction.requested",
+            "payload": {
+                "interactionKind": "approval",
+                "requestedBy": forged.clone(),
+                "interaction": {
+                    "id": journal_card, "kind": "approval", "state": "pending",
+                    "blocking": true, "answerable": true, "carrier": "harness-hook",
+                    "deadline": {"state": "unknown"}, "resolution": {"state": "unknown"},
+                    "request": {"kind": "approval", "title": "Bash",
+                                "description": "a Node's own card", "options": []},
+                    "requestedBy": forged.clone(),
+                }
+            }
+        }),
+    )
+    .await;
+    // A Node lists a live item with its own record, at both levels.
+    let list_card = "int_node_list_card";
+    node.cards.lock().expect("cards").push(json!({
+        "interactionId": list_card, "id": list_card,
+        "instanceId": seat, "hostId": ctx.host, "kind": "approval",
+        "state": "pending",
+        "interaction": {"id": list_card, "kind": "approval", "requestedBy": forged.clone()},
+        "requestedBy": forged.clone(),
+    }));
+
+    // The owner and a Bot read the page: neither the words nor the record a
+    // Node supplied on either card.
+    for (who, token) in [("owner", ctx.human.clone()), ("bot", bot.clone())] {
+        let (status, body) = ctx
+            .call(&token, &[], reqwest::Method::GET, "/v1/interactions", None)
+            .await;
+        assert_eq!(status, 200, "{who}: {body}");
+        assert!(
+            !body.contains(NODE_SENTINEL),
+            "{who} read the Node's words: {body}"
+        );
+        let page: Value = serde_json::from_str(&body)?;
+        for id in [journal_card, list_card] {
+            let card = card_in(&page, id).unwrap_or_else(|| panic!("{who}: no card {id}: {body}"));
+            assert!(
+                card.get("requestedBy").is_none(),
+                "{who}: {id} kept a supplied requestedBy: {card}"
+            );
+            assert!(
+                card["interaction"].get("requestedBy").is_none(),
+                "{who}: {id} kept a supplied nested requestedBy: {card}"
+            );
+        }
+    }
+
+    // Never persisted: the interaction row and the journal row that carried it
+    // hold no record and none of the words.
+    let conn = rusqlite::Connection::open(ctx.dir.path().join("data/hub.sqlite"))?;
+    let stored: Vec<String> = conn
+        .prepare("SELECT payload_json FROM interactions")?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    assert!(!stored.is_empty(), "no interaction row to check");
+    for payload in stored {
+        assert!(
+            !payload.contains("requestedBy") && !payload.contains(NODE_SENTINEL),
+            "{payload}"
+        );
+    }
+    let journaled: Vec<String> = conn
+        .prepare(
+            "SELECT payload_json FROM journal WHERE payload_json LIKE '%interaction.requested%'",
+        )?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    assert!(!journaled.is_empty(), "no journal row to check");
+    for payload in journaled {
+        assert!(
+            !payload.contains("requestedBy") && !payload.contains(NODE_SENTINEL),
+            "{payload}"
+        );
+    }
     Ok(())
 }

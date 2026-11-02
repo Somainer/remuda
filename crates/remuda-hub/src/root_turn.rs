@@ -490,6 +490,48 @@ pub(crate) fn owner_excerpts(
     Ok(excerpts)
 }
 
+/// cb-requested-by: drop any `requestedBy` inside an interaction event's
+/// payload. `requestedBy` is Hub-stamped only; a Node's payload is untrusted
+/// content, so a Node or worker can neither leak nor forge the owner's words
+/// on a card. Called before an interaction event is journaled, so the record
+/// is never persisted, and again on every Node-merged item served.
+pub(crate) fn strip_supplied_requested_by(event: &mut Value) {
+    let interaction = event
+        .get("kind")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.starts_with("interaction"))
+        || event.pointer("/payload/entityType").and_then(Value::as_str) == Some("interaction")
+        || event
+            .pointer("/payload/interaction")
+            .is_some_and(Value::is_object)
+        || event.get("interaction").is_some_and(Value::is_object);
+    if interaction {
+        strip_requested_by(event);
+    }
+}
+
+/// Remove `requestedBy` from an interaction-shaped value at every level the
+/// Hub serves it: the top level, under `payload`, and inside the nested
+/// `interaction` object.
+pub(crate) fn strip_requested_by(value: &mut Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    object.remove("requestedBy");
+    if let Some(payload) = object.get_mut("payload").and_then(Value::as_object_mut) {
+        payload.remove("requestedBy");
+        if let Some(interaction) = payload
+            .get_mut("interaction")
+            .and_then(Value::as_object_mut)
+        {
+            interaction.remove("requestedBy");
+        }
+    }
+    if let Some(interaction) = object.get_mut("interaction").and_then(Value::as_object_mut) {
+        interaction.remove("requestedBy");
+    }
+}
+
 /// One line of at most [`EXCERPT_CHARS`] characters, cut on a char boundary.
 fn clip_excerpt(text: &str) -> String {
     if text.chars().count() <= EXCERPT_CHARS {

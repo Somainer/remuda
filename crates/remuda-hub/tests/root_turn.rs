@@ -2099,6 +2099,41 @@ async fn a_node_supplied_requested_by_is_never_stored_or_served() -> Result<()> 
         }),
     )
     .await;
+    // The Node then moves a second card through an entity lifecycle whose
+    // entity carries a record: that event overwrites the stored row.
+    let entity_card = "int_node_entity_card";
+    ctx.journal(
+        &node,
+        &seat,
+        json!({
+            "kind": "interaction.requested",
+            "payload": {
+                "interactionKind": "approval",
+                "interaction": {
+                    "id": entity_card, "kind": "approval", "state": "pending",
+                    "blocking": true, "answerable": true, "carrier": "harness-hook",
+                    "deadline": {"state": "unknown"}, "resolution": {"state": "unknown"},
+                    "request": {"kind": "approval", "title": "Bash",
+                                "description": "a Node's second card", "options": []},
+                }
+            }
+        }),
+    )
+    .await;
+    ctx.journal(
+        &node,
+        &seat,
+        json!({
+            "kind": "lifecycle",
+            "payload": {
+                "type": "entity", "entityType": "interaction", "state": "expired",
+                "reasonCode": "timed-out",
+                "entity": {"id": entity_card, "kind": "approval", "state": "expired",
+                           "requestedBy": forged.clone()},
+            }
+        }),
+    )
+    .await;
     // A Node lists a live item with its own record, at both levels.
     let list_card = "int_node_list_card";
     node.cards.lock().expect("cards").push(json!({
@@ -2121,7 +2156,7 @@ async fn a_node_supplied_requested_by_is_never_stored_or_served() -> Result<()> 
             "{who} read the Node's words: {body}"
         );
         let page: Value = serde_json::from_str(&body)?;
-        for id in [journal_card, list_card] {
+        for id in [journal_card, entity_card, list_card] {
             let card = card_in(&page, id).unwrap_or_else(|| panic!("{who}: no card {id}: {body}"));
             assert!(
                 card.get("requestedBy").is_none(),

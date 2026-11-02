@@ -508,11 +508,12 @@ pub(crate) fn owner_excerpts(
     Ok(excerpts)
 }
 
-/// cb-requested-by: drop any `requestedBy` inside an interaction event's
-/// payload. `requestedBy` is Hub-stamped only; a Node's payload is untrusted
+/// cb-requested-by: drop any `requestedBy` inside an interaction event a Node
+/// journals. `requestedBy` is Hub-stamped only; a Node's payload is untrusted
 /// content, so a Node or worker can neither leak nor forge the owner's words
-/// on a card. Called before an interaction event is journaled, so the record
-/// is never persisted, and again on every Node-merged item served.
+/// on a card. Runs before the event is journaled, so neither the journal row
+/// nor the interaction row it feeds can hold one. Other events (a native turn
+/// lifecycle's `relatedIds.requestedBy`, for one) are left alone.
 pub(crate) fn strip_supplied_requested_by(event: &mut Value) {
     let interaction = event
         .get("kind")
@@ -528,25 +529,18 @@ pub(crate) fn strip_supplied_requested_by(event: &mut Value) {
     }
 }
 
-/// Remove `requestedBy` from an interaction-shaped value at every level the
-/// Hub serves it: the top level, under `payload`, and inside the nested
-/// `interaction` object.
+/// Remove `requestedBy` from an interaction-shaped value and from every copy
+/// nested in it: the event `payload`, the `interaction` or lifecycle `entity`
+/// object, and the stored `event` a served list item carries.
 pub(crate) fn strip_requested_by(value: &mut Value) {
     let Some(object) = value.as_object_mut() else {
         return;
     };
     object.remove("requestedBy");
-    if let Some(payload) = object.get_mut("payload").and_then(Value::as_object_mut) {
-        payload.remove("requestedBy");
-        if let Some(interaction) = payload
-            .get_mut("interaction")
-            .and_then(Value::as_object_mut)
-        {
-            interaction.remove("requestedBy");
+    for key in ["payload", "interaction", "entity", "event"] {
+        if let Some(nested) = object.get_mut(key) {
+            strip_requested_by(nested);
         }
-    }
-    if let Some(interaction) = object.get_mut("interaction").and_then(Value::as_object_mut) {
-        interaction.remove("requestedBy");
     }
 }
 
@@ -1091,6 +1085,55 @@ mod tests {
             None,
         );
         assert_eq!(excerpt(&conn, "cmd_keys"), None);
+    }
+
+    /// cb-requested-by r4: a Node-supplied record is dropped from every copy an
+    /// interaction event or a served card carries, and nothing else changes.
+    #[test]
+    fn strip_requested_by_reaches_every_copy_and_only_interactions() {
+        let forged = json!({"commandId": "cmd_x", "excerpt": "forged words"});
+        let mut requested = json!({
+            "kind": "interaction.requested",
+            "requestedBy": forged,
+            "payload": {
+                "requestedBy": forged,
+                "interaction": {"id": "int_a", "requestedBy": forged, "title": "kept"},
+            },
+        });
+        strip_supplied_requested_by(&mut requested);
+        assert!(
+            !requested.to_string().contains("requestedBy"),
+            "{requested}"
+        );
+        assert_eq!(requested["payload"]["interaction"]["title"], "kept");
+
+        let mut entity = json!({
+            "kind": "lifecycle",
+            "payload": {"type": "entity", "entityType": "interaction",
+                        "entity": {"id": "int_a", "state": "expired", "requestedBy": forged}},
+        });
+        strip_supplied_requested_by(&mut entity);
+        assert!(!entity.to_string().contains("requestedBy"), "{entity}");
+
+        // A served list item: top level, the merged interaction and the
+        // stored event it carries.
+        let mut item = json!({
+            "id": "int_a", "requestedBy": forged,
+            "interaction": {"requestedBy": forged},
+            "event": {"payload": {"interaction": {"requestedBy": forged}}},
+        });
+        strip_requested_by(&mut item);
+        assert!(!item.to_string().contains("requestedBy"), "{item}");
+
+        // Not an interaction event: a native turn's own `requestedBy` stays.
+        let mut native = json!({
+            "kind": "lifecycle",
+            "payload": {"type": "native", "nativeName": "interrupted",
+                        "relatedIds": {"requestedBy": "instance.cancel"}},
+        });
+        let before = native.clone();
+        strip_supplied_requested_by(&mut native);
+        assert_eq!(native, before);
     }
 
     /// cb-requested-by: one statement per chunk of ids, however long the list

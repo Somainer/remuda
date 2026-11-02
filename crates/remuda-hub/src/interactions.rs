@@ -401,8 +401,9 @@ pub async fn list_interactions(
         .map(|row| row.to_list_item())
         .collect();
     // cb-requested-by: durable rows are Node-sourced and `requestedBy` is
-    // Hub-stamped only, so a record a Node supplied (including one stored
-    // before ingest stripped it) is dropped before this page is built.
+    // Hub-stamped only. Ingest already drops a supplied record; this drops
+    // any that is still stored (a row written before ingest stripped it),
+    // from the item and from the stored event it carries, for every caller.
     for item in &mut items {
         crate::root_turn::strip_requested_by(item);
     }
@@ -510,6 +511,8 @@ pub async fn list_interactions(
                                 continue;
                             }
                             if id.is_empty() || seen.insert(id.to_string()) {
+                                // A live Node item never carries a record the
+                                // Hub stamped: drop any it supplies.
                                 let mut item = item.clone();
                                 crate::root_turn::strip_requested_by(&mut item);
                                 items.push(flatten_interaction(item));

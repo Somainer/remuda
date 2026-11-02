@@ -58,6 +58,69 @@ pub fn hide_requested_by_excerpt(value: &mut Value) {
     }
 }
 
+/// cb-requested-by: add the owner's own words to every `requestedBy` record in
+/// `docs`, for a Human caller only.
+///
+/// This read is the one place the excerpt is produced, from the Hub's own
+/// command row ([`crate::root_turn::owner_excerpts`]). An Agent — possibly a
+/// lineage that could never read the owner's command — and a Bot, which
+/// relays to a chat platform, get the bare reference. `docs` are serialized
+/// task docs, board cards or interaction views; a record is read at the top
+/// level and inside a nested `interaction`. Best effort: a failed lookup
+/// leaves the reference as it is.
+pub async fn hydrate_owner_words<'a>(
+    state: &AppState,
+    device: &Device,
+    docs: impl IntoIterator<Item = &'a mut Value>,
+) {
+    if origin(device) != InputOrigin::Human {
+        return;
+    }
+    let mut records = Vec::new();
+    for doc in docs {
+        let Some(object) = doc.as_object_mut() else {
+            continue;
+        };
+        for (key, value) in object.iter_mut() {
+            let record = match key.as_str() {
+                "requestedBy" => Some(value),
+                "interaction" => value.get_mut("requestedBy"),
+                _ => None,
+            };
+            if let Some(record) = record.and_then(Value::as_object_mut)
+                && record.get("commandId").and_then(Value::as_str).is_some()
+            {
+                records.push(record);
+            }
+        }
+    }
+    if records.is_empty() {
+        return;
+    }
+    let ids = records
+        .iter()
+        .filter_map(|record| record.get("commandId").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect();
+    let excerpts = match state.store.owner_excerpts(ids).await {
+        Ok(excerpts) => excerpts,
+        Err(error) => {
+            tracing::warn!(%error, "requestedBy: the owner's words are unavailable for this read");
+            return;
+        }
+    };
+    for record in records {
+        let excerpt = record
+            .get("commandId")
+            .and_then(Value::as_str)
+            .and_then(|id| excerpts.get(id))
+            .cloned();
+        if let Some(excerpt) = excerpt {
+            record.insert("excerpt".into(), Value::String(excerpt));
+        }
+    }
+}
+
 /// A caller header can narrow a Human/Bot token; it cannot promote a scoped token.
 pub async fn caller(state: &AppState, headers: &HeaderMap) -> Result<Device, HubError> {
     let device = auth::require_device(&state.store, headers).await?;

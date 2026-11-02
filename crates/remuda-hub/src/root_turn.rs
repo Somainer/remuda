@@ -47,6 +47,8 @@
 //! `result` has not been ingested yet: the call then belongs to the owner's
 //! turn, which has not ended.
 
+use std::collections::HashMap;
+
 use remuda_protocol::{InputOrigin, RequestedBy, RootTurn, RootTurnContinuation};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -437,25 +439,55 @@ pub(crate) fn requested_by(conn: &Connection, turn: &RootTurn) -> Result<Request
             origin: Some(turn.origin),
         });
     }
-    let payload: Option<String> = conn
-        .query_row(
-            "SELECT payload_json FROM commands WHERE id = ?1",
-            params![turn.command_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let excerpt = payload
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .and_then(|payload| prompt_text(&payload))
-        // One line, credential-shaped words withheld, then bounded at a char
-        // boundary. Attachment contents are never in the prompt text.
-        .map(|text| clip_excerpt(&crate::digest::redact_secrets(&text)))
-        .filter(|text| !text.is_empty());
+    let excerpt =
+        owner_excerpts(conn, std::slice::from_ref(&turn.command_id))?.remove(&turn.command_id);
     Ok(RequestedBy {
         command_id: Some(turn.command_id.clone()),
         excerpt,
         origin: None,
     })
+}
+
+/// cb-requested-by: the owner's own words for each of `command_ids`, read from
+/// the Hub's command rows: one line, credential-shaped words withheld, then at
+/// most [`EXCERPT_CHARS`] characters cut on a char boundary. Attachment
+/// contents are never in the prompt text.
+///
+/// Only an owner's input yields words. A row an Agent sent (it carries an
+/// initiator) or one not stamped `human` yields none, so a record can never
+/// put another author's text under the owner's name. Ids with no such row, or
+/// no prompt text, are absent from the map.
+pub(crate) fn owner_excerpts(
+    conn: &Connection,
+    command_ids: &[String],
+) -> Result<HashMap<String, String>, StoreError> {
+    let mut statement = conn
+        .prepare_cached("SELECT payload_json, initiator_instance_id FROM commands WHERE id = ?1")?;
+    let mut excerpts = HashMap::new();
+    for id in command_ids {
+        if excerpts.contains_key(id) {
+            continue;
+        }
+        let row: Option<(String, Option<String>)> = statement
+            .query_row(params![id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()?;
+        let Some((payload, None)) = row else {
+            continue;
+        };
+        let Ok(payload) = serde_json::from_str::<Value>(&payload) else {
+            continue;
+        };
+        if payload.get("origin").and_then(Value::as_str) != Some("human") {
+            continue;
+        }
+        if let Some(excerpt) = prompt_text(&payload)
+            .map(|text| clip_excerpt(&crate::digest::redact_secrets(&text)))
+            .filter(|text| !text.is_empty())
+        {
+            excerpts.insert(id.clone(), excerpt);
+        }
+    }
+    Ok(excerpts)
 }
 
 /// One line of at most [`EXCERPT_CHARS`] characters, cut on a char boundary.
@@ -1029,5 +1061,64 @@ mod tests {
                 }
             );
         }
+    }
+
+    /// cb-requested-by: one batched read serves a whole list, and only an
+    /// owner's input yields words — never a row an Agent sent or one not
+    /// stamped `human`, whatever id a record names.
+    #[test]
+    fn owner_excerpts_read_only_owner_input_rows_in_one_batch() {
+        let conn = db();
+        command(
+            &conn,
+            "cmd_owner",
+            json!({"origin": "human", "prompt": "ship it"}),
+            None,
+        );
+        command(
+            &conn,
+            "cmd_other_owner",
+            json!({"origin": "human", "input": {"type": "prompt", "text": "and this"}}),
+            None,
+        );
+        // An Agent's send carries an initiator; a Bot's is stamped `bot`.
+        command(
+            &conn,
+            "cmd_agent",
+            json!({"origin": "agent", "prompt": "agent words"}),
+            Some("ins_peer"),
+        );
+        command(
+            &conn,
+            "cmd_agent_claiming_human",
+            json!({"origin": "human", "prompt": "forged"}),
+            Some("ins_peer"),
+        );
+        command(
+            &conn,
+            "cmd_bot",
+            json!({"origin": "bot", "prompt": "bot words"}),
+            None,
+        );
+        let ids: Vec<String> = [
+            "cmd_owner",
+            "cmd_other_owner",
+            "cmd_owner",
+            "cmd_agent",
+            "cmd_agent_claiming_human",
+            "cmd_bot",
+            "cmd_missing",
+        ]
+        .iter()
+        .map(|id| id.to_string())
+        .collect();
+        let excerpts = owner_excerpts(&conn, &ids).unwrap();
+        assert_eq!(
+            excerpts,
+            HashMap::from([
+                ("cmd_owner".to_string(), "ship it".to_string()),
+                ("cmd_other_owner".to_string(), "and this".to_string()),
+            ])
+        );
     }
 }

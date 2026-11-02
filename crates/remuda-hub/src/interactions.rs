@@ -527,6 +527,8 @@ pub async fn list_interactions(
             crate::agent_scope::hide_requested_by_excerpt(item);
         }
     }
+    // cb-requested-by: this list is the PWA's approval card source.
+    crate::agent_scope::hydrate_owner_words(&state, &device, items.iter_mut()).await;
     Ok(Json(json!({ "items": items, "nextCursor": null })))
 }
 

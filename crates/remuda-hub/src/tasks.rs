@@ -335,6 +335,7 @@ async fn board(
     // `list_tasks` returns oldest first; number per project independently.
     let mut display_seq: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
+    let mut cards = Vec::new();
     for task in items {
         if !scope.allows_project(task.project_id.as_id().as_str()) {
             continue;
@@ -353,6 +354,16 @@ async fn board(
         let mut card = json!(task);
         card["boardColumn"] = json!(column);
         card["displayKey"] = json!(format!("SE-{:02}", seq));
+        cards.push((column, card));
+    }
+    // cb-requested-by: the board feeds the PWA's task detail panel.
+    crate::agent_scope::hydrate_owner_words(
+        &state,
+        &device,
+        cards.iter_mut().map(|(_, card)| card),
+    )
+    .await;
+    for (column, card) in cards {
         groups
             .get_mut(&column)
             .and_then(Value::as_array_mut)
@@ -852,6 +863,7 @@ async fn get_task_http(
     let locked = task.locked_deps(&all);
     let mut value = json!(task);
     value["lockedDeps"] = json!(locked.into_iter().map(|dep| json!(dep)).collect::<Vec<_>>());
+    crate::agent_scope::hydrate_owner_words(&state, &device, std::iter::once(&mut value)).await;
     Ok(Json(value))
 }
 

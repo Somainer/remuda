@@ -3681,6 +3681,19 @@ impl Store {
         .await
     }
 
+    /// cb-requested-by: the owner's own words for each of `command_ids`, from
+    /// the Hub's command rows ([`crate::root_turn::owner_excerpts`]). One read
+    /// for a whole list or board.
+    pub async fn owner_excerpts(
+        &self,
+        command_ids: Vec<String>,
+    ) -> Result<std::collections::HashMap<String, String>, StoreError> {
+        self.read("owner_excerpts", move |conn| {
+            crate::root_turn::owner_excerpts(conn, &command_ids)
+        })
+        .await
+    }
+
     /// Audit rows for one subject, oldest first (tests and support queries).
     pub async fn audit_for(&self, subject: String) -> Result<Vec<Value>, StoreError> {
         self.run_named("audit_for", move |conn| {

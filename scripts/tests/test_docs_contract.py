@@ -522,7 +522,10 @@ def strip_wrappers(type_name: str) -> str:
     return type_name.strip()
 
 
-DECL = re.compile(r"\b(?:struct|enum)\s+([A-Za-z_]\w*)[^{;]*\{")
+DECL = re.compile(
+    r"^(?:pub(?:\([^)]*\))?\s+)?(?P<kind>struct|enum)\s+(?P<name>[A-Za-z_]\w*)[^{;]*\{",
+    re.MULTILINE,
+)
 
 
 def _module_name(path: Path, source_root: Path) -> str:
@@ -587,9 +590,8 @@ def cli_modules(root: Path) -> dict[str, Module]:
         module = Module(module_name, imports=parse_imports(module_name, text))
         for match in DECL.finditer(text):
             body, _ = _block(text, match.end() - 1)
-            is_enum = match.group(0).lstrip().startswith("enum")
-            definition = TypeDef(match.group(1), module_name)
-            if is_enum:
+            definition = TypeDef(match.group("name"), module_name)
+            if match.group("kind") == "enum":
                 definition.variants = parse_variants(body)
             else:
                 definition.fields = parse_fields(body)
@@ -665,6 +667,7 @@ def flags_for(definition: TypeDef, modules: dict[str, Module],
         long_name = None
         short = None
         is_global = False
+        aliases: list[str] = []
         for part in args:
             key, _, value = part.partition("=")
             key = key.strip()
@@ -676,12 +679,14 @@ def flags_for(definition: TypeDef, modules: dict[str, Module],
             elif key in ("visible_alias", "alias"):
                 alias = value.strip("\"'")
                 if alias:
-                    flags[f"--{alias}"] = Flag(f"--{alias}", True)
+                    aliases.append(alias)
             elif key == "global" and value == "true":
                 is_global = True
         takes_value = strip_wrappers(item.type) != "bool"
         if long_name:
             flags[f"--{long_name}"] = Flag(f"--{long_name}", takes_value, is_global)
+        for alias in aliases:
+            flags[f"--{alias}"] = Flag(f"--{alias}", takes_value, is_global)
         if short:
             flags[f"-{short}"] = Flag(f"-{short}", takes_value, is_global)
     return flags
@@ -702,6 +707,16 @@ def _aliases(variant: VariantDef) -> list[str]:
         for match in re.finditer(r"(?:visible_alias|alias)\s*=\s*\"([^\"]+)\"", attr):
             aliases.append(match.group(1))
     return aliases
+
+
+def _is_positional(item: FieldDef) -> bool:
+    """A plain field, or an `#[arg(...)]` with neither a long nor a short name."""
+    if any(a.startswith("command(") for a in item.attrs):
+        return False
+    arg_attrs = [a for a in item.attrs if a.startswith("arg(")]
+    if not arg_attrs:
+        return True
+    return not any(re.search(r"\b(?:long|short)\b", attr) for attr in arg_attrs)
 
 
 def build_node(name: str, definition: TypeDef, modules: dict[str, Module],
@@ -734,13 +749,12 @@ def build_node(name: str, definition: TypeDef, modules: dict[str, Module],
                     node.aliases[alias] = child_name
                 node.subcommands[child_name].has_positionals = (
                     node.subcommands[child_name].has_positionals
-                    or any(not any(a.startswith("arg(") or a.startswith("command(")
-                                   for a in field.attrs) for field in fields))
+                    or any(_is_positional(field) for field in fields))
             continue
         if any(a.startswith("command(") and re.search(r"\bflatten\b", a)
                for a in item.attrs):
             continue
-        if not any(a.startswith("arg(") for a in item.attrs):
+        if _is_positional(item):
             node.has_positionals = True
     return node
 

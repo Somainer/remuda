@@ -402,6 +402,85 @@ fn granted_claude_with_an_inherited_home_writes_nothing_into_it() {
 }
 
 #[test]
+fn granted_skill_tree_in_a_transferred_home_installs_and_keeps_the_transcript() {
+    // resume-config r2: a resumed chapter owns its managed home because the
+    // Node MOVED the predecessor's directory into this instance's slot. The
+    // grant materializer must install into that moved home exactly as it does
+    // into a freshly created one, and must not disturb what came with it.
+    let tmp = tempfile::tempdir().unwrap();
+    let instance = tmp
+        .path()
+        .join("instances")
+        .join("ins_01993ab0-0000-7000-8000-0000000000b2");
+    let launch = instance.join("launch");
+    let home = instance.join("native-home");
+    fs::create_dir_all(&launch).unwrap();
+    // The transcript travelled with the home from the predecessor's slot.
+    let transcript = home
+        .join("projects")
+        .join("-workspace")
+        .join("01993ab0-0000-7000-8000-0000000000a1.jsonl");
+    fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    fs::write(&transcript, b"{\"type\":\"user\"}\n").unwrap();
+    let binary = stub_binary(tmp.path());
+    let mut spec = load_spec();
+    grant(&mut spec);
+
+    let recipe = materialize(&MaterializeRequest {
+        creator: remuda_driver::CreatorControl::default(),
+        memory_context: None,
+        spec: &spec,
+        profile: Box::leak(Box::new(profile())),
+        launch_dir: launch.clone(),
+        native_home: home.clone(),
+        session: SessionAction::Resume {
+            session_id: "01993ab0-0000-7000-8000-0000000000a1".into(),
+        },
+        launch_id: Id::new("launch").unwrap(),
+        binary: BinarySource::Pinned(BinaryPinShim::pin(&binary)),
+        setting_sources: None,
+        origin: LaunchOrigin::Human,
+        native_home_managed: Some(true),
+        settings_overlay_path: None,
+        secret_policy: None,
+    })
+    .unwrap();
+
+    // The whole skill tree lands in the successor's own (transferred) home.
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills/codex-computer-use");
+    for rel in EMBEDDED_FILES {
+        let delivered = home.join(SKILL_ROOT).join(rel);
+        assert!(delivered.is_file(), "missing {rel}");
+        assert_eq!(
+            fs::read(&delivered).unwrap(),
+            fs::read(source.join(rel)).unwrap()
+        );
+    }
+    // The transcript that arrived with the home is untouched.
+    assert_eq!(
+        fs::read(&transcript).unwrap(),
+        b"{\"type\":\"user\"}\n".to_vec()
+    );
+    // The home is inside this instance's directory, so its skill files have
+    // the per-instance lifetime (shredded with this chapter), like every
+    // other managed home — ownership moved, the lifetime rule did not.
+    let skills: Vec<_> = recipe
+        .materialized_files
+        .iter()
+        .filter(|file| file.role == FileRole::CapabilitySkill)
+        .collect();
+    assert_eq!(skills.len(), EMBEDDED_FILES.len());
+    for file in skills {
+        assert_eq!(file.lifetime, FileLifetime::Launch);
+        assert!(
+            Path::new(&file.path).starts_with(&home),
+            "skill file {} is inside the transferred home",
+            file.path
+        );
+    }
+}
+
+#[test]
 fn ungranted_launch_writes_nothing_and_sets_no_handshake() {
     let dirs = dirs();
     let binary = stub_binary(dirs.root.path());

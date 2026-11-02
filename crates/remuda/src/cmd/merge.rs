@@ -2139,6 +2139,7 @@ mod tests {
                 "secret-scan",
                 "no-tunnel-scan",
                 "no-host-wide-kills",
+                "docs-contract",
                 "cargo-fmt",
                 "cargo-check",
                 "cargo-clippy",
@@ -2149,7 +2150,7 @@ mod tests {
                 "web-hub-e2e"
             ]
         );
-        assert!(plan[7..].iter().all(|step| step.status == "skipped"));
+        assert!(plan[8..].iter().all(|step| step.status == "skipped"));
         assert!(
             gate_plan(&repo, true, None, true)
                 .unwrap()
@@ -2162,9 +2163,9 @@ mod tests {
             .unwrap();
         assert!(output.status.success());
         let web_only: Vec<Step> = serde_json::from_slice(&output.stdout).unwrap();
-        assert!(web_only[..7].iter().all(|step| step.status == "skipped"));
-        assert!(web_only[7..10].iter().all(|step| step.status == "planned"));
-        assert_eq!(web_only[10].status, "skipped");
+        assert!(web_only[..8].iter().all(|step| step.status == "skipped"));
+        assert!(web_only[8..11].iter().all(|step| step.status == "planned"));
+        assert_eq!(web_only[11].status, "skipped");
     }
 
     // ── r16 item 3: merge-base exit tri-state + shallow history ────────────

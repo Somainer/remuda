@@ -707,6 +707,19 @@ pub struct InstanceRecord {
     /// Working directory recorded on the workspace / spec.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Explicit `CLAUDE_CONFIG_DIR` persisted from the create spec.
+    ///
+    /// A resumed or restarted chapter must keep the parent's native home, or
+    /// its `--resume <sessionId>` finds no transcript (the same per-instance
+    /// home the parent wrote to). Projected from the stored spec and carried
+    /// by [`InstanceRecord::spec_for_resume`] like every other launch field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_config_dir: Option<String>,
+    /// Host-local `--settings` overlay path persisted from the create spec.
+    /// Carried into a successor for the same reason as
+    /// [`InstanceRecord::claude_config_dir`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings_overlay_path: Option<String>,
     /// Provider delegation persisted from the create spec (`none` / `gateway`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegation: Option<String>,
@@ -1945,6 +1958,11 @@ impl InstanceRecord {
             "tui": self.tui,
             "delegation": self.delegation,
             "providerProfileId": self.provider_profile_id,
+            // A successor runs the native process in the parent's Claude home
+            // (else `--resume <sessionId>` looks in a directory the parent's
+            // transcript was never written to) and under its settings overlay.
+            "claudeConfigDir": self.claude_config_dir,
+            "settingsOverlayPath": self.settings_overlay_path,
         });
         if let Some(object) = spec.as_object_mut() {
             if let Some(name) = &self.effort_name {
@@ -15754,6 +15772,19 @@ pub(crate) fn load_instance(
                 .and_then(Value::as_str)
                 .map(str::to_string)
                 .or_else(|| title.clone());
+            // The parent's native home and settings overlay are create-spec
+            // facts, not runtime observations: project them so a resume or the
+            // C1 supervisor can carry them onto the successor (§resume-config).
+            let claude_config_dir = spec
+                .get("claudeConfigDir")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            let settings_overlay_path = spec
+                .get("settingsOverlayPath")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
             let delegation = spec
                 .get("delegation")
                 .and_then(Value::as_str)
@@ -15893,6 +15924,8 @@ pub(crate) fn load_instance(
                 title,
                 name,
                 cwd,
+                claude_config_dir,
+                settings_overlay_path,
                 delegation,
                 provider_profile_id,
                 provider_source,

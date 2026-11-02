@@ -258,7 +258,10 @@ test.describe("phone 390", () => {
 
       await page.goto("/m");
       const glance = page.getByTestId("home-glance");
-      await expect(glance).toBeVisible();
+      // First paint after a navigation: under gate load the SPA mount can
+      // outlast Playwright's 5 s default (it did at loadavg 12), so wait the
+      // same 20 s the next assertion already uses. Nothing is weakened.
+      await expect(glance).toBeVisible({ timeout: 20_000 });
       // §5.2: the pending approval the fake Node parks is one 需要你, so the
       // first segment is the count — never the empty-queue greeting.
       await expect(page.getByTestId("glance-need-you")).toContainText(/\d+ 需要你/, {

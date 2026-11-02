@@ -62,6 +62,11 @@ export function useRowLongPress(onOpen: () => void) {
   return {
     onPointerDown(event: ReactPointerEvent) {
       if (event.button !== 0) return;
+      // A press on an open overlay is that surface's gesture, not the row's.
+      // The home row renders the menu's Sheet inside its own article, so a
+      // HELD backdrop press would otherwise arm this timer and re-open the
+      // menu (before pointerup) the press is dismissing.
+      if ((event.target as Element | null)?.closest("[data-overlay]")) return;
       clear();
       const timer = setTimeout(() => {
         press.current = null;

@@ -1697,6 +1697,8 @@ async fn the_inbox_survives_backup_and_restore() -> Result<()> {
     // started, six questions (the seventh capped).
     assert_eq!(before["items"].as_array().map(Vec::len), Some(7));
 
+    let host = ctx.host.clone();
+    let workspace = ctx.workspace.clone();
     let data = ctx.data_dir();
     let Ctx { dir, hub, .. } = ctx;
     hub.shutdown().await;
@@ -1773,8 +1775,8 @@ async fn the_inbox_survives_backup_and_restore() -> Result<()> {
         hub,
         http: reqwest::Client::new(),
         human,
-        host: String::new(),
-        workspace: String::new(),
+        host,
+        workspace,
         node: None,
     };
     let after = restored_ctx
@@ -1787,6 +1789,17 @@ async fn the_inbox_survives_backup_and_restore() -> Result<()> {
         .await?
         .1;
     assert_eq!(after, before, "rows, keys, counts and settings survive");
+
+    // The restored Hub caps too: an eighth question is counted, not recorded.
+    restored_ctx
+        .journal(&worker, question("int_bk_8", &at(60 * 8)))
+        .await?;
+    let items = restored_ctx.inbox(&restored_ctx.human, &seat).await?;
+    assert_eq!(
+        of_kind(&items, "interaction", &worker).len(),
+        6,
+        "the cap and its count survive the restore"
+    );
     drop(dir);
     Ok(())
 }

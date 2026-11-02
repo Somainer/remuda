@@ -1,5 +1,6 @@
 import { Link } from "react-router-dom";
 import type { Task } from "../../types/generated";
+import { RequestedByNote, RequestedByTag } from "../../components/RequestedByNote";
 import { TASK_STATE_LABEL } from "./taskRows";
 import css from "./tasklist.module.css";
 
@@ -56,6 +57,18 @@ export function TaskDetailPanel({
       <h2 className={css.detailTitle} data-testid="task-detail-title">
         {task.title}
       </h2>
+
+      {/*
+       * cb-requested-by: who asked for a task an Agent created — the owner's
+       * own words, or the non-owner origin that started the turn. Record
+       * only: it never gates, annotates or changes the task's state.
+       */}
+      {task.requestedBy ? (
+        <div data-testid="task-detail-requested-by">
+          <RequestedByTag requestedBy={task.requestedBy} />
+          <RequestedByNote requestedBy={task.requestedBy} />
+        </div>
+      ) : null}
 
       {task.blockedReason?.trim() ? (
         <p className={css.detailBlocked} data-testid="task-detail-blocked" role="status">

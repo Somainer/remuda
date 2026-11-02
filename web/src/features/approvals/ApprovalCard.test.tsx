@@ -377,3 +377,52 @@ describe("DecisionCard root-turn tag", () => {
     }
   });
 });
+
+describe("DecisionCard requestedBy note (cb-requested-by)", () => {
+  it("shows the owner's own words for a request made in an owner turn", () => {
+    for (const mode of ["desktop", "compact"] as const) {
+      const item = cnItem({
+        rootTurn: { commandId: "cmd_owner", origin: "human", continuation: "none" },
+        requestedBy: {
+          commandId: "cmd_owner",
+          excerpt: "dispatch a worker on the other node",
+        },
+      });
+      const { unmount } = renderCard(viewFor(item), mode);
+      const note = screen.getByTestId("requested-by");
+      expect(note).toHaveTextContent("你说：dispatch a worker on the other node");
+      expect(note.getAttribute("title")).toContain("cmd_owner");
+      // An owner turn still carries no "agent 自发" tag.
+      expect(screen.queryByTestId("root-turn-tag")).toBeNull();
+      unmount();
+    }
+  });
+
+  it("labels an agent-origin turn without inventing owner words", () => {
+    const item = cnItem({
+      rootTurn: { commandId: "cmd_fact", origin: "agent", continuation: "native" },
+      requestedBy: { origin: "agent" },
+    });
+    renderCard(viewFor(item));
+    expect(screen.getByTestId("root-turn-tag")).toHaveTextContent("agent 自发");
+    expect(screen.queryByTestId("requested-by")).toBeNull();
+  });
+
+  it("labels a hub-origin turn as agent 自发 and shows no owner words", () => {
+    const item = cnItem({
+      rootTurn: { commandId: "cmd_notice", origin: "hub", continuation: "hub" },
+      requestedBy: { origin: "hub" },
+    });
+    renderCard(viewFor(item));
+    expect(screen.getByTestId("root-turn-tag")).toHaveTextContent("agent 自发");
+    expect(screen.queryByTestId("requested-by")).toBeNull();
+  });
+
+  it("leaves the card unchanged when the Hub recorded nothing", () => {
+    const item = cnItem();
+    renderCard(viewFor(item));
+    expect(screen.queryByTestId("requested-by")).toBeNull();
+    expect(screen.queryByTestId("root-turn-tag")).toBeNull();
+    expect(screen.getByRole("button", { name: "允许一次" })).toBeEnabled();
+  });
+});

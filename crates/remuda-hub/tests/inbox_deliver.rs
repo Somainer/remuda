@@ -1352,7 +1352,8 @@ async fn a_batch_carries_no_owner_text() -> Result<()> {
 
 /// The root turn a batch starts is hub-origin: a dispatch made in it is
 /// stamped `rootTurn {commandId: batch, origin: hub}` on its audit row and
-/// its forwarded create.
+/// its forwarded create, and cb-requested-by records what the seat asks for
+/// in it as `{origin: hub}`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_dispatch_in_the_turn_a_batch_started_is_labelled_hub() -> Result<()> {
     let ctx = Ctx::spawn().await?;
@@ -1402,6 +1403,30 @@ async fn a_dispatch_in_the_turn_a_batch_started_is_labelled_hub() -> Result<()> 
         dispatch[0]["initiator"]["rootTurn"], expected,
         "{:#}",
         dispatch[0]
+    );
+    // cb-requested-by labels what the seat asks for in that turn as the
+    // Hub's, never the owner's: a task it creates records {origin: hub}.
+    let task = ctx
+        .post(
+            &token,
+            "/v1/tasks",
+            json!({ "projectId": project, "title": "follow up", "intent": "act on the facts" }),
+        )
+        .await?;
+    assert_eq!(task["requestedBy"], json!({ "origin": "hub" }), "{task:#}");
+    let (status, read) = ctx
+        .request(
+            reqwest::Method::GET,
+            &ctx.human,
+            &format!("/v1/tasks/{}", task["id"].as_str().context("task id")?),
+            None,
+        )
+        .await?;
+    assert_eq!(status, 200);
+    assert_eq!(
+        read["requestedBy"],
+        json!({ "origin": "hub" }),
+        "no owner words: {read:#}"
     );
     Ok(())
 }

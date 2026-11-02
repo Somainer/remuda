@@ -65,6 +65,10 @@ const MAX_OPEN_TURNS: usize = 64;
 /// (cb-requested-by).
 pub(crate) const EXCERPT_CHARS: usize = 280;
 
+/// Most command ids one excerpt query binds. Older SQLite builds cap a
+/// statement at 999 variables; 900 keeps one statement per chunk everywhere.
+pub(crate) const EXCERPT_QUERY_IDS: usize = 900;
+
 /// Columns for the ledger and for the root turn stamped on command rows and
 /// audit rows. Plain additive columns, so no `user_version` rung.
 pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
@@ -453,6 +457,10 @@ pub(crate) fn requested_by(turn: &RootTurn) -> RequestedBy {
 /// most [`EXCERPT_CHARS`] characters cut on a char boundary. Attachment
 /// contents are never in the prompt text.
 ///
+/// One statement per chunk of ids, whatever the list length — the approval
+/// list and the board are polled every few seconds. Ids are deduped first, so
+/// an id that yields no words costs nothing.
+///
 /// Only an owner's input yields words. A row an Agent sent (it carries an
 /// initiator) or one not stamped `human` yields none, so a record can never
 /// put another author's text under the owner's name. Ids with no such row, or
@@ -461,30 +469,40 @@ pub(crate) fn owner_excerpts(
     conn: &Connection,
     command_ids: &[String],
 ) -> Result<HashMap<String, String>, StoreError> {
-    let mut statement = conn
-        .prepare_cached("SELECT payload_json, initiator_instance_id FROM commands WHERE id = ?1")?;
+    let mut ids: Vec<&str> = command_ids.iter().map(String::as_str).collect();
+    ids.sort_unstable();
+    ids.dedup();
     let mut excerpts = HashMap::new();
-    for id in command_ids {
-        if excerpts.contains_key(id) {
-            continue;
-        }
-        let row: Option<(String, Option<String>)> = statement
-            .query_row(params![id], |row| Ok((row.get(0)?, row.get(1)?)))
-            .optional()?;
-        let Some((payload, None)) = row else {
-            continue;
-        };
-        let Ok(payload) = serde_json::from_str::<Value>(&payload) else {
-            continue;
-        };
-        if payload.get("origin").and_then(Value::as_str) != Some("human") {
-            continue;
-        }
-        if let Some(excerpt) = prompt_text(&payload)
-            .map(|text| clip_excerpt(&crate::digest::redact_secrets(&text)))
-            .filter(|text| !text.is_empty())
-        {
-            excerpts.insert(id.clone(), excerpt);
+    for chunk in ids.chunks(EXCERPT_QUERY_IDS) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!(
+            "SELECT id, payload_json, initiator_instance_id FROM commands WHERE id IN ({placeholders})"
+        );
+        let mut statement = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> = chunk
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        let mut rows = statement.query(params.as_slice())?;
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            let payload: String = row.get(1)?;
+            // An Agent's send carries an initiator: never the owner's words.
+            if row.get::<_, Option<String>>(2)?.is_some() {
+                continue;
+            }
+            let Ok(payload) = serde_json::from_str::<Value>(&payload) else {
+                continue;
+            };
+            if payload.get("origin").and_then(Value::as_str) != Some("human") {
+                continue;
+            }
+            if let Some(excerpt) = prompt_text(&payload)
+                .map(|text| clip_excerpt(&crate::digest::redact_secrets(&text)))
+                .filter(|text| !text.is_empty())
+            {
+                excerpts.insert(id, excerpt);
+            }
         }
     }
     Ok(excerpts)
@@ -1073,6 +1091,64 @@ mod tests {
             None,
         );
         assert_eq!(excerpt(&conn, "cmd_keys"), None);
+    }
+
+    /// cb-requested-by: one statement per chunk of ids, however long the list
+    /// and however often an id repeats — the approval list and the board are
+    /// polled every few seconds. Counted with SQLite's statement trace.
+    #[test]
+    fn owner_excerpts_runs_one_statement_per_chunk() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static STATEMENTS: AtomicUsize = AtomicUsize::new(0);
+        fn count(event: rusqlite::trace::TraceEvent<'_>) {
+            if matches!(event, rusqlite::trace::TraceEvent::Stmt(..)) {
+                STATEMENTS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let conn = db();
+        {
+            let mut insert = conn
+                .prepare(
+                    "INSERT INTO commands (id, instance_id, payload_json)
+                     VALUES (?1, 'ins_main', ?2)",
+                )
+                .unwrap();
+            for n in 0..EXCERPT_QUERY_IDS + 1 {
+                insert
+                    .execute(params![
+                        format!("cmd_{n:05}"),
+                        format!("{{\"origin\":\"human\",\"prompt\":\"words {n}\"}}")
+                    ])
+                    .unwrap();
+            }
+        }
+        let ids: Vec<String> = (0..EXCERPT_QUERY_IDS + 1)
+            .map(|n| format!("cmd_{n:05}"))
+            .collect();
+        let count_statements = |ids: &[String]| {
+            STATEMENTS.store(0, Ordering::SeqCst);
+            conn.trace_v2(
+                rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+                Some(count),
+            );
+            let excerpts = owner_excerpts(&conn, ids).unwrap();
+            conn.trace_v2(rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT, None);
+            (excerpts, STATEMENTS.load(Ordering::SeqCst))
+        };
+
+        let (excerpts, statements) = count_statements(&ids);
+        assert_eq!(excerpts.len(), EXCERPT_QUERY_IDS + 1);
+        assert_eq!(
+            statements, 2,
+            "one statement per chunk of {EXCERPT_QUERY_IDS}"
+        );
+
+        // A repeated id is queried once, not once per occurrence.
+        let repeated = vec![ids[0].clone(); 50];
+        let (excerpts, statements) = count_statements(&repeated);
+        assert_eq!(excerpts.len(), 1);
+        assert_eq!(statements, 1, "a deduped list costs one statement");
     }
 
     /// cb-requested-by: one batched read serves a whole list, and only an

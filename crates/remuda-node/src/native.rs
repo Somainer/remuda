@@ -410,6 +410,7 @@ impl DriverFactory for NativeClaudeFactory {
                 options.settings_overlay_path = overlay.clone();
                 options.media_stager = self.tool_media_stager();
                 options.memory_context = launch.request.memory_context.clone();
+                options.skill_context = launch.request.skill_context.clone();
                 Arc::new(ClaudePrintDriver::new(options))
             }
             // Same options as print: the carriers differ by one launch flag, so
@@ -431,6 +432,7 @@ impl DriverFactory for NativeClaudeFactory {
                 options.settings_overlay_path = overlay.clone();
                 options.media_stager = self.tool_media_stager();
                 options.memory_context = launch.request.memory_context.clone();
+                options.skill_context = launch.request.skill_context.clone();
                 Arc::new(ClaudeSdkDriver::new(options))
             }
             DriverKind::ClaudePty => {
@@ -461,6 +463,7 @@ impl DriverFactory for NativeClaudeFactory {
                 options.instance_id = Some(launch.instance.meta.id.clone());
                 options.media_stager = self.tool_media_stager();
                 options.memory_context = launch.request.memory_context.clone();
+                options.skill_context = launch.request.skill_context.clone();
                 Arc::new(ClaudePtyDriver::new(options))
             }
             DriverKind::ClaudeBg => {
@@ -479,6 +482,7 @@ impl DriverFactory for NativeClaudeFactory {
                 options.settings_overlay_path = overlay;
                 options.instance_id = Some(launch.instance.meta.id.clone());
                 options.memory_context = launch.request.memory_context.clone();
+                options.skill_context = launch.request.skill_context.clone();
                 Arc::new(ClaudeBgDriver::new(options))
             }
             DriverKind::GenericPty => {
@@ -498,6 +502,7 @@ impl DriverFactory for NativeClaudeFactory {
                 options.instance_id = Some(launch.instance.meta.id.clone());
                 options.node_epoch = Some(self.epoch.clone());
                 options.memory_context = launch.request.memory_context.clone();
+                options.skill_context = launch.request.skill_context.clone();
                 Arc::new(GenericPtyDriver::new(options))
             }
             DriverKind::ShellPty => {
@@ -600,6 +605,7 @@ impl DriverFactory for NativeClaudeFactory {
                 // D-060: only an agent target materializes it; a login shell
                 // never reads it.
                 options.memory_context = launch.request.memory_context.clone();
+                options.skill_context = launch.request.skill_context.clone();
                 if agent_kind.is_none() {
                     // An agent's argv comes from its recipe (§5.1 step 3), not
                     // from the request; only the shell path forwards args.
@@ -1907,6 +1913,7 @@ mod tests {
             let request = crate::CreateInstanceRequest {
                 creator_permission_mode: None,
                 memory_context: None,
+                skill_context: None,
                 initiator: None,
                 origin: InputOrigin::Human,
                 agent_credential: None,
@@ -2123,6 +2130,7 @@ mod tests {
             let request = crate::CreateInstanceRequest {
                 creator_permission_mode: None,
                 memory_context: None,
+                skill_context: None,
                 initiator: None,
                 origin: InputOrigin::Human,
                 agent_credential: None,
@@ -2336,6 +2344,7 @@ mod tests {
         let mut request = crate::CreateInstanceRequest {
             creator_permission_mode: None,
             memory_context: None,
+            skill_context: None,
             initiator: None,
             origin: InputOrigin::Human,
             agent_credential: None,
@@ -2490,6 +2499,7 @@ mod tests {
             let request = crate::CreateInstanceRequest {
                 creator_permission_mode: None,
                 memory_context: None,
+                skill_context: None,
                 initiator: None,
                 origin: InputOrigin::Human,
                 agent_credential: None,
@@ -2553,6 +2563,7 @@ mod tests {
         let request = crate::CreateInstanceRequest {
             creator_permission_mode: None,
             memory_context: None,
+            skill_context: None,
             initiator: None,
             origin: InputOrigin::Human,
             agent_credential: None,
@@ -2607,6 +2618,7 @@ mod tests {
         let mut request = crate::CreateInstanceRequest {
             creator_permission_mode: None,
             memory_context: None,
+            skill_context: None,
             initiator: None,
             origin: InputOrigin::Human,
             agent_credential: None,
@@ -2665,6 +2677,7 @@ mod tests {
         let request = crate::CreateInstanceRequest {
             creator_permission_mode: None,
             memory_context: None,
+            skill_context: None,
             initiator: None,
             origin: remuda_protocol::InputOrigin::Agent,
             agent_credential: None,
@@ -2727,6 +2740,7 @@ mod tests {
         let request = crate::CreateInstanceRequest {
             creator_permission_mode: None,
             memory_context: None,
+            skill_context: None,
             initiator: None,
             origin: remuda_protocol::InputOrigin::Agent,
             agent_credential: None,
@@ -3212,6 +3226,7 @@ mod tests {
         let request = crate::CreateInstanceRequest {
             creator_permission_mode: None,
             memory_context: None,
+            skill_context: None,
             initiator: None,
             origin: remuda_protocol::InputOrigin::Agent,
             agent_credential: None,
@@ -3638,6 +3653,7 @@ mod tests {
             assert!(request_is_bypass(&crate::CreateInstanceRequest {
                 creator_permission_mode: None,
                 memory_context: None,
+                skill_context: None,
                 permission_mode: spelling.into(),
                 ..test_create_request()
             }));
@@ -3646,6 +3662,7 @@ mod tests {
             assert!(!request_is_bypass(&crate::CreateInstanceRequest {
                 creator_permission_mode: None,
                 memory_context: None,
+                skill_context: None,
                 permission_mode: spelling.into(),
                 ..test_create_request()
             }));
@@ -3656,6 +3673,7 @@ mod tests {
         crate::CreateInstanceRequest {
             creator_permission_mode: None,
             memory_context: None,
+            skill_context: None,
             initiator: None,
             origin: InputOrigin::Human,
             agent_credential: None,

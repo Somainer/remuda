@@ -159,6 +159,7 @@ async fn live_tasktrack_fg_and_bg_agent() {
     let driver = ClaudePtyDriver::new(ClaudePtyOptions {
         creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
+        skill_context: None,
         profile: profile(),
         launch_dir: launch.clone(),
         native_home: isolated_native_home(),

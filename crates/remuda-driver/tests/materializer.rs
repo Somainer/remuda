@@ -57,6 +57,7 @@ fn request<'a>(
     MaterializeRequest {
         creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
+        skill_context: None,
         spec,
         profile,
         launch_dir: launch.to_path_buf(),

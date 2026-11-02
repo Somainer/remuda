@@ -236,6 +236,9 @@ pub struct ShellPtyOptions {
     /// other agent kinds get the data block ahead of their first input. A
     /// login shell never uses it.
     pub memory_context: Option<crate::memory_context::MemoryContext>,
+    /// ma-skill: the Hub-stamped launch facts; the materializer installs the
+    /// `remuda` skill and carries the seat's capability section from them.
+    pub skill_context: Option<crate::launch::remuda_skill::SkillContext>,
     /// Fault injection: make `spawn_at` fail at the post-spawn adapter-setup
     /// decision — AFTER the child spawned and the switch workers started — so a
     /// test can drive the real launch path into its failure cleanup (reap the
@@ -281,6 +284,7 @@ impl ShellPtyOptions {
             instance_id: None,
             node_epoch: None,
             memory_context: None,
+            skill_context: None,
             #[cfg(any(test, feature = "test-stub"))]
             fail_after_spawn: false,
         }
@@ -2701,6 +2705,7 @@ fn recipe_for_blocking(
         cwd,
         resume.as_deref(),
         options.memory_context.as_ref(),
+        options.skill_context.as_ref(),
     )
 }
 
@@ -4103,6 +4108,8 @@ fn shell_recipe(options: &ShellPtyOptions, cwd: &str) -> DriverResult<LaunchReci
         },
         // A login shell is never given the chapter's memory (D-060).
         memory: None,
+        skill: None,
+        system_prompt: None,
     })
 }
 

@@ -1782,8 +1782,8 @@ mod tests {
     #[test]
     fn wss_hello_without_inventory_sends_no_inventory_rather_than_an_empty_claim() {
         // Absence must read as "not reported", never as "cannot launch". The
-        // build's own lineageFence and memoryContext support is still
-        // advertised.
+        // build's own lineageFence, memoryContext and skillContext support is
+        // still advertised.
         let epoch = Id::new("epoch").expect("epoch");
         let host_id = remuda_protocol::HostId::new();
         let mut config = WssConfig::loopback(
@@ -1795,7 +1795,7 @@ mod tests {
         let value = encode_hello_params(&config, &epoch, &HashMap::new());
         assert_eq!(
             value["capabilities"],
-            json!({"lineageFence": true, "memoryContext": true})
+            json!({"lineageFence": true, "memoryContext": true, "skillContext": true})
         );
 
         // No host at all (loopback config before inventory collection) still
@@ -1808,7 +1808,7 @@ mod tests {
         let value = encode_hello_params(&bare, &epoch, &HashMap::new());
         assert_eq!(
             value["capabilities"],
-            json!({"lineageFence": true, "memoryContext": true})
+            json!({"lineageFence": true, "memoryContext": true, "skillContext": true})
         );
     }
 

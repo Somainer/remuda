@@ -362,6 +362,7 @@ async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeErr
             host_id: None,
             workspace_id: None,
             memory_context: None,
+            skill_context: None,
         });
     let spec = parsed.spec.clone().unwrap_or_else(|| params.clone());
     let mut spec_for_request = spec.clone();
@@ -442,6 +443,7 @@ async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeErr
             api_route: None,
             api_relay_endpoint: None,
             memory_context: None,
+            skill_context: None,
         },
     };
     // Honour the requested product or refuse it. An unrecognized kind/driver is
@@ -477,6 +479,8 @@ async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeErr
     request.initiator = crate::origin::wire_initiator(&params);
     // D-060: top-level `memoryContext` only, never the spec's.
     request.take_memory_context(&params);
+    // ma-skill: likewise the launch facts for the capability section.
+    request.take_skill_context(&params);
     // D-057 OA1: top-level `creatorPermissionMode` only, never the spec's.
     request.take_creator_permission_mode(&params);
     request.agent_credential = params
@@ -886,10 +890,11 @@ pub fn hello_capabilities(host: &Value) -> Option<Value> {
     Some(node_capabilities(Some(host)))
 }
 
-/// The hello/heartbeat `capabilities` blob. `lineageFence` (D-057 §7.6) and
-/// `memoryContext` (D-060) are properties of this build and are always
-/// advertised: the Hub stamps a chapter's memory on create/resume only for a
-/// Node that says it carries it to the materializer. `driverInventory` (and
+/// The hello/heartbeat `capabilities` blob. `lineageFence` (D-057 §7.6),
+/// `memoryContext` (D-060) and `skillContext` (ma-skill) are properties of
+/// this build and are always advertised: the Hub stamps a chapter's memory and
+/// a seat's launch facts on create/resume only for a Node that says it carries
+/// them to the materializer. `driverInventory` (and
 /// the relay flag that rides with it) only when the inventory was collected —
 /// its absence reads "not reported", never "cannot launch".
 #[must_use]
@@ -897,6 +902,7 @@ pub fn node_capabilities(host: Option<&Value>) -> Value {
     let mut capabilities = json!({
         remuda_protocol::LINEAGE_FENCE_CAPABILITY: true,
         remuda_protocol::hubnode::MEMORY_CONTEXT_CAPABILITY: true,
+        remuda_protocol::hubnode::SKILL_CONTEXT_CAPABILITY: true,
     });
     if let Some(inventory) = host
         .and_then(|host| host.get("driverInventory"))
@@ -1115,11 +1121,11 @@ mod tests {
             None,
             None,
         );
-        // No inventory claim; only this build's own lineage-fence and
-        // memory-context support.
+        // No inventory claim; only this build's own lineage-fence,
+        // memory-context and skill-context support.
         assert_eq!(
             params["capabilities"],
-            json!({"lineageFence": true, "memoryContext": true})
+            json!({"lineageFence": true, "memoryContext": true, "skillContext": true})
         );
     }
 

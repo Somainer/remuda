@@ -111,6 +111,9 @@ pub struct GenericPtyOptions {
     /// D-060: the Hub-stamped lineage memory. A raw PTY never takes it as a
     /// flag; the driver puts it ahead of the first input it delivers.
     pub memory_context: Option<crate::memory_context::MemoryContext>,
+    /// ma-skill: the Hub-stamped launch facts; the materializer installs the
+    /// `remuda` skill and carries the seat's capability section from them.
+    pub skill_context: Option<crate::launch::remuda_skill::SkillContext>,
 }
 
 impl GenericPtyOptions {
@@ -141,6 +144,7 @@ impl GenericPtyOptions {
             file_adapter_home: None,
             node_epoch: None,
             memory_context: None,
+            skill_context: None,
         }
     }
 }
@@ -320,6 +324,7 @@ impl GenericPtyDriver {
             settings_overlay_path: None,
             secret_policy: None,
             memory_context: self.options.memory_context.as_ref(),
+            skill_context: self.options.skill_context.as_ref(),
         };
         let mut recipe = materialize(&request)?;
         self.memory_block.arm(&recipe);

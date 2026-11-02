@@ -3,8 +3,9 @@
 use crate::binary::{BinaryPin, pin_binary};
 use crate::error::{DriverError, DriverResult};
 use crate::flags::{reject_banned_env, validate_spec_args};
+use crate::launch::remuda_skill::{SkillContext, SkillPlan, SkillRequest};
 use crate::memory_context::{
-    APPEND_SYSTEM_PROMPT, MemoryContext, RecipeMemory, SYSTEM_PROMPT_SNAPSHOT,
+    APPEND_SYSTEM_PROMPT, MemoryContext, RecipeMemory, SYSTEM_PROMPT_SNAPSHOT, join_blocks,
     snapshot_switch_supported,
 };
 use crate::profile::{
@@ -101,6 +102,10 @@ pub struct MaterializeRequest<'a> {
     /// D-060: the Hub-stamped lineage memory for this chapter. The
     /// materializer is its only writer; [`memory_plan`] picks the mechanism.
     pub memory_context: Option<&'a MemoryContext>,
+    /// ma-skill: the Hub-stamped launch facts. Present, they install the
+    /// embedded `remuda` skill where the harness reads it and carry the
+    /// seat's capability section ([`crate::launch::remuda_skill`]).
+    pub skill_context: Option<&'a SkillContext>,
 }
 
 /// Node token-broker bind baked into a Claude `apiKeyHelper` script.
@@ -286,6 +291,7 @@ fn materialize_inner(
     let input_delivery;
     let session_id;
     let memory;
+    let mut system_prompt = None;
 
     // D-028 §5.1: `shell-pty` is no longer a materializer dead end. Which
     // recipe it gets depends on `spec.kind`, because one driver now carries
@@ -300,6 +306,10 @@ fn materialize_inner(
             binary_override.is_some(),
         );
     }
+
+    // ma-skill: decided per path here, written only once the launch is past
+    // every refusal below.
+    let skill = skill_plan(request, is_claude_argv_driver(request.spec.driver));
 
     match request.spec.driver {
         DriverKind::ClaudePrint
@@ -350,6 +360,7 @@ fn materialize_inner(
             // version cannot be read; the version comes from `--version`.
             crate::effort::ensure_claude_ultracode_version(&binary.version, request.spec.effort)?;
             memory = memory_plan(request, true, &binary.version);
+            let pair = own_pair(request, memory.as_ref(), skill.as_ref(), &binary.version);
             argv = claude_argv(
                 request.spec.driver,
                 &ClaudeArgv {
@@ -360,10 +371,11 @@ fn materialize_inner(
                     effort: request.spec.effort,
                     session: &request.session,
                     extras: &extras,
-                    system_prompt: memory.as_ref().and_then(RecipeMemory::flag_text),
-                    fresh_prompt: memory.as_ref().is_some_and(RecipeMemory::fresh_prompt),
+                    system_prompt: pair.as_ref().map(|(text, _)| text.as_str()),
+                    fresh_prompt: pair.as_ref().is_some_and(|(_, fresh)| *fresh),
                 },
             )?;
+            system_prompt = pair.map(|(text, _)| text);
             input_delivery = match request.spec.driver {
                 // Both stream-json carriers take turns as `user` NDJSON lines on
                 // the child's stdin; sdk simply keeps that stdin open (§2.1).
@@ -525,6 +537,9 @@ fn materialize_inner(
 
     let (capabilities, mcp_servers) =
         apply_capability_grant(request, &mut argv, &mut files, &mut env_allowlist)?;
+    if let Some(plan) = &skill {
+        files.extend(plan.write()?);
+    }
 
     let settings_digest = files
         .iter()
@@ -585,6 +600,8 @@ fn materialize_inner(
             approval_authority: approval,
         },
         memory,
+        skill: skill.map(|plan| plan.recipe),
+        system_prompt,
     };
     tracing::info!(
         launch_id = %recipe.launch_id,
@@ -776,18 +793,17 @@ fn materialize_shell_pty_agent(
     argv.extend(extras);
     // D-060: kind `claude` on the native carrier never reaches `claude_argv`,
     // so this path emits its own pair, after the caller-derived arguments.
-    let memory = memory_plan(
-        request,
-        request.spec.kind == AgentKind::Claude,
-        &binary.version,
-    );
-    if let Some(text) = memory.as_ref().and_then(RecipeMemory::flag_text) {
-        if memory.as_ref().is_some_and(RecipeMemory::fresh_prompt) {
+    let claude = request.spec.kind == AgentKind::Claude;
+    let memory = memory_plan(request, claude, &binary.version);
+    let skill = skill_plan(request, claude);
+    let pair = own_pair(request, memory.as_ref(), skill.as_ref(), &binary.version);
+    if let Some((text, fresh_prompt)) = &pair {
+        if *fresh_prompt {
             argv.push(SYSTEM_PROMPT_SNAPSHOT.into());
             argv.push("off".into());
         }
         argv.push(APPEND_SYSTEM_PROMPT.into());
-        argv.push(text.to_owned());
+        argv.push(text.clone());
     }
     // Per-harness permission axes: Codex's approval policy + sandbox mode,
     // Per-harness permission axes ride `permission.extra_flags` from
@@ -823,6 +839,9 @@ fn materialize_shell_pty_agent(
 
     let (capabilities, mcp_servers) =
         apply_capability_grant(request, &mut argv, &mut files, &mut env_allowlist)?;
+    if let Some(plan) = &skill {
+        files.extend(plan.write()?);
+    }
 
     let settings_digest = files
         .iter()
@@ -888,7 +907,63 @@ fn materialize_shell_pty_agent(
             },
         },
         memory,
+        skill: skill.map(|plan| plan.recipe),
+        system_prompt: pair.map(|(text, _)| text),
     })
+}
+
+/// The carriers whose Claude argv [`claude_argv`] builds.
+fn is_claude_argv_driver(driver: DriverKind) -> bool {
+    matches!(
+        driver,
+        DriverKind::ClaudePrint
+            | DriverKind::ClaudeSdk
+            | DriverKind::ClaudePty
+            | DriverKind::ClaudeBg
+    )
+}
+
+/// ma-skill: what this launch does with `skillContext`. `claude_argv` is true
+/// where the materializer builds the Claude argv itself, the paths whose
+/// section rides its own system-prompt pair. `reads_skills` is the separate
+/// question of whether the harness reads `<native_home>/skills`: those paths,
+/// plus a `generic-pty` Claude pane, which the driver pins to the home only
+/// when the home holds login material (`generic_pty::pane_home_env`).
+fn skill_plan(request: &MaterializeRequest<'_>, claude_argv: bool) -> Option<SkillPlan> {
+    crate::launch::remuda_skill::plan(&SkillRequest {
+        context: request.skill_context,
+        kind: request.spec.kind,
+        claude_argv,
+        reads_skills: claude_argv
+            || (request.spec.driver == DriverKind::GenericPty
+                && request.spec.kind == AgentKind::Claude
+                && crate::claude_onboarding::has_login_material(&request.native_home)),
+        resume: matches!(request.session, SessionAction::Resume { .. }),
+        launch_dir: &request.launch_dir,
+        native_home: &request.native_home,
+        native_home_managed: request.native_home_managed.unwrap_or(true),
+    })
+}
+
+/// The materializer's own system-prompt pair on a Claude argv path: the
+/// memory index (D-060), then the capability section when it is not in a
+/// per-instance skill tree (ma-skill), as one `--append-system-prompt` value;
+/// and whether a native resume precedes it with `--system-prompt-snapshot
+/// off` (from 2.1.257, `pinned_version` permitting), for the reason
+/// [`memory_plan`] gives.
+fn own_pair(
+    request: &MaterializeRequest<'_>,
+    memory: Option<&RecipeMemory>,
+    skill: Option<&SkillPlan>,
+    pinned_version: &str,
+) -> Option<(String, bool)> {
+    let text = join_blocks(
+        memory.and_then(RecipeMemory::flag_text),
+        skill.and_then(|plan| plan.recipe.flag_text()),
+    )?;
+    let fresh_prompt = matches!(request.session, SessionAction::Resume { .. })
+        && snapshot_switch_supported(pinned_version);
+    Some((text, fresh_prompt))
 }
 
 /// D-060 (main-agent.md §12.3): how `memoryContext` rides this launch. The

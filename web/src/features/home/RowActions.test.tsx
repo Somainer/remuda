@@ -11,7 +11,13 @@ import { known, unknownKnowledge, type Id } from "../../types/wire";
  * naming the session and the host, and the long-press entry.
  */
 
-const calls = vi.hoisted(() => ({ markSeen: vi.fn().mockResolvedValue(null), cancel: vi.fn(), close: vi.fn(), rename: vi.fn() }));
+const calls = vi.hoisted(() => ({
+  markSeen: vi.fn().mockResolvedValue(null),
+  cancel: vi.fn().mockResolvedValue(undefined),
+  close: vi.fn().mockResolvedValue(undefined),
+  rename: vi.fn(),
+  toast: vi.fn(),
+}));
 
 vi.mock("../../lib/store", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../lib/store")>();
@@ -27,7 +33,7 @@ vi.mock("../../lib/store", async (importOriginal) => {
       cancel: calls.cancel,
       close: calls.close,
       rename: calls.rename,
-      toast: vi.fn(),
+      toast: calls.toast,
     },
   };
 });
@@ -208,6 +214,25 @@ describe("RowActions", () => {
       document.documentElement.style.removeProperty("--workbench-height");
       delete document.documentElement.dataset.keyboard;
     }
+  });
+
+  it("reports a refused 中断 instead of an unhandled rejection", async () => {
+    calls.cancel.mockRejectedValueOnce(new Error("409"));
+    calls.toast.mockClear();
+    render(<Harness instance={inst()} />);
+    await userEvent.click(screen.getByTestId("row-actions-more"));
+    await userEvent.click(screen.getByTestId("row-action-interrupt"));
+    await vi.waitFor(() => expect(calls.toast).toHaveBeenCalledWith("中断失败，请重试"));
+  });
+
+  it("reports a refused 关闭 instead of an unhandled rejection", async () => {
+    calls.close.mockRejectedValueOnce(new Error("410"));
+    calls.toast.mockClear();
+    render(<Harness instance={inst()} />);
+    await userEvent.click(screen.getByTestId("row-actions-more"));
+    await userEvent.click(screen.getByTestId("row-action-close"));
+    await userEvent.click(screen.getByTestId("row-close-confirm-yes"));
+    await vi.waitFor(() => expect(calls.toast).toHaveBeenCalledWith("关闭失败，请重试"));
   });
 
   it("offers 复制恢复命令 only for a claude row", async () => {

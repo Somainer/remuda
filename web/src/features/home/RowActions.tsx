@@ -126,7 +126,9 @@ export function RowActions({
         hubStore.toast("主机离线，无法中断");
         return;
       }
-      void hubStore.cancel(instance.id);
+      // 409/410 (the turn already ended) is the common refusal; never leave
+      // it as an unhandled rejection.
+      void hubStore.cancel(instance.id).catch(() => hubStore.toast("中断失败，请重试"));
     } else if (key === "rename") {
       setRenaming(true);
       return;
@@ -197,7 +199,7 @@ export function RowActions({
           onClick={() => {
             setConfirming(false);
             onClose();
-            void hubStore.close(instance.id);
+            void hubStore.close(instance.id).catch(() => hubStore.toast("关闭失败，请重试"));
           }}
         >
           关闭

@@ -773,6 +773,45 @@ async fn an_owner_command_in_flight_holds_the_batch_and_goes_first() -> Result<(
     Ok(())
 }
 
+/// Hub-written input already queued for the chapter (a successor's restart
+/// notice) goes first: the batch forms only once it settled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_queued_restart_notice_goes_before_the_batch() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("deliver-notice").await?;
+    let (seat, token) = ctx.seat(&project).await?;
+    ctx.journal(&seat, activity("working", &at(1))).await?;
+    let (notice, _) = ctx
+        .hub
+        .store()
+        .context("store")?
+        .queue_command(
+            None,
+            Some(seat.clone()),
+            ctx.host.clone(),
+            "instance.send".into(),
+            json!({ "instanceId": seat, "origin": "hub",
+                    "input": { "type": "prompt", "text": "<remuda-restart> notice", "origin": "hub" } }),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?;
+    let worker = ctx.worker(&token, &project).await?;
+    ctx.worker_turn(&worker, 10, "done").await?;
+    ctx.journal(&seat, activity("idle", &at(30))).await?;
+    ctx.settle().await?;
+    assert!(ctx.batch_rows()?.is_empty(), "held behind the notice");
+
+    ctx.settle_command(&seat, &notice.command_id).await?;
+    ctx.settle().await?;
+    let sends = ctx.seen.sends_to(&seat);
+    assert_eq!(sends.len(), 1, "{sends:#?}");
+    assert!(text_of(&sends[0]).starts_with(OPENING_TAG));
+    Ok(())
+}
+
 // ─── ids and replay ─────────────────────────────────────────────────────────
 
 /// D-055: the batch's id is its replay identity. Driving delivery again, and

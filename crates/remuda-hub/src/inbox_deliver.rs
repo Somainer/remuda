@@ -223,7 +223,8 @@ enum Hold {
     /// queued or in flight: it goes first. The chapter's own launch and the
     /// owner's control verbs are not input and hold nothing.
     OwnerFirst,
-    /// The chapter's previous batch has not settled.
+    /// Hub-written input to the chapter has not settled: its previous batch,
+    /// or a successor's restart notice, which stays its first input (§6.4).
     InFlight,
     HostOffline,
     /// Hub-origin input goes only to Nodes that advertise the fence
@@ -315,7 +316,11 @@ fn gate(conn: &Connection, lineage_id: &str) -> Result<Result<Chapter, Hold>, St
                                          'instance.keys', 'tty.write')
                        AND initiator_instance_id IS NULL
                        AND json_extract(payload_json, '$.origin') = 'human'),
-            EXISTS (SELECT 1 FROM inbox_batches WHERE instance_id = ?1 AND outcome IS NULL)",
+            EXISTS (SELECT 1 FROM inbox_batches WHERE instance_id = ?1 AND outcome IS NULL)
+              OR EXISTS (SELECT 1 FROM commands
+                          WHERE instance_id = ?1 AND state <> 'settled'
+                            AND operation = 'instance.send'
+                            AND json_extract(payload_json, '$.origin') = 'hub')",
         params![chapter_id],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;

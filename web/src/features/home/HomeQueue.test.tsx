@@ -80,6 +80,14 @@ function renderQueue(placement: "phone" | "desktop" = "phone", url = "/m", searc
   );
 }
 
+function rerenderQueue(view: ReturnType<typeof render>) {
+  view.rerender(
+    <MemoryRouter initialEntries={["/m"]}>
+      <HomeQueue placement="phone" searching={false} />
+    </MemoryRouter>,
+  );
+}
+
 function cards() {
   return screen.queryAllByTestId("home-queue-card");
 }
@@ -181,6 +189,59 @@ describe("HomeQueue (§4.1)", () => {
       fireEvent.click(within(card).getByTestId("home-card-ack"));
     });
     expect(fake.markSeen).toHaveBeenCalledWith("ins_f");
+  });
+});
+
+describe("HomeQueue holds the order during interaction (§3.3, §4.1)", () => {
+  function fiveInteractions(): HubState {
+    return hub({
+      instances: ["ins_a", "ins_b", "ins_c", "ins_d", "ins_e"].map((id) => inst({ id })),
+      interactions: [
+        interaction({ id: "int_1", instanceId: "ins_a", createdAt: T2 }),
+        interaction({ id: "int_2", instanceId: "ins_b", createdAt: T1 }),
+        interaction({ id: "int_3", instanceId: "ins_c", createdAt: T0 }),
+        interaction({ id: "int_4", instanceId: "ins_d", createdAt: "2026-10-31T07:00:00.000Z" }),
+        interaction({ id: "int_5", instanceId: "ins_e", createdAt: "2026-10-31T06:00:00.000Z" }),
+      ],
+    });
+  }
+
+  function paintedIds() {
+    return cards().map((card) => card.getAttribute("data-card-id"));
+  }
+
+  it("freezes the expanded queue when a newer card arrives, and re-orders on collapse", () => {
+    fake.state = fiveInteractions();
+    const view = renderQueue("phone");
+    fireEvent.click(screen.getByTestId("home-queue-more"));
+    expect(screen.getByTestId("home-queue")).toHaveAttribute("data-order-held", "1");
+    expect(paintedIds()).toEqual(["int_1", "int_2", "int_3", "int_4", "int_5"]);
+
+    // A 2 s poll lands a newer interaction (and drops one) while the queue
+    // is open: the painted order must not move under the reader.
+    const next = fiveInteractions();
+    fake.state = hub({
+      instances: next.instances,
+      interactions: [
+        interaction({ id: "int_0", instanceId: "ins_a", createdAt: "2026-10-31T11:00:00.000Z" }),
+        interaction({ id: "int_1", instanceId: "ins_b", createdAt: T2 }),
+        interaction({ id: "int_2", instanceId: "ins_c", createdAt: T1 }),
+        interaction({ id: "int_3", instanceId: "ins_d", createdAt: T0 }),
+        interaction({ id: "int_4", instanceId: "ins_e", createdAt: "2026-10-31T07:00:00.000Z" }),
+      ],
+    });
+    rerenderQueue(view);
+    expect(paintedIds()).toEqual(["int_1", "int_2", "int_3", "int_4", "int_5"]);
+    // The card that vanished from the live data is an inert placeholder.
+    expect(cards()[4]).toHaveAttribute("data-stale", "1");
+    // The new card waits for the release.
+    expect(paintedIds()).not.toContain("int_0");
+
+    // Collapsing releases the hold: the queue re-orders once, back to the
+    // collapsed 3-card slice with the new card first.
+    fireEvent.click(screen.getByTestId("home-queue-more"));
+    expect(screen.getByTestId("home-queue")).toHaveAttribute("data-order-held", "0");
+    expect(paintedIds()).toEqual(["int_0", "int_1", "int_2"]);
   });
 });
 

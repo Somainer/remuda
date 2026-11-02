@@ -3,7 +3,7 @@ import { Link, useSearchParams } from "react-router-dom";
 import { hubStore, useHub } from "../../lib/store";
 import { thisDeviceId } from "../../lib/interactionStatus";
 import { formatListTime } from "../../lib/format";
-import { useHeldOrder } from "../../lib/useHeldOrder";
+import { useHeldOrder, type HoldSource } from "../../lib/useHeldOrder";
 import type { Id } from "../../types/wire";
 import type { Interaction, InteractionAnswer } from "../../types/interaction";
 import { DecisionCard, type DecisionView, type HomeCardState } from "../approvals/ApprovalCard";
@@ -157,7 +157,7 @@ export function HomeQueue({
   // is showing its receipt) and a new card waits for the release.
   const { begin, end, held, snapshot, regionRef } = useHeldOrder<readonly HomeQueueCard[]>();
   const startHold = useCallback(
-    (source: "pointer" | "focus") => begin(source, () => paintedRef.current),
+    (source: HoldSource) => begin(source, () => paintedRef.current),
     [begin],
   );
 
@@ -187,6 +187,13 @@ export function HomeQueue({
   const [expandedChoice, setExpanded] = useState<boolean | null>(null);
   const focusIndex = focus ? ids.indexOf(focus) : -1;
   const expanded = expandedChoice ?? focusIndex >= limit;
+  // §4.1: 「展开期间同样遵守 §3.3」 — the expansion is itself a hold source, so
+  // while the whole queue is open a poll can neither re-sort the cards nor
+  // slip a new one in. The "sheet" source lasts until the queue collapses.
+  useEffect(() => {
+    if (expanded) startHold("sheet");
+    else end("sheet");
+  }, [expanded, startHold, end]);
 
   // Push landing: scroll the focused card into view once per focus value.
   const scrolledFor = useRef<string | null>(null);

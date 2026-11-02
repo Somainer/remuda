@@ -220,6 +220,12 @@ function card(page: Page, id: string): Locator {
   return page.locator(`[data-testid="home-queue-card"][data-card-id="${id}"]`);
 }
 
+/** Release the expansion hold (§4.1: expanded = held until collapsed). */
+async function collapseQueue(page: Page) {
+  const collapse = page.locator('[data-testid="home-queue-more"][aria-expanded="true"]');
+  if (await collapse.count()) await collapse.click();
+}
+
 /** Other specs' cards may fill the fold: open the queue in place. */
 async function expandQueue(page: Page) {
   const more = page.locator('[data-testid="home-queue-more"][aria-expanded="false"]');
@@ -323,6 +329,9 @@ test.describe("home queue", () => {
       // `hqueue-race`: the fake Node refuses a second answer the way the real
       // Node does, so the Hub's own 409 reaches this device.
       const raced = await park(page, "mhome-blocked hqueue-race");
+      // The open queue holds its order (§4.1): collapse and re-expand to take
+      // in the card that arrived while it was frozen.
+      await collapseQueue(page);
       await expect(card(page, raced.interactionId).or(page.getByTestId("home-queue-more")).first()).toBeVisible({
         timeout: 20_000,
       });
@@ -389,6 +398,63 @@ test.describe("home queue", () => {
       await expect(allow).toBeEnabled({ timeout: 30_000 });
     } finally {
       await context.setOffline(false);
+      await cleanup(page.request);
+      await context.close();
+    }
+  });
+
+  test("390: the expanded queue holds its order while a card arrives, and re-orders on collapse", async ({
+    browser,
+  }) => {
+    const baseURL = test.info().project.use.baseURL!;
+    const context = await phoneContext(browser, baseURL, "e2e-hqueue-hold");
+    const page = await context.newPage();
+    try {
+      await page.goto("/m");
+      if (!(await needsFakeNode(page))) test.skip(true, "needs the in-process fake Node");
+      const first: string[] = [];
+      for (let index = 0; index < 4; index += 1) first.push((await park(page, "mhome-blocked")).interactionId);
+
+      await page.goto("/m");
+      await expect(page.getByTestId("home-queue").or(page.getByTestId("home-queue-more")).first()).toBeVisible({
+        timeout: 20_000,
+      });
+      await expandQueue(page);
+      await expect(page.getByTestId("home-queue")).toHaveAttribute("data-order-held", "1");
+      const before = await page.getByTestId("home-queue-card").evaluateAll((nodes) =>
+        nodes.map((node) => node.getAttribute("data-card-id")),
+      );
+      for (const id of first) expect(before).toContain(id);
+
+      // A newer card lands while the queue is open: §3.3 freezes the order.
+      // Count the page's own interaction polls so the assertion waits for the
+      // new data to have been DELIVERED (no wall-clock threshold).
+      let polls = 0;
+      const countPoll = (response: import("@playwright/test").Response) => {
+        if (response.request().method() === "GET" && /\/v1\/interactions(\?|$)/.test(response.url())) polls += 1;
+      };
+      page.on("response", countPoll);
+      const startPolls = polls;
+      const later = await park(page, "mhome-blocked");
+      await expect.poll(() => pendingOnHub(page, later.interactionId), { timeout: 20_000 }).toBe(true);
+      await expect.poll(() => polls, { timeout: 20_000 }).toBeGreaterThan(startPolls + 3);
+      page.off("response", countPoll);
+      const during = await page.getByTestId("home-queue-card").evaluateAll((nodes) =>
+        nodes.map((node) => node.getAttribute("data-card-id")),
+      );
+      expect(during).toEqual(before);
+      expect(during).not.toContain(later.interactionId);
+
+      // Collapsing releases the hold; re-expanding paints the new card first.
+      await collapseQueue(page);
+      await expect(page.getByTestId("home-queue")).toHaveAttribute("data-order-held", "0");
+      await expandQueue(page);
+      await expect(card(page, later.interactionId)).toBeVisible({ timeout: 20_000 });
+      const after = await page.getByTestId("home-queue-card").evaluateAll((nodes) =>
+        nodes.map((node) => node.getAttribute("data-card-id")),
+      );
+      expect(after[0]).toBe(later.interactionId);
+    } finally {
       await cleanup(page.request);
       await context.close();
     }

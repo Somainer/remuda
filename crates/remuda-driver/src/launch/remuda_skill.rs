@@ -361,7 +361,9 @@ fn is_symlink(path: &Path) -> bool {
 
 /// Refuse to write when `skills` or `skills/remuda` is a link, or the tree is
 /// the user's. Called before anything is created or written, and again right
-/// before the first write.
+/// before the first write: two lstat checks around the directory creation,
+/// which narrow — but cannot close — the window for a link swapped in
+/// between by someone who can already write inside this home.
 fn refuse_user_owned(skills_root: &Path, root: &Path) -> DriverResult<()> {
     if is_symlink(skills_root) || user_owned(root) {
         return Err(DriverError::SettingsIsolationUnavailable(format!(
@@ -400,7 +402,11 @@ fn write_tree(
     };
     // The decision above ran before the launch dir and any overlay were
     // written; re-check now, immediately before the first write, so a link
-    // planted in between cannot be won. Nothing has been written yet.
+    // planted in between narrows the window rather than closing it. An lstat
+    // followed by a use is a sequence, not a transaction: whoever can swap
+    // links inside this home between the two calls still controls the write
+    // (and already controls the home). Closing that would need openat-style
+    // walking, which this does not do.
     refuse_user_owned(skills_root, root)?;
     // The marker goes first, through a temporary name and a rename: the
     // rename replaces whatever entry is at that path (a link included)

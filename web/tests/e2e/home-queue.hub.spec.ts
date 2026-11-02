@@ -258,19 +258,30 @@ async function phoneContext(browser: Browser, baseURL: string, name: string): Pr
   return context;
 }
 
-/** How many line boxes one element's text paints (a clamp shows fewer). */
-async function renderedLines(locator: Locator): Promise<number> {
+/**
+ * The rendered line budget of one element's text. Counting line boxes alone
+ * cannot prove a line is unclipped (a 1-line clamp still paints one box), so
+ * the measurement also records whether the LAST box ends inside the element
+ * and whether the element overflows vertically.
+ */
+async function lineBudget(locator: Locator): Promise<{ lines: number; lastInside: boolean; noOverflow: boolean }> {
   return locator.evaluate((el) => {
-    const tops = new Set<number>();
+    const rects: DOMRect[] = [];
     for (const node of Array.from(el.childNodes)) {
       if (node.nodeType !== Node.TEXT_NODE) continue;
       const range = document.createRange();
       range.selectNodeContents(node);
       for (const rect of range.getClientRects()) {
-        if (rect.width > 0.5 && rect.height > 0.5) tops.add(Math.round(rect.top));
+        if (rect.width > 0.5 && rect.height > 0.5) rects.push(rect);
       }
     }
-    return tops.size;
+    const box = el.getBoundingClientRect();
+    const last = rects[rects.length - 1];
+    return {
+      lines: new Set(rects.map((rect) => Math.round(rect.top))).size,
+      lastInside: last ? last.bottom <= box.bottom + 0.5 : false,
+      noOverflow: el.scrollHeight <= el.clientHeight + 1,
+    };
   });
 }
 
@@ -327,7 +338,30 @@ test.describe("home queue", () => {
       // §4.2 标题、正文前 2 行: the title is its own line and the body paints
       // BOTH plan lines in full (not a title+1-line clamp).
       await expect(planCard.getByTestId("home-card-plan-title")).toHaveText("Plan: split the gate");
-      expect(await renderedLines(planCard.getByTestId("home-card-body"))).toBe(2);
+      const planBody = planCard.getByTestId("home-card-body");
+      const budget = await lineBudget(planBody);
+      expect(budget.lines, "both plan lines paint").toBe(2);
+      expect(budget.lastInside, "the second line ends inside the body box").toBe(true);
+      expect(budget.noOverflow, "the body does not overflow its box").toBe(true);
+      // RED proof: force a 1-line clamp and the same measurement must report
+      // clipping; restore the card afterwards.
+      await planBody.evaluate((el) => {
+        const styled = el as HTMLElement;
+        styled.dataset.clampBefore = styled.style.cssText;
+        styled.style.webkitLineClamp = "1";
+        styled.style.lineClamp = "1";
+      });
+      const red = await lineBudget(planBody);
+      expect(
+        red.lines === 2 && red.lastInside && red.noOverflow,
+        `a 1-line clamp is detected as clipping: ${JSON.stringify(red)}`,
+      ).toBe(false);
+      await planBody.evaluate((el) => {
+        const styled = el as HTMLElement;
+        styled.style.cssText = styled.dataset.clampBefore ?? "";
+        delete styled.dataset.clampBefore;
+      });
+      expect(await lineBudget(planBody)).toEqual(budget);
 
       const otherCard = card(page, other.interactionId);
       await expect(otherCard).toHaveAttribute("data-home-kind", "question");

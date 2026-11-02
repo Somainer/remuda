@@ -848,6 +848,15 @@ def build_node(name: str, definition: TypeDef, modules: dict[str, Module],
             continue
         if any(a.startswith("command(") and re.search(r"\bflatten\b", a)
                for a in item.attrs):
+            # A flattened struct contributes flags, and possibly its own
+            # subcommands and aliases.
+            nested = resolve_type(modules, definition.module, item.type)
+            if nested and nested.qualified not in seen:
+                deeper = build_node(item.name, nested, modules, set(seen))
+                node.flags.update(deeper.flags)
+                node.subcommands.update(deeper.subcommands)
+                node.aliases.update(deeper.aliases)
+                node.has_positionals = node.has_positionals or deeper.has_positionals
             continue
         if _is_positional(item):
             node.has_positionals = True

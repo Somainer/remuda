@@ -13,6 +13,7 @@ and deliberately broken in known places.
 - [missing heading](docs/guide.md#no-such-heading)
 
 Commands that exist: `remuda demo run --fast`, `remuda demo run --quick`,
+`remuda demo --verbose run`, `remuda demo inspect`,
 `remuda --data-dir D demo list`, `just build`, `just check`,
 `pnpm --dir web test`.
 

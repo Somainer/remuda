@@ -468,15 +468,33 @@ fn clip_excerpt(text: &str) -> String {
     clipped
 }
 
-/// The prompt text of a stored input, in each shape the clients send
-/// (`text`, `prompt`, `input.blocks`) or the Hub writes (`input.text`).
+/// The prompt text of a stored input, mirroring the Node's `prompt_of`
+/// (`runtime_wss.rs`): `initialInput.text` (a create's opening prompt),
+/// `prompt` (the web), `spec.prompt`, `input.text` (Hub-authored inputs),
+/// `text`, then the `input.blocks` text parts joined by newlines.
 fn prompt_text(payload: &Value) -> Option<String> {
-    crate::http::send_message_text(payload).or_else(|| {
-        payload
-            .pointer("/input/text")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-    })
+    if let Some(text) = payload
+        .pointer("/initialInput/text")
+        .or_else(|| payload.get("prompt"))
+        .or_else(|| payload.pointer("/spec/prompt"))
+        .or_else(|| payload.pointer("/input/text"))
+        .or_else(|| payload.get("text"))
+        .and_then(Value::as_str)
+    {
+        return Some(text.to_owned());
+    }
+    let blocks = payload.pointer("/input/blocks")?.as_array()?;
+    let mut out = String::new();
+    for block in blocks {
+        let Some(text) = block.get("text").and_then(Value::as_str) else {
+            continue;
+        };
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(text);
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 #[cfg(test)]
@@ -937,6 +955,43 @@ mod tests {
         assert!(excerpt.contains("please use"), "{excerpt}");
         assert!(excerpt.contains("now"), "{excerpt}");
         assert!(!excerpt.contains("abcd1234"), "{excerpt}");
+
+        // Every command shape the Node reads is understood, in the Node's
+        // `prompt_of` order: a create's opening prompt, an explicit
+        // `spec.prompt`, and `input.blocks`.
+        for (id, payload, wanted) in [
+            (
+                "cmd_create",
+                json!({"origin": "human",
+                       "initialInput": {"type": "prompt", "text": "open the seat now"},
+                       "spec": {"prompt": "spec words must not win"}}),
+                "open the seat now",
+            ),
+            (
+                "cmd_spec",
+                json!({"origin": "human", "spec": {"prompt": "spec words only"}}),
+                "spec words only",
+            ),
+            (
+                "cmd_blocks",
+                json!({"origin": "human", "input": {"type": "prompt", "blocks": [
+                    {"type": "text", "text": "first"}, {"type": "text", "text": "second"}]}}),
+                "first second",
+            ),
+        ] {
+            command(&conn, id, payload, None);
+            assert_eq!(
+                requested_by(
+                    &conn,
+                    &rt(id, InputOrigin::Human, RootTurnContinuation::Fresh)
+                )
+                .unwrap()
+                .excerpt
+                .as_deref(),
+                Some(wanted),
+                "{id}"
+            );
+        }
 
         // A command with no prompt text still names the command, with no
         // excerpt invented for it.

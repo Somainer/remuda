@@ -1342,3 +1342,69 @@ async fn owner_words_are_human_only_on_task_worker_and_card_reads() -> Result<()
     );
     Ok(())
 }
+
+/// A create's opening prompt (`initialInput.text` / `spec.prompt`) is the
+/// owner's input too: a dispatch in that first turn carries the excerpt.
+#[tokio::test]
+async fn an_owner_create_prompt_is_the_first_turns_excerpt() -> Result<()> {
+    let (ctx, mut node) = Ctx::boot().await?;
+    let (status, created) = ctx
+        .post(
+            &ctx.human,
+            "/v1/instances",
+            &[],
+            json!({
+                "hostId": ctx.host, "kind": "claude", "driver": "claude-sdk",
+                "name": "seeded", "permissionMode": "manual", "grants": ["dispatch"],
+                "prompt": "the owner opened this seat with these words",
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "{created}");
+    let seat = created["instance"]["instanceId"]
+        .as_str()
+        .context("instance id")?
+        .to_owned();
+    let create_command = created["command"]["commandId"]
+        .as_str()
+        .context("create command id")?
+        .to_owned();
+    node.next("instance.create").await;
+    let (status, token) = ctx
+        .post(
+            &ctx.human,
+            &format!("/v1/instances/{seat}/mcp-token"),
+            &[],
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, 200, "{token}");
+    let token = token["token"].as_str().context("token")?.to_owned();
+    // The Node delivers the create's opening prompt as that command's input.
+    ctx.turn_starts(&node, &seat, &create_command).await;
+
+    let project = ctx.create_project().await;
+    let (status, pending) = ctx
+        .worker_dispatch(&token, &project, &[("x-remuda-require-approval", "true")])
+        .await;
+    assert_eq!(status, 409, "{pending}");
+    let approval = pending["interactionId"]
+        .as_str()
+        .context("interactionId")?
+        .to_owned();
+    let card = ctx.card(&approval).await;
+    assert_eq!(
+        card["rootTurn"]["commandId"],
+        json!(create_command),
+        "{card}"
+    );
+    assert_eq!(
+        card["requestedBy"],
+        json!({
+            "commandId": create_command,
+            "excerpt": "the owner opened this seat with these words",
+        }),
+        "{card}"
+    );
+    Ok(())
+}

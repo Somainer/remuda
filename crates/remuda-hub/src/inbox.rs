@@ -87,7 +87,7 @@ pub(crate) fn validate_configured_minutes(
 
 /// `minutes` as a duration the tick may add to a time, when it is in range
 /// and representable; `None` means "skip this subject".
-fn window_minutes(minutes: i64) -> Option<time::Duration> {
+pub(crate) fn window_minutes(minutes: i64) -> Option<time::Duration> {
     if !(1..=MAX_CONFIGURED_MINUTES).contains(&minutes) {
         return None;
     }
@@ -103,7 +103,7 @@ static REPORTED_ONCE: std::sync::OnceLock<
 
 /// Log a category once per process; never the values, which can be arbitrary
 /// input.
-fn report_once(code: &'static str) {
+pub(crate) fn report_once(code: &'static str) {
     let seen = REPORTED_ONCE.get_or_init(Default::default);
     let mut seen = seen.lock().unwrap_or_else(|poison| poison.into_inner());
     if seen.insert(code) {
@@ -259,6 +259,7 @@ pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
          );
          CREATE INDEX IF NOT EXISTS inbox_supply_parks_due ON inbox_supply_parks(resets_at);",
     )?;
+    crate::stall_screen::migrate(conn)?;
     migrate_sources(conn)
 }
 
@@ -542,7 +543,7 @@ pub(crate) fn canonical_at(raw: &str) -> Option<String> {
     parse_at(raw).map(crate::config::rfc3339)
 }
 
-fn parse_at(raw: &str) -> Option<OffsetDateTime> {
+pub(crate) fn parse_at(raw: &str) -> Option<OffsetDateTime> {
     OffsetDateTime::parse(raw.trim(), &Rfc3339)
         .ok()
         .map(|at| at.to_offset(time::UtcOffset::UTC))
@@ -613,7 +614,10 @@ fn receives(conn: &Connection, lineage_id: &str, kind: InboxFactKind) -> Result<
 
 /// The single project of `instance_id`'s scope, whose policy holds the cap
 /// and the stall windows.
-fn project_of(conn: &Connection, instance_id: &str) -> Result<Option<String>, StoreError> {
+pub(crate) fn project_of(
+    conn: &Connection,
+    instance_id: &str,
+) -> Result<Option<String>, StoreError> {
     let scope: Option<String> = conn
         .query_row(
             "SELECT scope_json FROM instances WHERE id = ?1",
@@ -850,7 +854,7 @@ fn record_about(conn: &Connection, instance_id: &str, fact: Fact) -> Result<Outc
 }
 
 /// A fact about `instance_id` itself (key and cap subject are the instance).
-fn instance_fact(
+pub(crate) fn instance_fact(
     conn: &Connection,
     kind: InboxFactKind,
     instance_id: &str,
@@ -966,7 +970,7 @@ pub(crate) fn forget_instance(conn: &Connection, instance_id: &str) -> Result<()
         "DELETE FROM inbox_supply_parks WHERE instance_id = ?1",
         params![instance_id],
     )?;
-    Ok(())
+    crate::stall_screen::forget(conn, instance_id)
 }
 
 /// The run generation `instance_id` is in now, and whether a journaled tool
@@ -1900,23 +1904,29 @@ fn due_supply_resets(conn: &Connection, now: OffsetDateTime) -> Result<usize, St
 /// * otherwise one fact per quiet period once no journal row arrived for the
 ///   project's `stallThresholdMins` (default
 ///   [`remuda_protocol::DEFAULT_STALL_THRESHOLD_MINS`]). The period starts at
-///   the latest row, so it restarts at a tool's result.
+///   the latest row, so it restarts at a tool's result. On a screen carrier
+///   ([`crate::stall_screen::SCREEN_CARRIERS`]) that quiet only makes the
+///   child a [`ScreenCandidate`]: the per-host screen sweep decides (§10).
 ///
 /// Both clocks are the Hub's own (the journal row's `observed_at`), so a
 /// Node's clock or a replayed backlog cannot make a child look stalled.
-fn due_stalls(conn: &Connection, now: OffsetDateTime) -> Result<usize, StoreError> {
-    let busy: Vec<String> = {
+fn due_stalls(
+    conn: &Connection,
+    now: OffsetDateTime,
+    screen: &mut Vec<ScreenCandidate>,
+) -> Result<usize, StoreError> {
+    let busy: Vec<(String, String, String)> = {
         let mut stmt = conn.prepare_cached(
-            "SELECT id FROM instances
+            "SELECT id, driver, host_id FROM instances
               WHERE activity IN ('working', 'draining') AND lifecycle IN ('running', 'ready')
                 AND ended_at IS NULL AND fenced_at IS NULL
                 AND json_extract(spec_json, '$.parentInstanceId') IS NOT NULL",
         )?;
-        stmt.query_map([], |row| row.get(0))?
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .collect::<Result<_, _>>()?
     };
     let mut written = 0;
-    for instance_id in busy {
+    for (instance_id, driver, host_id) in busy {
         let Some(subscriber) = subscriber_of(conn, &instance_id)? else {
             continue;
         };
@@ -1964,20 +1974,18 @@ fn due_stalls(conn: &Connection, now: OffsetDateTime) -> Result<usize, StoreErro
             fact.payload["runGeneration"] = json!(tracker.run);
             fact
         } else {
-            let threshold = project_policy_number(conn, project.as_deref(), "stallThresholdMins")?
-                .filter(|mins| *mins > 0)
-                .unwrap_or(remuda_protocol::DEFAULT_STALL_THRESHOLD_MINS);
-            let last: Option<String> = conn
-                .query_row(
-                    "SELECT observed_at FROM journal WHERE instance_id = ?1
-                      ORDER BY seq DESC LIMIT 1",
-                    params![instance_id],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            let Some(quiet_since) = last.as_deref().and_then(parse_at) else {
+            let threshold = quiet_threshold(conn, project.as_deref())?;
+            let Some(mut quiet_since) = journal_quiet_since(conn, &instance_id)? else {
                 continue;
             };
+            let screen_carrier = crate::stall_screen::is_screen_carrier(&driver);
+            if screen_carrier
+                && let Some(changed) = crate::stall_screen::screen_changed_at(conn, &instance_id)?
+            {
+                // Progress the screen showed after the last journal row
+                // restarts the quiet period.
+                quiet_since = quiet_since.max(changed);
+            }
             let Some(stalled_at) =
                 window_minutes(threshold).and_then(|window| quiet_since.checked_add(window))
             else {
@@ -1985,6 +1993,15 @@ fn due_stalls(conn: &Connection, now: OffsetDateTime) -> Result<usize, StoreErro
                 continue;
             };
             if stalled_at > now {
+                continue;
+            }
+            if screen_carrier {
+                // Journal quiet is not enough on a screen carrier: the screen
+                // can show progress the journal never carries (§10).
+                screen.push(ScreenCandidate {
+                    instance_id,
+                    host_id,
+                });
                 continue;
             }
             // Keyed by when the quiet period started, for the same reason.
@@ -2007,6 +2024,53 @@ fn due_stalls(conn: &Connection, now: OffsetDateTime) -> Result<usize, StoreErro
         }
     }
     Ok(written)
+}
+
+/// The project's quiet window: `stallThresholdMins`, else the default.
+pub(crate) fn quiet_threshold(
+    conn: &Connection,
+    project_id: Option<&str>,
+) -> Result<i64, StoreError> {
+    Ok(
+        project_policy_number(conn, project_id, "stallThresholdMins")?
+            .filter(|mins| *mins > 0)
+            .unwrap_or(remuda_protocol::DEFAULT_STALL_THRESHOLD_MINS),
+    )
+}
+
+/// The Hub time of `instance_id`'s latest journal row: when its journal went
+/// quiet, if it is quiet now.
+pub(crate) fn journal_quiet_since(
+    conn: &Connection,
+    instance_id: &str,
+) -> Result<Option<OffsetDateTime>, StoreError> {
+    let last: Option<String> = conn
+        .query_row(
+            "SELECT observed_at FROM journal WHERE instance_id = ?1
+              ORDER BY seq DESC LIMIT 1",
+            params![instance_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(last.as_deref().and_then(parse_at))
+}
+
+/// A busy child on a screen carrier whose journal (and last observed screen
+/// change) has been quiet for its window: the screen sweep reads its screen
+/// before any stall fact is recorded (`crate::stall_screen`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScreenCandidate {
+    pub(crate) instance_id: String,
+    pub(crate) host_id: String,
+}
+
+/// What one tick evaluation produced.
+#[derive(Debug, Default)]
+pub(crate) struct TickOutcome {
+    /// Facts the writer job recorded.
+    pub(crate) written: usize,
+    /// Screen carriers the screen sweep must read before deciding.
+    pub(crate) screen: Vec<ScreenCandidate>,
 }
 
 /// Tasks whose `TaskBudget.max_wall_mins` has elapsed since their first
@@ -2084,14 +2148,15 @@ pub(crate) fn tick(
     conn: &mut Connection,
     now: OffsetDateTime,
     clock: TickClock,
-) -> Result<usize, StoreError> {
+) -> Result<TickOutcome, StoreError> {
     let tx = crate::store::immediate_tx(conn)?;
+    let mut screen = Vec::new();
     let written = due_supply_resets(&tx, now)?
         + due_host_offline(&tx, now, &clock)?
-        + due_stalls(&tx, now)?
+        + due_stalls(&tx, now, &mut screen)?
         + due_budgets(&tx, now)?;
     tx.commit()?;
-    Ok(written)
+    Ok(TickOutcome { written, screen })
 }
 
 /// Hooks for the wake tasks (`cb-wake-engine`, context-percentage wake-ups).
@@ -2109,7 +2174,7 @@ pub(crate) mod hooks {
 }
 
 /// A log-safe code for an error: never its message, which can carry text.
-fn error_code(err: &StoreError) -> String {
+pub(crate) fn error_code(err: &StoreError) -> String {
     match err {
         StoreError::Sqlite(rusqlite::Error::SqliteFailure(failure, _)) => {
             format!("sqlite-{}", failure.extended_code)
@@ -2126,18 +2191,24 @@ pub(crate) const TICK_EVERY: u64 = 15;
 
 /// One inbox evaluation from the scheduler loop. A failure is logged by
 /// error code and retried on the next evaluation: every due row stays due
-/// until its fact commits.
+/// until its fact commits. Screen candidates go to the per-host screen sweep,
+/// which runs off this task (`crate::stall_screen::sweep`).
 pub(crate) async fn run_tick(state: &AppState) {
     let clock = TickClock {
         booted_at: state.store.opened_at(),
         host_grace: host_grace(&state.config),
     };
-    if let Err(err) = state
-        .store
-        .inbox_tick(OffsetDateTime::now_utc(), clock)
-        .await
-    {
-        tracing::error!(code = error_code(&err), "inbox tick failed");
+    let now = OffsetDateTime::now_utc();
+    match state.store.inbox_tick(now, clock).await {
+        Ok(outcome) => {
+            crate::stall_screen::sweep(
+                state,
+                outcome.screen,
+                now,
+                crate::worker_watch::SCREEN_TIMEOUT,
+            );
+        }
+        Err(err) => tracing::error!(code = error_code(&err), "inbox tick failed"),
     }
 }
 
@@ -2166,7 +2237,7 @@ impl Store {
         &self,
         now: OffsetDateTime,
         clock: TickClock,
-    ) -> Result<usize, StoreError> {
+    ) -> Result<TickOutcome, StoreError> {
         self.run_named("inbox_tick", move |conn| tick(conn, now, clock))
             .await
     }
@@ -2470,7 +2541,8 @@ mod tests {
             store
                 .inbox_tick(at("2026-11-01T00:30:00Z"), clock)
                 .await
-                .unwrap(),
+                .unwrap()
+                .written,
             0
         );
         // Parked again before the first reset passed: the window now runs
@@ -2490,21 +2562,24 @@ mod tests {
             store
                 .inbox_tick(at("2026-11-01T01:30:00Z"), clock)
                 .await
-                .unwrap(),
+                .unwrap()
+                .written,
             0
         );
         assert_eq!(
             store
                 .inbox_tick(at("2026-11-01T02:00:30Z"), clock)
                 .await
-                .unwrap(),
+                .unwrap()
+                .written,
             1
         );
         assert_eq!(
             store
                 .inbox_tick(at("2026-11-01T03:00:00Z"), clock)
                 .await
-                .unwrap(),
+                .unwrap()
+                .written,
             0
         );
         let facts = store
@@ -2566,7 +2641,8 @@ mod tests {
             store
                 .inbox_tick(at("2026-11-01T00:20:00Z"), clock)
                 .await
-                .unwrap(),
+                .unwrap()
+                .written,
             1
         );
         // The run moves on with the call still tracked.
@@ -2582,7 +2658,8 @@ mod tests {
             store
                 .inbox_tick(at("2026-11-01T00:40:00Z"), clock)
                 .await
-                .unwrap(),
+                .unwrap()
+                .written,
             0
         );
         let (facts, run): (Vec<(String, String)>, i64) = store

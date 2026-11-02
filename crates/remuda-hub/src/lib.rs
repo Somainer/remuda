@@ -86,6 +86,7 @@ pub mod secret_lint;
 mod seen;
 mod skill_context;
 pub mod ssh_hosts;
+mod stall_screen;
 mod store;
 mod store_tickets;
 /// Managed-process supervision (`--managed`): parent-death watch and pid file.
@@ -200,6 +201,8 @@ pub struct AppState {
     pub(crate) fences: crate::fence::FenceState,
     /// D-057 §6.3.1 (ma-restart): the C1 supervisor's tick serialization.
     pub(crate) restart: crate::restart::SupervisorState,
+    /// cb-stall-tooluse: hosts whose screen stall sweep is still running.
+    pub(crate) screen_sweeps: crate::stall_screen::SweepsInFlight,
 }
 
 impl AppState {
@@ -1340,7 +1343,29 @@ impl RunningHub {
             booted_at: self.state.store.opened_at(),
             host_grace: crate::inbox::host_grace(&self.state.config),
         };
-        Ok(self.state.store.inbox_tick(now, clock).await?)
+        Ok(self.state.store.inbox_tick(now, clock).await?.written)
+    }
+
+    /// Test-only: [`Self::test_inbox_tick`], then the screen stall sweep over
+    /// the screen candidates it named, each screen read bounded by
+    /// `timeout`. Returns the tick's facts and the per-host sweep tasks (each
+    /// resolves to the facts it recorded); hosts whose earlier sweep is still
+    /// running get no task.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_inbox_screen_sweep(
+        &self,
+        now: &str,
+        timeout: Duration,
+    ) -> anyhow::Result<(usize, Vec<(String, tokio::task::JoinHandle<usize>)>)> {
+        let now = time::OffsetDateTime::parse(now, &time::format_description::well_known::Rfc3339)?;
+        let clock = crate::inbox::TickClock {
+            booted_at: self.state.store.opened_at(),
+            host_grace: crate::inbox::host_grace(&self.state.config),
+        };
+        let outcome = self.state.store.inbox_tick(now, clock).await?;
+        let tasks = crate::stall_screen::sweep(&self.state, outcome.screen, now, timeout);
+        Ok((outcome.written, tasks))
     }
 
     /// Test-only: apply a gate run verdict through the real `apply_result`
@@ -2236,6 +2261,7 @@ async fn spawn_inner(
         gate_decision_guards: crate::gatequeue::GateDecisionGuards::new(),
         fences: crate::fence::FenceState::default(),
         restart: crate::restart::SupervisorState::default(),
+        screen_sweeps: crate::stall_screen::SweepsInFlight::default(),
     };
     // D-057 §7.7: the send gate's map survives a Hub restart through the
     // lineages table; deliveries are re-sent on hello and by the tick.

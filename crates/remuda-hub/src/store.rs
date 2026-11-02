@@ -371,6 +371,9 @@ pub struct Store {
     /// When this process opened the store: the inbox measures a host's
     /// offline grace from no earlier than its own start (cb-inbox-facts).
     opened_at: time::OffsetDateTime,
+    /// Raised by the writer after it formed an inbox batch or owes a
+    /// fallback push (cb-inbox-deliver); the delivery driver waits on it.
+    deliver_signal: Arc<tokio::sync::Notify>,
 }
 
 impl Store {
@@ -2636,6 +2639,8 @@ impl Store {
         // back a Store, so the first read cannot race schema creation.
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let writer_path = path.clone();
+        let deliver_signal = Arc::new(tokio::sync::Notify::new());
+        let writer_signal = deliver_signal.clone();
         let thread = thread::Builder::new()
             .name("remuda-hub-sqlite".into())
             .spawn(move || {
@@ -2653,6 +2658,13 @@ impl Store {
                 drop(ready_tx);
                 // cb-inbox-facts: facts the previous process left queued.
                 crate::inbox::drain_sources(&mut conn);
+                // cb-inbox-deliver: rows the previous process left waiting.
+                if let Err(err) = crate::inbox_deliver::mark_all_due(&conn) {
+                    tracing::error!(error = %err, "inbox delivery boot mark failed");
+                }
+                if crate::inbox_deliver::form_due(&mut conn) {
+                    writer_signal.notify_one();
+                }
                 while let Ok(job) = rx.recv() {
                     match job {
                         Job::Run(work) => {
@@ -2660,6 +2672,11 @@ impl Store {
                             // cb-inbox-facts: the state changes this job
                             // committed that queued a fact source.
                             crate::inbox::drain_sources(&mut conn);
+                            // cb-inbox-deliver: the lineages whose delivery
+                            // gate this job's state changes may have opened.
+                            if crate::inbox_deliver::form_due(&mut conn) {
+                                writer_signal.notify_one();
+                            }
                         }
                         Job::Stop(done) => {
                             let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
@@ -2715,12 +2732,24 @@ impl Store {
             faults: Arc::new(test_faults::FaultFlags::default()),
             seen_presence: Arc::default(),
             opened_at: time::OffsetDateTime::now_utc(),
+            deliver_signal,
         })
     }
 
     /// When this process opened the store.
     pub(crate) fn opened_at(&self) -> time::OffsetDateTime {
         self.opened_at
+    }
+
+    /// The signal the inbox delivery driver waits on (cb-inbox-deliver).
+    pub(crate) fn deliver_signal(&self) -> Arc<tokio::sync::Notify> {
+        self.deliver_signal.clone()
+    }
+
+    /// Wake the inbox delivery driver: a host came back, so a batch held
+    /// while it was away may be forwarded now.
+    pub(crate) fn kick_delivery(&self) {
+        self.deliver_signal.notify_one();
     }
 
     /// Finish in-flight jobs, checkpoint WAL, and close every connection.
@@ -8370,6 +8399,9 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     // cb-inbox-facts: after `restart` (its `end_seen_at` column) and the gate
     // queue (its `gate_jobs` table), which the inbox's source triggers read.
     crate::inbox::migrate(&conn)?;
+    // cb-inbox-deliver: after the inbox (its rows), lineages, interactions,
+    // commands and hosts, which its due triggers read.
+    crate::inbox_deliver::migrate(&conn)?;
     // c-usagefu r14 item 1 (Ruling M1): a failed usage migration must never
     // brick Hub startup. The migration is one transaction and rolls back to
     // the previously-openable shape on any error; log it and open. Usage

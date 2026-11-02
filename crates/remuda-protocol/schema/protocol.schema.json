@@ -7540,6 +7540,85 @@
       "pattern": "^(hst|wsp|wkt|ins|run|cmd|int|evt|dev|prn|pvp|cred|obj|sub|tty|launch|epoch|hook|prj|tsk|plc|wkr|gjb|wtl)_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
       "type": "string"
     },
+    "InboxBatch": {
+      "description": "One delivery batch (cb-inbox-deliver; D-060 §10.1 items 6 and 7): the\nHub-origin row written before its `instance.send` is forwarded. The\nbatch id is that send's `commandId`.",
+      "properties": {
+        "batchId": {
+          "description": "The batch's `instance.send` command id, chosen when it was formed.",
+          "type": "string"
+        },
+        "createdAt": {
+          "description": "When it was formed (UTC RFC3339).",
+          "type": "string"
+        },
+        "factIds": {
+          "description": "The inbox rows the batch carries, in order.",
+          "items": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "generation": {
+          "description": "That chapter's generation; the batch carries the Hub-internal\ninitiator for it.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "instanceId": {
+          "description": "The live chapter it targets.",
+          "type": "string"
+        },
+        "lineageId": {
+          "description": "Subscriber lineage.",
+          "type": "string"
+        },
+        "listed": {
+          "description": "How many of them the text lists in full; the rest are summarized by\ncount per kind.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "openingTag": {
+          "description": "The fixed tag the text opens with.",
+          "type": "string"
+        },
+        "outcome": {
+          "description": "The send's settlement outcome once settled (`completed`,\n`rejected`, `cancelled`, `withheld`); absent while it is in flight or\nits outcome is unknown.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "releasedAt": {
+          "description": "When its rows were handed back because the send provably never\nreached the chapter (cancelled by a fence before it left the Hub,\nwithheld at the send gate, or refused as fenced); they are re-batched\nunder a new id.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "templateVersion": {
+          "description": "Version of the template the text was rendered from.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "text": {
+          "description": "The text, verbatim, as sent with origin `hub`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "batchId",
+        "lineageId",
+        "instanceId",
+        "generation",
+        "openingTag",
+        "templateVersion",
+        "factIds",
+        "listed",
+        "text",
+        "createdAt"
+      ],
+      "type": "object"
+    },
     "InboxFact": {
       "description": "One inbox row.",
       "properties": {
@@ -7557,6 +7636,17 @@
         "dedupeKey": {
           "description": "`kind:subject:runGeneration:stateEnteredAt`; unique in the\nsubscriber's inbox and stable across a Hub restart and a replayed\njournal append.",
           "type": "string"
+        },
+        "fallback": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InboxFallback"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set when the row failed the re-check at batch formation and fell\nback to the owner push instead (§10.1 item 4): it is neither held nor\nrecorded as consumed. Absent while the row waits or once a batch\ncarried it."
         },
         "id": {
           "description": "Row id; the `after` cursor of the read route.",
@@ -7683,6 +7773,44 @@
         }
       ]
     },
+    "InboxFallback": {
+      "description": "Why and when a row fell back to the owner push (§10.1 item 4).",
+      "properties": {
+        "at": {
+          "description": "When the batch formation found it (UTC RFC3339).",
+          "type": "string"
+        },
+        "reason": {
+          "$ref": "#/$defs/InboxFallbackReason",
+          "description": "The subscriber muted the kind since the row was written, the subject\nnow has another parent, or it has none."
+        }
+      },
+      "required": [
+        "at",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "InboxFallbackReason": {
+      "description": "InboxFallbackReason wire values; `protocol.md` §8.4.",
+      "oneOf": [
+        {
+          "const": "muted",
+          "description": "Wire value `muted`.",
+          "type": "string"
+        },
+        {
+          "const": "re-parented",
+          "description": "Wire value `re-parented`.",
+          "type": "string"
+        },
+        {
+          "const": "no-subscriber",
+          "description": "Wire value `no-subscriber`.",
+          "type": "string"
+        }
+      ]
+    },
     "InboxOccurrence": {
       "description": "How often the same fact occurred for this subscriber in the rolling window\nending at the fact's `stateEnteredAt` (§10.1 item 2). The count survives a\nHub restart; occurrences over the cap are counted but write no row, so the\nnext recorded fact carries them.",
       "properties": {
@@ -7718,6 +7846,14 @@
     "InboxPage": {
       "description": "`GET /v1/lineages/{id}/inbox`: one page of a lineage's inbox, oldest first.",
       "properties": {
+        "batches": {
+          "default": [],
+          "description": "The delivery batches that carried this page's rows (by `batchId`),\noldest first: each one's verbatim text and record.",
+          "items": {
+            "$ref": "#/$defs/InboxBatch"
+          },
+          "type": "array"
+        },
         "items": {
           "description": "Rows with `id > after`, ascending, at most `limit`.",
           "items": {
@@ -7748,7 +7884,8 @@
         "items",
         "nextAfter",
         "more",
-        "settings"
+        "settings",
+        "batches"
       ],
       "type": "object"
     },

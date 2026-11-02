@@ -2089,14 +2089,19 @@ GET /v1/lineages/{id}/glance
 ~~~text
 GET   /v1/lineages/{id}/inbox?after=<rowId>&limit=<n>
   -> 200 {lineageId, items: [InboxFact], nextAfter, more,
-          settings: {optIn, mutedKinds: [kind]}}
-     rows with id > after, oldest first; limit defaults to 50, at most 200
+          settings: {optIn, mutedKinds: [kind]}, batches: [InboxBatch]}
+     rows with id > after, oldest first; limit defaults to 50, at most 200;
+     batches: the delivery batches that carried this page's rows
 PATCH /v1/lineages/{id}/inbox
   body {optIn?: bool, mutedKinds?: [kind]}      absent fields keep their value
   -> 200 {optIn, mutedKinds}
 
 InboxFact = {id, lineageId, kind, dedupeKey, subjectInstanceId?, runGeneration,
-             stateEnteredAt, createdAt, batchId?, payload}
+             stateEnteredAt, createdAt, batchId?, fallback?, payload}
+fallback  = {at, reason: muted | re-parented | no-subscriber}
+InboxBatch = {batchId, lineageId, instanceId, generation, openingTag,
+              templateVersion, factIds: [id], listed, text, createdAt,
+              outcome?, releasedAt?}
 dedupeKey = kind:subject:runGeneration:stateEnteredAt
 kind      = started | exited | waiting | turn-done | turn-failed | interaction
           | interaction-superseded | gate | supply-reset | host-online
@@ -2108,6 +2113,7 @@ payload.occurrence = {count, capped, cap, windowHours}
 - `optIn` 只有 Human 能改（"创建者打开"）；Agent 写它得到 403。`mutedKinds` 是整组替换，血缘自己或 Human 都可以改。被 mute 的种类不写行。
 - `payload` 里 worker 或工具产出的文本（问题、错误）是不可信数据，读者不得把它当指令或授权。
 - 新增的项目设置：`policy.configurable.factOccurrenceCap`（默认 6）与 `policy.configurable.stallToolThresholdMins`（缺省表示工具在途时永不产生 stall 事实）。
+- **投递（`cb-inbox-deliver`）。** 血缘的当前章节空闲、没有自己的待决交互、也没有所有者输入在排队或在途时，Hub 把全部未投递的行合成一批，作为一条 `instance.send`（`origin: hub`）发给该章节；`batchId` 就是这条 send 的 `commandId`，成批时选定并落库，带该章节代数的 Hub 内部 initiator，不带设备 id。批行（`InboxBatch`：原文、开头标签、模板版本、事实 id）与命令行在同一事务里提交，早于任何转发意图。文本是 Hub 的口吻，以固定标签 `<remuda-facts>` 开头、`</remuda-facts>` 结尾，不超过 4096 字节；worker 或工具写的文本以 `untrusted: "…"` 的 JSON 字符串引用（引号、换行、控制字符、`<`、`>`、`&` 与不可见格式字符都被转义），读者按 JSON 字符串解出原文，并把它当数据。成批时逐行复查：订阅者已 mute 该种类、主体换了父血缘或已无订阅者的行带 `fallback` 退回所有者推送（只有今天会推送的种类才推：`interaction`、`exited`、`waiting`），不再进入任何批，也不算已消费。F 取消尚未转发的批时，它的行回到未投递，之后以新 id 成批；可能已到达章节的批保留它的行（每批至多一次）。
 
 ## 9. 错误码、未知值与兼容性
 

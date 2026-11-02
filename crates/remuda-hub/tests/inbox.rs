@@ -1892,6 +1892,12 @@ async fn the_inbox_survives_backup_and_restore() -> Result<()> {
     }
     ctx.patch_inbox(&seat_token, &seat, json!({ "mutedKinds": ["waiting"] }))
         .await?;
+    // cb-inbox-deliver: the idle seat gets the rows as one batch, and the
+    // batch row (its text, tag, template version and fact ids) is in the
+    // backup with them.
+    ctx.journal(&seat, entity("running", &at(600))).await?;
+    ctx.journal(&seat, activity("idle", &at(601))).await?;
+    ctx.hub.test_settle_inbox().await?;
     let mut ctx = ctx;
     ctx.disconnect().await?;
     let before = ctx
@@ -1905,6 +1911,14 @@ async fn the_inbox_survives_backup_and_restore() -> Result<()> {
         .1;
     // started, six questions (the seventh capped).
     assert_eq!(before["items"].as_array().map(Vec::len), Some(7));
+    let batches = before["batches"].as_array().context("batches")?;
+    assert_eq!(batches.len(), 1, "{before:#}");
+    assert_eq!(batches[0]["factIds"].as_array().map(Vec::len), Some(7));
+    assert!(
+        batches[0]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("<remuda-facts>"))
+    );
 
     let host = ctx.host.clone();
     let workspace = ctx.workspace.clone();

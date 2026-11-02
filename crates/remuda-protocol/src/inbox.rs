@@ -135,6 +135,12 @@ pub struct InboxFact {
     /// The delivery batch that carried the row; absent until one does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch_id: Option<String>,
+    /// Set when the row failed the re-check at batch formation and fell
+    /// back to the owner push instead (§10.1 item 4): it is neither held nor
+    /// recorded as consumed. Absent while the row waits or once a batch
+    /// carried it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<InboxFallback>,
     /// Kind-specific detail. Worker- and tool-produced text in it is
     /// untrusted data.
     pub payload: serde_json::Value,
@@ -155,6 +161,88 @@ pub struct InboxPage {
     pub more: bool,
     /// The lineage's subscription settings.
     pub settings: InboxSettings,
+    /// The delivery batches that carried this page's rows (by `batchId`),
+    /// oldest first: each one's verbatim text and record.
+    #[serde(default)]
+    pub batches: Vec<InboxBatch>,
+}
+
+wire_enum!(InboxFallbackReason, "8.4", {
+    Muted => "muted",
+    Reparented => "re-parented",
+    NoSubscriber => "no-subscriber",
+});
+
+impl InboxFallbackReason {
+    /// Wire spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Muted => "muted",
+            Self::Reparented => "re-parented",
+            Self::NoSubscriber => "no-subscriber",
+        }
+    }
+
+    /// Parse a wire spelling.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        [Self::Muted, Self::Reparented, Self::NoSubscriber]
+            .into_iter()
+            .find(|reason| reason.as_str() == raw)
+    }
+}
+
+/// Why and when a row fell back to the owner push (§10.1 item 4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct InboxFallback {
+    /// When the batch formation found it (UTC RFC3339).
+    pub at: String,
+    /// The subscriber muted the kind since the row was written, the subject
+    /// now has another parent, or it has none.
+    pub reason: InboxFallbackReason,
+}
+
+/// One delivery batch (cb-inbox-deliver; D-060 §10.1 items 6 and 7): the
+/// Hub-origin row written before its `instance.send` is forwarded. The
+/// batch id is that send's `commandId`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct InboxBatch {
+    /// The batch's `instance.send` command id, chosen when it was formed.
+    pub batch_id: String,
+    /// Subscriber lineage.
+    pub lineage_id: String,
+    /// The live chapter it targets.
+    pub instance_id: String,
+    /// That chapter's generation; the batch carries the Hub-internal
+    /// initiator for it.
+    pub generation: i64,
+    /// The fixed tag the text opens with.
+    pub opening_tag: String,
+    /// Version of the template the text was rendered from.
+    pub template_version: i64,
+    /// The inbox rows the batch carries, in order.
+    pub fact_ids: Vec<i64>,
+    /// How many of them the text lists in full; the rest are summarized by
+    /// count per kind.
+    pub listed: i64,
+    /// The text, verbatim, as sent with origin `hub`.
+    pub text: String,
+    /// When it was formed (UTC RFC3339).
+    pub created_at: String,
+    /// The send's settlement outcome once settled (`completed`,
+    /// `rejected`, `cancelled`, `withheld`); absent while it is in flight or
+    /// its outcome is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    /// When its rows were handed back because the send provably never
+    /// reached the chapter (cancelled by a fence before it left the Hub,
+    /// withheld at the send gate, or refused as fenced); they are re-batched
+    /// under a new id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub released_at: Option<String>,
 }
 
 /// A lineage's inbox settings (§10, Defaults).

@@ -693,6 +693,9 @@ pub(crate) fn spawn_post_hello_tasks(
     }
     spawn_egress_reinstall(state, host_id.clone());
     crate::workspaces::spawn_unregister_abort_sweep(state, host_id.clone());
+    // cb-inbox-deliver: a batch formed or released while this host was away
+    // is forwarded now (held behind its fences until they are acknowledged).
+    state.store.kick_delivery();
     // r13 item 1: now that this carrier is registered, immediately reconcile
     // (read-only, forced) any Landing row pinned to this host against the exact
     // granted merge — covering a Hub restart where the push reached origin

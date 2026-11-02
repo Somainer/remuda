@@ -93,6 +93,39 @@ enum AlertKind {
     Waiting,
 }
 
+/// The title, body, tag and landing URL of one alert about `instance_id`.
+fn content(kind: &AlertKind, instance_id: &str) -> (&'static str, &'static str, PushTag, String) {
+    let instance = || PushTag::Instance {
+        id: instance_id.to_owned(),
+    };
+    match kind {
+        AlertKind::Interaction { id } => (
+            "Need your input",
+            "An approval or question is waiting.",
+            PushTag::Interaction { id: id.clone() },
+            interaction_landing_url(id),
+        ),
+        AlertKind::TurnError => (
+            "Turn failed",
+            "The last turn ended with an error.",
+            instance(),
+            format!("/s/{instance_id}"),
+        ),
+        AlertKind::Exited => (
+            "Session exited",
+            "An instance left the ready state.",
+            instance(),
+            format!("/s/{instance_id}"),
+        ),
+        AlertKind::Waiting => (
+            "Still waiting",
+            "This session has been blocked for more than 30s.",
+            instance(),
+            format!("/s/{instance_id}"),
+        ),
+    }
+}
+
 async fn dispatch(state: AppState, instance_id: String, kind: AlertKind) {
     match &kind {
         AlertKind::Waiting => {
@@ -102,58 +135,52 @@ async fn dispatch(state: AppState, instance_id: String, kind: AlertKind) {
             if !state.blocked.still(&instance_id, generation).await {
                 return;
             }
-            fanout(
-                &state,
-                &instance_id,
-                "Still waiting",
-                "This session has been blocked for more than 30s.",
-                PushTag::Instance {
-                    id: instance_id.clone(),
-                },
-                format!("/s/{instance_id}"),
-            )
-            .await;
         }
         other => {
             if !matches!(other, AlertKind::Interaction { .. }) {
                 state.blocked.clear(&instance_id).await;
             }
-            let (title, body, tag, url) = match other {
-                AlertKind::Interaction { id } => (
-                    "Need your input",
-                    "An approval or question is waiting.".to_string(),
-                    PushTag::Interaction { id: id.clone() },
-                    interaction_landing_url(id),
-                ),
-                AlertKind::TurnError => (
-                    "Turn failed",
-                    "The last turn ended with an error.".to_string(),
-                    PushTag::Instance {
-                        id: instance_id.clone(),
-                    },
-                    format!("/s/{instance_id}"),
-                ),
-                AlertKind::Exited => {
-                    // D-057 §8.5: on a lineage that restarts on process loss
-                    // the C1 push ("restarted" / "paused: restart cap")
-                    // replaces the generic exited push.
-                    if crate::restart::c1_replaces_exit_push(&state, &instance_id).await {
-                        return;
-                    }
-                    (
-                        "Session exited",
-                        "An instance left the ready state.".to_string(),
-                        PushTag::Instance {
-                            id: instance_id.clone(),
-                        },
-                        format!("/s/{instance_id}"),
-                    )
-                }
-                AlertKind::Waiting => unreachable!(),
-            };
-            fanout(&state, &instance_id, title, &body, tag, url).await;
+            // D-057 §8.5: on a lineage that restarts on process loss the C1
+            // push ("restarted" / "paused: restart cap") replaces the generic
+            // exited push.
+            if matches!(other, AlertKind::Exited)
+                && crate::restart::c1_replaces_exit_push(&state, &instance_id).await
+            {
+                return;
+            }
         }
     }
+    let (title, body, tag, url) = content(&kind, &instance_id);
+    fanout(&state, &instance_id, title, body, tag, url).await;
+}
+
+/// An owner alert an inbox row fell back to (cb-inbox-deliver; D-060 §10.1
+/// item 4): one of the kinds that page today.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Paged {
+    /// "Need your input", tagged by the interaction.
+    Interaction(String),
+    /// "Session exited".
+    Exited,
+    /// "Still waiting".
+    Waiting,
+    /// Nothing pages for it.
+    Nothing,
+}
+
+/// Page the owner for an inbox row that fell back (§10.1 item 4), with the
+/// same title, body, tag and landing as the alert of that kind, so on a
+/// device still showing the alert this replaces it rather than adding a
+/// second one. Follow suppression applies as for every alert.
+pub(crate) async fn page_owner(state: &AppState, instance_id: &str, paged: Paged) -> Fanout {
+    let kind = match paged {
+        Paged::Interaction(id) => AlertKind::Interaction { id },
+        Paged::Exited => AlertKind::Exited,
+        Paged::Waiting => AlertKind::Waiting,
+        Paged::Nothing => return Fanout::Nothing,
+    };
+    let (title, body, tag, url) = content(&kind, instance_id);
+    fanout(state, instance_id, title, body, tag, url).await
 }
 
 /// What one fanout did.

@@ -3,8 +3,8 @@
 //! A fact is a durable row for a *subscriber lineage*: something it may act
 //! on happened to a subject it is responsible for. This module writes and
 //! keeps those rows; delivering them (batching, the idle gate, the owner-push
-//! fallback, the paused hold) is `cb-inbox-deliver`'s, which reads the table
-//! through [`Store::inbox_page`] and stamps `batch_id`.
+//! fallback, the paused hold) is `inbox_deliver.rs` (cb-inbox-deliver), which
+//! stamps `batch_id` or the fallback marker.
 //!
 //! Tables (idempotent DDL, so no `user_version` rung; they live in
 //! `hub.sqlite`, which `scripts/hub-backup.sh` carries whole):
@@ -44,8 +44,8 @@ use axum::routing::get;
 use axum::{Json, Router};
 use remuda_protocol::{
     DEFAULT_FACT_OCCURRENCE_CAP, FACT_OCCURRENCE_WINDOW_HOURS, INBOX_PAGE_DEFAULT_LIMIT,
-    INBOX_PAGE_MAX_LIMIT, InboxFact, InboxFactKind, InboxOccurrence, InboxPage, InboxSettings,
-    InboxSettingsPatch, InputOrigin,
+    INBOX_PAGE_MAX_LIMIT, InboxFact, InboxFactKind, InboxFallback, InboxFallbackReason,
+    InboxOccurrence, InboxPage, InboxSettings, InboxSettingsPatch, InputOrigin,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -332,6 +332,14 @@ fn fact_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<InboxFact>>
         return Ok(None);
     };
     let payload: String = row.get(6)?;
+    let fallback_at: Option<String> = row.get(10)?;
+    let fallback_reason: Option<String> = row.get(11)?;
+    let fallback = fallback_at.and_then(|at| {
+        fallback_reason
+            .as_deref()
+            .and_then(InboxFallbackReason::parse)
+            .map(|reason| InboxFallback { at, reason })
+    });
     Ok(Some(InboxFact {
         id: row.get(0)?,
         lineage_id: row.get(1)?,
@@ -343,6 +351,7 @@ fn fact_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<InboxFact>>
         state_entered_at: row.get(7)?,
         created_at: row.get(8)?,
         batch_id: row.get(9)?,
+        fallback,
     }))
 }
 
@@ -356,7 +365,8 @@ pub(crate) fn page(
     let limit = limit.clamp(1, INBOX_PAGE_MAX_LIMIT);
     let mut stmt = conn.prepare_cached(
         "SELECT id, subscriber_lineage_id, kind, dedupe_key, subject_instance_id,
-                run_generation, payload_json, state_entered_at, created_at, batch_id
+                run_generation, payload_json, state_entered_at, created_at, batch_id,
+                fallback_at, fallback_reason
            FROM inbox_facts
           WHERE subscriber_lineage_id = ?1 AND id > ?2
           ORDER BY id ASC
@@ -372,17 +382,24 @@ pub(crate) fn page(
     let next_after = rows[..rows.len().min(limit as usize)]
         .last()
         .map_or(after, |(id, _)| *id);
-    let items = rows
+    let items: Vec<InboxFact> = rows
         .into_iter()
         .take(limit as usize)
         .filter_map(|(_, fact)| fact)
         .collect();
+    let mut batch_ids: Vec<String> = Vec::new();
+    for id in items.iter().filter_map(|fact| fact.batch_id.as_ref()) {
+        if !batch_ids.contains(id) {
+            batch_ids.push(id.clone());
+        }
+    }
     Ok(InboxPage {
         lineage_id: lineage_id.to_owned(),
         items,
         next_after,
         more,
         settings: load_settings(conn, lineage_id)?,
+        batches: crate::inbox_deliver::batches(conn, &batch_ids)?,
     })
 }
 
@@ -585,6 +602,14 @@ fn receives(conn: &Connection, lineage_id: &str, kind: InboxFactKind) -> Result<
     if settings.muted_kinds.contains(&kind) {
         return Ok(false);
     }
+    receives_with(conn, lineage_id, &settings)
+}
+
+fn receives_with(
+    conn: &Connection,
+    lineage_id: &str,
+    settings: &InboxSettings,
+) -> Result<bool, StoreError> {
     if settings.opt_in {
         return Ok(true);
     }

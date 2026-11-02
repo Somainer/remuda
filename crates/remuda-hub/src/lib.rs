@@ -28,6 +28,8 @@ mod host_files;
 mod hosts;
 mod http;
 mod inbox;
+mod inbox_deliver;
+mod inbox_voice;
 mod instances;
 mod interactions;
 /// Test-only seam for the D-051 delegated-decisions feature switch.
@@ -196,6 +198,9 @@ pub struct AppState {
     pub(crate) fences: crate::fence::FenceState,
     /// D-057 §6.3.1 (ma-restart): the C1 supervisor's tick serialization.
     pub(crate) restart: crate::restart::SupervisorState,
+    /// cb-inbox-deliver: the delivery driver's serialization (and its test
+    /// hold).
+    pub(crate) deliver: crate::inbox_deliver::DeliverState,
 }
 
 impl AppState {
@@ -1325,6 +1330,31 @@ impl RunningHub {
         self.state.config.host_lost_grace_ms
     }
 
+    /// Test-only: hold (or release) every inbox batch forward
+    /// (cb-inbox-deliver). A held batch forms and stays queued.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_hold_inbox_forward(&self, hold: bool) {
+        self.state
+            .deliver
+            .hold_forward
+            .store(hold, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test-only: let the inbox delivery settle: one writer job (so every
+    /// earlier job's post-job formation has run), then one driver pass (so
+    /// every batch formed by then has been forwarded, or held).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_settle_inbox(&self) -> anyhow::Result<()> {
+        self.state
+            .store
+            .run_named("test_inbox_barrier", |_| Ok(()))
+            .await?;
+        crate::inbox_deliver::drive(&self.state).await;
+        Ok(())
+    }
+
     /// Test-only: one evaluation of the inbox's time-driven facts (supply
     /// resets, stalls, wall budgets) as of `now` (RFC3339), returning how
     /// many facts it recorded.
@@ -2232,6 +2262,7 @@ async fn spawn_inner(
         gate_decision_guards: crate::gatequeue::GateDecisionGuards::new(),
         fences: crate::fence::FenceState::default(),
         restart: crate::restart::SupervisorState::default(),
+        deliver: crate::inbox_deliver::DeliverState::default(),
     };
     // D-057 §7.7: the send gate's map survives a Hub restart through the
     // lineages table; deliveries are re-sent on hello and by the tick.
@@ -2259,6 +2290,20 @@ async fn spawn_inner(
     // Batch 6: jobs left running by a previous Hub process re-enter the queue.
     crate::gatequeue::reconcile(&state).await;
     crate::gatequeue::tick(&state).await;
+    // cb-inbox-deliver test seam (RC builds with `test-faults` only): hold
+    // every batch forward, so a batch can be formed and the Hub restarted
+    // before it leaves.
+    #[cfg(any(test, feature = "test-faults"))]
+    if std::env::var_os("REMUDA_TEST_INBOX_HOLD_FORWARD").is_some() {
+        state
+            .deliver
+            .hold_forward
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    // cb-inbox-deliver: owner pushes a previous process still owed. Batches
+    // it formed go out once their host says hello.
+    crate::inbox_deliver::drive(&state).await;
+    let deliver_signal = state.store.deliver_signal();
     let reaper_state = state.clone();
     let app = router(state.clone());
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
@@ -2292,6 +2337,14 @@ async fn spawn_inner(
                 result = &mut server => {
                     if let Err(err) = result { tracing::error!(error = %err, "hub server exited"); }
                     break;
+                }
+                // cb-inbox-deliver: the writer formed a batch or owes a
+                // fallback push. Off the loop, like the other drivers.
+                () = deliver_signal.notified() => {
+                    let deliver_state = reaper_state.clone();
+                    tokio::spawn(async move {
+                        crate::inbox_deliver::drive(&deliver_state).await;
+                    });
                 }
                 _ = interval.tick() => {
                     let sweep = reaper_state

@@ -534,7 +534,7 @@ describe("SessionList rows: next step, wire disclosure and overflow sheet", () =
     expect(blockedCard.querySelector("[data-testid='board-go-handle']")).toBeNull();
   });
 
-  it("keeps send/keys/stop testids inside the overflow sheet, which opens and closes", async () => {
+  it("keeps send and stop in the overflow sheet, with no bare keys, and stop confirms", async () => {
     const user = userEvent.setup();
     renderList();
     const card = screen.getAllByTestId("board-card")[0];
@@ -555,18 +555,25 @@ describe("SessionList rows: next step, wire disclosure and overflow sheet", () =
     expect(panel).toHaveAttribute("data-variant", "popover");
     expect(panel.querySelector("[data-testid='board-prompt']")).not.toBeNull();
     expect(panel.querySelector("[data-testid='board-send']")).not.toBeNull();
-    expect(panel.querySelector("[data-testid='board-key-enter']")).not.toBeNull();
-    expect(panel.querySelector("[data-testid='board-key-esc']")).not.toBeNull();
-    expect(panel.querySelector("[data-testid='board-key-ctrl-c']")).not.toBeNull();
     expect(panel.querySelector("[data-testid='board-stop']")).not.toBeNull();
+    // home.md §9 (D-061): the bare keys moved to /s/:id/tty.
+    expect(panel.querySelector("[data-testid='board-key-enter']")).toBeNull();
+    expect(panel.querySelector("[data-testid='board-key-esc']")).toBeNull();
+    expect(panel.querySelector("[data-testid='board-key-ctrl-c']")).toBeNull();
 
-    // Keys stay in the open sheet for rapid presses and still reach the store.
-    await user.click(panel.querySelector("[data-testid='board-key-esc']") as HTMLElement);
+    // 停止 asks first, naming the session and the host, and does nothing until
+    // the confirm.
     const store = await import("../../lib/store");
-    expect(store.hubStore.sendKeys).toHaveBeenCalledWith("ins_b", "esc");
-    expect(screen.getByTestId("board-actions-panel")).toBeVisible();
+    await user.click(panel.querySelector("[data-testid='board-stop']") as HTMLElement);
+    const confirm = screen.getByTestId("board-stop-confirm");
+    expect(confirm.textContent).toContain("等待批准");
+    expect(confirm.textContent).toContain("alpha");
+    expect(store.hubStore.close).not.toHaveBeenCalled();
+    await user.click(screen.getByTestId("board-stop-confirm-yes"));
+    expect(store.hubStore.close).toHaveBeenCalledWith("ins_b");
 
     // Escape closes and focus returns to the row trigger.
+    await user.click(trigger);
     await user.keyboard("{Escape}");
     expect(screen.queryByTestId("board-actions-panel")).toBeNull();
     expect(trigger).toHaveFocus();

@@ -45,6 +45,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import unicodedata
@@ -64,11 +65,13 @@ KIND_ORPHAN = "orphan"
 KINDS = (KIND_LINK, KIND_ANCHOR, KIND_FILE_ANCHOR, KIND_COMMAND, KIND_ORPHAN)
 
 SCAN_DIRS = ("docs", "skills")
-# Directory names never descended into while collecting markdown. Test
-# fixtures are excluded because they are deliberately broken corpora.
+# Directory names never considered, tracked or not. Test fixtures are
+# excluded because they are deliberately broken corpora; build outputs and
+# vendored trees must not change the result on one host.
 SKIP_DIRS = {
     ".git", ".hg", ".svn", "node_modules", ".venv", "venv", "__pycache__",
     "scratch", "dist", "coverage", "test-results", "playwright-report",
+    "target", "vendor",
 }
 SKIP_PATH_PREFIXES = (("scripts", "tests", "fixtures"),)
 
@@ -192,25 +195,66 @@ def _skipped(rel: Path) -> bool:
     return any(part in SKIP_DIRS or part.startswith("target-") for part in parts)
 
 
-def markdown_files(root: Path) -> list[Path]:
-    """Every scanned markdown file, in a stable order.
+def _in_markdown_scope(rel: Path) -> bool:
+    return rel.parts[:1] in (("docs",), ("skills",)) or rel.name == "README.md"
 
-    ``docs/`` and ``skills/`` are scanned whole; elsewhere only README files
-    are part of the contract.
+
+def tracked_files(root: Path) -> list[Path] | None:
+    """Tracked files under ``root`` (git index), or None outside git.
+
+    The corpus must not depend on one host's untracked or gitignored local
+    files (private research notes, cargo package output under ``target/``).
     """
-    found: set[Path] = set()
+    if not (root / ".git").exists():
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "-z"],
+            capture_output=True, check=False,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    found: list[Path] = []
+    for raw in result.stdout.split(b"\0"):
+        if not raw:
+            continue
+        try:
+            path = root / raw.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        if path.is_file():
+            found.append(path)
+    return found
+
+
+def _walk_files(root: Path) -> list[Path]:
+    found: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(root):
         here = Path(dirpath)
         rel = here.relative_to(root)
-        dirnames[:] = sorted(
-            name for name in dirnames
-            if not _skipped(rel / name)
-        )
-        for name in filenames:
-            if not name.endswith(".md"):
-                continue
-            if rel.parts[:1] in (("docs",), ("skills",)) or name == "README.md":
-                found.add(here / name)
+        dirnames[:] = sorted(name for name in dirnames if not _skipped(rel / name))
+        found.extend(here / name for name in filenames)
+    return found
+
+
+def markdown_files(root: Path, use_git: bool = True) -> list[Path]:
+    """Every scanned markdown file, in a stable order.
+
+    ``docs/`` and ``skills/`` are scanned whole; elsewhere only README files
+    are part of the contract. With a git checkout the file list comes from
+    the index, so local-only files never change the answer. Fixture roots
+    pass ``use_git=False``.
+    """
+    tracked = tracked_files(root) if use_git else None
+    candidates = tracked if tracked is not None else _walk_files(root)
+    found = {
+        path for path in candidates
+        if path.name.endswith(".md")
+        and _in_markdown_scope(path.relative_to(root))
+        and not _skipped(path.relative_to(root))
+    }
     return sorted(found)
 
 
@@ -1045,15 +1089,17 @@ def check_commands(report: Report, documents: dict[Path, str], root: Path) -> No
 
 # ── file:line anchors ─────────────────────────────────────────────────────
 
-def source_index(root: Path) -> dict[str, list[Path]]:
+def source_index(root: Path, use_git: bool = True) -> dict[str, list[Path]]:
+    """Source files by basename, from the git index when available."""
+    tracked = tracked_files(root) if use_git else None
+    candidates = tracked if tracked is not None else _walk_files(root)
     index: dict[str, list[Path]] = {}
-    for dirpath, dirnames, filenames in os.walk(root):
-        here = Path(dirpath)
-        rel = here.relative_to(root)
-        dirnames[:] = [name for name in dirnames if not _skipped(rel / name)]
-        for name in filenames:
-            if Path(name).suffix in (".rs", ".py", ".ts", ".tsx", ".js", ".jsx"):
-                index.setdefault(name, []).append(here / name)
+    for path in candidates:
+        rel = path.relative_to(root)
+        if _skipped(rel):
+            continue
+        if path.suffix in (".rs", ".py", ".ts", ".tsx", ".js", ".jsx"):
+            index.setdefault(path.name, []).append(path)
     return index
 
 
@@ -1125,8 +1171,9 @@ def _candidates(line: str, anchor_text: str) -> list[str]:
     return names
 
 
-def check_file_anchors(report: Report, documents: dict[Path, str], root: Path) -> None:
-    index = source_index(root)
+def check_file_anchors(report: Report, documents: dict[Path, str], root: Path,
+                       use_git: bool = True) -> None:
+    index = source_index(root, use_git)
     cache: dict[Path, list[str]] = {}
 
     def source_lines_of(path: Path) -> list[str] | None:
@@ -1213,8 +1260,8 @@ def check_file_anchors(report: Report, documents: dict[Path, str], root: Path) -
 
 # ── driver ────────────────────────────────────────────────────────────────
 
-def scan(root: Path) -> Report:
-    files = markdown_files(root)
+def scan(root: Path, use_git: bool = True) -> Report:
+    files = markdown_files(root, use_git)
     report = Report(files)
     if not files:
         raise SystemExit(f"docs contract: no markdown files scanned under {root}")
@@ -1229,7 +1276,7 @@ def scan(root: Path) -> Report:
     }
     linked = check_links(report, documents, anchors, root)
     check_orphans(report, files, linked, root)
-    check_file_anchors(report, documents, root)
+    check_file_anchors(report, documents, root, use_git)
     check_commands(report, documents, root)
     return report
 
@@ -1342,14 +1389,14 @@ class DocsContractFixtureTests(unittest.TestCase):
     }
 
     def test_fixture_scan_reports_exactly_the_known_violations(self):
-        report = scan(FIXTURE_ROOT)
+        report = scan(FIXTURE_ROOT, use_git=False)
         self.assertEqual(set(report.violations), self.EXPECTED)
         self.assertEqual(report.enforced(),
                          self.EXPECTED - {"file-anchor|docs/anchors.md|crates/demo/src/lib.rs:11"})
         self.assertGreater(len(report.files), 0)
 
     def test_paths_with_spaces_and_cjk_are_scanned_and_resolve(self):
-        report = scan(FIXTURE_ROOT)
+        report = scan(FIXTURE_ROOT, use_git=False)
         scanned = {relative(path, FIXTURE_ROOT) for path in report.files}
         self.assertIn("docs/设计 笔记.md", scanned)
         self.assertIn("docs/space dir/notes.md", scanned)
@@ -1359,10 +1406,31 @@ class DocsContractFixtureTests(unittest.TestCase):
         self.assertNotIn("space dir", flagged)
         self.assertNotIn("目录 空格", flagged)
 
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_untracked_markdown_does_not_change_the_corpus(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            (repo / "docs").mkdir(parents=True)
+            (repo / "docs" / "kept.md").write_text("# Kept\n", encoding="utf-8")
+            (repo / "README.md").write_text(
+                "# Fixture\n\n[kept](docs/kept.md)\n", encoding="utf-8")
+            for command in (["init", "-q"], ["add", "README.md", "docs/kept.md"]):
+                subprocess.run(["git", "-C", str(repo), *command], check=True,
+                               capture_output=True)
+            (repo / "docs" / "local.md").write_text(
+                "# Local only\n\n[broken](nowhere.md)\n", encoding="utf-8")
+            tracked = scan(repo)
+            self.assertEqual(
+                {relative(path, repo) for path in tracked.files},
+                {"README.md", "docs/kept.md"})
+            self.assertEqual(tracked.violations, {})
+            walked = scan(repo, use_git=False)
+            self.assertIn("link|docs/local.md|nowhere.md", walked.violations)
+
     def test_scan_never_passes_vacuously(self):
         with tempfile.TemporaryDirectory() as empty:
             with self.assertRaises(SystemExit) as raised:
-                scan(Path(empty))
+                scan(Path(empty), use_git=False)
             self.assertIn("no markdown files scanned", str(raised.exception))
 
     def test_heading_slugs_follow_github(self):
@@ -1380,7 +1448,7 @@ class DocsContractFixtureTests(unittest.TestCase):
         shutil.copytree(FIXTURE_ROOT, repo)
         baseline = repo / "scripts" / "tests" / "docs_contract_baseline.json"
         baseline.parent.mkdir(parents=True)
-        dump_baseline(baseline, scan(repo).enforced())
+        dump_baseline(baseline, scan(repo, use_git=False).enforced())
         return repo, baseline
 
     def test_baseline_only_shrinks(self):

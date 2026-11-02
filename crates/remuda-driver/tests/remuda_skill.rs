@@ -802,6 +802,61 @@ fn concurrent_installs_on_one_shared_home_never_clobber_each_other() {
     );
 }
 
+/// A write that fails after its temporary file exists removes the temporary:
+/// a leftover dotfile would make a later launch read the tree as non-empty and
+/// therefore user-owned.
+#[test]
+fn a_failed_write_leaves_no_temporary_file_behind() {
+    let context = facts(&["dispatch"]);
+    let at = launch(false);
+    let root = at.home.join(SKILL_ROOT);
+    fs::create_dir_all(&root).unwrap();
+    // Remuda's own tree, but `SKILL.md` is a directory, so the rename onto it
+    // fails after the temporary file was written.
+    fs::write(root.join(MANAGED_MARKER), b"remuda").unwrap();
+    fs::create_dir_all(root.join("SKILL.md")).unwrap();
+    let mut spec = spec(DriverKind::ClaudeSdk, AgentKind::Claude);
+    spec.capabilities.clear();
+    let profile = profile(DriverKind::ClaudeSdk);
+    let result = materialize(&MaterializeRequest {
+        creator: remuda_driver::CreatorControl::default(),
+        spec: &spec,
+        profile: &profile,
+        launch_dir: at.launch.clone(),
+        native_home: at.home.clone(),
+        session: SessionAction::New {
+            session_id: "01993ab0-0000-7000-8000-000000000003".into(),
+        },
+        launch_id: Id::new("launch").unwrap(),
+        binary: BinarySource::Pinned(remuda_driver::BinaryPin {
+            abs_path: at.binary.to_string_lossy().into_owned(),
+            version: "2.1.291 (Claude Code)".into(),
+            sha256: hash_file(&at.binary).unwrap(),
+        }),
+        setting_sources: None,
+        origin: LaunchOrigin::Human,
+        native_home_managed: Some(true),
+        settings_overlay_path: None,
+        secret_policy: None,
+        memory_context: None,
+        skill_context: Some(&context),
+    });
+    assert!(
+        result.is_err(),
+        "the rename onto a directory must fail the launch"
+    );
+    let leftovers: Vec<String> = fs::read_dir(&root)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".tmp"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "temporary files left behind: {leftovers:?}"
+    );
+}
+
 /// The `skills` directory is often the user's own: its mode is theirs. Only
 /// directories Remuda creates get 0700.
 #[cfg(unix)]

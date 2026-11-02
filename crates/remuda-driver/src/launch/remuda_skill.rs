@@ -397,10 +397,19 @@ fn write_atomic(dest: &Path, bytes: &[u8]) -> DriverResult<()> {
     // and a seat sharing the home never reads a half-written file.
     let serial = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let temp: PathBuf = dest.with_file_name(format!(".{name}.{}.{serial}.tmp", std::process::id()));
-    fs::write(&temp, bytes)?;
-    set_mode(&temp, 0o600)?;
-    fs::rename(&temp, dest)?;
-    Ok(())
+    let written = (|| -> DriverResult<()> {
+        fs::write(&temp, bytes)?;
+        set_mode(&temp, 0o600)?;
+        fs::rename(&temp, dest)?;
+        Ok(())
+    })();
+    if written.is_err() {
+        // A failed write must not leave a dotfile behind: it would make the
+        // directory read as non-empty, and a later launch would take the
+        // tree for the user's.
+        let _ = fs::remove_file(&temp);
+    }
+    written
 }
 
 #[cfg(unix)]

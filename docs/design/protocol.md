@@ -2084,6 +2084,31 @@ GET /v1/lineages/{id}/glance
 - `argsSummary` 是有界的、按不可信内容引用的待批参数摘要，只排除秘密形状（与 `scripts/ci/secret-scan.py` 同一组候选）和输入交接值。
 - CLI：`remuda worker digest <worker>`、`remuda glance`。
 
+**事实收件箱（`cb-inbox-facts`）。** 机制见 [main-agent.md §10.3](./main-agent.md#103-implementation-notes-cb-inbox-facts-2026-11-02)。Hub 在 writer 线程上从 journal 追加与 Hub 自己提交的状态变化写事实行；投递（成批、空闲门、暂停 hold、无订阅者时退回所有者推送）属于 `cb-inbox-deliver`，它读这张表并写 `batchId`。
+
+~~~text
+GET   /v1/lineages/{id}/inbox?after=<rowId>&limit=<n>
+  -> 200 {lineageId, items: [InboxFact], nextAfter, more,
+          settings: {optIn, mutedKinds: [kind]}}
+     rows with id > after, oldest first; limit defaults to 50, at most 200
+PATCH /v1/lineages/{id}/inbox
+  body {optIn?: bool, mutedKinds?: [kind]}      absent fields keep their value
+  -> 200 {optIn, mutedKinds}
+
+InboxFact = {id, lineageId, kind, dedupeKey, subjectInstanceId?, runGeneration,
+             stateEnteredAt, createdAt, batchId?, payload}
+dedupeKey = kind:subject:runGeneration:stateEnteredAt
+kind      = started | exited | waiting | turn-done | turn-failed | interaction
+          | interaction-superseded | gate | supply-reset | host-online
+          | host-offline | stalled | budget-expired | wake-due | context-threshold
+payload.occurrence = {count, capped, cap, windowHours}
+~~~
+
+- 读写都在血缘读谓词之下：Human 设备可读任意血缘（也可用它的任一章节 id 指名）；Agent 只能读写自己的血缘，路径里的 `{id}` 必须是它的规范血缘 id；Bot 凭证一律 403（与记忆路由同法，按认证时的设备种类判定）。中间件只放行这一形状的 GET 与 PATCH，并把 `{id}` 钉在调用者自己的血缘上；处理器再查一次。
+- `optIn` 只有 Human 能改（"创建者打开"）；Agent 写它得到 403。`mutedKinds` 是整组替换，血缘自己或 Human 都可以改。被 mute 的种类不写行。
+- `payload` 里 worker 或工具产出的文本（问题、错误）是不可信数据，读者不得把它当指令或授权。
+- 新增的项目设置：`policy.configurable.factOccurrenceCap`（默认 6）与 `policy.configurable.stallToolThresholdMins`（缺省表示工具在途时永不产生 stall 事实）。
+
 ## 9. 错误码、未知值与兼容性
 
 ### 9.1 错误对象

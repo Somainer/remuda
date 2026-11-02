@@ -368,6 +368,9 @@ pub struct Store {
     /// seen-hub: owner clients showing a session right now. Read by the append
     /// path so a turn end that lands while one is visible folds seen.
     seen_presence: Arc<crate::seen::SeenPresence>,
+    /// When this process opened the store: the inbox measures a host's
+    /// offline grace from no earlier than its own start (cb-inbox-facts).
+    opened_at: time::OffsetDateTime,
 }
 
 impl Store {
@@ -425,6 +428,12 @@ fn delete_instance_rows(tx: &Transaction, instance_id: &str) -> Result<(), Store
         "DELETE FROM instance_views WHERE instance_id = ?1",
         params![instance_id],
     )?;
+    // cb-inbox-facts: the instance's journal-derived run tracker and supply
+    // parks go with it; facts already recorded about it stay in their
+    // subscriber's inbox.
+    crate::inbox::guard("forget_instance", tx, || {
+        crate::inbox::forget_instance(tx, instance_id)
+    });
     // t-pool: a deleted instance must not keep holding an attach lock.
     tx.execute(
         "UPDATE worktree_leases SET holder_instance_id = NULL, updated_at = ?2
@@ -2642,9 +2651,16 @@ impl Store {
                     }
                 };
                 drop(ready_tx);
+                // cb-inbox-facts: facts the previous process left queued.
+                crate::inbox::drain_sources(&mut conn);
                 while let Ok(job) = rx.recv() {
                     match job {
-                        Job::Run(work) => work(&mut conn),
+                        Job::Run(work) => {
+                            work(&mut conn);
+                            // cb-inbox-facts: the state changes this job
+                            // committed that queued a fact source.
+                            crate::inbox::drain_sources(&mut conn);
+                        }
                         Job::Stop(done) => {
                             let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
                             drop(conn);
@@ -2698,7 +2714,13 @@ impl Store {
             #[cfg(any(test, feature = "test-faults"))]
             faults: Arc::new(test_faults::FaultFlags::default()),
             seen_presence: Arc::default(),
+            opened_at: time::OffsetDateTime::now_utc(),
         })
+    }
+
+    /// When this process opened the store.
+    pub(crate) fn opened_at(&self) -> time::OffsetDateTime {
+        self.opened_at
     }
 
     /// Finish in-flight jobs, checkpoint WAL, and close every connection.
@@ -7462,6 +7484,43 @@ impl Store {
         .await
     }
 
+    /// [`Self::update_provider_supply`] for a 429 a child's own journal
+    /// showed, recording in the same transaction that the child is parked on
+    /// its family until `resets_at` (epoch seconds), for the supply-reset
+    /// fact (cb-inbox-facts).
+    pub async fn update_provider_supply_parked(
+        &self,
+        id: String,
+        supply: remuda_protocol::SupplyProfile,
+        instance_id: String,
+        family: String,
+        resets_at: Option<i64>,
+    ) -> Result<ProviderRecord, StoreError> {
+        self.run_named("update_provider_supply_parked", move |conn| {
+            let tx = immediate_tx(conn)?;
+            if load_provider(&tx, &id)?.is_none() {
+                return Err(StoreError::Id("unknown provider".into()));
+            }
+            let encoded = serde_json::to_string(&supply)?;
+            let now = now_rfc3339();
+            tx.execute(
+                "UPDATE provider_profiles SET supply_json = ?1, revision = revision + 1, updated_at = ?2
+                 WHERE id = ?3",
+                params![encoded, now, id],
+            )?;
+            if let Some(resets_at) = resets_at {
+                crate::inbox::guard("note_supply_park", &tx, || {
+                    crate::inbox::note_supply_park(&tx, &instance_id, &id, &family, resets_at)
+                });
+            }
+            let record =
+                load_provider(&tx, &id)?.ok_or_else(|| StoreError::Id("unknown provider".into()))?;
+            tx.commit()?;
+            Ok(record)
+        })
+        .await
+    }
+
     /// Read every live instance (same lifecycle set as host counts) for
     /// supply concurrency accounting.
     pub async fn list_live_instances(&self) -> Result<Vec<InstanceRecord>, StoreError> {
@@ -8308,6 +8367,9 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     crate::node_ops::migrate(&conn)?;
     crate::fence::migrate(&conn)?;
     crate::restart::migrate(&conn)?;
+    // cb-inbox-facts: after `restart` (its `end_seen_at` column) and the gate
+    // queue (its `gate_jobs` table), which the inbox's source triggers read.
+    crate::inbox::migrate(&conn)?;
     // c-usagefu r14 item 1 (Ruling M1): a failed usage migration must never
     // brick Hub startup. The migration is one transaction and rolls back to
     // the previously-openable shape on any error; log it and open. Usage
@@ -15461,7 +15523,15 @@ fn touch_host_online(
          WHERE id = ?3 AND state != 'retired'",
         params![now, node_version, host_id],
     )?;
-    load_host(conn, host_id)?.ok_or_else(|| StoreError::Id("host vanished after auth".into()))
+    let host = load_host(conn, host_id)?
+        .ok_or_else(|| StoreError::Id("host vanished after auth".into()))?;
+    // cb-inbox-facts: a Node link came up.
+    if host.state == "online" {
+        crate::inbox::guard("host_link", conn, || {
+            crate::inbox::host_link(conn, host_id, true)
+        });
+    }
+    Ok(host)
 }
 
 struct HostDedupRow {
@@ -16079,6 +16149,13 @@ fn append_loaded_event(
             .or_insert_with(|| json!(instance_id.to_string()));
     }
     let now = now_rfc3339();
+    // cb-inbox-facts: the row as it was before this event's projections. Like
+    // the fold below, it can never fail the append: an error only means this
+    // event records no fact.
+    let inbox_before = crate::inbox::guard("before_append", conn, || {
+        crate::inbox::before_append(conn, instance_id, &event)
+    })
+    .flatten();
     conn.execute(
         "INSERT INTO journal (instance_id, seq, event_id, payload_json, observed_at)
          VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -16102,6 +16179,15 @@ fn append_loaded_event(
     // D-057 §6.2: the lineage's stored state follows its current chapter's
     // first running report (`starting` → `running`).
     crate::restart::note_chapter_running(conn, instance_id)?;
+    // cb-inbox-facts: the facts this event implies, in the same transaction
+    // as the row; a replayed append (returned above) writes none.
+    if let Some(before) = inbox_before {
+        // A fact must never harm the append (r2): the fold runs inside its own
+        // savepoint, and a failure rolls back to it and is logged.
+        crate::inbox::guard("fold_append", conn, || {
+            crate::inbox::fold_append(conn, instance_id, &event, &now, before, turn_ended)
+        });
+    }
     // seen-hub: a settled turn end becomes the instance's turn-end mark; an
     // owner client showing the session right now folds it seen in this write.
     let seen = if turn_ended {
@@ -16865,11 +16951,18 @@ pub(crate) fn immediate_tx(conn: &mut Connection) -> rusqlite::Result<rusqlite::
 
 /// The host-offline rows: the host leaves `online` (stamping `offline_since`
 /// for the host-lost grace) and its instances read disconnected.
-fn mark_host_offline_rows(conn: &Connection, host_id: &str) -> rusqlite::Result<()> {
-    conn.execute(
+fn mark_host_offline_rows(conn: &Connection, host_id: &str) -> Result<(), StoreError> {
+    let went_offline = conn.execute(
         "UPDATE hosts SET state = 'offline', offline_since = ?2 WHERE id = ?1 AND state = 'online'",
         params![host_id, now_rfc3339()],
     )?;
+    // cb-inbox-facts: a live Node link went down (link loss, not boot
+    // bookkeeping, which `mark_all_hosts_offline` does without a fact).
+    if went_offline > 0 {
+        crate::inbox::guard("host_link", conn, || {
+            crate::inbox::host_link(conn, host_id, false)
+        });
+    }
     conn.execute(
         "UPDATE instances SET connectivity = 'disconnected', updated_at = ?1
          WHERE host_id = ?2 AND connectivity != 'disconnected'",

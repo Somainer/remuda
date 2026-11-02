@@ -27,6 +27,7 @@ mod host_dirs;
 mod host_files;
 mod hosts;
 mod http;
+mod inbox;
 mod instances;
 mod interactions;
 /// Test-only seam for the D-051 delegated-decisions feature switch.
@@ -301,6 +302,26 @@ impl AppState {
     pub(crate) fn config_relay_chunk_bytes(&self) -> usize {
         remuda_protocol::default_api_chunk_bytes() as usize
     }
+}
+
+/// Test-only seams of the inbox (`cb-inbox-facts` r2): inject a failing
+/// inbox hook to prove the write that produced it still commits.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-faults"))]
+pub mod inbox_test_support {
+    /// Make the next inbox fold for `instance_id` fail.
+    pub fn arm_fold_failure(instance_id: &str) {
+        crate::inbox::test_seams::arm_fold_failure(instance_id);
+    }
+
+    /// Make the next inbox fold for `instance_id` fail right after it has
+    /// recorded its first fact.
+    pub fn arm_fold_failure_after_record(instance_id: &str) {
+        crate::inbox::test_seams::arm_fold_failure_after_record(instance_id);
+    }
+
+    /// The bound `host_lost_grace_ms` is clamped to at load (one year).
+    pub const MAX_HOST_LOST_GRACE_MS: u64 = crate::inbox::MAX_CONFIGURED_MS;
 }
 
 /// Test-only constructors for types private modules would otherwise hide
@@ -1296,6 +1317,28 @@ impl RunningHub {
         crate::gatequeue::tick(&self.state).await;
     }
 
+    /// Test-only: the `host_lost_grace_ms` this Hub runs with, after the
+    /// load-time clamp (cb-inbox-facts r3).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_effective_host_lost_grace_ms(&self) -> u64 {
+        self.state.config.host_lost_grace_ms
+    }
+
+    /// Test-only: one evaluation of the inbox's time-driven facts (supply
+    /// resets, stalls, wall budgets) as of `now` (RFC3339), returning how
+    /// many facts it recorded.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_inbox_tick(&self, now: &str) -> anyhow::Result<usize> {
+        let now = time::OffsetDateTime::parse(now, &time::format_description::well_known::Rfc3339)?;
+        let clock = crate::inbox::TickClock {
+            booted_at: self.state.store.opened_at(),
+            host_grace: crate::inbox::host_grace(&self.state.config),
+        };
+        Ok(self.state.store.inbox_tick(now, clock).await?)
+    }
+
     /// Test-only: apply a gate run verdict through the real `apply_result`
     /// path (pre-read + writer job), for the cancel-vs-result race suite.
     #[doc(hidden)]
@@ -2116,6 +2159,16 @@ async fn spawn_inner(
     transport: Option<Arc<dyn remuda_push::Transport>>,
 ) -> anyhow::Result<RunningHub> {
     supervise::mark_started();
+    // cb-inbox-facts r2: the host-lost grace feeds a `Duration` subtraction
+    // on every inbox tick; an operator value no time arithmetic can hold is
+    // clamped once here, and logged rather than carried into the tick.
+    if config.host_lost_grace_ms > crate::inbox::MAX_CONFIGURED_MS {
+        tracing::warn!(
+            code = "host-grace-clamped",
+            "host_lost_grace_ms is above the one-year bound; using the bound"
+        );
+        config.host_lost_grace_ms = crate::inbox::MAX_CONFIGURED_MS;
+    }
     proxy::configure_public_origin(&mut config)?;
     std::fs::create_dir_all(&config.data_dir)?;
     let bootstrap_resolution = resolve_bootstrap(&mut config)?;
@@ -2233,6 +2286,7 @@ async fn spawn_inner(
         let mut interval = tokio::time::interval(Duration::from_millis(
             crate::gatequeue::SCHEDULE_TICK_MILLIS,
         ));
+        let mut inbox_ticks: u64 = 0;
         loop {
             tokio::select! {
                 result = &mut server => {
@@ -2269,6 +2323,15 @@ async fn spawn_inner(
                     tokio::spawn(async move {
                         crate::restart::note_alive(&alive_state).await;
                     });
+                    // cb-inbox-facts: the time-driven facts, off the loop
+                    // and at a coarser pace (their windows are minutes).
+                    if inbox_ticks.is_multiple_of(crate::inbox::TICK_EVERY) {
+                        let inbox_state = reaper_state.clone();
+                        tokio::spawn(async move {
+                            crate::inbox::run_tick(&inbox_state).await;
+                        });
+                    }
+                    inbox_ticks = inbox_ticks.wrapping_add(1);
                     // D-057 §6.3.1: the C1 supervisor, off the loop too.
                     if config.restart_supervisor {
                         let supervisor_state = reaper_state.clone();
@@ -2356,6 +2419,7 @@ pub fn router(state: AppState) -> Router {
         .merge(gatequeue::routes())
         .merge(worker_watch::routes())
         .merge(digest::routes())
+        .merge(inbox::routes())
         .merge(bot::routes());
     if let Some(push) = state.push.clone() {
         app = app.nest_service("/push", push_http::nest(push, state.store.clone()));

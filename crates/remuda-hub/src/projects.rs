@@ -209,6 +209,9 @@ async fn create_project(
     if body.name.trim().is_empty() {
         return Err(HubError::BadRequest("project name required".into()));
     }
+    if let Some(policy) = &body.policy {
+        validate_configurable_minutes(&policy.configurable)?;
+    }
     if let Some(host) = &body.home_host {
         require_known_host(&state, host).await?;
     }
@@ -300,6 +303,28 @@ async fn get_project_http(
     Ok(Json(json!(project)))
 }
 
+/// Refuse a configurable policy whose inbox windows are outside the range the
+/// Hub's tick can act on (`cb-inbox-facts` r2; 400). `stallThresholdMins`
+/// keeps accepting 0 (its documented minimum, read as "the default window");
+/// `stallToolThresholdMins` has no 0 meaning (absent is "never").
+fn validate_configurable_minutes(
+    policy: &remuda_protocol::ProjectConfigurablePolicy,
+) -> Result<(), HubError> {
+    crate::inbox::validate_configured_minutes(
+        "policy.configurable.stallThresholdMins",
+        Some(policy.stall_threshold_mins),
+        0,
+    )
+    .and_then(|()| {
+        crate::inbox::validate_configured_minutes(
+            "policy.configurable.stallToolThresholdMins",
+            policy.stall_tool_threshold_mins,
+            1,
+        )
+    })
+    .map_err(HubError::BadRequest)
+}
+
 /// `PATCH /v1/projects/{id}` — `remuda project set`.
 async fn set_project(
     State(state): State<AppState>,
@@ -315,6 +340,11 @@ async fn set_project(
     }
     if let Some(host) = body.home_host.as_ref().and_then(Option::as_ref) {
         require_known_host(&state, host).await?;
+    }
+    // cb-inbox-facts r2: the inbox tick turns these windows into durations and
+    // times; refuse a value it could not, before the patch job starts.
+    if let Some(policy) = &body.policy {
+        validate_configurable_minutes(&policy.configurable)?;
     }
     let hosts = if body.hosts.is_some() {
         Some(resolve_hosts(&state, body.hosts.unwrap_or_default()).await?)

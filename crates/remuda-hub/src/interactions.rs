@@ -114,6 +114,71 @@ pub(crate) fn delegated_decisions_enabled(project_id: Option<&str>) -> bool {
     )
 }
 
+/// Whether an interaction of `kind` raised by `target_id` is routed to its
+/// Agent parent under D-051 as amended by OA3 (D-057 §8.1 condition 2), read
+/// on the caller's connection for the inbox's `routedToParent`.
+///
+/// The same predicate [`delegated_visible_items`] applies to a parent's list,
+/// evaluated for the parent lineage's current chapter: approvals never route;
+/// the target needs a parent outside its own lineage (so a plan review is
+/// never routed to its own lineage); the D-051 switch must be on for the
+/// target's project; and bypass on either side excludes every kind but
+/// questions and plan reviews.
+pub(crate) fn routed_to_parent_conn(
+    conn: &rusqlite::Connection,
+    target_id: &str,
+    kind: &str,
+) -> Result<bool, crate::store::StoreError> {
+    use rusqlite::{OptionalExtension, params};
+    if kind == APPROVAL_KIND {
+        return Ok(false);
+    }
+    let Some(target_lineage) = crate::store::lineage_id_of(conn, target_id)? else {
+        return Ok(false);
+    };
+    let Some(parent_lineage) = crate::store::parent_lineage_of(conn, target_id)? else {
+        return Ok(false);
+    };
+    if parent_lineage == target_lineage {
+        return Ok(false);
+    }
+    let mode_of = |id: &str| -> Result<Option<String>, rusqlite::Error> {
+        conn.query_row(
+            "SELECT json_extract(spec_json, '$.permissionMode') FROM instances WHERE id = ?1",
+            params![id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map(Option::flatten)
+    };
+    let parent_chapter: String = conn
+        .query_row(
+            "SELECT current_instance_id FROM lineages WHERE lineage_id = ?1",
+            params![parent_lineage],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(parent_lineage);
+    if bypass_excludes(kind)
+        && (mode_of(&parent_chapter)?.as_deref() == Some(BYPASS_PERMISSIONS)
+            || mode_of(target_id)?.as_deref() == Some(BYPASS_PERMISSIONS))
+    {
+        return Ok(false);
+    }
+    let scope: Option<String> = conn
+        .query_row(
+            "SELECT scope_json FROM instances WHERE id = ?1",
+            params![target_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let project = scope
+        .and_then(|raw| serde_json::from_str::<remuda_protocol::InstanceScope>(&raw).ok())
+        .and_then(|scope| scope.single_project_id().map(|id| id.as_id().to_string()));
+    Ok(delegated_decisions_enabled(project.as_deref()))
+}
+
 /// Hub-side facts about the instance owning an Interaction, gathered the same
 /// way for the list filter and the answer gate. `parent_instance_id` is the
 /// Hub-stamped create-time edge read by `owns()`

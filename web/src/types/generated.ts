@@ -1673,6 +1673,57 @@ export type HostTransportMode = ("outbound-wss" | "ssh-tunnel");
 
 export type Id = (string);
 
+/** One inbox row. */
+export type InboxFact = ({
+  "batchId"?: (string | null);
+  "createdAt": (string);
+  "dedupeKey": (string);
+  "id": (number);
+  "kind": InboxFactKind;
+  "lineageId": (string);
+  "payload": unknown;
+  "runGeneration": (number);
+  "stateEnteredAt": (string);
+  "subjectInstanceId"?: (string | null);
+  [key: string]: unknown;
+});
+
+/** InboxFactKind wire values; `protocol.md` §8.4. */
+export type InboxFactKind = ("started" | "exited" | "waiting" | "turn-done" | "turn-failed" | "interaction" | "interaction-superseded" | "gate" | "supply-reset" | "host-online" | "host-offline" | "stalled" | "budget-expired" | "wake-due" | "context-threshold");
+
+/** How often the same fact occurred for this subscriber in the rolling window ending at the fact's `stateEnteredAt` (§10.1 item 2). The count survives a Hub restart; occurrences over the cap are counted but write no row, so the next recorded fact carries them. */
+export type InboxOccurrence = ({
+  "cap": (number);
+  "capped": (number);
+  "count": (number);
+  "windowHours": (number);
+  [key: string]: unknown;
+});
+
+/** `GET /v1/lineages/{id}/inbox`: one page of a lineage's inbox, oldest first. */
+export type InboxPage = ({
+  "items": ((InboxFact)[]);
+  "lineageId": (string);
+  "more": (boolean);
+  "nextAfter": (number);
+  "settings": InboxSettings;
+  [key: string]: unknown;
+});
+
+/** A lineage's inbox settings (§10, Defaults). */
+export type InboxSettings = ({
+  "mutedKinds": ((InboxFactKind)[]);
+  "optIn": (boolean);
+  [key: string]: unknown;
+});
+
+/** `PATCH /v1/lineages/{id}/inbox`: absent fields keep their value. */
+export type InboxSettingsPatch = ({
+  "mutedKinds"?: ((InboxFactKind)[] | null);
+  "optIn"?: (boolean | null);
+  [key: string]: unknown;
+});
+
 /** The chapter instance a mutation was initiated by, with its place in the lineage. `{instanceId, lineageId, generation}` — D-057 §7.1.  The generation is the chapter generation stamped at authentication time. A fence bumps the lineage's live generation, so the commit-time check can refuse a request authenticated before the fence (main-agent.md §7.3). */
 export type Initiator = ({
   "generation": (number);
@@ -3558,11 +3609,13 @@ export type ProjectConfigurablePolicy = ({
   "completionLine": (string);
   "coordinatorFanOut": (number);
   "defaultPlacement": (string);
+  "factOccurrenceCap": (number);
   "maxConcurrentWorkers": (number);
   "maxDelegationDepth": (number);
   "maxFanOutPerTask": (number);
   "nudgeThrottleMins": (number);
   "stallThresholdMins": (number);
+  "stallToolThresholdMins"?: (number | null);
   [key: string]: unknown;
 });
 

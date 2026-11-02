@@ -582,15 +582,15 @@ pub(crate) fn fence_core(conn: &Connection, spec: &FenceSpec) -> Result<FenceTx,
     }
 
     // 8. The predecessor's pending interactions are superseded.
-    let pending: Vec<(String, String)> = rows(
+    let pending: Vec<(String, String, String)> = rows(
         conn,
-        "SELECT id, payload_json FROM interactions
+        "SELECT id, payload_json, kind FROM interactions
           WHERE instance_id = ?1 AND state = 'pending' ORDER BY id ASC",
         params![predecessor],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
     let mut settlement = Settlement::default();
-    for (id, payload) in pending {
+    for (id, payload, interaction_kind) in pending {
         let mut event: Value = serde_json::from_str(&payload).unwrap_or_else(|_| json!({}));
         supersede_interaction_payload(&mut event, &now, &superseded_by);
         let changed = conn.execute(
@@ -601,6 +601,18 @@ pub(crate) fn fence_core(conn: &Connection, spec: &FenceSpec) -> Result<FenceTx,
             params![id, superseded_by, event.to_string(), now],
         )?;
         if changed > 0 {
+            // cb-inbox-facts: the predecessor's subscriber learns the
+            // interaction is moot, in F's transaction.
+            crate::inbox::guard("interaction_superseded", conn, || {
+                crate::inbox::interaction_superseded(
+                    conn,
+                    &predecessor,
+                    &id,
+                    &interaction_kind,
+                    &superseded_by,
+                    &now,
+                )
+            });
             let seq = insert_settlement_event(conn, &predecessor, &id, "superseded", &now)?;
             settlement.interactions.push(SettledInteraction {
                 instance_id: predecessor.clone(),

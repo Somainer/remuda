@@ -1324,6 +1324,15 @@ async fn an_invalid_credential_shaped_slug_is_never_echoed() -> Result<()> {
                                     {"slug": "other", "expectedRevision": 1}],
                         "entry": entry(&slug, "merged")})),
         ),
+        // A source without its expectedRevision: the slug is checked
+        // before the missing revision is reported.
+        (
+            "POST",
+            mem(&lineage, "/consolidate"),
+            Some(json!({"sources": [{"slug": "kept", "expectedRevision": 1},
+                                    {"slug": slug}],
+                        "entry": entry("merged", "m")})),
+        ),
         (
             "POST",
             mem(&lineage, "/restore"),

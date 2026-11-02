@@ -1933,11 +1933,15 @@ impl Store {
                 "consolidate takes 2 to {MAX_CONSOLIDATE_SOURCES} source entries"
             )));
         }
-        for (index, (slug, _)) in sources.iter().enumerate() {
+        // Every slug is linted and validated before any other check; the
+        // messages name a source by its position, never by its slug.
+        for (slug, _) in &sources {
             check_slug(slug)?;
-            if sources[..index].iter().any(|(other, _)| other == slug) {
+        }
+        for (index, (slug, _)) in sources.iter().enumerate() {
+            if let Some(first) = sources[..index].iter().position(|(other, _)| other == slug) {
                 return Err(MemoryError::BadRequest(format!(
-                    "source {slug:?} is listed twice"
+                    "sources[{first}] and sources[{index}] name the same entry"
                 )));
             }
         }
@@ -2552,12 +2556,19 @@ async fn consolidate(
     Json(body): Json<ConsolidateBody>,
 ) -> Result<Json<MemoryWriteResult>, MemoryError> {
     let writer = memory_caller(&state, &headers, &lineage_id).await?;
+    // Lint and validate every source slug before anything else reports on
+    // a source, and name a source only by its position: a slug may carry a
+    // credential.
+    for source in &body.sources {
+        check_slug(&source.slug)?;
+    }
     let sources = body
         .sources
         .into_iter()
-        .map(|source| {
+        .enumerate()
+        .map(|(index, source)| {
             let expected = source.expected_revision.ok_or_else(|| {
-                MemoryError::BadRequest(format!("source {:?} needs expectedRevision", source.slug))
+                MemoryError::BadRequest(format!("sources[{index}] needs expectedRevision"))
             })?;
             Ok((source.slug, expected))
         })

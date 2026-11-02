@@ -95,7 +95,10 @@ EXTERNAL_SCHEME = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
 FENCE_OPEN = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
 INLINE_CODE = re.compile(r"`+[^`\n]*?`+")
 INLINE_LINK = re.compile(r"!?\[[^\]\n]*\]\(\s*(<[^>\n]*>|[^)\n]+?)\s*\)")
-LINK_DEFINITION = re.compile(r"^\s{0,3}\[[^\]]+\]:\s*(\S+)")
+# Footnote definitions (`[^1]: ...`) are not links.
+REFERENCE_DEFINITION = re.compile(r"^\s{0,3}\[(?!\^)([^\]]+)\]:")
+REFERENCE_USE = re.compile(r"\[([^\]\n]*)\]\[([^\]\n]*)\]")
+BRACKET = re.compile(r"\[([^\]\n]+)\]")
 HTML_ANCHOR = re.compile(
     r"<a\s[^>]*(?:id|name)\s*=\s*[\"']([^\"']+)[\"']", re.IGNORECASE
 )
@@ -349,20 +352,50 @@ def anchors_for(text: str) -> set[str]:
 
 # ── links and orphans ─────────────────────────────────────────────────────
 
+def _definition_target(text: str, index: int) -> str | None:
+    match = re.match(r"\s*(\S+)", text[index:])
+    return match.group(1).strip("<>") if match else None
+
+
+def _normalize_label(label: str) -> str:
+    return re.sub(r"\s+", " ", label.strip()).lower()
+
+
 def iter_links(lines: list[Line]):
-    """Yield (line, raw_target) for inline links and reference definitions."""
+    """Yield (line, raw_target) for inline links and used reference definitions.
+
+    Footnote definitions are not links, and a reference definition is only
+    checked when a full, collapsed or shortcut reference uses its label.
+    """
+    definitions: dict[str, tuple[Line, str]] = {}
+    body: list[Line] = []
     for line in lines:
+        definition = REFERENCE_DEFINITION.match(line.text)
+        if definition:
+            target = _definition_target(line.text, definition.end())
+            if target is not None:
+                definitions[_normalize_label(definition.group(1))] = (line, target)
+            continue
+        body.append(line)
+    used: set[str] = set()
+    for line in body:
+        for match in REFERENCE_USE.finditer(line.text):
+            used.add(_normalize_label(match.group(2) or match.group(1)))
+        for match in BRACKET.finditer(line.text):
+            following = line.text[match.end():match.end() + 1]
+            if following not in ("(", "[", ":"):
+                used.add(_normalize_label(match.group(1)))
+    for line in body:
         for match in INLINE_LINK.finditer(line.text):
             target = match.group(1).strip()
             if target.startswith("<") and target.endswith(">"):
                 target = target[1:-1]
             else:
-                # Drop an optional markdown title ("title" after the target).
                 target = target.split()[0] if target.split() else ""
             yield line, target
-        definition = LINK_DEFINITION.match(line.text)
-        if definition:
-            yield line, definition.group(1).strip("<>")
+    for label, (line, target) in definitions.items():
+        if label in used:
+            yield line, target
 
 
 def link_target(doc: Path, target: str) -> tuple[Path, str] | None:
@@ -1469,6 +1502,13 @@ class DocsContractFixtureTests(unittest.TestCase):
         self.assertNotIn("设计 笔记", flagged)
         self.assertNotIn("space dir", flagged)
         self.assertNotIn("目录 空格", flagged)
+
+    def test_footnotes_and_unused_definitions_are_not_links(self):
+        text = (FIXTURE_ROOT / "README.md").read_text(encoding="utf-8")
+        targets = [target for _, target in iter_links(visible_markdown(text))]
+        self.assertIn("docs/guide.md#setup-steps", targets)  # shortcut [guide-ref]
+        self.assertNotIn("See", targets)  # footnote body is prose
+        self.assertNotIn("nowhere.md", targets)  # definition nothing uses
 
     def test_enforced_record_replaces_an_advisory_with_the_same_key(self):
         report = Report([])

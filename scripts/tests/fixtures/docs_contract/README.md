@@ -11,6 +11,14 @@ and deliberately broken in known places.
 - [design entry](docs/design/home.md)
 - [missing document](docs/missing.md)
 - [missing heading](docs/guide.md#no-such-heading)
+- [guide-ref]
+
+A footnote marker.[^1]
+
+[^1]: Footnotes are prose, not links.
+
+[guide-ref]: docs/guide.md#setup-steps
+[unused]: nowhere.md
 
 Commands that exist: `remuda demo run --fast`, `remuda demo run --quick`,
 `remuda demo --verbose run`, `remuda demo inspect`,

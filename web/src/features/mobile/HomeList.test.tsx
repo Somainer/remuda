@@ -257,6 +257,24 @@ describe("HomeList hold", () => {
     expect(ids()).toEqual(["/s/ins-other", "/s/ins-held"]);
   });
 
+  it("releases the hold when a rank filter drops the row whose menu was open", async () => {
+    hub.instances = [
+      row("ins-work", { activity: known("working") }),
+      row("ins-done", { activity: known("idle"), unseen: true }),
+    ];
+    renderHome();
+    const workingArticle = (await screen.findByText("title ins-work")).closest("article")!;
+    await userEvent.click(workingArticle.querySelector("[data-testid='row-actions-more']") as HTMLElement);
+    expect(screen.getByTestId("row-actions-menu")).toBeTruthy();
+    expect(document.querySelector(HELD)).not.toBeNull();
+
+    // A filter tap drops the row even while the hold freezes the rest; its
+    // menu id must not keep the order frozen with no menu to close it.
+    fireEvent.click(screen.getByTestId("glance-done-unseen"));
+    await waitFor(() => expect(document.querySelector(RELEASED)).not.toBeNull());
+    expect(screen.queryByTestId("row-actions-menu")).toBeNull();
+  });
+
   it("also freezes while focus sits in a row's control, and re-ranks when it leaves", () => {
     hub.instances = [
       row("ins-focused", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" }),

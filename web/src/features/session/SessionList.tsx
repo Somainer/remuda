@@ -297,6 +297,15 @@ export function SessionList({
     if (actionFor !== null && staleIds.has(actionFor)) setActionFor(null);
   }, [actionFor, staleIds]);
 
+  // The row menu is a §3.3 hold source: a menu id whose row is not painted
+  // (a rank-filter tap drops rows mid-hold) would hold the order forever with
+  // no menu to close it. Release it.
+  useEffect(() => {
+    if (rowMenuFor === null) return;
+    if (sections.some((section) => section.instances.some((instance) => instance.id === rowMenuFor))) return;
+    setRowMenuFor(null);
+  }, [rowMenuFor, sections]);
+
   // Rows currently on screen (IntersectionObserver), so the screen poll can
   // prefer them. The viewport root stays correct inside an overflow
   // container: intersection accounts for clipping by intermediate scrollers.

@@ -1,4 +1,4 @@
-import { useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { useNavigate } from "react-router-dom";
 import { Modal } from "../../components/Modal";
 import { Sheet } from "../../components/Sheet";
@@ -34,12 +34,35 @@ const LABELS: Record<RowActionKey, string> = {
  * The long-press handlers, for a caller that wants the press on the whole row
  * rather than on the ⋯ button. A short tap does nothing, so the row's own
  * click still navigates.
+ *
+ * The timer is cleared on a WINDOW pointerup/pointercancel as well as on the
+ * element's own events: a press that starts inside the menu and ends on the
+ * scrim (which closes the menu) retargets the pointerup elsewhere, and a
+ * stranded timer would pop the menu open 500 ms after the user dismissed it.
+ * The unmount cleanup clears it too, so a row removed by a poll inside the
+ * hold window never opens a menu the ledger can no longer show.
  */
 export function useRowLongPress(onOpen: () => void) {
   const press = useRef<{ timer: ReturnType<typeof setTimeout>; x: number; y: number } | null>(null);
+  const clear = useCallback(() => {
+    const current = press.current;
+    if (!current) return;
+    clearTimeout(current.timer);
+    press.current = null;
+  }, []);
+  useEffect(() => {
+    window.addEventListener("pointerup", clear);
+    window.addEventListener("pointercancel", clear);
+    return () => {
+      clear();
+      window.removeEventListener("pointerup", clear);
+      window.removeEventListener("pointercancel", clear);
+    };
+  }, [clear]);
   return {
     onPointerDown(event: ReactPointerEvent) {
       if (event.button !== 0) return;
+      clear();
       const timer = setTimeout(() => {
         press.current = null;
         onOpen();
@@ -50,20 +73,11 @@ export function useRowLongPress(onOpen: () => void) {
       const current = press.current;
       if (!current) return;
       if (Math.abs(event.clientX - current.x) > LONG_PRESS_SLOP_PX || Math.abs(event.clientY - current.y) > LONG_PRESS_SLOP_PX) {
-        clearTimeout(current.timer);
-        press.current = null;
+        clear();
       }
     },
-    onPointerUp() {
-      if (!press.current) return;
-      clearTimeout(press.current.timer);
-      press.current = null;
-    },
-    onPointerCancel() {
-      if (!press.current) return;
-      clearTimeout(press.current.timer);
-      press.current = null;
-    },
+    onPointerUp: clear,
+    onPointerCancel: clear,
   };
 }
 
@@ -128,7 +142,7 @@ export function RowActions({
   }
 
   return (
-    <div className={css.wrap} data-testid="row-actions" {...longPress}>
+    <div className={css.wrap} data-testid="row-actions">
       <button
         type="button"
         className={css.more}
@@ -137,6 +151,9 @@ export function RowActions({
         aria-haspopup="menu"
         aria-expanded={open}
         disabled={stale}
+        // The press lives on the trigger, never on the wrapper that holds the
+        // Sheet: a pointerdown on the scrim must not arm a second open.
+        {...longPress}
         onClick={(event) => {
           event.preventDefault();
           event.stopPropagation();

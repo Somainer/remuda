@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { act, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { useState } from "react";
@@ -51,11 +51,25 @@ function inst(overrides: Partial<Instance> = {}): Instance {
   } as Instance;
 }
 
-function Harness({ instance }: { instance: Instance }) {
+function Harness({
+  instance,
+  onOpen,
+}: {
+  instance: Instance;
+  onOpen?: () => void;
+}) {
   const [open, setOpen] = useState(false);
   return (
     <MemoryRouter>
-      <RowActions instance={instance} open={open} onOpen={() => setOpen(true)} onClose={() => setOpen(false)} />
+      <RowActions
+        instance={instance}
+        open={open}
+        onOpen={() => {
+          onOpen?.();
+          setOpen(true);
+        }}
+        onClose={() => setOpen(false)}
+      />
     </MemoryRouter>
   );
 }
@@ -63,6 +77,16 @@ function Harness({ instance }: { instance: Instance }) {
 function items() {
   return screen.getAllByRole("menuitem").map((item) => item.textContent);
 }
+
+function pressOnMore() {
+  act(() => {
+    screen.getByTestId("row-actions-more").dispatchEvent(
+      new PointerEvent("pointerdown", { bubbles: true, clientX: 5, clientY: 5 }),
+    );
+  });
+}
+
+const wait = (ms: number) => act(() => new Promise((resolve) => setTimeout(resolve, ms)));
 
 describe("RowActions", () => {
   it("lists the items a running row allows, and not 标为已看", async () => {
@@ -100,16 +124,59 @@ describe("RowActions", () => {
 
   it("opens on a long-press and not on a short tap", async () => {
     render(<Harness instance={inst()} />);
-    const wrap = screen.getByTestId("row-actions");
-    const down = () => wrap.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, clientX: 5, clientY: 5 }));
-    const up = () => wrap.dispatchEvent(new PointerEvent("pointerup", { bubbles: true }));
+    const more = screen.getByTestId("row-actions-more");
+    const down = () => act(() => {
+      more.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, clientX: 5, clientY: 5 }));
+    });
     down();
-    await new Promise((resolve) => setTimeout(resolve, LONG_PRESS_MS - 50));
-    up();
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await wait(LONG_PRESS_MS - 50);
+    act(() => {
+      more.dispatchEvent(new PointerEvent("pointerup", { bubbles: true }));
+    });
+    await wait(100);
     expect(screen.queryByRole("menuitem")).toBeNull();
     down();
-    await new Promise((resolve) => setTimeout(resolve, LONG_PRESS_MS + 50));
+    await wait(LONG_PRESS_MS + 50);
     expect(screen.getAllByRole("menuitem").length).toBeGreaterThan(0);
+  });
+
+  it("does not re-open 500ms after the backdrop dismisses the menu", async () => {
+    const onOpen = vi.fn();
+    render(<Harness instance={inst()} onOpen={onOpen} />);
+    await userEvent.click(screen.getByTestId("row-actions-more"));
+    onOpen.mockClear();
+    const panel = screen.getByTestId("row-actions-panel");
+    const scrim = panel.parentElement!;
+    // The scrim closes on mousedown; the pointerdown that precedes it must not
+    // arm the long-press the wrapper used to own.
+    act(() => {
+      scrim.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, clientX: 5, clientY: 5 }));
+      scrim.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    });
+    expect(screen.queryByTestId("row-actions-panel")).toBeNull();
+    await wait(LONG_PRESS_MS + 100);
+    expect(onOpen).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("row-actions-panel")).toBeNull();
+  });
+
+  it("clears the press when the pointer is released anywhere", async () => {
+    const onOpen = vi.fn();
+    render(<Harness instance={inst()} onOpen={onOpen} />);
+    pressOnMore();
+    act(() => {
+      window.dispatchEvent(new PointerEvent("pointerup"));
+    });
+    await wait(LONG_PRESS_MS + 100);
+    expect(onOpen).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("row-actions-panel")).toBeNull();
+  });
+
+  it("clears the press when the row unmounts inside the hold window", async () => {
+    const onOpen = vi.fn();
+    const { unmount } = render(<Harness instance={inst()} onOpen={onOpen} />);
+    pressOnMore();
+    unmount();
+    await wait(LONG_PRESS_MS + 100);
+    expect(onOpen).not.toHaveBeenCalled();
   });
 });

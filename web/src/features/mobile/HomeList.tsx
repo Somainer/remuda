@@ -396,6 +396,15 @@ export const HomeList = memo(function HomeList() {
   const renderedFold = snapshot ? snapshot.fold : painted.fold;
   const renderedQuietOpen = snapshot ? snapshot.quietOpen : painted.quietOpen;
 
+  // A menu id whose row is no longer painted has no menu to close it (a rank
+  // filter drops rows even while a hold freezes the rest): release the hold
+  // instead of leaving the ledger frozen on nothing.
+  useEffect(() => {
+    if (rowMenuFor === null) return;
+    if (renderedGroups.some((group) => group.rows.some((row) => row.id === rowMenuFor))) return;
+    setRowMenuFor(null);
+  }, [renderedGroups, rowMenuFor]);
+
   // D-050 task layer stacked above the project+branch session groups:
   // 需要你 first, tasks nested by parent, SE-nn keys, archive folded. Tapping
   // a task row opens the shared /s/:id — no second transcript (D-049).
@@ -513,7 +522,13 @@ export const HomeList = memo(function HomeList() {
                 resumeStates={resumeStates}
                 staleIds={staleIds}
                 rowMenuFor={rowMenuFor}
-                onMenu={(id) => setRowMenuFor(id)}
+                onMenu={(id) => {
+                  // A press can outlive the row it started on (a poll dropped
+                  // it): opening a menu for an id with no menu would freeze
+                  // the ledger with nothing able to release it.
+                  if (!renderedGroups.some((group) => group.rows.some((row) => row.id === id))) return;
+                  setRowMenuFor(id);
+                }}
                 onMenuClose={(id) => setRowMenuFor((current) => (current === id ? null : current))}
                 onResume={(instanceId) => void onResume(instanceId)}
               />

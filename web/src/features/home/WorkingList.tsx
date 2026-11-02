@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { StateDot } from "../../components/StateDot";
 import { formatListTime } from "../../lib/format";
@@ -26,6 +26,12 @@ export function WorkingList() {
     .filter((row) => row.parent == null && projectStatus(row) === "working")
     .sort((a, b) => (Date.parse(b.updatedAt) || 0) - (Date.parse(a.updatedAt) || 0));
   const stale = hub.connection !== "live";
+  // A menu id whose row stopped ranking working has no menu to close it.
+  useEffect(() => {
+    if (menuFor === null) return;
+    if (rows.some((row) => row.id === menuFor)) return;
+    setMenuFor(null);
+  }, [menuFor, rows]);
   return (
     <section className={css.section} data-testid="home-working" data-stale={stale ? "1" : "0"} aria-label="工作中">
       <header className={css.head}>工作中 · {hub.ready ? rows.length : "–"}</header>

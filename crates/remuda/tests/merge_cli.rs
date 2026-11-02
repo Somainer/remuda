@@ -352,6 +352,7 @@ fn docs_only_gate_skips_tests_but_keeps_the_other_rust_checks() {
         "secret-scan",
         "no-tunnel-scan",
         "no-host-wide-kills",
+        "docs-contract",
         "cargo-fmt",
         "cargo-check",
         "cargo-clippy",
@@ -405,6 +406,7 @@ fn merge_pushes_verified_no_ff_commit_and_preserves_worker_edits() {
             "secret-scan",
             "no-tunnel-scan",
             "no-host-wide-kills",
+            "docs-contract",
             "cargo-fmt",
             "cargo-check",
             "cargo-clippy",
@@ -465,6 +467,7 @@ fn test_retry_is_reported_once_and_forced_web_runs_in_web_directory_without_push
             "secret-scan",
             "no-tunnel-scan",
             "no-host-wide-kills",
+            "docs-contract",
             "cargo-fmt",
             "cargo-check",
             "cargo-clippy",
@@ -482,11 +485,11 @@ fn test_retry_is_reported_once_and_forced_web_runs_in_web_directory_without_push
             .all(|event| event["target"] == repo.root.join("chosen-target").to_str().unwrap())
     );
     assert!(
-        trace[8..11]
+        trace[9..12]
             .iter()
             .all(|event| Path::new(event["cwd"].as_str().unwrap()).ends_with("worktree/web"))
     );
-    assert!(Path::new(trace[11]["cwd"].as_str().unwrap()).ends_with("worktree"));
+    assert!(Path::new(trace[12]["cwd"].as_str().unwrap()).ends_with("worktree"));
     assert!(trace.iter().all(|event| event["incremental"] == "0"));
     let generated = step(&report, "gen-api-current");
     assert_eq!(

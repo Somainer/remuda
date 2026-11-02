@@ -32,6 +32,26 @@ const LISTEN: &str = "127.0.0.1:18787";
 /// Fake Anthropic-Messages gateway for provider discovery.
 const UPSTREAM_LISTEN: &str = "127.0.0.1:18788";
 
+/// home-evidence showcase fixture (H5): under `HUB_E2E_HOME_EVIDENCE=1` the
+/// fake Node announces neutral host/workspace names and journals human
+/// assistant lines, so the home evidence shots carry no test strings, real
+/// host names or paths (home.md §11). Off by default: every other spec sees
+/// the byte-identical harness.
+fn home_evidence_enabled() -> bool {
+    std::env::var("HUB_E2E_HOME_EVIDENCE").as_deref() == Ok("1")
+}
+
+/// The assistant line the fake turn journals. The showcase run replaces the
+/// `echo: <prompt>` wire echo (which would carry the fixture sentinels into
+/// row bodies) with a sentence a person would read.
+fn journaled_reply(prompt: &str) -> String {
+    if home_evidence_enabled() {
+        "已核对完这一步，下一步等你确认。".to_string()
+    } else {
+        format!("echo: {prompt}")
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -670,6 +690,13 @@ fn node_hello_frame(host_id: &HostId, workspaces: &Value, epoch: u64, live: &[St
         .iter()
         .map(|instance_id| json!({ "id": instance_id, "hostId": host, "lifecycle": "running" }))
         .collect();
+    // The showcase run names the host the way the owner would (home.md §11);
+    // every other spec keys on the original label.
+    let (label, hostname) = if home_evidence_enabled() {
+        ("forge", "forge.local")
+    } else {
+        ("e2e-fake-node", "e2e-fake-node.local")
+    };
     json!({
         "jsonrpc": "2.0",
         "id": "hello",
@@ -677,7 +704,7 @@ fn node_hello_frame(host_id: &HostId, workspaces: &Value, epoch: u64, live: &[St
         "params": {
             "hostId": host,
             "nodeVersion": "0.1.0-e2e",
-            "label": "e2e-fake-node",
+            "label": label,
             // A new epoch on every restart is what makes the Hub reconcile;
             // an unchanged epoch is a reconnect and settles nothing.
             "nodeEpoch": format!("epoch-e2e-{epoch}"),
@@ -687,7 +714,7 @@ fn node_hello_frame(host_id: &HostId, workspaces: &Value, epoch: u64, live: &[St
             // omits the key instead (see `DevNode::announceable_inventory`).
             "instanceStoreFound": true,
             "host": {
-                "hostname": "e2e-fake-node.local",
+                "hostname": hostname,
                 "workspaceRevision": 1,
                 "workspaces": workspaces,
                 "labels": { "role": "e2e" },
@@ -873,17 +900,30 @@ async fn fake_node(
     );
     let (mut ws, _) = tokio_tungstenite::connect_async(req).await?;
     let host = host_id.as_id().as_str();
+    // home-evidence showcase: the workspace label is its root's last segment
+    // (`web/src/features/workspaces/registry.ts`), so the run announces
+    // human-named roots and drops the scenario-only g2 roots from the list.
+    let showcase = home_evidence_enabled();
+    let (e2e_root, e2e_second_root) = if showcase {
+        ("/srv/remuda", "/srv/atlas")
+    } else {
+        ("/tmp/remuda-e2e", "/tmp/remuda-e2e-second")
+    };
     let mut workspaces = vec![
-        json!({ "workspaceId": "wsp_e2e", "hostId": host, "root": "/tmp/remuda-e2e" }),
-        json!({ "workspaceId": "wsp_e2e_second", "hostId": host, "root": "/tmp/remuda-e2e-second" }),
-        // G2 files-view synthetic scenarios (docs/design/files-view-contract.md §3.6).
-        json!({ "workspaceId": "wsp_g2_changes", "hostId": host, "root": "/tmp/remuda-g2/changes" }),
-        json!({ "workspaceId": "wsp_g2_clean", "hostId": host, "root": "/tmp/remuda-g2/clean" }),
-        json!({ "workspaceId": "wsp_g2_nogit", "hostId": host, "root": "/tmp/remuda-g2/nogit" }),
-        json!({ "workspaceId": "wsp_g2_denied", "hostId": host, "root": "/tmp/remuda-g2/denied" }),
-        json!({ "workspaceId": "wsp_g2_trunc", "hostId": host, "root": "/tmp/remuda-g2/trunc" }),
-        json!({ "workspaceId": "wsp_g2_changed", "hostId": host, "root": "/tmp/remuda-g2/changed" }),
+        json!({ "workspaceId": "wsp_e2e", "hostId": host, "root": e2e_root }),
+        json!({ "workspaceId": "wsp_e2e_second", "hostId": host, "root": e2e_second_root }),
     ];
+    if !showcase {
+        // G2 files-view synthetic scenarios (docs/design/files-view-contract.md §3.6).
+        workspaces.extend([
+            json!({ "workspaceId": "wsp_g2_changes", "hostId": host, "root": "/tmp/remuda-g2/changes" }),
+            json!({ "workspaceId": "wsp_g2_clean", "hostId": host, "root": "/tmp/remuda-g2/clean" }),
+            json!({ "workspaceId": "wsp_g2_nogit", "hostId": host, "root": "/tmp/remuda-g2/nogit" }),
+            json!({ "workspaceId": "wsp_g2_denied", "hostId": host, "root": "/tmp/remuda-g2/denied" }),
+            json!({ "workspaceId": "wsp_g2_trunc", "hostId": host, "root": "/tmp/remuda-g2/trunc" }),
+            json!({ "workspaceId": "wsp_g2_changed", "hostId": host, "root": "/tmp/remuda-g2/changed" }),
+        ]);
+    }
     // D-047 operator knob (HUB_E2E_API_ROUTE=1, api-route.hub.spec): project
     // members require a branded workspace id from the host's acknowledged
     // snapshot; the legacy `wsp_e2e` labels are deliberately non-branded.
@@ -1468,13 +1508,20 @@ async fn fake_node(
                             Some(&session_id),
                         )
                         .await?;
+                        // The raw error is tooltip-only on the row; the
+                        // showcase run still keeps it free of fixture tokens.
+                        let exit_error = if home_evidence_enabled() {
+                            "API Error: 服务暂时不可用 (503)"
+                        } else {
+                            "API Error: MHOME_EXIT_SENTINEL (429)"
+                        };
                         append_n = append_instance_exit(
                             &mut ws,
                             &mut frame_queue,
                             &instance_id,
                             append_n,
                             &session_id,
-                            "API Error: MHOME_EXIT_SENTINEL (429)",
+                            exit_error,
                         )
                         .await?;
                         send_rpc_ok(
@@ -1694,6 +1741,22 @@ async fn fake_node(
                             host_id.as_id().as_str(),
                             interaction_id.as_id().as_str(),
                         )
+                    } else if prompt.contains("hshowcase-approval") {
+                        // c-homeev: a showcase approval whose verbatim body
+                        // reads like a real command, so evidence shots carry no
+                        // fixture paths (home.md §11).
+                        fake_showcase_approval(
+                            &instance_id,
+                            host_id.as_id().as_str(),
+                            interaction_id.as_id().as_str(),
+                        )
+                    } else if prompt.contains("hshowcase-plan") {
+                        // c-homeev: a showcase plan in the owner's language.
+                        fake_showcase_plan(
+                            &instance_id,
+                            host_id.as_id().as_str(),
+                            interaction_id.as_id().as_str(),
+                        )
                     } else if prompt.contains("ask-question") {
                         fake_hook_question(
                             &instance_id,
@@ -1779,7 +1842,7 @@ async fn fake_node(
                             &instance_id,
                             append_n,
                             "assistant",
-                            &format!("echo: {prompt}"),
+                            &journaled_reply(prompt),
                         )
                         .await?;
                     }
@@ -2407,9 +2470,9 @@ async fn fake_node(
                         .collect::<Vec<_>>()
                         .join(",");
                     let mut reply = if sent.is_empty() {
-                        format!("echo: {prompt}")
+                        journaled_reply(prompt)
                     } else {
-                        format!("echo: {prompt} [attachments: {types}]")
+                        format!("{} [attachments: {types}]", journaled_reply(prompt))
                     };
                     for (index, object_id, _kind, media_type, _name, _size) in &sent {
                         reply.push_str(&format!(
@@ -5051,6 +5114,27 @@ fn fake_plan_review(instance_id: &str, host_id: &str, interaction_id: &str) -> V
         "allowFeedback": true,
         "plan": "1. read the gate\n2. split it\n3. land it"
     });
+    card
+}
+
+/// c-homeev: the showcase approval for the home evidence matrix — the same
+/// control-channel shape as [`fake_approval`], with a command a person would
+/// actually see and no fixture path in the verbatim body (home.md §11).
+fn fake_showcase_approval(instance_id: &str, host_id: &str, interaction_id: &str) -> Value {
+    let mut card = fake_approval(instance_id, host_id, interaction_id);
+    card["request"]["title"] = json!("Bash");
+    card["request"]["description"] = json!("cargo test --workspace --locked");
+    card
+}
+
+/// c-homeev: the showcase plan for the home evidence matrix — the same
+/// review-only shape as [`fake_plan_review`], written the way a worker would
+/// describe its next steps.
+fn fake_showcase_plan(instance_id: &str, host_id: &str, interaction_id: &str) -> Value {
+    let mut card = fake_plan_review(instance_id, host_id, interaction_id);
+    card["request"]["title"] = json!("发布拆成两步");
+    card["request"]["plan"] =
+        json!("1. 先在预发环境跑一遍完整测试\n2. 确认没问题后分两次合并\n3. 观察一天再删旧流程");
     card
 }
 

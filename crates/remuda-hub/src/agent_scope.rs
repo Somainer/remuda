@@ -31,6 +31,69 @@ pub fn origin(device: &Device) -> InputOrigin {
     }
 }
 
+/// cb-requested-by: add the owner's own words to every `requestedBy` record in
+/// `docs`, for a Human caller only.
+///
+/// This read is the one place the excerpt is produced, from the Hub's own
+/// command row ([`crate::root_turn::owner_excerpts`]). An Agent — possibly a
+/// lineage that could never read the owner's command — and a Bot, which
+/// relays to a chat platform, get the bare reference. `docs` are serialized
+/// task docs, board cards or interaction views; a record is read at the top
+/// level and inside a nested `interaction`. Best effort: a failed lookup
+/// leaves the reference as it is.
+pub async fn hydrate_owner_words<'a>(
+    state: &AppState,
+    device: &Device,
+    docs: impl IntoIterator<Item = &'a mut Value>,
+) {
+    if origin(device) != InputOrigin::Human {
+        return;
+    }
+    let mut records = Vec::new();
+    for doc in docs {
+        let Some(object) = doc.as_object_mut() else {
+            continue;
+        };
+        for (key, value) in object.iter_mut() {
+            let record = match key.as_str() {
+                "requestedBy" => Some(value),
+                "interaction" => value.get_mut("requestedBy"),
+                _ => None,
+            };
+            if let Some(record) = record.and_then(Value::as_object_mut)
+                && record.get("commandId").and_then(Value::as_str).is_some()
+            {
+                records.push(record);
+            }
+        }
+    }
+    if records.is_empty() {
+        return;
+    }
+    let ids = records
+        .iter()
+        .filter_map(|record| record.get("commandId").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect();
+    let excerpts = match state.store.owner_excerpts(ids).await {
+        Ok(excerpts) => excerpts,
+        Err(error) => {
+            tracing::warn!(%error, "requestedBy: the owner's words are unavailable for this read");
+            return;
+        }
+    };
+    for record in records {
+        let excerpt = record
+            .get("commandId")
+            .and_then(Value::as_str)
+            .and_then(|id| excerpts.get(id))
+            .cloned();
+        if let Some(excerpt) = excerpt {
+            record.insert("excerpt".into(), Value::String(excerpt));
+        }
+    }
+}
+
 /// A caller header can narrow a Human/Bot token; it cannot promote a scoped token.
 pub async fn caller(state: &AppState, headers: &HeaderMap) -> Result<Device, HubError> {
     let device = auth::require_device(&state.store, headers).await?;
@@ -157,11 +220,13 @@ pub fn stamp(payload: &mut Value, device: &Device) {
     }
     // Never accept caller-selected provenance, a credential, or an initiator
     // in JSON. D-057 §7.1: the initiator is Hub-stamped from auth, not the body.
+    // cb-requested-by: likewise never from a body.
     if let Some(object) = payload.as_object_mut() {
         object.remove("agentCredential");
         object.remove("actor");
         object.remove("initiator");
         object.remove("initiatorDeviceId");
+        object.remove("requestedBy");
     }
 }
 
@@ -901,11 +966,13 @@ pub async fn require_approval(
         host_id: instance.host_id.parse().map_err(|_| HubError::Forbidden)?,
     };
     // cb-rootturn: recorded on a new card for display; never part of the
-    // grant's match (the caller and the exact request decide).
+    // grant's match (the caller and the exact request decide). cb-requested-by
+    // rides the same card: the owner's words, or the non-owner origin.
     let root_turn = state.store.root_turn(id).await?;
+    let requested_by = root_turn.as_ref().map(crate::root_turn::requested_by);
     state
         .agent_approvals
-        .require_recorded(headers, &caller, request, root_turn)
+        .require_recorded(headers, &caller, request, root_turn, requested_by)
         .await
 }
 

@@ -1,4 +1,4 @@
-import type { RootTurn } from "./generated";
+import type { RequestedBy, RootTurn } from "./generated";
 import type { NativeRequestKey } from "./nativeRef";
 import type { ActorRef, Digest, EntityMeta, Id, Knowledge, Timestamp, U64 } from "./wire";
 
@@ -102,4 +102,11 @@ export type Interaction = EntityMeta & {
    * approval cards. Display only; absent everywhere else.
    */
   rootTurn?: RootTurn | null;
+  /**
+   * cb-requested-by: who asked for an Agent request, on the Hub's own one-shot
+   * approval cards — the owner's command (with a read-time `excerpt` of the
+   * owner's words, on the owner's own reads only) or the non-owner origin
+   * that started the turn. Display only; the decision never reads it.
+   */
+  requestedBy?: RequestedBy | null;
 };

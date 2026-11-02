@@ -801,6 +801,7 @@ async fn seed_hub_worker(
     let worker = WorkerRoster {
         permission_mode: None,
         permission_mode_requested: None,
+        requested_by: None,
         meta: EntityMeta {
             id: WorkerRosterId::new(),
             revision: U64(1),

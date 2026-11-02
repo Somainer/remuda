@@ -1,6 +1,7 @@
 import { memo, useState } from "react";
 import { Link } from "react-router-dom";
 import { RootTurnTag } from "../../components/RootTurnTag";
+import { RequestedByNote } from "../../components/RequestedByNote";
 import { StateDot } from "../../components/StateDot";
 import type { UiStatus } from "../../types/instance";
 import type { Interaction, InteractionAnswer } from "../../types/interaction";
@@ -246,6 +247,8 @@ export const DecisionCard = memo(function DecisionCard({
       <StatusLine uiState={uiState} dot={statusDotOf(uiState)} />
 
       <h3 className={css.title}>{decisionTitle(item)}</h3>
+
+      <RequestedByNote requestedBy={item.requestedBy} />
 
       {showPreview ? <pre className={css.preview}>{previewText}</pre> : null}
 

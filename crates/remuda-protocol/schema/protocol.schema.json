@@ -17671,6 +17671,30 @@
       ],
       "type": "object"
     },
+    "RequestedBy": {
+      "description": "D-060 companion item (cb-requested-by): who asked for an Agent-created\ndispatch or task, as the Hub recorded it from its own root-turn ledger.\n\nA reference, never the words. An owner-origin root turn records the Hub\ncommand that carried the owner's input; any other origin records only that\norigin — `hub` for a restart notice or a fact, `agent` for a turn the agent\nstarted on its own. The owner's words stay in that command row: the type\nhas no field for them, so a task doc, roster row or approval card can\nnever store them, and a Human read of the approval card source, the board\nor a task detail gains a read-time `excerpt` from the command row\n(protocol.md). It is a record for the audit trail and `/approvals`, never\na gate: no admission, grant, scope or approval rule reads it (owner ruling\nR2).",
+      "properties": {
+        "commandId": {
+          "description": "Hub command id of the owner's input that started the root turn, when\nthat turn's origin is `human`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "origin": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InputOrigin"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The origin that started the turn, recorded only when it was not the\nowner."
+        }
+      },
+      "type": "object"
+    },
     "ResolutionState": {
       "description": "ResolutionState wire values; `protocol.md` §2.5.",
       "oneOf": [
@@ -20180,6 +20204,17 @@
           "$ref": "#/$defs/ProjectId",
           "description": "Owning project; the task ledger slice key."
         },
+        "requestedBy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RequestedBy"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "cb-requested-by: for a task an Agent created, who asked for it — a\nreference only: the owner's command id when the root turn was the\nowner's, else the non-owner origin that started the turn. The owner's\nwords are never stored with it; they are hydrated at read time for a\nHuman reader. Record only, never a gate; absent on human-created tasks\nand on rows written before the field."
+        },
         "revision": {
           "$ref": "#/$defs/U64",
           "description": "`revision`; protocol §1.1."
@@ -22279,6 +22314,17 @@
             }
           ],
           "description": "How many times `worker replace` re-dispatched this worker name."
+        },
+        "requestedBy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RequestedBy"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "cb-requested-by: for a dispatch an Agent made, who asked for it — a\nreference only: the owner's command id when the root turn was the\nowner's, else the non-owner origin that started the turn. The owner's\nwords are never stored with it (they are hydrated at read time for a\nHuman reader of the approval card). Record only, never a gate; absent\non Human/Bot dispatches and on rows written before the field."
         },
         "resumedFrom": {
           "anyOf": [

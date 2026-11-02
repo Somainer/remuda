@@ -94,20 +94,23 @@ impl AgentApprovals {
         caller: &ApprovalCaller,
         request: Value,
     ) -> Result<(), HubError> {
-        self.require_recorded(headers, caller, request, None).await
+        self.require_recorded(headers, caller, request, None, None)
+            .await
     }
 
     /// [`Self::require`], recording the root turn the caller asked in on the
     /// card a new approval opens (cb-rootturn), so `/approvals` can mark an
-    /// agent-initiated request. Display only: the grant is matched on the
-    /// caller and the exact request alone, so the decision is identical with
-    /// or without it, and a replay from a different turn uses the same grant.
+    /// agent-initiated request, and the owner's own words behind it
+    /// (cb-requested-by). Display only: the grant is matched on the caller
+    /// and the exact request alone, so the decision is identical with or
+    /// without them, and a replay from a different turn uses the same grant.
     pub async fn require_recorded(
         &self,
         headers: &HeaderMap,
         caller: &ApprovalCaller,
         request: Value,
         root_turn: Option<remuda_protocol::RootTurn>,
+        requested_by: Option<remuda_protocol::RequestedBy>,
     ) -> Result<(), HubError> {
         self.broker.sweep_expired().await;
         let mut grants = self.grants.lock().await;
@@ -216,6 +219,9 @@ impl AgentApprovals {
         let mut interaction = interaction;
         if let Some(root_turn) = root_turn {
             interaction["rootTurn"] = json!(root_turn);
+        }
+        if let Some(requested_by) = requested_by {
+            interaction["requestedBy"] = json!(requested_by);
         }
         let mut view = interaction.clone();
         view["interactionId"] = json!(id);

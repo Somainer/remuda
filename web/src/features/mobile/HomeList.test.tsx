@@ -28,6 +28,7 @@ import { mockDb } from "../../lib/mock";
 import type { Instance } from "../../types/instance";
 import { known, type Id } from "../../types/wire";
 import { HomeList } from "./HomeList";
+import { LONG_PRESS_MS } from "../home/RowActions";
 import { GLANCE_TARGETS } from "../home/glanceNav";
 import { interaction as queueInteraction } from "../home/queueTestData";
 import { SPACES_PREFS_KEY, spaceKey, spaceStore } from "../spaces/store";
@@ -842,5 +843,41 @@ describe("empty and skeleton states sit in the ledger slot (§2.1)", () => {
     } finally {
       publishHealth({ lastOkAt: Date.now() });
     }
+  });
+});
+
+describe("⑦ row menu long-press", () => {
+  it("opens the menu on a body long-press", async () => {
+    hub.instances = [row("ins-menu", { activity: known("working") })];
+    renderHome();
+    const article = (await screen.findByText("title ins-menu")).closest("article")!;
+    act(() => {
+      article.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, clientX: 10, clientY: 10 }));
+    });
+    await waitFor(() => expect(screen.getByTestId("row-actions-menu")).toBeTruthy());
+    act(() => {
+      window.dispatchEvent(new PointerEvent("pointerup"));
+    });
+  });
+
+  it("does not re-open when the open menu's backdrop is held past the press threshold", async () => {
+    hub.instances = [row("ins-menu", { activity: known("working") })];
+    renderHome();
+    const article = (await screen.findByText("title ins-menu")).closest("article")!;
+    await userEvent.click(article.querySelector("[data-testid='row-actions-more']") as HTMLElement);
+    const scrim = screen.getByTestId("row-actions-panel").parentElement!;
+    // The scrim closes on mousedown; the pointerdown that precedes it lands
+    // inside the row article too (the Sheet is not portaled).
+    act(() => {
+      scrim.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, clientX: 10, clientY: 10 }));
+      scrim.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    });
+    expect(screen.queryByTestId("row-actions-panel")).toBeNull();
+    // A HELD press: no pointerup until after the row's threshold.
+    await act(() => new Promise((resolve) => setTimeout(resolve, LONG_PRESS_MS + 120)));
+    expect(screen.queryByTestId("row-actions-panel")).toBeNull();
+    act(() => {
+      window.dispatchEvent(new PointerEvent("pointerup"));
+    });
   });
 });

@@ -83,15 +83,16 @@ const MAX_SOURCE_REFS: usize = 64;
 const MAX_CONSOLIDATE_SOURCES: usize = 32;
 /// Entries per Phase 1 import.
 const MAX_IMPORT_ENTRIES: usize = 512;
-/// The import route's request body limit: every entry at the 8 KiB cap with
-/// its text escaped to twice that in JSON (newlines, quotes), plus 1 KiB per
-/// entry for its keys, slug, type and origin, plus the envelope. Larger is
-/// 413 before the body is parsed. It is set on this route alone: the
-/// default (2 MB) would refuse a legitimate full import.
+/// The import route's request body limit, sized for the worst case JSON
+/// escaping allows: every entry at the 8 KiB cap with text that escapes to
+/// six bytes a byte (a control character becomes `\u00XX`), plus 1 KiB per
+/// entry for its keys, slug, type and origin, plus 4 KiB for the envelope.
+/// Larger is 413 before the body is parsed. It is set on this route alone:
+/// the default (2 MB) would refuse a legitimate full import.
 pub(crate) const IMPORT_BODY_LIMIT: usize =
-    MAX_IMPORT_ENTRIES * (2 * MEMORY_ENTRY_HARD_BYTES as usize + 1024) + 4096;
+    MAX_IMPORT_ENTRIES * (6 * MEMORY_ENTRY_HARD_BYTES as usize + 1024) + 4096;
 // protocol.md §8.4 and the OpenAPI description state this number.
-const _: () = assert!(IMPORT_BODY_LIMIT == 8_916_992);
+const _: () = assert!(IMPORT_BODY_LIMIT == 25_694_208);
 /// What the import's same-content check trims from a body, on both sides.
 const IMPORT_TRIM: [char; 4] = [' ', '\t', '\n', '\r'];
 /// Search terms considered (whitespace-separated).
@@ -1982,13 +1983,13 @@ impl Store {
                 source_refs: Vec::new(),
             }
             .normalized()?;
-            if entries[..index]
+            if let Some(first) = entries[..index]
                 .iter()
-                .any(|(seen, _): &(MemoryInput, MemoryOrigin)| seen.slug == input.slug)
+                .position(|(seen, _): &(MemoryInput, MemoryOrigin)| seen.slug == input.slug)
             {
+                // By position, never by slug.
                 return Err(MemoryError::BadRequest(format!(
-                    "slug {:?} appears twice in the import",
-                    input.slug
+                    "entries[{first}] and entries[{index}] have the same slug"
                 )));
             }
             entries.push((input, entry.origin));

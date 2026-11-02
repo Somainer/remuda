@@ -1253,7 +1253,7 @@ async fn the_import_is_bounded_per_entry_and_per_request() -> Result<()> {
     assert_eq!(ctx.snapshot(&lineage, &lineage).await?, before);
 
     // A body over the route limit is refused before it is parsed.
-    let limit = 512 * (2 * 8 * 1024 + 1024) + 4096;
+    let limit = 512 * (6 * 8 * 1024 + 1024) + 4096;
     let padding = "z".repeat(limit + 1);
     let response = ctx
         .http
@@ -1275,6 +1275,21 @@ async fn the_import_is_bounded_per_entry_and_per_request() -> Result<()> {
         .collect();
     let request = json!({"entries": entries, "dryRun": true});
     assert!(request.to_string().len() > 3 * 1024 * 1024);
+    let full = ctx.ok("POST", &path, &ctx.human, Some(request)).await?;
+    assert_eq!(full["created"].as_array().map(Vec::len), Some(512));
+
+    // The worst case JSON escaping allows: every entry at the cap with a
+    // body of control characters, each escaped to six bytes (`\u0001`).
+    let entries: Vec<Value> = (0..512)
+        .map(|i| {
+            let slug = format!("ctl-{i}");
+            let fixed = format!("Title {slug}").len() + format!("About {slug}").len() + 4;
+            let body = format!("{i:04}{}", "\u{1}".repeat(8 * 1024 - fixed));
+            import_entry(&slug, "agent", &body)
+        })
+        .collect();
+    let request = json!({"entries": entries, "dryRun": true});
+    assert!(request.to_string().len() > 6 * 512 * 8000);
     let full = ctx.ok("POST", &path, &ctx.human, Some(request)).await?;
     assert_eq!(full["created"].as_array().map(Vec::len), Some(512));
     Ok(())

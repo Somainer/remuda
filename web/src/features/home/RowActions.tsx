@@ -3,10 +3,10 @@ import { useNavigate } from "react-router-dom";
 import { Modal } from "../../components/Modal";
 import { Sheet } from "../../components/Sheet";
 import { clipboardIo } from "../../lib/clipboard";
-import { useWorkbenchViewport } from "../../lib/viewport";
 import { hubStore } from "../../lib/store";
 import type { Instance } from "../../types/instance";
 import { resumeCommand, rowActionKeys, type RowActionKey } from "./rowActions";
+import { useCompactLayout } from "./useMain";
 import css from "./rowActions.module.css";
 
 /** How long a press must hold before it counts as the menu's long-press entry. */
@@ -107,7 +107,10 @@ export function RowActions({
   stale?: boolean;
 }) {
   const navigate = useNavigate();
-  const { mobile } = useWorkbenchViewport();
+  // A read-only compact-layout read: useWorkbenchViewport's cleanup deletes
+  // the shell's --workbench-* vars and keyboard flags, and a per-row caller
+  // unmounting would collapse the /m band under the soft keyboard.
+  const mobile = useCompactLayout();
   const [confirming, setConfirming] = useState(false);
   const [renaming, setRenaming] = useState(false);
   const longPress = useRowLongPress(onOpen);

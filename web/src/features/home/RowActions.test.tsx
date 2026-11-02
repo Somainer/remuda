@@ -179,4 +179,18 @@ describe("RowActions", () => {
     await wait(LONG_PRESS_MS + 100);
     expect(onOpen).not.toHaveBeenCalled();
   });
+
+  it("leaves the shell's keyboard band alone when a row unmounts", () => {
+    document.documentElement.style.setProperty("--workbench-height", "500px");
+    document.documentElement.dataset.keyboard = "1";
+    try {
+      const { unmount } = render(<Harness instance={inst()} />);
+      unmount();
+      expect(document.documentElement.style.getPropertyValue("--workbench-height")).toBe("500px");
+      expect(document.documentElement.dataset.keyboard).toBe("1");
+    } finally {
+      document.documentElement.style.removeProperty("--workbench-height");
+      delete document.documentElement.dataset.keyboard;
+    }
+  });
 });

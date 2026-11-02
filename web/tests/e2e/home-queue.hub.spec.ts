@@ -239,6 +239,22 @@ async function phoneContext(browser: Browser, baseURL: string, name: string): Pr
   return context;
 }
 
+/** How many line boxes one element's text paints (a clamp shows fewer). */
+async function renderedLines(locator: Locator): Promise<number> {
+  return locator.evaluate((el) => {
+    const tops = new Set<number>();
+    for (const node of Array.from(el.childNodes)) {
+      if (node.nodeType !== Node.TEXT_NODE) continue;
+      const range = document.createRange();
+      range.selectNodeContents(node);
+      for (const rect of range.getClientRects()) {
+        if (rect.width > 0.5 && rect.height > 0.5) tops.add(Math.round(rect.top));
+      }
+    }
+    return tops.size;
+  });
+}
+
 /** The card's top and bottom are both inside the viewport. */
 async function inViewport(locator: Locator): Promise<boolean> {
   return locator.evaluate((el) => {
@@ -289,6 +305,10 @@ test.describe("home queue", () => {
       await expect(planCard).toHaveAttribute("data-home-kind", "plan");
       await expect(planCard.getByRole("button")).toHaveCount(0);
       await expect(planCard.getByTestId("home-card-review")).toHaveText("审阅计划");
+      // §4.2 标题、正文前 2 行: the title is its own line and the body paints
+      // BOTH plan lines in full (not a title+1-line clamp).
+      await expect(planCard.getByTestId("home-card-plan-title")).toHaveText("Plan: split the gate");
+      expect(await renderedLines(planCard.getByTestId("home-card-body"))).toBe(2);
 
       const otherCard = card(page, other.interactionId);
       await expect(otherCard).toHaveAttribute("data-home-kind", "question");

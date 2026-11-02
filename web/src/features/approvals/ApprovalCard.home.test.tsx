@@ -91,10 +91,13 @@ describe('DecisionCard mode="home" (§4.2, §4.3)', () => {
     expect(screen.queryAllByRole("button")).toHaveLength(0);
     expect(screen.queryByText("批准")).toBeNull();
     expect(screen.getByTestId("home-card-review")).toHaveTextContent("审阅计划");
-    // Title plus the first two plan lines.
-    expect(screen.getByTestId("home-card-body").textContent).toBe(
-      "Plan: split the gate\n1. read the gate\n2. split it",
-    );
+    // §4.2 标题、正文前 2 行: the title is its own line (outside the body's
+    // 2-line budget), and the body carries exactly the first two plan lines —
+    // each rendered in full, never clipped into a title+1 budget.
+    expect(screen.getByTestId("home-card-plan-title").textContent).toBe("Plan: split the gate");
+    const body = screen.getByTestId("home-card-body");
+    expect(body.textContent).toBe("1. read the gate\n2. split it");
+    expect(body.textContent!.split("\n")).toHaveLength(2);
   });
 
   it("shows a terminal prompt's last 3 screen lines and 去终端", () => {

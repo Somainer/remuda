@@ -145,6 +145,20 @@
   line-clamp: 3;
 }
 
+/* 计划 (§4.2 标题、正文前 2 行): the title is its own single line, so the
+   plan body below it keeps the full 2-line budget (clamp on .body). */
+.planTitle {
+  margin: 0;
+  min-width: 0;
+  color: var(--fg-strong);
+  font-size: var(--text-ui);
+  font-weight: 600;
+  line-height: var(--lh-ui);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* 回合失败: the error text verbatim, one truncated line (§4.2). */
 .bodyLine {
   composes: bodyMono;

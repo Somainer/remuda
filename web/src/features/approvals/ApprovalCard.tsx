@@ -449,11 +449,18 @@ function homeBody(item: Interaction, kind: HomeCardKind, screenLines: readonly s
     if (fields.length === 1) return fields[0].title || fields[0].description || item.request.title;
     return `问你 ${fields.length} 题 · ${item.request.title}`;
   }
-  if (item.request.kind === "plan-review") {
-    const plan = typeof item.request.plan === "string" ? lastLinesHead(item.request.plan, 2) : "";
-    return plan ? `${item.request.title}\n${plan}` : item.request.title;
-  }
+  if (item.request.kind === "plan-review") return planPreview(item);
   return decisionPreview(item);
+}
+
+/**
+ * §4.2 计划：「标题、正文前 2 行」. The title is its own line (never clamped
+ * into the body's budget); the body carries exactly the first two non-blank
+ * plan lines, both shown in full.
+ */
+function planPreview(item: Interaction): string {
+  if (item.request.kind !== "plan-review") return "";
+  return typeof item.request.plan === "string" ? lastLinesHead(item.request.plan, 2) : "";
 }
 
 /** The first `count` non-blank lines of a text. */
@@ -594,9 +601,25 @@ function HomeDecision({
           </span>
         ) : null}
       </header>
-      <p className={kind === "tty" || kind === "approval" ? homeCss.bodyMono : homeCss.body} data-testid="home-card-body">
-        {homeBody(item, kind, home.screenLines ?? [])}
-      </p>
+      {kind === "plan" && item.request.kind === "plan-review" ? (
+        <>
+          <p className={homeCss.planTitle} data-testid="home-card-plan-title" title={item.request.title}>
+            {item.request.title}
+          </p>
+          {planPreview(item) ? (
+            <p className={homeCss.body} data-testid="home-card-body">
+              {planPreview(item)}
+            </p>
+          ) : null}
+        </>
+      ) : (
+        <p
+          className={kind === "tty" || kind === "approval" ? homeCss.bodyMono : homeCss.body}
+          data-testid="home-card-body"
+        >
+          {homeBody(item, kind, home.screenLines ?? [])}
+        </p>
+      )}
       {home.receipt ? (
         <p className={homeCss.receipt} role="status" data-testid="home-card-receipt" data-receipt={home.receipt}>
           {HOME_RECEIPT_TEXT[home.receipt]}

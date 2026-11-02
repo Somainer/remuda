@@ -613,6 +613,9 @@ mod scan {
     #[derive(Debug, Default)]
     pub struct FileScan {
         pub reads: Vec<(usize, String, Option<String>)>,
+        /// Lines of `use …memory::*` (directly or inside a `{…}` group):
+        /// a glob import makes a bare `load_entry(…)` call invisible.
+        pub globs: Vec<usize>,
         pub sql: Vec<(usize, String)>,
         pub test_mods: Vec<String>,
     }
@@ -636,6 +639,36 @@ mod scan {
             && p(open + 4, ')')
             && p(open + 5, ']'))
         .then_some((open + 6, inner))
+    }
+
+    /// Whether `::*` or `::{…, *, …}` follows (the `memory` of a `use`).
+    fn glob_after(toks: &[(Tok, usize)], at: usize) -> bool {
+        let punct =
+            |k: usize, ch: char| matches!(toks.get(k), Some((Tok::Punct(c), _)) if *c == ch);
+        if !(punct(at, ':') && punct(at + 1, ':')) {
+            return false;
+        }
+        if punct(at + 2, '*') {
+            return true;
+        }
+        if !punct(at + 2, '{') {
+            return false;
+        }
+        let mut depth = 0usize;
+        for (tok, _) in &toks[at + 2..] {
+            match tok {
+                Tok::Punct('{') => depth += 1,
+                Tok::Punct('}') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return false;
+                    }
+                }
+                Tok::Punct('*') if depth == 1 => return true,
+                _ => {}
+            }
+        }
+        false
     }
 
     fn is_attribute(toks: &[(Tok, usize)], at: usize) -> bool {
@@ -774,6 +807,9 @@ mod scan {
                     }
                     depth = depth.saturating_sub(1);
                 }
+                Tok::Ident(w) if in_use && w == "memory" && glob_after(toks, i + 1) => {
+                    found.globs.push(toks[i].1);
+                }
                 Tok::Ident(w) if READS.contains(&w.as_str()) => {
                     let path = matches!(prev, Some(Tok::Punct(':')));
                     let method = matches!(prev, Some(Tok::Punct('.')))
@@ -878,6 +914,13 @@ mod scan {
                 continue;
             }
             if in_hub.is_some() {
+                for line in &scan.globs {
+                    out.push(Offender {
+                        file: relative.clone(),
+                        line: *line,
+                        what: "glob import of the memory module".into(),
+                    });
+                }
                 for (line, read, enclosing) in &scan.reads {
                     let allowed = ALLOWED.iter().any(|(file, func, name)| {
                         *file == relative && Some(*func) == enclosing.as_deref() && name == read
@@ -992,6 +1035,11 @@ fn the_structure_scan_catches_out_of_place_reads_however_written() {
         "fn f() { conn.prepare(concat!(\"SELECT body FROM \", \"memory_entries\")); }",
         "fn f() { conn.prepare(\"SELECT rowid FROM t JOIN main.memory_fts f ON 1\"); }",
         "fn f() { conn.prepare(\"SELECT * FROM \\\n      memory_write_log\"); }",
+        // A glob import of the memory module, then a bare call.
+        "use crate::memory::*;\nfn f() { load_entry(conn, l, s); }",
+        "use super::memory::*;\nfn f() { render_index(c, l, false); }",
+        "use crate::{memory::*, store::Store};\nfn f() {}",
+        "use crate::memory :: { * };\nfn f() {}",
         // Test-only code next to production code does not hide the latter.
         "fn f() { match x {\n    #[cfg(test)]\n    A => 1,\n    B => s.memory_get(a, b),\n} }",
         "struct S {\n    #[cfg(test)]\n    a: u8,\n}\nfn f() { s.memory_get(a, b); }",
@@ -1026,6 +1074,8 @@ fn the_structure_scan_catches_out_of_place_reads_however_written() {
         "fn f() { // s.store.memory_get(a, b)\n /* .memory_list( */ }",
         "fn f(row: &Row) { let v = chapter.memory_index; let w = Row { memory_index: x }; }",
         "pub memory_index: Option<String>,",
+        "use crate::memory::{self, ChapterMemory};\nuse crate::store::*;\nuse super::*;",
+        "fn f() { let product = a * b; let m = memory::ChapterMemory::NotApplicable; }",
         "fn f() { conn.execute(\"UPDATE lineages SET memory_rev = memory_rev + 1\", p); }",
         "fn f() { conn.execute(\"DROP TABLE memory_entries\", p); }",
         "#[cfg(test)]\nmod tests { fn t() { s.store.memory_get(a, b); } }",

@@ -1,0 +1,8 @@
+.page {
+  padding: 0;
+}
+
+.row {
+  composes: baseRow from "./base.module.css";
+  margin: 0;
+}

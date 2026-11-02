@@ -550,3 +550,91 @@ async fn resume_redelivers_current_gateway_profile_and_host_scoped_secret() -> R
     }
     Ok(())
 }
+
+/// resume-config: a D-026 resumed child runs the native process in the
+/// parent's Claude home and under its settings overlay. Without the home the
+/// child's `--resume <sessionId>` looks in a directory the parent's transcript
+/// was never written to; the resume body may not redirect either.
+#[tokio::test]
+async fn resume_carries_the_parents_claude_config_dir_and_settings_overlay() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let hub = spawn(HubConfig::for_test(dir.path().join("hub"))).await?;
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", hub.addr);
+    let human = hub.mint_device_token("resume-config-phone").await?;
+    let host = HostId::new().as_id().as_str().to_owned();
+    let mut node = FakeNode::connect(&hub, &host).await?;
+    let claude_home = "/srv/remuda/seats/claude-home";
+    let overlay = "/srv/remuda/seats/settings-overlay.json";
+
+    let created: Value = client
+        .post(format!("{base}/v1/instances"))
+        .bearer_auth(&human)
+        .json(&json!({
+            "hostId": host,
+            "kind": "claude",
+            "driver": "claude-print",
+            "prompt": "hi",
+            "claudeConfigDir": claude_home,
+            "settingsOverlayPath": overlay,
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let parent = created["instance"]["instanceId"]
+        .as_str()
+        .context("parent id")?
+        .to_owned();
+    let (method, create_params) = node.launch().await?;
+    assert_eq!(method, "instance.create");
+    assert_eq!(create_params["spec"]["claudeConfigDir"], json!(claude_home));
+    assert_eq!(create_params["spec"]["settingsOverlayPath"], json!(overlay));
+    let session = "01993ab0-0000-7000-8000-0000000000ee";
+    finish_session(&node, &client, &base, &human, &parent, session).await?;
+
+    // A resume body naming different paths is ignored: the recorded pair is
+    // the only source, never the request.
+    let resumed: Value = client
+        .post(format!("{base}/v1/instances/{parent}/resume"))
+        .bearer_auth(&human)
+        .json(&json!({
+            "mode": "structured",
+            "claudeConfigDir": "/srv/remuda/elsewhere/claude-home",
+            "settingsOverlayPath": "/srv/remuda/elsewhere/overlay.json",
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(resumed["replayed"], json!(false));
+    let child = resumed["instance"]["instanceId"]
+        .as_str()
+        .context("child id")?;
+    let (method, resume_params) = node.launch().await?;
+    assert_eq!(method, "instance.resume");
+    assert_eq!(resume_params["instanceId"], json!(child));
+    assert_eq!(resume_params["spec"]["resumeSessionId"], json!(session));
+    assert_eq!(resume_params["spec"]["claudeConfigDir"], json!(claude_home));
+    assert_eq!(resume_params["spec"]["settingsOverlayPath"], json!(overlay));
+    assert!(
+        !resume_params.to_string().contains("elsewhere"),
+        "the resume body must not override the recorded home: {resume_params}"
+    );
+
+    // The child records the same pair, so a resume of the child carries them
+    // again.
+    let child_view: Value = client
+        .get(format!("{base}/v1/instances/{child}"))
+        .bearer_auth(&human)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(child_view["claudeConfigDir"], json!(claude_home));
+    assert_eq!(child_view["settingsOverlayPath"], json!(overlay));
+    Ok(())
+}

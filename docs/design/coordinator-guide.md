@@ -67,7 +67,9 @@ remuda merge wt/<agent>/<topic> --gate --json      # verify and land
 Read the branch diff first regardless (`git log --oneline
 main..wt/<agent>/<topic>`, `git diff --stat main...wt/<agent>/<topic>`): a
 diff that has grown beyond the files the task named is the most common
-reason to reject, and no gate catches it. Command surface, exit codes, and
+reason to reject, and no gate catches it. How to judge what you read there —
+severity, what a finding must contain, what the gate already checks — is in
+[`review-rubric.md`](./review-rubric.md). Command surface, exit codes, and
 report fields are in [`skills/remuda/SKILL.md`](../../skills/remuda/SKILL.md)
 and [`dogfood.md`](./dogfood.md).
 

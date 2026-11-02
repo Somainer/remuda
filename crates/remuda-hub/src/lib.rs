@@ -78,6 +78,8 @@ mod rate_limit;
 mod registry;
 mod restart;
 mod root_turn;
+/// The shared secret lint (memory writes, brief lint; main-agent.md §12.5).
+pub mod secret_lint;
 mod seen;
 pub mod ssh_hosts;
 mod store;

@@ -24,6 +24,12 @@
 //!   token, so a two-character query such as 边界 only hits by substring.
 //! - **Sizes.** Soft warnings (entry 2 KB, index 4 KB) report the actual
 //!   numbers; above 8 KB an entry is refused.
+//! - **Secret lint** (main-agent.md §12.5). Every write that stores text —
+//!   create, update, consolidate target and the Phase 1 import — runs the
+//!   shared credential shapes ([`crate::secret_lint`]) over the slug, title,
+//!   description and body before the writer job. A hit is a 422
+//!   `MEMORY_SECRET_REJECTED` naming the field and rule, never the text, and
+//!   nothing is stored. It is a lint on secrets only (D-060 R2).
 //!
 //! The FTS table is external-content over `memory_entries` and kept in sync by
 //! triggers, so every write path (including the retire archive) updates it in
@@ -504,6 +510,13 @@ pub(crate) enum MemoryError {
         slug: String,
         bytes: u64,
     },
+    /// The secret lint flagged a field. Carries the rule name (the shape's
+    /// literal needle), never the matched text.
+    SecretRejected {
+        slug: String,
+        field: &'static str,
+        rule: &'static str,
+    },
     Hub(HubError),
 }
 
@@ -614,6 +627,33 @@ impl IntoResponse for MemoryError {
                     "maxBytes": MEMORY_ENTRY_HARD_BYTES,
                 }),
             ),
+            Self::SecretRejected { slug, field, rule } => {
+                // A secret in the slug must not come back as the slug.
+                let named = if field == "slug" {
+                    "this memory entry".to_string()
+                } else {
+                    format!("memory entry {slug:?}")
+                };
+                let mut body = json!({
+                    "error": format!(
+                        "{named} was not stored: its {field} looks like a credential \
+                         (shape {rule:?}); the text is not echoed"
+                    ),
+                    "code": "MEMORY_SECRET_REJECTED",
+                    "field": field,
+                    "rule": rule,
+                    "next": NextStep::new(
+                        action::FIX_REQUEST,
+                        "remove the credential from the entry and write it again; record \
+                         where the secret is kept, never the secret itself",
+                    )
+                    .json(),
+                });
+                if field != "slug" {
+                    body["slug"] = json!(slug);
+                }
+                (StatusCode::UNPROCESSABLE_ENTITY, body)
+            }
         };
         (status, Json(body)).into_response()
     }
@@ -714,6 +754,22 @@ fn check_source_refs(refs: &[MemorySourceRef]) -> Result<(), MemoryError> {
     Ok(())
 }
 
+/// The secret lint over the fields a write stores (§12.5). The slug is
+/// checked first so a refusal never names a slug that carries a secret.
+fn check_secrets(slug: &str, fields: &[(&'static str, Option<&str>)]) -> Result<(), MemoryError> {
+    let named = std::iter::once(("slug", Some(slug))).chain(fields.iter().copied());
+    for (field, text) in named {
+        if let Some(rule) = text.and_then(crate::secret_lint::first_secret) {
+            return Err(MemoryError::SecretRejected {
+                slug: slug.to_string(),
+                field,
+                rule,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn check_size(slug: &str, title: &str, description: &str, body: &str) -> Result<(), MemoryError> {
     let bytes = memory_entry_bytes(title, description, body);
     if bytes > MEMORY_ENTRY_HARD_BYTES {
@@ -731,6 +787,14 @@ impl MemoryInput {
         self.title = one_line("title", &self.title)?;
         self.description = one_line("description", &self.description)?;
         check_source_refs(&self.source_refs)?;
+        check_secrets(
+            &self.slug,
+            &[
+                ("title", Some(&self.title)),
+                ("description", Some(&self.description)),
+                ("body", Some(&self.body)),
+            ],
+        )?;
         check_size(&self.slug, &self.title, &self.description, &self.body)?;
         self.source_refs = merge_refs(&[], &self.source_refs);
         Ok(self)
@@ -738,7 +802,7 @@ impl MemoryInput {
 }
 
 impl MemoryPatch {
-    fn normalized(mut self) -> Result<Self, MemoryError> {
+    fn normalized(mut self, slug: &str) -> Result<Self, MemoryError> {
         if let Some(title) = &self.title {
             self.title = Some(one_line("title", title)?);
         }
@@ -746,6 +810,15 @@ impl MemoryPatch {
             self.description = Some(one_line("description", description)?);
         }
         check_source_refs(&self.source_refs)?;
+        // The fields this update writes; a kept field is not new text.
+        check_secrets(
+            slug,
+            &[
+                ("title", self.title.as_deref()),
+                ("description", self.description.as_deref()),
+                ("body", self.body.as_deref()),
+            ],
+        )?;
         Ok(self)
     }
 }
@@ -1681,7 +1754,7 @@ impl Store {
         expected_revision: u64,
     ) -> Result<MemoryWriteResult, MemoryError> {
         check_slug(&slug)?;
-        let patch = patch.normalized()?;
+        let patch = patch.normalized(&slug)?;
         write(self, "memory_update", move |conn| {
             update_tx(conn, &lineage_id, &slug, &writer, patch, expected_revision)
         })

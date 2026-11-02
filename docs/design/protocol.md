@@ -2048,7 +2048,7 @@ turnRef     = {instanceId, seq} | null             turn of the latest write
 
 - 写入按条目做 revision CAS。`expectedRevision` 不符：409，`code: "MEMORY_REVISION_CONFLICT"`，`reason: "revision-mismatch"`，并带 `currentRevision`；绝不覆盖。
 - 正文超过 8 KiB：422，`code: "MEMORY_ENTRY_TOO_LARGE"`。正文超过 2 KiB 或索引超过 4 KiB 时写入成功，`warnings` 给出实际字节数。
-- 秘密 lint 命中：422，`code: "MEMORY_SECRET_REJECTED"`，错误体不回显命中的文本。
+- 秘密 lint 命中：422，`code: "MEMORY_SECRET_REJECTED"`，错误体不回显命中的文本，只给出 `field`（`slug`、`title`、`description` 或 `body`）与 `rule`（命中形状的名字），什么也不存。slug 本身命中时错误体也不带 `slug`。lint 覆盖创建、更新、consolidate 的目标与 Phase 1 导入，只查凭据形状（`cb-memory-guard`；形状与 `scripts/ci/secret-scan.py`、`remuda brief lint` 共用 `scripts/ci/secret-shapes.json`），不做内容策略检查（D-060 R2）。
 - Agent 写入只接受血缘当前章节：否则 409，`reason: "not-current-chapter"`；F 落地后改为既有的 `reason: "fenced"`（§9.1）。Agent 写 `about-me`：403，`reason: "owner-authored"`。已归档的血缘拒绝写入：409，`reason: "archived"`。
 - `origin`、`writerInstanceId` 与 `turnRef` 由 Hub 盖章，请求体里的同名字段被剥掉。Agent 写入的 `origin` 取自写入所在根回合的 `rootTurn.origin`（只有所有者的输入开启的回合才是 `human`，Hub 不知道回合时为 `agent`），条目另带 `rootTurn`，写入章节仍记在 `writerInstanceId`（cb-rootturn）。
 - **写入日志。** 每次成功写入在同一事务里追加一行 `memory_write_log`（`lineage_id, slug, revision, title, op, origin, writer_instance, turn_seq, written_at`）；consolidate 每个输入一行，另加目标一行。行不随条目改写或删除而消失，所以每个写过记忆的回合都能显示自己的行。`turnSeq` 是写者章节在写入时最近一条 `turn_started` 的 journal seq，由 Hub 记下，从不取自请求体；所有者的写入和章节首个回合之前的写入为 NULL。`turnRef` 取自最近一次写入。

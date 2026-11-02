@@ -1,33 +1,26 @@
 #!/usr/bin/env python3
 """Scan git worktree / index / given paths for undeclared secrets.
 
-Patterns (task impl-acceptance-m0): agk_, sk-, Bearer[space],
-ANTHROPIC_AUTH_TOKEN=, api_key. First-4-character redactions and obvious
+Patterns: scripts/ci/secret-shapes.json (agk_, sk-, Bearer[space],
+ANTHROPIC_AUTH_TOKEN=, api_key, ...), shared with the Hub memory lint and
+`remuda brief lint`. First-4-character redactions and obvious
 placeholders/dummies are allowed.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import subprocess
 import sys
 from pathlib import Path
 
-# Concatenate so this file does not itself contain the search needles.
-P_AGK = "agk" + "_"
-P_SK = "sk" + "-"
-P_BEARER = "Bearer" + " "
-P_TOKEN = "ANTHROPIC_AUTH_TOKEN" + "="
-P_API = "api" + "_" + "key"
-P_BOOT = "REMUDA_BOOTSTRAP_TOKEN" + "="
-P_OPENAI = "OPENAI_API_KEY" + "="
-P_XAI = "xai" + "-"
-P_GHP = "ghp" + "_"
-P_GPAT = "github" + "_pat_"
-P_APPSEC = "app" + "_secret"
-P_PEM = "BEGIN" + " " + "PRIVATE" + " " + "KEY"
+# The candidate shapes live in secret-shapes.json, shared with the Hub's
+# memory write lint and `remuda brief lint` (remuda-hub secret_lint).
+SHAPES_NAME = "secret-shapes.json"
+SHAPES = json.loads((Path(__file__).resolve().parent / SHAPES_NAME).read_text(encoding="utf-8"))
 
 SKIP_DIR_NAMES = {
     ".git",
@@ -96,67 +89,15 @@ IDENT_RE = re.compile(r"(?i)\b[a-z][a-z0-9_-]{4,39}\b")
 HASHES_NAME = "private-tokens.sha256"
 LOCAL_NAME = "private-tokens.local"
 MAX_BYTES = 2_000_000
-MASK = set("*xX•.…][)(") | {"…"}
-DUMMY_PART = re.compile(
-    r"(?i)(^|[-_/])(secret|example|placeholder|dummy|redacted|fake|sample|yourkey|xxx+|should-not|bootstrap|leak)([-_]|$)"
-)
-PLACEHOLDER = re.compile(
-    r"^(<[^>]+>|\$\{[^}]+\}|\$[A-Za-z_][A-Za-z0-9_]*|\{[^}]+\})"
-)
+MASK = set(SHAPES["mask"])
+DUMMY_PART = re.compile(SHAPES["dummyPart"])
+PLACEHOLDER = re.compile(SHAPES["placeholder"])
 
+# (name, compiled pattern, minimum payload length). Group 1, when the pattern
+# has one, is the payload; otherwise the whole match.
 RULES = [
-    (
-        "agk_",
-        re.compile(r"(?<![A-Za-z0-9_])" + re.escape(P_AGK) + r"[A-Za-z0-9_\-]{8,}"),
-    ),
-    (
-        "sk-",
-        re.compile(r"(?<![A-Za-z0-9_])" + re.escape(P_SK) + r"[A-Za-z0-9_\-]{8,}"),
-    ),
-    (
-        "Bearer ",
-        re.compile(r"(?<![A-Za-z])" + re.escape(P_BEARER) + r"([A-Za-z0-9._\-+=/]{8,})"),
-    ),
-    (
-        "ANTHROPIC_AUTH_TOKEN=",
-        re.compile(re.escape(P_TOKEN) + r"['\"]?([A-Za-z0-9_\-]{8,})"),
-    ),
-    (
-        "api_key",
-        re.compile(
-            r"\b" + re.escape(P_API) + r"\b\s*[=:]\s*['\"]?([A-Za-z0-9_\-]{8,})"
-        ),
-    ),
-    (
-        "REMUDA_BOOTSTRAP_TOKEN=",
-        re.compile(re.escape(P_BOOT) + r"['\"]?([A-Za-z0-9_\-]{8,})"),
-    ),
-    (
-        "OPENAI_API_KEY=",
-        re.compile(re.escape(P_OPENAI) + r"['\"]?([A-Za-z0-9_\-]{8,})"),
-    ),
-    (
-        "xai-",
-        re.compile(r"(?<![A-Za-z0-9_])" + re.escape(P_XAI) + r"[A-Za-z0-9_\-]{8,}"),
-    ),
-    (
-        "ghp_",
-        re.compile(r"(?<![A-Za-z0-9_])" + re.escape(P_GHP) + r"[A-Za-z0-9]{8,}"),
-    ),
-    (
-        "github_pat_",
-        re.compile(r"(?<![A-Za-z0-9_])" + re.escape(P_GPAT) + r"[A-Za-z0-9_]{8,}"),
-    ),
-    (
-        "app_secret",
-        re.compile(
-            r"\b" + re.escape(P_APPSEC) + r"\b\s*[=:]\s*['\"]?([A-Za-z0-9_\-]{8,})"
-        ),
-    ),
-    (
-        "BEGIN PRIVATE KEY",
-        re.compile(r"-----" + re.escape(P_PEM) + r"-----"),
-    ),
+    (rule["name"], re.compile(rule["pattern"]), int(rule["minPayload"]))
+    for rule in SHAPES["rules"]
 ]
 
 
@@ -179,56 +120,27 @@ def is_redacted(match: str, payload: str) -> bool:
     return False
 
 
-def payload_for(name: str, m: re.Match[str]) -> str:
-    if name in {
-        "Bearer ",
-        "ANTHROPIC_AUTH_TOKEN=",
-        "api_key",
-        "REMUDA_BOOTSTRAP_TOKEN=",
-        "OPENAI_API_KEY=",
-        "app_secret",
-    } and m.lastindex:
-        return m.group(1)
-    text = m.group(0)
-    if name == "agk_":
-        return text[len(P_AGK) :]
-    if name == "sk-":
-        return text[len(P_SK) :]
-    if name == "xai-":
-        return text[len(P_XAI) :]
-    if name == "ghp_":
-        return text[len(P_GHP) :]
-    if name == "github_pat_":
-        return text[len(P_GPAT) :]
-    return text
+def payload_for(m: re.Match[str]) -> str:
+    return m.group(1) if m.lastindex else m.group(0)
 
 
-def looks_like_secret(name: str, m: re.Match[str]) -> bool:
-    raw = m.group(0)
-    payload = payload_for(name, m)
-    if is_redacted(raw, payload):
+def looks_like_secret(min_payload: int, m: re.Match[str]) -> bool:
+    payload = payload_for(m)
+    if is_redacted(m.group(0), payload):
         return False
-    if name == "api_key":
-        body = payload.strip().strip("\"'")
-        if len(body) < 8:
-            return False
-    body = payload.strip().strip("\"'")
     # Short literals are placeholders (docs/fixtures), not live tokens.
-    if name in {
-        "sk-",
-        "agk_",
-        "xai-",
-        "ghp_",
-        "github_pat_",
-        "Bearer ",
-        "ANTHROPIC_AUTH_TOKEN=",
-        "REMUDA_BOOTSTRAP_TOKEN=",
-        "OPENAI_API_KEY=",
-        "api_key",
-        "app_secret",
-    } and len(body) < 16:
-        return False
-    return True
+    body = payload.strip().strip("\"'")
+    return len(body) >= min_payload
+
+
+def secret_hits(line: str) -> list[tuple[str, str]]:
+    """(rule name, full match) for every secret candidate on one line."""
+    hits: list[tuple[str, str]] = []
+    for name, rx, min_payload in RULES:
+        for m in rx.finditer(line):
+            if looks_like_secret(min_payload, m):
+                hits.append((name, m.group(0)))
+    return hits
 
 
 def preview(match: str) -> str:
@@ -406,12 +318,8 @@ def should_skip_private(path: Path) -> bool:
 
 def scan_text(label: str, text: str, findings: list[str]) -> None:
     for lineno, line in enumerate(text.splitlines(), 1):
-        for name, rx in RULES:
-            for m in rx.finditer(line):
-                if looks_like_secret(name, m):
-                    findings.append(
-                        f"{label}:{lineno}: {name} {preview(m.group(0))}"
-                    )
+        for name, match in secret_hits(line):
+            findings.append(f"{label}:{lineno}: {name} {preview(match)}")
 
 
 def scan_file(path: Path, findings: list[str], denylist: set[str]) -> None:

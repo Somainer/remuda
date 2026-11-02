@@ -313,6 +313,12 @@ pub mod inbox_test_support {
     pub fn arm_fold_failure(instance_id: &str) {
         crate::inbox::test_seams::arm_fold_failure(instance_id);
     }
+
+    /// Make the next inbox fold for `instance_id` fail right after it has
+    /// recorded its first fact.
+    pub fn arm_fold_failure_after_record(instance_id: &str) {
+        crate::inbox::test_seams::arm_fold_failure_after_record(instance_id);
+    }
 }
 
 /// Test-only constructors for types private modules would otherwise hide

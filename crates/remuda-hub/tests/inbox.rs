@@ -1117,6 +1117,62 @@ async fn each_subscriber_has_its_own_occurrence_cap() -> Result<()> {
     Ok(())
 }
 
+/// r3 item 2: the fold fails AFTER it has written its first fact. The
+/// savepoint must undo that partial write — no `inbox_facts` row and no
+/// `inbox_occurrences` row for the event — while the journal row and the
+/// projections it drove still commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hook_failing_after_a_recorded_fact_leaves_no_partial_write() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("inbox-hook-partial").await?;
+    let (seat, seat_token) = ctx.coordinator(&project).await?;
+    let worker = ctx.worker(&seat_token, &project).await?;
+
+    remuda_hub::inbox_test_support::arm_fold_failure_after_record(&worker);
+    // `running` records a started fact first; the seam fails right after it.
+    assert!(!ctx.journal(&worker, entity("running", &at(0))).await?);
+
+    let db = ctx.db()?;
+    let journaled: i64 = db.query_row(
+        "SELECT COUNT(*) FROM journal
+          WHERE instance_id = ?1 AND json_extract(payload_json, '$.payload.state') = 'running'",
+        rusqlite::params![worker],
+        |row| row.get(0),
+    )?;
+    assert_eq!(journaled, 1, "the journal row committed");
+    let lifecycle: String = db.query_row(
+        "SELECT lifecycle FROM instances WHERE id = ?1",
+        rusqlite::params![worker],
+        |row| row.get(0),
+    )?;
+    assert_eq!(lifecycle, "running", "the append's projections committed");
+    let facts: i64 = db.query_row(
+        "SELECT COUNT(*) FROM inbox_facts WHERE subject_instance_id = ?1",
+        rusqlite::params![worker],
+        |row| row.get(0),
+    )?;
+    let occurrences: i64 = db.query_row(
+        "SELECT COUNT(*) FROM inbox_occurrences WHERE subject = ?1",
+        rusqlite::params![worker],
+        |row| row.get(0),
+    )?;
+    assert_eq!(
+        (facts, occurrences),
+        (0, 0),
+        "the started fact and its occurrence were rolled back"
+    );
+    drop(db);
+
+    // The writer is usable and the next fact is recorded normally.
+    ctx.journal(&worker, question("int_after_partial", &at(1)))
+        .await?;
+    let items = ctx.inbox(&ctx.human, &seat).await?;
+    assert_eq!(items.len(), 1, "{items:#?}");
+    assert_eq!(items[0]["kind"], "interaction");
+    assert_eq!(items[0]["payload"]["occurrence"]["count"], 1);
+    Ok(())
+}
+
 // ─── stalls and wall budgets (§10.1 item 8) ─────────────────────────────────
 
 fn tool_call(id: &str) -> Value {

@@ -172,9 +172,27 @@ pub(crate) mod test_seams {
 
     /// Whether this fold for `instance_id` is the armed one (consumes it).
     pub(crate) fn take_fold_failure(instance_id: &str) -> bool {
-        let mut slot = FOLD_FAILURE
+        take(&FOLD_FAILURE, instance_id)
+    }
+
+    static FAILURE_AFTER_RECORD: Mutex<Option<String>> = Mutex::new(None);
+
+    /// Make the next inbox fold for `instance_id` fail right after it has
+    /// recorded its first fact (r3): the rollback must undo that write.
+    pub fn arm_fold_failure_after_record(instance_id: &str) {
+        *FAILURE_AFTER_RECORD
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(instance_id.to_owned());
+    }
+
+    /// Whether this record in a fold for `instance_id` is the armed one
+    /// (consumes it).
+    pub(crate) fn take_failure_after_record(instance_id: &str) -> bool {
+        take(&FAILURE_AFTER_RECORD, instance_id)
+    }
+
+    fn take(slot: &Mutex<Option<String>>, instance_id: &str) -> bool {
+        let mut slot = slot.lock().unwrap_or_else(|poison| poison.into_inner());
         if slot.as_deref() == Some(instance_id) {
             *slot = None;
             true
@@ -1071,6 +1089,16 @@ fn knowledge_text(value: Option<&Value>) -> Option<&str> {
         .or_else(|| value.get("value").and_then(Value::as_str))
 }
 
+/// [`record_about`] for the journal fold, with the after-record fault seam.
+fn fold_record(conn: &Connection, instance_id: &str, fact: Fact) -> Result<Outcome, StoreError> {
+    let outcome = record_about(conn, instance_id, fact)?;
+    #[cfg(any(test, feature = "test-faults"))]
+    if test_seams::take_failure_after_record(instance_id) {
+        return Err(StoreError::FaultInjected("inbox fold after record".into()));
+    }
+    Ok(outcome)
+}
+
 /// Fold one appended (not replayed) journal event into the facts it implies,
 /// after every projection of the append ran, in the same transaction.
 /// `turn_ended` is the projection's busy→idle verdict for this event.
@@ -1168,7 +1196,7 @@ pub(crate) fn fold_append(
             entered_at.clone(),
             json!({ "lifecycle": lifecycle, "from": before.lifecycle }),
         )?;
-        record_about(conn, instance_id, fact)?;
+        fold_record(conn, instance_id, fact)?;
     }
 
     let requested = requested_interaction_id(event);
@@ -1202,7 +1230,7 @@ pub(crate) fn fold_append(
             )?;
             // Several interactions can open at one instant.
             fact.key_subject = format!("{instance_id}/{interaction_id}");
-            record_about(conn, instance_id, fact)?;
+            fold_record(conn, instance_id, fact)?;
         }
     }
 
@@ -1224,7 +1252,7 @@ pub(crate) fn fold_append(
                 entered_at.clone(),
                 json!({ "activity": activity }),
             )?;
-            record_about(conn, instance_id, fact)?;
+            fold_record(conn, instance_id, fact)?;
         }
     }
 
@@ -1316,7 +1344,7 @@ pub(crate) fn fold_append(
             detail["error"] = json!(error);
         }
         let fact = instance_fact(conn, kind, instance_id, run, entered_at.clone(), detail)?;
-        record_about(conn, instance_id, fact)?;
+        fold_record(conn, instance_id, fact)?;
         if attributed {
             tracker.settled = tracker.settled.max(run);
         }

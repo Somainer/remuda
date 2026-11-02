@@ -104,6 +104,7 @@ async fn dispatch(state: AppState, instance_id: String, kind: AlertKind) {
             }
             fanout(
                 &state,
+                "waiting",
                 &instance_id,
                 "Still waiting",
                 "This session has been blocked for more than 30s.",
@@ -118,14 +119,28 @@ async fn dispatch(state: AppState, instance_id: String, kind: AlertKind) {
             if !matches!(other, AlertKind::Interaction { .. }) {
                 state.blocked.clear(&instance_id).await;
             }
-            let (title, body, tag, url) = match other {
-                AlertKind::Interaction { id } => (
-                    "Need your input",
-                    "An approval or question is waiting.".to_string(),
-                    PushTag::Interaction { id: id.clone() },
-                    interaction_landing_url(id),
-                ),
+            let (category, title, body, tag, url) = match other {
+                AlertKind::Interaction { id } => {
+                    // D-057 §8.1: an item routed to an effectively running
+                    // Agent parent is not pushed; it stays in /approvals and
+                    // in the transcript, and the lift pages it later if the
+                    // parent stops running first.
+                    if route_interaction(&state, id, &instance_id).await
+                        == crate::push_route::Route::Suppressed
+                    {
+                        return;
+                    }
+                    let (title, body) = INTERACTION_PUSH;
+                    (
+                        "interaction",
+                        title,
+                        body.to_string(),
+                        PushTag::Interaction { id: id.clone() },
+                        interaction_landing_url(id),
+                    )
+                }
                 AlertKind::TurnError => (
+                    "turn-error",
                     "Turn failed",
                     "The last turn ended with an error.".to_string(),
                     PushTag::Instance {
@@ -141,6 +156,7 @@ async fn dispatch(state: AppState, instance_id: String, kind: AlertKind) {
                         return;
                     }
                     (
+                        "exited",
                         "Session exited",
                         "An instance left the ready state.".to_string(),
                         PushTag::Instance {
@@ -151,7 +167,41 @@ async fn dispatch(state: AppState, instance_id: String, kind: AlertKind) {
                 }
                 AlertKind::Waiting => unreachable!(),
             };
-            fanout(&state, &instance_id, title, &body, tag, url).await;
+            fanout(&state, category, &instance_id, title, &body, tag, url).await;
+        }
+    }
+}
+
+/// Today's title and body of a push about a pending interaction; the lift
+/// (D-057 §8.3) resends exactly this.
+pub(crate) const INTERACTION_PUSH: (&str, &str) =
+    ("Need your input", "An approval or question is waiting.");
+
+/// §8.1 at fire time. A store failure pages: a missed suppression costs one
+/// extra push, a missed page could cost the owner the question.
+async fn route_interaction(
+    state: &AppState,
+    interaction_id: &str,
+    instance_id: &str,
+) -> crate::push_route::Route {
+    let interaction = interaction_id.to_owned();
+    let instance = instance_id.to_owned();
+    match state
+        .store
+        .run_named("push_route_interaction", move |conn| {
+            crate::push_route::route_interaction(conn, &interaction, &instance)
+        })
+        .await
+    {
+        Ok(route) => {
+            if route == crate::push_route::Route::Suppressed {
+                tracing::info!(category = "interaction", "push routed to a running parent");
+            }
+            route
+        }
+        Err(_) => {
+            tracing::warn!(category = "interaction", "push routing failed; paging");
+            crate::push_route::Route::Page
         }
     }
 }
@@ -195,6 +245,7 @@ pub(crate) async fn c1_push(
 ) -> Fanout {
     fanout(
         state,
+        "c1",
         instance_id,
         title,
         body,
@@ -207,9 +258,10 @@ pub(crate) async fn c1_push(
 }
 
 /// Send one notification to every subscription unless a device follows the
-/// instance.
-async fn fanout(
+/// instance, and record the fanout in the push log under `category`.
+pub(crate) async fn fanout(
     state: &AppState,
+    category: &'static str,
     instance_id: &str,
     title: &str,
     body: &str,
@@ -219,17 +271,35 @@ async fn fanout(
     let Some(push) = state.push.as_ref() else {
         return Fanout::Nothing;
     };
-    if state.followers.any_watching(instance_id).await {
-        tracing::debug!(instance_id, "push suppressed: a device is following");
-        return Fanout::Nothing;
-    }
+    let mut entry = crate::push_route::LogEntry {
+        category,
+        tag: tag.as_str(),
+        instance_id: instance_id.to_owned(),
+        ..Default::default()
+    };
+    let following = state.followers.any_watching(instance_id).await;
     let subs = match push.subscriptions() {
         Ok(subs) => subs,
-        Err(error) => {
-            tracing::warn!(%error, "could not read push subscriptions");
+        Err(_) => {
+            tracing::warn!(category, "could not read push subscriptions");
+            entry.outcome = "failed";
+            crate::push_route::log_push(state, entry).await;
             return Fanout::Failed;
         }
     };
+    let (subs, skipped): (Vec<_>, Vec<_>) = subs.into_iter().partition(|_| !following);
+    let mut suppressed_devices: Vec<String> =
+        skipped.into_iter().map(|sub| sub.device_id).collect();
+    suppressed_devices.sort();
+    suppressed_devices.dedup();
+    if !suppressed_devices.is_empty() {
+        tracing::debug!(
+            category,
+            devices = suppressed_devices.len(),
+            "push suppressed: a device is following"
+        );
+    }
+    entry.suppressed_devices = suppressed_devices;
     // The badge is the owner's 「需要你」 N (home.md §5.1, ui-spec §4.5): the
     // interactions really waiting plus the owner-blocked tasks with no such
     // interaction. Pending is global durable state — every subscribed device
@@ -238,23 +308,36 @@ async fn fanout(
     // all thanks to the suppression above.
     let pending = owner_badge(state).await;
     let base = Notification::new(title, body, tag.clone(), url);
-    let (mut sent, mut failed) = (0, 0);
+    let (mut sent, mut gone, mut failed) = (0, 0, 0);
     for sub in subs {
         let notification = base.clone().with_badge(pending);
         match push.notify(&sub, &notification, &tag).await {
-            Ok(remuda_push::Delivery::Sent) => sent += 1,
-            Ok(remuda_push::Delivery::Gone) => {}
-            Err(err) => {
+            Ok(remuda_push::Delivery::Sent) => {
+                sent += 1;
+                entry.delivered_devices.push(sub.device_id);
+            }
+            Ok(remuda_push::Delivery::Gone) => gone += 1,
+            Err(_) => {
                 failed += 1;
-                tracing::debug!(error = %err, endpoint = %sub.endpoint, "push notify failed");
+                tracing::debug!(category, "push notify failed");
             }
         }
     }
-    match (sent, failed) {
+    entry.delivered_devices.sort();
+    entry.delivered_devices.dedup();
+    let outcome = match (sent, failed) {
         (0, 0) => Fanout::Nothing,
         (0, _) => Fanout::Failed,
         (sent, _) => Fanout::Sent(sent),
-    }
+    };
+    entry.outcome = match outcome {
+        Fanout::Sent(_) => "sent",
+        Fanout::Nothing => "nothing",
+        Fanout::Failed => "failed",
+    };
+    (entry.sent, entry.gone, entry.failed) = (sent, gone, failed);
+    crate::push_route::log_push(state, entry).await;
+    outcome
 }
 
 /// Where a push about interaction `id` lands (home.md §9 角标与落点): the
@@ -370,12 +453,19 @@ fn classify(event: &Value) -> Option<AlertKind> {
         .or_else(|| event.pointer("/payload/lifecycle").and_then(Value::as_str))
         .unwrap_or("");
     if kind == "interaction.requested" || kind == "interactionRequested" {
+        // The id where the durable row takes it from: a Node journals the
+        // entity at `payload.interaction` (D-057 §8.1 routes by that row).
         let id = event
             .get("interactionId")
             .and_then(Value::as_str)
             .or_else(|| {
                 event
                     .pointer("/payload/interactionId")
+                    .and_then(Value::as_str)
+            })
+            .or_else(|| {
+                event
+                    .pointer("/payload/interaction/id")
                     .and_then(Value::as_str)
             })
             .unwrap_or("")

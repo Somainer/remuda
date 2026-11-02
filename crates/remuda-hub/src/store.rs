@@ -371,6 +371,8 @@ pub struct Store {
     /// When this process opened the store: the inbox measures a host's
     /// offline grace from no earlier than its own start (cb-inbox-facts).
     opened_at: time::OffsetDateTime,
+    /// D-057 §8.3: notified after a writer job queued push outbox rows.
+    outbox_notify: Arc<tokio::sync::Notify>,
 }
 
 impl Store {
@@ -2636,6 +2638,8 @@ impl Store {
         // back a Store, so the first read cannot race schema creation.
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let writer_path = path.clone();
+        let outbox_notify = Arc::new(tokio::sync::Notify::new());
+        let writer_outbox = Arc::clone(&outbox_notify);
         let thread = thread::Builder::new()
             .name("remuda-hub-sqlite".into())
             .spawn(move || {
@@ -2660,6 +2664,11 @@ impl Store {
                             // cb-inbox-facts: the state changes this job
                             // committed that queued a fact source.
                             crate::inbox::drain_sources(&mut conn);
+                            // D-057 §8.3: push outbox rows this job queued
+                            // are sent after its commit.
+                            if crate::push_route::take_outbox_dirty() {
+                                writer_outbox.notify_one();
+                            }
                         }
                         Job::Stop(done) => {
                             let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
@@ -2715,7 +2724,14 @@ impl Store {
             faults: Arc::new(test_faults::FaultFlags::default()),
             seen_presence: Arc::default(),
             opened_at: time::OffsetDateTime::now_utc(),
+            outbox_notify,
         })
+    }
+
+    /// Woken after a writer job that queued push outbox rows committed
+    /// (D-057 §8.3).
+    pub(crate) fn outbox_notify(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.outbox_notify)
     }
 
     /// When this process opened the store.
@@ -3610,6 +3626,24 @@ impl Store {
                  )",
                 params![&now, grace, HOST_LOST_MARKER],
             )?;
+            // D-057 §8.3: host-loss detection under the same grace is a
+            // cause of "effectively running" turning false for the parent
+            // lineages on each lost host (at boot it is the grace path).
+            let lost: Vec<String> = {
+                let mut stmt = tx.prepare(
+                    "SELECT id FROM hosts WHERE state != 'online' AND
+                    (NOT EXISTS (SELECT 1 FROM ssh_hosts WHERE host_id = hosts.id) OR state = 'daemon-unreachable') AND
+                    (julianday(?1) - julianday(COALESCE(offline_since, last_seen_at, created_at))) * 86400000 >= ?2",
+                )?;
+                stmt.query_map(params![&now, grace], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for host_id in &lost {
+                crate::push_route::transition_guarded(
+                    &tx,
+                    crate::push_route::Transition::HostLost { host_id },
+                );
+            }
             // r8 item 2(c): the host-lost sweep must NOT settle cards — the
             // process behind the lost contact may still be live and a new
             // approval from it must stay answerable after reconnect. Only a
@@ -8380,6 +8414,7 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     crate::node_ops::migrate(&conn)?;
     crate::fence::migrate(&conn)?;
     crate::restart::migrate(&conn)?;
+    crate::push_route::migrate(&conn)?;
     // cb-inbox-facts: after `restart` (its `end_seen_at` column) and the gate
     // queue (its `gate_jobs` table), which the inbox's source triggers read.
     crate::inbox::migrate(&conn)?;
@@ -16197,6 +16232,18 @@ fn append_loaded_event(
     // D-057 §6.2: the lineage's stored state follows its current chapter's
     // first running report (`starting` → `running`).
     crate::restart::note_chapter_running(conn, instance_id)?;
+    // D-057 §8.3: a chapter's recorded end turns its lineage's "effectively
+    // running" false before the supervisor acts (§8.2). It cannot fail the
+    // append.
+    if matches!(
+        derive_instance_state(&event).0,
+        Some("exited" | "failed" | "closed")
+    ) {
+        crate::push_route::transition_guarded(
+            conn,
+            crate::push_route::Transition::ChapterEnded { instance_id },
+        );
+    }
     // cb-inbox-facts: the facts this event implies, in the same transaction
     // as the row; a replayed append (returned above) writes none.
     if let Some(before) = inbox_before {
@@ -16994,6 +17041,14 @@ fn mark_host_offline_rows(conn: &Connection, host_id: &str) -> Result<(), StoreE
          WHERE host_id = ?2 AND connectivity != 'disconnected'",
         params![now_rfc3339(), host_id],
     )?;
+    // D-057 §8.3: host link loss is a cause of "effectively running" turning
+    // false for every parent lineage whose chapter is on this host (the WS
+    // session end and the SSH carrier both arrive here; a host retired
+    // first is no longer online either).
+    crate::push_route::transition_guarded(
+        conn,
+        crate::push_route::Transition::LinkLost { host_id },
+    );
     Ok(())
 }
 

@@ -545,11 +545,13 @@ pub(crate) async fn drive_pushes(state: &AppState) {
         )
         .await;
         let Some(recipients) = fanout.recipients() else {
-            tracing::warn!(lineage_id = %push.lineage_id, title = %push.title,
-                "C1 push failed; it stays unsent and is retried");
+            tracing::warn!(
+                category = "c1",
+                "C1 push failed; it stays unsent and is retried"
+            );
             continue;
         };
-        tracing::info!(lineage_id = %push.lineage_id, title = %push.title, recipients, "C1 push");
+        tracing::info!(category = "c1", recipients, "C1 push");
         if let Err(error) = state
             .store
             .run_named("c1_push_sent", move |conn| {
@@ -1466,6 +1468,17 @@ async fn evaluate_pass(state: &AppState, pass: Pass) -> Vec<Decided> {
     };
     let mut decided = Vec::new();
     for (lineage_id, failed_id, seen) in candidates {
+        // D-057 §8.3: the supervisor's own transition. The lineage's current
+        // chapter has ended, so it is not effectively running whatever this
+        // evaluation decides (a stale-at-boot decision or a retried
+        // preparation runs no F).
+        if let Err(error) = state
+            .store
+            .push_supervisor_transition(lineage_id.clone())
+            .await
+        {
+            tracing::warn!(%error, "push lift by the supervisor failed");
+        }
         let outcome = match pending(state, &lineage_id, &failed_id, seen.clone(), &pass).await {
             Ok(Some(pending)) => decide(state, pending).await,
             Ok(None) => continue,

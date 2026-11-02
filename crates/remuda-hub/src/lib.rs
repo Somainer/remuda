@@ -75,6 +75,7 @@ mod provider_resolve;
 mod providers;
 mod proxy;
 mod push_http;
+mod push_route;
 mod rate_limit;
 mod registry;
 mod restart;
@@ -196,6 +197,8 @@ pub struct AppState {
     pub(crate) fences: crate::fence::FenceState,
     /// D-057 §6.3.1 (ma-restart): the C1 supervisor's tick serialization.
     pub(crate) restart: crate::restart::SupervisorState,
+    /// D-057 §8.3 (ma-push): the push outbox drive.
+    pub(crate) outbox: crate::push_route::OutboxState,
 }
 
 impl AppState {
@@ -870,6 +873,19 @@ impl HubTestHandle {
             .into_iter()
             .filter_map(|decided| serde_json::to_value(decided).ok())
             .collect()
+    }
+
+    /// D-057 §8.3: one push outbox drive (send every undelivered row).
+    pub async fn test_drive_outbox(&self) {
+        crate::push_route::drive_outbox(&self.state).await;
+    }
+
+    /// D-057 §8.3: the next `count` outbox rows the drive delivers are not
+    /// marked delivered, as if the Hub stopped between send and mark
+    /// (test-faults).
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_skip_outbox_marks(&self, count: usize) {
+        self.state.outbox.skip_next_marks(count);
     }
 
     /// D-057 §6.3.1: the next `count` C1 successor preparations fail with a
@@ -2185,7 +2201,7 @@ async fn spawn_inner(
             &config.data_dir,
             OpenOptions::test(t),
         )?),
-        None => match PushService::open(&config.data_dir) {
+        None => match open_push(&config.data_dir) {
             Ok(svc) => Some(svc),
             Err(err) => {
                 tracing::warn!(error = %err, "web push disabled");
@@ -2232,6 +2248,7 @@ async fn spawn_inner(
         gate_decision_guards: crate::gatequeue::GateDecisionGuards::new(),
         fences: crate::fence::FenceState::default(),
         restart: crate::restart::SupervisorState::default(),
+        outbox: crate::push_route::OutboxState::default(),
     };
     // D-057 §7.7: the send gate's map survives a Hub restart through the
     // lineages table; deliveries are re-sent on hello and by the tick.
@@ -2251,6 +2268,15 @@ async fn spawn_inner(
     // A Hub restart must not inherit yesterday's unacknowledged creates: they
     // would keep holding placement slots with no Node that can ever settle them.
     expire_stale_requested(&state, config.requested_grace_ms).await;
+    // D-057 §8.3 boot reconciliation: send what the previous process left
+    // undelivered, then lift for every parent lineage not running by state.
+    // A lineage running by state waits for its host's hello, or for
+    // host-loss detection under the grace (the sweep above and on the tick).
+    crate::push_route::drive_outbox(&state).await;
+    if let Err(err) = state.store.push_boot_transition().await {
+        tracing::error!(error = %err, "boot push lift failed");
+    }
+    crate::push_route::drive_outbox(&state).await;
     // D-057 §6.3.1 / §7.7: the C1 supervisor evaluates once at boot, so a
     // failure the previous Hub process left pending is decided exactly once.
     if config.restart_supervisor {
@@ -2287,13 +2313,26 @@ async fn spawn_inner(
             crate::gatequeue::SCHEDULE_TICK_MILLIS,
         ));
         let mut inbox_ticks: u64 = 0;
+        let outbox_ready = reaper_state.store.outbox_notify();
         loop {
             tokio::select! {
                 result = &mut server => {
                     if let Err(err) = result { tracing::error!(error = %err, "hub server exited"); }
                     break;
                 }
+                // D-057 §8.3: a writer job committed push outbox rows.
+                () = outbox_ready.notified() => {
+                    let outbox_state = reaper_state.clone();
+                    tokio::spawn(async move {
+                        crate::push_route::drive_outbox(&outbox_state).await;
+                    });
+                }
                 _ = interval.tick() => {
+                    // D-057 §8.3: retry undelivered outbox rows.
+                    let outbox_state = reaper_state.clone();
+                    tokio::spawn(async move {
+                        crate::push_route::drive_outbox_if_idle(&outbox_state).await;
+                    });
                     let sweep = reaper_state
                         .publish_settlement(async {
                             reaper_state
@@ -2356,6 +2395,19 @@ async fn spawn_inner(
         store: Some(store),
         state,
     })
+}
+
+/// The production push service. Test-faults builds alone also honour
+/// `REMUDA_TEST_PUSH_ALLOW_LOOPBACK`, so a scratch Hub can deliver real
+/// encrypted pushes to a local sink standing in for a phone's push service.
+fn open_push(data_dir: &std::path::Path) -> Result<PushService, remuda_push::Error> {
+    #[cfg(any(test, feature = "test-faults"))]
+    if std::env::var_os("REMUDA_TEST_PUSH_ALLOW_LOOPBACK").is_some() {
+        let mut options = OpenOptions::production()?;
+        options.allow_loopback = true;
+        return PushService::open_with(data_dir, options);
+    }
+    PushService::open(data_dir)
 }
 
 /// Fail `requested` instances the Node never acknowledged.

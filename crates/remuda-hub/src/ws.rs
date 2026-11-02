@@ -878,7 +878,22 @@ pub(crate) async fn handle_node_method(
                     ))
                     .await?;
             }
-            reconcile_lost_instances(state, &host.host_id, &params).await?;
+            let same_epoch = reconcile_lost_instances(state, &host.host_id, &params).await?;
+            // D-057 §8.3 boot step 3, on every hello: a parent lineage whose
+            // chapter is on this host stays effectively running only for the
+            // same epoch with its chapter in this hello's live inventory;
+            // otherwise its suppressed interactions are lifted now.
+            let live: Vec<String> = live_inventory_entries(&params)
+                .into_iter()
+                .map(|(id, _, _)| id)
+                .collect();
+            if let Err(error) = state
+                .store
+                .push_hello_transition(host.host_id.clone(), same_epoch, live)
+                .await
+            {
+                tracing::warn!(%error, "push lift on hello failed");
+            }
             // Test-only: a regression parks this hello here, after its
             // generation bump and inventory awaits, to reorder two hellos.
             #[cfg(any(test, feature = "test-faults"))]
@@ -1526,11 +1541,12 @@ async fn object_pull(
 /// path enumerates zero rows without that meaning anything, and trusting it
 /// would exit every session on the host. Absent evidence, the rows are left
 /// alone — the same hands-off answer an absent key gets.
+/// Returns whether the hello came from the same Node epoch.
 async fn reconcile_lost_instances(
     state: &AppState,
     host_id: &str,
     params: &Value,
-) -> Result<(), HubError> {
+) -> Result<bool, HubError> {
     let epoch = params
         .get("nodeEpoch")
         .and_then(Value::as_str)
@@ -1548,7 +1564,7 @@ async fn reconcile_lost_instances(
         // contact loss, never process end, and a new approval from the revived
         // process must stay pending and answerable.
         revive_live_inventory(state, host_id, params).await?;
-        return Ok(());
+        return Ok(true);
     }
     let Some(reported) = params.get("instances").and_then(Value::as_array) else {
         tracing::warn!(
@@ -1556,7 +1572,7 @@ async fn reconcile_lost_instances(
             "node epoch changed but hello carried no instance inventory; \
              leaving instance rows untouched"
         );
-        return Ok(());
+        return Ok(false);
     };
     if reported.is_empty() && params.get("instanceStoreFound") != Some(&Value::Bool(true)) {
         tracing::warn!(
@@ -1564,7 +1580,7 @@ async fn reconcile_lost_instances(
             "node epoch changed and hello reported an empty inventory this node does not \
              vouch for; leaving instance rows untouched"
         );
-        return Ok(());
+        return Ok(false);
     }
     let reported: Vec<String> = reported
         .iter()
@@ -1630,7 +1646,7 @@ async fn reconcile_lost_instances(
         )
         .await;
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Extract the instances a hello inventory reports as LIVE as

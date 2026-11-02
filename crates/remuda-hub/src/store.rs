@@ -16111,8 +16111,13 @@ fn append_loaded_event(
             .or_insert_with(|| json!(instance_id.to_string()));
     }
     let now = now_rfc3339();
-    // cb-inbox-facts: the row as it was before this event's projections.
-    let inbox_before = crate::inbox::before_append(conn, instance_id, &event)?;
+    // cb-inbox-facts: the row as it was before this event's projections. Like
+    // the fold below, it can never fail the append: an error only means this
+    // event records no fact.
+    let inbox_before = crate::inbox::guard("before_append", conn, || {
+        crate::inbox::before_append(conn, instance_id, &event)
+    })
+    .flatten();
     conn.execute(
         "INSERT INTO journal (instance_id, seq, event_id, payload_json, observed_at)
          VALUES (?1, ?2, ?3, ?4, ?5)",

@@ -304,11 +304,9 @@ impl AppState {
     }
 }
 
-/// Test-only constructors for types private modules would otherwise hide
-/// from integration tests. Not part of the supported API.
-#[doc(hidden)]
 /// Test-only seams of the inbox (`cb-inbox-facts` r2): inject a failing
 /// inbox hook to prove the write that produced it still commits.
+#[doc(hidden)]
 #[cfg(any(test, feature = "test-faults"))]
 pub mod inbox_test_support {
     /// Make the next inbox fold for `instance_id` fail.
@@ -317,6 +315,9 @@ pub mod inbox_test_support {
     }
 }
 
+/// Test-only constructors for types private modules would otherwise hide
+/// from integration tests. Not part of the supported API.
+#[doc(hidden)]
 pub mod store_test_support {
     use std::path::Path;
     use std::time::Duration;

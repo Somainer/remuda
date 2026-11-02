@@ -26,21 +26,27 @@ import css from "./homeGlance.module.css";
  * the inbox deadline clock and the §8 freshness verdict.
  *
  * Taps: 需要你 scrolls to the queue (today: the ledger's first blocked row —
- * the queue itself lands with H2); 工作中 filters the ledger to that rank and
- * a second tap clears it.
+ * the queue itself lands with H2); 完成未看 and 工作中 each filter the ledger
+ * to that rank, and a second tap clears it.
  */
 export function HomeGlance({
   placement,
   onNeedYou,
   onWorking,
+  onDoneUnseen,
   workingFilter = false,
+  doneUnseenFilter = false,
   workingInstances,
 }: {
   placement: "phone" | "desktop";
   onNeedYou: () => void;
   onWorking: () => void;
+  /** Narrow the ledger to the done-unseen rank; a second tap clears it. */
+  onDoneUnseen?: () => void;
   /** The rank filter this segment currently applies, for aria-pressed. */
   workingFilter?: boolean;
+  /** The done-unseen rank filter this segment currently applies. */
+  doneUnseenFilter?: boolean;
   /**
    * Which instances this surface lists for 工作中 (default: every instance).
    * `/sessions` hides child sessions, so it passes TOP_LEVEL_WORKING — the
@@ -92,6 +98,7 @@ export function HomeGlance({
     hostsTotal: hub.hosts.length,
     // Keep the segment on screen while it is the only way to clear the filter.
     workingFilter,
+    doneUnseenFilter,
   });
   // §8: stale greys the whole row and names the last successful update. A
   // foreground grace is explicitly NOT stale.
@@ -123,6 +130,20 @@ export function HomeGlance({
                 ⚠
               </span>
               {piece.count === null ? "–" : formatGlanceCount(piece.count)} 需要你
+            </button>
+          ) : piece.key === "doneUnseen" ? (
+            <button
+              type="button"
+              className={css.seg}
+              data-testid="glance-done-unseen"
+              data-key="doneUnseen"
+              aria-pressed={doneUnseenFilter}
+              onClick={onDoneUnseen}
+            >
+              <span className={css.glyph} aria-hidden="true">
+                ◉
+              </span>
+              {piece.count === null ? "–" : formatGlanceCount(piece.count)} 完成未看
             </button>
           ) : piece.key === "working" ? (
             <button

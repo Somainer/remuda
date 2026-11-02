@@ -28,6 +28,7 @@ import { mockDb } from "../../lib/mock";
 import type { Instance } from "../../types/instance";
 import { known, type Id } from "../../types/wire";
 import { HomeList } from "./HomeList";
+import { LONG_PRESS_MS } from "../home/RowActions";
 import { GLANCE_TARGETS } from "../home/glanceNav";
 import { interaction as queueInteraction } from "../home/queueTestData";
 import { SPACES_PREFS_KEY, spaceKey, spaceStore } from "../spaces/store";
@@ -56,34 +57,38 @@ function publishHealth(patch: Partial<typeof health>) {
   for (const listener of healthListeners) listener();
 }
 
-vi.mock("../../lib/store", () => ({
-  useHub: () => hub,
-  // The home reads the store through the cached external-store seam: the mock
-  // offers the same subscribe/getSnapshot surface (no store polling in unit
-  // tests) plus the imperative row helpers the component calls.
-  // No address-owner Main in these fixtures: the Main card renders nothing.
-  useMainEntry: () => null,
-  hubStore: {
-    subscribe: (listener: () => void) => {
-      listeners.add(listener);
-      return () => listeners.delete(listener);
+vi.mock("../../lib/store", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../lib/store")>();
+  return {
+    useHub: () => hub,
+    resolveMain: actual.resolveMain,
+    // The home reads the store through the cached external-store seam: the mock
+    // offers the same subscribe/getSnapshot surface (no store polling in unit
+    // tests) plus the imperative row helpers the component calls.
+    // No address-owner Main in these fixtures: the Main card renders nothing.
+    useMainEntry: () => null,
+    hubStore: {
+      subscribe: (listener: () => void) => {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
+      getSnapshot: () => ({ ...hub, instances: hub.instances.slice() }),
+      getRefreshHealth: () => health,
+      subscribeRefreshHealth: (listener: () => void) => {
+        healthListeners.add(listener);
+        return () => healthListeners.delete(listener);
+      },
+      refresh: () => refreshMock(),
+      titleOf: (id: string) => `title ${id}`,
+      hostName: () => "alpha",
+      usageRollupOf: () => null,
+      summaryOf: () => undefined,
+      resume: (...args: unknown[]) => resumeMock(...args),
+      refreshScreens: vi.fn().mockResolvedValue(undefined),
+      hydrateRowSummaries: vi.fn().mockResolvedValue(undefined),
     },
-    getSnapshot: () => ({ ...hub, instances: hub.instances.slice() }),
-    getRefreshHealth: () => health,
-    subscribeRefreshHealth: (listener: () => void) => {
-      healthListeners.add(listener);
-      return () => healthListeners.delete(listener);
-    },
-    refresh: () => refreshMock(),
-    titleOf: (id: string) => `title ${id}`,
-    hostName: () => "alpha",
-    usageRollupOf: () => null,
-    summaryOf: () => undefined,
-    resume: (...args: unknown[]) => resumeMock(...args),
-    refreshScreens: vi.fn().mockResolvedValue(undefined),
-    hydrateRowSummaries: vi.fn().mockResolvedValue(undefined),
-  },
-}));
+  };
+});
 
 vi.mock("../files/filesApi", () => ({
   fetchChanges: vi.fn(() => Promise.reject(new Error("offline"))),
@@ -224,6 +229,51 @@ describe("HomeList hold", () => {
     expect(document.querySelector(RELEASED)).not.toBeNull();
     // Released, blocked outranks working, so the changed worker moves above.
     expect(ids()).toEqual(["/s/ins-other", "/s/ins-held"]);
+  });
+
+  it("freezes the order while the row menu is open and re-ranks when it closes", async () => {
+    hub.instances = [
+      row("ins-held", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+      row("ins-other", { activity: known("working"), updatedAt: "2026-09-19T08:00:00.000Z" }),
+    ];
+    renderHome();
+    expect(ids()).toEqual(["/s/ins-held", "/s/ins-other"]);
+
+    const menu = screen.getAllByTestId("row-actions-more")[0];
+    await userEvent.click(menu);
+    expect(screen.getByTestId("row-actions-menu")).toBeTruthy();
+    expect(document.querySelector(HELD)).not.toBeNull();
+
+    act(() => {
+      hub.instances = [
+        row("ins-held", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+        row("ins-other", { activity: known("waiting-interaction"), updatedAt: "2026-09-19T12:00:00.000Z" }),
+      ];
+      for (const listener of listeners) listener();
+    });
+    expect(ids()).toEqual(["/s/ins-held", "/s/ins-other"]);
+
+    await userEvent.keyboard("{Escape}");
+    expect(document.querySelector(RELEASED)).not.toBeNull();
+    expect(ids()).toEqual(["/s/ins-other", "/s/ins-held"]);
+  });
+
+  it("releases the hold when a rank filter drops the row whose menu was open", async () => {
+    hub.instances = [
+      row("ins-work", { activity: known("working") }),
+      row("ins-done", { activity: known("idle"), unseen: true }),
+    ];
+    renderHome();
+    const workingArticle = (await screen.findByText("title ins-work")).closest("article")!;
+    await userEvent.click(workingArticle.querySelector("[data-testid='row-actions-more']") as HTMLElement);
+    expect(screen.getByTestId("row-actions-menu")).toBeTruthy();
+    expect(document.querySelector(HELD)).not.toBeNull();
+
+    // A filter tap drops the row even while the hold freezes the rest; its
+    // menu id must not keep the order frozen with no menu to close it.
+    fireEvent.click(screen.getByTestId("glance-done-unseen"));
+    await waitFor(() => expect(document.querySelector(RELEASED)).not.toBeNull());
+    expect(screen.queryByTestId("row-actions-menu")).toBeNull();
   });
 
   it("also freezes while focus sits in a row's control, and re-ranks when it leaves", () => {
@@ -576,6 +626,14 @@ describe("HomeList §8 freshness states", () => {
     await waitFor(() => expect(screen.queryByTestId("home-empty")).toBeNull());
   });
 
+  it("disables a row's ⋯ menu while stale (home.md §8 controls grey)", async () => {
+    health.lastOkAt = NOW - 20_000;
+    hub.instances = [row("ins-a", { activity: known("working") })];
+    renderHome();
+    await screen.findByTestId("home-row");
+    expect(screen.getAllByTestId("row-actions-more")[0]).toBeDisabled();
+  });
+
   it("greys the cached rows while stale, and a foreground grace lifts the grey until the first refresh settles", async () => {
     health.lastOkAt = NOW - 20_000;
     hub.instances = [row("ins-a", { activity: known("waiting-interaction") })];
@@ -669,6 +727,35 @@ describe("① 工作中 filter and the group header", () => {
   });
 });
 
+describe("⑤ 刚完成", () => {
+  it("lists the unseen finished rows under the queue", async () => {
+    hub.instances = [row("ins-done", { activity: known("idle"), unseen: true })];
+    renderHome();
+    const section = await screen.findByTestId("home-just-done");
+    expect(section).toHaveTextContent("title ins-done");
+    const queue = screen.getByTestId("home-queue");
+    expect(queue.compareDocumentPosition(section) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+});
+
+describe("① 完成未看 filter", () => {
+  it("narrows the ledger to the done-unseen rank and clears it on the second tap", async () => {
+    hub.instances = [
+      row("ins-done", { activity: known("idle"), unseen: true }),
+      row("ins-work", { activity: known("working") }),
+    ];
+    renderHome();
+    const segment = await screen.findByTestId("glance-done-unseen");
+    expect(segment).toHaveTextContent("1 完成未看");
+    await userEvent.click(segment);
+    expect(screen.getAllByTestId("home-row").map((el) => el.getAttribute("data-rank"))).toEqual(["done-unseen"]);
+    expect(screen.getByTestId("glance-done-unseen")).toHaveAttribute("aria-pressed", "true");
+    await userEvent.click(screen.getByTestId("glance-done-unseen"));
+    expect(screen.getAllByTestId("home-row")).toHaveLength(2);
+    expect(screen.getByTestId("glance-done-unseen")).toHaveAttribute("aria-pressed", "false");
+  });
+});
+
 describe("① filter under an active hold", () => {
   it("recomputes the dots from the rendered rows and drops groups the filter empties", async () => {
     hub.instances = [
@@ -756,5 +843,41 @@ describe("empty and skeleton states sit in the ledger slot (§2.1)", () => {
     } finally {
       publishHealth({ lastOkAt: Date.now() });
     }
+  });
+});
+
+describe("⑦ row menu long-press", () => {
+  it("opens the menu on a body long-press", async () => {
+    hub.instances = [row("ins-menu", { activity: known("working") })];
+    renderHome();
+    const article = (await screen.findByText("title ins-menu")).closest("article")!;
+    act(() => {
+      article.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, clientX: 10, clientY: 10 }));
+    });
+    await waitFor(() => expect(screen.getByTestId("row-actions-menu")).toBeTruthy());
+    act(() => {
+      window.dispatchEvent(new PointerEvent("pointerup"));
+    });
+  });
+
+  it("does not re-open when the open menu's backdrop is held past the press threshold", async () => {
+    hub.instances = [row("ins-menu", { activity: known("working") })];
+    renderHome();
+    const article = (await screen.findByText("title ins-menu")).closest("article")!;
+    await userEvent.click(article.querySelector("[data-testid='row-actions-more']") as HTMLElement);
+    const scrim = screen.getByTestId("row-actions-panel").parentElement!;
+    // The scrim closes on mousedown; the pointerdown that precedes it lands
+    // inside the row article too (the Sheet is not portaled).
+    act(() => {
+      scrim.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, clientX: 10, clientY: 10 }));
+      scrim.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    });
+    expect(screen.queryByTestId("row-actions-panel")).toBeNull();
+    // A HELD press: no pointerup until after the row's threshold.
+    await act(() => new Promise((resolve) => setTimeout(resolve, LONG_PRESS_MS + 120)));
+    expect(screen.queryByTestId("row-actions-panel")).toBeNull();
+    act(() => {
+      window.dispatchEvent(new PointerEvent("pointerup"));
+    });
   });
 });

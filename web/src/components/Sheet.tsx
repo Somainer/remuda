@@ -43,7 +43,16 @@ export function Sheet({
   const { containerRef, onKeyDown, ...aria } = trap;
   if (!open) return null;
   return (
-    <div className={css.scrim} data-variant={variant} onMouseDown={onClose} role="presentation">
+    <div
+      className={css.scrim}
+      data-variant={variant}
+      // Marks the whole overlay subtree (scrim + panel) for surfaces that
+      // must not treat an overlay press as their own gesture — e.g. a row's
+      // long-press, whose row element contains this Sheet.
+      data-overlay={variant}
+      onMouseDown={onClose}
+      role="presentation"
+    >
       <div
         {...aria}
         ref={containerRef}

@@ -26,3 +26,6 @@ blob-report
 *.sln
 *.sw?
 dist-e2e
+
+# Worker-local scratch for e2e runs (mirrors the repo-root /scratch/ ignore).
+scratch/

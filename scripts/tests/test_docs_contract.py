@@ -514,24 +514,48 @@ def _block(text: str, start: int) -> tuple[str, int]:
     return text[start + 1:], len(text)
 
 
+def _attribute(lines: list[str], index: int) -> tuple[str, int]:
+    """Read one ``#[...]`` attribute, which may span several lines.
+
+    Returns the text between ``#[`` and the matching ``]`` plus the index of
+    the next unconsumed line. Accumulating on bracket balance keeps a
+    hand-formatted multi-line ``#[arg(`` declaration parseable.
+    """
+    text = lines[index].strip()
+    consumed = 1
+    while text.count("[") > text.count("]") and index + consumed < len(lines):
+        text += " " + lines[index + consumed].strip()
+        consumed += 1
+    text = re.sub(r"\s+", " ", text)
+    if text.startswith("#["):
+        text = text[2:]
+    if text.endswith("]"):
+        text = text[:-1]
+    return text.strip(), index + consumed
+
+
 def parse_fields(body: str) -> list[FieldDef]:
     fields: list[FieldDef] = []
     pending: list[str] = []
-    for raw in body.splitlines():
-        stripped = raw.strip()
+    lines = body.splitlines()
+    index = 0
+    while index < len(lines):
+        stripped = lines[index].strip()
         if not stripped or stripped.startswith("//"):
+            index += 1
             continue
         if stripped.startswith("#["):
-            pending.append(stripped[2:-1].strip())
+            attribute, index = _attribute(lines, index)
+            pending.append(attribute)
             continue
         match = re.match(
             r"(?:pub(?:\([^)]*\))?\s+)?([A-Za-z_]\w*)\s*:\s*(.+?)\s*,?\s*$", stripped)
         if match:
             fields.append(FieldDef(match.group(1), match.group(2).strip(), pending))
             pending = []
-            continue
-        if stripped.endswith("}"):
+        elif stripped.endswith("}"):
             pending = []
+        index += 1
     return fields
 
 
@@ -543,8 +567,8 @@ def parse_variants(body: str) -> list[VariantDef]:
     while index < len(lines):
         stripped = lines[index].strip()
         if stripped.startswith("#["):
-            pending.append(stripped[2:-1].strip())
-            index += 1
+            attribute, index = _attribute(lines, index)
+            pending.append(attribute)
             continue
         if not stripped or stripped.startswith("//"):
             index += 1

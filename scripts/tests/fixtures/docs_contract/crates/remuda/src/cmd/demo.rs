@@ -23,7 +23,10 @@ enum Command {
 #[derive(ClapArgs)]
 pub(crate) struct RunArgs {
     /// Skip the slow path.
-    #[arg(long)]
+    #[arg(
+        long,
+        visible_alias = "quick"
+    )]
     fast: bool,
     /// Entry name.
     name: Option<String>,

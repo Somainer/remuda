@@ -12,8 +12,8 @@ and deliberately broken in known places.
 - [missing document](docs/missing.md)
 - [missing heading](docs/guide.md#no-such-heading)
 
-Commands that exist: `remuda demo run --fast`, `remuda --data-dir D demo list`,
-`just build`, `pnpm --dir web test`.
+Commands that exist: `remuda demo run --fast`, `remuda demo run --quick`,
+`remuda --data-dir D demo list`, `just build`, `pnpm --dir web test`.
 
 Commands that do not: `remuda demo nope`, `remuda demo run --slow`,
 `just nope`, `pnpm --dir web nope`.

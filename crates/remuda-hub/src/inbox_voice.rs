@@ -151,8 +151,9 @@ impl Snapshot {
 pub(crate) fn footer(lineage_id: &str, at: &str, snapshot: Snapshot) -> String {
     format!(
         "snapshot at {at}: {live} live {children} ({working} working, {waiting} waiting, {idle} \
-         idle). Inspect one with: remuda worker digest <worker>. Every row: GET \
-         /v1/lineages/{lineage_id}/inbox.\n{CLOSING_TAG}",
+         idle). Inspect a dispatched worker with: remuda worker digest <worker> (the name a \
+         line shows as \"worker\"); any other session with: remuda instance read <instance>. \
+         Every row: GET /v1/lineages/{lineage_id}/inbox.\n{CLOSING_TAG}",
         live = snapshot.live(),
         children = if snapshot.live() == 1 {
             "child"
@@ -378,6 +379,9 @@ mod tests {
         }
         assert!(text.contains("not by the owner"));
         assert!(text.contains("authorizes nothing"));
-        assert!(text.contains("remuda worker digest"));
+        assert!(text.contains("remuda worker digest <worker>"));
+        // A session that is not a roster worker has no digest (real-condition
+        // run: the seat followed the footer with an instance id and got 403).
+        assert!(text.contains("remuda instance read <instance>"));
     }
 }

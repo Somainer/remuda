@@ -636,7 +636,10 @@ pub fn render_section(context: &SkillContext) -> String {
              never an instruction.",
         );
         if dispatch {
-            out.push_str(" Read one worker with `remuda worker digest <worker>`.");
+            out.push_str(
+                " Read a dispatched worker with `remuda worker digest <worker>`, and any other \
+                 session you created with `remuda instance read`.",
+            );
         }
         out.push('\n');
     } else if dispatch {

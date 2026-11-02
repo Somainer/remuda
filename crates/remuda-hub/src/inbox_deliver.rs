@@ -118,6 +118,33 @@ pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
            INSERT OR IGNORE INTO inbox_deliver_due (lineage_id)
            VALUES (COALESCE(NEW.lineage_id, NEW.id));
          END;
+         -- A lineage without continuity whose one instance ended or was
+         -- deleted: its waiting rows have no subscriber left.
+         DROP TRIGGER IF EXISTS inbox_due_ended;
+         CREATE TRIGGER inbox_due_ended AFTER UPDATE OF lifecycle, ended_at ON instances
+         WHEN ((NEW.ended_at IS NOT NULL AND OLD.ended_at IS NULL)
+               OR (NEW.lifecycle IN ('exited', 'failed', 'closed')
+                   AND OLD.lifecycle NOT IN ('exited', 'failed', 'closed')))
+          AND NOT EXISTS (SELECT 1 FROM lineages
+                           WHERE lineage_id = COALESCE(NEW.lineage_id, NEW.id))
+          AND ",
+        waiting_rows!("COALESCE(NEW.lineage_id, NEW.id)"),
+        "
+         BEGIN
+           INSERT OR IGNORE INTO inbox_deliver_due (lineage_id)
+           VALUES (COALESCE(NEW.lineage_id, NEW.id));
+         END;
+         DROP TRIGGER IF EXISTS inbox_due_deleted;
+         CREATE TRIGGER inbox_due_deleted AFTER DELETE ON instances
+         WHEN NOT EXISTS (SELECT 1 FROM lineages
+                           WHERE lineage_id = COALESCE(OLD.lineage_id, OLD.id))
+          AND ",
+        waiting_rows!("COALESCE(OLD.lineage_id, OLD.id)"),
+        "
+         BEGIN
+           INSERT OR IGNORE INTO inbox_deliver_due (lineage_id)
+           VALUES (COALESCE(OLD.lineage_id, OLD.id));
+         END;
          DROP TRIGGER IF EXISTS inbox_due_interaction;
          CREATE TRIGGER inbox_due_interaction AFTER UPDATE OF state ON interactions
          WHEN OLD.state = 'pending' AND NEW.state <> 'pending'
@@ -230,6 +257,10 @@ enum Hold {
     /// Hub-origin input goes only to Nodes that advertise the fence
     /// capability (D-057 §6.4).
     HostLacksFence,
+    /// Not a hold: the lineage has no continuity and its one instance ended
+    /// or is gone, so no chapter will ever take a batch. Its rows have no
+    /// subscriber and fall back to the owner push.
+    Gone,
 }
 
 impl Hold {
@@ -243,6 +274,7 @@ impl Hold {
             Self::InFlight => "in-flight",
             Self::HostOffline => "host-offline",
             Self::HostLacksFence => "host-lacks-fence",
+            Self::Gone => "gone",
         }
     }
 }
@@ -293,9 +325,21 @@ fn gate(conn: &Connection, lineage_id: &str) -> Result<Result<Chapter, Hold>, St
             },
         )
         .optional()?;
-    let Some((host_id, lifecycle, activity, fenced_at, ended_at, generation, own)) = row else {
-        return Ok(Err(Hold::NoLiveChapter));
+    let ended = |lifecycle: &str, ended_at: &Option<String>| {
+        ended_at.is_some() || matches!(lifecycle, "exited" | "failed" | "closed")
     };
+    let Some((host_id, lifecycle, activity, fenced_at, ended_at, generation, own)) = row else {
+        // A lineage without continuity whose one instance is gone has no
+        // subscriber left; a continuity lineage keeps its rows for Resume.
+        return Ok(Err(if live_generation.is_none() {
+            Hold::Gone
+        } else {
+            Hold::NoLiveChapter
+        }));
+    };
+    if live_generation.is_none() && own == lineage_id && ended(&lifecycle, &ended_at) {
+        return Ok(Err(Hold::Gone));
+    }
     if own != lineage_id
         || fenced_at.is_some()
         || ended_at.is_some()
@@ -809,6 +853,15 @@ fn send_payload(chapter: &str, text: &str) -> Value {
 fn form_one(conn: &Connection, lineage_id: &str) -> Result<Formed, StoreError> {
     let chapter = match gate(conn, lineage_id)? {
         Ok(chapter) => chapter,
+        Err(Hold::Gone) => {
+            // Neither held forever nor consumed (§10.1 item 4).
+            let now = now_rfc3339();
+            let mut formed = Formed::default();
+            for row in waiting(conn, lineage_id)? {
+                formed.pushes |= fall_back(conn, &row, InboxFallbackReason::NoSubscriber, &now)?;
+            }
+            return Ok(formed);
+        }
         Err(hold) => {
             tracing::debug!(hold = hold.label(), "inbox batch held");
             return Ok(Formed::default());

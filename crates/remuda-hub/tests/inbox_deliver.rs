@@ -1126,6 +1126,63 @@ async fn muted_reparented_and_orphaned_rows_fall_back_to_the_owner_push() -> Res
     Ok(())
 }
 
+/// A subscriber without continuity whose one instance ended will never take
+/// a batch: its waiting rows have no subscriber, so they fall back to the
+/// owner push (a still-pending question pages) instead of waiting forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rows_of_an_ended_subscriber_without_continuity_fall_back() -> Result<()> {
+    let ctx = Ctx::spawn_with_push().await?;
+    let push = ctx.push.clone().context("push")?;
+    let store = ctx.hub.store().context("store")?;
+    // An agent-created coordinator without continuity, and its child.
+    let parent = store
+        .insert_instance(
+            ctx.host.clone(),
+            Some(ctx.workspace.clone()),
+            "claude".into(),
+            "claude-pty".into(),
+            None,
+            json!({ "origin": "agent" }),
+        )
+        .await?
+        .instance_id;
+    let child = store
+        .insert_instance(
+            ctx.host.clone(),
+            Some(ctx.workspace.clone()),
+            "claude".into(),
+            "claude-pty".into(),
+            None,
+            json!({ "origin": "agent", "parentInstanceId": parent }),
+        )
+        .await?
+        .instance_id;
+    ctx.journal(&parent, entity("running", &at(0))).await?;
+    ctx.journal(&parent, activity("working", &at(1))).await?;
+    ctx.journal(&child, entity("running", &at(2))).await?;
+    ctx.journal(&child, question("int_orphaned", "Proceed?", &at(3)))
+        .await?;
+    ctx.settle().await?;
+    let page = ctx.inbox(&parent).await?;
+    assert_eq!(page["items"].as_array().map(Vec::len), Some(2), "{page:#}");
+    let pushed_before = push.sent.lock().unwrap().len();
+
+    ctx.journal(&parent, entity("exited", &at(10))).await?;
+    ctx.settle().await?;
+    let page = ctx.inbox(&parent).await?;
+    for fact in page["items"].as_array().unwrap() {
+        assert_eq!(fact["fallback"]["reason"], "no-subscriber", "{fact:#}");
+        assert!(fact["batchId"].is_null(), "not consumed: {fact:#}");
+    }
+    assert!(ctx.batch_rows()?.is_empty());
+    assert_eq!(
+        push.sent.lock().unwrap().len(),
+        pushed_before + 1,
+        "the pending question pages the owner"
+    );
+    Ok(())
+}
+
 // ─── visible row first, Hub voice, budget ───────────────────────────────────
 
 /// §10.1 item 6: when the Node receives the batch's send, its batch row

@@ -763,7 +763,18 @@ fn one_line(field: &str, value: &str) -> Result<String, MemoryError> {
     Ok(trimmed.to_string())
 }
 
+/// Every slug a request names goes through here before anything else uses
+/// it. The secret lint runs first, so a credential-shaped slug is refused
+/// (422, without the slug) even when it is not a valid slug either; the
+/// invalid-slug message names no slug.
 fn check_slug(slug: &str) -> Result<(), MemoryError> {
+    if let Some(rule) = crate::secret_lint::first_secret(slug) {
+        return Err(MemoryError::SecretRejected {
+            slug: String::new(),
+            field: "slug",
+            rule,
+        });
+    }
     validate_memory_slug(slug).map_err(MemoryError::BadRequest)
 }
 

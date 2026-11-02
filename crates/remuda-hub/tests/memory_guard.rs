@@ -1229,3 +1229,88 @@ async fn the_import_is_bounded_per_entry_and_per_request() -> Result<()> {
     assert_eq!(full["created"].as_array().map(Vec::len), Some(512));
     Ok(())
 }
+
+/// A slug that is invalid AND credential-shaped is never echoed: the lint
+/// runs before slug validation, and the invalid-slug message names no slug.
+#[tokio::test]
+async fn an_invalid_credential_shaped_slug_is_never_echoed() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let lineage = ctx.seat().await?;
+    ctx.ok(
+        "POST",
+        &mem(&lineage, ""),
+        &ctx.human,
+        Some(entry("kept", "x")),
+    )
+    .await?;
+    let ok_entry = entry("kept", "x");
+    // Uppercase, so not a valid slug, and shaped like a key.
+    let slug = ["sk", "-ProjTq7Wm2Xn9Bv4Lc8Rz5Hd1Kf6"].concat();
+    let tail = "Bv4Lc8Rz5Hd1Kf6";
+    let calls: Vec<(&str, String, Option<Value>)> = vec![
+        ("POST", mem(&lineage, ""), Some(entry(&slug, "x"))),
+        ("GET", mem(&lineage, &format!("/entries/{slug}")), None),
+        (
+            "PUT",
+            mem(&lineage, &format!("/entries/{slug}")),
+            Some(json!({"expectedRevision": 1, "body": "y"})),
+        ),
+        (
+            "DELETE",
+            mem(&lineage, &format!("/entries/{slug}?expectedRevision=1")),
+            None,
+        ),
+        (
+            "POST",
+            mem(&lineage, "/consolidate"),
+            Some(json!({"sources": [{"slug": slug, "expectedRevision": 1},
+                                    {"slug": "kept", "expectedRevision": 1}],
+                        "entry": ok_entry})),
+        ),
+        (
+            "POST",
+            mem(&lineage, "/consolidate"),
+            Some(json!({"sources": [{"slug": "kept", "expectedRevision": 1},
+                                    {"slug": "other", "expectedRevision": 1}],
+                        "entry": entry(&slug, "merged")})),
+        ),
+        (
+            "POST",
+            mem(&lineage, "/restore"),
+            Some(json!({"slugs": [slug]})),
+        ),
+        (
+            "POST",
+            mem(&lineage, "/import"),
+            Some(json!({"entries": [import_entry(&slug, "agent", "x")]})),
+        ),
+    ];
+    for (method, path, body) in calls {
+        let reply = ctx.call(method, &path, &ctx.human, body).await?;
+        assert_eq!(reply.status, 422, "{method} {path}: {}", reply.text);
+        assert_eq!(
+            reply.body["code"], "MEMORY_SECRET_REJECTED",
+            "{}",
+            reply.text
+        );
+        assert_eq!(reply.body["field"], "slug", "{}", reply.text);
+        assert!(
+            !reply.text.contains(tail),
+            "{method} echoes the slug: {}",
+            reply.text
+        );
+    }
+    // An invalid slug that is not a credential is a 400 that names no slug.
+    let plain = "Not-A-Slug-Zebra";
+    let reply = ctx
+        .call(
+            "POST",
+            &mem(&lineage, ""),
+            &ctx.human,
+            Some(entry(plain, "x")),
+        )
+        .await?;
+    assert_eq!(reply.status, 400, "{}", reply.text);
+    assert!(!reply.text.contains("Zebra"), "{}", reply.text);
+    Ok(())
+}

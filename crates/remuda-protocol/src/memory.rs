@@ -382,10 +382,12 @@ pub fn validate_memory_slug(slug: &str) -> Result<(), String> {
     if first_ok && rest_ok && slug.len() <= 64 {
         Ok(())
     } else {
-        Err(format!(
-            "invalid memory slug {slug:?}: use 1-64 characters of a-z, 0-9, '.', '_' or '-', \
+        // The slug itself is never echoed: it may carry a credential.
+        Err(
+            "invalid memory slug: use 1-64 characters of a-z, 0-9, '.', '_' or '-', \
              starting with a letter or digit"
-        ))
+                .to_string(),
+        )
     }
 }
 

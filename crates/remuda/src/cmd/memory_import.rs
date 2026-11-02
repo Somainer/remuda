@@ -410,7 +410,7 @@ fn parse_entry(
     let name = fields.get("name").map(String::as_str).unwrap_or(stem);
     let slug = slug_from(name);
     validate_memory_slug(&slug)
-        .map_err(|error| format!("no usable slug from {name:?}: {error}"))?;
+        .map_err(|error| format!("no usable slug from its name: {error}"))?;
     let memory_type = match fields.get("type") {
         Some(raw) => MemoryType::parse(raw.trim())
             .ok_or_else(|| format!("type {raw:?} is not user, feedback, project or reference"))?,

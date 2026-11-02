@@ -396,3 +396,52 @@ async fn the_owner_imports_phase1_memory_once() -> Result<()> {
     assert!(stderr.contains("403"), "{stderr}");
     Ok(())
 }
+
+/// The CLI never prints a credential-shaped slug it was given, valid or not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_credential_shaped_slug_is_not_echoed_by_the_cli() -> Result<()> {
+    let hub = spawn_hub().await?;
+    let (seat, _) = hub.seat().await?;
+    let tail = "Bv4Lc8Rz5Hd1Kf6";
+    for slug in [
+        ["sk", "-ProjTq7Wm2Xn9Bv4Lc8Rz5Hd1Kf6"].concat(),
+        ["sk", "-projtq7wm2xn9bv4lc8rz5hd1kf6"].concat(),
+    ] {
+        let tail = if slug.contains('P') {
+            tail.to_string()
+        } else {
+            tail.to_lowercase()
+        };
+        for args in [
+            vec![
+                "write",
+                slug.as_str(),
+                "--type",
+                "user",
+                "--title",
+                "t",
+                "--description",
+                "d",
+                "--body",
+                "b",
+            ],
+            vec!["read", slug.as_str()],
+            vec!["rm", slug.as_str(), "--expected-revision", "1"],
+        ] {
+            let mut full = vec!["--lineage", seat.as_str()];
+            full.extend(args.iter().copied());
+            let output = run(hub.command(&hub.owner, None), &full);
+            let stderr = refused(&output);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stderr.contains("MEMORY_SECRET_REJECTED"),
+                "{args:?}: {stderr}"
+            );
+            assert!(
+                !stderr.contains(&tail) && !stdout.contains(&tail),
+                "{args:?}: {stderr}"
+            );
+        }
+    }
+    Ok(())
+}

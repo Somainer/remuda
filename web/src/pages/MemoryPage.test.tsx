@@ -353,3 +353,42 @@ describe("a delete target already removed elsewhere", () => {
     await waitFor(() => expect(listMemory.mock.calls.length).toBeGreaterThan(1));
   });
 });
+
+describe("a credential-shaped slug is never shown back", () => {
+  // Built from pieces so this source holds no credential-shaped text.
+  const tail = "Bv4Lc8Rz5Hd1Kf6";
+  const upper = ["sk", "-ProjTq7Wm2Xn9", tail].join("");
+  const lower = upper.toLowerCase();
+
+  async function submit(slug: string) {
+    renderPage("/s/ins_x/memory");
+    fireEvent.click(await screen.findByTestId("memory-new"));
+    fireEvent.change(screen.getByTestId("memory-editor-slug"), { target: { value: slug } });
+    fireEvent.change(screen.getByTestId("memory-editor-title-input"), { target: { value: "t" } });
+    fireEvent.change(screen.getByTestId("memory-editor-description"), { target: { value: "d" } });
+    fireEvent.change(screen.getByTestId("memory-editor-body"), { target: { value: "b" } });
+    fireEvent.click(screen.getByTestId("memory-editor-save"));
+    return screen.findByTestId("memory-editor-error");
+  }
+
+  it("refuses an invalid one locally without repeating it", async () => {
+    const error = await submit(upper);
+    expect(createMemory).not.toHaveBeenCalled();
+    expect(error.textContent).not.toContain(tail);
+  });
+
+  it("shows the Hub's secret refusal without repeating it", async () => {
+    // The Hub's own 422 for a slug: it names neither the slug nor the text.
+    createMemory.mockRejectedValue(
+      new HubHttpError(
+        422,
+        "MEMORY_SECRET_REJECTED",
+        'this memory entry was not stored: its slug looks like a credential (shape "sk-"); the text is not echoed',
+      ),
+    );
+    const error = await submit(lower);
+    await waitFor(() => expect(createMemory).toHaveBeenCalled());
+    await waitFor(() => expect(error.textContent).toContain("秘密"));
+    expect(error.textContent).not.toContain(tail.toLowerCase());
+  });
+});

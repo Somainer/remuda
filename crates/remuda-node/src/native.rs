@@ -2344,6 +2344,7 @@ mod tests {
         let mut request = crate::CreateInstanceRequest {
             creator_permission_mode: None,
             memory_context: None,
+            skill_context: None,
             initiator: None,
             origin: InputOrigin::Human,
             agent_credential: None,

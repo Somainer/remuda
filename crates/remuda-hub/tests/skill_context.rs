@@ -25,6 +25,8 @@ struct FakeNode {
     frames: tokio::sync::mpsc::UnboundedReceiver<(String, Value)>,
     appends: tokio::sync::mpsc::UnboundedSender<(String, Value)>,
     task: tokio::task::JoinHandle<()>,
+    /// The persistent bearer the hello returned (enroll tokens are single-use).
+    node_token: Option<String>,
 }
 
 impl FakeNode {
@@ -37,6 +39,18 @@ impl FakeNode {
         capabilities: Option<Value>,
     ) -> Result<Self> {
         let enroll = hub.mint_enroll_token(5).await?;
+        Self::connect_with(hub, host, herdr, &enroll, capabilities).await
+    }
+
+    /// Hello presenting `bearer` (an enroll token, or a prior hello's
+    /// `nodeToken` to reconnect the same host).
+    async fn connect_with(
+        hub: &remuda_hub::RunningHub,
+        host: &str,
+        herdr: bool,
+        enroll: &str,
+        capabilities: Option<Value>,
+    ) -> Result<Self> {
         let mut request = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
         request
             .headers_mut()
@@ -62,6 +76,7 @@ impl FakeNode {
         let hello: Value =
             serde_json::from_str(&node.next().await.context("hello")??.into_text()?)?;
         anyhow::ensure!(hello.get("result").is_some(), "hello failed: {hello}");
+        let node_token = hello["result"]["nodeToken"].as_str().map(str::to_owned);
         let (frame_tx, frames) = tokio::sync::mpsc::unbounded_channel();
         let (appends, mut append_rx) = tokio::sync::mpsc::unbounded_channel::<(String, Value)>();
         let task = tokio::spawn(async move {
@@ -100,6 +115,7 @@ impl FakeNode {
             frames,
             appends,
             task,
+            node_token,
         })
     }
 
@@ -393,5 +409,57 @@ async fn a_terminal_gets_no_stamp() -> Result<()> {
         .create(&mut node, "terminal", "shell-pty", json!({}))
         .await?;
     assert!(params.get("skillContext").is_none(), "{params}");
+    Ok(())
+}
+
+/// A Node that reconnects without `capabilities` came from an older build: the
+/// claim a newer build left on the host row used to make the Hub stamp
+/// `memoryContext` (and, ma-skill, `skillContext`), so both are dropped and the
+/// next create goes out without the stamp.
+#[tokio::test]
+async fn a_hello_without_capabilities_forgets_a_stale_skill_context_claim() -> Result<()> {
+    let _switch = SWITCH.lock().await;
+    let ctx = Ctx::boot().await?;
+    let capable_node = FakeNode::connect(&ctx.hub, &ctx.host, true, capable()).await?;
+    let node_token = capable_node
+        .node_token
+        .clone()
+        .context("hello returned no nodeToken")?;
+    let mut node = capable_node;
+    let (_, params) = ctx
+        .create(
+            &mut node,
+            "claude",
+            "claude-sdk",
+            json!({"grants": ["land"]}),
+        )
+        .await?;
+    assert_eq!(
+        params["skillContext"]["grants"],
+        json!(["land"]),
+        "{params}"
+    );
+    let seat = params["instanceId"].as_str().unwrap().to_owned();
+    // Close the link, then come back as an older build: same host, same node
+    // token, no capability blob.
+    ctx.ok(
+        &format!("/v1/instances/{seat}/commands"),
+        json!({"operation": "instance.close", "payload": {}}),
+    )
+    .await
+    .ok();
+    drop(node);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut old_node = FakeNode::connect_with(&ctx.hub, &ctx.host, true, &node_token, None).await?;
+    let (_, params) = ctx
+        .create(
+            &mut old_node,
+            "claude",
+            "claude-sdk",
+            json!({"grants": ["land"]}),
+        )
+        .await?;
+    assert!(params.get("skillContext").is_none(), "{params}");
+    assert!(params.get("memoryContext").is_none(), "{params}");
     Ok(())
 }

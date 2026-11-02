@@ -227,6 +227,25 @@ async function collapseQueue(page: Page) {
 }
 
 /** Other specs' cards may fill the fold: open the queue in place. */
+/**
+ * Wait until `id` is painted, opening the fold on each round: after a release
+ * the card may be the newest painted, or still behind a fold row that only
+ * appears with the poll that delivers it.
+ */
+async function showCard(page: Page, id: string, timeout = 30_000) {
+  await expect
+    .poll(
+      async () => {
+        if (await card(page, id).count()) return true;
+        const more = page.locator('[data-testid="home-queue-more"][aria-expanded="false"]');
+        if (await more.count()) await more.click();
+        return (await card(page, id).count()) > 0;
+      },
+      { timeout },
+    )
+    .toBe(true);
+}
+
 async function expandQueue(page: Page) {
   const more = page.locator('[data-testid="home-queue-more"][aria-expanded="false"]');
   if (await more.count()) await more.click();
@@ -352,10 +371,7 @@ test.describe("home queue", () => {
       // The open queue holds its order (§4.1): collapse and re-expand to take
       // in the card that arrived while it was frozen.
       await collapseQueue(page);
-      await expect(card(page, raced.interactionId).or(page.getByTestId("home-queue-more")).first()).toBeVisible({
-        timeout: 20_000,
-      });
-      await expandQueue(page);
+      await showCard(page, raced.interactionId);
       const racedCard = card(page, raced.interactionId);
       await expect(racedCard).toBeVisible();
       const frozen = await (await page.request.get("/v1/interactions")).text();

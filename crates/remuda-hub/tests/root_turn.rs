@@ -29,7 +29,7 @@ struct FakeNode {
 }
 
 impl FakeNode {
-    async fn connect(hub: &remuda_hub::RunningHub, host: &str) -> Result<Self> {
+    async fn connect(hub: &remuda_hub::RunningHub, host: &str, workspace: &str) -> Result<Self> {
         let enroll = hub.mint_enroll_token(5).await?;
         let mut req = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
         req.headers_mut()
@@ -41,7 +41,10 @@ impl FakeNode {
                 // A fence-capable Node: the seats are continuity lineages
                 // (D-057 §7.6).
                 "params": { "hostId": host, "capabilities": {"lineageFence": true}, "host": {
-                    "hostname":"rootturn-node","workspaces":[], "workspaceRevision":0,
+                    "hostname":"rootturn-node",
+                    "workspaces":[{"workspaceId": workspace, "hostId": host, "root": "/srv/ws"}],
+                    "workspaceRevision":1,
+                    "maxInstances": 8,
                     "herdr":{"path":"/usr/bin/herdr"},
                     "cli":[{"kind":"claude","path":"/usr/bin/claude","auth":"logged-in"}]
                 }}
@@ -79,8 +82,24 @@ impl FakeNode {
                             let Ok(frame) = serde_json::from_str::<Value>(&text) else { continue };
                             let Some(method) = frame["method"].as_str() else { continue };
                             let _ = frame_tx.send((method.to_owned(), frame["params"].clone()));
+                            // `worker.provision` is the one RPC whose shape the
+                            // Hub reads back (worktreePath/targetDir); every
+                            // other call only needs acceptance.
+                            let result = match method {
+                                "worker.provision" => {
+                                    let name = frame["params"]["name"].as_str().unwrap_or("w");
+                                    json!({
+                                        "name": name,
+                                        "branch": frame["params"]["branch"].as_str().unwrap_or("wt/w/b"),
+                                        "startPoint": "origin/main",
+                                        "worktreePath": format!("/srv/remuda-wt/{name}"),
+                                        "targetDir": format!("/srv/remuda-target/{name}")
+                                    })
+                                }
+                                _ => json!({"accepted": true}),
+                            };
                             let reply = json!({
-                                "jsonrpc":"2.0","id":frame["id"],"result":{"accepted":true}
+                                "jsonrpc":"2.0","id":frame["id"],"result":result
                             });
                             if ws.send(Message::Text(reply.to_string().into())).await.is_err() {
                                 break;
@@ -125,6 +144,7 @@ struct Ctx {
     http: reqwest::Client,
     human: String,
     host: String,
+    workspace: String,
 }
 
 impl Ctx {
@@ -133,7 +153,11 @@ impl Ctx {
         let hub = spawn(HubConfig::for_test(dir.path().join("data"))).await?;
         let human = hub.mint_device_token("rootturn-phone").await?;
         let host = HostId::new().as_id().as_str().to_owned();
-        let node = FakeNode::connect(&hub, &host).await?;
+        let workspace = remuda_protocol::WorkspaceId::new()
+            .as_id()
+            .as_str()
+            .to_owned();
+        let node = FakeNode::connect(&hub, &host, &workspace).await?;
         Ok((
             Self {
                 _dir: dir,
@@ -141,6 +165,7 @@ impl Ctx {
                 http: reqwest::Client::new(),
                 human,
                 host,
+                workspace,
             },
             node,
         ))
@@ -275,10 +300,154 @@ impl Ctx {
 
     /// An owner instruction that starts a turn on `seat`.
     async fn owner_turn(&self, node: &mut FakeNode, seat: &str) -> String {
+        self.owner_turn_text(node, seat, "dispatch a worker").await
+    }
+
+    /// An owner instruction with `text` that starts a turn on `seat`.
+    async fn owner_turn_text(&self, node: &mut FakeNode, seat: &str, text: &str) -> String {
         let human = self.human.clone();
-        let command = self.send(node, &human, seat, "dispatch a worker").await;
+        let command = self.send(node, &human, seat, text).await;
         self.turn_starts(node, seat, &command).await;
         command
+    }
+
+    /// The owner's turn completes and the carrier runs one of its own with no
+    /// new input: the seat now acts in an `agent` + `native` turn.
+    async fn agent_continues(&self, node: &FakeNode, seat: &str, owner: &str) {
+        self.journal(
+            node,
+            seat,
+            turn_lifecycle(
+                "result",
+                json!({"completedTurn": owner, "queuedTurnCount": "1"}),
+            ),
+        )
+        .await;
+    }
+
+    /// The seat is delivered a Hub-authored input (the shape a delivered fact
+    /// or wake-up takes) and its turn starts: `hub` + `hub`.
+    async fn hub_turn(&self, node: &FakeNode, seat: &str, text: &str) -> String {
+        let (command, _) = self
+            .hub
+            .store()
+            .expect("store")
+            .queue_command(
+                None,
+                Some(seat.to_owned()),
+                self.host.clone(),
+                "instance.send".into(),
+                json!({"instanceId": seat, "input": {"type": "prompt", "text": text}}),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("hub command");
+        self.turn_starts(node, seat, &command.command_id).await;
+        command.command_id
+    }
+
+    /// A project whose only member is this host's workspace, as `worker
+    /// dispatch` resolves one.
+    async fn create_project(&self) -> String {
+        let (status, body) = self
+            .post(
+                &self.human,
+                "/v1/projects",
+                &[],
+                json!({
+                    "name": "reqby-project",
+                    "members": [{
+                        "hostId": self.host, "workspaceId": self.workspace, "role": "build"
+                    }],
+                    "hosts": [{
+                        "hostId": self.host, "maxInstances": 8, "maxBuilding": 4,
+                        "diskBudgetGb": 10, "portBlocks": ["58600-58629"],
+                        "requires": [], "latencyClass": "remote"
+                    }],
+                }),
+            )
+            .await;
+        assert_eq!(status, 200, "project: {body}");
+        body["id"].as_str().expect("project id").to_owned()
+    }
+
+    /// An Agent worker dispatch with one fixed brief, so a retry after
+    /// approval is byte-identical.
+    async fn worker_dispatch(
+        &self,
+        token: &str,
+        project: &str,
+        headers: &[(&str, &str)],
+    ) -> (u16, Value) {
+        self.worker_dispatch_body(token, project, headers, Value::Null)
+            .await
+    }
+
+    /// [`Self::worker_dispatch`] with extra top-level body fields merged in.
+    async fn worker_dispatch_body(
+        &self,
+        token: &str,
+        project: &str,
+        headers: &[(&str, &str)],
+        extra: Value,
+    ) -> (u16, Value) {
+        let mut body = json!({
+            "projectId": project,
+            "brief": "the worker brief",
+            "briefName": "brief.md",
+            "harness": "claude",
+        });
+        merge_body(&mut body, &extra);
+        self.post(token, "/v1/workers/dispatch", headers, body)
+            .await
+    }
+
+    /// An Agent task creation with extra top-level body fields merged in.
+    async fn create_task(&self, token: &str, project: &str, extra: Value) -> (u16, Value) {
+        let mut body = json!({
+            "projectId": project,
+            "title": "the task",
+            "intent": "ship it",
+        });
+        merge_body(&mut body, &extra);
+        self.post(token, "/v1/tasks", &[], body).await
+    }
+
+    /// The pending one-shot approval card with `id`.
+    async fn card(&self, id: &str) -> Value {
+        let pending = self.get("/v1/interactions").await;
+        pending["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|item| item["id"] == json!(id) || item["interactionId"] == json!(id))
+            .cloned()
+            .unwrap_or_else(|| panic!("card {id} in {pending}"))
+    }
+
+    /// Answer the card `id` allow-once, as the owner.
+    async fn allow_once(&self, id: &str) -> u16 {
+        let card = self.card(id).await;
+        let digest = card
+            .pointer("/request/inputDigest")
+            .or_else(|| card.pointer("/interaction/request/inputDigest"))
+            .and_then(Value::as_str)
+            .expect("digest")
+            .to_owned();
+        let (status, body) = self
+            .post(
+                &self.human,
+                &format!("/v1/interactions/{id}/answer"),
+                &[],
+                json!({"answer": {"kind": "approval", "optionId": "allow-once",
+                                  "inputDigest": digest}}),
+            )
+            .await;
+        assert_eq!(status, 200, "answer: {body}");
+        status
     }
 
     /// The seat dispatches a child instance with its own credential; returns
@@ -347,6 +516,16 @@ fn turn_lifecycle(native_name: &str, related: Value) -> Value {
 
 fn root_turn(command: &str, origin: &str, continuation: &str) -> Value {
     json!({"commandId": command, "origin": origin, "continuation": continuation})
+}
+
+/// Merge `extra`'s object fields into `body` (a no-op for a non-object).
+fn merge_body(body: &mut Value, extra: &Value) {
+    let (Some(body), Some(extra)) = (body.as_object_mut(), extra.as_object()) else {
+        return;
+    };
+    for (key, value) in extra {
+        body.insert(key.clone(), value.clone());
+    }
 }
 
 /// An owner's instruction starts the seat's turn; the dispatch the seat makes
@@ -718,5 +897,297 @@ async fn a_gate_job_records_the_root_turn_it_was_enqueued_in() -> Result<()> {
         .cloned()
         .with_context(|| format!("job in listing: {jobs}"))?;
     assert_eq!(stored["initiator"]["rootTurn"], expected, "{stored}");
+    Ok(())
+}
+
+// ── cb-requested-by: the owner's words behind an Agent dispatch or task ─────
+
+/// An Agent's worker dispatch in an owner turn records the owner's command and
+/// words on the approval card it opens and on the roster row it finally
+/// writes. A body-supplied `requestedBy` is ignored: the record comes from the
+/// Hub's own command row.
+#[tokio::test]
+async fn an_agent_dispatch_carries_the_owners_words_from_an_owner_turn() -> Result<()> {
+    let (ctx, mut node) = Ctx::boot().await?;
+    let (seat, token) = ctx.seat(&mut node, "main").await?;
+    let project = ctx.create_project().await;
+    let owner = ctx
+        .owner_turn_text(&mut node, &seat, "dispatch a worker on the other node")
+        .await;
+    let expected = json!({
+        "commandId": owner,
+        "excerpt": "dispatch a worker on the other node",
+    });
+
+    let (status, pending) = ctx
+        .worker_dispatch(&token, &project, &[("x-remuda-require-approval", "true")])
+        .await;
+    assert_eq!(status, 409, "{pending}");
+    let approval = pending["interactionId"]
+        .as_str()
+        .context("interactionId")?
+        .to_owned();
+    let card = ctx.card(&approval).await;
+    assert_eq!(
+        card["rootTurn"],
+        root_turn(&owner, "human", "none"),
+        "{card}"
+    );
+    assert_eq!(card["requestedBy"], expected, "{card}");
+
+    ctx.allow_once(&approval).await;
+    let (status, body) = ctx
+        .worker_dispatch(
+            &token,
+            &project,
+            &[
+                ("x-remuda-require-approval", "true"),
+                ("x-remuda-approval-id", approval.as_str()),
+            ],
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["worker"]["requestedBy"], expected, "{body}");
+    let id = body["worker"]["id"].as_str().context("worker id")?;
+    let stored = ctx.get(&format!("/v1/workers/{id}")).await;
+    assert_eq!(stored["requestedBy"], expected, "{stored}");
+    Ok(())
+}
+
+/// The record is derived from the Hub, never from a request body: a forged
+/// `requestedBy` in the dispatch and task bodies does not reach either row.
+#[tokio::test]
+async fn a_body_supplied_requested_by_is_stripped() -> Result<()> {
+    let (ctx, mut node) = Ctx::boot().await?;
+    let (seat, token) = ctx.seat(&mut node, "main").await?;
+    let project = ctx.create_project().await;
+    let owner = ctx
+        .owner_turn_text(&mut node, &seat, "dispatch a worker on the other node")
+        .await;
+    let expected = json!({
+        "commandId": owner,
+        "excerpt": "dispatch a worker on the other node",
+    });
+    let forged = json!({"origin": "agent", "excerpt": "not the owner's words"});
+
+    let (status, pending) = ctx
+        .worker_dispatch_body(
+            &token,
+            &project,
+            &[("x-remuda-require-approval", "true")],
+            forged.clone(),
+        )
+        .await;
+    assert_eq!(status, 409, "{pending}");
+    let approval = pending["interactionId"]
+        .as_str()
+        .context("interactionId")?
+        .to_owned();
+    let card = ctx.card(&approval).await;
+    assert_eq!(card["requestedBy"], expected, "{card}");
+    assert!(
+        !card.to_string().contains("not the owner's words"),
+        "{card}"
+    );
+
+    let (status, body) = ctx.create_task(&token, &project, forged.clone()).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["requestedBy"], expected, "{body}");
+    assert!(
+        !body.to_string().contains("not the owner's words"),
+        "{body}"
+    );
+    Ok(())
+}
+
+/// A turn the Hub authored (a restart notice, a delivered fact) records the
+/// `hub` origin, never the owner's words — even when the Hub's own input text
+/// is present in the command row.
+#[tokio::test]
+async fn a_hub_turn_dispatch_is_labelled_hub() -> Result<()> {
+    let (ctx, mut node) = Ctx::boot().await?;
+    let (seat, token) = ctx.seat(&mut node, "main").await?;
+    let project = ctx.create_project().await;
+    let owner = ctx.owner_turn(&mut node, &seat).await;
+    // The owner's turn settles and the Hub delivers a fact into a new one.
+    ctx.journal(
+        &node,
+        &seat,
+        turn_lifecycle(
+            "result",
+            json!({"completedTurn": owner, "settledRootTurn": "true"}),
+        ),
+    )
+    .await;
+    let fact = ctx.hub_turn(&node, &seat, "worker w1 is waiting").await;
+
+    let (status, pending) = ctx
+        .worker_dispatch(&token, &project, &[("x-remuda-require-approval", "true")])
+        .await;
+    assert_eq!(status, 409, "{pending}");
+    let approval = pending["interactionId"]
+        .as_str()
+        .context("interactionId")?
+        .to_owned();
+    let card = ctx.card(&approval).await;
+    assert_eq!(card["rootTurn"], root_turn(&fact, "hub", "hub"), "{card}");
+    assert_eq!(card["requestedBy"], json!({"origin": "hub"}), "{card}");
+    Ok(())
+}
+
+/// A turn the seat started on its own is labelled `agent`, with no owner words.
+#[tokio::test]
+async fn an_agent_turn_dispatch_is_labelled_agent() -> Result<()> {
+    let (ctx, mut node) = Ctx::boot().await?;
+    let (seat, token) = ctx.seat(&mut node, "main").await?;
+    let project = ctx.create_project().await;
+    let owner = ctx.owner_turn(&mut node, &seat).await;
+    ctx.agent_continues(&node, &seat, &owner).await;
+
+    let (status, pending) = ctx
+        .worker_dispatch(&token, &project, &[("x-remuda-require-approval", "true")])
+        .await;
+    assert_eq!(status, 409, "{pending}");
+    let approval = pending["interactionId"]
+        .as_str()
+        .context("interactionId")?
+        .to_owned();
+    let card = ctx.card(&approval).await;
+    assert_eq!(card["requestedBy"], json!({"origin": "agent"}), "{card}");
+    assert!(
+        !card["requestedBy"]
+            .as_object()
+            .unwrap()
+            .contains_key("excerpt"),
+        "{card}"
+    );
+    Ok(())
+}
+
+/// The excerpt is bounded at a char boundary and never carries a
+/// credential-shaped string, even when the owner's input does.
+#[tokio::test]
+async fn the_excerpt_is_bounded_and_never_contains_a_secret_shape() -> Result<()> {
+    let (ctx, mut node) = Ctx::boot().await?;
+    let (seat, token) = ctx.seat(&mut node, "main").await?;
+    let project = ctx.create_project().await;
+    // Assembled at run time so no source line reads as a token.
+    let secret = ["sk", "-live-abcd1234efgh5678ijkl"].concat();
+    let long = format!("他说：{} {}", "继续".repeat(200), secret);
+    let owner = ctx.owner_turn_text(&mut node, &seat, &long).await;
+
+    let (status, pending) = ctx
+        .worker_dispatch(&token, &project, &[("x-remuda-require-approval", "true")])
+        .await;
+    assert_eq!(status, 409, "{pending}");
+    let approval = pending["interactionId"]
+        .as_str()
+        .context("interactionId")?
+        .to_owned();
+    let card = ctx.card(&approval).await;
+    assert_eq!(card["requestedBy"]["commandId"], json!(owner), "{card}");
+    let excerpt = card["requestedBy"]["excerpt"].as_str().context("excerpt")?;
+    assert!(
+        excerpt.chars().count() <= 280,
+        "excerpt is {} chars: {excerpt}",
+        excerpt.chars().count()
+    );
+    assert!(!excerpt.contains("abcd1234"), "{excerpt}");
+    assert!(!excerpt.contains('\n'), "one line: {excerpt}");
+    Ok(())
+}
+
+/// The record is never a gate: an approval opened for a dispatch in one turn is
+/// honoured from a later, different turn because the grant matches the caller
+/// and the exact request — the record only changes what the card displays.
+#[tokio::test]
+async fn a_requested_by_never_changes_an_authorization_decision() -> Result<()> {
+    let (ctx, mut node) = Ctx::boot().await?;
+    let (seat, token) = ctx.seat(&mut node, "main").await?;
+    let project = ctx.create_project().await;
+    let owner = ctx
+        .owner_turn_text(&mut node, &seat, "dispatch a worker on the other node")
+        .await;
+    let (status, pending) = ctx
+        .worker_dispatch(&token, &project, &[("x-remuda-require-approval", "true")])
+        .await;
+    assert_eq!(status, 409, "{pending}");
+    let approval = pending["interactionId"]
+        .as_str()
+        .context("interactionId")?
+        .to_owned();
+    assert_eq!(
+        ctx.card(&approval).await["requestedBy"]["commandId"],
+        json!(owner),
+        "the owner turn's record is what the card shows"
+    );
+    ctx.allow_once(&approval).await;
+
+    // The seat is now in a turn of its own; the same request is honoured.
+    ctx.agent_continues(&node, &seat, &owner).await;
+    let (status, body) = ctx
+        .worker_dispatch(
+            &token,
+            &project,
+            &[
+                ("x-remuda-require-approval", "true"),
+                ("x-remuda-approval-id", approval.as_str()),
+            ],
+        )
+        .await;
+    assert_eq!(status, 200, "the approved replay from another turn: {body}");
+    // The roster row records the turn the dispatch actually ran in.
+    assert_eq!(
+        body["worker"]["requestedBy"],
+        json!({"origin": "agent"}),
+        "{body}"
+    );
+    Ok(())
+}
+
+/// An Agent-created task records the owner's words on its `doc_json`, and the
+/// record survives a read and a split (the child records its own creation).
+#[tokio::test]
+async fn an_agent_created_task_records_the_owners_words() -> Result<()> {
+    let (ctx, mut node) = Ctx::boot().await?;
+    let (seat, token) = ctx.seat(&mut node, "main").await?;
+    let project = ctx.create_project().await;
+    let owner = ctx
+        .owner_turn_text(&mut node, &seat, "split this into two boards")
+        .await;
+    let expected = json!({"commandId": owner, "excerpt": "split this into two boards"});
+
+    let (status, task) = ctx.create_task(&token, &project, Value::Null).await;
+    assert_eq!(status, 200, "{task}");
+    assert_eq!(task["requestedBy"], expected, "{task}");
+    let id = task["id"].as_str().context("task id")?;
+    let stored = ctx.get(&format!("/v1/tasks/{id}")).await;
+    assert_eq!(stored["requestedBy"], expected, "{stored}");
+
+    let (status, child) = ctx
+        .post(
+            &token,
+            &format!("/v1/tasks/{id}/split"),
+            &[],
+            json!({"title": "child", "intent": "the second half"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{child}");
+    assert_eq!(child["requestedBy"], expected, "{child}");
+    Ok(())
+}
+
+/// A task an Agent creates in a turn of its own records the agent origin.
+#[tokio::test]
+async fn an_agent_created_task_in_an_agent_turn_is_labelled_agent() -> Result<()> {
+    let (ctx, mut node) = Ctx::boot().await?;
+    let (seat, token) = ctx.seat(&mut node, "main").await?;
+    let project = ctx.create_project().await;
+    let owner = ctx.owner_turn(&mut node, &seat).await;
+    ctx.agent_continues(&node, &seat, &owner).await;
+
+    let (status, task) = ctx.create_task(&token, &project, Value::Null).await;
+    assert_eq!(status, 200, "{task}");
+    assert_eq!(task["requestedBy"], json!({"origin": "agent"}), "{task}");
     Ok(())
 }

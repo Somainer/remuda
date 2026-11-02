@@ -923,7 +923,7 @@ Additive, like the Phase 1 budget. Each item lands with the task named in bracke
   - `resume_on_reset` [`cb-usage-resume`].
   - `owner notify` claim rows, unique per dedupe key [`cb-owner-notify`].
 - Hub columns: instances `auto_continue` [`cb-usage-resume`]; memory write references (instance, turn) [`cb-memory-ui`].
-- Task and dispatch documents gain `requestedBy {lineageId, commandId}` inside the existing `doc_json`, with a serde default and no migration [`cb-requested-by`].
+- Task and dispatch documents gain `requestedBy` inside the existing `doc_json`, with a serde default and no migration: an owner-origin root turn records `{commandId, excerpt}` (the owner's own words for that command, one line, at most 280 chars, secret-scrubbed); any other origin records `{origin}` [`cb-requested-by`]. The same record rides the approval card the request opened. It is never a gate.
 - Project policy gains an optional `stallToolThresholdMins` (unset by default: no stall fact while a tool call is in flight) and the 24-hour fact cap (default 6) [`cb-stall-tooluse`, `cb-inbox-facts`].
 - On the Node: nothing for memory, digest or glance. `check` runs keep their exit code and a bounded stdout [`cb-wake-check`].
 
@@ -1121,7 +1121,7 @@ Each keeps the full gated suite green on its own, like the tasks above. `cb-adr`
 | Task | Content | After |
 |---|---|---|
 | `cb-rootturn` | `rootTurn {commandId, origin, continuation}` on the initiator, derived by the Hub from the turn record; written to audit rows, journal rows and gate jobs; never a gate (D-060 R2). Until `ma-restart` adds `hub`, a fact-triggered turn is recorded as `agent` with `continuation` | `ma-initiator` |
-| `cb-requested-by` | `requestedBy {lineageId, commandId}` stamped from `rootTurn` in owner turns; `/approvals` shows the owner's words, or "agent-initiated" for a hub-origin turn. It never replaces the approval | `cb-rootturn` |
+| `cb-requested-by` | `requestedBy` stamped from `rootTurn` on Agent-created dispatches and tasks: `{commandId, excerpt}` (the owner's words, bounded and secret-scrubbed) in an owner turn, else `{origin}`. `/approvals` and the task detail show the owner's words, or "agent 自发" for an agent/hub-origin turn. It never replaces the approval and no decision reads it | `cb-rootturn` |
 
 **Phase 2 (after `ma-initiator`, `ma-fence` and `ma-restart`).**
 

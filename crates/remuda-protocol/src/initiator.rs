@@ -86,6 +86,33 @@ wire_enum!(RootTurnContinuation, "8.4", {
     Unknown => "unknown",
 });
 
+/// D-060 companion item (cb-requested-by): who asked for an Agent-created
+/// dispatch or task, as the Hub recorded it from its own root-turn ledger.
+///
+/// An owner-origin root turn records the command that carried the owner's
+/// input and a bounded, secret-scrubbed excerpt of their words. Any other
+/// origin records only that origin — `hub` for a restart notice or a fact,
+/// `agent` for a turn the agent started on its own. It is a record for the
+/// audit trail and `/approvals`, never a gate: no admission, grant, scope or
+/// approval rule reads it (owner ruling R2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestedBy {
+    /// Hub command id of the owner's input that started the root turn, when
+    /// that turn's origin is `human`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_id: Option<String>,
+    /// The owner's own words for that command, one line, at most 280 chars
+    /// and free of credential-shaped strings. Present only for an owner turn
+    /// whose command carried prompt text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excerpt: Option<String>,
+    /// The origin that started the turn, recorded only when it was not the
+    /// owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<InputOrigin>,
+}
+
 fn lenient_root_turn<'de, D: Deserializer<'de>>(d: D) -> Result<Option<RootTurn>, D::Error> {
     let value = serde_json::Value::deserialize(d)?;
     Ok(serde_json::from_value(value).ok())
@@ -130,5 +157,34 @@ mod tests {
         .expect("an unknown rootTurn value never drops the initiator");
         assert_eq!(future.root_turn, None);
         assert_eq!(future.instance_id, "ins_a");
+    }
+
+    /// cb-requested-by: an owner turn records the command and the words; a
+    /// non-owner turn records only its origin; absent fields never serialize.
+    #[test]
+    fn requested_by_records_the_owner_words_or_the_other_origin() {
+        let owner = RequestedBy {
+            command_id: Some("cmd_owner".into()),
+            excerpt: Some("dispatch a worker on the other node".into()),
+            origin: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&owner).unwrap(),
+            json!({"commandId": "cmd_owner", "excerpt": "dispatch a worker on the other node"})
+        );
+
+        let hub = RequestedBy {
+            command_id: None,
+            excerpt: None,
+            origin: Some(InputOrigin::Hub),
+        };
+        assert_eq!(
+            serde_json::to_value(&hub).unwrap(),
+            json!({"origin": "hub"})
+        );
+        let parsed: RequestedBy =
+            serde_json::from_value(json!({"origin": "agent"})).expect("parses");
+        assert_eq!(parsed.origin, Some(InputOrigin::Agent));
+        assert_eq!(parsed.excerpt, None);
     }
 }

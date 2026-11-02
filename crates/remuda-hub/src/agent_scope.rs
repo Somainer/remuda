@@ -157,11 +157,13 @@ pub fn stamp(payload: &mut Value, device: &Device) {
     }
     // Never accept caller-selected provenance, a credential, or an initiator
     // in JSON. D-057 §7.1: the initiator is Hub-stamped from auth, not the body.
+    // cb-requested-by: likewise never from a body.
     if let Some(object) = payload.as_object_mut() {
         object.remove("agentCredential");
         object.remove("actor");
         object.remove("initiator");
         object.remove("initiatorDeviceId");
+        object.remove("requestedBy");
     }
 }
 
@@ -889,11 +891,13 @@ pub async fn require_approval(
         host_id: instance.host_id.parse().map_err(|_| HubError::Forbidden)?,
     };
     // cb-rootturn: recorded on a new card for display; never part of the
-    // grant's match (the caller and the exact request decide).
+    // grant's match (the caller and the exact request decide). cb-requested-by
+    // rides the same card: the owner's words, or the non-owner origin.
     let root_turn = state.store.root_turn(id).await?;
+    let requested_by = state.store.requested_by(root_turn.clone()).await?;
     state
         .agent_approvals
-        .require_recorded(headers, &caller, request, root_turn)
+        .require_recorded(headers, &caller, request, root_turn, requested_by)
         .await
 }
 

@@ -313,6 +313,19 @@ pub(crate) async fn dispatch_core(
     // D-057 §7.1: every mutation this dispatch admits (provision admission,
     // create + brief commands, the roster row) carries the caller's initiator.
     let (dispatch_initiator, dispatch_device_id) = initiator_and_device(&state, &device).await?;
+    // cb-requested-by: for an Agent dispatch, who asked for it, derived from
+    // the same root turn the initiator carries. Record only, never a gate.
+    // A request body cannot supply one: `DispatchBody` has no such field and
+    // `stamp` strips the key from any command payload.
+    let requested_by = state
+        .store
+        .requested_by(
+            dispatch_initiator
+                .as_ref()
+                .and_then(|i| i.root_turn.clone()),
+        )
+        .await
+        .map_err(map_store)?;
     if !scope.allows_project(body.project_id.as_id().as_str()) {
         return Err(HubError::Forbidden);
     }
@@ -884,6 +897,9 @@ pub(crate) async fn dispatch_core(
             // and what the worker launched with.
             permission_mode_requested: body.permission_mode.clone(),
             permission_mode: Some(permission_mode),
+            // cb-requested-by: the owner's words behind an Agent dispatch, or
+            // the non-owner origin, recorded on the roster row.
+            requested_by,
         };
         let row = state
             .store

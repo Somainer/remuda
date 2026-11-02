@@ -4075,6 +4075,30 @@
         ],
         "type": "object"
       },
+      "RequestedBy": {
+        "description": "cb-requested-by: who asked for an Agent-created dispatch or task. An owner-origin root turn records the command that carried the owner's input and a bounded, secret-scrubbed excerpt of their words; any other origin records only that origin. Record only, never a gate.",
+        "properties": {
+          "commandId": {
+            "description": "Hub command id of the owner's input that started the root turn.",
+            "type": "string"
+          },
+          "excerpt": {
+            "description": "The owner's own words for that command: one line, at most 280 characters, credential-shaped strings withheld.",
+            "type": "string"
+          },
+          "origin": {
+            "description": "The origin that started the turn, recorded only when it was not the owner.",
+            "enum": [
+              "human",
+              "bot",
+              "agent",
+              "hub"
+            ],
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
       "SshHostCreate": {
         "additionalProperties": false,
         "properties": {
@@ -4273,6 +4297,9 @@
           },
           "workspaceBinding": {
             "$ref": "#/components/schemas/TaskSpaceBinding"
+          },
+          "requestedBy": {
+            "$ref": "#/components/schemas/RequestedBy"
           }
         },
         "required": [
@@ -5030,6 +5057,10 @@
           "permissionMode": {
             "type": "string",
             "description": "The permission mode the worker launched with (effective)."
+          },
+          "requestedBy": {
+            "$ref": "#/components/schemas/RequestedBy",
+            "description": "cb-requested-by: the owner's words behind an Agent dispatch, or the non-owner origin; absent on Human/Bot dispatches."
           }
         },
         "required": [

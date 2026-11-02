@@ -3443,7 +3443,7 @@ const JOURNAL_MESSAGE_TEXT_CHARS: usize = 4096;
 
 /// Pull the prompt text off an `instance.send` payload in every shape the CLI,
 /// MCP tools and worker briefs build.
-fn send_message_text(payload: &Value) -> Option<String> {
+pub(crate) fn send_message_text(payload: &Value) -> Option<String> {
     if let Some(text) = payload.get("text").and_then(Value::as_str) {
         return Some(text.to_owned());
     }

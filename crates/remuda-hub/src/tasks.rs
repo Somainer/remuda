@@ -356,6 +356,18 @@ async fn create_task(
     let device = require_dispatch(&state, &headers).await?;
     let (_, scope) = require_project_scope(&state, &headers).await?;
     let authority = crate::agent_scope::CallerAuthority::for_device(&state, &device).await?;
+    // cb-requested-by: who asked for this task — the owner's words when the
+    // Agent acted in an owner turn, else the non-owner origin. Record only.
+    let requested_by = state
+        .store
+        .requested_by(
+            authority
+                .initiator
+                .as_ref()
+                .and_then(|i| i.root_turn.clone()),
+        )
+        .await
+        .map_err(map_store)?;
     if !scope.allows_project(body.project_id.as_id().as_str()) {
         return Err(HubError::Forbidden);
     }
@@ -395,7 +407,7 @@ async fn create_task(
             body.project_id.clone(),
             move |project, conn| {
                 ensure_project_exists(conn, project)?;
-                let task = Task::new_root(
+                let mut task = Task::new_root(
                     now,
                     project.clone(),
                     body.title.trim().to_string(),
@@ -405,6 +417,7 @@ async fn create_task(
                     deps,
                     budget,
                 );
+                task.requested_by = requested_by;
                 ensure_deps_in_project(conn, &task)?;
                 Ok(task)
             },
@@ -932,6 +945,17 @@ async fn split_task(
     let device = require_dispatch(&state, &headers).await?;
     let (_, scope) = require_project_scope(&state, &headers).await?;
     let authority = crate::agent_scope::CallerAuthority::for_device(&state, &device).await?;
+    // cb-requested-by: the same record as a root task creation, for the child.
+    let requested_by = state
+        .store
+        .requested_by(
+            authority
+                .initiator
+                .as_ref()
+                .and_then(|i| i.root_turn.clone()),
+        )
+        .await
+        .map_err(map_store)?;
     if body.title.trim().is_empty() || body.intent.trim().is_empty() {
         return Err(HubError::BadRequest("title and intent are required".into()));
     }
@@ -957,7 +981,7 @@ async fn split_task(
                         project.policy.configurable.max_delegation_depth
                     )));
                 }
-                let child = parent.new_child(
+                let mut child = parent.new_child(
                     now,
                     body.title.trim().to_string(),
                     body.intent.trim().to_string(),
@@ -966,6 +990,7 @@ async fn split_task(
                     deps,
                     budget,
                 );
+                child.requested_by = requested_by;
                 ensure_deps_in_project(conn, &child)?;
                 Ok(child)
             },

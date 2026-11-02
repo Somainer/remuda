@@ -321,6 +321,12 @@ pub struct Task {
     /// as `None` and serialise byte-identically (no migration).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_binding: Option<TaskSpaceBinding>,
+    /// cb-requested-by: for a task an Agent created, who asked for it — the
+    /// owner's command and words when the root turn was the owner's, else the
+    /// non-owner origin that started the turn. Record only, never a gate;
+    /// absent on human-created tasks and on rows written before the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_by: Option<RequestedBy>,
 }
 
 fn default_task_class() -> TaskClass {
@@ -362,6 +368,7 @@ impl Task {
             blocked_reason: None,
             archived_at: None,
             workspace_binding: None,
+            requested_by: None,
         }
     }
 
@@ -401,6 +408,7 @@ impl Task {
             blocked_reason: None,
             archived_at: None,
             workspace_binding: None,
+            requested_by: None,
         }
     }
 

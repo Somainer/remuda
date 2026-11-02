@@ -111,7 +111,7 @@ test("a long-press at 390 opens the row menu below the sticky head, and 关闭�
   try {
     await login(page, "e2e-seenweb-phone");
     test.skip(!(await needsFakeNode(page)), "needs the in-process fake node");
-    const id = await createSession(page, `seenweb menu ${Date.now().toString(36)}`);
+    await createSession(page, `seenweb menu ${Date.now().toString(36)}`);
 
     await page.goto("/m");
     const row = page.getByTestId("home-row").first();
@@ -136,8 +136,12 @@ test("a long-press at 390 opens the row menu below the sticky head, and 关闭�
     const confirm = page.getByTestId("row-close-confirm");
     await expect(confirm).toContainText("e2e-fake-node");
     await shot(page, "seenweb-menu-390.png");
-    void id;
   } finally {
+    // The default page never logged in, so the shared afterEach cannot delete
+    // this context's session; a leftover working row changes m-home's counts.
+    for (const id of created.splice(0)) {
+      await page.request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
+    }
     await context.close();
   }
 });

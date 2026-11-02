@@ -777,10 +777,12 @@ fn concurrent_installs_on_one_shared_home_never_clobber_each_other() {
                 for _ in 0..25 {
                     let recipe = Run::new(DriverKind::ClaudeSdk, AgentKind::Claude, Some(context))
                         .materialize(at);
-                    assert!(matches!(
-                        recipe.skill.unwrap().tree,
-                        SkillTree::Installed { shared: true, .. }
-                    ));
+                    let skill = recipe.skill.unwrap();
+                    assert!(
+                        matches!(skill.tree, SkillTree::Installed { shared: true, .. }),
+                        "{:?}",
+                        skill.tree
+                    );
                 }
             });
         }
@@ -884,6 +886,76 @@ fn a_user_skills_directory_keeps_its_mode() {
     assert_eq!(
         fs::metadata(&root).unwrap().permissions().mode() & 0o777,
         0o700
+    );
+}
+
+/// A symlink is never followed: `skills/remuda` pointing at an empty
+/// directory is still the user's (Remuda did not create that target), so the
+/// launch skips the tree and the target stays empty.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_skill_root_is_user_owned_and_never_followed() {
+    use std::os::unix::fs::symlink;
+    let context = facts(&["dispatch"]);
+    let at = launch(false);
+    let target = at._root.path().join("elsewhere");
+    fs::create_dir_all(&target).unwrap();
+    let skills = at.home.join("skills");
+    fs::create_dir_all(&skills).unwrap();
+    let root = skills.join("remuda");
+    symlink(&target, &root).unwrap();
+    let recipe =
+        Run::new(DriverKind::ClaudeSdk, AgentKind::Claude, Some(&context)).materialize(&at);
+    assert_eq!(
+        recipe.skill.as_ref().unwrap().tree,
+        SkillTree::Skipped {
+            reason: TreeSkip::UserOwned
+        }
+    );
+    assert!(
+        fs::read_dir(&target).unwrap().next().is_none(),
+        "the link target stays empty"
+    );
+    assert!(
+        fs::symlink_metadata(&root)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the link is untouched"
+    );
+    // The section still reaches the seat, on the launch's own pair.
+    assert!(recipe.skill.unwrap().flag_text().is_some());
+}
+
+/// The same for a symlinked `skills` parent: writing through it would put the
+/// tree outside the home.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_skills_parent_is_user_owned_and_never_followed() {
+    use std::os::unix::fs::symlink;
+    let context = facts(&["dispatch"]);
+    let at = launch(false);
+    let target = at._root.path().join("elsewhere");
+    fs::create_dir_all(&target).unwrap();
+    let skills = at.home.join("skills");
+    symlink(&target, &skills).unwrap();
+    let recipe =
+        Run::new(DriverKind::ClaudeSdk, AgentKind::Claude, Some(&context)).materialize(&at);
+    assert_eq!(
+        recipe.skill.as_ref().unwrap().tree,
+        SkillTree::Skipped {
+            reason: TreeSkip::UserOwned
+        }
+    );
+    assert!(
+        fs::read_dir(&target).unwrap().next().is_none(),
+        "the link target stays empty"
+    );
+    assert!(
+        fs::symlink_metadata(&skills)
+            .unwrap()
+            .file_type()
+            .is_symlink()
     );
 }
 

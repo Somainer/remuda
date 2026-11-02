@@ -16,8 +16,9 @@
 //!   home too (`generic_pty::pane_home_env`). It follows the computer-use
 //!   rules: never the inherited operator home (D-045), and file lifetime by
 //!   [`native_home_is_shared`]. It also never overwrites a tree it did not
-//!   write: a `skills/remuda` without Remuda's marker is user-owned and left
-//!   alone.
+//!   write, and never follows a symlink at `skills` or `skills/remuda`: a
+//!   marker-less directory holding files, and any symlink, is user-owned and
+//!   left alone; only an empty real directory is taken over (§3.4.1).
 //! * **The capability section.** Rendered by [`render_section`]. It goes into
 //!   the installed `SKILL.md` only when the tree is this seat's alone (a
 //!   per-instance home); a shared tree is the same bytes for every seat on it,
@@ -87,7 +88,10 @@ pub enum TreeSkip {
     /// The native home is the inherited operator home, which Remuda never
     /// writes (D-045).
     OperatorHome,
-    /// `skills/remuda` already exists without Remuda's marker.
+    /// The tree is the user's: a symlink at `skills` or at `skills/remuda`
+    /// (never followed), or a real `skills/remuda` holding files without
+    /// Remuda's marker (kept byte for byte). An empty real directory is not
+    /// this case; the launch takes it over.
     UserOwned,
 }
 
@@ -239,7 +243,8 @@ pub(crate) fn plan(request: &SkillRequest<'_>) -> Option<SkillPlan> {
         }
     } else {
         let root = request.native_home.join("skills").join(SKILL_DIR);
-        if user_owned(&root) {
+        let parent_linked = root.parent().is_some_and(is_symlink);
+        if parent_linked || user_owned(&root) {
             SkillTree::Skipped {
                 reason: TreeSkip::UserOwned,
             }
@@ -291,16 +296,62 @@ fn framed(section: &str) -> String {
     )
 }
 
-/// A `skills/remuda` that holds something without Remuda's marker. Its files
-/// are the user's and stay byte for byte. An empty directory is taken over: it
-/// holds no bytes to keep, and it is what a launch's own cleanup leaves when
-/// it shreds a per-instance tree, so refusing it would leave the next launch
-/// in that home without a tree.
+/// A `skills/remuda` Remuda must not write: a symlink, a tree with Remuda's
+/// marker absent but files in it, or a path that is not a directory at all.
+///
+/// A symlink is never followed — not even to an empty directory — because its
+/// target is a directory Remuda did not create, and writing the marker and the
+/// tree through it would put them outside the home. A real directory holding
+/// files without the marker is the user's and stays byte for byte. An empty
+/// real directory is taken over: it holds no bytes to keep, and it is what a
+/// launch's own cleanup leaves when it shreds a per-instance tree, so refusing
+/// it would leave the next launch in that home without a tree.
 fn user_owned(root: &Path) -> bool {
-    if fs::symlink_metadata(root).is_err() || root.join(MANAGED_MARKER).is_file() {
+    let Ok(meta) = fs::symlink_metadata(root) else {
+        // Does not exist: the launch may create it.
         return false;
+    };
+    if meta.file_type().is_symlink() {
+        return true;
     }
-    fs::read_dir(root).map_or(true, |mut entries| entries.next().is_some())
+    if !meta.is_dir() {
+        return true;
+    }
+    // One scan, not "is the marker there, then is anything there": the two
+    // separate checks have a window in which a sibling launch creates its
+    // marker in between, so this launch read a marker-less non-empty tree and
+    // skipped. Every writer writes the marker before any other file, so a
+    // single listing that holds a file must also hold the marker.
+    let Ok(entries) = fs::read_dir(root) else {
+        return true;
+    };
+    let mut any = false;
+    for entry in entries.flatten() {
+        if entry.file_name() == MANAGED_MARKER {
+            return false;
+        }
+        any = true;
+    }
+    any
+}
+
+/// Whether `path` is a symbolic link (never followed).
+fn is_symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
+}
+
+/// Refuse to write when `skills` or `skills/remuda` is a link, or the tree is
+/// the user's. Called before anything is created or written, and again right
+/// before the first write.
+fn refuse_user_owned(skills_root: &Path, root: &Path) -> DriverResult<()> {
+    if is_symlink(skills_root) || user_owned(root) {
+        return Err(DriverError::SettingsIsolationUnavailable(format!(
+            "refusing to write the remuda skill: {} is a symlink or a tree Remuda did not \
+             write; the launch runs without a skill tree",
+            root.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Write the embedded tree (and, for a per-instance home, the section appended
@@ -315,6 +366,10 @@ fn write_tree(
     let skills_root = root.parent().ok_or_else(|| {
         DriverError::InvalidLaunchSpec("the skill root has no parent directory".into())
     })?;
+    // Never follow a link, and not even to create a directory through one:
+    // `create_dir_all` would lay a directory down inside the link's target,
+    // outside the home.
+    refuse_user_owned(skills_root, root)?;
     // Only paths this launch creates get a mode: `skills` may be the user's
     // own directory, and Remuda never changes permissions it did not set.
     ensure_dir(skills_root)?;
@@ -324,6 +379,10 @@ fn write_tree(
     } else {
         FileLifetime::Launch
     };
+    // The decision above ran before the launch dir and any overlay were
+    // written; re-check now, immediately before the first write, so a link
+    // planted in between cannot be won. Nothing has been written yet.
+    refuse_user_owned(skills_root, root)?;
     // The marker goes first and directly: the ownership check reads "any
     // entry at all without the marker" as the user's tree, so a launch that
     // ran between a temporary marker file and its rename would see a
@@ -561,6 +620,44 @@ pub fn render_section(context: &SkillContext) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The re-check that runs inside `write_tree`, immediately before the
+    /// first write: a link planted after `plan` decided would otherwise be
+    /// followed, and the tree would land outside the home.
+    #[cfg(unix)]
+    #[test]
+    fn write_tree_refuses_a_link_planted_after_the_plan() {
+        use std::os::unix::fs::symlink;
+        for linked_parent in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path().join("home");
+            let skills = home.join("skills");
+            let target = tmp.path().join("elsewhere");
+            std::fs::create_dir_all(&target).unwrap();
+            let root = if linked_parent {
+                std::fs::create_dir_all(&home).unwrap();
+                symlink(&target, &skills).unwrap();
+                skills.join(SKILL_DIR)
+            } else {
+                std::fs::create_dir_all(&skills).unwrap();
+                let root = skills.join(SKILL_DIR);
+                symlink(&target, &root).unwrap();
+                root
+            };
+            let mut files = Vec::new();
+            let error = write_tree(&root, true, None, &mut files)
+                .expect_err("a symlink is never written through");
+            assert!(
+                matches!(error, DriverError::SettingsIsolationUnavailable(_)),
+                "{error}"
+            );
+            assert!(files.is_empty(), "nothing may be recorded as written");
+            assert!(
+                std::fs::read_dir(&target).unwrap().next().is_none(),
+                "the link target stays empty (linked_parent={linked_parent})"
+            );
+        }
+    }
 
     #[test]
     fn the_frame_cannot_be_closed_from_inside() {

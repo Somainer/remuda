@@ -1521,17 +1521,28 @@ class DocsContractFixtureTests(unittest.TestCase):
     def test_code_shift_warns_but_does_not_fail_enforced_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo, baseline = self._baselined_copy(tmp)
+            before = scan(repo, use_git=False).advisory()
             source = repo / "crates" / "demo" / "src" / "lib.rs"
             lines = source.read_text(encoding="utf-8").splitlines()
             # Code-only change: every anchored symbol moves ten lines down.
             source.write_text("\n".join(lines[:1] + [""] * 10 + lines[1:]) + "\n",
                               encoding="utf-8")
+            after = scan(repo, use_git=False).advisory()
+            # Prove the shift itself produces the warnings: the anchors that
+            # used to resolve now mismatch, and the old mismatch resolves.
+            self.assertIn("file-anchor|docs/anchors.md|crates/demo/src/lib.rs:3",
+                          after - before)
+            self.assertIn("file-anchor|docs/anchors.md|crates/demo/src/lib.rs:6",
+                          after - before)
+            self.assertNotIn("file-anchor|docs/anchors.md|crates/demo/src/lib.rs:11",
+                             after)
             out = io.StringIO()
             self.assertEqual(run_check(repo, baseline, out), 0)
             self.assertIn("advisory", out.getvalue())
             strict_out = io.StringIO()
             self.assertEqual(run_check(repo, baseline, strict_out, strict=True), 1)
-            self.assertIn("ADVISORY", strict_out.getvalue())
+            self.assertIn("ADVISORY file-anchor|docs/anchors.md|crates/demo/src/lib.rs:6",
+                          strict_out.getvalue())
 
     def test_new_broken_link_fails(self):
         with tempfile.TemporaryDirectory() as tmp:

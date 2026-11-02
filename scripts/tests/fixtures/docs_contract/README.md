@@ -11,12 +11,16 @@ and deliberately broken in known places.
 - [design entry](docs/design/home.md)
 - [missing document](docs/missing.md)
 - [missing heading](docs/guide.md#no-such-heading)
+- [notes with a title](<docs/space dir/notes.md> "Notes")
+- [balanced parentheses](docs/a_(b).md)
+- [the space note][space-note]
 - [guide-ref]
 
 A footnote marker.[^1]
 
 [^1]: Footnotes are prose, not links.
 
+[space-note]: <docs/space dir/notes.md>
 [guide-ref]: docs/guide.md#setup-steps
 [unused]: nowhere.md
 

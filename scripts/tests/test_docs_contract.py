@@ -94,7 +94,7 @@ ORPHAN_ENTRY_POINTS = {
 EXTERNAL_SCHEME = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
 FENCE_OPEN = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
 INLINE_CODE = re.compile(r"`+[^`\n]*?`+")
-INLINE_LINK = re.compile(r"!?\[[^\]\n]*\]\(\s*(<[^>\n]*>|[^)\n]+?)\s*\)")
+LINK_START = re.compile(r"!?\[[^\]\n]*\]\(")
 # Footnote definitions (`[^1]: ...`) are not links.
 REFERENCE_DEFINITION = re.compile(r"^\s{0,3}\[(?!\^)([^\]]+)\]:")
 REFERENCE_USE = re.compile(r"\[([^\]\n]*)\]\[([^\]\n]*)\]")
@@ -352,9 +352,84 @@ def anchors_for(text: str) -> set[str]:
 
 # ── links and orphans ─────────────────────────────────────────────────────
 
+def _parse_destination(text: str, index: int) -> tuple[str, int] | None:
+    """Parse a CommonMark destination at ``text[index]``.
+
+    Angle-bracketed destinations may contain spaces; bare destinations end at
+    whitespace or the closing parenthesis, with balanced parentheses allowed.
+    """
+    size = len(text)
+    while index < size and text[index] in " \t":
+        index += 1
+    if index >= size:
+        return None
+    if text[index] == "<":
+        end = text.find(">", index + 1)
+        if end < 0:
+            return None
+        return text[index + 1:end], end + 1
+    start = index
+    depth = 0
+    while index < size:
+        char = text[index]
+        if char == "\\":
+            index += 2
+            continue
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            if depth == 0:
+                break
+            depth -= 1
+        elif char.isspace() and depth == 0:
+            break
+        index += 1
+    return text[start:index], index
+
+
+def _skip_title(text: str, index: int) -> int | None:
+    """Skip an optional link title; None when it is unterminated."""
+    size = len(text)
+    while index < size and text[index] in " \t":
+        index += 1
+    if index >= size or text[index] not in "\"'(":
+        return index
+    closing = ")" if text[index] == "(" else text[index]
+    index += 1
+    while index < size:
+        if text[index] == "\\":
+            index += 2
+            continue
+        if text[index] == closing:
+            return index + 1
+        index += 1
+    return None
+
+
+def _inline_target(text: str, index: int) -> str | None:
+    parsed = _parse_destination(text, index)
+    if parsed is None:
+        return None
+    target, after = parsed
+    after = _skip_title(text, after)
+    if after is None:
+        return None
+    while after < len(text) and text[after] in " \t":
+        after += 1
+    if after >= len(text) or text[after] != ")":
+        return None
+    return target
+
+
 def _definition_target(text: str, index: int) -> str | None:
-    match = re.match(r"\s*(\S+)", text[index:])
-    return match.group(1).strip("<>") if match else None
+    parsed = _parse_destination(text, index)
+    if parsed is None:
+        return None
+    target, after = parsed
+    after = _skip_title(text, after)
+    if after is None or text[after:].strip():
+        return None
+    return target
 
 
 def _normalize_label(label: str) -> str:
@@ -386,13 +461,10 @@ def iter_links(lines: list[Line]):
             if following not in ("(", "[", ":"):
                 used.add(_normalize_label(match.group(1)))
     for line in body:
-        for match in INLINE_LINK.finditer(line.text):
-            target = match.group(1).strip()
-            if target.startswith("<") and target.endswith(">"):
-                target = target[1:-1]
-            else:
-                target = target.split()[0] if target.split() else ""
-            yield line, target
+        for match in LINK_START.finditer(line.text):
+            target = _inline_target(line.text, match.end())
+            if target is not None:
+                yield line, target
     for label, (line, target) in definitions.items():
         if label in used:
             yield line, target
@@ -1507,8 +1579,16 @@ class DocsContractFixtureTests(unittest.TestCase):
         text = (FIXTURE_ROOT / "README.md").read_text(encoding="utf-8")
         targets = [target for _, target in iter_links(visible_markdown(text))]
         self.assertIn("docs/guide.md#setup-steps", targets)  # shortcut [guide-ref]
+        self.assertIn("docs/space dir/notes.md", targets)  # angled definition
         self.assertNotIn("See", targets)  # footnote body is prose
         self.assertNotIn("nowhere.md", targets)  # definition nothing uses
+
+    def test_commonmark_destinations_with_titles_and_parens(self):
+        text = (FIXTURE_ROOT / "README.md").read_text(encoding="utf-8")
+        targets = [target for _, target in iter_links(visible_markdown(text))]
+        self.assertIn("docs/a_(b).md", targets)
+        # plain, titled, and via the angled reference definition
+        self.assertEqual(targets.count("docs/space dir/notes.md"), 3)
 
     def test_enforced_record_replaces_an_advisory_with_the_same_key(self):
         report = Report([])

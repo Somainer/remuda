@@ -83,6 +83,9 @@ pub struct ClaudeBgOptions {
     /// its own `--append-system-prompt` pair, which every `--bg` process
     /// (first dispatch and each follow-up) carries.
     pub memory_context: Option<crate::memory_context::MemoryContext>,
+    /// ma-skill: the Hub-stamped launch facts; the materializer installs the
+    /// `remuda` skill and carries the seat's capability section from them.
+    pub skill_context: Option<crate::launch::remuda_skill::SkillContext>,
 }
 
 impl ClaudeBgOptions {
@@ -111,6 +114,7 @@ impl ClaudeBgOptions {
             settings_overlay_path: None,
             instance_id: None,
             memory_context: None,
+            skill_context: None,
         }
     }
 }
@@ -269,6 +273,7 @@ impl ClaudeBgDriver {
             settings_overlay_path: self.options.settings_overlay_path.clone(),
             secret_policy: None,
             memory_context: self.options.memory_context.as_ref(),
+            skill_context: self.options.skill_context.as_ref(),
         };
         let mut recipe = materialize(&request)?;
         recipe.argv = strip_named_flags(&recipe.argv, &["--session-id", "--cwd", "--continue"]);

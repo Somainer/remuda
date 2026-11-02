@@ -91,6 +91,7 @@ fn recipe(
         settings_overlay_path: None,
         secret_policy: None,
         memory_context: memory,
+        skill_context: None,
     })
 }
 
@@ -270,6 +271,7 @@ fn a_native_resume_renders_its_own_system_prompt() {
             settings_overlay_path: None,
             secret_policy: None,
             memory_context: Some(&context),
+            skill_context: None,
         })
         .unwrap()
         .argv

@@ -132,20 +132,75 @@ pub const MEMORY_CONTEXT_OPEN: &str = "<remuda-memory";
 /// Closing tag of the Hub-rendered [`MemoryContext::text`] frame.
 pub const MEMORY_CONTEXT_CLOSE: &str = "</remuda-memory>";
 
-/// `text` without a leading memory data block: what the sender typed after the
-/// block a data-block launch puts ahead of its first input. Text that does not
-/// open with the frame is returned unchanged.
+/// `text` without the leading data blocks a data-block launch puts ahead of its
+/// first input (the memory block, then the capability block): what the sender
+/// typed. Text that does not open with one of the frames is returned
+/// unchanged; a frame that is never closed is left in place.
 #[must_use]
 pub fn strip_memory_context_block(text: &str) -> &str {
-    let trimmed = text.trim_start();
-    if !trimmed.starts_with(MEMORY_CONTEXT_OPEN) {
-        return text;
+    let mut rest = text;
+    for (open, close) in [
+        (MEMORY_CONTEXT_OPEN, MEMORY_CONTEXT_CLOSE),
+        (SKILL_CONTEXT_OPEN, SKILL_CONTEXT_CLOSE),
+    ] {
+        let trimmed = rest.trim_start();
+        if !trimmed.starts_with(open) {
+            continue;
+        }
+        match trimmed.find(close) {
+            Some(end) => rest = trimmed[end + close.len()..].trim_start(),
+            None => return rest,
+        }
     }
-    match trimmed.find(MEMORY_CONTEXT_CLOSE) {
-        Some(end) => trimmed[end + MEMORY_CONTEXT_CLOSE.len()..].trim_start(),
-        None => text,
+    rest
+}
+
+/// Hello `capabilities` key (ma-skill, D-060 item 5): `true` when this Node
+/// carries a create/resume [`SkillContext`] to its launch materializer, which
+/// installs the embedded `remuda` skill and renders the seat's capability
+/// section from it. Create params do not reject unknown fields, so an older
+/// Node would drop the field silently; the Hub stamps it only for a Node that
+/// advertises this.
+pub const SKILL_CONTEXT_CAPABILITY: &str = "skillContext";
+
+/// `skillContext` on forwarded `instance.create` / `instance.resume` params
+/// (ma-skill, D-060 item 5, main-agent.md §3.4.1): the launch facts the seat's
+/// capability section is generated from.
+///
+/// Hub-stamped like `memoryContext`: read from the instance, host and project
+/// rows at forward time, never from a request body (a body-supplied copy is
+/// stripped), never in `InstanceSpec.args`, and read by the Node only from the
+/// top level of the params. It grants nothing: the Hub enforces every verb it
+/// names on each call, exactly as it would without it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillContext {
+    /// The grant verbs the instance holds (`dispatch`, `land`, …), as stored.
+    #[serde(default)]
+    pub grants: Vec<String>,
+    /// Whether the instance's host advertises herdr.
+    #[serde(default)]
+    pub herdr: bool,
+    /// Whether the D-051 switch is on for the instance's project.
+    #[serde(default)]
+    pub delegated_decisions: bool,
+    /// Whether the Hub delivers inbox facts (`cb-inbox-*`); false until then.
+    #[serde(default)]
+    pub inbox: bool,
+}
+
+impl SkillContext {
+    /// Whether the instance holds `grant` (a wire verb such as `land`).
+    #[must_use]
+    pub fn holds(&self, grant: &str) -> bool {
+        self.grants.iter().any(|held| held == grant)
     }
 }
+
+/// Opening tag of the capability section when it rides a launch as data.
+pub const SKILL_CONTEXT_OPEN: &str = "<remuda-capabilities";
+/// Closing tag of the capability section when it rides a launch as data.
+pub const SKILL_CONTEXT_CLOSE: &str = "</remuda-capabilities>";
 
 // ── api.* stream class (D-048, 2026-09-19) ─────────────────────────────────
 //
@@ -783,6 +838,10 @@ pub struct InstanceCreateParams {
     /// Hub-stamped lineage memory (D-060); top level only, never in `spec`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_context: Option<MemoryContext>,
+    /// Hub-stamped launch facts for the seat's capability section (ma-skill);
+    /// top level only, never in `spec`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_context: Option<SkillContext>,
 }
 
 /// Kind of a staged attachment (D-027b, 2026-09-15).
@@ -1910,6 +1969,27 @@ pub fn value_as_i64(value: &Value) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What the sender typed survives the blocks a data-block launch puts
+    /// ahead of its first input: the memory block, the capability block
+    /// (ma-skill), or both in that order; an unclosed frame stays.
+    #[test]
+    fn the_first_input_blocks_are_stripped_in_order() {
+        let memory = "<remuda-memory rev=\"3\">\nindex\n</remuda-memory>";
+        let skill = "<remuda-capabilities>\n## This seat in Remuda\n</remuda-capabilities>";
+        assert_eq!(strip_memory_context_block(&format!("{memory}\n\nhi")), "hi");
+        assert_eq!(strip_memory_context_block(&format!("{skill}\n\nhi")), "hi");
+        assert_eq!(
+            strip_memory_context_block(&format!("{memory}\n\n{skill}\n\nhi")),
+            "hi"
+        );
+        assert_eq!(strip_memory_context_block("hi"), "hi");
+        let open = "<remuda-capabilities>\nno close";
+        assert_eq!(strip_memory_context_block(open), open);
+        // Only a leading frame is a block; one later in the text is input.
+        let typed = format!("hi {skill}");
+        assert_eq!(strip_memory_context_block(&typed), typed);
+    }
 
     #[test]
     fn hello_round_trip_lifts_nested_host_id() {

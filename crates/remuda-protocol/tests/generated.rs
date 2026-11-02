@@ -93,6 +93,8 @@ fn public_wire_types_are_registered_for_generation() {
         "InstanceCreateParams",
         // D-060: Hub-stamped field of InstanceCreateParams, same family.
         "MemoryContext",
+        // ma-skill: Hub-stamped launch facts of InstanceCreateParams, same family.
+        "SkillContext",
         "InstanceSendParams",
         "AttachmentRef",
         "AttachmentKind",

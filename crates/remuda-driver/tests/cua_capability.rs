@@ -66,6 +66,7 @@ fn request<'a>(
     MaterializeRequest {
         creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
+        skill_context: None,
         spec,
         profile: Box::leak(Box::new(profile())),
         launch_dir: launch.to_path_buf(),
@@ -326,6 +327,7 @@ fn granted_skill_tree_in_a_shared_home_is_native_store_lifetime() {
     let recipe = materialize(&MaterializeRequest {
         creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
+        skill_context: None,
         spec: &spec,
         profile: Box::leak(Box::new(profile())),
         launch_dir: launch.clone(),
@@ -429,6 +431,7 @@ fn granted_skill_tree_in_a_transferred_home_installs_and_keeps_the_transcript() 
     let recipe = materialize(&MaterializeRequest {
         creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
+        skill_context: None,
         spec: &spec,
         profile: Box::leak(Box::new(profile())),
         launch_dir: launch.clone(),

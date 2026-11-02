@@ -143,6 +143,8 @@ impl FakeDriver {
                 approval_authority: ApprovalAuthority::Unknown,
             },
             memory: None,
+            skill: None,
+            system_prompt: None,
         })
     }
 

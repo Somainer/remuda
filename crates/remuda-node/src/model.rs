@@ -178,6 +178,13 @@ pub struct CreateInstanceRequest {
     /// whose index was re-rendered is still the same create.
     #[serde(skip)]
     pub memory_context: Option<remuda_protocol::hubnode::MemoryContext>,
+    /// ma-skill: the Hub-stamped launch facts the materializer renders the
+    /// seat's capability section from (and the trigger for installing the
+    /// embedded `remuda` skill). Read only from the top level of the
+    /// create/resume params by [`Self::take_skill_context`], like
+    /// `memoryContext`, and kept out of the payload digest.
+    #[serde(skip)]
+    pub skill_context: Option<remuda_protocol::hubnode::SkillContext>,
     /// D-057 OA1: the Hub-stamped `creatorPermissionMode` of an Agent-origin
     /// create or resume — the creator chapter's effective mode, read at the
     /// create's commit point. Read only from the top level of the forwarded
@@ -195,6 +202,16 @@ impl CreateInstanceRequest {
     pub fn take_memory_context(&mut self, params: &serde_json::Value) {
         self.memory_context = params
             .get("memoryContext")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok());
+    }
+
+    /// Carry the Hub-stamped `skillContext` from the top level of the
+    /// forwarded create/resume `params` (ma-skill). A copy nested in the spec
+    /// is not the Hub's and is ignored; a malformed value carries nothing.
+    pub fn take_skill_context(&mut self, params: &serde_json::Value) {
+        self.skill_context = params
+            .get("skillContext")
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok());
     }
@@ -577,6 +594,36 @@ mod tests {
         assert_eq!(request.creator_control(), remuda_driver::CreatorControl::On);
         request.take_creator_permission_mode(&json!({ "creatorPermissionMode": true }));
         assert_eq!(request.creator_permission_mode, None);
+    }
+
+    /// ma-skill: the launch facts are the Hub's, read only from the top level
+    /// of the forwarded params. A local request body and a copy nested in the
+    /// spec carry nothing, and neither does a malformed value.
+    #[test]
+    fn the_skill_context_is_read_only_from_the_top_level_params() {
+        let facts = json!({"grants": ["dispatch", "land"], "herdr": true,
+                           "delegatedDecisions": true, "inbox": false});
+        let mut request: CreateInstanceRequest =
+            serde_json::from_value(json!({ "kind": "claude", "skillContext": facts })).unwrap();
+        assert_eq!(request.skill_context, None, "a body never sets it");
+        request.take_skill_context(&json!({ "spec": { "skillContext": facts } }));
+        assert_eq!(request.skill_context, None, "the spec copy is ignored");
+        request.take_skill_context(&json!({ "skillContext": facts }));
+        let context = request.skill_context.clone().expect("the top-level stamp");
+        assert!(context.holds("land") && context.holds("dispatch"));
+        assert!(context.herdr && context.delegated_decisions && !context.inbox);
+        request.take_skill_context(&json!({ "skillContext": "land" }));
+        assert_eq!(
+            request.skill_context, None,
+            "a malformed stamp carries nothing"
+        );
+        // The stamp never enters the create's payload digest input.
+        let mut stamped = request.clone();
+        stamped.take_skill_context(&json!({ "skillContext": facts }));
+        assert_eq!(
+            serde_json::to_value(&stamped).unwrap(),
+            serde_json::to_value(&request).unwrap()
+        );
     }
 
     #[test]

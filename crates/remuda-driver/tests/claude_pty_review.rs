@@ -244,6 +244,7 @@ fn inject_hook_writes_launch_dir_not_native_home_and_keeps_sources() {
     let mut recipe = remuda_driver::materialize(&remuda_driver::MaterializeRequest {
         creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
+        skill_context: None,
         spec: &{
             let cwd = tmp.path().join("work");
             fs::create_dir_all(&cwd).unwrap();
@@ -324,6 +325,7 @@ fn tty_bypass_strips_print_flag() {
     let mut recipe = remuda_driver::materialize(&remuda_driver::MaterializeRequest {
         creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
+        skill_context: None,
         spec: &spec,
         profile: &profile(),
         launch_dir: launch,
@@ -428,6 +430,7 @@ async fn pty_resume_keeps_settings_model_and_never_bare() {
     let driver = ClaudePtyDriver::new(ClaudePtyOptions {
         creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
+        skill_context: None,
         instance_id: None,
         media_stager: None,
         profile: profile(),
@@ -519,6 +522,7 @@ async fn bg_resume_keeps_settings_attach_after_stop_does_not_wake() {
     let driver = ClaudeBgDriver::new(ClaudeBgOptions {
         creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
+        skill_context: None,
         instance_id: None,
         profile: profile(),
         launch_dir: launch.clone(),
@@ -632,6 +636,7 @@ async fn bg_attach_before_dispatch_would_wake() {
     let driver = ClaudeBgDriver::new(ClaudeBgOptions {
         creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
+        skill_context: None,
         instance_id: None,
         profile: profile(),
         launch_dir: launch,

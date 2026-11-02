@@ -155,6 +155,7 @@ async fn run_reap_barrier(session_name: &str, model: StopModel) {
     let driver = ClaudePtyDriver::new(ClaudePtyOptions {
         creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
+        skill_context: None,
         instance_id: None,
         media_stager: None,
         profile: profile(),

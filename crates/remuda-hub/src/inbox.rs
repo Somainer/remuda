@@ -2201,6 +2201,11 @@ pub(crate) async fn run_tick(state: &AppState) {
     let now = OffsetDateTime::now_utc();
     match state.store.inbox_tick(now, clock).await {
         Ok(outcome) => {
+            tracing::debug!(
+                recorded = outcome.written,
+                screen_candidates = outcome.screen.len(),
+                "inbox tick"
+            );
             crate::stall_screen::sweep(
                 state,
                 outcome.screen,

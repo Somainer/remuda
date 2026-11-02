@@ -1,0 +1,8 @@
+build:
+    cargo build
+
+check: build
+    cargo test
+
+gen-types:
+    cargo run -p demo --example gen

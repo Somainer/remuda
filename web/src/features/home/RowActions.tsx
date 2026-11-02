@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { Modal } from "../../components/Modal";
 import { Sheet } from "../../components/Sheet";
 import { clipboardIo } from "../../lib/clipboard";
+import { useWorkbenchViewport } from "../../lib/viewport";
 import { hubStore } from "../../lib/store";
 import type { Instance } from "../../types/instance";
 import { resumeCommand, rowActionKeys, type RowActionKey } from "./rowActions";
@@ -33,6 +34,43 @@ const LABELS: Record<RowActionKey, string> = {
  * first, naming the session and the host. While the read is stale every item
  * is disabled.
  */
+/**
+ * The long-press handlers, for a caller that wants the press on the whole row
+ * rather than on the ⋯ button. A short tap does nothing, so the row's own
+ * click still navigates.
+ */
+export function useRowLongPress(onOpen: () => void) {
+  const press = useRef<{ timer: ReturnType<typeof setTimeout>; x: number; y: number } | null>(null);
+  return {
+    onPointerDown(event: ReactPointerEvent) {
+      if (event.button !== 0) return;
+      const timer = setTimeout(() => {
+        press.current = null;
+        onOpen();
+      }, LONG_PRESS_MS);
+      press.current = { timer, x: event.clientX, y: event.clientY };
+    },
+    onPointerMove(event: ReactPointerEvent) {
+      const current = press.current;
+      if (!current) return;
+      if (Math.abs(event.clientX - current.x) > LONG_PRESS_SLOP_PX || Math.abs(event.clientY - current.y) > LONG_PRESS_SLOP_PX) {
+        clearTimeout(current.timer);
+        press.current = null;
+      }
+    },
+    onPointerUp() {
+      if (!press.current) return;
+      clearTimeout(press.current.timer);
+      press.current = null;
+    },
+    onPointerCancel() {
+      if (!press.current) return;
+      clearTimeout(press.current.timer);
+      press.current = null;
+    },
+  };
+}
+
 export function RowActions({
   instance,
   open,
@@ -48,9 +86,10 @@ export function RowActions({
   stale?: boolean;
 }) {
   const navigate = useNavigate();
+  const { mobile } = useWorkbenchViewport();
   const [confirming, setConfirming] = useState(false);
   const [renaming, setRenaming] = useState(false);
-  const press = useRef<{ timer: ReturnType<typeof setTimeout>; x: number; y: number } | null>(null);
+  const longPress = useRowLongPress(onOpen);
   const title = hubStore.titleOf(instance.id);
   const host = hubStore.hostName(instance.hostId);
   const keys = rowActionKeys(instance);
@@ -81,40 +120,8 @@ export function RowActions({
     onClose();
   }
 
-  function onPointerDown(event: ReactPointerEvent) {
-    if (event.pointerType === "mouse" && event.button !== 0) return;
-    const start = { x: event.clientX, y: event.clientY };
-    const timer = setTimeout(() => {
-      press.current = null;
-      onOpen();
-    }, LONG_PRESS_MS);
-    press.current = { timer, ...start };
-  }
-
-  function onPointerMove(event: ReactPointerEvent) {
-    const current = press.current;
-    if (!current) return;
-    if (Math.abs(event.clientX - current.x) > LONG_PRESS_SLOP_PX || Math.abs(event.clientY - current.y) > LONG_PRESS_SLOP_PX) {
-      clearTimeout(current.timer);
-      press.current = null;
-    }
-  }
-
-  function onPointerUp() {
-    if (!press.current) return;
-    clearTimeout(press.current.timer);
-    press.current = null;
-  }
-
   return (
-    <div
-      className={css.wrap}
-      data-testid="row-actions"
-      onPointerDown={onPointerDown}
-      onPointerMove={onPointerMove}
-      onPointerUp={onPointerUp}
-      onPointerCancel={onPointerUp}
-    >
+    <div className={css.wrap} data-testid="row-actions" {...longPress}>
       <button
         type="button"
         className={css.more}
@@ -132,7 +139,7 @@ export function RowActions({
       >
         ⋯
       </button>
-      <Sheet open={open} onClose={onClose} labelledBy="row-actions-title" testId="row-actions-panel">
+      <Sheet open={open} onClose={onClose} labelledBy="row-actions-title" testId="row-actions-panel" variant={mobile ? "sheet" : "popover"}>
         <h2 id="row-actions-title" className={css.heading}>行操作</h2>
         <ul className={css.menu} data-testid="row-actions-menu" role="menu">
           {keys.map((key) => (

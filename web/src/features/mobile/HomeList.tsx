@@ -47,7 +47,7 @@ import { scrollToQueue } from "../home/glanceNav";
 import { MainAskDock, MainCard } from "../home/MainCard";
 import { HomeQueue } from "../home/HomeQueue";
 import { JustDone } from "../home/JustDone";
-import { RowActions } from "../home/RowActions";
+import { RowActions, useRowLongPress } from "../home/RowActions";
 import { NoMatches, NoSessions, SkeletonRows } from "../home/HomeStates";
 import { newSessionPath } from "../spaces/store";
 import ui from "../../styles/ui.module.css";
@@ -643,9 +643,13 @@ function HomeRowView({
   /** Painted during a hold but gone from the live data: show it, let nothing fire. */
   stale?: boolean;
 }) {
+  // The long-press covers the whole row: the ⋯ button is hover-only on a fine
+  // pointer and hidden on a coarse one, so the row body is the phone's entry.
+  const longPress = useRowLongPress(() => onMenu?.());
   return (
     <article
       className={css.row}
+      {...(onMenu && !stale ? longPress : {})}
       data-testid="home-row"
       data-status={row.status}
       data-rank={row.rank}

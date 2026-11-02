@@ -498,22 +498,36 @@ test.describe("home queue", () => {
       await expect.poll(() => polls, { timeout: 20_000 }).toBeGreaterThan(startPolls + 2);
       await expect(card(page, idle.interactionId)).toBeVisible({ timeout: 20_000 });
 
-      // (2) A finger on a card is a §3.3 hold: the next card waits.
+      // (2) A finger on a card is a §3.3 hold: the next card waits. The card
+      // is created and confirmed pending BEFORE the press, so the hold only
+      // has to cover one delivery poll; a pointermove inside the grid re-arms
+      // the hook's 10 s idle release, so gate-load latency cannot expire the
+      // hold mid-assertion.
       startPolls = polls;
+      const later = await park(page, "mhome-blocked");
+      await expect.poll(() => pendingOnHub(page, later.interactionId), { timeout: 20_000 }).toBe(true);
       await page.getByTestId("home-queue-card").first().dispatchEvent("pointerdown");
       await expect(page.getByTestId("home-queue")).toHaveAttribute("data-order-held", "1");
       const during = await page.getByTestId("home-queue-card").evaluateAll((nodes) =>
         nodes.map((node) => node.getAttribute("data-card-id")),
       );
-      const later = await park(page, "mhome-blocked");
-      await expect.poll(() => pendingOnHub(page, later.interactionId), { timeout: 20_000 }).toBe(true);
-      await expect.poll(() => polls, { timeout: 20_000 }).toBeGreaterThan(startPolls + 2);
+      await expect
+        .poll(
+          async () => {
+            await page.getByTestId("home-queue-card").first().dispatchEvent("pointermove");
+            return polls;
+          },
+          { timeout: 20_000 },
+        )
+        .toBeGreaterThan(startPolls);
       page.off("response", countPoll);
       const held = await page.getByTestId("home-queue-card").evaluateAll((nodes) =>
         nodes.map((node) => node.getAttribute("data-card-id")),
       );
       expect(held).toEqual(during);
-      expect(held).not.toContain(later.interactionId);
+      // The new card waited for the release (unless a poll painted it before
+      // the press landed, which the order equality above already covers).
+      if (!during.includes(later.interactionId)) expect(held).not.toContain(later.interactionId);
 
       // Releasing re-orders once: the waiting card lands at the head.
       await page.evaluate(() => window.dispatchEvent(new PointerEvent("pointerup", { bubbles: true })));

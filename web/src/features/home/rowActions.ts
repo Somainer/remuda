@@ -10,7 +10,8 @@ import { rank } from "../mobile/homeRows";
  * - 中断: only a row ranked working, and only when interrupt is not reported
  *   unsupported. A row that is merely idle, ended, or starting has no turn.
  * - 重命名: always. It is a local display name; no Hub route exists for it.
- * - 复制目录: only when the row has a working directory.
+ * - 复制目录: only when the row has a real working directory (mapInstance
+ *   falls back to the workspace id, which is not a path).
  * - 复制恢复命令: only for a kind with a documented resume form and a native
  *   session id. Only `claude --resume <id>` is documented.
  * - 在此项目新建: only when the row names a host and a workspace or directory.
@@ -20,6 +21,13 @@ export type RowActionKey = "markSeen" | "interrupt" | "rename" | "copyCwd" | "co
 
 const ENDED = new Set<Instance["lifecycle"]>(["exited", "failed", "closing"]);
 
+/** A real directory, not `mapInstance`'s workspace-id fallback (`wsp_…`). */
+export function directoryPath(value: string | null | undefined): string | null {
+  const cwd = value?.trim();
+  if (!cwd) return null;
+  return cwd.includes("/") || cwd.includes("\\") ? cwd : null;
+}
+
 export function rowActionKeys(instance: Instance): RowActionKey[] {
   const keys: RowActionKey[] = [];
   if (rank(instance) === "done-unseen") keys.push("markSeen");
@@ -27,7 +35,7 @@ export function rowActionKeys(instance: Instance): RowActionKey[] {
     keys.push("interrupt");
   }
   keys.push("rename");
-  if (instance.cwd?.trim()) keys.push("copyCwd");
+  if (directoryPath(instance.cwd)) keys.push("copyCwd");
   if (resumeCommand(instance)) keys.push("copyResume");
   if (instance.hostId && (instance.workspaceId || instance.cwd)) keys.push("newInProject");
   if (!ENDED.has(instance.lifecycle)) keys.push("close");

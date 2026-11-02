@@ -132,8 +132,9 @@ export function RowActions({
     } else if (key === "rename") {
       setRenaming(true);
       return;
-    } else if (key === "copyCwd") void copy(instance.cwd ?? "");
-    else if (key === "copyResume") {
+    } else if (key === "copyCwd") {
+      if (instance.cwd) void copy(instance.cwd);
+    } else if (key === "copyResume") {
       const command = resumeCommand(instance);
       if (command) void copy(command);
     } else if (key === "newInProject") {

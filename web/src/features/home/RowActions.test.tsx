@@ -246,4 +246,10 @@ describe("RowActions", () => {
     await userEvent.click(screen.getByTestId("row-actions-more"));
     expect(screen.queryByTestId("row-action-copyResume")).toBeNull();
   });
+
+  it("drops 复制目录 for the workspace-id fallback", async () => {
+    render(<Harness instance={inst({ cwd: "wsp_1" })} />);
+    await userEvent.click(screen.getByTestId("row-actions-more"));
+    expect(items()).not.toContain("复制目录");
+  });
 });

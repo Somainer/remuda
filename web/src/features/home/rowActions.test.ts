@@ -89,6 +89,13 @@ describe("rowActionKeys", () => {
     );
   });
 
+  it("offers 复制目录 only for a path, not the workspace-id fallback", () => {
+    expect(rowActionKeys(inst({ cwd: "/work/proj" }))).toContain("copyCwd");
+    expect(rowActionKeys(inst({ cwd: "C:\\work\\proj" }))).toContain("copyCwd");
+    expect(rowActionKeys(inst({ cwd: "wsp_e2e" }))).not.toContain("copyCwd");
+    expect(rowActionKeys(inst({ cwd: null }))).not.toContain("copyCwd");
+  });
+
   it("offers 关闭… only while the session is alive", () => {
     expect(rowActionKeys(inst())).toContain("close");
     expect(rowActionKeys(inst({ lifecycle: "exited" }))).not.toContain("close");

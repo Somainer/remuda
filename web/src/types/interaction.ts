@@ -103,9 +103,10 @@ export type Interaction = EntityMeta & {
    */
   rootTurn?: RootTurn | null;
   /**
-   * cb-requested-by: the owner's words behind an Agent request (or the
-   * non-owner origin that started the turn), on the Hub's own one-shot
-   * approval cards. Display only; the decision never reads it.
+   * cb-requested-by: who asked for an Agent request, on the Hub's own one-shot
+   * approval cards — the owner's command (with a read-time `excerpt` of the
+   * owner's words, on the owner's own reads only) or the non-owner origin
+   * that started the turn. Display only; the decision never reads it.
    */
   requestedBy?: RequestedBy | null;
 };

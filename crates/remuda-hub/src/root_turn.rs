@@ -61,7 +61,8 @@ use crate::store::{StoreError, ensure_column};
 /// journal from growing the row.
 const MAX_OPEN_TURNS: usize = 64;
 
-/// Longest owner excerpt recorded as `requestedBy.excerpt` (cb-requested-by).
+/// Longest owner excerpt a Human read gains as `requestedBy.excerpt`
+/// (cb-requested-by).
 pub(crate) const EXCERPT_CHARS: usize = 280;
 
 /// Columns for the ledger and for the root turn stamped on command rows and
@@ -424,28 +425,27 @@ pub(crate) fn from_column(text: Option<String>) -> Option<RootTurn> {
     text.and_then(|text| serde_json::from_str(&text).ok())
 }
 
-/// cb-requested-by: the `requestedBy` record for one root turn, taken from
-/// the Hub's own command row and never from a request body.
+/// cb-requested-by: the `requestedBy` record for one root turn, derived from
+/// the Hub's own turn record and never from a request body.
 ///
-/// An owner-origin turn records the command that carried the input plus a
-/// bounded, secret-scrubbed excerpt of the owner's words. Every other origin
-/// records only that origin (`hub` for a restart notice or a fact, `agent`
-/// for a turn the seat started on its own). Record only, never a gate.
-pub(crate) fn requested_by(conn: &Connection, turn: &RootTurn) -> Result<RequestedBy, StoreError> {
-    if turn.origin != InputOrigin::Human {
-        return Ok(RequestedBy {
+/// A reference only: an owner-origin turn records the command that carried
+/// the owner's input, and every other origin records that origin (`hub` for a
+/// restart notice or a fact, `agent` for a turn the seat started on its own).
+/// The owner's words are never part of it, so no task doc, roster row,
+/// approval card or journal payload can carry them; a Human read adds them
+/// from the command row ([`owner_excerpts`]). Record only, never a gate.
+pub(crate) fn requested_by(turn: &RootTurn) -> RequestedBy {
+    if turn.origin == InputOrigin::Human {
+        RequestedBy {
+            command_id: Some(turn.command_id.clone()),
+            origin: None,
+        }
+    } else {
+        RequestedBy {
             command_id: None,
-            excerpt: None,
             origin: Some(turn.origin),
-        });
+        }
     }
-    let excerpt =
-        owner_excerpts(conn, std::slice::from_ref(&turn.command_id))?.remove(&turn.command_id);
-    Ok(RequestedBy {
-        command_id: Some(turn.command_id.clone()),
-        excerpt,
-        origin: None,
-    })
 }
 
 /// cb-requested-by: the owner's own words for each of `command_ids`, read from
@@ -921,26 +921,50 @@ mod tests {
         assert_eq!(now(&conn), agent_unknown());
     }
 
-    /// cb-requested-by: the record reads the owner's words off the Hub's own
-    /// command row — bounded at a char boundary, one line, secret-shaped
-    /// tokens withheld — and non-owner turns record only their origin.
+    /// cb-requested-by: the record is a reference, never the words — an owner
+    /// turn names its command, any other origin names itself.
     #[test]
-    fn requested_by_reads_the_owners_words_from_the_command_row() {
+    fn requested_by_is_a_reference_and_never_the_words() {
+        assert_eq!(
+            requested_by(&rt(
+                "cmd_owner",
+                InputOrigin::Human,
+                RootTurnContinuation::Fresh
+            )),
+            RequestedBy {
+                command_id: Some("cmd_owner".into()),
+                origin: None,
+            }
+        );
+        for origin in [InputOrigin::Agent, InputOrigin::Hub, InputOrigin::Bot] {
+            assert_eq!(
+                requested_by(&rt("cmd_owner", origin, RootTurnContinuation::Unknown)),
+                RequestedBy {
+                    command_id: None,
+                    origin: Some(origin),
+                }
+            );
+        }
+    }
+
+    /// The words a Human read gains, from the Hub's own command row: bounded
+    /// at a char boundary, one line, secret-shaped tokens withheld, read from
+    /// every command shape the Node reads.
+    #[test]
+    fn owner_excerpts_are_bounded_scrubbed_and_read_every_input_shape() {
         let conn = db();
+        let excerpt = |conn: &Connection, id: &str| {
+            owner_excerpts(conn, &[id.to_string()]).unwrap().remove(id)
+        };
         command(
             &conn,
             "cmd_owner",
             json!({"origin": "human", "prompt": "  dispatch a worker\non the other node "}),
             None,
         );
-        let turn = rt("cmd_owner", InputOrigin::Human, RootTurnContinuation::Fresh);
         assert_eq!(
-            requested_by(&conn, &turn).unwrap(),
-            RequestedBy {
-                command_id: Some("cmd_owner".into()),
-                excerpt: Some("dispatch a worker on the other node".into()),
-                origin: None,
-            }
+            excerpt(&conn, "cmd_owner").as_deref(),
+            Some("dispatch a worker on the other node")
         );
 
         // A long body is cut at a char boundary (multi-byte chars included)
@@ -952,17 +976,11 @@ mod tests {
             json!({"origin": "human", "text": long}),
             None,
         );
-        let excerpt = requested_by(
-            &conn,
-            &rt("cmd_long", InputOrigin::Human, RootTurnContinuation::Fresh),
-        )
-        .unwrap()
-        .excerpt
-        .expect("excerpt");
-        assert_eq!(excerpt.chars().count(), EXCERPT_CHARS, "{excerpt}");
-        assert!(excerpt.ends_with('…'), "{excerpt}");
+        let long = excerpt(&conn, "cmd_long").expect("excerpt");
+        assert_eq!(long.chars().count(), EXCERPT_CHARS, "{long}");
+        assert!(long.ends_with('…'), "{long}");
 
-        // A credential-shaped word never reaches the record; the rest does.
+        // A credential-shaped word never reaches the words; the rest does.
         let secret = format!(
             "please use {} now",
             ["sk", "-live-abcd1234efgh5678ijkl"].concat()
@@ -973,20 +991,10 @@ mod tests {
             json!({"origin": "human", "text": secret}),
             None,
         );
-        let excerpt = requested_by(
-            &conn,
-            &rt(
-                "cmd_secret",
-                InputOrigin::Human,
-                RootTurnContinuation::Fresh,
-            ),
-        )
-        .unwrap()
-        .excerpt
-        .expect("excerpt");
-        assert!(excerpt.contains("please use"), "{excerpt}");
-        assert!(excerpt.contains("now"), "{excerpt}");
-        assert!(!excerpt.contains("abcd1234"), "{excerpt}");
+        let scrubbed = excerpt(&conn, "cmd_secret").expect("excerpt");
+        assert!(scrubbed.contains("please use"), "{scrubbed}");
+        assert!(scrubbed.contains("now"), "{scrubbed}");
+        assert!(!scrubbed.contains("abcd1234"), "{scrubbed}");
 
         // Every command shape the Node reads is understood, in the Node's
         // `prompt_of` order: a create's opening prompt, an explicit
@@ -1012,55 +1020,17 @@ mod tests {
             ),
         ] {
             command(&conn, id, payload, None);
-            assert_eq!(
-                requested_by(
-                    &conn,
-                    &rt(id, InputOrigin::Human, RootTurnContinuation::Fresh)
-                )
-                .unwrap()
-                .excerpt
-                .as_deref(),
-                Some(wanted),
-                "{id}"
-            );
+            assert_eq!(excerpt(&conn, id).as_deref(), Some(wanted), "{id}");
         }
 
-        // A command with no prompt text still names the command, with no
-        // excerpt invented for it.
+        // A command with no prompt text yields no words; none are invented.
         command(
             &conn,
             "cmd_keys",
             json!({"origin": "human", "keys": "enter"}),
             None,
         );
-        assert_eq!(
-            requested_by(
-                &conn,
-                &rt("cmd_keys", InputOrigin::Human, RootTurnContinuation::Fresh)
-            )
-            .unwrap(),
-            RequestedBy {
-                command_id: Some("cmd_keys".into()),
-                excerpt: None,
-                origin: None,
-            }
-        );
-
-        // Non-owner origins record the origin alone, never the words.
-        for origin in [InputOrigin::Agent, InputOrigin::Hub, InputOrigin::Bot] {
-            assert_eq!(
-                requested_by(
-                    &conn,
-                    &rt("cmd_owner", origin, RootTurnContinuation::Unknown)
-                )
-                .unwrap(),
-                RequestedBy {
-                    command_id: None,
-                    excerpt: None,
-                    origin: Some(origin),
-                }
-            );
-        }
+        assert_eq!(excerpt(&conn, "cmd_keys"), None);
     }
 
     /// cb-requested-by: one batched read serves a whole list, and only an

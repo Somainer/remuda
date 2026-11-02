@@ -7,18 +7,24 @@ import type { RequestedBy } from "../types/generated";
  * Provenance only. The Hub records `requestedBy` and never gates on it: the
  * approval decision and the admission rules are the same with or without it.
  *
- * - A request made in an owner turn carries the owner's own words.
+ * - The stored record is a reference (`commandId`, or a non-owner `origin`).
+ *   For the owner's own reads of the approval cards, the board and a task
+ *   detail, the Hub adds a read-time `excerpt` of the owner's words from its
+ *   command row; it is not part of the generated type, so it is read here as
+ *   untrusted data.
  * - Any other origin is labelled "agent 自发" (owner ruling R2). `/approvals`
  *   already carries `RootTurnTag` for that label; surfaces without a
  *   `rootTurn` of their own, such as a task document, use `RequestedByTag`.
  */
 
-/** The owner's words, trimmed; null when none were recorded. */
+/** The owner's words, trimmed; null when the read carried none. */
 export function requestedByExcerpt(
   requestedBy?: RequestedBy | null,
 ): string | null {
-  const excerpt = requestedBy?.excerpt?.trim();
-  return excerpt ? excerpt : null;
+  const excerpt = requestedBy?.excerpt;
+  if (typeof excerpt !== "string") return null;
+  const trimmed = excerpt.trim();
+  return trimmed ? trimmed : null;
 }
 
 /** The non-owner label for `requestedBy`, or null for an owner turn. */

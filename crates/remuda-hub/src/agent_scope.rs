@@ -31,33 +31,6 @@ pub fn origin(device: &Device) -> InputOrigin {
     }
 }
 
-/// cb-requested-by: whether the caller may see the owner's own words.
-///
-/// Only a Human caller may. An Agent is a different lineage that could not
-/// already read the owner's command text, and a Bot relays its cards to a chat
-/// platform; both keep `requestedBy.commandId` / `{origin}` and lose the
-/// excerpt at read time.
-pub fn owner_words_visible(device: &Device) -> bool {
-    origin(device) == InputOrigin::Human
-}
-
-/// Remove `requestedBy.excerpt` from an interaction-shaped value (the view's
-/// top-level copy and the nested `interaction` copy when present). A no-op
-/// when there is no record; other callers' fields are untouched.
-pub fn hide_requested_by_excerpt(value: &mut Value) {
-    if let Some(requested_by) = value.get_mut("requestedBy").and_then(Value::as_object_mut) {
-        requested_by.remove("excerpt");
-    }
-    if let Some(requested_by) = value
-        .get_mut("interaction")
-        .and_then(Value::as_object_mut)
-        .and_then(|interaction| interaction.get_mut("requestedBy"))
-        .and_then(Value::as_object_mut)
-    {
-        requested_by.remove("excerpt");
-    }
-}
-
 /// cb-requested-by: add the owner's own words to every `requestedBy` record in
 /// `docs`, for a Human caller only.
 ///
@@ -984,7 +957,7 @@ pub async fn require_approval(
     // grant's match (the caller and the exact request decide). cb-requested-by
     // rides the same card: the owner's words, or the non-owner origin.
     let root_turn = state.store.root_turn(id).await?;
-    let requested_by = state.store.requested_by(root_turn.clone()).await?;
+    let requested_by = root_turn.as_ref().map(crate::root_turn::requested_by);
     state
         .agent_approvals
         .require_recorded(headers, &caller, request, root_turn, requested_by)

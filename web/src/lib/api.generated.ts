@@ -3459,11 +3459,11 @@ export interface components {
                 p256dh: string;
             };
         };
-        /** @description cb-requested-by: who asked for an Agent-created dispatch or task. An owner-origin root turn records the command that carried the owner's input and a bounded, secret-scrubbed excerpt of their words; any other origin records only that origin. Record only, never a gate. */
+        /** @description cb-requested-by: who asked for an Agent-created dispatch, task or approval card. Stored as a reference only: an owner-origin root turn records the command that carried the owner's input, any other origin records only that origin. The owner's words are never stored with it. Record only, never a gate. */
         RequestedBy: {
             /** @description Hub command id of the owner's input that started the root turn. */
             commandId?: string;
-            /** @description The owner's own words for that command: one line, at most 280 characters, credential-shaped strings withheld. */
+            /** @description Read-time only, for a Human caller: the owner's own words for that command, read from the Hub's command row on GET /v1/interactions, GET /v1/board and GET /v1/tasks/{id}. One line, at most 280 characters, credential-shaped strings withheld. Never stored, and never served to an Agent or Bot caller. */
             excerpt?: string;
             /**
              * @description The origin that started the turn, recorded only when it was not the owner.

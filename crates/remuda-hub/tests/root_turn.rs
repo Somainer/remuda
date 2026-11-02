@@ -999,10 +999,13 @@ async fn an_agent_dispatch_carries_the_owners_words_from_an_owner_turn() -> Resu
         without_excerpt(&expected),
         "{body}"
     );
+    // The roster row stores the reference alone: the PWA shows no words on
+    // a worker, so even the owner's read of it is not hydrated.
     let id = body["worker"]["id"].as_str().context("worker id")?;
     let stored = ctx.get(&format!("/v1/workers/{id}")).await;
     assert_eq!(
-        stored["requestedBy"], expected,
+        stored["requestedBy"],
+        without_excerpt(&expected),
         "the owner's read: {stored}"
     );
     Ok(())
@@ -1265,8 +1268,9 @@ async fn an_agent_created_task_in_an_agent_turn_is_labelled_agent() -> Result<()
 }
 
 /// The owner's own words are served to Human callers only: every task, board,
-/// worker and approval read an Agent or Bot can make keeps the command id and
-/// drops the excerpt (cb-requested-by privacy).
+/// worker and approval read an Agent or Bot can make carries the command id
+/// alone, and the owner gains the words on the card, the board and the task
+/// detail (cb-requested-by privacy).
 #[tokio::test]
 async fn owner_words_are_human_only_on_task_worker_and_card_reads() -> Result<()> {
     let (ctx, mut node) = Ctx::boot().await?;
@@ -1331,12 +1335,19 @@ async fn owner_words_are_human_only_on_task_worker_and_card_reads() -> Result<()
         "{bot_cards}"
     );
 
-    // The owner sees the words on every one of those reads.
+    // The owner sees the words where the PWA shows them — the board and the
+    // task detail — and the reference on the reads it does not.
     for path in &paths {
         let body = ctx.get(path).await;
+        let hydrated =
+            path.starts_with("/v1/board") || path.starts_with(&format!("/v1/tasks/{task_id}"));
         assert_eq!(
             first_requested_by(&body).expect("human read"),
-            expected,
+            if hydrated {
+                expected.clone()
+            } else {
+                stripped.clone()
+            },
             "Human read of {path}"
         );
     }

@@ -249,18 +249,6 @@ async fn require_project_scope(
 
 // ─── Task CRUD ─────────────────────────────────────────────────────────────
 
-/// cb-requested-by: serve the owner's own words to Human callers only. Every
-/// task serializer below passes through here, so an Agent (another lineage)
-/// or a Bot (which relays to a chat platform) keeping project scope still
-/// cannot read the owner's instruction to whichever agent asked.
-fn hide_owner_words(device: &crate::store::Device, task: &mut Task) {
-    if !crate::agent_scope::owner_words_visible(device)
-        && let Some(requested_by) = &mut task.requested_by
-    {
-        requested_by.excerpt = None;
-    }
-}
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ListQuery {
@@ -285,7 +273,7 @@ async fn list_tasks(
     headers: HeaderMap,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<Value>, HubError> {
-    let (device, scope) = require_project_scope(&state, &headers).await?;
+    let (_, scope) = require_project_scope(&state, &headers).await?;
     let state_filter = match query.state.as_deref() {
         None => None,
         Some(raw) => Some(parse_state(raw)?),
@@ -298,9 +286,6 @@ async fn list_tasks(
     items.retain(|task| scope.allows_project(task.project_id.as_id().as_str()));
     if let Some(wanted) = state_filter {
         items.retain(|task| task.state == wanted);
-    }
-    for task in &mut items {
-        hide_owner_words(&device, task);
     }
     Ok(Json(json!({ "items": items, "nextCursor": null })))
 }
@@ -340,8 +325,6 @@ async fn board(
         if !scope.allows_project(task.project_id.as_id().as_str()) {
             continue;
         }
-        let mut task = task;
-        hide_owner_words(&device, &mut task);
         let seq = display_seq
             .entry(task.project_id.as_id().to_string())
             .or_insert(0);
@@ -384,18 +367,14 @@ async fn create_task(
     let device = require_dispatch(&state, &headers).await?;
     let (_, scope) = require_project_scope(&state, &headers).await?;
     let authority = crate::agent_scope::CallerAuthority::for_device(&state, &device).await?;
-    // cb-requested-by: who asked for this task — the owner's words when the
-    // Agent acted in an owner turn, else the non-owner origin. Record only.
-    let requested_by = state
-        .store
-        .requested_by(
-            authority
-                .initiator
-                .as_ref()
-                .and_then(|i| i.root_turn.clone()),
-        )
-        .await
-        .map_err(map_store)?;
+    // cb-requested-by: who asked for this task — the owner's command when the
+    // Agent acted in an owner turn, else the non-owner origin; never the
+    // owner's words. Record only.
+    let requested_by = authority
+        .initiator
+        .as_ref()
+        .and_then(|initiator| initiator.root_turn.as_ref())
+        .map(crate::root_turn::requested_by);
     if !scope.allows_project(body.project_id.as_id().as_str()) {
         return Err(HubError::Forbidden);
     }
@@ -575,8 +554,6 @@ async fn create_task(
     let (task, sharing) = sharing
         .map(|(task, sharing)| (task, Some(sharing)))
         .unwrap_or((task, None));
-    let mut task = task;
-    hide_owner_words(&device, &mut task);
     state
         .store
         .append_audit(
@@ -855,8 +832,7 @@ async fn get_task_http(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, HubError> {
     let (device, scope) = require_project_scope(&state, &headers).await?;
-    let mut task = load_scoped_task(&state, &scope, &id).await?;
-    hide_owner_words(&device, &mut task);
+    let task = load_scoped_task(&state, &scope, &id).await?;
     // The live dependency view: edges locked until each dep carries a landed
     // sha (§7 #8). Computed at read time, never stored.
     let all = state.store.list_tasks(None).await.map_err(map_store)?;
@@ -907,8 +883,6 @@ async fn set_task_state(
         .await
         .map_err(map_store)?
         .ok_or(HubError::NotFound)?;
-    let mut updated = updated;
-    hide_owner_words(&device, &mut updated);
     state
         .store
         .append_audit(
@@ -956,8 +930,6 @@ async fn archive_task(
         .await
         .map_err(map_store)?
         .ok_or(HubError::NotFound)?;
-    let mut updated = updated;
-    hide_owner_words(&device, &mut updated);
     state
         .store
         .append_audit(
@@ -982,16 +954,11 @@ async fn split_task(
     let (_, scope) = require_project_scope(&state, &headers).await?;
     let authority = crate::agent_scope::CallerAuthority::for_device(&state, &device).await?;
     // cb-requested-by: the same record as a root task creation, for the child.
-    let requested_by = state
-        .store
-        .requested_by(
-            authority
-                .initiator
-                .as_ref()
-                .and_then(|i| i.root_turn.clone()),
-        )
-        .await
-        .map_err(map_store)?;
+    let requested_by = authority
+        .initiator
+        .as_ref()
+        .and_then(|initiator| initiator.root_turn.as_ref())
+        .map(crate::root_turn::requested_by);
     if body.title.trim().is_empty() || body.intent.trim().is_empty() {
         return Err(HubError::BadRequest("title and intent are required".into()));
     }
@@ -1036,8 +1003,6 @@ async fn split_task(
         .await
         .map_err(map_store)?
         .ok_or(HubError::NotFound)?;
-    let mut child = child;
-    hide_owner_words(&device, &mut child);
     state
         .store
         .append_audit(
@@ -1092,8 +1057,6 @@ async fn land_task(
         .await
         .map_err(map_store)?
         .ok_or(HubError::NotFound)?;
-    let mut updated = updated;
-    hide_owner_words(&device, &mut updated);
     state
         .store
         .append_audit(

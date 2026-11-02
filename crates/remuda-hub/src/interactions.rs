@@ -519,15 +519,8 @@ pub async fn list_interactions(
     if agent_origin {
         items = delegated_visible_items(&state, &device, items).await?;
     }
-    // cb-requested-by: the owner's own words on a card are for a Human caller.
-    // An Agent (a different lineage) or a Bot (which relays to chat) keeps
-    // the command id / origin and loses the excerpt.
-    if !crate::agent_scope::owner_words_visible(&device) {
-        for item in &mut items {
-            crate::agent_scope::hide_requested_by_excerpt(item);
-        }
-    }
-    // cb-requested-by: this list is the PWA's approval card source.
+    // cb-requested-by: this list is the PWA's approval card source. The cards
+    // store a reference only; a Human read gains the owner's words here.
     crate::agent_scope::hydrate_owner_words(&state, &device, items.iter_mut()).await;
     Ok(Json(json!({ "items": items, "nextCursor": null })))
 }

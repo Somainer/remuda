@@ -17399,17 +17399,10 @@
       "type": "object"
     },
     "RequestedBy": {
-      "description": "D-060 companion item (cb-requested-by): who asked for an Agent-created\ndispatch or task, as the Hub recorded it from its own root-turn ledger.\n\nAn owner-origin root turn records the command that carried the owner's\ninput and a bounded, secret-scrubbed excerpt of their words. Any other\norigin records only that origin — `hub` for a restart notice or a fact,\n`agent` for a turn the agent started on its own. It is a record for the\naudit trail and `/approvals`, never a gate: no admission, grant, scope or\napproval rule reads it (owner ruling R2).",
+      "description": "D-060 companion item (cb-requested-by): who asked for an Agent-created\ndispatch or task, as the Hub recorded it from its own root-turn ledger.\n\nA reference, never the words. An owner-origin root turn records the Hub\ncommand that carried the owner's input; any other origin records only that\norigin — `hub` for a restart notice or a fact, `agent` for a turn the agent\nstarted on its own. The owner's words stay in that command row: the type\nhas no field for them, so a task doc, roster row or approval card can\nnever store them, and a Human read of the approval card source, the board\nor a task detail gains a read-time `excerpt` from the command row\n(protocol.md). It is a record for the audit trail and `/approvals`, never\na gate: no admission, grant, scope or approval rule reads it (owner ruling\nR2).",
       "properties": {
         "commandId": {
           "description": "Hub command id of the owner's input that started the root turn, when\nthat turn's origin is `human`.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "excerpt": {
-          "description": "The owner's own words for that command, one line, at most 280 chars\nand free of credential-shaped strings. Present only for an owner turn\nwhose command carried prompt text.",
           "type": [
             "string",
             "null"

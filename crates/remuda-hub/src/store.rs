@@ -3664,23 +3664,6 @@ impl Store {
         .await
     }
 
-    /// cb-requested-by: the record for the root turn an Agent call was made
-    /// in — the owner's command and words when the turn was the owner's, else
-    /// the non-owner origin. Read from the Hub's own command rows; `None`
-    /// when the Hub knows no turn.
-    pub async fn requested_by(
-        &self,
-        turn: Option<remuda_protocol::RootTurn>,
-    ) -> Result<Option<remuda_protocol::RequestedBy>, StoreError> {
-        let Some(turn) = turn else {
-            return Ok(None);
-        };
-        self.read("requested_by", move |conn| {
-            crate::root_turn::requested_by(conn, &turn).map(Some)
-        })
-        .await
-    }
-
     /// cb-requested-by: the owner's own words for each of `command_ids`, from
     /// the Hub's command rows ([`crate::root_turn::owner_excerpts`]). One read
     /// for a whole list or board.

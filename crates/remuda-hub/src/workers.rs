@@ -171,17 +171,6 @@ struct BriefBody {
 
 // ── list / get ─────────────────────────────────────────────────────────────
 
-/// cb-requested-by: serve the owner's own words to Human callers only. Every
-/// roster serializer below passes through here, so an Agent (a different
-/// lineage) or a Bot still reads at most `requestedBy.commandId`.
-fn hide_owner_words(device: &crate::store::Device, worker: &mut WorkerRoster) {
-    if !crate::agent_scope::owner_words_visible(device)
-        && let Some(requested_by) = &mut worker.requested_by
-    {
-        requested_by.excerpt = None;
-    }
-}
-
 async fn list_workers(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -202,9 +191,6 @@ async fn list_workers(
                 .as_deref()
                 .is_none_or(|wanted| worker.state.kind() == wanted)
     });
-    for worker in &mut items {
-        hide_owner_words(&device, worker);
-    }
     Ok(Json(json!({ "items": items, "nextCursor": null })))
 }
 
@@ -216,8 +202,7 @@ async fn get_worker(
     let device = caller(&state, &headers).await?;
     require_grant(&state, &device, remuda_protocol::GrantVerb::Dispatch).await?;
     let scope = caller_project_scope(&state, &device).await?;
-    let mut worker = resolve_worker(&state, &id, &scope).await?;
-    hide_owner_words(&device, &mut worker);
+    let worker = resolve_worker(&state, &id, &scope).await?;
     Ok(Json(json!(worker)))
 }
 
@@ -329,18 +314,14 @@ pub(crate) async fn dispatch_core(
     // create + brief commands, the roster row) carries the caller's initiator.
     let (dispatch_initiator, dispatch_device_id) = initiator_and_device(&state, &device).await?;
     // cb-requested-by: for an Agent dispatch, who asked for it, derived from
-    // the same root turn the initiator carries. Record only, never a gate.
-    // A request body cannot supply one: `DispatchBody` has no such field and
-    // `stamp` strips the key from any command payload.
-    let requested_by = state
-        .store
-        .requested_by(
-            dispatch_initiator
-                .as_ref()
-                .and_then(|i| i.root_turn.clone()),
-        )
-        .await
-        .map_err(map_store)?;
+    // the same root turn the initiator carries: a reference to the owner's
+    // command, never the owner's words. Record only, never a gate. A request
+    // body cannot supply one: `DispatchBody` has no such field and `stamp`
+    // strips the key from any command payload.
+    let requested_by = dispatch_initiator
+        .as_ref()
+        .and_then(|initiator| initiator.root_turn.as_ref())
+        .map(crate::root_turn::requested_by);
     if !scope.allows_project(body.project_id.as_id().as_str()) {
         return Err(HubError::Forbidden);
     }
@@ -912,8 +893,8 @@ pub(crate) async fn dispatch_core(
             // and what the worker launched with.
             permission_mode_requested: body.permission_mode.clone(),
             permission_mode: Some(permission_mode),
-            // cb-requested-by: the owner's words behind an Agent dispatch, or
-            // the non-owner origin, recorded on the roster row.
+            // cb-requested-by: the owner's command behind an Agent dispatch,
+            // or the non-owner origin; never the owner's words.
             requested_by,
         };
         let row = state
@@ -932,9 +913,7 @@ pub(crate) async fn dispatch_core(
         state
             .store
             .append_audit(
-                // Cloned: the caller's device is still needed after the block
-                // to hide the owner's words from a non-Human response.
-                device.id.clone(),
+                device.id,
                 "worker.dispatch".into(),
                 Some(row.meta.id.as_id().to_string()),
                 json!({ "project": row.project_id.as_id(), "host": row.host_id.as_id() }),
@@ -958,8 +937,6 @@ pub(crate) async fn dispatch_core(
             return Err(error);
         }
     };
-    let mut row = row;
-    hide_owner_words(&device, &mut row);
     Ok(Json(json!({
         "worker": row,
         "instanceId": instance.instance_id,
@@ -1716,8 +1693,6 @@ pub(crate) async fn retire_core(
         .await
         .map_err(map_store)?
         .ok_or(HubError::NotFound)?;
-    let mut updated = updated;
-    hide_owner_words(&device, &mut updated);
     state
         .store
         .append_audit(
@@ -1770,8 +1745,6 @@ async fn set_worker_state(
         .await
         .map_err(map_store)?
         .ok_or(HubError::NotFound)?;
-    let mut updated = updated;
-    hide_owner_words(&device, &mut updated);
     Ok(Json(json!(updated)))
 }
 
@@ -1851,8 +1824,6 @@ async fn send_worker_brief(
         .await
         .map_err(map_store)?
         .ok_or(HubError::NotFound)?;
-    let mut updated = updated;
-    hide_owner_words(&device, &mut updated);
     Ok(Json(json!({ "worker": updated, "command": command })))
 }
 

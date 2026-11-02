@@ -89,12 +89,16 @@ wire_enum!(RootTurnContinuation, "8.4", {
 /// D-060 companion item (cb-requested-by): who asked for an Agent-created
 /// dispatch or task, as the Hub recorded it from its own root-turn ledger.
 ///
-/// An owner-origin root turn records the command that carried the owner's
-/// input and a bounded, secret-scrubbed excerpt of their words. Any other
-/// origin records only that origin — `hub` for a restart notice or a fact,
-/// `agent` for a turn the agent started on its own. It is a record for the
-/// audit trail and `/approvals`, never a gate: no admission, grant, scope or
-/// approval rule reads it (owner ruling R2).
+/// A reference, never the words. An owner-origin root turn records the Hub
+/// command that carried the owner's input; any other origin records only that
+/// origin — `hub` for a restart notice or a fact, `agent` for a turn the agent
+/// started on its own. The owner's words stay in that command row: the type
+/// has no field for them, so a task doc, roster row or approval card can
+/// never store them, and a Human read of the approval card source, the board
+/// or a task detail gains a read-time `excerpt` from the command row
+/// (protocol.md). It is a record for the audit trail and `/approvals`, never
+/// a gate: no admission, grant, scope or approval rule reads it (owner ruling
+/// R2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RequestedBy {
@@ -102,11 +106,6 @@ pub struct RequestedBy {
     /// that turn's origin is `human`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command_id: Option<String>,
-    /// The owner's own words for that command, one line, at most 280 chars
-    /// and free of credential-shaped strings. Present only for an owner turn
-    /// whose command carried prompt text.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub excerpt: Option<String>,
     /// The origin that started the turn, recorded only when it was not the
     /// owner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -159,23 +158,22 @@ mod tests {
         assert_eq!(future.instance_id, "ins_a");
     }
 
-    /// cb-requested-by: an owner turn records the command and the words; a
-    /// non-owner turn records only its origin; absent fields never serialize.
+    /// cb-requested-by: an owner turn records its command, a non-owner turn
+    /// its origin; absent fields never serialize, and words a stored row may
+    /// carry are dropped on read, never re-served.
     #[test]
-    fn requested_by_records_the_owner_words_or_the_other_origin() {
+    fn requested_by_is_a_reference_and_drops_words_on_read() {
         let owner = RequestedBy {
             command_id: Some("cmd_owner".into()),
-            excerpt: Some("dispatch a worker on the other node".into()),
             origin: None,
         };
         assert_eq!(
             serde_json::to_value(&owner).unwrap(),
-            json!({"commandId": "cmd_owner", "excerpt": "dispatch a worker on the other node"})
+            json!({"commandId": "cmd_owner"})
         );
 
         let hub = RequestedBy {
             command_id: None,
-            excerpt: None,
             origin: Some(InputOrigin::Hub),
         };
         assert_eq!(
@@ -185,6 +183,14 @@ mod tests {
         let parsed: RequestedBy =
             serde_json::from_value(json!({"origin": "agent"})).expect("parses");
         assert_eq!(parsed.origin, Some(InputOrigin::Agent));
-        assert_eq!(parsed.excerpt, None);
+
+        let stored_with_words: RequestedBy = serde_json::from_value(
+            json!({"commandId": "cmd_owner", "excerpt": "the owner's words"}),
+        )
+        .expect("parses");
+        assert_eq!(
+            serde_json::to_value(&stored_with_words).unwrap(),
+            json!({"commandId": "cmd_owner"})
+        );
     }
 }

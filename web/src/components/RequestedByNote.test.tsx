@@ -12,6 +12,9 @@ describe("requestedByExcerpt", () => {
       }),
     ).toBe("dispatch a worker on the other node");
     expect(requestedByExcerpt({ excerpt: "   " })).toBeNull();
+    // The excerpt is a read-time field outside the stored record's type; a
+    // value that is not text is ignored rather than rendered.
+    expect(requestedByExcerpt({ commandId: "cmd_1", excerpt: 42 })).toBeNull();
     expect(requestedByExcerpt({ commandId: "cmd_1" })).toBeNull();
     expect(requestedByExcerpt(null)).toBeNull();
     expect(requestedByExcerpt(undefined)).toBeNull();

@@ -1,7 +1,7 @@
 import type { Host, Instance } from "../../types/instance";
 import type { Interaction } from "../../types/interaction";
 import type { Task } from "../../types/generated";
-import { deriveInboxQueue } from "../mobile/inboxRows";
+import { deriveInboxQueue, type InboxQueueItem } from "../mobile/inboxRows";
 import { liveChildParents, rank } from "../mobile/homeRows";
 
 /**
@@ -67,22 +67,7 @@ export function glanceCounts(
     deviceId: source.deviceId,
     nowMs: source.nowMs,
   });
-  const queuedInstanceIds = new Set(queue.map((row) => row.item.instanceId));
-  const sessionsByTask = new Map<string, string[]>();
-  for (const instance of source.instances) {
-    if (!instance.taskId) continue;
-    const list = sessionsByTask.get(instance.taskId) ?? [];
-    list.push(instance.id);
-    sessionsByTask.set(instance.taskId, list);
-  }
-  let blockedTasks = 0;
-  for (const task of source.tasks) {
-    if (task.archivedAt != null) continue;
-    if (!task.blockedReason?.trim()) continue;
-    const sessions = sessionsByTask.get(task.id) ?? [];
-    if (sessions.some((id) => queuedInstanceIds.has(id))) continue;
-    blockedTasks += 1;
-  }
+  const blockedTasks = ownerBlockedTasks(source.tasks, source.instances, queue).length;
 
   const childLive = liveChildParents(source.instances);
   const seen = new Set<string>();
@@ -93,6 +78,35 @@ export function glanceCounts(
     if (rank(instance, childLive.has(instance.id)) === "working") working += 1;
   }
   return { needYou: queue.length + blockedTasks, working };
+}
+
+/**
+ * home.md §4.6 / §5.1 B: unarchived tasks with a blocked reason none of whose
+ * sessions has an interaction in the 待你处理 queue. The ONE derivation both
+ * the count (glanceCounts) and the queue's 「任务待你」 cards read, so the
+ * header number and the cards can never disagree. Oldest task first.
+ */
+export function ownerBlockedTasks(
+  tasks: readonly Task[],
+  instances: readonly Instance[],
+  queue: readonly InboxQueueItem[],
+): Task[] {
+  const queuedInstanceIds = new Set(queue.map((row) => row.item.instanceId));
+  const sessionsByTask = new Map<string, string[]>();
+  for (const instance of instances) {
+    if (!instance.taskId) continue;
+    const list = sessionsByTask.get(instance.taskId) ?? [];
+    list.push(instance.id);
+    sessionsByTask.set(instance.taskId, list);
+  }
+  return tasks
+    .filter((task) => {
+      if (task.archivedAt != null) return false;
+      if (!task.blockedReason?.trim()) return false;
+      const sessions = sessionsByTask.get(task.id) ?? [];
+      return !sessions.some((id) => queuedInstanceIds.has(id));
+    })
+    .sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
 
 /** The largest number the row spells out; above it the segment reads 99+. */

@@ -106,6 +106,7 @@ async fn a_refused_optional_shell_exit_send_does_not_abort_the_close() {
     let driver = ClaudePtyDriver::new(ClaudePtyOptions {
         creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
+        skill_context: None,
         instance_id: None,
         media_stager: None,
         profile: profile(),

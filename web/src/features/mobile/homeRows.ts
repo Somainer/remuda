@@ -664,6 +664,9 @@ export type HomeTaskLayerInput = {
 };
 
 export function buildHomeTaskLayer(input: HomeTaskLayerInput): TaskListGroup[] {
+  // home.md §4.6: the home has ONE 需要你 — the ④ queue. The ledger's task
+  // layer no longer renders the ledger's own attention group (/board and the
+  // task list keep theirs, ui-spec §2.9); its tasks stay in their projects.
   return buildTaskGroups({
     tasks: input.tasks,
     instances: input.instances,
@@ -672,5 +675,5 @@ export function buildHomeTaskLayer(input: HomeTaskLayerInput): TaskListGroup[] {
     projectName: input.projectName,
     branchOfSpace: input.branchOfSpace,
     query: input.query,
-  });
+  }).filter((group) => group.kind !== "attention");
 }

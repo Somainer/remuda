@@ -96,6 +96,7 @@ async fn a_forced_close_after_a_server_restart_refuses_the_reused_foreign_pane()
     let driver = ClaudePtyDriver::new(ClaudePtyOptions {
         creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
+        skill_context: None,
         instance_id: None,
         media_stager: None,
         profile: profile(),

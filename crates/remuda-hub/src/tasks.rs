@@ -24,6 +24,7 @@ use remuda_protocol::{
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 
 // ─── Request bodies ────────────────────────────────────────────────────────
 
@@ -1699,6 +1700,21 @@ impl Store {
                     load_task(conn, &id)?.ok_or_else(|| StoreError::Id("task vanished".into()))
                 })
                 .collect()
+        })
+        .await
+    }
+
+    /// `instances.task_id` membership, instance id → task id, for every
+    /// instance bound to a task. The push badge's §5.1 B (home.md) needs only
+    /// this join, not the full instance projection.
+    pub async fn instance_task_ids(&self) -> Result<HashMap<String, String>, StoreError> {
+        self.read("instance_task_ids", |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, task_id FROM instances WHERE task_id IS NOT NULL AND task_id != ''",
+            )?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<rusqlite::Result<HashMap<String, String>>>()
+                .map_err(StoreError::from)
         })
         .await
     }

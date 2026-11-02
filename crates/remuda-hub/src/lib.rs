@@ -83,6 +83,7 @@ mod root_turn;
 /// The shared secret lint (memory writes, brief lint; main-agent.md §12.5).
 pub mod secret_lint;
 mod seen;
+mod skill_context;
 pub mod ssh_hosts;
 mod store;
 mod store_tickets;

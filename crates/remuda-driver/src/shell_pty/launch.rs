@@ -98,6 +98,7 @@ pub fn agent_recipe(
     cwd: &str,
     resume: Option<&str>,
     memory_context: Option<&crate::memory_context::MemoryContext>,
+    skill_context: Option<&crate::launch::remuda_skill::SkillContext>,
 ) -> DriverResult<LaunchRecipe> {
     if spec.driver != DriverKind::ShellPty {
         return Err(DriverError::InvalidLaunchSpec(
@@ -140,6 +141,7 @@ pub fn agent_recipe(
         settings_overlay_path: launch.settings_overlay.clone(),
         secret_policy: None,
         memory_context,
+        skill_context,
     })
 }
 

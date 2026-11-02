@@ -365,11 +365,14 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
         api_route: None,
         api_relay_endpoint: None,
         memory_context: None,
+        skill_context: None,
     };
     request.apply_spec_launch_fields(spec);
     // D-060: the Hub-stamped memory rides the top level of the params, for
     // create and resume alike; never read from `spec`.
     request.take_memory_context(params);
+    // ma-skill: likewise the launch facts for the capability section.
+    request.take_skill_context(params);
     // D-057 OA1: likewise the creator stamp, top level only.
     request.take_creator_permission_mode(params);
     Ok(request)

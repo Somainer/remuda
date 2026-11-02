@@ -127,6 +127,7 @@ async fn stub_bg_start_send_stop_does_not_rm() {
     let driver = ClaudeBgDriver::new(ClaudeBgOptions {
         creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
+        skill_context: None,
         instance_id: None,
         profile: profile(),
         launch_dir: launch,
@@ -225,6 +226,7 @@ async fn live_claude_bg_haiku_once() {
     let driver = ClaudeBgDriver::new(ClaudeBgOptions {
         creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
+        skill_context: None,
         instance_id: None,
         profile: profile(),
         launch_dir: launch,

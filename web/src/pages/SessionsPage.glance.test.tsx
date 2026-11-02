@@ -77,3 +77,35 @@ it("counts 工作中 from the top-level sessions the list shows, not child agent
   // So the count says 1, not 2 — the tapped list equals it.
   expect(await screen.findByTestId("glance-working")).toHaveTextContent("1 工作中");
 });
+
+it("mounts the ④ queue in the main column and hides it while the list search has text", async () => {
+  vi.spyOn(api, "hello").mockResolvedValue({} as never);
+  vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+  vi.spyOn(api, "hostList").mockResolvedValue({ items: [], nextCursor: null } as never);
+  vi.spyOn(api, "instanceList").mockResolvedValue({ items: [], nextCursor: null });
+  vi.spyOn(api, "interactionList").mockResolvedValue([]);
+  vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] });
+  vi.spyOn(api, "hostWorkspaceSubscribe").mockImplementation(() => () => undefined);
+  vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+  vi.spyOn(hubStore, "flushAllOutbox").mockImplementation(() => undefined as never);
+  await hubStore.bootstrap();
+  await hubStore.refresh();
+
+  const { unmount } = render(
+    <MemoryRouter initialEntries={["/sessions"]}>
+      <SessionsPage />
+    </MemoryRouter>,
+  );
+  const queue = await screen.findByTestId("home-queue");
+  expect(queue).toHaveAttribute("data-placement", "desktop");
+  expect(queue).toHaveAttribute("id", "home-queue");
+  unmount();
+
+  render(
+    <MemoryRouter initialEntries={["/sessions?q=gate"]}>
+      <SessionsPage />
+    </MemoryRouter>,
+  );
+  await screen.findByTestId("session-list");
+  expect(screen.queryByTestId("home-queue")).toBeNull();
+});

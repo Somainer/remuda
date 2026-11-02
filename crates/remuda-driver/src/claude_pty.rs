@@ -134,6 +134,9 @@ pub struct ClaudePtyOptions {
     /// D-060: the Hub-stamped lineage memory; the materializer emits it as
     /// its own `--append-system-prompt` pair on every process start.
     pub memory_context: Option<crate::memory_context::MemoryContext>,
+    /// ma-skill: the Hub-stamped launch facts; the materializer installs the
+    /// `remuda` skill and carries the seat's capability section from them.
+    pub skill_context: Option<crate::launch::remuda_skill::SkillContext>,
 }
 
 impl ClaudePtyOptions {
@@ -167,6 +170,7 @@ impl ClaudePtyOptions {
             instance_id: None,
             media_stager: None,
             memory_context: None,
+            skill_context: None,
         }
     }
 }
@@ -352,6 +356,7 @@ impl ClaudePtyDriver {
             settings_overlay_path: self.options.settings_overlay_path.clone(),
             secret_policy: None,
             memory_context: self.options.memory_context.as_ref(),
+            skill_context: self.options.skill_context.as_ref(),
         };
         let mut recipe = materialize(&request)?;
         apply_tty_bypass_flag(&mut recipe);

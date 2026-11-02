@@ -118,6 +118,7 @@ async fn assert_pin_reaches_the_harness(mismatch: bool) {
         .create_instance(CreateInstanceRequest {
             creator_permission_mode: None,
             memory_context: None,
+            skill_context: None,
             initiator: None,
             origin: remuda_protocol::InputOrigin::Human,
             agent_credential: None,

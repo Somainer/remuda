@@ -41,6 +41,14 @@ struct Args {
     /// Legacy spelling on older builds; ignored the same way.
     #[arg(long = "dangerously-skip-permissions", hide = true)]
     _skip_permissions_legacy: bool,
+    /// The materializer's own system-prompt pair (the memory index and the
+    /// seat's capability section, main-agent.md §12.3/§3.4.1). Claude takes
+    /// it as context; the fake drives its turns from the scenario instead.
+    #[arg(long = "append-system-prompt", allow_hyphen_values = true, hide = true)]
+    _append_system_prompt: Option<String>,
+    /// `--system-prompt-snapshot off` on a native resume; accepted and ignored.
+    #[arg(long = "system-prompt-snapshot", hide = true)]
+    _system_prompt_snapshot: Option<String>,
     /// Absorb any remaining unknown trailing arguments (forward-compatible
     /// with future materializer flags).
     #[arg(last = true, allow_hyphen_values = true, hide = true)]

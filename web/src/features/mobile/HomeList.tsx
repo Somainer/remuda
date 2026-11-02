@@ -573,8 +573,6 @@ export const HomeList = memo(function HomeList() {
           card and above the ledger; outside the probe (its answers and
           receipts never report commit:HomeList). Hidden while searching. */}
       <HomeQueue placement="phone" searching={searching} />
-      {/* ⑤ 刚完成 (home.md §7): under the queue, hidden when nothing is ◉. */}
-      <JustDone placement="phone" />
       {/* Outside the probe: its 5s ledger poll never reports commit:HomeList.
           CSS order keeps it under the sticky head and above project groups. */}
       <HomeTaskLayer
@@ -591,6 +589,9 @@ export const HomeList = memo(function HomeList() {
         // designed empty state for the unfiltered ledger only.
         sessionEmpty={renderedGroups.length === 0 && rankFilter === null}
       />
+      {/* ⑤ 刚完成 (home.md §7): after the whole queue, including the task
+          layer above, so it never splits ④. Hidden when nothing is ◉. */}
+      <JustDone placement="phone" />
       {/* D-061 ⑨: 问 Main docked at the bottom, above PhoneNav. */}
       <MainAskDock />
     </div>

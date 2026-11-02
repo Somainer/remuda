@@ -24,6 +24,7 @@ const shotDir = evidence
   : path.join(here, "../../test-results/evidence");
 
 const created: string[] = [];
+const createdTasks: string[] = [];
 
 async function shot(page: Page, name: string) {
   if (!evidence) return;
@@ -78,10 +79,36 @@ async function finishTurn(page: Page, id: string): Promise<void> {
   expect(result.ok(), `instance.send: ${result.status()}`).toBe(true);
 }
 
+/**
+ * An owner-blocked task with no session: a 任务待你 row in the phone task layer
+ * (§4.6). Archived at the end — a leftover blocked task changes the next
+ * spec's exact counts.
+ */
+async function blockedTask(page: Page): Promise<string> {
+  const suffix = Date.now().toString(36);
+  const project = await page.request.post("/v1/projects", { data: { name: `seenweb ${suffix}` } });
+  expect(project.ok(), `POST /v1/projects: ${project.status()}`).toBe(true);
+  const projectId = ((await project.json()) as { id: string }).id;
+  const createdTask = await page.request.post("/v1/tasks", {
+    data: { projectId, title: `seenweb blocked ${suffix}`, intent: `e2e seen order ${suffix}` },
+  });
+  expect(createdTask.ok(), `POST /v1/tasks: ${createdTask.status()}`).toBe(true);
+  const taskId = ((await createdTask.json()) as { id: string }).id;
+  createdTasks.push(taskId);
+  const patched = await page.request.patch(`/v1/tasks/${taskId}`, {
+    data: { state: "failed", reason: `等你确认验收范围 ${suffix}` },
+  });
+  expect(patched.ok(), `PATCH /v1/tasks/${taskId}: ${patched.status()}`).toBe(true);
+  return taskId;
+}
+
 test.afterEach(async ({ page }) => {
   const ids = created.splice(0);
   for (const id of ids) {
     await page.request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
+  }
+  for (const id of createdTasks.splice(0)) {
+    await page.request.post(`/v1/tasks/${id}/archive`, { data: {} }).catch(() => undefined);
   }
 });
 
@@ -141,6 +168,39 @@ test("a long-press at 390 opens the row menu below the sticky head, and 关闭�
     // this context's session; a leftover working row changes m-home's counts.
     for (const id of created.splice(0)) {
       await page.request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
+    }
+    await context.close();
+  }
+});
+
+test("390: ⑤ paints below the whole queue, including 任务待你", async ({ browser }) => {
+  const context = await browser.newContext({ ...devices["iPhone 13"] });
+  const page = await context.newPage();
+  try {
+    await login(page, "e2e-seenweb-order");
+    test.skip(!(await needsFakeNode(page)), "needs the in-process fake node");
+    await blockedTask(page);
+    const id = await createSession(page, `seenweb order ${Date.now().toString(36)}`);
+    await finishTurn(page, id);
+
+    await page.goto("/m");
+    const tasks = page.getByTestId("home-tasks");
+    const done = page.getByTestId("home-just-done");
+    await expect(tasks).toBeVisible({ timeout: 20_000 });
+    await expect(done).toBeVisible({ timeout: 20_000 });
+    const tasksBox = await tasks.boundingBox();
+    const doneBox = await done.boundingBox();
+    expect(tasksBox).not.toBeNull();
+    expect(doneBox).not.toBeNull();
+    // ⑤ after the entire queue: the task layer's painted box ends above it.
+    expect(tasksBox!.y + tasksBox!.height).toBeLessThanOrEqual(doneBox!.y + 1);
+    await shot(page, "seenweb-order-390.png");
+  } finally {
+    for (const id of created.splice(0)) {
+      await page.request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
+    }
+    for (const id of createdTasks.splice(0)) {
+      await page.request.post(`/v1/tasks/${id}/archive`, { data: {} }).catch(() => undefined);
     }
     await context.close();
   }

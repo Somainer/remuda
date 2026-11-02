@@ -5,6 +5,15 @@
   margin: 0 var(--space-4) var(--space-3);
 }
 
+/* home.md §2.1: ⑤ paints after the WHOLE queue — the interaction cards AND
+   the D-050 task layer (order 1) — and before the search/ledger row (3).
+   Scoped to the phone placement so the desktop list column keeps its DOM
+   order (its parent is a flex column too). */
+.section[data-placement="phone"] {
+  order: 2;
+  flex: none;
+}
+
 .head {
   display: flex;
   align-items: center;

@@ -1464,16 +1464,20 @@ class DocsContractFixtureTests(unittest.TestCase):
 
 
 class RepositoryContractTests(unittest.TestCase):
-    """The checkout's own corpus against its committed baseline."""
+    """The checkout's own corpus against its committed baseline.
+
+    Only NEW enforced violations fail here. A branch that fixes a baselined
+    violation must stay green in CI; the vanished entry is an advisory
+    warning (and a --strict failure) until a maintenance pass shrinks the
+    baseline, which is covered by the fixture test instead.
+    """
 
     def test_repository_matches_the_committed_baseline(self):
         report = scan(ROOT)
         self.assertGreater(len(report.files), 0)
         baseline = load_baseline(BASELINE)
         new = sorted(report.enforced() - baseline)
-        stale = sorted(baseline - report.enforced())
         self.assertEqual(new, [], f"new enforced docs-contract violations: {new}")
-        self.assertEqual(stale, [], f"stale baseline entries: {stale}")
         self.assertEqual(run_check(ROOT, BASELINE, io.StringIO()), 0)
 
 

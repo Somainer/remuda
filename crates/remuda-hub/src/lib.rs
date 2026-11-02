@@ -319,6 +319,9 @@ pub mod inbox_test_support {
     pub fn arm_fold_failure_after_record(instance_id: &str) {
         crate::inbox::test_seams::arm_fold_failure_after_record(instance_id);
     }
+
+    /// The bound `host_lost_grace_ms` is clamped to at load (one year).
+    pub const MAX_HOST_LOST_GRACE_MS: u64 = crate::inbox::MAX_CONFIGURED_MS;
 }
 
 /// Test-only constructors for types private modules would otherwise hide
@@ -1312,6 +1315,14 @@ impl RunningHub {
     #[cfg(any(test, feature = "test-faults"))]
     pub async fn test_gate_tick(&self) {
         crate::gatequeue::tick(&self.state).await;
+    }
+
+    /// Test-only: the `host_lost_grace_ms` this Hub runs with, after the
+    /// load-time clamp (cb-inbox-facts r3).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_effective_host_lost_grace_ms(&self) -> u64 {
+        self.state.config.host_lost_grace_ms
     }
 
     /// Test-only: one evaluation of the inbox's time-driven facts (supply

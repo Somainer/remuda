@@ -1528,6 +1528,17 @@ async fn an_out_of_range_window_is_skipped_and_never_panics_the_writer() -> Resu
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_out_of_range_host_grace_is_clamped_at_load() -> Result<()> {
     let ctx = Ctx::spawn_with(|config| config.host_lost_grace_ms = u64::MAX).await?;
+    // The load clamp itself (r3): the Hub runs with the bound, not the
+    // configured value, so neither the reaper nor the tick ever sees it.
+    assert_eq!(
+        ctx.hub.test_effective_host_lost_grace_ms(),
+        remuda_hub::inbox_test_support::MAX_HOST_LOST_GRACE_MS
+    );
+    assert_eq!(
+        remuda_hub::inbox_test_support::MAX_HOST_LOST_GRACE_MS,
+        525_600 * 60_000,
+        "one year"
+    );
     let project = ctx.project("inbox-grace-overflow").await?;
     let (seat, seat_token) = ctx.coordinator(&project).await?;
     assert_eq!(ctx.hub.test_inbox_tick(&minutes_from_now(600)).await?, 0);

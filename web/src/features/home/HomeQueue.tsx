@@ -152,10 +152,13 @@ export function HomeQueue({
     [queue.cards, gone],
   );
 
-  // §3.3: a press, focus inside the cards, or the expansion holds the order.
-  // The snapshot is the painted card list; while held, live content replaces
-  // each card by id, a card that left stays as an inert placeholder (unless it
-  // is showing its receipt) and a new card waits for the release.
+  // §3.3: ONLY an interaction holds the order — a press, focus on a row
+  // control or an open sheet/menu (§4.1's 「展开期间同样遵守 §3.3」 is the same
+  // rule applied inside the expansion, never a hold of its own). The snapshot
+  // is the painted card list; while held, live content replaces each card by
+  // id, a card that left stays as an inert placeholder (unless it is showing
+  // its receipt) and a new card waits for the release — which the hook's
+  // pointerup/blur/idle paths always provide.
   const { begin, end, held, snapshot, regionRef } = useHeldOrder<readonly HomeQueueCard[]>();
   const startHold = useCallback(
     (source: HoldSource) => begin(source, () => paintedRef.current),
@@ -188,13 +191,16 @@ export function HomeQueue({
   const [expandedChoice, setExpanded] = useState<boolean | null>(null);
   const focusIndex = focus ? ids.indexOf(focus) : -1;
   const expanded = expandedChoice ?? focusIndex >= limit;
-  // §4.1: 「展开期间同样遵守 §3.3」 — the expansion is itself a hold source, so
-  // while the whole queue is open a poll can neither re-sort the cards nor
-  // slip a new one in. The "sheet" source lasts until the queue collapses.
+  // A hold must never strand the queue: if the held cards are all answered
+  // (or otherwise leave), the painted list empties while a source is still
+  // open. Release everything — the queue goes live again and the empty branch
+  // cannot hide new arrivals behind a frozen, empty snapshot.
   useEffect(() => {
-    if (expanded) startHold("sheet");
-    else end("sheet");
-  }, [expanded, startHold, end]);
+    if (!held || painted.length > 0) return;
+    end("pointer");
+    end("focus");
+    end("sheet");
+  }, [held, painted.length, end]);
 
   // Push landing: scroll the focused card into view once per focus value.
   const scrolledFor = useRef<string | null>(null);
@@ -225,10 +231,19 @@ export function HomeQueue({
   }
 
   if (ids.length === 0) {
+    // The header number is the LIVE §5.1 count, never the painted slice: a
+    // held snapshot that has emptied must not claim zero while ① says N.
     return (
-      <section className={css.queue} data-testid="home-queue" data-placement={placement} data-empty="1" id={anchor}>
+      <section
+        className={css.queue}
+        data-testid="home-queue"
+        data-placement={placement}
+        data-empty="1"
+        data-order-held={held ? "1" : "0"}
+        id={anchor}
+      >
         <h2 className={css.queueTitle} data-testid="home-queue-title">
-          需要你 · 0
+          需要你 · {formatGlanceCount(needYou)}
         </h2>
       </section>
     );

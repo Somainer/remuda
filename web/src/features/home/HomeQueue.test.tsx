@@ -207,7 +207,7 @@ describe("HomeQueue (§4.1)", () => {
   });
 });
 
-describe("HomeQueue holds the order during interaction (§3.3, §4.1)", () => {
+describe("HomeQueue holds the order only while interacting (§3.3, §4.1)", () => {
   function fiveInteractions(): HubState {
     return hub({
       instances: ["ins_a", "ins_b", "ins_c", "ins_d", "ins_e"].map((id) => inst({ id })),
@@ -221,28 +221,55 @@ describe("HomeQueue holds the order during interaction (§3.3, §4.1)", () => {
     });
   }
 
+  /** The live poll: a newer interaction arrives at the head. */
+  function withNewest(ids: string[]): HubState {
+    const created = ["2026-10-31T11:00:00.000Z", T2, T1, T0, "2026-10-31T07:00:00.000Z"];
+    return hub({
+      instances: ids.map((id) => inst({ id: `ins_${id}` })),
+      interactions: ids.map((id, index) =>
+        interaction({ id, instanceId: `ins_${id}`, createdAt: created[index] }),
+      ),
+    });
+  }
+
   function paintedIds() {
     return cards().map((card) => card.getAttribute("data-card-id"));
   }
 
-  it("freezes the expanded queue when a newer card arrives, and re-orders on collapse", () => {
+  it("(a) does not hold an expanded queue left idle: a new card paints", () => {
     fake.state = fiveInteractions();
     const view = renderQueue("phone");
     fireEvent.click(screen.getByTestId("home-queue-more"));
-    expect(screen.getByTestId("home-queue")).toHaveAttribute("data-order-held", "1");
+    expect(screen.getByTestId("home-queue")).toHaveAttribute("data-order-held", "0");
     expect(paintedIds()).toEqual(["int_1", "int_2", "int_3", "int_4", "int_5"]);
 
-    // A 2 s poll lands a newer interaction (and drops one) while the queue
-    // is open: the painted order must not move under the reader.
-    const next = fiveInteractions();
+    // §3.3 freezes only while interacting; an open queue nobody touches stays
+    // live, so the poll's newest card lands at the head.
+    fake.state = withNewest(["int_0", "int_1", "int_2", "int_3", "int_4"]);
+    rerenderQueue(view);
+    expect(screen.getByTestId("home-queue")).toHaveAttribute("data-order-held", "0");
+    expect(paintedIds()).toEqual(["int_0", "int_1", "int_2", "int_3", "int_4"]);
+  });
+
+  it("(b) holds the order while a finger is on a card, and re-orders on release", () => {
+    fake.state = fiveInteractions();
+    const view = renderQueue("phone");
+    fireEvent.click(screen.getByTestId("home-queue-more"));
+    act(() => {
+      cards()[0].dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+    });
+    expect(screen.getByTestId("home-queue")).toHaveAttribute("data-order-held", "1");
+
+    // The poll lands a newer card and drops one while the finger is down.
+    const next = withNewest(["int_0", "int_1", "int_2", "int_3", "int_4"]);
     fake.state = hub({
       instances: next.instances,
       interactions: [
-        interaction({ id: "int_0", instanceId: "ins_a", createdAt: "2026-10-31T11:00:00.000Z" }),
-        interaction({ id: "int_1", instanceId: "ins_b", createdAt: T2 }),
-        interaction({ id: "int_2", instanceId: "ins_c", createdAt: T1 }),
-        interaction({ id: "int_3", instanceId: "ins_d", createdAt: T0 }),
-        interaction({ id: "int_4", instanceId: "ins_e", createdAt: "2026-10-31T07:00:00.000Z" }),
+        interaction({ id: "int_0", instanceId: "ins_int_0", createdAt: "2026-10-31T11:00:00.000Z" }),
+        interaction({ id: "int_1", instanceId: "ins_int_1", createdAt: T2 }),
+        interaction({ id: "int_2", instanceId: "ins_int_2", createdAt: T1 }),
+        interaction({ id: "int_3", instanceId: "ins_int_3", createdAt: T0 }),
+        interaction({ id: "int_4", instanceId: "ins_int_4", createdAt: "2026-10-31T07:00:00.000Z" }),
       ],
     });
     rerenderQueue(view);
@@ -252,12 +279,52 @@ describe("HomeQueue holds the order during interaction (§3.3, §4.1)", () => {
     // The new card waits for the release.
     expect(paintedIds()).not.toContain("int_0");
 
-    // Collapsing releases the hold: the queue re-orders once, back to the
-    // collapsed 3-card slice with the new card first. (The release control is
-    // offered even though the painted list shrank to the fold's size.)
-    fireEvent.click(screen.getByTestId("home-queue-more"));
+    // Lifting the finger re-orders once.
+    act(() => {
+      fireEvent.pointerUp(document.body);
+    });
     expect(screen.getByTestId("home-queue")).toHaveAttribute("data-order-held", "0");
-    expect(paintedIds()).toEqual(["int_0", "int_1", "int_2"]);
+    expect(paintedIds()).toEqual(["int_0", "int_1", "int_2", "int_3", "int_4"]);
+  });
+
+  it("(c) never strands a hold: answer every card, then a new one paints", async () => {
+    vi.useFakeTimers();
+    fake.respond.mockResolvedValue(undefined);
+    fake.state = hub({
+      instances: [inst({ id: "ins_a" })],
+      interactions: [interaction({ id: "int_1", instanceId: "ins_a", createdAt: T2 })],
+    });
+    const view = renderQueue("phone");
+    act(() => {
+      cards()[0].dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "允许一次" }));
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(2_000);
+    });
+    // Every held card is answered: the painted list is empty, and the hold is
+    // released rather than freezing an empty snapshot. The header reads the
+    // LIVE count — the list still carries the answered row until its poll.
+    expect(cards()).toHaveLength(0);
+    expect(screen.getByTestId("home-queue")).toHaveAttribute("data-empty", "1");
+    expect(screen.getByTestId("home-queue")).toHaveAttribute("data-order-held", "0");
+    expect(screen.getByTestId("home-queue-title")).toHaveTextContent("需要你 · 1");
+
+    // The poll drops the answered row: the header follows it to zero.
+    fake.state = hub({ instances: [inst({ id: "ins_a" })], interactions: [] });
+    rerenderQueue(view);
+    expect(screen.getByTestId("home-queue-title")).toHaveTextContent("需要你 · 0");
+
+    // The next poll's new card paints without any navigation.
+    fake.state = hub({
+      instances: [inst({ id: "ins_b" })],
+      interactions: [interaction({ id: "int_2", instanceId: "ins_b", createdAt: "2026-10-31T11:00:00.000Z" })],
+    });
+    rerenderQueue(view);
+    expect(paintedIds()).toEqual(["int_2"]);
+    expect(screen.getByTestId("home-queue-title")).toHaveTextContent("需要你 · 1");
   });
 
   it("keeps a release control when answered cards shrink the expanded list", async () => {
@@ -266,12 +333,10 @@ describe("HomeQueue holds the order during interaction (§3.3, §4.1)", () => {
     fake.state = fiveInteractions();
     renderQueue("phone");
     fireEvent.click(screen.getByTestId("home-queue-more"));
-    expect(screen.getByTestId("home-queue")).toHaveAttribute("data-order-held", "1");
     expect(cards()).toHaveLength(5);
 
-    // Answer three cards in place: their receipts leave the hold's painted
-    // list, so only two remain and nothing is hidden any more — the release
-    // control must still be there (the queue is still held).
+    // Answer three cards in place: only two remain and nothing is hidden any
+    // more — the collapse row must still be there to close the expansion.
     for (let index = 0; index < 3; index += 1) {
       await act(async () => {
         fireEvent.click(screen.getAllByRole("button", { name: "允许一次" })[0]);
@@ -281,9 +346,7 @@ describe("HomeQueue holds the order during interaction (§3.3, §4.1)", () => {
       });
     }
     expect(cards()).toHaveLength(2);
-    expect(screen.getByTestId("home-queue")).toHaveAttribute("data-order-held", "1");
     fireEvent.click(screen.getByTestId("home-queue-more"));
-    expect(screen.getByTestId("home-queue")).toHaveAttribute("data-order-held", "0");
     expect(screen.queryByTestId("home-queue-more")).toBeNull();
   });
 });

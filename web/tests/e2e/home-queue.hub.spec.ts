@@ -439,9 +439,7 @@ test.describe("home queue", () => {
     }
   });
 
-  test("390: the expanded queue holds its order while a card arrives, and re-orders on collapse", async ({
-    browser,
-  }) => {
+  test("390: an idle open queue stays live, and only an interaction holds the order", async ({ browser }) => {
     const baseURL = test.info().project.use.baseURL!;
     const context = await phoneContext(browser, baseURL, "e2e-hqueue-hold");
     const page = await context.newPage();
@@ -452,44 +450,55 @@ test.describe("home queue", () => {
       for (let index = 0; index < 4; index += 1) first.push((await park(page, "mhome-blocked")).interactionId);
 
       await page.goto("/m");
-      await expect(page.getByTestId("home-queue").or(page.getByTestId("home-queue-more")).first()).toBeVisible({
-        timeout: 20_000,
-      });
+      await expect(page.getByTestId("home-queue")).toBeVisible({ timeout: 20_000 });
       await expandQueue(page);
-      await expect(page.getByTestId("home-queue")).toHaveAttribute("data-order-held", "1");
+      // §3.3: an expansion nobody is touching is NOT a hold.
+      await expect(page.getByTestId("home-queue")).toHaveAttribute("data-order-held", "0");
       const before = await page.getByTestId("home-queue-card").evaluateAll((nodes) =>
         nodes.map((node) => node.getAttribute("data-card-id")),
       );
       for (const id of first) expect(before).toContain(id);
 
-      // A newer card lands while the queue is open: §3.3 freezes the order.
-      // Count the page's own interaction polls so the assertion waits for the
+      // Count the page's own interaction polls so the assertions wait for the
       // new data to have been DELIVERED (no wall-clock threshold).
       let polls = 0;
       const countPoll = (response: import("@playwright/test").Response) => {
         if (response.request().method() === "GET" && /\/v1\/interactions(\?|$)/.test(response.url())) polls += 1;
       };
       page.on("response", countPoll);
-      const startPolls = polls;
-      const later = await park(page, "mhome-blocked");
-      await expect.poll(() => pendingOnHub(page, later.interactionId), { timeout: 20_000 }).toBe(true);
-      await expect.poll(() => polls, { timeout: 20_000 }).toBeGreaterThan(startPolls + 3);
-      page.off("response", countPoll);
+
+      // (1) Expanded and left alone: the newer card paints at the head.
+      let startPolls = polls;
+      const idle = await park(page, "mhome-blocked");
+      await expect.poll(() => pendingOnHub(page, idle.interactionId), { timeout: 20_000 }).toBe(true);
+      await expect.poll(() => polls, { timeout: 20_000 }).toBeGreaterThan(startPolls + 2);
+      await expect(card(page, idle.interactionId)).toBeVisible({ timeout: 20_000 });
+
+      // (2) A finger on a card is a §3.3 hold: the next card waits.
+      startPolls = polls;
+      await page.getByTestId("home-queue-card").first().dispatchEvent("pointerdown");
+      await expect(page.getByTestId("home-queue")).toHaveAttribute("data-order-held", "1");
       const during = await page.getByTestId("home-queue-card").evaluateAll((nodes) =>
         nodes.map((node) => node.getAttribute("data-card-id")),
       );
-      expect(during).toEqual(before);
-      expect(during).not.toContain(later.interactionId);
-
-      // Collapsing releases the hold; re-expanding paints the new card first.
-      await collapseQueue(page);
-      await expect(page.getByTestId("home-queue")).toHaveAttribute("data-order-held", "0");
-      await expandQueue(page);
-      await expect(card(page, later.interactionId)).toBeVisible({ timeout: 20_000 });
-      const after = await page.getByTestId("home-queue-card").evaluateAll((nodes) =>
+      const later = await park(page, "mhome-blocked");
+      await expect.poll(() => pendingOnHub(page, later.interactionId), { timeout: 20_000 }).toBe(true);
+      await expect.poll(() => polls, { timeout: 20_000 }).toBeGreaterThan(startPolls + 2);
+      page.off("response", countPoll);
+      const held = await page.getByTestId("home-queue-card").evaluateAll((nodes) =>
         nodes.map((node) => node.getAttribute("data-card-id")),
       );
-      expect(after[0]).toBe(later.interactionId);
+      expect(held).toEqual(during);
+      expect(held).not.toContain(later.interactionId);
+
+      // Releasing re-orders once: the waiting card lands at the head.
+      await page.evaluate(() => window.dispatchEvent(new PointerEvent("pointerup", { bubbles: true })));
+      await expect(page.getByTestId("home-queue")).toHaveAttribute("data-order-held", "0");
+      await expect
+        .poll(async () =>
+          page.getByTestId("home-queue-card").first().getAttribute("data-card-id"),
+        )
+        .toBe(later.interactionId);
     } finally {
       await cleanup(page.request);
       await context.close();

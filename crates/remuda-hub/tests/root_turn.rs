@@ -25,6 +25,8 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 struct FakeNode {
     frames: mpsc::UnboundedReceiver<(String, Value)>,
     appends: mpsc::UnboundedSender<(String, Value)>,
+    /// What this Node lists for `interaction.list` (its own live cards).
+    cards: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -67,6 +69,8 @@ impl FakeNode {
         }
         let (frame_tx, frames) = mpsc::unbounded_channel();
         let (appends, mut append_rx) = mpsc::unbounded_channel::<(String, Value)>();
+        let cards = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listed = cards.clone();
         let task = tokio::spawn(async move {
             let mut append_seq = 0u64;
             loop {
@@ -101,6 +105,9 @@ impl FakeNode {
                                         "targetDir": format!("/srv/remuda-target/{name}")
                                     })
                                 }
+                                "interaction.list" => {
+                                    json!({"items": listed.lock().expect("cards").clone()})
+                                }
                                 _ => json!({"accepted": true}),
                             };
                             let reply = json!({
@@ -119,6 +126,7 @@ impl FakeNode {
         Ok(Self {
             frames,
             appends,
+            cards,
             task,
         })
     }
@@ -1995,6 +2003,25 @@ async fn the_owner_reads_their_words_on_the_card_board_and_task_detail() -> Resu
         first_requested_by(&ctx.get(&format!("/v1/tasks?project={project}")).await),
         Some(json!({"commandId": owner})),
         "the task list is not a surface the words are shown on"
+    );
+
+    // A card a Node lists is the Node's word, not a record the Hub stamped:
+    // naming the owner's command never borrows the owner's words.
+    node.cards.lock().expect("cards").push(json!({
+        "interactionId": "int_node_card", "id": "int_node_card",
+        "instanceId": seat, "hostId": ctx.host, "kind": "approval",
+        "state": "pending", "requestedBy": {"commandId": owner},
+    }));
+    let cards = ctx.get("/v1/interactions").await;
+    assert_eq!(
+        card_in(&cards, "int_node_card").context("the Node's card")?["requestedBy"],
+        json!({"commandId": owner}),
+        "{cards}"
+    );
+    assert_eq!(
+        card_in(&cards, &card).context("owner's card")?["requestedBy"],
+        expected,
+        "the Hub's own card still carries the words"
     );
     Ok(())
 }

@@ -16396,17 +16396,25 @@ fn load_interaction(conn: &Connection, id: &str) -> Result<Option<InteractionRec
     .map_err(StoreError::from)
 }
 
+/// The kind a journal event is classified by: `kind`, else `subtype`. The one
+/// derivation the interaction fold, the instance projection and the
+/// cb-requested-by ingest gate share, so they can never disagree on which
+/// events are interactions.
+pub(crate) fn journal_event_kind(event: &Value) -> &str {
+    event
+        .get("kind")
+        .and_then(Value::as_str)
+        .or_else(|| event.get("subtype").and_then(Value::as_str))
+        .unwrap_or("")
+}
+
 fn apply_interaction_event(
     conn: &Connection,
     host_id: &str,
     instance_id: &str,
     event: &Value,
 ) -> Result<Settlement, StoreError> {
-    let kind = event
-        .get("kind")
-        .and_then(Value::as_str)
-        .or_else(|| event.get("subtype").and_then(Value::as_str))
-        .unwrap_or("");
+    let kind = journal_event_kind(event);
     if event.pointer("/payload/entityType").and_then(Value::as_str) == Some("interaction")
         && let Some(entity) = event.pointer("/payload/entity")
         && let (Some(id), Some(state)) = (
@@ -17123,11 +17131,7 @@ fn normalize_activity(status: &str) -> Option<&'static str> {
 /// terminal events (exited/failed) the projection applies, rather than
 /// re-deriving the event shape in a second place.
 pub(crate) fn derive_instance_state(event: &Value) -> (Option<&'static str>, Option<&'static str>) {
-    let kind = event
-        .get("kind")
-        .and_then(Value::as_str)
-        .or_else(|| event.get("subtype").and_then(Value::as_str))
-        .unwrap_or("");
+    let kind = journal_event_kind(event);
     let payload = event.get("payload").unwrap_or(event);
     let payload_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
     let native_name = payload

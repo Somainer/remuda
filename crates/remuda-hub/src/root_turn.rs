@@ -515,10 +515,9 @@ pub(crate) fn owner_excerpts(
 /// nor the interaction row it feeds can hold one. Other events (a native turn
 /// lifecycle's `relatedIds.requestedBy`, for one) are left alone.
 pub(crate) fn strip_supplied_requested_by(event: &mut Value) {
-    let interaction = event
-        .get("kind")
-        .and_then(Value::as_str)
-        .is_some_and(|kind| kind.starts_with("interaction"))
+    // The same `kind`-else-`subtype` the store's interaction fold reads, so a
+    // flat `{"subtype": "interaction.requested"}` event is gated too.
+    let interaction = crate::store::journal_event_kind(event).starts_with("interaction")
         || event.pointer("/payload/entityType").and_then(Value::as_str) == Some("interaction")
         || event
             .pointer("/payload/interaction")
@@ -1106,6 +1105,19 @@ mod tests {
             "{requested}"
         );
         assert_eq!(requested["payload"]["interaction"]["title"], "kept");
+
+        // r5: a flat event the store classifies by `subtype` (no `kind`, no
+        // nested interaction object) is gated the same way.
+        let mut flat = json!({
+            "subtype": "interaction.requested",
+            "payload": {"interactionId": "int_a", "requestedBy": forged},
+        });
+        assert_eq!(
+            crate::store::journal_event_kind(&flat),
+            "interaction.requested"
+        );
+        strip_supplied_requested_by(&mut flat);
+        assert!(!flat.to_string().contains("requestedBy"), "{flat}");
 
         let mut entity = json!({
             "kind": "lifecycle",

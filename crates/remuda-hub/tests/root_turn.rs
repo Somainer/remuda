@@ -29,7 +29,12 @@ struct FakeNode {
 }
 
 impl FakeNode {
-    async fn connect(hub: &remuda_hub::RunningHub, host: &str, workspace: &str) -> Result<Self> {
+    async fn connect(
+        hub: &remuda_hub::RunningHub,
+        host: &str,
+        workspace: &str,
+        max_instances: u32,
+    ) -> Result<Self> {
         let enroll = hub.mint_enroll_token(5).await?;
         let mut req = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
         req.headers_mut()
@@ -44,7 +49,7 @@ impl FakeNode {
                     "hostname":"rootturn-node",
                     "workspaces":[{"workspaceId": workspace, "hostId": host, "root": "/srv/ws"}],
                     "workspaceRevision":1,
-                    "maxInstances": 8,
+                    "maxInstances": max_instances,
                     "herdr":{"path":"/usr/bin/herdr"},
                     "cli":[{"kind":"claude","path":"/usr/bin/claude","auth":"logged-in"}]
                 }}
@@ -139,7 +144,7 @@ impl Drop for FakeNode {
 }
 
 struct Ctx {
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
     hub: remuda_hub::RunningHub,
     http: reqwest::Client,
     human: String,
@@ -149,6 +154,11 @@ struct Ctx {
 
 impl Ctx {
     async fn boot() -> Result<(Self, FakeNode)> {
+        Self::boot_with_capacity(8).await
+    }
+
+    /// [`Self::boot`] on a fake host that holds `max_instances` instances.
+    async fn boot_with_capacity(max_instances: u32) -> Result<(Self, FakeNode)> {
         let dir = tempfile::tempdir()?;
         let hub = spawn(HubConfig::for_test(dir.path().join("data"))).await?;
         let human = hub.mint_device_token("rootturn-phone").await?;
@@ -157,10 +167,10 @@ impl Ctx {
             .as_id()
             .as_str()
             .to_owned();
-        let node = FakeNode::connect(&hub, &host, &workspace).await?;
+        let node = FakeNode::connect(&hub, &host, &workspace, max_instances).await?;
         Ok((
             Self {
-                _dir: dir,
+                dir,
                 hub,
                 http: reqwest::Client::new(),
                 human,
@@ -203,21 +213,6 @@ impl Ctx {
             .json()
             .await
             .expect("json")
-    }
-
-    /// `GET path` as `token`, asserting 200.
-    async fn get_with(&self, token: &str, path: &str) -> Value {
-        let response = self
-            .http
-            .get(self.url(path))
-            .bearer_auth(token)
-            .send()
-            .await
-            .expect("http");
-        let status = response.status().as_u16();
-        let body: Value = response.json().await.unwrap_or(Value::Null);
-        assert_eq!(status, 200, "GET {path}: {body}");
-        body
     }
 
     /// A claude-sdk seat with the dispatch grant, created by the owner, and
@@ -326,6 +321,44 @@ impl Ctx {
         command
     }
 
+    /// [`Self::owner_turn_text`], journaling the user message with the
+    /// owner's actual words, as a real carrier records the seat's input.
+    async fn owner_turn_recorded(&self, node: &mut FakeNode, seat: &str, text: &str) -> String {
+        let human = self.human.clone();
+        let command = self.send(node, &human, seat, text).await;
+        self.journal(node, seat, user_message_text(&command, text))
+            .await;
+        self.journal(
+            node,
+            seat,
+            turn_lifecycle("turn_started", json!({"nativeClientMessageId": command})),
+        )
+        .await;
+        command
+    }
+
+    /// `method path` as `token` with `headers`; the status and the RAW body,
+    /// so a check sees exactly the bytes a caller receives.
+    async fn call(
+        &self,
+        token: &str,
+        headers: &[(String, String)],
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> (u16, String) {
+        let mut request = self.http.request(method, self.url(path)).bearer_auth(token);
+        for (name, value) in headers {
+            request = request.header(name.as_str(), value.as_str());
+        }
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request.send().await.expect("http");
+        let status = response.status().as_u16();
+        (status, response.text().await.unwrap_or_default())
+    }
+
     /// The owner's turn completes and the carrier runs one of its own with no
     /// new input: the seat now acts in an `agent` + `native` turn.
     async fn agent_continues(&self, node: &FakeNode, seat: &str, owner: &str) {
@@ -367,24 +400,31 @@ impl Ctx {
     /// A project whose only member is this host's workspace, as `worker
     /// dispatch` resolves one.
     async fn create_project(&self) -> String {
-        let (status, body) = self
-            .post(
-                &self.human,
-                "/v1/projects",
-                &[],
-                json!({
+        self.create_project_with_capacity(8, "58600-58629").await
+    }
+
+    /// [`Self::create_project`] with room for `max_instances` workers and the
+    /// port range they draw their blocks from (never bound by the fake). A
+    /// larger project also lets one seat hold that many active children.
+    async fn create_project_with_capacity(&self, max_instances: u32, ports: &str) -> String {
+        let mut body = json!({
                     "name": "reqby-project",
                     "members": [{
                         "hostId": self.host, "workspaceId": self.workspace, "role": "build"
                     }],
                     "hosts": [{
-                        "hostId": self.host, "maxInstances": 8, "maxBuilding": 4,
-                        "diskBudgetGb": 10, "portBlocks": ["58600-58629"],
+                        "hostId": self.host, "maxInstances": max_instances, "maxBuilding": 4,
+                        "diskBudgetGb": 10, "portBlocks": [ports],
                         "requires": [], "latencyClass": "remote"
                     }],
-                }),
-            )
-            .await;
+        });
+        if max_instances > 8 {
+            body["policy"] = json!({"configurable": {
+                "coordinatorFanOut": max_instances,
+                "maxConcurrentWorkers": max_instances,
+            }});
+        }
+        let (status, body) = self.post(&self.human, "/v1/projects", &[], body).await;
         assert_eq!(status, 200, "project: {body}");
         body["id"].as_str().expect("project id").to_owned()
     }
@@ -513,10 +553,14 @@ impl Ctx {
 }
 
 fn user_message(command: &str) -> Value {
+    user_message_text(command, "input")
+}
+
+fn user_message_text(command: &str, text: &str) -> Value {
     json!({"kind": "message", "payload": {
         "operation": "open", "messageId": format!("msg_{command}"), "role": "user",
         "phase": "input", "parentToolCallId": null, "commandId": command,
-        "blocks": [{"type": "text", "text": "input"}]
+        "blocks": [{"type": "text", "text": text}]
     }})
 }
 
@@ -1267,99 +1311,6 @@ async fn an_agent_created_task_in_an_agent_turn_is_labelled_agent() -> Result<()
     Ok(())
 }
 
-/// The owner's own words are served to Human callers only: every task, board,
-/// worker and approval read an Agent or Bot can make carries the command id
-/// alone, and the owner gains the words on the card, the board and the task
-/// detail (cb-requested-by privacy).
-#[tokio::test]
-async fn owner_words_are_human_only_on_task_worker_and_card_reads() -> Result<()> {
-    let (ctx, mut node) = Ctx::boot().await?;
-    let (seat, token) = ctx.seat(&mut node, "main").await?;
-    let project = ctx.create_project().await;
-    let owner = ctx
-        .owner_turn_text(&mut node, &seat, "the owner's private words")
-        .await;
-    let expected = json!({"commandId": owner, "excerpt": "the owner's private words"});
-    let stripped = json!({"commandId": owner});
-
-    // An Agent-created task and an Agent dispatch, both recorded in the owner
-    // turn, plus a pending card from the same turn.
-    let (status, task) = ctx.create_task(&token, &project, Value::Null).await;
-    assert_eq!(status, 200, "{task}");
-    let task_id = task["id"].as_str().context("task id")?.to_owned();
-    let (status, sent) = ctx.worker_dispatch(&token, &project, &[]).await;
-    assert_eq!(status, 200, "{sent}");
-    let worker_id = sent["worker"]["id"]
-        .as_str()
-        .context("worker id")?
-        .to_owned();
-    assert_eq!(
-        sent["worker"]["requestedBy"], stripped,
-        "the dispatch response itself is stripped for an Agent caller: {sent}"
-    );
-    let (status, pending) = ctx
-        .worker_dispatch(&token, &project, &[("x-remuda-require-approval", "true")])
-        .await;
-    assert_eq!(status, 409, "{pending}");
-    let approval = pending["interactionId"]
-        .as_str()
-        .context("interactionId")?
-        .to_owned();
-
-    let paths = [
-        format!("/v1/tasks?project={project}"),
-        format!("/v1/tasks/{task_id}"),
-        format!("/v1/board?project={project}"),
-        format!("/v1/workers?project={project}"),
-        format!("/v1/workers/{worker_id}"),
-    ];
-    for path in &paths {
-        let body = ctx.get_with(&token, path).await;
-        let found = first_requested_by(&body)
-            .unwrap_or_else(|| panic!("no requestedBy in the Agent read of {path}: {body}"));
-        assert_eq!(found, stripped, "Agent read of {path}");
-        assert!(
-            !body.to_string().contains("private words"),
-            "the words never reach an Agent on {path}: {body}"
-        );
-    }
-
-    // A Bot relays cards to a chat platform: same strip, by deliberate choice.
-    let bot = ctx.hub.mint_bot_device_token("reqby-bot").await?;
-    let bot_cards = ctx.get_with(&bot, "/v1/interactions").await;
-    let bot_card =
-        card_in(&bot_cards, &approval).unwrap_or_else(|| panic!("bot card: {bot_cards}"));
-    assert_eq!(bot_card["requestedBy"], stripped, "{bot_card}");
-    assert!(
-        !bot_cards.to_string().contains("private words"),
-        "{bot_cards}"
-    );
-
-    // The owner sees the words where the PWA shows them — the board and the
-    // task detail — and the reference on the reads it does not.
-    for path in &paths {
-        let body = ctx.get(path).await;
-        let hydrated =
-            path.starts_with("/v1/board") || path.starts_with(&format!("/v1/tasks/{task_id}"));
-        assert_eq!(
-            first_requested_by(&body).expect("human read"),
-            if hydrated {
-                expected.clone()
-            } else {
-                stripped.clone()
-            },
-            "Human read of {path}"
-        );
-    }
-    let human_cards = ctx.get("/v1/interactions").await;
-    assert_eq!(
-        card_in(&human_cards, &approval).expect("human card")["requestedBy"],
-        expected,
-        "{human_cards}"
-    );
-    Ok(())
-}
-
 /// A create's opening prompt (`initialInput.text` / `spec.prompt`) is the
 /// owner's input too: a dispatch in that first turn carries the excerpt.
 #[tokio::test]
@@ -1422,6 +1373,628 @@ async fn an_owner_create_prompt_is_the_first_turns_excerpt() -> Result<()> {
             "excerpt": "the owner opened this seat with these words",
         }),
         "{card}"
+    );
+    Ok(())
+}
+
+// ── cb-requested-by r3: the owner's words are default-deny ──────────────────
+
+/// A string from the owner's input that nothing but the owner's own command
+/// row and the seat's own input record may ever hold. ASCII, so a raw JSON
+/// body carries it verbatim if a route leaks it.
+const SENTINEL: &str = "reqby-sentinel-8c1f";
+
+/// Where [`scan_data_dir`] found the sentinel: the file, and for a SQLite
+/// file the table, the column and the row's text and integer cells.
+#[derive(Debug)]
+struct Hit {
+    file: String,
+    table: Option<String>,
+    column: Option<String>,
+    row: serde_json::Map<String, Value>,
+}
+
+/// Every place under the Hub's data directory that holds `needle`: each cell
+/// of each table of each SQLite database (text and blobs), and the raw bytes
+/// of every other file. A database's `-wal`/`-shm` sidecars are skipped: their
+/// pages are read through the database itself.
+fn scan_data_dir(root: &std::path::Path, needle: &str) -> Vec<Hit> {
+    let mut hits = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).expect("data dir").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            let name = path.to_string_lossy().into_owned();
+            if name.ends_with("-wal") || name.ends_with("-shm") || name.ends_with("-journal") {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            if bytes.starts_with(b"SQLite format 3\0") {
+                hits.extend(scan_sqlite(&path, needle));
+            } else if contains_bytes(&bytes, needle.as_bytes()) {
+                hits.push(Hit {
+                    file: name,
+                    table: None,
+                    column: None,
+                    row: serde_json::Map::new(),
+                });
+            }
+        }
+    }
+    hits
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+fn scan_sqlite(path: &std::path::Path, needle: &str) -> Vec<Hit> {
+    use rusqlite::{OpenFlags, types::ValueRef};
+    let file = path.to_string_lossy().into_owned();
+    let conn = rusqlite::Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("open a Hub database read-only");
+    let tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .expect("tables")
+        .query_map([], |row| row.get(0))
+        .expect("tables")
+        .collect::<rusqlite::Result<_>>()
+        .expect("tables");
+    let mut hits = Vec::new();
+    for table in tables {
+        let sql = format!("SELECT * FROM \"{}\"", table.replace('"', "\"\""));
+        let mut statement = conn.prepare(&sql).expect("select");
+        let columns: Vec<String> = statement
+            .column_names()
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        let mut rows = statement.query([]).expect("rows");
+        while let Some(row) = rows.next().expect("row") {
+            let mut cells = serde_json::Map::new();
+            let mut matched = Vec::new();
+            for (index, column) in columns.iter().enumerate() {
+                let text = match row.get_ref(index).expect("cell") {
+                    ValueRef::Text(bytes) | ValueRef::Blob(bytes) => {
+                        if contains_bytes(bytes, needle.as_bytes()) {
+                            matched.push(column.clone());
+                        }
+                        String::from_utf8_lossy(bytes).into_owned()
+                    }
+                    ValueRef::Integer(value) => {
+                        cells.insert(column.clone(), json!(value));
+                        continue;
+                    }
+                    _ => continue,
+                };
+                cells.insert(column.clone(), Value::String(text));
+            }
+            for column in matched {
+                hits.push(Hit {
+                    file: file.clone(),
+                    table: Some(table.clone()),
+                    column: Some(column),
+                    row: cells.clone(),
+                });
+            }
+        }
+    }
+    hits
+}
+
+/// (a) Store-level default-deny: after an owner-turn dispatch, its approval,
+/// a task create and a split, a string from the owner's input is stored only
+/// in the owner's command row and in the seat's own input record — never in a
+/// task doc, a roster row, an interaction, a journal payload or any other
+/// table or file the Hub writes.
+#[tokio::test]
+async fn the_owners_words_are_stored_only_in_the_command_row() -> Result<()> {
+    let (ctx, mut node) = Ctx::boot().await?;
+    let (seat, token) = ctx.seat(&mut node, "main").await?;
+    let project = ctx.create_project().await;
+    let text = format!("{SENTINEL}: dispatch a worker on the other node");
+    let owner = ctx.owner_turn_recorded(&mut node, &seat, &text).await;
+
+    // An owner-turn dispatch that needs the D-017 approval, approved and run.
+    let gated = [("x-remuda-require-approval", "true")];
+    let (status, pending) = ctx.worker_dispatch(&token, &project, &gated).await;
+    assert_eq!(status, 409, "{pending}");
+    let approval = pending["interactionId"]
+        .as_str()
+        .context("interactionId")?
+        .to_owned();
+    ctx.allow_once(&approval).await;
+    let (status, sent) = ctx
+        .worker_dispatch(
+            &token,
+            &project,
+            &[
+                ("x-remuda-require-approval", "true"),
+                ("x-remuda-approval-id", approval.as_str()),
+            ],
+        )
+        .await;
+    assert_eq!(status, 200, "{sent}");
+    // A second card left pending, and a task with a split child.
+    let (status, pending) = ctx.worker_dispatch(&token, &project, &gated).await;
+    assert_eq!(status, 409, "{pending}");
+    let pending_card = pending["interactionId"]
+        .as_str()
+        .context("interactionId")?
+        .to_owned();
+    let (status, task) = ctx.create_task(&token, &project, Value::Null).await;
+    assert_eq!(status, 200, "{task}");
+    let task_id = task["id"].as_str().context("task id")?;
+    let (status, child) = ctx
+        .post(
+            &token,
+            &format!("/v1/tasks/{task_id}/split"),
+            &[],
+            json!({"title": "child", "intent": "the second half"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{child}");
+    // Every record names the owner's command; the reads below are what the
+    // scan must see stored.
+    for (what, record) in [
+        ("roster row", &sent["worker"]["requestedBy"]),
+        ("task", &task["requestedBy"]),
+        ("split child", &child["requestedBy"]),
+    ] {
+        assert_eq!(record, &json!({"commandId": owner}), "{what}");
+    }
+
+    let hits = scan_data_dir(&ctx.dir.path().join("data"), SENTINEL);
+    let allowed = |hit: &Hit| match hit.table.as_deref() {
+        // The owner's own command row.
+        Some("commands") => hit.row.get("id") == Some(&json!(owner)),
+        // The seat's own input record: the user message naming that command.
+        Some("journal") => {
+            let payload: Value = hit
+                .row
+                .get("payload_json")
+                .and_then(Value::as_str)
+                .and_then(|text| serde_json::from_str(text).ok())
+                .unwrap_or(Value::Null);
+            hit.row.get("instance_id") == Some(&json!(seat))
+                && payload["kind"] == "message"
+                && payload["payload"]["role"] == "user"
+                && payload["payload"]["commandId"] == json!(owner)
+        }
+        _ => false,
+    };
+    let leaks: Vec<String> = hits
+        .iter()
+        .filter(|hit| !allowed(hit))
+        .map(|hit| {
+            format!(
+                "{} {:?}.{:?}: {:?}",
+                hit.file, hit.table, hit.column, hit.row
+            )
+        })
+        .collect();
+    assert!(
+        leaks.is_empty(),
+        "the owner's words are stored outside the command row:\n{}",
+        leaks.join("\n")
+    );
+    // The scan is not blind: it finds the two places the words belong.
+    for table in ["commands", "journal"] {
+        assert!(
+            hits.iter().any(|hit| hit.table.as_deref() == Some(table)),
+            "the scan saw no {table} row with the owner's words: {hits:?}"
+        );
+    }
+
+    // The approval cards live in the Hub's memory, not a table: a Bot reads
+    // them exactly as stored (nothing hydrates a Bot), and they hold the
+    // reference alone.
+    let bot = ctx.hub.mint_bot_device_token("reqby-bot").await?;
+    let (status, cards) = ctx
+        .call(&bot, &[], reqwest::Method::GET, "/v1/interactions", None)
+        .await;
+    assert_eq!(status, 200, "{cards}");
+    assert!(
+        !cards.contains(SENTINEL),
+        "a stored card holds the words: {cards}"
+    );
+    let cards: Value = serde_json::from_str(&cards)?;
+    let card = card_in(&cards, &pending_card).context("the pending card")?;
+    assert_eq!(card["requestedBy"], json!({"commandId": owner}), "{card}");
+    Ok(())
+}
+
+/// Who calls in [`the_owners_words_reach_no_agent_or_bot_route`].
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Caller {
+    /// An Agent of another lineage, with `dispatch`, in the same project.
+    OtherLineage,
+    /// A Bot, which relays to a chat platform.
+    Bot,
+    /// The seat the owner spoke to, with its own credential.
+    Seat,
+    /// The owner's own token narrowed to the seat (`x-remuda-instance-id`).
+    OwnerAsSeat,
+}
+
+/// What a sweep call must return so the no-sentinel check is not vacuous.
+enum Want {
+    /// 200, and the body names the owner's command: the doc that carries the
+    /// record was really served.
+    Entity,
+    /// Exactly this status.
+    Status(u16),
+    /// Any status: a route admitted for this caller that carries no record.
+    Any,
+}
+
+/// (b) Route-level default-deny: every Agent- or Bot-admitted route that
+/// returns a task, a roster row or an interaction — the agent_scope task,
+/// worker and interaction allowlist entries, observe, placements, the worker
+/// verbs and dispatch — never puts the owner's words in the raw body, for an
+/// Agent of another lineage, a Bot, the seat itself and the owner narrowed to
+/// the seat.
+#[tokio::test]
+async fn the_owners_words_reach_no_agent_or_bot_route() -> Result<()> {
+    let (ctx, mut node) = Ctx::boot_with_capacity(64).await?;
+    let (seat, token) = ctx.seat(&mut node, "main").await?;
+    let (_, other_lineage) = ctx.seat(&mut node, "other-lineage").await?;
+    let bot = ctx.hub.mint_bot_device_token("reqby-bot").await?;
+    let project = ctx.create_project_with_capacity(64, "58600-58959").await;
+    let text = format!("{SENTINEL}: dispatch a worker on the other node");
+    let owner = ctx.owner_turn_recorded(&mut node, &seat, &text).await;
+
+    // In the owner's turn the seat opens a card (left pending, so the card
+    // reads below serve a record) and, for each caller, creates a task and
+    // dispatches a worker of its own.
+    let (status, pending) = ctx
+        .worker_dispatch(&token, &project, &[("x-remuda-require-approval", "true")])
+        .await;
+    assert_eq!(status, 409, "{pending}");
+    let callers = [
+        Caller::OtherLineage,
+        Caller::Bot,
+        Caller::Seat,
+        Caller::OwnerAsSeat,
+    ];
+    let mut owned = Vec::new();
+    for (index, caller) in callers.into_iter().enumerate() {
+        let (status, task) = ctx.create_task(&token, &project, Value::Null).await;
+        assert_eq!(status, 200, "{task}");
+        // Named: the Hub's auto-name repeats within a project for weeks.
+        let (status, sent) = ctx
+            .worker_dispatch_body(
+                &token,
+                &project,
+                &[],
+                json!({"name": format!("reqby-w{index}")}),
+            )
+            .await;
+        assert_eq!(status, 200, "{sent}");
+        owned.push((
+            caller,
+            task["id"].as_str().context("task id")?.to_owned(),
+            sent["worker"]["id"]
+                .as_str()
+                .context("worker id")?
+                .to_owned(),
+        ));
+    }
+
+    // (b) Every caller sweeps every route; collect every leak and every
+    // unexpected status so one run reports them all.
+    let mut problems = Vec::new();
+    let seat_header = vec![("x-remuda-instance-id".to_string(), seat.clone())];
+    for (index, (caller, task_id, worker_id)) in owned.iter().enumerate() {
+        let (credential, headers) = match caller {
+            Caller::OtherLineage => (other_lineage.as_str(), Vec::new()),
+            Caller::Bot => (bot.as_str(), Vec::new()),
+            Caller::Seat => (token.as_str(), Vec::new()),
+            Caller::OwnerAsSeat => (ctx.human.as_str(), seat_header.clone()),
+        };
+        let agent = *caller != Caller::Bot;
+        let owns_worker = *caller != Caller::OtherLineage;
+        let mut check = |label: String, want: Want, status: u16, body: &str| {
+            if body.contains(SENTINEL) {
+                problems.push(format!(
+                    "{caller:?} {label}: the owner's words leaked: {body}"
+                ));
+            }
+            let ok = match want {
+                Want::Entity => status == 200 && body.contains(&owner),
+                Want::Status(wanted) => status == wanted,
+                Want::Any => true,
+            };
+            if !ok {
+                problems.push(format!(
+                    "{caller:?} {label}: unexpected {status} (the check would be vacuous): {body}"
+                ));
+            }
+        };
+        let get = reqwest::Method::GET;
+        let post = reqwest::Method::POST;
+        macro_rules! sweep {
+            ($want:expr, $method:expr, $path:expr) => {
+                sweep!($want, $method, $path, None)
+            };
+            ($want:expr, $method:expr, $path:expr, $body:expr) => {{
+                let path: String = $path;
+                let (status, body) = ctx.call(credential, &headers, $method, &path, $body).await;
+                check(format!("{} {path}", $method), $want, status, &body);
+                body
+            }};
+        }
+
+        // Tasks: the agent_scope task read and write entries.
+        sweep!(
+            Want::Entity,
+            get.clone(),
+            format!("/v1/tasks?project={project}")
+        );
+        sweep!(Want::Entity, get.clone(), format!("/v1/tasks/{task_id}"));
+        sweep!(
+            Want::Entity,
+            get.clone(),
+            format!("/v1/board?project={project}")
+        );
+        sweep!(
+            Want::Status(200),
+            get.clone(),
+            format!("/v1/tasks/{task_id}/placements")
+        );
+        sweep!(
+            Want::Entity,
+            post.clone(),
+            format!("/v1/tasks/{task_id}/placements"),
+            Some(json!({"kind": "dispatch"}))
+        );
+        sweep!(
+            Want::Entity,
+            reqwest::Method::PATCH,
+            format!("/v1/tasks/{task_id}"),
+            Some(json!({"state": "running"}))
+        );
+        sweep!(
+            Want::Status(200),
+            post.clone(),
+            format!("/v1/tasks/{task_id}/own"),
+            Some(json!({"paths": ["src/reqby/**"]}))
+        );
+        sweep!(
+            Want::Status(200),
+            get.clone(),
+            format!("/v1/own?project={project}")
+        );
+        sweep!(
+            Want::Status(200),
+            post.clone(),
+            "/v1/own/check".to_string(),
+            Some(json!({"taskId": task_id, "paths": ["src/reqby/a.rs"]}))
+        );
+        sweep!(
+            Want::Status(200),
+            reqwest::Method::DELETE,
+            format!("/v1/tasks/{task_id}/own"),
+            Some(json!({"paths": ["src/reqby/**"]}))
+        );
+        sweep!(
+            Want::Status(200),
+            post.clone(),
+            format!("/v1/tasks/{task_id}/split"),
+            Some(json!({"title": "child", "intent": "a part"}))
+        );
+        sweep!(
+            if agent {
+                Want::Status(403)
+            } else {
+                Want::Entity
+            },
+            post.clone(),
+            format!("/v1/tasks/{task_id}/land"),
+            Some(json!({"sha": "deadbeef1"}))
+        );
+        sweep!(
+            Want::Entity,
+            post.clone(),
+            format!("/v1/tasks/{task_id}/archive")
+        );
+        sweep!(
+            Want::Status(200),
+            post.clone(),
+            "/v1/tasks".to_string(),
+            Some(json!({"projectId": project, "title": "mine", "intent": "my own"}))
+        );
+
+        // Workers: reads, observe, every per-worker verb and dispatch.
+        sweep!(
+            Want::Entity,
+            get.clone(),
+            format!("/v1/workers?project={project}")
+        );
+        sweep!(
+            Want::Entity,
+            get.clone(),
+            format!("/v1/workers/{worker_id}")
+        );
+        sweep!(
+            Want::Entity,
+            post.clone(),
+            "/v1/workers/observe".to_string(),
+            Some(json!({"projectId": project}))
+        );
+        sweep!(
+            Want::Any,
+            get.clone(),
+            format!("/v1/workers/{worker_id}/digest")
+        );
+        sweep!(
+            Want::Any,
+            get.clone(),
+            format!("/v1/hosts/{}/hostcap", ctx.host)
+        );
+        sweep!(
+            Want::Any,
+            get.clone(),
+            format!("/v1/lineages/{seat}/glance")
+        );
+        let verb = |entity: bool| {
+            if !owns_worker {
+                Want::Status(403)
+            } else if entity {
+                Want::Entity
+            } else {
+                Want::Status(200)
+            }
+        };
+        sweep!(
+            verb(true),
+            post.clone(),
+            format!("/v1/workers/{worker_id}/nudge"),
+            Some(json!({}))
+        );
+        sweep!(
+            verb(true),
+            post.clone(),
+            format!("/v1/workers/{worker_id}/brief"),
+            Some(json!({"content": "more context"}))
+        );
+        sweep!(
+            if !owns_worker {
+                Want::Status(403)
+            } else if agent {
+                // keys stand in for no approval: an Agent is asked once
+                Want::Status(409)
+            } else {
+                Want::Status(200)
+            },
+            post.clone(),
+            format!("/v1/workers/{worker_id}/answer"),
+            Some(json!({"key": "enter"}))
+        );
+        sweep!(
+            verb(true),
+            post.clone(),
+            format!("/v1/workers/{worker_id}/switch-model"),
+            Some(json!({"model": "claude-sonnet-5-5"}))
+        );
+        sweep!(
+            verb(true),
+            post.clone(),
+            format!("/v1/workers/{worker_id}/resume"),
+            Some(json!({}))
+        );
+        let replaced = sweep!(
+            verb(true),
+            post.clone(),
+            format!("/v1/workers/{worker_id}/replace")
+        );
+        let current = serde_json::from_str::<Value>(&replaced)
+            .ok()
+            .and_then(|body| body["worker"]["id"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| worker_id.clone());
+        sweep!(
+            verb(false),
+            post.clone(),
+            format!("/v1/workers/{current}/state"),
+            Some(json!({"state": "done", "sha": "deadbeef2"}))
+        );
+        sweep!(
+            verb(false),
+            post.clone(),
+            format!("/v1/workers/{current}/stop")
+        );
+        sweep!(
+            verb(false),
+            post.clone(),
+            format!("/v1/workers/{current}/retire"),
+            Some(json!({"force": true}))
+        );
+        sweep!(
+            Want::Status(200),
+            post.clone(),
+            "/v1/workers/dispatch".to_string(),
+            Some(json!({
+                "projectId": project, "brief": "the caller's own brief",
+                "briefName": "brief.md", "harness": "claude",
+                "name": format!("reqby-own{index}"),
+            }))
+        );
+
+        // The approval card source: a Bot reads every card; an Agent is
+        // refused while delegated decisions are off.
+        sweep!(
+            if agent {
+                Want::Status(403)
+            } else {
+                Want::Entity
+            },
+            get.clone(),
+            "/v1/interactions".to_string()
+        );
+    }
+    assert!(
+        problems.is_empty(),
+        "{} problem(s):\n{}",
+        problems.len(),
+        problems.join("\n")
+    );
+    Ok(())
+}
+
+/// (c) The owner still reads their words where the PWA shows them — the
+/// approval card source, the board (the task detail panel's source) and the
+/// task detail — and only there: the task list carries the reference alone.
+#[tokio::test]
+async fn the_owner_reads_their_words_on_the_card_board_and_task_detail() -> Result<()> {
+    let (ctx, mut node) = Ctx::boot().await?;
+    let (seat, token) = ctx.seat(&mut node, "main").await?;
+    let project = ctx.create_project().await;
+    let text = format!("{SENTINEL}: dispatch a worker on the other node");
+    let owner = ctx.owner_turn_recorded(&mut node, &seat, &text).await;
+    let (status, pending) = ctx
+        .worker_dispatch(&token, &project, &[("x-remuda-require-approval", "true")])
+        .await;
+    assert_eq!(status, 409, "{pending}");
+    let card = pending["interactionId"]
+        .as_str()
+        .context("interactionId")?
+        .to_owned();
+    let (status, task) = ctx.create_task(&token, &project, Value::Null).await;
+    assert_eq!(status, 200, "{task}");
+    let task_id = task["id"].as_str().context("task id")?.to_owned();
+
+    let expected = json!({"commandId": owner, "excerpt": text});
+    let cards = ctx.get("/v1/interactions").await;
+    assert_eq!(
+        card_in(&cards, &card).context("owner's card")?["requestedBy"],
+        expected,
+        "the approval card source"
+    );
+    let board = ctx.get(&format!("/v1/board?project={project}")).await;
+    let board_card = board["columns"]
+        .as_object()
+        .into_iter()
+        .flat_map(|columns| columns.values())
+        .filter_map(Value::as_array)
+        .flatten()
+        .find(|card| card["id"] == json!(task_id))
+        .cloned()
+        .context("the task on the board")?;
+    assert_eq!(board_card["requestedBy"], expected, "the board");
+    let detail = ctx.get(&format!("/v1/tasks/{task_id}")).await;
+    assert_eq!(detail["requestedBy"], expected, "the task detail");
+    assert_eq!(
+        first_requested_by(&ctx.get(&format!("/v1/tasks?project={project}")).await),
+        Some(json!({"commandId": owner})),
+        "the task list is not a surface the words are shown on"
     );
     Ok(())
 }

@@ -84,6 +84,7 @@ DONE <task> tip=<sha>
 item 1: commit=<sha> test=<name> red=<the assertion that failed on the base tip>
 item 2: commit=<sha> test=<name> red=<the assertion that failed on the base tip>
 checks: <check> — <the verbatim final result line>
+ui: <UNCOVERED list from `pnpm --dir web run coverage:ui -- --base origin/main`, or "no web/src changes">
 rc: <what ran outside the unit suites> — <observed result>; evidence: <path>
 flake: <test name> — <failure message>
 ```
@@ -99,6 +100,13 @@ flake: <test name> — <failure message>
   `0 unhandled errors`, the exit status). Do not paraphrase or summarise a
   log. A check that did not run says `skipped` and why; a check that failed is
   reported as failed, not omitted.
+- **Web coverage.** A branch that changes `web/src` runs
+  `pnpm --dir web run coverage:ui -- --base origin/main` and pastes the
+  UNCOVERED list verbatim (or `none`). The table above it is optional
+  evidence. "Covered" there means a hub spec navigates a route that
+  transitively imports the file — an upper bound, not proof the spec drives
+  that code. A branch with no `web/src` change writes
+  `ui: no web/src changes`.
 - **Real-condition check.** Name what ran outside the unit suites (a live
   round trip, a real service, a browser flow), the observed result, and the
   path to the evidence file under `scratch/proof/`. The path is the evidence;

@@ -1476,6 +1476,80 @@ async fn a_threshold_change_records_no_second_stall_fact() -> Result<()> {
     Ok(())
 }
 
+/// r2 item 4: a result naming a turn the tracker has forgotten (more than 32
+/// root turns ago) is recorded as unattributed. It never settles the current
+/// run and never clears a tool call that is still in flight.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_result_for_a_forgotten_turn_is_unattributed_and_settles_nothing() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("inbox-old-turn").await?;
+    let (status, body) = ctx
+        .request(
+            reqwest::Method::PATCH,
+            &ctx.human,
+            &format!("/v1/projects/{project}"),
+            Some(json!({ "policy": { "configurable": { "stallToolThresholdMins": 1 } } })),
+        )
+        .await?;
+    assert_eq!(status, 200, "{body}");
+    let (seat, seat_token) = ctx.coordinator(&project).await?;
+    let worker = ctx.worker(&seat_token, &project).await?;
+    ctx.journal(&worker, entity("running", &at(0))).await?;
+    // Forty root turns; the tracker remembers the last 32.
+    for n in 1..=40 {
+        let command = format!("cmd_turn_{n}");
+        ctx.journal(&worker, turn_started(&command, &at(3 * n)))
+            .await?;
+        ctx.journal(
+            &worker,
+            turn_result("turn_done", Some(&command), false, None, &at(3 * n + 1)),
+        )
+        .await?;
+    }
+    ctx.journal(&worker, tool_call("tc_still_open")).await?;
+    // A late error for the first turn, whose command the tracker dropped.
+    ctx.journal(
+        &worker,
+        turn_result(
+            "error",
+            Some("cmd_turn_1"),
+            false,
+            Some("late 529"),
+            &at(200),
+        ),
+    )
+    .await?;
+
+    let items = ctx.inbox(&seat_token, &seat).await?;
+    let failed: Vec<_> = items
+        .iter()
+        .filter(|fact| fact["kind"] == "turn-failed")
+        .collect();
+    assert_eq!(failed.len(), 1, "{items:#?}");
+    assert_eq!(failed[0]["payload"]["unattributed"], true, "{failed:#?}");
+    assert_eq!(failed[0]["runGeneration"], 0, "no run is claimed");
+    assert_eq!(failed[0]["payload"]["currentRun"], 40);
+    assert!(
+        failed[0]["dedupeKey"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("turn-failed:{worker}:0:")),
+        "{}",
+        failed[0]
+    );
+
+    // The tool call is still in flight: its own stall fact can still follow.
+    assert_eq!(ctx.hub.test_inbox_tick(&minutes_from_now(3)).await?, 1);
+    let items = ctx.inbox(&seat_token, &seat).await?;
+    assert!(
+        stalls(&items)
+            .iter()
+            .any(|fact| fact["payload"]["toolCallId"] == "tc_still_open"),
+        "{items:#?}"
+    );
+    Ok(())
+}
+
 // ─── logs (§10.1 item 9) ────────────────────────────────────────────────────
 
 /// Everything the inbox logs in this test binary, captured once.

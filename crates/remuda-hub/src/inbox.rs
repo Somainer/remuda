@@ -939,6 +939,15 @@ fn current_run(conn: &Connection, instance_id: &str) -> Result<i64, StoreError> 
 
 // ── facts from a journal append ────────────────────────────────────────────
 
+/// What a structured turn result names (r2 item 4).
+enum TurnEnd {
+    /// A run the Hub can name: settle it.
+    Run { run: i64, failed: bool },
+    /// A turn the tracker dropped and the durable ledger does not place:
+    /// recorded, but it settles nothing and clears nothing.
+    Unattributed { failed: bool },
+}
+
 /// The instance row's state before an append's projections ran, for the
 /// events that can produce a fact.
 #[derive(Debug, Clone)]
@@ -1204,43 +1213,95 @@ pub(crate) fn fold_append(
     let status = knowledge_text(payload.get("status"));
     let completed = text("/relatedIds/completedTurn");
     let settles_root = text("/relatedIds/settledRootTurn") == Some("true");
+    // The run a turn end belongs to, when it can be told (§10.1 item 3).
     let turn_fact = if root_turn && native_name == "result" && (completed.is_some() || settles_root)
     {
         // A structured result names its own turn: a late result of an
         // earlier run is that run's outcome, never the current one's.
-        let run = completed
-            .and_then(|command_id| tracker.run_of(command_id))
-            .unwrap_or(tracker.run);
-        Some((run, status == Some("error")))
+        let failed = status == Some("error");
+        match completed {
+            Some(command_id) => match tracker.run_of(command_id) {
+                Some(run) => Some(TurnEnd::Run { run, failed }),
+                None => {
+                    // The tracker's window no longer names it. The durable
+                    // root-turn ledger can still say the result is the turn
+                    // running now; otherwise it is not attributable at all.
+                    let current = crate::root_turn::derive(conn, instance_id)?;
+                    if current
+                        .as_ref()
+                        .is_some_and(|turn| turn.command_id == command_id)
+                    {
+                        Some(TurnEnd::Run {
+                            run: tracker.run,
+                            failed,
+                        })
+                    } else {
+                        Some(TurnEnd::Unattributed { failed })
+                    }
+                }
+            },
+            None => Some(TurnEnd::Run {
+                run: tracker.run,
+                failed,
+            }),
+        }
     } else if turn_ended && tracker.settled < tracker.run {
         let failed = status == Some("error")
             || text("/relatedIds/outcome").is_some_and(|o| o.eq_ignore_ascii_case("failed"));
-        Some((tracker.run, failed))
+        Some(TurnEnd::Run {
+            run: tracker.run,
+            failed,
+        })
     } else {
         None
     };
-    if let Some((run, failed)) = turn_fact {
+    if let Some(end) = turn_fact {
+        let (kind, mut detail, run, attributed) = match end {
+            TurnEnd::Run { run, failed } => (
+                if failed {
+                    InboxFactKind::TurnFailed
+                } else {
+                    InboxFactKind::TurnDone
+                },
+                json!({
+                    "outcome": if failed { "failed" } else { "done" },
+                    "late": run < tracker.run,
+                    "currentRun": tracker.run,
+                }),
+                run,
+                true,
+            ),
+            TurnEnd::Unattributed { failed } => (
+                if failed {
+                    InboxFactKind::TurnFailed
+                } else {
+                    InboxFactKind::TurnDone
+                },
+                json!({
+                    "outcome": if failed { "failed" } else { "done" },
+                    "unattributed": true,
+                    "currentRun": tracker.run,
+                }),
+                // Not about any run the Hub can name: it settles nothing.
+                0,
+                false,
+            ),
+        };
         // The current root turn is over: nothing it started still runs. A
-        // late result of an earlier run says nothing about the current one.
-        if run == tracker.run {
+        // late or unattributable result says nothing about the current one.
+        if attributed && run == tracker.run {
             tracker.tools.clear();
         }
-        let mut detail = json!({
-            "outcome": if failed { "failed" } else { "done" },
-            "late": run < tracker.run,
-            "currentRun": tracker.run,
-        });
-        if failed && let Some(error) = text("/relatedIds/lastError").map(bounded_text) {
+        if let Some(error) = text("/relatedIds/lastError").map(bounded_text)
+            && detail["outcome"] == "failed"
+        {
             detail["error"] = json!(error);
         }
-        let kind = if failed {
-            InboxFactKind::TurnFailed
-        } else {
-            InboxFactKind::TurnDone
-        };
         let fact = instance_fact(conn, kind, instance_id, run, entered_at.clone(), detail)?;
         record_about(conn, instance_id, fact)?;
-        tracker.settled = tracker.settled.max(run);
+        if attributed {
+            tracker.settled = tracker.settled.max(run);
+        }
     }
 
     if tracker != original {

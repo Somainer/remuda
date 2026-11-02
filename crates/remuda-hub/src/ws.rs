@@ -2134,9 +2134,10 @@ async fn follow_session(
     // c-cardsettle: separate receiver on the dedicated settlement bus.
     let mut settlement_rx = state.settlement_bus.subscribe();
     let mut instance_ids: Vec<String> = filter.into_iter().collect();
-    for id in &instance_ids {
-        state.followers.watch(device_id.clone(), id.clone()).await;
-    }
+    // D-057 §8.4: this socket's follows suppress pushes for its own device
+    // only, and only while its page reports visible (it starts visible).
+    let watch = state.followers.open(device_id.clone()).await;
+    state.followers.follow(watch, &instance_ids).await;
 
     let writer = async {
         while let Some(msg) = out_rx.recv().await {
@@ -2217,14 +2218,13 @@ async fn follow_session(
                                 && let Some(ids) = value.get("instanceIds").and_then(Value::as_array)
                             {
                                 want_tty = value.get("tty").and_then(Value::as_u64) == Some(1) || want_tty;
-                                state.followers.unwatch(&device_id, &instance_ids).await;
                                 instance_ids = ids
                                     .iter()
                                     .filter_map(Value::as_str)
                                     .map(str::to_string)
                                     .collect();
+                                state.followers.follow(watch, &instance_ids).await;
                                 for id in &instance_ids {
-                                    state.followers.watch(device_id.clone(), id.clone()).await;
                                     if send_follow_snapshot(&state, &out_tx, id, want_tty)
                                         .await
                                         .is_err()
@@ -2234,6 +2234,10 @@ async fn follow_session(
                                 }
                             } else if kind == Some("tty.resize") && want_tty {
                                 handle_follow_resize(&state, &out_tx, &instance_ids, &value).await;
+                            } else if kind == Some("visibility")
+                                && let Some(visible) = follow_visibility(&value)
+                            {
+                                state.followers.set_visible(watch, visible).await;
                             }
                         }
                         _ => {}
@@ -2362,7 +2366,18 @@ async fn follow_session(
         () = writer => {}
         () = pump => {}
     }
-    state.followers.unwatch(&device_id, &instance_ids).await;
+    state.followers.close(watch).await;
+}
+
+/// D-057 §8.4: the additive follow frame `{"type":"visibility","state":
+/// "hidden"|"visible"}` the PWA sends from `visibilitychange`. `None` for a
+/// state it does not name (the frame is then ignored).
+fn follow_visibility(frame: &Value) -> Option<bool> {
+    match frame.get("state").and_then(Value::as_str)? {
+        "visible" => Some(true),
+        "hidden" => Some(false),
+        _ => None,
+    }
 }
 
 async fn send_follow_snapshot(

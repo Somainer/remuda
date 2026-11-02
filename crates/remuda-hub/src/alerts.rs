@@ -11,43 +11,79 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::Mutex;
 
-/// Devices currently watching an instance over `/v1/follow`.
+/// The follow sockets currently open over `/v1/follow`, per device.
+///
+/// D-057 §8.4: a follow suppresses pushes only for the device that is
+/// following, and only while that device reports the page visible. The PWA
+/// reports visibility with the additive `visibility` follow frame; a socket
+/// that never sends it counts as visible.
 #[derive(Clone, Default)]
 pub struct Followers {
-    inner: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+    inner: Arc<Mutex<FollowSockets>>,
+}
+
+#[derive(Default)]
+struct FollowSockets {
+    next: u64,
+    sockets: HashMap<u64, FollowSocket>,
+}
+
+/// One follow socket: its device, the instances it follows, and whether its
+/// page reports visible.
+struct FollowSocket {
+    device_id: String,
+    instances: HashSet<String>,
+    visible: bool,
 }
 
 impl Followers {
-    /// Record that `device_id` is following `instance_id`.
-    pub async fn watch(&self, device_id: String, instance_id: String) {
-        self.inner
-            .lock()
-            .await
-            .entry(instance_id)
-            .or_default()
-            .insert(device_id);
+    /// Register a follow socket of `device_id`; it starts visible and
+    /// following nothing. Returns its handle.
+    pub async fn open(&self, device_id: String) -> u64 {
+        let mut guard = self.inner.lock().await;
+        guard.next += 1;
+        let handle = guard.next;
+        guard.sockets.insert(
+            handle,
+            FollowSocket {
+                device_id,
+                instances: HashSet::new(),
+                visible: true,
+            },
+        );
+        handle
     }
 
-    /// Drop watches for this device on the given instances.
-    pub async fn unwatch(&self, device_id: &str, instance_ids: &[String]) {
-        let mut guard = self.inner.lock().await;
-        for id in instance_ids {
-            if let Some(set) = guard.get_mut(id) {
-                set.remove(device_id);
-                if set.is_empty() {
-                    guard.remove(id);
-                }
-            }
+    /// Replace the instances socket `handle` follows.
+    pub async fn follow(&self, handle: u64, instance_ids: &[String]) {
+        if let Some(socket) = self.inner.lock().await.sockets.get_mut(&handle) {
+            socket.instances = instance_ids.iter().cloned().collect();
         }
     }
 
-    /// True when any device is following the instance (Paseo attention suppress).
-    pub async fn any_watching(&self, instance_id: &str) -> bool {
+    /// Record what socket `handle`'s page reports: document shown or hidden.
+    pub async fn set_visible(&self, handle: u64, visible: bool) {
+        if let Some(socket) = self.inner.lock().await.sockets.get_mut(&handle) {
+            socket.visible = visible;
+        }
+    }
+
+    /// Drop socket `handle`.
+    pub async fn close(&self, handle: u64) {
+        self.inner.lock().await.sockets.remove(&handle);
+    }
+
+    /// Devices with a visible follow of `instance_id`: a push about it skips
+    /// their subscriptions, and only theirs.
+    pub async fn suppressed_devices(&self, instance_id: &str) -> HashSet<String> {
         self.inner
             .lock()
             .await
-            .get(instance_id)
-            .is_some_and(|set| !set.is_empty())
+            .sockets
+            .values()
+            .filter(|socket| socket.visible && socket.instances.contains(instance_id))
+            .map(|socket| socket.device_id.clone())
+            .collect()
     }
 }
 
@@ -257,8 +293,9 @@ pub(crate) async fn c1_push(
     .await
 }
 
-/// Send one notification to every subscription unless a device follows the
-/// instance, and record the fanout in the push log under `category`.
+/// Send one notification to every subscription except those of a device that
+/// is following the instance with its page visible (D-057 §8.4), and record
+/// the fanout in the push log under `category`.
 pub(crate) async fn fanout(
     state: &AppState,
     category: &'static str,
@@ -277,7 +314,7 @@ pub(crate) async fn fanout(
         instance_id: instance_id.to_owned(),
         ..Default::default()
     };
-    let following = state.followers.any_watching(instance_id).await;
+    let suppressed = state.followers.suppressed_devices(instance_id).await;
     let subs = match push.subscriptions() {
         Ok(subs) => subs,
         Err(_) => {
@@ -287,7 +324,9 @@ pub(crate) async fn fanout(
             return Fanout::Failed;
         }
     };
-    let (subs, skipped): (Vec<_>, Vec<_>) = subs.into_iter().partition(|_| !following);
+    let (subs, skipped): (Vec<_>, Vec<_>) = subs
+        .into_iter()
+        .partition(|sub| !suppressed.contains(&sub.device_id));
     let mut suppressed_devices: Vec<String> =
         skipped.into_iter().map(|sub| sub.device_id).collect();
     suppressed_devices.sort();
@@ -296,7 +335,7 @@ pub(crate) async fn fanout(
         tracing::debug!(
             category,
             devices = suppressed_devices.len(),
-            "push suppressed: a device is following"
+            "push skipped for devices following with the page visible"
         );
     }
     entry.suppressed_devices = suppressed_devices;

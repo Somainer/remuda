@@ -1031,6 +1031,105 @@ async fn a_crash_between_send_and_mark_resends_with_the_same_tag() -> Result<()>
     Ok(())
 }
 
+// ─── §8.4 per device ────────────────────────────────────────────────────────
+
+async fn follow(
+    ctx: &Ctx,
+    device: &Device,
+    instance: &str,
+) -> Result<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+> {
+    let mut request =
+        format!("ws://{}/v1/follow?instanceId={instance}", ctx.hub.addr).into_client_request()?;
+    request
+        .headers_mut()
+        .insert("Authorization", format!("Bearer {}", device.token).parse()?);
+    let (mut ws, _) = tokio_tungstenite::connect_async(request).await?;
+    // The snapshot proves the Hub registered the follow.
+    let first = tokio::time::timeout(Duration::from_secs(10), ws.next())
+        .await?
+        .context("snapshot")??;
+    anyhow::ensure!(matches!(first, Message::Text(_)), "{first:?}");
+    Ok(ws)
+}
+
+/// Send a visibility frame and prove the Hub applied it: a `subscribe` on
+/// the same socket is read after it, and its snapshot comes back.
+async fn report_visibility<S>(ws: &mut S, instance: &str, state: &str) -> Result<()>
+where
+    S: SinkExt<Message>
+        + StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+        + Unpin,
+    <S as futures::Sink<Message>>::Error: std::fmt::Debug,
+{
+    ws.send(Message::Text(
+        json!({"type": "visibility", "state": state})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    ws.send(Message::Text(
+        json!({"type": "subscribe", "instanceIds": [instance]})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    tokio::time::timeout(Duration::from_secs(10), ws.next())
+        .await?
+        .context("snapshot")??;
+    Ok(())
+}
+
+/// A follow suppresses pushes only for its own device and only while that
+/// device reports the page visible; a client that never sends the frame
+/// counts as visible.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_follow_mutes_only_its_own_visible_device() -> Result<()> {
+    let _flag = d051(true).await;
+    let ctx = Ctx::boot().await?;
+    let desktop = Ctx::device(&ctx.hub, &ctx.http, "desktop").await?;
+    let tablet = Ctx::device(&ctx.hub, &ctx.http, "tablet").await?;
+    let instance = ctx.child(None).await?;
+    // The desktop follows and never sends the frame: visible.
+    let mut desktop_ws = follow(&ctx, &desktop, &instance).await?;
+    ctx.raise(&instance, "int_dev_1", "approval")?;
+    ctx.wait_pushes(&ctx.phone, "interaction:int_dev_1", 1)
+        .await?;
+    ctx.wait_pushes(&tablet, "interaction:int_dev_1", 1).await?;
+    assert!(
+        ctx.pushes_tagged(&desktop, "interaction:int_dev_1")
+            .is_empty()
+    );
+    let suppressed: String = ctx.db()?.query_row(
+        "SELECT suppressed_devices_json FROM push_log WHERE tag = 'interaction:int_dev_1'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(suppressed, json!([desktop.id]).to_string());
+    // The desktop's page goes hidden: it is pushed again.
+    report_visibility(&mut desktop_ws, &instance, "hidden").await?;
+    ctx.raise(&instance, "int_dev_2", "approval")?;
+    ctx.wait_pushes(&desktop, "interaction:int_dev_2", 1)
+        .await?;
+    // Shown again: muted again, and only the desktop.
+    report_visibility(&mut desktop_ws, &instance, "visible").await?;
+    // The tablet follows too and hides its page.
+    let mut tablet_ws = follow(&ctx, &tablet, &instance).await?;
+    report_visibility(&mut tablet_ws, &instance, "hidden").await?;
+    ctx.raise(&instance, "int_dev_3", "approval")?;
+    ctx.wait_pushes(&ctx.phone, "interaction:int_dev_3", 1)
+        .await?;
+    ctx.wait_pushes(&tablet, "interaction:int_dev_3", 1).await?;
+    assert!(
+        ctx.pushes_tagged(&desktop, "interaction:int_dev_3")
+            .is_empty()
+    );
+    Ok(())
+}
+
 /// The push log carries categories, tags and counts, never a body.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_push_log_records_categories_and_counts() -> Result<()> {

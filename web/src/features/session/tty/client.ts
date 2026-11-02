@@ -1,6 +1,7 @@
 import type { Instance } from "../../../types/instance";
 import { readAccessCode } from "../../../lib/accessCode";
 import { readSession } from "../../../lib/session";
+import { reportFollowVisibility } from "../../../lib/followVisibility";
 import {
   CHANNEL_TTY_OUTPUT,
   bytesToUuid,
@@ -485,6 +486,8 @@ function openLiveSession(instance: Instance, handlers: TtyHandlers): TtySession 
     replayNext = true;
     const ws = new WebSocket(followTtyUrl(instance.id));
     ws.binaryType = "arraybuffer";
+    // D-057 §8.4: a follow mutes pushes for this device only while visible.
+    reportFollowVisibility(ws);
     socket = ws;
     ws.addEventListener("open", () => {
       backoff = RECONNECT_MIN_MS;

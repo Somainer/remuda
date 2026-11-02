@@ -1663,6 +1663,8 @@ cursor 是服务器签名的 opaque token，绑定 principal、journal、方向�
 
 `tty.write` 参数 `{commandId,instanceId,processGeneration,streamId,streamEpoch,writerLeaseId,inputSeq:U64,dataBase64:string,keys?:string[]}`；Node 把 `dataBase64` 原字节写入 PTY，或把逻辑键（`enter`=`\\r`、`esc`=`\\x1b`、`ctrl+c`=`\\x03` 等）映射成字节后写入，返回 scope=tty-bytes。Web 终端优先走 channel-3 二进制，不经 keys。inputSeq 在该 lease 下严格单调。相同 commandId/inputSeq 的重试只查记录；已可能写入但 ACK 丢失时返回 unknown，不重复送 Enter、Ctrl+C 或粘贴。响应超时不自动重传按键。`tty.resize` 参数 `{instanceId,streamId,writerLeaseId,resizeRevision,cols,rows}` 是状态设置；follow 套接字上的简写是 `{type:"tty.resize",cols,rows}`。较旧 revision 忽略并返回实际尺寸，新设置可安全幂等重发。
 
+**follow 可见性帧（D-057 §8.4，ma-push，加性）**：浏览器可在 `/v1/follow` 上发控制帧 `{type:"visibility",state:"hidden"|"visible"}`，PWA 在 socket 打开时与每次 `visibilitychange` 时发送。Hub 按 socket 记录：该 socket 所 follow 的实例的推送只对**这台设备**跳过，且只在它最近报告 `visible` 时；从不发送此帧的 socket 按可见处理，`state` 取其他值的帧被忽略。没有回复帧；不认识该帧的旧 Hub 直接忽略它。
+
 输出 offset 按字节而非字符计数，UTF-8/ANSI 可以跨帧，终端客户端保留增量解析状态。断线从 afterOffset 补该 stream 实际保存的 bytes；新终端需要从有效终端状态快照的 snapshotAtOffset 开始，或从 stream 开头重放。前缀已 GC 且无可恢复终端快照时明确 `TTY_HISTORY_GAP`，不把普通屏幕截图当 xterm serialize state。
 
 representation=rendered-ansi 时，Node 把 Herdr terminal.frame 的 base64 解码后经上述 binary framing 发送，并在 raw_tty 记录 native frame seq/full/尺寸；消费者以该 stream 的字节 offset 为水位，不以 Herdr per-client seq 作为跨重连游标。新 Herdr 连接先等 full frame，建立新 stream，清空渲染器后恢复当前画面；若无法得到 full frame，返回 TTY_HISTORY_GAP。该恢复不承诺先前 scrollback/源 PTY 模式恢复。只实现 pane.read 的 backend 仍只能提供 screen-snapshot UI，不能冒充此 ANSI bridge。Herdr terminal transport 源码

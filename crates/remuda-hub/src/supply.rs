@@ -1580,9 +1580,23 @@ pub async fn observe_journal_text(state: &AppState, record: &crate::store::Journ
                 .filter_map(|w| w.cooldown_until)
                 .max();
             supply.last_error = Some(format!("429/rate-limit text for family {family}"));
+            // cb-inbox-facts: the child is parked on this family until the
+            // last window that covers it clears.
+            let resets_at = supply
+                .windows
+                .iter()
+                .filter(|window| window.applies_to_family(&family))
+                .filter_map(|window| window.cooldown_until)
+                .max();
             if let Err(error) = state
                 .store
-                .update_provider_supply(profile.id.clone(), supply.clone())
+                .update_provider_supply_parked(
+                    profile.id.clone(),
+                    supply.clone(),
+                    record.instance_id.clone(),
+                    family.clone(),
+                    resets_at,
+                )
                 .await
             {
                 tracing::warn!(%error, "supply.cooldown persist failed");

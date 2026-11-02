@@ -365,7 +365,7 @@ async fn create_task(
     }
     let now = now_timestamp()?;
     let deps = resolve_deps(body.deps);
-    let budget = budget_from(body.budget);
+    let budget = budget_from(body.budget)?;
     let class = class_from(body.class.as_deref())?;
     let binding_request = body.workspace_binding;
     // c-dirpicker round 4 item 5: validate the binding ids (and mode) BEFORE
@@ -938,7 +938,7 @@ async fn split_task(
     }
     let now = now_timestamp()?;
     let deps = resolve_deps(body.deps);
-    let budget = budget_from(body.budget);
+    let budget = budget_from(body.budget)?;
     let class = class_from(body.class.as_deref())?;
     let child = state
         .store
@@ -1426,15 +1426,20 @@ fn resolve_deps(deps: Option<Vec<DepBody>>) -> Vec<TaskDep> {
         .collect()
 }
 
-fn budget_from(body: Option<BudgetBody>) -> TaskBudget {
-    match body {
-        Some(body) => TaskBudget {
-            max_usd: body.max_usd,
-            max_turns: body.max_turns,
-            max_wall_mins: body.max_wall_mins,
-        },
-        None => TaskBudget::default(),
-    }
+fn budget_from(body: Option<BudgetBody>) -> Result<TaskBudget, HubError> {
+    let Some(body) = body else {
+        return Ok(TaskBudget::default());
+    };
+    // cb-inbox-facts r2: the wall budget becomes a duration on the inbox tick;
+    // refuse a value it could not turn into one (400). 0 keeps meaning "no
+    // wall budget", as it did before the bound.
+    crate::inbox::validate_configured_minutes("budget.maxWallMins", body.max_wall_mins, 0)
+        .map_err(HubError::BadRequest)?;
+    Ok(TaskBudget {
+        max_usd: body.max_usd,
+        max_turns: body.max_turns,
+        max_wall_mins: body.max_wall_mins,
+    })
 }
 
 fn ensure_project_exists(

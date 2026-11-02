@@ -1002,6 +1002,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/lineages/{id}/inbox": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One page of a lineage's inbox of facts, oldest first
+         * @description Facts the Hub recorded for the lineage (D-057 §10, D-060 §10.1): rows with id > after, ascending. A Human device reads any lineage and may name any chapter of it; an Agent only its own lineage, by its canonical id; a Bot credential is refused (403). Payload text a worker or tool produced is untrusted data.
+         */
+        get: operations["lineageInbox"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Change a lineage's inbox settings
+         * @description Absent fields keep their value. optIn (a Human-created lineage without continuity receives facts only when its creator opted in) is Human-only; mutedKinds replaces the muted set and may be set by the lineage itself or a Human. A Bot credential is refused (403).
+         */
+        patch: operations["patchLineageInbox"];
+        trace?: never;
+    };
     "/v1/lineages/{id}/memory": {
         parameters: {
             query?: never;
@@ -2421,6 +2445,57 @@ export interface components {
             /** @description Absolute path on the Node, within its configured workspace roots */
             path: string;
         };
+        InboxFact: {
+            /** @description Delivery batch that carried the row; absent until one does. */
+            batchId?: string;
+            /** Format: date-time */
+            createdAt: string;
+            /** @description kind:subject:runGeneration:stateEnteredAt; unique in the lineage's inbox, stable across a Hub restart and a replayed journal append. */
+            dedupeKey: string;
+            /** @description Row id; the after cursor. */
+            id: number;
+            kind: components["schemas"]["InboxFactKind"];
+            /** @description Lineage the fact is for. */
+            lineageId: string;
+            /** @description Kind-specific detail, with occurrence {count, capped, cap, windowHours}. Worker- and tool-produced text in it is untrusted data. */
+            payload: {
+                [key: string]: unknown;
+            };
+            /** @description Run generation of the subject the fact is about; 0 when not about a run. */
+            runGeneration: number;
+            /**
+             * Format: date-time
+             * @description When the subject entered the state (journal time for journal facts).
+             */
+            stateEnteredAt: string;
+            /** @description The instance the fact is about, when it is about one. */
+            subjectInstanceId?: string;
+        };
+        /**
+         * @description What happened to the fact's subject.
+         * @enum {string}
+         */
+        InboxFactKind: "started" | "exited" | "waiting" | "turn-done" | "turn-failed" | "interaction" | "interaction-superseded" | "gate" | "supply-reset" | "host-online" | "host-offline" | "stalled" | "budget-expired" | "wake-due" | "context-threshold";
+        InboxPage: {
+            items: components["schemas"]["InboxFact"][];
+            lineageId: string;
+            /** @description Whether rows beyond this page exist. */
+            more: boolean;
+            /** @description Cursor for the next page: the last row's id, or the request's after when empty. */
+            nextAfter: number;
+            settings: components["schemas"]["InboxSettings"];
+        };
+        InboxSettings: {
+            mutedKinds: components["schemas"]["InboxFactKind"][];
+            /** @description A Human-created lineage without continuity receives facts only when its creator opted in. */
+            optIn: boolean;
+        };
+        InboxSettingsPatch: {
+            /** @description The full muted set (replaces the stored one). */
+            mutedKinds?: components["schemas"]["InboxFactKind"][];
+            /** @description Human devices only. */
+            optIn?: boolean;
+        };
         /** @description D-057 §7.1: the Hub-stamped initiator of an Agent-initiated mutation, derived from the authenticating device's bound instance and forwarded to Nodes. The authenticating device id stays Hub-only and is not part of this shape. Absent for Human/Bot callers. `rootTurn` records the turn the initiator acted in (cb-rootturn); absent when the Hub knows no turn. */
         Initiator: {
             /**
@@ -3191,12 +3266,17 @@ export interface components {
             /** @description Active children one node may delegate (Hub default 8). */
             coordinatorFanOut?: number;
             defaultPlacement?: string;
+            /** @description Inbox facts recorded per (subscriber, subject, kind) in a rolling 24 h window (default 6). */
+            factOccurrenceCap?: number;
             maxConcurrentWorkers?: number;
             /** @description Delegation-tree depth limit (Hub default 3); design §2.5. */
             maxDelegationDepth?: number;
             maxFanOutPerTask?: number;
             nudgeThrottleMins?: number;
+            /** @description Quiet window before a busy, silent worker yields a stall fact, minutes (0 to 525600; 0 uses the Hub default). */
             stallThresholdMins?: number;
+            /** @description Minutes a tool call may stay in flight before it yields one stall fact (1 to 525600); absent means never. */
+            stallToolThresholdMins?: number;
         };
         ProjectCreate: {
             /**
@@ -3576,6 +3656,7 @@ export interface components {
         TaskBudget: {
             maxTurns?: number;
             maxUsd?: string;
+            /** @description Wall-clock budget in minutes (0 to 525600; 0 or absent: none). The Hub records one budget-expired fact for the dispatcher when it elapses and stops nothing. */
             maxWallMins?: number;
         };
         /**
@@ -5853,6 +5934,67 @@ export interface operations {
                     "application/json": components["schemas"]["LineageGlance"];
                 };
             };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
+    lineageInbox: {
+        parameters: {
+            query?: {
+                /** @description Exclusive row-id cursor (default 0). */
+                after?: number;
+                /** @description Rows per page (default 50, at most 200). */
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Inbox page */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InboxPage"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
+    patchLineageInbox: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InboxSettingsPatch"];
+            };
+        };
+        responses: {
+            /** @description The lineage's settings */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InboxSettings"];
+                };
+            };
+            400: components["responses"]["Error"];
             401: components["responses"]["Error"];
             403: components["responses"]["Error"];
             404: components["responses"]["Error"];

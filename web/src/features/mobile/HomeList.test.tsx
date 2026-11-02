@@ -673,6 +673,17 @@ describe("① 工作中 filter and the group header", () => {
   });
 });
 
+describe("⑤ 刚完成", () => {
+  it("lists the unseen finished rows under the queue", async () => {
+    hub.instances = [row("ins-done", { activity: known("idle"), unseen: true })];
+    renderHome();
+    const section = await screen.findByTestId("home-just-done");
+    expect(section).toHaveTextContent("title ins-done");
+    const queue = screen.getByTestId("home-queue");
+    expect(queue.compareDocumentPosition(section) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+});
+
 describe("① 完成未看 filter", () => {
   it("narrows the ledger to the done-unseen rank and clears it on the second tap", async () => {
     hub.instances = [

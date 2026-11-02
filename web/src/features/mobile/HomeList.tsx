@@ -46,6 +46,7 @@ import { HomeGlance } from "../home/HomeGlance";
 import { scrollToQueue } from "../home/glanceNav";
 import { MainAskDock, MainCard } from "../home/MainCard";
 import { HomeQueue } from "../home/HomeQueue";
+import { JustDone } from "../home/JustDone";
 import { NoMatches, NoSessions, SkeletonRows } from "../home/HomeStates";
 import { newSessionPath } from "../spaces/store";
 import ui from "../../styles/ui.module.css";
@@ -566,6 +567,8 @@ export const HomeList = memo(function HomeList() {
           card and above the ledger; outside the probe (its answers and
           receipts never report commit:HomeList). Hidden while searching. */}
       <HomeQueue placement="phone" searching={searching} />
+      {/* ⑤ 刚完成 (home.md §7): under the queue, hidden when nothing is ◉. */}
+      <JustDone placement="phone" />
       {/* Outside the probe: its 5s ledger poll never reports commit:HomeList.
           CSS order keeps it under the sticky head and above project groups. */}
       <HomeTaskLayer

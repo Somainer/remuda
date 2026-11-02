@@ -125,6 +125,38 @@ it("filters the ledger to 完成未看 when ◉ is tapped, and clears it on the 
   expect(screen.getAllByTestId("board-card")).toHaveLength(2);
 });
 
+it("mounts ⑤ under the queue", async () => {
+  const host = {
+    ...mockDb.hosts[0], id: "host-a",
+    workspaces: [{ workspaceId: "wsp-a", hostId: "host-a", root: "/home/dev/ws" }],
+  };
+  const done = {
+    ...mockDb.instances[0], id: "ins-done", hostId: "host-a", workspaceId: "wsp-a",
+    lifecycle: "running", connectivity: "connected", activity: known("idle"), parent: null, unseen: true,
+  } as Instance;
+  vi.spyOn(api, "hello").mockResolvedValue({} as never);
+  vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+  vi.spyOn(api, "hostList").mockResolvedValue({ items: [host], nextCursor: null } as never);
+  vi.spyOn(api, "instanceList").mockResolvedValue({ items: [done], nextCursor: null });
+  vi.spyOn(api, "interactionList").mockResolvedValue([]);
+  vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] });
+  vi.spyOn(api, "hostWorkspaceSubscribe").mockImplementation(() => () => undefined);
+  vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+  vi.spyOn(hubStore, "flushAllOutbox").mockImplementation(() => undefined as never);
+  await hubStore.bootstrap();
+  await hubStore.refresh();
+
+  render(
+    <MemoryRouter initialEntries={["/sessions"]}>
+      <SessionsPage />
+    </MemoryRouter>,
+  );
+  const section = await screen.findByTestId("home-just-done");
+  const queue = screen.getByTestId("home-queue");
+  expect(section).toHaveAttribute("data-placement", "desktop");
+  expect(queue.compareDocumentPosition(section) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+});
+
 it("mounts the ④ queue in the main column and hides it while the list search has text", async () => {
   vi.spyOn(api, "hello").mockResolvedValue({} as never);
   vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);

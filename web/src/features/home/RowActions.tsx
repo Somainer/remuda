@@ -14,6 +14,12 @@ export const LONG_PRESS_MS = 500;
 /** Movement beyond this cancels the long-press, so a scroll never opens it. */
 const LONG_PRESS_SLOP_PX = 8;
 
+/**
+ * The class every ledger puts on its row element: the whole row is the ⋯
+ * button's hover target (see rowActions.module.css).
+ */
+export const ROW_ACTIONS_HOST = css.host;
+
 const LABELS: Record<RowActionKey, string> = {
   markSeen: "标为已看",
   interrupt: "中断",
@@ -24,16 +30,6 @@ const LABELS: Record<RowActionKey, string> = {
   close: "关闭…",
 };
 
-/**
- * ⑦ 行操作菜单 (home.md §9), shared by the phone ledger, the desktop ledger
- * and ⑥ 工作中.
- *
- * Entry is a long-press on the row, or the 44px ⋯ button: hidden until hover
- * or keyboard focus on a fine pointer, always in tab order. Items that do not
- * apply to the row's state are absent ({@link rowActionKeys}). 关闭… confirms
- * first, naming the session and the host. While the read is stale every item
- * is disabled.
- */
 /**
  * The long-press handlers, for a caller that wants the press on the whole row
  * rather than on the ⋯ button. A short tap does nothing, so the row's own
@@ -71,6 +67,17 @@ export function useRowLongPress(onOpen: () => void) {
   };
 }
 
+/**
+ * ⑦ 行操作菜单 (home.md §9), shared by the phone ledger, the desktop ledger
+ * and ⑥ 工作中.
+ *
+ * Entry is a long-press on the row, or the 44px ⋯ button: on a fine pointer
+ * the button paints only while its whole row is hovered or the button is
+ * focus-visible, and it is always in flow and in tab order. Items that do not
+ * apply to the row's state are absent ({@link rowActionKeys}). 关闭… confirms
+ * first, naming the session and the host. While the read is stale every item
+ * is disabled.
+ */
 export function RowActions({
   instance,
   open,

@@ -47,7 +47,7 @@ import { scrollToQueue } from "../home/glanceNav";
 import { MainAskDock, MainCard } from "../home/MainCard";
 import { HomeQueue } from "../home/HomeQueue";
 import { JustDone } from "../home/JustDone";
-import { RowActions, useRowLongPress } from "../home/RowActions";
+import { RowActions, ROW_ACTIONS_HOST, useRowLongPress } from "../home/RowActions";
 import { NoMatches, NoSessions, SkeletonRows } from "../home/HomeStates";
 import { newSessionPath } from "../spaces/store";
 import ui from "../../styles/ui.module.css";
@@ -648,7 +648,7 @@ function HomeRowView({
   const longPress = useRowLongPress(() => onMenu?.());
   return (
     <article
-      className={css.row}
+      className={`${css.row} ${ROW_ACTIONS_HOST}`}
       {...(onMenu && !stale ? longPress : {})}
       data-testid="home-row"
       data-status={row.status}

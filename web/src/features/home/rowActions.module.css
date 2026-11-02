@@ -8,9 +8,9 @@
   align-items: center;
 }
 
-/* Always in tab order. Visually hidden until hover or keyboard focus on a
-   fine pointer; a coarse pointer keeps it hidden because the long-press is
-   that surface's entry. */
+/* Always in tab order, and always in flow at the 44px hit area. On a fine
+   pointer its paint waits for the row hover or keyboard focus; a coarse
+   pointer shows it outright, next to the long-press that surface also has. */
 .more {
   display: inline-flex;
   align-items: center;
@@ -27,23 +27,21 @@
   cursor: pointer;
 }
 
+/* The hover target is the WHOLE row, not the 44px the button occupies: every
+   ledger puts .host on its row element, so a fine pointer anywhere over the
+   row reveals the ⋯. The button stays in flow at its full 44px hit area; only
+   its paint is hidden, so it never leaves the tab order (a clipped 1x1 button
+   was unreachable for a mouse and nearly invisible to the keyboard). */
 @media (hover: hover) and (pointer: fine) {
   .more {
-    position: absolute;
-    right: 0;
-    width: 1px;
-    height: 1px;
-    overflow: hidden;
-    clip: rect(0 0 0 0);
+    opacity: 0;
+    pointer-events: none;
   }
 
-  .wrap:hover .more,
+  .host:hover .more,
   .more:focus-visible {
-    position: static;
-    width: var(--touch);
-    height: var(--touch);
-    overflow: visible;
-    clip: auto;
+    opacity: 1;
+    pointer-events: auto;
   }
 }
 

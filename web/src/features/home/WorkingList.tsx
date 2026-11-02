@@ -6,7 +6,7 @@ import { projectStatus } from "../../lib/status";
 import { hubStore, useHub } from "../../lib/store";
 import { useNowTick } from "../../lib/useNowTick";
 import type { Id } from "../../types/wire";
-import { RowActions } from "./RowActions";
+import { RowActions, ROW_ACTIONS_HOST } from "./RowActions";
 import css from "./workingList.module.css";
 
 /** Rows shown before 「+N ›」 (home.md §9 ⑥). */
@@ -36,7 +36,7 @@ export function WorkingList() {
       ) : (
         <ul className={css.list}>
           {rows.slice(0, WORKING_ROWS).map((row) => (
-            <li key={row.id} className={css.row} data-testid="home-working-row">
+            <li key={row.id} className={`${css.row} ${ROW_ACTIONS_HOST}`} data-testid="home-working-row">
               <Link className={css.rowLink} to={`/s/${row.id}`}>
                 <StateDot status="working" />
                 <span className={css.title}>{hubStore.titleOf(row.id as Id)}</span>

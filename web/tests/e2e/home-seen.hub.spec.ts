@@ -1,4 +1,4 @@
-import { devices, expect, test, type Page } from "@playwright/test";
+import { devices, expect, test, type Locator, type Page } from "@playwright/test";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -144,4 +144,45 @@ test("a long-press at 390 opens the row menu below the sticky head, and 关闭�
     }
     await context.close();
   }
+});
+
+test("1440: hovering a ⑦ and a ⑥ row reveals the ⋯, and each menu opens", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await login(page);
+  test.skip(!(await needsFakeNode(page)), "needs the in-process fake node");
+  // A normal create parks the fake turn on an approval; the `hold-working`
+  // send models an agent still inside a long turn, so the row ranks 工作中.
+  const prompt = `seenweb hover ${Date.now().toString(36)}`;
+  const id = await createSession(page, prompt);
+  const held = await page.request.post(`/v1/instances/${id}/commands`, {
+    data: { operation: "instance.send", payload: { prompt: "hold-working keep the turn" } },
+  });
+  expect(held.ok(), `instance.send: ${held.status()}`).toBe(true);
+  await page.goto("/sessions");
+
+  const opacityOf = (locator: Locator) => locator.evaluate((el) => getComputedStyle(el).opacity);
+
+  // ⑦ 台账 row in the main column.
+  const card = page.locator('[data-testid="board-card"]').filter({ hasText: prompt }).first();
+  await expect(card).toBeVisible({ timeout: 20_000 });
+  const more = card.getByTestId("row-actions-more");
+  expect(await opacityOf(more)).toBe("0");
+  await card.hover();
+  await expect.poll(() => opacityOf(more)).toBe("1");
+  await more.click();
+  await expect(page.getByTestId("row-actions-menu")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("row-actions-menu")).toHaveCount(0);
+
+  // ⑥ 工作中 in the ≥1440 aside.
+  const working = page.locator('[data-testid="home-working-row"]').filter({ hasText: prompt }).first();
+  await expect(working).toBeVisible({ timeout: 20_000 });
+  const moreWorking = working.getByTestId("row-actions-more");
+  expect(await opacityOf(moreWorking)).toBe("0");
+  await working.hover();
+  await expect.poll(() => opacityOf(moreWorking)).toBe("1");
+  await moreWorking.click();
+  await expect(page.getByTestId("row-actions-menu")).toBeVisible();
+  await expect(page.getByTestId("row-action-interrupt")).toBeVisible();
+  await shot(page, "seenweb-hover-1440.png");
 });

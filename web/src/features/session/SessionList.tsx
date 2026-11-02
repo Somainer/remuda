@@ -17,7 +17,7 @@ import { useModifierHeld } from "../../lib/useModifierHeld";
 import { buildSpaces, useSpacesPrefs } from "../spaces/store";
 import { switchSlots } from "../../lib/sessionSlots";
 import { isEmberEffort } from "./effort";
-import { RowActions } from "../home/RowActions";
+import { RowActions, ROW_ACTIONS_HOST } from "../home/RowActions";
 import { nextStep } from "./nextStep";
 import { LaunchedByMark } from "./LaunchedBy";
 import { HarnessGlyph } from "../spaces/SpacesPanel";
@@ -771,7 +771,7 @@ export function SessionList({
               return (
                 <article
                   key={instance.id}
-                  className={`${css.row} ${status === "blocked" ? css.rowBlocked : ""}`}
+                  className={`${css.row} ${status === "blocked" ? css.rowBlocked : ""} ${ROW_ACTIONS_HOST}`}
                   data-testid="board-card"
                   data-instance-id={instance.id}
                   data-status={status}

@@ -1552,8 +1552,9 @@ def print_report(report: Report, baseline: set[str], strict: bool,
         for key in sorted(advisory):
             print(f"ADVISORY {key}: {by_key[key].message}", file=stream)
     else:
-        print(f"docs contract: advisory: {len(advisory)} symbol-proximity "
-              f"mismatch(es) and {len(vanished)} vanished baseline "
+        print(f"docs contract: advisory: {len(advisory)} item(s) "
+              f"(symbol proximity, command references, orphan docs) and "
+              f"{len(vanished)} vanished baseline "
               f"entr{'y' if len(vanished) == 1 else 'ies'} (warnings only)",
               file=stream)
         if vanished:

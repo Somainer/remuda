@@ -116,8 +116,16 @@ struct Ctx {
 
 impl Ctx {
     async fn spawn() -> Result<Ctx> {
+        Self::spawn_with(|_| {}).await
+    }
+
+    /// [`Self::spawn`] with the Hub config mutated first (the config a
+    /// production Hub loads is the operator's; a test writes it directly).
+    async fn spawn_with(mutate: impl FnOnce(&mut HubConfig)) -> Result<Ctx> {
         let dir = tempfile::tempdir()?;
-        let hub = spawn(HubConfig::for_test(dir.path().join("hub"))).await?;
+        let mut config = HubConfig::for_test(dir.path().join("hub"));
+        mutate(&mut config);
+        let hub = spawn(config).await?;
         let human = hub.mint_device_token("inbox-human").await?;
         let host = HostId::new().as_id().to_string();
         let workspace = remuda_protocol::WorkspaceId::new().as_id().to_string();
@@ -195,6 +203,14 @@ impl Ctx {
 
     fn data_dir(&self) -> PathBuf {
         self.dir.path().join("hub")
+    }
+
+    /// A second connection to the Hub's database, for a test that must store
+    /// a value the routes would refuse.
+    fn db(&self) -> Result<rusqlite::Connection> {
+        let db = rusqlite::Connection::open(self.data_dir().join("hub.sqlite"))?;
+        db.busy_timeout(Duration::from_secs(5))?;
+        Ok(db)
     }
 
     fn base(&self) -> String {
@@ -1175,6 +1191,184 @@ async fn a_wall_budget_yields_one_fact_and_kills_nothing() -> Result<()> {
         .or_else(|| instance.get("lifecycle"))
         .cloned();
     assert_eq!(lifecycle, Some(json!("running")), "{instance}");
+    Ok(())
+}
+
+// ─── out-of-range windows (r2 item 1) ───────────────────────────────────────
+
+/// The Hub's database, written directly: a value the routes would refuse.
+fn store_minutes(
+    db: &rusqlite::Connection,
+    table: &str,
+    id: &str,
+    path: &str,
+    mins: i64,
+) -> Result<()> {
+    let sql =
+        format!("UPDATE {table} SET doc_json = json_set(doc_json, '${path}', ?1) WHERE id = ?2");
+    db.execute(&sql, rusqlite::params![mins, id])?;
+    Ok(())
+}
+
+/// A stored window no `Duration` or time arithmetic can hold must neither
+/// panic the Hub's only writer thread nor wrap into a past time: the tick
+/// skips that subject, logs a category, and the writer keeps serving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_out_of_range_window_is_skipped_and_never_panics_the_writer() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("inbox-overflow").await?;
+    let (seat, seat_token) = ctx.coordinator(&project).await?;
+    // One busy child per branch: the quiet window, the tool window.
+    let quiet = ctx.worker(&seat_token, &project).await?;
+    let hung = ctx.worker(&seat_token, &project).await?;
+    let task = ctx
+        .post(
+            &ctx.human,
+            "/v1/tasks",
+            json!({ "projectId": project, "title": "overflow", "intent": "overflow",
+                    "budget": { "maxWallMins": 45 } }),
+        )
+        .await?;
+    let task_id = task["id"]
+        .as_str()
+        .or_else(|| task["task"]["id"].as_str())
+        .context("task id")?
+        .to_string();
+    let created = ctx
+        .post(
+            &seat_token,
+            "/v1/instances",
+            json!({ "role": "worker", "projectId": project, "prompt": "work",
+                    "driver": "claude-pty", "taskId": task_id }),
+        )
+        .await?;
+    let budgeted = created["instance"]["instanceId"]
+        .as_str()
+        .context("id")?
+        .to_string();
+    for worker in [&quiet, &hung, &budgeted] {
+        ctx.journal(worker, entity("running", &at(0))).await?;
+        ctx.journal(worker, activity("working", &at(1))).await?;
+    }
+    ctx.journal(&hung, tool_call("tc_overflow")).await?;
+
+    // The routes would refuse these; the database still holds them (an older
+    // build, a hand edit, a restore).
+    let db = ctx.db()?;
+    store_minutes(
+        &db,
+        "projects",
+        &project,
+        ".policy.configurable.stallThresholdMins",
+        i64::MAX,
+    )?;
+    store_minutes(
+        &db,
+        "projects",
+        &project,
+        ".policy.configurable.stallToolThresholdMins",
+        i64::MAX,
+    )?;
+    store_minutes(&db, "tasks", &task_id, ".budget.maxWallMins", i64::MAX)?;
+    drop(db);
+
+    // A tick far enough ahead that every deadline has passed.
+    assert_eq!(ctx.hub.test_inbox_tick(&minutes_from_now(600)).await?, 0);
+    assert_eq!(ctx.hub.test_inbox_tick(&minutes_from_now(1200)).await?, 0);
+
+    // The writer still commits: a normal append and a settings write.
+    ctx.journal(&quiet, question("int_after_overflow", &at(2)))
+        .await?;
+    let (status, settings) = ctx
+        .patch_inbox(&seat_token, &seat, json!({ "mutedKinds": ["waiting"] }))
+        .await?;
+    assert_eq!(status, 200, "{settings}");
+    assert_eq!(settings["mutedKinds"], json!(["waiting"]));
+
+    // Nothing was recorded for the subjects whose window could not be used.
+    let items = ctx.inbox(&ctx.human, &seat).await?;
+    assert!(
+        items.iter().all(|fact| fact["kind"] != "stalled"),
+        "{items:#?}"
+    );
+    assert!(
+        items.iter().all(|fact| fact["kind"] != "budget-expired"),
+        "{items:#?}"
+    );
+    Ok(())
+}
+
+/// A host-lost grace too large for a `Duration` is clamped at load, not
+/// subtracted blindly on the tick.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_out_of_range_host_grace_is_clamped_at_load() -> Result<()> {
+    let ctx = Ctx::spawn_with(|config| config.host_lost_grace_ms = u64::MAX).await?;
+    let project = ctx.project("inbox-grace-overflow").await?;
+    let (seat, seat_token) = ctx.coordinator(&project).await?;
+    assert_eq!(ctx.hub.test_inbox_tick(&minutes_from_now(600)).await?, 0);
+    // The writer still commits.
+    let (status, settings) = ctx
+        .patch_inbox(&seat_token, &seat, json!({ "mutedKinds": [] }))
+        .await?;
+    assert_eq!(status, 200, "{settings}");
+    Ok(())
+}
+
+/// The write routes refuse a window outside `1..=525600` minutes with 400,
+/// so the tick never sees one from a live caller.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn out_of_range_windows_are_rejected_at_the_routes() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("inbox-route-limits").await?;
+    for field in ["stallThresholdMins", "stallToolThresholdMins"] {
+        for (mins, status) in [
+            (i64::MAX, 400),
+            (0, 400),
+            (-1, 400),
+            (525_601, 400),
+            (45, 200),
+        ] {
+            let (got, body) = ctx
+                .request(
+                    reqwest::Method::PATCH,
+                    &ctx.human,
+                    &format!("/v1/projects/{project}"),
+                    Some(json!({ "policy": { "configurable": { field: mins } } })),
+                )
+                .await?;
+            assert_eq!(got, status, "{field}={mins}: {body}");
+            if status == 400 {
+                assert!(
+                    body["error"]
+                        .as_str()
+                        .is_some_and(|error| error.contains("minutes")),
+                    "{field}={mins}: {body}"
+                );
+            }
+        }
+    }
+    for (mins, status) in [(i64::MAX, 400), (0, 400), (525_600, 200)] {
+        let (got, body) = ctx
+            .request(
+                reqwest::Method::POST,
+                &ctx.human,
+                "/v1/tasks",
+                Some(
+                    json!({ "projectId": project, "title": "window", "intent": "window",
+                             "budget": { "maxWallMins": mins } }),
+                ),
+            )
+            .await?;
+        assert_eq!(got, status, "maxWallMins={mins}: {body}");
+        if status == 400 {
+            assert!(
+                body["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("minutes")),
+                "maxWallMins={mins}: {body}"
+            );
+        }
+    }
     Ok(())
 }
 

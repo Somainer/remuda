@@ -59,6 +59,55 @@ const OCCURRENCE_RETENTION_DAYS: i64 = 7;
 /// Characters of worker- or tool-produced text a payload carries.
 const FACT_TEXT_MAX_CHARS: usize = 200;
 
+/// Longest configured window the Hub accepts or acts on, in minutes (one
+/// year). The routes refuse more; the tick skips a stored value that is
+/// outside it rather than turning it into a `Duration` or a time.
+pub(crate) const MAX_CONFIGURED_MINUTES: i64 = 525_600;
+
+/// The same bound in milliseconds, for `host_lost_grace_ms`.
+pub(crate) const MAX_CONFIGURED_MS: u64 = MAX_CONFIGURED_MINUTES as u64 * 60_000;
+
+/// Refuse a configured minute value outside `1..=MAX_CONFIGURED_MINUTES`, so
+/// every stored window the tick reads can be a `Duration` added to a time.
+/// `None` is "not set" and is admitted; the error text is the 400 body.
+pub(crate) fn validate_configured_minutes(field: &str, minutes: Option<i64>) -> Result<(), String> {
+    match minutes {
+        Some(minutes) if !(1..=MAX_CONFIGURED_MINUTES).contains(&minutes) => Err(format!(
+            "{field} must be between 1 and {MAX_CONFIGURED_MINUTES} minutes (got {minutes})"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// `minutes` as a duration the tick may add to a time, when it is in range
+/// and representable; `None` means "skip this subject".
+fn window_minutes(minutes: i64) -> Option<time::Duration> {
+    if !(1..=MAX_CONFIGURED_MINUTES).contains(&minutes) {
+        return None;
+    }
+    // `Duration::minutes` panics past its range; seconds are ranged wide.
+    minutes.checked_mul(60).map(time::Duration::seconds)
+}
+
+/// Codes already reported in this process, so a stored misconfiguration is
+/// logged once per category instead of on every 15 s tick.
+static REPORTED_ONCE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<&'static str>>,
+> = std::sync::OnceLock::new();
+
+/// Log a category once per process; never the values, which can be arbitrary
+/// input.
+fn report_once(code: &'static str) {
+    let seen = REPORTED_ONCE.get_or_init(Default::default);
+    let mut seen = seen.lock().unwrap_or_else(|poison| poison.into_inner());
+    if seen.insert(code) {
+        tracing::warn!(
+            code,
+            "inbox tick skipped a subject: unusable configured window"
+        );
+    }
+}
+
 /// Idempotent DDL; no `user_version` rung.
 pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
@@ -408,7 +457,9 @@ fn parse_at(raw: &str) -> Option<OffsetDateTime> {
 /// `at` shifted by `delta`, in the canonical shape. An unparsable `at`
 /// (never written by this module) comes back unchanged.
 fn shifted(at: &str, delta: time::Duration) -> String {
-    parse_at(at).map_or_else(|| at.to_owned(), |at| crate::config::rfc3339(at + delta))
+    parse_at(at)
+        .and_then(|at| at.checked_add(delta))
+        .map_or_else(|| at.to_owned(), crate::config::rfc3339)
 }
 
 // ── subscribers ────────────────────────────────────────────────────────────
@@ -1402,11 +1453,15 @@ fn due_host_offline(
     now: OffsetDateTime,
     clock: &TickClock,
 ) -> Result<usize, StoreError> {
-    let cutoff = crate::config::rfc3339(now - clock.host_grace);
-    if clock.booted_at > now - clock.host_grace {
+    let Some(cutoff_at) = now.checked_sub(clock.host_grace) else {
+        report_once("host-grace-out-of-range");
+        return Ok(0);
+    };
+    if clock.booted_at > cutoff_at {
         // Every link this process has not seen yet had the grace to return.
         return Ok(0);
     }
+    let cutoff = crate::config::rfc3339(cutoff_at);
     let due: Vec<(String, String)> = {
         let mut stmt = conn.prepare_cached(
             "SELECT l.host_id, l.lost_at FROM inbox_host_links l
@@ -1659,7 +1714,12 @@ fn due_stalls(conn: &Connection, now: OffsetDateTime) -> Result<usize, StoreErro
             let Some(since) = parse_at(opened) else {
                 continue;
             };
-            let stalled_at = since + time::Duration::minutes(threshold);
+            let Some(stalled_at) =
+                window_minutes(threshold).and_then(|window| since.checked_add(window))
+            else {
+                report_once("stall-tool-window-out-of-range");
+                continue;
+            };
             if stalled_at > now {
                 continue;
             }
@@ -1693,7 +1753,12 @@ fn due_stalls(conn: &Connection, now: OffsetDateTime) -> Result<usize, StoreErro
             let Some(quiet_since) = last.as_deref().and_then(parse_at) else {
                 continue;
             };
-            let stalled_at = quiet_since + time::Duration::minutes(threshold);
+            let Some(stalled_at) =
+                window_minutes(threshold).and_then(|window| quiet_since.checked_add(window))
+            else {
+                report_once("stall-window-out-of-range");
+                continue;
+            };
             if stalled_at > now {
                 continue;
             }
@@ -1743,7 +1808,12 @@ fn due_budgets(conn: &Connection, now: OffsetDateTime) -> Result<usize, StoreErr
         let Some(started_at) = parse_at(&started) else {
             continue;
         };
-        let deadline = started_at + time::Duration::minutes(max_wall_mins);
+        let Some(deadline) =
+            window_minutes(max_wall_mins).and_then(|window| started_at.checked_add(window))
+        else {
+            report_once("budget-window-out-of-range");
+            continue;
+        };
         if deadline > now {
             continue;
         }
@@ -1846,7 +1916,9 @@ pub(crate) async fn run_tick(state: &AppState) {
 
 /// The configured host-lost grace as a duration.
 pub(crate) fn host_grace(config: &crate::config::HubConfig) -> time::Duration {
-    time::Duration::milliseconds(i64::try_from(config.host_lost_grace_ms).unwrap_or(i64::MAX))
+    // Clamped here as well as at load: a caller that builds a config by hand
+    // may carry any value, and this is the last point before time arithmetic.
+    time::Duration::milliseconds(config.host_lost_grace_ms.min(MAX_CONFIGURED_MS) as i64)
 }
 
 impl Store {

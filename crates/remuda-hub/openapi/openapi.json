@@ -3046,7 +3046,9 @@
             "type": "integer"
           },
           "stallThresholdMins": {
-            "minimum": 0,
+            "description": "Quiet window before a busy, silent worker yields a stall fact, minutes (1 to 525600).",
+            "maximum": 525600,
+            "minimum": 1,
             "type": "integer"
           },
           "factOccurrenceCap": {
@@ -3055,7 +3057,8 @@
             "type": "integer"
           },
           "stallToolThresholdMins": {
-            "description": "Minutes a tool call may stay in flight before it yields one stall fact; absent means never.",
+            "description": "Minutes a tool call may stay in flight before it yields one stall fact (1 to 525600); absent means never.",
+            "maximum": 525600,
             "minimum": 1,
             "type": "integer"
           }
@@ -4308,6 +4311,9 @@
             "type": "string"
           },
           "maxWallMins": {
+            "description": "Wall-clock budget in minutes (1 to 525600). The Hub records one budget-expired fact for the dispatcher when it elapses and stops nothing.",
+            "maximum": 525600,
+            "minimum": 1,
             "type": "integer"
           }
         },

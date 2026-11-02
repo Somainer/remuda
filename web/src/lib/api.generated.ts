@@ -3273,8 +3273,9 @@ export interface components {
             maxDelegationDepth?: number;
             maxFanOutPerTask?: number;
             nudgeThrottleMins?: number;
+            /** @description Quiet window before a busy, silent worker yields a stall fact, minutes (1 to 525600). */
             stallThresholdMins?: number;
-            /** @description Minutes a tool call may stay in flight before it yields one stall fact; absent means never. */
+            /** @description Minutes a tool call may stay in flight before it yields one stall fact (1 to 525600); absent means never. */
             stallToolThresholdMins?: number;
         };
         ProjectCreate: {
@@ -3655,6 +3656,7 @@ export interface components {
         TaskBudget: {
             maxTurns?: number;
             maxUsd?: string;
+            /** @description Wall-clock budget in minutes (1 to 525600). The Hub records one budget-expired fact for the dispatcher when it elapses and stops nothing. */
             maxWallMins?: number;
         };
         /**

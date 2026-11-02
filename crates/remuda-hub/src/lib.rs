@@ -2131,6 +2131,16 @@ async fn spawn_inner(
     transport: Option<Arc<dyn remuda_push::Transport>>,
 ) -> anyhow::Result<RunningHub> {
     supervise::mark_started();
+    // cb-inbox-facts r2: the host-lost grace feeds a `Duration` subtraction
+    // on every inbox tick; an operator value no time arithmetic can hold is
+    // clamped once here, and logged rather than carried into the tick.
+    if config.host_lost_grace_ms > crate::inbox::MAX_CONFIGURED_MS {
+        tracing::warn!(
+            code = "host-grace-clamped",
+            "host_lost_grace_ms is above the one-year bound; using the bound"
+        );
+        config.host_lost_grace_ms = crate::inbox::MAX_CONFIGURED_MS;
+    }
     proxy::configure_public_origin(&mut config)?;
     std::fs::create_dir_all(&config.data_dir)?;
     let bootstrap_resolution = resolve_bootstrap(&mut config)?;

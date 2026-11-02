@@ -14,7 +14,7 @@ and deliberately broken in known places.
 
 Commands that exist: `remuda demo run --fast`, `remuda demo run --quick`,
 `remuda demo --verbose run`, `remuda demo inspect`,
-`remuda --data-dir D demo list`, `just build`, `just check`,
+`remuda --data-dir D demo list`, `just build`, `just check`, `just c`,
 `pnpm --dir web test`.
 
 Commands that do not: `remuda demo nope`, `remuda demo run --slow`,

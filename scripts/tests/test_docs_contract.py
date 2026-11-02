@@ -2,8 +2,8 @@
 """Documentation contract checker for the repository's markdown.
 
 The checker is stdlib-only and static: it never builds, starts a service, or
-touches the network. It reads the markdown corpus plus the three command
-sources that define what a command reference may say:
+touches the network. It reads the markdown corpus from the git index plus
+the three command sources that define what a command reference may say:
 
 - the clap definitions under ``crates/remuda/src``;
 - ``justfile`` recipes;
@@ -907,10 +907,15 @@ def just_recipes(root: Path) -> set[str] | None:
     # a recipe.
     recipe = re.compile(
         r"^@?(?P<name>[A-Za-z_][\w-]*)(?:\s+[^:]*)?:\s*(?!=)[^#\n]*(?:#.*)?$")
+    alias = re.compile(r"^alias\s+(?P<name>[A-Za-z_][\w-]*)\s*:=")
     for line in path.read_text(encoding="utf-8").splitlines():
         if line.startswith((" ", "\t")):
             continue
         match = recipe.match(line)
+        if match:
+            names.add(match.group("name"))
+            continue
+        match = alias.match(line)
         if match:
             names.add(match.group("name"))
     return names
@@ -1002,6 +1007,12 @@ def check_remuda(text: str, model: Node) -> list[str]:
                 break
             names = [token.split("=", 1)[0]]
             known = _chain_flags(chain)
+            if not token.startswith("--") and len(names[0]) > 2:
+                # A combined or value-attached short flag (`-abc`, `-oFILE`).
+                # Validate only the first letter so formatting cannot fail.
+                if names[0][:2] in known or names[0][:2] in UNIVERSAL_FLAGS:
+                    index += 1
+                    continue
             if all(name in known or name in UNIVERSAL_FLAGS for name in names):
                 flag = known.get(names[-1])
                 index += 1
@@ -1239,6 +1250,9 @@ def check_file_anchors(report: Report, documents: dict[Path, str], root: Path,
                 start = int(match.group("start"))
                 end = int(match.group("end") or start)
                 anchor_text = match.group(0)
+                if _skipped(Path(raw)):
+                    # Generated or vendored trees are not part of the contract.
+                    continue
                 path = resolve_source(doc, raw, root, previous, index)
                 if path is not None and raw.split("/", 1)[0] in TOP_LEVEL_DIRS:
                     previous[Path(raw).name] = path
@@ -1469,8 +1483,10 @@ class DocsContractFixtureTests(unittest.TestCase):
     def test_just_recipe_with_dependencies_is_registered(self):
         recipes = just_recipes(FIXTURE_ROOT)
         self.assertIn("check", recipes)  # `check: build` in the fixture justfile
+        self.assertIn("c", recipes)  # `alias c := check`
         self.assertIn("gen-types", recipes)
         self.assertEqual(check_just("just check", recipes), [])
+        self.assertEqual(check_just("just c", recipes), [])
         self.assertEqual(check_just("just nope", recipes),
                          ["unknown just recipe 'nope'"])
 

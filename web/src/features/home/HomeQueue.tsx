@@ -39,8 +39,9 @@ type ReceiptEntry = { receipt: Receipt | "sending"; card: HomeQueueCard; index: 
  * number is `glanceCounts()` — the same N as ① and the OS badge (§5.1).
  *
  * - collapsed: 3 cards on the phone, a 2×4 grid on desktop; 「还有 N 条 ▾」
- *   expands in place (not persisted) and the order holds still while a
- *   finger, focus or the expansion is on it (§3.3);
+ *   expands in place (not persisted; 「收起 ▴」 closes it). §3.3 holds the
+ *   order only while the reader interacts — a press, focus on a row control
+ *   or an open sheet — never merely because the expansion is open;
  * - hidden while the ledger search has text;
  * - `?focus=<id>` (push landing, §9) expands if needed, scrolls the card
  *   into view and rings it.
@@ -313,9 +314,9 @@ export function HomeQueue({
         })}
       </div>
       {expanded ? (
-        // Always offered while expanded — including after cards leave and
-        // nothing is hidden any more: the expansion holds the order (§4.1),
-        // so the reader must always have the control that releases it.
+        // Always offered while expanded, even after cards leave and nothing
+        // is hidden any more: 「收起 ▴」 just closes the expansion (it is not a
+        // hold — §3.3 holds only on a press, focus or an open sheet).
         <button
           type="button"
           className={css.more}

@@ -220,12 +220,6 @@ function card(page: Page, id: string): Locator {
   return page.locator(`[data-testid="home-queue-card"][data-card-id="${id}"]`);
 }
 
-/** Release the expansion hold (§4.1: expanded = held until collapsed). */
-async function collapseQueue(page: Page) {
-  const collapse = page.locator('[data-testid="home-queue-more"][aria-expanded="true"]');
-  if (await collapse.count()) await collapse.click();
-}
-
 /**
  * Wait until `id` is painted. The queue is live unless a finger is on it
  * (§3.3), so after one expansion a new card simply arrives on the next poll;
@@ -392,9 +386,6 @@ test.describe("home queue", () => {
       // `hqueue-race`: the fake Node refuses a second answer the way the real
       // Node does, so the Hub's own 409 reaches this device.
       const raced = await park(page, "mhome-blocked hqueue-race");
-      // The open queue holds its order (§4.1): collapse and re-expand to take
-      // in the card that arrived while it was frozen.
-      await collapseQueue(page);
       await showCard(page, raced.interactionId);
       const racedCard = card(page, raced.interactionId);
       await expect(racedCard).toBeVisible();

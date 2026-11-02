@@ -304,18 +304,22 @@ async fn get_project_http(
 }
 
 /// Refuse a configurable policy whose inbox windows are outside the range the
-/// Hub's tick can act on (`cb-inbox-facts` r2; 400).
+/// Hub's tick can act on (`cb-inbox-facts` r2; 400). `stallThresholdMins`
+/// keeps accepting 0 (its documented minimum, read as "the default window");
+/// `stallToolThresholdMins` has no 0 meaning (absent is "never").
 fn validate_configurable_minutes(
     policy: &remuda_protocol::ProjectConfigurablePolicy,
 ) -> Result<(), HubError> {
     crate::inbox::validate_configured_minutes(
         "policy.configurable.stallThresholdMins",
         Some(policy.stall_threshold_mins),
+        0,
     )
     .and_then(|()| {
         crate::inbox::validate_configured_minutes(
             "policy.configurable.stallToolThresholdMins",
             policy.stall_tool_threshold_mins,
+            1,
         )
     })
     .map_err(HubError::BadRequest)

@@ -1430,8 +1430,9 @@ fn budget_from(body: Option<BudgetBody>) -> Result<TaskBudget, HubError> {
         return Ok(TaskBudget::default());
     };
     // cb-inbox-facts r2: the wall budget becomes a duration on the inbox tick;
-    // refuse a value it could not turn into one (400).
-    crate::inbox::validate_configured_minutes("budget.maxWallMins", body.max_wall_mins)
+    // refuse a value it could not turn into one (400). 0 keeps meaning "no
+    // wall budget", as it did before the bound.
+    crate::inbox::validate_configured_minutes("budget.maxWallMins", body.max_wall_mins, 0)
         .map_err(HubError::BadRequest)?;
     Ok(TaskBudget {
         max_usd: body.max_usd,

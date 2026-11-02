@@ -1438,19 +1438,22 @@ async fn an_out_of_range_host_grace_is_clamped_at_load() -> Result<()> {
     Ok(())
 }
 
-/// The write routes refuse a window outside `1..=525600` minutes with 400,
-/// so the tick never sees one from a live caller.
+/// The write routes refuse a window the tick could not use with 400, so the
+/// tick never sees one from a live caller: above a year or negative for
+/// every window, and 0 for the tool window (absent is "never" there); the
+/// two older fields keep accepting 0, their documented "default"/"none".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn out_of_range_windows_are_rejected_at_the_routes() -> Result<()> {
     let ctx = Ctx::spawn().await?;
     let project = ctx.project("inbox-route-limits").await?;
-    for field in ["stallThresholdMins", "stallToolThresholdMins"] {
+    for (field, zero) in [("stallThresholdMins", 200), ("stallToolThresholdMins", 400)] {
         for (mins, status) in [
             (i64::MAX, 400),
-            (0, 400),
             (-1, 400),
             (525_601, 400),
+            (0, zero),
             (45, 200),
+            (525_600, 200),
         ] {
             let (got, body) = ctx
                 .request(
@@ -1471,7 +1474,13 @@ async fn out_of_range_windows_are_rejected_at_the_routes() -> Result<()> {
             }
         }
     }
-    for (mins, status) in [(i64::MAX, 400), (0, 400), (525_600, 200)] {
+    for (mins, status) in [
+        (i64::MAX, 400),
+        (-1, 400),
+        (525_601, 400),
+        (0, 200),
+        (525_600, 200),
+    ] {
         let (got, body) = ctx
             .request(
                 reqwest::Method::POST,

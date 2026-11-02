@@ -67,13 +67,19 @@ pub(crate) const MAX_CONFIGURED_MINUTES: i64 = 525_600;
 /// The same bound in milliseconds, for `host_lost_grace_ms`.
 pub(crate) const MAX_CONFIGURED_MS: u64 = MAX_CONFIGURED_MINUTES as u64 * 60_000;
 
-/// Refuse a configured minute value outside `1..=MAX_CONFIGURED_MINUTES`, so
-/// every stored window the tick reads can be a `Duration` added to a time.
+/// Refuse a configured minute value outside `min..=MAX_CONFIGURED_MINUTES`,
+/// so every stored window the tick reads can be a `Duration` added to a
+/// time. `min` is 0 for the fields where 0 already meant "the default" or
+/// "none" before this bound existed, 1 for a field with no such meaning.
 /// `None` is "not set" and is admitted; the error text is the 400 body.
-pub(crate) fn validate_configured_minutes(field: &str, minutes: Option<i64>) -> Result<(), String> {
+pub(crate) fn validate_configured_minutes(
+    field: &str,
+    minutes: Option<i64>,
+    min: i64,
+) -> Result<(), String> {
     match minutes {
-        Some(minutes) if !(1..=MAX_CONFIGURED_MINUTES).contains(&minutes) => Err(format!(
-            "{field} must be between 1 and {MAX_CONFIGURED_MINUTES} minutes (got {minutes})"
+        Some(minutes) if !(min..=MAX_CONFIGURED_MINUTES).contains(&minutes) => Err(format!(
+            "{field} must be between {min} and {MAX_CONFIGURED_MINUTES} minutes (got {minutes})"
         )),
         _ => Ok(()),
     }

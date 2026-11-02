@@ -1178,6 +1178,85 @@ async fn a_wall_budget_yields_one_fact_and_kills_nothing() -> Result<()> {
     Ok(())
 }
 
+// ─── logs (§10.1 item 9) ────────────────────────────────────────────────────
+
+/// Everything the inbox logs in this test binary, captured once.
+fn inbox_logs() -> std::sync::Arc<std::sync::Mutex<Vec<u8>>> {
+    static LOGS: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<Vec<u8>>>> =
+        std::sync::OnceLock::new();
+    LOGS.get_or_init(|| {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(
+                "remuda_hub::inbox=trace",
+            ))
+            .with_ansi(false)
+            .with_writer(move || Sink(sink.clone()))
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).expect("one log capture");
+        buffer
+    })
+    .clone()
+}
+
+struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Sink {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log buffer").extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The inbox logs the kind, the outcome, counts and error codes; never the
+/// fact's text or anything a worker wrote, even when the fact carries it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbox_logs_carry_categories_and_counts_never_fact_text() -> Result<()> {
+    let logs = inbox_logs();
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("inbox-logs").await?;
+    let (seat, seat_token) = ctx.coordinator(&project).await?;
+    let worker = ctx.worker(&seat_token, &project).await?;
+    let marker = "worker-said-ZQ7XK2-confidential";
+    ctx.journal(&worker, entity("running", &at(0))).await?;
+    ctx.journal(&worker, turn_started("cmd_logs", &at(1)))
+        .await?;
+    let mut ask = question("int_logs_1", &at(2));
+    ask["payload"]["interaction"]["request"]["title"] = json!(marker);
+    ctx.journal(&worker, ask).await?;
+    ctx.journal(
+        &worker,
+        turn_result("error", Some("cmd_logs"), true, Some(marker), &at(3)),
+    )
+    .await?;
+
+    // The fact carries the worker's text (it is the agent's to read)…
+    let items = ctx.inbox(&seat_token, &seat).await?;
+    let failed = items
+        .iter()
+        .find(|f| f["kind"] == "turn-failed")
+        .context("turn-failed fact")?;
+    assert_eq!(failed["payload"]["error"], marker);
+
+    // …the log does not. It names the kind, the outcome and the count.
+    let text = String::from_utf8(logs.lock().expect("log buffer").clone())?;
+    assert!(
+        text.lines().any(|line| line.contains("inbox fact")
+            && line.contains("kind=\"turn-failed\"")
+            && line.contains("outcome=\"recorded\"")
+            && line.contains("occurrences=1")),
+        "{text}"
+    );
+    assert!(!text.contains(marker), "{text}");
+    assert!(!text.contains(&worker), "no ids either: {text}");
+    Ok(())
+}
+
 // ─── backup ─────────────────────────────────────────────────────────────────
 
 fn repo_root() -> PathBuf {

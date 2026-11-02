@@ -576,22 +576,26 @@ pub(crate) fn record(
     subscriber: &str,
     mut fact: Fact,
 ) -> Result<Outcome, StoreError> {
-    let outcome = record_inner(conn, subscriber, &mut fact)?;
+    let (outcome, occurrences) = record_inner(conn, subscriber, &mut fact)?;
+    // §10.1 item 9: the kind, the outcome and a count; never the payload,
+    // the subscriber's text, or anything a worker or tool wrote.
     tracing::debug!(
         kind = fact.kind.as_str(),
         outcome = outcome.label(),
+        occurrences,
         "inbox fact"
     );
     Ok(outcome)
 }
 
+/// The outcome and the window's occurrence count (0 when none was counted).
 fn record_inner(
     conn: &Connection,
     subscriber: &str,
     fact: &mut Fact,
-) -> Result<Outcome, StoreError> {
+) -> Result<(Outcome, i64), StoreError> {
     if !receives(conn, subscriber, fact.kind)? {
-        return Ok(Outcome::NotReceived);
+        return Ok((Outcome::NotReceived, 0));
     }
     let key = dedupe_key(fact.kind, &fact.key_subject, fact.run, &fact.entered_at);
     let seen: bool = conn.query_row(
@@ -603,7 +607,7 @@ fn record_inner(
         |row| row.get(0),
     )?;
     if seen {
-        return Ok(Outcome::Duplicate);
+        return Ok((Outcome::Duplicate, 0));
     }
     let cap = occurrence_cap(conn, fact.project_id.as_deref())?;
     let window_start = shifted(
@@ -654,7 +658,7 @@ fn record_inner(
         ],
     )?;
     if !admitted {
-        return Ok(Outcome::Capped);
+        return Ok((Outcome::Capped, earlier + 1));
     }
     let occurrence = InboxOccurrence {
         count: earlier + 1,
@@ -682,7 +686,7 @@ fn record_inner(
             now_rfc3339()
         ],
     )?;
-    Ok(Outcome::Recorded(conn.last_insert_rowid()))
+    Ok((Outcome::Recorded(conn.last_insert_rowid()), earlier + 1))
 }
 
 /// Record a fact about one instance for that instance's subscriber, if it

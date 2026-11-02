@@ -421,8 +421,24 @@ pub(crate) fn transition(conn: &Connection, cause: Transition<'_>) -> Result<usi
     Ok(lifted)
 }
 
-/// [`transition`] inside a savepoint (see [`guard`]).
+/// Whether any suppression is still unlifted: with none, no transition has
+/// anything to lift. A read error answers yes, so the guarded hook runs and
+/// reports it.
+pub(crate) fn any_active(conn: &Connection) -> bool {
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM push_suppressions WHERE lifted_at IS NULL)",
+        [],
+        |row| row.get::<_, bool>(0),
+    )
+    .unwrap_or(true)
+}
+
+/// [`transition`] inside a savepoint (see [`guard`]); skipped outright while
+/// nothing is suppressed.
 pub(crate) fn transition_guarded(conn: &Connection, cause: Transition<'_>) {
+    if !any_active(conn) {
+        return;
+    }
     guard("transition", conn, || transition(conn, cause));
 }
 
@@ -716,13 +732,15 @@ fn final_message_line(
     Ok(first_line(&text))
 }
 
-/// The first non-empty line of `text`, truncated with an ellipsis.
+/// The first non-empty line of `text`, credential-shaped content redacted
+/// (item 6: a push body never carries a secret), truncated with an ellipsis.
 fn first_line(text: &str) -> String {
     let line = text
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
         .unwrap_or("");
+    let line = crate::digest::redact_secrets(line);
     let mut out: String = line.chars().take(REPLY_LINE_CHARS).collect();
     if line.chars().count() > REPLY_LINE_CHARS {
         out.push('…');
@@ -970,6 +988,19 @@ pub(crate) async fn log_push(state: &AppState, entry: LogEntry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_reply_line_never_carries_a_credential() {
+        // Split so no source line reads as a token (scripts/ci/secret-scan.py
+        // scans this file too); the redactor sees the real shape at run time.
+        let token = ["gh", "p_abcdefghijklmnopqrstuvwxyz0123456789"].concat();
+        let line = first_line(&format!("Pushed with {token} as asked.\nmore"));
+        assert!(!line.contains(&token), "{line}");
+        assert!(
+            line.starts_with("Pushed with ") && line.ends_with(" as asked."),
+            "{line}"
+        );
+    }
 
     #[test]
     fn the_first_line_is_trimmed_and_truncated() {

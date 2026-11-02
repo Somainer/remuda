@@ -3629,7 +3629,7 @@ impl Store {
             // D-057 §8.3: host-loss detection under the same grace is a
             // cause of "effectively running" turning false for the parent
             // lineages on each lost host (at boot it is the grace path).
-            let lost: Vec<String> = {
+            let lost: Vec<String> = if crate::push_route::any_active(&tx) {
                 let mut stmt = tx.prepare(
                     "SELECT id FROM hosts WHERE state != 'online' AND
                     (NOT EXISTS (SELECT 1 FROM ssh_hosts WHERE host_id = hosts.id) OR state = 'daemon-unreachable') AND
@@ -3637,6 +3637,8 @@ impl Store {
                 )?;
                 stmt.query_map(params![&now, grace], |row| row.get(0))?
                     .collect::<rusqlite::Result<Vec<_>>>()?
+            } else {
+                Vec::new()
             };
             for host_id in &lost {
                 crate::push_route::transition_guarded(

@@ -49,7 +49,7 @@ use crate::error::{HubError, NextStep, action};
 use crate::store::{Device, Store, StoreError, immediate_tx};
 use axum::Json;
 use axum::Router;
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -83,6 +83,15 @@ const MAX_SOURCE_REFS: usize = 64;
 const MAX_CONSOLIDATE_SOURCES: usize = 32;
 /// Entries per Phase 1 import.
 const MAX_IMPORT_ENTRIES: usize = 512;
+/// The import route's request body limit: every entry at the 8 KiB cap with
+/// its text escaped to twice that in JSON (newlines, quotes), plus 1 KiB per
+/// entry for its keys, slug, type and origin, plus the envelope. Larger is
+/// 413 before the body is parsed. It is set on this route alone: the
+/// default (2 MB) would refuse a legitimate full import.
+pub(crate) const IMPORT_BODY_LIMIT: usize =
+    MAX_IMPORT_ENTRIES * (2 * MEMORY_ENTRY_HARD_BYTES as usize + 1024) + 4096;
+// protocol.md §8.4 and the OpenAPI description state this number.
+const _: () = assert!(IMPORT_BODY_LIMIT == 8_916_992);
 /// What the import's same-content check trims from a body, on both sides.
 const IMPORT_TRIM: [char; 4] = [' ', '\t', '\n', '\r'];
 /// Search terms considered (whitespace-separated).
@@ -2221,7 +2230,10 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/lineages/{id}/memory/search", get(search))
         .route("/v1/lineages/{id}/memory/consolidate", post(consolidate))
         .route("/v1/lineages/{id}/memory/restore", post(restore))
-        .route("/v1/lineages/{id}/memory/import", post(import))
+        .route(
+            "/v1/lineages/{id}/memory/import",
+            post(import).layer(DefaultBodyLimit::max(IMPORT_BODY_LIMIT)),
+        )
         .route("/v1/memory/derived", get(derived))
         // The transcript's write rows: one writer chapter's log, Human/Bot
         // callers only. Deliberately absent from `restrict_agent_routes`, so

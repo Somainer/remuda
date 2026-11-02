@@ -1171,3 +1171,61 @@ async fn the_import_is_owner_only_linted_and_all_or_nothing() -> Result<()> {
     assert_eq!(reply.status, 404, "{}", reply.text);
     Ok(())
 }
+
+/// The import is bounded per entry (the same 8 KiB cap as a create) and as a
+/// whole (the route's body limit), and a full legitimate import, above the
+/// framework's 2 MB default, is accepted.
+#[tokio::test]
+async fn the_import_is_bounded_per_entry_and_per_request() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let lineage = ctx.seat().await?;
+    let path = mem(&lineage, "/import");
+    let before = ctx.snapshot(&lineage, &lineage).await?;
+
+    // One entry over the cap refuses the import: 413, nothing stored.
+    let big = "y".repeat(8 * 1024 + 1);
+    let reply = ctx
+        .call(
+            "POST",
+            &path,
+            &ctx.human,
+            Some(json!({"entries": [import_entry("small", "agent", "fine"),
+                                    import_entry("big", "agent", &big)]})),
+        )
+        .await?;
+    assert_eq!(reply.status, 413, "{}", reply.text);
+    assert_eq!(
+        reply.body["code"], "MEMORY_ENTRY_TOO_LARGE",
+        "{}",
+        reply.text
+    );
+    assert_eq!(reply.body["slug"], "big");
+    assert_eq!(ctx.snapshot(&lineage, &lineage).await?, before);
+
+    // A body over the route limit is refused before it is parsed.
+    let limit = 512 * (2 * 8 * 1024 + 1024) + 4096;
+    let padding = "z".repeat(limit + 1);
+    let response = ctx
+        .http
+        .post(format!("http://{}{path}", ctx.hub.addr))
+        .bearer_auth(&ctx.human)
+        .header("content-type", "application/json")
+        .body(format!(r#"{{"entries":[],"pad":"{padding}"}}"#))
+        .send()
+        .await?;
+    assert_eq!(response.status().as_u16(), 413);
+    assert_eq!(ctx.snapshot(&lineage, &lineage).await?, before);
+
+    // 512 entries just under the cap (over 3 MiB of JSON) are accepted.
+    let entries: Vec<Value> = (0..512)
+        .map(|i| {
+            let body = format!("{i:04} {}", "w".repeat(8 * 1024 - 200));
+            import_entry(&format!("full-{i}"), "agent", &body)
+        })
+        .collect();
+    let request = json!({"entries": entries, "dryRun": true});
+    assert!(request.to_string().len() > 3 * 1024 * 1024);
+    let full = ctx.ok("POST", &path, &ctx.human, Some(request)).await?;
+    assert_eq!(full["created"].as_array().map(Vec::len), Some(512));
+    Ok(())
+}

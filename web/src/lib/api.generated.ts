@@ -3776,7 +3776,7 @@ export interface components {
             providerProfileId?: string;
             reclaimedBytes?: string;
             replaceCount?: string;
-            /** @description cb-requested-by: the owner's words behind an Agent dispatch, or the non-owner origin; absent on Human/Bot dispatches. */
+            /** @description cb-requested-by: a reference to the owner's command behind an Agent dispatch, or the non-owner origin; never the owner's words (those are hydrated at read time for a Human reader). Absent on Human/Bot dispatches. */
             requestedBy?: components["schemas"]["RequestedBy"];
             resumedFrom?: string;
             revision: string;

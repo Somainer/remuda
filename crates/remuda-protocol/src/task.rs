@@ -321,10 +321,12 @@ pub struct Task {
     /// as `None` and serialise byte-identically (no migration).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_binding: Option<TaskSpaceBinding>,
-    /// cb-requested-by: for a task an Agent created, who asked for it — the
-    /// owner's command and words when the root turn was the owner's, else the
-    /// non-owner origin that started the turn. Record only, never a gate;
-    /// absent on human-created tasks and on rows written before the field.
+    /// cb-requested-by: for a task an Agent created, who asked for it — a
+    /// reference only: the owner's command id when the root turn was the
+    /// owner's, else the non-owner origin that started the turn. The owner's
+    /// words are never stored with it; they are hydrated at read time for a
+    /// Human reader. Record only, never a gate; absent on human-created tasks
+    /// and on rows written before the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_by: Option<RequestedBy>,
 }

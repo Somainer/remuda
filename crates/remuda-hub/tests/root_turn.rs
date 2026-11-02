@@ -998,12 +998,13 @@ async fn a_gate_job_records_the_root_turn_it_was_enqueued_in() -> Result<()> {
     Ok(())
 }
 
-// ── cb-requested-by: the owner's words behind an Agent dispatch or task ─────
+// ── cb-requested-by: the owner's command behind an Agent dispatch or task ───
 
-/// An Agent's worker dispatch in an owner turn records the owner's command and
-/// words on the approval card it opens and on the roster row it finally
-/// writes. A body-supplied `requestedBy` is ignored: the record comes from the
-/// Hub's own command row.
+/// An Agent's worker dispatch in an owner turn records the owner's command (a
+/// reference) on the approval card it opens and on the roster row it finally
+/// writes; the owner's words are hydrated at read time for a Human reader. A
+/// body-supplied `requestedBy` is ignored: the record comes from the Hub's own
+/// command row.
 #[tokio::test]
 async fn an_agent_dispatch_carries_the_owners_words_from_an_owner_turn() -> Result<()> {
     let (ctx, mut node) = Ctx::boot().await?;
@@ -1263,7 +1264,8 @@ async fn a_requested_by_never_changes_an_authorization_decision() -> Result<()> 
     Ok(())
 }
 
-/// An Agent-created task records the owner's words on its `doc_json`, and the
+/// An Agent-created task records a reference to the owner's command on its
+/// `doc_json` (the words are hydrated for a Human read, never stored), and the
 /// record survives a read and a split (the child records its own creation).
 #[tokio::test]
 async fn an_agent_created_task_records_the_owners_words() -> Result<()> {

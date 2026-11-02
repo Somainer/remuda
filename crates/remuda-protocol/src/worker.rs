@@ -1002,10 +1002,12 @@ pub struct WorkerRoster {
     /// rows written before D-057 §4.2 recorded it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<String>,
-    /// cb-requested-by: for a dispatch an Agent made, who asked for it — the
-    /// owner's command and words when the root turn was the owner's, else the
-    /// non-owner origin that started the turn. Record only, never a gate;
-    /// absent on Human/Bot dispatches and on rows written before the field.
+    /// cb-requested-by: for a dispatch an Agent made, who asked for it — a
+    /// reference only: the owner's command id when the root turn was the
+    /// owner's, else the non-owner origin that started the turn. The owner's
+    /// words are never stored with it (they are hydrated at read time for a
+    /// Human reader of the approval card). Record only, never a gate; absent
+    /// on Human/Bot dispatches and on rows written before the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_by: Option<crate::RequestedBy>,
 }

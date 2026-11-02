@@ -19940,7 +19940,7 @@
               "type": "null"
             }
           ],
-          "description": "cb-requested-by: for a task an Agent created, who asked for it — the\nowner's command and words when the root turn was the owner's, else the\nnon-owner origin that started the turn. Record only, never a gate;\nabsent on human-created tasks and on rows written before the field."
+          "description": "cb-requested-by: for a task an Agent created, who asked for it — a\nreference only: the owner's command id when the root turn was the\nowner's, else the non-owner origin that started the turn. The owner's\nwords are never stored with it; they are hydrated at read time for a\nHuman reader. Record only, never a gate; absent on human-created tasks\nand on rows written before the field."
         },
         "revision": {
           "$ref": "#/$defs/U64",
@@ -22051,7 +22051,7 @@
               "type": "null"
             }
           ],
-          "description": "cb-requested-by: for a dispatch an Agent made, who asked for it — the\nowner's command and words when the root turn was the owner's, else the\nnon-owner origin that started the turn. Record only, never a gate;\nabsent on Human/Bot dispatches and on rows written before the field."
+          "description": "cb-requested-by: for a dispatch an Agent made, who asked for it — a\nreference only: the owner's command id when the root turn was the\nowner's, else the non-owner origin that started the turn. The owner's\nwords are never stored with it (they are hydrated at read time for a\nHuman reader of the approval card). Record only, never a gate; absent\non Human/Bot dispatches and on rows written before the field."
         },
         "resumedFrom": {
           "anyOf": [

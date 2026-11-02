@@ -12,6 +12,14 @@
 //!   records who the entry came from; a file that records none was written
 //!   by the seat on its own and imports as `agent`.
 //!
+//! Only regular files directly inside the directory are read. A symbolic
+//! link, a directory, a FIFO or a device is skipped and reported, never
+//! opened for reading: each name is checked with `lstat`, opened with
+//! `O_NOFOLLOW | O_NONBLOCK`, checked again on the open handle, and its
+//! canonical path must sit directly in the canonical source directory. A
+//! source directory that is itself a link is refused. Each file is read up to
+//! [`MAX_FILE_BYTES`].
+//!
 //! Every file is read before anything is sent. "Not found" is empty — a
 //! missing directory imports nothing, a file that vanished between listing
 //! and reading is skipped — but any other read failure (permission, I/O) is
@@ -33,27 +41,128 @@ use super::hub_client::{HubClient, hub_http_error, print_json};
 /// The index file of a Phase 1 memory directory; not an entry itself.
 const INDEX_FILE: &str = "MEMORY.md";
 
+/// The most bytes read from one file. An entry holds at most 8 KiB of
+/// title, description and body; the rest is front matter and slack.
+pub(crate) const MAX_FILE_BYTES: u64 = 64 * 1024;
+
+/// What opening one name in the source directory gave.
+#[derive(Debug)]
+pub(crate) enum Opened {
+    /// A regular file directly in the directory, and its text.
+    Text(String),
+    /// Not read, and why: a link, a directory, a FIFO, a device, a file
+    /// outside the directory, an oversized file.
+    Skipped(String),
+}
+
 /// Filesystem access for the import, so tests can inject read failures.
 pub(crate) trait MemoryFiles {
+    /// The source directory as it will be read: refused when it is a link
+    /// or not a directory; its canonical path otherwise.
+    fn source(&self, dir: &Path) -> io::Result<Result<PathBuf, String>>;
     /// Paths of the directory's entries (files and directories alike).
     fn list(&self, dir: &Path) -> io::Result<Vec<PathBuf>>;
-    /// A file's text.
-    fn read(&self, path: &Path) -> io::Result<String>;
+    /// A file directly in `root` (canonical), read only if it is a regular
+    /// file there, up to [`MAX_FILE_BYTES`].
+    fn read(&self, root: &Path, path: &Path) -> io::Result<Opened>;
 }
 
 /// The real filesystem.
 pub(crate) struct DiskFiles;
 
+/// What an `lstat` or `fstat` type names, for a skip reason.
+fn kind_of(file_type: std::fs::FileType) -> &'static str {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        if file_type.is_fifo() {
+            return "a FIFO";
+        }
+        if file_type.is_socket() {
+            return "a socket";
+        }
+        if file_type.is_block_device() || file_type.is_char_device() {
+            return "a device";
+        }
+    }
+    if file_type.is_symlink() {
+        "a symbolic link"
+    } else if file_type.is_dir() {
+        "a directory"
+    } else if file_type.is_file() {
+        "a regular file"
+    } else {
+        "not a regular file"
+    }
+}
+
 impl MemoryFiles for DiskFiles {
+    fn source(&self, dir: &Path) -> io::Result<Result<PathBuf, String>> {
+        let meta = std::fs::symlink_metadata(dir)?;
+        if !meta.file_type().is_dir() {
+            return Ok(Err(format!(
+                "the source {} is {}, not a directory; pass the directory's own path",
+                dir.display(),
+                kind_of(meta.file_type())
+            )));
+        }
+        Ok(Ok(std::fs::canonicalize(dir)?))
+    }
+
     fn list(&self, dir: &Path) -> io::Result<Vec<PathBuf>> {
         std::fs::read_dir(dir)?
             .map(|entry| entry.map(|entry| entry.path()))
             .collect()
     }
 
-    fn read(&self, path: &Path) -> io::Result<String> {
-        let bytes = std::fs::read(path)?;
+    fn read(&self, root: &Path, path: &Path) -> io::Result<Opened> {
+        use std::io::Read;
+        let skipped = |kind: &str| {
+            Ok(Opened::Skipped(format!(
+                "{kind}; only regular files are read"
+            )))
+        };
+        let before = std::fs::symlink_metadata(path)?;
+        if !before.file_type().is_file() {
+            return skipped(kind_of(before.file_type()));
+        }
+        // The name may be swapped between the lstat and the open: never
+        // follow a final link, never block on a FIFO, and check the handle.
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use nix::fcntl::OFlag;
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags((OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK).bits());
+        }
+        let file = match options.open(path) {
+            Ok(file) => file,
+            #[cfg(unix)]
+            Err(error) if error.raw_os_error() == Some(nix::libc::ELOOP) => {
+                return skipped("a symbolic link");
+            }
+            Err(error) => return Err(error),
+        };
+        let opened = file.metadata()?;
+        if !opened.file_type().is_file() {
+            return skipped(kind_of(opened.file_type()));
+        }
+        let canonical = std::fs::canonicalize(path)?;
+        if canonical.parent() != Some(root) {
+            return Ok(Opened::Skipped(
+                "outside the source directory; only its own files are read".into(),
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_FILE_BYTES {
+            return Ok(Opened::Skipped(format!(
+                "larger than {MAX_FILE_BYTES} bytes; a memory entry holds at most 8 KiB"
+            )));
+        }
         String::from_utf8(bytes)
+            .map(Opened::Text)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.utf8_error()))
     }
 }
@@ -67,6 +176,9 @@ pub(crate) struct Collected {
     pub sources: Vec<String>,
     /// Files that were empty or vanished (not found) before they were read.
     pub empty: Vec<String>,
+    /// Names that were not read, with the reason (links, directories,
+    /// FIFOs, devices, oversized files).
+    pub skipped: Vec<(String, String)>,
     /// Entries whose file recorded no origin (imported as `agent`).
     pub origin_defaulted: usize,
     /// The directory itself was not found.
@@ -88,6 +200,19 @@ fn name_of(path: &Path) -> String {
 /// file; all of them are reported at once.
 pub(crate) fn collect(dir: &Path, files: &dyn MemoryFiles) -> anyhow::Result<Collected> {
     let mut collected = Collected::default();
+    let root = match files.source(dir) {
+        Ok(Ok(root)) => root,
+        Ok(Err(refusal)) => bail!("{refusal}; nothing was imported"),
+        Err(error) if not_found(&error) => {
+            collected.missing = true;
+            return Ok(collected);
+        }
+        Err(error) => bail!(
+            "cannot read the memory directory {}: {error}; nothing was imported",
+            dir.display()
+        ),
+    };
+    let dir = root.as_path();
     let mut paths = match files.list(dir) {
         Ok(paths) => paths,
         Err(error) if not_found(&error) => {
@@ -101,8 +226,12 @@ pub(crate) fn collect(dir: &Path, files: &dyn MemoryFiles) -> anyhow::Result<Col
     };
     paths.sort();
     let mut problems = Vec::new();
-    let index = match files.read(&dir.join(INDEX_FILE)) {
-        Ok(text) => parse_index(&text),
+    let index = match files.read(dir, &dir.join(INDEX_FILE)) {
+        Ok(Opened::Text(text)) => parse_index(&text),
+        Ok(Opened::Skipped(reason)) => {
+            collected.skipped.push((INDEX_FILE.to_string(), reason));
+            BTreeMap::new()
+        }
         Err(error) if not_found(&error) => BTreeMap::new(),
         Err(error) => {
             problems.push(format!("{INDEX_FILE}: cannot read it: {error}"));
@@ -114,8 +243,12 @@ pub(crate) fn collect(dir: &Path, files: &dyn MemoryFiles) -> anyhow::Result<Col
         if name == INDEX_FILE || name.starts_with('.') || !name.ends_with(".md") {
             continue;
         }
-        let text = match files.read(&path) {
-            Ok(text) => text,
+        let text = match files.read(dir, &path) {
+            Ok(Opened::Text(text)) => text,
+            Ok(Opened::Skipped(reason)) => {
+                collected.skipped.push((name, reason));
+                continue;
+            }
             Err(error) if not_found(&error) => {
                 collected.empty.push(name);
                 continue;
@@ -346,6 +479,11 @@ pub(crate) async fn run_import(
         "missing": collected.missing,
         "files": collected.sources,
         "empty": collected.empty,
+        "skipped": collected
+            .skipped
+            .iter()
+            .map(|(name, reason)| json!({"file": name, "reason": reason}))
+            .collect::<Vec<_>>(),
         "originDefaulted": collected.origin_defaulted,
     });
     if collected.entries.is_empty() {
@@ -365,6 +503,9 @@ pub(crate) async fn run_import(
             );
             for name in &collected.empty {
                 println!("empty    {name}");
+            }
+            for (name, reason) in &collected.skipped {
+                println!("not read {name}: {reason}");
             }
         }
         return Ok(value);
@@ -427,6 +568,9 @@ fn summary(value: &Value, collected: &Collected) -> String {
     }
     for name in &collected.empty {
         out.push_str(&format!("empty    {name}\n"));
+    }
+    for (name, reason) in &collected.skipped {
+        out.push_str(&format!("not read {name}: {reason}\n"));
     }
     if collected.origin_defaulted > 0 {
         out.push_str(&format!(
@@ -501,14 +645,18 @@ mod tests {
     }
 
     impl MemoryFiles for Faulty {
+        fn source(&self, dir: &Path) -> io::Result<Result<PathBuf, String>> {
+            DiskFiles.source(dir)
+        }
+
         fn list(&self, dir: &Path) -> io::Result<Vec<PathBuf>> {
             self.fault(dir)?;
             DiskFiles.list(dir)
         }
 
-        fn read(&self, path: &Path) -> io::Result<String> {
+        fn read(&self, root: &Path, path: &Path) -> io::Result<Opened> {
             self.fault(path)?;
-            DiskFiles.read(path)
+            DiskFiles.read(root, path)
         }
     }
 
@@ -655,6 +803,147 @@ mod tests {
         );
         assert!(error.contains("nothing was imported"), "{error}");
         assert!(!error.contains("Zq8vR2nL"), "{error}");
+    }
+
+    /// A source directory with a private file and a directory beside it,
+    /// and links inside it that point out of it (and a FIFO, when asked).
+    #[cfg(unix)]
+    fn planted(fifo: bool) -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(
+            outside.join("private.md"),
+            "---\nname: private\ndescription: not the seat's\ntype: user\n---\nprivate text\n",
+        )
+        .unwrap();
+        std::fs::write(
+            outside.join(INDEX_FILE),
+            "- [Planted title](devbox.md) — planted hook\n",
+        )
+        .unwrap();
+        let dir = root.path().join("phase1");
+        std::fs::create_dir(&dir).unwrap();
+        phase1(&dir);
+        std::os::unix::fs::symlink(outside.join("private.md"), dir.join("notes.md")).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("folder.md")).unwrap();
+        if fifo {
+            nix::unistd::mkfifo(&dir.join("pipe.md"), nix::sys::stat::Mode::S_IRWXU).unwrap();
+        }
+        (root, dir)
+    }
+
+    /// `collect` on a thread, so a read that blocks (a FIFO) fails the test
+    /// instead of hanging it.
+    #[cfg(unix)]
+    fn collect_bounded(dir: PathBuf) -> anyhow::Result<Collected> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(collect(&dir, &DiskFiles));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(20))
+            .expect("collect blocked: it opened something that is not a regular file")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_out_of_the_directory_are_never_followed() {
+        let (_root, dir) = planted(false);
+        // The index is a link too, to a planted index outside.
+        std::fs::remove_file(dir.join(INDEX_FILE)).unwrap();
+        std::os::unix::fs::symlink(
+            dir.parent().unwrap().join("outside").join(INDEX_FILE),
+            dir.join(INDEX_FILE),
+        )
+        .unwrap();
+        let collected = collect_bounded(dir).unwrap();
+        assert_eq!(
+            collected.sources,
+            ["devbox.md", "gate-order.md", "status-outcome-first.md"]
+        );
+        assert!(collected.entries.iter().all(|e| e.slug != "private"));
+        assert!(
+            collected
+                .entries
+                .iter()
+                .all(|e| e.title != "Planted title" && !e.body.contains("private text"))
+        );
+        let reasons: BTreeMap<&str, &str> = collected
+            .skipped
+            .iter()
+            .map(|(name, reason)| (name.as_str(), reason.as_str()))
+            .collect();
+        assert_eq!(
+            reasons.keys().copied().collect::<Vec<_>>(),
+            [INDEX_FILE, "folder.md", "notes.md"]
+        );
+        for reason in reasons.values() {
+            assert!(reason.starts_with("a symbolic link"), "{reasons:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_is_never_opened_for_reading() {
+        let (_root, dir) = planted(true);
+        let collected = collect_bounded(dir).unwrap();
+        assert!(!collected.sources.iter().any(|s| s == "pipe.md"));
+        assert!(
+            collected
+                .skipped
+                .iter()
+                .any(|(name, reason)| name == "pipe.md" && reason.starts_with("a FIFO")),
+            "{:?}",
+            collected.skipped
+        );
+    }
+
+    #[test]
+    fn a_file_whose_canonical_path_is_not_in_the_source_is_not_read() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let other = root.path().join("other");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        std::fs::write(other.join("note.md"), "private").unwrap();
+        let source = std::fs::canonicalize(&source).unwrap();
+        // A name that resolves elsewhere (here: a parent component) is not
+        // read even though the file itself is regular.
+        let elsewhere = source.join("..").join("other").join("note.md");
+        match DiskFiles.read(&source, &elsewhere).unwrap() {
+            Opened::Skipped(reason) => assert!(reason.starts_with("outside"), "{reason}"),
+            Opened::Text(text) => panic!("read {text:?}"),
+        }
+    }
+
+    #[test]
+    fn an_oversized_file_is_read_only_up_to_the_limit_and_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        phase1(dir.path());
+        let mut big = String::from("---\nname: big\ndescription: d\ntype: project\n---\n");
+        big.push_str(&"x".repeat(MAX_FILE_BYTES as usize));
+        std::fs::write(dir.path().join("big.md"), big).unwrap();
+        let collected = collect(dir.path(), &DiskFiles).unwrap();
+        assert!(collected.entries.iter().all(|e| e.slug != "big"));
+        assert_eq!(collected.skipped.len(), 1, "{:?}", collected.skipped);
+        assert_eq!(collected.skipped[0].0, "big.md");
+        assert!(
+            collected.skipped[0]
+                .1
+                .starts_with("larger than 65536 bytes")
+        );
+        assert_eq!(collected.entries.len(), 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_source_directory_that_is_a_link_is_refused() {
+        let (root, dir) = planted(false);
+        let link = root.path().join("linked");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        let error = collect_bounded(link).unwrap_err().to_string();
+        assert!(error.contains("symbolic link"), "{error}");
+        assert!(error.contains("nothing was imported"), "{error}");
     }
 
     #[tokio::test]

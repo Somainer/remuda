@@ -24,6 +24,18 @@
 //!   token, so a two-character query such as 边界 only hits by substring.
 //! - **Sizes.** Soft warnings (entry 2 KB, index 4 KB) report the actual
 //!   numbers; above 8 KB an entry is refused.
+//! - **Secret lint** (main-agent.md §12.5). Every write that stores text —
+//!   create, update, consolidate target and the Phase 1 import — runs the
+//!   shared credential shapes ([`crate::secret_lint`]) over the slug, title,
+//!   description and body before the writer job. A hit is a 422
+//!   `MEMORY_SECRET_REJECTED` naming the field and rule, never the text, and
+//!   nothing is stored. It is a lint on secrets only (D-060 R2).
+//! - **Phase 1 import** (main-agent.md §12.4). The owner imports a seat's
+//!   workspace memory files once: one writer transaction creates what is new
+//!   with the origin each file recorded, skips duplicates by slug and by
+//!   content, and never overwrites or deletes. A dry run decides the same and
+//!   rolls back. Reading the files (and refusing on any read error but "not
+//!   found") is the CLI's half, `remuda memory import`.
 //!
 //! The FTS table is external-content over `memory_entries` and kept in sync by
 //! triggers, so every write path (including the retire archive) updates it in
@@ -37,7 +49,7 @@ use crate::error::{HubError, NextStep, action};
 use crate::store::{Device, Store, StoreError, immediate_tx};
 use axum::Json;
 use axum::Router;
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -46,7 +58,8 @@ use remuda_protocol::hubnode::{
 };
 use remuda_protocol::{
     InputOrigin, MEMORY_ENTRY_HARD_BYTES, MEMORY_ENTRY_SOFT_BYTES, MEMORY_INDEX_SOFT_BYTES,
-    MemoryEntry, MemoryIndex, MemoryLimit, MemoryMatch, MemoryOrigin, MemorySearchHit,
+    MemoryEntry, MemoryImportCreated, MemoryImportRequest, MemoryImportResult, MemoryImportSkip,
+    MemoryImportSkipReason, MemoryIndex, MemoryLimit, MemoryMatch, MemoryOrigin, MemorySearchHit,
     MemorySizeWarning, MemorySourceRef, MemoryTurnRef, MemoryType, MemoryWriteItem, MemoryWriteOp,
     MemoryWritePage, MemoryWriteResult, U64, memory_entry_bytes, memory_index_line,
     validate_memory_slug,
@@ -68,6 +81,20 @@ pub(crate) const MEMORY_WRITE_LOG_SCHEMA_VERSION: i64 = 6;
 const MAX_SOURCE_REFS: usize = 64;
 /// Inputs per consolidate.
 const MAX_CONSOLIDATE_SOURCES: usize = 32;
+/// Entries per Phase 1 import.
+const MAX_IMPORT_ENTRIES: usize = 512;
+/// The import route's request body limit, sized for the worst case JSON
+/// escaping allows: every entry at the 8 KiB cap with text that escapes to
+/// six bytes a byte (a control character becomes `\u00XX`), plus 1 KiB per
+/// entry for its keys, slug, type and origin, plus 4 KiB for the envelope.
+/// Larger is 413 before the body is parsed. It is set on this route alone:
+/// the default (2 MB) would refuse a legitimate full import.
+pub(crate) const IMPORT_BODY_LIMIT: usize =
+    MAX_IMPORT_ENTRIES * (6 * MEMORY_ENTRY_HARD_BYTES as usize + 1024) + 4096;
+// protocol.md §8.4 and the OpenAPI description state this number.
+const _: () = assert!(IMPORT_BODY_LIMIT == 25_694_208);
+/// What the import's same-content check trims from a body, on both sides.
+const IMPORT_TRIM: [char; 4] = [' ', '\t', '\n', '\r'];
 /// Search terms considered (whitespace-separated).
 const MAX_SEARCH_TERMS: usize = 8;
 /// Search hits returned by default / at most.
@@ -504,6 +531,13 @@ pub(crate) enum MemoryError {
         slug: String,
         bytes: u64,
     },
+    /// The secret lint flagged a field. Carries the rule name (the shape's
+    /// literal needle), never the matched text.
+    SecretRejected {
+        slug: String,
+        field: &'static str,
+        rule: &'static str,
+    },
     Hub(HubError),
 }
 
@@ -614,6 +648,33 @@ impl IntoResponse for MemoryError {
                     "maxBytes": MEMORY_ENTRY_HARD_BYTES,
                 }),
             ),
+            Self::SecretRejected { slug, field, rule } => {
+                // A secret in the slug must not come back as the slug.
+                let named = if field == "slug" {
+                    "this memory entry".to_string()
+                } else {
+                    format!("memory entry {slug:?}")
+                };
+                let mut body = json!({
+                    "error": format!(
+                        "{named} was not stored: its {field} looks like a credential \
+                         (shape {rule:?}); the text is not echoed"
+                    ),
+                    "code": "MEMORY_SECRET_REJECTED",
+                    "field": field,
+                    "rule": rule,
+                    "next": NextStep::new(
+                        action::FIX_REQUEST,
+                        "remove the credential from the entry and write it again; record \
+                         where the secret is kept, never the secret itself",
+                    )
+                    .json(),
+                });
+                if field != "slug" {
+                    body["slug"] = json!(slug);
+                }
+                (StatusCode::UNPROCESSABLE_ENTITY, body)
+            }
         };
         (status, Json(body)).into_response()
     }
@@ -628,6 +689,9 @@ pub(crate) enum MemoryWriter {
     Owner,
     /// Agent origin, bound to this instance (chapter).
     Agent { instance_id: String },
+    /// The owner's Phase 1 import: an owner write that stores the origin the
+    /// imported file recorded, with no writing chapter.
+    Import { origin: MemoryOrigin },
 }
 
 impl MemoryWriter {
@@ -639,6 +703,13 @@ impl MemoryWriter {
     fn stamp(&self, conn: &Connection) -> Result<(&'static str, Option<String>), MemoryError> {
         match self {
             Self::Owner => Ok(("human", None)),
+            Self::Import { origin } => Ok((
+                match origin {
+                    MemoryOrigin::Human => "human",
+                    MemoryOrigin::Agent => "agent",
+                },
+                None,
+            )),
             Self::Agent { instance_id } => {
                 let root_turn = crate::root_turn::derive(conn, instance_id)?;
                 let origin = match root_turn.as_ref().map(|turn| turn.origin) {
@@ -652,7 +723,7 @@ impl MemoryWriter {
 
     fn instance(&self) -> Option<&str> {
         match self {
-            Self::Owner => None,
+            Self::Owner | Self::Import { .. } => None,
             Self::Agent { instance_id } => Some(instance_id),
         }
     }
@@ -693,7 +764,18 @@ fn one_line(field: &str, value: &str) -> Result<String, MemoryError> {
     Ok(trimmed.to_string())
 }
 
+/// Every slug a request names goes through here before anything else uses
+/// it. The secret lint runs first, so a credential-shaped slug is refused
+/// (422, without the slug) even when it is not a valid slug either; the
+/// invalid-slug message names no slug.
 fn check_slug(slug: &str) -> Result<(), MemoryError> {
+    if let Some(rule) = crate::secret_lint::first_secret(slug) {
+        return Err(MemoryError::SecretRejected {
+            slug: String::new(),
+            field: "slug",
+            rule,
+        });
+    }
     validate_memory_slug(slug).map_err(MemoryError::BadRequest)
 }
 
@@ -709,6 +791,22 @@ fn check_source_refs(refs: &[MemorySourceRef]) -> Result<(), MemoryError> {
             return Err(MemoryError::BadRequest(format!(
                 "sourceRefs instanceId {id:?} is not an instance id"
             )));
+        }
+    }
+    Ok(())
+}
+
+/// The secret lint over the fields a write stores (§12.5). The slug is
+/// checked first so a refusal never names a slug that carries a secret.
+fn check_secrets(slug: &str, fields: &[(&'static str, Option<&str>)]) -> Result<(), MemoryError> {
+    let named = std::iter::once(("slug", Some(slug))).chain(fields.iter().copied());
+    for (field, text) in named {
+        if let Some(rule) = text.and_then(crate::secret_lint::first_secret) {
+            return Err(MemoryError::SecretRejected {
+                slug: slug.to_string(),
+                field,
+                rule,
+            });
         }
     }
     Ok(())
@@ -731,6 +829,14 @@ impl MemoryInput {
         self.title = one_line("title", &self.title)?;
         self.description = one_line("description", &self.description)?;
         check_source_refs(&self.source_refs)?;
+        check_secrets(
+            &self.slug,
+            &[
+                ("title", Some(&self.title)),
+                ("description", Some(&self.description)),
+                ("body", Some(&self.body)),
+            ],
+        )?;
         check_size(&self.slug, &self.title, &self.description, &self.body)?;
         self.source_refs = merge_refs(&[], &self.source_refs);
         Ok(self)
@@ -738,7 +844,7 @@ impl MemoryInput {
 }
 
 impl MemoryPatch {
-    fn normalized(mut self) -> Result<Self, MemoryError> {
+    fn normalized(mut self, slug: &str) -> Result<Self, MemoryError> {
         if let Some(title) = &self.title {
             self.title = Some(one_line("title", title)?);
         }
@@ -746,6 +852,15 @@ impl MemoryPatch {
             self.description = Some(one_line("description", description)?);
         }
         check_source_refs(&self.source_refs)?;
+        // The fields this update writes; a kept field is not new text.
+        check_secrets(
+            slug,
+            &[
+                ("title", self.title.as_deref()),
+                ("description", self.description.as_deref()),
+                ("body", self.body.as_deref()),
+            ],
+        )?;
         Ok(self)
     }
 }
@@ -868,7 +983,7 @@ fn authorize_write(
         )));
     };
     match writer {
-        MemoryWriter::Owner => Ok(()),
+        MemoryWriter::Owner | MemoryWriter::Import { .. } => Ok(()),
         MemoryWriter::Agent { instance_id } => {
             if instance_id == &current_id && fenced_at.is_none() {
                 Ok(())
@@ -1457,6 +1572,109 @@ fn consolidate_tx(
     Ok(result)
 }
 
+/// The Phase 1 import in one writer transaction: create each new entry with
+/// its recorded origin, skip what is already there, and roll back on a dry
+/// run. Inputs arrive normalized (slug, one-line fields, size, secret lint).
+fn import_tx(
+    conn: &mut Connection,
+    lineage_id: &str,
+    entries: &[(MemoryInput, MemoryOrigin)],
+    dry_run: bool,
+) -> Result<MemoryImportResult, MemoryError> {
+    let tx = immediate_tx(conn)?;
+    authorize_write(&tx, lineage_id, &MemoryWriter::Owner, WriteKind::Create)?;
+    let now = now_rfc3339();
+    let mut created = Vec::new();
+    let mut skipped = Vec::new();
+    for (input, origin) in entries {
+        let skip = |reason, existing: Option<String>| MemoryImportSkip {
+            slug: input.slug.clone(),
+            reason,
+            existing,
+        };
+        if let Some(existing) = load_entry(&tx, lineage_id, &input.slug)? {
+            let same = existing.memory_type == input.memory_type
+                && existing.title == input.title
+                && existing.description == input.description
+                && existing.body == input.body;
+            skipped.push(skip(
+                if same {
+                    MemoryImportSkipReason::SameEntry
+                } else {
+                    MemoryImportSkipReason::SlugExists
+                },
+                None,
+            ));
+            continue;
+        }
+        // The same content under another slug: the body, or for an entry
+        // without one, its title and description. Archived entries count.
+        // Both sides trim the same characters (SQLite's trim() alone strips
+        // only spaces).
+        let body = input.body.trim_matches(IMPORT_TRIM);
+        let twin: Option<String> = if body.is_empty() {
+            tx.query_row(
+                "SELECT slug FROM memory_entries
+                  WHERE lineage_id = ?1
+                    AND trim(body, ' ' || char(9) || char(10) || char(13)) = ''
+                    AND title = ?2 AND description = ?3
+                  ORDER BY slug LIMIT 1",
+                params![lineage_id, input.title, input.description],
+                |row| row.get(0),
+            )
+            .optional()?
+        } else {
+            tx.query_row(
+                "SELECT slug FROM memory_entries
+                  WHERE lineage_id = ?1
+                    AND trim(body, ' ' || char(9) || char(10) || char(13)) = ?2
+                  ORDER BY slug LIMIT 1",
+                params![lineage_id, body],
+                |row| row.get(0),
+            )
+            .optional()?
+        };
+        if let Some(twin) = twin {
+            skipped.push(skip(MemoryImportSkipReason::SameContent, Some(twin)));
+            continue;
+        }
+        let writer = MemoryWriter::Import { origin: *origin };
+        let revision = next_revision(&tx, lineage_id, &input.slug)?;
+        insert_entry(&tx, lineage_id, &writer, input, revision, None, &now, &now)?;
+        record_revision(&tx, lineage_id, &input.slug, revision)?;
+        log_write(
+            &tx,
+            lineage_id,
+            &input.slug,
+            revision,
+            &input.title,
+            MemoryWriteOp::Write,
+            &writer,
+            None,
+            &now,
+        )?;
+        created.push(MemoryImportCreated {
+            slug: input.slug.clone(),
+            origin: *origin,
+            revision,
+        });
+    }
+    if !created.is_empty() {
+        bump_memory_rev(&tx, lineage_id)?;
+    }
+    if dry_run {
+        tx.rollback()?;
+    } else {
+        tx.commit()?;
+    }
+    Ok(MemoryImportResult {
+        lineage_id: lineage_id.to_string(),
+        dry_run,
+        created,
+        skipped,
+    })
+}
+
 fn restore_tx(
     conn: &mut Connection,
     lineage_id: &str,
@@ -1681,7 +1899,7 @@ impl Store {
         expected_revision: u64,
     ) -> Result<MemoryWriteResult, MemoryError> {
         check_slug(&slug)?;
-        let patch = patch.normalized()?;
+        let patch = patch.normalized(&slug)?;
         write(self, "memory_update", move |conn| {
             update_tx(conn, &lineage_id, &slug, &writer, patch, expected_revision)
         })
@@ -1716,17 +1934,69 @@ impl Store {
                 "consolidate takes 2 to {MAX_CONSOLIDATE_SOURCES} source entries"
             )));
         }
-        for (index, (slug, _)) in sources.iter().enumerate() {
+        // Every slug is linted and validated before any other check; the
+        // messages name a source by its position, never by its slug.
+        for (slug, _) in &sources {
             check_slug(slug)?;
-            if sources[..index].iter().any(|(other, _)| other == slug) {
+        }
+        for (index, (slug, _)) in sources.iter().enumerate() {
+            if let Some(first) = sources[..index].iter().position(|(other, _)| other == slug) {
                 return Err(MemoryError::BadRequest(format!(
-                    "source {slug:?} is listed twice"
+                    "sources[{first}] and sources[{index}] name the same entry"
                 )));
             }
         }
         let input = input.normalized()?;
         write(self, "memory_consolidate", move |conn| {
             consolidate_tx(conn, &lineage_id, &writer, &sources, &input)
+        })
+        .await
+    }
+
+    /// The owner's Phase 1 import (main-agent.md §12.4). Every entry is
+    /// validated and linted before the writer job, so a refusal stores
+    /// nothing; the transaction itself only creates.
+    pub(crate) async fn memory_import(
+        &self,
+        lineage_id: String,
+        request: MemoryImportRequest,
+    ) -> Result<MemoryImportResult, MemoryError> {
+        if request.entries.len() > MAX_IMPORT_ENTRIES {
+            return Err(MemoryError::BadRequest(format!(
+                "an import takes at most {MAX_IMPORT_ENTRIES} entries"
+            )));
+        }
+        let mut entries = Vec::with_capacity(request.entries.len());
+        for (index, entry) in request.entries.into_iter().enumerate() {
+            if entry.slug == OWNER_AUTHORED_SLUG && entry.origin != MemoryOrigin::Human {
+                return Err(MemoryError::BadRequest(format!(
+                    "{OWNER_AUTHORED_SLUG:?} is owner-authored; import it with origin human \
+                     or under another slug"
+                )));
+            }
+            let input = MemoryInput {
+                slug: entry.slug,
+                memory_type: entry.memory_type,
+                title: entry.title,
+                description: entry.description,
+                body: entry.body,
+                source_refs: Vec::new(),
+            }
+            .normalized()?;
+            if let Some(first) = entries[..index]
+                .iter()
+                .position(|(seen, _): &(MemoryInput, MemoryOrigin)| seen.slug == input.slug)
+            {
+                // By position, never by slug.
+                return Err(MemoryError::BadRequest(format!(
+                    "entries[{first}] and entries[{index}] have the same slug"
+                )));
+            }
+            entries.push((input, entry.origin));
+        }
+        let dry_run = request.dry_run;
+        write(self, "memory_import", move |conn| {
+            import_tx(conn, &lineage_id, &entries, dry_run)
         })
         .await
     }
@@ -1976,6 +2246,10 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/lineages/{id}/memory/search", get(search))
         .route("/v1/lineages/{id}/memory/consolidate", post(consolidate))
         .route("/v1/lineages/{id}/memory/restore", post(restore))
+        .route(
+            "/v1/lineages/{id}/memory/import",
+            post(import).layer(DefaultBodyLimit::max(IMPORT_BODY_LIMIT)),
+        )
         .route("/v1/memory/derived", get(derived))
         // The transcript's write rows: one writer chapter's log, Human/Bot
         // callers only. Deliberately absent from `restrict_agent_routes`, so
@@ -2283,12 +2557,19 @@ async fn consolidate(
     Json(body): Json<ConsolidateBody>,
 ) -> Result<Json<MemoryWriteResult>, MemoryError> {
     let writer = memory_caller(&state, &headers, &lineage_id).await?;
+    // Lint and validate every source slug before anything else reports on
+    // a source, and name a source only by its position: a slug may carry a
+    // credential.
+    for source in &body.sources {
+        check_slug(&source.slug)?;
+    }
     let sources = body
         .sources
         .into_iter()
-        .map(|source| {
+        .enumerate()
+        .map(|(index, source)| {
             let expected = source.expected_revision.ok_or_else(|| {
-                MemoryError::BadRequest(format!("source {:?} needs expectedRevision", source.slug))
+                MemoryError::BadRequest(format!("sources[{index}] needs expectedRevision"))
             })?;
             Ok((source.slug, expected))
         })
@@ -2311,6 +2592,18 @@ async fn restore(
     require_owner(&state, &headers).await?;
     let restored = state.store.memory_restore(lineage_id, body.slugs).await?;
     Ok(Json(json!({ "restored": restored })))
+}
+
+/// `POST /v1/lineages/{id}/memory/import` — the owner's one-time Phase 1
+/// import. Human only, like restore.
+async fn import(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(lineage_id): Path<String>,
+    Json(body): Json<MemoryImportRequest>,
+) -> Result<Json<MemoryImportResult>, MemoryError> {
+    require_owner(&state, &headers).await?;
+    Ok(Json(state.store.memory_import(lineage_id, body).await?))
 }
 
 async fn derived(

@@ -189,6 +189,9 @@ Write rules:
 - Use absolute dates (`2026-10-30`), never "today" or "last week".
 - Store no logs, code facts or git history — the journal and the repo keep
   those. Task state belongs in tasks (D-050), not in memory.
+- Never store a credential (API key, token, private key). The Hub refuses
+  credential-shaped text with `422 MEMORY_SECRET_REJECTED` and stores
+  nothing; record where the secret is kept, not the secret.
 - Run `remuda memory index`, or `search` for the words involved, before
   writing; do not add a second entry that says the same thing.
 - An update carries `--expected-revision <rev>`; without it a write creates.

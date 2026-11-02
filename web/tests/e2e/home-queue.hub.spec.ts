@@ -226,24 +226,14 @@ async function collapseQueue(page: Page) {
   if (await collapse.count()) await collapse.click();
 }
 
-/** Other specs' cards may fill the fold: open the queue in place. */
 /**
- * Wait until `id` is painted, opening the fold on each round: after a release
- * the card may be the newest painted, or still behind a fold row that only
- * appears with the poll that delivers it.
+ * Wait until `id` is painted. The queue is live unless a finger is on it
+ * (§3.3), so after one expansion a new card simply arrives on the next poll;
+ * the fold is opened once here when the card is still behind it.
  */
 async function showCard(page: Page, id: string, timeout = 30_000) {
-  await expect
-    .poll(
-      async () => {
-        if (await card(page, id).count()) return true;
-        const more = page.locator('[data-testid="home-queue-more"][aria-expanded="false"]');
-        if (await more.count()) await more.click();
-        return (await card(page, id).count()) > 0;
-      },
-      { timeout },
-    )
-    .toBe(true);
+  await expandQueue(page);
+  await expect(card(page, id)).toBeVisible({ timeout });
 }
 
 async function expandQueue(page: Page) {

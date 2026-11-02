@@ -137,7 +137,12 @@ class Report:
             advisory: bool = False) -> None:
         doc_text = relative(doc, root)
         violation = Violation(kind, doc_text, ref, message, advisory)
-        self.violations.setdefault(violation.key, violation)
+        # A key is unique, but the same citation can be advisory once and
+        # enforced later (or vice versa). Keep the stronger record so an
+        # advisory can never mask an enforced violation.
+        existing = self.violations.get(violation.key)
+        if existing is None or (existing.advisory and not advisory):
+            self.violations[violation.key] = violation
 
     def enforced(self) -> set[str]:
         """Keys that fail the gate when absent from the baseline."""
@@ -1435,6 +1440,16 @@ class DocsContractFixtureTests(unittest.TestCase):
         self.assertNotIn("设计 笔记", flagged)
         self.assertNotIn("space dir", flagged)
         self.assertNotIn("目录 空格", flagged)
+
+    def test_enforced_record_replaces_an_advisory_with_the_same_key(self):
+        report = Report([])
+        report.add(KIND_FILE_ANCHOR, "docs/a.md", "x.rs:1", "symbol moved",
+                   ROOT, advisory=True)
+        report.add(KIND_FILE_ANCHOR, "docs/a.md", "x.rs:1", "file missing", ROOT)
+        self.assertEqual(report.enforced(), {"file-anchor|docs/a.md|x.rs:1"})
+        self.assertEqual(report.advisory(), set())
+        self.assertEqual(report.violations["file-anchor|docs/a.md|x.rs:1"].message,
+                         "file missing")
 
     def test_just_recipe_with_dependencies_is_registered(self):
         recipes = just_recipes(FIXTURE_ROOT)

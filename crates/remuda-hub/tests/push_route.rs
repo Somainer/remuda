@@ -1130,6 +1130,262 @@ async fn a_follow_mutes_only_its_own_visible_device() -> Result<()> {
     Ok(())
 }
 
+// ─── §8.5 the seat's own pushes ─────────────────────────────────────────────
+
+/// A Main seat on host P, reported running; returns its id.
+async fn seat(ctx: &Ctx) -> Result<String> {
+    let created = ctx
+        .post(
+            "/v1/instances",
+            json!({
+                "hostId": ctx.host_p, "kind": "claude", "driver": "claude-sdk",
+                "name": "main", "title": "Main", "grants": ["address-owner"],
+                "permissionMode": "auto", "model": "claude-test-model",
+                "restart": {"onProcessLoss": true, "maxPerHour": 3},
+                "prompt": "seat brief",
+            }),
+        )
+        .await?;
+    let id = created["instance"]["instanceId"]
+        .as_str()
+        .context("seat")?
+        .to_owned();
+    ctx.report_running(ctx.node_p(), &id).await?;
+    ctx.wait_lineage(&id, "running").await?;
+    Ok(id)
+}
+
+fn user_message(command: &str) -> Value {
+    json!({"kind":"message","payload":{"operation":"open","messageId":format!("msg_{command}"),
+        "role":"user","phase":"final","blocks":[{"type":"text","text":"hello"}],
+        "parentToolCallId":null,"commandId":command}})
+}
+
+fn turn_started(command: &str) -> Value {
+    json!({"kind":"lifecycle","payload":{"type":"native","topic":"turn","nativeName":"turn_started",
+        "nativeId":{"state":"known","value":"session-1"},
+        "status":{"state":"known","value":"working"},
+        "relatedIds":{"nativeClientMessageId":command},"severity":"info","affectsCompletion":false}})
+}
+
+fn assistant(id: &str, operation: &str, text: &str) -> Value {
+    json!({"kind":"message","payload":{"operation":operation,"messageId":id,"role":"assistant",
+        "phase":"final","blocks":[{"type":"text","text":text}],"parentToolCallId":null}})
+}
+
+fn turn_settled(command: &str) -> Value {
+    json!({"kind":"lifecycle","payload":{"type":"native","topic":"turn","nativeName":"result",
+        "nativeId":{"state":"known","value":"session-1"},
+        "status":{"state":"known","value":"turn_done"},
+        "relatedIds":{"completedTurn":command,"settledRootTurn":"true"},
+        "severity":"info","affectsCompletion":true}})
+}
+
+/// Run one turn of `seat` for the input `command`, ending with `reply`.
+async fn turn(ctx: &Ctx, seat: &str, command: &str, reply: &str) -> Result<()> {
+    let node = ctx.node_p();
+    node.append(seat, user_message(command))?;
+    node.append(seat, turn_started(command))?;
+    node.append(seat, assistant(&format!("a_{command}"), "open", "Here"))?;
+    node.append(seat, assistant(&format!("a_{command}"), "replace", reply))?;
+    node.append(seat, turn_settled(command))?;
+    ctx.wait_until("the turn ended", || async {
+        let activity: Option<String> = ctx
+            .db()
+            .ok()?
+            .query_row(
+                "SELECT activity FROM instances WHERE id = ?1",
+                [seat],
+                |row| row.get(0),
+            )
+            .ok();
+        let reached: i64 = ctx
+            .db()
+            .ok()?
+            .query_row(
+                "SELECT COUNT(*) FROM journal WHERE instance_id = ?1
+                  AND json_extract(payload_json, '$.payload.nativeName') = 'result'
+                  AND json_extract(payload_json, '$.payload.relatedIds.completedTurn') = ?2",
+                [seat, command],
+                |row| row.get(0),
+            )
+            .ok()?;
+        (reached > 0 && activity.as_deref() == Some("idle")).then_some(())
+    })
+    .await
+}
+
+/// A Human input to Main: an `instance.send` from the phone; returns its
+/// command id.
+async fn human_send(ctx: &Ctx, seat: &str) -> Result<String> {
+    let sent = ctx
+        .post(
+            &format!("/v1/instances/{seat}/commands"),
+            json!({"operation": "instance.send",
+                   "payload": {"input": {"type": "prompt", "text": "status?"}}}),
+        )
+        .await?;
+    Ok(sent["commandId"]
+        .as_str()
+        .or(sent["command"]["commandId"].as_str())
+        .or(sent["id"].as_str())
+        .context("command id")?
+        .to_owned())
+}
+
+/// Reply-ready: a turn of the live address-owner chapter reached by a Human
+/// input pushes "Main replied: <first line>", per-device suppression
+/// applies; a turn reached only by Agent or Hub input does not push.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reply_ready_only_for_turns_reached_by_human_input() -> Result<()> {
+    let _flag = d051(true).await;
+    let ctx = Ctx::boot().await?;
+    let desktop = Ctx::device(&ctx.hub, &ctx.http, "desktop").await?;
+    let main = seat(&ctx).await?;
+    let tag = format!("instance:{main}");
+    // The desktop has /s/:main visible.
+    let _desktop_ws = follow(&ctx, &desktop, &main).await?;
+    let command = human_send(&ctx, &main).await?;
+    turn(
+        &ctx,
+        &main,
+        &command,
+        "All three workers are green.\nDetails follow.",
+    )
+    .await?;
+    let pushes = ctx.wait_pushes(&ctx.phone, &tag, 1).await?;
+    assert_eq!(
+        pushes[0]["title"],
+        "Main replied: All three workers are green."
+    );
+    assert_eq!(pushes[0]["data"]["url"], format!("/s/{main}"));
+    assert!(
+        ctx.pushes_tagged(&desktop, &tag).is_empty(),
+        "the desktop showing Main is not pushed"
+    );
+    // Agent- and Hub-origin inputs: no push.
+    let db = ctx.db()?;
+    for (id, origin) in [("cmd_agent_in", "agent"), ("cmd_hub_in", "hub")] {
+        db.execute(
+            "INSERT INTO commands (id, instance_id, host_id, operation, state, resolution,
+                forwarded, payload_json, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'instance.send', 'settled', 'clear', 1, ?4, ?5, ?5)",
+            rusqlite::params![
+                id,
+                main,
+                ctx.host_p,
+                json!({"origin": origin, "input": {"type": "prompt", "text": "x"}}).to_string(),
+                "2026-11-01T00:00:00.000Z"
+            ],
+        )?;
+        turn(&ctx, &main, id, "not for the owner").await?;
+    }
+    // A turn with no Remuda input at all (the carrier's own turn).
+    turn(&ctx, &main, "native-turn", "background work done").await?;
+    ctx.hub.test_handle().test_drive_outbox().await;
+    let replies = ctx.query_i64(
+        "SELECT COUNT(*) FROM push_outbox WHERE kind = 'reply' AND instance_id = ?1",
+        [&main],
+    )?;
+    assert_eq!(replies, 1, "only the Human-reached turn queued a reply");
+    assert_eq!(ctx.pushes_tagged(&ctx.phone, &tag).len(), 1);
+    Ok(())
+}
+
+/// End pushes need process-end evidence (OA6): "Main closed itself" waits
+/// for the end its close brings, and an exited event that ends nothing (a
+/// subagent's) sends no exited push.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn end_pushes_need_process_end_evidence() -> Result<()> {
+    let _flag = d051(true).await;
+    let ctx = Ctx::boot().await?;
+    // A plain session: a subagent's "exited" is no end of the instance.
+    let plain = ctx.child(None).await?;
+    let exited_tag = format!("instance:{plain}");
+    ctx.node_i().append(
+        &plain,
+        json!({"kind":"lifecycle","lifecycle":"exited","payload":{
+            "type":"native","topic":"session","nativeName":"session",
+            "status":{"state":"known","value":"exited"},"severity":"info",
+            "affectsCompletion":false,"relatedIds":{"agentId":"sub-1"}}}),
+    )?;
+    // Its real end pushes "Session exited".
+    ctx.node_i().append(
+        &plain,
+        json!({"kind":"lifecycle","lifecycle":"exited","payload":{
+            "type":"native","topic":"session","nativeName":"session",
+            "status":{"state":"known","value":"exited"},"severity":"info",
+            "affectsCompletion":true,"relatedIds":{"exitCode":"0"}}}),
+    )?;
+    let exited = ctx.wait_pushes(&ctx.phone, &exited_tag, 1).await?;
+    assert_eq!(exited[0]["title"], "Session exited");
+    assert_eq!(
+        ctx.query_i64(
+            "SELECT COUNT(*) FROM push_log WHERE category = 'exited' AND instance_id = ?1",
+            [&plain],
+        )?,
+        1,
+        "the subagent's exited event pushed nothing"
+    );
+
+    // Main closes itself: recorded at admission, pushed only after its end.
+    let main = seat(&ctx).await?;
+    let token = ctx
+        .post(&format!("/v1/instances/{main}/mcp-token"), json!({}))
+        .await?["token"]
+        .as_str()
+        .context("seat token")?
+        .to_owned();
+    let closed = ctx
+        .http
+        .post(format!("{}/v1/instances/{main}/commands", ctx.base()))
+        .bearer_auth(&token)
+        .json(&json!({"operation": "instance.close", "payload": {}}))
+        .send()
+        .await?;
+    anyhow::ensure!(closed.status().is_success(), "{}", closed.text().await?);
+    ctx.wait_lineage(&main, "paused").await?;
+    let lineage_tag = format!("instance:{main}");
+    let recorded = ctx.query_i64(
+        "SELECT COUNT(*) FROM lineage_c1_pushes WHERE lineage_id = ?1 AND kind = 'self'",
+        [&main],
+    )?;
+    assert_eq!(recorded, 1);
+    ctx.hub.test_handle().test_supervise().await;
+    assert!(
+        ctx.pushes_tagged(&ctx.phone, &lineage_tag)
+            .iter()
+            .all(|push| push["title"] != "Main closed itself"),
+        "no C1 push before the end"
+    );
+    // The close ends the process.
+    ctx.node_p().append(
+        &main,
+        json!({"kind":"lifecycle","lifecycle":"exited","payload":{
+            "type":"native","topic":"session","nativeName":"session",
+            "status":{"state":"known","value":"exited"},"severity":"info",
+            "affectsCompletion":true,"relatedIds":{"exitCode":"0"}}}),
+    )?;
+    let pushes = ctx
+        .wait_until("the C1 push", || async {
+            let pushes: Vec<Value> = ctx
+                .pushes_tagged(&ctx.phone, &lineage_tag)
+                .into_iter()
+                .filter(|push| push["title"] == "Main closed itself")
+                .collect();
+            (!pushes.is_empty()).then_some(pushes)
+        })
+        .await?;
+    assert_eq!(pushes.len(), 1);
+    // A restart lineage gets no generic exited push.
+    assert!(
+        ctx.pushes_tagged(&ctx.phone, &lineage_tag)
+            .iter()
+            .all(|push| push["title"] != "Session exited")
+    );
+    Ok(())
+}
+
 /// The push log carries categories, tags and counts, never a body.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_push_log_records_categories_and_counts() -> Result<()> {

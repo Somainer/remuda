@@ -185,9 +185,18 @@ async fn dispatch(state: AppState, instance_id: String, kind: AlertKind) {
                     format!("/s/{instance_id}"),
                 ),
                 AlertKind::Exited => {
-                    // D-057 §8.5: on a lineage that restarts on process loss
-                    // the C1 push ("restarted" / "paused: restart cap")
-                    // replaces the generic exited push.
+                    // D-057 §8.5 / OA6: an end push needs process-end
+                    // evidence on the durable row (a subagent's exit, or a
+                    // non-terminal failure, is no end of this instance).
+                    if !ended_by_evidence(&state, &instance_id).await {
+                        return;
+                    }
+                    // C1 pushes wait for the same evidence: the one this end
+                    // brings may now be due.
+                    crate::restart::drive_pushes(&state).await;
+                    // On a lineage that restarts on process loss the C1 push
+                    // ("restarted" / "paused: restart cap") replaces the
+                    // generic exited push.
                     if crate::restart::c1_replaces_exit_push(&state, &instance_id).await {
                         return;
                     }
@@ -240,6 +249,18 @@ async fn route_interaction(
             crate::push_route::Route::Page
         }
     }
+}
+
+/// Whether the instance's durable row carries process-end evidence (§6.2).
+async fn ended_by_evidence(state: &AppState, instance_id: &str) -> bool {
+    let Ok(Some(instance)) = state.store.get_instance_read(instance_id.to_owned()).await else {
+        return false;
+    };
+    state
+        .store
+        .instance_has_process_end_evidence(&instance)
+        .await
+        .unwrap_or(false)
 }
 
 /// What one fanout did.

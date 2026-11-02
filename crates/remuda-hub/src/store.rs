@@ -16233,8 +16233,8 @@ fn append_loaded_event(
     // first running report (`starting` → `running`).
     crate::restart::note_chapter_running(conn, instance_id)?;
     // D-057 §8.3: a chapter's recorded end turns its lineage's "effectively
-    // running" false before the supervisor acts (§8.2). It cannot fail the
-    // append.
+    // running" false before the supervisor acts (§8.2); §8.5: reply-ready.
+    // Neither can fail the append.
     if matches!(
         derive_instance_state(&event).0,
         Some("exited" | "failed" | "closed")
@@ -16244,6 +16244,9 @@ fn append_loaded_event(
             crate::push_route::Transition::ChapterEnded { instance_id },
         );
     }
+    crate::push_route::guard("fold_reply", conn, || {
+        crate::push_route::fold_reply(conn, instance_id, &event, seq, turn_ended)
+    });
     // cb-inbox-facts: the facts this event implies, in the same transaction
     // as the row; a replayed append (returned above) writes none.
     if let Some(before) = inbox_before {

@@ -20,6 +20,11 @@
 //! again after a Hub restart, and the tag makes a resend replace the first
 //! notification. A lifted interaction is never suppressed again.
 //!
+//! **Reply-ready (§8.5).** [`fold_reply`] runs in the journal append
+//! transaction: a Human-origin input to an `address-owner` chapter arms its
+//! tracker, and the settled end of that turn on the live chapter queues one
+//! "Main replied: …" outbox row.
+//!
 //! **Push log (§8.6).** Every fanout records one `push_log` row: category,
 //! tag, counts and the devices it reached or skipped, never a body.
 
@@ -27,6 +32,7 @@ use crate::AppState;
 use crate::store::{StoreError, immediate_tx, lineage_id_of, parent_lineage_of};
 use remuda_push::PushTag;
 use rusqlite::{Connection, OptionalExtension, params};
+use serde_json::Value;
 use std::cell::Cell;
 use std::sync::Arc;
 
@@ -40,6 +46,12 @@ const ROUTABLE_KINDS: &[&str] = &["question", "plan-review", "elicitation"];
 
 /// Push log rows kept; older rows are pruned by the insert.
 const PUSH_LOG_KEEP: i64 = 5000;
+
+/// Characters of the final message's first line in "Main replied: …".
+const REPLY_LINE_CHARS: usize = 80;
+
+/// Journal rows read back to find a turn's final message.
+const REPLY_SCAN_ROWS: i64 = 400;
 
 /// Idempotent DDL; no `user_version` rung.
 pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
@@ -87,6 +99,12 @@ pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             suppressed INTEGER NOT NULL,
             delivered_devices_json TEXT NOT NULL,
             suppressed_devices_json TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS push_reply_trackers (
+            instance_id TEXT PRIMARY KEY,
+            command_id TEXT NOT NULL,
+            armed_seq INTEGER NOT NULL,
+            armed_at TEXT NOT NULL
          );",
     )
 }
@@ -509,6 +527,209 @@ fn lift_lineage(conn: &Connection, lineage_id: &str, cause: &str) -> Result<usiz
     Ok(lifted)
 }
 
+// ─── reply-ready (§8.5) ─────────────────────────────────────────────────────
+
+/// Whether `instance_id` holds the `address-owner` grant.
+fn holds_address_owner(conn: &Connection, instance_id: &str) -> Result<bool, StoreError> {
+    let grants: Option<String> = conn
+        .query_row(
+            "SELECT grants_json FROM instances WHERE id = ?1",
+            params![instance_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(grants
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+        .is_some_and(|grants| grants.iter().any(|grant| grant == "address-owner")))
+}
+
+/// Whether `instance_id` is the live `address-owner` chapter: it holds the
+/// grant and is its lineage's current chapter, at the live generation and
+/// unfenced.
+fn live_address_owner(conn: &Connection, instance_id: &str) -> Result<bool, StoreError> {
+    if !holds_address_owner(conn, instance_id)? {
+        return Ok(false);
+    }
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM instances i
+               JOIN lineages l ON l.current_instance_id = i.id
+              WHERE i.id = ?1 AND i.generation = l.generation AND i.fenced_at IS NULL",
+            params![instance_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// The command id of a root user input `event` delivered, if it is one.
+fn root_input_command(event: &Value) -> Option<&str> {
+    if event.get("kind").and_then(Value::as_str) != Some("message") {
+        return None;
+    }
+    let payload = event.get("payload")?;
+    let root_user = payload.get("role").and_then(Value::as_str) == Some("user")
+        && payload.get("operation").and_then(Value::as_str) == Some("open")
+        && payload.get("parentToolCallId").is_none_or(Value::is_null);
+    root_user
+        .then(|| payload.get("commandId").and_then(Value::as_str))
+        .flatten()
+}
+
+/// Fold one appended journal event for reply-ready, in the append
+/// transaction: a Human-origin input arms the chapter's tracker; the settled
+/// end of a turn (`turn_ended`) takes it and, on the live `address-owner`
+/// chapter, queues "Main replied: <first line of the final message>". A turn
+/// reached only by Hub or Agent input arms nothing and pushes nothing.
+pub(crate) fn fold_reply(
+    conn: &Connection,
+    instance_id: &str,
+    event: &Value,
+    seq: i64,
+    turn_ended: bool,
+) -> Result<(), StoreError> {
+    if let Some(command_id) = root_input_command(event)
+        && crate::root_turn::input_is_human(conn, instance_id, command_id)?
+        && holds_address_owner(conn, instance_id)?
+    {
+        conn.execute(
+            "INSERT INTO push_reply_trackers (instance_id, command_id, armed_seq, armed_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(instance_id) DO NOTHING",
+            params![instance_id, command_id, seq, crate::config::now_rfc3339()],
+        )?;
+    }
+    if !turn_ended {
+        return Ok(());
+    }
+    let armed: Option<i64> = conn
+        .query_row(
+            "DELETE FROM push_reply_trackers WHERE instance_id = ?1 RETURNING armed_seq",
+            params![instance_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(armed_seq) = armed else {
+        return Ok(());
+    };
+    if !live_address_owner(conn, instance_id)? {
+        return Ok(());
+    }
+    let line = final_message_line(conn, instance_id, armed_seq, seq)?;
+    let title = if line.is_empty() {
+        "Main replied".to_owned()
+    } else {
+        format!("Main replied: {line}")
+    };
+    let inserted = conn.execute(
+        "INSERT OR IGNORE INTO push_outbox
+            (outbox_key, kind, instance_id, interaction_id, tag_kind, tag_id, title, body, url,
+             created_at)
+         VALUES (?1, 'reply', ?2, NULL, 'instance', ?2, ?3, ?4, ?5, ?6)",
+        params![
+            format!("reply:{instance_id}:{seq}"),
+            instance_id,
+            title,
+            "Open Main to read the reply.",
+            format!("/s/{instance_id}"),
+            crate::config::now_rfc3339()
+        ],
+    )?;
+    if inserted > 0 {
+        note_outbox();
+    }
+    Ok(())
+}
+
+/// Text of a message's text blocks.
+fn blocks_text(blocks: Option<&Value>) -> String {
+    blocks
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The first non-empty line of the turn's last root assistant message (after
+/// the input that armed it at `after`, up to the turn end at `seq`),
+/// truncated to [`REPLY_LINE_CHARS`]. Empty when the turn wrote none.
+fn final_message_line(
+    conn: &Connection,
+    instance_id: &str,
+    after: i64,
+    seq: i64,
+) -> Result<String, StoreError> {
+    let rows: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT payload_json FROM journal WHERE instance_id = ?1 AND seq > ?2 AND seq <= ?3
+              ORDER BY seq DESC LIMIT ?4",
+        )?;
+        stmt.query_map(params![instance_id, after, seq, REPLY_SCAN_ROWS], |row| {
+            row.get(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    // Ascending, folding each assistant message's mutations by id.
+    let mut last: Option<(String, String)> = None;
+    for raw in rows.iter().rev() {
+        let Ok(event) = serde_json::from_str::<Value>(raw) else {
+            continue;
+        };
+        if event.get("kind").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        let Some(payload) = event.get("payload") else {
+            continue;
+        };
+        if payload.get("role").and_then(Value::as_str) != Some("assistant")
+            || payload
+                .get("parentToolCallId")
+                .is_some_and(|parent| !parent.is_null())
+        {
+            continue;
+        }
+        let id = payload
+            .get("messageId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let text = blocks_text(payload.get("blocks"));
+        let operation = payload
+            .get("operation")
+            .and_then(Value::as_str)
+            .unwrap_or("open");
+        match &mut last {
+            Some((known, existing)) if *known == id => match operation {
+                "append" => existing.push_str(&text),
+                "close" => {}
+                _ => *existing = text,
+            },
+            _ => last = Some((id, text)),
+        }
+    }
+    let text = last.map(|(_, text)| text).unwrap_or_default();
+    Ok(first_line(&text))
+}
+
+/// The first non-empty line of `text`, truncated with an ellipsis.
+fn first_line(text: &str) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("");
+    let mut out: String = line.chars().take(REPLY_LINE_CHARS).collect();
+    if line.chars().count() > REPLY_LINE_CHARS {
+        out.push('…');
+    }
+    out
+}
+
 // ─── the outbox ─────────────────────────────────────────────────────────────
 
 /// In-process outbox state: drives are serialized, so one row is never sent
@@ -748,6 +969,46 @@ pub(crate) async fn log_push(state: &AppState, entry: LogEntry) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn the_first_line_is_trimmed_and_truncated() {
+        assert_eq!(
+            first_line("\n  Done: three files.  \nmore"),
+            "Done: three files."
+        );
+        let long = "x".repeat(REPLY_LINE_CHARS + 5);
+        let line = first_line(&long);
+        assert_eq!(line.chars().count(), REPLY_LINE_CHARS + 1);
+        assert!(line.ends_with('…'));
+        assert_eq!(first_line(""), "");
+    }
+
+    #[test]
+    fn only_root_user_inputs_with_a_command_arm_a_reply() {
+        let input = |role: &str, parent: Value, command: Value| {
+            serde_json::json!({"kind": "message", "payload": {
+                "role": role, "operation": "open", "parentToolCallId": parent,
+                "commandId": command}})
+        };
+        assert_eq!(
+            root_input_command(&input("user", Value::Null, "cmd_1".into())),
+            Some("cmd_1")
+        );
+        assert_eq!(
+            root_input_command(&input("assistant", Value::Null, "cmd_1".into())),
+            None
+        );
+        assert_eq!(
+            root_input_command(&input("user", "tc_1".into(), "cmd_1".into())),
+            None
+        );
+        assert_eq!(
+            root_input_command(&input("user", Value::Null, Value::Null)),
+            None
+        );
+    }
+
     /// Structural: every §8.3 cause calls the one transition function from
     /// the place that causes it (directly, or through its `Store` wrapper
     /// here).

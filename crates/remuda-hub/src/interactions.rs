@@ -519,6 +519,14 @@ pub async fn list_interactions(
     if agent_origin {
         items = delegated_visible_items(&state, &device, items).await?;
     }
+    // cb-requested-by: the owner's own words on a card are for a Human caller.
+    // An Agent (a different lineage) or a Bot (which relays to chat) keeps
+    // the command id / origin and loses the excerpt.
+    if !crate::agent_scope::owner_words_visible(&device) {
+        for item in &mut items {
+            crate::agent_scope::hide_requested_by_excerpt(item);
+        }
+    }
     Ok(Json(json!({ "items": items, "nextCursor": null })))
 }
 

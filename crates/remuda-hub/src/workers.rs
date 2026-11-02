@@ -171,6 +171,17 @@ struct BriefBody {
 
 // ── list / get ─────────────────────────────────────────────────────────────
 
+/// cb-requested-by: serve the owner's own words to Human callers only. Every
+/// roster serializer below passes through here, so an Agent (a different
+/// lineage) or a Bot still reads at most `requestedBy.commandId`.
+fn hide_owner_words(device: &crate::store::Device, worker: &mut WorkerRoster) {
+    if !crate::agent_scope::owner_words_visible(device)
+        && let Some(requested_by) = &mut worker.requested_by
+    {
+        requested_by.excerpt = None;
+    }
+}
+
 async fn list_workers(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -191,6 +202,9 @@ async fn list_workers(
                 .as_deref()
                 .is_none_or(|wanted| worker.state.kind() == wanted)
     });
+    for worker in &mut items {
+        hide_owner_words(&device, worker);
+    }
     Ok(Json(json!({ "items": items, "nextCursor": null })))
 }
 
@@ -202,7 +216,8 @@ async fn get_worker(
     let device = caller(&state, &headers).await?;
     require_grant(&state, &device, remuda_protocol::GrantVerb::Dispatch).await?;
     let scope = caller_project_scope(&state, &device).await?;
-    let worker = resolve_worker(&state, &id, &scope).await?;
+    let mut worker = resolve_worker(&state, &id, &scope).await?;
+    hide_owner_words(&device, &mut worker);
     Ok(Json(json!(worker)))
 }
 
@@ -917,7 +932,9 @@ pub(crate) async fn dispatch_core(
         state
             .store
             .append_audit(
-                device.id,
+                // Cloned: the caller's device is still needed after the block
+                // to hide the owner's words from a non-Human response.
+                device.id.clone(),
                 "worker.dispatch".into(),
                 Some(row.meta.id.as_id().to_string()),
                 json!({ "project": row.project_id.as_id(), "host": row.host_id.as_id() }),
@@ -941,6 +958,8 @@ pub(crate) async fn dispatch_core(
             return Err(error);
         }
     };
+    let mut row = row;
+    hide_owner_words(&device, &mut row);
     Ok(Json(json!({
         "worker": row,
         "instanceId": instance.instance_id,
@@ -1697,6 +1716,8 @@ pub(crate) async fn retire_core(
         .await
         .map_err(map_store)?
         .ok_or(HubError::NotFound)?;
+    let mut updated = updated;
+    hide_owner_words(&device, &mut updated);
     state
         .store
         .append_audit(
@@ -1749,6 +1770,8 @@ async fn set_worker_state(
         .await
         .map_err(map_store)?
         .ok_or(HubError::NotFound)?;
+    let mut updated = updated;
+    hide_owner_words(&device, &mut updated);
     Ok(Json(json!(updated)))
 }
 
@@ -1828,6 +1851,8 @@ async fn send_worker_brief(
         .await
         .map_err(map_store)?
         .ok_or(HubError::NotFound)?;
+    let mut updated = updated;
+    hide_owner_words(&device, &mut updated);
     Ok(Json(json!({ "worker": updated, "command": command })))
 }
 

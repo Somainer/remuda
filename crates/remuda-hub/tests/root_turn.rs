@@ -205,6 +205,21 @@ impl Ctx {
             .expect("json")
     }
 
+    /// `GET path` as `token`, asserting 200.
+    async fn get_with(&self, token: &str, path: &str) -> Value {
+        let response = self
+            .http
+            .get(self.url(path))
+            .bearer_auth(token)
+            .send()
+            .await
+            .expect("http");
+        let status = response.status().as_u16();
+        let body: Value = response.json().await.unwrap_or(Value::Null);
+        assert_eq!(status, 200, "GET {path}: {body}");
+        body
+    }
+
     /// A claude-sdk seat with the dispatch grant, created by the owner, and
     /// its Agent (MCP) credential.
     async fn seat(&self, node: &mut FakeNode, name: &str) -> Result<(String, String)> {
@@ -526,6 +541,37 @@ fn merge_body(body: &mut Value, extra: &Value) {
     for (key, value) in extra {
         body.insert(key.clone(), value.clone());
     }
+}
+
+/// The same `requestedBy` record without the owner's words — what a non-Human
+/// caller reads.
+fn without_excerpt(record: &Value) -> Value {
+    let mut record = record.clone();
+    record.as_object_mut().expect("object").remove("excerpt");
+    record
+}
+
+/// The first `requestedBy` anywhere in a task / board / worker payload.
+fn first_requested_by(value: &Value) -> Option<Value> {
+    match value {
+        Value::Object(map) => {
+            if let Some(requested_by) = map.get("requestedBy") {
+                return Some(requested_by.clone());
+            }
+            map.values().find_map(first_requested_by)
+        }
+        Value::Array(items) => items.iter().find_map(first_requested_by),
+        _ => None,
+    }
+}
+
+/// The pending card with `id` in an `/v1/interactions` page.
+fn card_in(body: &Value, id: &str) -> Option<Value> {
+    body["items"]
+        .as_array()?
+        .iter()
+        .find(|item| item["id"] == json!(id) || item["interactionId"] == json!(id))
+        .cloned()
 }
 
 /// An owner's instruction starts the seat's turn; the dispatch the seat makes
@@ -947,10 +993,18 @@ async fn an_agent_dispatch_carries_the_owners_words_from_an_owner_turn() -> Resu
         )
         .await;
     assert_eq!(status, 200, "{body}");
-    assert_eq!(body["worker"]["requestedBy"], expected, "{body}");
+    // The Agent that dispatched keeps the ids and not the owner's words.
+    assert_eq!(
+        body["worker"]["requestedBy"],
+        without_excerpt(&expected),
+        "{body}"
+    );
     let id = body["worker"]["id"].as_str().context("worker id")?;
     let stored = ctx.get(&format!("/v1/workers/{id}")).await;
-    assert_eq!(stored["requestedBy"], expected, "{stored}");
+    assert_eq!(
+        stored["requestedBy"], expected,
+        "the owner's read: {stored}"
+    );
     Ok(())
 }
 
@@ -992,10 +1046,13 @@ async fn a_body_supplied_requested_by_is_stripped() -> Result<()> {
 
     let (status, body) = ctx.create_task(&token, &project, forged.clone()).await;
     assert_eq!(status, 200, "{body}");
-    assert_eq!(body["requestedBy"], expected, "{body}");
+    assert_eq!(body["requestedBy"], without_excerpt(&expected), "{body}");
+    let id = body["id"].as_str().context("task id")?;
+    let human = ctx.get(&format!("/v1/tasks/{id}")).await;
+    assert_eq!(human["requestedBy"], expected, "the owner's read: {human}");
     assert!(
-        !body.to_string().contains("not the owner's words"),
-        "{body}"
+        !human.to_string().contains("not the owner's words"),
+        "{human}"
     );
     Ok(())
 }
@@ -1159,10 +1216,13 @@ async fn an_agent_created_task_records_the_owners_words() -> Result<()> {
 
     let (status, task) = ctx.create_task(&token, &project, Value::Null).await;
     assert_eq!(status, 200, "{task}");
-    assert_eq!(task["requestedBy"], expected, "{task}");
+    assert_eq!(task["requestedBy"], without_excerpt(&expected), "{task}");
     let id = task["id"].as_str().context("task id")?;
     let stored = ctx.get(&format!("/v1/tasks/{id}")).await;
-    assert_eq!(stored["requestedBy"], expected, "{stored}");
+    assert_eq!(
+        stored["requestedBy"], expected,
+        "the owner's read: {stored}"
+    );
 
     let (status, child) = ctx
         .post(
@@ -1173,7 +1233,13 @@ async fn an_agent_created_task_records_the_owners_words() -> Result<()> {
         )
         .await;
     assert_eq!(status, 200, "{child}");
-    assert_eq!(child["requestedBy"], expected, "{child}");
+    assert_eq!(child["requestedBy"], without_excerpt(&expected), "{child}");
+    let child_id = child["id"].as_str().context("child id")?;
+    let child_stored = ctx.get(&format!("/v1/tasks/{child_id}")).await;
+    assert_eq!(
+        child_stored["requestedBy"], expected,
+        "the owner's read: {child_stored}"
+    );
     Ok(())
 }
 
@@ -1189,5 +1255,90 @@ async fn an_agent_created_task_in_an_agent_turn_is_labelled_agent() -> Result<()
     let (status, task) = ctx.create_task(&token, &project, Value::Null).await;
     assert_eq!(status, 200, "{task}");
     assert_eq!(task["requestedBy"], json!({"origin": "agent"}), "{task}");
+    Ok(())
+}
+
+/// The owner's own words are served to Human callers only: every task, board,
+/// worker and approval read an Agent or Bot can make keeps the command id and
+/// drops the excerpt (cb-requested-by privacy).
+#[tokio::test]
+async fn owner_words_are_human_only_on_task_worker_and_card_reads() -> Result<()> {
+    let (ctx, mut node) = Ctx::boot().await?;
+    let (seat, token) = ctx.seat(&mut node, "main").await?;
+    let project = ctx.create_project().await;
+    let owner = ctx
+        .owner_turn_text(&mut node, &seat, "the owner's private words")
+        .await;
+    let expected = json!({"commandId": owner, "excerpt": "the owner's private words"});
+    let stripped = json!({"commandId": owner});
+
+    // An Agent-created task and an Agent dispatch, both recorded in the owner
+    // turn, plus a pending card from the same turn.
+    let (status, task) = ctx.create_task(&token, &project, Value::Null).await;
+    assert_eq!(status, 200, "{task}");
+    let task_id = task["id"].as_str().context("task id")?.to_owned();
+    let (status, sent) = ctx.worker_dispatch(&token, &project, &[]).await;
+    assert_eq!(status, 200, "{sent}");
+    let worker_id = sent["worker"]["id"]
+        .as_str()
+        .context("worker id")?
+        .to_owned();
+    assert_eq!(
+        sent["worker"]["requestedBy"], stripped,
+        "the dispatch response itself is stripped for an Agent caller: {sent}"
+    );
+    let (status, pending) = ctx
+        .worker_dispatch(&token, &project, &[("x-remuda-require-approval", "true")])
+        .await;
+    assert_eq!(status, 409, "{pending}");
+    let approval = pending["interactionId"]
+        .as_str()
+        .context("interactionId")?
+        .to_owned();
+
+    let paths = [
+        format!("/v1/tasks?project={project}"),
+        format!("/v1/tasks/{task_id}"),
+        format!("/v1/board?project={project}"),
+        format!("/v1/workers?project={project}"),
+        format!("/v1/workers/{worker_id}"),
+    ];
+    for path in &paths {
+        let body = ctx.get_with(&token, path).await;
+        let found = first_requested_by(&body)
+            .unwrap_or_else(|| panic!("no requestedBy in the Agent read of {path}: {body}"));
+        assert_eq!(found, stripped, "Agent read of {path}");
+        assert!(
+            !body.to_string().contains("private words"),
+            "the words never reach an Agent on {path}: {body}"
+        );
+    }
+
+    // A Bot relays cards to a chat platform: same strip, by deliberate choice.
+    let bot = ctx.hub.mint_bot_device_token("reqby-bot").await?;
+    let bot_cards = ctx.get_with(&bot, "/v1/interactions").await;
+    let bot_card =
+        card_in(&bot_cards, &approval).unwrap_or_else(|| panic!("bot card: {bot_cards}"));
+    assert_eq!(bot_card["requestedBy"], stripped, "{bot_card}");
+    assert!(
+        !bot_cards.to_string().contains("private words"),
+        "{bot_cards}"
+    );
+
+    // The owner sees the words on every one of those reads.
+    for path in &paths {
+        let body = ctx.get(path).await;
+        assert_eq!(
+            first_requested_by(&body).expect("human read"),
+            expected,
+            "Human read of {path}"
+        );
+    }
+    let human_cards = ctx.get("/v1/interactions").await;
+    assert_eq!(
+        card_in(&human_cards, &approval).expect("human card")["requestedBy"],
+        expected,
+        "{human_cards}"
+    );
     Ok(())
 }

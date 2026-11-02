@@ -31,6 +31,33 @@ pub fn origin(device: &Device) -> InputOrigin {
     }
 }
 
+/// cb-requested-by: whether the caller may see the owner's own words.
+///
+/// Only a Human caller may. An Agent is a different lineage that could not
+/// already read the owner's command text, and a Bot relays its cards to a chat
+/// platform; both keep `requestedBy.commandId` / `{origin}` and lose the
+/// excerpt at read time.
+pub fn owner_words_visible(device: &Device) -> bool {
+    origin(device) == InputOrigin::Human
+}
+
+/// Remove `requestedBy.excerpt` from an interaction-shaped value (the view's
+/// top-level copy and the nested `interaction` copy when present). A no-op
+/// when there is no record; other callers' fields are untouched.
+pub fn hide_requested_by_excerpt(value: &mut Value) {
+    if let Some(requested_by) = value.get_mut("requestedBy").and_then(Value::as_object_mut) {
+        requested_by.remove("excerpt");
+    }
+    if let Some(requested_by) = value
+        .get_mut("interaction")
+        .and_then(Value::as_object_mut)
+        .and_then(|interaction| interaction.get_mut("requestedBy"))
+        .and_then(Value::as_object_mut)
+    {
+        requested_by.remove("excerpt");
+    }
+}
+
 /// A caller header can narrow a Human/Bot token; it cannot promote a scoped token.
 pub async fn caller(state: &AppState, headers: &HeaderMap) -> Result<Device, HubError> {
     let device = auth::require_device(&state.store, headers).await?;

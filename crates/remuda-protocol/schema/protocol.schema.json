@@ -11664,6 +11664,171 @@
       ],
       "type": "object"
     },
+    "MemoryImportCreated": {
+      "description": "One entry the import created.",
+      "properties": {
+        "origin": {
+          "$ref": "#/$defs/MemoryOrigin",
+          "description": "The recorded origin it was stored with."
+        },
+        "revision": {
+          "description": "Its revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "slug": {
+          "description": "Entry slug.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "slug",
+        "origin",
+        "revision"
+      ],
+      "type": "object"
+    },
+    "MemoryImportEntry": {
+      "description": "One entry of the one-time Phase 1 import (main-agent.md §12.4,\ncb-memory-guard): a workspace memory file, with the origin it recorded.",
+      "properties": {
+        "body": {
+          "default": "",
+          "description": "Body.",
+          "type": "string"
+        },
+        "description": {
+          "description": "One-line description.",
+          "type": "string"
+        },
+        "origin": {
+          "$ref": "#/$defs/MemoryOrigin",
+          "description": "The origin the file recorded: `human` for what the owner said,\n`agent` for what the seat noted on its own."
+        },
+        "slug": {
+          "description": "Entry slug.",
+          "type": "string"
+        },
+        "title": {
+          "description": "One-line title.",
+          "type": "string"
+        },
+        "type": {
+          "$ref": "#/$defs/MemoryType",
+          "description": "Entry type."
+        }
+      },
+      "required": [
+        "slug",
+        "type",
+        "title",
+        "description",
+        "body",
+        "origin"
+      ],
+      "type": "object"
+    },
+    "MemoryImportRequest": {
+      "description": "`POST /v1/lineages/{id}/memory/import` body. Owner only.",
+      "properties": {
+        "dryRun": {
+          "default": false,
+          "description": "Decide everything and commit nothing.",
+          "type": "boolean"
+        },
+        "entries": {
+          "description": "The entries, in file order; at most 512, slugs distinct.",
+          "items": {
+            "$ref": "#/$defs/MemoryImportEntry"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "entries",
+        "dryRun"
+      ],
+      "type": "object"
+    },
+    "MemoryImportResult": {
+      "description": "Result of a Phase 1 import: what was (or, in a dry run, would be)\ncreated and what was skipped. Nothing else changes.",
+      "properties": {
+        "created": {
+          "description": "Created entries, in request order.",
+          "items": {
+            "$ref": "#/$defs/MemoryImportCreated"
+          },
+          "type": "array"
+        },
+        "dryRun": {
+          "description": "True when nothing was committed.",
+          "type": "boolean"
+        },
+        "lineageId": {
+          "description": "Lineage.",
+          "type": "string"
+        },
+        "skipped": {
+          "description": "Skipped entries, in request order.",
+          "items": {
+            "$ref": "#/$defs/MemoryImportSkip"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "lineageId",
+        "dryRun",
+        "created",
+        "skipped"
+      ],
+      "type": "object"
+    },
+    "MemoryImportSkip": {
+      "description": "One entry the import skipped.",
+      "properties": {
+        "existing": {
+          "description": "The entry it duplicates (`same-content` only).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "$ref": "#/$defs/MemoryImportSkipReason",
+          "description": "Why it was skipped."
+        },
+        "slug": {
+          "description": "The slug the file asked for.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "slug",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "MemoryImportSkipReason": {
+      "description": "MemoryImportSkipReason wire values; `protocol.md` §8.",
+      "oneOf": [
+        {
+          "const": "same-entry",
+          "description": "Wire value `same-entry`.",
+          "type": "string"
+        },
+        {
+          "const": "slug-exists",
+          "description": "Wire value `slug-exists`.",
+          "type": "string"
+        },
+        {
+          "const": "same-content",
+          "description": "Wire value `same-content`.",
+          "type": "string"
+        }
+      ]
+    },
     "MemoryIndex": {
       "description": "The Hub-rendered index: one line per live entry (archived entries too\nwhen asked for, marked `(archived)`), stable-ordered by type then slug.",
       "properties": {

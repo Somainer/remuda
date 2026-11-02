@@ -574,56 +574,6 @@ async fn the_hub_still_refuses_caller_prompt_flags_with_a_400() -> Result<()> {
     Ok(())
 }
 
-/// main-agent.md §12.5 (structure): the memory read interface is called only
-/// from the memory module (its HTTP handlers and the chapter-start renderer
-/// live there; backup is `scripts/hub-backup.sh`), and the chapter-start
-/// renderer only from the create/resume forward.
-#[test]
-fn the_memory_read_interface_has_no_caller_outside_the_allowed_modules() {
-    const READS: [&str; 6] = [
-        ".memory_get(",
-        ".memory_list(",
-        ".memory_index(",
-        ".memory_search(",
-        ".memory_derived_from(",
-        "memory::render",
-    ];
-    const RAW: [&str; 2] = ["FROM memory_entries", "FROM memory_fts"];
-    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut files = Vec::new();
-    let mut stack = vec![src.clone()];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).expect("src dir") {
-            let path = entry.expect("entry").path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().is_some_and(|ext| ext == "rs") {
-                files.push(path);
-            }
-        }
-    }
-    assert!(files.len() > 10, "scanned {} files", files.len());
-    let mut offenders = Vec::new();
-    for path in files {
-        let relative = path.strip_prefix(&src).expect("under src");
-        let relative = relative.to_string_lossy();
-        if relative == "memory.rs" {
-            continue;
-        }
-        let source = std::fs::read_to_string(&path).expect("source");
-        // Inline test modules may seed and inspect rows directly.
-        let source = source.split("#[cfg(test)]").next().unwrap_or_default();
-        for needle in READS.iter().chain(RAW.iter()) {
-            if source.contains(needle) {
-                offenders.push(format!("{relative}: {needle}"));
-            }
-        }
-        if source.contains(".memory_chapter_start(") && relative != "http.rs" {
-            offenders.push(format!("{relative}: .memory_chapter_start("));
-        }
-    }
-    assert!(
-        offenders.is_empty(),
-        "memory read interface called outside the allowed modules: {offenders:?}"
-    );
-}
+// main-agent.md §12.5 (structure): the read-interface scan lives in
+// tests/memory_guard.rs (cb-memory-guard), token-based and allowlisted per
+// enclosing function.

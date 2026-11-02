@@ -8,6 +8,8 @@
 //!   backtick in an inline prompt would be executed by the remote shell);
 //! - no personal absolute home paths (`/home/<user>`, `/Users/<user>`);
 //! - no private hostname/username matching the secret-scan denylist;
+//! - no credential-shaped text (the shared shapes of `scripts/ci/secret-shapes.json`,
+//!   which the gate scan and the Hub memory lint use too);
 //! - the `DONE <sha>` / `BLOCKED <reason>` reply contract is present;
 //! - a brief that asks a worker to drive a desktop carries the terms its grant
 //!   is refused without (D-045 / D-046, `docs/design/codex-cua.md` §2/§4/§5.2):
@@ -33,7 +35,7 @@ const PRIVATE_TOKENS_SHA256: &str = include_str!("../../../../scripts/ci/private
 pub struct Violation {
     /// 1-based source line.
     pub line: usize,
-    /// Stable rule id (`backtick` / `home-path` / `private-token` /
+    /// Stable rule id (`backtick` / `home-path` / `private-token` / `secret` /
     /// `missing-contract` / `missing-capability` / `missing-host` /
     /// `missing-bundle-id` / `capability-bypass`).
     pub rule: &'static str,
@@ -357,6 +359,16 @@ pub fn lint_brief(text: &str) -> Vec<Violation> {
                 ),
             ));
         }
+        for shape in remuda_hub::secret_lint::secret_rules(line) {
+            violations.push(violation(
+                line_no,
+                "secret",
+                format!(
+                    "credential-shaped text (shape {shape:?}); a brief never carries a \
+                     credential — name where it is kept instead"
+                ),
+            ));
+        }
         let mut candidates: Vec<String> = Vec::new();
         candidates.extend(email_re().find_iter(line).map(|m| m.as_str().to_string()));
         candidates.extend(host_re().find_iter(line).map(|m| m.as_str().to_string()));
@@ -618,6 +630,21 @@ Rules: never run deploy/ scripts. Reply on one line: DONE <sha> or BLOCKED <reas
                 .iter()
                 .any(|v| v.rule == "missing-contract")
         );
+    }
+
+    #[test]
+    fn rejects_credentials_with_the_shared_shapes() {
+        // Built from pieces so this source holds no credential-shaped text.
+        let key = ["sk", "-ant-api03-Zq8vR2nL5tK9wX3mB7cJ4hP"].concat();
+        let text = format!("{CLEAN}\nThe gateway key is {key}.\n");
+        let violations = lint_brief(&text);
+        let secret: Vec<_> = violations.iter().filter(|v| v.rule == "secret").collect();
+        assert_eq!(secret.len(), 1, "{violations:?}");
+        assert_eq!(secret[0].line, 4);
+        assert!(!secret[0].message.contains("Zq8vR2nL"));
+        // A placeholder or a near-miss is not a credential.
+        let near = format!("{CLEAN}\nExport $GATEWAY_KEY; task-scheduler-backfill runs nightly.\n");
+        assert!(lint_brief(&near).is_empty());
     }
 
     #[test]

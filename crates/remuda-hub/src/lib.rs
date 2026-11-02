@@ -62,6 +62,8 @@ pub mod usage_store_test_support {
 mod inventory;
 mod maintenance;
 mod memory;
+#[cfg(test)]
+mod memory_invariant;
 mod model_catalog;
 /// Built-in model catalog revision (tests compare the served catalog against it).
 pub use model_catalog::CATALOG_REVISION;
@@ -80,6 +82,8 @@ mod rate_limit;
 mod registry;
 mod restart;
 mod root_turn;
+/// The shared secret lint (memory writes, brief lint; main-agent.md §12.5).
+pub mod secret_lint;
 mod seen;
 mod skill_context;
 pub mod ssh_hosts;

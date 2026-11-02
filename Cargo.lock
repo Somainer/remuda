@@ -3317,6 +3317,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "ece",
+ "fancy-regex",
  "futures",
  "nix",
  "openssl",

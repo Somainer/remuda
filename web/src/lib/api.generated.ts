@@ -1041,7 +1041,7 @@ export interface paths {
         put?: never;
         /**
          * Create a memory entry
-         * @description Create one entry at the slug's next revision (1 for a slug never used before; a recreated slug continues after its last revision); 409 MEMORY_SLUG_EXISTS when the slug exists (archived included). Soft limits (entry 2048 bytes, index 4096 bytes) come back as warnings with the actual numbers; above 8192 bytes the entry is refused (413). Human devices create memory only for an existing lineage (404 for a retired one) and may update, delete and consolidate (into one of the inputs) any lineage's retained entries, a retired lineage's included. An Agent writes only its own lineage and only from the lineage's current, unfenced chapter (403 otherwise). Bot devices are refused. An Agent write to `about-me` (create, update, delete, or a consolidate that names it as input or target) is refused 403 with reason `owner-authored`.
+         * @description Create one entry at the slug's next revision (1 for a slug never used before; a recreated slug continues after its last revision); 409 MEMORY_SLUG_EXISTS when the slug exists (archived included). Soft limits (entry 2048 bytes, index 4096 bytes) come back as warnings with the actual numbers; above 8192 bytes the entry is refused (413). Human devices create memory only for an existing lineage (404 for a retired one) and may update, delete and consolidate (into one of the inputs) any lineage's retained entries, a retired lineage's included. An Agent writes only its own lineage and only from the lineage's current, unfenced chapter (403 otherwise). Bot devices are refused. An Agent write to `about-me` (create, update, delete, or a consolidate that names it as input or target) is refused 403 with reason `owner-authored`. The secret lint (main-agent.md §12.5) runs over the slug and every text field the write stores: credential-shaped text is refused 422 MEMORY_SECRET_REJECTED with `field` and `rule` (the shape's name), never the text, and nothing is stored.
          */
         post: operations["memoryCreate"];
         delete?: never;
@@ -1061,7 +1061,7 @@ export interface paths {
         put?: never;
         /**
          * Consolidate memory entries (CAS on every input)
-         * @description Atomically replace 2-32 entries with one: every source carries its expectedRevision, and any stale one is 409 MEMORY_REVISION_CONFLICT listing each conflict, with nothing changed. The new entry may reuse a source's slug (its revision then continues) or take a new one (409 when that slug exists elsewhere); it keeps every source's sourceRefs. Human devices create memory only for an existing lineage (404 for a retired one) and may update, delete and consolidate (into one of the inputs) any lineage's retained entries, a retired lineage's included. An Agent writes only its own lineage and only from the lineage's current, unfenced chapter (403 otherwise). Bot devices are refused. An Agent write to `about-me` (create, update, delete, or a consolidate that names it as input or target) is refused 403 with reason `owner-authored`.
+         * @description Atomically replace 2-32 entries with one: every source carries its expectedRevision, and any stale one is 409 MEMORY_REVISION_CONFLICT listing each conflict, with nothing changed. The new entry may reuse a source's slug (its revision then continues) or take a new one (409 when that slug exists elsewhere); it keeps every source's sourceRefs. Human devices create memory only for an existing lineage (404 for a retired one) and may update, delete and consolidate (into one of the inputs) any lineage's retained entries, a retired lineage's included. An Agent writes only its own lineage and only from the lineage's current, unfenced chapter (403 otherwise). Bot devices are refused. An Agent write to `about-me` (create, update, delete, or a consolidate that names it as input or target) is refused 403 with reason `owner-authored`. The secret lint (main-agent.md §12.5) runs over the slug and every text field the write stores: credential-shaped text is refused 422 MEMORY_SECRET_REJECTED with `field` and `rule` (the shape's name), never the text, and nothing is stored.
          */
         post: operations["memoryConsolidate"];
         delete?: never;
@@ -1084,7 +1084,7 @@ export interface paths {
         get: operations["memoryGet"];
         /**
          * Update a memory entry (revision CAS)
-         * @description Revision compare-and-set update: expectedRevision is required, and a stale one is 409 MEMORY_REVISION_CONFLICT with currentRevision. Omitted fields keep their values; sourceRefs are appended. An archived entry is 409 MEMORY_ARCHIVED until restored. Human devices create memory only for an existing lineage (404 for a retired one) and may update, delete and consolidate (into one of the inputs) any lineage's retained entries, a retired lineage's included. An Agent writes only its own lineage and only from the lineage's current, unfenced chapter (403 otherwise). Bot devices are refused. An Agent write to `about-me` (create, update, delete, or a consolidate that names it as input or target) is refused 403 with reason `owner-authored`.
+         * @description Revision compare-and-set update: expectedRevision is required, and a stale one is 409 MEMORY_REVISION_CONFLICT with currentRevision. Omitted fields keep their values; sourceRefs are appended. An archived entry is 409 MEMORY_ARCHIVED until restored. Human devices create memory only for an existing lineage (404 for a retired one) and may update, delete and consolidate (into one of the inputs) any lineage's retained entries, a retired lineage's included. An Agent writes only its own lineage and only from the lineage's current, unfenced chapter (403 otherwise). Bot devices are refused. An Agent write to `about-me` (create, update, delete, or a consolidate that names it as input or target) is refused 403 with reason `owner-authored`. The secret lint (main-agent.md §12.5) runs over the slug and every text field the write stores: credential-shaped text is refused 422 MEMORY_SECRET_REJECTED with `field` and `rule` (the shape's name), never the text, and nothing is stored.
          */
         put: operations["memoryUpdate"];
         post?: never;
@@ -1093,6 +1093,26 @@ export interface paths {
          * @description Revision compare-and-set delete: the expectedRevision query parameter is required; a stale one is 409 MEMORY_REVISION_CONFLICT. Human devices create memory only for an existing lineage (404 for a retired one) and may update, delete and consolidate (into one of the inputs) any lineage's retained entries, a retired lineage's included. An Agent writes only its own lineage and only from the lineage's current, unfenced chapter (403 otherwise). Bot devices are refused. An Agent write to `about-me` (create, update, delete, or a consolidate that names it as input or target) is refused 403 with reason `owner-authored`.
          */
         delete: operations["memoryDelete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/lineages/{id}/memory/import": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Import Phase 1 memory files once (owner only)
+         * @description Owner (Human) only: the one-time Phase 1 import of a seat's workspace memory files (main-agent.md §12.4), as `remuda memory import --from <dir>` sends it after reading every file. One writer transaction creates each new entry with the origin its file recorded (no writing chapter, no turn), and skips an entry whose slug is already there (`same-entry` when identical, `slug-exists` when different, which is kept) or whose body (title and description for an empty body) another entry already has (`same-content`, naming it). Nothing is ever overwritten or deleted, so a re-run changes nothing. `dryRun` decides the same and commits nothing. Every entry is validated and linted first: credential-shaped text is 422 MEMORY_SECRET_REJECTED (field and rule, never the text), a repeated slug, an `about-me` entry whose origin is not human or more than 512 entries are 400, and an unknown lineage is 404; an entry over the 8192-byte cap is 413 MEMORY_ENTRY_TOO_LARGE, as for a create, and a request body over 25,694,208 bytes (512 entries at the cap with every byte JSON-escaped to six, as a control character is, plus 1 KiB each and 4 KiB for the envelope) is 413 before it is parsed; any of these stores nothing. Agent and Bot devices are refused.
+         */
+        post: operations["memoryImport"];
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -2972,6 +2992,42 @@ export interface components {
         /** @description Memory entries. */
         MemoryEntryPage: {
             items: components["schemas"]["MemoryEntry"][];
+        };
+        /** @description A Phase 1 import: the seat's memory files as entries, in file order. */
+        MemoryImport: {
+            /** @description Decide everything and commit nothing. */
+            dryRun?: boolean;
+            entries: {
+                body?: string;
+                description: string;
+                /**
+                 * @description The origin the file recorded.
+                 * @enum {string}
+                 */
+                origin: "human" | "agent";
+                slug: string;
+                title: string;
+                /** @enum {string} */
+                type: "user" | "feedback" | "project" | "reference";
+            }[];
+        };
+        /** @description What a Phase 1 import created (or, in a dry run, would create) and skipped; nothing else changes. */
+        MemoryImportResult: {
+            created: {
+                /** @enum {string} */
+                origin: "human" | "agent";
+                revision: number;
+                slug: string;
+            }[];
+            dryRun: boolean;
+            lineageId: string;
+            skipped: {
+                /** @description The entry it duplicates (`same-content` only). */
+                existing?: string;
+                /** @enum {string} */
+                reason: "same-entry" | "slug-exists" | "same-content";
+                slug: string;
+            }[];
         };
         /** @description The Hub-rendered index of a lineage's live entries (archived ones too on request). */
         MemoryIndex: {
@@ -6081,6 +6137,7 @@ export interface operations {
             404: components["responses"]["Error"];
             409: components["responses"]["Error"];
             413: components["responses"]["Error"];
+            422: components["responses"]["Error"];
         };
     };
     memoryConsolidate: {
@@ -6116,6 +6173,7 @@ export interface operations {
             404: components["responses"]["Error"];
             409: components["responses"]["Error"];
             413: components["responses"]["Error"];
+            422: components["responses"]["Error"];
         };
     };
     memoryGet: {
@@ -6184,6 +6242,7 @@ export interface operations {
             404: components["responses"]["Error"];
             409: components["responses"]["Error"];
             413: components["responses"]["Error"];
+            422: components["responses"]["Error"];
         };
     };
     memoryDelete: {
@@ -6219,6 +6278,38 @@ export interface operations {
             403: components["responses"]["Error"];
             404: components["responses"]["Error"];
             409: components["responses"]["Error"];
+        };
+    };
+    memoryImport: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MemoryImport"];
+            };
+        };
+        responses: {
+            /** @description Created and skipped entries */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryImportResult"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            413: components["responses"]["Error"];
+            422: components["responses"]["Error"];
         };
     };
     memoryIndex: {

@@ -2039,6 +2039,11 @@ DELETE /v1/lineages/{id}/memory/{slug}?expectedRevision=<n>
 POST   /v1/lineages/{id}/memory/consolidate
   body {sources: [{slug, expectedRevision}], target: {slug, type, title, description, body}}
   -> 200 {entry: MemoryEntry, removed: [slug]}      one writer job, all or nothing
+POST   /v1/lineages/{id}/memory/import                 owner only (cb-memory-guard)
+  body {entries: [{slug, type, title, description, body, origin: human|agent}], dryRun?}
+  -> 200 {lineageId, dryRun, created: [{slug, origin, revision}],
+          skipped: [{slug, reason: same-entry|slug-exists|same-content, existing?}]}
+     one writer job; creates only, never overwrites or deletes; dryRun commits nothing
 
 GET    /v1/instances/{id}/memory-writes?afterId=<n>
   -> 200 {items: [{slug, title, revision, op: write|consolidate|delete,
@@ -2055,11 +2060,12 @@ turnRef     = {instanceId, seq} | null             turn of the latest write
 
 - 写入按条目做 revision CAS。`expectedRevision` 不符：409，`code: "MEMORY_REVISION_CONFLICT"`，`reason: "revision-mismatch"`，并带 `currentRevision`；绝不覆盖。
 - 正文超过 8 KiB：422，`code: "MEMORY_ENTRY_TOO_LARGE"`。正文超过 2 KiB 或索引超过 4 KiB 时写入成功，`warnings` 给出实际字节数。
-- 秘密 lint 命中：422，`code: "MEMORY_SECRET_REJECTED"`，错误体不回显命中的文本。
+- 秘密 lint 命中：422，`code: "MEMORY_SECRET_REJECTED"`，错误体不回显命中的文本，只给出 `field`（`slug`、`title`、`description` 或 `body`）与 `rule`（命中形状的名字），什么也不存。slug 本身命中时错误体也不带 `slug`；请求里出现的每个 slug 都先过 lint 再做 slug 校验，所以既无效又像凭据的 slug 同样得到这个 422，而无效 slug 的 400 消息从不回显 slug。lint 覆盖创建、更新、consolidate 的目标与 Phase 1 导入，只查凭据形状（`cb-memory-guard`；形状与 `scripts/ci/secret-scan.py`、`remuda brief lint` 共用 `scripts/ci/secret-shapes.json`），不做内容策略检查（D-060 R2）。
 - Agent 写入只接受血缘当前章节：否则 409，`reason: "not-current-chapter"`；F 落地后改为既有的 `reason: "fenced"`（§9.1）。Agent 写 `about-me`：403，`reason: "owner-authored"`。已归档的血缘拒绝写入：409，`reason: "archived"`。
 - `origin`、`writerInstanceId` 与 `turnRef` 由 Hub 盖章，请求体里的同名字段被剥掉。Agent 写入的 `origin` 取自写入所在根回合的 `rootTurn.origin`（只有所有者的输入开启的回合才是 `human`，Hub 不知道回合时为 `agent`），条目另带 `rootTurn`，写入章节仍记在 `writerInstanceId`（cb-rootturn）。
 - **写入日志。** 每次成功写入在同一事务里追加一行 `memory_write_log`（`lineage_id, slug, revision, title, op, origin, writer_instance, turn_seq, written_at`）；consolidate 每个输入一行，另加目标一行。行不随条目改写或删除而消失，所以每个写过记忆的回合都能显示自己的行。`turnSeq` 是写者章节在写入时最近一条 `turn_started` 的 journal seq，由 Hub 记下，从不取自请求体；所有者的写入和章节首个回合之前的写入为 NULL。`turnRef` 取自最近一次写入。
 - CLI：`remuda memory write|read|search|rm|consolidate`。超过软上限时打印实际数字。
+- **Phase 1 导入**（`cb-memory-guard`，main-agent.md §12.4）。只有所有者（Human）能调用，Agent 与 Bot 403。`remuda memory import --from <dir> [--dry-run]` 先读完目录里的每个文件再发请求：目录或文件「不存在」算空，其他读取错误（权限、IO）直接报错，什么也不发。Hub 在一个写事务里只做创建：条目带文件记录的 `origin`，不带写入章节与回合；slug 已存在时跳过（内容相同为 `same-entry`，不同为 `slug-exists`，保留原条目），正文相同（正文为空时比标题与描述）的条目在别的 slug 下已存在时跳过（`same-content`，给出那个 slug）。因此重跑什么也不改。每个条目先过校验与秘密 lint：凭据形状 422 `MEMORY_SECRET_REJECTED`，slug 重复、`origin` 不是 human 的 `about-me`、超过 512 条为 400，血缘不存在为 404；单个条目超过 8 KiB 与创建一样是 413 `MEMORY_ENTRY_TOO_LARGE`，请求体超过 25,694,208 字节（512 个条目、每条按上限且每个字节都按 JSON 转义成六个字节计——控制字符正是如此——再各加 1 KiB，加 4 KiB 信封）在解析前即 413。这些情况都什么也不存。
 
 **worker digest 与血缘 glance（`cb-digest`）。**
 

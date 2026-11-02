@@ -256,6 +256,12 @@ pub(crate) fn hub_http_error(err: ClientError) -> anyhow::Error {
                     lines.push(format!("  - {reason}"));
                 }
             }
+            // §12.5: a seat whose memory write was refused for a credential
+            // reports the refusal by its stable code (the PWA keys on it too);
+            // the message deliberately carries no part of the text.
+            if code == "MEMORY_SECRET_REJECTED" {
+                lines.push(format!("  code: {code}"));
+            }
             // D-060 §9.1: a refusal's `next.hint` is the instruction, so it
             // sits directly under the message in plain text, never inside the
             // JSON detail dump.
@@ -357,6 +363,25 @@ mod tests {
             text.contains("  next: await-approval — wait for the owner"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn a_secret_refusal_names_its_code() {
+        let text = hub_http_error(ClientError::Http {
+            status: 422,
+            body: json!({
+                "error": "memory entry \"gateway\" was not stored: its body looks like a credential",
+                "code": "MEMORY_SECRET_REJECTED", "field": "body", "rule": "sk-",
+                "slug": "gateway",
+                "next": {"action": "fix-request", "hint": "remove the credential"},
+            })
+            .to_string(),
+        })
+        .to_string();
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].starts_with("hub HTTP 422: memory entry"), "{text}");
+        assert_eq!(lines[1], "  code: MEMORY_SECRET_REJECTED");
+        assert_eq!(lines[2], "  next: fix-request — remove the credential");
     }
 
     #[test]

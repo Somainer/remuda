@@ -340,10 +340,8 @@ pub(crate) fn collect(dir: &Path, files: &dyn MemoryFiles) -> anyhow::Result<Col
     let mut seen: BTreeMap<&str, &str> = BTreeMap::new();
     for (entry, name) in collected.entries.iter().zip(&collected.sources) {
         if let Some(first) = seen.insert(entry.slug.as_str(), name.as_str()) {
-            problems.push(format!(
-                "{name}: slug {:?} is also the slug of {first}",
-                entry.slug
-            ));
+            // Name the files, never the slug: it may carry a credential.
+            problems.push(format!("{name} and {first} give the same slug"));
         }
     }
     if !problems.is_empty() {
@@ -463,14 +461,14 @@ fn parse_entry(
         .map_err(|error| format!("no usable slug from its name: {error}"))?;
     let memory_type = match fields.get("type") {
         Some(raw) => MemoryType::parse(raw.trim())
-            .ok_or_else(|| format!("type {raw:?} is not user, feedback, project or reference"))?,
+            .ok_or_else(|| "its type is not user, feedback, project or reference".to_string())?,
         None => return Err("no type in the front matter".into()),
     };
     let (origin, defaulted) = match fields.get("origin").map(|raw| raw.trim()) {
         None => (MemoryOrigin::Agent, true),
         Some("human") => (MemoryOrigin::Human, false),
         Some("agent") => (MemoryOrigin::Agent, false),
-        Some(other) => return Err(format!("origin {other:?} is not human or agent")),
+        Some(_) => return Err("its origin is not human or agent".into()),
     };
     let heading = body
         .lines()
@@ -828,6 +826,28 @@ mod tests {
         assert_eq!(devbox.origin, MemoryOrigin::Agent);
         assert_eq!(devbox.title, "devbox");
         assert_eq!(collected.origin_defaulted, 1);
+    }
+
+    #[test]
+    fn colliding_slugs_name_the_files_never_the_slug() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two names that become the same slug, both shaped like a key.
+        let tail = "Bv4Lc8Rz5Hd1Kf6";
+        let upper = ["sk", "-ProjTq7Wm2Xn9", tail].concat();
+        for (file, name) in [("a.md", upper.clone()), ("b.md", upper.to_lowercase())] {
+            std::fs::write(
+                dir.path().join(file),
+                format!("---\nname: {name}\ndescription: d\ntype: user\n---\nbody {file}\n"),
+            )
+            .unwrap();
+        }
+        let error = collect(dir.path(), &DiskFiles).unwrap_err().to_string();
+        assert!(error.contains("b.md and a.md"), "{error}");
+        assert!(error.contains("same slug"), "{error}");
+        assert!(
+            !error.to_lowercase().contains(&tail.to_lowercase()),
+            "{error}"
+        );
     }
 
     #[test]

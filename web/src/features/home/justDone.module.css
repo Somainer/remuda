@@ -1,0 +1,86 @@
+/* @tokens strict */
+/* ⑤ 刚完成 (home.md §2.1 / §7): under the queue, hidden when empty. */
+
+.section {
+  margin: 0 var(--space-4) var(--space-3);
+}
+
+/* home.md §2.1: ⑤ paints after the WHOLE queue — the interaction cards AND
+   the D-050 task layer (order 1) — and before the search/ledger row (3).
+   Scoped to the phone placement so the desktop list column keeps its DOM
+   order (its parent is a flex column too). */
+.section[data-placement="phone"] {
+  order: 2;
+  flex: none;
+}
+
+.head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: var(--space-2) 0;
+}
+
+.heading {
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+  white-space: nowrap;
+}
+
+.markAll,
+.seen,
+.more {
+  margin: 0;
+  padding: 0 var(--space-2);
+  border: 0;
+  background: transparent;
+  color: var(--link);
+  font-family: var(--font-ui);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+  cursor: pointer;
+}
+
+.list,
+.inline {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.inline {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.open {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+  min-height: var(--control-h);
+  color: var(--fg-body);
+  font-weight: 700;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.mark {
+  color: var(--link);
+}
+
+.title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}

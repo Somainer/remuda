@@ -5,6 +5,7 @@
  * count promised.
  */
 import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, expect, it, vi } from "vitest";
 import { api } from "../lib/api";
@@ -76,6 +77,84 @@ it("counts 工作中 from the top-level sessions the list shows, not child agent
   expect(screen.getAllByTestId("board-card")).toHaveLength(1);
   // So the count says 1, not 2 — the tapped list equals it.
   expect(await screen.findByTestId("glance-working")).toHaveTextContent("1 工作中");
+});
+
+it("filters the ledger to 完成未看 when ◉ is tapped, and clears it on the second tap", async () => {
+  const host = {
+    ...mockDb.hosts[0],
+    id: "host-a",
+    workspaces: [{ workspaceId: "wsp-a", hostId: "host-a", root: "/home/dev/ws" }],
+  };
+  const base = mockDb.instances[0];
+  const done = {
+    ...base, id: "ins-done", hostId: "host-a", workspaceId: "wsp-a",
+    lifecycle: "running", connectivity: "connected", activity: known("idle"), parent: null, unseen: true,
+  } as Instance;
+  const working = {
+    ...base, id: "ins-work", hostId: "host-a", workspaceId: "wsp-a",
+    lifecycle: "running", connectivity: "connected", activity: known("working"), parent: null,
+  } as Instance;
+
+  vi.spyOn(api, "hello").mockResolvedValue({} as never);
+  vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+  vi.spyOn(api, "hostList").mockResolvedValue({ items: [host], nextCursor: null } as never);
+  vi.spyOn(api, "instanceList").mockResolvedValue({ items: [done, working], nextCursor: null });
+  vi.spyOn(api, "interactionList").mockResolvedValue([]);
+  vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] });
+  vi.spyOn(api, "hostWorkspaceSubscribe").mockImplementation(() => () => undefined);
+  vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+  vi.spyOn(hubStore, "flushAllOutbox").mockImplementation(() => undefined as never);
+  await hubStore.bootstrap();
+  await hubStore.refresh();
+
+  render(
+    <MemoryRouter initialEntries={["/sessions"]}>
+      <SessionsPage />
+    </MemoryRouter>,
+  );
+  await screen.findByTestId("session-list");
+  expect(screen.getAllByTestId("board-card")).toHaveLength(2);
+  const segment = await screen.findByTestId("glance-done-unseen");
+  expect(segment).toHaveTextContent("1 完成未看");
+  const user = userEvent.setup();
+  await user.click(segment);
+  expect(screen.getByTestId("glance-done-unseen")).toHaveAttribute("aria-pressed", "true");
+  expect(screen.getAllByTestId("board-card")).toHaveLength(1);
+  await user.click(screen.getByTestId("glance-done-unseen"));
+  expect(screen.getByTestId("glance-done-unseen")).toHaveAttribute("aria-pressed", "false");
+  expect(screen.getAllByTestId("board-card")).toHaveLength(2);
+});
+
+it("mounts ⑤ under the queue", async () => {
+  const host = {
+    ...mockDb.hosts[0], id: "host-a",
+    workspaces: [{ workspaceId: "wsp-a", hostId: "host-a", root: "/home/dev/ws" }],
+  };
+  const done = {
+    ...mockDb.instances[0], id: "ins-done", hostId: "host-a", workspaceId: "wsp-a",
+    lifecycle: "running", connectivity: "connected", activity: known("idle"), parent: null, unseen: true,
+  } as Instance;
+  vi.spyOn(api, "hello").mockResolvedValue({} as never);
+  vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+  vi.spyOn(api, "hostList").mockResolvedValue({ items: [host], nextCursor: null } as never);
+  vi.spyOn(api, "instanceList").mockResolvedValue({ items: [done], nextCursor: null });
+  vi.spyOn(api, "interactionList").mockResolvedValue([]);
+  vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] });
+  vi.spyOn(api, "hostWorkspaceSubscribe").mockImplementation(() => () => undefined);
+  vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+  vi.spyOn(hubStore, "flushAllOutbox").mockImplementation(() => undefined as never);
+  await hubStore.bootstrap();
+  await hubStore.refresh();
+
+  render(
+    <MemoryRouter initialEntries={["/sessions"]}>
+      <SessionsPage />
+    </MemoryRouter>,
+  );
+  const section = await screen.findByTestId("home-just-done");
+  const queue = screen.getByTestId("home-queue");
+  expect(section).toHaveAttribute("data-placement", "desktop");
+  expect(queue.compareDocumentPosition(section) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
 });
 
 it("mounts the ④ queue in the main column and hides it while the list search has text", async () => {

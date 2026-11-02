@@ -1,6 +1,7 @@
 import type { Host, Instance } from "../../types/instance";
 import type { Interaction } from "../../types/interaction";
 import type { Task } from "../../types/generated";
+import { resolveMain } from "../../lib/store";
 import { deriveInboxQueue, type InboxQueueItem } from "../mobile/inboxRows";
 import { liveChildParents, rank } from "../mobile/homeRows";
 
@@ -12,8 +13,8 @@ import { liveChildParents, rank } from "../mobile/homeRows";
  * into the segments the row paints.
  *
  * Numbers never come from decoration: a segment with no source is absent
- * (◉ 完成未看 belongs to seen-web, 今日完成 to home-glance-d060), a known zero
- * segment is hidden, an unknown number is 「–」 and anything above 99 is 99+.
+ * (今日完成 belongs to home-glance-d060), a known zero segment is hidden, an
+ * unknown number is 「–」 and anything above 99 is 99+.
  */
 
 export type GlanceSource = {
@@ -36,6 +37,8 @@ export const TOP_LEVEL_WORKING = (instance: Instance): boolean => instance.paren
 export type GlanceCounts = {
   /** §5.1 N = A (interactions really waiting on the owner) + B (owner-blocked tasks with no such interaction). */
   needYou: number;
+  /** §5.2 ◉: instances ranked done-unseen (§3.1 rank 2), current chapter only. */
+  doneUnseen: number;
   /** §5.2 ●: instances ranked working (§3.1 rank 3). */
   working: number;
 };
@@ -48,7 +51,8 @@ export type GlanceCounts = {
  * B is an unarchived task with a blocked reason whose sessions have no
  * interaction in that queue (§4.6: the interaction card and the task card are
  * never both shown, so the task is never counted next to its interaction).
- * 完成未看, notices and failed turns are deliberately absent.
+ * Notices and failed turns are deliberately absent: a failed turn is a queue
+ * card, never ◉.
  */
 export function glanceCounts(
   source: GlanceSource,
@@ -72,12 +76,31 @@ export function glanceCounts(
   const childLive = liveChildParents(source.instances);
   const seen = new Set<string>();
   let working = 0;
+  let doneUnseen = 0;
   for (const instance of workingInstances) {
     if (seen.has(instance.id)) continue;
     seen.add(instance.id);
-    if (rank(instance, childLive.has(instance.id)) === "working") working += 1;
+    const homeRank = rank(instance, childLive.has(instance.id));
+    if (homeRank === "working") working += 1;
+    else if (homeRank === "done-unseen" && showsDoneUnseen(instance, source.instances)) doneUnseen += 1;
   }
-  return { needYou: queue.length + blockedTasks, working };
+  return { needYou: queue.length + blockedTasks, doneUnseen, working };
+}
+
+/**
+ * home.md §7: only Main's current chapter shows ◉. A session that holds the
+ * address-owner grant, or that shares the Main lineage, is counted only when
+ * it IS the chapter `resolveMain` addresses; an older or fenced chapter of
+ * that lineage is not. An ordinary session (no grant, another lineage) is
+ * counted whenever it ranks done-unseen.
+ */
+export function showsDoneUnseen(instance: Instance, instances: readonly Instance[]): boolean {
+  const main = resolveMain(instances);
+  if (main === null) return true;
+  const lineage = instance.lineageId ?? instance.id;
+  const inMainLineage = lineage === main.lineageId || instance.grants?.includes("address-owner") === true;
+  if (!inMainLineage) return true;
+  return instance.id === main.instance.id;
 }
 
 /**
@@ -138,13 +161,18 @@ export function formatUpdatedAt(ms: number): string {
  */
 export type GlancePiece =
   | { key: "needYou"; count: number | null }
+  | { key: "doneUnseen"; count: number | null }
   | { key: "working"; count: number | null }
   | { key: "greeting"; text: string }
   | { key: "hosts"; text: string };
 
 export type GlanceLineInput = {
-  /** null before the first Hub snapshot. */
-  counts: GlanceCounts | null;
+  /**
+   * null before the first Hub snapshot. `doneUnseen` is optional so a caller
+   * that only knows the older two counts still type-checks; an omitted count
+   * reads as 0.
+   */
+  counts: (Omit<GlanceCounts, "doneUnseen"> & { doneUnseen?: number }) | null;
   /** Local hour, injected so the greeting is testable. */
   hour: number;
   hostsOnline: number;
@@ -155,6 +183,12 @@ export type GlanceLineInput = {
    * so it stays, at 0, until the second tap.
    */
   workingFilter?: boolean;
+  /**
+   * The 完成未看 rank filter is applied. Same rule as `workingFilter`: the
+   * active filter needs its control on screen to be cleared, so a known-zero
+   * ◉ segment stays until the second tap.
+   */
+  doneUnseenFilter?: boolean;
 };
 
 /**
@@ -168,15 +202,22 @@ export function glancePieces(input: GlanceLineInput): GlancePiece[] {
   if (input.counts === null) {
     return [
       { key: "needYou", count: null },
+      { key: "doneUnseen", count: null },
       { key: "working", count: null },
     ];
   }
   const { needYou, working } = input.counts;
+  const doneUnseen = input.counts.doneUnseen ?? 0;
   const pieces: GlancePiece[] = [];
   if (needYou > 0) pieces.push({ key: "needYou", count: needYou });
   else pieces.push({ key: "greeting", text: greetingForHour(input.hour) });
+  // §5.2 order: 需要你 · 完成未看 · 工作中.
+  if (doneUnseen > 0 || input.doneUnseenFilter === true) pieces.push({ key: "doneUnseen", count: doneUnseen });
   if (working > 0 || input.workingFilter === true) pieces.push({ key: "working", count: working });
-  else if (needYou === 0 && input.hostsTotal > 0) {
+  // The host tail closes a line that otherwise says nothing but the greeting.
+  // A zero segment kept alive only because its filter is active still leaves
+  // the line empty of news, so the tail stays.
+  else if (needYou === 0 && doneUnseen === 0 && input.hostsTotal > 0) {
     pieces.push({ key: "hosts", text: `${input.hostsOnline}/${input.hostsTotal} 主机在线` });
   }
   return pieces;
@@ -188,6 +229,9 @@ export function glanceText(pieces: readonly GlancePiece[]): string {
     .map((piece) => {
       if (piece.key === "needYou") {
         return `⚠${piece.count === null ? "–" : formatGlanceCount(piece.count)} 需要你`;
+      }
+      if (piece.key === "doneUnseen") {
+        return `◉${piece.count === null ? "–" : formatGlanceCount(piece.count)} 完成未看`;
       }
       if (piece.key === "working") {
         return `●${piece.count === null ? "–" : formatGlanceCount(piece.count)} 工作中`;

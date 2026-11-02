@@ -14,10 +14,14 @@ const fake = vi.hoisted(() => ({
   freshness: { state: "fresh", lastOkAt: null as number | null, failingSince: null as number | null },
 }));
 
-vi.mock("../../lib/store", () => ({
-  useHub: () => fake.state,
-  hubStore: { titleOf: (id: string) => id, getSnapshot: () => fake.state },
-}));
+vi.mock("../../lib/store", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../lib/store")>();
+  return {
+    ...actual,
+    useHub: () => fake.state,
+    hubStore: { ...actual.hubStore, titleOf: (id: string) => id, getSnapshot: () => fake.state },
+  };
+});
 
 vi.mock("./freshness", () => ({
   useHomeFreshness: () => fake.freshness,
@@ -44,11 +48,12 @@ function hub(overrides: Partial<HubState> = {}): HubState {
 const noop = () => {};
 
 describe("HomeGlance", () => {
-  it("reads 「–」 for both segments before the first snapshot", () => {
+  it("reads 「–」 for every segment before the first snapshot", () => {
     fake.state = hub();
     fake.freshness = { state: "unknown", lastOkAt: null, failingSince: null };
     render(<HomeGlance placement="phone" onNeedYou={noop} onWorking={noop} />);
     expect(screen.getByTestId("glance-need-you")).toHaveTextContent("– 需要你");
+    expect(screen.getByTestId("glance-done-unseen")).toHaveTextContent("– 完成未看");
     expect(screen.getByTestId("glance-working")).toHaveTextContent("– 工作中");
     expect(screen.queryByTestId("glance-greeting")).toBeNull();
     expect(screen.queryByTestId("glance-updated")).toBeNull();
@@ -119,6 +124,21 @@ describe("HomeGlance", () => {
     expect(screen.getByTestId("glance-working")).toHaveTextContent("1 工作中");
   });
 
+  it("toggles the 完成未看 filter and reports its pressed state", async () => {
+    fake.state = hub({ instances: [instance("ins_done", null, { activity: { state: "known", value: "idle" }, unseen: true })] });
+    fake.freshness = { state: "fresh", lastOkAt: 1, failingSince: null };
+    const onDoneUnseen = vi.fn();
+    const user = userEvent.setup();
+    render(
+      <HomeGlance placement="desktop" onNeedYou={noop} onWorking={noop} onDoneUnseen={onDoneUnseen} doneUnseenFilter />,
+    );
+    const segment = screen.getByTestId("glance-done-unseen");
+    expect(segment).toHaveTextContent("1 完成未看");
+    expect(segment).toHaveAttribute("aria-pressed", "true");
+    await user.click(segment);
+    expect(onDoneUnseen).toHaveBeenCalledTimes(1);
+  });
+
   it("toggles the working filter segment and reports its state", async () => {
     fake.state = hub({ instances: [instance()] });
     fake.freshness = { state: "fresh", lastOkAt: 1, failingSince: null };
@@ -136,7 +156,7 @@ describe("HomeGlance", () => {
 });
 
 /** A live instance on an unknown activity: rank 3 (home.md §3.1 h). */
-function instance(id = "ins_a", parent: unknown = null) {
+function instance(id = "ins_a", parent: unknown = null, extra: Record<string, unknown> = {}) {
   return {
     id,
     revision: "1",
@@ -161,5 +181,6 @@ function instance(id = "ins_a", parent: unknown = null) {
     journalId: "jrn_1",
     durableSeq: "1",
     exit: { state: "na" },
+    ...extra,
   } as unknown as HubState["instances"][number];
 }

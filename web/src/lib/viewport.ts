@@ -46,15 +46,15 @@ export function useNarrowDesktop(): boolean {
 }
 
 export function useWorkbenchViewport() {
+  // No matchMedia (jsdom unit DOM, or an old webview) reads as desktop: the
+  // same fallback useNarrowDesktop already uses, so a row menu there stays the
+  // popover instead of throwing.
+  const hasMedia = typeof window !== "undefined" && typeof window.matchMedia === "function";
   const [mobile, setMobile] = useState(() =>
-    typeof window === "undefined"
-      ? false
-      : window.matchMedia(COMPACT_WORKBENCH_QUERY).matches,
+    hasMedia ? window.matchMedia(COMPACT_WORKBENCH_QUERY).matches : false,
   );
   const [coarsePointer, setCoarsePointer] = useState(() =>
-    typeof window === "undefined"
-      ? false
-      : window.matchMedia(COARSE_POINTER_QUERY).matches,
+    hasMedia ? window.matchMedia(COARSE_POINTER_QUERY).matches : false,
   );
   const [height, setHeight] = useState(() =>
     typeof window === "undefined" ? 800 : window.innerHeight,
@@ -62,8 +62,10 @@ export function useWorkbenchViewport() {
   const [offsetTop, setOffsetTop] = useState(0);
 
   useEffect(() => {
-    const media = window.matchMedia(COMPACT_WORKBENCH_QUERY);
-    const coarse = window.matchMedia(COARSE_POINTER_QUERY);
+    // Optional: a DOM without matchMedia (jsdom) keeps the desktop default
+    // and still tracks the keyboard band below.
+    const media = typeof window.matchMedia === "function" ? window.matchMedia(COMPACT_WORKBENCH_QUERY) : null;
+    const coarse = typeof window.matchMedia === "function" ? window.matchMedia(COARSE_POINTER_QUERY) : null;
     const apply = (nextHeight: number, nextOffset: number) => {
       document.documentElement.style.setProperty(
         "--workbench-height",
@@ -112,9 +114,9 @@ export function useWorkbenchViewport() {
       }
     };
     const update = () => {
-      const isCompact = media.matches;
+      const isCompact = media?.matches ?? false;
       setMobile(isCompact);
-      setCoarsePointer(coarse.matches);
+      setCoarsePointer(coarse?.matches ?? false);
       const viewport = window.visualViewport;
       if (!viewport) {
         apply(window.innerHeight, 0);
@@ -138,16 +140,16 @@ export function useWorkbenchViewport() {
       setKeyboard(Boolean(isCompact && lost >= KEYBOARD_MIN_HEIGHT_PX));
     };
     update();
-    media.addEventListener("change", update);
-    coarse.addEventListener("change", update);
+    media?.addEventListener("change", update);
+    coarse?.addEventListener("change", update);
     window.addEventListener("resize", update);
     window.visualViewport?.addEventListener("resize", update);
     window.visualViewport?.addEventListener("scroll", update);
     document.addEventListener("focusin", updateKeyboardFocus, true);
     document.addEventListener("focusout", updateKeyboardFocus, true);
     return () => {
-      media.removeEventListener("change", update);
-      coarse.removeEventListener("change", update);
+      media?.removeEventListener("change", update);
+      coarse?.removeEventListener("change", update);
       window.removeEventListener("resize", update);
       window.visualViewport?.removeEventListener("resize", update);
       window.visualViewport?.removeEventListener("scroll", update);

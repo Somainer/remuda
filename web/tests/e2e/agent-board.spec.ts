@@ -32,22 +32,24 @@ test.describe("agent board", () => {
     await expect(grok.getByTestId("session-wire")).toContainText("wt/x-acpwire/canary");
   });
 
-  test("quick send, keys, and stop", async ({ page }) => {
+  test("quick send and a confirmed stop", async ({ page }) => {
     await page.goto("/sessions?scope=all");
     const codex = row(page, "codex-worker");
     await codex.getByTestId("board-more").click();
     await expect(page.getByTestId("board-actions-panel")).toBeVisible();
+    // home.md §9 (D-061): the bare keys are gone from the sheet.
+    await expect(page.getByTestId("board-key-enter")).toHaveCount(0);
+    await expect(page.getByTestId("board-key-esc")).toHaveCount(0);
     await codex.getByTestId("board-prompt").fill("PAUSE");
     await codex.getByTestId("board-send").click();
     await expect(codex.getByTestId("board-snippet")).toContainText("PAUSE");
-    // Sending closes the sheet; reopen for the key row. Keys keep it open so
-    // several keys can land in a row.
+    // 停止 confirms, naming the session and the host, before the row exits.
     await codex.getByTestId("board-more").click();
-    await codex.getByTestId("board-key-enter").click();
-    await expect(codex.getByTestId("board-snippet")).toContainText("^ENTER");
-    await codex.getByTestId("board-key-esc").click();
-    await expect(codex.getByTestId("board-snippet")).toContainText("^ESC");
     await codex.getByTestId("board-stop").click();
+    const confirm = page.getByTestId("board-stop-confirm");
+    await expect(confirm).toBeVisible();
+    await expect(confirm).toContainText("codex-worker");
+    await page.getByTestId("board-stop-confirm-yes").click();
     await expect(codex).toHaveAttribute("data-status", "exited");
   });
 

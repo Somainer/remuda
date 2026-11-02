@@ -11,7 +11,9 @@
 //!   `<native_home>/skills/remuda` for the launches whose harness reads that
 //!   directory: kind `claude` on the carriers whose argv the materializer
 //!   builds (`claude_argv`, and `materialize_shell_pty_agent`), which pin
-//!   `CLAUDE_CONFIG_DIR` to the native home. It follows the computer-use
+//!   `CLAUDE_CONFIG_DIR` to the native home; and a `generic-pty` Claude pane
+//!   whose home holds login material, the one case where that driver pins the
+//!   home too (`generic_pty::pane_home_env`). It follows the computer-use
 //!   rules: never the inherited operator home (D-045), and file lifetime by
 //!   [`native_home_is_shared`]. It also never overwrites a tree it did not
 //!   write: a `skills/remuda` without Remuda's marker is user-owned and left
@@ -78,8 +80,9 @@ pub fn embedded_skill_files() -> impl Iterator<Item = (&'static str, &'static [u
 #[serde(rename_all = "kebab-case")]
 pub enum TreeSkip {
     /// The harness or carrier reads no skills directory Remuda can write: every
-    /// non-Claude harness, and kind `claude` on `generic-pty` (the pane runs
-    /// with the operator's own home).
+    /// non-Claude harness, and kind `claude` on `generic-pty` whose home holds
+    /// no login (the pane then runs with the operator's own home, so a tree
+    /// written here would have no reader).
     NoSkillReader,
     /// The native home is the inherited operator home, which Remuda never
     /// writes (D-045).
@@ -162,9 +165,15 @@ impl RecipeSkill {
 pub(crate) struct SkillRequest<'a> {
     pub context: Option<&'a SkillContext>,
     pub kind: remuda_protocol::AgentKind,
-    /// The materializer builds this launch's Claude argv itself (and pins
-    /// `CLAUDE_CONFIG_DIR` to `native_home`).
+    /// The materializer builds this launch's Claude argv itself; the section
+    /// rides its own `--append-system-prompt` pair.
     pub claude_argv: bool,
+    /// The launch is pinned to `native_home` as the harness's config
+    /// directory, so `<native_home>/skills` is read: true on the Claude argv
+    /// paths (which pin `CLAUDE_CONFIG_DIR`), and for a `generic-pty` Claude
+    /// pane whose home holds login material (the pane is pinned only then,
+    /// `generic_pty::pane_home_env`).
+    pub reads_skills: bool,
     /// A native resume: the conversation already holds an earlier data block.
     pub resume: bool,
     pub launch_dir: &'a Path,
@@ -219,7 +228,8 @@ pub(crate) fn plan(request: &SkillRequest<'_>) -> Option<SkillPlan> {
     }
     let section = render_section(context);
     let mut write = None;
-    let tree = if !(request.claude_argv && request.kind == remuda_protocol::AgentKind::Claude) {
+    let claude = request.kind == remuda_protocol::AgentKind::Claude;
+    let tree = if !(request.reads_skills && claude) {
         SkillTree::Skipped {
             reason: TreeSkip::NoSkillReader,
         }
@@ -281,9 +291,11 @@ fn framed(section: &str) -> String {
     )
 }
 
-/// A `skills/remuda` that holds something without Remuda's marker. An empty
-/// directory is not the user's: it is what a launch's own cleanup leaves when
-/// it shreds a per-instance tree, and the next launch in that home rewrites it.
+/// A `skills/remuda` that holds something without Remuda's marker. Its files
+/// are the user's and stay byte for byte. An empty directory is taken over: it
+/// holds no bytes to keep, and it is what a launch's own cleanup leaves when
+/// it shreds a per-instance tree, so refusing it would leave the next launch
+/// in that home without a tree.
 fn user_owned(root: &Path) -> bool {
     if fs::symlink_metadata(root).is_err() || root.join(MANAGED_MARKER).is_file() {
         return false;
@@ -303,21 +315,36 @@ fn write_tree(
     let skills_root = root.parent().ok_or_else(|| {
         DriverError::InvalidLaunchSpec("the skill root has no parent directory".into())
     })?;
-    fs::create_dir_all(root)?;
-    set_mode(skills_root, 0o700)?;
-    set_mode(root, 0o700)?;
+    // Only paths this launch creates get a mode: `skills` may be the user's
+    // own directory, and Remuda never changes permissions it did not set.
+    ensure_dir(skills_root)?;
+    ensure_dir(root)?;
     let lifetime = if shared {
         FileLifetime::NativeStore
     } else {
         FileLifetime::Launch
     };
+    // The marker goes first and directly: the ownership check reads "any
+    // entry at all without the marker" as the user's tree, so a launch that
+    // ran between a temporary marker file and its rename would see a
+    // markerless, non-empty directory and skip the tree. The bytes are fixed
+    // text, so a concurrent reader of the file has nothing to lose.
+    let marker = root.join(MANAGED_MARKER);
+    fs::write(&marker, MARKER_TEXT)?;
+    set_mode(&marker, 0o600)?;
+    files.push(MaterializedFile {
+        path: marker.to_string_lossy().into_owned(),
+        role: FileRole::RemudaSkill,
+        mode: "0600".into(),
+        content_digest: hash_bytes(MARKER_TEXT)?,
+        lifetime,
+    });
     let mut write = |rel: &str, bytes: &[u8]| -> DriverResult<()> {
         let dest = root.join(rel);
         if let Some(parent) = dest.parent()
             && parent != root
         {
-            fs::create_dir_all(parent)?;
-            set_mode(parent, 0o700)?;
+            ensure_dir(parent)?;
         }
         write_atomic(&dest, bytes)?;
         files.push(MaterializedFile {
@@ -329,7 +356,6 @@ fn write_tree(
         });
         Ok(())
     };
-    write(MANAGED_MARKER, MARKER_TEXT)?;
     for embedded in EMBEDDED_SKILL {
         match appended {
             Some(section) if embedded.rel == "SKILL.md" => {
@@ -344,12 +370,33 @@ fn write_tree(
     Ok(())
 }
 
+/// Create `dir` (and its parents) and set 0700 only on the directories this
+/// call created. A directory that already exists belongs to whoever made it —
+/// the user, an earlier launch, another seat — and its mode is left alone.
+fn ensure_dir(dir: &Path) -> DriverResult<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    fs::create_dir_all(dir)?;
+    set_mode(dir, 0o700)?;
+    Ok(())
+}
+
+/// Distinguishes concurrent writers of one shared home inside this process.
+/// A Node launches many seats from one process, so the pid alone would make
+/// two launches pick the same temporary name.
+static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn write_atomic(dest: &Path, bytes: &[u8]) -> DriverResult<()> {
     let name = dest
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let temp: PathBuf = dest.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    // Unique per writer: pid for other processes, the counter for threads of
+    // this one. Written in the destination's directory so the rename is atomic
+    // and a seat sharing the home never reads a half-written file.
+    let serial = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp: PathBuf = dest.with_file_name(format!(".{name}.{}.{serial}.tmp", std::process::id()));
     fs::write(&temp, bytes)?;
     set_mode(&temp, 0o600)?;
     fs::rename(&temp, dest)?;

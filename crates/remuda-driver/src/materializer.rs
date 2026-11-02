@@ -924,14 +924,20 @@ fn is_claude_argv_driver(driver: DriverKind) -> bool {
 }
 
 /// ma-skill: what this launch does with `skillContext`. `claude_argv` is true
-/// where the materializer builds the Claude argv itself (and pins
-/// `CLAUDE_CONFIG_DIR` to the native home), the paths that read a skills
-/// directory; every other agent launch gets the section as a data block.
+/// where the materializer builds the Claude argv itself, the paths whose
+/// section rides its own system-prompt pair. `reads_skills` is the separate
+/// question of whether the harness reads `<native_home>/skills`: those paths,
+/// plus a `generic-pty` Claude pane, which the driver pins to the home only
+/// when the home holds login material (`generic_pty::pane_home_env`).
 fn skill_plan(request: &MaterializeRequest<'_>, claude_argv: bool) -> Option<SkillPlan> {
     crate::launch::remuda_skill::plan(&SkillRequest {
         context: request.skill_context,
         kind: request.spec.kind,
         claude_argv,
+        reads_skills: claude_argv
+            || (request.spec.driver == DriverKind::GenericPty
+                && request.spec.kind == AgentKind::Claude
+                && crate::claude_onboarding::has_login_material(&request.native_home)),
         resume: matches!(request.session, SessionAction::Resume { .. }),
         launch_dir: &request.launch_dir,
         native_home: &request.native_home,

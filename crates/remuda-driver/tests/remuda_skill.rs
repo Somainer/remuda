@@ -466,6 +466,8 @@ fn other_harnesses_get_the_section_as_a_first_input_data_block() {
         (DriverKind::CodexAppserver, AgentKind::Codex),
         (DriverKind::GrokAcp, AgentKind::Grok),
         (DriverKind::AgyPrint, AgentKind::Agy),
+        // A generic-pty Claude pane is pinned to the home only when the home
+        // holds a login; this one does not, so there is no skills reader.
         (DriverKind::GenericPty, AgentKind::Claude),
         (DriverKind::GenericPty, AgentKind::Codex),
         (DriverKind::ShellPty, AgentKind::Codex),
@@ -697,10 +699,148 @@ fn every_section_carries_the_memory_rule() {
     }
 }
 
+/// A `generic-pty` Claude pane IS pinned to its native home once that home
+/// holds a login (`generic_pty::pane_home_env`), so Claude reads
+/// `<native_home>/skills` there and the tree is installed under the shared-home
+/// rules (the home outlives nothing; the section stays out of it and rides the
+/// first-input data block).
+#[test]
+fn a_generic_pty_claude_with_a_logged_in_home_gets_the_tree() {
+    let context = facts(&["dispatch"]);
+    let at = launch(true);
+    // Login evidence, the same test `pane_home_env` applies.
+    fs::write(
+        at.home.join(".claude.json"),
+        r#"{"oauthAccount": {"emailAddress": "seat@example.invalid"}}"#,
+    )
+    .unwrap();
+    let recipe =
+        Run::new(DriverKind::GenericPty, AgentKind::Claude, Some(&context)).materialize(&at);
+    let root = at.home.join(SKILL_ROOT);
+    let skill = recipe.skill.as_ref().unwrap();
+    assert_eq!(
+        skill.tree,
+        SkillTree::Installed {
+            root: root.to_string_lossy().into_owned(),
+            shared: true
+        }
+    );
+    assert_eq!(
+        fs::read(root.join("SKILL.md")).unwrap(),
+        embedded_skill_md()
+    );
+    assert_eq!(
+        skill.section,
+        Some(SectionDelivery::DataBlock {
+            text: skill.data_block().unwrap().to_owned()
+        })
+    );
+    // Never a flag on a raw pane.
+    assert!(pairs(&recipe.argv).is_empty(), "{:?}", recipe.argv);
+    assert!(
+        recipe
+            .materialized_files
+            .iter()
+            .filter(|file| file.role == FileRole::RemudaSkill)
+            .all(|file| file.lifetime == FileLifetime::NativeStore)
+    );
+
+    // Without the login the pane runs on the operator's own home instead.
+    let at = launch(true);
+    let plain =
+        Run::new(DriverKind::GenericPty, AgentKind::Claude, Some(&context)).materialize(&at);
+    assert!(!at.home.join("skills").exists());
+    assert_eq!(
+        plain.skill.unwrap().tree,
+        SkillTree::Skipped {
+            reason: TreeSkip::NoSkillReader
+        }
+    );
+}
+
+/// Two seats launched together on one shared home write the same files: every
+/// file lands whole (no interleaved or truncated bytes) and no temporary file
+/// survives. Before the temp name carried a per-writer serial, both launches
+/// inside one Node process picked the same name.
+#[test]
+fn concurrent_installs_on_one_shared_home_never_clobber_each_other() {
+    let context = facts(&["dispatch", "land"]);
+    let at = launch(true);
+    let expected: Vec<(&str, Vec<u8>)> = embedded_skill_files()
+        .map(|(rel, bytes)| (rel, bytes.to_vec()))
+        .collect();
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            let context = &context;
+            let at = &at;
+            scope.spawn(move || {
+                for _ in 0..25 {
+                    let recipe = Run::new(DriverKind::ClaudeSdk, AgentKind::Claude, Some(context))
+                        .materialize(at);
+                    assert!(matches!(
+                        recipe.skill.unwrap().tree,
+                        SkillTree::Installed { shared: true, .. }
+                    ));
+                }
+            });
+        }
+    });
+    let root = at.home.join(SKILL_ROOT);
+    for (rel, bytes) in expected {
+        assert_eq!(fs::read(root.join(rel)).unwrap(), bytes, "{rel}");
+    }
+    let leftovers: Vec<String> = fs::read_dir(&root)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".tmp") || name.starts_with('.'))
+        .filter(|name| name != MANAGED_MARKER)
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "temporary files left behind: {leftovers:?}"
+    );
+}
+
+/// The `skills` directory is often the user's own: its mode is theirs. Only
+/// directories Remuda creates get 0700.
+#[cfg(unix)]
+#[test]
+fn a_user_skills_directory_keeps_its_mode() {
+    let context = facts(&["dispatch"]);
+    let at = launch(false);
+    let skills = at.home.join("skills");
+    fs::create_dir_all(&skills).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&skills, fs::Permissions::from_mode(0o751)).unwrap();
+    let recipe =
+        Run::new(DriverKind::ClaudeSdk, AgentKind::Claude, Some(&context)).materialize(&at);
+    assert!(matches!(
+        recipe.skill.unwrap().tree,
+        SkillTree::Installed { shared: false, .. }
+    ));
+    let mode = fs::metadata(&skills).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o751,
+        "a directory Remuda did not create keeps its mode"
+    );
+    // The tree Remuda did create is owner-only.
+    let root = skills.join("remuda");
+    assert_eq!(
+        fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+}
+
 // ── the parity ledger ──────────────────────────────────────────────────────
 
-/// The CLI subcommands the ledger lists, split by whether the Today column
-/// says an Agent can use them (`Agent route …` or `Local`).
+/// The CLI subcommands the ledger lists, split by what its Today column says.
+///
+/// `agent`: an Agent-origin caller gets the subcommand (`Agent route …`).
+/// `other`: every other row — Safety, Gap, Local, Deployment, not an agent
+/// action. The section may promise only `agent` verbs: `remuda merge`, for
+/// one, is `Local` and bypasses the Hub's `land` grant, so a one-word match
+/// against any Today row must never accept it.
 fn ledger() -> (BTreeSet<String>, BTreeSet<String>) {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/design/agent-parity.md");
     let text = fs::read_to_string(&path).unwrap();
@@ -709,8 +849,8 @@ fn ledger() -> (BTreeSet<String>, BTreeSet<String>) {
         .expect("the ledger has a CLI section");
     let rest = &text[start + 1..];
     let end = rest[3..].find("\n## ").map_or(rest.len(), |at| at + 3);
-    let mut today = BTreeSet::new();
-    let mut not_today = BTreeSet::new();
+    let mut agent = BTreeSet::new();
+    let mut other = BTreeSet::new();
     for line in rest[..end].lines() {
         let cells: Vec<&str> = line.split('|').map(str::trim).collect();
         // `| subcommand | route or kind | Today | Planned |`
@@ -726,24 +866,28 @@ fn ledger() -> (BTreeSet<String>, BTreeSet<String>) {
             .take_while(|word| !word.starts_with('<') && !word.starts_with('-'))
             .collect::<Vec<_>>()
             .join(" ");
-        let available = cells[3].starts_with("Agent route") || cells[3].starts_with("Local");
-        if available {
-            today.insert(name);
+        if cells[3].starts_with("Agent route") {
+            agent.insert(name);
         } else {
-            not_today.insert(name);
+            other.insert(name);
         }
     }
-    (today, not_today)
+    (agent, other)
 }
 
-/// Every `remuda …` verb the section can render, for every combination of
-/// facts, is a subcommand the ledger's Today column gives an Agent; the
-/// section names no Gap, Safety or deployment row.
+/// Every `remuda …` command the section can render, for every combination of
+/// facts, resolves to a subcommand the ledger's Today column gives an Agent:
+/// the longest of its words that names a row (at most three) must be that
+/// row, so neither a Gap/Safety/Local verb nor a shorter prefix that happens
+/// to be one slips through.
 #[test]
 fn the_section_names_only_verbs_in_the_ledger_today_column() {
-    let (today, not_today) = ledger();
-    assert!(today.contains("instance read") && today.contains("land"));
-    assert!(not_today.contains("instance list") && not_today.contains("instance keys"));
+    let (agent, other) = ledger();
+    assert!(agent.contains("instance read") && agent.contains("land"));
+    assert!(other.contains("instance list") && other.contains("instance keys"));
+    // The traps this test exists for.
+    assert!(other.contains("merge") && other.contains("host files list"));
+    assert!(!agent.contains("merge"));
     let mut named = BTreeSet::new();
     for context in every_context() {
         let text = render_section(&context);
@@ -755,18 +899,17 @@ fn the_section_names_only_verbs_in_the_ledger_today_column() {
                 .split_whitespace()
                 .take_while(|word| !word.starts_with('<') && !word.starts_with('-'))
                 .collect();
-            let two = words.iter().take(2).copied().collect::<Vec<_>>().join(" ");
-            let one = words.first().copied().unwrap_or_default().to_owned();
-            let verb = if today.contains(&two) || not_today.contains(&two) {
-                two
-            } else {
-                one
-            };
+            let resolved = (1..=words.len().min(3))
+                .rev()
+                .map(|len| words[..len].join(" "))
+                .find(|verb| agent.contains(verb) || other.contains(verb))
+                .unwrap_or_default();
             assert!(
-                today.contains(&verb),
-                "`remuda {command}` is not in the ledger's Today column ({context:?})"
+                agent.contains(&resolved),
+                "`remuda {command}` resolves to `{resolved}`, which the ledger's Today column \
+                 does not give an Agent ({context:?})"
             );
-            named.insert(verb);
+            named.insert(resolved);
         }
     }
     // The walk saw the verbs it is meant to police.

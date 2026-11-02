@@ -1029,6 +1029,94 @@ async fn a_failing_inbox_hook_rolls_back_and_leaves_the_append_committed() -> Re
     Ok(())
 }
 
+/// §10.1 item 2, the subscriber half of the key: two seats in one project,
+/// each with its own worker, each with its own cap in the same rolling
+/// window. Exhausting one leaves the other recording.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_subscriber_has_its_own_occurrence_cap() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("inbox-cap-two").await?;
+    // One dispatch holder per project is the default; this test needs two.
+    let (status, body) = ctx
+        .request(
+            reqwest::Method::PATCH,
+            &ctx.human,
+            &format!("/v1/projects/{project}"),
+            Some(json!({ "policy": { "configurable": { "allowMultipleDispatchers": true } } })),
+        )
+        .await?;
+    assert_eq!(status, 200, "{body}");
+    let (seat_a, token_a) = ctx.coordinator(&project).await?;
+    let (seat_b, token_b) = ctx.coordinator(&project).await?;
+    let worker_a = ctx.worker(&token_a, &project).await?;
+    let worker_b = ctx.worker(&token_b, &project).await?;
+
+    for (worker, prefix) in [(&worker_a, "a"), (&worker_b, "b")] {
+        ctx.journal(worker, entity("running", &at(0))).await?;
+        for n in 1..=7 {
+            ctx.journal(worker, question(&format!("int_{prefix}_{n}"), &at(60 * n)))
+                .await?;
+        }
+    }
+
+    let a_items = ctx.inbox(&token_a, &seat_a).await?;
+    let b_items = ctx.inbox(&token_b, &seat_b).await?;
+    assert_eq!(
+        of_kind(&a_items, "interaction", &worker_a).len(),
+        6,
+        "{a_items:#?}"
+    );
+    assert_eq!(
+        of_kind(&b_items, "interaction", &worker_b).len(),
+        6,
+        "{b_items:#?}"
+    );
+    // Neither seat hears about the other's worker.
+    assert!(of_kind(&a_items, "interaction", &worker_b).is_empty());
+    assert!(of_kind(&b_items, "interaction", &worker_a).is_empty());
+    // Both caps counted only their own occurrences.
+    let last = of_kind(&a_items, "interaction", &worker_a);
+    assert_eq!(last[5]["payload"]["occurrence"]["count"], 6);
+    let last = of_kind(&b_items, "interaction", &worker_b);
+    assert_eq!(last[5]["payload"]["occurrence"]["count"], 6);
+
+    // An eighth for each, still inside the same window: both capped, and
+    // both counts keep rising independently.
+    ctx.journal(&worker_a, question("int_a_8", &at(600)))
+        .await?;
+    ctx.journal(&worker_b, question("int_b_8", &at(600)))
+        .await?;
+    assert_eq!(
+        of_kind(
+            &ctx.inbox(&token_a, &seat_a).await?,
+            "interaction",
+            &worker_a
+        )
+        .len(),
+        6
+    );
+    assert_eq!(
+        of_kind(
+            &ctx.inbox(&token_b, &seat_b).await?,
+            "interaction",
+            &worker_b
+        )
+        .len(),
+        6
+    );
+    let db = ctx.db()?;
+    for (seat, worker) in [(&seat_a, &worker_a), (&seat_b, &worker_b)] {
+        let (total, recorded): (i64, i64) = db.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(recorded), 0) FROM inbox_occurrences
+              WHERE subscriber_lineage_id = ?1 AND subject = ?2 AND kind = 'interaction'",
+            rusqlite::params![seat, worker],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!((total, recorded), (8, 6), "{seat}/{worker}");
+    }
+    Ok(())
+}
+
 // ─── stalls and wall budgets (§10.1 item 8) ─────────────────────────────────
 
 fn tool_call(id: &str) -> Value {

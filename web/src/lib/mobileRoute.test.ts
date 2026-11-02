@@ -36,6 +36,12 @@ describe("resolveLanding — compact landing resolution", () => {
     );
   });
 
+  it("lands an interaction push on the phone home with its focus (home.md §9)", () => {
+    // alerts.rs points interaction pushes at /sessions?focus=<id>.
+    expect(resolveLanding("/sessions", "?focus=int_0193", true)).toBe("/m?focus=int_0193");
+    expect(resolveLanding("/sessions", "?focus=int_0193", false)).toBeNull();
+  });
+
   it("never rewrites /s/:id and its sub-views", () => {
     expect(resolveLanding("/s/ins_1", "", true)).toBeNull();
     expect(resolveLanding("/s/ins_1", "?focus=int_1", true)).toBeNull();

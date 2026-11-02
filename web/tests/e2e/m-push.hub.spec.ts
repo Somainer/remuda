@@ -13,9 +13,9 @@ import { login } from "./hub-auth";
  *    and disappears on explicit dismiss, staying dismissed per device;
  *  - granted notification permission hides the banner outright (the only
  *    asks are the banner tap and settings — nothing is requested here);
- *  - the closed-state click landing: /approvals?focus=<id> is what the
- *    service worker opens, and the compact redirect layer must land it on
- *    /m/inbox?focus=<id> with that row focused (redirect from c-minbox /
+ *  - the closed-state click landing: /sessions?focus=<id> is what the
+ *    service worker opens (home.md §9), and the compact redirect layer must
+ *    land it on /m?focus=<id> with that ④ queue card focused (redirect from
  *    m-shell; asserted here, not reimplemented).
  */
 test.describe.configure({ mode: "serial" });
@@ -106,7 +106,7 @@ test.describe("390px m-push in-app surface", () => {
     await expect(page.getByTestId("m-inbox-push-banner")).toHaveCount(0);
   });
 
-  test("a closed-state notification click lands /approvals?focus= on the focused inbox row", async ({
+  test("a closed-state notification click lands /sessions?focus= on the focused home queue card", async ({
     page,
   }) => {
     await login(page);
@@ -114,11 +114,11 @@ test.describe("390px m-push in-app surface", () => {
     const interactionId = await pendingInteractionId(page, instanceId);
 
     // sw.src.js notificationclick opens data.url — for an interaction that
-    // is /approvals?focus=<id>. In compact the redirect layer carries the
-    // query verbatim to /m/inbox; the row renders focused and in view.
-    await page.goto(`/approvals?focus=${interactionId}`);
-    await expect(page).toHaveURL(`/m/inbox?focus=${interactionId}`);
-    const row = page.locator(`[data-interaction-id="${interactionId}"]`);
+    // is /sessions?focus=<id> (home.md §9). In compact the redirect layer
+    // carries the query verbatim to /m; the ④ card renders ringed and in view.
+    await page.goto(`/sessions?focus=${interactionId}`);
+    await expect(page).toHaveURL(`/m?focus=${interactionId}`);
+    const row = page.locator(`[data-testid="home-queue-card"][data-interaction-id="${interactionId}"]`);
     await expect(row).toHaveAttribute("data-focus", "true");
     const box = await row.boundingBox();
     expect(box, "focused row rendered").toBeTruthy();

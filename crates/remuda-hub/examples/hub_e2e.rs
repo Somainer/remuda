@@ -993,6 +993,11 @@ async fn fake_node(
     // by interaction id -> instance id. See the `ask-question-terminal` arm.
     let terminal_pending: Arc<Mutex<HashMap<String, String>>> =
         Arc::new(Mutex::new(HashMap::new()));
+    // c-hqueue: interaction ids raised under the `hqueue-race` sentinel. Once
+    // answered, a SECOND answer gets the real Node's "already answered"
+    // refusal (the Hub's 409 INTERACTION_SUPERSEDED) instead of the default
+    // idempotent ok, so a second device can genuinely lose the race.
+    let mut race_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Frames read while waiting for a journal.append ack (they may be stale
     // append responses or — importantly — unrelated Hub RPCs such as the
     // web poll's interaction.list). Never drop RPCs: reprocess them as soon
@@ -1674,6 +1679,21 @@ async fn fake_node(
                             interaction_id.as_id().as_str(),
                             &deadline,
                         )
+                    } else if prompt.contains("hqueue-chips") {
+                        // c-hqueue: a single-field single-select question
+                        // with three options — the home's chip case (§4.2).
+                        fake_single_question(
+                            &instance_id,
+                            host_id.as_id().as_str(),
+                            interaction_id.as_id().as_str(),
+                        )
+                    } else if prompt.contains("hqueue-plan") {
+                        // c-hqueue: a plan review — review-only on the home.
+                        fake_plan_review(
+                            &instance_id,
+                            host_id.as_id().as_str(),
+                            interaction_id.as_id().as_str(),
+                        )
                     } else if prompt.contains("ask-question") {
                         fake_hook_question(
                             &instance_id,
@@ -1704,6 +1724,9 @@ async fn fake_node(
                         )
                     };
                     let terminal_answer = prompt.contains("ask-question-terminal");
+                    if prompt.contains("hqueue-race") {
+                        race_ids.insert(interaction_id.as_id().as_str().to_string());
+                    }
                     if row_scenario.is_none() {
                         pending
                             .lock()
@@ -2843,6 +2866,15 @@ async fn fake_node(
                         } else {
                             None
                         };
+                    if removed.is_none()
+                        && params
+                            .get("interactionId")
+                            .and_then(Value::as_str)
+                            .is_some_and(|iid| race_ids.contains(iid))
+                    {
+                        send_rpc_error(&mut ws, id, "interaction already answered").await?;
+                        continue;
+                    }
                     // Reply to the answer RPC FIRST (the Hub gives the Node only
                     // a short RPC budget); journal the harness continuation
                     // afterwards, like the real Node applying owner answers.
@@ -4977,6 +5009,49 @@ fn fake_hook_question(instance_id: &str, host_id: &str, interaction_id: &str) ->
         "delivery": "not-sent",
         "resolution": { "state": "not-applicable" }
     })
+}
+
+/// c-hqueue: the home's chip question (home.md §4.2 简单问题): one field,
+/// single-select, three options, not sensitive.
+fn fake_single_question(instance_id: &str, host_id: &str, interaction_id: &str) -> Value {
+    let mut card = fake_hook_question(instance_id, host_id, interaction_id);
+    card["request"]["fields"] = json!([{
+        "id": "q0",
+        "title": "旧迁移 0042 删掉还是保留？",
+        "description": "迁移",
+        "input": "single-select",
+        "required": true,
+        "options": [
+            { "id": "删除", "label": "删除", "description": "删掉旧迁移" },
+            { "id": "保留", "label": "保留", "description": "原样保留" },
+            { "id": "改名", "label": "改名", "description": "改成新编号" }
+        ],
+        "allowFreeText": true,
+        "sensitive": false
+    }]);
+    card
+}
+
+/// c-hqueue: a plan review with an inline plan (home.md §4.2 计划: review-only
+/// on the home, never approved there).
+fn fake_plan_review(instance_id: &str, host_id: &str, interaction_id: &str) -> Value {
+    let mut card = fake_hook_question(instance_id, host_id, interaction_id);
+    card["kind"] = json!("plan-review");
+    card["carrier"] = json!("claude-control");
+    card["request"] = json!({
+        "kind": "plan-review",
+        "title": "Plan: split the gate",
+        "planRef": interaction_id,
+        "planRevision": "1",
+        "planDigest": "sha256:efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",
+        "options": [
+            { "id": "approve", "label": "批准", "effect": "allow-once", "nativeValueRef": interaction_id },
+            { "id": "deny", "label": "拒绝", "effect": "deny", "nativeValueRef": interaction_id }
+        ],
+        "allowFeedback": true,
+        "plan": "1. read the gate\n2. split it\n3. land it"
+    });
+    card
 }
 
 /// c-question-alert: like [`fake_hook_question`] but with a KNOWN deadline

@@ -702,7 +702,7 @@ fn every_section_carries_the_memory_rule() {
 /// A `generic-pty` Claude pane IS pinned to its native home once that home
 /// holds a login (`generic_pty::pane_home_env`), so Claude reads
 /// `<native_home>/skills` there and the tree is installed under the shared-home
-/// rules (the home outlives nothing; the section stays out of it and rides the
+/// rules (the home outlives the launch; the section stays out of it and rides the
 /// first-input data block).
 #[test]
 fn a_generic_pty_claude_with_a_logged_in_home_gets_the_tree() {

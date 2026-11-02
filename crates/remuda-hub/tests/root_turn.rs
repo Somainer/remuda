@@ -1128,9 +1128,11 @@ async fn the_excerpt_is_bounded_and_never_contains_a_secret_shape() -> Result<()
     let (ctx, mut node) = Ctx::boot().await?;
     let (seat, token) = ctx.seat(&mut node, "main").await?;
     let project = ctx.create_project().await;
-    // Assembled at run time so no source line reads as a token.
+    // Assembled at run time so no source line reads as a token. The secret
+    // sits INSIDE the bound, so the 280-char cap cannot be what removes it:
+    // only the scrub can.
     let secret = ["sk", "-live-abcd1234efgh5678ijkl"].concat();
-    let long = format!("他说：{} {}", "继续".repeat(200), secret);
+    let long = format!("他说：{} {}", secret, "继续".repeat(200));
     let owner = ctx.owner_turn_text(&mut node, &seat, &long).await;
 
     let (status, pending) = ctx
@@ -1150,6 +1152,10 @@ async fn the_excerpt_is_bounded_and_never_contains_a_secret_shape() -> Result<()
         excerpt.chars().count()
     );
     assert!(!excerpt.contains("abcd1234"), "{excerpt}");
+    assert!(
+        excerpt.contains("[redacted]"),
+        "the scrub ran and withheld the token: {excerpt}"
+    );
     assert!(!excerpt.contains('\n'), "one line: {excerpt}");
     Ok(())
 }

@@ -85,17 +85,6 @@
     "link|docs/design/evidence/ui-pty-1.md|./ui-pty-1-grok-running.png",
     "link|docs/design/evidence/ui-pty-1.md|./ui-pty-1-new-codex.png",
     "link|docs/design/evidence/ui-pty-1.md|./ui-pty-1-new-grok.png",
-    "link|docs/design/evidence/ui-pty-1.md|./ui-pty-1-sessions-final.png",
-    "orphan|docs/design/command-registration.md|",
-    "orphan|docs/design/feishu-session-card.md|",
-    "orphan|docs/design/hub-auth-hardening.md|",
-    "orphan|docs/design/main-agent-control.md|",
-    "orphan|docs/design/remuda-mcp.md|",
-    "orphan|docs/design/review-claude-print.md|",
-    "orphan|docs/design/review-claude-pty-bg.md|",
-    "orphan|docs/design/review-hubnode-wire.md|",
-    "orphan|docs/design/security-review-1.md|",
-    "orphan|docs/design/security-review-3.md|",
-    "orphan|docs/design/usage-adapter.md|"
+    "link|docs/design/evidence/ui-pty-1.md|./ui-pty-1-sessions-final.png"
   ]
 }

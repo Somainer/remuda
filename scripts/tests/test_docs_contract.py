@@ -20,14 +20,15 @@ Five check kinds:
 - ``command``: ``remuda``/``just``/``pnpm --dir web`` references name a real
   subcommand or flag, recipe, or package script;
 - ``orphan``: a ``docs/design/*.md`` document nothing links to, excluding a
-  short entry-point allowlist.
+  short entry-point allowlist. Advisory: a branch often lands a design doc
+  before the link that points at it.
 
 The landing gate runs on every branch, including branches that move code
 lines without touching docs. So the enforced mode fails only on tool-owned
-breakage: links, anchors, commands, orphans, and file-anchor existence/extent.
-Symbol-proximity mismatches and baselined violations that have vanished are
-advisory warnings there. ``--strict`` (maintenance only, never the gate)
-also fails on those advisory results.
+breakage: links, anchors, commands, and file-anchor existence/extent.
+Symbol-proximity mismatches, orphan design docs, and baselined violations
+that have vanished are advisory warnings there. ``--strict`` (maintenance
+only, never the gate) also fails on those advisory results.
 
 The enforced violations are recorded in
 ``scripts/tests/docs_contract_baseline.json``. The baseline may only shrink:
@@ -422,7 +423,8 @@ def check_orphans(report: Report, files: list[Path], linked: set[Path],
         if path.resolve() in linked:
             continue
         report.add(KIND_ORPHAN, path, "",
-                   "no scanned document links to this design doc", root)
+                   "no scanned document links to this design doc", root,
+                   advisory=True)
 
 
 # ── clap model ────────────────────────────────────────────────────────────
@@ -1426,8 +1428,12 @@ class DocsContractFixtureTests(unittest.TestCase):
     def test_fixture_scan_reports_exactly_the_known_violations(self):
         report = scan(FIXTURE_ROOT, use_git=False)
         self.assertEqual(set(report.violations), self.EXPECTED)
-        self.assertEqual(report.enforced(),
-                         self.EXPECTED - {"file-anchor|docs/anchors.md|crates/demo/src/lib.rs:11"})
+        advisory = {
+            "file-anchor|docs/anchors.md|crates/demo/src/lib.rs:11",
+            "orphan|docs/design/orphan.md|",
+        }
+        self.assertEqual(report.advisory(), advisory)
+        self.assertEqual(report.enforced(), self.EXPECTED - advisory)
         self.assertGreater(len(report.files), 0)
 
     def test_paths_with_spaces_and_cjk_are_scanned_and_resolve(self):
@@ -1558,6 +1564,20 @@ class DocsContractFixtureTests(unittest.TestCase):
             self.assertEqual(run_check(repo, baseline, strict_out, strict=True), 1)
             self.assertIn("ADVISORY file-anchor|docs/anchors.md|crates/demo/src/lib.rs:6",
                           strict_out.getvalue())
+
+    def test_new_orphan_design_doc_is_advisory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, baseline = self._baselined_copy(tmp)
+            before = scan(repo, use_git=False).advisory()
+            (repo / "docs" / "design" / "newdoc.md").write_text(
+                "# New design\n", encoding="utf-8")
+            after = scan(repo, use_git=False).advisory()
+            key = "orphan|docs/design/newdoc.md|"
+            self.assertIn(key, after - before)
+            self.assertEqual(run_check(repo, baseline, io.StringIO()), 0)
+            strict_out = io.StringIO()
+            self.assertEqual(run_check(repo, baseline, strict_out, strict=True), 1)
+            self.assertIn(f"ADVISORY {key}", strict_out.getvalue())
 
     def test_new_broken_link_fails(self):
         with tempfile.TemporaryDirectory() as tmp:

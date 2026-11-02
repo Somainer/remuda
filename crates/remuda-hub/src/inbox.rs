@@ -1797,17 +1797,20 @@ fn due_stalls(conn: &Connection, now: OffsetDateTime) -> Result<usize, StoreErro
             if stalled_at > now {
                 continue;
             }
+            // Keyed by the call and when it opened, never by the threshold
+            // that measured it: a threshold change mid-call is the same stall.
             let mut fact = instance_fact(
                 conn,
                 InboxFactKind::Stalled,
                 &instance_id,
                 tracker.run,
-                crate::config::rfc3339(stalled_at),
+                opened.clone(),
                 json!({
                     "cause": "tool-in-flight",
                     "toolCallId": tool_call_id,
                     "since": opened,
                     "thresholdMins": threshold,
+                    "detectedAt": crate::config::rfc3339(stalled_at),
                 }),
             )?;
             fact.key_subject = format!("{instance_id}/{tool_call_id}");
@@ -1836,16 +1839,18 @@ fn due_stalls(conn: &Connection, now: OffsetDateTime) -> Result<usize, StoreErro
             if stalled_at > now {
                 continue;
             }
+            // Keyed by when the quiet period started, for the same reason.
             instance_fact(
                 conn,
                 InboxFactKind::Stalled,
                 &instance_id,
                 tracker.run,
-                crate::config::rfc3339(stalled_at),
+                crate::config::rfc3339(quiet_since),
                 json!({
                     "cause": "quiet",
                     "since": crate::config::rfc3339(quiet_since),
                     "thresholdMins": threshold,
+                    "detectedAt": crate::config::rfc3339(stalled_at),
                 }),
             )?
         };

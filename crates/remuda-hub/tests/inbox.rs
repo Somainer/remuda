@@ -1408,6 +1408,74 @@ async fn out_of_range_windows_are_rejected_at_the_routes() -> Result<()> {
     Ok(())
 }
 
+/// r2 item 3: a stall fact is keyed by what the stall is about — the tool
+/// call and when it was opened, or the quiet period's start — never by the
+/// threshold that measured it, so changing the project's window mid-stall
+/// records no second fact for the same stall.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_threshold_change_records_no_second_stall_fact() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("inbox-stall-rekey").await?;
+    let (status, body) = ctx
+        .request(
+            reqwest::Method::PATCH,
+            &ctx.human,
+            &format!("/v1/projects/{project}"),
+            Some(json!({ "policy": { "configurable": {
+                "stallThresholdMins": 90, "stallToolThresholdMins": 15 } } })),
+        )
+        .await?;
+    assert_eq!(status, 200, "{body}");
+    let (seat, seat_token) = ctx.coordinator(&project).await?;
+    let hung = ctx.worker(&seat_token, &project).await?;
+    let quiet = ctx.worker(&seat_token, &project).await?;
+    for worker in [&hung, &quiet] {
+        ctx.journal(worker, entity("running", &at(0))).await?;
+        ctx.journal(worker, activity("working", &at(1))).await?;
+    }
+    ctx.journal(&hung, tool_call("tc_rekey")).await?;
+
+    // The tool call passes its 15 min window; the quiet child its 90.
+    assert_eq!(ctx.hub.test_inbox_tick(&minutes_from_now(16)).await?, 1);
+    assert_eq!(ctx.hub.test_inbox_tick(&minutes_from_now(95)).await?, 1);
+    let items = ctx.inbox(&seat_token, &seat).await?;
+    assert_eq!(stalls(&items).len(), 2, "{items:#?}");
+
+    // Both windows change mid-stall (shorter now, both already passed).
+    let (status, body) = ctx
+        .request(
+            reqwest::Method::PATCH,
+            &ctx.human,
+            &format!("/v1/projects/{project}"),
+            Some(json!({ "policy": { "configurable": {
+                "stallThresholdMins": 20, "stallToolThresholdMins": 5 } } })),
+        )
+        .await?;
+    assert_eq!(status, 200, "{body}");
+    for minutes in [30, 120, 600] {
+        assert_eq!(
+            ctx.hub.test_inbox_tick(&minutes_from_now(minutes)).await?,
+            0
+        );
+    }
+    let items = ctx.inbox(&seat_token, &seat).await?;
+    let stalls_now = stalls(&items);
+    assert_eq!(
+        stalls_now.len(),
+        2,
+        "one per stall, not per threshold: {items:#?}"
+    );
+    let tool = stalls_now
+        .iter()
+        .find(|fact| fact["subjectInstanceId"] == hung.as_str())
+        .context("tool stall")?;
+    assert_eq!(
+        tool["payload"]["thresholdMins"], 15,
+        "the payload keeps the threshold that measured it"
+    );
+    Ok(())
+}
+
 // ─── logs (§10.1 item 9) ────────────────────────────────────────────────────
 
 /// Everything the inbox logs in this test binary, captured once.

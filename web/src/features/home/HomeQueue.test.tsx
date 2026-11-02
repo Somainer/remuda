@@ -253,10 +253,38 @@ describe("HomeQueue holds the order during interaction (§3.3, §4.1)", () => {
     expect(paintedIds()).not.toContain("int_0");
 
     // Collapsing releases the hold: the queue re-orders once, back to the
-    // collapsed 3-card slice with the new card first.
+    // collapsed 3-card slice with the new card first. (The release control is
+    // offered even though the painted list shrank to the fold's size.)
     fireEvent.click(screen.getByTestId("home-queue-more"));
     expect(screen.getByTestId("home-queue")).toHaveAttribute("data-order-held", "0");
     expect(paintedIds()).toEqual(["int_0", "int_1", "int_2"]);
+  });
+
+  it("keeps a release control when answered cards shrink the expanded list", async () => {
+    vi.useFakeTimers();
+    fake.respond.mockResolvedValue(undefined);
+    fake.state = fiveInteractions();
+    renderQueue("phone");
+    fireEvent.click(screen.getByTestId("home-queue-more"));
+    expect(screen.getByTestId("home-queue")).toHaveAttribute("data-order-held", "1");
+    expect(cards()).toHaveLength(5);
+
+    // Answer three cards in place: their receipts leave the hold's painted
+    // list, so only two remain and nothing is hidden any more — the release
+    // control must still be there (the queue is still held).
+    for (let index = 0; index < 3; index += 1) {
+      await act(async () => {
+        fireEvent.click(screen.getAllByRole("button", { name: "允许一次" })[0]);
+      });
+      await act(async () => {
+        vi.advanceTimersByTime(2_000);
+      });
+    }
+    expect(cards()).toHaveLength(2);
+    expect(screen.getByTestId("home-queue")).toHaveAttribute("data-order-held", "1");
+    fireEvent.click(screen.getByTestId("home-queue-more"));
+    expect(screen.getByTestId("home-queue")).toHaveAttribute("data-order-held", "0");
+    expect(screen.queryByTestId("home-queue-more")).toBeNull();
   });
 });
 

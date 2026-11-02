@@ -297,17 +297,10 @@ export function HomeQueue({
           );
         })}
       </div>
-      {hidden > 0 ? (
-        <button
-          type="button"
-          className={css.more}
-          data-testid="home-queue-more"
-          aria-expanded={false}
-          onClick={() => setExpanded(true)}
-        >
-          还有 {hidden} 条 ▾
-        </button>
-      ) : expanded && ids.length > limit ? (
+      {expanded ? (
+        // Always offered while expanded — including after cards leave and
+        // nothing is hidden any more: the expansion holds the order (§4.1),
+        // so the reader must always have the control that releases it.
         <button
           type="button"
           className={css.more}
@@ -316,6 +309,16 @@ export function HomeQueue({
           onClick={() => setExpanded(false)}
         >
           收起 ▴
+        </button>
+      ) : hidden > 0 ? (
+        <button
+          type="button"
+          className={css.more}
+          data-testid="home-queue-more"
+          aria-expanded={false}
+          onClick={() => setExpanded(true)}
+        >
+          还有 {hidden} 条 ▾
         </button>
       ) : null}
     </section>

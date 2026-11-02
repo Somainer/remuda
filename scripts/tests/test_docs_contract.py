@@ -14,18 +14,25 @@ Five check kinds:
 - ``link``: relative links resolve to an existing file or directory;
 - ``anchor``: ``#fragment`` links resolve to a heading or an explicit HTML
   anchor in the target document;
-- ``file-anchor``: ``path/file.rs:NNN`` points at (within three lines) the
-  symbol the surrounding text names; when no symbol can be inferred the check
-  is only that the file exists and is long enough;
+- ``file-anchor``: ``path/file.rs:NNN`` names a file that exists and has at
+  least NNN lines. Pointing at the symbol the surrounding text names (within
+  three lines) is checked too, but its result is advisory;
 - ``command``: ``remuda``/``just``/``pnpm --dir web`` references name a real
   subcommand or flag, recipe, or package script;
 - ``orphan``: a ``docs/design/*.md`` document nothing links to, excluding a
   short entry-point allowlist.
 
-Violations are recorded in ``scripts/tests/docs_contract_baseline.json``.
-The baseline may only shrink: the checker fails on a new violation and also
-when a baselined violation disappears while the baseline still lists it.
-``--update-baseline`` removes vanished entries and refuses to add any.
+The landing gate runs on every branch, including branches that move code
+lines without touching docs. So the enforced mode fails only on tool-owned
+breakage: links, anchors, commands, orphans, and file-anchor existence/extent.
+Symbol-proximity mismatches and baselined violations that have vanished are
+advisory warnings there. ``--strict`` (maintenance only, never the gate)
+also fails on those advisory results.
+
+The enforced violations are recorded in
+``scripts/tests/docs_contract_baseline.json``. The baseline may only shrink:
+``--update-baseline`` removes entries whose violation is gone and refuses to
+add any.
 
 Run ``python3 -B scripts/tests/test_docs_contract.py --check`` from the repo
 root (the gate does this), or with ``--root`` against a fixture tree.
@@ -110,6 +117,8 @@ class Violation:
     doc: str
     ref: str
     message: str
+    # Advisory results never fail the gate; --strict fails on them.
+    advisory: bool = False
 
     @property
     def key(self) -> str:
@@ -121,13 +130,23 @@ class Report:
     files: list[Path]
     violations: dict[str, Violation] = field(default_factory=dict)
 
-    def add(self, kind: str, doc: Path | str, ref: str, message: str, root: Path) -> None:
+    def add(self, kind: str, doc: Path | str, ref: str, message: str, root: Path,
+            advisory: bool = False) -> None:
         doc_text = relative(doc, root)
-        violation = Violation(kind, doc_text, ref, message)
+        violation = Violation(kind, doc_text, ref, message, advisory)
         self.violations.setdefault(violation.key, violation)
 
-    def count(self, kind: str) -> int:
-        return sum(1 for v in self.violations.values() if v.kind == kind)
+    def enforced(self) -> set[str]:
+        """Keys that fail the gate when absent from the baseline."""
+        return {v.key for v in self.violations.values() if not v.advisory}
+
+    def advisory(self) -> set[str]:
+        """Keys reported as warnings, failing only under --strict."""
+        return {v.key for v in self.violations.values() if v.advisory}
+
+    def count(self, kind: str, advisory: bool | None = None) -> int:
+        return sum(1 for v in self.violations.values()
+                   if v.kind == kind and (advisory is None or v.advisory == advisory))
 
 
 def relative(path: Path | str, root: Path) -> str:
@@ -152,8 +171,9 @@ def dump_baseline(path: Path, keys: set[str]) -> None:
     payload = {
         "version": 1,
         "note": (
-            "Docs-contract violations accepted at the time this baseline was "
-            "written. It may only shrink: fix a violation and run "
+            "Enforced docs-contract violations accepted at the time this "
+            "baseline was written (advisory symbol-proximity results are not "
+            "recorded). It may only shrink: fix a violation and run "
             "`python3 -B scripts/tests/test_docs_contract.py --update-baseline`."
         ),
         "violations": sorted(keys),
@@ -1107,6 +1127,16 @@ def _candidates(line: str, anchor_text: str) -> list[str]:
 
 def check_file_anchors(report: Report, documents: dict[Path, str], root: Path) -> None:
     index = source_index(root)
+    cache: dict[Path, list[str]] = {}
+
+    def source_lines_of(path: Path) -> list[str] | None:
+        if path not in cache:
+            try:
+                cache[path] = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                return None
+        return cache[path]
+
     for doc, text in documents.items():
         previous: dict[str, Path] = {}
         lines = text.splitlines()
@@ -1126,18 +1156,45 @@ def check_file_anchors(report: Report, documents: dict[Path, str], root: Path) -
                     report.add(KIND_FILE_ANCHOR, doc, anchor_text,
                                f"line {source_line}: file does not exist", root)
                     continue
-                try:
-                    source = path.read_text(encoding="utf-8", errors="replace")
-                except OSError:
+                source_lines = source_lines_of(path)
+                if source_lines is None:
                     report.add(KIND_FILE_ANCHOR, doc, anchor_text,
                                f"line {source_line}: file cannot be read", root)
                     continue
-                source_lines = source.splitlines()
+                if "/" not in raw and (start < 1 or end > len(source_lines)):
+                    # The most recent full path with this basename can point at
+                    # another file with the same name. Before reporting a stale
+                    # line, prefer a same-named file that is long enough, first
+                    # in a directory a sibling anchor on this line names.
+                    candidates = [candidate for candidate in index.get(raw, [])
+                                  if candidate != path
+                                  and len(source_lines_of(candidate) or []) >= end]
+                    hints = {
+                        resolved.parent
+                        for other in FILE_ANCHOR.finditer(line)
+                        if other.group(0) != anchor_text
+                        for resolved in [resolve_source(doc, other.group("path"), root,
+                                                        previous, index)]
+                        if resolved is not None
+                    }
+                    preferred = [candidate for candidate in candidates
+                                 if candidate.parent in hints]
+                    if len(preferred) == 1:
+                        path = preferred[0]
+                    elif len(candidates) == 1:
+                        path = candidates[0]
+                    elif candidates:
+                        # Several plausible files: not a contract violation.
+                        continue
+                    source_lines = source_lines_of(path)
+                    if source_lines is None:
+                        continue
                 if start < 1 or end > len(source_lines):
                     report.add(KIND_FILE_ANCHOR, doc, anchor_text,
                                f"line {source_line}: {raw} has {len(source_lines)} "
                                f"lines, anchor asks for {start}-{end}", root)
                     continue
+                source = "\n".join(source_lines)
                 candidates = [name for name in _candidates(line, anchor_text)
                               if re.search(rf"\b{re.escape(name)}\b", source)]
                 if not candidates:
@@ -1150,7 +1207,8 @@ def check_file_anchors(report: Report, documents: dict[Path, str], root: Path) -
                     report.add(
                         KIND_FILE_ANCHOR, doc, anchor_text,
                         f"line {source_line}: {', '.join(candidates[:3])} not "
-                        f"within {SYMBOL_WINDOW} lines of {raw}:{start}", root)
+                        f"within {SYMBOL_WINDOW} lines of {raw}:{start}", root,
+                        advisory=True)
 
 
 # ── driver ────────────────────────────────────────────────────────────────
@@ -1176,28 +1234,50 @@ def scan(root: Path) -> Report:
     return report
 
 
-def print_report(report: Report, current: set[str], baseline: set[str],
-                 stream=sys.stdout) -> None:
-    new = sorted(current - baseline)
-    stale = sorted(baseline - current)
+def print_report(report: Report, baseline: set[str], strict: bool,
+                 stream=sys.stdout) -> bool:
+    """Print the report; return True when the mode must fail."""
+    enforced = report.enforced()
+    advisory = report.advisory()
+    new = sorted(enforced - baseline)
+    vanished = sorted(baseline - enforced)
     print(f"docs contract: scanned {len(report.files)} markdown files", file=stream)
     for kind in KINDS:
         total = report.count(kind)
+        held = report.count(kind, advisory=False)
+        warning = report.count(kind, advisory=True)
         fresh = sum(1 for key in new if key.split("|", 1)[0] == kind)
-        print(f"  {kind}: {total} violation(s), {fresh} new", file=stream)
+        detail = f"{total} violation(s) ({held} enforced"
+        if warning:
+            detail += f", {warning} advisory"
+        detail += ")"
+        print(f"  {kind}: {detail}, {fresh} new enforced", file=stream)
     by_key = report.violations
     for key in new:
-        violation = by_key[key]
-        print(f"NEW {key}: {violation.message}", file=stream)
-    for key in stale:
-        print(f"STALE {key}: baselined violation is gone; "
-              f"run --update-baseline to shrink", file=stream)
-    if not new and not stale:
-        print("docs contract: no new violations and no stale baseline entries",
+        print(f"NEW {key}: {by_key[key].message}", file=stream)
+    if strict:
+        for key in vanished:
+            print(f"STALE {key}: baselined violation is gone; "
+                  f"run --update-baseline to shrink", file=stream)
+        for key in sorted(advisory):
+            print(f"ADVISORY {key}: {by_key[key].message}", file=stream)
+    else:
+        print(f"docs contract: advisory: {len(advisory)} symbol-proximity "
+              f"mismatch(es) and {len(vanished)} vanished baseline "
+              f"entr{'y' if len(vanished) == 1 else 'ies'} (warnings only)",
               file=stream)
+        if vanished:
+            print("docs contract: run --update-baseline to shrink the baseline",
+                  file=stream)
+        print("docs contract: run --strict for the advisory details", file=stream)
+    failed = bool(new) or (strict and bool(vanished or advisory))
+    if not failed:
+        print("docs contract: no new enforced violations", file=stream)
+    return failed
 
 
-def run_check(root: Path, baseline_path: Path, stream=sys.stdout) -> int:
+def run_check(root: Path, baseline_path: Path, stream=sys.stdout,
+              strict: bool = False) -> int:
     report = scan(root)
     if not baseline_path.is_file():
         print(f"docs contract: baseline missing: {relative(baseline_path, root)}",
@@ -1208,9 +1288,7 @@ def run_check(root: Path, baseline_path: Path, stream=sys.stdout) -> int:
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"docs contract: cannot read baseline: {exc}", file=stream)
         return 2
-    current = set(report.violations)
-    print_report(report, current, baseline, stream)
-    return 1 if current != baseline else 0
+    return 1 if print_report(report, baseline, strict, stream) else 0
 
 
 def update_baseline(root: Path, baseline_path: Path, stream=sys.stdout) -> int:
@@ -1224,7 +1302,7 @@ def update_baseline(root: Path, baseline_path: Path, stream=sys.stdout) -> int:
         print(f"docs contract: cannot read baseline: {exc}", file=stream)
         return 2
     report = scan(root)
-    current = set(report.violations)
+    current = report.enforced()
     added = sorted(current - baseline)
     if added:
         print("docs contract: --update-baseline may only remove entries; "
@@ -1266,6 +1344,8 @@ class DocsContractFixtureTests(unittest.TestCase):
     def test_fixture_scan_reports_exactly_the_known_violations(self):
         report = scan(FIXTURE_ROOT)
         self.assertEqual(set(report.violations), self.EXPECTED)
+        self.assertEqual(report.enforced(),
+                         self.EXPECTED - {"file-anchor|docs/anchors.md|crates/demo/src/lib.rs:11"})
         self.assertGreater(len(report.files), 0)
 
     def test_paths_with_spaces_and_cjk_are_scanned_and_resolve(self):
@@ -1295,28 +1375,34 @@ class DocsContractFixtureTests(unittest.TestCase):
         anchors = anchors_for("# Repeat\n\n## Repeat\n\n### Repeat\n\n<a id=\"explicit\"></a>")
         self.assertEqual(anchors, {"repeat", "repeat-1", "repeat-2", "explicit"})
 
+    def _baselined_copy(self, tmp: str) -> tuple[Path, Path]:
+        repo = Path(tmp) / "repo"
+        shutil.copytree(FIXTURE_ROOT, repo)
+        baseline = repo / "scripts" / "tests" / "docs_contract_baseline.json"
+        baseline.parent.mkdir(parents=True)
+        dump_baseline(baseline, scan(repo).enforced())
+        return repo, baseline
+
     def test_baseline_only_shrinks(self):
         with tempfile.TemporaryDirectory() as tmp:
-            repo = Path(tmp) / "repo"
-            shutil.copytree(FIXTURE_ROOT, repo)
-            baseline = repo / "scripts" / "tests" / "docs_contract_baseline.json"
-            baseline.parent.mkdir(parents=True)
-            current = set(scan(repo).violations)
-            dump_baseline(baseline, current)
+            repo, baseline = self._baselined_copy(tmp)
             self.assertEqual(run_check(repo, baseline, io.StringIO()), 0)
 
-            # A baselined violation that disappears must be reported until the
-            # baseline is shrunk.
-            anchors_doc = repo / "docs" / "anchors.md"
-            kept = [line for line in anchors_doc.read_text(encoding="utf-8").splitlines()
-                    if "lib.rs:11" not in line]
-            anchors_doc.write_text("\n".join(kept) + "\n", encoding="utf-8")
+            # Removing an enforced violation leaves a stale baseline entry:
+            # advisory in normal mode, a failure under --strict, and removed
+            # (only) by --update-baseline.
+            readme = repo / "README.md"
+            kept = [line for line in readme.read_text(encoding="utf-8").splitlines()
+                    if "docs/missing.md" not in line]
+            readme.write_text("\n".join(kept) + "\n", encoding="utf-8")
             out = io.StringIO()
-            self.assertEqual(run_check(repo, baseline, out), 1)
-            self.assertIn("STALE", out.getvalue())
+            self.assertEqual(run_check(repo, baseline, out), 0)
+            self.assertIn("vanished baseline", out.getvalue())
+            strict_out = io.StringIO()
+            self.assertEqual(run_check(repo, baseline, strict_out, strict=True), 1)
+            self.assertIn("STALE", strict_out.getvalue())
             self.assertEqual(update_baseline(repo, baseline, io.StringIO()), 0)
-            self.assertNotIn("file-anchor|docs/anchors.md|crates/demo/src/lib.rs:11",
-                             load_baseline(baseline))
+            self.assertNotIn("link|README.md|docs/missing.md", load_baseline(baseline))
 
             # A new violation is never absorbed by --update-baseline.
             (repo / "docs" / "new.md").write_text(
@@ -1325,6 +1411,47 @@ class DocsContractFixtureTests(unittest.TestCase):
             before = baseline.read_text(encoding="utf-8")
             self.assertEqual(update_baseline(repo, baseline, io.StringIO()), 1)
             self.assertEqual(baseline.read_text(encoding="utf-8"), before)
+
+    def test_code_shift_warns_but_does_not_fail_enforced_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, baseline = self._baselined_copy(tmp)
+            source = repo / "crates" / "demo" / "src" / "lib.rs"
+            lines = source.read_text(encoding="utf-8").splitlines()
+            # Code-only change: every anchored symbol moves ten lines down.
+            source.write_text("\n".join(lines[:1] + [""] * 10 + lines[1:]) + "\n",
+                              encoding="utf-8")
+            out = io.StringIO()
+            self.assertEqual(run_check(repo, baseline, out), 0)
+            self.assertIn("advisory", out.getvalue())
+            strict_out = io.StringIO()
+            self.assertEqual(run_check(repo, baseline, strict_out, strict=True), 1)
+            self.assertIn("ADVISORY", strict_out.getvalue())
+
+    def test_new_broken_link_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, baseline = self._baselined_copy(tmp)
+            (repo / "docs" / "new.md").write_text(
+                "# New\n\n[broken](nowhere.md)\n", encoding="utf-8")
+            out = io.StringIO()
+            self.assertEqual(run_check(repo, baseline, out), 1)
+            self.assertIn("NEW link|docs/new.md|nowhere.md", out.getvalue())
+
+    def test_removed_doc_file_referenced_by_link_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, baseline = self._baselined_copy(tmp)
+            (repo / "docs" / "space dir" / "notes.md").unlink()
+            out = io.StringIO()
+            self.assertEqual(run_check(repo, baseline, out), 1)
+            self.assertIn("NEW link|README.md|docs/space dir/notes.md", out.getvalue())
+
+    def test_strict_fails_on_symbol_mismatches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, baseline = self._baselined_copy(tmp)
+            self.assertEqual(run_check(repo, baseline, io.StringIO()), 0)
+            out = io.StringIO()
+            self.assertEqual(run_check(repo, baseline, out, strict=True), 1)
+            self.assertIn("ADVISORY file-anchor|docs/anchors.md|crates/demo/src/lib.rs:11",
+                          out.getvalue())
 
     def test_update_baseline_refuses_without_a_baseline(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1343,10 +1470,11 @@ class RepositoryContractTests(unittest.TestCase):
         report = scan(ROOT)
         self.assertGreater(len(report.files), 0)
         baseline = load_baseline(BASELINE)
-        new = sorted(set(report.violations) - baseline)
-        stale = sorted(baseline - set(report.violations))
-        self.assertEqual(new, [], f"new docs-contract violations: {new}")
+        new = sorted(report.enforced() - baseline)
+        stale = sorted(baseline - report.enforced())
+        self.assertEqual(new, [], f"new enforced docs-contract violations: {new}")
         self.assertEqual(stale, [], f"stale baseline entries: {stale}")
+        self.assertEqual(run_check(ROOT, BASELINE, io.StringIO()), 0)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1357,16 +1485,19 @@ def main(argv: list[str] | None = None) -> int:
                         help="baseline JSON (default: scripts/tests/docs_contract_baseline.json)")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true",
-                      help="fail on new violations or stale baseline entries (default)")
+                      help="fail on new enforced violations (default)")
     mode.add_argument("--update-baseline", action="store_true",
                       help="remove baseline entries whose violation is gone")
+    parser.add_argument("--strict", action="store_true",
+                        help="also fail on symbol-proximity mismatches and "
+                             "vanished baseline entries (maintenance only)")
     arguments = parser.parse_args(argv)
     root = arguments.root.resolve()
     baseline = arguments.baseline or root / "scripts" / "tests" / "docs_contract_baseline.json"
     try:
         if arguments.update_baseline:
             return update_baseline(root, baseline)
-        return run_check(root, baseline)
+        return run_check(root, baseline, strict=arguments.strict)
     except SystemExit as exc:
         print(str(exc), file=sys.stderr)
         return 2

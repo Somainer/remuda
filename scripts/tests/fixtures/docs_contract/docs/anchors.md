@@ -7,3 +7,4 @@
 - Missing source file: `crates/demo/src/nope.rs:1`.
 - Anchor beyond the end of the file: `crates/demo/src/lib.rs:900`.
 - Shorthand resolved from the earlier full path: `lib.rs:3`.
+- Heuristic shorthand with no full path in this document: `only.rs:900`.

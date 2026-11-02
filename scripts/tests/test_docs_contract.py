@@ -1391,6 +1391,22 @@ def _candidates(line: str, anchor_text: str) -> list[str]:
     return names
 
 
+def _explicit_anchor_target(raw: str, doc: Path, root: Path,
+                            previous: dict[str, Path]) -> bool:
+    """True when the citation names its file without a repo-wide guess.
+
+    A bare basename is explicit only after the document named a full path
+    for it. Heuristic matches (unique basename anywhere, partial suffix) may
+    change when an unrelated branch adds a same-named file, so their
+    existence/line-count results stay advisory.
+    """
+    if raw.split("/", 1)[0] in TOP_LEVEL_DIRS:
+        return True
+    if "/" in raw:
+        return (doc.parent / raw).resolve().is_file()
+    return raw in previous
+
+
 def check_file_anchors(report: Report, documents: dict[Path, str], root: Path,
                        use_git: bool = True) -> None:
     index = source_index(root, use_git)
@@ -1417,6 +1433,7 @@ def check_file_anchors(report: Report, documents: dict[Path, str], root: Path,
                     # Generated or vendored trees are not part of the contract.
                     continue
                 path = resolve_source(doc, raw, root, previous, index)
+                explicit = _explicit_anchor_target(raw, doc, root, previous)
                 if path is not None and raw.split("/", 1)[0] in TOP_LEVEL_DIRS:
                     previous[Path(raw).name] = path
                 if path is None:
@@ -1424,12 +1441,14 @@ def check_file_anchors(report: Report, documents: dict[Path, str], root: Path,
                     continue
                 if not path.is_file():
                     report.add(KIND_FILE_ANCHOR, doc, anchor_text,
-                               f"line {source_line}: file does not exist", root)
+                               f"line {source_line}: file does not exist", root,
+                               advisory=not explicit)
                     continue
                 source_lines = source_lines_of(path)
                 if source_lines is None:
                     report.add(KIND_FILE_ANCHOR, doc, anchor_text,
-                               f"line {source_line}: file cannot be read", root)
+                               f"line {source_line}: file cannot be read", root,
+                               advisory=not explicit)
                     continue
                 if "/" not in raw and (start < 1 or end > len(source_lines)):
                     # The most recent full path with this basename can point at
@@ -1462,7 +1481,8 @@ def check_file_anchors(report: Report, documents: dict[Path, str], root: Path,
                 if start < 1 or end > len(source_lines):
                     report.add(KIND_FILE_ANCHOR, doc, anchor_text,
                                f"line {source_line}: {raw} has {len(source_lines)} "
-                               f"lines, anchor asks for {start}-{end}", root)
+                               f"lines, anchor asks for {start}-{end}", root,
+                               advisory=not explicit)
                     continue
                 source = "\n".join(source_lines)
                 candidates = [name for name in _candidates(line, anchor_text)
@@ -1607,6 +1627,7 @@ class DocsContractFixtureTests(unittest.TestCase):
         "file-anchor|docs/anchors.md|crates/demo/src/lib.rs:11",
         "file-anchor|docs/anchors.md|crates/demo/src/lib.rs:900",
         "file-anchor|docs/anchors.md|crates/demo/src/nope.rs:1",
+        "file-anchor|docs/anchors.md|only.rs:900",
         "link|README.md|docs/missing.md",
         "orphan|docs/design/orphan.md|",
     }
@@ -1616,6 +1637,7 @@ class DocsContractFixtureTests(unittest.TestCase):
         self.assertEqual(set(report.violations), self.EXPECTED)
         advisory = {
             "file-anchor|docs/anchors.md|crates/demo/src/lib.rs:11",
+            "file-anchor|docs/anchors.md|only.rs:900",
             "orphan|docs/design/orphan.md|",
             "command|README.md|just nope",
             "command|README.md|pnpm --dir web nope",

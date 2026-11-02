@@ -3,10 +3,6 @@
   "note": "Enforced docs-contract violations accepted at the time this baseline was written (advisory symbol-proximity results are not recorded). It may only shrink: fix a violation and run `python3 -B scripts/tests/test_docs_contract.py --update-baseline`.",
   "violations": [
     "file-anchor|docs/design/decisions.md|web/src/pages/ApprovalsPage.tsx:42-66",
-    "file-anchor|docs/design/evidence/inbox-perf-1.md|ApprovalsPage.tsx:48",
-    "file-anchor|docs/design/evidence/perf-audit-1.md|ApprovalsPage.tsx:48",
-    "file-anchor|docs/design/evidence/ui-upgrade-1.md|ApprovalsPage.tsx:42-66",
-    "file-anchor|docs/design/evidence/ui-upgrade-1.md|ApprovalsPage.tsx:69",
     "file-anchor|docs/design/security-review-2.md|crates/remuda/src/cmd/mcp.rs:270",
     "file-anchor|docs/design/security-review-2.md|crates/remuda/src/cmd/mcp.rs:362-373",
     "file-anchor|docs/design/security-review-2.md|mcp.rs:141",
@@ -17,7 +13,6 @@
     "file-anchor|docs/design/security-review-2.md|mcp.rs:378-388",
     "file-anchor|docs/design/security-review-2.md|mcp.rs:392-396",
     "file-anchor|docs/design/security-review-2.md|mcp.rs:401-404",
-    "file-anchor|docs/design/workbench-ux-improvement-2026-09.md|ApprovalsPage.tsx:92-95",
     "link|docs/design/evidence/api-routing-cli-web.md|./decisions.md",
     "link|docs/design/evidence/composer-slider-5.md|./composer-slider-5-new-ultra-ledger-1440.png",
     "link|docs/design/evidence/composer-slider-5.md|./composer-slider-5-new-ultra-night-1440.png",

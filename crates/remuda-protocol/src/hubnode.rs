@@ -184,7 +184,9 @@ pub struct SkillContext {
     /// Whether the D-051 switch is on for the instance's project.
     #[serde(default)]
     pub delegated_decisions: bool,
-    /// Whether the Hub delivers inbox facts (`cb-inbox-*`); false until then.
+    /// Whether the Hub delivers inbox facts to this instance's lineage as
+    /// Hub-voiced batches (`cb-inbox-deliver`): it receives facts and its
+    /// host takes hub-origin input.
     #[serde(default)]
     pub inbox: bool,
 }

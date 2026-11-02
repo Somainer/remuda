@@ -1197,3 +1197,24 @@ async fn push_owed(state: &AppState) {
         }
     }
 }
+
+/// Whether the Hub delivers inbox facts to `instance_id`'s lineage (the skill's
+/// `inbox` flag): the lineage receives facts (§10, Defaults) and its host
+/// takes hub-origin input.
+pub(crate) fn delivers_to(conn: &Connection, instance_id: &str) -> Result<bool, StoreError> {
+    let Some(lineage) = crate::store::lineage_id_of(conn, instance_id)? else {
+        return Ok(false);
+    };
+    let host: Option<String> = conn
+        .query_row(
+            "SELECT host_id FROM instances WHERE id = ?1",
+            params![instance_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let capable = match host {
+        Some(host) => crate::fence::host_capable(conn, &host)?,
+        None => false,
+    };
+    Ok(capable && crate::inbox::receives_any(conn, &lineage)?)
+}

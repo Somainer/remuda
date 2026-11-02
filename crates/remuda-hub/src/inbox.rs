@@ -605,6 +605,13 @@ fn receives(conn: &Connection, lineage_id: &str, kind: InboxFactKind) -> Result<
     receives_with(conn, lineage_id, &settings)
 }
 
+/// Whether `lineage_id` receives facts at all, whatever it muted (the
+/// skill's `inbox` flag, cb-inbox-deliver).
+pub(crate) fn receives_any(conn: &Connection, lineage_id: &str) -> Result<bool, StoreError> {
+    let settings = load_settings(conn, lineage_id)?;
+    receives_with(conn, lineage_id, &settings)
+}
+
 fn receives_with(
     conn: &Connection,
     lineage_id: &str,

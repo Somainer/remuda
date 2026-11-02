@@ -4844,7 +4844,19 @@ pub(crate) async fn forward_if_online(
         ) {
             let delegated =
                 crate::interactions::delegated_decisions_enabled(instance.project_id.as_deref());
-            if let Some(context) = crate::skill_context::facts(&instance, &host, delegated) {
+            // cb-inbox-deliver: whether this lineage gets Hub-voiced fact
+            // batches, read from the same rows delivery reads.
+            let inbox = state
+                .store
+                .read("skill_context_inbox", {
+                    let instance_id = instance_id.clone();
+                    move |conn| crate::inbox_deliver::delivers_to(conn, &instance_id)
+                })
+                .await
+                .unwrap_or(false);
+            if let Some(context) =
+                crate::skill_context::facts(&instance, &host, delegated, inbox)
+            {
                 object.insert(
                     "skillContext".into(),
                     serde_json::to_value(context)

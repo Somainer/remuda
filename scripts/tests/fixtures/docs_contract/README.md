@@ -25,9 +25,10 @@ A footnote marker.[^1]
 [unused]: nowhere.md
 
 Commands that exist: `remuda demo run --fast`, `remuda demo run --quick`,
-`remuda demo --verbose run`, `remuda demo inspect`,
+`remuda demo run --type structured`, `remuda demo run --timeout-ms 5`,
+`remuda demo --verbose run`, `remuda demo inspect`, `remuda help demo`,
 `remuda --data-dir D demo list`, `just build`, `just check`, `just c`,
-`pnpm --dir web test`.
+`just -f ci.just check`, `pnpm --dir web test`.
 
 Commands that do not: `remuda demo nope`, `remuda demo run --slow`,
 `just nope`, `pnpm --dir web nope`.

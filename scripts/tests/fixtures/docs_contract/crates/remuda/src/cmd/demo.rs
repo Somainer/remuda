@@ -45,4 +45,10 @@ pub(crate) struct RunArgs {
     fast: bool,
     /// Entry name.
     name: Option<String>,
+    /// Entry type.
+    #[arg(long, default_value = "textual")]
+    r#type: Option<String>,
+    /// Timeout in milliseconds.
+    #[arg(long, help = "timeout [ms")]
+    timeout_ms: Option<u64>,
 }

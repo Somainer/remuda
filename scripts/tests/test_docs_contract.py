@@ -18,17 +18,20 @@ Five check kinds:
   least NNN lines. Pointing at the symbol the surrounding text names (within
   three lines) is checked too, but its result is advisory;
 - ``command``: ``remuda``/``just``/``pnpm --dir web`` references name a real
-  subcommand or flag, recipe, or package script;
+  subcommand or flag, recipe, or package script. Advisory: these models are
+  hand-parsed from Rust, the justfile and package.json, so a parser gap must
+  never fail a branch;
 - ``orphan``: a ``docs/design/*.md`` document nothing links to, excluding a
   short entry-point allowlist. Advisory: a branch often lands a design doc
   before the link that points at it.
 
 The landing gate runs on every branch, including branches that move code
-lines without touching docs. So the enforced mode fails only on tool-owned
-breakage: links, anchors, commands, and file-anchor existence/extent.
-Symbol-proximity mismatches, orphan design docs, and baselined violations
-that have vanished are advisory warnings there. ``--strict`` (maintenance
-only, never the gate) also fails on those advisory results.
+lines without touching docs. So the enforced mode fails only on the
+well-defined checks: links, heading anchors, and file-anchor existence and
+line count. Symbol-proximity mismatches, command references, orphan design
+docs, and baselined violations that have vanished are advisory warnings
+there. ``--strict`` (maintenance only, never the gate) also fails on those
+advisory results.
 
 The enforced violations are recorded in
 ``scripts/tests/docs_contract_baseline.json``. The baseline may only shrink:
@@ -635,7 +638,7 @@ def _attribute(lines: list[str], index: int) -> tuple[str, int]:
     """
     text = lines[index].strip()
     consumed = 1
-    while text.count("[") > text.count("]") and index + consumed < len(lines):
+    while not _attribute_complete(text) and index + consumed < len(lines):
         text += " " + lines[index + consumed].strip()
         consumed += 1
     text = re.sub(r"\s+", " ", text)
@@ -644,6 +647,32 @@ def _attribute(lines: list[str], index: int) -> tuple[str, int]:
     if text.endswith("]"):
         text = text[:-1]
     return text.strip(), index + consumed
+
+
+def _attribute_complete(text: str) -> bool:
+    """True when the attribute's opening ``[`` is closed.
+
+    Quoted strings are skipped so a help text containing an unmatched
+    bracket cannot swallow the following field.
+    """
+    depth = 0
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char in "\"'":
+            index = _skip_quoted(text, index)
+            continue
+        if char == "\\":
+            index += 2
+            continue
+        if char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+            if depth == 0:
+                return True
+        index += 1
+    return False
 
 
 def parse_fields(body: str) -> list[FieldDef]:
@@ -661,11 +690,14 @@ def parse_fields(body: str) -> list[FieldDef]:
             pending.append(attribute)
             continue
         match = re.match(
-            r"(?:pub(?:\([^)]*\))?\s+)?([A-Za-z_]\w*)\s*:\s*(.+?)\s*,?\s*$", stripped)
+            r"(?:pub(?:\([^)]*\))?\s+)?(?:r#)?([A-Za-z_]\w*)\s*:\s*(.+?)\s*,?\s*$",
+            stripped)
         if match:
             fields.append(FieldDef(match.group(1), match.group(2).strip(), pending))
             pending = []
-        elif stripped.endswith("}"):
+        else:
+            # An attribute belongs to the declaration that follows it; a line
+            # that is not a field must not leak it onto a later one.
             pending = []
         index += 1
     return fields
@@ -1138,6 +1170,9 @@ def check_remuda(text: str, model: Node) -> list[str]:
             index += 1
             continue
         node = chain[-1]
+        if token == "help":
+            # clap's generated help subcommand takes any topic.
+            break
         if not node.subcommands:
             break
         child_name = node.aliases.get(token, token)
@@ -1158,18 +1193,38 @@ def check_remuda(text: str, model: Node) -> list[str]:
     return problems
 
 
+# Global just flags whose next token is a value, not a recipe name.
+JUST_VALUE_FLAGS = {
+    "-f", "--justfile", "-d", "--working-directory", "--set", "--shell",
+    "--shell-arg", "--command-color", "--dotenv-path", "--dotenv-filename",
+    "--list-heading", "--list-prefix", "--chooser", "--tempdir",
+}
+
+
 def check_just(text: str, recipes: set[str] | None) -> list[str]:
     if recipes is None:
         return []
     tokens = shell_tokens(text.strip())
     if len(tokens) < 2 or tokens[0] != "just":
         return []
-    for token in tokens[1:]:
+    candidates: list[str] = []
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
         if token.startswith("-"):
+            if "=" in token:
+                index += 1
+            elif token in JUST_VALUE_FLAGS:
+                index += 2
+            else:
+                index += 1
             continue
-        if token in recipes:
-            return []
-        return [f"unknown just recipe {token!r}"]
+        candidates.append(token)
+        index += 1
+    if any(candidate in recipes for candidate in candidates):
+        return []
+    if candidates:
+        return [f"unknown just recipe {candidates[0]!r}"]
     return []
 
 
@@ -1246,7 +1301,10 @@ def check_commands(report: Report, documents: dict[Path, str], root: Path) -> No
             else:
                 continue
             for problem in problems:
-                report.add(KIND_COMMAND, doc, reference, problem, root)
+                # Command references are advisory: the clap/just/pnpm models
+                # are hand-parsed, and a parser gap must never fail a branch.
+                report.add(KIND_COMMAND, doc, reference, problem, root,
+                           advisory=True)
 
 
 # ── file:line anchors ─────────────────────────────────────────────────────
@@ -1559,6 +1617,10 @@ class DocsContractFixtureTests(unittest.TestCase):
         advisory = {
             "file-anchor|docs/anchors.md|crates/demo/src/lib.rs:11",
             "orphan|docs/design/orphan.md|",
+            "command|README.md|just nope",
+            "command|README.md|pnpm --dir web nope",
+            "command|README.md|remuda demo nope",
+            "command|README.md|remuda demo run --slow",
         }
         self.assertEqual(report.advisory(), advisory)
         self.assertEqual(report.enforced(), self.EXPECTED - advisory)

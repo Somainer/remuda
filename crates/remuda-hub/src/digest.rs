@@ -2393,38 +2393,23 @@ mod tests {
 
     #[test]
     fn the_redactor_covers_every_secret_scan_prefix() {
-        let source = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../scripts/ci/secret-scan.py"),
-        )
-        .expect("scripts/ci/secret-scan.py is part of the repo");
-        let mut literals: Vec<(String, String)> = Vec::new();
-        for line in source.lines() {
-            let Some(rest) = line.trim().strip_prefix("P_") else {
-                continue;
-            };
-            let Some((name, expression)) = rest.split_once(" = ") else {
-                continue;
-            };
-            let mut value = String::new();
-            for part in expression.split(" + ") {
-                let Some(literal) = part
-                    .trim()
-                    .strip_prefix('"')
-                    .and_then(|p| p.strip_suffix('"'))
-                else {
-                    value.clear();
-                    break;
-                };
-                value.push_str(literal);
-            }
-            if !value.is_empty() {
-                literals.push((name.to_string(), value));
-            }
-        }
+        // The scanner's shapes live in scripts/ci/secret-shapes.json; each
+        // rule's name is its literal needle.
+        let shapes: serde_json::Value =
+            serde_json::from_str(include_str!("../../../scripts/ci/secret-shapes.json"))
+                .expect("scripts/ci/secret-shapes.json parses");
+        let literals: Vec<(String, String)> = shapes["rules"]
+            .as_array()
+            .expect("rules")
+            .iter()
+            .map(|rule| {
+                let name = rule["name"].as_str().expect("rule name").to_string();
+                (name.clone(), name)
+            })
+            .collect();
         assert!(
             literals.len() >= 10,
-            "parsed only {} prefixes from secret-scan.py",
+            "parsed only {} prefixes from secret-shapes.json",
             literals.len()
         );
         const TOKEN: &str = "q7Zr2LmW8pXc4VbN1";

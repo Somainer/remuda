@@ -2198,3 +2198,131 @@ async fn a_node_supplied_requested_by_is_never_stored_or_served() -> Result<()> 
     }
     Ok(())
 }
+
+/// cb-requested-by r5: the ingest gate classifies an interaction event exactly
+/// as the store does (`kind`, else `subtype`), and the strip walks the whole
+/// value. A flat `subtype` event and records nested in `meta` objects and array
+/// elements are neither stored nor served — not in the journal row, the
+/// interaction row, the raw `/v1/interactions` page or the raw journal read.
+#[tokio::test]
+async fn a_flat_or_deeply_nested_node_requested_by_is_never_stored_or_served() -> Result<()> {
+    let (ctx, mut node) = Ctx::boot().await?;
+    let (seat, _token) = ctx.seat(&mut node, "main").await?;
+    let bot = ctx.hub.mint_bot_device_token("reqby-bot").await?;
+    let forged = json!({
+        "commandId": "cmd_never_issued",
+        "excerpt": NODE_SENTINEL,
+        "origin": "human",
+    });
+
+    // A flat event the store classifies by `subtype`: no `kind`, no nested
+    // interaction object, the record at the top of its payload.
+    let flat_card = "int_node_flat_card";
+    ctx.journal(
+        &node,
+        &seat,
+        json!({
+            "subtype": "interaction.requested",
+            "interactionKind": "approval",
+            "payload": {
+                "interactionId": flat_card,
+                "kind": "approval",
+                "requestedBy": forged.clone(),
+            }
+        }),
+    )
+    .await;
+    // A record buried in a `meta` object and inside an array element.
+    let nested_card = "int_node_nested_card";
+    ctx.journal(
+        &node,
+        &seat,
+        json!({
+            "kind": "interaction.requested",
+            "payload": {
+                "interactionKind": "approval",
+                "interaction": {
+                    "id": nested_card, "kind": "approval", "state": "pending",
+                    "blocking": true, "answerable": true, "carrier": "harness-hook",
+                    "deadline": {"state": "unknown"}, "resolution": {"state": "unknown"},
+                    "meta": {"requestedBy": forged.clone()},
+                    "request": {"kind": "approval", "title": "Bash",
+                                "description": "a Node's own card",
+                                "options": [{"id": "allow-once", "label": "Allow",
+                                             "meta": {"requestedBy": forged.clone()}}]},
+                }
+            }
+        }),
+    )
+    .await;
+    // A live Node item with the same buried records.
+    let list_card = "int_node_nested_list_card";
+    node.cards.lock().expect("cards").push(json!({
+        "interactionId": list_card, "id": list_card,
+        "instanceId": seat, "hostId": ctx.host, "kind": "approval", "state": "pending",
+        "meta": {"requestedBy": forged.clone()},
+        "interaction": {"id": list_card, "kind": "approval",
+                        "request": {"options": [{"meta": {"requestedBy": forged.clone()}}]}},
+    }));
+
+    // Every leak is collected, so one run names them all.
+    let mut leaks = Vec::new();
+    for (who, token) in [("owner", ctx.human.clone()), ("bot", bot.clone())] {
+        let (status, body) = ctx
+            .call(&token, &[], reqwest::Method::GET, "/v1/interactions", None)
+            .await;
+        assert_eq!(status, 200, "{who}: {body}");
+        let page: Value = serde_json::from_str(&body)?;
+        for id in [flat_card, nested_card, list_card] {
+            let card = card_in(&page, id).unwrap_or_else(|| panic!("{who}: no card {id}: {body}"));
+            if card.to_string().contains(NODE_SENTINEL) {
+                leaks.push(format!("{who} /v1/interactions card {id}: {card}"));
+            }
+        }
+        let (status, journal) = ctx
+            .call(
+                &token,
+                &[],
+                reqwest::Method::GET,
+                &format!("/v1/instances/{seat}/journal"),
+                None,
+            )
+            .await;
+        assert_eq!(status, 200, "{who}: {journal}");
+        let journal: Value = serde_json::from_str(&journal)?;
+        let events = journal["events"].as_array().cloned().unwrap_or_default();
+        for id in [flat_card, nested_card] {
+            let row = events
+                .iter()
+                .find(|row| row.to_string().contains(id))
+                .unwrap_or_else(|| panic!("{who}: the journal read lacks {id}: {journal}"));
+            if row.to_string().contains(NODE_SENTINEL) {
+                leaks.push(format!("{who} journal read {id}: {row}"));
+            }
+        }
+    }
+
+    let conn = rusqlite::Connection::open(ctx.dir.path().join("data/hub.sqlite"))?;
+    for table in ["interactions", "journal"] {
+        let rows: Vec<String> = conn
+            .prepare(&format!("SELECT payload_json FROM {table}"))?
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for id in [flat_card, nested_card] {
+            let row = rows
+                .iter()
+                .find(|row| row.contains(id))
+                .unwrap_or_else(|| panic!("no {table} row for {id}"));
+            if row.contains("requestedBy") || row.contains(NODE_SENTINEL) {
+                leaks.push(format!("stored {table} row {id}: {row}"));
+            }
+        }
+    }
+    assert!(
+        leaks.is_empty(),
+        "{} leak(s) of a Node-supplied requestedBy:\n{}",
+        leaks.len(),
+        leaks.join("\n")
+    );
+    Ok(())
+}

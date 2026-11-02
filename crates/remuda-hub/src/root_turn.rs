@@ -528,18 +528,41 @@ pub(crate) fn strip_supplied_requested_by(event: &mut Value) {
     }
 }
 
-/// Remove `requestedBy` from an interaction-shaped value and from every copy
-/// nested in it: the event `payload`, the `interaction` or lifecycle `entity`
-/// object, and the stored `event` a served list item carries.
+/// Deepest level [`strip_requested_by`] walks. No real interaction nests
+/// anywhere near this deep; a container below it is dropped (replaced by
+/// `null`) rather than stored or served unexamined.
+const STRIP_MAX_DEPTH: usize = 64;
+
+/// Remove every object key named `requestedBy`, at any depth and inside
+/// arrays, from an interaction-shaped value. An interaction event or card
+/// holds no legitimate `requestedBy` of its own — the Hub stamps its own
+/// cards separately — so nothing a Node supplied survives, wherever it is
+/// buried (`payload.interaction.meta`, an option in an array, the stored
+/// `event` a served card carries).
 pub(crate) fn strip_requested_by(value: &mut Value) {
-    let Some(object) = value.as_object_mut() else {
-        return;
-    };
-    object.remove("requestedBy");
-    for key in ["payload", "interaction", "entity", "event"] {
-        if let Some(nested) = object.get_mut(key) {
-            strip_requested_by(nested);
+    strip_requested_by_at(value, 0);
+}
+
+fn strip_requested_by_at(value: &mut Value, depth: usize) {
+    if depth >= STRIP_MAX_DEPTH {
+        if value.is_object() || value.is_array() {
+            *value = Value::Null;
         }
+        return;
+    }
+    match value {
+        Value::Object(object) => {
+            object.remove("requestedBy");
+            for nested in object.values_mut() {
+                strip_requested_by_at(nested, depth + 1);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                strip_requested_by_at(item, depth + 1);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1136,6 +1159,39 @@ mod tests {
         });
         strip_requested_by(&mut item);
         assert!(!item.to_string().contains("requestedBy"), "{item}");
+
+        // r5: the whole value is walked — a `meta` object, an array element,
+        // any key — and a container past the depth bound is dropped, never
+        // kept unexamined. Everything else is left as it was.
+        let mut buried = json!({
+            "kind": "interaction.requested",
+            "payload": {"interaction": {
+                "id": "int_a",
+                "meta": {"requestedBy": forged, "note": "kept"},
+                "request": {"options": [
+                    {"id": "allow-once", "meta": {"requestedBy": forged}},
+                    [{"requestedBy": forged}],
+                ]},
+            }},
+        });
+        strip_supplied_requested_by(&mut buried);
+        assert!(!buried.to_string().contains("requestedBy"), "{buried}");
+        assert_eq!(buried["payload"]["interaction"]["meta"]["note"], "kept");
+        assert_eq!(
+            buried["payload"]["interaction"]["request"]["options"][0]["id"],
+            "allow-once"
+        );
+        let mut deep = json!({"requestedBy": forged});
+        for _ in 0..STRIP_MAX_DEPTH + 6 {
+            deep = json!({"nested": deep});
+        }
+        let mut deep_event = json!({"kind": "interaction.requested", "payload": deep});
+        strip_supplied_requested_by(&mut deep_event);
+        assert!(!deep_event.to_string().contains("requestedBy"));
+        assert!(
+            deep_event.to_string().contains("nested"),
+            "shallow levels kept"
+        );
 
         // Not an interaction event: a native turn's own `requestedBy` stays.
         let mut native = json!({

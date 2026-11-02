@@ -11,7 +11,6 @@ import { known, type Id } from "../../types/wire";
 import { detectPlatform, setPlatformForTest } from "../../lib/platform";
 import { setClock } from "../../lib/clock";
 import { SessionList } from "./SessionList";
-import { GLANCE_TARGETS } from "../home/glanceNav";
 
 // jsdom has no matchMedia; the workbench viewport hook needs one to pick the
 // popover (desktop) or the sheet (phone). Default to desktop; `viewport` flips it.
@@ -1099,14 +1098,17 @@ describe("SessionList §8 freshness states", () => {
   });
 });
 
-describe("① 需要你 anchor on the real list markup", () => {
+/** The full-variant row that carries rank 1 (blocked). */
+const BLOCKED_CARD = '[data-testid="board-card"][data-rank="blocked"]';
+
+describe("rank 1 on the real list markup", () => {
   it("matches the full-variant row (board-card with the shared rank), not the inner link", () => {
     hub.instances = [
       session("ins_blocked", { activity: known("waiting-interaction") }),
       session("ins_idle", { activity: known("idle") }),
     ];
     const { container } = renderList();
-    const article = container.querySelector(GLANCE_TARGETS.needYouDesktop);
+    const article = container.querySelector(BLOCKED_CARD);
     expect(article).not.toBeNull();
     expect(article).toHaveAttribute("data-testid", "board-card");
     expect(article).toHaveAttribute("data-instance-id", "ins_blocked");
@@ -1119,13 +1121,13 @@ describe("① 需要你 anchor on the real list markup", () => {
     const { container } = renderList();
     // The UiStatus projects unknown for a dropped host; rank 1 does not.
     expect(screen.getByTestId("board-card")).toHaveAttribute("data-status", "unknown");
-    expect(container.querySelector(GLANCE_TARGETS.needYouDesktop)).not.toBeNull();
+    expect(container.querySelector(BLOCKED_CARD)).not.toBeNull();
   });
 
   it("finds nothing when no row is blocked", () => {
     hub.instances = [session("ins_idle", { activity: known("idle") })];
     const { container } = renderList();
-    expect(container.querySelector(GLANCE_TARGETS.needYouDesktop)).toBeNull();
+    expect(container.querySelector(BLOCKED_CARD)).toBeNull();
   });
 });
 

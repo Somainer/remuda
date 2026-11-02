@@ -29,6 +29,7 @@ import type { Instance } from "../../types/instance";
 import { known, type Id } from "../../types/wire";
 import { HomeList } from "./HomeList";
 import { GLANCE_TARGETS } from "../home/glanceNav";
+import { interaction as queueInteraction } from "../home/queueTestData";
 import { SPACES_PREFS_KEY, spaceKey, spaceStore } from "../spaces/store";
 import { setClock } from "../../lib/clock";
 
@@ -39,6 +40,7 @@ const hub = {
   interactions: [] as unknown[],
   events: {} as Record<string, unknown>,
   screens: {} as Record<string, unknown>,
+  answering: {} as Record<string, true>,
   connection: "live",
 };
 
@@ -597,7 +599,7 @@ describe("HomeList §8 freshness states", () => {
   });
 });
 
-describe("① 需要你 anchor on the phone ledger", () => {
+describe("① 需要你 on the phone home", () => {
   it("marks the row by rank 1, so a dropped host still carries the anchor", async () => {
     hub.instances = [
       row("ins-dropped", {
@@ -611,7 +613,26 @@ describe("① 需要你 anchor on the phone ledger", () => {
     expect(article).toHaveAttribute("data-status", "unknown");
     expect(article).toHaveAttribute("data-rank", "blocked");
     expect(article).toHaveAttribute("data-blocked", "1");
-    expect(container.querySelector(GLANCE_TARGETS.needYou)).toBe(article);
+    expect(container.querySelector('[data-testid="home-row"][data-blocked="1"]')).toBe(article);
+  });
+
+  it("scrolls to the ④ queue anchor when 需要你 is tapped (home.md §5.2)", async () => {
+    hub.instances = [row("ins-wait", { activity: known("waiting-interaction") })];
+    hub.interactions = [queueInteraction({ id: "int_wait", instanceId: "ins-wait", hostId: "host-a" })];
+    const scroll = vi.fn();
+    const original = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = scroll;
+    try {
+      renderHome();
+      const queue = await screen.findByTestId("home-queue");
+      expect(queue).toHaveAttribute("id", GLANCE_TARGETS.queueId);
+      fireEvent.click(await screen.findByTestId("glance-need-you"));
+      expect(scroll).toHaveBeenCalledWith(expect.objectContaining({ block: "start" }));
+      expect(scroll.mock.contexts.at(-1)).toBe(queue);
+    } finally {
+      hub.interactions = [];
+      Element.prototype.scrollIntoView = original;
+    }
   });
 });
 

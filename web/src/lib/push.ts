@@ -1,7 +1,8 @@
 import { deletePushSubscription, fetchPushConfig, postPushSubscription } from "./api";
 import { isIosDevice, isStandalone } from "./pwa";
 import { readDeviceSettings } from "../features/settings";
-import { deriveInboxQueue } from "../features/mobile/inboxRows";
+import { glanceCounts } from "../features/home/glance";
+import { subscribeTaskLedger, taskLedgerSnapshot } from "../features/tasks/taskLedger";
 import {
   subscribeInboxClock,
   syncInboxDeadlineClock,
@@ -120,20 +121,23 @@ export function syncAppBadge(pending: number): void {
 }
 
 /**
- * Pending interactions, same rule the in-app badges use (Shell/PhoneNav):
- * the single 待你处理 queue projection (deriveInboxQueue), never a raw
- * `state === "pending"` count (c-ghostbadge: that counts ghost cards whose
- * deadline has passed that the inbox does not show).
+ * The OS badge number: home.md §5.1 N — the interactions really waiting (the
+ * single 待你处理 projection, deriveInboxQueue, never a raw `state ===
+ * "pending"` count: c-ghostbadge) plus the owner-blocked tasks with no such
+ * interaction. It is `glanceCounts().needYou`, the same N the ① count row and
+ * the ④ queue header show. The in-app 收件箱 counts stay A only (§5.1).
  */
 export function pendingInteractionCount(): number {
   const state = hubStore.getSnapshot();
-  return deriveInboxQueue({
+  return glanceCounts({
     interactions: state.interactions,
     instances: state.instances,
     hosts: state.hosts,
+    tasks: taskLedgerSnapshot(null).tasks,
     answering: state.answering,
     deviceId: thisDeviceId(),
-  }).length;
+    nowMs: Date.now(),
+  }).needYou;
 }
 
 let badgeUnsubscribe: (() => void) | null = null;
@@ -160,9 +164,13 @@ export function startAppBadgeSync(): () => void {
     apply();
     const offStore = hubStore.subscribe(apply);
     const offClock = subscribeInboxClock(apply);
+    // B of §5.1 comes from the owner-wide task ledger; this shares the one
+    // 5 s poller the home's count row and queue already read.
+    const offTasks = subscribeTaskLedger(null, apply);
     badgeUnsubscribe = () => {
       offStore();
       offClock();
+      offTasks();
     };
   }
   return stopAppBadgeSync;

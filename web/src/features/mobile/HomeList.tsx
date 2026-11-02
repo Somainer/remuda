@@ -43,8 +43,9 @@ import { useHomeFreshness } from "../home/freshness";
 import { HostStrip } from "../home/HostStrip";
 import { HubBanner } from "../home/HubBanner";
 import { HomeGlance } from "../home/HomeGlance";
-import { GLANCE_TARGETS, scrollToFirst } from "../home/glanceNav";
+import { scrollToQueue } from "../home/glanceNav";
 import { MainAskDock, MainCard } from "../home/MainCard";
+import { HomeQueue } from "../home/HomeQueue";
 import { NoMatches, NoSessions, SkeletonRows } from "../home/HomeStates";
 import { newSessionPath } from "../spaces/store";
 import ui from "../../styles/ui.module.css";
@@ -450,7 +451,7 @@ export const HomeList = memo(function HomeList() {
         <HomeGlance
           placement="phone"
           workingFilter={rankFilter === "working"}
-          onNeedYou={() => scrollToFirst(GLANCE_TARGETS.needYou, GLANCE_TARGETS.tasks)}
+          onNeedYou={scrollToQueue}
           onWorking={() => setRankFilter((current) => (current === "working" ? null : "working"))}
         />
       </header>
@@ -559,6 +560,10 @@ export const HomeList = memo(function HomeList() {
           right under the sticky head, below the banner. Renders nothing
           without a Main. */}
       <MainCard placement="phone" />
+      {/* ④ 需要你 (home.md §4): the page's one needs-you queue, under the Main
+          card and above the ledger; outside the probe (its answers and
+          receipts never report commit:HomeList). Hidden while searching. */}
+      <HomeQueue placement="phone" searching={searching} />
       {/* Outside the probe: its 5s ledger poll never reports commit:HomeList.
           CSS order keeps it under the sticky head and above project groups. */}
       <HomeTaskLayer

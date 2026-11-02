@@ -11,8 +11,9 @@ import { PageHeader } from "../components/PageHeader";
 import { HomeGlance } from "../features/home/HomeGlance";
 import { TOP_LEVEL_WORKING } from "../features/home/glance";
 import { HostStrip } from "../features/home/HostStrip";
-import { GLANCE_TARGETS, scrollToFirst } from "../features/home/glanceNav";
+import { scrollToQueue } from "../features/home/glanceNav";
 import { MainCard } from "../features/home/MainCard";
+import { HomeQueue } from "../features/home/HomeQueue";
 import { WorkingList } from "../features/home/WorkingList";
 import { useMainAside } from "../features/home/useMain";
 import css from "./SessionsPage.module.css";
@@ -46,6 +47,8 @@ export function SessionsPage({ dimmed = false }: { dimmed?: boolean }) {
   // second tap removes it again.
   const [params, setParams] = useSearchParams();
   const workingFilter = rankValues(params).includes("working");
+  // §4.1: the queue hides while the SessionList search (its `q` param) is set.
+  const searching = (params.get("q") ?? "").trim().length > 0;
 
   function toggleWorking() {
     const next = new URLSearchParams(params);
@@ -90,7 +93,7 @@ export function SessionsPage({ dimmed = false }: { dimmed?: boolean }) {
               // The list drops child sessions; the count must use that set.
               workingInstances={TOP_LEVEL_WORKING}
               workingFilter={workingFilter}
-              onNeedYou={() => scrollToFirst(GLANCE_TARGETS.needYouDesktop)}
+              onNeedYou={scrollToQueue}
               onWorking={toggleWorking}
             />
           }
@@ -133,6 +136,10 @@ export function SessionsPage({ dimmed = false }: { dimmed?: boolean }) {
           {/* D-061 (home.md §2.2–2.4): the Main card heads the main column
               at 1280–1439; at ≥1440 it lives in the right column instead. */}
           {showMain && !mainAside ? <MainCard placement="desktop" /> : null}
+          {/* ④ 需要你 (home.md §2.2–2.3, §4): the 2-column grid at the top
+              of the main column, under the 1280 Main card; hidden while the
+              list search (?q=) has text. */}
+          {!mobile ? <HomeQueue placement="desktop" searching={searching} /> : null}
           {/* home.md §8: no empty state before the first Hub snapshot — the
               list below paints its skeleton until then. */}
           {!firstSnapshot && hub.ready && hub.hosts.length === 0 && hub.instances.length === 0 ? (

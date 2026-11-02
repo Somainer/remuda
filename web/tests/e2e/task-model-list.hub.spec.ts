@@ -341,10 +341,18 @@ test.describe("task layer at 390 phone (/m)", () => {
     const layer = page.getByTestId("home-tasks");
     await expect(layer).toBeVisible();
 
-    // The layer is the same read-only projection: 需要你 first.
+    // home.md §4.6: the home has ONE 需要你 — the ④ queue. The layer drops
+    // its own attention group; the owner-blocked task (no interaction on its
+    // sessions) is a 「任务待你」 card in the queue and stays in its project.
     const taskGroups = layer.getByTestId("task-group");
-    await expect(taskGroups.first()).toHaveAttribute("data-kind", "attention");
-    await expect(taskGroups.first()).toContainText(fx.blocked.title);
+    await expect(layer.locator('[data-testid="task-group"][data-kind="attention"]')).toHaveCount(0);
+    await expect(rowIn(layer, fx.blocked.id).first()).toBeVisible();
+    // Other specs' cards may fill the collapsed queue: expand it in place.
+    const more = page.locator('[data-testid="home-queue-more"][aria-expanded="false"]');
+    if (await more.count()) await more.click();
+    await expect(
+      page.locator(`[data-testid="home-queue"] [data-card-type="task"][data-card-id="${fx.blocked.id}"]`),
+    ).toHaveCount(1);
 
     // Parent/child nesting + SE-nn key, no bare task id.
     await expect(rowIn(layer, fx.parent.id).first()).toHaveAttribute("data-depth", "0");

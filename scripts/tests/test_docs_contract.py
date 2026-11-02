@@ -887,10 +887,16 @@ def just_recipes(root: Path) -> set[str] | None:
     if not path.is_file():
         return None
     names = set()
+    # `name [args]: [dependencies] [# comment]`. A bare `:=` assignment is not
+    # a recipe.
+    recipe = re.compile(
+        r"^@?(?P<name>[A-Za-z_][\w-]*)(?:\s+[^:]*)?:\s*(?!=)[^#\n]*(?:#.*)?$")
     for line in path.read_text(encoding="utf-8").splitlines():
-        match = re.match(r"^([A-Za-z_][\w-]*)(?:\s[^:]*)?:\s*(?:#.*)?$", line)
-        if match and not line.startswith((" ", "\t")):
-            names.add(match.group(1))
+        if line.startswith((" ", "\t")):
+            continue
+        match = recipe.match(line)
+        if match:
+            names.add(match.group("name"))
     return names
 
 
@@ -1429,6 +1435,14 @@ class DocsContractFixtureTests(unittest.TestCase):
         self.assertNotIn("设计 笔记", flagged)
         self.assertNotIn("space dir", flagged)
         self.assertNotIn("目录 空格", flagged)
+
+    def test_just_recipe_with_dependencies_is_registered(self):
+        recipes = just_recipes(FIXTURE_ROOT)
+        self.assertIn("check", recipes)  # `check: build` in the fixture justfile
+        self.assertIn("gen-types", recipes)
+        self.assertEqual(check_just("just check", recipes), [])
+        self.assertEqual(check_just("just nope", recipes),
+                         ["unknown just recipe 'nope'"])
 
     @unittest.skipUnless(shutil.which("git"), "needs git")
     def test_untracked_markdown_does_not_change_the_corpus(self):

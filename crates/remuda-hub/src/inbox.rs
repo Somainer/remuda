@@ -453,16 +453,17 @@ fn receives(conn: &Connection, lineage_id: &str, kind: InboxFactKind) -> Result<
         return Ok(true);
     }
     // An Agent created it (the create spec carries the stamped origin), and
-    // it is a parent: the subject is its child.
-    let agent_created: bool = conn.query_row(
-        "SELECT EXISTS (
-            SELECT 1 FROM instances
-             WHERE COALESCE(lineage_id, id) = ?1
-               AND json_extract(spec_json, '$.origin') = 'agent')",
-        params![lineage_id],
-        |row| row.get(0),
-    )?;
-    Ok(agent_created)
+    // it is a parent: the subject is its child. Without continuity the
+    // lineage is that one instance, whose id is the lineage id.
+    let agent_created: Option<bool> = conn
+        .query_row(
+            "SELECT json_extract(spec_json, '$.origin') = 'agent' FROM instances WHERE id = ?1",
+            params![lineage_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(agent_created == Some(true))
 }
 
 /// The single project of `instance_id`'s scope, whose policy holds the cap

@@ -643,12 +643,15 @@ pub fn render_section(context: &SkillContext) -> String {
 mod tests {
     use super::*;
 
-    /// The re-check that runs inside `write_tree`, immediately before the
-    /// first write: a link planted after `plan` decided would otherwise be
-    /// followed, and the tree would land outside the home.
+    /// `write_tree` refuses a link that is already in place when it starts —
+    /// this reaches the check before the first `ensure_dir`, which is the one
+    /// that stops `create_dir_all` from laying a directory down inside a
+    /// linked `skills` target. The second check (immediately before the
+    /// marker write) has no seam between the two calls and is covered only by
+    /// the concurrent installs test.
     #[cfg(unix)]
     #[test]
-    fn write_tree_refuses_a_link_planted_after_the_plan() {
+    fn write_tree_refuses_a_symlink_already_in_place() {
         use std::os::unix::fs::symlink;
         for linked_parent in [false, true] {
             let tmp = tempfile::tempdir().unwrap();

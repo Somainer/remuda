@@ -1230,6 +1230,51 @@ async fn an_explicit_tool_threshold_yields_exactly_one_stall_fact() -> Result<()
     Ok(())
 }
 
+/// r3 item 1: a tool-stall fact is keyed by the instance, the call and the
+/// time it opened, never by the run generation. A root `turn_started` while
+/// the call is still tracked (its result never journaled, e.g. across a
+/// host blip) bumps the run; it must not turn the same call into a second
+/// stall fact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_run_does_not_rekey_a_tool_stall() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("inbox-stall-run").await?;
+    let (status, body) = ctx
+        .request(
+            reqwest::Method::PATCH,
+            &ctx.human,
+            &format!("/v1/projects/{project}"),
+            // A year-long quiet window: only the tool window can yield here.
+            Some(json!({ "policy": { "configurable": {
+                "stallToolThresholdMins": 15, "stallThresholdMins": 525_600 } } })),
+        )
+        .await?;
+    assert_eq!(status, 200, "{body}");
+    let (seat, seat_token) = ctx.coordinator(&project).await?;
+    let worker = ctx.worker(&seat_token, &project).await?;
+    ctx.journal(&worker, entity("running", &at(0))).await?;
+    ctx.journal(&worker, turn_started("cmd_stall_run_1", &at(1)))
+        .await?;
+    ctx.journal(&worker, tool_call("tc_across_runs")).await?;
+
+    assert_eq!(ctx.hub.test_inbox_tick(&minutes_from_now(16)).await?, 1);
+    // A new root turn starts; the call's result was never journaled.
+    ctx.journal(&worker, turn_started("cmd_stall_run_2", &at(2)))
+        .await?;
+    for minutes in [17, 60, 600] {
+        assert_eq!(
+            ctx.hub.test_inbox_tick(&minutes_from_now(minutes)).await?,
+            0
+        );
+    }
+    let items = ctx.inbox(&seat_token, &seat).await?;
+    let stalled = stalls(&items);
+    assert_eq!(stalled.len(), 1, "one call, one stall fact: {items:#?}");
+    assert_eq!(stalled[0]["payload"]["toolCallId"], "tc_across_runs");
+    assert_eq!(stalled[0]["runGeneration"], 1);
+    Ok(())
+}
+
 /// A task's `maxWallMins` elapsing yields one budget-expired fact for the
 /// dispatcher; the worker keeps running and nothing is sent to it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -658,6 +658,10 @@ pub(crate) struct Fact {
     pub(crate) cap_subject: String,
     /// The subject's run generation the fact is about; 0 when not a run.
     pub(crate) run: i64,
+    /// Whether `run` is part of the dedupe key. False for a fact whose
+    /// identity does not depend on the run (a tool call's stall): the run is
+    /// still stored and in the payload, but a new run cannot re-key it.
+    pub(crate) run_in_key: bool,
     /// When the subject entered the state (canonical shape).
     pub(crate) entered_at: String,
     /// The project whose policy sets the cap.
@@ -725,7 +729,8 @@ fn record_inner(
     if !receives(conn, subscriber, fact.kind)? {
         return Ok((Outcome::NotReceived, 0));
     }
-    let key = dedupe_key(fact.kind, &fact.key_subject, fact.run, &fact.entered_at);
+    let key_run = if fact.run_in_key { fact.run } else { 0 };
+    let key = dedupe_key(fact.kind, &fact.key_subject, key_run, &fact.entered_at);
     let seen: bool = conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM inbox_occurrences
                          WHERE subscriber_lineage_id = ?1 AND dedupe_key = ?2)
@@ -841,6 +846,7 @@ fn instance_fact(
         key_subject: instance_id.to_owned(),
         cap_subject: instance_id.to_owned(),
         run,
+        run_in_key: true,
         entered_at,
         project_id: project_of(conn, instance_id)?,
         payload,
@@ -1109,6 +1115,12 @@ pub(crate) fn fold_append(
     if root_turn && native_name == "turn_started" {
         tracker.run += 1;
         tracker.structured = true;
+        // A root turn starts only after the previous one ended, so a call
+        // still tracked here belongs to an earlier run whose result was never
+        // journaled: it is not running under this turn. Dropping it keeps a
+        // stale call from suppressing this turn's quiet-window stall and from
+        // reading as in flight (r3).
+        tracker.tools.clear();
         if let Some(command_id) = text("/relatedIds/nativeClientMessageId") {
             if tracker.turns.len() >= TRACKED_TURNS {
                 tracker.turns.remove(0);
@@ -1537,6 +1549,7 @@ fn gate_fact(conn: &Connection, job_id: &str, finished_at: &str) -> Result<(), S
             key_subject: job_id.to_owned(),
             cap_subject: job_id.to_owned(),
             run: 0,
+            run_in_key: true,
             entered_at,
             project_id: Some(project_id),
             payload: detail,
@@ -1668,6 +1681,7 @@ fn host_facts(
                 key_subject: host_id.to_owned(),
                 cap_subject: host_id.to_owned(),
                 run: 0,
+                run_in_key: true,
                 entered_at: canonical_at(at).unwrap_or_else(now_rfc3339),
                 project_id: scope.single_project_id().map(|id| id.as_id().to_string()),
                 payload: json!({ "hostId": host_id, "online": online }),
@@ -1881,6 +1895,10 @@ fn due_stalls(conn: &Connection, now: OffsetDateTime) -> Result<usize, StoreErro
                 }),
             )?;
             fact.key_subject = format!("{instance_id}/{tool_call_id}");
+            // The call and its opened time are the stall; a run that began
+            // since (r3) is not a new one.
+            fact.run_in_key = false;
+            fact.payload["runGeneration"] = json!(tracker.run);
             fact
         } else {
             let threshold = project_policy_number(conn, project.as_deref(), "stallThresholdMins")?
@@ -2351,6 +2369,92 @@ mod tests {
                 "supply-reset:ins_w:0:2026-11-01T02:00:00.000Z".to_owned()
             )]
         );
+    }
+
+    /// r3 item 1, the key itself: a run that changes while the call stays
+    /// tracked (here without a `turn_started`, the path that does not drop
+    /// tracked calls) re-keys nothing. The fact keeps the run it was found in.
+    #[tokio::test]
+    async fn a_tool_stall_key_does_not_carry_the_run_generation() {
+        let (_dir, store) = store().await;
+        let opened = "2026-11-01T00:00:00.000Z";
+        let project = remuda_protocol::ProjectId::new().as_id().to_string();
+        store
+            .run_named("t", move |conn| {
+                instance(conn, "ins_seat", "ins_seat", None, "human");
+                continuity(conn, "ins_seat", "ins_seat");
+                instance(conn, "ins_w", "ins_w", Some("ins_seat"), "agent");
+                conn.execute(
+                    "INSERT INTO projects (id, name, doc_json, created_at, updated_at)
+                     VALUES (?1, 't', ?2, ?3, ?3)",
+                    params![
+                        project,
+                        json!({ "policy": { "configurable": {
+                            "stallToolThresholdMins": 15, "stallThresholdMins": 525_600 } } })
+                        .to_string(),
+                        now_rfc3339()
+                    ],
+                )?;
+                conn.execute(
+                    "UPDATE instances SET scope_json = ?1 WHERE id = 'ins_w'",
+                    params![json!({ "projectIds": [project] }).to_string()],
+                )?;
+                let tracker = Tracker {
+                    run: 1,
+                    tools: vec![("tc_1".into(), opened.into())],
+                    ..Tracker::default()
+                };
+                save_tracker(conn, "ins_w", &tracker)
+            })
+            .await
+            .unwrap();
+        let clock = TickClock {
+            booted_at: OffsetDateTime::UNIX_EPOCH,
+            host_grace: time::Duration::minutes(10),
+        };
+        let at = |s: &str| OffsetDateTime::parse(s, &Rfc3339).unwrap();
+        assert_eq!(
+            store
+                .inbox_tick(at("2026-11-01T00:20:00Z"), clock)
+                .await
+                .unwrap(),
+            1
+        );
+        // The run moves on with the call still tracked.
+        store
+            .run_named("t", |conn| {
+                let mut tracker = load_tracker(conn, "ins_w")?;
+                tracker.run = 2;
+                save_tracker(conn, "ins_w", &tracker)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .inbox_tick(at("2026-11-01T00:40:00Z"), clock)
+                .await
+                .unwrap(),
+            0
+        );
+        let (facts, run): (Vec<(String, String)>, i64) = store
+            .run_named("t", |conn| {
+                let run = conn.query_row(
+                    "SELECT run_generation FROM inbox_facts WHERE kind = 'stalled'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok((facts(conn, "ins_seat"), run))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            facts,
+            [(
+                "stalled".to_owned(),
+                format!("stalled:ins_w/tc_1:0:{opened}")
+            )]
+        );
+        assert_eq!(run, 1, "the run it was found in is kept on the row");
     }
 
     #[test]

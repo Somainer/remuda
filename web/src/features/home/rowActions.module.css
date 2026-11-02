@@ -1,0 +1,82 @@
+/* @tokens strict */
+/* ⑦ 行操作菜单 (home.md §9): the 44px ⋯ and the long-press target. */
+
+.wrap {
+  position: relative;
+  display: flex;
+  flex: none;
+  align-items: center;
+}
+
+/* Always in tab order, and always in flow at the 44px hit area. On a fine
+   pointer its paint waits for the row hover or keyboard focus; a coarse
+   pointer shows it outright, next to the long-press that surface also has. */
+.more {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--touch);
+  height: var(--touch);
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-xs);
+  background: transparent;
+  color: var(--fg-muted);
+  font-size: var(--text-ui);
+  cursor: pointer;
+}
+
+/* The hover target is the WHOLE row, not the 44px the button occupies: every
+   ledger puts .host on its row element, so a fine pointer anywhere over the
+   row reveals the ⋯. The button stays in flow at its full 44px hit area; only
+   its paint is hidden, so it never leaves the tab order (a clipped 1x1 button
+   was unreachable for a mouse and nearly invisible to the keyboard). */
+@media (hover: hover) and (pointer: fine) {
+  .more {
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .host:hover .more,
+  .more:focus-visible {
+    opacity: 1;
+    pointer-events: auto;
+  }
+}
+
+.heading {
+  margin: 0;
+  padding: var(--space-3) var(--space-3) 0;
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  font-weight: 500;
+  line-height: var(--lh-meta);
+}
+
+.menu {
+  margin: 0;
+  padding: var(--space-2);
+  list-style: none;
+}
+
+.item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: var(--touch);
+  margin: 0;
+  padding: 0 var(--space-3);
+  border: 0;
+  background: transparent;
+  color: var(--fg-body);
+  font-family: var(--font-ui);
+  font-size: var(--text-ui);
+  text-align: left;
+  cursor: pointer;
+}
+
+.item:disabled {
+  color: var(--fg-faint);
+  cursor: default;
+}

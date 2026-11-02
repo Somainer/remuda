@@ -65,9 +65,14 @@
   cursor: pointer;
 }
 
-/* 需要你 is the one attention-toned segment; 工作中 is an ordinary count. */
+/* 需要你 is the one attention-toned segment; 工作中 is an ordinary count.
+   ◉ takes the link color (ui-spec: the done-unseen mark is link-colored). */
 .seg[data-key="needYou"] {
   color: var(--attention-fg);
+}
+
+.seg[data-key="doneUnseen"] {
+  color: var(--link);
 }
 
 .row[data-placement="desktop"] .seg {

@@ -333,21 +333,27 @@ test("row shows the approval summary, tucks wire fields into a disclosure, and k
   await expect(approvalRow.getByTestId("session-lifecycle")).toContainText("connected");
   await expect(wire).toContainText(approvalId.slice(0, 8));
 
-  // Remote controls live in the overflow sheet, with every old testid.
+  // Remote controls live in the overflow sheet. home.md §9 (D-061): the bare
+  // enter / esc / ctrl+c keys moved to /s/:id/tty, and 停止 confirms first.
   const terminalRow = page.getByTestId("board-card").filter({ has: page.locator(`a[href="/s/${terminalId}"]`) });
   await expect(terminalRow.getByTestId("board-prompt")).toHaveCount(0);
   await terminalRow.getByTestId("board-more").click();
   const panel = page.getByTestId("board-actions-panel");
   await expect(panel).toBeVisible();
-  for (const testid of ["board-prompt", "board-send", "board-key-enter", "board-key-esc", "board-key-ctrl-c", "board-stop"]) {
+  for (const testid of ["board-prompt", "board-send", "board-stop"]) {
     await expect(panel.getByTestId(testid)).toBeVisible();
   }
+  for (const testid of ["board-key-enter", "board-key-esc", "board-key-ctrl-c"]) {
+    await expect(panel.getByTestId(testid)).toHaveCount(0);
+  }
 
-  // An ESC sent from the sheet reaches the fake-harness process: its screen
-  // answers with the marker, and the list poll surfaces it on the row.
-  await panel.getByTestId("board-key-esc").click();
-  await expect.poll(async () => screenLines(page, terminalId), { timeout: 15_000 }).toContain("QUICKFIND_ESC_RECEIVED");
-  await expect(terminalRow.getByTestId("board-snippet")).toContainText("QUICKFIND_ESC_RECEIVED", { timeout: 15_000 });
+  // 停止 names the session and the host, and does not close until confirmed.
+  await panel.getByTestId("board-stop").click();
+  const confirm = page.getByTestId("board-stop-confirm");
+  await expect(confirm).toBeVisible();
+  await expect(confirm).toContainText("e2e-fake-node");
+  await page.getByRole("button", { name: "取消" }).click();
+  await expect(terminalRow).not.toHaveAttribute("data-status", "exited");
 
   // Evidence shots show the default (collapsed) row shape; the expanded
   // disclosure was already asserted above. Hold the desktop list mounted

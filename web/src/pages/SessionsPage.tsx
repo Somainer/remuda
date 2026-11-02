@@ -14,6 +14,7 @@ import { HostStrip } from "../features/home/HostStrip";
 import { scrollToQueue } from "../features/home/glanceNav";
 import { MainCard } from "../features/home/MainCard";
 import { HomeQueue } from "../features/home/HomeQueue";
+import { JustDone } from "../features/home/JustDone";
 import { WorkingList } from "../features/home/WorkingList";
 import { useMainAside } from "../features/home/useMain";
 import css from "./SessionsPage.module.css";
@@ -47,18 +48,25 @@ export function SessionsPage({ dimmed = false }: { dimmed?: boolean }) {
   // second tap removes it again.
   const [params, setParams] = useSearchParams();
   const workingFilter = rankValues(params).includes("working");
+  const doneUnseenFilter = rankValues(params).includes("done-unseen");
   // §4.1: the queue hides while the SessionList search (its `q` param) is set.
   const searching = (params.get("q") ?? "").trim().length > 0;
 
-  function toggleWorking() {
+  function toggleRank(rank: string, active: boolean) {
     const next = new URLSearchParams(params);
     const ranks = rankValues(params);
-    const updated = workingFilter
-      ? ranks.filter((value) => value !== "working")
-      : [...ranks, "working"];
+    const updated = active ? ranks.filter((value) => value !== rank) : [...ranks, rank];
     if (updated.length) next.set("rank", updated.join(","));
     else next.delete("rank");
     setParams(next, { replace: true });
+  }
+
+  function toggleWorking() {
+    toggleRank("working", workingFilter);
+  }
+
+  function toggleDoneUnseen() {
+    toggleRank("done-unseen", doneUnseenFilter);
   }
 
   useEffect(() => {
@@ -93,8 +101,10 @@ export function SessionsPage({ dimmed = false }: { dimmed?: boolean }) {
               // The list drops child sessions; the count must use that set.
               workingInstances={TOP_LEVEL_WORKING}
               workingFilter={workingFilter}
+              doneUnseenFilter={doneUnseenFilter}
               onNeedYou={scrollToQueue}
               onWorking={toggleWorking}
+              onDoneUnseen={toggleDoneUnseen}
             />
           }
         />
@@ -140,6 +150,8 @@ export function SessionsPage({ dimmed = false }: { dimmed?: boolean }) {
               of the main column, under the 1280 Main card; hidden while the
               list search (?q=) has text. */}
           {!mobile ? <HomeQueue placement="desktop" searching={searching} /> : null}
+          {/* ⑤ 刚完成 (home.md §2.2, §7): under the queue. */}
+          {!mobile ? <JustDone placement="desktop" /> : null}
           {/* home.md §8: no empty state before the first Hub snapshot — the
               list below paints its skeleton until then. */}
           {!firstSnapshot && hub.ready && hub.hosts.length === 0 && hub.instances.length === 0 ? (

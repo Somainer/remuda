@@ -4,6 +4,7 @@ import type { Id } from "../../types/wire";
 import type { Instance } from "../../types/instance";
 import type { Interaction } from "../../types/interaction";
 import { knowledgeValue } from "../../types/command";
+import { Modal } from "../../components/Modal";
 import { Sheet } from "../../components/Sheet";
 import { StateDot } from "../../components/StateDot";
 import { formatListTime, shortId } from "../../lib/format";
@@ -16,6 +17,7 @@ import { useModifierHeld } from "../../lib/useModifierHeld";
 import { buildSpaces, useSpacesPrefs } from "../spaces/store";
 import { switchSlots } from "../../lib/sessionSlots";
 import { isEmberEffort } from "./effort";
+import { RowActions, ROW_ACTIONS_HOST } from "../home/RowActions";
 import { nextStep } from "./nextStep";
 import { LaunchedByMark } from "./LaunchedBy";
 import { HarnessGlyph } from "../spaces/SpacesPanel";
@@ -156,6 +158,10 @@ export function SessionList({
   // Only one row can have it open; actionReturnRef restores focus to the ⋯
   // trigger that opened it (useFocusTrap contract).
   const [actionFor, setActionFor] = useState<Id | null>(null);
+  // home.md §9: the row menu, distinct from the 会话遥控 sheet above. One at a time.
+  const [rowMenuFor, setRowMenuFor] = useState<Id | null>(null);
+  // home.md §9: 停止 confirms first, naming the session and the host.
+  const [stopFor, setStopFor] = useState<Id | null>(null);
   const actionReturnRef = useRef<HTMLButtonElement | null>(null);
   // One hold: a finger in the list, keyboard focus in a row, or the open
   // action Sheet. It freezes the painted buckets and row order; content still
@@ -250,7 +256,7 @@ export function SessionList({
   // The open action Sheet is its own sticky source: pointer and keyboard
   // activity inside it must not release the freeze, only closing it.
   useEffect(() => {
-    if (actionFor !== null) {
+    if (actionFor !== null || rowMenuFor !== null) {
       startHold("sheet");
     } else {
       // Closing releases the Sheet's own source, and the focus source it
@@ -259,7 +265,7 @@ export function SessionList({
       end("sheet");
       end("focus");
     }
-  }, [actionFor, startHold, end]);
+  }, [actionFor, rowMenuFor, startHold, end]);
 
   // While held, the snapshot owns the buckets and the order; live data only
   // replaces each row by id. A row that vanished keeps its last painted
@@ -290,6 +296,15 @@ export function SessionList({
   useEffect(() => {
     if (actionFor !== null && staleIds.has(actionFor)) setActionFor(null);
   }, [actionFor, staleIds]);
+
+  // The row menu is a §3.3 hold source: a menu id whose row is not painted
+  // (a rank-filter tap drops rows mid-hold) would hold the order forever with
+  // no menu to close it. Release it.
+  useEffect(() => {
+    if (rowMenuFor === null) return;
+    if (sections.some((section) => section.instances.some((instance) => instance.id === rowMenuFor))) return;
+    setRowMenuFor(null);
+  }, [rowMenuFor, sections]);
 
   // Rows currently on screen (IntersectionObserver), so the screen poll can
   // prefer them. The viewport root stays correct inside an overflow
@@ -765,7 +780,7 @@ export function SessionList({
               return (
                 <article
                   key={instance.id}
-                  className={`${css.row} ${status === "blocked" ? css.rowBlocked : ""}`}
+                  className={`${css.row} ${status === "blocked" ? css.rowBlocked : ""} ${ROW_ACTIONS_HOST}`}
                   data-testid="board-card"
                   data-instance-id={instance.id}
                   data-status={status}
@@ -871,6 +886,15 @@ export function SessionList({
                     >
                       详情
                     </button>
+                    <RowActions
+                      instance={instance}
+                      open={rowMenuFor === instance.id}
+                      onOpen={() => setRowMenuFor(instance.id)}
+                      onClose={() => setRowMenuFor((current) => (current === instance.id ? null : current))}
+                      // §8: a stale read greys the menu, not just a row that
+                      // vanished under a hold.
+                      stale={stale || freshness.state === "stale"}
+                    />
                     <button
                       type="button"
                       className={css.moreBtn}
@@ -1068,50 +1092,18 @@ export function SessionList({
                         <button type="submit" className={css.actionBtn} data-testid="board-send">
                           发送
                         </button>
-                        <button
-                          type="button"
-                          className={css.actionBtn}
-                          data-testid="board-key-enter"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            void hubStore.sendKeys(instance.id, "enter");
-                          }}
-                        >
-                          enter
-                        </button>
-                        <button
-                          type="button"
-                          className={css.actionBtn}
-                          data-testid="board-key-esc"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            void hubStore.sendKeys(instance.id, "esc");
-                          }}
-                        >
-                          esc
-                        </button>
-                        <button
-                          type="button"
-                          className={css.actionBtn}
-                          data-testid="board-key-ctrl-c"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            void hubStore.sendKeys(instance.id, "ctrl+c");
-                          }}
-                        >
-                          ctrl+c
-                        </button>
+                        {/* home.md §9 (D-061): the bare enter / esc / ctrl+c keys
+                            live on /s/:id/tty now, not in this sheet. */}
                         <button
                           type="button"
                           className={css.actionBtn}
                           data-testid="board-stop"
                           onClick={(event) => {
                             event.stopPropagation();
-                            void hubStore.close(instance.id);
-                            setActionFor(null);
+                            setStopFor(instance.id);
                           }}
                         >
-                          stop
+                          停止
                         </button>
                       </div>
                     </form>
@@ -1123,6 +1115,24 @@ export function SessionList({
         );
       })}
       </div>
+      <Modal open={stopFor !== null} onClose={() => setStopFor(null)} labelledBy="board-stop-title">
+        <p id="board-stop-title" data-testid="board-stop-confirm">
+          停止会话「{stopFor ? hubStore.titleOf(stopFor) : ""}」？（主机 {stopFor ? hubStore.hostName(hub.instances.find((row) => row.id === stopFor)?.hostId ?? "") : ""}）
+        </p>
+        <button type="button" onClick={() => setStopFor(null)}>取消</button>
+        <button
+          type="button"
+          data-testid="board-stop-confirm-yes"
+          onClick={() => {
+            const id = stopFor;
+            setStopFor(null);
+            setActionFor(null);
+            if (id) void hubStore.close(id);
+          }}
+        >
+          停止
+        </button>
+      </Modal>
       {gestureEnabled && slots.length ? (
         <footer className={css.switchHint} data-testid="session-switch-hint" aria-hidden="true">
           按住 {platform.glyph} 快捷切换

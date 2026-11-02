@@ -330,7 +330,8 @@ export function mapInstance(rec: components["schemas"]["InstanceRecord"]): Insta
       hostId,
       nativeStoreId: id,
       kind,
-      sessionId: unknownKnowledge("hub"),
+      // D-026: the id `claude --resume` takes. Absent until a driver reports one.
+      sessionId: rec.nativeSessionId ? known(rec.nativeSessionId) : unknownKnowledge("hub"),
       transcript: unknownKnowledge("hub"),
       ...(signalTier ? { signalTier } : {}),
     },
@@ -833,6 +834,12 @@ export type HubApi = {
   eventsAck(subscriptionId: Id, journalId: Id, throughSeq: U64): Promise<{ acknowledgedSeq: U64 }>;
   eventsUnsubscribe(subscriptionId: Id): Promise<void>;
   titleOf(instanceId: Id): string;
+  /**
+   * A local display name (home.md §9 重命名). There is no Hub rename route, so
+   * this overrides what the instance list reports for this device only; the
+   * next poll must not clobber it.
+   */
+  setTitle(instanceId: Id, title: string): void;
   summaryOf(instanceId: Id): string | undefined;
   permissionModeOf(instanceId: Id): string;
   hostName(hostId: Id): string;
@@ -1507,6 +1514,10 @@ function createMockApi(): HubApi {
     titleOf(instanceId) {
       return mockDb.titles.get(instanceId) ?? "会话";
     },
+    setTitle(instanceId, title) {
+      const trimmed = title.trim();
+      if (trimmed) mockDb.titles.set(instanceId, trimmed);
+    },
     summaryOf(instanceId) {
       return mockDb.summaries.get(instanceId);
     },
@@ -1529,6 +1540,7 @@ function createLiveApi(): HubApi {
   const follows = new Map<Id, WebSocket>();
   const followSubs = new Map<Id, Id>();
   const titles = new Map<Id, string>();
+  const titleOverrides = new Set<Id>();
   const hosts = new Map<Id, Host>();
   const workspaces = new Map<Id, Workspace>();
   const journals = new Map<Id, Id>();
@@ -1536,7 +1548,8 @@ function createLiveApi(): HubApi {
   function remember(instance: Instance, title?: string): Instance {
     journals.set(instance.journalId, instance.id);
     journals.set(instance.id, instance.id);
-    if (title) titles.set(instance.id, title);
+    // A local rename wins over the polled title until the device clears it.
+    if (title && !titleOverrides.has(instance.id)) titles.set(instance.id, title);
     return instance;
   }
 
@@ -2208,6 +2221,12 @@ function createLiveApi(): HubApi {
     },
     titleOf(instanceId) {
       return titles.get(instanceId) ?? "会话";
+    },
+    setTitle(instanceId, title) {
+      const trimmed = title.trim();
+      if (!trimmed) return;
+      titles.set(instanceId, trimmed);
+      titleOverrides.add(instanceId);
     },
     summaryOf() {
       return undefined;

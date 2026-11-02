@@ -2453,10 +2453,17 @@ async fn execute_queued(
         )?;
         if let ObservationPayload::Message(message) = &mut payload {
             message.command_id = Some(queued.command_id.clone());
-            prompts.register(
+            // cb-inbox-deliver: Hub-written input (a fact batch, the restart
+            // notice) is the Hub's row, never the owner's bubble, and the
+            // joined transcript record keeps that.
+            let origin = crate::origin::input_origin(command.origin);
+            message.origin = Some(crate::origin::message_origin(origin));
+            prompts.register_origin(
                 queued.command_id.clone(),
                 message.mutation.node_id.clone(),
                 prompt.clone(),
+                (origin == remuda_protocol::InputOrigin::Hub)
+                    .then_some(remuda_protocol::MessageOrigin::Hub),
             );
         }
         store.append_observation(instance_id, None, Completeness::Structured, payload)?;
@@ -6113,6 +6120,80 @@ mod tests {
         })
         .await
         .expect("fake-driver-keys lifecycle");
+    }
+
+    /// cb-inbox-deliver (D-057 §6.4, §9): Hub-written input is journaled as
+    /// the Hub's user message, never the owner's; an owner send stays human.
+    #[tokio::test]
+    async fn a_hub_origin_send_is_journaled_as_the_hubs_message() {
+        let node = DevNode::new(
+            &crate::DevServerConfig::loopback(0)
+                .with_workspace_roots(remuda_testing::test_workspace_roots!()),
+        )
+        .expect("node");
+        let created = node
+            .create_instance(
+                serde_json::from_value(serde_json::json!({
+                    "kind": "claude",
+                    "driver": "claude-print",
+                    "prompt": ""
+                }))
+                .expect("request"),
+            )
+            .await
+            .expect("create");
+        let mut origins = Vec::new();
+        for (origin, text) in [
+            ("hub", "<remuda-facts> one fact"),
+            ("human", "owner says hi"),
+        ] {
+            let command_id = CommandId::new();
+            let result = crate::transport::hubnode::dispatch_method(
+                &node,
+                remuda_protocol::hubnode::METHOD_INSTANCE_SEND,
+                serde_json::json!({
+                    "instanceId": created.instance.meta.id,
+                    "commandId": command_id,
+                    "origin": origin,
+                    "input": { "type": "prompt", "text": text, "origin": origin },
+                }),
+            )
+            .await
+            .expect("instance.send");
+            assert!(result.get("error").is_none(), "{result}");
+            let found = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let journal = node
+                        .read_journal(&created.instance.journal_id, None, 512)
+                        .expect("journal");
+                    let message = journal.events.iter().find_map(|event| match event {
+                        JournalEvent::Instance(observation) => match &observation.body {
+                            ObservationPayload::Message(message)
+                                if message.command_id.as_ref() == Some(&command_id) =>
+                            {
+                                Some(message.origin)
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    });
+                    if let Some(origin) = message {
+                        break origin;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the send's user message");
+            origins.push(found);
+        }
+        assert_eq!(
+            origins,
+            vec![
+                Some(remuda_protocol::MessageOrigin::Hub),
+                Some(remuda_protocol::MessageOrigin::Human)
+            ]
+        );
     }
 
     #[tokio::test]

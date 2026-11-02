@@ -247,13 +247,18 @@ fn enqueue(
     // subsequent hook/transcript evidence onto this same node.
     let node_id = message.mutation.node_id.clone();
     message.command_id = Some(command_id.clone());
+    // cb-inbox-deliver: Hub-written input is the Hub's row, never the
+    // owner's bubble, on every revision and on the joined transcript record.
+    message.origin = Some(crate::origin::message_origin(origin));
     store.append_observation(
         instance_id,
         None,
         Completeness::Structured,
         ObservationPayload::Message(message.clone()),
     )?;
-    prompts.register(command_id.clone(), node_id, prompt.clone());
+    let authored = (origin == remuda_protocol::InputOrigin::Hub)
+        .then_some(remuda_protocol::MessageOrigin::Hub);
+    prompts.register_origin(command_id.clone(), node_id, prompt.clone(), authored);
     // NOTE: instance activity is re-projected by the caller
     // (`remark_after_enqueue`), never from inside `enqueue`: the right state
     // depends on the queued prompt's mode and on whatever sits at the head.

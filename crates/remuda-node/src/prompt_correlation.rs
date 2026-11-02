@@ -66,6 +66,9 @@ struct PendingPrompt {
     registered_at: Instant,
     hook_matched: bool,
     transcript_matched: bool,
+    /// The author the Node's own message carries when it is not the
+    /// correspondent (`hub`); the joined transcript record keeps it.
+    origin: Option<MessageOrigin>,
 }
 
 /// Per-instance registry of prompts delivered through commands.
@@ -80,6 +83,9 @@ pub struct PromptMatch {
     pub command_id: CommandId,
     /// Node id the transcript record joins instead of minting its own.
     pub node_id: Id,
+    /// The author the joined record keeps, when the Node's message named one
+    /// other than the correspondent (`hub`).
+    pub origin: Option<MessageOrigin>,
 }
 
 impl Default for PromptCorrelator {
@@ -101,6 +107,19 @@ impl PromptCorrelator {
     /// `node_id` is the Node-owned message node already journaled for the
     /// queued/delivered prompt; the matching transcript record joins it.
     pub fn register(&self, command_id: CommandId, node_id: Id, text: String) {
+        self.register_origin(command_id, node_id, text, None);
+    }
+
+    /// [`Self::register`] for a prompt whose message names its author
+    /// (`hub` for Hub-written input): the transcript record that joins the
+    /// node keeps that author instead of the transcript's own reading.
+    pub fn register_origin(
+        &self,
+        command_id: CommandId,
+        node_id: Id,
+        text: String,
+        origin: Option<MessageOrigin>,
+    ) {
         let normalized = normalize_ws(&text);
         let mut pending = self.pending.lock().expect("prompt correlator");
         pending.push_back(PendingPrompt {
@@ -111,6 +130,7 @@ impl PromptCorrelator {
             registered_at: Instant::now(),
             hook_matched: false,
             transcript_matched: false,
+            origin,
         });
         prune(&mut pending);
     }
@@ -154,6 +174,7 @@ impl PromptCorrelator {
         let matched = PromptMatch {
             command_id: entry.command_id.clone(),
             node_id: entry.node_id.clone(),
+            origin: entry.origin,
         };
         if entry.hook_matched && entry.transcript_matched {
             pending.remove(index);
@@ -241,6 +262,9 @@ impl PromptCorrelator {
 const JOINED_REVISION: u64 = 3;
 
 fn join_queued_node(payload: &mut Box<MessagePayload>, matched: PromptMatch) {
+    if let Some(origin) = matched.origin {
+        payload.origin = Some(origin);
+    }
     payload.command_id = Some(matched.command_id);
     payload.mutation.operation = MutationOperation::Replace;
     payload.mutation.base_revision = Some(U64(JOINED_REVISION - 1));
@@ -276,6 +300,58 @@ mod tests {
             Id::new("obj").unwrap(),
             format!("prompt {n}"),
         )
+    }
+
+    /// cb-inbox-deliver: the transcript echo of Hub-written input joins its
+    /// node as the Hub's row; a correspondent's echo keeps `human`.
+    #[test]
+    fn a_joined_transcript_record_keeps_the_hub_author() {
+        let correlator = PromptCorrelator::new();
+        let echo = || {
+            let ObservationPayload::Message(message) = crate::driver::message_payload(
+                MessageRole::User,
+                remuda_protocol::MessagePhase::Input,
+                "<remuda-facts> facts".into(),
+                Vec::new(),
+            )
+            .unwrap() else {
+                unreachable!()
+            };
+            message
+        };
+        let (hub, hub_node, text) = (
+            CommandId::new(),
+            Id::new("obj").unwrap(),
+            "<remuda-facts> facts",
+        );
+        correlator.register_origin(
+            hub.clone(),
+            hub_node.clone(),
+            text.into(),
+            Some(MessageOrigin::Hub),
+        );
+        let matched = correlator
+            .match_prompt(text, PromptChannel::Transcript)
+            .expect("joins");
+        assert_eq!(matched.origin, Some(MessageOrigin::Hub));
+        let mut record = echo();
+        assert_eq!(
+            record.origin,
+            Some(MessageOrigin::Human),
+            "the echo reads human"
+        );
+        join_queued_node(&mut record, matched);
+        assert_eq!(record.origin, Some(MessageOrigin::Hub));
+        assert_eq!(record.command_id, Some(hub));
+
+        let owner = CommandId::new();
+        correlator.register(owner, Id::new("obj").unwrap(), text.into());
+        let matched = correlator
+            .match_prompt(text, PromptChannel::Transcript)
+            .expect("joins");
+        let mut record = echo();
+        join_queued_node(&mut record, matched);
+        assert_eq!(record.origin, Some(MessageOrigin::Human));
     }
 
     #[test]

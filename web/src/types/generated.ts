@@ -2734,7 +2734,7 @@ export type MemoryWriteResult = ({
 });
 
 /** MessageOrigin wire values; `protocol.md` §5.2. */
-export type MessageOrigin = ("human" | "injected-skill" | "injected-command-output" | "hook-context" | "tool-result" | "compaction" | "unknown");
+export type MessageOrigin = ("human" | "injected-skill" | "injected-command-output" | "hook-context" | "tool-result" | "compaction" | "hub" | "unknown");
 
 /** MessagePayload; `protocol.md` §5.2. */
 export type MessagePayload = ({

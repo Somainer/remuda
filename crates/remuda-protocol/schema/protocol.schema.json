@@ -12171,6 +12171,11 @@
           "type": "string"
         },
         {
+          "const": "hub",
+          "description": "Wire value `hub`.",
+          "type": "string"
+        },
+        {
           "const": "unknown",
           "description": "Wire value `unknown`.",
           "type": "string"

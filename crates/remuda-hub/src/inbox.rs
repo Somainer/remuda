@@ -882,6 +882,9 @@ fn bounded_text(text: &str) -> String {
 const TRACKED_TURNS: usize = 32;
 /// Tool calls tracked in flight per instance; the oldest drops beyond it.
 const TRACKED_TOOLS: usize = 64;
+/// Calls whose final result was seen, remembered per instance so a late copy
+/// of the call cannot reopen it; the oldest drops beyond it.
+const CLOSED_TOOLS: usize = 64;
 
 /// Journal-derived per-instance state the facts need beyond the instance row,
 /// folded in the append transaction (`inbox_trackers.tracker_json`).
@@ -906,11 +909,15 @@ struct Tracker {
     turns: Vec<(String, i64)>,
     /// Tool calls in flight, `(toolCallId, Hub time the call was journaled)`,
     /// oldest first: from the call to its final result (they share a
-    /// `toolCallId`, protocol.md §5.2). This is the minimal journal-derived
-    /// tracker the stall rules need until `cb-stall-tooluse` provides the
-    /// state for every carrier.
+    /// `toolCallId`, protocol.md §5.2). The single source of tool-in-flight
+    /// state for every carrier that journals its calls (main-agent.md §10.5).
     #[serde(default)]
     tools: Vec<(String, String)>,
+    /// Calls whose final result was seen, newest last. A carrier can journal
+    /// one call on two channels (a Claude hook and its transcript): the copy
+    /// that lands after the result must not reopen a finished call.
+    #[serde(default)]
+    closed: Vec<String>,
 }
 
 impl Tracker {
@@ -960,6 +967,16 @@ pub(crate) fn forget_instance(conn: &Connection, instance_id: &str) -> Result<()
         params![instance_id],
     )?;
     Ok(())
+}
+
+/// The run generation `instance_id` is in now, and whether a journaled tool
+/// call is in flight (the screen sweep re-checks it before a fact).
+pub(crate) fn run_and_tool_in_flight(
+    conn: &Connection,
+    instance_id: &str,
+) -> Result<(i64, bool), StoreError> {
+    let tracker = load_tracker(conn, instance_id)?;
+    Ok((tracker.run, !tracker.tools.is_empty()))
 }
 
 /// The run generation `instance_id` is in now.
@@ -1165,6 +1182,7 @@ pub(crate) fn fold_append(
         "tool_call" => {
             if let Some(id) = text("/toolCallId")
                 && !tracker.tools.iter().any(|(open, _)| open == id)
+                && !tracker.closed.iter().any(|closed| closed == id)
             {
                 if tracker.tools.len() >= TRACKED_TOOLS {
                     tracker.tools.remove(0);
@@ -1177,10 +1195,20 @@ pub(crate) fn fold_append(
             let final_stage = text("/stage").unwrap_or("final") == "final";
             if final_stage && let Some(id) = text("/toolCallId") {
                 tracker.tools.retain(|(open, _)| open != id);
+                if !tracker.closed.iter().any(|closed| closed == id) {
+                    if tracker.closed.len() >= CLOSED_TOOLS {
+                        tracker.closed.remove(0);
+                    }
+                    tracker.closed.push(id.to_owned());
+                }
             }
         }
         _ => {}
     }
+    // A process that ended runs none of its calls: a kill mid-call journals
+    // no result. (A Hub-recorded end with no journal lifecycle clears them in
+    // `exit_fact`; host contact loss is not an end and clears nothing, since
+    // the process may still be running the call.)
     if matches!(lifecycle.as_str(), "exited" | "failed" | "closed")
         && !matches!(before.lifecycle.as_str(), "exited" | "failed" | "closed")
     {
@@ -1519,7 +1547,14 @@ fn exit_fact(conn: &Connection, instance_id: &str, seen_at: &str) -> Result<(), 
     if let Some(error) = last_error.as_deref().map(bounded_text) {
         detail["lastError"] = json!(error);
     }
-    let run = current_run(conn, instance_id)?;
+    // An end recorded without a journal lifecycle (OA6 evidence, a lost
+    // host) still leaves no call running.
+    let mut tracker = load_tracker(conn, instance_id)?;
+    if !tracker.tools.is_empty() {
+        tracker.tools.clear();
+        save_tracker(conn, instance_id, &tracker)?;
+    }
+    let run = tracker.run;
     let fact = instance_fact(
         conn,
         InboxFactKind::Exited,
@@ -2114,6 +2149,18 @@ pub(crate) fn host_grace(config: &crate::config::HubConfig) -> time::Duration {
 }
 
 impl Store {
+    /// Whether `instance_id` has a journaled tool call in flight (the
+    /// tracker; the worker digest reads it).
+    pub(crate) async fn inbox_tool_in_flight(
+        &self,
+        instance_id: String,
+    ) -> Result<bool, StoreError> {
+        self.read("inbox_tool_in_flight", move |conn| {
+            Ok(run_and_tool_in_flight(conn, &instance_id)?.1)
+        })
+        .await
+    }
+
     /// One evaluation of the time-driven facts at `now`.
     pub(crate) async fn inbox_tick(
         &self,
@@ -2202,6 +2249,80 @@ mod tests {
             .unwrap();
         assert_eq!(own, None);
         assert_eq!(other.as_deref(), Some("ins_a"));
+    }
+
+    /// A process end clears the calls it had in flight (a kill mid-call
+    /// journals no result): a journaled end, and an end the Hub records with
+    /// no journal lifecycle (OA6 evidence). Host contact loss is not an end:
+    /// the process may still be running the call.
+    #[tokio::test]
+    async fn a_process_end_clears_its_calls_and_contact_loss_does_not() {
+        let (_dir, store) = store().await;
+        let children = ["ins_journaled", "ins_recorded", "ins_contact"];
+        store
+            .run_named("t", move |conn| {
+                instance(conn, "ins_seat", "ins_seat", None, "human");
+                continuity(conn, "ins_seat", "ins_seat");
+                for child in children {
+                    instance(conn, child, child, Some("ins_seat"), "agent");
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        for child in children {
+            store
+                .append_journal(
+                    "hst_t".into(),
+                    child.into(),
+                    None,
+                    json!({ "kind": "tool_call", "payload": { "toolCallId": "tc_1" } }),
+                )
+                .await
+                .unwrap();
+        }
+        let in_flight = |store: &Store| {
+            let store = store.clone();
+            async move {
+                let mut open = Vec::new();
+                for child in children {
+                    if store.inbox_tool_in_flight(child.into()).await.unwrap() {
+                        open.push(child);
+                    }
+                }
+                open
+            }
+        };
+        assert_eq!(in_flight(&store).await, children);
+
+        store
+            .append_journal(
+                "hst_t".into(),
+                "ins_journaled".into(),
+                None,
+                json!({ "kind": "lifecycle", "payload": {
+                    "type": "entity", "entityType": "instance", "state": "exited" } }),
+            )
+            .await
+            .unwrap();
+        store
+            .run_named("t", |conn| {
+                conn.execute(
+                    "UPDATE instances SET lifecycle = 'exited', ended_at = ?1
+                      WHERE id = 'ins_recorded'",
+                    params![now_rfc3339()],
+                )?;
+                conn.execute(
+                    "UPDATE instances SET lifecycle = 'exited', last_error = 'host-contact-lost'
+                      WHERE id = 'ins_contact'",
+                    [],
+                )?;
+                drain_sources(conn);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(in_flight(&store).await, ["ins_contact"]);
     }
 
     /// A gate job's terminal state, written by any of the queue's paths,

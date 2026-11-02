@@ -47,6 +47,7 @@ import { scrollToQueue } from "../home/glanceNav";
 import { MainAskDock, MainCard } from "../home/MainCard";
 import { HomeQueue } from "../home/HomeQueue";
 import { JustDone } from "../home/JustDone";
+import { RowActions } from "../home/RowActions";
 import { NoMatches, NoSessions, SkeletonRows } from "../home/HomeStates";
 import { newSessionPath } from "../spaces/store";
 import ui from "../../styles/ui.module.css";
@@ -195,6 +196,8 @@ export const HomeList = memo(function HomeList() {
   const [branches, setBranches] = useState<Record<string, string>>({});
   const [resumeStates, setResumeStates] = useState<Record<string, ResumeState>>({});
   const [drawerOpen, setDrawerOpen] = useState(false);
+  // home.md §3.3: the row menu is a sheet hold source. One menu at a time.
+  const [rowMenuFor, setRowMenuFor] = useState<string | null>(null);
   const drawerOpener = useRef<HTMLButtonElement>(null);
 
   const active = useMemo(() => selectedSpace(spaces, prefs), [spaces, prefs]);
@@ -345,7 +348,7 @@ export const HomeList = memo(function HomeList() {
   // freezes the list and only closing it releases — taps inside the drawer
   // must not.
   useEffect(() => {
-    if (drawerOpen) {
+    if (drawerOpen || rowMenuFor !== null) {
       startHold("sheet");
     } else {
       // Closing the drawer releases its source and the focus it restored to
@@ -353,7 +356,7 @@ export const HomeList = memo(function HomeList() {
       end("sheet");
       end("focus");
     }
-  }, [drawerOpen, startHold, end]);
+  }, [drawerOpen, rowMenuFor, startHold, end]);
 
   // While held, the snapshot owns the structure; live data only replaces each
   // row's content by id. A row that vanished keeps its last painted content as
@@ -509,6 +512,9 @@ export const HomeList = memo(function HomeList() {
                 quietOpen={renderedQuietOpen}
                 resumeStates={resumeStates}
                 staleIds={staleIds}
+                rowMenuFor={rowMenuFor}
+                onMenu={(id) => setRowMenuFor(id)}
+                onMenuClose={(id) => setRowMenuFor((current) => (current === id ? null : current))}
                 onResume={(instanceId) => void onResume(instanceId)}
               />
             </div>
@@ -623,11 +629,17 @@ function HomeRowView({
   row,
   resumeState,
   onResume,
+  menuOpen = false,
+  onMenu,
+  onMenuClose,
   stale = false,
 }: {
   row: HomeRow;
   resumeState: ResumeState | undefined;
   onResume: (instanceId: string) => void;
+  menuOpen?: boolean;
+  onMenu?: () => void;
+  onMenuClose?: () => void;
   /** Painted during a hold but gone from the live data: show it, let nothing fire. */
   stale?: boolean;
 }) {
@@ -683,6 +695,15 @@ function HomeRowView({
         </span>
         <ContextRing pct={row.contextPct} approximate={row.contextPctApproximate} />
       </Link>
+      {onMenu && onMenuClose ? (
+        <RowActions
+          instance={row.instance}
+          open={menuOpen}
+          onOpen={onMenu}
+          onClose={onMenuClose}
+          stale={stale}
+        />
+      ) : null}
       {row.canResume ? (
         <button
           type="button"
@@ -746,6 +767,9 @@ function HomeGroups({
   quietOpen,
   resumeStates,
   staleIds,
+  rowMenuFor,
+  onMenu,
+  onMenuClose,
   onResume,
 }: {
   groups: HomeGroup[];
@@ -754,6 +778,9 @@ function HomeGroups({
   quietOpen: boolean;
   resumeStates: Record<string, ResumeState>;
   staleIds: ReadonlySet<string>;
+  rowMenuFor: string | null;
+  onMenu: (id: string) => void;
+  onMenuClose: (id: string) => void;
   onResume: (instanceId: string) => void;
 }) {
   const searching = query.trim().length > 0;
@@ -785,6 +812,9 @@ function HomeGroups({
             row={row}
             resumeState={resumeStates[row.id]}
             stale={staleIds.has(row.id)}
+            menuOpen={rowMenuFor === row.id}
+            onMenu={() => onMenu(row.id)}
+            onMenuClose={() => onMenuClose(row.id)}
             onResume={onResume}
           />
         ))}

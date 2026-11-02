@@ -8976,6 +8976,15 @@ class HubStore {
     return api.titleOf(instanceId);
   }
 
+  /**
+   * home.md §9 重命名. Local to this device: no Hub route renames a session, so
+   * the override lives in the client and survives the next instance poll.
+   */
+  rename(instanceId: Id, title: string) {
+    api.setTitle(instanceId, title);
+    this.emit({ instances: this.state.instances.slice() });
+  }
+
   summaryOf(instanceId: Id) {
     // The live list projects the phrase from the journal tail into state;
     // the mock client still supplies its scripted summaries directly.

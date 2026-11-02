@@ -1,0 +1,84 @@
+/* @tokens strict */
+/* ⑦ 行操作菜单 (home.md §9): the 44px ⋯ and the long-press target. */
+
+.wrap {
+  position: relative;
+  display: flex;
+  flex: none;
+  align-items: center;
+}
+
+/* Always in tab order. Visually hidden until hover or keyboard focus on a
+   fine pointer; a coarse pointer keeps it hidden because the long-press is
+   that surface's entry. */
+.more {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--touch);
+  height: var(--touch);
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-xs);
+  background: transparent;
+  color: var(--fg-muted);
+  font-size: var(--text-ui);
+  cursor: pointer;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .more {
+    position: absolute;
+    right: 0;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+  }
+
+  .wrap:hover .more,
+  .more:focus-visible {
+    position: static;
+    width: var(--touch);
+    height: var(--touch);
+    overflow: visible;
+    clip: auto;
+  }
+}
+
+.heading {
+  margin: 0;
+  padding: var(--space-3) var(--space-3) 0;
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  font-weight: 500;
+  line-height: var(--lh-meta);
+}
+
+.menu {
+  margin: 0;
+  padding: var(--space-2);
+  list-style: none;
+}
+
+.item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: var(--touch);
+  margin: 0;
+  padding: 0 var(--space-3);
+  border: 0;
+  background: transparent;
+  color: var(--fg-body);
+  font-family: var(--font-ui);
+  font-size: var(--text-ui);
+  text-align: left;
+  cursor: pointer;
+}
+
+.item:disabled {
+  color: var(--fg-faint);
+  cursor: default;
+}

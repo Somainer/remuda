@@ -10,7 +10,16 @@ const hub = { ready: true, connection: "live", instances: [] as Instance[] };
 
 vi.mock("../../lib/store", () => ({
   useHub: () => hub,
-  hubStore: { titleOf: (id: string) => `title ${id}`, cancel: vi.fn().mockResolvedValue(undefined) },
+  hubStore: {
+    titleOf: (id: string) => `title ${id}`,
+    hostName: () => "alpha",
+    canInterrupt: true,
+    cancel: vi.fn().mockResolvedValue(undefined),
+    markSeen: vi.fn().mockResolvedValue(null),
+    close: vi.fn(),
+    rename: vi.fn(),
+    toast: vi.fn(),
+  },
 }));
 
 function row(id: string, minute: number, activity: "working" | "idle" = "working"): Instance {

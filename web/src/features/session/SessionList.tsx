@@ -16,6 +16,7 @@ import { useModifierHeld } from "../../lib/useModifierHeld";
 import { buildSpaces, useSpacesPrefs } from "../spaces/store";
 import { switchSlots } from "../../lib/sessionSlots";
 import { isEmberEffort } from "./effort";
+import { RowActions } from "../home/RowActions";
 import { nextStep } from "./nextStep";
 import { LaunchedByMark } from "./LaunchedBy";
 import { HarnessGlyph } from "../spaces/SpacesPanel";
@@ -156,6 +157,8 @@ export function SessionList({
   // Only one row can have it open; actionReturnRef restores focus to the ⋯
   // trigger that opened it (useFocusTrap contract).
   const [actionFor, setActionFor] = useState<Id | null>(null);
+  // home.md §9: the row menu, distinct from the 会话遥控 sheet above. One at a time.
+  const [rowMenuFor, setRowMenuFor] = useState<Id | null>(null);
   const actionReturnRef = useRef<HTMLButtonElement | null>(null);
   // One hold: a finger in the list, keyboard focus in a row, or the open
   // action Sheet. It freezes the painted buckets and row order; content still
@@ -250,7 +253,7 @@ export function SessionList({
   // The open action Sheet is its own sticky source: pointer and keyboard
   // activity inside it must not release the freeze, only closing it.
   useEffect(() => {
-    if (actionFor !== null) {
+    if (actionFor !== null || rowMenuFor !== null) {
       startHold("sheet");
     } else {
       // Closing releases the Sheet's own source, and the focus source it
@@ -259,7 +262,7 @@ export function SessionList({
       end("sheet");
       end("focus");
     }
-  }, [actionFor, startHold, end]);
+  }, [actionFor, rowMenuFor, startHold, end]);
 
   // While held, the snapshot owns the buckets and the order; live data only
   // replaces each row by id. A row that vanished keeps its last painted
@@ -871,6 +874,13 @@ export function SessionList({
                     >
                       详情
                     </button>
+                    <RowActions
+                      instance={instance}
+                      open={rowMenuFor === instance.id}
+                      onOpen={() => setRowMenuFor(instance.id)}
+                      onClose={() => setRowMenuFor((current) => (current === instance.id ? null : current))}
+                      stale={stale}
+                    />
                     <button
                       type="button"
                       className={css.moreBtn}

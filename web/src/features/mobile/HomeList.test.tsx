@@ -230,6 +230,33 @@ describe("HomeList hold", () => {
     expect(ids()).toEqual(["/s/ins-other", "/s/ins-held"]);
   });
 
+  it("freezes the order while the row menu is open and re-ranks when it closes", async () => {
+    hub.instances = [
+      row("ins-held", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+      row("ins-other", { activity: known("working"), updatedAt: "2026-09-19T08:00:00.000Z" }),
+    ];
+    renderHome();
+    expect(ids()).toEqual(["/s/ins-held", "/s/ins-other"]);
+
+    const menu = screen.getAllByTestId("row-actions-more")[0];
+    await userEvent.click(menu);
+    expect(screen.getByTestId("row-actions-menu")).toBeTruthy();
+    expect(document.querySelector(HELD)).not.toBeNull();
+
+    act(() => {
+      hub.instances = [
+        row("ins-held", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" }),
+        row("ins-other", { activity: known("waiting-interaction"), updatedAt: "2026-09-19T12:00:00.000Z" }),
+      ];
+      for (const listener of listeners) listener();
+    });
+    expect(ids()).toEqual(["/s/ins-held", "/s/ins-other"]);
+
+    await userEvent.keyboard("{Escape}");
+    expect(document.querySelector(RELEASED)).not.toBeNull();
+    expect(ids()).toEqual(["/s/ins-other", "/s/ins-held"]);
+  });
+
   it("also freezes while focus sits in a row's control, and re-ranks when it leaves", () => {
     hub.instances = [
       row("ins-focused", { activity: known("working"), updatedAt: "2026-09-19T09:00:00.000Z" }),

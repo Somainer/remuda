@@ -6,6 +6,7 @@ import { projectStatus } from "../../lib/status";
 import { hubStore, useHub } from "../../lib/store";
 import { useNowTick } from "../../lib/useNowTick";
 import type { Id } from "../../types/wire";
+import { RowActions } from "./RowActions";
 import css from "./workingList.module.css";
 
 /** Rows shown before 「+N ›」 (home.md §9 ⑥). */
@@ -41,32 +42,13 @@ export function WorkingList() {
                 <span className={css.title}>{hubStore.titleOf(row.id as Id)}</span>
                 <span className={css.time}>{formatListTime(row.updatedAt, nowMs)}</span>
               </Link>
-              <button
-                type="button"
-                className={css.more}
-                aria-label="更多操作"
-                aria-expanded={menuFor === row.id}
-                data-testid="home-working-more"
-                onClick={() => setMenuFor((current) => (current === row.id ? null : row.id))}
-              >
-                ⋯
-              </button>
-              {menuFor === row.id ? (
-                <div className={css.menu} role="menu">
-                  <button
-                    type="button"
-                    role="menuitem"
-                    className={css.menuItem}
-                    data-testid="home-working-interrupt"
-                    onClick={() => {
-                      setMenuFor(null);
-                      void hubStore.cancel(row.id as Id).catch(() => undefined);
-                    }}
-                  >
-                    中断
-                  </button>
-                </div>
-              ) : null}
+              <RowActions
+                instance={row}
+                open={menuFor === row.id}
+                onOpen={() => setMenuFor(row.id)}
+                onClose={() => setMenuFor((current) => (current === row.id ? null : current))}
+                stale={stale}
+              />
             </li>
           ))}
         </ul>

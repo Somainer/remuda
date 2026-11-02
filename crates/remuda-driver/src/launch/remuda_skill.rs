@@ -327,12 +327,31 @@ fn user_owned(root: &Path) -> bool {
     };
     let mut any = false;
     for entry in entries.flatten() {
-        if entry.file_name() == MANAGED_MARKER {
+        let name = entry.file_name();
+        // By type, not by name: `DirEntry::file_type` is an lstat that never
+        // follows, so a `.remuda-managed` that is a link to a user file, or a
+        // dangling link, or a directory, is content and the tree is the
+        // user's. Accepting it by name would let the marker write follow it.
+        if name == MANAGED_MARKER && entry.file_type().is_ok_and(|file_type| file_type.is_file()) {
             return false;
+        }
+        // Our own marker temp (`.remuda-managed.<pid>.<serial>.tmp`), written
+        // by `write_atomic` and renamed onto the marker: not user content.
+        if marker_temp(&name) {
+            continue;
         }
         any = true;
     }
     any
+}
+
+/// Whether `name` is one of `write_atomic`'s temporary names for the marker.
+fn marker_temp(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let prefix = format!(".{MANAGED_MARKER}.");
+    name.starts_with(&prefix) && name.ends_with(".tmp")
 }
 
 /// Whether `path` is a symbolic link (never followed).
@@ -383,14 +402,13 @@ fn write_tree(
     // written; re-check now, immediately before the first write, so a link
     // planted in between cannot be won. Nothing has been written yet.
     refuse_user_owned(skills_root, root)?;
-    // The marker goes first and directly: the ownership check reads "any
-    // entry at all without the marker" as the user's tree, so a launch that
-    // ran between a temporary marker file and its rename would see a
-    // markerless, non-empty directory and skip the tree. The bytes are fixed
-    // text, so a concurrent reader of the file has nothing to lose.
+    // The marker goes first, through a temporary name and a rename: the
+    // rename replaces whatever entry is at that path (a link included)
+    // instead of following it, and the ownership scan ignores this temp name,
+    // so a launch that runs between the write and the rename still reads the
+    // tree as Remuda's.
     let marker = root.join(MANAGED_MARKER);
-    fs::write(&marker, MARKER_TEXT)?;
-    set_mode(&marker, 0o600)?;
+    write_atomic(&marker, MARKER_TEXT)?;
     files.push(MaterializedFile {
         path: marker.to_string_lossy().into_owned(),
         role: FileRole::RemudaSkill,

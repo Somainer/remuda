@@ -859,6 +859,72 @@ fn a_failed_write_leaves_no_temporary_file_behind() {
     );
 }
 
+/// The marker is accepted by type, not by name: a `.remuda-managed` that is a
+/// link is not Remuda's, and writing through it would truncate the file it
+/// points at.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_marker_makes_the_tree_the_users() {
+    use std::os::unix::fs::symlink;
+    let context = facts(&["dispatch"]);
+    let at = launch(false);
+    let root = at.home.join(SKILL_ROOT);
+    fs::create_dir_all(&root).unwrap();
+    let outside = at._root.path().join("outside.txt");
+    fs::write(&outside, b"the user's file\n").unwrap();
+    symlink(&outside, root.join(MANAGED_MARKER)).unwrap();
+    let recipe =
+        Run::new(DriverKind::ClaudeSdk, AgentKind::Claude, Some(&context)).materialize(&at);
+    assert_eq!(
+        recipe.skill.as_ref().unwrap().tree,
+        SkillTree::Skipped {
+            reason: TreeSkip::UserOwned
+        }
+    );
+    assert_eq!(
+        fs::read(&outside).unwrap(),
+        b"the user's file\n",
+        "the target is untouched"
+    );
+    assert!(
+        fs::symlink_metadata(root.join(MANAGED_MARKER))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the marker link is untouched"
+    );
+    assert!(!root.join("SKILL.md").exists(), "no tree was written");
+}
+
+/// A dangling marker link is not a marker either: following it would create a
+/// file outside the home.
+#[cfg(unix)]
+#[test]
+fn a_dangling_marker_link_makes_the_tree_the_users() {
+    use std::os::unix::fs::symlink;
+    let context = facts(&["dispatch"]);
+    let at = launch(false);
+    let root = at.home.join(SKILL_ROOT);
+    fs::create_dir_all(&root).unwrap();
+    let target = at._root.path().join("nowhere.txt");
+    symlink(&target, root.join(MANAGED_MARKER)).unwrap();
+    let recipe =
+        Run::new(DriverKind::ClaudeSdk, AgentKind::Claude, Some(&context)).materialize(&at);
+    assert_eq!(
+        recipe.skill.as_ref().unwrap().tree,
+        SkillTree::Skipped {
+            reason: TreeSkip::UserOwned
+        }
+    );
+    assert!(!target.exists(), "nothing was created through the link");
+    assert!(
+        fs::symlink_metadata(root.join(MANAGED_MARKER))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
 /// The `skills` directory is often the user's own: its mode is theirs. Only
 /// directories Remuda creates get 0700.
 #[cfg(unix)]

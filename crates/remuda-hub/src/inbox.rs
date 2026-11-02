@@ -724,6 +724,8 @@ fn bounded_text(text: &str) -> String {
 
 /// Root-turn commands remembered per instance, newest last.
 const TRACKED_TURNS: usize = 32;
+/// Tool calls tracked in flight per instance; the oldest drops beyond it.
+const TRACKED_TOOLS: usize = 64;
 
 /// Journal-derived per-instance state the facts need beyond the instance row,
 /// folded in the append transaction (`inbox_trackers.tracker_json`).
@@ -746,6 +748,13 @@ struct Tracker {
     /// `(commandId, run)` of recent root turns started for an input.
     #[serde(default)]
     turns: Vec<(String, i64)>,
+    /// Tool calls in flight, `(toolCallId, Hub time the call was journaled)`,
+    /// oldest first: from the call to its final result (they share a
+    /// `toolCallId`, protocol.md §5.2). This is the minimal journal-derived
+    /// tracker the stall rules need until `cb-stall-tooluse` provides the
+    /// state for every carrier.
+    #[serde(default)]
+    tools: Vec<(String, String)>,
 }
 
 impl Tracker {
@@ -853,7 +862,11 @@ fn requested_interaction_id(event: &Value) -> Option<&str> {
 fn watches(event: &Value) -> bool {
     if matches!(
         event_kind(event),
-        "lifecycle" | "interaction.requested" | "interactionRequested"
+        "lifecycle"
+            | "interaction.requested"
+            | "interactionRequested"
+            | "tool_call"
+            | "tool_result"
     ) {
         return true;
     }
@@ -961,6 +974,34 @@ pub(crate) fn fold_append(
         tracker.run += 1;
     }
 
+    // §10.1 item 8: a tool call is in flight from its call to its final
+    // result; a process end leaves nothing running.
+    match event_kind(event) {
+        "tool_call" => {
+            if let Some(id) = text("/toolCallId")
+                && !tracker.tools.iter().any(|(open, _)| open == id)
+            {
+                if tracker.tools.len() >= TRACKED_TOOLS {
+                    tracker.tools.remove(0);
+                }
+                let opened = canonical_at(hub_now).unwrap_or_else(now_rfc3339);
+                tracker.tools.push((id.to_owned(), opened));
+            }
+        }
+        "tool_result" => {
+            let final_stage = text("/stage").unwrap_or("final") == "final";
+            if final_stage && let Some(id) = text("/toolCallId") {
+                tracker.tools.retain(|(open, _)| open != id);
+            }
+        }
+        _ => {}
+    }
+    if matches!(lifecycle.as_str(), "exited" | "failed" | "closed")
+        && !matches!(before.lifecycle.as_str(), "exited" | "failed" | "closed")
+    {
+        tracker.tools.clear();
+    }
+
     if is_live(&lifecycle) && !is_live(&before.lifecycle) {
         let fact = instance_fact(
             conn,
@@ -1049,6 +1090,11 @@ pub(crate) fn fold_append(
         None
     };
     if let Some((run, failed)) = turn_fact {
+        // The current root turn is over: nothing it started still runs. A
+        // late result of an earlier run says nothing about the current one.
+        if run == tracker.run {
+            tracker.tools.clear();
+        }
         let mut detail = json!({
             "outcome": if failed { "failed" } else { "done" },
             "late": run < tracker.run,
@@ -1568,6 +1614,157 @@ fn due_supply_resets(conn: &Connection, now: OffsetDateTime) -> Result<usize, St
     Ok(written)
 }
 
+/// Busy children that went quiet (§10.1 item 8):
+///
+/// * with a tool call in flight, nothing, unless the project sets a finite
+///   `stallToolThresholdMins`; then one fact per call once it has been in
+///   flight that long;
+/// * otherwise one fact per quiet period once no journal row arrived for the
+///   project's `stallThresholdMins` (default
+///   [`remuda_protocol::DEFAULT_STALL_THRESHOLD_MINS`]). The period starts at
+///   the latest row, so it restarts at a tool's result.
+///
+/// Both clocks are the Hub's own (the journal row's `observed_at`), so a
+/// Node's clock or a replayed backlog cannot make a child look stalled.
+fn due_stalls(conn: &Connection, now: OffsetDateTime) -> Result<usize, StoreError> {
+    let busy: Vec<String> = {
+        let mut stmt = conn.prepare_cached(
+            "SELECT id FROM instances
+              WHERE activity IN ('working', 'draining') AND lifecycle IN ('running', 'ready')
+                AND ended_at IS NULL AND fenced_at IS NULL
+                AND json_extract(spec_json, '$.parentInstanceId') IS NOT NULL",
+        )?;
+        stmt.query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?
+    };
+    let mut written = 0;
+    for instance_id in busy {
+        let Some(subscriber) = subscriber_of(conn, &instance_id)? else {
+            continue;
+        };
+        let project = project_of(conn, &instance_id)?;
+        let tracker = load_tracker(conn, &instance_id)?;
+        let fact = if let Some((tool_call_id, opened)) = tracker.tools.first() {
+            let Some(threshold) =
+                project_policy_number(conn, project.as_deref(), "stallToolThresholdMins")?
+                    .filter(|mins| *mins > 0)
+            else {
+                continue;
+            };
+            let Some(since) = parse_at(opened) else {
+                continue;
+            };
+            let stalled_at = since + time::Duration::minutes(threshold);
+            if stalled_at > now {
+                continue;
+            }
+            let mut fact = instance_fact(
+                conn,
+                InboxFactKind::Stalled,
+                &instance_id,
+                tracker.run,
+                crate::config::rfc3339(stalled_at),
+                json!({
+                    "cause": "tool-in-flight",
+                    "toolCallId": tool_call_id,
+                    "since": opened,
+                    "thresholdMins": threshold,
+                }),
+            )?;
+            fact.key_subject = format!("{instance_id}/{tool_call_id}");
+            fact
+        } else {
+            let threshold = project_policy_number(conn, project.as_deref(), "stallThresholdMins")?
+                .filter(|mins| *mins > 0)
+                .unwrap_or(remuda_protocol::DEFAULT_STALL_THRESHOLD_MINS);
+            let last: Option<String> = conn
+                .query_row(
+                    "SELECT observed_at FROM journal WHERE instance_id = ?1
+                      ORDER BY seq DESC LIMIT 1",
+                    params![instance_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(quiet_since) = last.as_deref().and_then(parse_at) else {
+                continue;
+            };
+            let stalled_at = quiet_since + time::Duration::minutes(threshold);
+            if stalled_at > now {
+                continue;
+            }
+            instance_fact(
+                conn,
+                InboxFactKind::Stalled,
+                &instance_id,
+                tracker.run,
+                crate::config::rfc3339(stalled_at),
+                json!({
+                    "cause": "quiet",
+                    "since": crate::config::rfc3339(quiet_since),
+                    "thresholdMins": threshold,
+                }),
+            )?
+        };
+        if matches!(record(conn, &subscriber, fact)?, Outcome::Recorded(_)) {
+            written += 1;
+        }
+    }
+    Ok(written)
+}
+
+/// Tasks whose `TaskBudget.max_wall_mins` has elapsed since their first
+/// worker was created (§10.1 item 8): one budget-expired fact for the
+/// dispatcher, per task and deadline. Nothing is stopped; the parent
+/// decides.
+fn due_budgets(conn: &Connection, now: OffsetDateTime) -> Result<usize, StoreError> {
+    let tasks: Vec<(String, i64, String, String)> = {
+        let mut stmt = conn.prepare_cached(
+            "SELECT t.id, CAST(json_extract(t.doc_json, '$.budget.maxWallMins') AS INTEGER),
+                    first.id, first.created_at
+               FROM tasks t
+               JOIN instances first ON first.id = (
+                    SELECT i.id FROM instances i WHERE i.task_id = t.id
+                     ORDER BY i.created_at, i.id LIMIT 1)
+              WHERE t.state NOT IN ('done', 'failed')
+                AND json_extract(t.doc_json, '$.budget.maxWallMins') > 0",
+        )?;
+        stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<Result<_, _>>()?
+    };
+    let mut written = 0;
+    for (task_id, max_wall_mins, instance_id, started) in tasks {
+        let Some(started_at) = parse_at(&started) else {
+            continue;
+        };
+        let deadline = started_at + time::Duration::minutes(max_wall_mins);
+        if deadline > now {
+            continue;
+        }
+        let mut fact = instance_fact(
+            conn,
+            InboxFactKind::BudgetExpired,
+            &instance_id,
+            0,
+            crate::config::rfc3339(deadline),
+            json!({
+                "taskId": task_id,
+                "maxWallMins": max_wall_mins,
+                "startedAt": crate::config::rfc3339(started_at),
+            }),
+        )?;
+        fact.key_subject = task_id;
+        if matches!(
+            record_about(conn, &instance_id, fact)?,
+            Outcome::Recorded(_)
+        ) {
+            written += 1;
+        }
+    }
+    Ok(written)
+}
+
 /// What the time-driven facts measure against besides `now`.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TickClock {
@@ -1579,15 +1776,18 @@ pub(crate) struct TickClock {
 }
 
 /// Facts whose state is entered by time passing rather than by a write:
-/// supply resets and hosts that stayed offline. One writer job; every fact
-/// it writes is claimed once by its key.
+/// supply resets, hosts that stayed offline, stalls and wall budgets. One
+/// writer job; every fact it writes is claimed once by its key.
 pub(crate) fn tick(
     conn: &mut Connection,
     now: OffsetDateTime,
     clock: TickClock,
 ) -> Result<usize, StoreError> {
     let tx = crate::store::immediate_tx(conn)?;
-    let written = due_supply_resets(&tx, now)? + due_host_offline(&tx, now, &clock)?;
+    let written = due_supply_resets(&tx, now)?
+        + due_host_offline(&tx, now, &clock)?
+        + due_stalls(&tx, now)?
+        + due_budgets(&tx, now)?;
     tx.commit()?;
     Ok(written)
 }

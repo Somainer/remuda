@@ -977,6 +977,207 @@ async fn host_link_changes_are_facts_for_lineages_in_scope() -> Result<()> {
     Ok(())
 }
 
+// ─── stalls and wall budgets (§10.1 item 8) ─────────────────────────────────
+
+fn tool_call(id: &str) -> Value {
+    json!({ "kind": "tool_call", "payload": { "operation": "open", "toolCallId": id,
+        "toolName": { "state": "known", "value": "Bash" },
+        "input": { "state": "known", "value": { "command": "cargo test --workspace" } },
+        "state": "proposed" } })
+}
+
+fn tool_result(id: &str) -> Value {
+    json!({ "kind": "tool_result", "payload": { "toolCallId": id, "stage": "final",
+        "outcome": "succeeded" } })
+}
+
+fn stalls(items: &[Value]) -> Vec<&Value> {
+    items.iter().filter(|f| f["kind"] == "stalled").collect()
+}
+
+/// No stall fact while a tool call is in flight, however long; once its
+/// result arrives the ordinary quiet window counts from the result, and one
+/// quiet period yields one fact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tool_in_flight_yields_no_stall_fact_and_the_window_restarts_at_its_result() -> Result<()>
+{
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("inbox-stall").await?;
+    let (seat, seat_token) = ctx.coordinator(&project).await?;
+    let worker = ctx.worker(&seat_token, &project).await?;
+    ctx.journal(&worker, entity("running", &at(0))).await?;
+    ctx.journal(&worker, activity("working", &at(1))).await?;
+    ctx.journal(&worker, tool_call("tc_long")).await?;
+
+    // Two hours in flight, past any quiet window: nothing.
+    assert_eq!(ctx.hub.test_inbox_tick(&minutes_from_now(120)).await?, 0);
+    assert!(stalls(&ctx.inbox(&seat_token, &seat).await?).is_empty());
+
+    // The result arrives; the quiet window counts from it.
+    // The project's own quiet window (a new project stores one).
+    let (_, doc) = ctx
+        .request(
+            reqwest::Method::GET,
+            &ctx.human,
+            &format!("/v1/projects/{project}"),
+            None,
+        )
+        .await?;
+    let window = doc
+        .pointer("/policy/configurable/stallThresholdMins")
+        .or_else(|| doc.pointer("/project/policy/configurable/stallThresholdMins"))
+        .and_then(Value::as_i64)
+        .context("stallThresholdMins")?;
+    assert!(window < 120, "the in-flight wait above outlasted it");
+    ctx.journal(&worker, tool_result("tc_long")).await?;
+    assert_eq!(
+        ctx.hub
+            .test_inbox_tick(&minutes_from_now(window - 1))
+            .await?,
+        0
+    );
+    assert_eq!(
+        ctx.hub
+            .test_inbox_tick(&minutes_from_now(window + 1))
+            .await?,
+        1
+    );
+    assert_eq!(ctx.hub.test_inbox_tick(&minutes_from_now(240)).await?, 0);
+    let items = ctx.inbox(&seat_token, &seat).await?;
+    let stalled = stalls(&items);
+    assert_eq!(stalled.len(), 1, "{items:#?}");
+    assert_eq!(stalled[0]["subjectInstanceId"], worker.as_str());
+    assert_eq!(stalled[0]["payload"]["cause"], "quiet");
+    assert_eq!(stalled[0]["payload"]["thresholdMins"], window);
+    Ok(())
+}
+
+/// With a finite `stallToolThresholdMins`, a tool call in flight longer than
+/// that yields exactly one stall fact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_explicit_tool_threshold_yields_exactly_one_stall_fact() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("inbox-stall-tool").await?;
+    let (status, body) = ctx
+        .request(
+            reqwest::Method::PATCH,
+            &ctx.human,
+            &format!("/v1/projects/{project}"),
+            Some(json!({ "policy": { "configurable": { "stallToolThresholdMins": 15 } } })),
+        )
+        .await?;
+    assert_eq!(status, 200, "{body}");
+    let (seat, seat_token) = ctx.coordinator(&project).await?;
+    let worker = ctx.worker(&seat_token, &project).await?;
+    ctx.journal(&worker, entity("running", &at(0))).await?;
+    ctx.journal(&worker, activity("working", &at(1))).await?;
+    ctx.journal(&worker, tool_call("tc_hung")).await?;
+
+    assert_eq!(ctx.hub.test_inbox_tick(&minutes_from_now(14)).await?, 0);
+    assert_eq!(ctx.hub.test_inbox_tick(&minutes_from_now(16)).await?, 1);
+    for minutes in [30, 60, 600] {
+        assert_eq!(
+            ctx.hub.test_inbox_tick(&minutes_from_now(minutes)).await?,
+            0
+        );
+    }
+    let items = ctx.inbox(&seat_token, &seat).await?;
+    let stalled = stalls(&items);
+    assert_eq!(stalled.len(), 1, "{items:#?}");
+    assert_eq!(stalled[0]["payload"]["cause"], "tool-in-flight");
+    assert_eq!(stalled[0]["payload"]["toolCallId"], "tc_hung");
+    assert_eq!(stalled[0]["payload"]["thresholdMins"], 15);
+    Ok(())
+}
+
+/// A task's `maxWallMins` elapsing yields one budget-expired fact for the
+/// dispatcher; the worker keeps running and nothing is sent to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wall_budget_yields_one_fact_and_kills_nothing() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("inbox-budget").await?;
+    let (seat, seat_token) = ctx.coordinator(&project).await?;
+    let task = ctx
+        .post(
+            &ctx.human,
+            "/v1/tasks",
+            json!({ "projectId": project, "title": "long", "intent": "a long task",
+                    "budget": { "maxWallMins": 45 } }),
+        )
+        .await?;
+    let task_id = task["id"]
+        .as_str()
+        .or_else(|| task["task"]["id"].as_str())
+        .context("task id")?
+        .to_string();
+    let created = ctx
+        .post(
+            &seat_token,
+            "/v1/instances",
+            json!({ "role": "worker", "projectId": project, "prompt": "work",
+                    "driver": "claude-pty", "taskId": task_id }),
+        )
+        .await?;
+    let worker = created["instance"]["instanceId"]
+        .as_str()
+        .context("id")?
+        .to_string();
+    ctx.journal(&worker, entity("running", &at(0))).await?;
+    let (_, before) = ctx
+        .request(
+            reqwest::Method::GET,
+            &ctx.human,
+            &format!("/v1/instances/{worker}/commands"),
+            None,
+        )
+        .await?;
+
+    assert_eq!(ctx.hub.test_inbox_tick(&minutes_from_now(44)).await?, 0);
+    assert_eq!(ctx.hub.test_inbox_tick(&minutes_from_now(46)).await?, 1);
+    assert_eq!(ctx.hub.test_inbox_tick(&minutes_from_now(240)).await?, 0);
+    let items = ctx.inbox(&seat_token, &seat).await?;
+    let expired: Vec<_> = items
+        .iter()
+        .filter(|f| f["kind"] == "budget-expired")
+        .collect();
+    assert_eq!(expired.len(), 1, "{items:#?}");
+    assert_eq!(expired[0]["subjectInstanceId"], worker.as_str());
+    assert_eq!(expired[0]["payload"]["taskId"], task_id.as_str());
+    assert_eq!(expired[0]["payload"]["maxWallMins"], 45);
+    assert!(
+        expired[0]["dedupeKey"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("budget-expired:{task_id}:0:")),
+        "{}",
+        expired[0]
+    );
+    // Kills nothing: no command was queued for the worker, and it runs.
+    let (_, after) = ctx
+        .request(
+            reqwest::Method::GET,
+            &ctx.human,
+            &format!("/v1/instances/{worker}/commands"),
+            None,
+        )
+        .await?;
+    assert_eq!(after, before);
+    let (_, instance) = ctx
+        .request(
+            reqwest::Method::GET,
+            &ctx.human,
+            &format!("/v1/instances/{worker}"),
+            None,
+        )
+        .await?;
+    let lifecycle = instance
+        .pointer("/instance/lifecycle")
+        .or_else(|| instance.get("lifecycle"))
+        .cloned();
+    assert_eq!(lifecycle, Some(json!("running")), "{instance}");
+    Ok(())
+}
+
 // ─── backup ─────────────────────────────────────────────────────────────────
 
 fn repo_root() -> PathBuf {

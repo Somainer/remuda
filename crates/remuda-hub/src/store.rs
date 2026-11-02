@@ -3715,6 +3715,19 @@ impl Store {
         .await
     }
 
+    /// cb-requested-by: the owner's own words for each of `command_ids`, from
+    /// the Hub's command rows ([`crate::root_turn::owner_excerpts`]). One read
+    /// for a whole list or board.
+    pub async fn owner_excerpts(
+        &self,
+        command_ids: Vec<String>,
+    ) -> Result<std::collections::HashMap<String, String>, StoreError> {
+        self.read("owner_excerpts", move |conn| {
+            crate::root_turn::owner_excerpts(conn, &command_ids)
+        })
+        .await
+    }
+
     /// Audit rows for one subject, oldest first (tests and support queries).
     pub async fn audit_for(&self, subject: String) -> Result<Vec<Value>, StoreError> {
         self.run_named("audit_for", move |conn| {
@@ -16172,6 +16185,11 @@ fn append_loaded_event(
         .and_then(Value::as_str)
         .map(str::to_string)
         .unwrap_or_else(|| new_id("evt").unwrap_or_else(|_| "evt_missing".into()));
+    // cb-requested-by: a Node's interaction payload is untrusted, and
+    // `requestedBy` is Hub-stamped only. Drop any record it supplied before
+    // the event is journaled, so it reaches neither the journal row nor the
+    // interaction table the inbox serves.
+    crate::root_turn::strip_supplied_requested_by(&mut event);
     if let Some(obj) = event.as_object_mut() {
         obj.entry("eventId".to_string())
             .or_insert_with(|| json!(event_id.clone()));
@@ -16496,17 +16514,25 @@ fn load_interaction(conn: &Connection, id: &str) -> Result<Option<InteractionRec
     .map_err(StoreError::from)
 }
 
+/// The kind a journal event is classified by: `kind`, else `subtype`. The one
+/// derivation the interaction fold, the instance projection and the
+/// cb-requested-by ingest gate share, so they can never disagree on which
+/// events are interactions.
+pub(crate) fn journal_event_kind(event: &Value) -> &str {
+    event
+        .get("kind")
+        .and_then(Value::as_str)
+        .or_else(|| event.get("subtype").and_then(Value::as_str))
+        .unwrap_or("")
+}
+
 fn apply_interaction_event(
     conn: &Connection,
     host_id: &str,
     instance_id: &str,
     event: &Value,
 ) -> Result<Settlement, StoreError> {
-    let kind = event
-        .get("kind")
-        .and_then(Value::as_str)
-        .or_else(|| event.get("subtype").and_then(Value::as_str))
-        .unwrap_or("");
+    let kind = journal_event_kind(event);
     if event.pointer("/payload/entityType").and_then(Value::as_str) == Some("interaction")
         && let Some(entity) = event.pointer("/payload/entity")
         && let (Some(id), Some(state)) = (
@@ -17230,11 +17256,7 @@ fn normalize_activity(status: &str) -> Option<&'static str> {
 /// terminal events (exited/failed) the projection applies, rather than
 /// re-deriving the event shape in a second place.
 pub(crate) fn derive_instance_state(event: &Value) -> (Option<&'static str>, Option<&'static str>) {
-    let kind = event
-        .get("kind")
-        .and_then(Value::as_str)
-        .or_else(|| event.get("subtype").and_then(Value::as_str))
-        .unwrap_or("");
+    let kind = journal_event_kind(event);
     let payload = event.get("payload").unwrap_or(event);
     let payload_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
     let native_name = payload

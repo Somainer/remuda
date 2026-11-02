@@ -3580,6 +3580,18 @@ export interface components {
                 p256dh: string;
             };
         };
+        /** @description cb-requested-by: who asked for an Agent-created dispatch, task or approval card. Stored as a reference only: an owner-origin root turn records the command that carried the owner's input, any other origin records only that origin. The owner's words are never stored with it. Record only, never a gate. */
+        RequestedBy: {
+            /** @description Hub command id of the owner's input that started the root turn. */
+            commandId?: string;
+            /** @description Read-time only, for a Human caller: the owner's own words for that command, read from the Hub's command row on GET /v1/interactions, GET /v1/board and GET /v1/tasks/{id}. One line, at most 280 characters, credential-shaped strings withheld. Never stored, and never served to an Agent or Bot caller. */
+            excerpt?: string;
+            /**
+             * @description The origin that started the turn, recorded only when it was not the owner.
+             * @enum {string}
+             */
+            origin?: "human" | "bot" | "agent" | "hub";
+        };
         /** @description D-057 §6.1 C1 restart policy chosen at create time. */
         RestartPolicy: {
             /** @description At-most restart decisions per rolling hour; at least 1. */
@@ -3681,6 +3693,7 @@ export interface components {
             parentTaskId?: string;
             placement?: components["schemas"]["TaskPlacementRef"];
             projectId: string;
+            requestedBy?: components["schemas"]["RequestedBy"];
             revision: string;
             state: components["schemas"]["TaskState"];
             title: string;
@@ -3885,6 +3898,8 @@ export interface components {
             providerProfileId?: string;
             reclaimedBytes?: string;
             replaceCount?: string;
+            /** @description cb-requested-by: a reference to the owner's command behind an Agent dispatch, or the non-owner origin; never the owner's words (those are hydrated at read time for a Human reader). Absent on Human/Bot dispatches. */
+            requestedBy?: components["schemas"]["RequestedBy"];
             resumedFrom?: string;
             revision: string;
             state: components["schemas"]["WorkerState"];

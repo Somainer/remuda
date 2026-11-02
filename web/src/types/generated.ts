@@ -4012,6 +4012,13 @@ export type RequestedApiRoute = ({
   "viaHostId"?: (HostId | (null));
 });
 
+/** D-060 companion item (cb-requested-by): who asked for an Agent-created dispatch or task, as the Hub recorded it from its own root-turn ledger.  A reference, never the words. An owner-origin root turn records the Hub command that carried the owner's input; any other origin records only that origin — `hub` for a restart notice or a fact, `agent` for a turn the agent started on its own. The owner's words stay in that command row: the type has no field for them, so a task doc, roster row or approval card can never store them, and a Human read of the approval card source, the board or a task detail gains a read-time `excerpt` from the command row (protocol.md). It is a record for the audit trail and `/approvals`, never a gate: no admission, grant, scope or approval rule reads it (owner ruling R2). */
+export type RequestedBy = ({
+  "commandId"?: (string | null);
+  "origin"?: (InputOrigin | (null));
+  [key: string]: unknown;
+});
+
 /** ResolutionState wire values; `protocol.md` §2.5. */
 export type ResolutionState = ("clear" | "unknown" | "reconciling");
 
@@ -4573,6 +4580,7 @@ export type Task = ({
   "parentTaskId"?: (TaskId | (null));
   "placement"?: (TaskPlacementRef | (null));
   "projectId": ProjectId;
+  "requestedBy"?: (RequestedBy | (null));
   "revision": U64;
   "state": TaskState;
   "title": (string);
@@ -5011,6 +5019,7 @@ export type WorkerRoster = ({
   "providerProfileId"?: (string | null);
   "reclaimedBytes"?: (U64 | (null));
   "replaceCount"?: (U64 | (null));
+  "requestedBy"?: (RequestedBy | (null));
   "resumedFrom"?: (InstanceId | (null));
   "revision": U64;
   "state": WorkerState;

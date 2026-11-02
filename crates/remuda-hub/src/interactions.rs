@@ -465,24 +465,36 @@ pub async fn list_interactions(
         .into_iter()
         .map(|row| row.to_list_item())
         .collect();
-    items.extend(
-        state
-            .agent_approvals
-            .list(&device)
-            .await
-            .into_iter()
-            .filter(|item| {
-                query
-                    .host_id
+    // cb-requested-by: durable rows are Node-sourced and `requestedBy` is
+    // Hub-stamped only. Ingest already drops a supplied record; this drops
+    // any that is still stored (a row written before ingest stripped it),
+    // from the item and from the stored event it carries, for every caller.
+    for item in &mut items {
+        crate::root_turn::strip_requested_by(item);
+    }
+    let mut hub_cards: Vec<Value> = state
+        .agent_approvals
+        .list(&device)
+        .await
+        .into_iter()
+        .filter(|item| {
+            query
+                .host_id
+                .as_deref()
+                .is_none_or(|host| item["hostId"] == host)
+                && query
+                    .instance_id
                     .as_deref()
-                    .is_none_or(|host| item["hostId"] == host)
-                    && query
-                        .instance_id
-                        .as_deref()
-                        .is_none_or(|id| item["instanceId"] == id)
-                    && query.kind.as_deref().is_none_or(|kind| kind == "approval")
-            }),
-    );
+                    .is_none_or(|id| item["instanceId"] == id)
+                && query.kind.as_deref().is_none_or(|kind| kind == "approval")
+        })
+        .collect();
+    // cb-requested-by: the Hub's own one-shot cards are the PWA's approval
+    // card source. They store a reference only; a Human read gains the
+    // owner's words here. Only these cards are hydrated: a Node-supplied item
+    // never carries a record the Hub stamped.
+    crate::agent_scope::hydrate_owner_words(&state, &device, hub_cards.iter_mut()).await;
+    items.extend(hub_cards);
     let mut seen: HashSet<String> = items
         .iter()
         .filter_map(|item| {
@@ -564,7 +576,11 @@ pub async fn list_interactions(
                                 continue;
                             }
                             if id.is_empty() || seen.insert(id.to_string()) {
-                                items.push(flatten_interaction(item.clone()));
+                                // A live Node item never carries a record the
+                                // Hub stamped: drop any it supplies.
+                                let mut item = item.clone();
+                                crate::root_turn::strip_requested_by(&mut item);
+                                items.push(flatten_interaction(item));
                             }
                         }
                     }

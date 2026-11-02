@@ -47,7 +47,9 @@
 //! `result` has not been ingested yet: the call then belongs to the owner's
 //! turn, which has not ended.
 
-use remuda_protocol::{InputOrigin, RootTurn, RootTurnContinuation};
+use std::collections::HashMap;
+
+use remuda_protocol::{InputOrigin, RequestedBy, RootTurn, RootTurnContinuation};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -58,6 +60,14 @@ use crate::store::{StoreError, ensure_column};
 /// handful of prompts written ahead; the bound only stops a pathological
 /// journal from growing the row.
 const MAX_OPEN_TURNS: usize = 64;
+
+/// Longest owner excerpt a Human read gains as `requestedBy.excerpt`
+/// (cb-requested-by).
+pub(crate) const EXCERPT_CHARS: usize = 280;
+
+/// Most command ids one excerpt query binds. Older SQLite builds cap a
+/// statement at 999 variables; 900 keeps one statement per chunk everywhere.
+pub(crate) const EXCERPT_QUERY_IDS: usize = 900;
 
 /// Columns for the ledger and for the root turn stamped on command rows and
 /// audit rows. Plain additive columns, so no `user_version` rung.
@@ -417,6 +427,182 @@ pub(crate) fn to_column(root_turn: Option<&RootTurn>) -> Option<String> {
 /// Read a root turn back from a `*_json` column; unreadable reads as absent.
 pub(crate) fn from_column(text: Option<String>) -> Option<RootTurn> {
     text.and_then(|text| serde_json::from_str(&text).ok())
+}
+
+/// cb-requested-by: the `requestedBy` record for one root turn, derived from
+/// the Hub's own turn record and never from a request body.
+///
+/// A reference only: an owner-origin turn records the command that carried
+/// the owner's input, and every other origin records that origin (`hub` for a
+/// restart notice or a fact, `agent` for a turn the seat started on its own).
+/// The owner's words are never part of it, so no task doc, roster row,
+/// approval card or journal payload can carry them; a Human read adds them
+/// from the command row ([`owner_excerpts`]). Record only, never a gate.
+pub(crate) fn requested_by(turn: &RootTurn) -> RequestedBy {
+    if turn.origin == InputOrigin::Human {
+        RequestedBy {
+            command_id: Some(turn.command_id.clone()),
+            origin: None,
+        }
+    } else {
+        RequestedBy {
+            command_id: None,
+            origin: Some(turn.origin),
+        }
+    }
+}
+
+/// cb-requested-by: the owner's own words for each of `command_ids`, read from
+/// the Hub's command rows: one line, credential-shaped words withheld, then at
+/// most [`EXCERPT_CHARS`] characters cut on a char boundary. Attachment
+/// contents are never in the prompt text.
+///
+/// One statement per chunk of ids, whatever the list length — the approval
+/// list and the board are polled every few seconds. Ids are deduped first, so
+/// an id that yields no words costs nothing.
+///
+/// Only an owner's input yields words. A row an Agent sent (it carries an
+/// initiator) or one not stamped `human` yields none, so a record can never
+/// put another author's text under the owner's name. Ids with no such row, or
+/// no prompt text, are absent from the map.
+pub(crate) fn owner_excerpts(
+    conn: &Connection,
+    command_ids: &[String],
+) -> Result<HashMap<String, String>, StoreError> {
+    let mut ids: Vec<&str> = command_ids.iter().map(String::as_str).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let mut excerpts = HashMap::new();
+    for chunk in ids.chunks(EXCERPT_QUERY_IDS) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!(
+            "SELECT id, payload_json, initiator_instance_id FROM commands WHERE id IN ({placeholders})"
+        );
+        let mut statement = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> = chunk
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        let mut rows = statement.query(params.as_slice())?;
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            let payload: String = row.get(1)?;
+            // An Agent's send carries an initiator: never the owner's words.
+            if row.get::<_, Option<String>>(2)?.is_some() {
+                continue;
+            }
+            let Ok(payload) = serde_json::from_str::<Value>(&payload) else {
+                continue;
+            };
+            if payload.get("origin").and_then(Value::as_str) != Some("human") {
+                continue;
+            }
+            if let Some(excerpt) = prompt_text(&payload)
+                .map(|text| clip_excerpt(&crate::digest::redact_secrets(&text)))
+                .filter(|text| !text.is_empty())
+            {
+                excerpts.insert(id, excerpt);
+            }
+        }
+    }
+    Ok(excerpts)
+}
+
+/// cb-requested-by: drop any `requestedBy` inside an interaction event a Node
+/// journals. `requestedBy` is Hub-stamped only; a Node's payload is untrusted
+/// content, so a Node or worker can neither leak nor forge the owner's words
+/// on a card. Runs before the event is journaled, so neither the journal row
+/// nor the interaction row it feeds can hold one. Other events (a native turn
+/// lifecycle's `relatedIds.requestedBy`, for one) are left alone.
+pub(crate) fn strip_supplied_requested_by(event: &mut Value) {
+    // The same `kind`-else-`subtype` the store's interaction fold reads, so a
+    // flat `{"subtype": "interaction.requested"}` event is gated too.
+    let interaction = crate::store::journal_event_kind(event).starts_with("interaction")
+        || event.pointer("/payload/entityType").and_then(Value::as_str) == Some("interaction")
+        || event
+            .pointer("/payload/interaction")
+            .is_some_and(Value::is_object)
+        || event.get("interaction").is_some_and(Value::is_object);
+    if interaction {
+        strip_requested_by(event);
+    }
+}
+
+/// Deepest level [`strip_requested_by`] walks. No real interaction nests
+/// anywhere near this deep; a container below it is dropped (replaced by
+/// `null`) rather than stored or served unexamined.
+const STRIP_MAX_DEPTH: usize = 64;
+
+/// Remove every object key named `requestedBy`, at any depth and inside
+/// arrays, from an interaction-shaped value. An interaction event or card
+/// holds no legitimate `requestedBy` of its own — the Hub stamps its own
+/// cards separately — so nothing a Node supplied survives, wherever it is
+/// buried (`payload.interaction.meta`, an option in an array, the stored
+/// `event` a served card carries).
+pub(crate) fn strip_requested_by(value: &mut Value) {
+    strip_requested_by_at(value, 0);
+}
+
+fn strip_requested_by_at(value: &mut Value, depth: usize) {
+    if depth >= STRIP_MAX_DEPTH {
+        if value.is_object() || value.is_array() {
+            *value = Value::Null;
+        }
+        return;
+    }
+    match value {
+        Value::Object(object) => {
+            object.remove("requestedBy");
+            for nested in object.values_mut() {
+                strip_requested_by_at(nested, depth + 1);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                strip_requested_by_at(item, depth + 1);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// One line of at most [`EXCERPT_CHARS`] characters, cut on a char boundary.
+fn clip_excerpt(text: &str) -> String {
+    if text.chars().count() <= EXCERPT_CHARS {
+        return text.to_string();
+    }
+    let mut clipped: String = text.chars().take(EXCERPT_CHARS - 1).collect();
+    clipped.push('…');
+    clipped
+}
+
+/// The prompt text of a stored input, mirroring the Node's `prompt_of`
+/// (`runtime_wss.rs`): `initialInput.text` (a create's opening prompt),
+/// `prompt` (the web), `spec.prompt`, `input.text` (Hub-authored inputs),
+/// `text`, then the `input.blocks` text parts joined by newlines.
+fn prompt_text(payload: &Value) -> Option<String> {
+    if let Some(text) = payload
+        .pointer("/initialInput/text")
+        .or_else(|| payload.get("prompt"))
+        .or_else(|| payload.pointer("/spec/prompt"))
+        .or_else(|| payload.pointer("/input/text"))
+        .or_else(|| payload.get("text"))
+        .and_then(Value::as_str)
+    {
+        return Some(text.to_owned());
+    }
+    let blocks = payload.pointer("/input/blocks")?.as_array()?;
+    let mut out = String::new();
+    for block in blocks {
+        let Some(text) = block.get("text").and_then(Value::as_str) else {
+            continue;
+        };
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(text);
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 #[cfg(test)]
@@ -809,5 +995,329 @@ mod tests {
         conn.execute("UPDATE instances SET lifecycle = 'exited'", [])
             .unwrap();
         assert_eq!(now(&conn), agent_unknown());
+    }
+
+    /// cb-requested-by: the record is a reference, never the words — an owner
+    /// turn names its command, any other origin names itself.
+    #[test]
+    fn requested_by_is_a_reference_and_never_the_words() {
+        assert_eq!(
+            requested_by(&rt(
+                "cmd_owner",
+                InputOrigin::Human,
+                RootTurnContinuation::Fresh
+            )),
+            RequestedBy {
+                command_id: Some("cmd_owner".into()),
+                origin: None,
+            }
+        );
+        for origin in [InputOrigin::Agent, InputOrigin::Hub, InputOrigin::Bot] {
+            assert_eq!(
+                requested_by(&rt("cmd_owner", origin, RootTurnContinuation::Unknown)),
+                RequestedBy {
+                    command_id: None,
+                    origin: Some(origin),
+                }
+            );
+        }
+    }
+
+    /// The words a Human read gains, from the Hub's own command row: bounded
+    /// at a char boundary, one line, secret-shaped tokens withheld, read from
+    /// every command shape the Node reads.
+    #[test]
+    fn owner_excerpts_are_bounded_scrubbed_and_read_every_input_shape() {
+        let conn = db();
+        let excerpt = |conn: &Connection, id: &str| {
+            owner_excerpts(conn, &[id.to_string()]).unwrap().remove(id)
+        };
+        command(
+            &conn,
+            "cmd_owner",
+            json!({"origin": "human", "prompt": "  dispatch a worker\non the other node "}),
+            None,
+        );
+        assert_eq!(
+            excerpt(&conn, "cmd_owner").as_deref(),
+            Some("dispatch a worker on the other node")
+        );
+
+        // A long body is cut at a char boundary (multi-byte chars included)
+        // and still one line.
+        let long = "他说：".repeat(120);
+        command(
+            &conn,
+            "cmd_long",
+            json!({"origin": "human", "text": long}),
+            None,
+        );
+        let long = excerpt(&conn, "cmd_long").expect("excerpt");
+        assert_eq!(long.chars().count(), EXCERPT_CHARS, "{long}");
+        assert!(long.ends_with('…'), "{long}");
+
+        // A credential-shaped word never reaches the words; the rest does.
+        let secret = format!(
+            "please use {} now",
+            ["sk", "-live-abcd1234efgh5678ijkl"].concat()
+        );
+        command(
+            &conn,
+            "cmd_secret",
+            json!({"origin": "human", "text": secret}),
+            None,
+        );
+        let scrubbed = excerpt(&conn, "cmd_secret").expect("excerpt");
+        assert!(scrubbed.contains("please use"), "{scrubbed}");
+        assert!(scrubbed.contains("now"), "{scrubbed}");
+        assert!(!scrubbed.contains("abcd1234"), "{scrubbed}");
+
+        // Every command shape the Node reads is understood, in the Node's
+        // `prompt_of` order: a create's opening prompt, an explicit
+        // `spec.prompt`, and `input.blocks`.
+        for (id, payload, wanted) in [
+            (
+                "cmd_create",
+                json!({"origin": "human",
+                       "initialInput": {"type": "prompt", "text": "open the seat now"},
+                       "spec": {"prompt": "spec words must not win"}}),
+                "open the seat now",
+            ),
+            (
+                "cmd_spec",
+                json!({"origin": "human", "spec": {"prompt": "spec words only"}}),
+                "spec words only",
+            ),
+            (
+                "cmd_blocks",
+                json!({"origin": "human", "input": {"type": "prompt", "blocks": [
+                    {"type": "text", "text": "first"}, {"type": "text", "text": "second"}]}}),
+                "first second",
+            ),
+        ] {
+            command(&conn, id, payload, None);
+            assert_eq!(excerpt(&conn, id).as_deref(), Some(wanted), "{id}");
+        }
+
+        // A command with no prompt text yields no words; none are invented.
+        command(
+            &conn,
+            "cmd_keys",
+            json!({"origin": "human", "keys": "enter"}),
+            None,
+        );
+        assert_eq!(excerpt(&conn, "cmd_keys"), None);
+    }
+
+    /// cb-requested-by r4: a Node-supplied record is dropped from every copy an
+    /// interaction event or a served card carries, and nothing else changes.
+    #[test]
+    fn strip_requested_by_reaches_every_copy_and_only_interactions() {
+        let forged = json!({"commandId": "cmd_x", "excerpt": "forged words"});
+        let mut requested = json!({
+            "kind": "interaction.requested",
+            "requestedBy": forged,
+            "payload": {
+                "requestedBy": forged,
+                "interaction": {"id": "int_a", "requestedBy": forged, "title": "kept"},
+            },
+        });
+        strip_supplied_requested_by(&mut requested);
+        assert!(
+            !requested.to_string().contains("requestedBy"),
+            "{requested}"
+        );
+        assert_eq!(requested["payload"]["interaction"]["title"], "kept");
+
+        // r5: a flat event the store classifies by `subtype` (no `kind`, no
+        // nested interaction object) is gated the same way.
+        let mut flat = json!({
+            "subtype": "interaction.requested",
+            "payload": {"interactionId": "int_a", "requestedBy": forged},
+        });
+        assert_eq!(
+            crate::store::journal_event_kind(&flat),
+            "interaction.requested"
+        );
+        strip_supplied_requested_by(&mut flat);
+        assert!(!flat.to_string().contains("requestedBy"), "{flat}");
+
+        let mut entity = json!({
+            "kind": "lifecycle",
+            "payload": {"type": "entity", "entityType": "interaction",
+                        "entity": {"id": "int_a", "state": "expired", "requestedBy": forged}},
+        });
+        strip_supplied_requested_by(&mut entity);
+        assert!(!entity.to_string().contains("requestedBy"), "{entity}");
+
+        // A served list item: top level, the merged interaction and the
+        // stored event it carries.
+        let mut item = json!({
+            "id": "int_a", "requestedBy": forged,
+            "interaction": {"requestedBy": forged},
+            "event": {"payload": {"interaction": {"requestedBy": forged}}},
+        });
+        strip_requested_by(&mut item);
+        assert!(!item.to_string().contains("requestedBy"), "{item}");
+
+        // r5: the whole value is walked — a `meta` object, an array element,
+        // any key — and a container past the depth bound is dropped, never
+        // kept unexamined. Everything else is left as it was.
+        let mut buried = json!({
+            "kind": "interaction.requested",
+            "payload": {"interaction": {
+                "id": "int_a",
+                "meta": {"requestedBy": forged, "note": "kept"},
+                "request": {"options": [
+                    {"id": "allow-once", "meta": {"requestedBy": forged}},
+                    [{"requestedBy": forged}],
+                ]},
+            }},
+        });
+        strip_supplied_requested_by(&mut buried);
+        assert!(!buried.to_string().contains("requestedBy"), "{buried}");
+        assert_eq!(buried["payload"]["interaction"]["meta"]["note"], "kept");
+        assert_eq!(
+            buried["payload"]["interaction"]["request"]["options"][0]["id"],
+            "allow-once"
+        );
+        let mut deep = json!({"requestedBy": forged});
+        for _ in 0..STRIP_MAX_DEPTH + 6 {
+            deep = json!({"nested": deep});
+        }
+        let mut deep_event = json!({"kind": "interaction.requested", "payload": deep});
+        strip_supplied_requested_by(&mut deep_event);
+        assert!(!deep_event.to_string().contains("requestedBy"));
+        assert!(
+            deep_event.to_string().contains("nested"),
+            "shallow levels kept"
+        );
+
+        // Not an interaction event: a native turn's own `requestedBy` stays.
+        let mut native = json!({
+            "kind": "lifecycle",
+            "payload": {"type": "native", "nativeName": "interrupted",
+                        "relatedIds": {"requestedBy": "instance.cancel"}},
+        });
+        let before = native.clone();
+        strip_supplied_requested_by(&mut native);
+        assert_eq!(native, before);
+    }
+
+    /// cb-requested-by: one statement per chunk of ids, however long the list
+    /// and however often an id repeats — the approval list and the board are
+    /// polled every few seconds. Counted with SQLite's statement trace.
+    #[test]
+    fn owner_excerpts_runs_one_statement_per_chunk() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static STATEMENTS: AtomicUsize = AtomicUsize::new(0);
+        fn count(event: rusqlite::trace::TraceEvent<'_>) {
+            if matches!(event, rusqlite::trace::TraceEvent::Stmt(..)) {
+                STATEMENTS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let conn = db();
+        {
+            let mut insert = conn
+                .prepare(
+                    "INSERT INTO commands (id, instance_id, payload_json)
+                     VALUES (?1, 'ins_main', ?2)",
+                )
+                .unwrap();
+            for n in 0..EXCERPT_QUERY_IDS + 1 {
+                insert
+                    .execute(params![
+                        format!("cmd_{n:05}"),
+                        format!("{{\"origin\":\"human\",\"prompt\":\"words {n}\"}}")
+                    ])
+                    .unwrap();
+            }
+        }
+        let ids: Vec<String> = (0..EXCERPT_QUERY_IDS + 1)
+            .map(|n| format!("cmd_{n:05}"))
+            .collect();
+        let count_statements = |ids: &[String]| {
+            STATEMENTS.store(0, Ordering::SeqCst);
+            conn.trace_v2(
+                rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+                Some(count),
+            );
+            let excerpts = owner_excerpts(&conn, ids).unwrap();
+            conn.trace_v2(rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT, None);
+            (excerpts, STATEMENTS.load(Ordering::SeqCst))
+        };
+
+        let (excerpts, statements) = count_statements(&ids);
+        assert_eq!(excerpts.len(), EXCERPT_QUERY_IDS + 1);
+        assert_eq!(
+            statements, 2,
+            "one statement per chunk of {EXCERPT_QUERY_IDS}"
+        );
+
+        // A repeated id is queried once, not once per occurrence.
+        let repeated = vec![ids[0].clone(); 50];
+        let (excerpts, statements) = count_statements(&repeated);
+        assert_eq!(excerpts.len(), 1);
+        assert_eq!(statements, 1, "a deduped list costs one statement");
+    }
+
+    /// cb-requested-by: one batched read serves a whole list, and only an
+    /// owner's input yields words — never a row an Agent sent or one not
+    /// stamped `human`, whatever id a record names.
+    #[test]
+    fn owner_excerpts_read_only_owner_input_rows_in_one_batch() {
+        let conn = db();
+        command(
+            &conn,
+            "cmd_owner",
+            json!({"origin": "human", "prompt": "ship it"}),
+            None,
+        );
+        command(
+            &conn,
+            "cmd_other_owner",
+            json!({"origin": "human", "input": {"type": "prompt", "text": "and this"}}),
+            None,
+        );
+        // An Agent's send carries an initiator; a Bot's is stamped `bot`.
+        command(
+            &conn,
+            "cmd_agent",
+            json!({"origin": "agent", "prompt": "agent words"}),
+            Some("ins_peer"),
+        );
+        command(
+            &conn,
+            "cmd_agent_claiming_human",
+            json!({"origin": "human", "prompt": "forged"}),
+            Some("ins_peer"),
+        );
+        command(
+            &conn,
+            "cmd_bot",
+            json!({"origin": "bot", "prompt": "bot words"}),
+            None,
+        );
+        let ids: Vec<String> = [
+            "cmd_owner",
+            "cmd_other_owner",
+            "cmd_owner",
+            "cmd_agent",
+            "cmd_agent_claiming_human",
+            "cmd_bot",
+            "cmd_missing",
+        ]
+        .iter()
+        .map(|id| id.to_string())
+        .collect();
+        let excerpts = owner_excerpts(&conn, &ids).unwrap();
+        assert_eq!(
+            excerpts,
+            HashMap::from([
+                ("cmd_owner".to_string(), "ship it".to_string()),
+                ("cmd_other_owner".to_string(), "and this".to_string()),
+            ])
+        );
     }
 }

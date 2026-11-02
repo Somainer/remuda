@@ -86,6 +86,32 @@ wire_enum!(RootTurnContinuation, "8.4", {
     Unknown => "unknown",
 });
 
+/// D-060 companion item (cb-requested-by): who asked for an Agent-created
+/// dispatch or task, as the Hub recorded it from its own root-turn ledger.
+///
+/// A reference, never the words. An owner-origin root turn records the Hub
+/// command that carried the owner's input; any other origin records only that
+/// origin — `hub` for a restart notice or a fact, `agent` for a turn the agent
+/// started on its own. The owner's words stay in that command row: the type
+/// has no field for them, so a task doc, roster row or approval card can
+/// never store them, and a Human read of the approval card source, the board
+/// or a task detail gains a read-time `excerpt` from the command row
+/// (protocol.md). It is a record for the audit trail and `/approvals`, never
+/// a gate: no admission, grant, scope or approval rule reads it (owner ruling
+/// R2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestedBy {
+    /// Hub command id of the owner's input that started the root turn, when
+    /// that turn's origin is `human`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_id: Option<String>,
+    /// The origin that started the turn, recorded only when it was not the
+    /// owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<InputOrigin>,
+}
+
 fn lenient_root_turn<'de, D: Deserializer<'de>>(d: D) -> Result<Option<RootTurn>, D::Error> {
     let value = serde_json::Value::deserialize(d)?;
     Ok(serde_json::from_value(value).ok())
@@ -130,5 +156,41 @@ mod tests {
         .expect("an unknown rootTurn value never drops the initiator");
         assert_eq!(future.root_turn, None);
         assert_eq!(future.instance_id, "ins_a");
+    }
+
+    /// cb-requested-by: an owner turn records its command, a non-owner turn
+    /// its origin; absent fields never serialize, and words a stored row may
+    /// carry are dropped on read, never re-served.
+    #[test]
+    fn requested_by_is_a_reference_and_drops_words_on_read() {
+        let owner = RequestedBy {
+            command_id: Some("cmd_owner".into()),
+            origin: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&owner).unwrap(),
+            json!({"commandId": "cmd_owner"})
+        );
+
+        let hub = RequestedBy {
+            command_id: None,
+            origin: Some(InputOrigin::Hub),
+        };
+        assert_eq!(
+            serde_json::to_value(&hub).unwrap(),
+            json!({"origin": "hub"})
+        );
+        let parsed: RequestedBy =
+            serde_json::from_value(json!({"origin": "agent"})).expect("parses");
+        assert_eq!(parsed.origin, Some(InputOrigin::Agent));
+
+        let stored_with_words: RequestedBy = serde_json::from_value(
+            json!({"commandId": "cmd_owner", "excerpt": "the owner's words"}),
+        )
+        .expect("parses");
+        assert_eq!(
+            serde_json::to_value(&stored_with_words).unwrap(),
+            json!({"commandId": "cmd_owner"})
+        );
     }
 }

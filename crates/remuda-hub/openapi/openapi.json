@@ -4088,6 +4088,30 @@
         ],
         "type": "object"
       },
+      "RequestedBy": {
+        "description": "cb-requested-by: who asked for an Agent-created dispatch, task or approval card. Stored as a reference only: an owner-origin root turn records the command that carried the owner's input, any other origin records only that origin. The owner's words are never stored with it. Record only, never a gate.",
+        "properties": {
+          "commandId": {
+            "description": "Hub command id of the owner's input that started the root turn.",
+            "type": "string"
+          },
+          "excerpt": {
+            "description": "Read-time only, for a Human caller: the owner's own words for that command, read from the Hub's command row on GET /v1/interactions, GET /v1/board and GET /v1/tasks/{id}. One line, at most 280 characters, credential-shaped strings withheld. Never stored, and never served to an Agent or Bot caller.",
+            "type": "string"
+          },
+          "origin": {
+            "description": "The origin that started the turn, recorded only when it was not the owner.",
+            "enum": [
+              "human",
+              "bot",
+              "agent",
+              "hub"
+            ],
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
       "SshHostCreate": {
         "additionalProperties": false,
         "properties": {
@@ -4286,6 +4310,9 @@
           },
           "workspaceBinding": {
             "$ref": "#/components/schemas/TaskSpaceBinding"
+          },
+          "requestedBy": {
+            "$ref": "#/components/schemas/RequestedBy"
           }
         },
         "required": [
@@ -5046,6 +5073,10 @@
           "permissionMode": {
             "type": "string",
             "description": "The permission mode the worker launched with (effective)."
+          },
+          "requestedBy": {
+            "$ref": "#/components/schemas/RequestedBy",
+            "description": "cb-requested-by: a reference to the owner's command behind an Agent dispatch, or the non-owner origin; never the owner's words (those are hydrated at read time for a Human reader). Absent on Human/Bot dispatches."
           }
         },
         "required": [

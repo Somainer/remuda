@@ -48,8 +48,7 @@ tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 agent-client-protocol = "2.1.0"
 futures = "0.3"
 bytes = { version = "1", features = ["serde"] }
-# `trace` lets the excerpt-batching test count the statements one read runs.
-rusqlite = { version = "0.37", features = ["bundled", "trace"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
 sha2 = "0.10"
 rust-embed = "8"
 portable-pty = "0.9"

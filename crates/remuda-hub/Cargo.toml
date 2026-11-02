@@ -80,7 +80,9 @@ remuda-protocol.workspace = true
 remuda-testing.workspace = true
 serde_cbor_2 = "0.13"
 sha2.workspace = true
-rusqlite.workspace = true
+# `trace` lets the excerpt-batching unit test count the statements one read
+# runs; test builds only.
+rusqlite = { workspace = true, features = ["trace"] }
 tempfile = "3"
 time.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

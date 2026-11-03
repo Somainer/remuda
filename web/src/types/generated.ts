@@ -4981,6 +4981,131 @@ export type UsageScope = ("message" | "turn" | "session" | "workflow-member");
 /** WaitReason wire values; `protocol.md` §7.2. */
 export type WaitReason = ("condition-met" | "timeout" | "unknown");
 
+/** `POST /v1/lineages/{id}/wake-ups`. */
+export type WakeAddRequest = ({
+  "check"?: unknown;
+  "mode"?: (WakeMode | (null));
+  "name"?: (string | null);
+  "notify": WakeNotify;
+  "text": (string);
+  "trigger": WakeTrigger;
+});
+
+/** `POST /v1/lineages/{id}/wake-ups` response. */
+export type WakeAddResult = ({
+  "created": (boolean);
+  "wakeUp": WakeUp;
+  [key: string]: unknown;
+});
+
+/** `at`: one occurrence. A request gives `at` or `afterSecs`; a stored wake-up always carries `at`. */
+export type WakeAt = ({
+  "afterSecs"?: (number | null);
+  "at"?: (string | null);
+  [key: string]: unknown;
+});
+
+/** Who added a wake-up. */
+export type WakeCreator = ({
+  "instanceId"?: (string | null);
+  "origin": InputOrigin;
+  [key: string]: unknown;
+});
+
+/** `every`: one occurrence per interval. */
+export type WakeEvery = ({
+  "everySecs": (number);
+  "startAt"?: (string | null);
+  [key: string]: unknown;
+});
+
+/** `GET /v1/lineages/{id}/wake-ups`. */
+export type WakeList = ({
+  "items": ((WakeUp)[]);
+  "lineageId": (string);
+  "runs": ((WakeRun)[]);
+  [key: string]: unknown;
+});
+
+/** WakeMode wire values; `protocol.md` §8.4. */
+export type WakeMode = ("persistent" | "fresh");
+
+/** WakeNotify wire values; `protocol.md` §8.4. */
+export type WakeNotify = ("never" | "failure" | "always");
+
+/** `DELETE /v1/lineages/{id}/wake-ups/{wake}`. */
+export type WakeRemoved = ({
+  "name": (string);
+  "wakeId": (string);
+  [key: string]: unknown;
+});
+
+/** One run of a wake-up. */
+export type WakeRun = ({
+  "batchId"?: (string | null);
+  "checkExit": (number | null);
+  "childInstanceId"?: (string | null);
+  "endedAt"?: (string | null);
+  "factId"?: (number | null);
+  "failureKind"?: (string | null);
+  "firedAt": (string);
+  "lineageId": (string);
+  "missedBefore": (number);
+  "mode": WakeMode;
+  "name": (string);
+  "runId": (string);
+  "scheduledAt": (string);
+  "startedAt"?: (string | null);
+  "state": WakeRunState;
+  "wakeId": (string);
+  [key: string]: unknown;
+});
+
+/** WakeRunState wire values; `protocol.md` §8.4. */
+export type WakeRunState = ("queued" | "running" | "success" | "failed" | "skipped" | "interrupted");
+
+/** When a wake-up fires. */
+export type WakeTrigger = (WakeAt & ({
+  "kind": "at";
+  [key: string]: unknown;
+}) | WakeEvery & ({
+  "kind": "every";
+  [key: string]: unknown;
+}) | WakeWhen & ({
+  "kind": "when";
+  [key: string]: unknown;
+}));
+
+/** One wake-up row. */
+export type WakeUp = ({
+  "check"?: unknown;
+  "createdAt": (string);
+  "creator": WakeCreator;
+  "lastFiredAt"?: (string | null);
+  "lineageId": (string);
+  "missedCount": (number);
+  "mode": WakeMode;
+  "name": (string);
+  "nextFireAt"?: (string | null);
+  "notify": WakeNotify;
+  "state": WakeUpState;
+  "text": (string);
+  "trigger": WakeTrigger;
+  "updatedAt": (string);
+  "wakeId": (string);
+  [key: string]: unknown;
+});
+
+/** WakeUpState wire values; `protocol.md` §8.4. */
+export type WakeUpState = ("active" | "done");
+
+/** `when`: a condition over the facts the lineage receives. Each fact of `factKind` (about `subjectInstanceId`, when set) recorded after the add is an occurrence. `wake-due` cannot be a condition, and nothing records `context-threshold` facts yet, so that kind is refused at add time. */
+export type WakeWhen = ({
+  "factKind": InboxFactKind;
+  "subjectInstanceId"?: (string | null);
+  [key: string]: unknown;
+});
+
 /** Where a window's numbers came from; §4.1.  Observed frames update `observed` fields but never erase a `declared` limit; `inferred` is filled by Hub-side usage aggregation (§4.5). */
 export type WindowSource = ("declared" | "observed" | "inferred");
 

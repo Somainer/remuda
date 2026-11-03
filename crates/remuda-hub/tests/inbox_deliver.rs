@@ -949,6 +949,63 @@ async fn owner_input_between_formation_and_forward_goes_first() -> Result<()> {
     Ok(())
 }
 
+/// Owner input committed after the driver's own precedence read but before
+/// the forward marks the batch's intent: the mark-time check in the writer
+/// job holds the batch, and the owner's settle re-drives it. The driver is
+/// parked between the two, so the interleaving is fixed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owner_input_between_the_drivers_read_and_the_mark_still_goes_first() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("deliver-mark-guard").await?;
+    let (seat, token) = ctx.seat(&project).await?;
+    let worker = ctx.worker(&token, &project).await?;
+    ctx.hub.test_hold_inbox_forward(true);
+    ctx.worker_turn(&worker, 10, "done").await?;
+    ctx.journal(&seat, activity("idle", &at(20))).await?;
+    ctx.settle().await?;
+    let batch = ctx.batch_rows()?[0].0.clone();
+    ctx.hub.test_hold_inbox_forward(false);
+    let (reached, release) = ctx.hub.test_arm_inbox_forward_barrier(&ctx.host, &batch);
+    let parked = reached.notified();
+    tokio::pin!(parked);
+    parked.as_mut().enable();
+    let owner_id = std::cell::RefCell::new(String::new());
+    let (driven, posted) = tokio::join!(ctx.settle(), async {
+        // The driver read no owner input and is parked before the forward.
+        parked.await;
+        let owner = ctx
+            .post(
+                &ctx.human,
+                &format!("/v1/instances/{seat}/commands"),
+                json!({ "operation": "instance.send",
+                        "payload": { "input": { "type": "prompt", "text": "owner: now" } } }),
+            )
+            .await?;
+        *owner_id.borrow_mut() = owner["command"]["commandId"].as_str().unwrap().to_owned();
+        let _ = release.send(());
+        anyhow::Ok(())
+    });
+    driven?;
+    posted?;
+    let owner_id = owner_id.into_inner();
+    let row = command_row(&ctx, &seat, &batch).await?;
+    assert_eq!(
+        (row["state"].as_str(), row["forwarded"].as_bool()),
+        (Some("queued"), Some(false)),
+        "held at the mark: {row:#}"
+    );
+    let sends = ctx.seen.sends_to(&seat);
+    assert_eq!(sends.len(), 1, "{sends:#?}");
+    assert_eq!(sends[0]["commandId"], owner_id.as_str());
+
+    ctx.settle_command(&seat, &owner_id).await?;
+    ctx.settle().await?;
+    let sends = ctx.seen.sends_to(&seat);
+    assert_eq!(sends.len(), 2, "{sends:#?}");
+    assert_eq!(sends[1]["commandId"], batch.as_str(), "then the same batch");
+    Ok(())
+}
+
 /// The settle of the owner's input alone re-drives the waiting batch: no
 /// explicit drive, the writer's signal does it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

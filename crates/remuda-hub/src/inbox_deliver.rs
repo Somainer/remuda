@@ -1481,6 +1481,17 @@ pub(crate) async fn drive(state: &AppState, pace: Pace) {
                     tracing::debug!("inbox batch waits behind input that goes first");
                     continue;
                 }
+                // Test seam: park between the read above and the forward that
+                // marks the intent (no-op unless a test armed it), so owner
+                // input can land in between and the mark-time check holds.
+                state
+                    .race_barriers
+                    .wait_if_armed(
+                        crate::workspaces::RacePhase::InboxBeforeForward,
+                        &batch.host_id,
+                        &batch.batch_id,
+                    )
+                    .await;
                 let command = match state.store.get_command(batch.batch_id.clone()).await {
                     Ok(Some(command)) => command,
                     Ok(None) => continue,

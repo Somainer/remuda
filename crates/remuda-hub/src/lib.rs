@@ -1386,6 +1386,32 @@ impl RunningHub {
         Ok(())
     }
 
+    /// Test-only: arm a one-shot park point in the inbox delivery driver
+    /// between its own precedence read and the forward of `batch_id` on
+    /// `host_id`. Returns `(reached, release)`.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_arm_inbox_forward_barrier(
+        &self,
+        host_id: &str,
+        batch_id: &str,
+    ) -> (
+        std::sync::Arc<tokio::sync::Notify>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let reached = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        self.state.race_barriers.insert(
+            crate::workspaces::RacePhase::InboxBeforeForward,
+            (host_id.to_owned(), batch_id.to_owned()),
+            crate::workspaces::BarrierSlot {
+                reached: reached.clone(),
+                release: release_rx,
+            },
+        );
+        (reached, release_tx)
+    }
+
     /// Test-only: the next `times` forwards of `command_id` are refused
     /// NODE_BUSY, as when its host's in-flight slots are full.
     #[doc(hidden)]

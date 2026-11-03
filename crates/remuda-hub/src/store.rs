@@ -1648,6 +1648,10 @@ pub(crate) enum ForwardMark {
     HeldForFence,
     /// Continuity-lineage work for a Node without fence support.
     NodeLacksFence,
+    /// cb-inbox-deliver: a fact batch whose chapter got owner input (or other
+    /// Hub input) after the batch formed; that input goes first, the batch
+    /// stays queued and is re-driven when it settles.
+    HeldBehindInput,
 }
 
 /// Payload of the winning continuation transaction.
@@ -5978,6 +5982,9 @@ impl Store {
             )?;
             if row.forwarded {
                 return Ok(ForwardMark::AlreadyForwarded);
+            }
+            if crate::inbox_deliver::forward_waits(conn, &command_id)? {
+                return Ok(ForwardMark::HeldBehindInput);
             }
             if crate::fence::host_gated(conn, &row.host_id)? {
                 return Ok(ForwardMark::HeldForFence);

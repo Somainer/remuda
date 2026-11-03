@@ -866,6 +866,92 @@ async fn a_queued_restart_notice_goes_before_the_batch() -> Result<()> {
     Ok(())
 }
 
+/// Owner input that arrives after the batch formed but before its forward
+/// still goes first: the forward re-checks, leaves the batch queued, and the
+/// owner command's settling re-drives it. The interleaving is fixed by the
+/// forward hold, not by timing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owner_input_between_formation_and_forward_goes_first() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("deliver-owner-race").await?;
+    let (seat, token) = ctx.seat(&project).await?;
+    let worker = ctx.worker(&token, &project).await?;
+    ctx.hub.test_hold_inbox_forward(true);
+    ctx.worker_turn(&worker, 10, "done").await?;
+    ctx.journal(&seat, activity("idle", &at(20))).await?;
+    ctx.settle().await?;
+    let rows = ctx.batch_rows()?;
+    assert_eq!(rows.len(), 1, "formed, forward held");
+    let batch = rows[0].0.clone();
+
+    // The owner writes now, before the batch has left the Hub.
+    let owner = ctx
+        .post(
+            &ctx.human,
+            &format!("/v1/instances/{seat}/commands"),
+            json!({ "operation": "instance.send",
+                    "payload": { "input": { "type": "prompt", "text": "owner: wait" } } }),
+        )
+        .await?;
+    let owner_id = owner["command"]["commandId"].as_str().unwrap().to_owned();
+    ctx.hub.test_hold_inbox_forward(false);
+    ctx.settle().await?;
+    let sends = ctx.seen.sends_to(&seat);
+    assert_eq!(sends.len(), 1, "only the owner's input left: {sends:#?}");
+    assert_eq!(sends[0]["commandId"], owner_id.as_str());
+    let row = command_row(&ctx, &seat, &batch).await?;
+    assert_eq!(row["state"], "queued", "{row:#}");
+    assert_eq!(row["forwarded"], false, "{row:#}");
+
+    // The owner's input settles: the waiting batch is re-driven, same id.
+    ctx.settle_command(&seat, &owner_id).await?;
+    ctx.settle().await?;
+    let sends = ctx.seen.sends_to(&seat);
+    assert_eq!(sends.len(), 2, "{sends:#?}");
+    assert_eq!(sends[0]["commandId"], owner_id.as_str(), "owner first");
+    assert_eq!(sends[1]["commandId"], batch.as_str(), "then the same batch");
+    assert_eq!(ctx.batch_rows()?.len(), 1);
+    Ok(())
+}
+
+/// The settle of the owner's input alone re-drives the waiting batch: no
+/// explicit drive, the writer's signal does it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_owner_settle_alone_re_drives_a_waiting_batch() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("deliver-owner-redrive").await?;
+    let (seat, token) = ctx.seat(&project).await?;
+    let worker = ctx.worker(&token, &project).await?;
+    ctx.hub.test_hold_inbox_forward(true);
+    ctx.worker_turn(&worker, 10, "done").await?;
+    ctx.journal(&seat, activity("idle", &at(20))).await?;
+    ctx.settle().await?;
+    let batch = ctx.batch_rows()?[0].0.clone();
+    let owner = ctx
+        .post(
+            &ctx.human,
+            &format!("/v1/instances/{seat}/commands"),
+            json!({ "operation": "instance.send",
+                    "payload": { "input": { "type": "prompt", "text": "owner: wait" } } }),
+        )
+        .await?;
+    let owner_id = owner["command"]["commandId"].as_str().unwrap().to_owned();
+    ctx.hub.test_hold_inbox_forward(false);
+    ctx.settle().await?;
+    assert_eq!(frames_for(&ctx, &batch), 0, "waits behind the owner");
+    ctx.settle_command(&seat, &owner_id).await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while frames_for(&ctx, &batch) == 0 {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "the settle never re-drove the batch"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(frames_for(&ctx, &batch), 1);
+    Ok(())
+}
+
 // ─── ids and replay ─────────────────────────────────────────────────────────
 
 /// D-055: the batch's id is its replay identity. Driving delivery again, and

@@ -4704,6 +4704,16 @@ pub(crate) async fn forward_if_online(
                         .await?
                         .ok_or(HubError::NotFound);
                 }
+                crate::store::ForwardMark::HeldBehindInput => {
+                    // cb-inbox-deliver: owner input reached the batch's
+                    // chapter after the batch formed and goes first; the
+                    // batch stays queued and its settling re-drives it.
+                    return state
+                        .store
+                        .get_command(command.command_id.clone())
+                        .await?
+                        .ok_or(HubError::NotFound);
+                }
                 crate::store::ForwardMark::HeldForFence => {
                     // D-057 §7.6: the host has unacknowledged fences. Exactly
                     // as for an offline host the row stays queued and nothing

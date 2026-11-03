@@ -62,6 +62,20 @@ macro_rules! waiting_rows {
     };
 }
 
+/// The predicate for a lineage with a formed batch still queued and not
+/// forwarded: one that waits behind input that went first, or was released
+/// for a same-id retry.
+macro_rules! unsent_batch {
+    ($lineage:expr) => {
+        concat!(
+            "EXISTS (SELECT 1 FROM inbox_batches b JOIN commands c ON c.id = b.batch_id
+                      WHERE b.lineage_id = ",
+            $lineage,
+            " AND b.outcome IS NULL AND c.state = 'queued' AND c.forwarded = 0)"
+        )
+    };
+}
+
 /// Idempotent DDL; no `user_version` rung. The tables live in `hub.sqlite`,
 /// which `scripts/hub-backup.sh` carries whole. The triggers are rebuilt on
 /// every open, so a change to their predicates reaches existing databases.
@@ -191,11 +205,15 @@ pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
               AND (NEW.forwarded = 0 OR NEW.settlement_outcome = 'withheld'
                    OR NEW.settlement_reason = 'fenced'
                    OR NEW.settlement_not_dispatched = 1);
+           -- Also a lineage whose formed batch waits in the queue behind
+           -- the input that just settled.
            INSERT OR IGNORE INTO inbox_deliver_due (lineage_id)
            SELECT COALESCE(i.lineage_id, i.id) FROM instances i
-            WHERE i.id = NEW.instance_id AND ",
+            WHERE i.id = NEW.instance_id AND (",
         waiting_rows!("COALESCE(i.lineage_id, i.id)"),
-        ";
+        " OR ",
+        unsent_batch!("COALESCE(i.lineage_id, i.id)"),
+        ");
          END;
          DROP TRIGGER IF EXISTS inbox_due_lineage;
          CREATE TRIGGER inbox_due_lineage AFTER UPDATE ON lineages
@@ -357,28 +375,21 @@ fn gate(conn: &Connection, lineage_id: &str) -> Result<Result<Chapter, Hold>, St
     if activity != "idle" {
         return Ok(Err(Hold::Busy));
     }
-    let (interaction, owner, in_flight): (bool, bool, bool) = conn.query_row(
-        "SELECT
-            EXISTS (SELECT 1 FROM interactions WHERE instance_id = ?1 AND state = 'pending'),
-            EXISTS (SELECT 1 FROM commands
-                     WHERE instance_id = ?1 AND state <> 'settled'
-                       AND operation IN ('instance.send', 'instance.respond',
-                                         'instance.keys', 'tty.write')
-                       AND initiator_instance_id IS NULL
-                       AND json_extract(payload_json, '$.origin') = 'human'),
-            EXISTS (SELECT 1 FROM inbox_batches WHERE instance_id = ?1 AND outcome IS NULL)
-              OR EXISTS (SELECT 1 FROM commands
-                          WHERE instance_id = ?1 AND state <> 'settled'
-                            AND operation = 'instance.send'
-                            AND json_extract(payload_json, '$.origin') = 'hub')",
+    let interaction: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM interactions WHERE instance_id = ?1 AND state = 'pending')",
         params![chapter_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        |row| row.get(0),
     )?;
     if interaction {
         return Ok(Err(Hold::Interaction));
     }
-    if owner {
-        return Ok(Err(Hold::OwnerFirst));
+    let in_flight: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM inbox_batches WHERE instance_id = ?1 AND outcome IS NULL)",
+        params![chapter_id],
+        |row| row.get(0),
+    )?;
+    if let Some(hold) = input_ahead(conn, &chapter_id, None)? {
+        return Ok(Err(hold));
     }
     if in_flight {
         return Ok(Err(Hold::InFlight));
@@ -402,6 +413,59 @@ fn gate(conn: &Connection, lineage_id: &str) -> Result<Result<Chapter, Hold>, St
         generation,
         host_id,
     }))
+}
+
+/// Input that goes before a batch to `chapter`: owner input queued or in
+/// flight ([`Hold::OwnerFirst`]), or Hub-written input not yet settled (a
+/// previous batch, a successor's restart notice; [`Hold::InFlight`]).
+/// `except` leaves out the batch being forwarded itself.
+fn input_ahead(
+    conn: &Connection,
+    chapter: &str,
+    except: Option<&str>,
+) -> Result<Option<Hold>, StoreError> {
+    let (owner, hub): (bool, bool) = conn.query_row(
+        "SELECT
+            EXISTS (SELECT 1 FROM commands
+                     WHERE instance_id = ?1 AND state <> 'settled'
+                       AND operation IN ('instance.send', 'instance.respond',
+                                         'instance.keys', 'tty.write')
+                       AND initiator_instance_id IS NULL
+                       AND json_extract(payload_json, '$.origin') = 'human'),
+            EXISTS (SELECT 1 FROM commands
+                     WHERE instance_id = ?1 AND state <> 'settled'
+                       AND operation = 'instance.send'
+                       AND json_extract(payload_json, '$.origin') = 'hub'
+                       AND id IS NOT ?2)",
+        params![chapter, except],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(if owner {
+        Some(Hold::OwnerFirst)
+    } else if hub {
+        Some(Hold::InFlight)
+    } else {
+        None
+    })
+}
+
+/// Whether the batch `command_id` must wait, at the moment its forward
+/// intent would commit: owner input (or other Hub input) to its chapter
+/// arrived after the batch formed and goes first. Run inside the writer job
+/// that marks the intent, so nothing can slip between this check and the
+/// mark. `false` for any command that is not a batch.
+pub(crate) fn forward_waits(conn: &Connection, command_id: &str) -> Result<bool, StoreError> {
+    let chapter: Option<String> = conn
+        .query_row(
+            "SELECT instance_id FROM inbox_batches WHERE batch_id = ?1",
+            params![command_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(chapter) = chapter else {
+        return Ok(false);
+    };
+    Ok(input_ahead(conn, &chapter, Some(command_id))?.is_some())
 }
 
 // ── the re-check and the owner-push fallback ──────────────────────────────
@@ -846,6 +910,15 @@ struct Formed {
     pushes: bool,
 }
 
+/// Whether `lineage_id` has a formed batch still queued and unforwarded.
+fn unsent_batch(conn: &Connection, lineage_id: &str) -> Result<bool, StoreError> {
+    Ok(conn.query_row(
+        concat!("SELECT ", unsent_batch!("?1")),
+        params![lineage_id],
+        |row| row.get(0),
+    )?)
+}
+
 /// The `instance.send` payload of a batch: Hub-written input, origin `hub`
 /// (D-057 §6.4), like the restart notice.
 fn send_payload(chapter: &str, text: &str) -> Value {
@@ -870,7 +943,13 @@ fn form_one(conn: &Connection, lineage_id: &str) -> Result<Formed, StoreError> {
         }
         Err(hold) => {
             tracing::debug!(hold = hold.label(), "inbox batch held");
-            return Ok(Formed::default());
+            // A batch formed earlier still waits in the queue (owner input
+            // arrived before its forward, or a forward was refused): the
+            // state change that queued this evaluation may let it go now.
+            return Ok(Formed {
+                batch: hold == Hold::InFlight && unsent_batch(conn, lineage_id)?,
+                pushes: false,
+            });
         }
     };
     let rows = waiting(conn, lineage_id)?;
@@ -1247,6 +1326,13 @@ pub(crate) async fn drive(state: &AppState, pace: Pace) {
                     // Offline: the host's next hello drives it.
                     continue;
                 }
+                if waits_behind(state, &batch.batch_id).await {
+                    // Input that arrived after the batch formed goes first;
+                    // its settling re-drives this batch.
+                    state.deliver.clear_retry(&batch.batch_id);
+                    tracing::debug!("inbox batch waits behind input that goes first");
+                    continue;
+                }
                 let command = match state.store.get_command(batch.batch_id.clone()).await {
                     Ok(Some(command)) => command,
                     Ok(None) => continue,
@@ -1256,6 +1342,16 @@ pub(crate) async fn drive(state: &AppState, pace: Pace) {
                     }
                 };
                 match crate::http::forward_if_online(state, command, true).await {
+                    Ok(row)
+                        if row.state == "queued"
+                            && !row.forwarded
+                            && waits_behind(state, &batch.batch_id).await =>
+                    {
+                        // Held in the writer job that would have marked it:
+                        // input went first in between.
+                        state.deliver.clear_retry(&batch.batch_id);
+                        tracing::debug!("inbox batch waits behind input that goes first");
+                    }
                     Ok(row) if row.state == "queued" && !row.forwarded => {
                         // Back in the queue: the forward proved it never
                         // reached the chapter (NODE_BUSY, the link gone, a
@@ -1294,6 +1390,16 @@ pub(crate) async fn drive(state: &AppState, pace: Pace) {
         Err(err) => tracing::warn!(code = error_code(&err), "inbox batches read failed"),
     }
     push_owed(state).await;
+}
+
+/// [`forward_waits`] on the reader pool; a read failure does not hold.
+async fn waits_behind(state: &AppState, batch_id: &str) -> bool {
+    let id = batch_id.to_owned();
+    state
+        .store
+        .read("inbox_batch_waits", move |conn| forward_waits(conn, &id))
+        .await
+        .unwrap_or(false)
 }
 
 /// Scheduler ticks between two delivery retry checks (the 1 s schedule

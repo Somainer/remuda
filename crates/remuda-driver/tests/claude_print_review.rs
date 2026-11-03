@@ -156,6 +156,44 @@ fn unknown_stdout_type_is_opaque_not_fatal() {
     assert!(matches!(obs[0].body, ObservationPayload::Opaque(_)));
 }
 
+/// cb-usage-resume: a subscription limit's `rate_limit_event` keeps its
+/// status, window and reset time on the lifecycle's `relatedIds`, the first
+/// source of the Hub's reset time.
+#[test]
+fn a_rate_limit_event_keeps_its_window_and_reset_time() {
+    let obs = review::map_stdout_json(json!({
+        "type": "rate_limit_event",
+        "rate_limit_info": {
+            "status": "rejected", "resetsAt": 1789155600_i64, "rateLimitType": "five_hour",
+            "overageStatus": "rejected", "isUsingOverage": false,
+            "unifiedWindows": { "five_hour": { "utilization": 1.0, "resetsAt": 1789155600_i64 } }
+        },
+        "uuid": "6d1b7a0e-0000-4000-8000-000000000001",
+        "session_id": "review-session"
+    }))
+    .unwrap();
+    assert_eq!(obs.len(), 1);
+    let ObservationPayload::Lifecycle(lifecycle) = &obs[0].body else {
+        panic!("lifecycle expected: {:?}", obs[0].body);
+    };
+    let LifecyclePayload::Native(native) = lifecycle.as_ref() else {
+        panic!("native lifecycle expected");
+    };
+    assert_eq!(native.native_name, "rate_limit_event");
+    assert_eq!(
+        native.status,
+        Knowledge::Known {
+            value: "rejected".into()
+        }
+    );
+    let related = &native.related_ids;
+    assert_eq!(related["rateLimitStatus"], "rejected");
+    assert_eq!(related["rateLimitResetsAt"], "1789155600");
+    assert_eq!(related["rateLimitType"], "five_hour");
+    assert_eq!(related["rateLimitUsingOverage"], "false");
+    assert!(!related.contains_key("unifiedWindows"), "{related:?}");
+}
+
 #[test]
 fn first_workflow_result_does_not_complete_the_run() {
     let first = review::map_stdout_json(json!({

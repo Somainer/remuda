@@ -5413,8 +5413,21 @@ fn map_outbound(mapper: &mut Mapper, frame: &Outbound) -> DriverResult<Vec<Obser
         Outbound::StreamEvent(event) => stream::map_stream(mapper, event),
         Outbound::ControlRequest(_) | Outbound::ControlResponse(_) => Ok(Vec::new()),
         Outbound::ControlCancelRequest { .. } => Ok(Vec::new()),
-        Outbound::RateLimitEvent(_) => {
-            mapper.lifecycle_named(LifecycleTopic::Diagnostic, "rate_limit_event")
+        Outbound::RateLimitEvent(event) => {
+            // cb-usage-resume: the window, its status and its reset time ride
+            // `relatedIds`, the first source of a usage-limit reset time.
+            use remuda_protocol::rate_limit_event as rle;
+            let info = event.rate_limit_info.as_ref();
+            let status = rle::status(info).unwrap_or_else(|| rle::NATIVE_NAME.to_owned());
+            let session_id = mapper.session_id.clone();
+            Ok(vec![mapper.lifecycle_related(
+                LifecycleTopic::Diagnostic,
+                rle::NATIVE_NAME,
+                Knowledge::Known { value: session_id },
+                &status,
+                rle::related_ids(info),
+                false,
+            )?])
         }
         Outbound::ToolProgress(_) => mapper.lifecycle_named(LifecycleTopic::Task, "tool_progress"),
         Outbound::PromptSuggestion(_) => {

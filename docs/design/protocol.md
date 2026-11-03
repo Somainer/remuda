@@ -1588,7 +1588,7 @@ object 上传授权绑定 actor、host/workspace 和用途；uploadId 使用 obj
 | `initiator` 与 `opId` | Hub→Node | 加在 `interaction.answer`、`worker.provision`、`worker.remove`、`worktree.lease`、`worktree.return`、`gate.run` 的 params 上。`opId` 是 Hub 在任何外部效果之前已持久化的受理记录 id：`interaction.answer` 用该答案的 commandId，`gate.run` 用 gate job id，其余方法用 Hub 的直连操作行 id。Node 在分发入口（`dispatch_frame`）、任何副作用之前按已持久化的 fence 拒绝被隔离的发起者（reason `fenced`）；对放行的操作，在任何副作用之前持久记下 opId、方法与发起者，之后再记结果。只有入口记录、没有结果的操作在 fence 确认里报告 `unknown` |
 | `gate.then` / `gate.land` / `gate.unpin` / `gate.cancel` | Hub→Node | 带 job id，是一个已开跑 job 的延续：Node 把它们作为 fence 之前已到达执行者的操作的后续步骤接纳，已开跑的 job（含 land 步骤）执行完毕 |
 
-`memoryContext` 在各启动路径上的注入机制（D-060；与 [main-agent.md §12.3](./main-agent.md#123-reading) 的表一致）。它覆盖 `materialize_inner` 里 driver match 的每个分支（:239）与之前的 shell-pty agent 分支（:229），乘以 Node 的 `validate_kind_driver`（`crates/remuda-node/src/runtime.rs:3047`）为该 driver 接受的每种 kind；其余组合在物化之前即被拒绝。此表对该 match 是穷尽的，新增 `DriverKind` 分支或新接受的组合必须同时加行。
+`memoryContext` 在各启动路径上的注入机制（D-060；与 [main-agent.md §12.3](./main-agent.md#123-reading) 的表一致）。它覆盖 `materialize_inner` 里 driver match 的每个分支（:239）与之前的 shell-pty agent 分支（:229），乘以 Node 的 `validate_kind_driver`（`crates/remuda-node/src/runtime.rs:3047`）为该 driver 接受的每种 kind；其余组合在物化之前即被拒绝。此表对该 match 是穷尽的，新增 `DriverKind` 分支或新接受的组合必须同时加行。唯一没有行的分支是 `herdr-claimed`（D-062）：Node 对任何 kind 都不在 create 时接受它，物化器的该分支直接拒绝；认领的外部 pane 从不启动，也从不收到 `memoryContext`。
 
 | # | Driver | Kind | `crates/remuda-driver/src/materializer.rs` 中的 match 分支（origin/main `c27e0eac`） | 机制 |
 |---|---|---|---|---|

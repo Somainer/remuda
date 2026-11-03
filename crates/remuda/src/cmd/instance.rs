@@ -129,6 +129,16 @@ pub(crate) enum InstanceCommand {
         #[arg(long)]
         command_id: Option<String>,
     },
+    /// Change a per-instance property (owner only): `--auto-continue on|off`
+    /// makes the Hub continue the instance once after a subscription usage
+    /// limit resets (main-agent.md §11.6).
+    Set {
+        /// Instance id (`ins_…`) or name.
+        instance_id: String,
+        /// `on` or `off`.
+        #[arg(long, value_parser = parse_on_off, value_name = "on|off")]
+        auto_continue: Option<bool>,
+    },
     /// Close an instance (`instance.close`).
     Rm {
         /// Instance id (`ins_…`) or name.
@@ -224,6 +234,10 @@ pub(crate) struct CreateArgs {
     /// the Hub refuses Agent and Bot callers with 403.
     #[arg(long, value_parser = parse_restart_flag)]
     pub restart: Option<RestartFlag>,
+    /// After a subscription usage limit resets, the Hub continues the
+    /// instance once (main-agent.md §11.6). Default off.
+    #[arg(long)]
+    pub auto_continue: bool,
 }
 
 /// Inputs for [`create`].
@@ -256,6 +270,8 @@ pub(crate) struct CreateOpts {
     pub permission_mode: Option<String>,
     pub model: Option<String>,
     pub restart: Option<RestartFlag>,
+    /// `autoContinue` (cb-usage-resume).
+    pub auto_continue: bool,
 }
 
 /// Parsed `--restart` value (D-057 §6.1).
@@ -269,6 +285,15 @@ pub(crate) enum RestartFlag {
     None,
     /// `--restart process-loss:<N>` — `{onProcessLoss:true,maxPerHour:N}`.
     ProcessLoss(u32),
+}
+
+/// clap value parser for `--auto-continue`: `on` or `off`.
+fn parse_on_off(raw: &str) -> Result<bool, String> {
+    match raw {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        other => Err(format!("expected on or off, got {other}")),
+    }
 }
 
 /// clap value parser for `--restart`: `none` or `process-loss:<N>` (N >= 1).
@@ -320,6 +345,7 @@ pub(crate) fn run(hub: HubOpts, command: InstanceCommand) -> Result<()> {
                     permission_mode,
                     model,
                     restart,
+                    auto_continue,
                 } = *args;
                 // `--project` is the single-project scope shortcut; the Hub
                 // ignores `projectId` whenever an explicit `scope` object is
@@ -369,6 +395,7 @@ pub(crate) fn run(hub: HubOpts, command: InstanceCommand) -> Result<()> {
                         permission_mode,
                         model,
                         restart,
+                        auto_continue,
                     },
                 )
                 .await?;
@@ -463,6 +490,20 @@ pub(crate) fn run(hub: HubOpts, command: InstanceCommand) -> Result<()> {
                     command_id.as_deref(),
                 )
                 .await?;
+                print_json(&value)
+            }
+            InstanceCommand::Set {
+                instance_id,
+                auto_continue,
+            } => {
+                let instance_id = resolve_instance_id(&client, &instance_id).await?;
+                let mut body = json!({});
+                if let Some(on) = auto_continue {
+                    body["autoContinue"] = json!(on);
+                }
+                let value = client
+                    .patch(&format!("/v1/instances/{instance_id}"), &body)
+                    .await?;
                 print_json(&value)
             }
             InstanceCommand::Rm {
@@ -585,6 +626,9 @@ pub(crate) async fn create(client: &HubClient, mut opts: CreateOpts) -> Result<V
     }
     if let Some(model) = &opts.model {
         body["model"] = json!(model);
+    }
+    if opts.auto_continue {
+        body["autoContinue"] = json!(true);
     }
     if let Some(RestartFlag::ProcessLoss(cap)) = &opts.restart {
         body["restart"] = json!({
@@ -1722,6 +1766,30 @@ mod tests {
         assert_eq!(normalize_driver("pty"), "generic-pty");
         assert!(tty_attach_driver("pty"));
         assert!(!tty_attach_driver("claude-print"));
+    }
+
+    #[test]
+    fn auto_continue_flag_is_on_or_off() {
+        assert_eq!(parse_on_off("on"), Ok(true));
+        assert_eq!(parse_on_off("off"), Ok(false));
+        assert!(parse_on_off("yes").is_err());
+        #[derive(clap::Parser, Debug)]
+        struct Wrap {
+            #[command(subcommand)]
+            command: InstanceCommand,
+        }
+        let parsed = <Wrap as clap::Parser>::try_parse_from([
+            "instance",
+            "set",
+            "ins_x",
+            "--auto-continue",
+            "off",
+        ])
+        .expect("parse");
+        match parsed.command {
+            InstanceCommand::Set { auto_continue, .. } => assert_eq!(auto_continue, Some(false)),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

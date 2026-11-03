@@ -89,6 +89,10 @@ pub(crate) struct DispatchArgs {
     /// attempt returned (D-017). The request must be the same one.
     #[arg(long = "approval-id", value_name = "INTERACTION_ID")]
     approval_id: Option<String>,
+    /// After a subscription usage limit resets, the Hub continues the worker
+    /// once (main-agent.md §11.6). Default off.
+    #[arg(long = "auto-continue")]
+    auto_continue: bool,
 }
 
 impl Entrypoint for DispatchArgs {
@@ -180,6 +184,11 @@ async fn run(args: DispatchArgs) -> anyhow::Result<i32> {
     // chooses a mode itself.
     if let Some(mode) = &args.permission_mode {
         body["permissionMode"] = json!(mode);
+    }
+    // cb-usage-resume: sent only when set, so a plain dispatch body is
+    // unchanged.
+    if args.auto_continue {
+        body["autoContinue"] = json!(true);
     }
     let value = client
         .post("/v1/workers/dispatch", &body)

@@ -1689,6 +1689,45 @@ async fn each_turn_line_quotes_its_own_turns_tail() -> Result<()> {
     Ok(())
 }
 
+/// A credential in a worker's turn error (the text a provider's 401 echoes)
+/// is redacted before the line quotes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_credential_in_a_turn_error_is_redacted_in_the_batch() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("deliver-redact").await?;
+    let (seat, token) = ctx.seat(&project).await?;
+    ctx.journal(&seat, activity("working", &at(1))).await?;
+    // Built at run time: no credential-shaped literal in the source.
+    let key = ["sk", "-ant-api03-", "QWERTYUIOPASDFGHJKLZXCVB"].concat();
+    let error = format!("upstream 401: Authorization: Bearer {key}");
+    let worker = ctx.worker(&token, &project).await?;
+    ctx.journal(&worker, entity("running", &at(2))).await?;
+    ctx.journal(&worker, turn_started("cmd_r", &at(3))).await?;
+    ctx.journal(
+        &worker,
+        turn_result("error", Some("cmd_r"), true, Some(&error), &at(4)),
+    )
+    .await?;
+    ctx.journal(&seat, activity("idle", &at(30))).await?;
+    ctx.settle().await?;
+    let sends = ctx.seen.sends_to(&seat);
+    assert_eq!(sends.len(), 1);
+    let text = text_of(&sends[0]);
+    let failed = text
+        .lines()
+        .find(|line| line.starts_with("- [turn-failed]"))
+        .context("the turn-failed line")?;
+    assert!(failed.contains("upstream 401"), "{failed}");
+    assert!(failed.contains("redacted"), "{failed}");
+    assert!(!text.contains(&key), "{text}");
+    let page = ctx.inbox(&seat).await?;
+    assert!(
+        !page["batches"].to_string().contains(&key),
+        "the stored batch row: {page:#}"
+    );
+    Ok(())
+}
+
 /// A batch never carries the owner's words: what the owner sent a worker is
 /// not a fact, and the only worker texts read are its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

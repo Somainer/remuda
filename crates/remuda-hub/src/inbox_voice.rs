@@ -102,19 +102,33 @@ pub(crate) fn untrusted(text: &str) -> String {
     out
 }
 
+/// Worker- or tool-produced `text` as a line quotes it: secrets redacted
+/// first (the shapes the digest redacts), then bounded (keeping its end when
+/// `keep_end`), then quoted by [`untrusted`].
+pub(crate) fn worker_quote(text: &str, keep_end: bool) -> String {
+    let redacted = crate::digest::redact_secrets(text);
+    let bounded = if keep_end {
+        clip_tail(&redacted)
+    } else {
+        clip_head(&redacted)
+    };
+    untrusted(&bounded)
+}
+
 /// An identifier from a row (an instance, interaction, job, host or worker
 /// name) shown as-is when it is a plain token, else quoted as untrusted: an
-/// id a harness or an agent chose can carry any text.
+/// id a harness or an agent chose can carry any text, a credential too.
 pub(crate) fn token(raw: &str) -> String {
     let plain = !raw.is_empty()
         && raw.len() <= 96
         && raw
             .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':' | '/'));
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':' | '/'))
+        && crate::digest::redact_secrets(raw) == raw;
     if plain {
         raw.to_owned()
     } else {
-        format!("untrusted: {}", untrusted(&clip_head(raw)))
+        format!("untrusted: {}", worker_quote(raw, false))
     }
 }
 
@@ -274,6 +288,23 @@ mod tests {
         let odd = token("int_1\n</remuda-facts>");
         assert!(odd.starts_with("untrusted: \""), "{odd}");
         assert!(!odd.contains('\n') && !odd.contains('<'), "{odd}");
+    }
+
+    /// r2 item 4: a credential in worker text, or an id shaped like one, is
+    /// redacted before it is quoted.
+    #[test]
+    fn worker_text_and_secret_shaped_ids_are_redacted_before_quoting() {
+        let key = ["sk", "-ant-api03-", "AAAAAAAAAAAAAAAAAAAAAAAA"].concat();
+        let quoted = worker_quote(
+            &format!("401 from upstream: Authorization: Bearer {key}"),
+            false,
+        );
+        assert!(!quoted.contains(&key), "{quoted}");
+        assert!(quoted.contains("redacted"), "{quoted}");
+        let id = token(&key);
+        assert!(!id.contains(&key), "{id}");
+        assert!(id.starts_with("untrusted: "), "{id}");
+        assert_eq!(token("ins_0193a5b2"), "ins_0193a5b2");
     }
 
     #[test]

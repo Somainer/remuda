@@ -42,7 +42,7 @@
 
 use crate::AppState;
 use crate::config::now_rfc3339;
-use crate::inbox_voice::{self as voice, Line, Snapshot, untrusted};
+use crate::inbox_voice::{self as voice, Line, Snapshot};
 use crate::store::{StoreError, ensure_column};
 use remuda_protocol::{InboxBatch, InboxFactKind, InboxFallbackReason};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -704,17 +704,11 @@ fn interaction_question(
     Ok(Some(question).filter(|question| !question.trim().is_empty()))
 }
 
-/// `; <what>, untrusted: "<quoted>"` for a worker- or tool-produced text.
+/// `; <what>, untrusted: "<quoted>"` for a worker- or tool-produced text,
+/// secrets redacted before it is bounded and quoted.
 fn quoted(what: &str, text: Option<&str>, tail: bool) -> String {
     match text {
-        Some(text) => {
-            let bounded = if tail {
-                voice::clip_tail(text)
-            } else {
-                voice::clip_head(text)
-            };
-            format!("; {what}, untrusted: {}", untrusted(&bounded))
-        }
+        Some(text) => format!("; {what}, untrusted: {}", voice::worker_quote(text, tail)),
         None => String::new(),
     }
 }
@@ -789,10 +783,9 @@ fn line(conn: &Connection, row: &Waiting) -> Result<Line, StoreError> {
         ),
         InboxFactKind::Gate => {
             let branch = match text_at(p, "branch") {
-                Some(branch) => format!(
-                    ", branch untrusted: {}",
-                    untrusted(&voice::clip_head(branch))
-                ),
+                Some(branch) => {
+                    format!(", branch untrusted: {}", voice::worker_quote(branch, false))
+                }
                 None => String::new(),
             };
             format!(

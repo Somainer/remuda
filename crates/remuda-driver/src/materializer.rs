@@ -531,6 +531,13 @@ fn materialize_inner(
             // `terminal` / `generic`: [`memory_plan`] gives them nothing.
             memory = memory_plan(request, false, &binary.version);
         }
+        // D-062: a claimed external pane was started by a human; Remuda never
+        // materializes or launches it.
+        DriverKind::HerdrClaimed => {
+            return Err(DriverError::InvalidLaunchSpec(
+                "herdr-claimed instances are claimed with instance.claim, never launched".into(),
+            ));
+        }
     }
 
     collect_spec_env(request.spec, request.profile.delegation, &mut env_allowlist)?;
@@ -1059,6 +1066,7 @@ fn agent_kind(driver: DriverKind) -> AgentKind {
         DriverKind::AgyPrint => AgentKind::Agy,
         DriverKind::GenericPty => AgentKind::Generic,
         DriverKind::ShellPty => AgentKind::Terminal,
+        DriverKind::HerdrClaimed => AgentKind::Generic,
     }
 }
 
@@ -1071,7 +1079,7 @@ fn provider_matches(driver: DriverKind, kind: ProviderKind) -> bool {
         DriverKind::CodexAppserver => kind == ProviderKind::OpenaiResponses,
         DriverKind::GrokAcp => kind == ProviderKind::Xai || kind == ProviderKind::OpenaiResponses,
         DriverKind::AgyPrint => kind == ProviderKind::Google,
-        DriverKind::GenericPty | DriverKind::ShellPty => true,
+        DriverKind::GenericPty | DriverKind::ShellPty | DriverKind::HerdrClaimed => true,
     }
 }
 

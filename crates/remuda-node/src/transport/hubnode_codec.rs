@@ -229,6 +229,9 @@ pub async fn dispatch_frame(
     if crate::dir_browser::is_host_dirs_method(method) {
         return node.host_dirs_rpc(method, params).await;
     }
+    if crate::herdr_claim::is_herdr_claim_method(method) {
+        return node.herdr_claim_rpc(method, params).await;
+    }
     if method == "host.doctor" {
         return node.doctor().await;
     }

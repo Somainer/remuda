@@ -196,6 +196,19 @@ async fn dispatch_hub(
         }
         return Ok(result);
     }
+    if method == remuda_protocol::hubnode::METHOD_INSTANCE_CLAIM {
+        // D-062: like create, the claimed instance's journal flows through a
+        // per-instance pump started with the reply.
+        let result = runtime.node.herdr_claim_rpc(method, params).await?;
+        if let Some(id) = result
+            .pointer("/instance/id")
+            .and_then(Value::as_str)
+            .and_then(|id| InstanceId::try_from(id.to_owned()).ok())
+        {
+            ensure_pump(runtime, &id);
+        }
+        return Ok(result);
+    }
     match HubNodeMethod::parse(method) {
         Some(HubNodeMethod::InstanceCreate) => {
             let mut request = create_from_params(&runtime.node, &params)?;

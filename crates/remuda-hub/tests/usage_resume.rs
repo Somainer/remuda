@@ -566,6 +566,14 @@ fn rate_limit_event(status: &str, resets_at: i64) -> Value {
         "dataRef": null, "severity": "info", "affectsCompletion": false } })
 }
 
+/// An interaction the carrier asked for (a pending question).
+fn question(id: &str, title: &str) -> Value {
+    json!({ "kind": "interaction.requested", "payload": { "interaction": {
+        "id": id, "kind": "question", "state": "pending", "blocking": true,
+        "answerable": true, "carrier": "harness-hook",
+        "request": { "kind": "question", "title": title, "options": [] } } } })
+}
+
 /// The carrier's session start, with the harness's credential source.
 fn session_started(api_key_source: &str) -> Value {
     json!({ "kind": "lifecycle", "payload": {
@@ -1137,6 +1145,89 @@ async fn a_second_turn_end_for_the_same_run_keeps_the_wait() -> Result<()> {
     ctx.tick(&first.fire_at).await?;
     assert_eq!(ctx.facts(&seat, "supply-reset").await?.len(), 1);
     assert_eq!(ctx.seen.hub_sends_to(&worker).len(), 1);
+    Ok(())
+}
+
+/// Answering an interaction is input to the instance: it reaches the Node as
+/// a direct RPC and inserts no command row, so the input trigger cannot see
+/// it. The wait is cancelled by the answer path itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn answering_an_interaction_cancels_the_wait() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("resume-answer").await?;
+    let (seat, token) = ctx.seat(&project).await?;
+    let worker = ctx.worker(&token, &project, true).await?;
+    let interaction = remuda_protocol::InteractionId::new().as_id().to_string();
+    ctx.journal(&worker, question(&interaction, "which branch?"))
+        .await?;
+    ctx.settle().await?;
+    ctx.limit_turn(&worker, "cmd_a_1", Some(resets_in(600)), true, NOTICE)
+        .await?;
+    ctx.settle().await?;
+    let fire_at = ctx.waits(&worker)?[0].fire_at.clone();
+    assert_eq!(ctx.waits(&worker)?[0].state, "waiting");
+
+    let (status, body) = ctx
+        .request(
+            reqwest::Method::POST,
+            &ctx.human,
+            &format!("/v1/interactions/{interaction}/answer"),
+            Some(json!({ "answer": { "kind": "question", "answers": {} } })),
+        )
+        .await?;
+    anyhow::ensure!((200..300).contains(&status), "answer {status}: {body}");
+    let waits = ctx.waits(&worker)?;
+    assert_eq!(waits[0].state, "cancelled", "{waits:?}");
+    assert_eq!(waits[0].reason.as_deref(), Some("input"));
+    ctx.tick(&fire_at).await?;
+    assert!(ctx.facts(&seat, "supply-reset").await?.is_empty());
+    assert!(ctx.seen.hub_sends_to(&worker).is_empty());
+    Ok(())
+}
+
+/// Each input route that does write a command row cancels too: keys
+/// (`instance.keys`), raw terminal bytes (`tty.write`, which is how a
+/// switch-model reaches a shell driver) and an answer typed into the
+/// transcript (`instance.respond`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn keys_typed_bytes_and_a_respond_cancel_the_wait() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("resume-inputs").await?;
+    let (seat, token) = ctx.seat(&project).await?;
+    let paths = [
+        ("instance.keys", json!({ "keys": ["enter"] })),
+        ("tty.write", json!({ "bytes": "eQ==" })),
+        (
+            "instance.respond",
+            json!({ "answer": { "kind": "question", "answers": {} } }),
+        ),
+    ];
+    for (n, (operation, payload)) in paths.iter().enumerate() {
+        let worker = ctx.worker(&token, &project, true).await?;
+        ctx.limit_turn(
+            &worker,
+            &format!("cmd_i_{n}"),
+            Some(resets_in(600)),
+            true,
+            NOTICE,
+        )
+        .await?;
+        ctx.settle().await?;
+        assert_eq!(ctx.waits(&worker)?[0].state, "waiting", "{operation}");
+        ctx.post(
+            &ctx.human,
+            &format!("/v1/instances/{worker}/commands"),
+            json!({ "operation": operation, "payload": payload }),
+        )
+        .await?;
+        let waits = ctx.waits(&worker)?;
+        assert_eq!(waits[0].state, "cancelled", "{operation}: {waits:?}");
+        assert_eq!(waits[0].reason.as_deref(), Some("input"), "{operation}");
+        let fire_at = waits[0].fire_at.clone();
+        ctx.tick(&fire_at).await?;
+        assert!(ctx.seen.hub_sends_to(&worker).is_empty(), "{operation}");
+    }
+    assert!(ctx.facts(&seat, "supply-reset").await?.is_empty());
     Ok(())
 }
 

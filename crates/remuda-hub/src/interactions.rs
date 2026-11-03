@@ -796,6 +796,15 @@ pub async fn answer_interaction(
             )
             .await;
         }
+        // cb-usage-resume r2: an answer is input to the instance. A live-only
+        // grant (no durable interaction row) settles in memory, so its wait
+        // is cancelled in its own writer job, after that settlement.
+        if let Some(instance) = &in_memory_grant_instance {
+            let instance = instance.clone();
+            if let Err(error) = state.store.cancel_usage_wait(instance, "input").await {
+                tracing::warn!(code = %crate::inbox::error_code(&error), "usage wait cancel failed");
+            }
+        }
         return Ok(Json(result));
     }
     // The chain start/kind for the unconditional answer audit, captured

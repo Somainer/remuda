@@ -1661,6 +1661,45 @@ fn original_prompt(payload: &Value) -> Option<Value> {
         .map(|text| json!({ "type": "prompt", "text": text }))
 }
 
+/// Cancel `instance_id`'s wait because input reached it (`reason`), from
+/// any writer transaction: the `waiting` and `holding` rows, and a formed
+/// continuation still queued and unforwarded (settled `cancelled`,
+/// `resume-cancelled`). The `commands` trigger does the same for input that
+/// passes through the command table; this is for the paths that do not —
+/// an answered interaction goes straight to its Node as a direct RPC
+/// (§7.5) and never inserts a command row. The only other input routes
+/// (`instance.send`, `instance.respond`, `instance.keys`, `tty.write`,
+/// `instance.configure`, and the worker keys/answer verbs that post them)
+/// all write command rows and are already covered by the trigger.
+pub(crate) fn cancel(
+    conn: &Connection,
+    instance_id: &str,
+    reason: &str,
+) -> Result<usize, StoreError> {
+    let now = now_rfc3339();
+    conn.execute(
+        "UPDATE commands
+            SET state = 'settled', resolution = 'clear',
+                settlement_outcome = 'cancelled', settlement_reason = 'resume-cancelled',
+                updated_at = ?2
+          WHERE id IN (SELECT command_id FROM resume_on_reset
+                        WHERE instance_id = ?1 AND state = 'continued')
+            AND state = 'queued' AND forwarded = 0",
+        params![instance_id, now],
+    )?;
+    Ok(conn.execute(
+        "UPDATE resume_on_reset
+            SET state = 'cancelled', reason = ?2, updated_at = ?3
+          WHERE instance_id = ?1
+            AND (state IN ('waiting', 'holding')
+                 OR (state = 'continued' AND EXISTS (
+                       SELECT 1 FROM commands c
+                        WHERE c.id = resume_on_reset.command_id
+                          AND c.settlement_reason = 'resume-cancelled')))",
+        params![instance_id, reason, now],
+    )?)
+}
+
 /// F (§7.2) moved `lineage_id` to `chapter` at `generation`: every wait that
 /// carries the lineage's initiator is re-attributed to it. That includes a
 /// `continued` row whose continuation is already forwarded: F settles only
@@ -1690,6 +1729,19 @@ pub(crate) const UNSENT_SQL: &str = "SELECT r.command_id, c.host_id, r.continued
       WHERE r.state = 'continued' AND c.state = 'queued' AND c.forwarded = 0";
 
 impl crate::store::Store {
+    /// [`cancel`] as its own writer job, for a caller whose settlement is not
+    /// one (a live-only approval grant has no durable row to join).
+    pub(crate) async fn cancel_usage_wait(
+        &self,
+        instance_id: String,
+        reason: &'static str,
+    ) -> Result<usize, StoreError> {
+        self.run_named("cancel_usage_wait", move |conn| {
+            cancel(conn, &instance_id, reason)
+        })
+        .await
+    }
+
     /// Set `instance_id`'s `autoContinue`; `false` when there is no such
     /// instance. Turning it off settles nothing already formed: a
     /// continuation formed before still goes (it is a command with its id).

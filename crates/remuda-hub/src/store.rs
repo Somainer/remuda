@@ -6929,7 +6929,25 @@ impl Store {
         interaction_id: String,
     ) -> Result<(), StoreError> {
         self.run_named("record_interaction_answer", move |conn| {
-            conn.execute("UPDATE interactions SET state = 'answer-committed', updated_at = ?1 WHERE id = ?2 AND state = 'pending'", params![now_rfc3339(), interaction_id])?;
+            let tx = immediate_tx(conn)?;
+            tx.execute("UPDATE interactions SET state = 'answer-committed', updated_at = ?1 WHERE id = ?2 AND state = 'pending'", params![now_rfc3339(), interaction_id])?;
+            // cb-usage-resume r2: an answer is input to the instance, and it
+            // arrives as a direct RPC that never inserts a command row, so
+            // the input trigger cannot see it. Cancel the wait here, in the
+            // same transaction as the settlement.
+            let instance: Option<String> = tx
+                .query_row(
+                    "SELECT instance_id FROM interactions WHERE id = ?1",
+                    params![interaction_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(instance) = instance {
+                crate::inbox::guard("usage_resume_cancel", &tx, || {
+                    crate::usage_resume::cancel(&tx, &instance, "input")
+                });
+            }
+            tx.commit()?;
             Ok(())
         }).await
     }

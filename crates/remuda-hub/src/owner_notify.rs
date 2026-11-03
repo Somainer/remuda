@@ -25,6 +25,11 @@
 //! - **Dedupe.** A repeat with the same dedupe key in the same scope (the
 //!   writer's lineage, or the owner for a Human call) returns the original
 //!   row, writes nothing and pushes nothing.
+//! - **Repeating failures.** [`notify_failure`] latches a failure kind per
+//!   scope: the first occurrence notifies, a repeat while the latch is set only
+//!   counts, and [`recover`] clears it. [`notify_wake`] is the wake engine's
+//!   entry: it applies a wake-up's `notify` declaration (`never`, `failure`,
+//!   `always`) on top of these.
 //! - **Notices.** `GET /v1/owner/notices` lists them (`unacked=1` for the home
 //!   queue, `instanceId` for one chapter's transcript); `POST
 //!   /v1/owner/notices/{id}/ack` is the owner's acknowledgement, on every
@@ -92,7 +97,15 @@ pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
          CREATE INDEX IF NOT EXISTS owner_notices_unacked
             ON owner_notices(created_at) WHERE acked_at IS NULL;
          CREATE INDEX IF NOT EXISTS owner_notices_chapter
-            ON owner_notices(chapter_instance_id, created_at);",
+            ON owner_notices(chapter_instance_id, created_at);
+         CREATE TABLE IF NOT EXISTS owner_notify_latches (
+            scope TEXT NOT NULL,
+            failure_kind TEXT NOT NULL,
+            notice_id TEXT NOT NULL,
+            since TEXT NOT NULL,
+            repeats INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (scope, failure_kind)
+         );",
     )
 }
 
@@ -346,6 +359,157 @@ pub(crate) fn claim(conn: &Connection, input: &NoticeInput) -> Result<Claimed, S
     let notice = load(conn, &notice_id)?
         .ok_or_else(|| StoreError::Id("owner notice vanished in its own transaction".into()))?;
     Ok(Claimed::Created(notice))
+}
+
+// ─── repeating failures (§11.5) ─────────────────────────────────────────────
+
+// cb-wake-engine calls this; until it lands only the tests do.
+#[cfg_attr(not(test), allow(dead_code))]
+/// The outcome of [`notify_failure`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FailureNotice {
+    /// The first failure of its kind since the scope last recovered: a
+    /// notice was claimed (or found by its dedupe key).
+    Notified(Box<Claimed>),
+    /// A repeat while the previous failure of the same kind has not
+    /// recovered: counted, nothing claimed, nothing pushed.
+    Repeat {
+        /// The notice the first failure claimed.
+        notice_id: String,
+        /// Repeats since that first failure, this one included.
+        repeats: i64,
+    },
+}
+
+// cb-wake-engine calls this; until it lands only the tests do.
+#[cfg_attr(not(test), allow(dead_code))]
+/// A failure of `kind` in `scope` (a wake-up, a lineage): notify only when no
+/// earlier failure of that kind is still unrecovered.
+pub(crate) fn notify_failure(
+    conn: &Connection,
+    scope: &str,
+    kind: &str,
+    input: &NoticeInput,
+) -> Result<FailureNotice, StoreError> {
+    let latched: Option<String> = conn
+        .query_row(
+            "SELECT notice_id FROM owner_notify_latches WHERE scope = ?1 AND failure_kind = ?2",
+            params![scope, kind],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(notice_id) = latched {
+        let repeats: i64 = conn.query_row(
+            "UPDATE owner_notify_latches SET repeats = repeats + 1
+              WHERE scope = ?1 AND failure_kind = ?2 RETURNING repeats",
+            params![scope, kind],
+            |row| row.get(0),
+        )?;
+        return Ok(FailureNotice::Repeat { notice_id, repeats });
+    }
+    let claimed = claim(conn, input)?;
+    conn.execute(
+        "INSERT INTO owner_notify_latches (scope, failure_kind, notice_id, since)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![scope, kind, claimed.notice().notice_id, now_rfc3339()],
+    )?;
+    Ok(FailureNotice::Notified(Box::new(claimed)))
+}
+
+// cb-wake-engine calls this; until it lands only the tests do.
+#[cfg_attr(not(test), allow(dead_code))]
+/// `scope` recovered: clear its latch for `kind`, or for every kind when
+/// `kind` is `None`, so the next failure notifies again. Returns how many
+/// latches were cleared.
+pub(crate) fn recover(
+    conn: &Connection,
+    scope: &str,
+    kind: Option<&str>,
+) -> Result<usize, StoreError> {
+    Ok(match kind {
+        Some(kind) => conn.execute(
+            "DELETE FROM owner_notify_latches WHERE scope = ?1 AND failure_kind = ?2",
+            params![scope, kind],
+        )?,
+        None => conn.execute(
+            "DELETE FROM owner_notify_latches WHERE scope = ?1",
+            params![scope],
+        )?,
+    })
+}
+
+// cb-wake-engine calls this; until it lands only the tests do.
+#[cfg_attr(not(test), allow(dead_code))]
+/// A wake-up's `notify` declaration (§11.5); the Hub never picks one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum NotifyPolicy {
+    /// Never notify.
+    Never,
+    /// Notify on a failure, once per unrecovered failure kind.
+    Failure,
+    /// Notify on every success, and on a failure as `failure` does.
+    Always,
+}
+
+impl std::str::FromStr for NotifyPolicy {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "never" => Ok(Self::Never),
+            "failure" => Ok(Self::Failure),
+            "always" => Ok(Self::Always),
+            other => Err(format!(
+                "unknown notify {other:?}; use never, failure or always"
+            )),
+        }
+    }
+}
+
+// cb-wake-engine calls this; until it lands only the tests do.
+#[cfg_attr(not(test), allow(dead_code))]
+/// How a wake run ended, for its `notify` declaration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WakeOutcome<'a> {
+    /// The run succeeded (or was skipped without failing).
+    Success,
+    /// The run failed; `kind` names the failure (`check-timeout`,
+    /// `check-exit`, `delivery`, …) so different failures latch apart.
+    Failure { kind: &'a str },
+}
+
+// cb-wake-engine calls this; until it lands only the tests do.
+#[cfg_attr(not(test), allow(dead_code))]
+/// The wake engine's call after a run settles: apply the wake-up's `notify`
+/// declaration. A success clears every failure latch of the wake-up (it
+/// recovered) and, under `always`, notifies; a failure under `failure` or
+/// `always` notifies once per unrecovered kind; `never` notifies nothing.
+/// `input.dedupe_key` may carry the run id so a retried result write claims
+/// nothing twice. Returns the notice outcome, `None` when nothing was due.
+pub(crate) fn notify_wake(
+    conn: &Connection,
+    wake_id: &str,
+    policy: NotifyPolicy,
+    outcome: WakeOutcome<'_>,
+    input: &NoticeInput,
+) -> Result<Option<FailureNotice>, StoreError> {
+    let scope = format!("wake:{wake_id}");
+    match outcome {
+        WakeOutcome::Success => {
+            recover(conn, &scope, None)?;
+            if policy == NotifyPolicy::Always {
+                return Ok(Some(FailureNotice::Notified(Box::new(claim(conn, input)?))));
+            }
+            Ok(None)
+        }
+        WakeOutcome::Failure { kind } => match policy {
+            NotifyPolicy::Never => Ok(None),
+            NotifyPolicy::Failure | NotifyPolicy::Always => {
+                Ok(Some(notify_failure(conn, &scope, kind, input)?))
+            }
+        },
+    }
 }
 
 /// Acknowledge a notice (idempotent): the first acknowledgement stamps it,
@@ -787,6 +951,104 @@ mod tests {
             claim(&conn, &other).expect("claim"),
             Claimed::Created(_)
         ));
+    }
+
+    #[test]
+    fn a_repeating_failure_pushes_once_until_it_recovers() {
+        let conn = db();
+        let failed = |conn: &Connection| {
+            notify_wake(
+                conn,
+                "wak_1",
+                NotifyPolicy::Failure,
+                WakeOutcome::Failure {
+                    kind: "check-timeout",
+                },
+                &input("Wake check timed out", None),
+            )
+            .expect("wake")
+        };
+        let Some(FailureNotice::Notified(claimed)) = failed(&conn) else {
+            panic!("the first failure notifies");
+        };
+        let Claimed::Created(first) = *claimed else {
+            panic!("the first failure claims a new notice");
+        };
+        assert_eq!(
+            failed(&conn),
+            Some(FailureNotice::Repeat {
+                notice_id: first.notice_id.clone(),
+                repeats: 1
+            })
+        );
+        assert_eq!(
+            failed(&conn),
+            Some(FailureNotice::Repeat {
+                notice_id: first.notice_id.clone(),
+                repeats: 2
+            })
+        );
+        assert_eq!(outbox_rows(&conn), 1, "repeats push nothing");
+        // A different failure kind latches apart.
+        let other = notify_wake(
+            &conn,
+            "wak_1",
+            NotifyPolicy::Failure,
+            WakeOutcome::Failure { kind: "check-exit" },
+            &input("Wake check failed", None),
+        )
+        .expect("wake");
+        assert!(matches!(other, Some(FailureNotice::Notified(_))));
+        assert_eq!(outbox_rows(&conn), 2);
+        // A success recovers every kind; `failure` sends nothing for it.
+        let ok = notify_wake(
+            &conn,
+            "wak_1",
+            NotifyPolicy::Failure,
+            WakeOutcome::Success,
+            &input("Wake ran", None),
+        )
+        .expect("wake");
+        assert_eq!(ok, None);
+        assert!(matches!(
+            failed(&conn),
+            Some(FailureNotice::Notified(ref claimed)) if matches!(**claimed, Claimed::Created(_))
+        ));
+        assert_eq!(
+            outbox_rows(&conn),
+            3,
+            "after recovery the failure pushes again"
+        );
+    }
+
+    #[test]
+    fn the_notify_declaration_decides_what_pushes() {
+        let conn = db();
+        let run = |policy, outcome| {
+            notify_wake(&conn, "wak_2", policy, outcome, &input("Wake", None)).expect("wake")
+        };
+        assert_eq!(
+            run(NotifyPolicy::Never, WakeOutcome::Failure { kind: "x" }),
+            None
+        );
+        assert_eq!(run(NotifyPolicy::Never, WakeOutcome::Success), None);
+        assert_eq!(run(NotifyPolicy::Failure, WakeOutcome::Success), None);
+        assert_eq!(outbox_rows(&conn), 0);
+        assert!(matches!(
+            run(NotifyPolicy::Always, WakeOutcome::Success),
+            Some(FailureNotice::Notified(ref claimed)) if matches!(**claimed, Claimed::Created(_))
+        ));
+        assert!(matches!(
+            run(NotifyPolicy::Always, WakeOutcome::Failure { kind: "x" }),
+            Some(FailureNotice::Notified(ref claimed)) if matches!(**claimed, Claimed::Created(_))
+        ));
+        assert!(matches!(
+            run(NotifyPolicy::Always, WakeOutcome::Failure { kind: "x" }),
+            Some(FailureNotice::Repeat { .. })
+        ));
+        assert_eq!(outbox_rows(&conn), 2);
+        assert_eq!("failure".parse(), Ok(NotifyPolicy::Failure));
+        assert!("sometimes".parse::<NotifyPolicy>().is_err());
     }
 
     #[test]

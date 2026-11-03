@@ -2129,6 +2129,35 @@ payload.tail      = turn-done only: the text that turn ended with, redacted,
 - 新增的项目设置：`policy.configurable.factOccurrenceCap`（默认 6）与 `policy.configurable.stallToolThresholdMins`（缺省表示工具在途时永不产生 stall 事实）。
 - **投递（`cb-inbox-deliver`）。** 血缘的当前章节空闲、没有自己的待决交互、也没有所有者输入在排队或在途时，Hub 把全部未投递的行合成一批，作为一条 `instance.send`（`origin: hub`）发给该章节；`batchId` 就是这条 send 的 `commandId`，成批时选定并落库，带该章节代数的 Hub 内部 initiator，不带设备 id。批行（`InboxBatch`：原文、开头标签、模板版本、事实 id）与命令行在同一事务里提交，早于任何转发意图。文本是 Hub 的口吻，以固定标签 `<remuda-facts>` 开头、`</remuda-facts>` 结尾，不超过 4096 字节；worker 或工具写的文本先按 digest 的秘密形状脱敏，再以 `untrusted: "…"` 的 JSON 字符串引用（引号、换行、控制字符、`<`、`>`、`&` 与不可见格式字符都被转义），读者按 JSON 字符串解出原文，并把它当数据。成批时逐行复查：订阅者已 mute 该种类、主体换了父血缘或已无订阅者的行带 `fallback` 退回所有者推送（只有今天会推送的种类才推：`interaction`、`exited`、`waiting`），不再进入任何批，也不算已消费。F 取消尚未转发的批时，它的行回到未投递，之后以新 id 成批；Node 以 `execution: not-dispatched` 结算的批同样交还它的行。Hub 能证明没有送达的转发（Hub 侧 NODE_BUSY、连接已断、Node 在记录前以 JSON-RPC 错误拒绝）不结算这条 send，而是放回队列，以同一 id 退避重试（1 s 起，最长 60 s，最多 10 次；次数记在命令行上，与放回在同一事务里计数，第 10 次在同一事务里以 `not-delivered` 结算，批的行回到未投递）。重启通知用同一退避。周期检查也会驱动没有任何重试登记、未被扣住的未发送批与重启通知，所以登记丢失也不会让它们搁浅。Node 回答 instance not found 时以 `instance-not-found` 结算，不再重试，该章节不再接批。成批之后、转发之前到达的所有者输入仍然先行：转发意图提交的同一 writer 任务里再查一次，批留在队列里，所有者输入结算后再驱动它。可能已到达章节的批保留它的行（每批至多一次）。
 
+
+**用量上限后的续跑（`cb-usage-resume`）。** 机制见 [main-agent.md §11.7](./main-agent.md#117-implementation-notes-cb-usage-resume-2026-11-03)。订阅窗口的用量上限才排等待行；API key 或网关的 429 不排，即使带了重试时刻。
+
+~~~text
+POST  /v1/instances            body gains  autoContinue?: bool      default false; any creator
+POST  /v1/workers/dispatch     body gains  autoContinue?: bool      default false
+GET   /v1/instances/{id}       InstanceRecord gains  autoContinue: bool
+PATCH /v1/instances/{id}
+  body {autoContinue?: bool}                absent keeps its value
+  -> 200 InstanceRecord                     Human only; Agent and Bot 403
+
+rate_limit_event (lifecycle, topic diagnostic) relatedIds, all strings:
+  rateLimitStatus          allowed | allowed_warning | rejected (also the lifecycle status)
+  rateLimitResetsAt        Unix-epoch seconds
+  rateLimitType            the window: five_hour | seven_day | seven_day_opus | ...
+  rateLimitOverageStatus, rateLimitUsingOverage
+
+turn-failed  payload.usageLimit = {class, window?, resetsAt?, source?, waits,
+                                   fireAt?, autoContinue?, reason?}
+  class  = subscription | api-key-or-gateway | api-rate-limit
+  source = structured | supply-window | error-text
+  reason = beyond-8-days | no-reset-time          (waits: false)
+supply-reset payload (from a wait) = {window, resetsAt, fireAt, source, profileId,
+                                      autoContinue: off | continue | capped}
+~~~
+
+- 续跑是一条新的 `instance.send`（`origin: hub`），commandId 在成形时选定并落库，带订阅血缘当前代的 Hub 内部 initiator，不带设备 id；F 把等待行改记到后继章节。任何不是 Hub 写的输入（含 `instance.configure`，即 switch-model）在同一事务里取消该实例的等待。
+- CLI：`remuda instance create --auto-continue`、`remuda dispatch --auto-continue`、`remuda instance set <instance> --auto-continue on|off`。
+
 ## 9. 错误码、未知值与兼容性
 
 ### 9.1 错误对象

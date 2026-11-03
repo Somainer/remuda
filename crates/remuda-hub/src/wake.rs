@@ -1515,12 +1515,26 @@ fn due_scheduled(
 
 /// The `when` conditions met since each one's cursor: one run for the facts
 /// that met it, the latest standing for them. Facts about a wake run's own
-/// fresh child never count, so a wake-up cannot keep re-firing itself.
+/// fresh child never count, so a wake-up cannot keep re-firing itself. A
+/// `when` wake-up whose lineage is gone turns `done`.
 fn due_conditions(
     conn: &Connection,
     now_s: &str,
     outcome: &mut TickOutcome,
 ) -> Result<(), StoreError> {
+    // A lineage that no longer exists records no facts, so its `when`
+    // wake-ups could never fire again: they turn `done`, as a scheduled
+    // wake-up does when it comes due.
+    let gone = conn.execute(
+        "UPDATE wake_ups SET state = 'done', updated_at = ?1
+          WHERE state = 'active' AND trigger_kind = 'when'
+            AND NOT EXISTS (SELECT 1 FROM lineages l WHERE l.lineage_id = wake_ups.lineage_id)
+            AND NOT EXISTS (SELECT 1 FROM instances i WHERE i.id = wake_ups.lineage_id)",
+        params![now_s],
+    )?;
+    if gone > 0 {
+        tracing::info!(category = "wake", outcome = "lineage-gone", wake_ups = gone);
+    }
     let candidates: Vec<Wake> = conn
         .prepare_cached(&format!(
             "SELECT {TICK_COLUMNS} FROM wake_ups w

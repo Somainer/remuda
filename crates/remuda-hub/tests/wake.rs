@@ -1225,6 +1225,59 @@ async fn a_queued_result_survives_a_restart_and_is_written_after_it() -> Result<
     Ok(())
 }
 
+/// r2 item 4: once its lineage is gone, a `when` wake-up turns `done` on the
+/// next tick (no fact can ever reach it again), and a scheduled one when it
+/// next comes due; neither fires.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wake_ups_of_a_deleted_lineage_turn_done() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("wake-gone").await?;
+    let (seat, token) = ctx.seat(&project).await?;
+    let when = ctx
+        .add_ok(
+            &token,
+            &seat,
+            json!({ "name": "on-gate", "text": "A gate ended.",
+                    "trigger": { "kind": "when", "factKind": "gate" }, "notify": "never" }),
+        )
+        .await?;
+    let scheduled = ctx
+        .add_ok(&token, &seat, every(600, "beat", "never"))
+        .await?;
+    // The seat's process ends; the owner deletes the lineage.
+    ctx.journal(&seat, entity("exited", &at(5))).await?;
+    let (status, body) = ctx
+        .request(
+            reqwest::Method::DELETE,
+            &ctx.human,
+            &format!("/v1/instances/{seat}"),
+            None,
+        )
+        .await?;
+    assert_eq!(status, 200, "{body}");
+    let state = |wake: &Value| -> Result<String> {
+        Ok(ctx.db()?.query_row(
+            "SELECT state FROM wake_ups WHERE wake_id = ?1",
+            [wake["wakeId"].as_str().unwrap()],
+            |row| row.get(0),
+        )?)
+    };
+    assert_eq!(state(&when)?, "active");
+    // A tick before the scheduled one is due: the `when` one is done.
+    assert_eq!(ctx.tick(&shift(&next_fire(&scheduled), -60)).await?, 0);
+    assert_eq!(state(&when)?, "done");
+    assert_eq!(state(&scheduled)?, "active");
+    // The scheduled one turns done when it comes due, without a run.
+    assert_eq!(ctx.tick(&shift(&next_fire(&scheduled), 1)).await?, 0);
+    assert_eq!(state(&scheduled)?, "done");
+    let runs: i64 = ctx.count(
+        "SELECT COUNT(*) FROM wake_runs WHERE lineage_id = ?1",
+        &seat,
+    )?;
+    assert_eq!(runs, 0, "nothing fired");
+    Ok(())
+}
+
 // ─── the routes ─────────────────────────────────────────────────────────────
 
 /// §11.1: `add --name` is idempotent: the same add returns the stored

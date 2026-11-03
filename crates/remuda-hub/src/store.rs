@@ -8223,6 +8223,16 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     // driver (`execution: not-dispatched` on its settlement), so what it
     // carried was not delivered.
     ensure_column(&conn, "commands", "settlement_not_dispatched", "INTEGER")?;
+    // cb-inbox-deliver r4: same-id attempts at a Hub-written send (a fact
+    // batch, a restart notice) that provably did not reach its chapter,
+    // counted on the row so the retry cap holds whatever happens to the
+    // in-memory backoff.
+    ensure_column(
+        &conn,
+        "commands",
+        "hub_attempts",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     // D-060 decision 1 (cb-rootturn): the per-instance root-turn ledger and
     // the root turn stamped beside the initiator on command and audit rows.
     crate::root_turn::migrate(&conn)?;

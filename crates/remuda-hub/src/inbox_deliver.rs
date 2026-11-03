@@ -1196,22 +1196,17 @@ pub(crate) struct DeliverState {
     /// once (the forward's own leader slot and the push's sent mark are the
     /// durable guards).
     drive: std::sync::Arc<tokio::sync::Mutex<()>>,
-    /// Batches released back to the queue after a forward that provably did
-    /// not reach the chapter (NODE_BUSY, the link gone, a Node refusal before
-    /// it recorded anything), by batch id: the same id is retried once its
-    /// backoff has passed. In memory: after a Hub restart every unsent batch
-    /// is tried again at once.
-    retry: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Retry>>>,
+    /// Hub-written sends released back to the queue after a forward that
+    /// provably did not reach the chapter (NODE_BUSY, the link gone, a Node
+    /// refusal before it recorded anything), by command id: when the same
+    /// id may be tried again. In memory: after a Hub restart every unsent
+    /// batch is tried again at once. The attempt count is on the command row
+    /// (`hub_attempts`), so the cap holds across a lost entry or a restart.
+    retry:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::time::Instant>>>,
     /// Test seam: hold every forward (a batch forms and stays queued).
     #[cfg(any(test, feature = "test-faults"))]
     pub(crate) hold_forward: std::sync::Arc<std::sync::atomic::AtomicBool>,
-}
-
-/// One batch's same-id retry schedule.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Retry {
-    attempts: u32,
-    next: tokio::time::Instant,
 }
 
 /// First retry delay after a forward that did not reach the chapter.
@@ -1228,25 +1223,60 @@ pub(crate) fn retry_delay(attempts: u32) -> std::time::Duration {
     RETRY_FIRST.saturating_mul(factor).min(RETRY_MAX)
 }
 
-/// Arm the next same-id attempt of a Hub-written send before its release
-/// commits, so no drive running meanwhile finds it unsent with no backoff.
-/// Returns whether the attempts are spent ([`give_up`] it once released).
-pub(crate) fn arm_retry(state: &AppState, command_id: &str) -> bool {
-    let (attempts, delay) = state.deliver.note_retry(command_id);
-    if attempts < RETRY_ATTEMPTS {
-        tracing::info!(
-            attempts,
-            retry_in_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
-            "hub-written input not delivered; retried under the same id"
-        );
-        return false;
-    }
-    true
+/// Arm a same-id retry of a Hub-written send before its release commits,
+/// so no drive running meanwhile finds it unsent with no backoff; the
+/// attempt the commit counts sets the real delay ([`rearm_retry`]).
+pub(crate) fn arm_retry(state: &AppState, command_id: &str) {
+    state
+        .deliver
+        .set_retry(command_id, tokio::time::Instant::now() + RETRY_FIRST);
 }
 
-/// A release that did not happen (the row had already advanced): no retry.
-pub(crate) fn disarm_retry(state: &AppState, command_id: &str) {
-    state.deliver.clear_retry(command_id);
+/// Count one same-id attempt of a Hub-written send that did not reach its
+/// chapter, on its row, if it is (back) in the queue unforwarded; returns
+/// the attempts made so far, or `None` when the row is no longer waiting
+/// for one (it advanced, or a fence settled it).
+pub(crate) fn count_attempt(
+    conn: &Connection,
+    command_id: &str,
+) -> Result<Option<u32>, StoreError> {
+    let counted = conn.execute(
+        "UPDATE commands SET hub_attempts = hub_attempts + 1
+          WHERE id = ?1 AND state = 'queued' AND forwarded = 0",
+        params![command_id],
+    )?;
+    if counted == 0 {
+        return Ok(None);
+    }
+    let attempts: i64 = conn.query_row(
+        "SELECT hub_attempts FROM commands WHERE id = ?1",
+        params![command_id],
+        |row| row.get(0),
+    )?;
+    Ok(Some(u32::try_from(attempts).unwrap_or(u32::MAX)))
+}
+
+/// After the commit that counted `attempts`: schedule the next same-id
+/// attempt on its backoff, or drop the entry when the row no longer waits.
+/// Returns whether the attempts are spent ([`give_up`] it).
+pub(crate) fn rearm_retry(state: &AppState, command_id: &str, attempts: Option<u32>) -> bool {
+    let Some(attempts) = attempts else {
+        state.deliver.clear_retry(command_id);
+        return false;
+    };
+    if attempts >= RETRY_ATTEMPTS {
+        return true;
+    }
+    let delay = retry_delay(attempts);
+    state
+        .deliver
+        .set_retry(command_id, tokio::time::Instant::now() + delay);
+    tracing::info!(
+        attempts,
+        retry_in_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+        "hub-written input not delivered; retried under the same id"
+    );
+    false
 }
 
 /// End a released Hub-written send whose same-id attempts are spent:
@@ -1283,7 +1313,24 @@ pub(crate) const NOT_DELIVERED_REASON: &str = "not-delivered";
 /// `not-delivered` so it ends (a batch's rows go back to waiting through the
 /// release trigger) and log that category once per process.
 pub(crate) async fn note_released_id(state: &AppState, command_id: &str) {
-    if arm_retry(state, command_id) {
+    arm_retry(state, command_id);
+    let id = command_id.to_owned();
+    let attempts = match state
+        .store
+        .run_named("hub_input_attempt", move |conn| count_attempt(conn, &id))
+        .await
+    {
+        Ok(attempts) => attempts,
+        Err(err) => {
+            // The entry stays armed; the retry tick tries again.
+            tracing::warn!(
+                code = error_code(&err),
+                "could not count a hub-written attempt"
+            );
+            return;
+        }
+    };
+    if rearm_retry(state, command_id, attempts) {
         give_up(state, command_id).await;
     }
 }
@@ -1400,38 +1447,28 @@ impl DeliverState {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .get(batch_id)
-            .is_none_or(|retry| retry.next <= now)
+            .is_none_or(|next| *next <= now)
     }
 
-    /// Schedule the next same-id attempt; returns the attempt count.
-    fn note_retry(&self, batch_id: &str) -> (u32, std::time::Duration) {
-        let mut retry = self
-            .retry
+    /// The next same-id attempt of `command_id` is not before `next`.
+    fn set_retry(&self, command_id: &str, next: tokio::time::Instant) {
+        self.retry
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let attempts = retry.get(batch_id).map_or(0, |r| r.attempts) + 1;
-        let delay = retry_delay(attempts);
-        retry.insert(
-            batch_id.to_owned(),
-            Retry {
-                attempts,
-                next: tokio::time::Instant::now() + delay,
-            },
-        );
-        (attempts, delay)
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(command_id.to_owned(), next);
     }
 
     /// Test seam: every armed retry is due now.
     #[cfg(any(test, feature = "test-faults"))]
     pub(crate) fn waive_backoff(&self) {
         let now = tokio::time::Instant::now();
-        for retry in self
+        for next in self
             .retry
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .values_mut()
         {
-            retry.next = now;
+            *next = now;
         }
     }
 

@@ -1486,6 +1486,44 @@ async fn spent_same_id_retries_end_the_batch_and_release_its_rows() -> Result<()
     Ok(())
 }
 
+/// The same-id attempt count lives on the command row: retry entries lost
+/// along the way do not reset it, so the batch still ends after ten
+/// attempts in all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_attempt_count_survives_lost_retry_entries() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("deliver-durable-count").await?;
+    let (seat, token) = ctx.seat(&project).await?;
+    let worker = ctx.worker(&token, &project).await?;
+    ctx.hub.test_hold_inbox_forward(true);
+    ctx.worker_turn(&worker, 10, "done").await?;
+    ctx.journal(&seat, activity("idle", &at(20))).await?;
+    ctx.settle().await?;
+    let first = ctx.batch_rows()?[0].0.clone();
+    ctx.hub.test_arm_node_busy(&first, usize::MAX);
+    ctx.hub.test_hold_inbox_forward(false);
+    for attempt in 0..10 {
+        if attempt % 3 == 2 {
+            ctx.hub.test_forget_inbox_retries();
+        }
+        ctx.hub.test_waive_inbox_backoff();
+        ctx.settle().await?;
+    }
+    let rows = ctx.batch_rows()?;
+    assert_eq!(rows[0].0, first);
+    assert_eq!(rows[0].2.as_deref(), Some("rejected"), "{rows:?}");
+    let row = command_row(&ctx, &seat, &first).await?;
+    assert_eq!(row["settlement"]["reason"], "not-delivered", "{row:#}");
+    let attempts: i64 = ctx.db()?.query_row(
+        "SELECT hub_attempts FROM commands WHERE id = ?1",
+        [&first],
+        |row| row.get(0),
+    )?;
+    assert_eq!(attempts, 10, "counted on the row");
+    assert_eq!(frames_for(&ctx, &first), 0, "never reached the Node");
+    Ok(())
+}
+
 /// A subscriber without continuity that dies while its batch is still queued
 /// ends that batch `not-delivered`: its rows are released and take the
 /// no-subscriber fallback exactly once (a still-pending question pages the

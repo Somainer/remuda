@@ -3612,48 +3612,7 @@ async fn release_forward_intent(
         .store
         .run_named("release_forward_intent", {
             let command_id = command_id.to_owned();
-            move |conn| {
-                let now = crate::config::now_rfc3339();
-                // D-057 §7.7: a row whose initiator is fenced is not returned
-                // to the queue (a same-id replay would only be refused); it
-                // settles `rejected(fenced)` — the frame was never queued on
-                // the Node, so it did not run.
-                let fenced = match crate::store::load_command(conn, &command_id)? {
-                    Some(row) => matches!(
-                        crate::store::check_initiator(
-                            conn,
-                            row.initiator.as_ref(),
-                            row.initiator_device_id.as_deref(),
-                        ),
-                        Err(crate::store::StoreError::Fenced)
-                    ),
-                    None => false,
-                };
-                if fenced {
-                    conn.execute(
-                        "UPDATE commands
-                            SET state = 'settled', resolution = 'clear', forwarded = 0,
-                                settlement_outcome = 'rejected', settlement_reason = ?1,
-                                updated_at = ?2
-                          WHERE id = ?3 AND state = 'queued' AND forwarded = 1",
-                        rusqlite::params![remuda_protocol::FENCED_REASON, now, command_id],
-                    )?;
-                    crate::fence::resolve_op_outcome(
-                        conn,
-                        "command",
-                        &command_id,
-                        crate::fence::outcome::CANCELLED_AT_HUB,
-                    )?;
-                    return Ok(());
-                }
-                conn.execute(
-                    "UPDATE commands
-                        SET forwarded = 0, resolution = 'clear', updated_at = ?1
-                      WHERE id = ?2 AND state = 'queued' AND forwarded = 1",
-                    rusqlite::params![now, command_id],
-                )?;
-                Ok(())
-            }
+            move |conn| release_intent(conn, &command_id)
         })
         .await?;
     state
@@ -3661,6 +3620,53 @@ async fn release_forward_intent(
         .get_command(command_id.to_owned())
         .await?
         .ok_or(HubError::NotFound)
+}
+
+/// The writes of [`release_forward_intent`].
+fn release_intent(
+    conn: &rusqlite::Connection,
+    command_id: &str,
+) -> Result<(), crate::store::StoreError> {
+    let now = crate::config::now_rfc3339();
+    // D-057 §7.7: a row whose initiator is fenced is not returned
+    // to the queue (a same-id replay would only be refused); it
+    // settles `rejected(fenced)` — the frame was never queued on
+    // the Node, so it did not run.
+    let fenced = match crate::store::load_command(conn, command_id)? {
+        Some(row) => matches!(
+            crate::store::check_initiator(
+                conn,
+                row.initiator.as_ref(),
+                row.initiator_device_id.as_deref(),
+            ),
+            Err(crate::store::StoreError::Fenced)
+        ),
+        None => false,
+    };
+    if fenced {
+        conn.execute(
+            "UPDATE commands
+                SET state = 'settled', resolution = 'clear', forwarded = 0,
+                    settlement_outcome = 'rejected', settlement_reason = ?1,
+                    updated_at = ?2
+              WHERE id = ?3 AND state = 'queued' AND forwarded = 1",
+            rusqlite::params![remuda_protocol::FENCED_REASON, now, command_id],
+        )?;
+        crate::fence::resolve_op_outcome(
+            conn,
+            "command",
+            command_id,
+            crate::fence::outcome::CANCELLED_AT_HUB,
+        )?;
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE commands
+            SET forwarded = 0, resolution = 'clear', updated_at = ?1
+          WHERE id = ?2 AND state = 'queued' AND forwarded = 1",
+        rusqlite::params![now, command_id],
+    )?;
+    Ok(())
 }
 
 /// Broadcast capacity for one attempt's followers. A leader publishes exactly
@@ -5242,9 +5248,9 @@ async fn release_hub_written(
     state: &AppState,
     command: &CommandRecord,
 ) -> Result<CommandRecord, HubError> {
-    // Armed before the release commits: a drive running meanwhile sees the
+    // Armed before the release commits: a drive running meanwhile sees a
     // backoff, never an unsent row it may forward again at once.
-    let spent = crate::inbox_deliver::arm_retry(state, &command.command_id);
+    crate::inbox_deliver::arm_retry(state, &command.command_id);
     // Test seam: park between the arm and the release's commit (no-op
     // unless a test armed it), so a concurrent drive's prune runs there.
     state
@@ -5255,17 +5261,27 @@ async fn release_hub_written(
             &command.command_id,
         )
         .await;
-    let row = release_forward_intent(state, &command.command_id).await?;
-    if row.state != "queued" || row.forwarded {
-        crate::inbox_deliver::disarm_retry(state, &command.command_id);
-        return Ok(row);
-    }
-    if spent {
+    // The release and the attempt it ends are one transaction: the count
+    // lives on the row, so a lost backoff entry never resets it.
+    let attempts = state
+        .store
+        .run_named("release_hub_written", {
+            let command_id = command.command_id.clone();
+            move |conn| {
+                let tx = crate::store::immediate_tx(conn)?;
+                release_intent(&tx, &command_id)?;
+                let attempts = crate::inbox_deliver::count_attempt(&tx, &command_id)?;
+                tx.commit()?;
+                Ok(attempts)
+            }
+        })
+        .await?;
+    if crate::inbox_deliver::rearm_retry(state, &command.command_id, attempts) {
         crate::inbox_deliver::give_up(state, &command.command_id).await;
     }
     state
         .store
-        .get_command(row.command_id.clone())
+        .get_command(command.command_id.clone())
         .await?
         .ok_or(HubError::NotFound)
 }

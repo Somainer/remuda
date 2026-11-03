@@ -15,7 +15,8 @@ use crate::{InboxFactKind, InputOrigin};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Characters a wake-up name may hold (from `[A-Za-z0-9._:/-]`).
+/// Characters a wake-up name may hold (from `[A-Za-z0-9._:-]`, not starting
+/// with `wak_`: `rm` takes a name or an id in the URL).
 pub const WAKE_NAME_MAX_CHARS: usize = 64;
 /// Characters a wake-up text may hold.
 pub const WAKE_TEXT_MAX_CHARS: usize = 2000;
@@ -213,8 +214,9 @@ pub struct WakeWhen {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WakeAddRequest {
-    /// Unique in the lineage; a repeat of the same add under the same name
-    /// returns the stored wake-up. The Hub generates one when absent.
+    /// Unique in the lineage (`[A-Za-z0-9._:-]`, not `wak_…`); a repeat of
+    /// the same add under the same name returns the stored wake-up. The Hub
+    /// generates one when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// What the wake-up is for: delivered with each run, or the brief of a

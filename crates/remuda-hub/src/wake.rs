@@ -454,7 +454,8 @@ impl IntoResponse for WakeError {
                         action::FIX_REQUEST,
                         format!(
                             "send a name of at most {WAKE_NAME_MAX_CHARS} characters from \
-                             [A-Za-z0-9._:/-], a text of at most {WAKE_TEXT_MAX_CHARS} \
+                             [A-Za-z0-9._:-] not starting with wak_, a text of at most \
+                             {WAKE_TEXT_MAX_CHARS} \
                              characters, one trigger (at a time or afterSecs within a year; \
                              every {WAKE_EVERY_MIN_SECS}..={WAKE_MAX_SECS} seconds; when a \
                              fact kind) and notify never, failure or always"
@@ -524,6 +525,19 @@ pub(crate) struct CheckedAdd {
     pub(crate) request_json: String,
 }
 
+/// A wake-up name: a path segment (`rm` takes it in the URL) that cannot
+/// read as a wake-up id (`rm` takes either).
+fn wake_name(raw: &str) -> bool {
+    !raw.starts_with("wak_")
+        && raw.chars().count() <= WAKE_NAME_MAX_CHARS
+        && !raw.is_empty()
+        && raw
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'))
+        && raw != "."
+        && raw != ".."
+}
+
 fn plain_token(raw: &str, max: usize) -> bool {
     !raw.is_empty()
         && raw.chars().count() <= max
@@ -571,10 +585,11 @@ pub(crate) fn check_add(
     }
     let name = match request.name.as_deref().map(str::trim) {
         None | Some("") => None,
-        Some(name) if plain_token(name, WAKE_NAME_MAX_CHARS) => Some(name.to_owned()),
+        Some(name) if wake_name(name) => Some(name.to_owned()),
         Some(_) => {
             return Err(WakeError::BadRequest(format!(
-                "name must be at most {WAKE_NAME_MAX_CHARS} characters from [A-Za-z0-9._:/-]"
+                "name must be at most {WAKE_NAME_MAX_CHARS} characters from [A-Za-z0-9._:-], \
+                 not starting with wak_"
             )));
         }
     };
@@ -1980,13 +1995,16 @@ fn notify_run(
 }
 
 /// At open, before any job: apply the results the previous process left
-/// queued, then mark every run still `running` as `interrupted`. An
-/// interrupted run is never replayed; its wake-up's next occurrence is
-/// computed from the schedule as usual.
+/// queued, then mark every run still `running` whose result is not already
+/// queued as `interrupted` (a queued result is evidence the run ended; it is
+/// applied on a later pass). An interrupted run is never replayed; its
+/// wake-up's next occurrence is computed from the schedule as usual.
 pub(crate) fn boot(conn: &mut Connection) {
     drain_outcomes(conn, OffsetDateTime::now_utc());
     match conn.execute(
-        "UPDATE wake_runs SET state = 'interrupted', ended_at = ?1 WHERE state = 'running'",
+        "UPDATE wake_runs SET state = 'interrupted', ended_at = ?1
+          WHERE state = 'running'
+            AND run_id NOT IN (SELECT run_id FROM wake_outcomes)",
         params![now_rfc3339()],
     ) {
         Ok(0) => {}
@@ -2577,12 +2595,14 @@ mod tests {
             check_add(&long, now),
             Err(WakeError::BadRequest(_))
         ));
-        let mut odd = request(json!({"kind": "at", "afterSecs": 1}));
-        odd.name = Some("two words".into());
-        assert!(matches!(
-            check_add(&odd, now),
-            Err(WakeError::BadRequest(_))
-        ));
+        for name in ["two words", "a/b", "wak_0193a5b2", "..", &"n".repeat(65)] {
+            let mut odd = request(json!({"kind": "at", "afterSecs": 1}));
+            odd.name = Some(name.to_owned());
+            assert!(
+                matches!(check_add(&odd, now), Err(WakeError::BadRequest(_))),
+                "{name}"
+            );
+        }
     }
 
     #[test]

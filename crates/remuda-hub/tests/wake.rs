@@ -1142,6 +1142,36 @@ async fn a_failed_result_write_is_retried_never_the_run() -> Result<()> {
     Ok(())
 }
 
+/// §11.1 at boot: a run whose result was already queued (its write kept
+/// failing) is not interrupted — the result is evidence the run ended — and
+/// the next pass writes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_queued_result_survives_a_restart_and_is_written_after_it() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("wake-boot-result").await?;
+    let (seat, token) = ctx.seat(&project).await?;
+    let wake = ctx
+        .add_ok(&token, &seat, every(600, "beat", "never"))
+        .await?;
+    ctx.tick(&shift(&next_fire(&wake), 1)).await?;
+    let run_id = ctx.runs(&seat).await?[0]["runId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    remuda_hub::wake_test_support::arm_result_failure(&run_id, 1000);
+    ctx.run_wake_turn(&seat, "success", 10).await?;
+    assert_eq!(ctx.runs(&seat).await?[0]["state"], "running");
+    let ctx = ctx.restart().await?;
+    let runs = ctx.runs(&seat).await?;
+    assert_eq!(runs[0]["state"], "running", "not interrupted: {runs:#?}");
+    remuda_hub::wake_test_support::arm_result_failure(&run_id, 0);
+    ctx.tick(&shift(&next_fire(&wake), 300)).await?;
+    let runs = ctx.runs(&seat).await?;
+    assert_eq!(runs[0]["state"], "success", "{runs:#?}");
+    assert_eq!(ctx.wake_sends(&seat).len(), 1, "never run again");
+    Ok(())
+}
+
 // ─── the routes ─────────────────────────────────────────────────────────────
 
 /// §11.1: `add --name` is idempotent: the same add returns the stored

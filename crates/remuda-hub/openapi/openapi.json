@@ -6799,7 +6799,7 @@
         "additionalProperties": false,
         "properties": {
           "name": {
-            "description": "Unique in the lineage (at most 64 of A-Z a-z 0-9 . _ : / -); the same add under the same name returns the stored wake-up. Generated when absent.",
+            "description": "Unique in the lineage (at most 64 of A-Z a-z 0-9 . _ : -, not starting with wak_); the same add under the same name returns the stored wake-up. Generated when absent.",
             "type": "string"
           },
           "text": {

@@ -2183,7 +2183,7 @@ GET /healthz
 ~~~
 
 - 调用方：Agent 只管自己的血缘（路径里的 `{id}` 必须是它的规范血缘 id，中间件钉住，处理器再查；写入过提交时的 initiator 检查，已被 fence 或暂停的章节得到 409 `fenced`）；Human 设备可管任意血缘，也可用它的任一章节 id 指名；Bot 凭证一律 403。中间件只放行这三种形状。
-- 边界：`name` 至多 64 个 `[A-Za-z0-9._:/-]` 字符（缺省时 Hub 生成）；`text` 至多 2000 字符；`at` 至多一年之后；每个血缘至多 64 个 wake-up。秘密 lint 先于其他检查覆盖 `name` 与 `text`：命中为 422，`code: "WAKE_SECRET_REJECTED"`，只给 `field` 与 `rule`，不回显文本，什么也不存。超界为 400，`reason: "invalid-wake-up"`。`notify` 必填，Hub 从不替调用方选。
+- 边界：`name` 至多 64 个 `[A-Za-z0-9._:-]` 字符，且不以 `wak_` 开头（它是 URL 路径段，`rm` 也接受 id；缺省时 Hub 生成）；`text` 至多 2000 字符；`at` 至多一年之后；每个血缘至多 64 个 wake-up。秘密 lint 先于其他检查覆盖 `name` 与 `text`：命中为 422，`code: "WAKE_SECRET_REJECTED"`，只给 `field` 与 `rule`，不回显文本，什么也不存。超界为 400，`reason: "invalid-wake-up"`。`notify` 必填，Hub 从不替调用方选。
 - 同名重复：请求按原样（`afterSecs` 原值，而非解析后的时间）存下；同名且请求相同返回已存的行，200 `created: false`；同名但请求不同为 409，`reason: "wake-name-taken"`。
 - 尚未实现的部分：带 `check` 为 422，`code: "WAKE_UNSUPPORTED"`，`reason: "check-unsupported"`（`cb-wake-check`）；`when` 的 `factKind` 为 `context-threshold` 为 422，`reason: "condition-unsupported"`（还没有任何来源记录上下文百分比越线）。血缘收不到事实时为 409 `wake-not-received`；超过 64 个为 409 `wake-limit`。
 - 投递：`persistent` 的 run 是血缘的一条 `wake-due` 事实，dedupe key 与 occurrence 上限的主体都是 run id；一个批次至多带一个 wake run，文本模板 v2，以该 run 的信封开头（main-agent.md §11.3）。`fresh` 的 run 不发事实，而由 Hub 以章节自己的 Agent 凭证发起一次普通的实例创建（`claude-print`，同 host），子实例 spec 带 `wakeRunId`，其事实经父边回到血缘。

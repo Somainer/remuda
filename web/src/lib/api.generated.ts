@@ -4004,7 +4004,7 @@ export interface components {
             /** @description Reserved for the optional check (main-agent.md §11.2): refused with 422 check-unsupported until it is built. */
             check?: unknown;
             mode?: components["schemas"]["WakeMode"];
-            /** @description Unique in the lineage (at most 64 of A-Z a-z 0-9 . _ : / -); the same add under the same name returns the stored wake-up. Generated when absent. */
+            /** @description Unique in the lineage (at most 64 of A-Z a-z 0-9 . _ : -, not starting with wak_); the same add under the same name returns the stored wake-up. Generated when absent. */
             name?: string;
             notify: components["schemas"]["WakeNotify"];
             /** @description What it is for (at most 2000 characters; the secret lint runs over it). */

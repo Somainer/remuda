@@ -49,7 +49,7 @@ struct AddArgs {
     #[command(flatten)]
     lineage: LineageArg,
     /// Unique in the lineage; repeating the same add under it returns the
-    /// stored wake-up (at most 64 of A-Z a-z 0-9 . _ : / -).
+    /// stored wake-up (at most 64 of A-Z a-z 0-9 . _ : -, not wak_…).
     #[arg(long)]
     name: Option<String>,
     /// What the wake-up is for (at most 2000 characters).

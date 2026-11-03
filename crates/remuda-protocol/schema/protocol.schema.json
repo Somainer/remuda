@@ -22208,7 +22208,7 @@
           "description": "`persistent` (default) or `fresh`."
         },
         "name": {
-          "description": "Unique in the lineage; a repeat of the same add under the same name\nreturns the stored wake-up. The Hub generates one when absent.",
+          "description": "Unique in the lineage (`[A-Za-z0-9._:-]`, not `wak_…`); a repeat of\nthe same add under the same name returns the stored wake-up. The Hub\ngenerates one when absent.",
           "type": [
             "string",
             "null"

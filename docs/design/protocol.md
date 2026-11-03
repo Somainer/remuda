@@ -220,6 +220,7 @@ stateDiagram-v2
 | `lastError?` | `string` | 可省略的 driver/原生诊断文本，通常随 `lifecycle=failed` 写入；只是展示用摘要，不是状态、不是终态证据，也不能替代 `exit` 或 Run 的 `terminalEvidence` |
 | `mode?` / `promotedAt?` | `native\|promoted` / `Timestamp` | 该 Instance 如何到达当前 `kind`。`promoted` 表示 `terminal` + `shell-pty` 实例的 PTY 前台被已知 agent CLI 接管（D-025）：`kind` 改为该 agent，`driver` 仍是 `shell-pty`，`promotedAt` 记录检测时刻。降级回 `terminal` 时 `mode` 复位为 `native` 且清空 `promotedAt`。只有 driver 的 `agent_promoted` / `agent_demoted` native lifecycle 能改这两个字段，同名 `agent_detected` diagnostic 只进 journal |
 | `launchedBy?` | `remuda\|user` | **谁敲的这条命令**（D-028 §1.0 规则 4）。只记录出身，**不表示能力等级**：user 启动的 session 与 remuda 启动的享有完全相同的信号与能力。D-028 之前写入的行没有这个字段，读取时由 `mode` / `promotedAt` 推导——`promoted` 意味着一个 login shell 的前台被 agent CLI 接管，那条命令只可能是人敲的，因此推导为 `user`，其余为 `remuda`。它与 `mode` 并存而不取代它：`mode` 回答「kind 是不是提升来的」，`launchedBy` 回答「谁启动的」 |
+| `herdrClaim?` | `HerdrClaim` | 仅 `driver = herdr-claimed`（D-062，[herdr-claim.md](./herdr-claim.md)）：认领的外部 herdr pane。`{session, socketPath, workspaceId, tabId, paneId, agent?, process?:{pid, command, startTicks?}, contact?:"ok"\|"lost"}`。认领不是托管：close/release 只脱离，绝不关 pane、杀进程或停 herdr server；`permissionMode` 记为 `"external"`，`launchedBy` 为 `user`。pane 消失或进程消失（`pane.process_info` 与内核同时确认）是进程结束证据；server 不可达只是失联（`contact:"lost"`），不终结实例 |
 | `unseen?` / `seenSeq?` / `turnEndSeq?` | `boolean` / `U64` / `U64` | 完成未看（seen-hub，H6，见本节末「完成未看」）。`turnEndSeq` 是最近一次结算回合结束的 journal seq，`seenSeq` 是 owner 已看到的 seq，`unseen = turnEndSeq > seenSeq`。按 owner 记，所有 owner 设备读到同一个值 |
 
 ~~~mermaid
@@ -1620,6 +1621,24 @@ instance.create params: "lineage": {"id": "ins_…", "generation": "3"}, "creato
 instance.create params (D-060): "memoryContext": {"rev": "12", "text": "<rendered index and about-me>"}
 instance.create params (ma-skill): "skillContext": {"grants": ["dispatch"], "herdr": true, "delegatedDecisions": true, "inbox": false}
 worker.provision params: "initiator": {"instanceId": "ins_…", "lineageId": "ins_…", "generation": "3"}, "opId": "…"
+~~~
+
+**2026-11-04 补（D-062）：认领外部 herdr pane。** 与 `host.dirs.list` 同族的加性 Hub→Node 方法，不属于上面 46 个目标方法。只有人类 operator 可经 Hub 调用（Agent、Bot、收窄到实例的 Human 一律 403，带 `reason` 与 `next`）。设计全文见 [herdr-claim.md](./herdr-claim.md)。
+
+| 方法 / 路由 | 方向 | payload / result |
+| --- | --- | --- |
+| `herdr.discover` | Hub→Node | `{session?}` → `{sessions:[{session,socketPath,reachable,error?,workspaces:[{workspaceId,label,tabs:[{tabId,label,panes:[{paneId,agent?,agentStatus,process?:{pid,command},claimedBy?}]}]}]}]}`；只读元数据，绝不调用 `pane.read`/`agent.read`；不列出 Node 自己的 session |
+| `herdr.resolve` | Hub→Node | `{session,workspaceId,tabId,paneId?,kind?}` → `{claim:HerdrClaim,kind,agentStatus,cwd?}`；只读校验 id 链（pane 在 tab 内、tab 在 workspace 内），tab 多于一个 pane 而未给 `paneId` 时拒绝并列出 pane id |
+| `instance.claim` | Hub→Node | `{instanceId,session,workspaceId,tabId,paneId,kind}` → `{instance}`；按 `instanceId` 幂等；同一 (socket, pane) 已有活认领时拒绝 |
+| `GET /v1/hosts/{id}/herdr?session=` | Client→Hub | 代理 `herdr.discover` |
+| `POST /v1/instances/claim` | Client→Hub | `{hostId,herdrSession,workspaceId,tabId,paneId?,kind?,name?,title?,projectId?}` → `{instance,claim}`；错误：id 不成链或 tab 多 pane → 400，(host, socket, pane) 已有活认领 → 409（带现有 instanceId），herdr 不可达 → 400 |
+| `POST /v1/instances/{id}/release` | Client→Hub | → `{instance,released}`；只脱离、幂等；对已结束的认领实例回 200 `released:false` |
+
+Node 拒绝时错误文本带稳定前缀，Hub 据此映射：`herdr-claim-invalid`、`herdr-claim-ambiguous`、`herdr-claim-own-session`、`herdr-unreachable` → 400，`herdr-claim-conflict` → 409。CLI：`remuda host herdr ls --host H [--session S]`、`remuda instance claim --host H --herdr-session S --workspace W --tab T [--pane P] [--kind claude|codex|grok|agy|shell] [--name N] [--project P]`、`remuda instance release <id>`。driver `herdr-claimed` 只由 `instance.claim` 产生，`instance.create` 拒绝它。
+
+~~~text
+→ {"jsonrpc":"2.0","id":"h-31","method":"instance.claim","params":{"instanceId":"ins_…","session":"work","workspaceId":"w2","tabId":"w2:t19","paneId":"w2:p5K","kind":"claude"}}
+← {"jsonrpc":"2.0","id":"h-31","result":{"instance":{"id":"ins_…","driver":"herdr-claimed","kind":"claude","herdrClaim":{"session":"work","socketPath":"…/sessions/work/herdr.sock","workspaceId":"w2","tabId":"w2:t19","paneId":"w2:p5K","agent":"claude","process":{"pid":4242,"command":"claude"}}}}}
 ~~~
 
 ### 7.3 Snapshot + seq follow 与重连补页

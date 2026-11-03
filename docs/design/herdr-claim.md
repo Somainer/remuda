@@ -1,0 +1,212 @@
+# Herdr claim: adopting an external herdr pane (D-062)
+
+Status: **adopted**. Owner request 2026-11-04 ("support claiming an external
+herdr, with workspace and tab"); the defaults below were set by the
+coordinator and are recorded in [D-062](./decisions.md#d-062).
+
+Until now a Node only drove panes it launched itself, in its own isolated
+herdr session (`crates/remuda-node/src/carrier_recovery.rs`: "A Node's Herdr
+session is named after its data dir"). A claim adopts a pane a human started
+in **another** herdr session on the same host, so it shows up in the ledger,
+on `/s/:id` and in the CLI like any other instance, without Remuda ever owning
+the process inside it.
+
+## 1. Who may claim
+
+Human operators only, in this first cut. An Agent, a Bot, and a Human device
+narrowed to an instance (`x-remuda-instance-id`) all get **403** with a
+`reason` and a `next` step on discovery, claim and release.
+
+The pane runs with whatever permission mode and credentials the human gave it
+when they started it. Remuda never set them and cannot see them, so letting an
+agent claim panes (or drive a claimed one) would widen its authority to
+whatever that pane can do. For the same reason the Hub refuses every
+`/v1/instances/{id}/commands` call on a claimed instance from a non-Human
+caller (403, reason `human-only`).
+
+## 2. Identity
+
+A claim names:
+
+| Field | Meaning |
+| --- | --- |
+| host | The Remuda host whose Node can reach the herdr socket. Claims are local: the Node and the herdr server share one machine. |
+| herdr session | A session **name** or an absolute **API socket path**. `default` is the user's default socket (`~/.config/herdr/herdr.sock`); any other name is `~/.config/herdr/sessions/<name>/herdr.sock`. Both are resolved against the herdr config dir of the user the Node runs as. |
+| workspace id | herdr workspace id, e.g. `w2`. |
+| tab id | herdr tab id, e.g. `w2:t19`. Must belong to the workspace. |
+| pane id | Optional herdr pane id, e.g. `w2:p5K`. Must belong to the tab. Without it the tab must have **exactly one** pane; otherwise the claim is refused with 400 and the error lists the tab's pane ids. |
+
+The Node validates the chain against one `session.snapshot`: the workspace
+exists, the tab is in that workspace, the pane is in that tab. Any mismatch is
+400 (`herdr-claim-invalid`).
+
+At claim time the Node records, on the instance (`herdrClaim`):
+
+- `session` (as the operator wrote it) and the resolved `socketPath`;
+- `workspaceId`, `tabId`, `paneId`;
+- `agent`: herdr's detected agent kind for the pane, if any;
+- `process`: the pane's foreground process from `pane.process_info` — its
+  `pid`, its `command` (the executable's base name only; full argv is never
+  read into Remuda, it may carry secrets) and, on Linux, the kernel start
+  time of that pid, so a recycled pid is never mistaken for the original.
+
+The Node's **own** herdr session is never claimable (400, `own-session`) and
+is not listed by discovery: its panes already are Remuda instances.
+
+## 3. Kind, driver and permission mode
+
+- `--kind claude|codex|grok|agy|shell` (`shell` is the `terminal` kind). Without
+  `--kind` the kind is herdr's agent kind for the pane when it reports
+  `claude`, `codex`, `grok` or `agy`; `generic` for any other agent herdr
+  reports; `terminal` when herdr reports no agent.
+- The driver is the new `DriverKind` **`herdr-claimed`**. It is registered
+  wherever driver kinds are enumerated (protocol enum, generated types, the
+  capability matrix, the web driver tables). `instance.create` refuses it:
+  a claimed instance only comes from `instance.claim`.
+- `permissionMode` is recorded as **`"external"`**: unknown, owned by the
+  human who started the pane. Remuda never invents a mode for it and never
+  sends a permission-mode switch to it.
+
+## 4. Ownership: a claim is not ownership
+
+Remuda does **not** own the claimed process.
+
+- **Release** — `remuda instance release <id>`, `POST /v1/instances/{id}/release`,
+  or an ordinary close on a claimed instance — **detaches only**. It stops the
+  Node's watcher and TTY bridge and ends the instance with reason `released`.
+  It never closes the pane, never kills or signals its process, and never stops
+  the herdr server. Release is idempotent: releasing an instance that already
+  ended answers 200 with `released: false`.
+- The only things that act on the pane are `instance send` (the prompt
+  input), `instance keys` and interrupt, and TTY control/observe from the PWA.
+- A Node shutdown is not a release: the claimed rows stay live and the next
+  Node start re-attaches them (§6).
+- None of the Node's carrier machinery applies to a claimed pane: it is never
+  recorded as a `pty_resources` row, so the orphan sweep, the stop ladder,
+  `reclaim_instance_carriers` and carrier recovery cannot reach it.
+
+## 5. Driving a claimed pane
+
+| Operation | herdr call | Notes |
+| --- | --- | --- |
+| `instance send` | `agent.prompt` (target = pane id) when herdr reports an agent in the pane; otherwise `pane.send_text(text)` then `pane.send_keys(["enter"])` | Queued like any PTY prompt: it waits until herdr reports the agent idle. |
+| `instance keys` | `pane.send_keys` | |
+| interrupt (cancel) | `pane.send_keys(["esc"])` for agent kinds, `["ctrl+c"]` for `terminal` | |
+| TTY observe/control in the PWA | `herdr terminal session control <pane>` with `HERDR_SOCKET_PATH=<socketPath>`, never `--takeover` | Same bridge as the Node's own panes. A resize from the PWA resizes the pane the same way another herdr client would. |
+| screen snapshot (`tty.screen`) | `pane.read` (visible viewport, text) | Used by the stall fallback; herdr-claimed is a screen carrier. |
+| activity | `session.snapshot` agent status | herdr `working` → working, `blocked` → waiting on input, `idle`/`done` → idle. |
+
+There is **no journal transcript** in this cut: the journal holds lifecycle,
+agent-status and contact events only, and the session page shows the screen
+and the TTY. Binding a claimed claude pane to its native session JSONL is out
+of scope (§10).
+
+All calls go to the socket recorded in the claim, and every one names the
+claimed pane id: nothing reaches another pane, tab or workspace.
+
+## 6. Liveness, end and restart
+
+The Node polls each claimed pane every 2 s (`session.snapshot` plus
+`pane.process_info`):
+
+- **Pane gone** — the pane is no longer in the session snapshot. This is
+  process-end evidence (OA6): the instance ends `exited` with reason code
+  `herdr-pane-gone`, and the evidence names the session and pane.
+- **Process gone** — the recorded pid is neither the pane's shell nor among its
+  foreground processes **and** the kernel confirms that pid is dead (or now
+  belongs to a different process, by start time). Both are required: an agent
+  that hands the terminal to an editor or a child must not end the instance.
+  The instance ends `exited` with reason code `herdr-process-gone`.
+- **Server unreachable** — the socket refuses, times out or answers
+  `server_unavailable`. This is contact loss, never process end: the instance
+  stays live, the journal gets a `herdr_claim_contact` = `lost` diagnostic, the
+  Hub shows `herdrClaim.contact = "lost"` (「外部 herdr 失联」), and it flips back
+  to `ok` when the server answers again. Nothing is failed by guess.
+
+In every case the pane is never touched.
+
+**Node restart.** A graceful shutdown leaves claimed rows live; a crash leaves
+them as they were. At start, before any command is served, the Node checks
+each live claim: pane present and process alive → re-attach (watcher, TTY
+bridge, command queue); pane gone or process gone → end with evidence as
+above; server unreachable → re-attach in the contact-lost state. The Hub sees
+the re-attached instances as live in the hello inventory.
+
+## 7. Wire
+
+Node RPCs (Hub→Node, additive, same family as `host.dirs.list`):
+
+| Method | Params | Result |
+| --- | --- | --- |
+| `herdr.discover` | `{session?}` | `{sessions:[{session, socketPath, reachable, error?, workspaces:[{workspaceId, label, tabs:[{tabId, label, panes:[{paneId, agent?, agentStatus, process?, claimedBy?}]}]}]}]}` |
+| `herdr.resolve` | `{session, workspaceId, tabId, paneId?, kind?}` | `{claim: HerdrClaim, kind, agentStatus, cwd?}` — read-only validation |
+| `instance.claim` | `{instanceId, session, workspaceId, tabId, paneId, kind}` | `{instance}` — idempotent per `instanceId` |
+
+Refusals carry a stable prefix in the Node's error text, which the Hub maps:
+`herdr-claim-invalid` and `herdr-claim-ambiguous` → 400, `herdr-claim-own-session`
+→ 400, `herdr-claim-conflict` → 409, `herdr-unreachable` → 400.
+
+Hub routes (Human only):
+
+- `GET /v1/hosts/{id}/herdr?session=S` — discovery.
+- `POST /v1/instances/claim` — `{hostId, herdrSession, workspaceId, tabId, paneId?, kind?, name?, title?, projectId?}` → `{instance, claim}`. A live claim on the same (host, socket, pane) is **409** with the existing instance id.
+- `POST /v1/instances/{id}/release` → `{instance, released}`.
+
+CLI:
+
+```text
+remuda host herdr ls --host H [--session S] [--json]
+remuda instance claim --host H --herdr-session S --workspace W --tab T [--pane P] [--kind K] [--name N] [--project P]
+remuda instance release <id>
+```
+
+The instance record gains `herdrClaim` (the §2 fields plus `contact`), `driver:
+"herdr-claimed"`, `launchedBy: "user"` and `permissionMode: "external"`.
+
+## 8. PWA
+
+A claimed instance shows in the ledger and on `/s/:id` like any instance, with a
+small 「外部 herdr」 badge carrying `session · workspace · tab` (and 失联 while
+contact is lost). Its TTY works like any herdr-carried terminal. The close
+action is labelled 「释放」 and its confirm says the pane keeps running. There
+is no claim UI in this cut; the CLI is the only way to claim.
+
+## 9. Audit and logs
+
+The Hub writes an audit row for every claim (`instance.claim`) and release
+(`instance.release`, including a close on a claimed instance): the device
+that did it, host, session, socket, workspace, tab, pane and kind; a claim also
+records the pid and command name. Logs and audit rows never carry pane
+content: discovery never calls `pane.read` or `agent.read`, and the only screen
+read is the stall fallback's, whose text is not logged.
+
+## 10. Threat model
+
+- **Same-uid trust boundary.** herdr's API socket is unauthenticated ("can
+  connect" is "can control"); its `0600` mode is the boundary
+  ([security-review-2.md](./security-review-2.md) G1). The Node runs as the
+  same user, so it can already reach every session that user owns. A claim
+  adds no new reach; it routes an operator's existing reach through the Hub,
+  which is why only an authenticated Human may use it.
+- **Authority of the pane.** The pane's agent may be in a permissive mode with
+  the human's own credentials. Remuda does not try to see or change that; it
+  confines who can drive the pane (Human only) and records `permissionMode:
+  "external"` so nothing downstream assumes a Remuda-set posture.
+- **No destructive reach.** Release, close, shutdown, orphan sweep and carrier
+  recovery never close a claimed pane or signal its process (§4), and tests
+  prove the fake herdr records no close or kill.
+- **Confusion with a reused id.** Identity is the socket plus the pane id,
+  re-validated against the recorded workspace and tab on every re-attach, and
+  the process by pid plus kernel start time; a pane id herdr reused after its
+  own restart in another tab is not re-attached.
+- **Content exposure.** Discovery is metadata only; full argv is never
+  collected; logs never carry pane content.
+
+## 11. Out of scope
+
+- Agent-initiated claims (and Agent/Bot commands to claimed instances).
+- Binding a claimed claude pane to its native session JSONL for a structured
+  transcript.
+- Claiming panes on a remote herdr through `--remote` / `--machine`.
+- Moving a claimed pane into the Node's own session.
+- A claim UI in the PWA.

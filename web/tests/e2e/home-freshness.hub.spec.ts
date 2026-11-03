@@ -92,11 +92,16 @@ async function failListReads(page: Page): Promise<void> {
   const fail = (route: Route) => route.abort("failed").catch(() => undefined);
   await page.route("**/v1/instances", fail);
   await page.route("**/v1/interactions", fail);
+  // The task ledger owns the same ledger slot: a task another spec seeded
+  // (archived tasks outlive their project) would otherwise paint the
+  // 「已归档」 group and hide the skeleton the state is about.
+  await page.route(/\/v1\/tasks(\?.*)?$/, fail);
 }
 
 async function allowListReads(page: Page): Promise<void> {
   await page.unroute("**/v1/instances");
   await page.unroute("**/v1/interactions");
+  await page.unroute(/\/v1\/tasks(\?.*)?$/);
 }
 
 async function phoneContext(browser: Browser, baseURL: string): Promise<BrowserContext> {

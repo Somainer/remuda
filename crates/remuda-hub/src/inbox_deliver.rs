@@ -1232,68 +1232,68 @@ pub(crate) fn arm_retry(state: &AppState, command_id: &str) {
         .set_retry(command_id, tokio::time::Instant::now() + RETRY_FIRST);
 }
 
+/// What counting one same-id attempt of a Hub-written send did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Attempt {
+    /// The row no longer waits for an attempt (it advanced, or a fence
+    /// settled it).
+    NotWaiting,
+    /// Counted; the send is retried under its id after its backoff.
+    Counted(u32),
+    /// The last attempt: the send is settled `rejected` / `not-delivered`
+    /// in the same transaction (a batch's rows go back to waiting through
+    /// the release trigger).
+    Spent,
+}
+
 /// Count one same-id attempt of a Hub-written send that did not reach its
-/// chapter, on its row, if it is (back) in the queue unforwarded; returns
-/// the attempts made so far, or `None` when the row is no longer waiting
-/// for one (it advanced, or a fence settled it).
-pub(crate) fn count_attempt(
-    conn: &Connection,
-    command_id: &str,
-) -> Result<Option<u32>, StoreError> {
+/// chapter, on its row, if it is (back) in the queue unforwarded; once
+/// [`RETRY_ATTEMPTS`] are counted, settle it not-delivered in the caller's
+/// transaction, so the ending commits with the count or not at all.
+pub(crate) fn count_attempt(conn: &Connection, command_id: &str) -> Result<Attempt, StoreError> {
     let counted = conn.execute(
         "UPDATE commands SET hub_attempts = hub_attempts + 1
           WHERE id = ?1 AND state = 'queued' AND forwarded = 0",
         params![command_id],
     )?;
     if counted == 0 {
-        return Ok(None);
+        return Ok(Attempt::NotWaiting);
     }
     let attempts: i64 = conn.query_row(
         "SELECT hub_attempts FROM commands WHERE id = ?1",
         params![command_id],
         |row| row.get(0),
     )?;
-    Ok(Some(u32::try_from(attempts).unwrap_or(u32::MAX)))
-}
-
-/// After the commit that counted `attempts`: schedule the next same-id
-/// attempt on its backoff, or drop the entry when the row no longer waits.
-/// Returns whether the attempts are spent ([`give_up`] it).
-pub(crate) fn rearm_retry(state: &AppState, command_id: &str, attempts: Option<u32>) -> bool {
-    let Some(attempts) = attempts else {
-        state.deliver.clear_retry(command_id);
-        return false;
-    };
+    let attempts = u32::try_from(attempts).unwrap_or(u32::MAX);
     if attempts >= RETRY_ATTEMPTS {
-        return true;
+        settle_not_delivered(conn, command_id)?;
+        return Ok(Attempt::Spent);
     }
-    let delay = retry_delay(attempts);
-    state
-        .deliver
-        .set_retry(command_id, tokio::time::Instant::now() + delay);
-    tracing::info!(
-        attempts,
-        retry_in_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
-        "hub-written input not delivered; retried under the same id"
-    );
-    false
+    Ok(Attempt::Counted(attempts))
 }
 
-/// End a released Hub-written send whose same-id attempts are spent:
-/// settled `rejected` / `not-delivered` (a batch's rows go back to waiting
-/// through the release trigger); the category is logged once per process.
-pub(crate) async fn give_up(state: &AppState, command_id: &str) {
-    state.deliver.clear_retry(command_id);
-    let id = command_id.to_owned();
-    match state
-        .store
-        .run_named("hub_input_not_delivered", move |conn| {
-            settle_not_delivered(conn, &id)
-        })
-        .await
-    {
-        Ok(_) => report_once("hub-input-retries-exhausted"),
-        Err(err) => tracing::warn!(code = error_code(&err), "could not settle a spent send"),
+/// After the commit of `attempt`: schedule the next same-id attempt on its
+/// backoff, or drop the entry of a row that no longer waits or has ended.
+/// Never before that commit: a failed transaction leaves the provisional
+/// entry armed.
+pub(crate) fn rearm_retry(state: &AppState, command_id: &str, attempt: Attempt) {
+    match attempt {
+        Attempt::NotWaiting => state.deliver.clear_retry(command_id),
+        Attempt::Spent => {
+            state.deliver.clear_retry(command_id);
+            report_once("hub-input-retries-exhausted");
+        }
+        Attempt::Counted(attempts) => {
+            let delay = retry_delay(attempts);
+            state
+                .deliver
+                .set_retry(command_id, tokio::time::Instant::now() + delay);
+            tracing::info!(
+                attempts,
+                retry_in_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                "hub-written input not delivered; retried under the same id"
+            );
+        }
     }
 }
 
@@ -1308,30 +1308,30 @@ pub(crate) const INSTANCE_NOT_FOUND_REASON: &str = "instance-not-found";
 /// it never reached its chapter, so a batch's rows are released.
 pub(crate) const NOT_DELIVERED_REASON: &str = "not-delivered";
 
-/// [`note_released`] by id: arm the next same-id attempt, or, once
-/// [`RETRY_ATTEMPTS`] are spent, settle the send `rejected` /
-/// `not-delivered` so it ends (a batch's rows go back to waiting through the
-/// release trigger) and log that category once per process.
+/// A forward of the Hub-written send `command_id` failed and left it
+/// queued: count the attempt in one transaction, then schedule the next
+/// same-id attempt, or, once [`RETRY_ATTEMPTS`] are spent, it is settled
+/// `rejected` / `not-delivered` in that transaction (a batch's rows go back
+/// to waiting through the release trigger), logged once per process.
 pub(crate) async fn note_released_id(state: &AppState, command_id: &str) {
     arm_retry(state, command_id);
     let id = command_id.to_owned();
-    let attempts = match state
+    match state
         .store
-        .run_named("hub_input_attempt", move |conn| count_attempt(conn, &id))
+        .run_named("hub_input_attempt", move |conn| {
+            let tx = crate::store::immediate_tx(conn)?;
+            let attempt = count_attempt(&tx, &id)?;
+            tx.commit()?;
+            Ok(attempt)
+        })
         .await
     {
-        Ok(attempts) => attempts,
-        Err(err) => {
-            // The entry stays armed; the retry tick tries again.
-            tracing::warn!(
-                code = error_code(&err),
-                "could not count a hub-written attempt"
-            );
-            return;
-        }
-    };
-    if rearm_retry(state, command_id, attempts) {
-        give_up(state, command_id).await;
+        Ok(attempt) => rearm_retry(state, command_id, attempt),
+        // The entry stays armed; the retry tick tries again.
+        Err(err) => tracing::warn!(
+            code = error_code(&err),
+            "could not count a hub-written attempt"
+        ),
     }
 }
 

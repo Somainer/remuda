@@ -5262,23 +5262,23 @@ async fn release_hub_written(
         )
         .await;
     // The release and the attempt it ends are one transaction: the count
-    // lives on the row, so a lost backoff entry never resets it.
-    let attempts = state
+    // lives on the row, so a lost backoff entry never resets it, and the
+    // last attempt settles the send not-delivered in that same transaction.
+    // The entry changes only once it committed.
+    let attempt = state
         .store
         .run_named("release_hub_written", {
             let command_id = command.command_id.clone();
             move |conn| {
                 let tx = crate::store::immediate_tx(conn)?;
                 release_intent(&tx, &command_id)?;
-                let attempts = crate::inbox_deliver::count_attempt(&tx, &command_id)?;
+                let attempt = crate::inbox_deliver::count_attempt(&tx, &command_id)?;
                 tx.commit()?;
-                Ok(attempts)
+                Ok(attempt)
             }
         })
         .await?;
-    if crate::inbox_deliver::rearm_retry(state, &command.command_id, attempts) {
-        crate::inbox_deliver::give_up(state, &command.command_id).await;
-    }
+    crate::inbox_deliver::rearm_retry(state, &command.command_id, attempt);
     state
         .store
         .get_command(command.command_id.clone())

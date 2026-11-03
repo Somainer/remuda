@@ -2396,18 +2396,26 @@ async fn create_fresh(state: &AppState, claim: FreshClaim) {
     }
 }
 
-/// Test seams: fault injection for the result write.
+/// Test seams: fault injection for the result write, keyed by run id so
+/// tests running in parallel never disarm each other.
 #[cfg(any(test, feature = "test-faults"))]
 pub(crate) mod test_seams {
+    use std::collections::HashMap;
     use std::sync::Mutex;
 
-    static RESULT_FAILURES: Mutex<Option<(String, u32)>> = Mutex::new(None);
+    static RESULT_FAILURES: Mutex<Option<HashMap<String, u32>>> = Mutex::new(None);
 
-    /// Make the next `times` full result writes for `run_id` fail.
+    /// Make the next `times` full result writes for `run_id` fail; 0 disarms.
     pub fn arm_result_failure(run_id: &str, times: u32) {
-        *RESULT_FAILURES
+        let mut slot = RESULT_FAILURES
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner()) = Some((run_id.to_owned(), times));
+            .unwrap_or_else(|poison| poison.into_inner());
+        let armed = slot.get_or_insert_with(HashMap::new);
+        if times == 0 {
+            armed.remove(run_id);
+        } else {
+            armed.insert(run_id.to_owned(), times);
+        }
     }
 
     /// Whether this result write for `run_id` is an armed failure (counts it).
@@ -2415,15 +2423,18 @@ pub(crate) mod test_seams {
         let mut slot = RESULT_FAILURES
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        match slot.as_mut() {
-            Some((armed, times)) if armed == run_id && *times > 0 => {
+        let Some(armed) = slot.as_mut() else {
+            return false;
+        };
+        match armed.get_mut(run_id) {
+            Some(times) => {
                 *times -= 1;
                 if *times == 0 {
-                    *slot = None;
+                    armed.remove(run_id);
                 }
                 true
             }
-            _ => false,
+            None => false,
         }
     }
 }

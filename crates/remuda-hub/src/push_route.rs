@@ -101,10 +101,11 @@ pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             suppressed_devices_json TEXT NOT NULL
          );
          CREATE TABLE IF NOT EXISTS push_reply_trackers (
-            instance_id TEXT PRIMARY KEY,
+            instance_id TEXT NOT NULL,
             command_id TEXT NOT NULL,
             armed_seq INTEGER NOT NULL,
-            armed_at TEXT NOT NULL
+            armed_at TEXT NOT NULL,
+            PRIMARY KEY (instance_id, command_id)
          );",
     )
 }
@@ -595,10 +596,14 @@ fn root_input_command(event: &Value) -> Option<&str> {
 }
 
 /// Fold one appended journal event for reply-ready, in the append
-/// transaction: a Human-origin input arms the chapter's tracker; the settled
-/// end of a turn (`turn_ended`) takes it and, on the live `address-owner`
-/// chapter, queues "Main replied: <first line of the final message>". A turn
-/// reached only by Hub or Agent input arms nothing and pushes nothing.
+/// transaction: each Human-origin input arms one tracker on the chapter; the
+/// settled end of a turn (`turn_ended`) takes the tracker of the input that
+/// turn answered and, on the live `address-owner` chapter, queues "Main
+/// replied: <first line of the final message>". A turn end that names its
+/// turn (`relatedIds.completedTurn`) takes only that input's tracker, so a
+/// Human input that lands mid-turn waits for the turn that answers it; an
+/// end that names no turn takes every armed tracker. A turn reached only by
+/// Hub or Agent input arms nothing and pushes nothing.
 pub(crate) fn fold_reply(
     conn: &Connection,
     instance_id: &str,
@@ -611,23 +616,33 @@ pub(crate) fn fold_reply(
         && holds_address_owner(conn, instance_id)?
     {
         conn.execute(
-            "INSERT INTO push_reply_trackers (instance_id, command_id, armed_seq, armed_at)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(instance_id) DO NOTHING",
+            "INSERT OR IGNORE INTO push_reply_trackers
+                (instance_id, command_id, armed_seq, armed_at)
+             VALUES (?1, ?2, ?3, ?4)",
             params![instance_id, command_id, seq, crate::config::now_rfc3339()],
         )?;
     }
     if !turn_ended {
         return Ok(());
     }
-    let armed: Option<i64> = conn
-        .query_row(
-            "DELETE FROM push_reply_trackers WHERE instance_id = ?1 RETURNING armed_seq",
-            params![instance_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let Some(armed_seq) = armed else {
+    let completed = event
+        .pointer("/payload/relatedIds/completedTurn")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty());
+    let taken: Vec<i64> = match completed {
+        Some(command_id) => conn
+            .prepare(
+                "DELETE FROM push_reply_trackers WHERE instance_id = ?1 AND command_id = ?2
+                 RETURNING armed_seq",
+            )?
+            .query_map(params![instance_id, command_id], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?,
+        None => conn
+            .prepare("DELETE FROM push_reply_trackers WHERE instance_id = ?1 RETURNING armed_seq")?
+            .query_map(params![instance_id], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?,
+    };
+    let Some(armed_seq) = taken.into_iter().min() else {
         return Ok(());
     };
     if !live_address_owner(conn, instance_id)? {

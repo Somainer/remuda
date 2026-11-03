@@ -1436,6 +1436,99 @@ async fn an_agent_created_seats_first_turn_pushes_nothing() -> Result<()> {
     Ok(())
 }
 
+/// Wait until `seat`'s root turn for `command` has settled and the seat
+/// reads idle.
+async fn turn_settled_for(ctx: &Ctx, seat: &str, command: &str) -> Result<()> {
+    ctx.wait_until("the turn ended", || async {
+        let db = ctx.db().ok()?;
+        let activity: String = db
+            .query_row(
+                "SELECT activity FROM instances WHERE id = ?1",
+                [seat],
+                |row| row.get(0),
+            )
+            .ok()?;
+        let reached: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM journal WHERE instance_id = ?1
+                  AND json_extract(payload_json, '$.payload.nativeName') = 'result'
+                  AND json_extract(payload_json, '$.payload.relatedIds.completedTurn') = ?2",
+                [seat, command],
+                |row| row.get(0),
+            )
+            .ok()?;
+        (reached > 0 && activity == "idle").then_some(())
+    })
+    .await
+}
+
+/// r2 item 2: a Human input that lands while an earlier (Agent) turn runs is
+/// answered by its own turn. The earlier turn's end names that turn
+/// (`completedTurn`), so it leaves the Human input's tracker armed and
+/// pushes nothing; the turn that answers the owner pushes, with its own
+/// final message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_human_input_mid_turn_is_pushed_by_the_turn_that_answers_it() -> Result<()> {
+    let _flag = d051(true).await;
+    let ctx = Ctx::boot().await?;
+    let main = seat(&ctx).await?;
+    let tag = format!("instance:{main}");
+    ctx.db()?.execute(
+        "INSERT INTO commands (id, instance_id, host_id, operation, state, resolution,
+            forwarded, payload_json, created_at, updated_at)
+         VALUES ('cmd_agent_mid', ?1, ?2, 'instance.send', 'settled', 'clear', 1, ?3, ?4, ?4)",
+        rusqlite::params![
+            main,
+            ctx.host_p,
+            json!({"origin": "agent", "input": {"type": "prompt", "text": "x"}}).to_string(),
+            "2026-11-01T00:00:00.000Z"
+        ],
+    )?;
+    let node = ctx.node_p();
+    node.append(&main, user_message("cmd_agent_mid"))?;
+    node.append(&main, turn_started("cmd_agent_mid"))?;
+    node.append(
+        &main,
+        assistant("a_agent", "open", "Working on the agent's ask."),
+    )?;
+    // The owner's input arrives while that turn runs.
+    let human = human_send(&ctx, &main).await?;
+    node.append(&main, user_message(&human))?;
+    node.append(&main, turn_settled("cmd_agent_mid"))?;
+    turn_settled_for(&ctx, &main, "cmd_agent_mid").await?;
+    ctx.hub.test_handle().test_drive_outbox().await;
+    assert_eq!(
+        reply_rows(&ctx, &main)?,
+        0,
+        "the earlier turn's end pushes nothing"
+    );
+    assert_eq!(
+        ctx.query_i64(
+            "SELECT COUNT(*) FROM push_reply_trackers WHERE instance_id = ?1 AND command_id = ?2",
+            [&main, &human],
+        )?,
+        1,
+        "the owner's input stays armed"
+    );
+    // The turn that answers the owner.
+    node.append(&main, turn_started(&human))?;
+    node.append(
+        &main,
+        assistant("a_owner", "open", "Here is the answer you asked for."),
+    )?;
+    node.append(&main, turn_settled(&human))?;
+    turn_settled_for(&ctx, &main, &human).await?;
+    let pushes = ctx.wait_pushes(&ctx.phone, &tag, 1).await?;
+    assert_eq!(
+        pushes[0]["title"],
+        "Main replied: Here is the answer you asked for."
+    );
+    ctx.hub.test_handle().test_drive_outbox().await;
+    assert_eq!(reply_rows(&ctx, &main)?, 1);
+    assert_eq!(ctx.pushes_tagged(&ctx.phone, &tag).len(), 1);
+    Ok(())
+}
+
 /// End pushes need process-end evidence (OA6): "Main closed itself" waits
 /// for the end its close brings, and an exited event that ends nothing (a
 /// subagent's) sends no exited push.

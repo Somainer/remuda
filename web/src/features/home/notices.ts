@@ -229,8 +229,10 @@ const CHAPTER_SOURCE: ChapterNoticeSource = { read: listChapterNotices, onRefres
  * nothing, so the poll is what brings that device the card within one 2 s
  * period.
  *
- * An acknowledgement from the card is folded in at once. Only the newest read
- * is applied.
+ * An acknowledgement from the card is folded in at once and survives a read
+ * that was already in flight when it landed: that read still lists the notice
+ * unacknowledged, and the page's own acknowledgement wins (an ack is never
+ * undone). Only the newest read is applied.
  */
 export function useChapterNotices(
   instanceId: string,
@@ -241,10 +243,12 @@ export function useChapterNotices(
   const [notices, setNotices] = useState<OwnerNotice[]>([]);
   const [polled, setPolled] = useState(0);
   const owner = useRef<string | null>(null);
+  const ackedHere = useRef(new Map<string, OwnerNotice>());
   const latest = useRef(0);
   useEffect(() => {
     if (owner.current === instanceId) return;
     owner.current = instanceId;
+    ackedHere.current = new Map();
     setNotices([]);
   }, [instanceId]);
   const { read, onRefresh } = source;
@@ -259,18 +263,18 @@ export function useChapterNotices(
     void read(instanceId, controller.signal).then(
       (rows) => {
         if (controller.signal.aborted || seq !== latest.current) return;
-        setNotices((current) => (sameNotices(rows, current) ? current : rows));
+        const merged = rows.map((row) => (row.ackedAt ? row : (ackedHere.current.get(row.noticeId) ?? row)));
+        setNotices((current) => (sameNotices(merged, current) ? current : merged));
       },
       () => undefined,
     );
     return () => controller.abort();
   }, [instanceId, enabled, refreshKey, polled, read]);
   // Stable, so the transcript rows' memo holds across renders.
-  const acked = useCallback(
-    (notice: OwnerNotice) =>
-      setNotices((current) => current.map((row) => (row.noticeId === notice.noticeId ? notice : row))),
-    [],
-  );
+  const acked = useCallback((notice: OwnerNotice) => {
+    ackedHere.current.set(notice.noticeId, notice);
+    setNotices((current) => current.map((row) => (row.noticeId === notice.noticeId ? notice : row)));
+  }, []);
   return { notices, acked };
 }
 

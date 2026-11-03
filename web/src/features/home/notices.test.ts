@@ -243,6 +243,23 @@ describe("useChapterNotices", () => {
     expect(result.current.notices.map((row) => row.noticeId)).toEqual(["ntc_new"]);
   });
 
+  it("keeps an acknowledgement when a read in flight across 知道了 lands after it (r2 item 3)", async () => {
+    const chapter = chapterSource();
+    const { result } = renderHook(() => useChapterNotices("ins_main", true, "7", chapter.source));
+    await act(async () => chapter.reads[0].resolve([notice({ noticeId: "ntc_1" })]));
+    // A poll starts a read; the owner acknowledges before it answers.
+    act(() => chapter.poll());
+    act(() => result.current.acked(notice({ noticeId: "ntc_1", ackedAt: T2 })));
+    expect(result.current.notices[0].ackedAt).toBe(T2);
+    // The delayed response was read before the ack committed.
+    await act(async () => chapter.reads[1].resolve([notice({ noticeId: "ntc_1", ackedAt: null })]));
+    expect(result.current.notices[0].ackedAt).toBe(T2);
+    // A later read that has the Hub's own stamp is taken as it is.
+    act(() => chapter.poll());
+    await act(async () => chapter.reads[2].resolve([notice({ noticeId: "ntc_1", ackedAt: T1 })]));
+    expect(result.current.notices[0].ackedAt).toBe(T1);
+  });
+
   it("applies only the newest read", async () => {
     const chapter = chapterSource();
     const { result } = renderHook(() => useChapterNotices("ins_main", true, "7", chapter.source));

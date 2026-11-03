@@ -2117,13 +2117,15 @@ kind      = started | exited | waiting | turn-done | turn-failed | interaction
           | interaction-superseded | gate | supply-reset | host-online
           | host-offline | stalled | budget-expired | wake-due | context-threshold
 payload.occurrence = {count, capped, cap, windowHours}
+payload.tail      = turn-done only: the text that turn ended with, redacted,
+                    its last 200 characters (untrusted)
 ~~~
 
 - 读写都在血缘读谓词之下：Human 设备可读任意血缘（也可用它的任一章节 id 指名）；Agent 只能读写自己的血缘，路径里的 `{id}` 必须是它的规范血缘 id；Bot 凭证一律 403（与记忆路由同法，按认证时的设备种类判定）。中间件只放行这一形状的 GET 与 PATCH，并把 `{id}` 钉在调用者自己的血缘上；处理器再查一次。
 - `optIn` 只有 Human 能改（"创建者打开"）；Agent 写它得到 403。`mutedKinds` 是整组替换，血缘自己或 Human 都可以改。被 mute 的种类不写行。
 - `payload` 里 worker 或工具产出的文本（问题、错误）是不可信数据，读者不得把它当指令或授权。
 - 新增的项目设置：`policy.configurable.factOccurrenceCap`（默认 6）与 `policy.configurable.stallToolThresholdMins`（缺省表示工具在途时永不产生 stall 事实）。
-- **投递（`cb-inbox-deliver`）。** 血缘的当前章节空闲、没有自己的待决交互、也没有所有者输入在排队或在途时，Hub 把全部未投递的行合成一批，作为一条 `instance.send`（`origin: hub`）发给该章节；`batchId` 就是这条 send 的 `commandId`，成批时选定并落库，带该章节代数的 Hub 内部 initiator，不带设备 id。批行（`InboxBatch`：原文、开头标签、模板版本、事实 id）与命令行在同一事务里提交，早于任何转发意图。文本是 Hub 的口吻，以固定标签 `<remuda-facts>` 开头、`</remuda-facts>` 结尾，不超过 4096 字节；worker 或工具写的文本以 `untrusted: "…"` 的 JSON 字符串引用（引号、换行、控制字符、`<`、`>`、`&` 与不可见格式字符都被转义），读者按 JSON 字符串解出原文，并把它当数据。成批时逐行复查：订阅者已 mute 该种类、主体换了父血缘或已无订阅者的行带 `fallback` 退回所有者推送（只有今天会推送的种类才推：`interaction`、`exited`、`waiting`），不再进入任何批，也不算已消费。F 取消尚未转发的批时，它的行回到未投递，之后以新 id 成批；可能已到达章节的批保留它的行（每批至多一次）。
+- **投递（`cb-inbox-deliver`）。** 血缘的当前章节空闲、没有自己的待决交互、也没有所有者输入在排队或在途时，Hub 把全部未投递的行合成一批，作为一条 `instance.send`（`origin: hub`）发给该章节；`batchId` 就是这条 send 的 `commandId`，成批时选定并落库，带该章节代数的 Hub 内部 initiator，不带设备 id。批行（`InboxBatch`：原文、开头标签、模板版本、事实 id）与命令行在同一事务里提交，早于任何转发意图。文本是 Hub 的口吻，以固定标签 `<remuda-facts>` 开头、`</remuda-facts>` 结尾，不超过 4096 字节；worker 或工具写的文本先按 digest 的秘密形状脱敏，再以 `untrusted: "…"` 的 JSON 字符串引用（引号、换行、控制字符、`<`、`>`、`&` 与不可见格式字符都被转义），读者按 JSON 字符串解出原文，并把它当数据。成批时逐行复查：订阅者已 mute 该种类、主体换了父血缘或已无订阅者的行带 `fallback` 退回所有者推送（只有今天会推送的种类才推：`interaction`、`exited`、`waiting`），不再进入任何批，也不算已消费。F 取消尚未转发的批时，它的行回到未投递，之后以新 id 成批；Node 以 `execution: not-dispatched` 结算的批同样交还它的行。Hub 能证明没有送达的转发（Hub 侧 NODE_BUSY、连接已断、Node 在记录前以 JSON-RPC 错误拒绝）不结算这条 send，而是放回队列，以同一 id 退避重试（1 s 起，最长 60 s）。成批之后、转发之前到达的所有者输入仍然先行：转发意图提交的同一 writer 任务里再查一次，批留在队列里，所有者输入结算后再驱动它。可能已到达章节的批保留它的行（每批至多一次）。
 
 ## 9. 错误码、未知值与兼容性
 

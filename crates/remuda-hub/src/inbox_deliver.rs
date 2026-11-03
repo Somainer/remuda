@@ -1420,7 +1420,6 @@ struct Owed {
     alert: String,
     instance_id: String,
     interaction_id: Option<String>,
-    attempts: i64,
 }
 
 /// Forward every formed batch whose send is still queued and unforwarded,
@@ -1582,6 +1581,9 @@ pub(crate) async fn retry_tick(state: &AppState) {
         .await
         .unwrap_or(false);
     if owed {
+        // Serialized with `drive`, which sends the same rows: one fanout per
+        // owed push at a time.
+        let _drive = state.deliver.drive.lock().await;
         push_owed(state).await;
     }
 }
@@ -1614,7 +1616,7 @@ async fn push_owed(state: &AppState) {
         .store
         .read("inbox_fallback_owed", move |conn| {
             let mut stmt = conn.prepare(concat!(
-                "SELECT fact_id, alert, instance_id, interaction_id, attempts ",
+                "SELECT fact_id, alert, instance_id, interaction_id ",
                 owed_push_due!(),
                 " ORDER BY fact_id"
             ))?;
@@ -1625,7 +1627,6 @@ async fn push_owed(state: &AppState) {
                         alert: row.get(1)?,
                         instance_id: row.get(2)?,
                         interaction_id: row.get(3)?,
-                        attempts: row.get(4)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1648,27 +1649,44 @@ async fn push_owed(state: &AppState) {
         };
         let fanout = crate::alerts::page_owner(state, &push.instance_id, alert).await;
         let Some(recipients) = fanout.recipients() else {
-            let attempts = push.attempts.saturating_add(1);
-            let gave_up = attempts >= PUSH_ATTEMPTS;
             let fact_id = push.fact_id;
+            // One writer job: count this attempt on the row itself and read
+            // the count back, so the give-up decision follows the attempts
+            // actually made, whichever pass made them.
             let marked = state
                 .store
                 .run_named("inbox_fallback_failed", move |conn| {
-                    let now = now_rfc3339();
-                    conn.execute(
-                        "UPDATE inbox_fallback_pushes
-                            SET attempts = ?2,
-                                next_attempt_at = CASE WHEN ?3 THEN NULL ELSE ?4 END,
-                                gave_up_at = CASE WHEN ?3 THEN ?5 END
-                          WHERE fact_id = ?1 AND recipients IS NULL",
-                        params![fact_id, attempts, gave_up, push_retry_at(attempts), now],
+                    let tx = crate::store::immediate_tx(conn)?;
+                    tx.execute(
+                        "UPDATE inbox_fallback_pushes SET attempts = attempts + 1
+                          WHERE fact_id = ?1 AND recipients IS NULL AND gave_up_at IS NULL",
+                        params![fact_id],
                     )?;
-                    Ok(())
+                    let attempts: i64 = tx.query_row(
+                        "SELECT attempts FROM inbox_fallback_pushes WHERE fact_id = ?1",
+                        params![fact_id],
+                        |row| row.get(0),
+                    )?;
+                    let gave_up = attempts >= PUSH_ATTEMPTS;
+                    tx.execute(
+                        "UPDATE inbox_fallback_pushes
+                            SET next_attempt_at = CASE WHEN ?2 THEN NULL ELSE ?3 END,
+                                gave_up_at = CASE WHEN ?2 THEN ?4 END
+                          WHERE fact_id = ?1 AND recipients IS NULL AND gave_up_at IS NULL",
+                        params![fact_id, gave_up, push_retry_at(attempts), now_rfc3339()],
+                    )?;
+                    tx.commit()?;
+                    Ok((attempts, gave_up))
                 })
                 .await;
-            if let Err(err) = marked {
-                tracing::warn!(code = error_code(&err), "inbox fallback push mark failed");
-            } else if gave_up {
+            let (attempts, gave_up) = match marked {
+                Ok(marked) => marked,
+                Err(err) => {
+                    tracing::warn!(code = error_code(&err), "inbox fallback push mark failed");
+                    continue;
+                }
+            };
+            if gave_up {
                 tracing::warn!(
                     alert = push.alert.as_str(),
                     attempts,

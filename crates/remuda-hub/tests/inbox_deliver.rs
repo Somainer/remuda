@@ -262,6 +262,8 @@ struct FakePush {
     sent: Mutex<Vec<String>>,
     /// While set, every delivery is refused (HTTP 400): the fanout fails.
     fail: std::sync::atomic::AtomicBool,
+    /// Every delivery tried, refused or not.
+    posts: std::sync::atomic::AtomicUsize,
 }
 
 impl remuda_push::Transport for FakePush {
@@ -273,6 +275,7 @@ impl remuda_push::Transport for FakePush {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<u16, remuda_push::Error>> + Send + '_>,
     > {
+        self.posts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
             return Box::pin(async { Ok(400) });
         }
@@ -1945,6 +1948,38 @@ async fn a_failed_fallback_push_is_retried_by_the_tick_and_bounded() -> Result<(
     )?;
     ctx.hub.test_inbox_retry_tick().await;
     assert_eq!(owed_push(&ctx, second)?.0, 8, "no attempt after giving up");
+    Ok(())
+}
+
+/// Concurrent passes over an owed push (the periodic check twice and a
+/// drive) make one attempt between them, and the row counts that attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_passes_make_one_attempt_at_an_owed_push() -> Result<()> {
+    let ctx = Ctx::spawn_with_push().await?;
+    let push = ctx.push.clone().context("push")?;
+    let project = ctx.project("deliver-push-race").await?;
+    let (seat, token) = ctx.seat(&project).await?;
+    push.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    let fact = muted_question(&ctx, &seat, &token, &project, 1).await?;
+    assert_eq!(owed_push(&ctx, fact)?.0, 1);
+    let posts = push.posts.load(std::sync::atomic::Ordering::SeqCst);
+    ctx.db()?.execute(
+        "UPDATE inbox_fallback_pushes SET next_attempt_at = '2000-01-01T00:00:00.000Z'
+          WHERE fact_id = ?1",
+        [fact],
+    )?;
+    let (_, _, settled) = tokio::join!(
+        ctx.hub.test_inbox_retry_tick(),
+        ctx.hub.test_inbox_retry_tick(),
+        ctx.settle()
+    );
+    settled?;
+    assert_eq!(
+        push.posts.load(std::sync::atomic::Ordering::SeqCst),
+        posts + 1,
+        "one attempt"
+    );
+    assert_eq!(owed_push(&ctx, fact)?.0, 2, "counted once on the row");
     Ok(())
 }
 

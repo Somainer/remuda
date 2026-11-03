@@ -534,8 +534,9 @@ fn resolve(
             let month = i8::try_from(u8::from(month)).ok()?;
             let day = i8::try_from(day).ok()?;
             let this_year = at(local.year(), month, day)?;
-            // A date earlier than a day before now is next year's.
-            if this_year < now.as_second() - 86_400 {
+            // The next occurrence: a date and time already past this year,
+            // earlier today included, is next year's.
+            if this_year <= now.as_second() {
                 at(local.year().checked_add(1)?, month, day)?
             } else {
                 this_year
@@ -871,6 +872,12 @@ fn decide(
     verdict.resets_at = Some(resets_at);
     verdict.window = Some(window.clone());
     verdict.source = Some(source);
+    // A reset already behind the turn's end is not a wait: it would fire at
+    // once, on a window that may already have reset and filled again.
+    if resets_at <= observed {
+        verdict.no_wait = Some("reset-passed");
+        return Ok(verdict);
+    }
     if resets_at - observed > MAX_WAIT {
         verdict.no_wait = Some("beyond-8-days");
         return Ok(verdict);
@@ -1846,6 +1853,17 @@ mod tests {
         assert_eq!(
             reset_in_text("weekly limit; resets Jan 2 at 9am (UTC)", observed),
             Some(at("2027-01-02T09:00:00Z"))
+        );
+        // A dated time earlier today is next year's occurrence, never a past
+        // instant that would fire at once (r2 item 4).
+        assert_eq!(
+            reset_in_text("weekly limit; resets Nov 3, 1am (UTC)", observed),
+            Some(at("2027-11-03T01:00:00Z"))
+        );
+        // Later today stays today.
+        assert_eq!(
+            reset_in_text("weekly limit; resets Nov 3, 11pm (UTC)", observed),
+            Some(at("2026-11-03T23:00:00Z"))
         );
         assert_eq!(
             reset_in_text("quota resets 2026-11-03T09:00:00+01:00", observed),

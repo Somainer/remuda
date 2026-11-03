@@ -789,6 +789,26 @@ async fn a_reset_beyond_eight_days_gives_the_fact_only() -> Result<()> {
     Ok(())
 }
 
+/// A reset time already behind the turn's end is not a wait (it would
+/// fire at once): the fact says so and no row is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reset_already_past_makes_no_row() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("resume-past").await?;
+    let (seat, token) = ctx.seat(&project).await?;
+    let worker = ctx.worker(&token, &project, true).await?;
+    ctx.limit_turn(&worker, "cmd_p_1", Some(resets_in(-120)), true, NOTICE)
+        .await?;
+    ctx.settle().await?;
+    assert!(ctx.waits(&worker)?.is_empty(), "no row for a past reset");
+    let failed = ctx.facts(&seat, "turn-failed").await?;
+    let limit = &failed[0]["payload"]["usageLimit"];
+    assert_eq!(limit["class"], "subscription", "{limit}");
+    assert_eq!(limit["waits"], false, "{limit}");
+    assert_eq!(limit["reason"], "reset-passed", "{limit}");
+    Ok(())
+}
+
 /// The zoned time in the notice is the third source: used when the turn had
 /// no structured event.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

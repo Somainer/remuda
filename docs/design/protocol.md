@@ -2173,7 +2173,7 @@ turn-failed  payload.usageLimit = {class, window?, resetsAt?, source?, waits,
                                    fireAt?, autoContinue?, reason?}
   class  = subscription | api-key-or-gateway | api-rate-limit
   source = structured | supply-window | error-text
-  reason = beyond-8-days | no-reset-time          (waits: false)
+  reason = beyond-8-days | no-reset-time | reset-passed   (waits: false)
 supply-reset payload (from a wait) = {window, resetsAt, fireAt, source, profileId,
                                       autoContinue: off | continue | capped}
 ~~~

@@ -1416,6 +1416,40 @@ async fn a_prune_between_the_arm_and_the_release_keeps_the_retry() -> Result<()>
     Ok(())
 }
 
+/// An unsent batch with nothing armed for it (its entry lost, whatever the
+/// interleaving) is not stranded: the periodic check drives it, once, under
+/// its id, with no other drive and no lineage change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unsent_batch_with_nothing_armed_is_driven_by_the_tick() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("deliver-tick-net").await?;
+    let (seat, token) = ctx.seat(&project).await?;
+    let worker = ctx.worker(&token, &project).await?;
+    ctx.hub.test_hold_inbox_forward(true);
+    ctx.worker_turn(&worker, 10, "done").await?;
+    ctx.journal(&seat, activity("idle", &at(20))).await?;
+    ctx.settle().await?;
+    let batch = ctx.batch_rows()?[0].0.clone();
+    ctx.hub.test_arm_node_busy(&batch, 1);
+    ctx.hub.test_hold_inbox_forward(false);
+    ctx.settle().await?;
+    let row = command_row(&ctx, &seat, &batch).await?;
+    assert_eq!(
+        (row["state"].as_str(), row["forwarded"].as_bool()),
+        (Some("queued"), Some(false)),
+        "released: {row:#}"
+    );
+    ctx.hub.test_forget_inbox_retries();
+    assert!(!ctx.hub.test_inbox_retry_armed(&batch));
+    retry_until(&ctx, || frames_for(&ctx, &batch) == 1).await?;
+    assert_eq!(ctx.batch_rows()?.len(), 1, "the same id");
+    for _ in 0..3 {
+        ctx.hub.test_inbox_retry_tick().await;
+    }
+    assert_eq!(frames_for(&ctx, &batch), 1, "once");
+    Ok(())
+}
+
 /// Same-id retries end: a batch whose host stays full is given up after its
 /// ten attempts, settled `not-delivered`, and its rows go back to waiting;
 /// they form a new batch, under a new id, which is delivered.

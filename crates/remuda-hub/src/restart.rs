@@ -959,6 +959,36 @@ impl Store {
     }
 }
 
+/// Whether some restart notice is due for [`drive_notices`]: its successor's
+/// create was accepted, its same-id retry's backoff has passed or nothing is
+/// armed for it, and its host is live, capable and has no unacknowledged
+/// fence. The delivery retry tick asks this, so a released notice is
+/// forwarded even when nothing else evaluates the lineage.
+pub(crate) async fn notice_due(state: &AppState, now: tokio::time::Instant) -> bool {
+    let Ok(due) = state.store.notices_due().await else {
+        return false;
+    };
+    for notice in due {
+        if !state.deliver.retry_due(&notice.notice_command_id, now)
+            || state.nodes.kind_of(&notice.host_id).await.is_none()
+        {
+            continue;
+        }
+        let ready = state
+            .store
+            .read("restart_notice_host", move |conn| {
+                Ok(crate::fence::host_capable(conn, &notice.host_id)?
+                    && !crate::fence::host_gated(conn, &notice.host_id)?)
+            })
+            .await
+            .unwrap_or(false);
+        if ready {
+            return true;
+        }
+    }
+    false
+}
+
 /// Forward every restart notice that is due: its successor's host
 /// acknowledged the fence (no unacknowledged fences: not gated), advertises
 /// fence support, is live, and accepted the successor's create. A notice

@@ -1457,6 +1457,13 @@ impl RunningHub {
         crate::inbox_deliver::prune_retries(&self.state).await;
     }
 
+    /// Test-only: lose every armed same-id retry entry.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_forget_inbox_retries(&self) {
+        self.state.deliver.forget_retries();
+    }
+
     /// Test-only: whether a same-id retry is armed for `command_id`.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-faults"))]

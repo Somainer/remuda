@@ -1435,6 +1435,16 @@ impl DeliverState {
         }
     }
 
+    /// Test seam: lose every armed retry, as an interleaving that drops an
+    /// entry would.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub(crate) fn forget_retries(&self) {
+        self.retry
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clear();
+    }
+
     /// Test seam: whether a same-id retry is armed for `command_id`.
     #[cfg(any(test, feature = "test-faults"))]
     pub(crate) fn retry_armed(&self, command_id: &str) -> bool {
@@ -1449,15 +1459,6 @@ impl DeliverState {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .remove(batch_id);
-    }
-
-    /// Whether some released batch's backoff has passed.
-    fn retry_pending(&self, now: tokio::time::Instant) -> bool {
-        self.retry
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .values()
-            .any(|retry| retry.next <= now)
     }
 }
 
@@ -1500,27 +1501,7 @@ struct Owed {
 /// was fenced meanwhile.
 pub(crate) async fn drive(state: &AppState, pace: Pace) {
     let _drive = state.deliver.drive.lock().await;
-    let unsent = state
-        .store
-        .read("inbox_batches_unsent", |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT b.batch_id, b.host_id FROM inbox_batches b
-                   JOIN commands c ON c.id = b.batch_id
-                  WHERE b.outcome IS NULL AND c.state = 'queued' AND c.forwarded = 0
-                  ORDER BY b.created_at",
-            )?;
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok(Unsent {
-                        batch_id: row.get(0)?,
-                        host_id: row.get(1)?,
-                    })
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })
-        .await;
-    match unsent {
+    match unsent_batches(state).await {
         Ok(unsent) if !forward_held(state) => {
             let now = tokio::time::Instant::now();
             prune_retries(state).await;
@@ -1603,6 +1584,63 @@ pub(crate) async fn drive(state: &AppState, pace: Pace) {
     push_owed(state).await;
 }
 
+/// Formed batches whose send is still queued and unforwarded, oldest first.
+async fn unsent_batches(state: &AppState) -> Result<Vec<Unsent>, StoreError> {
+    state
+        .store
+        .read("inbox_batches_unsent", |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT b.batch_id, b.host_id FROM inbox_batches b
+                   JOIN commands c ON c.id = b.batch_id
+                  WHERE b.outcome IS NULL AND c.state = 'queued' AND c.forwarded = 0
+                  ORDER BY b.created_at",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(Unsent {
+                        batch_id: row.get(0)?,
+                        host_id: row.get(1)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+}
+
+/// Whether some unsent batch is due for a driver pass: its same-id retry's
+/// backoff has passed, or nothing is armed for it at all; its host is live;
+/// and it is not held (behind the host's unacknowledged fences, or behind
+/// input that goes first: the acknowledgement and that input's settle
+/// forward those).
+async fn batch_due(state: &AppState, now: tokio::time::Instant) -> bool {
+    if forward_held(state) {
+        return false;
+    }
+    let Ok(unsent) = unsent_batches(state).await else {
+        return false;
+    };
+    for batch in unsent {
+        if !state.deliver.retry_due(&batch.batch_id, now)
+            || state.nodes.kind_of(&batch.host_id).await.is_none()
+        {
+            continue;
+        }
+        let held = state
+            .store
+            .read("inbox_batch_held", move |conn| {
+                Ok(crate::fence::host_gated(conn, &batch.host_id)?
+                    || forward_waits(conn, &batch.batch_id)?)
+            })
+            .await
+            .unwrap_or(true);
+        if !held {
+            return true;
+        }
+    }
+    false
+}
+
 /// Drop the retry entries of sends that left the queue (accepted, settled,
 /// cancelled by a fence): batches and restart notices share the map, so it
 /// is pruned by the command rows, not by the batch list. A row still
@@ -1660,11 +1698,18 @@ async fn waits_behind(state: &AppState, batch_id: &str) -> bool {
 /// tick).
 pub(crate) const RETRY_TICK_EVERY: u64 = 5;
 
-/// The periodic retry check: a driver pass, honouring the backoff, when a
-/// released batch's backoff has passed. One in-memory look; nothing polls a
+/// The periodic retry check. A driver pass, honouring the backoff, runs
+/// when an unsent batch is due and not held — its retry's backoff has
+/// passed, or nothing is armed for it at all — so a batch left unsent with
+/// no entry (whatever interleaving lost it) is still forwarded; restart
+/// notices get the same look. It reads the Hub's own store; nothing polls a
 /// Node.
 pub(crate) async fn retry_tick(state: &AppState) {
-    if state.deliver.retry_pending(tokio::time::Instant::now()) {
+    let now = tokio::time::Instant::now();
+    if crate::restart::notice_due(state, now).await {
+        crate::restart::drive_notices(state).await;
+    }
+    if batch_due(state, now).await {
         drive(state, Pace::Backoff).await;
         return;
     }

@@ -983,6 +983,99 @@ async fn a_failed_first_turn_is_continued_with_the_create_prompt() -> Result<()>
     Ok(())
 }
 
+/// Source 2 is a full subscription window of the instance's own native
+/// profile with a reported `resetsAt`. A window parked by the Hub's backoff
+/// (a cooldown and no `resetsAt`) is the Hub's own estimate, never a remote
+/// Node's report, so it makes no row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_full_window_with_a_reported_reset_is_a_source_and_a_backoff_is_not() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("resume-window").await?;
+    let (seat, token) = ctx.seat(&project).await?;
+    let reset = resets_in(900);
+    let reported = ctx
+        .http
+        .post(format!("{}/v1/providers", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .json(&json!({ "name": "login-window", "kind": "native",
+                       "baseUrl": "https://api.anthropic.com",
+                       "supply": { "windows": [{ "id": "five_hour", "appliesTo": ["*"],
+                                                "usedPercent": 100.0, "resetsAt": reset }] } }))
+        .send()
+        .await?;
+    let status = reported.status();
+    let reported = reported.json::<Value>().await?;
+    anyhow::ensure!(status.is_success(), "{status} {reported}");
+    let backed_off = ctx
+        .http
+        .post(format!("{}/v1/providers", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .json(&json!({ "name": "login-backoff", "kind": "native",
+                       "baseUrl": "https://api.anthropic.com",
+                       "supply": { "windows": [{ "id": "model", "appliesTo": ["*"],
+                                                "usedPercent": 100.0,
+                                                "cooldownUntil": reset }] } }))
+        .send()
+        .await?;
+    anyhow::ensure!(backed_off.status().is_success(), "{backed_off:?}");
+    let backed_off = backed_off.json::<Value>().await?;
+    let id = |value: &Value| {
+        value["id"]
+            .as_str()
+            .or_else(|| value["provider"]["id"].as_str())
+            .expect("provider id")
+            .to_owned()
+    };
+    let with_window = ctx.worker(&token, &project, true).await?;
+    let with_backoff = ctx.worker(&token, &project, true).await?;
+    for (worker, provider) in [
+        (&with_window, id(&reported)),
+        (&with_backoff, id(&backed_off)),
+    ] {
+        ctx.db()?.execute(
+            "UPDATE instances SET spec_json = json_set(spec_json, '$.providerProfileId', ?2)
+              WHERE id = ?1",
+            rusqlite::params![worker, provider],
+        )?;
+    }
+    // No structured event: the notice alone.
+    ctx.limit_turn(&with_window, "cmd_v_1", None, true, NOTICE)
+        .await?;
+    // No zone stated either, so the backoff is the only candidate left.
+    ctx.limit_turn(
+        &with_backoff,
+        "cmd_b_1",
+        None,
+        true,
+        "You've hit your limit · resets 3pm",
+    )
+    .await?;
+    ctx.settle().await?;
+    let waits = ctx.waits(&with_window)?;
+    assert_eq!(waits.len(), 1, "{waits:?}");
+    assert_eq!(waits[0].source, "supply-window");
+    assert_eq!(
+        parse(&waits[0].resets_at).unix_timestamp(),
+        reset,
+        "the Node's reported resetsAt"
+    );
+    assert!(
+        ctx.waits(&with_backoff)?.is_empty(),
+        "a backoff is not a report"
+    );
+    let failed = ctx.facts(&seat, "turn-failed").await?;
+    let detail = |worker: &str| {
+        failed
+            .iter()
+            .find(|fact| fact["subjectInstanceId"] == worker)
+            .map(|fact| fact["payload"]["usageLimit"].clone())
+            .unwrap_or(Value::Null)
+    };
+    assert_eq!(detail(&with_window)["source"], "supply-window");
+    assert_eq!(detail(&with_backoff)["waits"], false);
+    Ok(())
+}
+
 /// The harness's own report decides when the instance has no profile: a
 /// session whose `apiKeySource` names an API key makes no row even with a
 /// structured `rejected` event, and one reporting `none` (a claude.ai login)

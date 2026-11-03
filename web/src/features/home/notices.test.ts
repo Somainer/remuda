@@ -1,3 +1,4 @@
+import { act, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Observation } from "../../types/observation";
 
@@ -17,6 +18,8 @@ import {
   listUnackedNotices,
   noticeVoice,
   noticesByReply,
+  useChapterNotices,
+  type ChapterNoticeSource,
   type OwnerNotice,
 } from "./notices";
 import { T0, T1, T2, notice } from "./queueTestData";
@@ -205,5 +208,55 @@ describe("listUnackedNotices (r2 item 5)", () => {
     expect(api.rest).toHaveBeenCalledWith(`/v1/owner/notices?unacked=1&limit=${NOTICE_LIST_MAX}`, {});
     expect(NOTICE_LIST_MAX).toBe(200);
     expect(listed).toHaveLength(60);
+  });
+});
+
+/** A chapter source whose reads the test resolves, and whose poll it fires. */
+function chapterSource() {
+  const reads: { resolve: (rows: OwnerNotice[]) => void; signal: AbortSignal }[] = [];
+  let poll: (() => void) | null = null;
+  const source: ChapterNoticeSource = {
+    read: (_id, signal) =>
+      new Promise<OwnerNotice[]>((resolve) => {
+        reads.push({ resolve, signal });
+      }),
+    onRefresh: (listener) => {
+      poll = listener;
+      return () => {
+        poll = null;
+      };
+    },
+  };
+  return { source, reads, poll: () => poll?.() };
+}
+
+describe("useChapterNotices", () => {
+  it("reads again on every successful list poll, not only when the journal grows (r2 item 2)", async () => {
+    const chapter = chapterSource();
+    const { result } = renderHook(() => useChapterNotices("ins_main", true, "7", chapter.source));
+    await act(async () => chapter.reads[0].resolve([]));
+    expect(result.current.notices).toEqual([]);
+    // Main writes a notice: nothing is journaled, so refreshKey stays "7".
+    act(() => chapter.poll());
+    expect(chapter.reads).toHaveLength(2);
+    await act(async () => chapter.reads[1].resolve([notice({ noticeId: "ntc_new" })]));
+    expect(result.current.notices.map((row) => row.noticeId)).toEqual(["ntc_new"]);
+  });
+
+  it("applies only the newest read", async () => {
+    const chapter = chapterSource();
+    const { result } = renderHook(() => useChapterNotices("ins_main", true, "7", chapter.source));
+    act(() => chapter.poll());
+    expect(chapter.reads[0].signal.aborted).toBe(true);
+    await act(async () => chapter.reads[1].resolve([notice({ noticeId: "ntc_new" })]));
+    await act(async () => chapter.reads[0].resolve([notice({ noticeId: "ntc_old" })]));
+    expect(result.current.notices.map((row) => row.noticeId)).toEqual(["ntc_new"]);
+  });
+
+  it("reads nothing off Main's lineage", () => {
+    const chapter = chapterSource();
+    renderHook(() => useChapterNotices("ins_worker", false, "7", chapter.source));
+    act(() => chapter.poll());
+    expect(chapter.reads).toHaveLength(0);
   });
 });

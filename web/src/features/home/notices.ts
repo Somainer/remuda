@@ -49,6 +49,21 @@ export function listChapterNotices(instanceId: string, signal?: AbortSignal): Pr
   return listNotices(`?instanceId=${encodeURIComponent(instanceId)}&limit=${NOTICE_LIST_MAX}`, signal);
 }
 
+/**
+ * Call `listener` after every SUCCESSFUL list refresh of the hub store (the
+ * 2 s poll and every other refresh); a failed one calls nothing, so a Hub
+ * that is down is not asked twice per failure.
+ */
+export function onSuccessfulRefresh(listener: () => void): () => void {
+  let last = hubStore.getRefreshHealth().lastOkAt;
+  return hubStore.subscribeRefreshHealth(() => {
+    const at = hubStore.getRefreshHealth().lastOkAt;
+    if (at === null || at === last) return;
+    last = at;
+    listener();
+  });
+}
+
 /** Acknowledge one notice on every device (idempotent). */
 export async function ackNotice(noticeId: string): Promise<OwnerNotice> {
   const body = await rest<{ notice: OwnerNotice }>(
@@ -196,35 +211,60 @@ export function useOwnerNotices(store: NoticeStore = noticeStore): NoticeSnapsho
   return useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
 }
 
+/** What `useChapterNotices` reads with; injectable for tests. */
+export type ChapterNoticeSource = {
+  read: (instanceId: string, signal: AbortSignal) => Promise<OwnerNotice[]>;
+  /** Subscribe to the moments the list should be read again. */
+  onRefresh: (listener: () => void) => () => void;
+};
+
+const CHAPTER_SOURCE: ChapterNoticeSource = { read: listChapterNotices, onRefresh: onSuccessfulRefresh };
+
 /**
- * One chapter's notices for its transcript, read with the transcript's
- * refresh (`refreshKey` is its tail seq) and only while `enabled` (a chapter
- * of Main's lineage: no other seat can notify). An acknowledgement from the
- * card is folded in at once.
+ * One chapter's notices for its transcript, only while `enabled` (a chapter of
+ * Main's lineage: no other seat can notify). Read when the transcript grows
+ * (`refreshKey` is its tail seq) AND on every successful list poll: a device
+ * following Main with its page visible gets no push for a notice Main writes
+ * (per-device suppression, main-agent.md §8.4), and writing a notice journals
+ * nothing, so the poll is what brings that device the card within one 2 s
+ * period.
+ *
+ * An acknowledgement from the card is folded in at once. Only the newest read
+ * is applied.
  */
 export function useChapterNotices(
   instanceId: string,
   enabled: boolean,
   refreshKey: string | undefined,
+  source: ChapterNoticeSource = CHAPTER_SOURCE,
 ): { notices: OwnerNotice[]; acked: (notice: OwnerNotice) => void } {
   const [notices, setNotices] = useState<OwnerNotice[]>([]);
+  const [polled, setPolled] = useState(0);
   const owner = useRef<string | null>(null);
+  const latest = useRef(0);
   useEffect(() => {
     if (owner.current === instanceId) return;
     owner.current = instanceId;
     setNotices([]);
   }, [instanceId]);
+  const { read, onRefresh } = source;
+  useEffect(() => {
+    if (!enabled) return;
+    return onRefresh(() => setPolled((count) => count + 1));
+  }, [enabled, onRefresh]);
   useEffect(() => {
     if (!instanceId || !enabled) return;
     const controller = new AbortController();
-    void listChapterNotices(instanceId, controller.signal).then(
+    const seq = ++latest.current;
+    void read(instanceId, controller.signal).then(
       (rows) => {
-        if (!controller.signal.aborted) setNotices((current) => (sameNotices(rows, current) ? current : rows));
+        if (controller.signal.aborted || seq !== latest.current) return;
+        setNotices((current) => (sameNotices(rows, current) ? current : rows));
       },
       () => undefined,
     );
     return () => controller.abort();
-  }, [instanceId, enabled, refreshKey]);
+  }, [instanceId, enabled, refreshKey, polled, read]);
   // Stable, so the transcript rows' memo holds across renders.
   const acked = useCallback(
     (notice: OwnerNotice) =>

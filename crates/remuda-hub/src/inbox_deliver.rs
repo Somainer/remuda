@@ -214,13 +214,13 @@ pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
                   settled_at = NEW.updated_at,
                   released_at = CASE
                     WHEN NEW.forwarded = 0 OR NEW.settlement_outcome = 'withheld'
-                      OR NEW.settlement_reason = 'fenced'
+                      OR NEW.settlement_reason IN ('fenced', 'not-delivered')
                       OR NEW.settlement_not_dispatched = 1 THEN NEW.updated_at END
             WHERE batch_id = NEW.id AND outcome IS NULL;
            UPDATE inbox_facts SET batch_id = NULL
             WHERE batch_id = NEW.id
               AND (NEW.forwarded = 0 OR NEW.settlement_outcome = 'withheld'
-                   OR NEW.settlement_reason = 'fenced'
+                   OR NEW.settlement_reason IN ('fenced', 'not-delivered')
                    OR NEW.settlement_not_dispatched = 1);
            -- Also a lineage whose formed batch waits in the queue behind
            -- the input that just settled.
@@ -1191,12 +1191,78 @@ pub(crate) fn retry_delay(attempts: u32) -> std::time::Duration {
 /// A Hub-written send (a batch or a restart notice) was released back to the
 /// queue after a forward that proved it never ran: arm its same-id retry.
 pub(crate) async fn note_released(state: &AppState, row: &crate::store::CommandRecord) {
-    let (attempts, delay) = state.deliver.note_retry(&row.command_id);
-    tracing::info!(
-        attempts,
-        retry_in_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
-        "hub-written input not delivered; retried under the same id"
-    );
+    note_released_id(state, &row.command_id).await;
+}
+
+/// Same-id attempts at one Hub-written send before it is given up.
+pub(crate) const RETRY_ATTEMPTS: u32 = 10;
+
+/// Settlement reason of a Hub-written send whose same-id attempts are spent:
+/// it never reached its chapter, so a batch's rows are released.
+pub(crate) const NOT_DELIVERED_REASON: &str = "not-delivered";
+
+/// [`note_released`] by id: arm the next same-id attempt, or, once
+/// [`RETRY_ATTEMPTS`] are spent, settle the send `rejected` /
+/// `not-delivered` so it ends (a batch's rows go back to waiting through the
+/// release trigger) and log that category once per process.
+pub(crate) async fn note_released_id(state: &AppState, command_id: &str) {
+    let (attempts, delay) = state.deliver.note_retry(command_id);
+    if attempts < RETRY_ATTEMPTS {
+        tracing::info!(
+            attempts,
+            retry_in_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+            "hub-written input not delivered; retried under the same id"
+        );
+        return;
+    }
+    state.deliver.clear_retry(command_id);
+    let id = command_id.to_owned();
+    match state
+        .store
+        .run_named("hub_input_not_delivered", move |conn| {
+            settle_not_delivered(conn, &id)
+        })
+        .await
+    {
+        Ok(_) => report_once("hub-input-retries-exhausted"),
+        Err(err) => tracing::warn!(code = error_code(&err), "could not settle a spent send"),
+    }
+}
+
+/// Settle a still-queued, unforwarded Hub-written send `rejected` with
+/// [`NOT_DELIVERED_REASON`]: it ends without having reached its chapter.
+/// Returns whether a row moved.
+pub(crate) fn settle_not_delivered(
+    conn: &Connection,
+    command_id: &str,
+) -> Result<bool, StoreError> {
+    let changed = conn.execute(
+        "UPDATE commands
+            SET state = 'settled', resolution = 'clear',
+                settlement_outcome = 'rejected', settlement_reason = ?2, updated_at = ?3
+          WHERE id = ?1 AND state = 'queued' AND forwarded = 0",
+        params![command_id, NOT_DELIVERED_REASON, now_rfc3339()],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Codes already logged in this process: an ending that can repeat (a host
+/// that stays full) is logged once per category, not per batch.
+fn report_once(code: &'static str) {
+    static REPORTED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<&'static str>>,
+    > = std::sync::OnceLock::new();
+    let reported = REPORTED.get_or_init(Default::default);
+    if reported
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .insert(code)
+    {
+        tracing::warn!(
+            code,
+            "hub-written input given up after its same-id attempts"
+        );
+    }
 }
 
 /// Test seams of delivery: make the next forwards of one command meet a
@@ -1412,8 +1478,8 @@ pub(crate) async fn drive(state: &AppState, pace: Pace) {
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or("")
                             .to_owned();
-                        let (attempts, _) = state.deliver.note_retry(&batch.batch_id);
-                        tracing::warn!(status, code = %code, attempts, "inbox batch forward failed");
+                        tracing::warn!(status, code = %code, "inbox batch forward failed");
+                        note_released_id(state, &batch.batch_id).await;
                     }
                 }
             }

@@ -1267,6 +1267,41 @@ async fn a_fence_held_batch_released_on_the_ack_path_is_retried_once() -> Result
     Ok(())
 }
 
+/// Same-id retries end: a batch whose host stays full is given up after its
+/// ten attempts, settled `not-delivered`, and its rows go back to waiting;
+/// they form a new batch, under a new id, which is delivered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spent_same_id_retries_end_the_batch_and_release_its_rows() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("deliver-retry-cap").await?;
+    let (seat, token) = ctx.seat(&project).await?;
+    let worker = ctx.worker(&token, &project).await?;
+    ctx.hub.test_hold_inbox_forward(true);
+    ctx.worker_turn(&worker, 10, "done").await?;
+    ctx.journal(&seat, activity("idle", &at(20))).await?;
+    ctx.settle().await?;
+    let (first, carried, ..) = ctx.batch_rows()?[0].clone();
+    ctx.hub.test_arm_node_busy(&first, usize::MAX);
+    ctx.hub.test_hold_inbox_forward(false);
+    // Each drive (the backoff waived) makes one attempt.
+    for _ in 0..10 {
+        ctx.settle().await?;
+    }
+    let rows = ctx.batch_rows()?;
+    assert_eq!(rows[0].0, first);
+    assert_eq!(rows[0].2.as_deref(), Some("rejected"), "{rows:?}");
+    assert!(rows[0].3.is_some(), "its rows released: {rows:?}");
+    let row = command_row(&ctx, &seat, &first).await?;
+    assert_eq!(row["settlement"]["reason"], "not-delivered", "{row:#}");
+    assert_eq!(frames_for(&ctx, &first), 0, "never reached the Node");
+    // The rows formed a new batch, which went out.
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_ne!(rows[1].0, first);
+    assert_eq!(rows[1].1, carried, "the same rows");
+    assert_eq!(frames_for(&ctx, &rows[1].0), 1);
+    Ok(())
+}
+
 /// A Node that settles the batch as rejected before dispatch (its queue was
 /// full, or it was interrupted before the driver saw it) attests it never
 /// reached the chapter: the rows go back and form a new batch, under a new

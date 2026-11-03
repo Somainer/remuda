@@ -105,6 +105,12 @@ async fn fake_herdr_start_prompt_idle_close() {
     });
 
     let mut handle = driver.start(spec(&cwd)).await.expect("start");
+    // cb-stall-tooluse r2: a started claude-pty has no `screen_read` grid,
+    // and the capability the Hub's screen stall fallback reads agrees.
+    assert!(driver.screen_read().await.expect("screen_read").is_none());
+    assert!(!remuda_driver::reads_screen(
+        remuda_protocol::DriverKind::ClaudePty
+    ));
     let recipe = handle.recipe();
     assert!(
         !recipe.argv.iter().any(|token| token == "--bare"),

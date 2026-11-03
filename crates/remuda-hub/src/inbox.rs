@@ -87,7 +87,7 @@ pub(crate) fn validate_configured_minutes(
 
 /// `minutes` as a duration the tick may add to a time, when it is in range
 /// and representable; `None` means "skip this subject".
-fn window_minutes(minutes: i64) -> Option<time::Duration> {
+pub(crate) fn window_minutes(minutes: i64) -> Option<time::Duration> {
     if !(1..=MAX_CONFIGURED_MINUTES).contains(&minutes) {
         return None;
     }
@@ -103,7 +103,7 @@ static REPORTED_ONCE: std::sync::OnceLock<
 
 /// Log a category once per process; never the values, which can be arbitrary
 /// input.
-fn report_once(code: &'static str) {
+pub(crate) fn report_once(code: &'static str) {
     let seen = REPORTED_ONCE.get_or_init(Default::default);
     let mut seen = seen.lock().unwrap_or_else(|poison| poison.into_inner());
     if seen.insert(code) {
@@ -259,6 +259,7 @@ pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
          );
          CREATE INDEX IF NOT EXISTS inbox_supply_parks_due ON inbox_supply_parks(resets_at);",
     )?;
+    crate::stall_screen::migrate(conn)?;
     migrate_sources(conn)
 }
 
@@ -559,7 +560,7 @@ pub(crate) fn canonical_at(raw: &str) -> Option<String> {
     parse_at(raw).map(crate::config::rfc3339)
 }
 
-fn parse_at(raw: &str) -> Option<OffsetDateTime> {
+pub(crate) fn parse_at(raw: &str) -> Option<OffsetDateTime> {
     OffsetDateTime::parse(raw.trim(), &Rfc3339)
         .ok()
         .map(|at| at.to_offset(time::UtcOffset::UTC))
@@ -645,7 +646,10 @@ fn receives_with(
 
 /// The single project of `instance_id`'s scope, whose policy holds the cap
 /// and the stall windows.
-fn project_of(conn: &Connection, instance_id: &str) -> Result<Option<String>, StoreError> {
+pub(crate) fn project_of(
+    conn: &Connection,
+    instance_id: &str,
+) -> Result<Option<String>, StoreError> {
     let scope: Option<String> = conn
         .query_row(
             "SELECT scope_json FROM instances WHERE id = ?1",
@@ -882,7 +886,7 @@ fn record_about(conn: &Connection, instance_id: &str, fact: Fact) -> Result<Outc
 }
 
 /// A fact about `instance_id` itself (key and cap subject are the instance).
-fn instance_fact(
+pub(crate) fn instance_fact(
     conn: &Connection,
     kind: InboxFactKind,
     instance_id: &str,
@@ -914,6 +918,9 @@ fn bounded_text(text: &str) -> String {
 const TRACKED_TURNS: usize = 32;
 /// Tool calls tracked in flight per instance; the oldest drops beyond it.
 const TRACKED_TOOLS: usize = 64;
+/// Calls whose final result was seen, remembered per instance so a late copy
+/// of the call cannot reopen it; the oldest drops beyond it.
+const CLOSED_TOOLS: usize = 64;
 
 /// Journal-derived per-instance state the facts need beyond the instance row,
 /// folded in the append transaction (`inbox_trackers.tracker_json`).
@@ -938,11 +945,15 @@ struct Tracker {
     turns: Vec<(String, i64)>,
     /// Tool calls in flight, `(toolCallId, Hub time the call was journaled)`,
     /// oldest first: from the call to its final result (they share a
-    /// `toolCallId`, protocol.md §5.2). This is the minimal journal-derived
-    /// tracker the stall rules need until `cb-stall-tooluse` provides the
-    /// state for every carrier.
+    /// `toolCallId`, protocol.md §5.2). The single source of tool-in-flight
+    /// state for every carrier that journals its calls (main-agent.md §10.5).
     #[serde(default)]
     tools: Vec<(String, String)>,
+    /// Calls whose final result was seen, newest last. A carrier can journal
+    /// one call on two channels (a Claude hook and its transcript): the copy
+    /// that lands after the result must not reopen a finished call.
+    #[serde(default)]
+    closed: Vec<String>,
 }
 
 impl Tracker {
@@ -991,7 +1002,17 @@ pub(crate) fn forget_instance(conn: &Connection, instance_id: &str) -> Result<()
         "DELETE FROM inbox_supply_parks WHERE instance_id = ?1",
         params![instance_id],
     )?;
-    Ok(())
+    crate::stall_screen::forget(conn, instance_id)
+}
+
+/// The run generation `instance_id` is in now, and whether a journaled tool
+/// call is in flight (the screen sweep re-checks it before a fact).
+pub(crate) fn run_and_tool_in_flight(
+    conn: &Connection,
+    instance_id: &str,
+) -> Result<(i64, bool), StoreError> {
+    let tracker = load_tracker(conn, instance_id)?;
+    Ok((tracker.run, !tracker.tools.is_empty()))
 }
 
 /// The run generation `instance_id` is in now.
@@ -1197,6 +1218,7 @@ pub(crate) fn fold_append(
         "tool_call" => {
             if let Some(id) = text("/toolCallId")
                 && !tracker.tools.iter().any(|(open, _)| open == id)
+                && !tracker.closed.iter().any(|closed| closed == id)
             {
                 if tracker.tools.len() >= TRACKED_TOOLS {
                     tracker.tools.remove(0);
@@ -1209,10 +1231,20 @@ pub(crate) fn fold_append(
             let final_stage = text("/stage").unwrap_or("final") == "final";
             if final_stage && let Some(id) = text("/toolCallId") {
                 tracker.tools.retain(|(open, _)| open != id);
+                if !tracker.closed.iter().any(|closed| closed == id) {
+                    if tracker.closed.len() >= CLOSED_TOOLS {
+                        tracker.closed.remove(0);
+                    }
+                    tracker.closed.push(id.to_owned());
+                }
             }
         }
         _ => {}
     }
+    // A process that ended runs none of its calls: a kill mid-call journals
+    // no result. (A Hub-recorded end with no journal lifecycle clears them in
+    // `exit_fact`; host contact loss is not an end and clears nothing, since
+    // the process may still be running the call.)
     if matches!(lifecycle.as_str(), "exited" | "failed" | "closed")
         && !matches!(before.lifecycle.as_str(), "exited" | "failed" | "closed")
     {
@@ -1600,7 +1632,14 @@ fn exit_fact(conn: &Connection, instance_id: &str, seen_at: &str) -> Result<(), 
     if let Some(error) = last_error.as_deref().map(bounded_text) {
         detail["lastError"] = json!(error);
     }
-    let run = current_run(conn, instance_id)?;
+    // An end recorded without a journal lifecycle (OA6 evidence, a lost
+    // host) still leaves no call running.
+    let mut tracker = load_tracker(conn, instance_id)?;
+    if !tracker.tools.is_empty() {
+        tracker.tools.clear();
+        save_tracker(conn, instance_id, &tracker)?;
+    }
+    let run = tracker.run;
     let fact = instance_fact(
         conn,
         InboxFactKind::Exited,
@@ -1941,118 +1980,254 @@ fn due_supply_resets(conn: &Connection, now: OffsetDateTime) -> Result<usize, St
 /// Busy children that went quiet (§10.1 item 8):
 ///
 /// * with a tool call in flight, nothing, unless the project sets a finite
-///   `stallToolThresholdMins`; then one fact per call once it has been in
-///   flight that long;
+///   `stallToolThresholdMins`; then one fact per call in flight, each once it
+///   has been in flight that long;
 /// * otherwise one fact per quiet period once no journal row arrived for the
 ///   project's `stallThresholdMins` (default
 ///   [`remuda_protocol::DEFAULT_STALL_THRESHOLD_MINS`]). The period starts at
-///   the latest row, so it restarts at a tool's result.
+///   the latest row, so it restarts at a tool's result. On a screen carrier
+///   ([`crate::stall_screen::is_screen_carrier`]) that quiet only makes the
+///   child a [`ScreenCandidate`]: the per-host screen sweep decides (§10).
 ///
 /// Both clocks are the Hub's own (the journal row's `observed_at`), so a
 /// Node's clock or a replayed backlog cannot make a child look stalled.
-fn due_stalls(conn: &Connection, now: OffsetDateTime) -> Result<usize, StoreError> {
-    let busy: Vec<String> = {
+fn due_stalls(
+    conn: &Connection,
+    now: OffsetDateTime,
+    screen: &mut Vec<ScreenCandidate>,
+) -> Result<usize, StoreError> {
+    let busy: Vec<(String, String, String)> = {
         let mut stmt = conn.prepare_cached(
-            "SELECT id FROM instances
+            "SELECT id, driver, host_id FROM instances
               WHERE activity IN ('working', 'draining') AND lifecycle IN ('running', 'ready')
                 AND ended_at IS NULL AND fenced_at IS NULL
                 AND json_extract(spec_json, '$.parentInstanceId') IS NOT NULL",
         )?;
-        stmt.query_map([], |row| row.get(0))?
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .collect::<Result<_, _>>()?
     };
     let mut written = 0;
-    for instance_id in busy {
+    for (instance_id, driver, host_id) in busy {
         let Some(subscriber) = subscriber_of(conn, &instance_id)? else {
             continue;
         };
         let project = project_of(conn, &instance_id)?;
         let tracker = load_tracker(conn, &instance_id)?;
-        let fact = if let Some((tool_call_id, opened)) = tracker.tools.first() {
-            let Some(threshold) =
-                project_policy_number(conn, project.as_deref(), "stallToolThresholdMins")?
-                    .filter(|mins| *mins > 0)
-            else {
-                continue;
-            };
-            let Some(since) = parse_at(opened) else {
-                continue;
-            };
-            let Some(stalled_at) =
-                window_minutes(threshold).and_then(|window| since.checked_add(window))
-            else {
-                report_once("stall-tool-window-out-of-range");
-                continue;
-            };
-            if stalled_at > now {
-                continue;
-            }
-            // Keyed by the call and when it opened, never by the threshold
-            // that measured it: a threshold change mid-call is the same stall.
-            let mut fact = instance_fact(
+        if !tracker.tools.is_empty() {
+            written += due_tool_stalls(
                 conn,
-                InboxFactKind::Stalled,
+                &subscriber,
                 &instance_id,
-                tracker.run,
-                opened.clone(),
-                json!({
-                    "cause": "tool-in-flight",
-                    "toolCallId": tool_call_id,
-                    "since": opened,
-                    "thresholdMins": threshold,
-                    "detectedAt": crate::config::rfc3339(stalled_at),
-                }),
+                project.as_deref(),
+                &tracker,
+                now,
             )?;
-            fact.key_subject = format!("{instance_id}/{tool_call_id}");
-            // The call and its opened time are the stall; a run that began
-            // since (r3) is not a new one.
-            fact.run_in_key = false;
-            fact.payload["runGeneration"] = json!(tracker.run);
-            fact
-        } else {
-            let threshold = project_policy_number(conn, project.as_deref(), "stallThresholdMins")?
-                .filter(|mins| *mins > 0)
-                .unwrap_or(remuda_protocol::DEFAULT_STALL_THRESHOLD_MINS);
-            let last: Option<String> = conn
-                .query_row(
-                    "SELECT observed_at FROM journal WHERE instance_id = ?1
-                      ORDER BY seq DESC LIMIT 1",
-                    params![instance_id],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            let Some(quiet_since) = last.as_deref().and_then(parse_at) else {
-                continue;
-            };
-            let Some(stalled_at) =
-                window_minutes(threshold).and_then(|window| quiet_since.checked_add(window))
-            else {
-                report_once("stall-window-out-of-range");
-                continue;
-            };
-            if stalled_at > now {
-                continue;
-            }
-            // Keyed by when the quiet period started, for the same reason.
-            instance_fact(
-                conn,
-                InboxFactKind::Stalled,
-                &instance_id,
-                tracker.run,
-                crate::config::rfc3339(quiet_since),
-                json!({
-                    "cause": "quiet",
-                    "since": crate::config::rfc3339(quiet_since),
-                    "thresholdMins": threshold,
-                    "detectedAt": crate::config::rfc3339(stalled_at),
-                }),
-            )?
+            continue;
+        }
+        let screen_carrier = crate::stall_screen::is_screen_carrier(&driver);
+        let Some(due) = due_quiet(conn, &instance_id, project.as_deref(), screen_carrier, now)?
+        else {
+            continue;
         };
-        if matches!(record(conn, &subscriber, fact)?, Outcome::Recorded(_)) {
+        if screen_carrier {
+            // Journal quiet is not enough on a screen carrier: the screen can
+            // show progress the journal never carries (§10).
+            screen.push(ScreenCandidate {
+                instance_id,
+                host_id,
+            });
+            continue;
+        }
+        if record_quiet_stall(conn, &subscriber, &instance_id, tracker.run, &due, None)? {
             written += 1;
         }
     }
     Ok(written)
+}
+
+/// Every call in flight whose `stallToolThresholdMins` window has passed gets
+/// its own fact: one per call, keyed by the call and when it opened, so a
+/// younger hung call is not hidden behind an older one and a later tick
+/// repeats nothing.
+fn due_tool_stalls(
+    conn: &Connection,
+    subscriber: &str,
+    instance_id: &str,
+    project: Option<&str>,
+    tracker: &Tracker,
+    now: OffsetDateTime,
+) -> Result<usize, StoreError> {
+    let Some(threshold) =
+        project_policy_number(conn, project, "stallToolThresholdMins")?.filter(|mins| *mins > 0)
+    else {
+        return Ok(0);
+    };
+    let Some(window) = window_minutes(threshold) else {
+        report_once("stall-tool-window-out-of-range");
+        return Ok(0);
+    };
+    let mut written = 0;
+    for (tool_call_id, opened) in &tracker.tools {
+        let Some(since) = parse_at(opened) else {
+            continue;
+        };
+        let Some(stalled_at) = since.checked_add(window) else {
+            report_once("stall-tool-window-out-of-range");
+            continue;
+        };
+        if stalled_at > now {
+            continue;
+        }
+        // Keyed by the call and when it opened, never by the threshold that
+        // measured it: a threshold change mid-call is the same stall.
+        let mut fact = instance_fact(
+            conn,
+            InboxFactKind::Stalled,
+            instance_id,
+            tracker.run,
+            opened.clone(),
+            json!({
+                "cause": "tool-in-flight",
+                "toolCallId": tool_call_id,
+                "since": opened,
+                "thresholdMins": threshold,
+                "detectedAt": crate::config::rfc3339(stalled_at),
+            }),
+        )?;
+        fact.key_subject = format!("{instance_id}/{tool_call_id}");
+        // The call and its opened time are the stall; a run that began since
+        // (r3) is not a new one.
+        fact.run_in_key = false;
+        fact.payload["runGeneration"] = json!(tracker.run);
+        if matches!(record(conn, subscriber, fact)?, Outcome::Recorded(_)) {
+            written += 1;
+        }
+    }
+    Ok(written)
+}
+
+/// A quiet period that has outlasted its window.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DueQuiet {
+    /// When the quiet period started: the last journal row, or a later screen
+    /// change on a screen carrier.
+    pub(crate) quiet_since: OffsetDateTime,
+    pub(crate) threshold: i64,
+    pub(crate) stalled_at: OffsetDateTime,
+}
+
+/// `instance_id`'s quiet period, when it has lasted the project's
+/// `stallThresholdMins` by `now`. On a screen carrier a screen change after
+/// the last journal row restarts the period.
+pub(crate) fn due_quiet(
+    conn: &Connection,
+    instance_id: &str,
+    project: Option<&str>,
+    screen_carrier: bool,
+    now: OffsetDateTime,
+) -> Result<Option<DueQuiet>, StoreError> {
+    let threshold = quiet_threshold(conn, project)?;
+    let Some(mut quiet_since) = journal_quiet_since(conn, instance_id)? else {
+        return Ok(None);
+    };
+    if screen_carrier
+        && let Some(changed) = crate::stall_screen::screen_changed_at(conn, instance_id)?
+    {
+        quiet_since = quiet_since.max(changed);
+    }
+    let Some(stalled_at) =
+        window_minutes(threshold).and_then(|window| quiet_since.checked_add(window))
+    else {
+        report_once("stall-window-out-of-range");
+        return Ok(None);
+    };
+    Ok((stalled_at <= now).then_some(DueQuiet {
+        quiet_since,
+        threshold,
+        stalled_at,
+    }))
+}
+
+/// Record the quiet stall `due` names for `subscriber`: keyed by when the
+/// quiet period started, so every tick of the same period is the same fact.
+/// `source` marks a fact the screen fallback decided. True when recorded.
+pub(crate) fn record_quiet_stall(
+    conn: &Connection,
+    subscriber: &str,
+    instance_id: &str,
+    run: i64,
+    due: &DueQuiet,
+    source: Option<&str>,
+) -> Result<bool, StoreError> {
+    let since = crate::config::rfc3339(due.quiet_since);
+    let mut payload = json!({
+        "cause": "quiet",
+        "since": since,
+        "thresholdMins": due.threshold,
+        "detectedAt": crate::config::rfc3339(due.stalled_at),
+    });
+    if let Some(source) = source {
+        payload["source"] = json!(source);
+    }
+    let fact = instance_fact(
+        conn,
+        InboxFactKind::Stalled,
+        instance_id,
+        run,
+        since,
+        payload,
+    )?;
+    Ok(matches!(
+        record(conn, subscriber, fact)?,
+        Outcome::Recorded(_)
+    ))
+}
+
+/// The project's quiet window: `stallThresholdMins`, else the default.
+pub(crate) fn quiet_threshold(
+    conn: &Connection,
+    project_id: Option<&str>,
+) -> Result<i64, StoreError> {
+    Ok(
+        project_policy_number(conn, project_id, "stallThresholdMins")?
+            .filter(|mins| *mins > 0)
+            .unwrap_or(remuda_protocol::DEFAULT_STALL_THRESHOLD_MINS),
+    )
+}
+
+/// The Hub time of `instance_id`'s latest journal row: when its journal went
+/// quiet, if it is quiet now.
+pub(crate) fn journal_quiet_since(
+    conn: &Connection,
+    instance_id: &str,
+) -> Result<Option<OffsetDateTime>, StoreError> {
+    let last: Option<String> = conn
+        .query_row(
+            "SELECT observed_at FROM journal WHERE instance_id = ?1
+              ORDER BY seq DESC LIMIT 1",
+            params![instance_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(last.as_deref().and_then(parse_at))
+}
+
+/// A busy child on a screen carrier whose journal (and last observed screen
+/// change) has been quiet for its window: the screen sweep reads its screen
+/// before any stall fact is recorded (`crate::stall_screen`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScreenCandidate {
+    pub(crate) instance_id: String,
+    pub(crate) host_id: String,
+}
+
+/// What one tick evaluation produced.
+#[derive(Debug, Default)]
+pub(crate) struct TickOutcome {
+    /// Facts the writer job recorded.
+    pub(crate) written: usize,
+    /// Screen carriers the screen sweep must read before deciding.
+    pub(crate) screen: Vec<ScreenCandidate>,
 }
 
 /// Tasks whose `TaskBudget.max_wall_mins` has elapsed since their first
@@ -2130,14 +2305,15 @@ pub(crate) fn tick(
     conn: &mut Connection,
     now: OffsetDateTime,
     clock: TickClock,
-) -> Result<usize, StoreError> {
+) -> Result<TickOutcome, StoreError> {
     let tx = crate::store::immediate_tx(conn)?;
+    let mut screen = Vec::new();
     let written = due_supply_resets(&tx, now)?
         + due_host_offline(&tx, now, &clock)?
-        + due_stalls(&tx, now)?
+        + due_stalls(&tx, now, &mut screen)?
         + due_budgets(&tx, now)?;
     tx.commit()?;
-    Ok(written)
+    Ok(TickOutcome { written, screen })
 }
 
 /// Hooks for the wake tasks (`cb-wake-engine`, context-percentage wake-ups).
@@ -2155,7 +2331,7 @@ pub(crate) mod hooks {
 }
 
 /// A log-safe code for an error: never its message, which can carry text.
-fn error_code(err: &StoreError) -> String {
+pub(crate) fn error_code(err: &StoreError) -> String {
     match err {
         StoreError::Sqlite(rusqlite::Error::SqliteFailure(failure, _)) => {
             format!("sqlite-{}", failure.extended_code)
@@ -2172,18 +2348,29 @@ pub(crate) const TICK_EVERY: u64 = 15;
 
 /// One inbox evaluation from the scheduler loop. A failure is logged by
 /// error code and retried on the next evaluation: every due row stays due
-/// until its fact commits.
+/// until its fact commits. Screen candidates go to the per-host screen sweep,
+/// which runs off this task (`crate::stall_screen::sweep`).
 pub(crate) async fn run_tick(state: &AppState) {
     let clock = TickClock {
         booted_at: state.store.opened_at(),
         host_grace: host_grace(&state.config),
     };
-    if let Err(err) = state
-        .store
-        .inbox_tick(OffsetDateTime::now_utc(), clock)
-        .await
-    {
-        tracing::error!(code = error_code(&err), "inbox tick failed");
+    let now = OffsetDateTime::now_utc();
+    match state.store.inbox_tick(now, clock).await {
+        Ok(outcome) => {
+            tracing::debug!(
+                recorded = outcome.written,
+                screen_candidates = outcome.screen.len(),
+                "inbox tick"
+            );
+            crate::stall_screen::sweep(
+                state,
+                outcome.screen,
+                now,
+                crate::worker_watch::SCREEN_TIMEOUT,
+            );
+        }
+        Err(err) => tracing::error!(code = error_code(&err), "inbox tick failed"),
     }
 }
 
@@ -2195,12 +2382,24 @@ pub(crate) fn host_grace(config: &crate::config::HubConfig) -> time::Duration {
 }
 
 impl Store {
+    /// Whether `instance_id` has a journaled tool call in flight (the
+    /// tracker; the worker digest reads it).
+    pub(crate) async fn inbox_tool_in_flight(
+        &self,
+        instance_id: String,
+    ) -> Result<bool, StoreError> {
+        self.read("inbox_tool_in_flight", move |conn| {
+            Ok(run_and_tool_in_flight(conn, &instance_id)?.1)
+        })
+        .await
+    }
+
     /// One evaluation of the time-driven facts at `now`.
     pub(crate) async fn inbox_tick(
         &self,
         now: OffsetDateTime,
         clock: TickClock,
-    ) -> Result<usize, StoreError> {
+    ) -> Result<TickOutcome, StoreError> {
         self.run_named("inbox_tick", move |conn| tick(conn, now, clock))
             .await
     }
@@ -2283,6 +2482,80 @@ mod tests {
             .unwrap();
         assert_eq!(own, None);
         assert_eq!(other.as_deref(), Some("ins_a"));
+    }
+
+    /// A process end clears the calls it had in flight (a kill mid-call
+    /// journals no result): a journaled end, and an end the Hub records with
+    /// no journal lifecycle (OA6 evidence). Host contact loss is not an end:
+    /// the process may still be running the call.
+    #[tokio::test]
+    async fn a_process_end_clears_its_calls_and_contact_loss_does_not() {
+        let (_dir, store) = store().await;
+        let children = ["ins_journaled", "ins_recorded", "ins_contact"];
+        store
+            .run_named("t", move |conn| {
+                instance(conn, "ins_seat", "ins_seat", None, "human");
+                continuity(conn, "ins_seat", "ins_seat");
+                for child in children {
+                    instance(conn, child, child, Some("ins_seat"), "agent");
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        for child in children {
+            store
+                .append_journal(
+                    "hst_t".into(),
+                    child.into(),
+                    None,
+                    json!({ "kind": "tool_call", "payload": { "toolCallId": "tc_1" } }),
+                )
+                .await
+                .unwrap();
+        }
+        let in_flight = |store: &Store| {
+            let store = store.clone();
+            async move {
+                let mut open = Vec::new();
+                for child in children {
+                    if store.inbox_tool_in_flight(child.into()).await.unwrap() {
+                        open.push(child);
+                    }
+                }
+                open
+            }
+        };
+        assert_eq!(in_flight(&store).await, children);
+
+        store
+            .append_journal(
+                "hst_t".into(),
+                "ins_journaled".into(),
+                None,
+                json!({ "kind": "lifecycle", "payload": {
+                    "type": "entity", "entityType": "instance", "state": "exited" } }),
+            )
+            .await
+            .unwrap();
+        store
+            .run_named("t", |conn| {
+                conn.execute(
+                    "UPDATE instances SET lifecycle = 'exited', ended_at = ?1
+                      WHERE id = 'ins_recorded'",
+                    params![now_rfc3339()],
+                )?;
+                conn.execute(
+                    "UPDATE instances SET lifecycle = 'exited', last_error = 'host-contact-lost'
+                      WHERE id = 'ins_contact'",
+                    [],
+                )?;
+                drain_sources(conn);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(in_flight(&store).await, ["ins_contact"]);
     }
 
     /// A gate job's terminal state, written by any of the queue's paths,
@@ -2430,7 +2703,8 @@ mod tests {
             store
                 .inbox_tick(at("2026-11-01T00:30:00Z"), clock)
                 .await
-                .unwrap(),
+                .unwrap()
+                .written,
             0
         );
         // Parked again before the first reset passed: the window now runs
@@ -2450,21 +2724,24 @@ mod tests {
             store
                 .inbox_tick(at("2026-11-01T01:30:00Z"), clock)
                 .await
-                .unwrap(),
+                .unwrap()
+                .written,
             0
         );
         assert_eq!(
             store
                 .inbox_tick(at("2026-11-01T02:00:30Z"), clock)
                 .await
-                .unwrap(),
+                .unwrap()
+                .written,
             1
         );
         assert_eq!(
             store
                 .inbox_tick(at("2026-11-01T03:00:00Z"), clock)
                 .await
-                .unwrap(),
+                .unwrap()
+                .written,
             0
         );
         let facts = store
@@ -2526,7 +2803,8 @@ mod tests {
             store
                 .inbox_tick(at("2026-11-01T00:20:00Z"), clock)
                 .await
-                .unwrap(),
+                .unwrap()
+                .written,
             1
         );
         // The run moves on with the call still tracked.
@@ -2542,7 +2820,8 @@ mod tests {
             store
                 .inbox_tick(at("2026-11-01T00:40:00Z"), clock)
                 .await
-                .unwrap(),
+                .unwrap()
+                .written,
             0
         );
         let (facts, run): (Vec<(String, String)>, i64) = store

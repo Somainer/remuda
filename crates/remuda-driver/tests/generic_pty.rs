@@ -129,6 +129,12 @@ async fn fake_herdr_codex_start_send_wait_read_stop() {
         permission.mode = remuda_protocol::ClaudePermissionMode::BypassPermissions;
     }
     let mut handle = driver.start(requested).await.expect("start");
+    // cb-stall-tooluse r2: a started generic-pty has no `screen_read` grid,
+    // and the capability the Hub's screen stall fallback reads agrees.
+    assert!(driver.screen_read().await.expect("screen_read").is_none());
+    assert!(!remuda_driver::reads_screen(
+        remuda_protocol::DriverKind::GenericPty
+    ));
     assert!(
         handle
             .recipe()

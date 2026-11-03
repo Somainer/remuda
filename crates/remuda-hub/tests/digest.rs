@@ -464,6 +464,51 @@ async fn digest_is_assembled_from_stored_rows_and_stays_within_budget() -> Resul
     Ok(())
 }
 
+/// cb-stall-tooluse: `toolInFlight` is the inbox tracker's state, the one
+/// source the stall rules read, not a scan of the digest's bounded journal
+/// tail. A call opened more journal rows ago than the tail holds is still in
+/// flight; its result ends it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_in_flight_is_the_trackers_state_past_the_journal_tail() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("digest-tool").await?;
+    let (_coordinator, token) = ctx.coordinator(&project).await?;
+    let (worker_id, instance_id) = ctx
+        .worker_under(&token, &project, "c-digest-tool", None)
+        .await?;
+    ctx.journal(
+        &instance_id,
+        json!({ "kind": "tool_call", "payload": { "toolCallId": "tc_old",
+            "toolName": { "state": "known", "value": "Bash" }, "state": "proposed" } }),
+    )
+    .await?;
+    // More rows than the digest's journal tail (256) after the call.
+    for n in 0..300 {
+        ctx.journal(
+            &instance_id,
+            json!({ "kind": "message", "payload": { "operation": "open",
+                "messageId": format!("m{n}"), "role": "assistant", "parentToolCallId": null,
+                "blocks": [{ "type": "text", "text": "still running" }] } }),
+        )
+        .await?;
+    }
+    let path = format!("/v1/workers/{worker_id}/digest");
+    let (status, bytes) = ctx.get(&token, &path).await?;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&bytes));
+    assert_eq!(json_of(&bytes)["toolInFlight"], true);
+
+    ctx.journal(
+        &instance_id,
+        json!({ "kind": "tool_result", "payload": { "toolCallId": "tc_old",
+            "stage": "final", "outcome": "succeeded" } }),
+    )
+    .await?;
+    let (status, bytes) = ctx.get(&token, &path).await?;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&bytes));
+    assert_eq!(json_of(&bytes)["toolInFlight"], false);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_off_wire_pending_kind_keeps_the_response_within_budget() -> Result<()> {
     let ctx = Ctx::spawn().await?;

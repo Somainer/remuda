@@ -289,12 +289,19 @@ impl Ctx {
 
     /// A worker the coordinator behind `token` dispatched.
     async fn worker(&self, token: &str, project: &str) -> Result<String> {
+        self.worker_on(token, project, "claude-pty").await
+    }
+
+    /// [`Self::worker`] on `driver`. A journal-quiet stall is recorded by the
+    /// tick only on a journal-structured carrier; a screen carrier's waits
+    /// for the screen sweep (cb-stall-tooluse).
+    async fn worker_on(&self, token: &str, project: &str, driver: &str) -> Result<String> {
         let created = self
             .post(
                 token,
                 "/v1/instances",
                 json!({ "role": "worker", "projectId": project, "prompt": "work",
-                        "driver": "claude-pty" }),
+                        "driver": driver }),
             )
             .await?;
         Ok(created["instance"]["instanceId"]
@@ -1200,7 +1207,7 @@ async fn a_tool_in_flight_yields_no_stall_fact_and_the_window_restarts_at_its_re
     let ctx = Ctx::spawn().await?;
     let project = ctx.project("inbox-stall").await?;
     let (seat, seat_token) = ctx.coordinator(&project).await?;
-    let worker = ctx.worker(&seat_token, &project).await?;
+    let worker = ctx.worker_on(&seat_token, &project, "claude-sdk").await?;
     ctx.journal(&worker, entity("running", &at(0))).await?;
     ctx.journal(&worker, activity("working", &at(1))).await?;
     ctx.journal(&worker, tool_call("tc_long")).await?;
@@ -1636,8 +1643,8 @@ async fn a_threshold_change_records_no_second_stall_fact() -> Result<()> {
         .await?;
     assert_eq!(status, 200, "{body}");
     let (seat, seat_token) = ctx.coordinator(&project).await?;
-    let hung = ctx.worker(&seat_token, &project).await?;
-    let quiet = ctx.worker(&seat_token, &project).await?;
+    let hung = ctx.worker_on(&seat_token, &project, "claude-sdk").await?;
+    let quiet = ctx.worker_on(&seat_token, &project, "claude-sdk").await?;
     for worker in [&hung, &quiet] {
         ctx.journal(worker, entity("running", &at(0))).await?;
         ctx.journal(worker, activity("working", &at(1))).await?;

@@ -21,6 +21,17 @@ pub enum MatrixMark {
     Unknown,
 }
 
+/// Whether a driver of `kind` answers [`crate::Driver::screen_read`] with a
+/// grid once started: the drivers the Hub's screen stall fallback may read
+/// (main-agent.md §10.5). Every other driver keeps the trait's default `None`,
+/// which the Node reports as `tty.screen` `supported: false`. `generic-pty`
+/// and `claude-pty` read their herdr pane through other paths, not this one.
+/// The started-driver tests pin each answer against the real `screen_read`.
+#[must_use]
+pub fn reads_screen(kind: DriverKind) -> bool {
+    matches!(kind, DriverKind::ShellPty)
+}
+
 /// Look up one cell of the §3.3 matrix (plus M0 `claude-bg`).
 pub fn capability_matrix(kind: DriverKind, name: CapabilityName) -> MatrixMark {
     use CapabilityName::*;

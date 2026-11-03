@@ -44,10 +44,11 @@
 //!   without doing anything is not progress, so a loop stops after three.
 //! * **Cancel.** Any input to the instance that the Hub did not write (a
 //!   Human's, an Agent's or a Bot's `instance.send`, `instance.respond`,
-//!   `instance.keys`, `tty.write`, or an `instance.configure`, which is how
-//!   a switch-model reaches it) cancels its wait in the same transaction, by
-//!   a trigger on the command insert. A continuation formed and not yet
-//!   forwarded is cancelled with it.
+//!   `instance.keys`, `tty.write` — how a switch-model reaches it — or an
+//!   `instance.configure`) cancels its wait in the same transaction, by a
+//!   trigger on the command insert; an interaction answer, a direct RPC
+//!   that writes no command row, cancels it through [`cancel`]. A
+//!   continuation formed and not yet forwarded is cancelled with it.
 //! * **Logs** carry categories and counts only: never error text, worker
 //!   output or ids.
 

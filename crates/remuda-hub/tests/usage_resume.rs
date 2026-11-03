@@ -1206,9 +1206,9 @@ async fn answering_an_interaction_cancels_the_wait() -> Result<()> {
 }
 
 /// Each input route that does write a command row cancels too: keys
-/// (`instance.keys`), raw terminal bytes (`tty.write`, which is how a
-/// switch-model reaches a shell driver) and an answer typed into the
-/// transcript (`instance.respond`).
+/// (`instance.keys`), raw terminal bytes (`tty.write`), an answer typed into
+/// the transcript (`instance.respond`), and a model change by
+/// `instance.configure`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn keys_typed_bytes_and_a_respond_cancel_the_wait() -> Result<()> {
     let ctx = Ctx::spawn().await?;
@@ -1217,6 +1217,7 @@ async fn keys_typed_bytes_and_a_respond_cancel_the_wait() -> Result<()> {
     let paths = [
         ("instance.keys", json!({ "keys": ["enter"] })),
         ("tty.write", json!({ "bytes": "eQ==" })),
+        ("instance.configure", json!({ "model": "sonnet" })),
         (
             "instance.respond",
             json!({ "answer": { "kind": "question", "answers": {} } }),
@@ -1252,7 +1253,13 @@ async fn keys_typed_bytes_and_a_respond_cancel_the_wait() -> Result<()> {
 }
 
 /// Any Human or Agent input cancels the wait, and a switch-model is such an
-/// input: no reset fact and no continuation follow a cancelled wait.
+/// input: no reset fact and no continuation follow a cancelled wait. The
+/// switch-model route (`POST /v1/workers/{id}/switch-model`) types into the
+/// worker's terminal: its first write is a `tty.write` of `esc` with the
+/// `keys` / `dataBase64` / `source: coordinator` payload `write_keys` builds,
+/// then `/model <id>`, then an `instance.send` nudge. That first `tty.write`
+/// is what the test sends; a model change by `instance.configure` cancels
+/// too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn any_input_cancels_the_wait() -> Result<()> {
     let ctx = Ctx::spawn().await?;
@@ -1282,12 +1289,25 @@ async fn any_input_cancels_the_wait() -> Result<()> {
     ctx.send(&ctx.human, &human_input, "never mind, do this instead")
         .await?;
     ctx.send(&token, &agent_input, "skip that step").await?;
-    ctx.post(
-        &ctx.human,
-        &format!("/v1/instances/{switch_model}/commands"),
-        json!({ "operation": "instance.configure", "payload": { "model": "sonnet" } }),
-    )
-    .await?;
+    // `write_keys` (worker_watch.rs) queues exactly this row through
+    // `Store::queue_command`, the same call made here, with no HTTP admission
+    // in between (an owner's switch: no initiator, no device).
+    ctx.hub
+        .store()
+        .context("store")?
+        .queue_command(
+            None,
+            Some(switch_model.clone()),
+            ctx.host.clone(),
+            "tty.write".into(),
+            json!({ "instanceId": switch_model, "keys": ["esc"], "dataBase64": "Gw==",
+                    "source": "coordinator" }),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?;
     for worker in [&human_input, &agent_input, &switch_model] {
         let waits = ctx.waits(worker)?;
         assert_eq!(waits[0].state, "cancelled", "{waits:?}");

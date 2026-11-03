@@ -878,7 +878,11 @@ fn record_inner(
 
 /// Record a fact about one instance for that instance's subscriber, if it
 /// has one (§10.1 item 4).
-fn record_about(conn: &Connection, instance_id: &str, fact: Fact) -> Result<Outcome, StoreError> {
+pub(crate) fn record_about(
+    conn: &Connection,
+    instance_id: &str,
+    fact: Fact,
+) -> Result<Outcome, StoreError> {
     match subscriber_of(conn, instance_id)? {
         Some(subscriber) => record(conn, &subscriber, fact),
         None => Ok(Outcome::NotReceived),
@@ -1013,6 +1017,24 @@ pub(crate) fn run_and_tool_in_flight(
 ) -> Result<(i64, bool), StoreError> {
     let tracker = load_tracker(conn, instance_id)?;
     Ok((tracker.run, !tracker.tools.is_empty()))
+}
+
+/// The run a root result naming `completed` belongs to: the tracker's
+/// record of that turn, else the run `instance_id` is in now.
+pub(crate) fn turn_run(
+    conn: &Connection,
+    instance_id: &str,
+    completed: Option<&str>,
+) -> Result<i64, StoreError> {
+    let tracker = load_tracker(conn, instance_id)?;
+    Ok(completed
+        .and_then(|command| tracker.run_of(command))
+        .unwrap_or(tracker.run))
+}
+
+/// Whether `instance_id`'s carrier reports root turn boundaries.
+pub(crate) fn structured_carrier(conn: &Connection, instance_id: &str) -> Result<bool, StoreError> {
+    Ok(load_tracker(conn, instance_id)?.structured)
 }
 
 /// The run generation `instance_id` is in now.
@@ -1406,6 +1428,14 @@ pub(crate) fn fold_append(
             && detail["outcome"] == "failed"
         {
             detail["error"] = json!(error);
+        }
+        // cb-usage-resume: a usage limit's class, reset time and wait, as the
+        // usage-resume fold decided them earlier in this append.
+        if attributed
+            && detail["outcome"] == "failed"
+            && let Some(limit) = crate::usage_resume::limit_detail(conn, instance_id, run)?
+        {
+            detail["usageLimit"] = limit;
         }
         // cb-inbox-deliver r2: the text this turn ended with, recorded now
         // while it is still the journal's latest turn, so a batch formed
@@ -1886,6 +1916,10 @@ pub(crate) fn note_supply_park(
     else {
         return Ok(());
     };
+    // cb-usage-resume: a subscription wait writes its own reset fact.
+    if crate::usage_resume::waits(conn, instance_id)? {
+        return Ok(());
+    }
     let run = current_run(conn, instance_id)?;
     conn.execute(
         "INSERT INTO inbox_supply_parks
@@ -2228,6 +2262,8 @@ pub(crate) struct TickOutcome {
     pub(crate) written: usize,
     /// Screen carriers the screen sweep must read before deciding.
     pub(crate) screen: Vec<ScreenCandidate>,
+    /// Usage-resume continuations formed: the delivery driver forwards them.
+    pub(crate) continued: usize,
 }
 
 /// Tasks whose `TaskBudget.max_wall_mins` has elapsed since their first
@@ -2308,12 +2344,18 @@ pub(crate) fn tick(
 ) -> Result<TickOutcome, StoreError> {
     let tx = crate::store::immediate_tx(conn)?;
     let mut screen = Vec::new();
+    let resumed = crate::usage_resume::due(&tx, now)?;
     let written = due_supply_resets(&tx, now)?
+        + resumed.facts
         + due_host_offline(&tx, now, &clock)?
         + due_stalls(&tx, now, &mut screen)?
         + due_budgets(&tx, now)?;
     tx.commit()?;
-    Ok(TickOutcome { written, screen })
+    Ok(TickOutcome {
+        written,
+        screen,
+        continued: resumed.continued,
+    })
 }
 
 /// Hooks for the wake tasks (`cb-wake-engine`, context-percentage wake-ups).
@@ -2369,6 +2411,11 @@ pub(crate) async fn run_tick(state: &AppState) {
                 now,
                 crate::worker_watch::SCREEN_TIMEOUT,
             );
+            // cb-usage-resume: a continuation formed by this tick goes out
+            // through the delivery driver, as a batch does.
+            if outcome.continued > 0 {
+                crate::inbox_deliver::drive(state, crate::inbox_deliver::Pace::Now).await;
+            }
         }
         Err(err) => tracing::error!(code = error_code(&err), "inbox tick failed"),
     }

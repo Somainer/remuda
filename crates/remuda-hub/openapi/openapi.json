@@ -1248,6 +1248,10 @@
           "tui": {
             "$ref": "#/components/schemas/TuiMode",
             "description": "Requested renderer. Omission inherits the host default, then fullscreen."
+          },
+          "autoContinue": {
+            "type": "boolean",
+            "description": "cb-usage-resume (main-agent.md §11.6): after a subscription usage limit resets, the Hub sends the instance one continuation input (origin `hub`): `continue` when the failed turn produced output, otherwise that turn's own input again; at most 3 between two pieces of substantive progress, and any Human or Agent input to the instance cancels the wait. Default off. Any creator may set it: an Agent for the child it creates, the owner for any instance."
           }
         },
         "type": "object"
@@ -1799,6 +1803,11 @@
             "description": "seen-hub: journal seq (decimal) of the latest settled turn end, i.e. the latest row that moved activity from working, blocked or draining to idle. Absent before any turn end; a resumed instance or a new lineage chapter starts without one (home.md §7).",
             "readOnly": true,
             "type": "string"
+          },
+          "autoContinue": {
+            "type": "boolean",
+            "readOnly": true,
+            "description": "cb-usage-resume (main-agent.md §11.6): after a subscription usage limit resets, the Hub sends the instance one continuation input (origin `hub`): `continue` when the failed turn produced output, otherwise that turn's own input again; at most 3 between two pieces of substantive progress, and any Human or Agent input to the instance cancels the wait. Default off. Copied to every chapter of a continuity lineage; the owner changes it with `PATCH /v1/instances/{id}`."
           },
           "herdrClaim": {
             "$ref": "#/components/schemas/HerdrClaim"
@@ -5203,6 +5212,10 @@
           "permissionMode": {
             "type": "string",
             "description": "D-057 §4.2 item 2: a word of the worker harness's own permission vocabulary. Omitted, a Human or Bot dispatch keeps the dispatch default (bypassPermissions) and an Agent dispatch inherits its own mode; an Agent may name a mode that switches the harness's permission control off only when it runs with that control off itself (OA1)."
+          },
+          "autoContinue": {
+            "type": "boolean",
+            "description": "cb-usage-resume (main-agent.md §11.6): after a subscription usage limit resets, the Hub sends the instance one continuation input (origin `hub`): `continue` when the failed turn produced output, otherwise that turn's own input again; at most 3 between two pieces of substantive progress, and any Human or Agent input to the instance cancels the wait. Default off. The dispatching Agent or the owner sets it at dispatch; a replace or respawn keeps it."
           }
         },
         "required": [
@@ -6678,6 +6691,16 @@
           "title",
           "body"
         ]
+      },
+      "InstancePatch": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "autoContinue": {
+            "type": "boolean",
+            "description": "Turn the instance's autoContinue on or off (cb-usage-resume). Absent keeps it."
+          }
+        }
       },
       "HerdrClaim": {
         "type": "object",
@@ -8472,6 +8495,53 @@
             "$ref": "#/components/responses/Error"
           }
         },
+        "tags": [
+          "instances"
+        ]
+      },
+      "patch": {
+        "description": "Change a per-instance property; today `autoContinue` (cb-usage-resume, main-agent.md §11.6). An absent field keeps its value. Human devices only: an Agent sets the property for its child at dispatch or create and gets 403 here, as does a Bot. Turning it off does not recall a continuation already formed.",
+        "operationId": "instancePatch",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InstancePatch"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstanceRecord"
+                }
+              }
+            },
+            "description": "The instance after the change"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Change an instance's properties",
         "tags": [
           "instances"
         ]

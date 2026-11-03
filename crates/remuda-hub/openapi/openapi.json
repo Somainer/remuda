@@ -6810,7 +6810,7 @@
             "$ref": "#/components/schemas/WakeTrigger"
           },
           "check": {
-            "description": "Reserved for the optional check (main-agent.md §11.2): refused with 422 check-unsupported until it is built."
+            "description": "Reserved for the optional check (main-agent.md §11.2): until it is built, a request carrying one is refused with 422, code WAKE_UNSUPPORTED, reason check-unsupported."
           },
           "mode": {
             "$ref": "#/components/schemas/WakeMode"

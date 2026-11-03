@@ -224,8 +224,9 @@ pub struct WakeAddRequest {
     pub text: String,
     /// When it fires.
     pub trigger: WakeTrigger,
-    /// Reserved for the optional check (main-agent.md §11.2); refused with
-    /// 422 `wake-check-unsupported` until it is built.
+    /// Reserved for the optional check (main-agent.md §11.2); until it is
+    /// built, a request carrying one is refused with 422, code
+    /// `WAKE_UNSUPPORTED`, reason `check-unsupported`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check: Option<serde_json::Value>,
     /// `persistent` (default) or `fresh`.

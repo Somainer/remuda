@@ -4001,7 +4001,7 @@ export interface components {
         /** @enum {string} */
         TuiMode: "fullscreen" | "default";
         WakeAddRequest: {
-            /** @description Reserved for the optional check (main-agent.md §11.2): refused with 422 check-unsupported until it is built. */
+            /** @description Reserved for the optional check (main-agent.md §11.2): until it is built, a request carrying one is refused with 422, code WAKE_UNSUPPORTED, reason check-unsupported. */
             check?: unknown;
             mode?: components["schemas"]["WakeMode"];
             /** @description Unique in the lineage (at most 64 of A-Z a-z 0-9 . _ : -, not starting with wak_); the same add under the same name returns the stored wake-up. Generated when absent. */

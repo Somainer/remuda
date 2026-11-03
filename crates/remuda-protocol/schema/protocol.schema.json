@@ -22194,7 +22194,7 @@
       "description": "`POST /v1/lineages/{id}/wake-ups`.",
       "properties": {
         "check": {
-          "description": "Reserved for the optional check (main-agent.md §11.2); refused with\n422 `wake-check-unsupported` until it is built."
+          "description": "Reserved for the optional check (main-agent.md §11.2); until it is\nbuilt, a request carrying one is refused with 422, code\n`WAKE_UNSUPPORTED`, reason `check-unsupported`."
         },
         "mode": {
           "anyOf": [

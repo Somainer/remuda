@@ -598,16 +598,51 @@ async fn at_every_and_when_each_fire_once() -> Result<()> {
         "the next occurrence follows the schedule"
     );
     assert_eq!(state("on-turn")["state"], "active");
-    // A later fact of the kind fires the `when` once more, a fact of
-    // another kind does not.
+    // A fact of another kind does not fire the `when`.
     let worker2 = ctx.worker(&token, &project).await?;
     ctx.journal(&worker2, entity("running", &at(40))).await?;
     assert_eq!(ctx.tick(&due).await?, 0, "a started fact is not turn-done");
+    // A later fact of the kind, while the `when` run is still queued, is
+    // counted and fires nothing.
+    worker_turn(&ctx, &worker2, 50).await?;
+    assert_eq!(ctx.tick(&due).await?, 0, "its previous run is still open");
+    let on_turn = |list: &Value| {
+        list["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|wake| wake["name"] == "on-turn")
+            .cloned()
+            .unwrap_or_default()
+    };
+    assert_eq!(on_turn(&ctx.list(&seat).await?)["missedCount"], 1);
+    // The seat takes the three queued runs, one turn each.
+    ctx.journal(&seat, activity("idle", &at(60))).await?;
+    ctx.settle().await?;
+    for turn in 1..=3 {
+        ctx.run_wake_turn(&seat, "success", 100 * turn).await?;
+    }
+    // Once no run is open, the next fact of the kind fires the `when` once
+    // more, and that run reports the fact counted meanwhile.
+    let worker3 = ctx.worker(&token, &project).await?;
+    worker_turn(&ctx, &worker3, 500).await?;
+    assert_eq!(ctx.tick(&due).await?, 1, "the `when` fires once more");
+    assert_eq!(ctx.tick(&due).await?, 0);
+    let refired: Vec<Value> = ctx
+        .runs(&seat)
+        .await?
+        .into_iter()
+        .filter(|run| run["name"] == "on-turn")
+        .collect();
+    assert_eq!(refired.len(), 2, "{refired:#?}");
+    assert_eq!(refired[0]["state"], "success");
+    assert_eq!(refired[1]["missedBefore"], 1);
+    assert_eq!(on_turn(&ctx.list(&seat).await?)["missedCount"], 0);
     let wake_due: i64 = ctx.count(
         "SELECT COUNT(*) FROM inbox_facts WHERE subscriber_lineage_id = ?1 AND kind = 'wake-due'",
         &seat,
     )?;
-    assert_eq!(wake_due, 3);
+    assert_eq!(wake_due, 4);
     Ok(())
 }
 

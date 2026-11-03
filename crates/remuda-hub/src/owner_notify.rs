@@ -119,7 +119,6 @@ pub(crate) enum NoticeSource {
     /// `remuda owner notify` (the route).
     Cli,
     /// A wake run's `notify` declaration (§11.5).
-    #[cfg_attr(not(test), allow(dead_code))]
     Wake,
 }
 
@@ -366,8 +365,6 @@ pub(crate) fn claim(conn: &Connection, input: &NoticeInput) -> Result<Claimed, S
 
 // ─── repeating failures (§11.5) ─────────────────────────────────────────────
 
-// cb-wake-engine calls this; until it lands only the tests do.
-#[cfg_attr(not(test), allow(dead_code))]
 /// The outcome of [`notify_failure`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FailureNotice {
@@ -384,8 +381,6 @@ pub(crate) enum FailureNotice {
     },
 }
 
-// cb-wake-engine calls this; until it lands only the tests do.
-#[cfg_attr(not(test), allow(dead_code))]
 /// A failure of `kind` in `scope` (a wake-up, a lineage): notify only when no
 /// earlier failure of that kind is still unrecovered.
 pub(crate) fn notify_failure(
@@ -419,8 +414,6 @@ pub(crate) fn notify_failure(
     Ok(FailureNotice::Notified(Box::new(claimed)))
 }
 
-// cb-wake-engine calls this; until it lands only the tests do.
-#[cfg_attr(not(test), allow(dead_code))]
 /// `scope` recovered: clear its latch for `kind`, or for every kind when
 /// `kind` is `None`, so the next failure notifies again. Returns how many
 /// latches were cleared.
@@ -441,8 +434,6 @@ pub(crate) fn recover(
     })
 }
 
-// cb-wake-engine calls this; until it lands only the tests do.
-#[cfg_attr(not(test), allow(dead_code))]
 /// A wake-up's `notify` declaration (§11.5); the Hub never picks one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -470,8 +461,6 @@ impl std::str::FromStr for NotifyPolicy {
     }
 }
 
-// cb-wake-engine calls this; until it lands only the tests do.
-#[cfg_attr(not(test), allow(dead_code))]
 /// How a wake run ended, for its `notify` declaration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WakeOutcome<'a> {
@@ -482,8 +471,6 @@ pub(crate) enum WakeOutcome<'a> {
     Failure { kind: &'a str },
 }
 
-// cb-wake-engine calls this; until it lands only the tests do.
-#[cfg_attr(not(test), allow(dead_code))]
 /// The wake engine's call after a run settles: apply the wake-up's `notify`
 /// declaration. A success clears every failure latch of the wake-up (it
 /// recovered) and, under `always`, notifies; a failure under `failure` or

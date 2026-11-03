@@ -11,7 +11,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Liveness */
+        /**
+         * Liveness
+         * @description Liveness, plus the wake tick (D-060 §11): the last completed tick, its age and period, and the delivery age of the oldest waiting wake run. 503 once no tick completed for 12 tick periods.
+         */
         get: operations["healthz"];
         put?: never;
         post?: never;
@@ -1177,6 +1180,50 @@ export interface paths {
         put?: never;
         post?: never;
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/lineages/{id}/wake-ups": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * A lineage's wake-ups and its latest runs (`remuda wake list`)
+         * @description D-060 §11. A Human device manages any lineage's wake-ups and may name any chapter of it; an Agent only its own lineage, by its canonical id (403 otherwise); a Bot credential is refused (403). An Agent write passes the commit-time initiator check (a fenced or paused chapter gets 409 fenced).
+         */
+        get: operations["lineageWakeUps"];
+        put?: never;
+        /**
+         * Add a wake-up (`remuda wake add`)
+         * @description D-060 §11. A Human device manages any lineage's wake-ups and may name any chapter of it; an Agent only its own lineage, by its canonical id (403 otherwise); a Bot credential is refused (403). An Agent write passes the commit-time initiator check (a fenced or paused chapter gets 409 fenced). The Hub claims each due occurrence once; a persistent run is delivered as a wake-due inbox fact at the lineage's idle point, a fresh run creates a short-lived child through the ordinary Agent create. notify is required. The same add under the same name returns the stored wake-up with 200; a different one under that name is 409 wake-name-taken. Refusals: 400 invalid-wake-up (bounds), 422 WAKE_SECRET_REJECTED (field and rule only, never the text), 422 WAKE_UNSUPPORTED (check-unsupported, condition-unsupported), 409 wake-not-received (the lineage receives no facts), 409 wake-limit (64 per lineage).
+         */
+        post: operations["addLineageWakeUp"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/lineages/{id}/wake-ups/{wake}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Remove a wake-up (`remuda wake rm`)
+         * @description D-060 §11. A Human device manages any lineage's wake-ups and may name any chapter of it; an Agent only its own lineage, by its canonical id (403 otherwise); a Bot credential is refused (403). An Agent write passes the commit-time initiator check (a fenced or paused chapter gets 409 fenced). Its runs stay as history; a run already queued or running ends as it would have.
+         */
+        delete: operations["removeLineageWakeUp"];
         options?: never;
         head?: never;
         patch?: never;
@@ -3965,6 +4012,148 @@ export interface components {
         };
         /** @enum {string} */
         TuiMode: "fullscreen" | "default";
+        WakeAddRequest: {
+            /** @description Reserved for the optional check (main-agent.md §11.2): until it is built, a request carrying one is refused with 422, code WAKE_UNSUPPORTED, reason check-unsupported. */
+            check?: unknown;
+            mode?: components["schemas"]["WakeMode"];
+            /** @description Unique in the lineage (at most 64 of A-Z a-z 0-9 . _ : -, not starting with wak_); the same add under the same name returns the stored wake-up. Generated when absent. */
+            name?: string;
+            notify: components["schemas"]["WakeNotify"];
+            /** @description What it is for (at most 2000 characters; the secret lint runs over it). */
+            text: string;
+            trigger: components["schemas"]["WakeTrigger"];
+        };
+        WakeAddResult: {
+            /** @description False when the same add under the same name already stored it. */
+            created: boolean;
+            wakeUp: components["schemas"]["WakeUp"];
+        };
+        /** @description Fires once. A request gives at or afterSecs; a stored wake-up carries at. */
+        WakeAt: {
+            /** @description Request only: seconds after the Hub received the request. */
+            afterSecs?: number;
+            /**
+             * Format: date-time
+             * @description When it fires (at most a year ahead).
+             */
+            at?: string;
+            /** @constant */
+            kind: "at";
+        };
+        WakeCreator: {
+            /** @description The chapter an Agent added it from. */
+            instanceId?: string;
+            /** @enum {string} */
+            origin: "agent" | "human";
+        };
+        /** @description Fires at every interval. */
+        WakeEvery: {
+            everySecs: number;
+            /** @constant */
+            kind: "every";
+            /**
+             * Format: date-time
+             * @description The first occurrence; one interval after the add when absent.
+             */
+            startAt?: string;
+        };
+        WakeList: {
+            /** @description Oldest first. */
+            items: components["schemas"]["WakeUp"][];
+            lineageId: string;
+            /** @description The latest 50 runs, newest first. */
+            runs: components["schemas"]["WakeRun"][];
+        };
+        /**
+         * @description How a run is carried out: persistent (the live chapter takes it at its idle point) or fresh (a short-lived child does).
+         * @enum {string}
+         */
+        WakeMode: "persistent" | "fresh";
+        /**
+         * @description Which runs notify the owner; declared at add time, never chosen by the Hub.
+         * @enum {string}
+         */
+        WakeNotify: "never" | "failure" | "always";
+        WakeRemoved: {
+            name: string;
+            wakeId: string;
+        };
+        WakeRun: {
+            /** @description The inbox batch that carried it (persistent mode). */
+            batchId?: string;
+            /** @description The optional check's exit code; null until the check exists. */
+            checkExit: number | null;
+            /** @description The child created for it (fresh mode). */
+            childInstanceId?: string;
+            /** Format: date-time */
+            endedAt?: string;
+            /** @description The wake-due inbox row (persistent mode). */
+            factId?: number;
+            /** @description not-received, not-delivered, delivery, turn-failed, chapter-ended, fresh-refused, child-failed or child-ended. */
+            failureKind?: string;
+            /** Format: date-time */
+            firedAt: string;
+            lineageId: string;
+            /** @description Occurrences skipped before it (none of them ran): those the Hub was down for, those due while the previous run was still open, and, for when, the other facts found in the same evaluation. */
+            missedBefore: number;
+            mode: components["schemas"]["WakeMode"];
+            name: string;
+            runId: string;
+            /**
+             * Format: date-time
+             * @description The occurrence it stands for: the latest one due when it fired.
+             */
+            scheduledAt: string;
+            /** Format: date-time */
+            startedAt?: string;
+            state: components["schemas"]["WakeRunState"];
+            wakeId: string;
+        };
+        /**
+         * @description queued → running → success, failed or skipped (reserved for the check); a run running when the Hub restarted is interrupted and never replayed.
+         * @enum {string}
+         */
+        WakeRunState: "queued" | "running" | "success" | "failed" | "skipped" | "interrupted";
+        /** @description When a wake-up fires. */
+        WakeTrigger: components["schemas"]["WakeAt"] | components["schemas"]["WakeEvery"] | components["schemas"]["WakeWhen"];
+        WakeUp: {
+            /** @description Reserved; always absent. */
+            check?: unknown;
+            /** Format: date-time */
+            createdAt: string;
+            creator: components["schemas"]["WakeCreator"];
+            /** Format: date-time */
+            lastFiredAt?: string;
+            lineageId: string;
+            /** @description Occurrences skipped because they came due while an earlier run was still queued or running: none of them gets a run of its own, not even once that run ends. The next run reports them and this resets. */
+            missedCount: number;
+            mode: components["schemas"]["WakeMode"];
+            name: string;
+            /**
+             * Format: date-time
+             * @description The next scheduled occurrence; absent for when and once done.
+             */
+            nextFireAt?: string;
+            notify: components["schemas"]["WakeNotify"];
+            state: components["schemas"]["WakeUpState"];
+            text: string;
+            trigger: components["schemas"]["WakeTrigger"];
+            /** Format: date-time */
+            updatedAt: string;
+            wakeId: string;
+        };
+        /**
+         * @description active, or done once an at has fired.
+         * @enum {string}
+         */
+        WakeUpState: "active" | "done";
+        /** @description Fires each time a fact of factKind (about subjectInstanceId, when set) reaches the lineage's inbox after the add. wake-due cannot be a condition; context-threshold is refused (422 condition-unsupported) because nothing records it yet. */
+        WakeWhen: {
+            factKind: components["schemas"]["InboxFactKind"];
+            /** @constant */
+            kind: "when";
+            subjectInstanceId?: string;
+        };
         /** @description Result of a worker intervention verb; carries the updated roster row and/or the queued command. */
         WorkerActionResult: {
             [key: string]: unknown;
@@ -4280,7 +4469,80 @@ export interface operations {
                 };
                 content: {
                     "application/json": {
+                        /**
+                         * Format: uint64
+                         * @description How long the oldest wake run that fired has waited for delivery; absent when none waits.
+                         */
+                        deliveryAgeSecs?: number;
+                        /**
+                         * Format: date-time
+                         * @description When the wake tick last completed; absent before the first.
+                         */
+                        lastTickAt?: string;
+                        /** @description True on 200, false on 503. */
                         ok: boolean;
+                        /**
+                         * Format: uint64
+                         * @description Seconds since the last completed wake tick (since the store opened, before the first).
+                         */
+                        tickAgeSecs: number;
+                        /**
+                         * Format: uint64
+                         * @description The wake tick's period (5 s).
+                         */
+                        tickPeriodSecs: number;
+                        /**
+                         * Format: uint64
+                         * @description tickAgeSecs past which the Hub answers 503: 12 tick periods.
+                         */
+                        tickStaleAfterSecs: number;
+                        /**
+                         * Format: uint64
+                         * @description Whole seconds since this Hub process started.
+                         */
+                        uptimeSecs: number;
+                        /** @description Hub package version (matches the remuda CLI version). */
+                        version: string;
+                    };
+                };
+            };
+            /** @description The wake tick is stale: the Hub serves but no longer claims due wake-ups */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @constant */
+                        code: "HUB_TICK_STALE";
+                        /**
+                         * Format: uint64
+                         * @description How long the oldest wake run that fired has waited for delivery; absent when none waits.
+                         */
+                        deliveryAgeSecs?: number;
+                        error: string;
+                        /**
+                         * Format: date-time
+                         * @description When the wake tick last completed; absent before the first.
+                         */
+                        lastTickAt?: string;
+                        /** @description True on 200, false on 503. */
+                        ok: boolean;
+                        /**
+                         * Format: uint64
+                         * @description Seconds since the last completed wake tick (since the store opened, before the first).
+                         */
+                        tickAgeSecs: number;
+                        /**
+                         * Format: uint64
+                         * @description The wake tick's period (5 s).
+                         */
+                        tickPeriodSecs: number;
+                        /**
+                         * Format: uint64
+                         * @description tickAgeSecs past which the Hub answers 503: 12 tick periods.
+                         */
+                        tickStaleAfterSecs: number;
                         /**
                          * Format: uint64
                          * @description Whole seconds since this Hub process started.
@@ -6599,6 +6861,100 @@ export interface operations {
             400: components["responses"]["Error"];
             401: components["responses"]["Error"];
             403: components["responses"]["Error"];
+        };
+    };
+    lineageWakeUps: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Wake-ups and runs */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WakeList"];
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
+    addLineageWakeUp: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WakeAddRequest"];
+            };
+        };
+        responses: {
+            /** @description The stored wake-up (a repeat) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WakeAddResult"];
+                };
+            };
+            /** @description Added */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WakeAddResult"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            409: components["responses"]["Error"];
+            422: components["responses"]["Error"];
+        };
+    };
+    removeLineageWakeUp: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+                /** @description The wake-up's id (wak_…) or name. */
+                wake: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WakeRemoved"];
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            409: components["responses"]["Error"];
         };
     };
     login: {

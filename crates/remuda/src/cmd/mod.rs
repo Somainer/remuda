@@ -35,6 +35,7 @@ pub mod ssh;
 pub mod table;
 mod task;
 pub mod version;
+mod wake;
 mod watch;
 mod worker;
 pub mod worktree;
@@ -70,6 +71,7 @@ commands! {
     Task(task::TaskArgs),
     Own(own::OwnArgs),
     Owner(owner::OwnerArgs),
+    Wake(wake::WakeArgs),
     Memory(memory::MemoryArgs),
     Profile(profile::ProfileArgs),
     Dispatch(dispatch::DispatchArgs),

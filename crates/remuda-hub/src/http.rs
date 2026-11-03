@@ -313,15 +313,40 @@ pub(crate) const WORKTREE_RPC_TIMEOUT: Duration = Duration::from_secs(60);
 /// `GET /healthz`
 ///
 /// Liveness probe fields:
-/// - `ok`: always `true` on 200; existing probes depend on this exact key.
+/// - `ok`: `true` on 200; existing probes depend on this exact key. `false`
+///   on 503.
 /// - `version`: Hub package version (matches the `remuda` CLI version).
 /// - `uptimeSecs`: whole seconds since this Hub process started.
-pub async fn healthz() -> Json<Value> {
-    Json(json!({
-        "ok": true,
+/// - cb-wake-engine (D-060 §11): `lastTickAt` (when the scheduler's wake
+///   tick last completed, absent before the first), `tickAgeSecs` (since
+///   then, or since the store opened), `tickPeriodSecs`, `tickStaleAfterSecs`
+///   (12 periods) and `deliveryAgeSecs` (how long the oldest wake run that
+///   fired has waited for delivery, absent when none waits).
+///
+/// 503 with `code: HUB_TICK_STALE` once the tick is older than the bound: the
+/// Hub still serves, but it no longer claims due wake-ups.
+pub async fn healthz(State(state): State<AppState>) -> Response {
+    let report = crate::wake::health(&state, time::OffsetDateTime::now_utc());
+    let mut body = json!({
+        "ok": !report.stale,
         "version": crate::supervise::HUB_VERSION,
         "uptimeSecs": crate::supervise::uptime_secs(),
-    }))
+        "tickAgeSecs": report.tick_age_secs,
+        "tickPeriodSecs": crate::wake::tick_period_secs(),
+        "tickStaleAfterSecs": crate::wake::stale_after_secs(),
+    });
+    if let Some(at) = report.last_tick_at {
+        body["lastTickAt"] = json!(at);
+    }
+    if let Some(age) = report.delivery_age_secs {
+        body["deliveryAgeSecs"] = json!(age);
+    }
+    if report.stale {
+        body["code"] = json!("HUB_TICK_STALE");
+        body["error"] = json!("the wake tick is stale: due wake-ups are not being claimed");
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
+    }
+    Json(body).into_response()
 }
 
 /// `POST /v1/login` — bootstrap access code → device token + cookie.
@@ -1245,10 +1270,47 @@ pub(crate) fn resolve_delegation(
 pub async fn create_instance(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(mut body): Json<CreateInstanceBody>,
+    Json(body): Json<CreateInstanceBody>,
 ) -> Result<Json<Value>, HubError> {
     require_origin(&headers, &state.config)?;
     let device = crate::agent_scope::caller(&state, &headers).await?;
+    create_instance_as(state, headers, device, body, None).await
+}
+
+/// cb-wake-engine (§11.4): a create the Hub makes on a lineage's behalf for
+/// a fresh-mode wake run. The caller is the lineage's live chapter (its own
+/// Agent credential), so the create passes the same admission as the
+/// chapter's own: grants, scope, OA1 and D-017. Two things differ, both
+/// records: the spec names the run (`wakeRunId`, which a trigger turns into
+/// the run's child in the create's own transaction), and the initiator's
+/// root turn is the Hub's (`origin: hub`), never the chapter's current turn.
+#[derive(Clone, Debug)]
+pub(crate) struct OnBehalf {
+    pub(crate) wake_run_id: String,
+    pub(crate) root_turn: remuda_protocol::RootTurn,
+}
+
+/// [`OnBehalf`]'s entry: `body` is a create request as the route takes it.
+pub(crate) async fn create_on_behalf(
+    state: &AppState,
+    device: crate::store::Device,
+    body: Value,
+    behalf: OnBehalf,
+) -> Result<Value, HubError> {
+    let body: CreateInstanceBody = serde_json::from_value(body)
+        .map_err(|err| HubError::Internal(format!("wake create body: {err}")))?;
+    create_instance_as(state.clone(), HeaderMap::new(), device, body, Some(behalf))
+        .await
+        .map(|Json(value)| value)
+}
+
+async fn create_instance_as(
+    state: AppState,
+    headers: HeaderMap,
+    device: crate::store::Device,
+    mut body: CreateInstanceBody,
+    behalf: Option<OnBehalf>,
+) -> Result<Json<Value>, HubError> {
     // D-045 Gate 1, before anything is placed, resolved or approved: an
     // agent-originated launch may never grant desktop control to itself.
     // Hoisted ahead of pick_hosts / provider resolution / prepare_create so
@@ -1785,6 +1847,17 @@ pub async fn create_instance(
         &mut spec,
     )
     .await?;
+    // cb-wake-engine: only the Hub's own fresh-mode create names a wake run.
+    if let Some(obj) = spec.as_object_mut() {
+        match &behalf {
+            Some(behalf) => {
+                obj.insert("wakeRunId".into(), json!(behalf.wake_run_id));
+            }
+            None => {
+                obj.remove("wakeRunId");
+            }
+        }
+    }
     // D-045: per-launch host capability gates, all before persistence.
     if let Some(capabilities) = body.capabilities.as_ref().filter(|list| !list.is_empty()) {
         crate::inventory::validate_capabilities(capabilities).map_err(HubError::BadRequest)?;
@@ -1867,8 +1940,12 @@ pub async fn create_instance(
         }
         binding_claim = Some((host_id, workspace_id, dir_key, claim));
     }
-    let (create_initiator, create_device_id) =
+    let (mut create_initiator, create_device_id) =
         crate::agent_scope::initiator_and_device(&state, &device).await?;
+    // A fresh-mode create was started by the Hub, not by the chapter's turn.
+    if let (Some(behalf), Some(initiator)) = (&behalf, create_initiator.as_mut()) {
+        initiator.root_turn = Some(behalf.root_turn.clone());
+    }
     let audit_initiator = create_initiator.clone();
     let spawn_result = crate::placement::spawn_on_host(
         &state,

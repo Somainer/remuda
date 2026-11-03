@@ -6698,6 +6698,382 @@
             "description": "Turn the instance's autoContinue on or off (cb-usage-resume). Absent keeps it."
           }
         }
+      },
+      "WakeMode": {
+        "description": "How a run is carried out: persistent (the live chapter takes it at its idle point) or fresh (a short-lived child does).",
+        "enum": [
+          "persistent",
+          "fresh"
+        ],
+        "type": "string"
+      },
+      "WakeNotify": {
+        "description": "Which runs notify the owner; declared at add time, never chosen by the Hub.",
+        "enum": [
+          "never",
+          "failure",
+          "always"
+        ],
+        "type": "string"
+      },
+      "WakeUpState": {
+        "description": "active, or done once an at has fired.",
+        "enum": [
+          "active",
+          "done"
+        ],
+        "type": "string"
+      },
+      "WakeRunState": {
+        "description": "queued → running → success, failed or skipped (reserved for the check); a run running when the Hub restarted is interrupted and never replayed.",
+        "enum": [
+          "queued",
+          "running",
+          "success",
+          "failed",
+          "skipped",
+          "interrupted"
+        ],
+        "type": "string"
+      },
+      "WakeAt": {
+        "description": "Fires once. A request gives at or afterSecs; a stored wake-up carries at.",
+        "properties": {
+          "kind": {
+            "const": "at",
+            "type": "string"
+          },
+          "at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When it fires (at most a year ahead)."
+          },
+          "afterSecs": {
+            "description": "Request only: seconds after the Hub received the request.",
+            "maximum": 31536000,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      },
+      "WakeEvery": {
+        "description": "Fires at every interval.",
+        "properties": {
+          "kind": {
+            "const": "every",
+            "type": "string"
+          },
+          "everySecs": {
+            "maximum": 31536000,
+            "minimum": 60,
+            "type": "integer"
+          },
+          "startAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "The first occurrence; one interval after the add when absent."
+          }
+        },
+        "required": [
+          "kind",
+          "everySecs"
+        ],
+        "type": "object"
+      },
+      "WakeWhen": {
+        "description": "Fires each time a fact of factKind (about subjectInstanceId, when set) reaches the lineage's inbox after the add. wake-due cannot be a condition; context-threshold is refused (422 condition-unsupported) because nothing records it yet.",
+        "properties": {
+          "kind": {
+            "const": "when",
+            "type": "string"
+          },
+          "factKind": {
+            "$ref": "#/components/schemas/InboxFactKind"
+          },
+          "subjectInstanceId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "factKind"
+        ],
+        "type": "object"
+      },
+      "WakeTrigger": {
+        "description": "When a wake-up fires.",
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/WakeAt"
+          },
+          {
+            "$ref": "#/components/schemas/WakeEvery"
+          },
+          {
+            "$ref": "#/components/schemas/WakeWhen"
+          }
+        ]
+      },
+      "WakeAddRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "description": "Unique in the lineage (at most 64 of A-Z a-z 0-9 . _ : -, not starting with wak_); the same add under the same name returns the stored wake-up. Generated when absent.",
+            "type": "string"
+          },
+          "text": {
+            "description": "What it is for (at most 2000 characters; the secret lint runs over it).",
+            "type": "string"
+          },
+          "trigger": {
+            "$ref": "#/components/schemas/WakeTrigger"
+          },
+          "check": {
+            "description": "Reserved for the optional check (main-agent.md §11.2): until it is built, a request carrying one is refused with 422, code WAKE_UNSUPPORTED, reason check-unsupported."
+          },
+          "mode": {
+            "$ref": "#/components/schemas/WakeMode"
+          },
+          "notify": {
+            "$ref": "#/components/schemas/WakeNotify"
+          }
+        },
+        "required": [
+          "text",
+          "trigger",
+          "notify"
+        ],
+        "type": "object"
+      },
+      "WakeCreator": {
+        "properties": {
+          "origin": {
+            "enum": [
+              "agent",
+              "human"
+            ],
+            "type": "string"
+          },
+          "instanceId": {
+            "description": "The chapter an Agent added it from.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "origin"
+        ],
+        "type": "object"
+      },
+      "WakeUp": {
+        "properties": {
+          "wakeId": {
+            "type": "string"
+          },
+          "lineageId": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          },
+          "trigger": {
+            "$ref": "#/components/schemas/WakeTrigger"
+          },
+          "check": {
+            "description": "Reserved; always absent."
+          },
+          "mode": {
+            "$ref": "#/components/schemas/WakeMode"
+          },
+          "notify": {
+            "$ref": "#/components/schemas/WakeNotify"
+          },
+          "state": {
+            "$ref": "#/components/schemas/WakeUpState"
+          },
+          "nextFireAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "The next scheduled occurrence; absent for when and once done."
+          },
+          "missedCount": {
+            "description": "Occurrences skipped because they came due while an earlier run was still queued or running: none of them gets a run of its own, not even once that run ends. The next run reports them and this resets.",
+            "type": "integer"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "lastFiredAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "creator": {
+            "$ref": "#/components/schemas/WakeCreator"
+          }
+        },
+        "required": [
+          "wakeId",
+          "lineageId",
+          "name",
+          "text",
+          "trigger",
+          "mode",
+          "notify",
+          "state",
+          "missedCount",
+          "createdAt",
+          "updatedAt",
+          "creator"
+        ],
+        "type": "object"
+      },
+      "WakeRun": {
+        "properties": {
+          "runId": {
+            "type": "string"
+          },
+          "wakeId": {
+            "type": "string"
+          },
+          "lineageId": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "mode": {
+            "$ref": "#/components/schemas/WakeMode"
+          },
+          "scheduledAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "The occurrence it stands for: the latest one due when it fired."
+          },
+          "firedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "state": {
+            "$ref": "#/components/schemas/WakeRunState"
+          },
+          "startedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "endedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "checkExit": {
+            "description": "The optional check's exit code; null until the check exists.",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "factId": {
+            "description": "The wake-due inbox row (persistent mode).",
+            "type": "integer"
+          },
+          "batchId": {
+            "description": "The inbox batch that carried it (persistent mode).",
+            "type": "string"
+          },
+          "childInstanceId": {
+            "description": "The child created for it (fresh mode).",
+            "type": "string"
+          },
+          "missedBefore": {
+            "description": "Occurrences skipped before it (none of them ran): those the Hub was down for, those due while the previous run was still open, and, for when, the other facts found in the same evaluation.",
+            "type": "integer"
+          },
+          "failureKind": {
+            "description": "not-received, not-delivered, delivery, turn-failed, chapter-ended, fresh-refused, child-failed or child-ended.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "runId",
+          "wakeId",
+          "lineageId",
+          "name",
+          "mode",
+          "scheduledAt",
+          "firedAt",
+          "state",
+          "checkExit",
+          "missedBefore"
+        ],
+        "type": "object"
+      },
+      "WakeAddResult": {
+        "properties": {
+          "wakeUp": {
+            "$ref": "#/components/schemas/WakeUp"
+          },
+          "created": {
+            "description": "False when the same add under the same name already stored it.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "wakeUp",
+          "created"
+        ],
+        "type": "object"
+      },
+      "WakeList": {
+        "properties": {
+          "lineageId": {
+            "type": "string"
+          },
+          "items": {
+            "description": "Oldest first.",
+            "items": {
+              "$ref": "#/components/schemas/WakeUp"
+            },
+            "type": "array"
+          },
+          "runs": {
+            "description": "The latest 50 runs, newest first.",
+            "items": {
+              "$ref": "#/components/schemas/WakeRun"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "lineageId",
+          "items",
+          "runs"
+        ],
+        "type": "object"
+      },
+      "WakeRemoved": {
+        "properties": {
+          "wakeId": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "wakeId",
+          "name"
+        ],
+        "type": "object"
       }
     }
   },
@@ -6718,7 +7094,8 @@
                 "schema": {
                   "properties": {
                     "ok": {
-                      "type": "boolean"
+                      "type": "boolean",
+                      "description": "True on 200, false on 503."
                     },
                     "version": {
                       "type": "string",
@@ -6729,24 +7106,129 @@
                       "format": "uint64",
                       "description": "Whole seconds since this Hub process started.",
                       "minimum": 0
+                    },
+                    "lastTickAt": {
+                      "type": "string",
+                      "format": "date-time",
+                      "description": "When the wake tick last completed; absent before the first."
+                    },
+                    "tickAgeSecs": {
+                      "type": "integer",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "description": "Seconds since the last completed wake tick (since the store opened, before the first)."
+                    },
+                    "tickPeriodSecs": {
+                      "type": "integer",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "description": "The wake tick's period (5 s)."
+                    },
+                    "tickStaleAfterSecs": {
+                      "type": "integer",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "description": "tickAgeSecs past which the Hub answers 503: 12 tick periods."
+                    },
+                    "deliveryAgeSecs": {
+                      "type": "integer",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "description": "How long the oldest wake run that fired has waited for delivery; absent when none waits."
                     }
                   },
                   "required": [
                     "ok",
                     "version",
-                    "uptimeSecs"
+                    "uptimeSecs",
+                    "tickAgeSecs",
+                    "tickPeriodSecs",
+                    "tickStaleAfterSecs"
                   ],
                   "type": "object"
                 }
               }
             },
             "description": "ok"
+          },
+          "503": {
+            "description": "The wake tick is stale: the Hub serves but no longer claims due wake-ups",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "description": "True on 200, false on 503."
+                    },
+                    "version": {
+                      "type": "string",
+                      "description": "Hub package version (matches the remuda CLI version)."
+                    },
+                    "uptimeSecs": {
+                      "type": "integer",
+                      "format": "uint64",
+                      "description": "Whole seconds since this Hub process started.",
+                      "minimum": 0
+                    },
+                    "lastTickAt": {
+                      "type": "string",
+                      "format": "date-time",
+                      "description": "When the wake tick last completed; absent before the first."
+                    },
+                    "tickAgeSecs": {
+                      "type": "integer",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "description": "Seconds since the last completed wake tick (since the store opened, before the first)."
+                    },
+                    "tickPeriodSecs": {
+                      "type": "integer",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "description": "The wake tick's period (5 s)."
+                    },
+                    "tickStaleAfterSecs": {
+                      "type": "integer",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "description": "tickAgeSecs past which the Hub answers 503: 12 tick periods."
+                    },
+                    "deliveryAgeSecs": {
+                      "type": "integer",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "description": "How long the oldest wake run that fired has waited for delivery; absent when none waits."
+                    },
+                    "code": {
+                      "const": "HUB_TICK_STALE",
+                      "type": "string"
+                    },
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "version",
+                    "uptimeSecs",
+                    "tickAgeSecs",
+                    "tickPeriodSecs",
+                    "tickStaleAfterSecs",
+                    "code",
+                    "error"
+                  ],
+                  "type": "object"
+                }
+              }
+            }
           }
         },
         "summary": "Liveness",
         "tags": [
           "health"
-        ]
+        ],
+        "description": "Liveness, plus the wake tick (D-060 §11): the last completed tick, its age and period, and the delivery age of the oldest waiting wake run. 503 once no tick completed for 12 tick periods."
       }
     },
     "/node/v1/connect": {
@@ -14160,6 +14642,153 @@
             "$ref": "#/components/responses/Error"
           }
         }
+      }
+    },
+    "/v1/lineages/{id}/wake-ups": {
+      "get": {
+        "operationId": "lineageWakeUps",
+        "summary": "A lineage's wake-ups and its latest runs (`remuda wake list`)",
+        "description": "D-060 §11. A Human device manages any lineage's wake-ups and may name any chapter of it; an Agent only its own lineage, by its canonical id (403 otherwise); a Bot credential is refused (403). An Agent write passes the commit-time initiator check (a fenced or paused chapter gets 409 fenced).",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Wake-ups and runs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WakeList"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "tags": [
+          "instances"
+        ]
+      },
+      "post": {
+        "operationId": "addLineageWakeUp",
+        "summary": "Add a wake-up (`remuda wake add`)",
+        "description": "D-060 §11. A Human device manages any lineage's wake-ups and may name any chapter of it; an Agent only its own lineage, by its canonical id (403 otherwise); a Bot credential is refused (403). An Agent write passes the commit-time initiator check (a fenced or paused chapter gets 409 fenced). The Hub claims each due occurrence once; a persistent run is delivered as a wake-due inbox fact at the lineage's idle point, a fresh run creates a short-lived child through the ordinary Agent create. notify is required. The same add under the same name returns the stored wake-up with 200; a different one under that name is 409 wake-name-taken. Refusals: 400 invalid-wake-up (bounds), 422 WAKE_SECRET_REJECTED (field and rule only, never the text), 422 WAKE_UNSUPPORTED (check-unsupported, condition-unsupported), 409 wake-not-received (the lineage receives no facts), 409 wake-limit (64 per lineage).",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WakeAddRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The stored wake-up (a repeat)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WakeAddResult"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Added",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WakeAddResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "tags": [
+          "instances"
+        ]
+      }
+    },
+    "/v1/lineages/{id}/wake-ups/{wake}": {
+      "delete": {
+        "operationId": "removeLineageWakeUp",
+        "summary": "Remove a wake-up (`remuda wake rm`)",
+        "description": "D-060 §11. A Human device manages any lineage's wake-ups and may name any chapter of it; an Agent only its own lineage, by its canonical id (403 otherwise); a Bot credential is refused (403). An Agent write passes the commit-time initiator check (a fenced or paused chapter gets 409 fenced). Its runs stay as history; a run already queued or running ends as it would have.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          },
+          {
+            "description": "The wake-up's id (wak_…) or name.",
+            "in": "path",
+            "name": "wake",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Removed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WakeRemoved"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "tags": [
+          "instances"
+        ]
       }
     }
   },

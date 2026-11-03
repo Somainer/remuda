@@ -101,6 +101,7 @@ mod transport;
 mod tty;
 mod usage_resume;
 mod usage_store;
+mod wake;
 mod web;
 mod worker_watch;
 mod workers;
@@ -213,6 +214,9 @@ pub struct AppState {
     pub(crate) screen_sweeps: crate::stall_screen::SweepsInFlight,
     /// D-057 §8.3 (ma-push): the push outbox drive.
     pub(crate) outbox: crate::push_route::OutboxState,
+    /// cb-wake-engine: the tick health `/healthz` reports and the fresh-mode
+    /// drive.
+    pub(crate) wake: crate::wake::WakeState,
 }
 
 impl AppState {
@@ -350,6 +354,21 @@ pub mod inbox_test_support {
 
     /// The bound `host_lost_grace_ms` is clamped to at load (one year).
     pub const MAX_HOST_LOST_GRACE_MS: u64 = crate::inbox::MAX_CONFIGURED_MS;
+}
+
+/// Test-only seams of the wake engine (cb-wake-engine).
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-faults"))]
+pub mod wake_test_support {
+    /// Make the next `times` full result writes for `run_id` fail.
+    pub fn arm_result_failure(run_id: &str, times: u32) {
+        crate::wake::test_seams::arm_result_failure(run_id, times);
+    }
+
+    /// Seconds without a completed tick after which `/healthz` answers 503.
+    pub fn stale_after_secs() -> u64 {
+        crate::wake::stale_after_secs()
+    }
 }
 
 /// Test-only constructors for types private modules would otherwise hide
@@ -1516,6 +1535,36 @@ impl RunningHub {
         crate::inbox_deliver::retry_tick(&self.state).await;
     }
 
+    /// Test-only: one wake evaluation as of `now` (RFC3339), then one
+    /// fresh-mode drive, awaited. Returns how many runs it recorded.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_wake_tick(&self, now: &str) -> anyhow::Result<usize> {
+        let now = time::OffsetDateTime::parse(now, &time::format_description::well_known::Rfc3339)?;
+        let outcome = self.state.store.wake_tick(now).await?;
+        self.state.wake.note_tick(outcome.oldest_waiting);
+        crate::wake::drive_fresh(&self.state).await;
+        Ok(outcome.fired)
+    }
+
+    /// Test-only: hold (or release) the scheduler's wake ticks, so a test
+    /// decides when the tick runs and what its last tick was.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_hold_wake_tick(&self, held: bool) {
+        self.state
+            .wake
+            .hold_tick
+            .store(held, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test-only: pretend the last wake tick completed `secs` seconds ago.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_backdate_wake_tick(&self, secs: i64) {
+        self.state.wake.backdate_tick(secs);
+    }
+
     /// Test-only: one evaluation of the inbox's time-driven facts (supply
     /// resets, stalls, wall budgets) as of `now` (RFC3339), returning how
     /// many facts it recorded.
@@ -2448,6 +2497,7 @@ async fn spawn_inner(
         deliver: crate::inbox_deliver::DeliverState::default(),
         screen_sweeps: crate::stall_screen::SweepsInFlight::default(),
         outbox: crate::push_route::OutboxState::default(),
+        wake: crate::wake::WakeState::default(),
     };
     // D-057 §7.7: the send gate's map survives a Hub restart through the
     // lineages table; deliveries are re-sent on hello and by the tick.
@@ -2602,6 +2652,13 @@ async fn spawn_inner(
                             crate::inbox_deliver::retry_tick(&retry_state).await;
                         });
                     }
+                    // cb-wake-engine: due wake-ups, off the loop.
+                    if inbox_ticks.is_multiple_of(crate::wake::TICK_EVERY) {
+                        let wake_state = reaper_state.clone();
+                        tokio::spawn(async move {
+                            crate::wake::run_tick(&wake_state).await;
+                        });
+                    }
                     inbox_ticks = inbox_ticks.wrapping_add(1);
                     // D-057 §6.3.1: the C1 supervisor, off the loop too.
                     if config.restart_supervisor {
@@ -2705,6 +2762,7 @@ pub fn router(state: AppState) -> Router {
         .merge(digest::routes())
         .merge(inbox::routes())
         .merge(owner_notify::routes())
+        .merge(wake::routes())
         .merge(bot::routes());
     if let Some(push) = state.push.clone() {
         app = app.nest_service("/push", push_http::nest(push, state.store.clone()));

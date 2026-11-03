@@ -22189,6 +22189,522 @@
         }
       ]
     },
+    "WakeAddRequest": {
+      "additionalProperties": false,
+      "description": "`POST /v1/lineages/{id}/wake-ups`.",
+      "properties": {
+        "check": {
+          "description": "Reserved for the optional check (main-agent.md §11.2); until it is\nbuilt, a request carrying one is refused with 422, code\n`WAKE_UNSUPPORTED`, reason `check-unsupported`."
+        },
+        "mode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WakeMode"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`persistent` (default) or `fresh`."
+        },
+        "name": {
+          "description": "Unique in the lineage (`[A-Za-z0-9._:-]`, not `wak_…`); a repeat of\nthe same add under the same name returns the stored wake-up. The Hub\ngenerates one when absent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "notify": {
+          "$ref": "#/$defs/WakeNotify",
+          "description": "Which runs notify the owner; required, the Hub never picks."
+        },
+        "text": {
+          "description": "What the wake-up is for: delivered with each run, or the brief of a\nfresh-mode child.",
+          "type": "string"
+        },
+        "trigger": {
+          "$ref": "#/$defs/WakeTrigger",
+          "description": "When it fires."
+        }
+      },
+      "required": [
+        "text",
+        "trigger",
+        "notify"
+      ],
+      "type": "object"
+    },
+    "WakeAddResult": {
+      "description": "`POST /v1/lineages/{id}/wake-ups` response.",
+      "properties": {
+        "created": {
+          "description": "False when the same add under the same name already stored it.",
+          "type": "boolean"
+        },
+        "wakeUp": {
+          "$ref": "#/$defs/WakeUp",
+          "description": "The stored wake-up."
+        }
+      },
+      "required": [
+        "wakeUp",
+        "created"
+      ],
+      "type": "object"
+    },
+    "WakeAt": {
+      "description": "`at`: one occurrence. A request gives `at` or `afterSecs`; a stored\nwake-up always carries `at`.",
+      "properties": {
+        "afterSecs": {
+          "description": "Request only: seconds after the Hub received the request.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "at": {
+          "description": "The time it fires (UTC RFC3339).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "WakeCreator": {
+      "description": "Who added a wake-up.",
+      "properties": {
+        "instanceId": {
+          "description": "The chapter an Agent added it from.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "origin": {
+          "$ref": "#/$defs/InputOrigin",
+          "description": "`agent` (the lineage itself) or `human` (the owner)."
+        }
+      },
+      "required": [
+        "origin"
+      ],
+      "type": "object"
+    },
+    "WakeEvery": {
+      "description": "`every`: one occurrence per interval.",
+      "properties": {
+        "everySecs": {
+          "description": "The interval in seconds, at least [`WAKE_EVERY_MIN_SECS`].",
+          "format": "int64",
+          "type": "integer"
+        },
+        "startAt": {
+          "description": "The first occurrence (UTC RFC3339); one interval after the add when\nabsent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "everySecs"
+      ],
+      "type": "object"
+    },
+    "WakeList": {
+      "description": "`GET /v1/lineages/{id}/wake-ups`.",
+      "properties": {
+        "items": {
+          "description": "Its wake-ups, oldest first.",
+          "items": {
+            "$ref": "#/$defs/WakeUp"
+          },
+          "type": "array"
+        },
+        "lineageId": {
+          "description": "The lineage.",
+          "type": "string"
+        },
+        "runs": {
+          "description": "Its latest runs, newest first, at most [`WAKE_RUNS_LISTED`].",
+          "items": {
+            "$ref": "#/$defs/WakeRun"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "lineageId",
+        "items",
+        "runs"
+      ],
+      "type": "object"
+    },
+    "WakeMode": {
+      "description": "WakeMode wire values; `protocol.md` §8.4.",
+      "oneOf": [
+        {
+          "const": "persistent",
+          "description": "Wire value `persistent`.",
+          "type": "string"
+        },
+        {
+          "const": "fresh",
+          "description": "Wire value `fresh`.",
+          "type": "string"
+        }
+      ]
+    },
+    "WakeNotify": {
+      "description": "WakeNotify wire values; `protocol.md` §8.4.",
+      "oneOf": [
+        {
+          "const": "never",
+          "description": "Wire value `never`.",
+          "type": "string"
+        },
+        {
+          "const": "failure",
+          "description": "Wire value `failure`.",
+          "type": "string"
+        },
+        {
+          "const": "always",
+          "description": "Wire value `always`.",
+          "type": "string"
+        }
+      ]
+    },
+    "WakeRemoved": {
+      "description": "`DELETE /v1/lineages/{id}/wake-ups/{wake}`.",
+      "properties": {
+        "name": {
+          "description": "Its name.",
+          "type": "string"
+        },
+        "wakeId": {
+          "description": "The removed wake-up.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "wakeId",
+        "name"
+      ],
+      "type": "object"
+    },
+    "WakeRun": {
+      "description": "One run of a wake-up.",
+      "properties": {
+        "batchId": {
+          "description": "The inbox batch that carried it (persistent mode).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "checkExit": {
+          "description": "The optional check's exit code (main-agent.md §11.2); null until the\ncheck exists.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "childInstanceId": {
+          "description": "The child the Hub created for it (fresh mode).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "endedAt": {
+          "description": "When it ended.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "factId": {
+          "description": "The `wake-due` inbox row it was delivered as (persistent mode).",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "failureKind": {
+          "description": "Why it failed: `not-received`, `not-delivered`, `delivery`,\n`turn-failed`, `chapter-ended`, `fresh-refused`, `child-failed`,\n`child-ended`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "firedAt": {
+          "description": "When the Hub claimed it.",
+          "type": "string"
+        },
+        "lineageId": {
+          "description": "The lineage it woke.",
+          "type": "string"
+        },
+        "missedBefore": {
+          "description": "Occurrences skipped before it (none of them ran): those the Hub was\ndown for, those due while the previous run was still open, and, for\n`when`, the other facts found in the same evaluation.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "mode": {
+          "$ref": "#/$defs/WakeMode",
+          "description": "The wake-up's mode when it fired."
+        },
+        "name": {
+          "description": "The wake-up's name when it fired.",
+          "type": "string"
+        },
+        "runId": {
+          "description": "`wrn_…`.",
+          "type": "string"
+        },
+        "scheduledAt": {
+          "description": "The occurrence it stands for: the latest one due when it fired.",
+          "type": "string"
+        },
+        "startedAt": {
+          "description": "When it started running: its batch was forwarded, or its fresh child\nwas being created.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/WakeRunState",
+          "description": "`queued` → `running` → `success`, `failed` or `skipped`; a run that\nwas running when the Hub restarted is `interrupted` and never\nreplayed."
+        },
+        "wakeId": {
+          "description": "The wake-up (it may have been removed since).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "runId",
+        "wakeId",
+        "lineageId",
+        "name",
+        "mode",
+        "scheduledAt",
+        "firedAt",
+        "state",
+        "checkExit",
+        "missedBefore"
+      ],
+      "type": "object"
+    },
+    "WakeRunState": {
+      "description": "WakeRunState wire values; `protocol.md` §8.4.",
+      "oneOf": [
+        {
+          "const": "queued",
+          "description": "Wire value `queued`.",
+          "type": "string"
+        },
+        {
+          "const": "running",
+          "description": "Wire value `running`.",
+          "type": "string"
+        },
+        {
+          "const": "success",
+          "description": "Wire value `success`.",
+          "type": "string"
+        },
+        {
+          "const": "failed",
+          "description": "Wire value `failed`.",
+          "type": "string"
+        },
+        {
+          "const": "skipped",
+          "description": "Wire value `skipped`.",
+          "type": "string"
+        },
+        {
+          "const": "interrupted",
+          "description": "Wire value `interrupted`.",
+          "type": "string"
+        }
+      ]
+    },
+    "WakeTrigger": {
+      "description": "When a wake-up fires.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/WakeAt",
+          "description": "Once, at a time.",
+          "properties": {
+            "kind": {
+              "const": "at",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/WakeEvery",
+          "description": "At every interval.",
+          "properties": {
+            "kind": {
+              "const": "every",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/WakeWhen",
+          "description": "Each time a fact of a kind reaches the lineage's inbox.",
+          "properties": {
+            "kind": {
+              "const": "when",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "WakeUp": {
+      "description": "One wake-up row.",
+      "properties": {
+        "check": {
+          "description": "Reserved for the optional check (main-agent.md §11.2); always absent."
+        },
+        "createdAt": {
+          "description": "When it was added (UTC RFC3339).",
+          "type": "string"
+        },
+        "creator": {
+          "$ref": "#/$defs/WakeCreator",
+          "description": "Who added it."
+        },
+        "lastFiredAt": {
+          "description": "When its latest run fired.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "lineageId": {
+          "description": "The lineage it wakes.",
+          "type": "string"
+        },
+        "missedCount": {
+          "description": "Occurrences skipped because they came due while an earlier run was\nstill queued or running: none of them gets a run of its own, not even\nonce that run ends. The next run reports them and this resets.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "mode": {
+          "$ref": "#/$defs/WakeMode",
+          "description": "Delivery mode."
+        },
+        "name": {
+          "description": "Unique in the lineage.",
+          "type": "string"
+        },
+        "nextFireAt": {
+          "description": "The next scheduled occurrence (UTC RFC3339); absent for `when` and\nonce done.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "notify": {
+          "$ref": "#/$defs/WakeNotify",
+          "description": "The declared notify policy."
+        },
+        "state": {
+          "$ref": "#/$defs/WakeUpState",
+          "description": "`done` once an `at` has fired."
+        },
+        "text": {
+          "description": "What it is for.",
+          "type": "string"
+        },
+        "trigger": {
+          "$ref": "#/$defs/WakeTrigger",
+          "description": "When it fires (an `at` carries its resolved time)."
+        },
+        "updatedAt": {
+          "description": "When the Hub last changed it.",
+          "type": "string"
+        },
+        "wakeId": {
+          "description": "`wak_…`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "wakeId",
+        "lineageId",
+        "name",
+        "text",
+        "trigger",
+        "mode",
+        "notify",
+        "state",
+        "missedCount",
+        "createdAt",
+        "updatedAt",
+        "creator"
+      ],
+      "type": "object"
+    },
+    "WakeUpState": {
+      "description": "WakeUpState wire values; `protocol.md` §8.4.",
+      "oneOf": [
+        {
+          "const": "active",
+          "description": "Wire value `active`.",
+          "type": "string"
+        },
+        {
+          "const": "done",
+          "description": "Wire value `done`.",
+          "type": "string"
+        }
+      ]
+    },
+    "WakeWhen": {
+      "description": "`when`: a condition over the facts the lineage receives. Each fact of\n`factKind` (about `subjectInstanceId`, when set) recorded after the add is\nan occurrence. `wake-due` cannot be a condition, and nothing records\n`context-threshold` facts yet, so that kind is refused at add time.",
+      "properties": {
+        "factKind": {
+          "$ref": "#/$defs/InboxFactKind",
+          "description": "The fact kind that fires it."
+        },
+        "subjectInstanceId": {
+          "description": "Only facts about this instance.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "factKind"
+      ],
+      "type": "object"
+    },
     "WindowSource": {
       "description": "Where a window's numbers came from; §4.1.\n\nObserved frames update `observed` fields but never erase a `declared`\nlimit; `inferred` is filled by Hub-side usage aggregation (§4.5).",
       "oneOf": [

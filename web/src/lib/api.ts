@@ -1653,13 +1653,24 @@ function createLiveApi(): HubApi {
       return Boolean(readSession());
     },
     async hello() {
-      const health = await rest<{ ok?: boolean }>("/healthz");
+      let reachable: boolean;
+      try {
+        const health = await rest<{ ok?: boolean }>("/healthz");
+        reachable = Boolean(health.ok);
+      } catch (err) {
+        // cb-wake-engine: a stale wake tick answers 503 while the Hub still
+        // serves every route; the PWA stays usable and the monitor sees it.
+        if (!(err instanceof HubHttpError && err.status === 503 && err.code === "HUB_TICK_STALE")) {
+          throw err;
+        }
+        reachable = true;
+      }
       return {
         protocol: { major: 1, minor: 0 },
         connectionId: id("conn_"),
         serverEpoch: id("epoch_"),
         observationSchemaMajor: 1 as const,
-        features: health.ok ? ["hub"] : [],
+        features: reachable ? ["hub"] : [],
       };
     },
     async instanceList(q) {

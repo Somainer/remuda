@@ -32,20 +32,49 @@ const LISTEN: &str = "127.0.0.1:18787";
 /// Fake Anthropic-Messages gateway for provider discovery.
 const UPSTREAM_LISTEN: &str = "127.0.0.1:18788";
 
-/// home-evidence showcase fixture (H5): under `HUB_E2E_HOME_EVIDENCE=1` the
-/// fake Node announces neutral host/workspace names and journals human
-/// assistant lines, so the home evidence shots carry no test strings, real
-/// host names or paths (home.md §11). Off by default: every other spec sees
-/// the byte-identical harness.
+/// home-evidence showcase fixture (H5): `HUB_E2E_HOME_EVIDENCE=1` starts
+/// ADDITIONAL harness-owned Nodes beside the primary fake Node, so the
+/// evidence run gets neutral names without rewriting the shared fixture.
+/// Off by default: every other spec sees the byte-identical primary Node.
 fn home_evidence_enabled() -> bool {
     std::env::var("HUB_E2E_HOME_EVIDENCE").as_deref() == Ok("1")
 }
 
-/// The assistant line the fake turn journals. The showcase run replaces the
-/// `echo: <prompt>` wire echo (which would carry the fixture sentinels into
-/// row bodies) with a sentence a person would read.
-fn journaled_reply(prompt: &str) -> String {
-    if home_evidence_enabled() {
+/// Per-Node appointment of a fake Node: the label a human sees and the
+/// assistant line the scripted turn journals.
+#[derive(Clone, Copy)]
+struct NodeProfile {
+    label: &'static str,
+    hostname: &'static str,
+    /// True only for the home-evidence showcase Node (neutral copy + the
+    /// `hshowcase-*` card sentinels).
+    showcase: bool,
+}
+
+const PRIMARY_PROFILE: NodeProfile = NodeProfile {
+    label: "e2e-fake-node",
+    hostname: "e2e-fake-node.local",
+    showcase: false,
+};
+const SHOWCASE_PROFILE: NodeProfile = NodeProfile {
+    label: "forge",
+    hostname: "forge.local",
+    showcase: true,
+};
+/// The evidence run's offline host: it joins and drops at once, so the Hub
+/// keeps a real offline `last_seen_at` for the ② 「离线 Nm」 chip.
+const LAPTOP_PROFILE: NodeProfile = NodeProfile {
+    label: "laptop",
+    hostname: "laptop.local",
+    showcase: false,
+};
+
+/// The assistant line a scripted turn journals. The showcase Node replaces
+/// the `echo: <prompt>` wire echo (which would carry the fixture sentinels into
+/// row bodies) with a sentence a person would read; the primary Node is
+/// unchanged.
+fn journaled_reply(showcase: bool, prompt: &str) -> String {
+    if showcase {
         "已核对完这一步，下一步等你确认。".to_string()
     } else {
         format!("echo: {prompt}")
@@ -170,6 +199,7 @@ async fn main() -> Result<()> {
         pending,
         ready_tx,
         rpc_gate.clone(),
+        PRIMARY_PROFILE,
     ));
     ready_rx.await.context("fake node hello")?;
     // A stand-in Anthropic-Messages gateway so provider discovery has a real
@@ -201,6 +231,35 @@ async fn main() -> Result<()> {
     let mut project_host_b: Option<tokio::task::JoinHandle<()>> = None;
     if let Some(hub) = &hub {
         project_host_b = maybe_spawn_project_host_b(addr, hub).await?;
+    }
+    // home-evidence (H5): the evidence run gets its OWN Nodes, so enabling it
+    // never rewrites the shared primary fixture (label, workspaces, echo
+    // copy). `forge` serves the showcase sessions; `laptop` announces once
+    // and drops, leaving a real offline last-seen age for the ② chip.
+    let mut showcase_node: Option<tokio::task::JoinHandle<Result<()>>> = None;
+    if home_evidence_enabled() {
+        let enroll = mint_node_enroll(addr, hub.as_ref()).await?;
+        let showcase_host = HostId::new();
+        let showcase_pending: Arc<Mutex<HashMap<String, Value>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (showcase_ready_tx, showcase_ready_rx) = oneshot::channel();
+        showcase_node = Some(tokio::spawn(fake_node(
+            addr,
+            enroll,
+            showcase_host.clone(),
+            showcase_pending,
+            showcase_ready_tx,
+            rpc_gate.clone(),
+            SHOWCASE_PROFILE,
+        )));
+        showcase_ready_rx
+            .await
+            .context("showcase fake node hello")?;
+        line["showcaseHost"] = json!(showcase_host.as_id().as_str());
+        let laptop_enroll = mint_node_enroll(addr, hub.as_ref()).await?;
+        let laptop_host = HostId::new();
+        announce_then_drop(addr, laptop_enroll, laptop_host.clone()).await?;
+        line["laptopHost"] = json!(laptop_host.as_id().as_str());
     }
     println!("HUB_E2E_READY {line}");
     let _ = io::stdout().flush();
@@ -235,6 +294,9 @@ async fn main() -> Result<()> {
         let _ = std::fs::remove_file(gate);
     }
     node.abort();
+    if let Some(showcase) = showcase_node {
+        showcase.abort();
+    }
     upstream_task.abort();
     if let Some(host_b) = project_host_b {
         host_b.abort();
@@ -262,6 +324,61 @@ async fn wait_for_sigterm() -> std::io::Result<()> {
 #[cfg(not(unix))]
 async fn wait_for_sigterm() -> std::io::Result<()> {
     std::future::pending::<()>().await;
+    Ok(())
+}
+
+/// Mint one single-use node enroll token: through the in-process Hub when
+/// this harness owns it, else through the device HTTP path like the primary.
+async fn mint_node_enroll(
+    addr: SocketAddr,
+    hub: Option<&remuda_hub::RunningHub>,
+) -> Result<String> {
+    match hub {
+        Some(hub) => hub
+            .mint_enroll_token(remuda_hub::DEFAULT_ENROLL_TOKEN_TTL_MINUTES)
+            .await
+            .context("mint extra node enroll token"),
+        None => mint_enroll_via_device(addr, BOOTSTRAP).await,
+    }
+}
+
+/// home-evidence: enroll a throwaway Node that announces itself and drops the
+/// link at once. The Hub marks the host offline on the link loss while the
+/// hello's `last_seen_at` stays, so the strip shows a real 「离线 Nm」 age
+/// without any machine behind it (no SSH supervisor is ever started).
+async fn announce_then_drop(addr: SocketAddr, enroll: String, host_id: HostId) -> Result<()> {
+    let mut req = format!("ws://{addr}/v1/node").into_client_request()?;
+    req.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {enroll}")
+            .parse()
+            .context("laptop node authorization")?,
+    );
+    let (mut ws, _) = tokio_tungstenite::connect_async(req).await?;
+    ws.send(Message::Text(
+        node_hello_frame(&host_id, &json!([]), 1, &[], LAPTOP_PROFILE)
+            .to_string()
+            .into(),
+    ))
+    .await?;
+    // Wait for the enrollment result before dropping, so the host really
+    // joined (an early close would leave no row to go offline).
+    loop {
+        let Some(Ok(Message::Text(text))) =
+            tokio::time::timeout(Duration::from_secs(10), ws.next()).await?
+        else {
+            anyhow::bail!("laptop node closed before its hello result");
+        };
+        let value: Value = serde_json::from_str(&text)?;
+        if value
+            .get("result")
+            .and_then(|result| result.get("nodeToken"))
+            .is_some()
+        {
+            break;
+        }
+    }
+    let _ = ws.close(None).await;
     Ok(())
 }
 
@@ -684,19 +801,18 @@ async fn mint_enroll_via_device(addr: SocketAddr, bootstrap: &str) -> Result<Str
 /// `live` is the instance inventory the Node announces. A restart reports what
 /// survived it — nothing, for an in-process carrier — which is what the Hub
 /// diffs against the epoch it recorded. See `NODE_RESTART_SENTINEL`.
-fn node_hello_frame(host_id: &HostId, workspaces: &Value, epoch: u64, live: &[String]) -> Value {
+fn node_hello_frame(
+    host_id: &HostId,
+    workspaces: &Value,
+    epoch: u64,
+    live: &[String],
+    profile: NodeProfile,
+) -> Value {
     let host = host_id.as_id().as_str();
     let inventory: Vec<Value> = live
         .iter()
         .map(|instance_id| json!({ "id": instance_id, "hostId": host, "lifecycle": "running" }))
         .collect();
-    // The showcase run names the host the way the owner would (home.md §11);
-    // every other spec keys on the original label.
-    let (label, hostname) = if home_evidence_enabled() {
-        ("forge", "forge.local")
-    } else {
-        ("e2e-fake-node", "e2e-fake-node.local")
-    };
     json!({
         "jsonrpc": "2.0",
         "id": "hello",
@@ -704,7 +820,7 @@ fn node_hello_frame(host_id: &HostId, workspaces: &Value, epoch: u64, live: &[St
         "params": {
             "hostId": host,
             "nodeVersion": "0.1.0-e2e",
-            "label": label,
+            "label": profile.label,
             // A new epoch on every restart is what makes the Hub reconcile;
             // an unchanged epoch is a reconnect and settles nothing.
             "nodeEpoch": format!("epoch-e2e-{epoch}"),
@@ -714,7 +830,7 @@ fn node_hello_frame(host_id: &HostId, workspaces: &Value, epoch: u64, live: &[St
             // omits the key instead (see `DevNode::announceable_inventory`).
             "instanceStoreFound": true,
             "host": {
-                "hostname": hostname,
+                "hostname": profile.hostname,
                 "workspaceRevision": 1,
                 "workspaces": workspaces,
                 "labels": { "role": "e2e" },
@@ -801,6 +917,7 @@ async fn node_restart_reconnect(
     node_epoch: &mut u64,
     survivors: Vec<String>,
     frame_queue: &mut std::collections::VecDeque<String>,
+    profile: NodeProfile,
 ) -> Result<NodeWs> {
     *node_epoch += 1;
     let mut req = format!("ws://{addr}/v1/node").into_client_request()?;
@@ -812,7 +929,7 @@ async fn node_restart_reconnect(
     );
     let (mut ws, _) = tokio_tungstenite::connect_async(req).await?;
     ws.send(Message::Text(
-        node_hello_frame(host_id, workspaces, *node_epoch, &survivors)
+        node_hello_frame(host_id, workspaces, *node_epoch, &survivors, profile)
             .to_string()
             .into(),
     ))
@@ -888,6 +1005,7 @@ async fn fake_node(
     pending: Arc<Mutex<HashMap<String, Value>>>,
     ready: oneshot::Sender<()>,
     rpc_gate: PathBuf,
+    profile: NodeProfile,
 ) -> Result<()> {
     let mut req = format!("ws://{addr}/v1/node")
         .into_client_request()
@@ -901,9 +1019,10 @@ async fn fake_node(
     let (mut ws, _) = tokio_tungstenite::connect_async(req).await?;
     let host = host_id.as_id().as_str();
     // home-evidence showcase: the workspace label is its root's last segment
-    // (`web/src/features/workspaces/registry.ts`), so the run announces
-    // human-named roots and drops the scenario-only g2 roots from the list.
-    let showcase = home_evidence_enabled();
+    // (`web/src/features/workspaces/registry.ts`), so the showcase Node
+    // announces human-named roots and drops the scenario-only g2 roots. The
+    // primary Node keeps the legacy list, g2 workspaces included.
+    let showcase = profile.showcase;
     let (e2e_root, e2e_second_root) = if showcase {
         ("/srv/remuda", "/srv/atlas")
     } else {
@@ -971,7 +1090,7 @@ async fn fake_node(
     // "owns nothing", so "no sessions yet" is spelled `[]` deliberately.
     let mut node_epoch = 1u64;
     ws.send(Message::Text(
-        node_hello_frame(&host_id, &workspaces, node_epoch, &[])
+        node_hello_frame(&host_id, &workspaces, node_epoch, &[], profile)
             .to_string()
             .into(),
     ))
@@ -1510,7 +1629,7 @@ async fn fake_node(
                         .await?;
                         // The raw error is tooltip-only on the row; the
                         // showcase run still keeps it free of fixture tokens.
-                        let exit_error = if home_evidence_enabled() {
+                        let exit_error = if profile.showcase {
                             "API Error: 服务暂时不可用 (503)"
                         } else {
                             "API Error: MHOME_EXIT_SENTINEL (429)"
@@ -1711,7 +1830,16 @@ async fn fake_node(
                     // card instead: harness-hook carrier, the real tool input as
                     // its description, and an always-allow option built from the
                     // permission_suggestion the harness offered.
-                    let card = if prompt.contains("ask-question-deadline") {
+                    // c-homeev round 2: the evidence fixture's cardless turns
+                    // (a working session, an idle row) raise no interaction,
+                    // so the matrix never depends on an answer RPC crossing
+                    // the Node link. Showcase Node only.
+                    let cardless = profile.showcase
+                        && (prompt.contains("hshowcase-working")
+                            || prompt.contains("hshowcase-idle"));
+                    let card = if cardless {
+                        Value::Null
+                    } else if prompt.contains("ask-question-deadline") {
                         // c-question-alert: a question with a short known
                         // deadline (~60 s). The e2e installs page.clock at
                         // roughly the same real instant and fast-forwards past
@@ -1741,7 +1869,7 @@ async fn fake_node(
                             host_id.as_id().as_str(),
                             interaction_id.as_id().as_str(),
                         )
-                    } else if prompt.contains("hshowcase-approval") {
+                    } else if profile.showcase && prompt.contains("hshowcase-approval") {
                         // c-homeev: a showcase approval whose verbatim body
                         // reads like a real command, so evidence shots carry no
                         // fixture paths (home.md §11).
@@ -1750,7 +1878,7 @@ async fn fake_node(
                             host_id.as_id().as_str(),
                             interaction_id.as_id().as_str(),
                         )
-                    } else if prompt.contains("hshowcase-plan") {
+                    } else if profile.showcase && prompt.contains("hshowcase-plan") {
                         // c-homeev: a showcase plan in the owner's language.
                         fake_showcase_plan(
                             &instance_id,
@@ -1790,7 +1918,7 @@ async fn fake_node(
                     if prompt.contains("hqueue-race") {
                         race_ids.insert(interaction_id.as_id().as_str().to_string());
                     }
-                    if row_scenario.is_none() {
+                    if row_scenario.is_none() && !cardless {
                         pending
                             .lock()
                             .await
@@ -1842,7 +1970,7 @@ async fn fake_node(
                             &instance_id,
                             append_n,
                             "assistant",
-                            &journaled_reply(prompt),
+                            &journaled_reply(profile.showcase, prompt),
                         )
                         .await?;
                     }
@@ -1871,6 +1999,11 @@ async fn fake_node(
                     } else if prompt.contains("blocked-question") {
                         append_n = append_native_status(&mut ws, &instance_id, append_n, "blocked")
                             .await?;
+                    } else if profile.showcase && prompt.contains("hshowcase-idle") {
+                        // The evidence run's idle ledger row: a finished turn
+                        // with no card and no answer round trip.
+                        append_n =
+                            append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
                     } else {
                         append_n = append_native_status(&mut ws, &instance_id, append_n, "working")
                             .await?;
@@ -1956,6 +2089,7 @@ async fn fake_node(
                             &mut node_epoch,
                             survivors,
                             &mut frame_queue,
+                            profile,
                         )
                         .await?;
                         continue;
@@ -2470,9 +2604,12 @@ async fn fake_node(
                         .collect::<Vec<_>>()
                         .join(",");
                     let mut reply = if sent.is_empty() {
-                        journaled_reply(prompt)
+                        journaled_reply(profile.showcase, prompt)
                     } else {
-                        format!("{} [attachments: {types}]", journaled_reply(prompt))
+                        format!(
+                            "{} [attachments: {types}]",
+                            journaled_reply(profile.showcase, prompt)
+                        )
                     };
                     for (index, object_id, _kind, media_type, _name, _size) in &sent {
                         reply.push_str(&format!(
@@ -3267,6 +3404,7 @@ async fn fake_node(
                             &mut node_epoch,
                             survivors,
                             &mut frame_queue,
+                            profile,
                         )
                         .await?;
                         continue;

@@ -150,6 +150,9 @@ pub(crate) struct NoticeInput {
     pub source: NoticeSource,
     /// `agent`, `human` or `hub`, for the audit row and the card.
     pub origin: &'static str,
+    /// The device the call authenticated as, for the audit row; `None` for
+    /// Hub-internal work (a wake run), recorded as `hub`.
+    pub device_id: Option<String>,
 }
 
 impl NoticeInput {
@@ -324,16 +327,14 @@ pub(crate) fn claim(conn: &Connection, input: &NoticeInput) -> Result<Claimed, S
         "INSERT INTO audit_log (device_id, action, subject, detail_json, created_at, initiator_json)
          VALUES (?1, 'owner.notify', ?2, ?3, ?4, ?5)",
         params![
-            input
-                .chapter
-                .as_ref()
-                .map_or_else(|| input.origin.to_owned(), |c| c.instance_id.clone()),
+            input.device_id.as_deref().unwrap_or("hub"),
             notice_id,
             json!({
                 "source": input.source.as_str(),
                 "origin": input.origin,
                 "dedupeKey": input.dedupe_key.is_some(),
                 "lineageId": input.chapter.as_ref().map(|c| c.lineage_id.as_str()),
+                "chapterInstanceId": input.chapter.as_ref().map(|c| c.instance_id.as_str()),
             })
             .to_string(),
             now,
@@ -830,6 +831,9 @@ async fn notify(
         } else {
             "agent"
         },
+        // The credential the call authenticated as (a narrowed Human token
+        // keeps its own device id), never the chapter.
+        device_id: Some(authenticated.id.clone()),
     };
     let claimed = state
         .store
@@ -944,6 +948,7 @@ mod tests {
             dedupe_key: key.map(str::to_owned),
             source: NoticeSource::Wake,
             origin: "hub",
+            device_id: None,
         }
     }
 

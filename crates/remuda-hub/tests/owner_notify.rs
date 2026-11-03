@@ -677,12 +677,20 @@ async fn dedupe_returns_the_original_row_with_one_push() -> Result<()> {
         ctx.query_i64("SELECT COUNT(*) FROM push_outbox WHERE kind = 'notice'", [])?,
         1
     );
-    // Audit: one row for the claim, without the text.
-    let audit: String = ctx.db()?.query_row(
-        "SELECT detail_json FROM audit_log WHERE action = 'owner.notify' AND subject = ?1",
+    // Audit: one row for the claim, without the text, bound to the device
+    // the call authenticated as; the chapter is in the detail (r2 item 4).
+    let (device, audit): (String, String) = ctx.db()?.query_row(
+        "SELECT device_id, detail_json FROM audit_log
+          WHERE action = 'owner.notify' AND subject = ?1",
         [&id],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
+    assert_eq!(
+        device, ctx.phone.id,
+        "the authenticating device, not the chapter"
+    );
+    let detail: Value = serde_json::from_str(&audit)?;
+    assert_eq!(detail["chapterInstanceId"], json!(main));
     assert!(!audit.contains("Nightly"), "{audit}");
     assert!(!audit.contains("gate:nightly"), "{audit}");
     // The push log has the category and the tag, never the text.

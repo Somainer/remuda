@@ -2948,6 +2948,13 @@ pub async fn post_command(
         .get_instance(instance_id.clone())
         .await?
         .ok_or(HubError::NotFound)?;
+    // D-062: a claimed external pane runs with authority Remuda never set;
+    // only a seated human operator may drive or release it.
+    if crate::herdr_claims::is_claimed(&instance)
+        && crate::agent_scope::origin(&device) != remuda_protocol::InputOrigin::Human
+    {
+        return Err(crate::herdr_claims::human_only());
+    }
     let mut payload = body.payload;
     if payload.is_null() {
         payload = json!({});
@@ -3162,6 +3169,10 @@ pub async fn post_command(
     }
     let live = state.nodes.kind_of(&instance.host_id).await.is_some();
     let command = forward_if_online(&state, command, live).await?;
+    // D-062: a close on a claimed pane is a release (detach only).
+    if command.operation == "instance.close" && crate::herdr_claims::is_claimed(&instance) {
+        crate::herdr_claims::audit_release(&state, &device, &instance).await;
+    }
     if command.operation == "instance.send" {
         journal_agent_message(
             &state,

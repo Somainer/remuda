@@ -618,6 +618,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/hosts/{id}/herdr": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List the host's reachable herdr sessions, workspaces, tabs and panes (human-only, D-062)
+         * @description Human operator origin only; Agent, Bot and narrowed callers get 403 with reason and next. Proxied to the addressed online Node's herdr.discover RPC. Metadata only: the Node never reads pane content (no pane.read / agent.read) and never lists its own carrier session. Each pane carries herdr's agent kind and status, the foreground process (pid and executable base name) and the instance that already claims it, if any.
+         */
+        get: operations["hostHerdrDiscover"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/hosts/{id}/hostcap": {
         parameters: {
             query?: never;
@@ -730,6 +750,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/instances/claim": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Claim an external herdr pane as an instance (human-only, D-062)
+         * @description Human operator origin only. The Node first validates the target read-only (the workspace exists, the tab is in it, the pane is in the tab; without paneId the tab must have exactly one pane, else 400 listing its pane ids). The Hub then indexes a `herdr-claimed` instance (permissionMode `external`, launchedBy `user`) and the Node commits the claim, recording the ids and the pane's foreground process. A claim is not ownership: release or close only detaches. One live claim per (host, socket, pane): a second claim is 409 naming the existing instance.
+         */
+        post: operations["instanceClaim"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/instances/{id}": {
         parameters: {
             query?: never;
@@ -832,6 +872,26 @@ export interface paths {
         get: operations["memoryWrites"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/instances/{id}/release": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Release a claimed herdr pane (detach only, human-only, D-062)
+         * @description Human operator origin only. Detaches from the claimed pane: the Node stops watching and bridging it and the instance ends with reason `released`. The pane, its process and its herdr server keep running. Idempotent: an instance that already ended answers 200 with released=false. 400 for an instance that is not `herdr-claimed`.
+         */
+        post: operations["instanceRelease"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2318,6 +2378,29 @@ export interface components {
             /** @description Advisory over-limit CPU/mem readings for explicitly requested (pinned) hosts; the fleet was still created. */
             warnings?: string[];
         };
+        /** @description D-062: the external herdr pane a `herdr-claimed` instance claims. */
+        HerdrClaim: {
+            /** @description Agent kind herdr detected in the pane at claim time. */
+            agent?: string;
+            /**
+             * @description `lost` while the herdr server does not answer; never process end.
+             * @enum {string}
+             */
+            contact?: "ok" | "lost";
+            paneId: string;
+            /** @description Foreground process at claim time; command is the executable base name only. */
+            process?: {
+                command: string;
+                pid: number;
+                startTicks?: string;
+            };
+            /** @description Session name (`default` = the user's default socket) or absolute API socket path, as the operator named it. */
+            session: string;
+            /** @description Resolved API socket. */
+            socketPath: string;
+            tabId: string;
+            workspaceId: string;
+        };
         /** @description Current host capacity snapshot; design §2.2/§3.4/§7 #6. */
         HostCapacity: {
             activeWorkers?: number;
@@ -2568,6 +2651,25 @@ export interface components {
             lineageId: string;
             rootTurn?: components["schemas"]["RootTurn"];
         };
+        InstanceClaimRequest: {
+            /** @description Session name or absolute API socket path. */
+            herdrSession: string;
+            hostId: string;
+            /**
+             * @description Defaults to herdr's agent kind for the pane (`terminal` when it reports none).
+             * @enum {string}
+             */
+            kind?: "claude" | "codex" | "grok" | "agy" | "shell";
+            name?: string;
+            /** @description Required when the tab has more than one pane. */
+            paneId?: string;
+            projectId?: string;
+            /** @description Explicit scope `{projectIds, hostIds, workspaceIds}`, as on create; not combined with projectId. */
+            scope?: Record<string, never>;
+            tabId: string;
+            title?: string;
+            workspaceId: string;
+        };
         InstanceCommands: {
             commands: components["schemas"]["CommandRecord"][];
             instanceId: string;
@@ -2697,6 +2799,7 @@ export interface components {
             readonly fencedAt?: string | null;
             /** @description D-057 §5: chapter position inside its lineage, 1-based. */
             readonly generation: number;
+            herdrClaim?: components["schemas"]["HerdrClaim"];
             hostId: string;
             instanceId: string;
             journalId: string;
@@ -5286,6 +5389,37 @@ export interface operations {
             422: components["responses"]["Error"];
         };
     };
+    hostHerdrDiscover: {
+        parameters: {
+            query?: {
+                /** @description Restrict to one herdr session: a name (`default` is the user's default socket) or an absolute API socket path. */
+                session?: string;
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Node answer (`{sessions:[…]}`) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            409: components["responses"]["Error"];
+            422: components["responses"]["Error"];
+        };
+    };
     hostCapacity: {
         parameters: {
             query?: never;
@@ -5565,6 +5699,39 @@ export interface operations {
             };
         };
     };
+    instanceClaim: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InstanceClaimRequest"];
+            };
+        };
+        responses: {
+            /** @description Claimed instance */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        claim: components["schemas"]["HerdrClaim"];
+                        instance: components["schemas"]["InstanceRecord"];
+                    };
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            409: components["responses"]["Error"];
+            422: components["responses"]["Error"];
+        };
+    };
     instanceGet: {
         parameters: {
             query?: never;
@@ -5783,6 +5950,35 @@ export interface operations {
                     "application/json": components["schemas"]["MemoryWritePage"];
                 };
             };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
+    instanceRelease: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Release outcome */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        instance: components["schemas"]["InstanceRecord"];
+                        released: boolean;
+                    };
+                };
+            };
+            400: components["responses"]["Error"];
             401: components["responses"]["Error"];
             403: components["responses"]["Error"];
             404: components["responses"]["Error"];

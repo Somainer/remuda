@@ -894,6 +894,15 @@ pub struct InstanceRecord {
         rename = "launchedBy"
     )]
     pub launched_by: Option<String>,
+    /// D-062: the external herdr pane this instance claims (`driver =
+    /// herdr-claimed`): session, socket, workspace, tab and pane ids, the
+    /// process recorded at claim time and `contact` (`ok` / `lost`).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "herdrClaim"
+    )]
+    pub herdr_claim: Option<Value>,
     /// Delegation preset name applied at create (`worker` /
     /// `project-coordinator` / `top-coordinator`); design §2.5.
     ///
@@ -5417,6 +5426,52 @@ impl Store {
         .await
     }
 
+    /// D-062: the live instance that already claims `(host, socket, pane)`.
+    pub async fn live_herdr_claim(
+        &self,
+        host_id: String,
+        socket_path: String,
+        pane_id: String,
+    ) -> Result<Option<String>, StoreError> {
+        self.run_named("live_herdr_claim", move |conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT id FROM instances
+                     WHERE host_id = ?1 AND driver = 'herdr-claimed'
+                       AND json_extract(spec_json, '$.herdrClaim.socketPath') = ?2
+                       AND json_extract(spec_json, '$.herdrClaim.paneId') = ?3
+                       AND (lifecycle NOT IN ('exited', 'failed', 'closed')
+                            OR (lifecycle = 'exited' AND ended_at IS NULL
+                                AND COALESCE(last_error, '') = ?4))
+                     ORDER BY created_at LIMIT 1",
+                    params![host_id, socket_path, pane_id, HOST_LOST_MARKER],
+                    |row| row.get(0),
+                )
+                .optional()?)
+        })
+        .await
+    }
+
+    /// D-062: the Node accepted a claim — the row is live, launched by a user.
+    pub async fn mark_claimed(
+        &self,
+        instance_id: String,
+        activity: String,
+    ) -> Result<(), StoreError> {
+        self.run_named("mark_claimed", move |conn| {
+            conn.execute(
+                "UPDATE instances SET lifecycle = CASE WHEN lifecycle = 'requested'
+                        THEN 'ready' ELSE lifecycle END,
+                    activity = CASE WHEN lifecycle = 'requested' THEN ?2 ELSE activity END,
+                    launched_by = 'user', updated_at = ?3
+                 WHERE id = ?1",
+                params![instance_id, activity, now_rfc3339()],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     /// Mark a create that the Node rejected so it does not occupy a slot.
     ///
     /// Returns the [`Settlement`] of any pending cards invalidated in the same
@@ -8803,6 +8858,18 @@ fn apply_instance_projection(
                     params![promoted_kind, mode, promoted_at, now, instance_id, name],
                 )?;
             }
+        }
+        // D-062: a claimed pane's herdr server stopped (or resumed) answering.
+        // Contact loss is never process end; it is shown on the claim badge.
+        if name == "herdr_claim_contact"
+            && let Some(contact) = payload.pointer("/status/value").and_then(Value::as_str)
+            && matches!(contact, "lost" | "ok")
+        {
+            conn.execute(
+                "UPDATE instances SET spec_json = json_set(spec_json, '$.herdrClaim.contact', ?1)
+                 WHERE id = ?2 AND json_type(spec_json, '$.herdrClaim') = 'object'",
+                params![contact, instance_id],
+            )?;
         }
         let native_name = name.to_ascii_lowercase();
         // ma-lineage r4 item 1+2 / c-cardsettle r5 addendum (OA6): terminal
@@ -16151,6 +16218,10 @@ pub(crate) fn load_instance(
                 mode,
                 promoted_at,
                 launched_by,
+                herdr_claim: spec
+                    .get("herdrClaim")
+                    .filter(|claim| claim.is_object())
+                    .cloned(),
                 role,
                 scope,
                 project_id,

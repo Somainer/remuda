@@ -137,6 +137,58 @@ pub(crate) enum InstanceCommand {
         #[arg(long)]
         command_id: Option<String>,
     },
+    /// Claim a pane a human started in another herdr session on the host
+    /// (D-062). Human operators only; the pane is never owned.
+    Claim(Box<ClaimArgs>),
+    /// Release a claimed herdr pane: detach only, the pane and its process
+    /// keep running.
+    Release {
+        /// Instance id (`ins_…`) or name.
+        instance_id: String,
+    },
+}
+
+/// Arguments for `remuda instance claim` (D-062).
+#[derive(Debug, ClapArgs)]
+pub(crate) struct ClaimArgs {
+    /// Host id (`hst_…`) or registered label.
+    #[arg(long)]
+    pub(crate) host: String,
+    /// herdr session: a name (`default` is the user's default socket) or an
+    /// absolute API socket path.
+    #[arg(long)]
+    pub(crate) herdr_session: String,
+    /// herdr workspace id (`w2`).
+    #[arg(long)]
+    pub(crate) workspace: String,
+    /// herdr tab id (`w2:t19`).
+    #[arg(long)]
+    pub(crate) tab: String,
+    /// herdr pane id (`w2:p5K`); required when the tab has more than one pane.
+    #[arg(long)]
+    pub(crate) pane: Option<String>,
+    /// `claude`, `codex`, `grok`, `agy` or `shell`; defaults to herdr's agent
+    /// kind for the pane.
+    #[arg(long, value_parser = ["claude", "codex", "grok", "agy", "shell"])]
+    pub(crate) kind: Option<String>,
+    /// Instance name.
+    #[arg(long)]
+    pub(crate) name: Option<String>,
+    /// Display title (defaults to the name).
+    #[arg(long)]
+    pub(crate) title: Option<String>,
+    /// Single-project scope shortcut.
+    #[arg(long, conflicts_with_all = ["scope_project", "scope_host", "scope_workspace"])]
+    pub(crate) project: Option<String>,
+    /// Scope: project ids (repeatable).
+    #[arg(long)]
+    pub(crate) scope_project: Vec<String>,
+    /// Scope: host ids (repeatable).
+    #[arg(long)]
+    pub(crate) scope_host: Vec<String>,
+    /// Scope: workspace ids (repeatable).
+    #[arg(long)]
+    pub(crate) scope_workspace: Vec<String>,
 }
 
 /// Arguments for `remuda instance create`.
@@ -463,6 +515,15 @@ pub(crate) fn run(hub: HubOpts, command: InstanceCommand) -> Result<()> {
                     command_id.as_deref(),
                 )
                 .await?;
+                print_json(&value)
+            }
+            InstanceCommand::Claim(args) => print_json(&claim(&client, *args).await?),
+            InstanceCommand::Release { instance_id } => {
+                let instance_id = resolve_instance_id(&client, &instance_id).await?;
+                let value = client
+                    .post(&format!("/v1/instances/{instance_id}/release"), &json!({}))
+                    .await
+                    .map_err(super::hub_client::hub_http_error)?;
                 print_json(&value)
             }
             InstanceCommand::Rm {
@@ -1102,6 +1163,44 @@ pub(crate) async fn send_keys(
         "dataBase64": encoded.data_base64,
         "driverHint": "tty.write is delivered to a tty-attach driver (generic-pty / claude-pty)",
     }))
+}
+
+/// `remuda instance claim`: the Hub validates on the Node first, so a bad
+/// target (wrong ids, a multi-pane tab without `--pane`, an already-claimed
+/// pane) fails with the Hub's reason and creates nothing.
+async fn claim(client: &HubClient, args: ClaimArgs) -> Result<Value> {
+    let host_id = super::host::resolve_host(client, &args.host).await?;
+    let mut body = json!({
+        "hostId": host_id,
+        "herdrSession": args.herdr_session,
+        "workspaceId": args.workspace,
+        "tabId": args.tab,
+    });
+    for (key, value) in [
+        ("paneId", args.pane),
+        ("kind", args.kind),
+        ("name", args.name),
+        ("title", args.title),
+        ("projectId", args.project),
+    ] {
+        if let Some(value) = value {
+            body[key] = json!(value);
+        }
+    }
+    if !args.scope_project.is_empty()
+        || !args.scope_host.is_empty()
+        || !args.scope_workspace.is_empty()
+    {
+        body["scope"] = json!({
+            "projectIds": args.scope_project,
+            "hostIds": args.scope_host,
+            "workspaceIds": args.scope_workspace,
+        });
+    }
+    client
+        .post("/v1/instances/claim", &body)
+        .await
+        .map_err(super::hub_client::hub_http_error)
 }
 
 pub(crate) async fn stop(

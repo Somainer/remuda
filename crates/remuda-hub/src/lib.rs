@@ -23,6 +23,7 @@ mod error;
 mod fence;
 mod fleet;
 mod gatequeue;
+mod herdr_claims;
 mod host_dirs;
 mod host_files;
 mod hosts;
@@ -2677,6 +2678,7 @@ pub fn router(state: AppState) -> Router {
         .merge(objects::routes(state.config.attachment_max_bytes))
         .merge(host_files::routes(state.config.attachment_max_bytes))
         .merge(host_dirs::routes())
+        .merge(herdr_claims::routes())
         .merge(attachments::routes())
         .merge(workspaces::routes())
         .merge(workers::routes())

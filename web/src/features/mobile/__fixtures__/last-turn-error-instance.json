@@ -24,5 +24,6 @@
   "generation": 1,
   "unseen": true,
   "turnEndSeq": "2",
+  "autoContinue": false,
   "id": "ins-turn-error-contract"
 }

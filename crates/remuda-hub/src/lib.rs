@@ -99,6 +99,7 @@ mod supply;
 mod tasks;
 mod transport;
 mod tty;
+mod usage_resume;
 mod usage_store;
 mod web;
 mod worker_watch;
@@ -429,6 +430,7 @@ pub mod store_test_support {
             enforce_tree: true,
             restart: None,
             seated_by: None,
+            auto_continue: false,
         })
     }
 
@@ -458,6 +460,7 @@ pub mod store_test_support {
             enforce_tree: false,
             restart: None,
             seated_by: None,
+            auto_continue: false,
         }
     }
 
@@ -1495,6 +1498,14 @@ impl RunningHub {
     #[cfg(any(test, feature = "test-faults"))]
     pub fn test_arm_node_busy(&self, command_id: &str, times: usize) {
         crate::inbox_deliver::test_seams::arm_node_busy(command_id, times);
+    }
+
+    /// Test-only: every usage-resume fire time from now on uses this jitter
+    /// (milliseconds, below 30 s); `None` restores the random draw.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_set_resume_jitter(&self, jitter_ms: Option<u64>) {
+        crate::usage_resume::test_seams::set_jitter(jitter_ms);
     }
 
     /// Test-only: one periodic delivery retry check, as the scheduler runs

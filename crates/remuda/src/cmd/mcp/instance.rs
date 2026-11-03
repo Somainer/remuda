@@ -286,5 +286,6 @@ fn create_opts_from_json(args: &Value) -> Result<CreateOpts> {
         permission_mode: None,
         model: None,
         restart: None,
+        auto_continue: false,
     })
 }

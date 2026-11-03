@@ -453,6 +453,14 @@ pub(crate) fn fence_core(conn: &Connection, spec: &FenceSpec) -> Result<FenceTx,
         )?;
     }
 
+    // cb-usage-resume (§11.6): a usage-limit wait carrying this lineage's
+    // initiator moves to the live generation (step 4 has just handed back a
+    // continuation it cancelled), so its continuation is formed for the
+    // successor, under a new id.
+    crate::inbox::guard("usage_resume_reattribute", conn, || {
+        crate::usage_resume::reattribute(conn, &lineage_id, &current, live)
+    });
+
     // 5. Forward-intended and unsettled: potentially executed.
     let in_flight: Vec<(String, String, String, i64)> = rows(
         conn,
@@ -796,6 +804,10 @@ fn resume_paused(
         )
         .optional()?
         .ok_or_else(|| StoreError::Id("current chapter missing".into()))?;
+    // cb-usage-resume: a wait held through the pause takes the successor.
+    crate::inbox::guard("usage_resume_reattribute", conn, || {
+        crate::usage_resume::reattribute(conn, &lineage.lineage_id, successor_id, g)
+    });
     // Belt and braces for a lineage paused before fences existed.
     conn.execute(
         "UPDATE instances SET fenced_at = ?1, updated_at = ?1 WHERE id = ?2 AND fenced_at IS NULL",

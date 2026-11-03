@@ -2151,6 +2151,36 @@ push tag    = notice:<noticeId>; landing /sessions?focus=<noticeId>
 - 标题一行、至多 120 字符；正文至多 2000 字符；`dedupeKey` 至多 128 个 `[A-Za-z0-9._:/-]` 字符。超界：400，`reason: "invalid-notice"`。秘密 lint 先于边界检查覆盖三者：命中为 422，`code: "OWNER_NOTIFY_SECRET_REJECTED"`，只给 `field` 与 `rule`，不回显文本，什么也不存。
 - Hub 在一个写事务里写认领行、它的审计行（`owner.notify`，不带文本）与推送 outbox 行，提交后才推送；推送之前（或推送之后、标记之前）崩溃，重启后以同一 tag 补发一次，替换而不是新增通知。去重键按写入血缘（所有者自己的为 `owner`）划分。确认先于推送时不再推送。
 
+**用量上限后的续跑（`cb-usage-resume`）。** 机制见 [main-agent.md §11.8](./main-agent.md#118-implementation-notes-cb-usage-resume-2026-11-03)。订阅窗口的用量上限才排等待行；API key 或网关的 429 不排，即使带了重试时刻。
+
+~~~text
+POST  /v1/instances            body gains  autoContinue?: bool      default false; any creator
+POST  /v1/workers/dispatch     body gains  autoContinue?: bool      default false
+GET   /v1/instances/{id}       InstanceRecord gains  autoContinue: bool
+PATCH /v1/instances/{id}
+  body {autoContinue?: bool}                absent keeps its value
+  -> 200 InstanceRecord                     Human only; Agent and Bot 403
+
+rate_limit_event (lifecycle, topic diagnostic) relatedIds, all strings:
+  rateLimitStatus          allowed | allowed_warning | rejected (also the lifecycle status)
+  rateLimitResetsAt        Unix-epoch seconds
+  rateLimitType            the window: five_hour | seven_day | seven_day_opus | ...
+  rateLimitOverageStatus, rateLimitUsingOverage
+session start (lifecycle, topic session) relatedIds gains
+  apiKeySource             none (a claude.ai login) | ANTHROPIC_API_KEY | apiKeyHelper | ...
+
+turn-failed  payload.usageLimit = {class, window?, resetsAt?, source?, waits,
+                                   fireAt?, autoContinue?, reason?}
+  class  = subscription | api-key-or-gateway | api-rate-limit
+  source = structured | supply-window | error-text
+  reason = beyond-8-days | no-reset-time | reset-passed   (waits: false)
+supply-reset payload (from a wait) = {window, resetsAt, fireAt, source, profileId,
+                                      autoContinue: off | continue | capped}
+~~~
+
+- 续跑是一条新的 `instance.send`（`origin: hub`），commandId 在成形时选定并落库，带订阅血缘当前代的 Hub 内部 initiator，不带设备 id；F 把等待行改记到后继章节。任何不是 Hub 写的输入（含 `instance.configure`，即 switch-model）在同一事务里取消该实例的等待。
+- CLI：`remuda instance create --auto-continue`、`remuda dispatch --auto-continue`、`remuda instance set <instance> --auto-continue on|off`。
+
 ## 9. 错误码、未知值与兼容性
 
 ### 9.1 错误对象

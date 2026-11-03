@@ -19,7 +19,9 @@ pub fn routes() -> Router<AppState> {
         )
         .route(
             "/v1/instances/{id}",
-            get(http::get_instance).delete(http::delete_instance),
+            get(http::get_instance)
+                .patch(patch_instance)
+                .delete(http::delete_instance),
         )
         .route(
             "/v1/instances/{id}/commands",
@@ -104,5 +106,50 @@ async fn mark_seen(
     }
     Ok(Json(
         serde_json::to_value(&marked.view).map_err(|err| HubError::Internal(err.to_string()))?,
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InstancePatch {
+    /// cb-usage-resume (main-agent.md §11.6): continue once after a
+    /// subscription usage limit resets.
+    #[serde(default)]
+    auto_continue: Option<bool>,
+}
+
+/// `PATCH /v1/instances/{id}` — the owner changes a per-instance property.
+/// Today that is `autoContinue` (cb-usage-resume); an absent field keeps its
+/// value. Human devices only: the agent-route middleware refuses Agent
+/// credentials on this path (an Agent sets the property for its child at
+/// dispatch or create), and a Bot is refused here.
+async fn patch_instance(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(instance_id): Path<String>,
+    Json(body): Json<InstancePatch>,
+) -> Result<Json<Value>, HubError> {
+    crate::auth::require_origin(&headers, &state.config)?;
+    let device = crate::agent_scope::caller(&state, &headers).await?;
+    if crate::agent_scope::origin(&device) != remuda_protocol::InputOrigin::Human {
+        return Err(HubError::Forbidden);
+    }
+    if let Some(auto_continue) = body.auto_continue {
+        state
+            .store
+            .set_auto_continue(instance_id.clone(), auto_continue)
+            .await
+            .map_err(http::map_store)?
+            .then_some(())
+            .ok_or(HubError::NotFound)?;
+    }
+    let instance = state
+        .store
+        .get_instance(instance_id)
+        .await
+        .map_err(http::map_store)?
+        .ok_or(HubError::NotFound)?;
+    Ok(Json(
+        serde_json::to_value(&instance).map_err(|err| HubError::Internal(err.to_string()))?,
     ))
 }

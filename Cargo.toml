@@ -42,6 +42,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
+# IANA time zones (a usage-limit notice states its reset in one; cb-usage-resume).
+jiff = "0.2"
 clap = { version = "4", features = ["derive"] }
 axum = { version = "0.8", features = ["ws"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }

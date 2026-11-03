@@ -1599,7 +1599,16 @@ pub(crate) fn lifecycle(
                     Some(s) => known(s.to_owned()),
                     None => unknown("not-emitted"),
                 },
-                related_ids: related_ids(value),
+                related_ids: {
+                    let mut ids = related_ids(value);
+                    // cb-usage-resume: the structured rate-limit window.
+                    if native_name == remuda_protocol::rate_limit_event::NATIVE_NAME {
+                        ids.extend(remuda_protocol::rate_limit_event::related_ids(
+                            value.get("rate_limit_info"),
+                        ));
+                    }
+                    ids
+                },
                 data_ref: None,
                 severity: Severity::Info,
                 affects_completion,

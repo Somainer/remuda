@@ -1001,6 +1001,38 @@ async fn an_unsupported_screen_falls_back_to_the_journal_quiet_rule() -> Result<
     Ok(())
 }
 
+/// r2 item 2: with `stallToolThresholdMins` set, every call in flight past
+/// the window gets its own fact, not only the oldest; later ticks add none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_hung_parallel_call_gets_its_own_tool_stall() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx
+        .project(
+            "stall-tool-parallel",
+            json!({ "stallThresholdMins": 525_600, "stallToolThresholdMins": 15 }),
+        )
+        .await?;
+    let (seat, token) = ctx.coordinator(&project).await?;
+    let child = ctx.child(&seat, &ctx.host, "claude", "claude-sdk").await?;
+    ctx.start(&ctx.host, &child).await?;
+    for id in ["tc_older", "tc_younger"] {
+        ctx.journal(&ctx.host, &child, tool_call(id)).await?;
+    }
+    assert_eq!(ctx.settle(14).await?, 0);
+    assert_eq!(ctx.settle(16).await?, 2, "one fact per hung call");
+    for minutes in [30, 60, 600] {
+        assert_eq!(ctx.settle(minutes).await?, 0, "+{minutes}m adds nothing");
+    }
+    let facts = ctx.stalls(&token, &seat).await?;
+    let mut calls: Vec<&str> = facts
+        .iter()
+        .filter_map(|fact| fact["payload"]["toolCallId"].as_str())
+        .collect();
+    calls.sort_unstable();
+    assert_eq!(calls, ["tc_older", "tc_younger"], "{facts:#?}");
+    Ok(())
+}
+
 /// A screen that shows a DONE report or a dialog is not a stall.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_screen_classification_decides_the_fact() -> Result<()> {

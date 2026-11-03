@@ -1899,8 +1899,8 @@ fn due_supply_resets(conn: &Connection, now: OffsetDateTime) -> Result<usize, St
 /// Busy children that went quiet (§10.1 item 8):
 ///
 /// * with a tool call in flight, nothing, unless the project sets a finite
-///   `stallToolThresholdMins`; then one fact per call once it has been in
-///   flight that long;
+///   `stallToolThresholdMins`; then one fact per call in flight, each once it
+///   has been in flight that long;
 /// * otherwise one fact per quiet period once no journal row arrived for the
 ///   project's `stallThresholdMins` (default
 ///   [`remuda_protocol::DEFAULT_STALL_THRESHOLD_MINS`]). The period starts at
@@ -1964,8 +1964,10 @@ fn due_stalls(
     Ok(written)
 }
 
-/// The oldest call in flight, once its `stallToolThresholdMins` window has
-/// passed: one fact, keyed by the call and when it opened.
+/// Every call in flight whose `stallToolThresholdMins` window has passed gets
+/// its own fact: one per call, keyed by the call and when it opened, so a
+/// younger hung call is not hidden behind an older one and a later tick
+/// repeats nothing.
 fn due_tool_stalls(
     conn: &Connection,
     subscriber: &str,
@@ -1984,8 +1986,7 @@ fn due_tool_stalls(
         return Ok(0);
     };
     let mut written = 0;
-    // The oldest call in flight decides.
-    for (tool_call_id, opened) in tracker.tools.iter().take(1) {
+    for (tool_call_id, opened) in &tracker.tools {
         let Some(since) = parse_at(opened) else {
             continue;
         };

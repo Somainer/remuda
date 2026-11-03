@@ -1091,7 +1091,7 @@ envelope `completeness`（`deepseek-harness.md` §8.3）：`structured` / `parti
 **PWA 关闭态**：SW 仍被系统唤醒并 `showNotification`（`sw.src.js:97`），点按走 `notificationclick` 聚焦既有窗口或 `openWindow`（`sw.src.js:106-120`），落点仍是 `data.url`（`/s/:id` 或 compact 下重定向到的 `/m/inbox?focus=`，§1.2）。`home-queue` 落地后，交互推送的落点改为 `/sessions?focus=`（compact 下重定向到 `/m?focus=`），高亮首页队列里的对应卡（§1.2，D-061）。「PWA 关着」正是推送真正生效的场景。
 
 **抑制与新增推送（D-057，2026-10-05，取代原「Hub 在有设备正 follow 该实例时抑制推送，这条抑制规则不改」；机制见 [main-agent.md §8](./main-agent.md#8-push)）**：
-- **按设备静音**：follow 只静音正在 follow 且页面可见的那台设备，其余设备照常推送。PWA 用新增的加性 follow 可见性帧报告 document hidden / shown；从不发送该帧的客户端按可见处理，等于今天对这一台设备的行为。桌面标签页停在 Main 上不再静音手机。这是对所有会话的投递修正（今天 `crates/remuda-hub/src/alerts.rs` 只要有任一设备 follow 就静音全部设备）。
+- **按设备静音**：follow 只静音正在 follow 且页面可见的那台设备，其余设备照常推送。PWA 用新增的加性 follow 可见性帧报告 document hidden / shown；从不发送该帧的客户端按可见处理，等于今天对这一台设备的行为。桌面标签页停在 Main 上不再静音手机。这是对所有会话的投递修正（ma-push 起 `crates/remuda-hub/src/alerts.rs` 按 follow socket 记录设备与可见性，帧为 `{type:"visibility",state:"hidden"|"visible"}`，由 `web/src/lib/followVisibility.ts` 在 socket 打开与 `visibilitychange` 时发送；此前只要有任一设备 follow 就静音全部设备）。
 - **转给 Agent 上级的交互**：一条关于实例 I 的告警只在三者同时成立时不推：I 有 Agent 上级血缘 P；该交互确实转给了 P（不是 approval，且 D-051 谓词对 P 的当前章节成立）；P 实际在运行（状态 running、当前章节未结束、章节所在 host 有活连接）。第一阶段其他种类的告警从不因此静音，approval 永远推送。
 - **重启窗口与补推**：P 不在「实际在运行」时（starting/正在重启、host 离线、暂停，或章节已结束而监督者尚未行动），它的子实例告警照常推送。P 从「实际在运行」变为否时，仍待回答的被静音交互各补推一次；触发点包括 F、监督者状态转移、host 断开、host 丢失判定与 Hub 启动对账。补推跨 Hub 重启仍会投递，推送 tag 用交互 id，所以重发会替换而不是叠加通知。P 恢复运行后，已补推的交互不再被静音。
 - **「Main 回复了」**：address-owner 当前章节的回合结束、且该回合收到过 Human 来源输入时，推送 “Main replied: <最终消息首行>”（截断），同样按设备静音；只由 Hub 或 Agent 输入触发的回合不推。

@@ -11,43 +11,79 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::Mutex;
 
-/// Devices currently watching an instance over `/v1/follow`.
+/// The follow sockets currently open over `/v1/follow`, per device.
+///
+/// D-057 §8.4: a follow suppresses pushes only for the device that is
+/// following, and only while that device reports the page visible. The PWA
+/// reports visibility with the additive `visibility` follow frame; a socket
+/// that never sends it counts as visible.
 #[derive(Clone, Default)]
 pub struct Followers {
-    inner: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+    inner: Arc<Mutex<FollowSockets>>,
+}
+
+#[derive(Default)]
+struct FollowSockets {
+    next: u64,
+    sockets: HashMap<u64, FollowSocket>,
+}
+
+/// One follow socket: its device, the instances it follows, and whether its
+/// page reports visible.
+struct FollowSocket {
+    device_id: String,
+    instances: HashSet<String>,
+    visible: bool,
 }
 
 impl Followers {
-    /// Record that `device_id` is following `instance_id`.
-    pub async fn watch(&self, device_id: String, instance_id: String) {
-        self.inner
-            .lock()
-            .await
-            .entry(instance_id)
-            .or_default()
-            .insert(device_id);
+    /// Register a follow socket of `device_id`; it starts visible and
+    /// following nothing. Returns its handle.
+    pub async fn open(&self, device_id: String) -> u64 {
+        let mut guard = self.inner.lock().await;
+        guard.next += 1;
+        let handle = guard.next;
+        guard.sockets.insert(
+            handle,
+            FollowSocket {
+                device_id,
+                instances: HashSet::new(),
+                visible: true,
+            },
+        );
+        handle
     }
 
-    /// Drop watches for this device on the given instances.
-    pub async fn unwatch(&self, device_id: &str, instance_ids: &[String]) {
-        let mut guard = self.inner.lock().await;
-        for id in instance_ids {
-            if let Some(set) = guard.get_mut(id) {
-                set.remove(device_id);
-                if set.is_empty() {
-                    guard.remove(id);
-                }
-            }
+    /// Replace the instances socket `handle` follows.
+    pub async fn follow(&self, handle: u64, instance_ids: &[String]) {
+        if let Some(socket) = self.inner.lock().await.sockets.get_mut(&handle) {
+            socket.instances = instance_ids.iter().cloned().collect();
         }
     }
 
-    /// True when any device is following the instance (Paseo attention suppress).
-    pub async fn any_watching(&self, instance_id: &str) -> bool {
+    /// Record what socket `handle`'s page reports: document shown or hidden.
+    pub async fn set_visible(&self, handle: u64, visible: bool) {
+        if let Some(socket) = self.inner.lock().await.sockets.get_mut(&handle) {
+            socket.visible = visible;
+        }
+    }
+
+    /// Drop socket `handle`.
+    pub async fn close(&self, handle: u64) {
+        self.inner.lock().await.sockets.remove(&handle);
+    }
+
+    /// Devices with a visible follow of `instance_id`: a push about it skips
+    /// their subscriptions, and only theirs.
+    pub async fn suppressed_devices(&self, instance_id: &str) -> HashSet<String> {
         self.inner
             .lock()
             .await
-            .get(instance_id)
-            .is_some_and(|set| !set.is_empty())
+            .sockets
+            .values()
+            .filter(|socket| socket.visible && socket.instances.contains(instance_id))
+            .map(|socket| socket.device_id.clone())
+            .collect()
     }
 }
 
@@ -104,6 +140,7 @@ async fn dispatch(state: AppState, instance_id: String, kind: AlertKind) {
             }
             fanout(
                 &state,
+                "waiting",
                 &instance_id,
                 "Still waiting",
                 "This session has been blocked for more than 30s.",
@@ -118,14 +155,28 @@ async fn dispatch(state: AppState, instance_id: String, kind: AlertKind) {
             if !matches!(other, AlertKind::Interaction { .. }) {
                 state.blocked.clear(&instance_id).await;
             }
-            let (title, body, tag, url) = match other {
-                AlertKind::Interaction { id } => (
-                    "Need your input",
-                    "An approval or question is waiting.".to_string(),
-                    PushTag::Interaction { id: id.clone() },
-                    interaction_landing_url(id),
-                ),
+            let (category, title, body, tag, url) = match other {
+                AlertKind::Interaction { id } => {
+                    // D-057 §8.1: an item routed to an effectively running
+                    // Agent parent is not pushed; it stays in /approvals and
+                    // in the transcript, and the lift pages it later if the
+                    // parent stops running first.
+                    if route_interaction(&state, id, &instance_id).await
+                        == crate::push_route::Route::Suppressed
+                    {
+                        return;
+                    }
+                    let (title, body) = INTERACTION_PUSH;
+                    (
+                        "interaction",
+                        title,
+                        body.to_string(),
+                        PushTag::Interaction { id: id.clone() },
+                        interaction_landing_url(id),
+                    )
+                }
                 AlertKind::TurnError => (
+                    "turn-error",
                     "Turn failed",
                     "The last turn ended with an error.".to_string(),
                     PushTag::Instance {
@@ -134,13 +185,30 @@ async fn dispatch(state: AppState, instance_id: String, kind: AlertKind) {
                     format!("/s/{instance_id}"),
                 ),
                 AlertKind::Exited => {
-                    // D-057 §8.5: on a lineage that restarts on process loss
-                    // the C1 push ("restarted" / "paused: restart cap")
-                    // replaces the generic exited push.
+                    // D-057 §8.5 / OA6: an end push needs process-end
+                    // evidence on the durable row (a subagent's exit, or a
+                    // non-terminal failure, is no end of this instance).
+                    // A failed read fails open (r2 item 3): it never drops
+                    // the end push, it sends it.
+                    match ended_by_evidence(&state, &instance_id).await {
+                        Ok(true) => {}
+                        Ok(false) => return,
+                        Err(_) => tracing::warn!(
+                            category = "exited",
+                            "could not read the end evidence; pushing the end anyway"
+                        ),
+                    }
+                    // C1 pushes wait for the same evidence: the one this end
+                    // brings may now be due.
+                    crate::restart::drive_pushes(&state).await;
+                    // On a lineage that restarts on process loss the C1 push
+                    // ("restarted" / "paused: restart cap") replaces the
+                    // generic exited push.
                     if crate::restart::c1_replaces_exit_push(&state, &instance_id).await {
                         return;
                     }
                     (
+                        "exited",
                         "Session exited",
                         "An instance left the ready state.".to_string(),
                         PushTag::Instance {
@@ -151,8 +219,92 @@ async fn dispatch(state: AppState, instance_id: String, kind: AlertKind) {
                 }
                 AlertKind::Waiting => unreachable!(),
             };
-            fanout(&state, &instance_id, title, &body, tag, url).await;
+            fanout(&state, category, &instance_id, title, &body, tag, url).await;
         }
+    }
+}
+
+/// Today's title and body of a push about a pending interaction; the lift
+/// (D-057 §8.3) resends exactly this.
+pub(crate) const INTERACTION_PUSH: (&str, &str) =
+    ("Need your input", "An approval or question is waiting.");
+
+/// §8.1 at fire time. A store failure pages: a missed suppression costs one
+/// extra push, a missed page could cost the owner the question.
+async fn route_interaction(
+    state: &AppState,
+    interaction_id: &str,
+    instance_id: &str,
+) -> crate::push_route::Route {
+    let interaction = interaction_id.to_owned();
+    let instance = instance_id.to_owned();
+    match state
+        .store
+        .run_named("push_route_interaction", move |conn| {
+            crate::push_route::route_interaction(conn, &interaction, &instance)
+        })
+        .await
+    {
+        Ok(route) => {
+            if route == crate::push_route::Route::Suppressed {
+                tracing::info!(category = "interaction", "push routed to a running parent");
+            }
+            route
+        }
+        Err(_) => {
+            tracing::warn!(category = "interaction", "push routing failed; paging");
+            crate::push_route::Route::Page
+        }
+    }
+}
+
+/// Whether the instance's durable row carries process-end evidence (§6.2).
+/// A row that is gone carries none; a read error is returned to the caller.
+async fn ended_by_evidence(
+    state: &AppState,
+    instance_id: &str,
+) -> Result<bool, crate::store::StoreError> {
+    #[cfg(any(test, feature = "test-faults"))]
+    if test_seams::take_end_evidence_read_failure(instance_id) {
+        return Err(crate::store::StoreError::FaultInjected(
+            "end evidence read".to_owned(),
+        ));
+    }
+    let Some(instance) = state
+        .store
+        .get_instance_read(instance_id.to_owned())
+        .await?
+    else {
+        return Ok(false);
+    };
+    state
+        .store
+        .instance_has_process_end_evidence(&instance)
+        .await
+}
+
+/// Test seam (r2 item 3): fail the next end-evidence read for one instance,
+/// consumed once, so parallel tests cannot cross.
+#[cfg(any(test, feature = "test-faults"))]
+pub(crate) mod test_seams {
+    use std::collections::HashSet;
+    use std::sync::{LazyLock, Mutex, PoisonError};
+
+    static END_READ_FAILURES: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Mutex::default);
+
+    /// Make the next end-evidence read for `instance_id` fail.
+    pub(crate) fn arm_end_evidence_read_failure(instance_id: &str) {
+        END_READ_FAILURES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(instance_id.to_owned());
+    }
+
+    pub(super) fn take_end_evidence_read_failure(instance_id: &str) -> bool {
+        END_READ_FAILURES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(instance_id)
     }
 }
 
@@ -195,6 +347,7 @@ pub(crate) async fn c1_push(
 ) -> Fanout {
     fanout(
         state,
+        "c1",
         instance_id,
         title,
         body,
@@ -206,10 +359,12 @@ pub(crate) async fn c1_push(
     .await
 }
 
-/// Send one notification to every subscription unless a device follows the
-/// instance.
-async fn fanout(
+/// Send one notification to every subscription except those of a device that
+/// is following the instance with its page visible (D-057 §8.4), and record
+/// the fanout in the push log under `category`.
+pub(crate) async fn fanout(
     state: &AppState,
+    category: &'static str,
     instance_id: &str,
     title: &str,
     body: &str,
@@ -219,17 +374,37 @@ async fn fanout(
     let Some(push) = state.push.as_ref() else {
         return Fanout::Nothing;
     };
-    if state.followers.any_watching(instance_id).await {
-        tracing::debug!(instance_id, "push suppressed: a device is following");
-        return Fanout::Nothing;
-    }
+    let mut entry = crate::push_route::LogEntry {
+        category,
+        tag: tag.as_str(),
+        instance_id: instance_id.to_owned(),
+        ..Default::default()
+    };
+    let suppressed = state.followers.suppressed_devices(instance_id).await;
     let subs = match push.subscriptions() {
         Ok(subs) => subs,
-        Err(error) => {
-            tracing::warn!(%error, "could not read push subscriptions");
+        Err(_) => {
+            tracing::warn!(category, "could not read push subscriptions");
+            entry.outcome = "failed";
+            crate::push_route::log_push(state, entry).await;
             return Fanout::Failed;
         }
     };
+    let (subs, skipped): (Vec<_>, Vec<_>) = subs
+        .into_iter()
+        .partition(|sub| !suppressed.contains(&sub.device_id));
+    let mut suppressed_devices: Vec<String> =
+        skipped.into_iter().map(|sub| sub.device_id).collect();
+    suppressed_devices.sort();
+    suppressed_devices.dedup();
+    if !suppressed_devices.is_empty() {
+        tracing::debug!(
+            category,
+            devices = suppressed_devices.len(),
+            "push skipped for devices following with the page visible"
+        );
+    }
+    entry.suppressed_devices = suppressed_devices;
     // The badge is the owner's 「需要你」 N (home.md §5.1, ui-spec §4.5): the
     // interactions really waiting plus the owner-blocked tasks with no such
     // interaction. Pending is global durable state — every subscribed device
@@ -238,23 +413,36 @@ async fn fanout(
     // all thanks to the suppression above.
     let pending = owner_badge(state).await;
     let base = Notification::new(title, body, tag.clone(), url);
-    let (mut sent, mut failed) = (0, 0);
+    let (mut sent, mut gone, mut failed) = (0, 0, 0);
     for sub in subs {
         let notification = base.clone().with_badge(pending);
         match push.notify(&sub, &notification, &tag).await {
-            Ok(remuda_push::Delivery::Sent) => sent += 1,
-            Ok(remuda_push::Delivery::Gone) => {}
-            Err(err) => {
+            Ok(remuda_push::Delivery::Sent) => {
+                sent += 1;
+                entry.delivered_devices.push(sub.device_id);
+            }
+            Ok(remuda_push::Delivery::Gone) => gone += 1,
+            Err(_) => {
                 failed += 1;
-                tracing::debug!(error = %err, endpoint = %sub.endpoint, "push notify failed");
+                tracing::debug!(category, "push notify failed");
             }
         }
     }
-    match (sent, failed) {
+    entry.delivered_devices.sort();
+    entry.delivered_devices.dedup();
+    let outcome = match (sent, failed) {
         (0, 0) => Fanout::Nothing,
         (0, _) => Fanout::Failed,
         (sent, _) => Fanout::Sent(sent),
-    }
+    };
+    entry.outcome = match outcome {
+        Fanout::Sent(_) => "sent",
+        Fanout::Nothing => "nothing",
+        Fanout::Failed => "failed",
+    };
+    (entry.sent, entry.gone, entry.failed) = (sent, gone, failed);
+    crate::push_route::log_push(state, entry).await;
+    outcome
 }
 
 /// Where a push about interaction `id` lands (home.md §9 角标与落点): the
@@ -370,12 +558,19 @@ fn classify(event: &Value) -> Option<AlertKind> {
         .or_else(|| event.pointer("/payload/lifecycle").and_then(Value::as_str))
         .unwrap_or("");
     if kind == "interaction.requested" || kind == "interactionRequested" {
+        // The id where the durable row takes it from: a Node journals the
+        // entity at `payload.interaction` (D-057 §8.1 routes by that row).
         let id = event
             .get("interactionId")
             .and_then(Value::as_str)
             .or_else(|| {
                 event
                     .pointer("/payload/interactionId")
+                    .and_then(Value::as_str)
+            })
+            .or_else(|| {
+                event
+                    .pointer("/payload/interaction/id")
                     .and_then(Value::as_str)
             })
             .unwrap_or("")

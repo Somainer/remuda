@@ -1,5 +1,6 @@
 import type { Command, CommandResult, Page } from "../types/command";
 import { profileRegion } from "./profileFlags";
+import { reportFollowVisibility } from "./followVisibility";
 import type { Host, HostCli, Instance, TuiMode } from "../types/instance";
 import type { Interaction, InteractionAnswer } from "../types/interaction";
 import type { EventsBatch, Observation, Snapshot } from "../types/observation";
@@ -2050,6 +2051,8 @@ function createLiveApi(): HubApi {
       if (previous) previous.close();
       const subscriptionId = id("sub_") as Id;
       const ws = new WebSocket(followUrl(instanceId));
+      // D-057 §8.4: a follow mutes pushes for this device only while visible.
+      reportFollowVisibility(ws);
       follows.set(journalId, ws);
       followSubs.set(subscriptionId, journalId);
       const snapshotMeta: { fromSeq: U64 | null; reachedAfterSeq: boolean } = {

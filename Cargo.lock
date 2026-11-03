@@ -3328,6 +3328,7 @@ dependencies = [
  "remuda-protocol",
  "remuda-push",
  "remuda-screen",
+ "remuda-signal",
  "remuda-ssh",
  "remuda-testing",
  "reqwest",

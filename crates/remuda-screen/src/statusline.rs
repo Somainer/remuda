@@ -26,7 +26,7 @@ use crate::grid::ScreenGrid;
 
 /// How many of the bottom non-empty rows may belong to the status region. The
 /// row itself plus a wrapping continuation and/or the tip line.
-const STATUS_REGION_ROWS: usize = 8;
+pub const STATUS_REGION_ROWS: usize = 8;
 
 /// One parsed spinner status line.
 ///

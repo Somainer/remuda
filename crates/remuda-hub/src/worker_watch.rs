@@ -41,7 +41,7 @@ use std::time::Duration;
 use time::OffsetDateTime;
 
 /// Screen-read budget per worker (the Node answers from an in-memory grid).
-const SCREEN_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const SCREEN_TIMEOUT: Duration = Duration::from_secs(5);
 /// How many journal events a watch observation scans for the last assistant
 /// message / turn result. A single turn's tail is far smaller than this; the
 /// cap bounds work on long-lived instances.
@@ -164,7 +164,7 @@ fn screen_dialog_title(lines: &[String], raw: bool) -> Option<String> {
 }
 
 /// What the Hub could read of one worker's live screen.
-enum ScreenRead {
+pub(crate) enum ScreenRead {
     /// Screen rows plus the carrier-reported lifecycle. `raw` is true when the
     /// rows are a raw VT ring tail rather than an emulated grid.
     /// `screen_available` is false for a print driver / dead pty carrier that
@@ -206,10 +206,27 @@ fn first_line(text: &str) -> String {
 }
 
 async fn read_worker_screen(state: &AppState, worker: &WorkerRoster) -> ScreenRead {
-    let host_id = worker.host_id.as_id().as_str();
     let Some(instance_id) = worker.instance_id.as_ref() else {
         return ScreenRead::Gone("no-instance");
     };
+    read_screen(
+        state,
+        worker.host_id.as_id().as_str(),
+        instance_id.as_id().as_str(),
+        SCREEN_TIMEOUT,
+    )
+    .await
+}
+
+/// Read one instance's live screen through the Node's `tty.screen` RPC,
+/// waiting at most `timeout` for the answer. Shared by `observe_one` and the
+/// inbox's screen stall fallback (main-agent.md §10).
+pub(crate) async fn read_screen(
+    state: &AppState,
+    host_id: &str,
+    instance_id: &str,
+    timeout: Duration,
+) -> ScreenRead {
     if state.nodes.kind_of(host_id).await.is_none() {
         return ScreenRead::Gone("host-offline");
     }
@@ -218,8 +235,8 @@ async fn read_worker_screen(state: &AppState, worker: &WorkerRoster) -> ScreenRe
         .call(
             host_id,
             remuda_protocol::hubnode::METHOD_TTY_SCREEN,
-            json!({ "instanceId": instance_id.as_id() }),
-            SCREEN_TIMEOUT,
+            json!({ "instanceId": instance_id }),
+            timeout,
         )
         .await
     {

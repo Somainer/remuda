@@ -1287,6 +1287,11 @@ struct Facts<'a> {
     commands: &'a [CommandRecord],
     profile: Option<&'a ProviderRecord>,
     now: i64,
+    /// Whether a tool call is in flight, from the inbox tracker: the one
+    /// source the stall rules read too (main-agent.md §10.5). `None` only
+    /// where no store is read (the pure builds below), which fall back to the
+    /// journal tail.
+    tool_in_flight: Option<bool>,
 }
 
 fn build_parts(facts: &Facts<'_>) -> Parts {
@@ -1298,6 +1303,7 @@ fn build_parts(facts: &Facts<'_>) -> Parts {
         commands,
         profile,
         now,
+        tool_in_flight,
     } = *facts;
     let tail = scan_tail(journal);
     // Only the state KIND is serialized: a blocked reason and a watch detail
@@ -1397,7 +1403,7 @@ fn build_parts(facts: &Facts<'_>) -> Parts {
         branch: worker.branch.clone(),
         sha,
         idle_secs: last_progress.map(|at| (now - at).max(0)),
-        tool_in_flight: !tail.open_tools.is_empty(),
+        tool_in_flight: tool_in_flight.unwrap_or(!tail.open_tools.is_empty()),
     }
 }
 
@@ -1407,6 +1413,14 @@ pub(crate) async fn collect_digest(
     worker: &WorkerRoster,
 ) -> Result<WorkerDigest, HubError> {
     let instance_id = worker.instance_id.as_ref().map(|id| id.as_id().to_string());
+    let tool_in_flight = match &instance_id {
+        Some(id) => state
+            .store
+            .inbox_tool_in_flight(id.clone())
+            .await
+            .map_err(map_store)?,
+        None => false,
+    };
     let (instance, journal, pending, commands) = match &instance_id {
         Some(id) => {
             let instance = state
@@ -1451,6 +1465,7 @@ pub(crate) async fn collect_digest(
         commands: &commands,
         profile: profile.as_ref(),
         now,
+        tool_in_flight: Some(tool_in_flight),
     });
     Ok(fit(&parts))
 }
@@ -2061,6 +2076,7 @@ mod tests {
             commands,
             profile,
             now: NOW,
+            tool_in_flight: None,
         }
     }
 

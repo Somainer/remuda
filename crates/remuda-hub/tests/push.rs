@@ -349,14 +349,46 @@ async fn pairing_list_revoke_and_push_with_follow_suppress() -> Result<()> {
     append(
         &mut node,
         instance_id.as_id().as_str(),
+        json!({ "kind": "turn_done", "isError": true }),
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let after_unfollow = fake.hits.lock().expect("hits").len();
+    assert!(
+        after_unfollow > after_follow,
+        "a turn error should push once follow ends"
+    );
+
+    // D-057 §8.5 / OA6: an exited push needs process-end evidence. A bare
+    // `exited` marker records no end and pushes nothing; the Node-attested
+    // end of another session pushes "Session exited".
+    let other = InstanceId::new();
+    append(
+        &mut node,
+        other.as_id().as_str(),
         json!({ "kind": "lifecycle", "lifecycle": "exited" }),
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        fake.hits.lock().expect("hits").len(),
+        after_unfollow,
+        "no exited push without process-end evidence"
+    );
+    append(
+        &mut node,
+        other.as_id().as_str(),
+        json!({ "kind": "lifecycle", "lifecycle": "exited", "payload": {
+            "type": "native", "topic": "session", "nativeName": "session",
+            "status": { "state": "known", "value": "exited" }, "severity": "info",
+            "affectsCompletion": true, "relatedIds": { "exitCode": "0" } } }),
     )
     .await?;
     tokio::time::sleep(Duration::from_millis(200)).await;
     let after_exit = fake.hits.lock().expect("hits").len();
     assert!(
-        after_exit > after_follow,
-        "lifecycle exited should push once follow ends"
+        after_exit > after_unfollow,
+        "a Node-attested exit pushes once"
     );
 
     append(

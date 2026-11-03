@@ -75,6 +75,9 @@ openssl = "0.10"
 # is pulled.
 nix = { version = "0.28", default-features = false, features = ["fs", "time", "net", "socket"] }
 remuda-journal.workspace = true
+# cb-stall-tooluse: the per-carrier stall tests fold recorded hook sessions
+# through the signal layer's live tool mapping.
+remuda-signal.workspace = true
 # tests/support/mod.rs (shared with the hub_e2e example) serializes a real
 # typed CommandResult for the accept_reply acceptance-envelope regression.
 remuda-protocol.workspace = true

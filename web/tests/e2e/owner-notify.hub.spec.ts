@@ -205,6 +205,41 @@ test.describe("owner notify: 告诉你", () => {
   });
 });
 
+test.describe("owner notify: many waiting notices", () => {
+  test.describe.configure({ timeout: 180_000 });
+
+  // r2 item 5: the ④ read is not cut at the Hub's default page of 50.
+  test("390: more than 50 waiting notices all reach ④", async ({ browser }) => {
+    const baseURL = test.info().project.use.baseURL!;
+    const context = await phoneContext(browser, baseURL, "e2e-notify-many");
+    const page = await context.newPage();
+    try {
+      await page.goto("/m");
+      const suffix = Date.now().toString(36);
+      const ids: string[] = [];
+      for (let index = 0; index < 55; index += 1) {
+        const { notice } = await notify(page, { title: `批量 ${suffix} #${index}`, body: "第 51 条之后也要显示。" });
+        ids.push(notice.noticeId);
+      }
+      const oldest = ids[0];
+      await page.goto("/m");
+      await showCard(page, oldest);
+      await expect(card(page, oldest).getByTestId("home-card-title")).toHaveText(`批量 ${suffix} #0`);
+      await expect
+        .poll(async () => {
+          const shown = await page
+            .locator('[data-testid="home-queue-card"][data-card-type="notice"]')
+            .evaluateAll((nodes) => nodes.map((node) => node.getAttribute("data-card-id")));
+          return ids.every((id) => shown.includes(id));
+        })
+        .toBe(true);
+    } finally {
+      await ackAll(page);
+      await context.close();
+    }
+  });
+});
+
 test.describe("owner notify: Main's voice and the Owner thread", () => {
   test.skip(
     process.env.HUB_E2E_MAIN_UI !== "1",
@@ -307,6 +342,27 @@ test.describe("owner notify: Main's voice and the Owner thread", () => {
 
       await inThread.getByTestId("transcript-notice-ack").click();
       await expect(inThread.getByTestId("transcript-notice-acked")).toHaveText("已确认", { timeout: 20_000 });
+
+      // r2 item 2: this page follows Main with the page visible, so the push
+      // for a new notice skips this device, and writing a notice journals
+      // nothing. The list poll still brings the card here.
+      const durableSeq = async () => {
+        type Row = { durableSeq?: string };
+        const body = (await (await page.request.get(`/v1/instances/${mainId}`)).json()) as Row & { instance?: Row };
+        return body.instance?.durableSeq ?? body.durableSeq;
+      };
+      const before = await durableSeq();
+      expect(before).toBeTruthy();
+      const { notice: second } = await notify(
+        page,
+        { title: "第二条", body: "跟随中的设备也要看到这张卡。" },
+        mainId,
+      );
+      await expect(
+        page.locator(`[data-testid="transcript-notice"][data-notice-id="${second.noticeId}"]`),
+      ).toBeVisible({ timeout: 20_000 });
+      // No journal growth carried it.
+      expect(await durableSeq()).toBe(before);
       expect(await unacked(page)).not.toContain(notice.noticeId);
       await page.goto("/m");
       await expect(page.getByTestId("home-queue")).toBeVisible({ timeout: 20_000 });

@@ -1637,6 +1637,58 @@ async fn many_facts_stay_within_the_byte_budget() -> Result<()> {
     Ok(())
 }
 
+/// Each turn-done line quotes the text that turn ended with, not the
+/// subject's newest text: two turns waiting in one batch keep their own
+/// conclusions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_turn_line_quotes_its_own_turns_tail() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("deliver-tails").await?;
+    let (seat, token) = ctx.seat(&project).await?;
+    ctx.journal(&seat, activity("working", &at(1))).await?;
+    let worker = ctx.worker(&token, &project).await?;
+    ctx.worker_turn(&worker, 10, "first turn ended ALPHA-7Q")
+        .await?;
+    ctx.worker_turn(&worker, 20, "second turn ended BETA-3K")
+        .await?;
+    ctx.journal(&seat, activity("idle", &at(60))).await?;
+    ctx.settle().await?;
+    let sends = ctx.seen.sends_to(&seat);
+    assert_eq!(sends.len(), 1);
+    let text = text_of(&sends[0]);
+    let line = |run: u32| {
+        text.lines()
+            .find(|line| {
+                line.starts_with("- [turn-done]") && line.contains(&format!("turn {run} "))
+            })
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let (first, second) = (line(1), line(2));
+    assert!(
+        first.contains("ALPHA-7Q") && !first.contains("BETA-3K"),
+        "{text}"
+    );
+    assert!(
+        second.contains("BETA-3K") && !second.contains("ALPHA-7Q"),
+        "{text}"
+    );
+    // Recorded on the row when the turn ended.
+    let page = ctx.inbox(&seat).await?;
+    let tails: Vec<&str> = page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|fact| fact["kind"] == "turn-done")
+        .filter_map(|fact| fact["payload"]["tail"].as_str())
+        .collect();
+    assert_eq!(
+        tails,
+        ["first turn ended ALPHA-7Q", "second turn ended BETA-3K"]
+    );
+    Ok(())
+}
+
 /// A batch never carries the owner's words: what the owner sent a worker is
 /// not a fact, and the only worker texts read are its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

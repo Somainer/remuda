@@ -48,9 +48,6 @@ use remuda_protocol::{InboxBatch, InboxFactKind, InboxFallbackReason};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
-/// Journal rows read from a subject's tail for its last assistant text.
-const TAIL_EVENTS: i64 = 64;
-
 /// The predicate every due trigger shares: the lineage has rows waiting.
 macro_rules! waiting_rows {
     ($lineage:expr) => {
@@ -674,21 +671,6 @@ fn subject_label(conn: &Connection, subject: Option<&str>) -> Result<String, Sto
     })
 }
 
-/// The subject's last root assistant text, from its journal tail.
-fn assistant_tail(conn: &Connection, subject: &str) -> Result<Option<String>, StoreError> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT payload_json FROM journal WHERE instance_id = ?1 ORDER BY seq DESC LIMIT ?2",
-    )?;
-    let mut events: Vec<Value> = stmt
-        .query_map(params![subject, TAIL_EVENTS], |row| row.get::<_, String>(0))?
-        .filter_map(|raw| raw.ok().and_then(|raw| serde_json::from_str(&raw).ok()))
-        .collect();
-    events.reverse();
-    Ok(crate::digest::last_assistant_text(&events)
-        .map(|text| crate::digest::redact_secrets(&text))
-        .filter(|text| !text.trim().is_empty()))
-}
-
 /// The question an interaction row asks (secrets redacted).
 fn interaction_question(
     conn: &Connection,
@@ -774,15 +756,12 @@ fn line(conn: &Connection, row: &Waiting) -> Result<Line, StoreError> {
                 }
                 _ => String::new(),
             };
+            // The turn's own tail, recorded when its result was folded: a
+            // batch carrying several turns quotes each one's conclusion.
             let detail = if failed {
                 quoted("error", text_at(p, "error"), false)
             } else {
-                match row.subject.as_deref() {
-                    Some(subject) => {
-                        quoted("last text", assistant_tail(conn, subject)?.as_deref(), true)
-                    }
-                    None => String::new(),
-                }
+                quoted("last text", text_at(p, "tail"), true)
             };
             format!("{who} {what} {run} at {at}{late}{detail}.")
         }

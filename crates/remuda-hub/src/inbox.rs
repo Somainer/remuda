@@ -1375,6 +1375,18 @@ pub(crate) fn fold_append(
         {
             detail["error"] = json!(error);
         }
+        // cb-inbox-deliver r2: the text this turn ended with, recorded now
+        // while it is still the journal's latest turn, so a batch formed
+        // after more turns quotes each turn's own conclusion. Only the
+        // current run's end: a late or unattributable result's text is no
+        // longer at the tail.
+        if attributed
+            && run == tracker.run
+            && detail["outcome"] == "done"
+            && let Some(tail) = turn_tail(conn, instance_id)?
+        {
+            detail["tail"] = json!(tail);
+        }
         let fact = instance_fact(conn, kind, instance_id, run, entered_at.clone(), detail)?;
         fold_record(conn, instance_id, fact)?;
         if attributed {
@@ -1386,6 +1398,43 @@ pub(crate) fn fold_append(
         save_tracker(conn, instance_id, &tracker)?;
     }
     Ok(())
+}
+
+/// Journal rows a turn's tail is read back from, at most.
+const TAIL_EVENTS: i64 = 64;
+
+/// The last root assistant text of the turn that has just ended on
+/// `instance_id`: read back from the journal's tail as far as that turn's
+/// root `turn_started` (or [`TAIL_EVENTS`] rows on a carrier without turn
+/// boundaries), secrets redacted, keeping its last
+/// [`crate::inbox_voice::QUOTE_MAX_CHARS`] characters. Worker text: a
+/// reader quotes it as untrusted data.
+fn turn_tail(conn: &Connection, instance_id: &str) -> Result<Option<String>, StoreError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT payload_json FROM journal WHERE instance_id = ?1 ORDER BY seq DESC LIMIT ?2",
+    )?;
+    let mut events = Vec::new();
+    for raw in stmt.query_map(params![instance_id, TAIL_EVENTS], |row| {
+        row.get::<_, String>(0)
+    })? {
+        let Ok(event) = serde_json::from_str::<Value>(&raw?) else {
+            continue;
+        };
+        let payload = event.get("payload").unwrap_or(&Value::Null);
+        let started = event_kind(&event) == "lifecycle"
+            && payload.get("topic").and_then(Value::as_str) == Some("turn")
+            && payload.get("nativeName").and_then(Value::as_str) == Some("turn_started")
+            && !crate::store::native_payload_is_subagent(payload);
+        if started {
+            break;
+        }
+        events.push(event);
+    }
+    events.reverse();
+    Ok(crate::digest::last_assistant_text(&events)
+        .map(|text| crate::digest::redact_secrets(&text))
+        .map(|text| crate::inbox_voice::clip_tail(&text))
+        .filter(|text| !text.is_empty()))
 }
 
 // ── facts from the Hub's own committed state changes ───────────────────────

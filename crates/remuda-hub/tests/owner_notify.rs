@@ -476,6 +476,85 @@ async fn only_address_owner_or_the_owner_may_notify() -> Result<()> {
     Ok(())
 }
 
+/// r2 item 1: notice content and its acknowledgement are Human-only. A Bot
+/// credential can neither list notices nor acknowledge one (so it cannot
+/// remove a card from the owner's devices), whatever instance it names; an
+/// Agent (a seat, or a Human token narrowed to one) is refused as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn notices_are_read_and_acknowledged_only_by_a_human() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let main = ctx.seat("Main", json!(["address-owner"])).await?;
+    let (status, body) = ctx
+        .notify(
+            Some(&main),
+            json!({"title": "Gate red", "body": "Lane 2 failed."}),
+        )
+        .await?;
+    assert_eq!(status, 201, "{body}");
+    let id = notice_id(&body)?;
+    let bot = ctx
+        .call(
+            reqwest::Method::POST,
+            "unused",
+            None,
+            "/v1/login",
+            Some(json!({ "bootstrapToken": ctx.hub.bootstrap_token,
+                    "deviceName": "notices-bot", "deviceKind": "bot" })),
+        )
+        .await?
+        .1["token"]
+        .as_str()
+        .context("bot token")?
+        .to_owned();
+    let ack_path = format!("/v1/owner/notices/{id}/ack");
+    for (token, instance) in [
+        (bot.as_str(), None),
+        (bot.as_str(), Some(main.as_str())),
+        (ctx.phone.token.as_str(), Some(main.as_str())),
+    ] {
+        for (method, path) in [
+            (reqwest::Method::GET, "/v1/owner/notices"),
+            (reqwest::Method::GET, "/v1/owner/notices?unacked=1"),
+            (reqwest::Method::POST, ack_path.as_str()),
+        ] {
+            let (status, body) = ctx
+                .call(method.clone(), token, instance, path, None)
+                .await?;
+            assert_eq!(status, 403, "{method} {path} as {instance:?}: {body}");
+            assert!(
+                body["reason"] == "owner-only" || body["reason"] == "agent-route",
+                "{body}"
+            );
+            assert_eq!(body["next"]["action"], "ask-owner", "{body}");
+            assert!(
+                !body.to_string().contains("Gate red"),
+                "no notice text: {body}"
+            );
+        }
+    }
+    // The card is still there for the owner: nothing acknowledged it.
+    let (status, page) = ctx
+        .call(
+            reqwest::Method::GET,
+            &ctx.phone.token,
+            None,
+            "/v1/owner/notices?unacked=1",
+            None,
+        )
+        .await?;
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(page["items"][0]["noticeId"], json!(id));
+    assert_eq!(page["items"][0]["ackedAt"], Value::Null);
+    assert_eq!(
+        ctx.query_i64(
+            "SELECT COUNT(*) FROM owner_notices WHERE acked_at IS NOT NULL",
+            []
+        )?,
+        0
+    );
+    Ok(())
+}
+
 /// A paused (fenced) Main chapter writes nothing (D-057 §7.3).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_paused_main_cannot_notify() -> Result<()> {

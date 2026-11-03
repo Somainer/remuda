@@ -2147,7 +2147,7 @@ OwnerNotice = {noticeId, lineageId, chapterInstanceId, turnSeq, title, body,
 push tag    = notice:<noticeId>; landing /sessions?focus=<noticeId>
 ~~~
 
-- 调用者只能是持有 `address-owner` 的 Agent（Main）或所有者自己的 Human 设备。没有这个 grant 的 Agent：403，`reason: "grant-required"`，`next.grant: "address-owner"`；Bot 凭证（不论用 `x-remuda-instance-id` 指名哪个实例）：403，`reason: "address-owner-required"`。Agent 调用过提交时的 initiator 检查，已被 fence 或暂停的章节得到 409 `fenced`。中间件只放行 Agent 的这一个 POST；两个 notices 路由只给 Human 与 Bot。
+- 调用者只能是持有 `address-owner` 的 Agent（Main）或所有者自己的 Human 设备。没有这个 grant 的 Agent：403，`reason: "grant-required"`，`next.grant: "address-owner"`；Bot 凭证（不论用 `x-remuda-instance-id` 指名哪个实例）：403，`reason: "address-owner-required"`。Agent 调用过提交时的 initiator 检查，已被 fence 或暂停的章节得到 409 `fenced`。中间件只放行 Agent 的这一个 POST。两个 notices 路由只给 Human：Bot 凭证与 Agent（包括用 `x-remuda-instance-id` 收窄的 Human 令牌）都得到 403，`reason: "owner-only"`（Agent 先被中间件以 `agent-route` 拦下）；确认因此只能来自所有者自己的设备。转给聊天 Bot 是之后单独的决定（T24）。
 - 标题一行、至多 120 字符；正文至多 2000 字符；`dedupeKey` 至多 128 个 `[A-Za-z0-9._:/-]` 字符。超界：400，`reason: "invalid-notice"`。秘密 lint 先于边界检查覆盖三者：命中为 422，`code: "OWNER_NOTIFY_SECRET_REJECTED"`，只给 `field` 与 `rule`，不回显文本，什么也不存。
 - Hub 在一个写事务里写认领行、它的审计行（`owner.notify`，不带文本）与推送 outbox 行，提交后才推送；推送之前（或推送之后、标记之前）崩溃，重启后以同一 tag 补发一次，替换而不是新增通知。去重键按写入血缘（所有者自己的为 `owner`）划分。确认先于推送时不再推送。
 

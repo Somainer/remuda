@@ -34,13 +34,15 @@
 //!   queue, `instanceId` for one chapter's transcript); `POST
 //!   /v1/owner/notices/{id}/ack` is the owner's acknowledgement, on every
 //!   device at once and idempotent. A notice acknowledged before its push went
-//!   out is not pushed. Both are operator routes.
+//!   out is not pushed. Both are Human-only: a notice is the owner's, so a
+//!   Bot credential (which relays to a chat platform) and an Agent (a seat, or
+//!   a Human token narrowed to one) get 403 with a reason and a next step.
 //! - **Logs.** Categories and outcomes only, never a title, a body or a key.
 //!
 //! The tables live in `hub.sqlite`, so `scripts/hub-backup.sh` carries them.
 
 use crate::AppState;
-use crate::agent_scope::{CallerAuthority, authenticated_caller, origin, require_operator};
+use crate::agent_scope::{CallerAuthority, authenticated_caller, caller, origin};
 use crate::auth::require_origin;
 use crate::config::now_rfc3339;
 use crate::error::{HubError, NextStep, action};
@@ -741,6 +743,35 @@ fn not_a_notifier() -> HubError {
     )
 }
 
+/// 403 for a notices read or acknowledgement from anything but the owner's
+/// own Human device: a Bot relays to a chat platform and an Agent is a seat
+/// (a narrowed Human token counts as its Agent), and neither may read the
+/// owner's notices or dismiss them from the owner's devices.
+fn owner_only() -> HubError {
+    HubError::Forbidden.with_next(
+        "owner-only",
+        NextStep::new(
+            action::ASK_OWNER,
+            "owner notices are read and acknowledged only from the owner's own device; do \
+             not retry with this credential",
+        ),
+    )
+}
+
+/// The owner's own Human device, or [`owner_only`].
+async fn owner_device(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<crate::store::Device, HubError> {
+    require_origin(headers, &state.config)?;
+    let device = caller(state, headers).await?;
+    if origin(&device) != InputOrigin::Human {
+        tracing::info!(category = "owner-notice", outcome = "refused-not-human");
+        return Err(owner_only());
+    }
+    Ok(device)
+}
+
 // ─── routes ─────────────────────────────────────────────────────────────────
 
 pub(crate) fn routes() -> Router<AppState> {
@@ -849,7 +880,7 @@ async fn list_notices(
     headers: HeaderMap,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<Value>, HubError> {
-    require_operator(&state, &headers).await?;
+    owner_device(&state, &headers).await?;
     let filter = ListFilter {
         unacked: matches!(query.unacked.as_deref(), Some("1" | "true")),
         chapter: query.instance_id.filter(|id| !id.is_empty()),
@@ -870,8 +901,7 @@ async fn ack_notice(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, HubError> {
-    require_origin(&headers, &state.config)?;
-    let device = require_operator(&state, &headers).await?;
+    let device = owner_device(&state, &headers).await?;
     let notice = state
         .store
         .run_named("owner_notice_ack", move |conn| ack(conn, &id, &device.id))

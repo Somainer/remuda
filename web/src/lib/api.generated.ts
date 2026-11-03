@@ -1315,7 +1315,7 @@ export interface paths {
         };
         /**
          * List the owner's notices, newest first
-         * @description Human and Bot callers only (an Agent is refused, 403). `unacked=1` lists the 「告诉你」 cards still waiting; `instanceId` lists one chapter's notices for its transcript.
+         * @description Human only: a Bot credential and an Agent (a seat, or a Human token narrowed to one) are refused with 403 `owner-only` (an Agent is stopped by the route middleware with `agent-route`). `unacked=1` lists the 「告诉你」 cards still waiting; `instanceId` lists one chapter's notices for its transcript.
          */
         get: operations["ownerNotices"];
         put?: never;
@@ -1337,7 +1337,7 @@ export interface paths {
         put?: never;
         /**
          * Acknowledge a notice on every device
-         * @description Idempotent: the first acknowledgement stamps `ackedAt`, later ones return the notice unchanged. A notice acknowledged before its push went out is not pushed. Human and Bot callers only.
+         * @description Idempotent: the first acknowledgement stamps `ackedAt`, later ones return the notice unchanged. A notice acknowledged before its push went out is not pushed. Human only: a Bot or an Agent gets 403 `owner-only` and the notice is left unacknowledged.
          */
         post: operations["ackOwnerNotice"];
         delete?: never;

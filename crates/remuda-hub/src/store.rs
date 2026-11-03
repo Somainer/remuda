@@ -6941,7 +6941,12 @@ impl Store {
             // cb-usage-resume r2: an answer is input to the instance, and it
             // arrives as a direct RPC that never inserts a command row, so
             // the input trigger cannot see it. Cancel the wait here, in the
-            // same transaction as the settlement.
+            // same transaction as the settlement. The instance is read from
+            // the interaction row now, so a live-only answer (no row when the
+            // handler looked) cancels too once the request has been
+            // ingested. If the Hub has still never ingested the request, the
+            // Node's reply names no instance and nothing is cancelled: a
+            // stated limit (main-agent.md §11.8).
             let instance: Option<String> = tx
                 .query_row(
                     "SELECT instance_id FROM interactions WHERE id = ?1",

@@ -21,7 +21,10 @@
 //!   its child until the child's first turn ends. At boot every `running` run
 //!   becomes `interrupted` and is never replayed (its fact stays consumed
 //!   even if the batch is later released); the next occurrence is computed
-//!   from the schedule as usual.
+//!   from the schedule as usual. The one exception is a run whose result is
+//!   already queued in `wake_outcomes` (its write kept failing): that result
+//!   is evidence the run ended, so the run stays `running` until a later pass
+//!   writes it.
 //! * **Missed (skipped) occurrences.** An `every` wake-up whose occurrences
 //!   passed while the Hub was down fires once, for the latest one, and
 //!   reports how many it skipped. An occurrence that comes due while the

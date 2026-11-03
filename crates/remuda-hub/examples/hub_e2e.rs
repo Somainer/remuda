@@ -909,6 +909,10 @@ const GATED_METHODS: &[&str] = &["tty.screen", "workspace.list", "worktree.list"
 ///
 /// Frames arriving before the hello reply share the socket with unrelated Hub
 /// RPCs; they are stashed into `frame_queue`, never swallowed.
+// The harness helper already threads the socket, its auth, identity, the
+// workspace snapshot, epoch, survivors and the stashed frame queue; the Node
+// profile is the eighth coordinate the showcase Nodes add.
+#[allow(clippy::too_many_arguments)]
 async fn node_restart_reconnect(
     addr: SocketAddr,
     durable_token: &str,

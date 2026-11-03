@@ -497,8 +497,11 @@ struct C1Push {
     body: String,
 }
 
-/// Send every recorded, unsent C1 push (`recipients IS NULL`) through the
-/// existing push fanout. A row is marked sent — `sent_at` and its recipient
+/// Send every recorded, unsent C1 push (`recipients IS NULL`) whose fenced
+/// chapter carries process-end evidence (D-057 §8.5, OA6: a self or ancestor
+/// close is recorded at admission, and its push waits for the end the close
+/// brings). The send goes through the existing push fanout. A row is marked
+/// sent — `sent_at` and its recipient
 /// count — only AFTER the fanout delivered it, or found nothing to deliver
 /// to (push off, a device following the chapter, no live subscription). A
 /// failed fanout leaves it unsent for the next evaluation, including the boot
@@ -511,21 +514,38 @@ pub(crate) async fn drive_pushes(state: &AppState) {
         .store
         .read("c1_pushes_unsent", |conn| {
             let mut stmt = conn.prepare(
-                "SELECT fence_id, lineage_id, instance_id, title, body
-                   FROM lineage_c1_pushes WHERE recipients IS NULL ORDER BY created_at",
+                "SELECT p.fence_id, p.lineage_id, p.instance_id, p.title, p.body,
+                        i.lifecycle, i.last_error, i.ended_at
+                   FROM lineage_c1_pushes p
+                   JOIN fences f ON f.fence_id = p.fence_id
+                   JOIN instances i ON i.id = f.predecessor_instance_id
+                  WHERE p.recipients IS NULL ORDER BY p.created_at",
             )?;
             let rows = stmt
                 .query_map([], |row| {
-                    Ok(C1Push {
-                        fence_id: row.get(0)?,
-                        lineage_id: row.get(1)?,
-                        instance_id: row.get(2)?,
-                        title: row.get(3)?,
-                        body: row.get(4)?,
-                    })
+                    let lifecycle: String = row.get(5)?;
+                    let last_error: Option<String> = row.get(6)?;
+                    let ended_at: Option<String> = row.get(7)?;
+                    Ok((
+                        C1Push {
+                            fence_id: row.get(0)?,
+                            lineage_id: row.get(1)?,
+                            instance_id: row.get(2)?,
+                            title: row.get(3)?,
+                            body: row.get(4)?,
+                        },
+                        lifecycle_has_process_end_evidence(
+                            &lifecycle,
+                            last_error.as_deref(),
+                            ended_at.as_deref(),
+                        ),
+                    ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
+            Ok(rows
+                .into_iter()
+                .filter_map(|(push, ended)| ended.then_some(push))
+                .collect::<Vec<_>>())
         })
         .await
     {
@@ -545,11 +565,13 @@ pub(crate) async fn drive_pushes(state: &AppState) {
         )
         .await;
         let Some(recipients) = fanout.recipients() else {
-            tracing::warn!(lineage_id = %push.lineage_id, title = %push.title,
-                "C1 push failed; it stays unsent and is retried");
+            tracing::warn!(
+                category = "c1",
+                "C1 push failed; it stays unsent and is retried"
+            );
             continue;
         };
-        tracing::info!(lineage_id = %push.lineage_id, title = %push.title, recipients, "C1 push");
+        tracing::info!(category = "c1", recipients, "C1 push");
         if let Err(error) = state
             .store
             .run_named("c1_push_sent", move |conn| {
@@ -1466,6 +1488,17 @@ async fn evaluate_pass(state: &AppState, pass: Pass) -> Vec<Decided> {
     };
     let mut decided = Vec::new();
     for (lineage_id, failed_id, seen) in candidates {
+        // D-057 §8.3: the supervisor's own transition. The lineage's current
+        // chapter has ended, so it is not effectively running whatever this
+        // evaluation decides (a stale-at-boot decision or a retried
+        // preparation runs no F).
+        if let Err(error) = state
+            .store
+            .push_supervisor_transition(lineage_id.clone())
+            .await
+        {
+            tracing::warn!(%error, "push lift by the supervisor failed");
+        }
         let outcome = match pending(state, &lineage_id, &failed_id, seen.clone(), &pass).await {
             Ok(Some(pending)) => decide(state, pending).await,
             Ok(None) => continue,

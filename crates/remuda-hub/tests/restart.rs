@@ -397,6 +397,22 @@ impl Ctx {
         Ok(())
     }
 
+    /// The process ends after a close (Node-attested, exit code 0).
+    async fn report_closed(&self, node: &FakeNode, id: &str) -> Result<()> {
+        node.appends.send((
+            id.to_owned(),
+            json!({"kind":"lifecycle","lifecycle":"exited","payload":{
+                "type":"native","topic":"session","nativeName":"session",
+                "status":{"state":"known","value":"exited"},"severity":"info",
+                "affectsCompletion":true,"relatedIds":{"exitCode":"0"}}}),
+        ))?;
+        self.wait_instance(id, |view| {
+            matches!(view["lifecycle"].as_str(), Some("exited" | "closed"))
+        })
+        .await?;
+        Ok(())
+    }
+
     /// The launch never started (the Node attests a start failure).
     async fn report_start_failed(&self, node: &FakeNode, id: &str) -> Result<()> {
         node.appends.send((
@@ -1575,6 +1591,8 @@ async fn c1_pushes_restart_cap_and_self_close_and_none_for_a_device_pause() -> R
     assert_eq!(closed.status(), 200, "{}", closed.text().await?);
     let record = ctx.lineage(&seat).await?;
     assert_eq!(record["pausedBy"]["kind"], json!("self"));
+    // D-057 §8.5 / OA6: the C1 push waits for the end the close brings.
+    ctx.report_closed(&node, &third).await?;
     let pushes = ctx.c1_pushes(&seat, 3).await?;
     assert_eq!(pushes[2].0, "self");
     assert_eq!(pushes[2].1, "Main closed itself");
@@ -1664,6 +1682,10 @@ async fn an_ancestor_close_records_a_c1_push() -> Result<()> {
     let record = ctx.lineage(&child).await?;
     assert_eq!(record["pausedBy"]["kind"], json!("ancestor"));
     assert_eq!(record["pausedBy"]["instanceId"], json!(seat));
+    // D-057 §8.5 / OA6: nothing is pushed before the end the close brings.
+    ctx.supervise().await;
+    assert_eq!(*fake.hits.lock().unwrap(), hits_before);
+    ctx.report_closed(&node, &child).await?;
     let pushes = ctx.c1_pushes(&child, 1).await?;
     assert_eq!(
         pushes,
@@ -1673,7 +1695,10 @@ async fn an_ancestor_close_records_a_c1_push() -> Result<()> {
             1
         )]
     );
-    assert_eq!(*fake.hits.lock().unwrap() - hits_before, 1);
+    // The child has no `restart`, so its end also keeps the generic exited
+    // push.
+    ctx.wait_until(|| async { (*fake.hits.lock().unwrap() - hits_before == 2).then_some(()) })
+        .await?;
     Ok(())
 }
 

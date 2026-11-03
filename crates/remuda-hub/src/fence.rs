@@ -697,6 +697,16 @@ pub(crate) fn fence_core(conn: &Connection, spec: &FenceSpec) -> Result<FenceTx,
         }
     }
 
+    // D-057 §8.3: F is a cause of "effectively running" turning false (a
+    // pause or a successor leaves the lineage paused or starting): its
+    // children's still-pending suppressed interactions are lifted with it.
+    crate::push_route::transition_guarded(
+        conn,
+        crate::push_route::Transition::Fence {
+            lineage_id: &lineage_id,
+        },
+    );
+
     // 11. Audit, with the actor chain.
     let audit_device = spec
         .actor

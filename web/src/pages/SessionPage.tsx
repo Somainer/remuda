@@ -1126,12 +1126,18 @@ function SessionPageBody({
           onFlushHeld={() => hubStore.flushHeld(instance.id)}
           onInterrupt={() => hubStore.cancel(instance.id)}
           permissionMode={
-            genericPty ? ptyYoloChipLabel(instance.kind) : hub.permissionMode
+            // D-062: a claimed pane runs with whatever mode its owner set;
+            // Remuda records it as unknown and never invents one.
+            isClaimed(instance)
+              ? "external"
+              : genericPty
+                ? ptyYoloChipLabel(instance.kind)
+                : hub.permissionMode
           }
           // generic-PTY read-only chip: the Node yolo preset (bypass /
           // always-approve / skip-permissions) is a danger state and is in no
           // live table, so mark it explicitly (c-effortui r4 item 5(b)).
-          permissionDanger={genericPty}
+          permissionDanger={genericPty && !isClaimed(instance)}
           launchPermissionMode={genericPty ? undefined : hubStore.launchPermissionModeOf(instance.id)}
           permissionEffective={genericPty ? null : hubStore.permissionEffectiveOf(instance.id)}
           permissionPending={genericPty ? null : hubStore.permissionPendingOf(instance.id)}

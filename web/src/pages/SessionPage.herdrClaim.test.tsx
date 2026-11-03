@@ -91,6 +91,12 @@ describe("SessionPage for a claimed herdr pane", () => {
     expect(read).toHaveBeenCalledWith(claimedInstance().id, 80);
   });
 
+  it("never invents a permission mode for the claimed pane", async () => {
+    await renderSession(claimedInstance());
+    expect(document.body.textContent).not.toContain("skip-permissions");
+    expect(document.body.textContent).toContain("external");
+  });
+
   it("labels the header button 释放 and confirms before releasing", async () => {
     const { close } = await renderSession(claimedInstance());
     const button = screen.getByRole("button", { name: "Release" });

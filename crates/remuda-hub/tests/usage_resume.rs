@@ -566,6 +566,16 @@ fn rate_limit_event(status: &str, resets_at: i64) -> Value {
         "dataRef": null, "severity": "info", "affectsCompletion": false } })
 }
 
+/// The carrier's session start, with the harness's credential source.
+fn session_started(api_key_source: &str) -> Value {
+    json!({ "kind": "lifecycle", "payload": {
+        "type": "native", "topic": "session", "nativeName": "session",
+        "nativeId": { "state": "known", "value": "session-1" },
+        "status": { "state": "known", "value": "started" },
+        "relatedIds": { "model": "claude-sonnet-5-5", "apiKeySource": api_key_source },
+        "dataRef": null, "severity": "info", "affectsCompletion": false } })
+}
+
 fn assistant(message: &str, text: &str) -> Value {
     json!({ "kind": "message", "payload": {
         "operation": "open", "messageId": message, "role": "assistant", "phase": "final",
@@ -945,6 +955,65 @@ async fn a_turn_without_output_is_continued_with_its_original_input() -> Result<
     assert_eq!(sends.len(), 1, "{sends:#?}");
     assert_eq!(sends[0]["input"]["text"], "run the migration");
     assert_ne!(sends[0]["commandId"], original.as_str(), "a new command id");
+    Ok(())
+}
+
+/// A failed turn the create prompt started, with no output, is continued
+/// with that prompt again (the create command's `initialInput`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_first_turn_is_continued_with_the_create_prompt() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("resume-create").await?;
+    let (_seat, token) = ctx.seat(&project).await?;
+    let worker = ctx.worker(&token, &project, true).await?;
+    let create: String = ctx.db()?.query_row(
+        "SELECT id FROM commands WHERE instance_id = ?1 AND operation = 'instance.create'",
+        [&worker],
+        |row| row.get(0),
+    )?;
+    ctx.limit_turn(&worker, &create, Some(resets_in(600)), false, NOTICE)
+        .await?;
+    ctx.settle().await?;
+    let fire_at = ctx.waits(&worker)?[0].fire_at.clone();
+    ctx.tick(&fire_at).await?;
+    let sends = ctx.seen.hub_sends_to(&worker);
+    assert_eq!(sends.len(), 1, "{sends:#?}");
+    assert_eq!(sends[0]["input"]["text"], "work", "the create prompt again");
+    assert_eq!(sends[0]["input"]["origin"], "hub");
+    Ok(())
+}
+
+/// The harness's own report decides when the instance has no profile: a
+/// session whose `apiKeySource` names an API key makes no row even with a
+/// structured `rejected` event, and one reporting `none` (a claude.ai login)
+/// waits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_api_key_session_makes_no_row_even_with_a_structured_rejection() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("resume-keysource").await?;
+    let (seat, token) = ctx.seat(&project).await?;
+    let keyed = ctx.worker(&token, &project, true).await?;
+    let login = ctx.worker(&token, &project, true).await?;
+    for (worker, source) in [(&keyed, "ANTHROPIC_API_KEY"), (&login, "none")] {
+        ctx.journal(worker, session_started(source)).await?;
+    }
+    ctx.limit_turn(&keyed, "cmd_k_1", Some(resets_in(600)), false, NOTICE)
+        .await?;
+    ctx.limit_turn(&login, "cmd_l_1", Some(resets_in(600)), false, NOTICE)
+        .await?;
+    ctx.settle().await?;
+    assert!(ctx.waits(&keyed)?.is_empty(), "an API key never waits");
+    assert_eq!(ctx.waits(&login)?.len(), 1, "a claude.ai login waits");
+    let failed = ctx.facts(&seat, "turn-failed").await?;
+    let class_of = |worker: &str| {
+        failed
+            .iter()
+            .find(|fact| fact["subjectInstanceId"] == worker)
+            .map(|fact| fact["payload"]["usageLimit"]["class"].clone())
+            .unwrap_or(Value::Null)
+    };
+    assert_eq!(class_of(&keyed), "api-key-or-gateway");
+    assert_eq!(class_of(&login), "subscription");
     Ok(())
 }
 

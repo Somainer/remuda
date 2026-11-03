@@ -2145,6 +2145,8 @@ rate_limit_event (lifecycle, topic diagnostic) relatedIds, all strings:
   rateLimitResetsAt        Unix-epoch seconds
   rateLimitType            the window: five_hour | seven_day | seven_day_opus | ...
   rateLimitOverageStatus, rateLimitUsingOverage
+session start (lifecycle, topic session) relatedIds gains
+  apiKeySource             none (a claude.ai login) | ANTHROPIC_API_KEY | apiKeyHelper | ...
 
 turn-failed  payload.usageLimit = {class, window?, resetsAt?, source?, waits,
                                    fireAt?, autoContinue?, reason?}

@@ -581,6 +581,10 @@ struct Tracker {
     /// `turn-failed` fact: `(run, detail)`.
     #[serde(default)]
     verdict: Option<(i64, Value)>,
+    /// The harness's credential source from its session start (Claude
+    /// `apiKeySource`): `none` is a claude.ai login.
+    #[serde(default)]
+    api_key_source: Option<String>,
 }
 
 fn load_tracker(conn: &Connection, instance_id: &str) -> Result<Tracker, StoreError> {
@@ -666,10 +670,13 @@ fn jitter_ms() -> u64 {
     u64::try_from(bits % u128::from(JITTER_MS)).unwrap_or(0)
 }
 
-/// The instance's credential, from its provider profile.
+/// The instance's credential: its provider profile when it has a real one;
+/// else the harness's own report (`apiKeySource`, `none` being a claude.ai
+/// login); else its host's inventory (a Claude configured for a gateway).
 fn credential_of(
     conn: &Connection,
     instance_id: &str,
+    api_key_source: Option<&str>,
 ) -> Result<(Credential, Option<String>), StoreError> {
     let profile: Option<String> = conn
         .query_row(
@@ -680,7 +687,42 @@ fn credential_of(
         .optional()?
         .flatten();
     let Some(profile) = profile.filter(|id| crate::provider_resolve::is_real_profile_id(id)) else {
-        return Ok((Credential::HostLogin, None));
+        if let Some(source) = api_key_source {
+            return Ok((
+                if source == "none" {
+                    Credential::HostLogin
+                } else {
+                    Credential::ApiKeyOrGateway
+                },
+                None,
+            ));
+        }
+        let cli: Option<String> = conn
+            .query_row(
+                "SELECT h.cli_json FROM hosts h JOIN instances i ON i.host_id = h.id
+                  WHERE i.id = ?1",
+                params![instance_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let gateway = cli
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .and_then(|cli| cli.as_array().cloned())
+            .is_some_and(|items| {
+                items.iter().any(|item| {
+                    item.get("kind").and_then(Value::as_str) == Some("claude")
+                        && (item.get("auth").and_then(Value::as_str) == Some("gateway-native")
+                            || item.get("nativeGateway").and_then(Value::as_bool) == Some(true))
+                })
+            });
+        return Ok((
+            if gateway {
+                Credential::ApiKeyOrGateway
+            } else {
+                Credential::HostLogin
+            },
+            None,
+        ));
     };
     let kind: Option<String> = conn
         .query_row(
@@ -760,7 +802,8 @@ fn decide(
     last_error: Option<&str>,
     observed: OffsetDateTime,
 ) -> Result<Verdict, StoreError> {
-    let (credential, profile_id) = credential_of(conn, instance_id)?;
+    let (credential, profile_id) =
+        credential_of(conn, instance_id, tracker.api_key_source.as_deref())?;
     let texts: Vec<&str> = [last_error, tracker.notice.as_deref()]
         .into_iter()
         .flatten()
@@ -925,11 +968,23 @@ pub(crate) fn fold(
     let assistant =
         kind == "message" && payload.get("role").and_then(Value::as_str) == Some("assistant");
     let tool = kind == "tool_call";
-    if !(rate_limit || started || result || assistant || tool || turn_ended) {
+    let key_source = (kind == "lifecycle" && text_at(payload, "/topic") == Some("session"))
+        .then(|| {
+            rle::api_key_source(text_at(
+                payload,
+                &format!("/relatedIds/{}", rle::API_KEY_SOURCE),
+            ))
+        })
+        .flatten();
+    if !(rate_limit || started || result || assistant || tool || turn_ended || key_source.is_some())
+    {
         return Ok(());
     }
     let mut tracker = load_tracker(conn, instance_id)?;
     let original = tracker.clone();
+    if key_source.is_some() {
+        tracker.api_key_source = key_source;
+    }
     if started {
         tracker.turn_output = false;
         tracker.rejected = None;
@@ -1508,15 +1563,15 @@ fn continuation_input(conn: &Connection, row: &Row) -> Result<Value, StoreError>
     let payload: Option<String> = conn
         .query_row(
             "SELECT payload_json FROM commands
-              WHERE id = ?1 AND instance_id = ?2 AND operation = 'instance.send'",
+              WHERE id = ?1 AND instance_id = ?2
+                AND operation IN ('instance.send', 'instance.create', 'instance.resume')",
             params![command, row.instance_id],
             |r| r.get(0),
         )
         .optional()?;
     let input = payload
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|payload| payload.get("input").cloned())
-        .filter(|input| input.get("type").and_then(Value::as_str) == Some("prompt"));
+        .and_then(|payload| original_prompt(&payload));
     Ok(match input {
         Some(mut input) => {
             input["origin"] = json!("hub");
@@ -1524,6 +1579,35 @@ fn continuation_input(conn: &Connection, row: &Row) -> Result<Value, StoreError>
         }
         None => prompt(CONTINUE_TEXT),
     })
+}
+
+/// The prompt input a command carried, in every shape the Hub stores: a
+/// send's `input` (`type: prompt`), a create's or resume's `initialInput`,
+/// or a bare `prompt` / `text`. `None` when it carried no prompt text (keys,
+/// an answer, a launch without a prompt).
+fn original_prompt(payload: &Value) -> Option<Value> {
+    for field in ["input", "initialInput"] {
+        if let Some(input) = payload.get(field)
+            && input.get("type").and_then(Value::as_str) == Some("prompt")
+        {
+            let has_text = input
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.trim().is_empty())
+                || input
+                    .get("blocks")
+                    .and_then(Value::as_array)
+                    .is_some_and(|blocks| !blocks.is_empty());
+            if has_text {
+                return Some(input.clone());
+            }
+        }
+    }
+    ["prompt", "text"]
+        .iter()
+        .filter_map(|field| payload.get(*field).and_then(Value::as_str))
+        .find(|text| !text.trim().is_empty())
+        .map(|text| json!({ "type": "prompt", "text": text }))
 }
 
 /// F (§7.2) moved `lineage_id` to `chapter` at `generation`: every wait

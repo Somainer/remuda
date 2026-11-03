@@ -367,6 +367,26 @@ pub mod rate_limit_event {
         out
     }
 
+    /// The `relatedIds` key a carrier writes on its session-start lifecycle
+    /// for the harness's credential source (Claude `system/init`
+    /// `apiKeySource`): `none` is a claude.ai login (a subscription); any
+    /// other value names an API key source (`ANTHROPIC_API_KEY`,
+    /// `apiKeyHelper`, …).
+    pub const API_KEY_SOURCE: &str = "apiKeySource";
+
+    /// The `apiKeySource` value, bounded to a short printable name (it is a
+    /// source name, never a key).
+    #[must_use]
+    pub fn api_key_source(raw: Option<&str>) -> Option<String> {
+        raw.map(str::trim)
+            .filter(|text| {
+                !text.is_empty()
+                    && text.len() <= 64
+                    && text.chars().all(|c| c.is_ascii_graphic() || c == ' ')
+            })
+            .map(str::to_owned)
+    }
+
     /// `rate_limit_info.status`, when it is a plain token.
     #[must_use]
     pub fn status(info: Option<&serde_json::Value>) -> Option<String> {

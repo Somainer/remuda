@@ -5494,6 +5494,16 @@ fn map_init(mapper: &mut Mapper, init: &SystemInit) -> DriverResult<Vec<Observat
     if let Some(model) = &init.model {
         related.insert("model".into(), model.clone());
     }
+    // cb-usage-resume: whether the harness runs on a subscription login
+    // (`none`) or an API key, for the usage-limit classification.
+    if let Some(source) =
+        remuda_protocol::rate_limit_event::api_key_source(init.api_key_source.as_deref())
+    {
+        related.insert(
+            remuda_protocol::rate_limit_event::API_KEY_SOURCE.into(),
+            source,
+        );
+    }
     Ok(vec![mapper.lifecycle_related(
         LifecycleTopic::Session,
         "session",

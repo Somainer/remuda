@@ -1327,6 +1327,34 @@ pub(crate) mod test_seams {
             .insert(command_id.to_owned(), times);
     }
 
+    static NODE_BUSY_LINEAGE: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+
+    /// The next `times` forwards of Hub-written input initiated by
+    /// `lineage_id` (its restart notice, its batches) are refused NODE_BUSY.
+    pub(crate) fn arm_node_busy_lineage(lineage_id: &str, times: usize) {
+        NODE_BUSY_LINEAGE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get_or_insert_with(HashMap::new)
+            .insert(lineage_id.to_owned(), times);
+    }
+
+    /// Whether this forward of Hub-written input by `lineage_id` is refused
+    /// (consumes one).
+    pub(crate) fn take_node_busy_lineage(lineage_id: &str) -> bool {
+        let mut armed = NODE_BUSY_LINEAGE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let Some(left) = armed.as_mut().and_then(|map| map.get_mut(lineage_id)) else {
+            return false;
+        };
+        if *left == 0 {
+            return false;
+        }
+        *left -= 1;
+        true
+    }
+
     /// Whether this forward of `command_id` is refused (consumes one).
     pub(crate) fn take_node_busy(command_id: &str) -> bool {
         let mut armed = NODE_BUSY
@@ -1352,7 +1380,7 @@ pub(crate) enum Pace {
 }
 
 impl DeliverState {
-    fn retry_due(&self, batch_id: &str, now: tokio::time::Instant) -> bool {
+    pub(crate) fn retry_due(&self, batch_id: &str, now: tokio::time::Instant) -> bool {
         self.retry
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -1457,14 +1485,7 @@ pub(crate) async fn drive(state: &AppState, pace: Pace) {
     match unsent {
         Ok(unsent) if !forward_held(state) => {
             let now = tokio::time::Instant::now();
-            // A batch that left the queue (forwarded, cancelled by a fence)
-            // has no retry left to make.
-            state
-                .deliver
-                .retry
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .retain(|id, _| unsent.iter().any(|batch| &batch.batch_id == id));
+            prune_retries(state).await;
             for batch in unsent {
                 if pace == Pace::Backoff && !state.deliver.retry_due(&batch.batch_id, now) {
                     continue;
@@ -1542,6 +1563,47 @@ pub(crate) async fn drive(state: &AppState, pace: Pace) {
         Err(err) => tracing::warn!(code = error_code(&err), "inbox batches read failed"),
     }
     push_owed(state).await;
+}
+
+/// Drop the retry entries of sends that left the queue (forwarded, settled,
+/// cancelled by a fence): batches and restart notices share the map, so it
+/// is pruned by the command rows, not by the batch list.
+async fn prune_retries(state: &AppState) {
+    let ids: Vec<String> = state
+        .deliver
+        .retry
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .keys()
+        .cloned()
+        .collect();
+    if ids.is_empty() {
+        return;
+    }
+    let pending = state
+        .store
+        .read("hub_input_retry_pending", move |conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT EXISTS (SELECT 1 FROM commands
+                                 WHERE id = ?1 AND state = 'queued' AND forwarded = 0)",
+            )?;
+            let mut keep = std::collections::HashSet::new();
+            for id in ids {
+                if stmt.query_row(params![id], |row| row.get::<_, bool>(0))? {
+                    keep.insert(id);
+                }
+            }
+            Ok(keep)
+        })
+        .await;
+    if let Ok(keep) = pending {
+        state
+            .deliver
+            .retry
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .retain(|id, _| keep.contains(id));
+    }
 }
 
 /// [`forward_waits`] on the reader pool; a read failure does not hold.

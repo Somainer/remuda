@@ -4942,7 +4942,11 @@ pub(crate) async fn forward_if_online(
         )
         .await;
     #[cfg(any(test, feature = "test-faults"))]
-    let refused_busy = crate::inbox_deliver::test_seams::take_node_busy(&command.command_id);
+    let refused_busy = crate::inbox_deliver::test_seams::take_node_busy(&command.command_id)
+        || (hub_written_send(&command)
+            && command.initiator.as_ref().is_some_and(|initiator| {
+                crate::inbox_deliver::test_seams::take_node_busy_lineage(&initiator.lineage_id)
+            }));
     #[cfg(not(any(test, feature = "test-faults")))]
     let refused_busy = false;
     let rpc = if refused_busy {

@@ -999,7 +999,14 @@ pub(crate) async fn drive_notices(state: &AppState) {
             return;
         }
     };
+    let now = tokio::time::Instant::now();
     for notice in due {
+        // A notice released after a forward that proved it never ran is
+        // retried under its id on the delivery backoff (1 s … 60 s, capped),
+        // not on every tick.
+        if !state.deliver.retry_due(&notice.notice_command_id, now) {
+            continue;
+        }
         if state.nodes.kind_of(&notice.host_id).await.is_none() {
             continue;
         }

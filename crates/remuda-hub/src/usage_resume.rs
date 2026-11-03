@@ -1102,6 +1102,37 @@ fn record_wait(
             verdict.no_wait.unwrap_or("not-a-subscription-window")
         }
         (Some(wait), _) => {
+            // A second end for the same run (a deferred settle correcting
+            // its result) finds the row it already wrote: it keeps it, and
+            // its fact reports where that wait stands.
+            let existing: Option<(String, String, String, String, String)> = conn
+                .query_row(
+                    "SELECT state, resets_at, fire_at, source, window_id FROM resume_on_reset
+                      WHERE instance_id = ?1 AND run_generation = ?2",
+                    params![instance_id, run],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            if let Some((state, resets_at, fire_at, source, window)) = existing {
+                let waits = matches!(state.as_str(), "waiting" | "holding");
+                detail["resetsAt"] = json!(resets_at);
+                detail["fireAt"] = json!(fire_at);
+                detail["source"] = json!(source);
+                detail["window"] = json!(window);
+                detail["waits"] = json!(waits);
+                if !waits {
+                    detail["reason"] = json!(state);
+                }
+                return Ok(Some(detail));
+            }
             let jitter = jitter_ms();
             let jitter_i64 = i64::try_from(jitter).unwrap_or(0);
             let fire_at = wait.resets_at + FIRE_DELAY + time::Duration::milliseconds(jitter_i64);

@@ -1110,6 +1110,36 @@ async fn an_api_key_session_makes_no_row_even_with_a_structured_rejection() -> R
     Ok(())
 }
 
+/// A second turn end for the same run (a deferred settle correcting the
+/// first result) does not destroy the wait the first one recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_turn_end_for_the_same_run_keeps_the_wait() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("resume-twice").await?;
+    let (seat, token) = ctx.seat(&project).await?;
+    let worker = ctx.worker(&token, &project, true).await?;
+    ctx.limit_turn(&worker, "cmd_x_1", Some(resets_in(600)), true, NOTICE)
+        .await?;
+    ctx.settle().await?;
+    let first = ctx.waits(&worker)?[0].clone();
+    assert_eq!(first.state, "waiting");
+
+    // The same run ends again.
+    ctx.journal(&worker, turn_result("error", "cmd_x_1", Some(NOTICE)))
+        .await?;
+    ctx.settle().await?;
+    let again = ctx.waits(&worker)?;
+    assert_eq!(again.len(), 1, "one row per run: {again:?}");
+    assert_eq!(again[0].state, "waiting", "the wait survives: {again:?}");
+    assert_eq!(again[0].fire_at, first.fire_at);
+
+    // It still fires, once, with its reset fact and continuation.
+    ctx.tick(&first.fire_at).await?;
+    assert_eq!(ctx.facts(&seat, "supply-reset").await?.len(), 1);
+    assert_eq!(ctx.seen.hub_sends_to(&worker).len(), 1);
+    Ok(())
+}
+
 /// Any Human or Agent input cancels the wait, and a switch-model is such an
 /// input: no reset fact and no continuation follow a cancelled wait.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

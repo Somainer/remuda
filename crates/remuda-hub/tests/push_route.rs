@@ -1695,3 +1695,150 @@ async fn the_push_log_records_categories_and_counts() -> Result<()> {
     );
     Ok(())
 }
+
+// ─── cb-inbox-deliver: a fallback page honours §8.1 ─────────────────────────
+
+/// The parent's session reports `state` (activity), naming its native session.
+fn session(state: &str) -> Value {
+    json!({"kind":"lifecycle","payload":{"type":"native","topic":"session","nativeName":"session",
+        "nativeId":{"state":"known","value":"session-1"},
+        "status":{"state":"known","value":state},"relatedIds":{},"dataRef":null,
+        "severity":"info","affectsCompletion":false}})
+}
+
+impl Ctx {
+    async fn wait_activity(&self, id: &str, activity: &str) -> Result<()> {
+        self.wait_until(&format!("activity {activity}"), || async {
+            let now: Option<String> = self
+                .db()
+                .ok()?
+                .query_row(
+                    "SELECT activity FROM instances WHERE id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .ok();
+            (now.as_deref() == Some(activity)).then_some(())
+        })
+        .await
+    }
+
+    /// The inbox row about `interaction` and, once it fell back, the owner
+    /// push it owes: `(fact id, fallback reason, push recipients)`.
+    fn fallback(&self, interaction: &str) -> Result<(i64, Option<String>, Option<i64>)> {
+        Ok(self.db()?.query_row(
+            "SELECT f.id, f.fallback_reason, p.recipients FROM inbox_facts f
+               LEFT JOIN inbox_fallback_pushes p ON p.fact_id = f.id
+              WHERE f.kind = 'interaction'
+                AND json_extract(f.payload_json, '$.interactionId') = ?1",
+            [interaction],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?)
+    }
+
+    async fn mute_interactions(&self, lineage: &str, muted: bool) -> Result<()> {
+        let kinds = if muted {
+            json!(["interaction"])
+        } else {
+            json!([])
+        };
+        let response = self
+            .http
+            .patch(format!("{}/v1/lineages/{lineage}/inbox", self.base()))
+            .bearer_auth(&self.phone.token)
+            .json(&json!({ "mutedKinds": kinds }))
+            .send()
+            .await?;
+        anyhow::ensure!(response.status().is_success(), "mute");
+        Ok(())
+    }
+}
+
+/// An inbox row that falls back to the owner push (its kind muted after it
+/// was written) does not page an interaction §8 owns. Routed to an
+/// effectively running parent, the fallback pages nothing; once the parent
+/// stops running the lift pages it once, and a fallback after that (in the
+/// resumed chapter) adds no second page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fallback_page_honours_the_routing_and_the_lift_pages_once() -> Result<()> {
+    let _flag = d051(true).await;
+    let ctx = Ctx::boot().await?;
+    let parent = ctx.parent(true).await?;
+    ctx.node_p().append(&parent, session("working"))?;
+    ctx.wait_activity(&parent, "working").await?;
+    let child = ctx.child(Some(&parent)).await?;
+
+    // Routed and running: suppressed at event time; muted before the batch
+    // forms, so the row falls back, and the fallback pages nothing.
+    suppressed_question(&ctx, &child, "int_fb_running").await?;
+    ctx.wait_until("the fact", || async {
+        ctx.fallback("int_fb_running").ok().map(|_| ())
+    })
+    .await?;
+    ctx.mute_interactions(&parent, true).await?;
+    ctx.node_p().append(&parent, session("idle"))?;
+    let (_, reason, recipients) = ctx
+        .wait_until("the fallback settled", || async {
+            let row = ctx.fallback("int_fb_running").ok()?;
+            row.2.is_some().then_some(row)
+        })
+        .await?;
+    assert_eq!(reason.as_deref(), Some("muted"));
+    assert_eq!(recipients, Some(0), "no page: §8.1 routes it");
+    assert!(
+        ctx.pushes_tagged(&ctx.phone, "interaction:int_fb_running")
+            .is_empty()
+    );
+
+    // A second question, suppressed the same way, still waiting.
+    ctx.mute_interactions(&parent, false).await?;
+    ctx.node_p().append(&parent, session("working"))?;
+    ctx.wait_activity(&parent, "working").await?;
+    suppressed_question(&ctx, &child, "int_fb_lifted").await?;
+    ctx.wait_until("the second fact", || async {
+        ctx.fallback("int_fb_lifted").ok().map(|_| ())
+    })
+    .await?;
+
+    // The parent stops running: the lift pages each once.
+    ctx.close(&parent).await?;
+    ctx.wait_lineage(&parent, "paused").await?;
+    ctx.wait_pushes(&ctx.phone, "interaction:int_fb_running", 1)
+        .await?;
+    ctx.wait_pushes(&ctx.phone, "interaction:int_fb_lifted", 1)
+        .await?;
+
+    // Resumed, the second row falls back (muted) in the new chapter: the
+    // lift already paged it, so the fallback adds nothing.
+    ctx.mute_interactions(&parent, true).await?;
+    let resumed = ctx
+        .post(&format!("/v1/instances/{parent}/resume"), json!({}))
+        .await?;
+    let successor = resumed["instance"]["instanceId"]
+        .as_str()
+        .context("successor")?
+        .to_owned();
+    ctx.report_running(ctx.node_p(), &successor).await?;
+    ctx.node_p().append(&successor, session("idle"))?;
+    let (_, reason, recipients) = ctx
+        .wait_until("the second fallback settled", || async {
+            let row = ctx.fallback("int_fb_lifted").ok()?;
+            row.2.is_some().then_some(row)
+        })
+        .await?;
+    assert_eq!(reason.as_deref(), Some("muted"));
+    assert_eq!(recipients, Some(0), "the lift owns that page");
+    ctx.hub.test_handle().test_drive_outbox().await;
+    assert_eq!(
+        ctx.pushes_tagged(&ctx.phone, "interaction:int_fb_running")
+            .len(),
+        1
+    );
+    assert_eq!(
+        ctx.pushes_tagged(&ctx.phone, "interaction:int_fb_lifted")
+            .len(),
+        1,
+        "one page, through the lift, not two"
+    );
+    Ok(())
+}

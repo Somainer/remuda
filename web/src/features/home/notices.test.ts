@@ -133,6 +133,10 @@ describe("NoticeStore", () => {
     await h.store.ack("ntc_1", ok);
     expect(ok).toHaveBeenCalledWith("ntc_1");
     expect(h.store.getSnapshot().notices.map((row) => row.noticeId)).toEqual(["ntc_2"]);
+    // A read that started before the ack landed still lists it: not repainted.
+    h.settle(5);
+    await flush();
+    expect(h.store.getSnapshot().notices.map((row) => row.noticeId)).toEqual(["ntc_2"]);
   });
 });
 

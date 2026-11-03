@@ -88,6 +88,12 @@ export class NoticeStore {
   private again = false;
   private stop: (() => void) | null = null;
   private lastOkAt: number | null = null;
+  /**
+   * Ids acknowledged from this page. A read that started before the ack
+   * committed may still list the notice; it must not paint the card again
+   * (ids are never reused, and an acknowledgement is never undone).
+   */
+  private acked = new Set<string>();
 
   private readonly read: () => Promise<OwnerNotice[]>;
   private readonly onRefresh: (listener: () => void) => () => void;
@@ -146,7 +152,7 @@ export class NoticeStore {
         do {
           this.again = false;
           try {
-            const notices = await this.read();
+            const notices = (await this.read()).filter((row) => !this.acked.has(row.noticeId));
             if (!this.snapshot.loaded || !sameNotices(notices, this.snapshot.notices)) {
               this.emit({ notices, loaded: true });
             }
@@ -169,6 +175,7 @@ export class NoticeStore {
    */
   async ack(noticeId: string, send: (id: string) => Promise<OwnerNotice> = ackNotice): Promise<OwnerNotice> {
     const notice = await send(noticeId);
+    this.acked.add(noticeId);
     const notices = this.snapshot.notices.filter((row) => row.noticeId !== noticeId);
     if (notices.length !== this.snapshot.notices.length) this.emit({ ...this.snapshot, notices });
     return notice;

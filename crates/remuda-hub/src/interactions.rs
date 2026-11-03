@@ -762,7 +762,18 @@ pub async fn answer_interaction(
             _ => {}
         }
     }
-    if let Some(result) = state
+    // cb-usage-resume r3: the in-memory grant's CAS cannot share a writer
+    // job with the wait's cancel, so the cancel is two-phase: the instance's
+    // open waits are held (no continuation forms) before the CAS, then
+    // cancelled when this call committed the answer, or released when it
+    // replayed one or failed. A hold the second phase never reaches lapses
+    // by itself (`usage_resume::INPUT_HOLD`).
+    if let Some(instance) = &in_memory_grant_instance
+        && let Err(error) = state.store.hold_usage_wait(instance.clone(), true).await
+    {
+        tracing::warn!(code = %crate::inbox::error_code(&error), "usage wait hold failed");
+    }
+    let in_memory = state
         .agent_approvals
         .answer(
             &interaction_id,
@@ -770,8 +781,25 @@ pub async fn answer_interaction(
             &device,
             command_id.clone(),
         )
-        .await?
-    {
+        .await;
+    if let Some(instance) = &in_memory_grant_instance {
+        let committed = matches!(
+            &in_memory,
+            Ok(Some(result)) if result.get("outcome").and_then(Value::as_str) == Some("accepted")
+        );
+        let settled = if committed {
+            state
+                .store
+                .cancel_usage_wait(instance.clone(), "input")
+                .await
+        } else {
+            state.store.hold_usage_wait(instance.clone(), false).await
+        };
+        if let Err(error) = settled {
+            tracing::warn!(code = %crate::inbox::error_code(&error), "usage wait settle failed");
+        }
+    }
+    if let Some(result) = in_memory? {
         // D-051 c-deleg2: every successful answer CAS leaves an
         // `interaction.answered` row; the bot-relay row below stays additive.
         if let Some(owner_instance) = &in_memory_grant_instance {
@@ -796,15 +824,6 @@ pub async fn answer_interaction(
             )
             .await;
         }
-        // cb-usage-resume r2: an answer is input to the instance. A live-only
-        // grant (no durable interaction row) settles in memory, so its wait
-        // is cancelled in its own writer job, after that settlement.
-        if let Some(instance) = &in_memory_grant_instance {
-            let instance = instance.clone();
-            if let Err(error) = state.store.cancel_usage_wait(instance, "input").await {
-                tracing::warn!(code = %crate::inbox::error_code(&error), "usage wait cancel failed");
-            }
-        }
         return Ok(Json(result));
     }
     // The chain start/kind for the unconditional answer audit, captured
@@ -813,6 +832,12 @@ pub async fn answer_interaction(
     let audit_target = stored
         .as_ref()
         .map(|row| (row.instance_id.clone(), row.kind.clone()));
+    // cb-usage-resume r3: the state before the RPC decides whether this call
+    // can be the answer's first commit. A row already answer-committed is a
+    // replay of the same commandId (protocol §2.5): it is not new input.
+    // Not the mirror UPDATE's row count, which the journal projection of the
+    // Node's own commit can already have taken to answer-committed.
+    let pending_before = stored.as_ref().is_none_or(|row| row.state == "pending");
     // Node owns first-answer-wins. Never commit an answer in the Hub before
     // the owner is reached, and let the Node reconcile same-command retries.
     let mut params = json!({
@@ -864,9 +889,11 @@ pub async fn answer_interaction(
                 Ok(result) => {
                     // Mirror the owner's successful CAS immediately; a delayed
                     // journal flush must not resurrect a just-answered card.
+                    let first_commit = pending_before
+                        && result.get("outcome").and_then(Value::as_str) != Some("idempotent");
                     state
                         .store
-                        .record_interaction_answer(interaction_id.as_id().to_string())
+                        .record_interaction_answer(interaction_id.as_id().to_string(), first_commit)
                         .await?;
                     // D-051 c-deleg2: one unconditional `interaction.answered`
                     // audit row per committed CAS, independent of bot relay.

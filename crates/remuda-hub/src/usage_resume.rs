@@ -72,6 +72,10 @@ pub(crate) const JITTER_MS: u64 = 30_000;
 /// Characters of the harness's limit notice the tracker keeps, enough for
 /// its reset clause.
 const NOTICE_MAX_CHARS: usize = 300;
+/// How long an input hold keeps a wait from forming its continuation when
+/// the answer that took it never settles it (a crash between the two
+/// phases): after this the hold is ignored.
+pub(crate) const INPUT_HOLD: time::Duration = time::Duration::seconds(60);
 /// The continuation text when the failed turn produced output.
 pub(crate) const CONTINUE_TEXT: &str = "continue";
 
@@ -199,6 +203,8 @@ pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             WHERE instance_id = OLD.id AND state IN ('waiting', 'holding');
          END;",
     )?;
+    // r3: an answer being committed holds the wait (`hold_for_input`).
+    ensure_column(conn, "resume_on_reset", "input_hold_at", "TEXT")?;
     Ok(())
 }
 
@@ -1406,6 +1412,8 @@ enum Hold {
     HostOffline,
     HostLacksFence,
     InitiatorNotLive,
+    /// An answer to the instance is being committed (an input hold).
+    InputPending,
 }
 
 impl Hold {
@@ -1417,6 +1425,7 @@ impl Hold {
             Self::HostOffline => "host-offline",
             Self::HostLacksFence => "host-lacks-fence",
             Self::InitiatorNotLive => "initiator-not-live",
+            Self::InputPending => "input-pending",
         }
     }
 }
@@ -1491,7 +1500,18 @@ fn try_continue(conn: &Connection, row: &Row) -> Result<bool, StoreError> {
             )?;
         }
     }
-    let hold = if activity != "idle" {
+    let held_since: Option<String> = conn.query_row(
+        "SELECT input_hold_at FROM resume_on_reset WHERE id = ?1",
+        params![row.id],
+        |r| r.get(0),
+    )?;
+    let input_held = held_since
+        .as_deref()
+        .and_then(crate::inbox::parse_at)
+        .is_some_and(|at| OffsetDateTime::now_utc() - at < INPUT_HOLD);
+    let hold = if input_held {
+        Some(Hold::InputPending)
+    } else if activity != "idle" {
         Some(Hold::Busy)
     } else if conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM interactions WHERE instance_id = ?1 AND state = 'pending')",
@@ -1708,6 +1728,22 @@ pub(crate) fn cancel(
     )?)
 }
 
+/// Phase one of an answer's cancel (`on`), or the release of a hold whose
+/// answer did not commit (`!on`): the instance's open waits form no
+/// continuation while held, for at most [`INPUT_HOLD`].
+pub(crate) fn hold_for_input(
+    conn: &Connection,
+    instance_id: &str,
+    on: bool,
+) -> Result<usize, StoreError> {
+    let now = now_rfc3339();
+    Ok(conn.execute(
+        "UPDATE resume_on_reset SET input_hold_at = ?2, updated_at = ?3
+          WHERE instance_id = ?1 AND state IN ('waiting', 'holding')",
+        params![instance_id, on.then_some(now.as_str()), now],
+    )?)
+}
+
 /// F (§7.2) moved `lineage_id` to `chapter` at `generation`: every wait that
 /// carries the lineage's initiator is re-attributed to it. That includes a
 /// `continued` row whose continuation is already forwarded: F settles only
@@ -1739,6 +1775,18 @@ pub(crate) const UNSENT_SQL: &str = "SELECT r.command_id, c.host_id, r.continued
 impl crate::store::Store {
     /// [`cancel`] as its own writer job, for a caller whose settlement is not
     /// one (a live-only approval grant has no durable row to join).
+    /// [`hold_for_input`] as its own writer job.
+    pub(crate) async fn hold_usage_wait(
+        &self,
+        instance_id: String,
+        on: bool,
+    ) -> Result<usize, StoreError> {
+        self.run_named("hold_usage_wait", move |conn| {
+            hold_for_input(conn, &instance_id, on)
+        })
+        .await
+    }
+
     pub(crate) async fn cancel_usage_wait(
         &self,
         instance_id: String,

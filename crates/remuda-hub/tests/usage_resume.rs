@@ -1205,6 +1205,175 @@ async fn answering_an_interaction_cancels_the_wait() -> Result<()> {
     Ok(())
 }
 
+/// An idempotent replay of an answer (the same commandId re-POSTed,
+/// protocol §2.5) is not new input: when the instance has since hit a new
+/// limit, the new wait survives the replay (r3 item 1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_answer_replay_does_not_cancel_a_newer_wait() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("resume-replay").await?;
+    let (_seat, token) = ctx.seat(&project).await?;
+    let worker = ctx.worker(&token, &project, true).await?;
+    let interaction = remuda_protocol::InteractionId::new().as_id().to_string();
+    ctx.journal(&worker, question(&interaction, "which branch?"))
+        .await?;
+    ctx.settle().await?;
+    let command = remuda_protocol::CommandId::new().as_id().to_string();
+    let answer = json!({ "commandId": command, "answer": { "kind": "question", "answers": {} } });
+    let path = format!("/v1/interactions/{interaction}/answer");
+    let (status, body) = ctx
+        .request(
+            reqwest::Method::POST,
+            &ctx.human,
+            &path,
+            Some(answer.clone()),
+        )
+        .await?;
+    anyhow::ensure!((200..300).contains(&status), "answer {status}: {body}");
+
+    // A new limit after the answer opens a wait.
+    ctx.limit_turn(&worker, "cmd_r3_1", Some(resets_in(600)), true, NOTICE)
+        .await?;
+    ctx.settle().await?;
+    assert_eq!(ctx.waits(&worker)?[0].state, "waiting");
+
+    // The same answer, re-POSTed.
+    let (status, body) = ctx
+        .request(reqwest::Method::POST, &ctx.human, &path, Some(answer))
+        .await?;
+    anyhow::ensure!((200..300).contains(&status), "replay {status}: {body}");
+    let waits = ctx.waits(&worker)?;
+    assert_eq!(
+        waits[0].state, "waiting",
+        "the replay is not input: {waits:?}"
+    );
+    let fire_at = waits[0].fire_at.clone();
+    ctx.tick(&fire_at).await?;
+    assert_eq!(
+        ctx.seen.hub_sends_to(&worker).len(),
+        1,
+        "it still continues"
+    );
+    Ok(())
+}
+
+/// The owner answering an Agent's in-memory approval card is input to that
+/// Agent's instance: its wait is cancelled. A replay of the same answer is
+/// not, and leaves a newer wait alone (r3 items 1 and 3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_in_memory_approval_answer_cancels_once_and_its_replay_does_not() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("resume-approval").await?;
+    let (seat, token) = ctx.seat(&project).await?;
+    let worker = ctx.worker(&token, &project, false).await?;
+    ctx.db()?.execute(
+        "UPDATE instances SET auto_continue = 1 WHERE id = ?1",
+        [&seat],
+    )?;
+    ctx.limit_turn(&seat, "cmd_s_1", Some(resets_in(600)), true, NOTICE)
+        .await?;
+    ctx.settle().await?;
+    assert_eq!(ctx.waits(&seat)?[0].state, "waiting");
+
+    // The seat's terminal write to its worker needs the owner's approval: a
+    // live-only card for the seat, no interactions row.
+    let (status, refused) = ctx
+        .request(
+            reqwest::Method::POST,
+            &token,
+            &format!("/v1/instances/{worker}/commands"),
+            Some(json!({ "operation": "tty.write", "payload": { "bytes": "eQ==" } })),
+        )
+        .await?;
+    assert_eq!(status, 409, "{refused}");
+    let card = refused["interactionId"]
+        .as_str()
+        .context("card")?
+        .to_owned();
+    let stored: bool = ctx.db()?.query_row(
+        "SELECT EXISTS (SELECT 1 FROM interactions WHERE id = ?1)",
+        [&card],
+        |row| row.get(0),
+    )?;
+    assert!(!stored, "an in-memory grant");
+    let (_, cards) = ctx
+        .request(reqwest::Method::GET, &ctx.human, "/v1/interactions", None)
+        .await?;
+    let digest = cards["items"]
+        .as_array()
+        .context("items")?
+        .iter()
+        .find(|item| item["id"] == card.as_str() || item["interactionId"] == card.as_str())
+        .and_then(|item| {
+            item.pointer("/request/inputDigest")
+                .or_else(|| item.pointer("/interaction/request/inputDigest"))
+        })
+        .and_then(Value::as_str)
+        .context(format!("digest in {cards}"))?
+        .to_owned();
+    let command = remuda_protocol::CommandId::new().as_id().to_string();
+    let answer = json!({ "commandId": command, "answer": {
+        "kind": "approval", "optionId": "allow-once", "inputDigest": digest } });
+    let path = format!("/v1/interactions/{card}/answer");
+    let (status, body) = ctx
+        .request(
+            reqwest::Method::POST,
+            &ctx.human,
+            &path,
+            Some(answer.clone()),
+        )
+        .await?;
+    anyhow::ensure!((200..300).contains(&status), "answer {status}: {body}");
+    assert_eq!(body["outcome"], "accepted", "{body}");
+    let waits = ctx.waits(&seat)?;
+    assert_eq!(
+        waits[0].state, "cancelled",
+        "the answer is input: {waits:?}"
+    );
+
+    // A new limit, then the same answer again.
+    ctx.limit_turn(&seat, "cmd_s_2", Some(resets_in(600)), true, NOTICE)
+        .await?;
+    ctx.settle().await?;
+    assert_eq!(ctx.waits(&seat)?[1].state, "waiting");
+    let (status, body) = ctx
+        .request(reqwest::Method::POST, &ctx.human, &path, Some(answer))
+        .await?;
+    anyhow::ensure!((200..300).contains(&status), "replay {status}: {body}");
+    assert_eq!(body["outcome"], "idempotent", "{body}");
+    let waits = ctx.waits(&seat)?;
+    assert_eq!(
+        waits[1].state, "waiting",
+        "the replay is not input: {waits:?}"
+    );
+    // The hold of the replay's first phase was released: the wait fires and
+    // continues the seat.
+    let fire_at = waits[1].fire_at.clone();
+    // The seat's inbox batches (its worker's facts) go first; their Node
+    // settles them, as a journal does.
+    let batches: Vec<String> = {
+        let db = ctx.db()?;
+        let mut stmt = db.prepare(
+            "SELECT id FROM commands WHERE instance_id = ?1 AND state <> 'settled'
+               AND operation = 'instance.send'",
+        )?;
+        stmt.query_map([&seat], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    for batch in &batches {
+        ctx.settle_command(&seat, batch).await?;
+    }
+    ctx.tick(&fire_at).await?;
+    let held: Option<String> = ctx.db()?.query_row(
+        "SELECT input_hold_at FROM resume_on_reset WHERE instance_id = ?1 ORDER BY id DESC",
+        [&seat],
+        |row| row.get(0),
+    )?;
+    assert!(held.is_none(), "the replay's hold was released");
+    assert_eq!(ctx.waits(&seat)?[1].state, "continued");
+    Ok(())
+}
+
 /// Each input route that does write a command row cancels too: keys
 /// (`instance.keys`), raw terminal bytes (`tty.write`), an answer typed into
 /// the transcript (`instance.respond`), and a model change by

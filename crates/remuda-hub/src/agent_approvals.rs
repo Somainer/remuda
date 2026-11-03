@@ -307,11 +307,20 @@ impl AgentApprovals {
         }
         let by_device =
             Id::try_from(caller.id.clone()).map_err(|err| HubError::Internal(err.to_string()))?;
-        self.broker
+        let outcome = self
+            .broker
             .answer(id.clone(), answer, by_device, command)
             .await
             .map_err(broker_error)?;
-        Ok(Some(json!({"interactionId": id, "state": "answered"})))
+        // cb-usage-resume r3: whether this commandId committed the answer or
+        // replayed one already committed, so input side effects run once.
+        let outcome = match outcome {
+            remuda_driver::interaction::AnswerOutcome::Accepted => "accepted",
+            remuda_driver::interaction::AnswerOutcome::Idempotent => "idempotent",
+        };
+        Ok(Some(
+            json!({"interactionId": id, "state": "answered", "outcome": outcome}),
+        ))
     }
 }
 

@@ -6924,9 +6924,16 @@ impl Store {
     }
 
     /// Mirror a successful Node answer ACK; never decide a winner in the Hub.
+    /// Mirror an answer the Node committed. `first_commit` is whether this
+    /// call committed it (the interaction was pending before the RPC and the
+    /// Node did not report a replay): only then is it new input to the
+    /// instance, so only then does it cancel the instance's usage wait. An
+    /// idempotent replay of the same commandId must not cancel a wait the
+    /// instance opened since (cb-usage-resume r3).
     pub async fn record_interaction_answer(
         &self,
         interaction_id: String,
+        first_commit: bool,
     ) -> Result<(), StoreError> {
         self.run_named("record_interaction_answer", move |conn| {
             let tx = immediate_tx(conn)?;
@@ -6942,7 +6949,7 @@ impl Store {
                     |row| row.get(0),
                 )
                 .optional()?;
-            if let Some(instance) = instance {
+            if let Some(instance) = instance.filter(|_| first_commit) {
                 crate::inbox::guard("usage_resume_cancel", &tx, || {
                     crate::usage_resume::cancel(&tx, &instance, "input")
                 });

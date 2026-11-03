@@ -59,6 +59,16 @@ macro_rules! waiting_rows {
     };
 }
 
+/// `FROM … WHERE …` for the fallback pushes owed now (`?1` is now): not
+/// sent, not given up, and past their retry time.
+macro_rules! owed_push_due {
+    () => {
+        "FROM inbox_fallback_pushes
+          WHERE recipients IS NULL AND gave_up_at IS NULL
+            AND (next_attempt_at IS NULL OR next_attempt_at <= ?1)"
+    };
+}
+
 /// The predicate for a lineage with a formed batch still queued and not
 /// forwarded: one that waits behind input that went first, or was released
 /// for a same-id retry.
@@ -111,6 +121,16 @@ pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     )?;
     ensure_column(conn, "inbox_facts", "fallback_at", "TEXT")?;
     ensure_column(conn, "inbox_facts", "fallback_reason", "TEXT")?;
+    // r2 item 5: a failed fallback push is retried on a durable schedule and
+    // given up after a bounded number of attempts.
+    ensure_column(
+        conn,
+        "inbox_fallback_pushes",
+        "attempts",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(conn, "inbox_fallback_pushes", "next_attempt_at", "TEXT")?;
+    ensure_column(conn, "inbox_fallback_pushes", "gave_up_at", "TEXT")?;
     conn.execute_batch(concat!(
         "DROP TRIGGER IF EXISTS inbox_due_fact;
          CREATE TRIGGER inbox_due_fact AFTER INSERT ON inbox_facts
@@ -1245,6 +1265,7 @@ struct Owed {
     alert: String,
     instance_id: String,
     interaction_id: Option<String>,
+    attempts: i64,
 }
 
 /// Forward every formed batch whose send is still queued and unforwarded,
@@ -1384,28 +1405,67 @@ pub(crate) const RETRY_TICK_EVERY: u64 = 5;
 pub(crate) async fn retry_tick(state: &AppState) {
     if state.deliver.retry_pending(tokio::time::Instant::now()) {
         drive(state, Pace::Backoff).await;
+        return;
     }
+    // A fallback push whose retry time has come: one cheap EXISTS on the
+    // reader pool, so an owed page goes out even when nothing else drives.
+    let now = now_rfc3339();
+    let owed = state
+        .store
+        .read("inbox_fallback_due", move |conn| {
+            Ok(conn.query_row(
+                concat!("SELECT EXISTS (SELECT 1 ", owed_push_due!(), ")"),
+                params![now],
+                |row| row.get::<_, bool>(0),
+            )?)
+        })
+        .await
+        .unwrap_or(false);
+    if owed {
+        push_owed(state).await;
+    }
+}
+
+/// Attempts at one fallback push before it is given up.
+const PUSH_ATTEMPTS: i64 = 8;
+/// First retry delay of a failed fallback push; it doubles per attempt.
+const PUSH_RETRY_FIRST_SECS: i64 = 1;
+/// Longest retry delay of a failed fallback push.
+const PUSH_RETRY_MAX_SECS: i64 = 300;
+
+/// When a fallback push that failed `attempts` times is tried again.
+fn push_retry_at(attempts: i64) -> String {
+    let shift = u32::try_from(attempts.saturating_sub(1).clamp(0, 16)).unwrap_or(16);
+    let delay = PUSH_RETRY_FIRST_SECS
+        .saturating_mul(1_i64 << shift)
+        .min(PUSH_RETRY_MAX_SECS);
+    crate::config::rfc3339(time::OffsetDateTime::now_utc() + time::Duration::seconds(delay))
 }
 
 /// Send each owner push a fallen-back row owes through `alerts.rs`, and
 /// mark it sent only after the fanout delivered it (or found nothing to
-/// deliver to). A failed fanout stays owed for the next drive; the alert's
-/// own tag makes a resend replace the notification instead of adding one.
+/// deliver to). A failed fanout is retried on a durable schedule (1 s, 2 s,
+/// 4 s … up to 5 min, by the periodic tick or any drive) and given up after
+/// [`PUSH_ATTEMPTS`]; the alert's own tag makes a resend replace the
+/// notification instead of adding one.
 async fn push_owed(state: &AppState) {
+    let now = now_rfc3339();
     let owed = state
         .store
-        .read("inbox_fallback_owed", |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT fact_id, alert, instance_id, interaction_id
-                   FROM inbox_fallback_pushes WHERE recipients IS NULL ORDER BY fact_id",
-            )?;
+        .read("inbox_fallback_owed", move |conn| {
+            let mut stmt = conn.prepare(concat!(
+                "SELECT fact_id, alert, instance_id, interaction_id, attempts ",
+                owed_push_due!(),
+                " ORDER BY fact_id"
+            ))?;
             let rows = stmt
-                .query_map([], |row| {
+                .query_map(params![now], |row| {
                     Ok(Owed {
                         fact_id: row.get(0)?,
                         alert: row.get(1)?,
                         instance_id: row.get(2)?,
                         interaction_id: row.get(3)?,
+                        attempts: row.get(4)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1428,10 +1488,40 @@ async fn push_owed(state: &AppState) {
         };
         let fanout = crate::alerts::page_owner(state, &push.instance_id, alert).await;
         let Some(recipients) = fanout.recipients() else {
-            tracing::warn!(
-                alert = push.alert.as_str(),
-                "inbox fallback push failed; it is retried"
-            );
+            let attempts = push.attempts.saturating_add(1);
+            let gave_up = attempts >= PUSH_ATTEMPTS;
+            let fact_id = push.fact_id;
+            let marked = state
+                .store
+                .run_named("inbox_fallback_failed", move |conn| {
+                    let now = now_rfc3339();
+                    conn.execute(
+                        "UPDATE inbox_fallback_pushes
+                            SET attempts = ?2,
+                                next_attempt_at = CASE WHEN ?3 THEN NULL ELSE ?4 END,
+                                gave_up_at = CASE WHEN ?3 THEN ?5 END
+                          WHERE fact_id = ?1 AND recipients IS NULL",
+                        params![fact_id, attempts, gave_up, push_retry_at(attempts), now],
+                    )?;
+                    Ok(())
+                })
+                .await;
+            if let Err(err) = marked {
+                tracing::warn!(code = error_code(&err), "inbox fallback push mark failed");
+            } else if gave_up {
+                tracing::warn!(
+                    alert = push.alert.as_str(),
+                    attempts,
+                    code = "push-gave-up",
+                    "inbox fallback push failed; given up"
+                );
+            } else {
+                tracing::warn!(
+                    alert = push.alert.as_str(),
+                    attempts,
+                    "inbox fallback push failed; it is retried"
+                );
+            }
             continue;
         };
         tracing::info!(

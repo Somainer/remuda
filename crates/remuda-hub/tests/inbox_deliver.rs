@@ -230,6 +230,8 @@ struct Ctx {
 #[derive(Default)]
 struct FakePush {
     sent: Mutex<Vec<String>>,
+    /// While set, every delivery is refused (HTTP 400): the fanout fails.
+    fail: std::sync::atomic::AtomicBool,
 }
 
 impl remuda_push::Transport for FakePush {
@@ -241,6 +243,9 @@ impl remuda_push::Transport for FakePush {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<u16, remuda_push::Error>> + Send + '_>,
     > {
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return Box::pin(async { Ok(400) });
+        }
         self.sent
             .lock()
             .unwrap()
@@ -1512,6 +1517,113 @@ async fn rows_of_an_ended_subscriber_without_continuity_fall_back() -> Result<()
         pushed_before + 1,
         "the pending question pages the owner"
     );
+    Ok(())
+}
+
+/// `(attempts, recipients, gave_up_at)` of the push a fallen-back row owes.
+fn owed_push(ctx: &Ctx, fact: i64) -> Result<(i64, Option<i64>, Option<String>)> {
+    Ok(ctx.db()?.query_row(
+        "SELECT attempts, recipients, gave_up_at FROM inbox_fallback_pushes WHERE fact_id = ?1",
+        [fact],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?)
+}
+
+async fn set_muted(ctx: &Ctx, seat: &str, kinds: Value) -> Result<()> {
+    let (status, body) = ctx
+        .request(
+            reqwest::Method::PATCH,
+            &ctx.human,
+            &format!("/v1/lineages/{seat}/inbox"),
+            Some(json!({ "mutedKinds": kinds })),
+        )
+        .await?;
+    anyhow::ensure!(status == 200, "{body}");
+    Ok(())
+}
+
+/// A worker question the seat muted after it was written: a fallback row
+/// owing the owner a page. Returns the row id.
+async fn muted_question(ctx: &Ctx, seat: &str, token: &str, project: &str, n: i64) -> Result<i64> {
+    // A muted kind writes no row: the question is recorded unmuted, then the
+    // seat mutes `interaction` before the batch forms.
+    set_muted(ctx, seat, json!([])).await?;
+    // The re-check runs at formation, and a batch still in flight holds it.
+    for (batch, _, outcome, _) in ctx.batch_rows()? {
+        if outcome.is_none() {
+            ctx.settle_command(seat, &batch).await?;
+        }
+    }
+    ctx.journal(seat, activity("working", &at(100 * n))).await?;
+    let asker = ctx.worker(token, project).await?;
+    ctx.journal(&asker, entity("running", &at(100 * n + 1)))
+        .await?;
+    ctx.journal(
+        &asker,
+        question(&format!("int_push_{n}"), "Which way?", &at(100 * n + 2)),
+    )
+    .await?;
+    set_muted(ctx, seat, json!(["interaction"])).await?;
+    ctx.journal(seat, activity("idle", &at(100 * n + 10)))
+        .await?;
+    ctx.settle().await?;
+    let page = ctx.inbox(seat).await?;
+    page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|fact| fact["kind"] == "interaction" && fact["subjectInstanceId"] == asker.as_str())
+        .and_then(|fact| fact["id"].as_i64())
+        .context("the fallen-back question")
+}
+
+/// A fallback push that fails is retried by the periodic tick, with no other
+/// state change to drive it, and goes out once the push service accepts it;
+/// one that keeps failing is given up after its attempts are spent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_fallback_push_is_retried_by_the_tick_and_bounded() -> Result<()> {
+    let ctx = Ctx::spawn_with_push().await?;
+    let push = ctx.push.clone().context("push")?;
+    let project = ctx.project("deliver-push-retry").await?;
+    let (seat, token) = ctx.seat(&project).await?;
+    push.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    let fact = muted_question(&ctx, &seat, &token, &project, 1).await?;
+    let (attempts, recipients, gave_up) = owed_push(&ctx, fact)?;
+    assert_eq!((attempts, recipients, gave_up), (1, None, None));
+
+    // The push service recovers; only the periodic tick runs.
+    push.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+    let sent = push.sent.lock().unwrap().len();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while owed_push(&ctx, fact)?.1.is_none() {
+        anyhow::ensure!(tokio::time::Instant::now() < deadline, "never retried");
+        ctx.hub.test_inbox_retry_tick().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(push.sent.lock().unwrap().len(), sent + 1, "paged once");
+    ctx.hub.test_inbox_retry_tick().await;
+    assert_eq!(push.sent.lock().unwrap().len(), sent + 1, "and only once");
+
+    // A push that keeps failing stops at its last attempt.
+    push.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    let second = muted_question(&ctx, &seat, &token, &project, 2).await?;
+    ctx.db()?.execute(
+        "UPDATE inbox_fallback_pushes
+            SET attempts = 7, next_attempt_at = '2000-01-01T00:00:00.000Z'
+          WHERE fact_id = ?1",
+        [second],
+    )?;
+    ctx.hub.test_inbox_retry_tick().await;
+    let (attempts, recipients, gave_up) = owed_push(&ctx, second)?;
+    assert_eq!((attempts, recipients), (8, None));
+    assert!(gave_up.is_some(), "given up after 8 attempts");
+    ctx.db()?.execute(
+        "UPDATE inbox_fallback_pushes SET next_attempt_at = '2000-01-01T00:00:00.000Z'
+          WHERE fact_id = ?1",
+        [second],
+    )?;
+    ctx.hub.test_inbox_retry_tick().await;
+    assert_eq!(owed_push(&ctx, second)?.0, 8, "no attempt after giving up");
     Ok(())
 }
 

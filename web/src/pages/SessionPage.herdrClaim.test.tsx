@@ -81,6 +81,16 @@ describe("SessionPage for a claimed herdr pane", () => {
     expect(badge).toHaveTextContent("work · w2 · w2:t19");
   });
 
+  it("shows the claimed pane's live viewport in the screen view", async () => {
+    const { api } = await import("../lib/api");
+    const read = vi
+      .spyOn(api, "screenRead")
+      .mockResolvedValue({ lines: ["HCLAIM-OK", "❯ "] } as Awaited<ReturnType<typeof api.screenRead>>);
+    await renderSession(claimedInstance());
+    expect(await screen.findByText(/HCLAIM-OK/)).toBeTruthy();
+    expect(read).toHaveBeenCalledWith(claimedInstance().id, 80);
+  });
+
   it("labels the header button 释放 and confirms before releasing", async () => {
     const { close } = await renderSession(claimedInstance());
     const button = screen.getByRole("button", { name: "Release" });

@@ -93,7 +93,7 @@ Remuda does **not** own the claimed process.
 | `instance keys` | `pane.send_keys` | |
 | interrupt (cancel) | `pane.send_keys(["esc"])` for agent kinds, `["ctrl+c"]` for `terminal` | |
 | TTY observe/control in the PWA | `herdr terminal session control <pane>` with `HERDR_SOCKET_PATH=<socketPath>`, never `--takeover` | Same bridge as the Node's own panes. A resize from the PWA resizes the pane the same way another herdr client would. |
-| screen snapshot (`tty.screen`) | `pane.read` (visible viewport, text) | Used by the stall fallback; herdr-claimed is a screen carrier. |
+| screen snapshot (`tty.screen`) | `pane.read` (visible viewport, text) | Used by the stall fallback (herdr-claimed is a screen carrier) and by the 结构 (screen) view on `/s/:id`, which re-reads it every 2 s while shown; the journal never stores it. |
 | activity | `session.snapshot` agent status | herdr `working` → working, `blocked` → waiting on input, `idle`/`done` → idle. |
 
 There is **no journal transcript** in this cut: the journal holds lifecycle,

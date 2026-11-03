@@ -26,6 +26,7 @@ import { Composer } from "../features/session/Composer";
 import { steerHeldControl } from "../features/composer/state";
 import { LaunchedByMark } from "../features/session/LaunchedBy";
 import { HerdrClaimBadge, isClaimed, releaseConfirmText } from "../features/session/HerdrClaimBadge";
+import { useClaimedScreen } from "../features/session/useClaimedScreen";
 import { Modal } from "../components/Modal";
 import { allModelPinMismatches } from "../features/session/modelEffective";
 import { RunDetails } from "../features/session/RunDetails";
@@ -587,6 +588,11 @@ function SessionPageBody({
     bubbles.length === 0 &&
     !isTtyLabFixtureId(instanceId);
 
+  // D-062: the screen projection of a claimed herdr pane is its live viewport.
+  const claimedScreen = useClaimedScreen(
+    instance && isClaimed(instance) && resolvedView === "structured" ? instance.id : null,
+  );
+
   if (!instance && hub.ready) {
     return <p style={{ padding: 16 }}>会话不存在</p>;
   }
@@ -954,7 +960,7 @@ function SessionPageBody({
             加载 snapshot…
           </p>
         ) : genericPty ? (
-          <ScreenView instance={instance} events={events} />
+          <ScreenView instance={instance} events={events} live={claimedScreen} />
         ) : (
           <Transcript
             ref={transcriptRef}

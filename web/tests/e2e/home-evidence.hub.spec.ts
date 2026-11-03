@@ -18,14 +18,19 @@ import { login } from "./hub-auth";
 /**
  * home-evidence (H5, home.md §11; ui-screenshots.md "Home state checklist").
  *
- * The showcase fixture is the fake Node under `HUB_E2E_HOME_EVIDENCE=1`: it
- * announces the neutral host `forge` and the workspace roots /srv/remuda and
- * /srv/atlas (labels 空间: remuda / atlas), journals human assistant lines
- * instead of `echo: <prompt>`, and the `hshowcase-approval` /
- * `hshowcase-plan` create sentinels raise cards whose verbatim text a person
- * would read. This spec seeds the rest (the offline `laptop` host, one
- * owner-blocked task, the working session, the address-owner Main) through
- * the public routes and releases everything it owns.
+ * `HUB_E2E_HOME_EVIDENCE=1` makes the harness start ADDITIONAL Nodes beside
+ * the shared fake Node; the primary `e2e-fake-node` and its g2 workspaces are
+ * untouched. The showcase `forge` Node announces the neutral host, the
+ * workspace roots /srv/remuda and /srv/atlas (labels 空间: remuda / atlas),
+ * journals human assistant lines instead of `echo: <prompt>`, and the
+ * `hshowcase-approval` / `hshowcase-plan` create sentinels raise cards whose
+ * verbatim text a person would read, and `hshowcase-working` /
+ * `hshowcase-idle` open cardless turns (a working session, an idle ledger
+ * row) whose state needs no answer round trip. The `laptop` Node announces
+ * once and drops, so ② has a real offline host with a 「离线 Nm」 age. This
+ * spec seeds the rest (one owner-blocked task, the address-owner Main)
+ * through the public routes and releases everything it owns, including its
+ * project.
  *
  * Matrix: routes {/m at 390, /sessions at 1280, /sessions at 1440} ×
  * appearance {light, dark} × the §11 states — queue full, all handled, before
@@ -37,10 +42,12 @@ import { login } from "./hub-auth";
  *
  * Screenshots go to the ignored `web/scratch/evidence/home-evidence/` (D-060
  * Q6 is undecided, so no PNG enters git). They are written ONLY when
- * REMUDA_EVIDENCE=1; without it (or without the showcase fixture) the whole
+ * REMUDA_EVIDENCE=1; without it (or without the showcase Nodes) the whole
  * file skips.
  *
- * No millisecond thresholds: only Playwright's waits for eventual state.
+ * No assertion uses a millisecond threshold: every wait is for an eventual
+ * state. The one fixed 500 ms pause is a bounded delete retry (ma-fence keeps
+ * a closing chapter's delete at 409), never an expected-duration assertion.
  */
 
 test.describe.configure({ mode: "serial" });
@@ -54,7 +61,7 @@ test.skip(
 );
 test.skip(
   !showcase,
-  "set HUB_E2E_HOME_EVIDENCE=1: the fake Node must announce the neutral showcase host and workspaces",
+  "set HUB_E2E_HOME_EVIDENCE=1: the harness must start the showcase and laptop Nodes",
 );
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -128,11 +135,30 @@ async function keyboardShot(page: Page, mode: AppearanceMode) {
   }
 }
 
-async function openRoute(browser: Browser, baseURL: string, route: HomeRoute) {
+async function openRoute(
+  browser: Browser,
+  baseURL: string,
+  route: HomeRoute,
+  { showPrimary = false }: { showPrimary?: boolean } = {},
+) {
   const context: BrowserContext = route.phone
     ? await browser.newContext({ ...devices["iPhone 13"], viewport: { width: route.width, height: route.height }, baseURL })
     : await browser.newContext({ baseURL, viewport: { width: route.width, height: route.height } });
   const page = await context.newPage();
+  if (!showPrimary) {
+    // The shared `e2e-fake-node` is the harness's primary fixture, not part
+    // of the showcase. Hide it from the APP's host reads so every shot carries
+    // only the neutral `forge`/`laptop` hosts (home.md §11). The spec's own
+    // API calls use `page.request`, which page routes do not intercept, so
+    // seeding and the isolation test still see the primary.
+    await page.route(/\/v1\/hosts(\?.*)?$/, async (intercepted) => {
+      if (intercepted.request().method() !== "GET") return intercepted.fallback();
+      const response = await intercepted.fetch();
+      const body = (await response.json()) as { items?: { label?: string }[] };
+      body.items = (body.items ?? []).filter((row) => row.label !== "e2e-fake-node");
+      await intercepted.fulfill({ response, json: body });
+    });
+  }
   await login(page, `evidence-${route.name}`);
   lastStorage = await context.storageState();
   return { context, page };
@@ -144,7 +170,6 @@ let lastStorage: Awaited<ReturnType<BrowserContext["storageState"]>> | null = nu
 const createdInstances: string[] = [];
 const createdTasks: string[] = [];
 const createdProjects: string[] = [];
-const createdHosts: string[] = [];
 /** Address-owner seats (they need the pause-then-delete routine). */
 const mainSeats: string[] = [];
 
@@ -159,14 +184,34 @@ async function apiJson<T>(page: Page, method: string, pathName: string, body?: u
   return (text ? JSON.parse(text) : null) as T;
 }
 
-type HostRow = { id?: string; label?: string };
+type HostRow = {
+  id?: string;
+  label?: string;
+  state?: string;
+  online?: boolean;
+  lastSeenAt?: string | null;
+  workspaces?: { workspaceId?: string; root?: string }[];
+};
 
-/** The showcase host. Under HUB_E2E_HOME_EVIDENCE=1 the fake Node is `forge`. */
-async function showcaseHost(page: Page): Promise<string> {
+async function hubHosts(page: Page): Promise<HostRow[]> {
   const body = await apiJson<{ items?: HostRow[] }>(page, "GET", "/v1/hosts");
-  const host = (body.items ?? []).find((row) => row.label === "forge");
-  expect(host?.id, "the showcase fake Node announces the neutral host `forge`").toBeTruthy();
-  return host!.id!;
+  return body.items ?? [];
+}
+
+/** The showcase host: the `forge` Node the harness starts beside the primary. */
+async function showcaseHost(page: Page): Promise<string> {
+  let id = "";
+  await expect
+    .poll(
+      async () => {
+        const host = (await hubHosts(page)).find((row) => row.label === "forge");
+        id = host?.id ?? "";
+        return id;
+      },
+      { timeout: 20_000 },
+    )
+    .not.toBe("");
+  return id;
 }
 
 async function createSession(page: Page, prompt: string, title: string): Promise<string> {
@@ -226,51 +271,6 @@ async function pendingCount(page: Page): Promise<number> {
   return (list.items ?? []).filter((row) => row.state === "pending").length;
 }
 
-/** Answer the instance's pending approval so its turn completes (idle). */
-async function answerApproval(page: Page, instanceId: string, optionId = "allow-once"): Promise<void> {
-  const row = await pendingFor(page, instanceId);
-  if (!row) return;
-  const interactionId = row.interactionId ?? row.id ?? "";
-  await apiJson(page, "POST", `/v1/interactions/${interactionId}/answer`, {
-    answer: { kind: "approval", optionId, inputDigest: row.request?.inputDigest ?? "" },
-  });
-}
-
-/**
- * Answer whatever card the instance is parked on. The Main's showcase
- * question must be cleared before its lineage may pause; answering the first
- * option of every field is enough for a fixture.
- */
-async function answerPending(page: Page, instanceId: string): Promise<void> {
-  const row = await pendingFor(page, instanceId);
-  if (!row) return;
-  const interactionId = row.interactionId ?? row.id ?? "";
-  const request = row.request ?? {};
-  let answer: unknown;
-  switch (request.kind) {
-    case "question": {
-      const answers: Record<string, { optionIds: string[]; text: string | null }> = {};
-      for (const field of request.fields ?? []) {
-        if (field.id) answers[field.id] = { optionIds: field.options?.[0]?.id ? [field.options[0].id] : [], text: null };
-      }
-      answer = { kind: "question", answers };
-      break;
-    }
-    case "plan-review":
-      answer = {
-        kind: "plan-review",
-        optionId: "approve",
-        planRevision: request.planRevision ?? "1",
-        planDigest: request.planDigest ?? "",
-        feedback: null,
-      };
-      break;
-    default:
-      answer = { kind: "approval", optionId: "allow-once", inputDigest: request.inputDigest ?? "" };
-  }
-  await apiJson(page, "POST", `/v1/interactions/${interactionId}/answer`, { answer });
-}
-
 /** An owner-blocked task with no session: one 「任务待你」 card (§4.6). */
 async function blockedTask(page: Page, projectName: string, title: string, reason: string): Promise<string> {
   const project = await apiJson<{ id: string }>(page, "POST", "/v1/projects", { name: projectName });
@@ -287,6 +287,16 @@ async function blockedTask(page: Page, projectName: string, title: string, reaso
 
 async function archiveTask(page: Page, taskId: string): Promise<void> {
   await page.request.post(`/v1/tasks/${taskId}/archive`, { data: {} }).catch(() => undefined);
+}
+
+/** Remove the seeded project so nothing outlives the spec (item 3). */
+async function deleteProject(page: Page, projectId: string): Promise<void> {
+  const origin = new URL(page.url()).origin;
+  await page.request
+    .delete(`/v1/projects/${projectId}`, { headers: { Origin: origin } })
+    .catch(() => undefined);
+  const at = createdProjects.indexOf(projectId);
+  if (at >= 0) createdProjects.splice(at, 1);
 }
 
 /** Seat the address-owner Main the way a human device does (ma-main-ui H8a). */
@@ -361,9 +371,10 @@ async function releaseQueue(page: Page, state: Showcase) {
     await deleteInstance(page, id);
   }
   // A parked question would keep the pause from settling: answer it first.
-  await answerPending(page, state.mainId).catch(() => undefined);
   await releaseMain(page, state.mainId).catch(() => undefined);
   await archiveTask(page, state.taskId);
+  // The project is part of the seed; nothing it created may outlive the spec.
+  for (const id of [...createdProjects]) await deleteProject(page, id);
   await expect.poll(() => pendingCount(page), { timeout: 30_000 }).toBe(0);
 }
 
@@ -460,9 +471,6 @@ test.afterAll(async () => {
   const origin = new URL(baseURL).origin;
   const request = await apiRequest.newContext({ baseURL, storageState: lastStorage });
   try {
-    for (const id of createdHosts.splice(0)) {
-      await request.delete(`/v1/hosts/${id}`).catch(() => undefined);
-    }
     for (const id of createdTasks.splice(0)) {
       await request.post(`/v1/tasks/${id}/archive`, { data: {} }).catch(() => undefined);
     }
@@ -475,6 +483,9 @@ test.afterAll(async () => {
         .catch(() => undefined);
       await request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
     }
+    for (const id of createdProjects.splice(0)) {
+      await request.delete(`/v1/projects/${id}`, { headers: { Origin: origin } }).catch(() => undefined);
+    }
   } finally {
     await request.dispose();
   }
@@ -485,12 +496,48 @@ async function failListReads(page: Page) {
   const fail = (route: PlaywrightRoute) => route.abort("failed").catch(() => undefined);
   await page.route("**/v1/instances", fail);
   await page.route("**/v1/interactions", fail);
+  // The task ledger would otherwise paint the 「已归档」 group and take the
+  // ledger slot the skeletons occupy (item 4: row-independent).
+  await page.route(/\/v1\/tasks(\?.*)?$/, fail);
 }
 
 /**
- * Runs FIRST, while the showcase Hub still holds no session and no task: the
- * ledger skeleton is the task layer's fallback only when there is no row to
- * paint (an archived task would fill it), so this state needs an empty Hub.
+ * HUB_E2E_HOME_EVIDENCE=1 must add Nodes, never rewrite the shared one: an
+ * existing spec's host label and its g2 workspaces are still there while the
+ * env var is set (home-evidence r2 item 2).
+ */
+test.describe("showcase fixture isolation", () => {
+  test("the shared e2e-fake-node and its g2 workspaces are untouched", async ({ browser }) => {
+    test.setTimeout(60_000);
+    const baseURL = test.info().project.use.baseURL!;
+    const { context, page } = await openRoute(browser, baseURL, ROUTES[0], { showPrimary: true });
+    try {
+      const hosts = await hubHosts(page);
+      const primary = hosts.find((row) => row.label === "e2e-fake-node");
+      expect(primary?.id, "the shared primary Node still announces e2e-fake-node").toBeTruthy();
+      const primaryWorkspaces = (primary?.workspaces ?? []).map((row) => row.workspaceId);
+      expect(primaryWorkspaces).toEqual(
+        expect.arrayContaining(["wsp_g2_clean", "wsp_g2_changes", "wsp_e2e"]),
+      );
+      const forge = hosts.find((row) => row.label === "forge");
+      expect(forge?.id, "the showcase Node is a SECOND host").toBeTruthy();
+      expect(forge?.id).not.toBe(primary?.id);
+      expect((forge?.workspaces ?? []).map((row) => row.root)).toEqual(
+        expect.arrayContaining(["/srv/remuda", "/srv/atlas"]),
+      );
+      const laptop = hosts.find((row) => row.label === "laptop");
+      expect(laptop?.id, "the harness announces the offline laptop host").toBeTruthy();
+      expect(laptop?.lastSeenAt, "laptop has a last-seen so ② can age it").toBeTruthy();
+    } finally {
+      await context.close();
+    }
+  });
+});
+
+/**
+ * The supported pre-snapshot state: an offline reload with every list read
+ * failing. It depends on NO rows: the task ledger read is failed too, so an
+ * archived task or a cached session can never take the ledger slot.
  */
 test.describe("before the first snapshot", () => {
   test("skeletons in ④ and the ledger, 「–」 in ①, never an empty state", async ({ browser }) => {
@@ -524,9 +571,8 @@ test.describe("all handled", () => {
 
       // One live session still working: a create raises an approval, answer
       // it, then a hold-working send leaves the turn open with no card.
-      workingSessionId = await createSession(page, "hold-working 继续拆分", "拆分发布脚本");
-      await waitPending(page, workingSessionId);
-      await answerApproval(page, workingSessionId);
+      // The showcase Node's cardless turn: native working, no interaction.
+      workingSessionId = await createSession(page, "hshowcase-working 继续拆分", "拆分发布脚本");
       await apiJson(page, "POST", `/v1/instances/${workingSessionId}/commands`, {
         operation: "instance.send",
         payload: { prompt: "hold-working 继续" },
@@ -557,7 +603,7 @@ test.describe("all handled", () => {
 });
 
 test.describe("Hub unreachable and stale data", () => {
-  test("the ⑤ banner, then the stale verdict with 数据可能过期 and 更新于 T", async ({ browser }) => {
+  test("the ⑧ banner, then the stale verdict with 数据可能过期 and 更新于 T", async ({ browser }) => {
     test.setTimeout(240_000);
     const baseURL = test.info().project.use.baseURL!;
     const setup = await openRoute(browser, baseURL, ROUTES[0]);
@@ -626,61 +672,47 @@ test.describe("host offline", () => {
   test("② puts the offline host first, dashed and grey, 离线 Nm; no green", async ({ browser }) => {
     test.setTimeout(120_000);
     const baseURL = test.info().project.use.baseURL!;
-    const setup = await openRoute(browser, baseURL, ROUTES[0]);
-    try {
-      const page = setup.page;
-      await page.goto("/m");
-      await waitQueue(page);
-      const origin = new URL(page.url()).origin;
-      const added = await page.request.post("/v1/hosts/ssh", {
-        headers: { Origin: origin },
-        data: { target: "laptop", label: "laptop", labels: [] },
+    // No host is registered here: the harness's own `laptop` Node announced
+    // once and dropped, so ② ages it without any SSH target (and therefore
+    // without an SSH supervisor probing a real machine).
+    await captureState(browser, baseURL, "host-offline", async (home) => {
+      await waitQueue(home);
+      await expect(home.getByTestId("host-summary")).toHaveCount(0);
+      // home.md §2.1: the offline host sorts FIRST, dashed and grey, with how
+      // long it has been away (ui-screenshots: 「离线 Nm」).
+      const first = home.getByTestId("host-chip").first();
+      await expect(first).toHaveAttribute("data-offline", "1", { timeout: 20_000 });
+      await expect(first).toContainText("laptop");
+      // The age becomes a minute once the dropped link is old enough; the
+      // strip re-renders on its own clock, so this is an eventual state.
+      await expect(first).toContainText(/离线\s+\d+[mhd]/, { timeout: 120_000 });
+      const forge = home.locator('[data-testid="host-chip"]').filter({ hasText: "forge" });
+      await expect(forge).toHaveAttribute("data-offline", "0");
+      // No green anywhere in the strip (home.md §0.3): text, background and
+      // every border side, not only the text colour.
+      const greens = await home.getByTestId("host-strip").evaluate((el) => {
+        const rgba = /^rgba?\(([\d.]+),\s*([\d.]+),\s*([\d.]+)(?:,\s*([\d.]+))?\)$/;
+        const isGreen = (value: string) => {
+          const match = value.match(rgba);
+          if (!match) return false;
+          const [red, green, blue] = [Number(match[1]), Number(match[2]), Number(match[3])];
+          const alpha = match[4] === undefined ? 1 : Number(match[4]);
+          return alpha > 0 && green > red + 24 && green > blue + 24;
+        };
+        return [...el.querySelectorAll("*")].flatMap((node) => {
+          const style = getComputedStyle(node);
+          return [
+            style.color,
+            style.backgroundColor,
+            style.borderTopColor,
+            style.borderRightColor,
+            style.borderBottomColor,
+            style.borderLeftColor,
+          ].filter(isGreen);
+        });
       });
-      expect(added.ok(), `add ssh host: ${added.status()} ${await added.text()}`).toBe(true);
-      const hostId = ((await added.json()) as { id?: string }).id;
-      expect(hostId).toBeTruthy();
-      createdHosts.push(hostId!);
-      await expect
-        .poll(async () => {
-          const response = await page.request.get("/v1/hosts");
-          const body = (await response.json()) as { items?: HostRow[] };
-          return (body.items ?? []).some((row) => row.id === hostId);
-        }, { timeout: 20_000 })
-        .toBe(true);
-    } finally {
-      await setup.context.close();
-    }
-
-    try {
-      await captureState(browser, baseURL, "host-offline", async (home) => {
-        await waitQueue(home);
-        await expect(home.getByTestId("host-summary")).toHaveCount(0);
-        // home.md §2.1: the offline host sorts FIRST, dashed and grey.
-        const first = home.getByTestId("host-chip").first();
-        await expect(first).toHaveAttribute("data-offline", "1", { timeout: 20_000 });
-        await expect(first).toContainText("laptop");
-        await expect(first).toContainText(/┄离线/);
-        const forge = home.locator('[data-testid="host-chip"]').filter({ hasText: "forge" });
-        await expect(forge).toHaveAttribute("data-offline", "0");
-        // No green anywhere in the strip (home.md §0.3).
-        const greens = await home.getByTestId("host-strip").evaluate((el) =>
-          [...el.querySelectorAll("*")]
-            .map((node) => getComputedStyle(node).color)
-            .filter((color) => /^rgb\(\s*(?:0|[1-9]\d?),\s*(?:1\d\d|2[0-4]\d|25[0-5]),/.test(color)),
-        );
-        expect(greens).toEqual([]);
-      });
-    } finally {
-      const cleanup = await openRoute(browser, baseURL, ROUTES[0]);
-      try {
-        await cleanup.page.goto("/m");
-        for (const id of createdHosts.splice(0)) {
-          await cleanup.page.request.delete(`/v1/hosts/${id}`).catch(() => undefined);
-        }
-      } finally {
-        await cleanup.context.close();
-      }
-    }
+      expect(greens).toEqual([]);
+    });
   });
 });
 
@@ -694,10 +726,8 @@ test.describe("soft keyboard up (390)", () => {
       const page = setup.page;
       await page.goto("/m");
       await expect(page.getByTestId("home-list")).toBeVisible({ timeout: 20_000 });
-      mainId = await seatMain(page, "hold-working 值班中", "值班 Main");
-      // Clear the launch approval so the seat pauses cleanly later.
-      await waitPending(page, mainId);
-      await answerApproval(page, mainId);
+      // Cardless turn: a live Main with no launch approval to clear.
+      mainId = await seatMain(page, "hshowcase-working 值班中", "值班 Main");
       await page.goto("/m");
       await expect(page.getByTestId("main-ask-dock")).toBeVisible({ timeout: 20_000 });
       const input = page.getByTestId("main-ask-dock").getByTestId("composer-input");
@@ -710,6 +740,19 @@ test.describe("soft keyboard up (390)", () => {
       await expect(page.getByTestId("main-ask-dock")).toBeVisible();
       await expect(page.getByTestId("home-list")).toBeVisible();
       await expect(page.locator('[data-testid="home-row"]').first()).toBeVisible();
+      // ui-screenshots asks for the 快捷提问 chips above the input while the
+      // keyboard is up. They belong to `home-main-extras` (home.md §6.3) and
+      // are not in this build: assert them the moment that slice lands,
+      // rather than pretending a surface the UI does not have.
+      const quickAsk = page.getByTestId("home-quick-ask");
+      if ((await quickAsk.count()) > 0) {
+        await expect(quickAsk).toBeVisible();
+      } else {
+        test.info().annotations.push({
+          type: "uncovered",
+          description: "home-main-extras: quick-ask chips above the focused ⑨",
+        });
+      }
       for (const mode of ["light", "dark"] as const) {
         await setMode(page, mode);
         await keyboardShot(page, mode);
@@ -885,9 +928,20 @@ test.describe("queue full", () => {
 });
 
 test.describe("searching", () => {
-  test("typing in the ledger search hides ④", async ({ browser }) => {
-    test.setTimeout(120_000);
+  test("typing in the ledger search hides ④ and expands every fold", async ({ browser }) => {
+    test.setTimeout(180_000);
     const baseURL = test.info().project.use.baseURL!;
+    // An IDLE row that the busy group would fold away; searching must show it
+    // (ui-screenshots: 「folds expanded」) while ④ is hidden.
+    const setup = await openRoute(browser, baseURL, ROUTES[0]);
+    try {
+      const page = setup.page;
+      await page.goto("/m");
+      await createSession(page, "hshowcase-idle 支付文档复核", "支付文档复核");
+    } finally {
+      await setup.context.close();
+    }
+
     await captureState(browser, baseURL, "searching", async (home, route) => {
       await waitQueue(home);
       if (route.phone) {
@@ -896,11 +950,20 @@ test.describe("searching", () => {
         await expect(home.getByTestId("home-row").filter({ hasText: "审查支付迁移" })).toBeVisible({
           timeout: 20_000,
         });
+        // Folded rows are visible and neither fold toggle is offered.
+        await expect(home.getByTestId("home-row").filter({ hasText: "支付文档复核" })).toBeVisible({
+          timeout: 20_000,
+        });
+        await expect(home.getByTestId("home-idle-fold")).toHaveCount(0);
+        await expect(home.getByTestId("home-quiet-fold")).toHaveCount(0);
       } else {
         await expect(home.getByTestId("session-search")).toBeVisible({ timeout: 20_000 });
         await home.getByTestId("session-search").fill("支付");
         await expect(home.getByTestId("home-queue")).toHaveCount(0);
         await expect(home.locator('[data-testid="board-card"]').filter({ hasText: "审查支付迁移" })).toBeVisible({
+          timeout: 20_000,
+        });
+        await expect(home.locator('[data-testid="board-card"]').filter({ hasText: "支付文档复核" })).toBeVisible({
           timeout: 20_000,
         });
       }

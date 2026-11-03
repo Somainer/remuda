@@ -63,6 +63,7 @@ pub use binary::{
 };
 pub use capabilities::{
     ADAPTER_VERSION, MatrixMark, capability_matrix, capability_set, capability_snapshot,
+    reads_screen,
 };
 pub use claude_bg::{ClaudeBgDriver, ClaudeBgOptions, parse_backgrounded};
 pub use claude_onboarding::{

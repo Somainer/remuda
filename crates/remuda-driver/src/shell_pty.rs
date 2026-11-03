@@ -6067,6 +6067,10 @@ mod tests {
             screen.lines
         );
         assert!(screen.cols > 0 && screen.rows > 0);
+        assert!(
+            crate::reads_screen(DriverKind::ShellPty),
+            "the capability the Hub's screen fallback reads must say so"
+        );
 
         driver.close().await.unwrap();
         assert!(

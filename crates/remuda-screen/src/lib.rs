@@ -43,7 +43,8 @@ pub use grid::{ModeSet, OscState, ScreenGrid};
 pub use osc::{OscStatus, ProgressBar, progress_active, progress_state};
 pub use signature::{HookHealth, ScreenLatch, ScreenStatus, detect_from_screen, screen_status};
 pub use statusline::{
-    ScreenElapsed, ScreenLive, ScreenLiveChange, ScreenLiveLatch, ScreenTokens, screen_live,
+    STATUS_REGION_ROWS, ScreenElapsed, ScreenLive, ScreenLiveChange, ScreenLiveLatch, ScreenTokens,
+    screen_live,
 };
 
 /// Where an attach snapshot's bytes came from.

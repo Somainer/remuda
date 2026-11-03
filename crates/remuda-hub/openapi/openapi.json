@@ -6509,6 +6509,176 @@
         ],
         "type": "object"
       },
+      "OwnerNotice": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "One `owner notify` claim row (D-060 §11.5): what the seat (or the owner's own device) told the owner. Title and body are the writer's text.",
+        "properties": {
+          "noticeId": {
+            "type": "string",
+            "description": "`ntc_…`; the push tag is `notice:<noticeId>`."
+          },
+          "lineageId": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Lineage of the writing chapter; null for the owner's own device."
+          },
+          "chapterInstanceId": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The chapter that wrote it; null for the owner's own device."
+          },
+          "turnSeq": {
+            "description": "Journal seq of the chapter's latest `turn_started` when it was written; null without one.",
+            "oneOf": [
+              {
+                "type": "integer",
+                "minimum": 0
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "title": {
+            "type": "string",
+            "description": "One line, at most 120 characters."
+          },
+          "body": {
+            "type": "string",
+            "description": "At most 2000 characters."
+          },
+          "dedupeKey": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The dedupe key it was written with."
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "cli",
+              "wake"
+            ],
+            "description": "`cli`: the notify route; `wake`: a wake run's notify declaration."
+          },
+          "origin": {
+            "type": "string",
+            "enum": [
+              "agent",
+              "human",
+              "hub"
+            ],
+            "description": "Who wrote it."
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "When the claim row was written."
+          },
+          "ackedAt": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "When the owner acknowledged it (on any device); null while unacknowledged."
+          }
+        },
+        "required": [
+          "noticeId",
+          "lineageId",
+          "chapterInstanceId",
+          "turnSeq",
+          "title",
+          "body",
+          "dedupeKey",
+          "source",
+          "origin",
+          "createdAt",
+          "ackedAt"
+        ]
+      },
+      "OwnerNoticeResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "One notice as a write returns it.",
+        "properties": {
+          "notice": {
+            "$ref": "#/components/schemas/OwnerNotice"
+          },
+          "created": {
+            "type": "boolean",
+            "description": "Notify only: false when a notice with the same dedupe key already existed (it is returned and nothing is pushed)."
+          }
+        },
+        "required": [
+          "notice"
+        ]
+      },
+      "OwnerNoticePage": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Notices, newest first.",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OwnerNotice"
+            }
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
+      "OwnerNotifyRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "`remuda owner notify`. A credential-shaped title, body or dedupe key is refused with 422 OWNER_NOTIFY_SECRET_REJECTED (the text is never echoed).",
+        "properties": {
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120,
+            "description": "One line."
+          },
+          "body": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000
+          },
+          "dedupeKey": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9._:/-]*$",
+            "description": "A repeat with the same key (per writing lineage, or the owner) returns the original notice and pushes nothing."
+          }
+        },
+        "required": [
+          "title",
+          "body"
+        ]
+      },
       "HerdrClaim": {
         "type": "object",
         "description": "D-062: the external herdr pane a `herdr-claimed` instance claims.",
@@ -13880,6 +14050,164 @@
         ]
       }
     },
+    "/v1/owner/notify": {
+      "post": {
+        "operationId": "ownerNotify",
+        "summary": "Notify the owner (`remuda owner notify`)",
+        "tags": [
+          "owner"
+        ],
+        "description": "D-060 §11.5. The caller is an Agent holding `address-owner` (Main) or the owner's own Human device; anyone else gets 403 with `reason` and `next`. An Agent call passes the commit-time initiator check (a fenced or paused chapter gets 409 `fenced`). The Hub writes the claim row (with its audit row) and queues the push in one transaction, then pushes under the tag `notice:<noticeId>`; a crash before the push is resent at boot under the same tag. Per-device suppression applies (a device visibly following the writing chapter is skipped). A repeat with the same dedupe key returns the original notice with 200 and pushes nothing.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OwnerNotifyRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The original notice (dedupe key repeat)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OwnerNoticeResult"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Claimed; the push is queued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OwnerNoticeResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/owner/notices": {
+      "get": {
+        "operationId": "ownerNotices",
+        "summary": "List the owner's notices, newest first",
+        "tags": [
+          "owner"
+        ],
+        "description": "Human only: a Bot credential and an Agent (a seat, or a Human token narrowed to one) are refused with 403 `owner-only` (an Agent is stopped by the route middleware with `agent-route`). `unacked=1` lists the 「告诉你」 cards still waiting; `instanceId` lists one chapter's notices for its transcript.",
+        "parameters": [
+          {
+            "name": "unacked",
+            "in": "query",
+            "required": false,
+            "description": "`1` for unacknowledged notices only.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "0",
+                "1",
+                "true",
+                "false"
+              ]
+            }
+          },
+          {
+            "name": "instanceId",
+            "in": "query",
+            "required": false,
+            "description": "Only notices this chapter wrote.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "At most this many (default 50, at most 200).",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Notices",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OwnerNoticePage"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/owner/notices/{id}/ack": {
+      "post": {
+        "operationId": "ackOwnerNotice",
+        "summary": "Acknowledge a notice on every device",
+        "tags": [
+          "owner"
+        ],
+        "description": "Idempotent: the first acknowledgement stamps `ackedAt`, later ones return the notice unchanged. A notice acknowledged before its push went out is not pushed. Human only: a Bot or an Agent gets 403 `owner-only` and the notice is left unacknowledged.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The notice",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OwnerNoticeResult"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/v1/hosts/{id}/herdr": {
       "get": {
         "tags": [
@@ -14099,6 +14427,10 @@
     },
     {
       "name": "memory"
+    },
+    {
+      "name": "owner",
+      "description": "The owner's notices: `remuda owner notify` and the 「告诉你」 cards (D-060 §11.5)."
     }
   ]
 }

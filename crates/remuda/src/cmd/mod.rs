@@ -25,6 +25,7 @@ mod memory_import;
 pub mod merge;
 pub mod node;
 mod own;
+mod owner;
 mod profile;
 mod project;
 pub(crate) mod registry;
@@ -68,6 +69,7 @@ commands! {
     Project(project::ProjectArgs),
     Task(task::TaskArgs),
     Own(own::OwnArgs),
+    Owner(owner::OwnerArgs),
     Memory(memory::MemoryArgs),
     Profile(profile::ProfileArgs),
     Dispatch(dispatch::DispatchArgs),

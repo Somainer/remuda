@@ -12,9 +12,11 @@ import {
   host,
   inst,
   interaction,
+  notice,
   question,
   task,
 } from "./queueTestData";
+import type { OwnerNotice } from "./notices";
 
 /**
  * The ④ queue's render contract (home.md §4.1, §4.4, §8, §9 落点): the
@@ -30,6 +32,8 @@ const fake = vi.hoisted(() => ({
   respond: vi.fn(),
   refresh: vi.fn(),
   markSeen: vi.fn(),
+  notices: [] as OwnerNotice[],
+  ack: vi.fn(),
 }));
 
 vi.mock("../../lib/store", () => ({
@@ -42,6 +46,12 @@ vi.mock("../../lib/store", () => ({
     refresh: fake.refresh,
     markSeen: fake.markSeen,
   },
+}));
+
+vi.mock("./notices", () => ({
+  useOwnerNotices: () => ({ notices: fake.notices, loaded: true }),
+  noticeStore: { ack: fake.ack },
+  noticeVoice: (row: { origin: string }) => (row.origin === "hub" ? "Hub" : row.origin === "human" ? "备忘" : "Main"),
 }));
 
 vi.mock("./freshness", () => ({
@@ -98,6 +108,8 @@ beforeEach(() => {
   fake.respond.mockReset();
   fake.refresh.mockReset().mockResolvedValue(undefined);
   fake.markSeen.mockReset().mockResolvedValue(null);
+  fake.notices = [];
+  fake.ack.mockReset();
   Element.prototype.scrollIntoView = vi.fn();
 });
 
@@ -204,6 +216,79 @@ describe("HomeQueue (§4.1)", () => {
       fireEvent.click(within(card).getByTestId("home-card-ack"));
     });
     expect(fake.markSeen).toHaveBeenCalledWith("ins_f");
+  });
+});
+
+describe("HomeQueue 告诉你 (§4.1 kind 4, §4.2, D-060 §11.5)", () => {
+  it("renders Main's notice after 任务待你 with title, body, 知道了 and 打开对话, outside the count", () => {
+    fake.tasks = [task({ id: "tsk_b", blockedReason: "等你确认" })];
+    fake.notices = [notice({ noticeId: "ntc_1" })];
+    fake.state = hub({
+      instances: [inst({ id: "ins_f", lastTurnError: { at: T1, text: "API Error: 529" }, unseen: true })],
+    });
+    renderQueue("desktop", "/sessions");
+    expect(cards().map((card) => card.getAttribute("data-card-type"))).toEqual(["task", "notice", "failed"]);
+    // N counts 任务待你 only (§5.1): not the notice, not the failed turn.
+    expect(screen.getByTestId("home-queue-title")).toHaveTextContent("需要你 · 1");
+    const card = cards()[1];
+    expect(card).toHaveAttribute("data-notice-id", "ntc_1");
+    // Main's voice, not the owner's.
+    expect(within(card).getByText("告诉你 · Main")).toBeInTheDocument();
+    expect(within(card).getByTestId("home-card-title")).toHaveTextContent("Nightly gate red");
+    expect(within(card).getByTestId("home-card-body")).toHaveTextContent("Lane 2 failed: wire_golden.");
+    expect(within(card).getByTestId("home-card-open")).toHaveAttribute("href", "/s/ins_main");
+  });
+
+  it("acknowledges on the Hub with 知道了 and shows a failure inline", async () => {
+    fake.notices = [notice({ noticeId: "ntc_1" }), notice({ noticeId: "ntc_2", origin: "human", chapterInstanceId: null, createdAt: T0 })];
+    fake.state = hub();
+    fake.ack.mockResolvedValueOnce(notice({ noticeId: "ntc_1", ackedAt: T2 }));
+    fake.ack.mockRejectedValueOnce(new Error("hub down"));
+    renderQueue();
+    const [first, second] = cards();
+    // The owner's own notice has no conversation to open.
+    expect(within(second).queryByTestId("home-card-open")).toBeNull();
+    expect(within(second).getByText("告诉你 · 备忘")).toBeInTheDocument();
+    await act(async () => {
+      fireEvent.click(within(first).getByTestId("home-card-ack"));
+    });
+    expect(fake.ack).toHaveBeenCalledWith("ntc_1");
+    await act(async () => {
+      fireEvent.click(within(second).getByTestId("home-card-ack"));
+    });
+    expect(within(second).getByRole("alert")).toHaveTextContent("hub down");
+    expect(within(second).getByTestId("home-card-ack")).toBeEnabled();
+  });
+
+  it("leaves the queue once the acknowledged notice is gone from the list", () => {
+    fake.notices = [notice({ noticeId: "ntc_1" })];
+    fake.state = hub();
+    const view = renderQueue();
+    expect(cards()).toHaveLength(1);
+    fake.notices = [];
+    rerenderQueue(view);
+    expect(cards()).toHaveLength(0);
+    expect(screen.getByTestId("home-queue-title")).toHaveTextContent("需要你 · 0");
+  });
+
+  it("greys 知道了 with 数据可能过期 while the queue is stale (§8)", () => {
+    fake.notices = [notice({ noticeId: "ntc_1" })];
+    fake.state = hub();
+    fake.freshness = { state: "stale", lastOkAt: 1, failingSince: 1 };
+    renderQueue();
+    const card = cards()[0];
+    expect(within(card).getByTestId("home-card-ack")).toBeDisabled();
+    expect(within(card).getByTestId("home-card-stale")).toHaveTextContent("数据可能过期");
+    expect(within(card).getByTestId("home-card-open")).not.toHaveAttribute("aria-disabled");
+    fireEvent.click(within(card).getByTestId("home-card-ack"));
+    expect(fake.ack).not.toHaveBeenCalled();
+  });
+
+  it("rings a notice a push landed on (?focus=<noticeId>)", () => {
+    fake.notices = [notice({ noticeId: "ntc_1" })];
+    fake.state = hub();
+    renderQueue("phone", "/m?focus=ntc_1");
+    expect(cards()[0]).toHaveAttribute("data-focus", "true");
   });
 });
 

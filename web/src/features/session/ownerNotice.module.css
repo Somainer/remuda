@@ -1,0 +1,94 @@
+/* @tokens strict */
+/*
+ * D-060 §11.5 「告诉你」 in Main's transcript: a card in Main's voice under the
+ * turn's reply — bordered and labelled so it never reads as the owner's own
+ * bubble, with the info (link) accent rather than the attention colour.
+ */
+.notices {
+  list-style: none;
+  margin: var(--space-2) 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.notice {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--link);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+}
+
+.notice[data-acked="1"] {
+  border-left-color: var(--divider);
+}
+
+.head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.voice {
+  color: var(--link);
+  font-size: var(--text-meta);
+  font-weight: 600;
+  line-height: var(--lh-meta);
+}
+
+.time {
+  margin-left: auto;
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+}
+
+.title {
+  margin: 0;
+  color: var(--fg-strong);
+  font-size: var(--text-ui);
+  font-weight: 600;
+  line-height: var(--lh-ui);
+  overflow-wrap: anywhere;
+}
+
+.body {
+  margin: 0;
+  color: var(--fg-body);
+  font-size: var(--text-ui);
+  line-height: var(--lh-ui);
+  overflow-wrap: anywhere;
+  white-space: pre-line;
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.ack {
+  composes: btn from "../../styles/ui.module.css";
+  border-radius: var(--radius-pill);
+}
+
+.done {
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+}
+
+.error {
+  color: var(--danger-fg);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+}

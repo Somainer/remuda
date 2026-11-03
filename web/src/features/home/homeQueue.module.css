@@ -110,6 +110,12 @@
   color: var(--danger-fg);
 }
 
+/* 告诉你 (D-060 §11.5): Main speaking to the owner — the info voice, not the
+   attention colour of a card that waits on them. */
+.card[data-card-type="notice"] .label {
+  color: var(--link);
+}
+
 .where {
   flex: 0 1 auto;
   min-width: 0;

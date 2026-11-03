@@ -120,6 +120,54 @@ fn note_outbox() {
     OUTBOX_DIRTY.with(|dirty| dirty.set(true));
 }
 
+/// One push to queue in the outbox from a writer job (D-060 §11.5 reuses
+/// the §8.3 outbox: `owner notify` writes its claim row and this row in one
+/// transaction, so a crash before the send is resent at boot under the same
+/// tag). `INSERT OR IGNORE` on `key`: queuing the same push twice adds
+/// nothing.
+pub(crate) struct OutboxPush<'a> {
+    pub key: &'a str,
+    pub kind: &'static str,
+    /// The instance the push is about: per-device suppression (§8.4) skips
+    /// the devices that follow it with the page visible.
+    pub instance_id: &'a str,
+    pub tag: PushTag,
+    pub title: &'a str,
+    pub body: &'a str,
+    pub url: &'a str,
+}
+
+/// Queue `push` in the outbox; the writer loop wakes the drive after the
+/// job commits. Returns whether a row was inserted.
+pub(crate) fn enqueue(conn: &Connection, push: &OutboxPush<'_>) -> Result<bool, StoreError> {
+    let (tag_kind, tag_id) = match &push.tag {
+        PushTag::Interaction { id } => ("interaction", id.as_str()),
+        PushTag::Instance { id } => ("instance", id.as_str()),
+        PushTag::Notice { id } => ("notice", id.as_str()),
+    };
+    let inserted = conn.execute(
+        "INSERT OR IGNORE INTO push_outbox
+            (outbox_key, kind, instance_id, interaction_id, tag_kind, tag_id, title, body, url,
+             created_at)
+         VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            push.key,
+            push.kind,
+            push.instance_id,
+            tag_kind,
+            tag_id,
+            push.title,
+            push.body,
+            push.url,
+            crate::config::now_rfc3339()
+        ],
+    )?;
+    if inserted > 0 {
+        note_outbox();
+    }
+    Ok(inserted > 0)
+}
+
 /// Whether the job that just ran on this thread queued outbox rows.
 pub(crate) fn take_outbox_dirty() -> bool {
     OUTBOX_DIRTY.with(|dirty| dirty.replace(false))
@@ -783,6 +831,11 @@ impl OutboxState {
         self.skip_marks
             .store(count, std::sync::atomic::Ordering::SeqCst);
     }
+
+    /// Hold the drive: no row is sent until the guard drops.
+    pub(crate) async fn hold(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.drive.clone().lock_owned().await
+    }
 }
 
 impl OutboxState {
@@ -854,10 +907,10 @@ async fn send_outbox(state: &AppState) {
                         kind: row.get(1)?,
                         instance_id: row.get(2)?,
                         interaction_id: row.get(3)?,
-                        tag: if tag_kind == "interaction" {
-                            PushTag::Interaction { id: tag_id }
-                        } else {
-                            PushTag::Instance { id: tag_id }
+                        tag: match tag_kind.as_str() {
+                            "interaction" => PushTag::Interaction { id: tag_id },
+                            "notice" => PushTag::Notice { id: tag_id },
+                            _ => PushTag::Instance { id: tag_id },
                         },
                         title: row.get(6)?,
                         body: row.get(7)?,
@@ -876,14 +929,21 @@ async fn send_outbox(state: &AppState) {
         }
     };
     for row in rows {
-        let moot = match &row.interaction_id {
-            Some(interaction_id) => !interaction_pending(state, interaction_id).await,
-            None => false,
+        let moot = match (&row.interaction_id, &row.tag) {
+            (Some(interaction_id), _) => !interaction_pending(state, interaction_id).await,
+            // D-060 §11.5: a notice the owner acknowledged before its push
+            // went out needs no push.
+            (None, PushTag::Notice { id }) => crate::owner_notify::acked(state, id).await,
+            (None, _) => false,
         };
         let recipients = if moot {
             Some(0)
         } else {
-            let category = if row.kind == "lift" { "lift" } else { "reply" };
+            let category = match row.kind.as_str() {
+                "lift" => "lift",
+                "notice" => "notice",
+                _ => "reply",
+            };
             crate::alerts::fanout(
                 state,
                 category,

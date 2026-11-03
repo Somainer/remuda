@@ -256,7 +256,7 @@
 1. **Main 在问你**：Main 现行章节上的待处理交互，置顶，只计一次（`home-main-extras`）。
 2. **其他待处理交互**：`GET /v1/interactions` 中 `status=pending` 且没有过期的项，派生规则和收件箱一样（`deriveInboxQueue`），顺序也和收件箱「待你处理」档一样。`routed-to` 落地后，`routedTo=main` 的项不进入队列（§5.1）。
 3. **任务待你**：`GET /v1/tasks` 中未归档、`blockedReason` 非空、并且它的会话都没有待处理交互的任务（§4.6）。
-4. **告诉你**：`home-to-you` 落地后，Main 用 `remuda owner notify` 发出、还没确认的通知（D-060 决策 7；`cb-owner-notify`）。
+4. **告诉你**：Main 用 `remuda owner notify` 发出、还没确认的通知（D-060 决策 7）。notices 的 list 与 ack 路由和卡片已随 `cb-owner-notify` 落地（[main-agent.md §11.7](./main-agent.md#117-implementation-notes-cb-owner-notify-2026-11-03)），按创建时间新的在前。
 5. **回合失败**：`GET /v1/instances` 中带 `lastTurnError` 的实例（D-057 OA6），离开规则见 §4.5。
 
 第 1–3 类计入「需要你」的数字（§5），第 4、5 类不计入。

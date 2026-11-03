@@ -72,6 +72,7 @@ mod model_catalog;
 pub use model_catalog::CATALOG_REVISION;
 mod node_ops;
 mod objects;
+mod owner_notify;
 mod passkeys;
 mod placement;
 mod projects;
@@ -910,6 +911,14 @@ impl HubTestHandle {
     #[cfg(any(test, feature = "test-faults"))]
     pub fn test_skip_outbox_marks(&self, count: usize) {
         self.state.outbox.skip_next_marks(count);
+    }
+
+    /// D-060 §11.5: hold the push outbox drive until the guard drops, as if
+    /// the Hub stopped right after a writer job committed its outbox rows and
+    /// before any drive sent them (test-faults). Drives wait; the tick skips.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_hold_outbox_drive(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.state.outbox.hold().await
     }
 
     /// D-057 §6.3.1: the next `count` C1 successor preparations fail with a
@@ -2686,6 +2695,7 @@ pub fn router(state: AppState) -> Router {
         .merge(worker_watch::routes())
         .merge(digest::routes())
         .merge(inbox::routes())
+        .merge(owner_notify::routes())
         .merge(bot::routes());
     if let Some(push) = state.push.clone() {
         app = app.nest_service("/push", push_http::nest(push, state.store.clone()));

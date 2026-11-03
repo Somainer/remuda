@@ -22452,7 +22452,7 @@
           "type": "string"
         },
         "missedBefore": {
-          "description": "Occurrences missed before it, which it reports.",
+          "description": "Occurrences skipped before it (none of them ran): those the Hub was\ndown for, those due while the previous run was still open, and, for\n`when`, the other facts found in the same evaluation.",
           "format": "int64",
           "type": "integer"
         },
@@ -22610,7 +22610,7 @@
           "type": "string"
         },
         "missedCount": {
-          "description": "Occurrences that came due while an earlier run was still queued or\nrunning; the next run reports them and this resets.",
+          "description": "Occurrences skipped because they came due while an earlier run was\nstill queued or running: none of them gets a run of its own, not even\nonce that run ends. The next run reports them and this resets.",
           "format": "int64",
           "type": "integer"
         },

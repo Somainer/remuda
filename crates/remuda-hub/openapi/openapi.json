@@ -6880,7 +6880,7 @@
             "description": "The next scheduled occurrence; absent for when and once done."
           },
           "missedCount": {
-            "description": "Occurrences that came due while an earlier run was still queued or running; the next run reports them.",
+            "description": "Occurrences skipped because they came due while an earlier run was still queued or running: none of them gets a run of its own, not even once that run ends. The next run reports them and this resets.",
             "type": "integer"
           },
           "createdAt": {
@@ -6972,7 +6972,7 @@
             "type": "string"
           },
           "missedBefore": {
-            "description": "Occurrences missed before it, which it reports.",
+            "description": "Occurrences skipped before it (none of them ran): those the Hub was down for, those due while the previous run was still open, and, for when, the other facts found in the same evaluation.",
             "type": "integer"
           },
           "failureKind": {

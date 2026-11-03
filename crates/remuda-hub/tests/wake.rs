@@ -648,7 +648,7 @@ async fn missed_occurrences_fire_once_with_their_count() -> Result<()> {
     ctx.settle().await?;
     let envelope = text_of(ctx.wake_sends(&seat).last().context("first batch")?);
     assert!(
-        envelope.contains("3 earlier occurrences were missed"),
+        envelope.contains("3 earlier occurrences were skipped without a run of their own"),
         "{envelope}"
     );
     ctx.run_wake_turn(&seat, "success", 10).await?;
@@ -660,7 +660,60 @@ async fn missed_occurrences_fire_once_with_their_count() -> Result<()> {
     assert_eq!(ctx.list(&seat).await?["items"][0]["missedCount"], 0);
     let envelope = text_of(ctx.wake_sends(&seat).last().context("second batch")?);
     assert!(
-        envelope.contains("1 earlier occurrence was missed"),
+        envelope.contains("1 earlier occurrence was skipped without a run of its own"),
+        "{envelope}"
+    );
+    Ok(())
+}
+
+/// §11.1, r2 item 1: an occurrence that comes due while the previous run is
+/// still open is skipped, not deferred. No run is ever made for it, not even
+/// once the open run ends; the next scheduled run reports exactly that one
+/// occurrence (it is counted once, and the fired one is never counted).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_occurrence_due_while_the_run_is_open_is_skipped_and_reported_once() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("wake-skip").await?;
+    let (seat, token) = ctx.seat(&project).await?;
+    let wake = ctx
+        .add_ok(&token, &seat, every(600, "beat", "never"))
+        .await?;
+    let first = next_fire(&wake);
+    // The first occurrence fires; its batch goes out at once: running.
+    assert_eq!(ctx.tick(&shift(&first, 1)).await?, 1);
+    let runs = ctx.runs(&seat).await?;
+    assert_eq!(runs[0]["state"], "running", "{runs:#?}");
+    assert_eq!(runs[0]["missedBefore"], 0);
+    // The next occurrence comes due while that run is open: no run, and it
+    // is counted once.
+    assert_eq!(ctx.tick(&shift(&first, 601)).await?, 0);
+    let listed = ctx.list(&seat).await?;
+    assert_eq!(listed["items"][0]["missedCount"], 1);
+    assert_eq!(next_fire(&listed["items"][0]), shift(&first, 1200));
+    // The open run ends. The skipped occurrence is not delivered late.
+    ctx.run_wake_turn(&seat, "success", 10).await?;
+    assert_eq!(ctx.runs(&seat).await?[0]["state"], "success");
+    assert_eq!(
+        ctx.tick(&shift(&first, 630)).await?,
+        0,
+        "skipped, not deferred"
+    );
+    assert_eq!(ctx.runs(&seat).await?.len(), 1);
+    // The occurrence after it fires and reports the one it skipped.
+    assert_eq!(ctx.tick(&shift(&first, 1201)).await?, 1);
+    let runs = ctx.runs(&seat).await?;
+    assert_eq!(runs.len(), 2, "{runs:#?}");
+    assert_eq!(runs[1]["scheduledAt"], shift(&first, 1200).as_str());
+    assert_eq!(runs[1]["missedBefore"], 1);
+    assert!(
+        runs.iter()
+            .all(|run| run["scheduledAt"] != shift(&first, 600).as_str()),
+        "no run for the skipped occurrence: {runs:#?}"
+    );
+    assert_eq!(ctx.list(&seat).await?["items"][0]["missedCount"], 0);
+    let envelope = text_of(ctx.wake_sends(&seat).last().context("second batch")?);
+    assert!(
+        envelope.contains("1 earlier occurrence was skipped without a run of its own"),
         "{envelope}"
     );
     Ok(())
@@ -726,7 +779,7 @@ async fn a_busy_lineage_waits_for_idle_through_the_inbox() -> Result<()> {
         "standup",
         run_id,
         &format!("fired at {}", runs[0]["firedAt"].as_str().unwrap()),
-        "no earlier occurrence was missed",
+        "no earlier occurrence was skipped",
         UNATTENDED,
         END_TURN,
         r#""Summarize the night's gate runs.\nKeep it short.""#,

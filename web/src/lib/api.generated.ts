@@ -4082,7 +4082,7 @@ export interface components {
             /** Format: date-time */
             firedAt: string;
             lineageId: string;
-            /** @description Occurrences missed before it, which it reports. */
+            /** @description Occurrences skipped before it (none of them ran): those the Hub was down for, those due while the previous run was still open, and, for when, the other facts found in the same evaluation. */
             missedBefore: number;
             mode: components["schemas"]["WakeMode"];
             name: string;
@@ -4113,7 +4113,7 @@ export interface components {
             /** Format: date-time */
             lastFiredAt?: string;
             lineageId: string;
-            /** @description Occurrences that came due while an earlier run was still queued or running; the next run reports them. */
+            /** @description Occurrences skipped because they came due while an earlier run was still queued or running: none of them gets a run of its own, not even once that run ends. The next run reports them and this resets. */
             missedCount: number;
             mode: components["schemas"]["WakeMode"];
             name: string;

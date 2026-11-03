@@ -22,12 +22,13 @@
 //!   becomes `interrupted` and is never replayed (its fact stays consumed
 //!   even if the batch is later released); the next occurrence is computed
 //!   from the schedule as usual.
-//! * **Missed occurrences.** An `every` wake-up whose occurrences passed
-//!   while the Hub was down fires once, for the latest one, and reports how
-//!   many it missed. An occurrence that comes due while the wake-up's
-//!   previous run is still queued or running fires nothing: it is added to
-//!   the wake-up's missed count, which the next run reports. Nothing is
-//!   merged silently.
+//! * **Missed (skipped) occurrences.** An `every` wake-up whose occurrences
+//!   passed while the Hub was down fires once, for the latest one, and
+//!   reports how many it skipped. An occurrence that comes due while the
+//!   wake-up's previous run is still queued or running is skipped too: the
+//!   schedule moves past it and it never gets a run of its own, not even
+//!   once that run ends. It is added to the wake-up's missed count, which
+//!   the next run reports. Nothing is merged silently.
 //! * **Delivery (§11.1).** A persistent run is a `wake-due` fact for the
 //!   lineage, so it waits for the idle point like any fact (§10); there is no
 //!   separate busy deferral. Each batch carries at most one wake run and opens
@@ -1289,7 +1290,10 @@ struct Fire {
 }
 
 /// Claim one occurrence of `wake`: a run, unless an earlier run of it is
-/// still queued or running, in which case the occurrences count as missed.
+/// still queued or running. Then the occurrences due now are skipped: the
+/// caller has already moved the schedule past them, so none of them ever
+/// gets a run of its own, not even once the open run ends. They are counted
+/// in the wake-up's missed count, which the next run reports as skipped.
 fn fire(
     conn: &Connection,
     wake: &Wake,
@@ -1304,6 +1308,9 @@ fn fire(
         |row| row.get(0),
     )?;
     if busy {
+        // Every occurrence due now is skipped (none of them fired), so all
+        // `due` of them count; the fire path below counts `due - 1` because
+        // it fires the latest one.
         conn.execute(
             "UPDATE wake_ups SET missed_count = ?2, updated_at = ?3 WHERE wake_id = ?1",
             params![
@@ -1946,12 +1953,17 @@ fn notify_run(
     let name = crate::inbox_voice::token(&run.name);
     let missed = if run.missed_before > 0 {
         format!(
-            " {} earlier occurrence{} missed.",
+            " {} earlier occurrence{} skipped without a run of {}.",
             run.missed_before,
             if run.missed_before == 1 {
                 " was"
             } else {
                 "s were"
+            },
+            if run.missed_before == 1 {
+                "its own"
+            } else {
+                "their own"
             }
         )
     } else {

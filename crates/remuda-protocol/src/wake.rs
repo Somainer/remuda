@@ -273,8 +273,9 @@ pub struct WakeUp {
     /// once done.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_fire_at: Option<String>,
-    /// Occurrences that came due while an earlier run was still queued or
-    /// running; the next run reports them and this resets.
+    /// Occurrences skipped because they came due while an earlier run was
+    /// still queued or running: none of them gets a run of its own, not even
+    /// once that run ends. The next run reports them and this resets.
     pub missed_count: i64,
     /// When it was added (UTC RFC3339).
     pub created_at: String,
@@ -328,7 +329,9 @@ pub struct WakeRun {
     /// The child the Hub created for it (fresh mode).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub child_instance_id: Option<String>,
-    /// Occurrences missed before it, which it reports.
+    /// Occurrences skipped before it (none of them ran): those the Hub was
+    /// down for, those due while the previous run was still open, and, for
+    /// `when`, the other facts found in the same evaluation.
     pub missed_before: i64,
     /// Why it failed: `not-received`, `not-delivered`, `delivery`,
     /// `turn-failed`, `chapter-ended`, `fresh-refused`, `child-failed`,

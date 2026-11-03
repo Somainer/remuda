@@ -81,23 +81,43 @@ pub(crate) fn screen_changed_at(
 }
 
 /// A digest of what the screen shows, without the parts that repaint on
-/// their own. A spinner status line counts by its signature (verb, token
+/// their own. When the grid carries a spinner status line
+/// (`remuda_screen::screen_live`, which also joins a line wrapped across
+/// rows), the status region counts only by the line's signature (verb, token
 /// estimate, phrase, interrupt hint), never its cycling glyph or printed
-/// elapsed, so a spinner that only ticks is not progress.
+/// elapsed time: a spinner that only ticks is not progress. Rows above the
+/// status region count as they are.
 pub(crate) fn progress_digest(lines: &[String], raw: bool) -> String {
     let grid = if raw {
         remuda_screen::ScreenGrid::from_raw(&lines.join("\n"))
     } else {
         remuda_screen::ScreenGrid::from_lines(lines.iter().cloned())
     };
+    let text = grid.text();
+    let rows: Vec<&str> = text.lines().map(str::trim_end).collect();
     let mut hasher = Sha256::new();
-    for row in grid.text().lines() {
-        let row = row.trim_end();
-        let one = remuda_screen::ScreenGrid::from_lines([row.to_owned()]);
-        match remuda_screen::screen_live(&one) {
-            Some(live) => hasher.update(format!("spinner:{}", live.signature()).as_bytes()),
-            None => hasher.update(row.as_bytes()),
+    let content = match remuda_screen::screen_live(&grid) {
+        Some(live) => {
+            hasher.update(format!("spinner:{}\n", live.signature()).as_bytes());
+            // The status region is the bottom non-empty rows `screen_live`
+            // searched; everything above it is content.
+            let mut seen = 0;
+            let mut cut = rows.len();
+            for (index, row) in rows.iter().enumerate().rev() {
+                if seen == remuda_screen::STATUS_REGION_ROWS {
+                    break;
+                }
+                if !row.trim().is_empty() {
+                    seen += 1;
+                    cut = index;
+                }
+            }
+            &rows[..cut]
         }
+        None => &rows[..],
+    };
+    for row in content {
+        hasher.update(row.as_bytes());
         hasher.update(b"\n");
     }
     hex(&hasher.finalize())
@@ -537,6 +557,35 @@ mod tests {
         assert_eq!(
             progress_digest(&before, false),
             progress_digest(&after, false)
+        );
+
+        // r2: an 80-column wrap (the statusline.rs fixture shape) splits the
+        // status line across two rows; its glyph and elapsed time still do not
+        // count as progress.
+        let wrapped = |glyph: &str, elapsed: &str, above: &[&str]| {
+            let full = format!(
+                "{glyph} Razzmatazzing… ({elapsed} · ↓ 66.0k tokens · thinking some more with xhigh effort)"
+            );
+            assert_eq!(full.chars().count(), 82);
+            let mut lines: Vec<String> = above.iter().map(|row| (*row).to_owned()).collect();
+            lines.push(full.chars().take(80).collect());
+            lines.push(full.chars().skip(80).collect());
+            lines.push("❯".to_owned());
+            lines
+        };
+        let transcript: Vec<String> = (1..=10).map(|n| format!("output line {n}")).collect();
+        let above: Vec<&str> = transcript.iter().map(String::as_str).collect();
+        assert_eq!(
+            progress_digest(&wrapped("·", "49m 38s", &above), false),
+            progress_digest(&wrapped("✻", "50m 02s", &above), false),
+            "a wrapped spinner that only ticks is not progress"
+        );
+        // Content above the status region still is.
+        let mut more = above.clone();
+        more.push("output line 11");
+        assert_ne!(
+            progress_digest(&wrapped("·", "49m 38s", &above), false),
+            progress_digest(&wrapped("·", "49m 38s", &more), false),
         );
     }
 

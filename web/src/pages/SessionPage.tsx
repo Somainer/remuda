@@ -30,6 +30,7 @@ import { RunDetails } from "../features/session/RunDetails";
 import { claudeDefaultTier, contextPercent } from "../features/session/effort";
 import { Transcript, type TranscriptHandle } from "../features/session/Transcript";
 import { rememberedByReply, useRememberedWrites } from "../features/session/remembered";
+import { noticeStore, noticesByReply, useChapterNotices } from "../features/home/notices";
 import { LiveStatusStrip } from "../features/session/live/LiveStatusStrip";
 import { useTurnDecision } from "../features/session/useTurnDecision";
 import { SessionNotifications } from "../features/session/notifications/SessionNotifications";
@@ -460,6 +461,25 @@ function SessionPageBody({
   const rememberedRows = useMemo(
     () => rememberedByReply(events, rememberedWrites),
     [events, rememberedWrites],
+  );
+  // D-060 §11.5: Main's 「告诉你」 cards, read with the same refresh and only
+  // on a chapter of Main's lineage (no other seat can notify the owner).
+  const chapterNotices = useChapterNotices(
+    instanceId,
+    mainLineage,
+    events.length ? String(events.at(-1)?.seq ?? instance?.durableSeq ?? "0") : instance?.durableSeq,
+  );
+  const noticeRows = useMemo(
+    () => noticesByReply(events, chapterNotices.notices),
+    [events, chapterNotices.notices],
+  );
+  const { acked: noticeAcked } = chapterNotices;
+  const ackNotice = useCallback(
+    async (noticeId: string) => {
+      const notice = await noticeStore.ack(noticeId);
+      noticeAcked(notice);
+    },
+    [noticeAcked],
   );
   const openMemory = useCallback(
     (slug: string) => navigate(`/s/${instanceId}/memory?slug=${encodeURIComponent(slug)}`),
@@ -916,6 +936,8 @@ function SessionPageBody({
             steerHeld={steerHeldControl(instance.kind, composerPhase, instance.capabilities)}
             remembered={rememberedRows}
             onOpenMemory={openMemory}
+            notices={noticeRows}
+            onAckNotice={ackNotice}
             onSteerHeld={async (_iid, id) => {
               const landed = await hubStore.steerHeld(instance.id, id);
               // 已打断 is a receipt for an interrupt that actually landed.

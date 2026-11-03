@@ -15,6 +15,11 @@ pub enum PushTag {
         /// Instance identity.
         id: String,
     },
+    /// `notice:{id}` — an `owner notify` notice (D-060 §11.5).
+    Notice {
+        /// Notice identity.
+        id: String,
+    },
 }
 
 impl PushTag {
@@ -23,6 +28,7 @@ impl PushTag {
         match self {
             Self::Interaction { id } => format!("interaction:{id}"),
             Self::Instance { id } => format!("instance:{id}"),
+            Self::Notice { id } => format!("notice:{id}"),
         }
     }
 

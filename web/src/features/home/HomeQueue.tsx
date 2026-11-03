@@ -23,6 +23,7 @@ import {
   type HomeQueueCard,
   type Receipt,
 } from "./homeQueue";
+import { noticeStore, noticeVoice, useOwnerNotices } from "./notices";
 import css from "./homeQueue.module.css";
 
 /**
@@ -35,7 +36,7 @@ type ReceiptEntry = { receipt: Receipt | "sending"; card: HomeQueueCard; index: 
 /**
  * ④ 「需要你」 (home.md §4): the page's ONE needs-you queue, on `/m` (phone)
  * and `/sessions` (desktop). Interaction cards are `DecisionCard
- * mode="home"`; 「任务待你」 and 回合失败 cards are drawn here. The header
+ * mode="home"`; 「任务待你」, 「告诉你」 and 回合失败 cards are drawn here. The header
  * number is `glanceCounts()` — the same N as ① and the OS badge (§5.1).
  *
  * - collapsed: 3 cards on the phone, a 2×4 grid on desktop; 「还有 N 条 ▾」
@@ -76,7 +77,9 @@ export function HomeQueue({
     }),
     [hub.instances, hub.interactions, hub.hosts, tasks, hub.answering, deviceId, nowMs],
   );
-  const queue = useMemo(() => deriveHomeQueue(source), [source]);
+  // §4.1 kind 4: the unacknowledged owner notices (not counted in N).
+  const { notices } = useOwnerNotices();
+  const queue = useMemo(() => deriveHomeQueue(source, notices), [source, notices]);
   // §5.1: the header N is the count row's N, read from the one derivation.
   const needYou = useMemo(() => glanceCounts(source).needYou, [source]);
 
@@ -474,6 +477,11 @@ function QueueCard({
       </article>
     );
   }
+  if (card.type === "notice") {
+    return (
+      <NoticeCard card={card} focused={focused} inert={inert} stale={stale} nowMs={nowMs} linkProps={linkProps} />
+    );
+  }
   return (
     <FailedCard
       card={card}
@@ -555,6 +563,92 @@ function FailedCard({
         >
           知道了
         </button>
+        {stale ? (
+          <span className={css.hint} data-testid="home-card-stale">
+            {HOME_STALE_TEXT}
+          </span>
+        ) : null}
+      </div>
+      {error ? (
+        <p className={css.hint} role="alert">
+          {error}
+        </p>
+      ) : null}
+    </article>
+  );
+}
+
+/**
+ * 告诉你 (§4.2, D-060 §11.5): what Main told the owner with `owner notify`,
+ * in Main's voice (never the owner's bubble): the title, the body's first 2
+ * lines, 「知道了」 and 「打开对话」. 知道了 acknowledges on the Hub, so the
+ * card leaves on every device; it waits for the Hub's answer (§4.4) and
+ * greys out while the queue is stale (§8). Not counted in N.
+ */
+function NoticeCard({
+  card,
+  focused,
+  inert,
+  stale,
+  nowMs,
+  linkProps,
+}: {
+  card: Extract<HomeQueueCard, { type: "notice" }>;
+  focused: boolean;
+  inert: boolean;
+  stale: boolean;
+  nowMs: number;
+  linkProps: object;
+}) {
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const { notice } = card;
+  const chapter = notice.chapterInstanceId;
+  return (
+    <article
+      className={`${css.card} ${focused ? css.cardFocus : ""}`}
+      data-testid="home-queue-card"
+      data-card-type="notice"
+      data-card-id={notice.noticeId}
+      data-notice-id={notice.noticeId}
+      data-focus={focused ? "true" : "false"}
+      data-stale={inert ? "1" : undefined}
+    >
+      <header className={css.head}>
+        <span className={css.label}>告诉你 · {noticeVoice(notice)}</span>
+        <span className={css.where}>{formatListTime(notice.createdAt, nowMs)}</span>
+      </header>
+      <p className={css.planTitle} title={notice.title} data-testid="home-card-title">
+        {notice.title}
+      </p>
+      <p className={css.body} title={notice.body} data-testid="home-card-body">
+        {notice.body}
+      </p>
+      <div className={css.actions}>
+        <button
+          type="button"
+          className={css.chip}
+          data-testid="home-card-ack"
+          disabled={inert || busy || stale}
+          onClick={() => {
+            setBusy(true);
+            setError(null);
+            noticeStore.ack(notice.noticeId).then(
+              () => setBusy(false),
+              (reason: unknown) => {
+                setBusy(false);
+                setError(reason instanceof Error ? reason.message : String(reason));
+              },
+            );
+          }}
+        >
+          知道了
+        </button>
+        {chapter ? (
+          <Link to={`/s/${chapter}`} className={css.chipLink} data-testid="home-card-open" {...linkProps}>
+            打开对话
+          </Link>
+        ) : null}
         {stale ? (
           <span className={css.hint} data-testid="home-card-stale">
             {HOME_STALE_TEXT}

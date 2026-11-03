@@ -1310,6 +1310,66 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/owner/notices": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List the owner's notices, newest first
+         * @description Human only: a Bot credential and an Agent (a seat, or a Human token narrowed to one) are refused with 403 `owner-only` (an Agent is stopped by the route middleware with `agent-route`). `unacked=1` lists the 「告诉你」 cards still waiting; `instanceId` lists one chapter's notices for its transcript.
+         */
+        get: operations["ownerNotices"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/owner/notices/{id}/ack": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Acknowledge a notice on every device
+         * @description Idempotent: the first acknowledgement stamps `ackedAt`, later ones return the notice unchanged. A notice acknowledged before its push went out is not pushed. Human only: a Bot or an Agent gets 403 `owner-only` and the notice is left unacknowledged.
+         */
+        post: operations["ackOwnerNotice"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/owner/notify": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Notify the owner (`remuda owner notify`)
+         * @description D-060 §11.5. The caller is an Agent holding `address-owner` (Main) or the owner's own Human device; anyone else gets 403 with `reason` and `next`. An Agent call passes the commit-time initiator check (a fenced or paused chapter gets 409 `fenced`). The Hub writes the claim row (with its audit row) and queues the push in one transaction, then pushes under the tag `notice:<noticeId>`; a crash before the push is resent at boot under the same tag. Per-device suppression applies (a device visibly following the writing chapter is skipped). A repeat with the same dedupe key returns the original notice with 200 and pushes nothing.
+         */
+        post: operations["ownerNotify"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/placement/resolve": {
         parameters: {
             query?: never;
@@ -3230,6 +3290,55 @@ export interface components {
             paths: string[];
             projectId: string;
             taskId: string;
+        };
+        /** @description One `owner notify` claim row (D-060 §11.5): what the seat (or the owner's own device) told the owner. Title and body are the writer's text. */
+        OwnerNotice: {
+            /** @description When the owner acknowledged it (on any device); null while unacknowledged. */
+            ackedAt: string | null;
+            /** @description At most 2000 characters. */
+            body: string;
+            /** @description The chapter that wrote it; null for the owner's own device. */
+            chapterInstanceId: string | null;
+            /** @description When the claim row was written. */
+            createdAt: string;
+            /** @description The dedupe key it was written with. */
+            dedupeKey: string | null;
+            /** @description Lineage of the writing chapter; null for the owner's own device. */
+            lineageId: string | null;
+            /** @description `ntc_…`; the push tag is `notice:<noticeId>`. */
+            noticeId: string;
+            /**
+             * @description Who wrote it.
+             * @enum {string}
+             */
+            origin: "agent" | "human" | "hub";
+            /**
+             * @description `cli`: the notify route; `wake`: a wake run's notify declaration.
+             * @enum {string}
+             */
+            source: "cli" | "wake";
+            /** @description One line, at most 120 characters. */
+            title: string;
+            /** @description Journal seq of the chapter's latest `turn_started` when it was written; null without one. */
+            turnSeq: number | null;
+        };
+        /** @description Notices, newest first. */
+        OwnerNoticePage: {
+            items: components["schemas"]["OwnerNotice"][];
+        };
+        /** @description One notice as a write returns it. */
+        OwnerNoticeResult: {
+            /** @description Notify only: false when a notice with the same dedupe key already existed (it is returned and nothing is pushed). */
+            created?: boolean;
+            notice: components["schemas"]["OwnerNotice"];
+        };
+        /** @description `remuda owner notify`. A credential-shaped title, body or dedupe key is refused with 422 OWNER_NOTIFY_SECRET_REJECTED (the text is never echoed). */
+        OwnerNotifyRequest: {
+            body: string;
+            /** @description A repeat with the same key (per writing lineage, or the owner) returns the original notice and pushes nothing. */
+            dedupeKey?: string;
+            /** @description One line. */
+            title: string;
         };
         PairCode: {
             code: string;
@@ -6672,6 +6781,98 @@ export interface operations {
             401: components["responses"]["Error"];
             403: components["responses"]["Error"];
             404: components["responses"]["Error"];
+        };
+    };
+    ownerNotices: {
+        parameters: {
+            query?: {
+                /** @description `1` for unacknowledged notices only. */
+                unacked?: "0" | "1" | "true" | "false";
+                /** @description Only notices this chapter wrote. */
+                instanceId?: string;
+                /** @description At most this many (default 50, at most 200). */
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Notices */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OwnerNoticePage"];
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+        };
+    };
+    ackOwnerNotice: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The notice */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OwnerNoticeResult"];
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
+    ownerNotify: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["OwnerNotifyRequest"];
+            };
+        };
+        responses: {
+            /** @description The original notice (dedupe key repeat) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OwnerNoticeResult"];
+                };
+            };
+            /** @description Claimed; the push is queued */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OwnerNoticeResult"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            409: components["responses"]["Error"];
+            422: components["responses"]["Error"];
         };
     };
     placementResolve: {

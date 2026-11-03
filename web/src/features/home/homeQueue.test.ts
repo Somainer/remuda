@@ -10,6 +10,7 @@ import {
   inboxHref,
   isSimpleQuestion,
   lastLines,
+  noticeCards,
 } from "./homeQueue";
 import {
   APPROVAL,
@@ -20,6 +21,7 @@ import {
   field,
   inst,
   interaction,
+  notice,
   question,
   source,
   task,
@@ -186,6 +188,29 @@ describe("deriveHomeQueue (§4.1 order, §4.6 dedupe, §5.1 count)", () => {
       "task:tsk_b",
       "failed:ins_fail",
     ]);
+  });
+
+  it("puts 告诉你 after 任务待你 and before 回合失败, newest first, and never counts it (§4.1 kind 4)", () => {
+    const src = fixture();
+    const notices = [
+      notice({ noticeId: "ntc_old", createdAt: T0 }),
+      notice({ noticeId: "ntc_new", createdAt: T2 }),
+      notice({ noticeId: "ntc_acked", createdAt: T2, ackedAt: T2 }),
+    ];
+    const queue = deriveHomeQueue(src, notices);
+    expect(queue.cards.map((card) => `${card.type}:${card.id}`)).toEqual([
+      "interaction:int_new",
+      "interaction:int_task",
+      "interaction:int_old",
+      "task:tsk_b",
+      "notice:ntc_new",
+      "notice:ntc_old",
+      "failed:ins_fail",
+    ]);
+    // Not in 「需要你」: the count is the same with or without notices.
+    expect(queue.counted).toBe(deriveHomeQueue(src).counted);
+    expect(queue.counted).toBe(glanceCounts(src).needYou);
+    expect(noticeCards([notice({ noticeId: "ntc_x", ackedAt: T1 })])).toEqual([]);
   });
 
   it("drops a blocked task whose session already has an interaction card, and archived tasks", () => {

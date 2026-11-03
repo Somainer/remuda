@@ -4,6 +4,7 @@ import type { Task } from "../../types/generated";
 import { HubHttpError } from "../../lib/httpError";
 import { deriveInboxQueue, type InboxQueueItem } from "../mobile/inboxRows";
 import { ownerBlockedTasks, type GlanceSource } from "./glance";
+import type { OwnerNotice } from "./notices";
 
 /**
  * The ④ 「需要你」 queue (home.md §4), as pure derivations: which cards it
@@ -109,10 +110,11 @@ export type HomeQueueCard =
       /** Where 「打开任务」 lands: its primary session, else the project board. */
       primarySessionId: string | null;
     }
+  | { type: "notice"; id: string; notice: OwnerNotice }
   | { type: "failed"; id: string; instance: Instance; text: string; at: string };
 
 export type HomeQueue = {
-  /** §4.1 order: interactions (inbox order), 任务待你, then 回合失败. */
+  /** §4.1 order: interactions (inbox order), 任务待你, 告诉你, then 回合失败. */
   cards: HomeQueueCard[];
   /** Cards that count toward N (§4.1 kinds 1–3); equals glanceCounts().needYou. */
   counted: number;
@@ -158,11 +160,27 @@ export function failedTurnCards(instances: readonly Instance[]): HomeQueueCard[]
 }
 
 /**
- * Build the ④ queue (home.md §4.1). Main's question pin (home-main-extras)
- * and 「告诉你」 (home-to-you) are not part of this slice: the former is just
- * an interaction here, the latter has no source yet and is not rendered.
+ * §4.1 kind 4 「告诉你」 (D-060 §11.5): the unacknowledged `owner notify`
+ * notices, newest first. Not counted in N (§5.1).
  */
-export function deriveHomeQueue(source: GlanceSource): HomeQueue {
+export function noticeCards(notices: readonly OwnerNotice[]): HomeQueueCard[] {
+  return notices
+    .filter((notice) => !notice.ackedAt)
+    .map((notice): HomeQueueCard => ({ type: "notice", id: notice.noticeId, notice }))
+    .sort((a, b) => {
+      const at = a.type === "notice" ? a.notice.createdAt : "";
+      const bt = b.type === "notice" ? b.notice.createdAt : "";
+      if (at !== bt) return at < bt ? 1 : -1;
+      return a.id < b.id ? 1 : a.id > b.id ? -1 : 0;
+    });
+}
+
+/**
+ * Build the ④ queue (home.md §4.1). Main's question pin (home-main-extras)
+ * is just an interaction here; 「告诉你」 cards come from `notices` and sit
+ * after 任务待你, uncounted.
+ */
+export function deriveHomeQueue(source: GlanceSource, notices: readonly OwnerNotice[] = []): HomeQueue {
   const queue = deriveInboxQueue({
     interactions: [...source.interactions],
     instances: [...source.instances],
@@ -185,7 +203,7 @@ export function deriveHomeQueue(source: GlanceSource): HomeQueue {
     if (!earliest || byRecency(item, earliest) > 0) earliest = item;
   }
   return {
-    cards: [...interactionCards, ...taskCards, ...failedTurnCards(source.instances)],
+    cards: [...interactionCards, ...taskCards, ...noticeCards(notices), ...failedTurnCards(source.instances)],
     counted: interactionCards.length + taskCards.length,
     earliestInteractionId: earliest?.id ?? null,
   };

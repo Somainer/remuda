@@ -80,6 +80,24 @@ function stableNodeIds(events: readonly Observation[]): Map<Observation, string>
 }
 
 /**
+ * The transcript node id of the newest assistant message in `events` (by
+ * seq), or null when there is none. D-060 §11.5 hangs a 「告诉你」 card whose
+ * turn has no reply in view under it.
+ */
+export function lastAssistantNodeId(events: readonly Observation[]): string | null {
+  const stable = stableNodeIds(events);
+  let newest: { seq: bigint; nodeId: string } | null = null;
+  for (const ev of events) {
+    if (ev.kind !== "message" || (ev.payload as { role?: unknown }).role !== "assistant") continue;
+    const seq = seqOf(ev);
+    const nodeId = stable.get(ev);
+    if (seq === null || !nodeId) continue;
+    if (!newest || seq > newest.seq) newest = { seq, nodeId };
+  }
+  return newest?.nodeId ?? null;
+}
+
+/**
  * Turn `turn_started` seq → the transcript node id of that turn's reply: the
  * last assistant message before the turn's `result` (or the next start). A
  * turn with no assistant message gets no placement.

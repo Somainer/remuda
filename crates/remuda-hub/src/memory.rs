@@ -1185,7 +1185,7 @@ fn insert_entry(
 /// the first match, so the write path never reads the instance's whole
 /// journal. The plan is asserted by
 /// `the_turn_start_lookup_walks_the_journal_key`.
-const TURN_STARTED_SQL: &str = "SELECT seq FROM journal
+pub(crate) const TURN_STARTED_SQL: &str = "SELECT seq FROM journal
       WHERE instance_id = ?1
         AND json_extract(payload_json, '$.payload.type') = 'native'
         AND json_extract(payload_json, '$.payload.topic') = 'turn'

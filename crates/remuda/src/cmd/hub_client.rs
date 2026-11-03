@@ -256,10 +256,13 @@ pub(crate) fn hub_http_error(err: ClientError) -> anyhow::Error {
                     lines.push(format!("  - {reason}"));
                 }
             }
-            // §12.5: a seat whose memory write was refused for a credential
-            // reports the refusal by its stable code (the PWA keys on it too);
+            // §12.5: a seat whose memory write (or owner notice, §11.5) was
+            // refused for a credential reports the refusal by its stable code (the PWA keys on it too);
             // the message deliberately carries no part of the text.
-            if code == "MEMORY_SECRET_REJECTED" {
+            if matches!(
+                code,
+                "MEMORY_SECRET_REJECTED" | "OWNER_NOTIFY_SECRET_REJECTED"
+            ) {
                 lines.push(format!("  code: {code}"));
             }
             // D-060 §9.1: a refusal's `next.hint` is the instruction, so it

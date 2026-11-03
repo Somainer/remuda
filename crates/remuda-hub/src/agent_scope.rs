@@ -1248,6 +1248,9 @@ pub async fn restrict_agent_routes(
                     // per-worker verbs. Handlers keep `dispatch` + project
                     // scope and add lineage-subtree ownership for mutations.
                     || worker_write_target(path)
+                    // D-060 §11.5: `remuda owner notify`; the handler
+                    // requires `address-owner` and the initiator check.
+                    || path == "/v1/owner/notify"
                     || task_write_target(request.method(), path))
                 || request.method() == axum::http::Method::PATCH
                     && (project_write_target(path) || task_write_target(request.method(), path))

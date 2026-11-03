@@ -8467,6 +8467,9 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     crate::fence::migrate(&conn)?;
     crate::restart::migrate(&conn)?;
     crate::push_route::migrate(&conn)?;
+    // cb-owner-notify: claim rows and failure latches (the outbox above
+    // carries their pushes).
+    crate::owner_notify::migrate(&conn)?;
     // cb-inbox-facts: after `restart` (its `end_seen_at` column) and the gate
     // queue (its `gate_jobs` table), which the inbox's source triggers read.
     crate::inbox::migrate(&conn)?;

@@ -1432,6 +1432,26 @@ fn try_continue(conn: &Connection, row: &Row) -> Result<bool, StoreError> {
     if continuations_since_progress(conn, &row.instance_id)? >= CONTINUATION_CAP {
         return finish(state::CAPPED, "cap");
     }
+    // The initiator the continuation will carry. A row F re-attributed names
+    // the live chapter; one released after F (a forwarded continuation the
+    // Node refused as `fenced`) carries the generation it was formed with, so
+    // when its lineage has moved on, follow it here as well: the wait belongs
+    // to the lineage, not to the chapter that happened to be live then.
+    let mut initiator = row.initiator.clone();
+    if let Some((_, lineage, _)) = &initiator {
+        let live = live_initiator(conn, lineage)?;
+        if live != initiator && lineage_running(conn, lineage)? {
+            initiator = live;
+        }
+        if let Some((chapter, _, generation)) = &initiator {
+            conn.execute(
+                "UPDATE resume_on_reset
+                    SET initiator_instance_id = ?2, initiator_generation = ?3, updated_at = ?4
+                  WHERE id = ?1 AND state = 'holding'",
+                params![row.id, chapter, generation, now_rfc3339()],
+            )?;
+        }
+    }
     let hold = if activity != "idle" {
         Some(Hold::Busy)
     } else if conn.query_row(
@@ -1462,7 +1482,7 @@ fn try_continue(conn: &Connection, row: &Row) -> Result<bool, StoreError> {
     } else if !crate::fence::host_capable(conn, &host_id)? {
         // §6.4: Hub-origin input goes only to Nodes that advertise the fence.
         Some(Hold::HostLacksFence)
-    } else if let Some((chapter, lineage, generation)) = &row.initiator {
+    } else if let Some((chapter, lineage, generation)) = &initiator {
         match live_initiator(conn, lineage)? {
             Some((live_chapter, _, live_generation))
                 if &live_chapter == chapter
@@ -1502,9 +1522,9 @@ fn try_continue(conn: &Connection, row: &Row) -> Result<bool, StoreError> {
             host_id,
             payload.to_string(),
             now,
-            row.initiator.as_ref().map(|i| i.0.clone()),
-            row.initiator.as_ref().map(|i| i.1.clone()),
-            row.initiator.as_ref().map(|i| i.2),
+            initiator.as_ref().map(|i| i.0.clone()),
+            initiator.as_ref().map(|i| i.1.clone()),
+            initiator.as_ref().map(|i| i.2),
         ],
     )?;
     let attempts = continuations_since_progress(conn, &row.instance_id)? + 1;
@@ -1610,11 +1630,13 @@ fn original_prompt(payload: &Value) -> Option<Value> {
         .map(|text| json!({ "type": "prompt", "text": text }))
 }
 
-/// F (§7.2) moved `lineage_id` to `chapter` at `generation`: every wait
-/// that carries the lineage's initiator and has no continuation in flight is
-/// re-attributed to it, so the continuation it forms carries the live
-/// generation. Runs inside F's transaction, after step 4 released a
-/// continuation it cancelled.
+/// F (§7.2) moved `lineage_id` to `chapter` at `generation`: every wait that
+/// carries the lineage's initiator is re-attributed to it. That includes a
+/// `continued` row whose continuation is already forwarded: F settles only
+/// unforwarded work, so the Node may still refuse that command as `fenced`
+/// afterwards, and the release must land on the successor's initiator rather
+/// than on a generation no longer live. Runs inside F's transaction, after
+/// step 4 released a continuation it cancelled.
 pub(crate) fn reattribute(
     conn: &Connection,
     lineage_id: &str,
@@ -1624,7 +1646,8 @@ pub(crate) fn reattribute(
     Ok(conn.execute(
         "UPDATE resume_on_reset
             SET initiator_instance_id = ?2, initiator_generation = ?3, updated_at = ?4
-          WHERE initiator_lineage_id = ?1 AND state IN ('waiting', 'holding')",
+          WHERE initiator_lineage_id = ?1
+            AND state IN ('waiting', 'holding', 'continued')",
         params![lineage_id, chapter, generation, now_rfc3339()],
     )?)
 }

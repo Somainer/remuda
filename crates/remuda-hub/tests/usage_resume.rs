@@ -1305,6 +1305,84 @@ async fn a_fence_mid_wait_re_attributes_the_row_to_the_successor() -> Result<()>
     Ok(())
 }
 
+/// A continuation F never settles because it was already forwarded, and that
+/// the Node then refuses as `fenced`, is re-attributed to the successor: the
+/// wait forms a new continuation under a new id, exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forwarded_continuation_refused_after_f_is_formed_again_for_the_successor() -> Result<()>
+{
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("resume-forwarded").await?;
+    let (seat, token) = ctx.seat(&project).await?;
+    let worker = ctx.worker(&token, &project, true).await?;
+    ctx.limit_turn(&worker, "cmd_f_1", Some(resets_in(600)), true, NOTICE)
+        .await?;
+    ctx.settle().await?;
+    let fire_at = ctx.waits(&worker)?[0].fire_at.clone();
+    ctx.tick(&fire_at).await?;
+    let sends = ctx.seen.hub_sends_to(&worker);
+    assert_eq!(
+        sends.len(),
+        1,
+        "the first continuation went out: {sends:#?}"
+    );
+    let forwarded = sends[0]["commandId"]
+        .as_str()
+        .context("commandId")?
+        .to_owned();
+    assert_eq!(ctx.waits(&worker)?[0].state, "continued");
+    let marked: bool = ctx.db()?.query_row(
+        "SELECT forwarded FROM commands WHERE id = ?1",
+        [&forwarded],
+        |row| row.get(0),
+    )?;
+    assert!(marked, "forwarded before F");
+
+    // F pauses the seat and resumes onto a successor.
+    pause(&ctx, &seat).await?;
+    ctx.settle().await?;
+    let successor = resume(&ctx, &seat).await?;
+    let row = ctx.waits(&worker)?[0].clone();
+    assert_eq!(row.state, "continued", "F settles no forwarded command");
+    assert_eq!(row.initiator_instance.as_deref(), Some(successor.as_str()));
+
+    // The Node refuses it at delivery: it never ran (the settlement a Node's
+    // fenced refusal writes).
+    let (state, marked): (String, bool) = ctx.db()?.query_row(
+        "SELECT state, forwarded FROM commands WHERE id = ?1",
+        [&forwarded],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert!(marked, "forwarded");
+    ctx.db()?.execute(
+        "UPDATE commands SET state = 'settled', resolution = 'clear',
+                settlement_outcome = 'rejected', settlement_reason = 'fenced',
+                updated_at = '2026-11-04T00:00:00.000Z'
+          WHERE id = ?1 AND state = ?2",
+        rusqlite::params![forwarded, state],
+    )?;
+    ctx.settle().await?;
+    let released = ctx.waits(&worker)?[0].clone();
+    assert_eq!(released.state, "holding", "{released:?}");
+    assert_eq!(
+        released.initiator_instance.as_deref(),
+        Some(successor.as_str()),
+        "the release keeps the successor"
+    );
+
+    ctx.tick(&fire_at).await?;
+    let sends = ctx.seen.hub_sends_to(&worker);
+    assert_eq!(sends.len(), 2, "one new continuation: {sends:#?}");
+    let again = sends[1]["commandId"].as_str().context("commandId")?;
+    assert_ne!(again, forwarded.as_str(), "a new id");
+    assert_eq!(sends[1]["initiator"]["instanceId"], successor.as_str());
+    assert_eq!(sends[1]["initiator"]["generation"], 2);
+    assert_eq!(ctx.waits(&worker)?[0].state, "continued");
+    ctx.tick(&fire_at).await?;
+    assert_eq!(ctx.seen.hub_sends_to(&worker).len(), 2, "exactly once");
+    Ok(())
+}
+
 /// The owner may turn autoContinue on later (`PATCH /v1/instances/{id}`);
 /// an Agent may not.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

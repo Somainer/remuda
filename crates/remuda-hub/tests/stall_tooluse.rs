@@ -34,6 +34,9 @@ enum Screen {
     Rows(Vec<String>),
     /// Never answers: the Hub's read waits out its timeout.
     Mute,
+    /// Answers `supported: false`, as a Node does for a driver without
+    /// `screen_read`.
+    Unsupported,
 }
 
 struct FakeNode {
@@ -56,6 +59,10 @@ impl FakeNode {
 
     fn mute(&self) {
         *self.screen.lock().unwrap() = Screen::Mute;
+    }
+
+    fn unsupported(&self) {
+        *self.screen.lock().unwrap() = Screen::Unsupported;
     }
 
     fn reads(&self) -> usize {
@@ -128,6 +135,9 @@ async fn connect_node(
                 let answer = task_screen.lock().unwrap().clone();
                 match answer {
                     Screen::Mute => continue,
+                    Screen::Unsupported => json!({
+                        "supported": false, "lifecycle": "running",
+                        "reason": "this driver carries no readable screen" }),
                     Screen::Rows(lines) => json!({
                         "supported": true, "lifecycle": "running",
                         "source": "emulator", "lines": lines }),
@@ -837,8 +847,8 @@ async fn the_screen_fallback_runs_only_after_journal_quiet() -> Result<()> {
         .project("stall-screen", json!({ "stallThresholdMins": 20 }))
         .await?;
     let (seat, token) = ctx.coordinator(&project).await?;
-    // A carrier with no tool channel at all: agy on generic-pty.
-    let child = ctx.child(&seat, &ctx.host, "agy", "generic-pty").await?;
+    // A carrier with no tool channel at all: agy on shell-pty.
+    let child = ctx.child(&seat, &ctx.host, "agy", "shell-pty").await?;
     ctx.start(&ctx.host, &child).await?;
     ctx.node().show(&["$ make", "building 1/40"]);
 
@@ -870,6 +880,78 @@ async fn the_screen_fallback_runs_only_after_journal_quiet() -> Result<()> {
     Ok(())
 }
 
+/// r2 item 1: claude-pty and generic-pty have no `screen_read`, so they are
+/// not screen carriers: a quiet child keeps the journal quiet rule (exactly
+/// one fact) and costs no `tty.screen` RPC.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_pty_and_generic_pty_keep_the_journal_quiet_rule() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx
+        .project("stall-pty", json!({ "stallThresholdMins": 20 }))
+        .await?;
+    let (seat, token) = ctx.coordinator(&project).await?;
+    let claude = ctx.child(&seat, &ctx.host, "claude", "claude-pty").await?;
+    let codex = ctx.child(&seat, &ctx.host, "codex", "generic-pty").await?;
+    for child in [&claude, &codex] {
+        ctx.start(&ctx.host, child).await?;
+    }
+    ctx.node().show(&STILL_SCREEN);
+    assert_eq!(ctx.settle(19).await?, 0);
+    assert_eq!(ctx.settle(21).await?, 2, "one quiet stall per child");
+    for minutes in [60, 240] {
+        assert_eq!(ctx.settle(minutes).await?, 0, "same quiet period");
+    }
+    assert_eq!(ctx.node().reads(), 0, "no tty.screen RPC for them");
+    let facts = ctx.stalls(&token, &seat).await?;
+    for child in [&claude, &codex] {
+        let mine: Vec<&Value> = facts
+            .iter()
+            .filter(|fact| fact["subjectInstanceId"] == child.as_str())
+            .collect();
+        assert_eq!(mine.len(), 1, "{facts:#?}");
+        assert_eq!(mine[0]["payload"]["cause"], "quiet");
+        assert!(mine[0]["payload"].get("source").is_none());
+    }
+    Ok(())
+}
+
+/// r2 item 1, defence: a screen carrier whose Node answers `supported:
+/// false` (an adopted PTY, a dropped one) is not a screen carrier for that
+/// evaluation: the journal quiet rule records its one fact. An unreachable
+/// host still records nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unsupported_screen_falls_back_to_the_journal_quiet_rule() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx
+        .project("stall-unsupported", json!({ "stallThresholdMins": 20 }))
+        .await?;
+    let (seat, token) = ctx.coordinator(&project).await?;
+    let child = ctx.child(&seat, &ctx.host, "claude", "shell-pty").await?;
+    ctx.start(&ctx.host, &child).await?;
+
+    // A host that does not answer in time: no fact.
+    ctx.node().mute();
+    let (_, tasks) = ctx
+        .hub
+        .test_inbox_screen_sweep(&minutes_from_now(21), Duration::from_millis(1))
+        .await?;
+    for (_, task) in tasks {
+        assert_eq!(task.await?, 0, "an unreachable screen records nothing");
+    }
+    assert!(ctx.stalls(&token, &seat).await?.is_empty());
+
+    ctx.node().unsupported();
+    assert_eq!(ctx.settle(22).await?, 1, "the journal quiet fact");
+    for minutes in [60, 240] {
+        assert_eq!(ctx.settle(minutes).await?, 0, "same quiet period");
+    }
+    let facts = ctx.stalls(&token, &seat).await?;
+    assert_eq!(facts.len(), 1, "{facts:#?}");
+    assert_eq!(facts[0]["payload"]["cause"], "quiet");
+    assert!(facts[0]["payload"].get("source").is_none());
+    Ok(())
+}
+
 /// A screen that shows a DONE report or a dialog is not a stall.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_screen_classification_decides_the_fact() -> Result<()> {
@@ -878,7 +960,7 @@ async fn the_screen_classification_decides_the_fact() -> Result<()> {
         .project("stall-classify", json!({ "stallThresholdMins": 20 }))
         .await?;
     let (seat, token) = ctx.coordinator(&project).await?;
-    let child = ctx.child(&seat, &ctx.host, "codex", "generic-pty").await?;
+    let child = ctx.child(&seat, &ctx.host, "codex", "shell-pty").await?;
     ctx.start(&ctx.host, &child).await?;
     ctx.node().show(&[
         "all tests passed",
@@ -1010,8 +1092,8 @@ async fn sweep_logs_carry_categories_never_screen_text() -> Result<()> {
         .await?;
     let (seat, token) = ctx.coordinator(&project).await?;
     let marker = "screen-row-QX93-confidential";
-    let still = ctx.child(&seat, &ctx.host, "agy", "generic-pty").await?;
-    let done = ctx.child(&seat, &ctx.host, "agy", "generic-pty").await?;
+    let still = ctx.child(&seat, &ctx.host, "agy", "shell-pty").await?;
+    let done = ctx.child(&seat, &ctx.host, "agy", "shell-pty").await?;
     ctx.start(&ctx.host, &still).await?;
     ctx.start(&ctx.host, &done).await?;
     ctx.node().show(&[

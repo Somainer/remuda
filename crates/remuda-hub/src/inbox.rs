@@ -1905,7 +1905,7 @@ fn due_supply_resets(conn: &Connection, now: OffsetDateTime) -> Result<usize, St
 ///   project's `stallThresholdMins` (default
 ///   [`remuda_protocol::DEFAULT_STALL_THRESHOLD_MINS`]). The period starts at
 ///   the latest row, so it restarts at a tool's result. On a screen carrier
-///   ([`crate::stall_screen::SCREEN_CARRIERS`]) that quiet only makes the
+///   ([`crate::stall_screen::is_screen_carrier`]) that quiet only makes the
 ///   child a [`ScreenCandidate`]: the per-host screen sweep decides (§10).
 ///
 /// Both clocks are the Hub's own (the journal row's `observed_at`), so a
@@ -1932,98 +1932,173 @@ fn due_stalls(
         };
         let project = project_of(conn, &instance_id)?;
         let tracker = load_tracker(conn, &instance_id)?;
-        let fact = if let Some((tool_call_id, opened)) = tracker.tools.first() {
-            let Some(threshold) =
-                project_policy_number(conn, project.as_deref(), "stallToolThresholdMins")?
-                    .filter(|mins| *mins > 0)
-            else {
-                continue;
-            };
-            let Some(since) = parse_at(opened) else {
-                continue;
-            };
-            let Some(stalled_at) =
-                window_minutes(threshold).and_then(|window| since.checked_add(window))
-            else {
-                report_once("stall-tool-window-out-of-range");
-                continue;
-            };
-            if stalled_at > now {
-                continue;
-            }
-            // Keyed by the call and when it opened, never by the threshold
-            // that measured it: a threshold change mid-call is the same stall.
-            let mut fact = instance_fact(
+        if !tracker.tools.is_empty() {
+            written += due_tool_stalls(
                 conn,
-                InboxFactKind::Stalled,
+                &subscriber,
                 &instance_id,
-                tracker.run,
-                opened.clone(),
-                json!({
-                    "cause": "tool-in-flight",
-                    "toolCallId": tool_call_id,
-                    "since": opened,
-                    "thresholdMins": threshold,
-                    "detectedAt": crate::config::rfc3339(stalled_at),
-                }),
+                project.as_deref(),
+                &tracker,
+                now,
             )?;
-            fact.key_subject = format!("{instance_id}/{tool_call_id}");
-            // The call and its opened time are the stall; a run that began
-            // since (r3) is not a new one.
-            fact.run_in_key = false;
-            fact.payload["runGeneration"] = json!(tracker.run);
-            fact
-        } else {
-            let threshold = quiet_threshold(conn, project.as_deref())?;
-            let Some(mut quiet_since) = journal_quiet_since(conn, &instance_id)? else {
-                continue;
-            };
-            let screen_carrier = crate::stall_screen::is_screen_carrier(&driver);
-            if screen_carrier
-                && let Some(changed) = crate::stall_screen::screen_changed_at(conn, &instance_id)?
-            {
-                // Progress the screen showed after the last journal row
-                // restarts the quiet period.
-                quiet_since = quiet_since.max(changed);
-            }
-            let Some(stalled_at) =
-                window_minutes(threshold).and_then(|window| quiet_since.checked_add(window))
-            else {
-                report_once("stall-window-out-of-range");
-                continue;
-            };
-            if stalled_at > now {
-                continue;
-            }
-            if screen_carrier {
-                // Journal quiet is not enough on a screen carrier: the screen
-                // can show progress the journal never carries (§10).
-                screen.push(ScreenCandidate {
-                    instance_id,
-                    host_id,
-                });
-                continue;
-            }
-            // Keyed by when the quiet period started, for the same reason.
-            instance_fact(
-                conn,
-                InboxFactKind::Stalled,
-                &instance_id,
-                tracker.run,
-                crate::config::rfc3339(quiet_since),
-                json!({
-                    "cause": "quiet",
-                    "since": crate::config::rfc3339(quiet_since),
-                    "thresholdMins": threshold,
-                    "detectedAt": crate::config::rfc3339(stalled_at),
-                }),
-            )?
+            continue;
+        }
+        let screen_carrier = crate::stall_screen::is_screen_carrier(&driver);
+        let Some(due) = due_quiet(conn, &instance_id, project.as_deref(), screen_carrier, now)?
+        else {
+            continue;
         };
-        if matches!(record(conn, &subscriber, fact)?, Outcome::Recorded(_)) {
+        if screen_carrier {
+            // Journal quiet is not enough on a screen carrier: the screen can
+            // show progress the journal never carries (§10).
+            screen.push(ScreenCandidate {
+                instance_id,
+                host_id,
+            });
+            continue;
+        }
+        if record_quiet_stall(conn, &subscriber, &instance_id, tracker.run, &due, None)? {
             written += 1;
         }
     }
     Ok(written)
+}
+
+/// The oldest call in flight, once its `stallToolThresholdMins` window has
+/// passed: one fact, keyed by the call and when it opened.
+fn due_tool_stalls(
+    conn: &Connection,
+    subscriber: &str,
+    instance_id: &str,
+    project: Option<&str>,
+    tracker: &Tracker,
+    now: OffsetDateTime,
+) -> Result<usize, StoreError> {
+    let Some(threshold) =
+        project_policy_number(conn, project, "stallToolThresholdMins")?.filter(|mins| *mins > 0)
+    else {
+        return Ok(0);
+    };
+    let Some(window) = window_minutes(threshold) else {
+        report_once("stall-tool-window-out-of-range");
+        return Ok(0);
+    };
+    let mut written = 0;
+    // The oldest call in flight decides.
+    for (tool_call_id, opened) in tracker.tools.iter().take(1) {
+        let Some(since) = parse_at(opened) else {
+            continue;
+        };
+        let Some(stalled_at) = since.checked_add(window) else {
+            report_once("stall-tool-window-out-of-range");
+            continue;
+        };
+        if stalled_at > now {
+            continue;
+        }
+        // Keyed by the call and when it opened, never by the threshold that
+        // measured it: a threshold change mid-call is the same stall.
+        let mut fact = instance_fact(
+            conn,
+            InboxFactKind::Stalled,
+            instance_id,
+            tracker.run,
+            opened.clone(),
+            json!({
+                "cause": "tool-in-flight",
+                "toolCallId": tool_call_id,
+                "since": opened,
+                "thresholdMins": threshold,
+                "detectedAt": crate::config::rfc3339(stalled_at),
+            }),
+        )?;
+        fact.key_subject = format!("{instance_id}/{tool_call_id}");
+        // The call and its opened time are the stall; a run that began since
+        // (r3) is not a new one.
+        fact.run_in_key = false;
+        fact.payload["runGeneration"] = json!(tracker.run);
+        if matches!(record(conn, subscriber, fact)?, Outcome::Recorded(_)) {
+            written += 1;
+        }
+    }
+    Ok(written)
+}
+
+/// A quiet period that has outlasted its window.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DueQuiet {
+    /// When the quiet period started: the last journal row, or a later screen
+    /// change on a screen carrier.
+    pub(crate) quiet_since: OffsetDateTime,
+    pub(crate) threshold: i64,
+    pub(crate) stalled_at: OffsetDateTime,
+}
+
+/// `instance_id`'s quiet period, when it has lasted the project's
+/// `stallThresholdMins` by `now`. On a screen carrier a screen change after
+/// the last journal row restarts the period.
+pub(crate) fn due_quiet(
+    conn: &Connection,
+    instance_id: &str,
+    project: Option<&str>,
+    screen_carrier: bool,
+    now: OffsetDateTime,
+) -> Result<Option<DueQuiet>, StoreError> {
+    let threshold = quiet_threshold(conn, project)?;
+    let Some(mut quiet_since) = journal_quiet_since(conn, instance_id)? else {
+        return Ok(None);
+    };
+    if screen_carrier
+        && let Some(changed) = crate::stall_screen::screen_changed_at(conn, instance_id)?
+    {
+        quiet_since = quiet_since.max(changed);
+    }
+    let Some(stalled_at) =
+        window_minutes(threshold).and_then(|window| quiet_since.checked_add(window))
+    else {
+        report_once("stall-window-out-of-range");
+        return Ok(None);
+    };
+    Ok((stalled_at <= now).then_some(DueQuiet {
+        quiet_since,
+        threshold,
+        stalled_at,
+    }))
+}
+
+/// Record the quiet stall `due` names for `subscriber`: keyed by when the
+/// quiet period started, so every tick of the same period is the same fact.
+/// `source` marks a fact the screen fallback decided. True when recorded.
+pub(crate) fn record_quiet_stall(
+    conn: &Connection,
+    subscriber: &str,
+    instance_id: &str,
+    run: i64,
+    due: &DueQuiet,
+    source: Option<&str>,
+) -> Result<bool, StoreError> {
+    let since = crate::config::rfc3339(due.quiet_since);
+    let mut payload = json!({
+        "cause": "quiet",
+        "since": since,
+        "thresholdMins": due.threshold,
+        "detectedAt": crate::config::rfc3339(due.stalled_at),
+    });
+    if let Some(source) = source {
+        payload["source"] = json!(source);
+    }
+    let fact = instance_fact(
+        conn,
+        InboxFactKind::Stalled,
+        instance_id,
+        run,
+        since,
+        payload,
+    )?;
+    Ok(matches!(
+        record(conn, subscriber, fact)?,
+        Outcome::Recorded(_)
+    ))
 }
 
 /// The project's quiet window: `stallThresholdMins`, else the default.

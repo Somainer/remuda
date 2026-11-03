@@ -16,31 +16,31 @@
 //!   read in a quiet period only records what the screen shows; a later read
 //!   that finds it unchanged lets `classify_screen` (the classifier
 //!   `observe_one` uses) decide, measured from the start of the quiet period.
-//! * An unreadable screen (host offline, timeout, no screen) yields nothing:
-//!   the host and exit facts cover a dead carrier, and a guess would be a
-//!   stall the Hub cannot show.
+//! * A Node that has no screen for the instance (`supported: false`) makes it
+//!   a journal carrier for that evaluation: the journal quiet rule records.
+//! * Any other unreadable screen (host offline, timeout) yields nothing: the
+//!   host and exit facts cover a dead carrier, and a guess would be a stall
+//!   the Hub cannot show.
 
 use crate::AppState;
 use crate::inbox::{self, ScreenCandidate};
 use crate::store::{Store, StoreError};
-use remuda_protocol::{InboxFactKind, ScreenClass, ScreenSignals, classify_screen};
+use remuda_protocol::{ScreenClass, ScreenSignals, classify_screen};
 use rusqlite::{Connection, OptionalExtension, params};
-use serde_json::json;
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use time::OffsetDateTime;
 
-/// Driver kinds whose Node reads a live screen (`tty.screen`) and whose
-/// activity can come from it: their journal can be quiet while the screen
-/// moves. Every other carrier, `claude-bg` included (it reads the job's
-/// `state.json`, not a screen), is journal-structured (§10.5).
-pub(crate) const SCREEN_CARRIERS: [&str; 3] = ["claude-pty", "generic-pty", "shell-pty"];
-
-/// Whether `driver` is a screen carrier.
+/// Whether `driver` is a screen carrier: a driver whose Node answers
+/// `tty.screen` with a grid ([`remuda_driver::reads_screen`]; today only
+/// `shell-pty`). Its activity can come from the screen, and its journal can
+/// be quiet while the screen moves. Every other carrier is journal-structured
+/// (§10.5).
 pub(crate) fn is_screen_carrier(driver: &str) -> bool {
-    SCREEN_CARRIERS.contains(&driver)
+    serde_json::from_value::<remuda_protocol::DriverKind>(serde_json::Value::from(driver))
+        .is_ok_and(remuda_driver::reads_screen)
 }
 
 /// The last screen read per screen carrier, so a quiet period survives a Hub
@@ -120,30 +120,111 @@ pub(crate) enum ScreenSnapshot {
     Unreadable(&'static str),
 }
 
+/// The category of a read the Node answered with `supported: false`: this
+/// instance has no screen to read, so it is not a screen carrier for this
+/// evaluation and the journal quiet rule decides.
+pub(crate) const SCREEN_UNSUPPORTED: &str = "screen-unsupported";
+
 fn is_ended(lifecycle: &str) -> bool {
     matches!(lifecycle, "exited" | "failed" | "closed" | "terminated")
 }
 
 /// Decide one candidate from its screen read, in one writer transaction.
-/// Returns how many facts it recorded (0 or 1).
+/// Returns how many facts it recorded (0 or 1). An unsupported screen falls
+/// back to the journal quiet rule; any other unreadable screen (host
+/// offline, a timeout) records nothing.
 pub(crate) fn verdict(
     conn: &mut Connection,
     candidate: &ScreenCandidate,
     snapshot: &ScreenSnapshot,
     now: OffsetDateTime,
 ) -> Result<usize, StoreError> {
-    let ScreenSnapshot::Lines {
-        lines,
-        raw,
-        lifecycle: screen_lifecycle,
-    } = snapshot
-    else {
-        return Ok(0);
-    };
     let tx = crate::store::immediate_tx(conn)?;
-    let written = verdict_in(&tx, candidate, lines, *raw, screen_lifecycle, now)?;
+    let written = match snapshot {
+        ScreenSnapshot::Lines {
+            lines,
+            raw,
+            lifecycle,
+        } => verdict_in(&tx, candidate, lines, *raw, lifecycle, now)?,
+        ScreenSnapshot::Unreadable(SCREEN_UNSUPPORTED) => journal_quiet_in(&tx, candidate, now)?,
+        ScreenSnapshot::Unreadable(_) => 0,
+    };
     tx.commit()?;
     Ok(written)
+}
+
+/// The candidate as the tick named it, re-read inside the verdict's
+/// transaction: still a busy, live child on the same host, with no journaled
+/// call in flight and a subscriber.
+struct Candidate {
+    activity: String,
+    run: i64,
+    subscriber: String,
+    project: Option<String>,
+}
+
+fn still_candidate(
+    conn: &Connection,
+    candidate: &ScreenCandidate,
+) -> Result<Option<Candidate>, StoreError> {
+    let instance_id = candidate.instance_id.as_str();
+    // A row that moved on since the tick is not this quiet period's.
+    let row: Option<(String, String, String)> = conn
+        .query_row(
+            "SELECT lifecycle, activity, host_id FROM instances
+              WHERE id = ?1 AND ended_at IS NULL AND fenced_at IS NULL
+                AND json_extract(spec_json, '$.parentInstanceId') IS NOT NULL",
+            params![instance_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((lifecycle, activity, host_id)) = row else {
+        return Ok(None);
+    };
+    if !matches!(activity.as_str(), "working" | "draining")
+        || !matches!(lifecycle.as_str(), "running" | "ready")
+        || host_id != candidate.host_id
+    {
+        return Ok(None);
+    }
+    let (run, tool_in_flight) = inbox::run_and_tool_in_flight(conn, instance_id)?;
+    if tool_in_flight {
+        // The journal's tool rule owns a call in flight.
+        return Ok(None);
+    }
+    let Some(subscriber) = inbox::subscriber_of(conn, instance_id)? else {
+        return Ok(None);
+    };
+    Ok(Some(Candidate {
+        activity,
+        run,
+        subscriber,
+        project: inbox::project_of(conn, instance_id)?,
+    }))
+}
+
+/// The Node has no screen for this instance: the journal quiet rule the
+/// tick applies to every other carrier decides.
+fn journal_quiet_in(
+    conn: &Connection,
+    candidate: &ScreenCandidate,
+    now: OffsetDateTime,
+) -> Result<usize, StoreError> {
+    let Some(live) = still_candidate(conn, candidate)? else {
+        return Ok(0);
+    };
+    let instance_id = candidate.instance_id.as_str();
+    let Some(due) = inbox::due_quiet(conn, instance_id, live.project.as_deref(), true, now)? else {
+        return Ok(0);
+    };
+    Ok(usize::from(inbox::record_quiet_stall(
+        conn,
+        &live.subscriber,
+        instance_id,
+        live.run,
+        &due,
+        None,
+    )?))
 }
 
 fn verdict_in(
@@ -154,38 +235,11 @@ fn verdict_in(
     screen_lifecycle: &str,
     now: OffsetDateTime,
 ) -> Result<usize, StoreError> {
+    let Some(live) = still_candidate(conn, candidate)? else {
+        return Ok(0);
+    };
     let instance_id = candidate.instance_id.as_str();
-    // Still the busy child the tick named: a row that moved on since is not
-    // this quiet period's.
-    let row: Option<(String, String, String, String)> = conn
-        .query_row(
-            "SELECT lifecycle, activity, driver, host_id FROM instances
-              WHERE id = ?1 AND ended_at IS NULL AND fenced_at IS NULL
-                AND json_extract(spec_json, '$.parentInstanceId') IS NOT NULL",
-            params![instance_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .optional()?;
-    let Some((lifecycle, activity, driver, host_id)) = row else {
-        return Ok(0);
-    };
-    if !matches!(activity.as_str(), "working" | "draining")
-        || !matches!(lifecycle.as_str(), "running" | "ready")
-        || !is_screen_carrier(&driver)
-        || host_id != candidate.host_id
-    {
-        return Ok(0);
-    }
-    let (run, tool_in_flight) = inbox::run_and_tool_in_flight(conn, instance_id)?;
-    if tool_in_flight {
-        // The journal's tool rule owns a call in flight.
-        return Ok(0);
-    }
-    let Some(subscriber) = inbox::subscriber_of(conn, instance_id)? else {
-        return Ok(0);
-    };
-    let project = inbox::project_of(conn, instance_id)?;
-    let threshold = inbox::quiet_threshold(conn, project.as_deref())?;
+    let threshold = inbox::quiet_threshold(conn, live.project.as_deref())?;
     let Some(journal_quiet) = inbox::journal_quiet_since(conn, instance_id)? else {
         return Ok(0);
     };
@@ -250,7 +304,7 @@ fn verdict_in(
     let signals = ScreenSignals {
         lines,
         lifecycle: class_lifecycle,
-        activity: &activity,
+        activity: &live.activity,
         host_online: true,
         now_unix: now.unix_timestamp(),
         last_activity_unix: Some(quiet_since.unix_timestamp()),
@@ -276,25 +330,19 @@ fn verdict_in(
     }
     // Keyed by when the quiet period started, like the journal quiet stall:
     // every read of the same period is the same fact.
-    let since = crate::config::rfc3339(quiet_since);
-    let fact = inbox::instance_fact(
+    let due = inbox::DueQuiet {
+        quiet_since,
+        threshold,
+        stalled_at,
+    };
+    Ok(usize::from(inbox::record_quiet_stall(
         conn,
-        InboxFactKind::Stalled,
+        &live.subscriber,
         instance_id,
-        run,
-        since.clone(),
-        json!({
-            "cause": "quiet",
-            "source": "screen",
-            "since": since,
-            "thresholdMins": threshold,
-            "detectedAt": crate::config::rfc3339(stalled_at),
-        }),
-    )?;
-    Ok(usize::from(matches!(
-        inbox::record(conn, &subscriber, fact)?,
-        inbox::Outcome::Recorded(_)
-    )))
+        live.run,
+        &due,
+        Some("screen"),
+    )?))
 }
 
 fn store_read(
@@ -436,11 +484,13 @@ async fn sweep_host(
                 lifecycle,
             },
             crate::worker_watch::ScreenRead::Screen { .. } => {
-                ScreenSnapshot::Unreadable("screen-unsupported")
+                ScreenSnapshot::Unreadable(SCREEN_UNSUPPORTED)
             }
             crate::worker_watch::ScreenRead::Gone(code) => ScreenSnapshot::Unreadable(code),
         };
-        if let ScreenSnapshot::Unreadable(code) = snapshot {
+        if let ScreenSnapshot::Unreadable(code) = snapshot
+            && code != SCREEN_UNSUPPORTED
+        {
             // §10.1 item 9: the category only.
             tracing::debug!(code, "inbox screen read: unreadable, no stall fact");
             if matches!(code, "host-offline" | "screen-unavailable") {
@@ -500,14 +550,17 @@ mod tests {
     }
 
     #[test]
-    fn screen_carriers_are_the_tty_drivers() {
-        for driver in ["claude-pty", "generic-pty", "shell-pty"] {
-            assert!(is_screen_carrier(driver), "{driver}");
-        }
+    fn screen_carriers_are_the_drivers_that_read_a_screen() {
+        assert!(is_screen_carrier("shell-pty"));
+        // r2: claude-pty and generic-pty keep `Driver::screen_read`'s default
+        // `None`, so the Node answers `supported: false` for them.
         for driver in [
+            "claude-pty",
+            "generic-pty",
             "claude-sdk",
             "claude-print",
             "claude-bg",
+            "unknown-driver",
             "codex-appserver",
             "grok-acp",
             "agy-print",
